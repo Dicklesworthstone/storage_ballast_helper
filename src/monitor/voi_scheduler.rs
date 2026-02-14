@@ -488,9 +488,8 @@ impl VoiScheduler {
             * (1.0 / (f64::from(stats.scan_count) + 1.0));
 
         // Combine.
-        let utility =
-            expected_reclaim.mul_add(uncertainty_discount, -io_penalty) - fp_penalty
-                + exploration_bonus;
+        let utility = expected_reclaim.mul_add(uncertainty_discount, -io_penalty) - fp_penalty
+            + exploration_bonus;
 
         // Clamp to non-negative (a path can't have negative priority — just low).
         utility.max(0.0)

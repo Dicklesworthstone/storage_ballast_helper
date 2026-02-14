@@ -2,6 +2,7 @@
 #![allow(missing_docs)]
 
 pub mod bootstrap;
+pub mod integrations;
 
 use std::fmt;
 use std::fs::File;
