@@ -1,6 +1,8 @@
 //! CLI contracts shared by installer and updater command paths.
 #![allow(missing_docs)]
 
+pub mod bootstrap;
+
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
