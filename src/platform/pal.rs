@@ -173,7 +173,10 @@ impl Platform for LinuxPlatform {
     }
 
     fn service_manager(&self) -> Box<dyn ServiceManager> {
-        Box::<NoopServiceManager>::default()
+        match crate::daemon::service::SystemdServiceManager::from_env(false) {
+            Ok(mgr) => Box::new(mgr),
+            Err(_) => Box::<NoopServiceManager>::default(),
+        }
     }
 }
 
