@@ -41,6 +41,7 @@ pub struct PressureConfig {
 pub struct ScannerConfig {
     pub root_paths: Vec<PathBuf>,
     pub excluded_paths: Vec<PathBuf>,
+    pub protected_paths: Vec<String>,
     pub min_file_age_minutes: u64,
     pub max_depth: usize,
     pub parallelism: usize,
@@ -136,6 +137,7 @@ impl Default for ScannerConfig {
                 PathBuf::from("/sys"),
                 PathBuf::from("/var/log"),
             ],
+            protected_paths: Vec::new(),
             min_file_age_minutes: 30,
             max_depth: 10,
             parallelism: std::thread::available_parallelism()

@@ -2,5 +2,6 @@
 
 pub mod deletion;
 pub mod patterns;
+pub mod protection;
 pub mod scoring;
 pub mod walker;
