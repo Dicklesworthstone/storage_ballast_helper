@@ -10,6 +10,6 @@ fn main() {
     let args = cli_app::Cli::parse();
     if let Err(e) = cli_app::run(&args) {
         eprintln!("sbh: {e}");
-        std::process::exit(1);
+        std::process::exit(e.exit_code());
     }
 }

@@ -3,6 +3,7 @@
 #![allow(missing_docs)]
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -11,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::core::errors::{Result, SbhError};
+use crate::daemon::notifications::NotificationConfig;
 
 /// Full SBH configuration model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -22,6 +24,7 @@ pub struct Config {
     pub ballast: BallastConfig,
     pub telemetry: TelemetryConfig,
     pub paths: PathsConfig,
+    pub notifications: NotificationConfig,
 }
 
 /// Pressure thresholds and control knobs.
@@ -33,6 +36,28 @@ pub struct PressureConfig {
     pub orange_min_free_pct: f64,
     pub red_min_free_pct: f64,
     pub poll_interval_ms: u64,
+    /// Predictive pre-emption settings.
+    pub prediction: PredictionConfig,
+}
+
+/// Knobs for predictive pre-emptive action (EWMA → graduated response).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PredictionConfig {
+    /// Master switch — when false, predictive pipeline is disabled.
+    pub enabled: bool,
+    /// Start pre-emptive cleanup when predicted exhaustion is within this many minutes.
+    pub action_horizon_minutes: f64,
+    /// Emit early-warning events when predicted exhaustion is within this many minutes.
+    pub warning_horizon_minutes: f64,
+    /// Minimum EWMA confidence required before any pre-emptive action.
+    pub min_confidence: f64,
+    /// Minimum EWMA sample count before any pre-emptive action.
+    pub min_samples: u64,
+    /// Threshold below which we escalate to imminent danger.
+    pub imminent_danger_minutes: f64,
+    /// Threshold below which imminent danger becomes critical.
+    pub critical_danger_minutes: f64,
 }
 
 /// Scanner behavior and safety constraints.
@@ -73,6 +98,61 @@ pub struct BallastConfig {
     pub file_count: usize,
     pub file_size_bytes: u64,
     pub replenish_cooldown_minutes: u64,
+    /// Automatically provision ballast pools on each monitored volume.
+    pub auto_provision: bool,
+    /// Per-volume overrides keyed by mount-point path (e.g., "/data").
+    #[serde(default)]
+    pub overrides: HashMap<String, BallastVolumeOverride>,
+}
+
+/// Per-volume override for ballast pool settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BallastVolumeOverride {
+    /// Whether to provision a ballast pool on this volume (default: true).
+    pub enabled: bool,
+    /// Override file count for this volume.
+    pub file_count: Option<usize>,
+    /// Override file size in bytes for this volume.
+    pub file_size_bytes: Option<u64>,
+}
+
+impl Default for BallastVolumeOverride {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            file_count: None,
+            file_size_bytes: None,
+        }
+    }
+}
+
+impl BallastConfig {
+    /// Resolve effective file_count for a given mount point, applying overrides.
+    #[must_use]
+    pub fn effective_file_count(&self, mount_path: &str) -> usize {
+        self.overrides
+            .get(mount_path)
+            .and_then(|o| o.file_count)
+            .unwrap_or(self.file_count)
+    }
+
+    /// Resolve effective file_size_bytes for a given mount point, applying overrides.
+    #[must_use]
+    pub fn effective_file_size_bytes(&self, mount_path: &str) -> u64 {
+        self.overrides
+            .get(mount_path)
+            .and_then(|o| o.file_size_bytes)
+            .unwrap_or(self.file_size_bytes)
+    }
+
+    /// Check whether a volume is enabled for ballast (disabled via override).
+    #[must_use]
+    pub fn is_volume_enabled(&self, mount_path: &str) -> bool {
+        self.overrides
+            .get(mount_path)
+            .map_or(true, |o| o.enabled)
+    }
 }
 
 /// Logging and stats-collector tuning.
@@ -106,6 +186,7 @@ impl Default for Config {
             ballast: BallastConfig::default(),
             telemetry: TelemetryConfig::default(),
             paths: PathsConfig::default(),
+            notifications: NotificationConfig::default(),
         }
     }
 }
@@ -118,6 +199,21 @@ impl Default for PressureConfig {
             orange_min_free_pct: 10.0,
             red_min_free_pct: 6.0,
             poll_interval_ms: 1_000,
+            prediction: PredictionConfig::default(),
+        }
+    }
+}
+
+impl Default for PredictionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            action_horizon_minutes: 30.0,
+            warning_horizon_minutes: 60.0,
+            min_confidence: 0.7,
+            min_samples: 5,
+            imminent_danger_minutes: 5.0,
+            critical_danger_minutes: 2.0,
         }
     }
 }
@@ -172,6 +268,8 @@ impl Default for BallastConfig {
             file_count: 10,
             file_size_bytes: 1_073_741_824,
             replenish_cooldown_minutes: 30,
+            auto_provision: true,
+            overrides: HashMap::new(),
         }
     }
 }
@@ -267,6 +365,36 @@ impl Config {
             &mut self.pressure.poll_interval_ms,
         )?;
 
+        // prediction
+        set_env_bool(
+            "SBH_PREDICTION_ENABLED",
+            &mut self.pressure.prediction.enabled,
+        )?;
+        set_env_f64(
+            "SBH_PREDICTION_ACTION_HORIZON_MINUTES",
+            &mut self.pressure.prediction.action_horizon_minutes,
+        )?;
+        set_env_f64(
+            "SBH_PREDICTION_WARNING_HORIZON_MINUTES",
+            &mut self.pressure.prediction.warning_horizon_minutes,
+        )?;
+        set_env_f64(
+            "SBH_PREDICTION_MIN_CONFIDENCE",
+            &mut self.pressure.prediction.min_confidence,
+        )?;
+        set_env_u64(
+            "SBH_PREDICTION_MIN_SAMPLES",
+            &mut self.pressure.prediction.min_samples,
+        )?;
+        set_env_f64(
+            "SBH_PREDICTION_IMMINENT_DANGER_MINUTES",
+            &mut self.pressure.prediction.imminent_danger_minutes,
+        )?;
+        set_env_f64(
+            "SBH_PREDICTION_CRITICAL_DANGER_MINUTES",
+            &mut self.pressure.prediction.critical_danger_minutes,
+        )?;
+
         // scanner
         set_env_u64(
             "SBH_SCANNER_MIN_FILE_AGE_MINUTES",
@@ -345,6 +473,36 @@ impl Config {
                 details: "pressure thresholds must strictly descend: green > yellow > orange > red"
                     .to_string(),
             });
+        }
+
+        if self.pressure.prediction.enabled {
+            let pred = &self.pressure.prediction;
+            if pred.warning_horizon_minutes <= pred.action_horizon_minutes {
+                return Err(SbhError::InvalidConfig {
+                    details: "prediction.warning_horizon_minutes must be > action_horizon_minutes"
+                        .to_string(),
+                });
+            }
+            if pred.action_horizon_minutes <= pred.imminent_danger_minutes {
+                return Err(SbhError::InvalidConfig {
+                    details:
+                        "prediction.action_horizon_minutes must be > imminent_danger_minutes"
+                            .to_string(),
+                });
+            }
+            if pred.imminent_danger_minutes <= pred.critical_danger_minutes {
+                return Err(SbhError::InvalidConfig {
+                    details:
+                        "prediction.imminent_danger_minutes must be > critical_danger_minutes"
+                            .to_string(),
+                });
+            }
+            if pred.critical_danger_minutes < 0.0 {
+                return Err(SbhError::InvalidConfig {
+                    details: "prediction.critical_danger_minutes must be >= 0".to_string(),
+                });
+            }
+            validate_prob("prediction.min_confidence", pred.min_confidence)?;
         }
 
         if self.scanner.parallelism == 0 {

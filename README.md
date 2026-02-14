@@ -73,6 +73,18 @@ sbh emergency /data --target-free 10 --yes
 
 ## Installation
 
+### Option 0: Unix One-Liner Installer
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_helper/main/scripts/install.sh | bash
+```
+
+Pin a specific version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_helper/main/scripts/install.sh | bash -s -- --version v0.1.0
+```
+
 ### Option 1: From Git (Cargo)
 
 ```bash

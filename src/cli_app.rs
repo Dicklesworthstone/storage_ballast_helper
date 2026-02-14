@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 
+use storage_ballast_helper::ballast::manager::BallastManager;
 use storage_ballast_helper::core::config::Config;
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::StatsEngine;
@@ -440,8 +441,8 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Stats(args) => emit_stub_with_args(cli, "stats", args),
         Command::Scan(args) => run_scan(cli, args),
         Command::Clean(args) => run_clean(cli, args),
-        Command::Ballast(args) => emit_stub_with_args(cli, ballast_command_label(args), args),
-        Command::Config(args) => emit_stub_with_args(cli, config_command_label(args), args),
+        Command::Ballast(args) => run_ballast(cli, args),
+        Command::Config(args) => run_config(cli, args),
         Command::Version(args) => emit_version(cli, args),
         Command::Emergency(args) => run_emergency(cli, args),
         Command::Protect(args) => run_protect(cli, args),

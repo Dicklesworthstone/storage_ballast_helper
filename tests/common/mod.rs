@@ -24,7 +24,10 @@ fn sanitize(name: &str) -> String {
 
 fn resolve_bin_path() -> PathBuf {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_sbh") {
-        return PathBuf::from(path);
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return p;
+        }
     }
 
     let exe_name = if cfg!(windows) { "sbh.exe" } else { "sbh" };
@@ -36,7 +39,9 @@ fn resolve_bin_path() -> PathBuf {
 
     match fallback {
         Some(path) if path.exists() => path,
-        _ => panic!("unable to resolve sbh binary path for integration test"),
+        _ => panic!(
+            "unable to resolve sbh binary path for integration test (checked CARGO_BIN_EXE_sbh and debug sibling path)"
+        ),
     }
 }
 
@@ -50,6 +55,7 @@ pub fn run_cli_case(case_name: &str, args: &[&str]) -> CmdResult {
     let output = Command::new(&bin_path)
         .args(args)
         .env("SBH_TEST_VERBOSE", "1")
+        .env("SBH_OUTPUT_FORMAT", "human")
         .env("RUST_BACKTRACE", "1")
         .output()
         .expect("execute sbh command");
