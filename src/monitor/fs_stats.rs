@@ -1,0 +1,273 @@
+//! Filesystem statistics collector: statvfs wrapper, usage percentages, inode tracking.
+
+#![allow(missing_docs)]
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use parking_lot::RwLock;
+
+use crate::core::errors::{Result, SbhError};
+use crate::platform::pal::{FsStats, MountPoint, Platform};
+
+#[derive(Debug, Clone)]
+struct CachedStats {
+    stats: FsStats,
+    collected_at: Instant,
+}
+
+/// Cache-aware, mount-deduplicating filesystem statistics collector.
+pub struct FsStatsCollector {
+    platform: Arc<dyn Platform>,
+    cache_ttl: Duration,
+    cache: RwLock<HashMap<PathBuf, CachedStats>>,
+}
+
+impl FsStatsCollector {
+    #[must_use]
+    pub fn new(platform: Arc<dyn Platform>, cache_ttl: Duration) -> Self {
+        Self {
+            platform,
+            cache_ttl,
+            cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn collect(&self, path: &Path) -> Result<FsStats> {
+        let mounts = self.platform.mount_points()?;
+        let mount = find_mount(path, &mounts).ok_or_else(|| SbhError::FsStats {
+            path: path.to_path_buf(),
+            details: "path does not belong to known mount".to_string(),
+        })?;
+        self.collect_for_mount(&mount.path)
+    }
+
+    pub fn collect_many(&self, paths: &[PathBuf]) -> Result<HashMap<PathBuf, FsStats>> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mounts = self.platform.mount_points()?;
+        let mut mounts_needed = HashSet::<PathBuf>::new();
+        for path in paths {
+            let Some(mount) = find_mount(path, &mounts) else {
+                return Err(SbhError::FsStats {
+                    path: path.clone(),
+                    details: "path does not belong to known mount".to_string(),
+                });
+            };
+            mounts_needed.insert(mount.path.clone());
+        }
+
+        let mut per_mount = HashMap::<PathBuf, FsStats>::new();
+        for mount_path in mounts_needed {
+            let stats = self.collect_for_mount(&mount_path)?;
+            per_mount.insert(mount_path, stats);
+        }
+
+        let mut out = HashMap::with_capacity(paths.len());
+        for path in paths {
+            let mount = find_mount(path, &mounts).ok_or_else(|| SbhError::FsStats {
+                path: path.clone(),
+                details: "path does not belong to known mount".to_string(),
+            })?;
+            let stats = per_mount
+                .get(&mount.path)
+                .cloned()
+                .ok_or_else(|| SbhError::FsStats {
+                    path: mount.path.clone(),
+                    details: "mount stats missing after collection".to_string(),
+                })?;
+            out.insert(path.clone(), stats);
+        }
+
+        Ok(out)
+    }
+
+    pub fn prune_expired_cache(&self) {
+        let now = Instant::now();
+        let ttl = self.cache_ttl;
+        self.cache
+            .write()
+            .retain(|_, entry| now.duration_since(entry.collected_at) <= ttl);
+    }
+
+    fn collect_for_mount(&self, mount_path: &Path) -> Result<FsStats> {
+        if let Some(hit) = self.cache_hit(mount_path) {
+            return Ok(hit);
+        }
+
+        let fresh = self.platform.fs_stats(mount_path)?;
+        let mut cache = self.cache.write();
+        cache.insert(
+            mount_path.to_path_buf(),
+            CachedStats {
+                stats: fresh.clone(),
+                collected_at: Instant::now(),
+            },
+        );
+        Ok(fresh)
+    }
+
+    fn cache_hit(&self, mount_path: &Path) -> Option<FsStats> {
+        let cache = self.cache.read();
+        let entry = cache.get(mount_path)?;
+        if entry.collected_at.elapsed() > self.cache_ttl {
+            return None;
+        }
+        Some(entry.stats.clone())
+    }
+}
+
+fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoint> {
+    mounts
+        .iter()
+        .filter(|mount| path.starts_with(&mount.path))
+        .max_by_key(|mount| mount.path.as_os_str().len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FsStatsCollector;
+    use crate::core::errors::{Result, SbhError};
+    use crate::platform::pal::{
+        FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
+    };
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct TestServiceManager;
+    impl ServiceManager for TestServiceManager {
+        fn install(&self) -> Result<()> {
+            Ok(())
+        }
+        fn uninstall(&self) -> Result<()> {
+            Ok(())
+        }
+        fn status(&self) -> Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    struct CountingPlatform {
+        mounts: Vec<MountPoint>,
+        stats: HashMap<PathBuf, FsStats>,
+        fs_stats_calls: AtomicUsize,
+    }
+
+    impl CountingPlatform {
+        fn new(mounts: Vec<MountPoint>, stats: HashMap<PathBuf, FsStats>) -> Self {
+            Self {
+                mounts,
+                stats,
+                fs_stats_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Platform for CountingPlatform {
+        fn fs_stats(&self, path: &Path) -> Result<FsStats> {
+            self.fs_stats_calls.fetch_add(1, Ordering::SeqCst);
+            self.stats
+                .get(path)
+                .cloned()
+                .ok_or_else(|| SbhError::FsStats {
+                    path: path.to_path_buf(),
+                    details: "missing stats".to_string(),
+                })
+        }
+
+        fn mount_points(&self) -> Result<Vec<MountPoint>> {
+            Ok(self.mounts.clone())
+        }
+
+        fn is_ram_backed(&self, _path: &Path) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn default_paths(&self) -> PlatformPaths {
+            PlatformPaths::default()
+        }
+
+        fn memory_info(&self) -> Result<MemoryInfo> {
+            Ok(MemoryInfo {
+                total_bytes: 1,
+                available_bytes: 1,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            })
+        }
+
+        fn service_manager(&self) -> Box<dyn ServiceManager> {
+            Box::<TestServiceManager>::default()
+        }
+    }
+
+    #[test]
+    fn collect_many_deduplicates_mount_queries() {
+        let mounts = vec![MountPoint {
+            path: PathBuf::from("/tmp"),
+            device: "tmpfs".to_string(),
+            fs_type: "tmpfs".to_string(),
+            is_ram_backed: true,
+        }];
+        let tmp_stats = FsStats {
+            total_bytes: 100,
+            free_bytes: 80,
+            available_bytes: 80,
+            fs_type: "tmpfs".to_string(),
+            mount_point: PathBuf::from("/tmp"),
+            is_readonly: false,
+        };
+        let platform = Arc::new(CountingPlatform::new(
+            mounts,
+            HashMap::from([(PathBuf::from("/tmp"), tmp_stats.clone())]),
+        ));
+        let collector = FsStatsCollector::new(platform.clone(), Duration::from_secs(5));
+
+        let inputs = vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")];
+        let out = collector
+            .collect_many(&inputs)
+            .expect("collect_many should work");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[&PathBuf::from("/tmp/a")], tmp_stats);
+        assert_eq!(platform.fs_stats_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cache_hit_avoids_repeat_syscall() {
+        let mounts = vec![MountPoint {
+            path: PathBuf::from("/tmp"),
+            device: "tmpfs".to_string(),
+            fs_type: "tmpfs".to_string(),
+            is_ram_backed: true,
+        }];
+        let tmp_stats = FsStats {
+            total_bytes: 100,
+            free_bytes: 80,
+            available_bytes: 80,
+            fs_type: "tmpfs".to_string(),
+            mount_point: PathBuf::from("/tmp"),
+            is_readonly: false,
+        };
+        let platform = Arc::new(CountingPlatform::new(
+            mounts,
+            HashMap::from([(PathBuf::from("/tmp"), tmp_stats)]),
+        ));
+        let collector = FsStatsCollector::new(platform.clone(), Duration::from_secs(10));
+
+        let _first = collector
+            .collect(Path::new("/tmp/work"))
+            .expect("first collect should work");
+        let _second = collector
+            .collect(Path::new("/tmp/work"))
+            .expect("second collect should hit cache");
+
+        assert_eq!(platform.fs_stats_calls.load(Ordering::SeqCst), 1);
+    }
+}

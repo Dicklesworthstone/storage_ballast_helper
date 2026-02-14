@@ -1,0 +1,254 @@
+//! EWMA rate estimator: disk usage velocity, acceleration, time-to-exhaustion prediction.
+
+#![allow(missing_docs)]
+#![allow(clippy::cast_precision_loss)]
+
+use std::time::Instant;
+
+/// Trend classification for disk pressure dynamics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trend {
+    Stable,
+    Accelerating,
+    Decelerating,
+    Recovering,
+}
+
+/// Output of the EWMA estimator.
+#[derive(Debug, Clone)]
+pub struct RateEstimate {
+    pub bytes_per_second: f64,
+    pub acceleration: f64,
+    pub seconds_to_exhaustion: f64,
+    pub seconds_to_threshold: f64,
+    pub confidence: f64,
+    pub trend: Trend,
+    pub alpha_used: f64,
+    pub fallback_active: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SampleState {
+    free_bytes: u64,
+    at: Instant,
+    inst_rate: f64,
+}
+
+/// Online EWMA estimator with adaptive alpha and fallback signaling.
+#[derive(Debug, Clone)]
+pub struct DiskRateEstimator {
+    base_alpha: f64,
+    min_alpha: f64,
+    max_alpha: f64,
+    ewma_rate: f64,
+    ewma_accel: f64,
+    residual_ewma: f64,
+    min_samples: u64,
+    samples: u64,
+    last: Option<SampleState>,
+}
+
+impl DiskRateEstimator {
+    #[must_use]
+    pub fn new(base_alpha: f64, min_alpha: f64, max_alpha: f64, min_samples: u64) -> Self {
+        Self {
+            base_alpha,
+            min_alpha,
+            max_alpha,
+            ewma_rate: 0.0,
+            ewma_accel: 0.0,
+            residual_ewma: 0.0,
+            min_samples,
+            samples: 0,
+            last: None,
+        }
+    }
+
+    /// Update estimator state with a new free-bytes sample.
+    ///
+    /// `threshold_free_bytes` should be the configured red threshold in bytes.
+    pub fn update(
+        &mut self,
+        free_bytes: u64,
+        observed_at: Instant,
+        threshold_free_bytes: u64,
+    ) -> RateEstimate {
+        let Some(previous) = self.last else {
+            self.last = Some(SampleState {
+                free_bytes,
+                at: observed_at,
+                inst_rate: 0.0,
+            });
+            return self.fallback_estimate(0.0, threshold_free_bytes);
+        };
+
+        let dt = observed_at.duration_since(previous.at).as_secs_f64();
+        if dt <= f64::EPSILON {
+            return self.fallback_estimate(free_bytes, threshold_free_bytes);
+        }
+
+        let consumed = previous.free_bytes as f64 - free_bytes as f64;
+        let inst_rate = consumed / dt;
+        let burstiness = ((inst_rate - self.ewma_rate).abs()) / (self.ewma_rate.abs() + 1.0);
+        let alpha = (self.base_alpha + 0.20 * burstiness).clamp(self.min_alpha, self.max_alpha);
+
+        self.ewma_rate = ewma(alpha, self.ewma_rate, inst_rate);
+        let inst_accel = (inst_rate - previous.inst_rate) / dt;
+        self.ewma_accel = ewma(alpha, self.ewma_accel, inst_accel);
+        self.residual_ewma = ewma(
+            alpha,
+            self.residual_ewma,
+            (inst_rate - self.ewma_rate).abs(),
+        );
+
+        self.samples = self.samples.saturating_add(1);
+        self.last = Some(SampleState {
+            free_bytes,
+            at: observed_at,
+            inst_rate,
+        });
+
+        let confidence = self.compute_confidence();
+        let trend = classify_trend(self.ewma_rate, self.ewma_accel);
+        let seconds_to_exhaustion =
+            project_time(self.ewma_rate, self.ewma_accel, free_bytes as f64);
+        let threshold_distance = free_bytes.saturating_sub(threshold_free_bytes);
+        let seconds_to_threshold =
+            project_time(self.ewma_rate, self.ewma_accel, threshold_distance as f64);
+        let fallback_active = self.samples < self.min_samples || confidence < 0.2;
+
+        RateEstimate {
+            bytes_per_second: self.ewma_rate,
+            acceleration: self.ewma_accel,
+            seconds_to_exhaustion,
+            seconds_to_threshold,
+            confidence,
+            trend,
+            alpha_used: alpha,
+            fallback_active,
+        }
+    }
+
+    #[must_use]
+    pub fn sample_count(&self) -> u64 {
+        self.samples
+    }
+
+    fn compute_confidence(&self) -> f64 {
+        if self.samples == 0 {
+            return 0.0;
+        }
+        let sample_term = (self.samples as f64 / self.min_samples.max(1) as f64).min(1.0);
+        let residual_term = 1.0 / (1.0 + self.residual_ewma / (self.ewma_rate.abs() + 1.0));
+        (0.7 * sample_term + 0.3 * residual_term).clamp(0.0, 1.0)
+    }
+
+    fn fallback_estimate(&self, free_bytes: u64, threshold_free_bytes: u64) -> RateEstimate {
+        let threshold_distance = free_bytes.saturating_sub(threshold_free_bytes);
+        RateEstimate {
+            bytes_per_second: self.ewma_rate,
+            acceleration: self.ewma_accel,
+            seconds_to_exhaustion: if self.ewma_rate > 0.0 {
+                free_bytes as f64 / self.ewma_rate
+            } else {
+                f64::INFINITY
+            },
+            seconds_to_threshold: if self.ewma_rate > 0.0 {
+                threshold_distance as f64 / self.ewma_rate
+            } else {
+                f64::INFINITY
+            },
+            confidence: self.compute_confidence(),
+            trend: classify_trend(self.ewma_rate, self.ewma_accel),
+            alpha_used: self.base_alpha,
+            fallback_active: true,
+        }
+    }
+}
+
+#[inline]
+fn ewma(alpha: f64, prev: f64, current: f64) -> f64 {
+    alpha * current + (1.0 - alpha) * prev
+}
+
+fn classify_trend(rate: f64, accel: f64) -> Trend {
+    if rate < -1.0 {
+        return Trend::Recovering;
+    }
+    if accel > 64.0 {
+        Trend::Accelerating
+    } else if accel < -64.0 {
+        Trend::Decelerating
+    } else {
+        Trend::Stable
+    }
+}
+
+fn project_time(rate: f64, accel: f64, distance_bytes: f64) -> f64 {
+    if distance_bytes <= 0.0 {
+        return 0.0;
+    }
+    if rate <= 0.0 {
+        return f64::INFINITY;
+    }
+    if accel.abs() < 1e-9 {
+        return distance_bytes / rate;
+    }
+
+    let discriminant = rate * rate + 2.0 * accel * distance_bytes;
+    if discriminant.is_sign_negative() {
+        return distance_bytes / rate;
+    }
+    let root = discriminant.sqrt();
+    let numerator = -rate + root;
+    if accel.abs() < 1e-9 || numerator <= 0.0 {
+        return distance_bytes / rate;
+    }
+    let t = numerator / accel;
+    if t.is_finite() && t > 0.0 {
+        t
+    } else {
+        distance_bytes / rate
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DiskRateEstimator, Trend};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn fallback_active_until_min_samples() {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 3);
+        let t0 = Instant::now();
+        let r0 = estimator.update(1_000, t0, 100);
+        assert!(r0.fallback_active);
+        let r1 = estimator.update(900, t0 + Duration::from_secs(1), 100);
+        assert!(r1.fallback_active);
+        let r2 = estimator.update(800, t0 + Duration::from_secs(2), 100);
+        assert!(!r2.fallback_active);
+    }
+
+    #[test]
+    fn detects_recovering_trend_on_free_space_growth() {
+        let mut estimator = DiskRateEstimator::new(0.4, 0.1, 0.8, 2);
+        let t0 = Instant::now();
+        let _ = estimator.update(1_000, t0, 100);
+        let _ = estimator.update(1_200, t0 + Duration::from_secs(1), 100);
+        let reading = estimator.update(1_400, t0 + Duration::from_secs(2), 100);
+        assert_eq!(reading.trend, Trend::Recovering);
+        assert!(reading.bytes_per_second < 0.0);
+    }
+
+    #[test]
+    fn produces_finite_exhaustion_time_for_positive_consumption() {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 2);
+        let t0 = Instant::now();
+        let _ = estimator.update(10_000, t0, 1_000);
+        let _ = estimator.update(9_000, t0 + Duration::from_secs(1), 1_000);
+        let reading = estimator.update(8_000, t0 + Duration::from_secs(2), 1_000);
+        assert!(reading.seconds_to_exhaustion.is_finite());
+        assert!(reading.seconds_to_exhaustion > 0.0);
+        assert!(reading.seconds_to_threshold.is_finite());
+    }
+}
