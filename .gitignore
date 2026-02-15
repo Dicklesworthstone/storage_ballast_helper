@@ -30,3 +30,14 @@ tmp/
 # Local planning state and caches
 .bv/
 .beads/
+
+# Ephemeral agent/runtime artifacts
+storage.sqlite3
+storage.sqlite3-*
+rustc-ice-*.txt
+a.out
+perf.data
+perf.data.*
+--graph-format.svg
+target-codex*/
+target_*/
