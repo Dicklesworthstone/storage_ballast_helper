@@ -649,11 +649,11 @@ impl MonitoringDaemon {
                 continue;
             }
 
-            self.last_special_scan.insert(location.path.clone(), now);
-
             let Ok(stats) = self.fs_collector.collect(&location.path) else {
                 continue;
             };
+
+            self.last_special_scan.insert(location.path.clone(), now);
 
             if location.needs_attention(&stats) {
                 self.logger_handle.send(ActivityEvent::Error {

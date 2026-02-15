@@ -17,6 +17,7 @@ use storage_ballast_helper::core::config::Config;
 use storage_ballast_helper::daemon::loop_main::{
     DaemonArgs as RuntimeDaemonArgs, MonitoringDaemon,
 };
+use storage_ballast_helper::daemon::self_monitor::DAEMON_STATE_STALE_THRESHOLD_SECS;
 use storage_ballast_helper::daemon::service::{
     LaunchdServiceManager, ServiceActionResult, SystemdServiceManager,
 };
@@ -2680,32 +2681,50 @@ const fn normalize_refresh_ms(refresh_ms: u64) -> u64 {
     }
 }
 
-fn run_live_status_loop(cli: &Cli, refresh_ms: u64, command: &str) -> Result<(), CliError> {
-    if output_mode(cli) == OutputMode::Json {
+fn validate_live_mode_output(
+    mode: OutputMode,
+    command: &str,
+    allow_json_live: bool,
+) -> Result<(), CliError> {
+    if mode == OutputMode::Json && !allow_json_live {
         return Err(CliError::User(format!(
             "{command}: live mode does not support --json; use `sbh status --json` for snapshots"
         )));
     }
+    Ok(())
+}
 
+fn run_live_status_loop(
+    cli: &Cli,
+    refresh_ms: u64,
+    command: &str,
+    allow_json_live: bool,
+) -> Result<(), CliError> {
+    let mode = output_mode(cli);
+    validate_live_mode_output(mode, command, allow_json_live)?;
     let refresh_ms = normalize_refresh_ms(refresh_ms);
 
     loop {
-        print!("\x1B[2J\x1B[H");
-        io::stdout().flush()?;
-        render_status(cli)?;
-        println!("\nRefreshing every {refresh_ms}ms (Ctrl-C to exit)");
+        if mode == OutputMode::Json {
+            render_status(cli)?;
+        } else {
+            print!("\x1B[2J\x1B[H");
+            io::stdout().flush()?;
+            render_status(cli)?;
+            println!("\nRefreshing every {refresh_ms}ms (Ctrl-C to exit)");
+        }
         io::stdout().flush()?;
         std::thread::sleep(std::time::Duration::from_millis(refresh_ms));
     }
 }
 
 fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
-    run_live_status_loop(cli, args.refresh_ms, "dashboard")
+    run_live_status_loop(cli, args.refresh_ms, "dashboard", false)
 }
 
 fn run_status(cli: &Cli, args: &StatusArgs) -> Result<(), CliError> {
     if args.watch {
-        run_live_status_loop(cli, STATUS_WATCH_REFRESH_MS, "status --watch")
+        run_live_status_loop(cli, STATUS_WATCH_REFRESH_MS, "status --watch", true)
     } else {
         render_status(cli)
     }
@@ -2730,8 +2749,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
 
     // I26: Check file modification time to detect stale state from a crashed daemon.
     let daemon_running = daemon_state.is_some() && {
-        let stale_threshold_secs = (config.pressure.poll_interval_ms / 1000).max(1) * 2;
-        let stale_threshold = std::time::Duration::from_secs(stale_threshold_secs);
+        let stale_threshold = std::time::Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS);
         std::fs::metadata(&config.paths.state_file)
             .ok()
             .and_then(|m| m.modified().ok())
@@ -3784,8 +3802,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         let age = SystemTime::now()
             .duration_since(modified)
             .unwrap_or_default();
-        let stale_threshold_secs = (config.pressure.poll_interval_ms / 1000).max(1) * 2;
-        let stale_threshold = std::time::Duration::from_secs(stale_threshold_secs);
+        let stale_threshold = std::time::Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS);
         if age > stale_threshold && output_mode(cli) == OutputMode::Human {
             eprintln!(
                 "sbh: warning: state.json is {:.0}s old (daemon may not be running)",
@@ -3866,11 +3883,11 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 fn read_daemon_prediction(state_path: &Path, mount_point: &Path) -> Option<f64> {
     let content = std::fs::read_to_string(state_path).ok()?;
 
-    // Check freshness: file modified within last 30 seconds.
+    // Check freshness: file modified within the staleness threshold.
     let meta = std::fs::metadata(state_path).ok()?;
     let modified = meta.modified().ok()?;
     let age = SystemTime::now().duration_since(modified).ok()?;
-    if age.as_secs() > 30 {
+    if age.as_secs() > DAEMON_STATE_STALE_THRESHOLD_SECS {
         return None; // Stale state, daemon likely not running.
     }
 
@@ -4976,6 +4993,21 @@ mod tests {
             LIVE_REFRESH_MIN_MS
         );
         assert_eq!(normalize_refresh_ms(2_500), 2_500);
+    }
+
+    #[test]
+    fn validate_live_mode_output_allows_status_watch_json_streaming() {
+        let result = validate_live_mode_output(OutputMode::Json, "status --watch", true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_live_mode_output_rejects_dashboard_json_live_mode() {
+        let result = validate_live_mode_output(OutputMode::Json, "dashboard", false);
+        assert!(result.is_err());
+        let err_text = result.err().map_or_else(String::new, |e| e.to_string());
+        assert!(err_text.contains("dashboard"));
+        assert!(err_text.contains("does not support --json"));
     }
 
     #[test]

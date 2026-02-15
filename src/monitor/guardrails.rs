@@ -239,7 +239,7 @@ impl AdaptiveGuard {
                 } else if median_error > self.config.max_rate_error {
                     format!("Rate calibration failed (median error={median_error:.2})")
                 } else {
-                    format!("TTE coverage low ({conservative_frac:.1}%)")
+                    format!("TTE coverage low ({:.1}%)", conservative_frac * 100.0)
                 }
             }
         };

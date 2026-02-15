@@ -557,8 +557,10 @@ impl Config {
         // Strip trailing slashes from scanner root_paths.
         for path in &mut self.scanner.root_paths {
             let s = path.to_string_lossy();
-            if s.len() > 1 && s.ends_with('/') {
-                *path = PathBuf::from(s.strip_suffix('/').unwrap());
+            if s.len() > 1
+                && let Some(stripped) = s.strip_suffix('/')
+            {
+                *path = PathBuf::from(stripped);
             }
         }
     }
@@ -778,7 +780,7 @@ fn parse_env_bool(name: &str, raw: &str) -> Result<bool> {
 mod tests {
     use super::{Config, SbhError};
     use std::collections::HashMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -994,6 +996,23 @@ mod tests {
         };
         assert!(!cfg.is_volume_enabled("/tmp"));
         assert!(cfg.is_volume_enabled("/data"));
+    }
+
+    #[test]
+    fn normalize_paths_trims_trailing_slashes_and_keeps_root() {
+        let mut cfg = Config::default();
+        cfg.ballast.overrides.insert(
+            "/data/".to_string(),
+            super::BallastVolumeOverride::default(),
+        );
+        cfg.scanner.root_paths = vec![PathBuf::from("/"), PathBuf::from("/data/")];
+
+        cfg.normalize_paths();
+
+        assert!(cfg.ballast.overrides.contains_key("/data"));
+        assert!(!cfg.ballast.overrides.contains_key("/data/"));
+        assert!(cfg.scanner.root_paths.contains(&PathBuf::from("/")));
+        assert!(cfg.scanner.root_paths.contains(&PathBuf::from("/data")));
     }
 
     #[test]

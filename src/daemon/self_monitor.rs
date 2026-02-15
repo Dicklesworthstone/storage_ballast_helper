@@ -2,7 +2,8 @@
 //! and sd_notify STATUS updates.
 //!
 //! The state file (`state.json`) is the primary mechanism for CLI-to-daemon communication.
-//! Written atomically (write to `.tmp`, then `rename()`) every 30 seconds so `sbh status`
+//! Written atomically (write to `.tmp`, then `rename()`) every `DAEMON_STATE_WRITE_INTERVAL_SECS`
+//! seconds so `sbh status`
 //! can always read a consistent snapshot.
 
 #![allow(missing_docs)]
@@ -17,6 +18,18 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::pid::PressureLevel;
+
+// ──────────────────── constants ────────────────────
+
+/// How often the daemon writes `state.json` (seconds).
+pub const DAEMON_STATE_WRITE_INTERVAL_SECS: u64 = 30;
+
+/// Floor for treating `state.json` as stale (seconds).
+///
+/// Must be `>= 2 × DAEMON_STATE_WRITE_INTERVAL_SECS` so that CLI commands
+/// (`sbh status`, `sbh check`, `read_daemon_prediction`) never report the
+/// daemon as absent simply because a write cycle hasn't completed yet.
+pub const DAEMON_STATE_STALE_THRESHOLD_SECS: u64 = 90;
 
 // ──────────────────── state file schema ────────────────────
 
@@ -224,7 +237,7 @@ impl SelfMonitor {
             state_file_path,
             start_time: Instant::now(),
             started_at_iso: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            write_interval: Duration::from_secs(30),
+            write_interval: Duration::from_secs(DAEMON_STATE_WRITE_INTERVAL_SECS),
             last_write: None,
             rss_limit_bytes: 256 * 1024 * 1024, // 256 MB
 

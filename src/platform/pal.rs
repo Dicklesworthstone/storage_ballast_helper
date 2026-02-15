@@ -349,7 +349,10 @@ fn unescape_mount_field(raw: &str) -> String {
             let a = bytes[i + 1];
             let b = bytes[i + 2];
             let c = bytes[i + 3];
-            if a.is_ascii_digit() && b.is_ascii_digit() && c.is_ascii_digit() {
+            if (b'0'..=b'7').contains(&a)
+                && (b'0'..=b'7').contains(&b)
+                && (b'0'..=b'7').contains(&c)
+            {
                 let val = (a - b'0') * 64 + (b - b'0') * 8 + (c - b'0');
                 result.push(char::from(val));
                 i += 4;
