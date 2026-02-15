@@ -9,7 +9,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -439,6 +439,10 @@ fn parse_last_scan_instant(timestamp: &str) -> Option<Instant> {
 // ──────────────────── atomic state file write ────────────────────
 
 /// Write state.json atomically: write to .tmp, then rename.
+///
+/// Sets 0o600 permissions on the temp file (Unix only) so the final
+/// state.json is owner-only readable, preventing information leak on
+/// multi-user systems.
 fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
     let tmp_path = path.with_extension("json.tmp");
 
@@ -450,7 +454,14 @@ fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
     {
         use std::io::Write;
-        let mut file = fs::File::create(&tmp_path)?;
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp_path)?;
         file.write_all(json.as_bytes())?;
         file.sync_all()?;
     }
@@ -594,6 +605,52 @@ mod tests {
         let read_back: DaemonState =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(read_back.uptime_seconds, 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let state = DaemonState {
+            version: "0.1.0".to_string(),
+            pid: 1,
+            started_at: "2026-01-01T00:00:00.000Z".to_string(),
+            uptime_seconds: 0,
+            last_updated: "2026-01-01T00:00:00.000Z".to_string(),
+            pressure: PressureState {
+                overall: "green".to_string(),
+                mounts: vec![],
+            },
+            ballast: BallastState {
+                available: 0,
+                total: 0,
+                released: 0,
+            },
+            last_scan: LastScanState {
+                at: None,
+                candidates: 0,
+                deleted: 0,
+            },
+            counters: Counters {
+                scans: 0,
+                deletions: 0,
+                bytes_freed: 0,
+                errors: 0,
+            },
+            memory_rss_bytes: 0,
+        };
+
+        write_state_atomic(&path, &state).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "state.json should be owner-only (0600), got {mode:o}"
+        );
     }
 
     #[test]
