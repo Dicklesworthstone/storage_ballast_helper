@@ -9,6 +9,7 @@
 #![allow(missing_docs)]
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -148,12 +149,13 @@ impl ProtectionRegistry {
     /// (we already know the entire subtree is protected).
     pub fn discover_markers(&mut self, root: &Path, max_depth: usize) -> Result<usize> {
         let mut found = 0usize;
-        let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+        let mut queue: Vec<(PathBuf, usize)> = vec![(normalize_path_for_protection(root), 0)];
 
         while let Some((dir, depth)) = queue.pop() {
             let marker_path = dir.join(MARKER_FILENAME);
             if marker_path.exists() {
-                if self.marker_paths.insert(dir.clone()) {
+                let marker_dir = normalize_path_for_protection(&dir);
+                if self.marker_paths.insert(marker_dir) {
                     found += 1;
                 }
                 // Don't descend into protected subtrees during discovery —
@@ -197,7 +199,7 @@ impl ProtectionRegistry {
     /// Register a single marker directory (used when walker encounters a marker
     /// during normal traversal, without full discovery).
     pub fn register_marker(&mut self, dir: &Path) -> bool {
-        self.marker_paths.insert(dir.to_path_buf())
+        self.marker_paths.insert(normalize_path_for_protection(dir))
     }
 
     /// List all currently known protections.
@@ -241,14 +243,16 @@ impl ProtectionRegistry {
     }
 
     fn find_marker_ancestor(&self, path: &Path) -> Option<&PathBuf> {
+        let normalized = normalize_path_for_protection(path);
+
         // Check exact path first.
-        if let Some(found) = self.marker_paths.get(&path.to_path_buf()) {
+        if let Some(found) = self.marker_paths.get(&normalized) {
             return Some(found);
         }
         // Walk ancestors.
-        let mut current = path.parent();
+        let mut current = normalized.parent();
         while let Some(ancestor) = current {
-            if let Some(found) = self.marker_paths.get(&ancestor.to_path_buf()) {
+            if let Some(found) = self.marker_paths.get(ancestor) {
                 return Some(found);
             }
             current = ancestor.parent();
@@ -283,7 +287,7 @@ impl ProtectionRegistry {
 ///
 /// If `metadata` is provided, writes it as JSON. Otherwise creates an empty file.
 pub fn create_marker(dir: &Path, metadata: Option<&ProtectionMetadata>) -> Result<()> {
-    let marker_path = dir.join(MARKER_FILENAME);
+    let marker_path = normalize_path_for_protection(dir).join(MARKER_FILENAME);
     let content = match metadata {
         Some(meta) => serde_json::to_string_pretty(meta)?,
         None => String::new(),
@@ -296,7 +300,7 @@ pub fn create_marker(dir: &Path, metadata: Option<&ProtectionMetadata>) -> Resul
 
 /// Remove a `.sbh-protect` marker file from the given directory.
 pub fn remove_marker(dir: &Path) -> Result<bool> {
-    let marker_path = dir.join(MARKER_FILENAME);
+    let marker_path = normalize_path_for_protection(dir).join(MARKER_FILENAME);
     match fs::remove_file(&marker_path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
@@ -373,6 +377,46 @@ fn glob_to_regex(pattern: &str) -> Result<Regex> {
 
 fn normalize_path_for_matching(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+fn normalize_path_for_protection(path: &Path) -> PathBuf {
+    let absolute = absolute_path(path);
+    if let Ok(canonical) = fs::canonicalize(&absolute) {
+        return canonical;
+    }
+
+    // If the full path doesn't exist yet, canonicalize the deepest existing
+    // ancestor and append the unresolved suffix. This keeps alias/symlink paths
+    // stable for marker ancestor matching.
+    let mut suffix: Vec<OsString> = Vec::new();
+    let mut current = absolute.as_path();
+    loop {
+        if let Ok(canonical_parent) = fs::canonicalize(current) {
+            let mut normalized = canonical_parent;
+            for segment in suffix.iter().rev() {
+                normalized.push(segment);
+            }
+            return normalized;
+        }
+        let Some(name) = current.file_name() else {
+            break;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+    }
+
+    absolute
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    }
 }
 
 #[cfg(test)]
@@ -735,5 +779,39 @@ mod tests {
             .protection_reason(Path::new("/data/projects/critical"))
             .unwrap();
         assert!(reason.contains(MARKER_FILENAME));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn register_marker_canonicalizes_symlink_aliases() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        let alias = tmp.path().join("alias");
+        fs::create_dir_all(real.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let mut reg = ProtectionRegistry::marker_only();
+        reg.register_marker(&alias);
+
+        assert!(reg.is_protected(&real));
+        assert!(reg.is_protected(&real.join("nested")));
+        assert!(reg.is_protected(&alias.join("nested")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_marker_resolves_symlink_aliases() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        let alias = tmp.path().join("alias");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        create_marker(&real, None).unwrap();
+        assert!(real.join(MARKER_FILENAME).exists());
+
+        let removed = remove_marker(&alias).unwrap();
+        assert!(removed);
+        assert!(!real.join(MARKER_FILENAME).exists());
     }
 }

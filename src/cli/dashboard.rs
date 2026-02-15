@@ -223,6 +223,11 @@ pub fn run(config: &DashboardConfig) -> io::Result<()> {
     result
 }
 
+fn initial_last_render(refresh: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_sub(refresh).unwrap_or(now)
+}
+
 fn run_inner(stdout: &mut io::Stdout, config: &DashboardConfig) -> io::Result<()> {
     let mut rate_histories: Vec<(String, RateHistory)> = Vec::new();
 
@@ -232,7 +237,8 @@ fn run_inner(stdout: &mut io::Stdout, config: &DashboardConfig) -> io::Result<()
         .as_ref()
         .map(|p| FsStatsCollector::new(std::sync::Arc::clone(p), Duration::from_secs(1)));
 
-    let mut last_render = Instant::now().checked_sub(config.refresh).unwrap(); // Force immediate first render.
+    // Force an immediate first render, even if `refresh` is unusually large.
+    let mut last_render = initial_last_render(config.refresh);
 
     loop {
         // Poll for keyboard events.
@@ -712,5 +718,18 @@ mod tests {
         assert_eq!(level_label("green"), "GREEN");
         assert_eq!(level_label("critical"), "CRITICAL");
         assert_eq!(level_label("weird"), "weird");
+    }
+
+    #[test]
+    fn initial_last_render_handles_oversized_refresh() {
+        let anchor = initial_last_render(Duration::MAX);
+        assert!(anchor.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn initial_last_render_backdates_for_normal_refresh() {
+        let refresh = Duration::from_millis(50);
+        let anchor = initial_last_render(refresh);
+        assert!(anchor.elapsed() >= refresh);
     }
 }
