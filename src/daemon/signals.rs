@@ -19,6 +19,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 /// All flags use `Ordering::Relaxed` because the main loop polls them every iteration
 /// and exact ordering with other atomics is not required.
 #[derive(Clone)]
+#[allow(clippy::struct_field_names)]
 pub struct SignalHandler {
     shutdown_flag: Arc<AtomicBool>,
     reload_flag: Arc<AtomicBool>,
@@ -30,6 +31,7 @@ impl SignalHandler {
     ///
     /// On Unix: SIGTERM/SIGINT -> shutdown, SIGHUP -> reload, SIGUSR1 -> scan.
     /// Registration is best-effort; failures are logged to stderr but not fatal.
+    #[must_use]
     pub fn new() -> Self {
         let handler = Self {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
@@ -42,16 +44,19 @@ impl SignalHandler {
     }
 
     /// Check whether a shutdown has been requested.
+    #[must_use]
     pub fn should_shutdown(&self) -> bool {
         self.shutdown_flag.load(Ordering::Relaxed)
     }
 
     /// Check (and clear) whether a config reload has been requested.
+    #[must_use]
     pub fn should_reload(&self) -> bool {
         self.reload_flag.swap(false, Ordering::Relaxed)
     }
 
     /// Check (and clear) whether an immediate scan has been requested.
+    #[must_use]
     pub fn should_scan(&self) -> bool {
         self.scan_flag.swap(false, Ordering::Relaxed)
     }
@@ -117,7 +122,8 @@ pub struct ShutdownCoordinator {
 
 impl ShutdownCoordinator {
     /// Create a coordinator with the default 30-second timeout.
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             timeout: Duration::from_secs(30),
         }
@@ -164,7 +170,7 @@ impl Default for ShutdownCoordinator {
 /// `maybe_notify()` each iteration. If enough time has elapsed, it sends
 /// `sd_notify(WATCHDOG=1)`.
 pub struct WatchdogHeartbeat {
-    /// Interval between heartbeat notifications (typically half of WatchdogSec).
+    /// Interval between heartbeat notifications (typically half of `WatchdogSec`).
     interval: Duration,
     /// Last time a heartbeat was sent.
     last_beat: Instant,
@@ -177,6 +183,7 @@ impl WatchdogHeartbeat {
     ///
     /// `watchdog_sec` is the full watchdog timeout from systemd. The heartbeat
     /// will fire at half that interval.
+    #[must_use]
     pub fn new(watchdog_sec: u64) -> Self {
         Self {
             interval: Duration::from_secs(watchdog_sec / 2),
@@ -186,6 +193,7 @@ impl WatchdogHeartbeat {
     }
 
     /// Create a disabled heartbeat (for non-systemd environments).
+    #[must_use]
     pub fn disabled() -> Self {
         Self {
             interval: Duration::from_secs(30),
@@ -212,14 +220,15 @@ impl WatchdogHeartbeat {
     }
 
     /// Whether the watchdog is enabled.
-    pub fn is_enabled(&self) -> bool {
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
         self.enabled
     }
 }
 
-/// Send sd_notify(WATCHDOG=1) + STATUS=<msg> to systemd.
+/// Send `sd_notify(WATCHDOG=1)` + STATUS=<msg> to systemd.
 ///
-/// Uses the NOTIFY_SOCKET environment variable. If not set, this is a no-op.
+/// Uses the `NOTIFY_SOCKET` environment variable. If not set, this is a no-op.
 fn sd_notify_watchdog(status: &str) {
     #[cfg(target_os = "linux")]
     {
@@ -241,9 +250,8 @@ fn sd_notify_linux(status: &str) {
     };
 
     let msg = format!("WATCHDOG=1\nSTATUS={status}\n");
-    let sock = match UnixDatagram::unbound() {
-        Ok(s) => s,
-        Err(_) => return,
+    let Ok(sock) = UnixDatagram::unbound() else {
+        return;
     };
 
     let _ = sock.send_to(msg.as_bytes(), &socket_path);

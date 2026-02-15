@@ -5,6 +5,7 @@
 //! is logged with a reason code and is reversible.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -274,10 +275,8 @@ fn candidate_binary_paths() -> Vec<PathBuf> {
     paths.push(PathBuf::from("/usr/local/bin/sbh"));
     paths.push(PathBuf::from("/usr/bin/sbh"));
     // Current executable location.
-    if let Ok(exe) = std::env::current_exe() {
-        if !paths.contains(&exe) {
-            paths.push(exe);
-        }
+    if let Ok(exe) = std::env::current_exe() && !paths.contains(&exe) {
+        paths.push(exe);
     }
     paths
 }
@@ -357,6 +356,7 @@ fn home_dir() -> Option<PathBuf> {
 
 /// Scan the system for all sbh installation footprints.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn scan_footprints() -> Vec<Footprint> {
     let mut footprints = Vec::new();
 
@@ -632,18 +632,16 @@ fn check_profile_health(
     }
 
     // Check if the referenced directory in the PATH entry actually contains sbh.
-    if let Some(line) = sbh_lines.first() {
-        if let Some(dir) = extract_path_dir_from_export(line) {
-            let binary = PathBuf::from(&dir).join("sbh");
-            if !binary.exists() {
-                return (
-                    false,
-                    Some(MigrationReason::StalePathEntry),
-                    Some(format!(
-                        "PATH entry references {dir} but sbh binary not found there"
-                    )),
-                );
-            }
+    if let Some(line) = sbh_lines.first() && let Some(dir) = extract_path_dir_from_export(line) {
+        let binary = PathBuf::from(&dir).join("sbh");
+        if !binary.exists() {
+            return (
+                false,
+                Some(MigrationReason::StalePathEntry),
+                Some(format!(
+                    "PATH entry references {dir} but sbh binary not found there"
+                )),
+            );
         }
     }
 
@@ -654,16 +652,12 @@ fn check_profile_health(
 fn extract_path_dir_from_export(line: &str) -> Option<String> {
     // Matches patterns like: export PATH="/some/path:$PATH"
     let trimmed = line.trim();
-    if let Some(after_eq) = trimmed.strip_prefix("export PATH=\"") {
-        if let Some(colon_pos) = after_eq.find(':') {
-            return Some(after_eq[..colon_pos].to_string());
-        }
+    if let Some(after_eq) = trimmed.strip_prefix("export PATH=\"") && let Some(colon_pos) = after_eq.find(':') {
+        return Some(after_eq[..colon_pos].to_string());
     }
     // Also handle: export PATH='/some/path:$PATH'
-    if let Some(after_eq) = trimmed.strip_prefix("export PATH='") {
-        if let Some(colon_pos) = after_eq.find(':') {
-            return Some(after_eq[..colon_pos].to_string());
-        }
+    if let Some(after_eq) = trimmed.strip_prefix("export PATH='") && let Some(colon_pos) = after_eq.find(':') {
+        return Some(after_eq[..colon_pos].to_string());
     }
     None
 }
@@ -708,19 +702,17 @@ fn check_launchd_health(path: &Path) -> (bool, Option<MigrationReason>, Option<S
                     // Search subsequent lines for first <string>...</string>.
                     for subsequent in &lines[i + 1..] {
                         let trimmed = subsequent.trim();
-                        if let Some(rest) = trimmed.strip_prefix("<string>") {
-                            if let Some(binary) = rest.strip_suffix("</string>") {
-                                if !Path::new(binary).exists() {
-                                    return (
-                                        false,
-                                        Some(MigrationReason::LaunchdPlistStaleBinary),
-                                        Some(format!(
-                                            "ProgramArguments references {binary} which does not exist"
-                                        )),
-                                    );
-                                }
-                                break;
+                        if let Some(rest) = trimmed.strip_prefix("<string>") && let Some(binary) = rest.strip_suffix("</string>") {
+                            if !Path::new(binary).exists() {
+                                return (
+                                    false,
+                                    Some(MigrationReason::LaunchdPlistStaleBinary),
+                                    Some(format!(
+                                        "ProgramArguments references {binary} which does not exist"
+                                    )),
+                                );
                             }
+                            break;
                         }
                     }
                 }
@@ -776,6 +768,7 @@ impl Default for MigrateOptions {
 }
 
 /// Run the full migration pipeline: scan, plan, apply (or dry-run).
+#[must_use]
 pub fn run_migration(opts: &MigrateOptions) -> MigrationReport {
     let footprints = scan_footprints();
     let mut actions = plan_actions(&footprints, opts);
@@ -843,6 +836,7 @@ fn assess_health(footprints: &[Footprint], actions: &[MigrationAction]) -> Envir
 // Action planning
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn plan_actions(footprints: &[Footprint], opts: &MigrateOptions) -> Vec<MigrationAction> {
     let mut actions = Vec::new();
 
@@ -938,18 +932,16 @@ fn plan_actions(footprints: &[Footprint], opts: &MigrateOptions) -> Vec<Migratio
                 });
             }
             (FootprintKind::BackupFile, Some(MigrationReason::StaleBackupFile)) => {
-                if opts.cleanup_backups_older_than > 0 {
-                    if is_older_than(&fp.path, opts.cleanup_backups_older_than) {
-                        actions.push(MigrationAction {
-                            kind: ActionKind::CleanupBackup,
-                            reason: MigrationReason::StaleBackupFile,
-                            target: fp.path.clone(),
-                            description: format!("remove stale backup {}", fp.path.display()),
-                            applied: false,
-                            backup_path: None,
-                            error: None,
-                        });
-                    }
+                if opts.cleanup_backups_older_than > 0 && is_older_than(&fp.path, opts.cleanup_backups_older_than) {
+                    actions.push(MigrationAction {
+                        kind: ActionKind::CleanupBackup,
+                        reason: MigrationReason::StaleBackupFile,
+                        target: fp.path.clone(),
+                        description: format!("remove stale backup {}", fp.path.display()),
+                        applied: false,
+                        backup_path: None,
+                        error: None,
+                    });
                 }
             }
             _ => {}
@@ -1046,7 +1038,7 @@ fn apply_deduplicate_profile(
 }
 
 #[cfg(unix)]
-fn apply_fix_permissions(action: &mut MigrationAction) -> std::io::Result<()> {
+fn apply_fix_permissions(action: &MigrationAction) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let meta = fs::metadata(&action.target)?;
     let mut perms = meta.permissions();
@@ -1057,7 +1049,7 @@ fn apply_fix_permissions(action: &mut MigrationAction) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn apply_fix_permissions(_action: &mut MigrationAction) -> std::io::Result<()> {
+fn apply_fix_permissions(_action: &MigrationAction) -> std::io::Result<()> {
     // No-op on non-Unix platforms.
     Ok(())
 }
@@ -1082,8 +1074,7 @@ fn apply_update_service_path(
         .lines()
         .map(|line| {
             let trimmed = line.trim();
-            if let Some(_rest) = trimmed.strip_prefix("ExecStart=") {
-                // Systemd: replace ExecStart line.
+            if trimmed.starts_with("ExecStart=") {
                 format!("ExecStart={exe_str} daemon run")
             } else if trimmed.starts_with("<string>") && trimmed.ends_with("</string>") {
                 // Launchd: this is a simplification; only replace the first
@@ -1114,17 +1105,17 @@ fn apply_remove_orphaned_file(
     Ok(())
 }
 
-fn apply_cleanup_backup(action: &mut MigrationAction) -> std::io::Result<()> {
+fn apply_cleanup_backup(action: &MigrationAction) -> std::io::Result<()> {
     fs::remove_file(&action.target)?;
     Ok(())
 }
 
-fn apply_create_directory(action: &mut MigrationAction) -> std::io::Result<()> {
+fn apply_create_directory(action: &MigrationAction) -> std::io::Result<()> {
     fs::create_dir_all(&action.target)?;
     Ok(())
 }
 
-fn apply_init_state_file(action: &mut MigrationAction) -> std::io::Result<()> {
+fn apply_init_state_file(action: &MigrationAction) -> std::io::Result<()> {
     if let Some(parent) = action.target.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1143,24 +1134,26 @@ fn apply_init_state_file(action: &mut MigrationAction) -> std::io::Result<()> {
 pub fn format_report_human(report: &MigrationReport) -> String {
     let mut out = String::new();
 
-    out.push_str(&format!("Environment health: {}\n", report.health));
-    out.push_str(&format!("Footprints found: {}\n", report.footprints.len()));
-    out.push_str(&format!(
+    let _ = writeln!(out, "Environment health: {}", report.health);
+    let _ = writeln!(out, "Footprints found: {}", report.footprints.len());
+    let _ = write!(
+        out,
         "Issues found: {} | Repaired: {}\n\n",
         report.issues_found, report.issues_repaired
-    ));
+    );
 
     if !report.footprints.is_empty() {
         out.push_str("Footprints:\n");
         for fp in &report.footprints {
             let status = if fp.healthy { "OK" } else { "ISSUE" };
-            out.push_str(&format!(
-                "  [{status}] {}: {}\n",
+            let _ = writeln!(
+                out,
+                "  [{status}] {}: {}",
                 fp.kind,
                 fp.path.display()
-            ));
+            );
             if let Some(detail) = &fp.detail {
-                out.push_str(&format!("        {detail}\n"));
+                let _ = writeln!(out, "        {detail}");
             }
         }
         out.push('\n');
@@ -1178,15 +1171,16 @@ pub fn format_report_human(report: &MigrationReport) -> String {
             } else {
                 "PLAN"
             };
-            out.push_str(&format!(
-                "  [{status}] {}: {}\n",
+            let _ = writeln!(
+                out,
+                "  [{status}] {}: {}",
                 action.reason, action.description
-            ));
+            );
             if let Some(backup) = &action.backup_path {
-                out.push_str(&format!("        backup: {}\n", backup.display()));
+                let _ = writeln!(out, "        backup: {}", backup.display());
             }
             if let Some(err) = &action.error {
-                out.push_str(&format!("        error: {err}\n"));
+                let _ = writeln!(out, "        error: {err}");
             }
         }
     }

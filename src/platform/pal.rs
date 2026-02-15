@@ -317,7 +317,10 @@ fn parse_meminfo(raw: &str) -> Result<MemoryInfo> {
 }
 
 fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoint> {
-    mounts.iter().find(|mount| path.starts_with(&mount.path))
+    mounts
+        .iter()
+        .filter(|mount| path.starts_with(&mount.path))
+        .max_by_key(|mount| mount.path.as_os_str().len())
 }
 
 fn is_ram_fs(fs_type: &str) -> bool {

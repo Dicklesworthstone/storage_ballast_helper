@@ -19,6 +19,7 @@ pub enum ArtifactCategory {
 }
 
 /// Structural features collected from a directory tree.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StructuralSignals {
     pub has_incremental: bool,
@@ -152,7 +153,7 @@ impl ArtifactPatternRegistry {
         }
 
         let structural = structural_score(best.category, signals);
-        let combined = (0.70 * best.name_confidence + 0.30 * structural).clamp(0.0, 1.0);
+        let combined = 0.70f64.mul_add(best.name_confidence, 0.30 * structural).clamp(0.0, 1.0);
 
         ArtifactClassification {
             structural_confidence: structural,
@@ -219,6 +220,7 @@ fn structural_score(category: ArtifactCategory, signals: StructuralSignals) -> f
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn builtin_patterns() -> Vec<ArtifactPattern> {
     vec![
         ArtifactPattern {

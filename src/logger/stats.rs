@@ -189,7 +189,7 @@ impl<'a> StatsEngine<'a> {
         })
     }
 
-    /// Top-N most deleted path patterns (by directory name prefix).
+    #[allow(clippy::cast_sign_loss)]
     pub fn top_patterns(&self, n: usize, window: Duration) -> Result<Vec<PatternStat>> {
         let since = since_timestamp(window);
         let conn = self.db.connection();
@@ -225,7 +225,7 @@ impl<'a> StatsEngine<'a> {
         Ok(patterns)
     }
 
-    /// Top-N largest deletions within a time window.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
     pub fn top_deletions(&self, n: usize, window: Duration) -> Result<Vec<DeletionDetail>> {
         let since = since_timestamp(window);
         let conn = self.db.connection();
@@ -296,6 +296,7 @@ impl<'a> StatsEngine<'a> {
 
     // ──────────────────── private helpers ────────────────────
 
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     fn deletion_stats(&self, since: &str) -> Result<DeletionStats> {
         let conn = self.db.connection();
 
@@ -391,6 +392,7 @@ impl<'a> StatsEngine<'a> {
         Ok(counts.into_iter().max_by_key(|&(_, c)| c).map(|(p, _)| p))
     }
 
+    #[allow(clippy::cast_sign_loss)]
     fn ballast_stats(&self, since: &str) -> Result<BallastStats> {
         let conn = self.db.connection();
 
@@ -514,6 +516,7 @@ impl<'a> StatsEngine<'a> {
 // ──────────────────── utility functions ────────────────────
 
 /// Compute an ISO 8601 timestamp for "now minus duration".
+#[allow(clippy::cast_possible_wrap)]
 fn since_timestamp(window: Duration) -> String {
     let now = chrono::Utc::now();
     let since = now - chrono::Duration::seconds(window.as_secs() as i64);
@@ -521,6 +524,7 @@ fn since_timestamp(window: Duration) -> String {
 }
 
 /// Compute approximate seconds between two ISO 8601 timestamps.
+#[allow(clippy::cast_precision_loss)]
 fn timestamp_delta_secs(a: &str, b: &str) -> f64 {
     let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
     match (parse(a), parse(b)) {

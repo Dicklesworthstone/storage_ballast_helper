@@ -5,6 +5,7 @@
 //! Integration teardown uses backup-first semantics from the bootstrap module.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -20,7 +21,7 @@ use serde::Serialize;
 pub enum CleanupMode {
     /// Remove binary and service registrations, keep data/config/assets.
     Conservative,
-    /// Remove everything except user data (logs, SQLite DB).
+    /// Remove everything except user data (logs, `SQLite` DB).
     KeepData,
     /// Remove everything except the config file.
     KeepConfig,
@@ -342,6 +343,7 @@ fn discover_profile_entries() -> Vec<PathBuf> {
 
 /// Generate an uninstall plan without executing anything.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn plan_uninstall(opts: &UninstallOptions) -> UninstallReport {
     let paths = discover_paths();
     let mut actions = Vec::new();
@@ -349,10 +351,8 @@ pub fn plan_uninstall(opts: &UninstallOptions) -> UninstallReport {
 
     // -- Binary (always removed).
     for bin in &paths.binaries {
-        if let Some(ref explicit) = opts.binary_path {
-            if bin != explicit {
-                continue;
-            }
+        if let Some(ref explicit) = opts.binary_path && bin != explicit {
+            continue;
         }
         actions.push(RemovalAction {
             category: RemovalCategory::Binary,
@@ -421,28 +421,26 @@ pub fn plan_uninstall(opts: &UninstallOptions) -> UninstallReport {
     }
 
     // -- Config file.
-    if let Some(ref cfg) = paths.config_file {
-        if cfg.exists() {
-            match opts.mode {
-                CleanupMode::KeepConfig | CleanupMode::Conservative => {
-                    kept.push(KeptItem {
-                        category: RemovalCategory::ConfigFile,
-                        path: cfg.clone(),
-                        reason: format!("kept by {} mode", opts.mode),
-                    });
-                }
-                _ => {
-                    actions.push(RemovalAction {
-                        category: RemovalCategory::ConfigFile,
-                        path: cfg.clone(),
-                        is_directory: false,
-                        backup_first: true,
-                        executed: false,
-                        backup_path: None,
-                        error: None,
-                        reason: "remove config file".to_string(),
-                    });
-                }
+    if let Some(ref cfg) = paths.config_file && cfg.exists() {
+        match opts.mode {
+            CleanupMode::KeepConfig | CleanupMode::Conservative => {
+                kept.push(KeptItem {
+                    category: RemovalCategory::ConfigFile,
+                    path: cfg.clone(),
+                    reason: format!("kept by {} mode", opts.mode),
+                });
+            }
+            _ => {
+                actions.push(RemovalAction {
+                    category: RemovalCategory::ConfigFile,
+                    path: cfg.clone(),
+                    is_directory: false,
+                    backup_first: true,
+                    executed: false,
+                    backup_path: None,
+                    error: None,
+                    reason: "remove config file".to_string(),
+                });
             }
         }
     }
@@ -454,74 +452,68 @@ pub fn plan_uninstall(opts: &UninstallOptions) -> UninstallReport {
         (&paths.jsonl_log, RemovalCategory::JsonlLog),
     ];
     for (path_opt, category) in &data_files {
-        if let Some(path) = path_opt {
-            if path.exists() {
-                match opts.mode {
-                    CleanupMode::KeepData | CleanupMode::Conservative => {
-                        kept.push(KeptItem {
-                            category: *category,
-                            path: path.clone(),
-                            reason: format!("kept by {} mode", opts.mode),
-                        });
-                    }
-                    _ => {
-                        actions.push(RemovalAction {
-                            category: *category,
-                            path: path.clone(),
-                            is_directory: false,
-                            backup_first: category == &RemovalCategory::SqliteDb,
-                            executed: false,
-                            backup_path: None,
-                            error: None,
-                            reason: format!("remove {category}"),
-                        });
-                    }
+        if let Some(path) = path_opt && path.exists() {
+            match opts.mode {
+                CleanupMode::KeepData | CleanupMode::Conservative => {
+                    kept.push(KeptItem {
+                        category: *category,
+                        path: path.clone(),
+                        reason: format!("kept by {} mode", opts.mode),
+                    });
+                }
+                _ => {
+                    actions.push(RemovalAction {
+                        category: *category,
+                        path: path.clone(),
+                        is_directory: false,
+                        backup_first: category == &RemovalCategory::SqliteDb,
+                        executed: false,
+                        backup_path: None,
+                        error: None,
+                        reason: format!("remove {category}"),
+                    });
                 }
             }
         }
     }
 
     // -- Asset cache.
-    if let Some(ref cache) = paths.asset_cache {
-        if cache.exists() {
-            match opts.mode {
-                CleanupMode::KeepAssets | CleanupMode::Conservative => {
-                    kept.push(KeptItem {
-                        category: RemovalCategory::AssetCache,
-                        path: cache.clone(),
-                        reason: format!("kept by {} mode", opts.mode),
-                    });
-                }
-                _ => {
-                    actions.push(RemovalAction {
-                        category: RemovalCategory::AssetCache,
-                        path: cache.clone(),
-                        is_directory: true,
-                        backup_first: false,
-                        executed: false,
-                        backup_path: None,
-                        error: None,
-                        reason: "remove asset cache directory".to_string(),
-                    });
-                }
+    if let Some(ref cache) = paths.asset_cache && cache.exists() {
+        match opts.mode {
+            CleanupMode::KeepAssets | CleanupMode::Conservative => {
+                kept.push(KeptItem {
+                    category: RemovalCategory::AssetCache,
+                    path: cache.clone(),
+                    reason: format!("kept by {} mode", opts.mode),
+                });
+            }
+            _ => {
+                actions.push(RemovalAction {
+                    category: RemovalCategory::AssetCache,
+                    path: cache.clone(),
+                    is_directory: true,
+                    backup_first: false,
+                    executed: false,
+                    backup_path: None,
+                    error: None,
+                    reason: "remove asset cache directory".to_string(),
+                });
             }
         }
     }
 
     // -- Data directory cleanup (only if all data files removed).
-    if let Some(ref data_dir) = paths.data_dir {
-        if data_dir.exists() && opts.mode == CleanupMode::Purge {
-            actions.push(RemovalAction {
-                category: RemovalCategory::DataDirectory,
-                path: data_dir.clone(),
-                is_directory: true,
-                backup_first: false,
-                executed: false,
-                backup_path: None,
-                error: None,
-                reason: "remove data directory".to_string(),
-            });
-        }
+    if let Some(ref data_dir) = paths.data_dir && data_dir.exists() && opts.mode == CleanupMode::Purge {
+        actions.push(RemovalAction {
+            category: RemovalCategory::DataDirectory,
+            path: data_dir.clone(),
+            is_directory: true,
+            backup_first: false,
+            executed: false,
+            backup_path: None,
+            error: None,
+            reason: "remove data directory".to_string(),
+        });
     }
 
     let timestamp = SystemTime::now()
@@ -547,6 +539,7 @@ pub fn plan_uninstall(opts: &UninstallOptions) -> UninstallReport {
 // ---------------------------------------------------------------------------
 
 /// Execute an uninstall plan. Returns the report with results.
+#[must_use]
 pub fn execute_uninstall(opts: &UninstallOptions) -> UninstallReport {
     let mut report = plan_uninstall(opts);
 
@@ -694,12 +687,11 @@ fn create_backup(path: &Path, backup_dir: Option<&Path>) -> std::io::Result<Path
 pub fn format_report_human(report: &UninstallReport) -> String {
     let mut out = String::new();
 
-    let mode_label = if report.dry_run {
-        format!("Uninstall plan (dry-run, mode: {})", report.mode)
+    if report.dry_run {
+        let _ = writeln!(out, "Uninstall plan (dry-run, mode: {})\n", report.mode);
     } else {
-        format!("Uninstall report (mode: {})", report.mode)
-    };
-    out.push_str(&format!("{mode_label}\n\n"));
+        let _ = writeln!(out, "Uninstall report (mode: {})\n", report.mode);
+    }
 
     if !report.actions.is_empty() {
         out.push_str("Actions:\n");
@@ -713,17 +705,18 @@ pub fn format_report_human(report: &UninstallReport) -> String {
             } else {
                 "SKIP"
             };
-            out.push_str(&format!(
-                "  [{status}] {}: {} ({})\n",
+            let _ = writeln!(
+                out,
+                "  [{status}] {}: {} ({})",
                 action.category,
                 action.path.display(),
                 action.reason
-            ));
+            );
             if let Some(backup) = &action.backup_path {
-                out.push_str(&format!("        backup: {}\n", backup.display()));
+                let _ = writeln!(out, "        backup: {}", backup.display());
             }
             if let Some(err) = &action.error {
-                out.push_str(&format!("        error: {err}\n"));
+                let _ = writeln!(out, "        error: {err}");
             }
         }
     }
@@ -731,25 +724,28 @@ pub fn format_report_human(report: &UninstallReport) -> String {
     if !report.kept.is_empty() {
         out.push_str("\nKept:\n");
         for item in &report.kept {
-            out.push_str(&format!(
-                "  [KEEP] {}: {} ({})\n",
+            let _ = writeln!(
+                out,
+                "  [KEEP] {}: {} ({})",
                 item.category,
                 item.path.display(),
                 item.reason
-            ));
+            );
         }
     }
 
-    if !report.dry_run {
-        out.push_str(&format!(
-            "\nSummary: {} removed, {} failed, {} bytes freed\n",
-            report.removed_count, report.failed_count, report.bytes_freed
-        ));
-    } else {
-        out.push_str(&format!(
-            "\n{} action(s) planned. Run without --dry-run to execute.\n",
+    if report.dry_run {
+        let _ = writeln!(
+            out,
+            "\n{} action(s) planned. Run without --dry-run to execute.",
             report.actions.len()
-        ));
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "\nSummary: {} removed, {} failed, {} bytes freed",
+            report.removed_count, report.failed_count, report.bytes_freed
+        );
     }
 
     out

@@ -183,10 +183,8 @@ impl DeletionExecutor {
             }
 
             // Pressure check: if pressure has resolved, stop deleting.
-            if let Some(check) = pressure_check {
-                if check() {
-                    break;
-                }
+            if let Some(check) = pressure_check && check() {
+                break;
             }
 
             // Pre-flight safety checks.
@@ -216,6 +214,7 @@ impl DeletionExecutor {
             let del_start = Instant::now();
             match self.delete_path(&candidate.path) {
                 Ok(()) => {
+                    #[allow(clippy::cast_possible_truncation)]
                     let duration_ms = del_start.elapsed().as_millis() as u64;
                     report.items_deleted += 1;
                     report.bytes_freed += candidate.size_bytes;
@@ -257,14 +256,12 @@ impl DeletionExecutor {
         }
 
         // 2. Parent directory is writable.
-        if let Some(parent) = path.parent() {
-            if parent
-                .metadata()
-                .map(|m| m.permissions().readonly())
-                .unwrap_or(true)
-            {
-                return Err(SkipReason::NotWritable);
-            }
+        if let Some(parent) = path.parent() && parent
+            .metadata()
+            .map(|m| m.permissions().readonly())
+            .unwrap_or(true)
+        {
+            return Err(SkipReason::NotWritable);
         }
 
         // 3. Does not contain .git (safety net).
@@ -282,6 +279,7 @@ impl DeletionExecutor {
 
     // ──────────────────── deletion ────────────────────
 
+    #[allow(clippy::unused_self)]
     fn delete_path(&self, path: &Path) -> Result<()> {
         if path.is_dir() {
             fs::remove_dir_all(path).map_err(|e| SbhError::io(path, e))?;
@@ -357,10 +355,7 @@ fn is_path_open_linux(target: &Path) -> bool {
     };
 
     let proc = Path::new("/proc");
-    let entries = match fs::read_dir(proc) {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
+    let Ok(entries) = fs::read_dir(proc) else { return false };
 
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -371,10 +366,7 @@ fn is_path_open_linux(target: &Path) -> bool {
         }
 
         let fd_dir = entry.path().join("fd");
-        let fds = match fs::read_dir(&fd_dir) {
-            Ok(f) => f,
-            Err(_) => continue, // Permission denied is common for other users' procs
-        };
+        let Ok(fds) = fs::read_dir(&fd_dir) else { continue };
 
         for fd_entry in fds.flatten() {
             if let Ok(link_target) = fs::read_link(fd_entry.path()) {

@@ -191,6 +191,7 @@ pub fn spawn_logger(
 
 // ──────────────────── logger thread ────────────────────
 
+#[allow(clippy::needless_pass_by_value)]
 fn logger_thread_main(
     rx: Receiver<ActivityEvent>,
     sqlite_path: Option<PathBuf>,
@@ -235,25 +236,20 @@ fn logger_thread_main(
 
         // Write SQLite.
         if let Some(db) = &sqlite {
-            let mut ok = true;
-            if let Some(row) = &activity_row {
-                if db.log_activity(row).is_err() {
-                    ok = false;
-                }
-            }
-            if let Some(row) = &pressure_row {
-                if db.log_pressure(row).is_err() {
-                    ok = false;
-                }
-            }
-            if !ok {
+            let activity_ok = activity_row
+                .as_ref()
+                .map_or(true, |row| db.log_activity(row).is_ok());
+            let pressure_ok = pressure_row
+                .as_ref()
+                .map_or(true, |row| db.log_pressure(row).is_ok());
+            if activity_ok && pressure_ok {
+                sqlite_failures = 0;
+            } else {
                 sqlite_failures += 1;
                 if sqlite_failures >= 3 {
                     eprintln!("[SBH-DUAL] SQLite write failed {sqlite_failures} times, disabling");
                     sqlite = None;
                 }
-            } else {
-                sqlite_failures = 0;
             }
         }
     }
@@ -265,6 +261,7 @@ fn logger_thread_main(
 
 // ──────────────────── event conversion ────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
     match event {
         ActivityEvent::DaemonStarted {
@@ -399,6 +396,7 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
     }
 }
 
+#[allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
 fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 

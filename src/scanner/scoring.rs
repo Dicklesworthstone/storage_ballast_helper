@@ -132,11 +132,19 @@ impl ScoringEngine {
             pressure_multiplier: pressure_multiplier(urgency),
         };
 
-        let base = self.weights.location * factors.location
-            + self.weights.name * factors.name
-            + self.weights.age * factors.age
-            + self.weights.size * factors.size
-            + self.weights.structure * factors.structure;
+        let base = self
+            .weights
+            .structure
+            .mul_add(factors.structure, self.weights.size.mul_add(
+                factors.size,
+                self.weights.age.mul_add(
+                    factors.age,
+                    self.weights.location.mul_add(
+                        factors.location,
+                        self.weights.name * factors.name,
+                    ),
+                ),
+            ));
         let total = (base * factors.pressure_multiplier).clamp(0.0, 3.0);
 
         let posterior_abandoned =
@@ -285,7 +293,7 @@ fn factor_location(path: &Path) -> f64 {
 
 fn factor_name(path: &Path, classification: &ArtifactClassification) -> f64 {
     let name = path.file_name().map_or_else(
-        || "".to_string(),
+        String::new,
         |value| value.to_string_lossy().to_lowercase(),
     );
     let mut score = classification.combined_confidence;
@@ -366,23 +374,23 @@ fn pressure_multiplier(urgency: f64) -> f64 {
     if u <= 0.3 {
         1.0 + u
     } else if u <= 0.5 {
-        1.3 + (u - 0.3) * 1.0
+        (u - 0.3).mul_add(1.0, 1.3)
     } else if u <= 0.8 {
-        1.5 + (u - 0.5) * (0.5 / 0.3)
+        (u - 0.5).mul_add(0.5 / 0.3, 1.5)
     } else {
-        2.0 + (u - 0.8) * 5.0
+        (u - 0.8).mul_add(5.0, 2.0)
     }
 }
 
 fn posterior_from_score(total_score: f64, confidence: f64) -> f64 {
     let scaled_score = (total_score / 3.0).clamp(0.0, 1.0);
-    let logit = 3.5 * (scaled_score - 0.5) + 2.0 * (confidence - 0.5);
+    let logit = 3.5f64.mul_add(scaled_score - 0.5, 2.0 * (confidence - 0.5));
     1.0 / (1.0 + (-logit).exp())
 }
 
 fn calibration_score(classification_confidence: f64, factors: ScoreFactors) -> f64 {
     let spread = (factors.location - factors.structure).abs();
-    (0.75 * classification_confidence + 0.25 * (1.0 - spread)).clamp(0.0, 1.0)
+    0.75f64.mul_add(classification_confidence, 0.25 * (1.0 - spread)).clamp(0.0, 1.0)
 }
 
 fn decide_action(

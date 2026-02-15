@@ -10,6 +10,7 @@
 
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_possible_truncation)]
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -411,6 +412,7 @@ impl BallastManager {
         Ok(())
     }
 
+    #[allow(clippy::unused_self)]
     fn write_random_data(&self, file: &mut File, data_size: u64, path: &Path) -> Result<()> {
         let mut rng = rand::rng();
         let mut written: u64 = 0;
