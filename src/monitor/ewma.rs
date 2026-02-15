@@ -219,14 +219,17 @@ mod tests {
 
     #[test]
     fn fallback_active_until_min_samples() {
+        // min_samples=3: first update is seed (samples=0), next 3 each increment.
         let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 3);
         let t0 = Instant::now();
         let r0 = estimator.update(1_000, t0, 100);
-        assert!(r0.fallback_active);
+        assert!(r0.fallback_active, "seed update should be fallback");
         let r1 = estimator.update(900, t0 + Duration::from_secs(1), 100);
-        assert!(r1.fallback_active);
+        assert!(r1.fallback_active, "samples=1 < min_samples=3");
         let r2 = estimator.update(800, t0 + Duration::from_secs(2), 100);
-        assert!(!r2.fallback_active);
+        assert!(r2.fallback_active, "samples=2 < min_samples=3");
+        let r3 = estimator.update(700, t0 + Duration::from_secs(3), 100);
+        assert!(!r3.fallback_active, "samples=3 >= min_samples=3");
     }
 
     #[test]
@@ -250,5 +253,112 @@ mod tests {
         assert!(reading.seconds_to_exhaustion.is_finite());
         assert!(reading.seconds_to_exhaustion > 0.0);
         assert!(reading.seconds_to_threshold.is_finite());
+    }
+
+    #[test]
+    fn first_update_is_always_fallback() {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+        let t0 = Instant::now();
+        let reading = estimator.update(50_000, t0, 5_000);
+        assert!(reading.fallback_active);
+        assert_eq!(estimator.sample_count(), 0);
+    }
+
+    #[test]
+    fn confidence_increases_with_samples() {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 5);
+        let t0 = Instant::now();
+        let _ = estimator.update(100_000, t0, 10_000);
+
+        let mut prev_conf = 0.0;
+        for i in 1..=10 {
+            let reading = estimator.update(
+                100_000 - i * 1_000,
+                t0 + Duration::from_secs(i as u64),
+                10_000,
+            );
+            // Confidence should generally increase (monotonic for steady input).
+            if i >= 3 {
+                assert!(
+                    reading.confidence >= prev_conf - 0.01,
+                    "confidence should increase: {} >= {} at sample {}",
+                    reading.confidence, prev_conf, i
+                );
+            }
+            prev_conf = reading.confidence;
+        }
+        assert!(prev_conf > 0.5, "confidence should be high after many steady samples");
+    }
+
+    #[test]
+    fn steady_consumption_detects_stable_trend() {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 3);
+        let t0 = Instant::now();
+        let _ = estimator.update(100_000, t0, 10_000);
+        // Feed steady 1000 bytes/sec consumption.
+        // EWMA needs several samples to converge; acceleration drops below
+        // threshold after ~8 steady samples.
+        for i in 1..=15 {
+            let reading = estimator.update(
+                100_000 - i * 1_000,
+                t0 + Duration::from_secs(i as u64),
+                10_000,
+            );
+            if i >= 10 {
+                assert_eq!(reading.trend, Trend::Stable, "should be stable at sample {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn zero_interval_returns_fallback() {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 2);
+        let t0 = Instant::now();
+        let _ = estimator.update(10_000, t0, 1_000);
+        // Same timestamp — zero dt.
+        let reading = estimator.update(9_000, t0, 1_000);
+        assert!(reading.fallback_active);
+    }
+
+    #[test]
+    fn no_consumption_gives_infinite_exhaustion() {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 2);
+        let t0 = Instant::now();
+        let _ = estimator.update(50_000, t0, 5_000);
+        let _ = estimator.update(50_000, t0 + Duration::from_secs(1), 5_000);
+        let reading = estimator.update(50_000, t0 + Duration::from_secs(2), 5_000);
+        // No consumption → rate ~0 → infinite exhaustion time.
+        assert!(reading.seconds_to_exhaustion > 1_000_000.0 || reading.seconds_to_exhaustion.is_infinite());
+    }
+
+    #[test]
+    fn sample_count_tracks_updates() {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 2);
+        assert_eq!(estimator.sample_count(), 0);
+        let t0 = Instant::now();
+        estimator.update(10_000, t0, 1_000);
+        assert_eq!(estimator.sample_count(), 0); // First update doesn't count as a sample.
+        estimator.update(9_000, t0 + Duration::from_secs(1), 1_000);
+        assert_eq!(estimator.sample_count(), 1);
+        estimator.update(8_000, t0 + Duration::from_secs(2), 1_000);
+        assert_eq!(estimator.sample_count(), 2);
+    }
+
+    #[test]
+    fn threshold_distance_respected() {
+        let mut estimator = DiskRateEstimator::new(0.3, 0.1, 0.8, 2);
+        let t0 = Instant::now();
+        let _ = estimator.update(50_000, t0, 10_000);
+        let _ = estimator.update(40_000, t0 + Duration::from_secs(1), 10_000);
+        let reading = estimator.update(30_000, t0 + Duration::from_secs(2), 10_000);
+
+        // seconds_to_threshold should be less than seconds_to_exhaustion
+        // because threshold (10_000) is reached before exhaustion (0).
+        assert!(
+            reading.seconds_to_threshold <= reading.seconds_to_exhaustion,
+            "threshold {} should be reached before exhaustion {}",
+            reading.seconds_to_threshold,
+            reading.seconds_to_exhaustion,
+        );
     }
 }

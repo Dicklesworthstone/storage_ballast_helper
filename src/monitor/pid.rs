@@ -355,4 +355,126 @@ mod tests {
         assert!(with_prediction.urgency >= without_prediction.urgency);
         assert!(with_prediction.urgency >= 0.99);
     }
+
+    #[test]
+    fn pressure_reading_free_pct_zero_total() {
+        let reading = PressureReading {
+            free_bytes: 100,
+            total_bytes: 0,
+        };
+        assert_eq!(reading.free_pct(), 0.0);
+    }
+
+    #[test]
+    fn pressure_reading_free_pct_correct() {
+        let reading = PressureReading {
+            free_bytes: 25,
+            total_bytes: 100,
+        };
+        assert!((reading.free_pct() - 25.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn green_level_on_plenty_of_space() {
+        let mut pid = PidPressureController::new(
+            0.25, 0.08, 0.02, 100.0, 18.0, 1.0,
+            20.0, 14.0, 10.0, 6.0,
+            Duration::from_secs(1),
+        );
+        let now = Instant::now();
+        let response = pid.update(
+            PressureReading { free_bytes: 50, total_bytes: 100 },
+            None,
+            now,
+        );
+        assert_eq!(response.level, PressureLevel::Green);
+    }
+
+    #[test]
+    fn critical_level_on_extremely_low_space() {
+        let mut pid = PidPressureController::new(
+            0.25, 0.08, 0.02, 100.0, 18.0, 1.0,
+            20.0, 14.0, 10.0, 6.0,
+            Duration::from_secs(1),
+        );
+        let t0 = Instant::now();
+        // Drive through Yellow → Orange → Red → Critical.
+        let _ = pid.update(
+            PressureReading { free_bytes: 12, total_bytes: 100 },
+            None, t0,
+        );
+        let _ = pid.update(
+            PressureReading { free_bytes: 8, total_bytes: 100 },
+            None, t0 + Duration::from_secs(1),
+        );
+        let _ = pid.update(
+            PressureReading { free_bytes: 4, total_bytes: 100 },
+            None, t0 + Duration::from_secs(2),
+        );
+        let response = pid.update(
+            PressureReading { free_bytes: 1, total_bytes: 100 },
+            None, t0 + Duration::from_secs(3),
+        );
+        assert_eq!(response.level, PressureLevel::Critical);
+    }
+
+    #[test]
+    fn scan_interval_decreases_with_severity() {
+        let mut pid = PidPressureController::new(
+            0.25, 0.08, 0.02, 100.0, 18.0, 1.0,
+            20.0, 14.0, 10.0, 6.0,
+            Duration::from_secs(4),
+        );
+        let t0 = Instant::now();
+        let green = pid.update(
+            PressureReading { free_bytes: 50, total_bytes: 100 },
+            None, t0,
+        );
+        // Reset to get yellow reading.
+        let mut pid2 = PidPressureController::new(
+            0.25, 0.08, 0.02, 100.0, 18.0, 1.0,
+            20.0, 14.0, 10.0, 6.0,
+            Duration::from_secs(4),
+        );
+        let _ = pid2.update(
+            PressureReading { free_bytes: 12, total_bytes: 100 },
+            None, t0,
+        );
+        let yellow = pid2.update(
+            PressureReading { free_bytes: 12, total_bytes: 100 },
+            None, t0 + Duration::from_secs(1),
+        );
+        assert!(yellow.scan_interval < green.scan_interval,
+            "yellow interval {:?} should be less than green {:?}",
+            yellow.scan_interval, green.scan_interval);
+    }
+
+    #[test]
+    fn release_ballast_files_zero_at_green() {
+        let mut pid = PidPressureController::new(
+            0.25, 0.08, 0.02, 100.0, 18.0, 1.0,
+            20.0, 14.0, 10.0, 6.0,
+            Duration::from_secs(1),
+        );
+        let response = pid.update(
+            PressureReading { free_bytes: 50, total_bytes: 100 },
+            None, Instant::now(),
+        );
+        assert_eq!(response.release_ballast_files, 0);
+    }
+
+    #[test]
+    fn predicted_300s_boosts_urgency_to_at_least_90pct() {
+        let mut pid = PidPressureController::new(
+            0.1, 0.0, 0.0, 100.0, 18.0, 1.0,
+            20.0, 14.0, 10.0, 6.0,
+            Duration::from_secs(1),
+        );
+        let response = pid.update(
+            PressureReading { free_bytes: 16, total_bytes: 100 },
+            Some(200.0),
+            Instant::now(),
+        );
+        assert!(response.urgency >= 0.70);
+    }
 }

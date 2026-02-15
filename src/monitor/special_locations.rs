@@ -206,4 +206,139 @@ mod tests {
                 .any(|location| location.path == Path::new("/tmp"))
         );
     }
+
+    #[test]
+    fn needs_attention_when_below_buffer() {
+        use super::{FsStats, SpecialLocation, SpecialKind};
+        use std::time::Duration;
+
+        let loc = SpecialLocation {
+            path: PathBuf::from("/tmp"),
+            kind: SpecialKind::Tmpfs,
+            buffer_pct: 15,
+            scan_interval: Duration::from_secs(5),
+            priority: 200,
+        };
+        let stats_low = FsStats {
+            total_bytes: 1000,
+            free_bytes: 100,    // 10% free — below buffer_pct 15
+            available_bytes: 100,
+            fs_type: "tmpfs".to_string(),
+            mount_point: PathBuf::from("/tmp"),
+            is_readonly: false,
+        };
+        assert!(loc.needs_attention(&stats_low));
+
+        let stats_ok = FsStats {
+            total_bytes: 1000,
+            free_bytes: 200,    // 20% free — above buffer_pct 15
+            available_bytes: 200,
+            fs_type: "tmpfs".to_string(),
+            mount_point: PathBuf::from("/tmp"),
+            is_readonly: false,
+        };
+        assert!(!loc.needs_attention(&stats_ok));
+    }
+
+    #[test]
+    fn scan_due_when_never_scanned() {
+        use super::{SpecialLocation, SpecialKind};
+        use std::time::{Duration, Instant};
+
+        let loc = SpecialLocation {
+            path: PathBuf::from("/tmp"),
+            kind: SpecialKind::Tmpfs,
+            buffer_pct: 15,
+            scan_interval: Duration::from_secs(60),
+            priority: 200,
+        };
+        assert!(loc.scan_due(None, Instant::now()));
+    }
+
+    #[test]
+    fn scan_not_due_when_recently_scanned() {
+        use super::{SpecialLocation, SpecialKind};
+        use std::time::{Duration, Instant};
+
+        let loc = SpecialLocation {
+            path: PathBuf::from("/tmp"),
+            kind: SpecialKind::Tmpfs,
+            buffer_pct: 15,
+            scan_interval: Duration::from_secs(60),
+            priority: 200,
+        };
+        let now = Instant::now();
+        assert!(!loc.scan_due(Some(now), now));
+    }
+
+    #[test]
+    fn registry_deduplicates_paths() {
+        use super::{SpecialLocation, SpecialKind};
+        use std::time::Duration;
+
+        let locations = vec![
+            SpecialLocation {
+                path: PathBuf::from("/tmp"),
+                kind: SpecialKind::Tmpfs,
+                buffer_pct: 15,
+                scan_interval: Duration::from_secs(5),
+                priority: 200,
+            },
+            SpecialLocation {
+                path: PathBuf::from("/tmp"),
+                kind: SpecialKind::UserTmp,
+                buffer_pct: 10,
+                scan_interval: Duration::from_secs(5),
+                priority: 160,
+            },
+        ];
+        let registry = SpecialLocationRegistry::new(locations);
+        assert_eq!(registry.all().len(), 1);
+    }
+
+    #[test]
+    fn registry_sorts_by_priority_descending() {
+        use super::{SpecialLocation, SpecialKind};
+        use std::time::Duration;
+
+        let locations = vec![
+            SpecialLocation {
+                path: PathBuf::from("/data/tmp"),
+                kind: SpecialKind::Custom("custom".to_string()),
+                buffer_pct: 15,
+                scan_interval: Duration::from_secs(5),
+                priority: 100,
+            },
+            SpecialLocation {
+                path: PathBuf::from("/dev/shm"),
+                kind: SpecialKind::DevShm,
+                buffer_pct: 20,
+                scan_interval: Duration::from_secs(3),
+                priority: 255,
+            },
+            SpecialLocation {
+                path: PathBuf::from("/tmp"),
+                kind: SpecialKind::Tmpfs,
+                buffer_pct: 15,
+                scan_interval: Duration::from_secs(5),
+                priority: 200,
+            },
+        ];
+        let registry = SpecialLocationRegistry::new(locations);
+        let all = registry.all();
+        assert_eq!(all[0].priority, 255);
+        assert_eq!(all[1].priority, 200);
+        assert_eq!(all[2].priority, 100);
+    }
+
+    #[test]
+    fn discover_adds_tmp_fallback_when_no_tmpfs_mount() {
+        let platform = TestPlatform { mounts: vec![] };
+        let registry = SpecialLocationRegistry::discover(&platform, &[])
+            .expect("discovery should succeed");
+        assert!(
+            registry.all().iter().any(|loc| loc.path == Path::new("/tmp")),
+            "/tmp should be added as fallback"
+        );
+    }
 }

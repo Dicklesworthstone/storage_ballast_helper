@@ -604,6 +604,7 @@ fn set_env_bool(name: &str, slot: &mut bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Config, SbhError};
+    use std::path::Path;
 
     #[test]
     fn default_config_is_valid() {
@@ -633,5 +634,114 @@ mod tests {
         modified.scanner.max_depth += 1;
         let hash_after = modified.stable_hash().expect("hash should compute");
         assert_ne!(hash_before, hash_after);
+    }
+
+    #[test]
+    fn pressure_thresholds_must_descend() {
+        let mut cfg = Config::default();
+        cfg.pressure.yellow_min_free_pct = cfg.pressure.green_min_free_pct + 1.0;
+        let err = cfg.validate().expect_err("expected validation error");
+        assert!(err.to_string().contains("strictly descend"));
+    }
+
+    #[test]
+    fn ewma_alpha_ordering_enforced() {
+        let mut cfg = Config::default();
+        cfg.telemetry.ewma_min_alpha = 0.9;
+        cfg.telemetry.ewma_base_alpha = 0.1;
+        let err = cfg.validate().expect_err("expected alpha validation error");
+        assert!(err.to_string().contains("alpha"));
+    }
+
+    #[test]
+    fn ballast_zero_count_rejected() {
+        let mut cfg = Config::default();
+        cfg.ballast.file_count = 0;
+        let err = cfg.validate().expect_err("expected ballast validation error");
+        assert!(err.to_string().contains("ballast"));
+    }
+
+    #[test]
+    fn scanner_zero_parallelism_rejected() {
+        let mut cfg = Config::default();
+        cfg.scanner.parallelism = 0;
+        let err = cfg.validate().expect_err("expected parallelism error");
+        assert!(err.to_string().contains("parallelism"));
+    }
+
+    #[test]
+    fn scoring_min_score_out_of_range_rejected() {
+        let mut cfg = Config::default();
+        cfg.scoring.min_score = 2.0;
+        let err = cfg.validate().expect_err("expected min_score error");
+        assert!(err.to_string().contains("min_score"));
+    }
+
+    #[test]
+    fn ballast_volume_override_effective_file_count() {
+        use super::BallastConfig;
+        use std::collections::HashMap;
+        let mut overrides = HashMap::new();
+        overrides.insert("/data".to_string(), super::BallastVolumeOverride {
+            enabled: true,
+            file_count: Some(20),
+            file_size_bytes: None,
+        });
+        let cfg = BallastConfig {
+            file_count: 10,
+            file_size_bytes: 1_000_000,
+            replenish_cooldown_minutes: 30,
+            auto_provision: true,
+            overrides,
+        };
+        assert_eq!(cfg.effective_file_count("/data"), 20);
+        assert_eq!(cfg.effective_file_count("/other"), 10);
+    }
+
+    #[test]
+    fn ballast_volume_disabled_override() {
+        use super::BallastConfig;
+        use std::collections::HashMap;
+        let mut overrides = HashMap::new();
+        overrides.insert("/tmp".to_string(), super::BallastVolumeOverride {
+            enabled: false,
+            file_count: None,
+            file_size_bytes: None,
+        });
+        let cfg = BallastConfig {
+            file_count: 10,
+            file_size_bytes: 1_000_000,
+            replenish_cooldown_minutes: 30,
+            auto_provision: true,
+            overrides,
+        };
+        assert!(!cfg.is_volume_enabled("/tmp"));
+        assert!(cfg.is_volume_enabled("/data"));
+    }
+
+    #[test]
+    fn load_returns_error_for_explicit_missing_path() {
+        let result = Config::load(Some(Path::new("/nonexistent/sbh/config.toml")));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, SbhError::MissingConfig { .. }));
+    }
+
+    #[test]
+    fn prediction_horizon_ordering_enforced() {
+        let mut cfg = Config::default();
+        // warning_horizon must be > action_horizon
+        cfg.pressure.prediction.warning_horizon_minutes = 10.0;
+        cfg.pressure.prediction.action_horizon_minutes = 30.0;
+        let err = cfg.validate().expect_err("expected prediction error");
+        assert!(err.to_string().contains("warning_horizon"));
+    }
+
+    #[test]
+    fn stable_hash_deterministic() {
+        let cfg = Config::default();
+        let h1 = cfg.stable_hash().expect("hash");
+        let h2 = cfg.stable_hash().expect("hash");
+        assert_eq!(h1, h2);
     }
 }

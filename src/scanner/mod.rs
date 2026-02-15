@@ -1,5 +1,6 @@
 //! Artifact scanner: directory walker, pattern matching, multi-factor scoring, deletion.
 
+pub mod decision_record;
 pub mod deletion;
 pub mod merkle;
 pub mod patterns;
