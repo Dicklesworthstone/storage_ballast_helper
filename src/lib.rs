@@ -16,3 +16,6 @@ pub mod logger;
 pub mod monitor;
 pub mod platform;
 pub mod scanner;
+
+#[cfg(test)]
+mod decision_plane_tests;
