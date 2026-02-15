@@ -182,8 +182,8 @@ impl AdaptiveGuard {
 
     /// Record a new forecast-vs-actual observation and update guard status.
     pub fn observe(&mut self, obs: CalibrationObservation) {
-        let obs_good = obs.rate_error_ratio() <= self.config.max_rate_error
-            && obs.tte_conservative();
+        let obs_good =
+            obs.rate_error_ratio() <= self.config.max_rate_error && obs.tte_conservative();
 
         // Maintain rolling window.
         self.observations.push_back(obs);

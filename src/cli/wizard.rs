@@ -226,7 +226,10 @@ pub fn run_interactive<R: BufRead, W: Write>(
     writer: &mut W,
 ) -> io::Result<WizardAnswers> {
     let _ = writeln!(writer, "\n  Storage Ballast Helper — First-Run Setup\n");
-    let _ = writeln!(writer, "  This wizard will configure sbh for your system.\n");
+    let _ = writeln!(
+        writer,
+        "  This wizard will configure sbh for your system.\n"
+    );
 
     // Step 1: Service manager.
     let service = prompt_service(reader, writer)?;
@@ -305,10 +308,7 @@ fn prompt_service<R: BufRead, W: Write>(
     }
 }
 
-fn prompt_user_scope<R: BufRead, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-) -> io::Result<bool> {
+fn prompt_user_scope<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<bool> {
     let _ = writeln!(writer);
     let _ = writeln!(writer, "  [1b] Service scope");
     let _ = write!(writer, "    Install as user service? [Y/n]: ");
@@ -363,7 +363,10 @@ fn prompt_ballast<R: BufRead, W: Write>(
     let _ = writeln!(writer, "  [3/4] Ballast pool sizing");
     let _ = writeln!(writer, "    Presets:");
     let _ = writeln!(writer, "      s) Small  —  5 GB (5 x 1 GB files)");
-    let _ = writeln!(writer, "      m) Medium — 10 GB (10 x 1 GB files) [default]");
+    let _ = writeln!(
+        writer,
+        "      m) Medium — 10 GB (10 x 1 GB files) [default]"
+    );
     let _ = writeln!(writer, "      l) Large  — 20 GB (20 x 1 GB files)");
     let _ = write!(writer, "    Choice [m]: ");
     writer.flush()?;
@@ -407,7 +410,9 @@ fn display_summary<W: Write>(writer: &mut W, answers: &WizardAnswers) {
     for path in &answers.watched_paths {
         let _ = writeln!(writer, "      - {}", path.display());
     }
-    let _ = writeln!(writer, "    Ballast: {} ({} x {} GB files)",
+    let _ = writeln!(
+        writer,
+        "    Ballast: {} ({} x {} GB files)",
         answers.ballast_preset,
         answers.ballast_file_count,
         answers.ballast_file_size_bytes / 1_073_741_824,
@@ -417,7 +422,10 @@ fn display_summary<W: Write>(writer: &mut W, answers: &WizardAnswers) {
 fn read_line<R: BufRead>(reader: &mut R) -> io::Result<String> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    Ok(line.trim_end_matches('\n').trim_end_matches('\r').to_string())
+    Ok(line
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -561,7 +569,10 @@ mod tests {
         };
 
         let config = answers.to_config();
-        assert_eq!(config.scanner.root_paths, vec![PathBuf::from("/home/user/projects")]);
+        assert_eq!(
+            config.scanner.root_paths,
+            vec![PathBuf::from("/home/user/projects")]
+        );
         assert_eq!(config.ballast.file_count, 5);
         assert_eq!(config.ballast.file_size_bytes, 1_073_741_824);
     }
@@ -664,8 +675,14 @@ mod tests {
         assert!(config_path.exists());
 
         let contents = std::fs::read_to_string(&config_path).unwrap();
-        assert!(contents.contains("[scanner]"), "should contain scanner section");
-        assert!(contents.contains("[ballast]"), "should contain ballast section");
+        assert!(
+            contents.contains("[scanner]"),
+            "should contain scanner section"
+        );
+        assert!(
+            contents.contains("[ballast]"),
+            "should contain ballast section"
+        );
     }
 
     #[test]
@@ -730,7 +747,10 @@ mod tests {
     #[test]
     fn auto_detect_watched_paths_not_empty() {
         let paths = auto_detect_watched_paths();
-        assert!(!paths.is_empty(), "should always return at least default paths");
+        assert!(
+            !paths.is_empty(),
+            "should always return at least default paths"
+        );
     }
 
     #[test]
@@ -743,7 +763,10 @@ mod tests {
 
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("First-Run Setup"), "should show header");
-        assert!(text.contains("Service manager"), "should prompt for service");
+        assert!(
+            text.contains("Service manager"),
+            "should prompt for service"
+        );
         assert!(text.contains("Watched paths"), "should prompt for paths");
         assert!(text.contains("Ballast"), "should prompt for ballast");
     }

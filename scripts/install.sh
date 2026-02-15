@@ -26,21 +26,31 @@ fi
 
 color() {
   local code="$1"
+  local stream="${2:-1}"
   if [[ "$NO_COLOR" -eq 1 ]]; then
     return 0
   fi
-  printf '\033[%sm' "$code"
+  if [[ "$stream" -eq 2 ]]; then
+    printf '\033[%sm' "$code" >&2
+  else
+    printf '\033[%sm' "$code"
+  fi
 }
 
 reset_color() {
+  local stream="${1:-1}"
   if [[ "$NO_COLOR" -eq 1 ]]; then
     return 0
   fi
-  printf '\033[0m'
+  if [[ "$stream" -eq 2 ]]; then
+    printf '\033[0m' >&2
+  else
+    printf '\033[0m'
+  fi
 }
 
 log_header() {
-  if [[ "$QUIET" -eq 1 ]]; then
+  if [[ "$QUIET" -eq 1 || "$JSON_MODE" -eq 1 ]]; then
     return 0
   fi
   color "1;34"
@@ -49,22 +59,22 @@ log_header() {
 }
 
 log_info() {
-  if [[ "$QUIET" -eq 1 ]]; then
+  if [[ "$QUIET" -eq 1 || "$JSON_MODE" -eq 1 ]]; then
     return 0
   fi
   printf '%s\n' "$1"
 }
 
 log_warn() {
-  color "1;33"
+  color "1;33" 2
   printf 'WARN: %s\n' "$1" >&2
-  reset_color
+  reset_color 2
 }
 
 log_error() {
-  color "1;31"
+  color "1;31" 2
   printf 'ERROR: %s\n' "$1" >&2
-  reset_color
+  reset_color 2
 }
 
 json_escape() {

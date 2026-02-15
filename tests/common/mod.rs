@@ -97,10 +97,10 @@ pub fn run_cli_case(case_name: &str, args: &[&str]) -> CmdResult {
 
 // ──────────────────── MockPlatform ────────────────────
 
+use storage_ballast_helper::core::errors::{Result, SbhError};
 use storage_ballast_helper::platform::pal::{
     FsStats, MemoryInfo, MountPoint, NoopServiceManager, Platform, PlatformPaths, ServiceManager,
 };
-use storage_ballast_helper::core::errors::{Result, SbhError};
 
 /// Configurable platform mock for unit tests.
 ///
@@ -246,10 +246,7 @@ impl TestEnvironment {
 
         // Set modification time to (now - age).
         let mtime = SystemTime::now() - age;
-        let _ = filetime::set_file_mtime(
-            &path,
-            filetime::FileTime::from_system_time(mtime),
-        );
+        let _ = filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(mtime));
 
         path
     }
@@ -302,10 +299,7 @@ pub fn create_fake_rust_target(root: &Path, age: Duration) -> PathBuf {
     // Set age on the top-level target directory.
     if age > Duration::ZERO {
         let mtime = SystemTime::now() - age;
-        let _ = filetime::set_file_mtime(
-            &target,
-            filetime::FileTime::from_system_time(mtime),
-        );
+        let _ = filetime::set_file_mtime(&target, filetime::FileTime::from_system_time(mtime));
     }
 
     target

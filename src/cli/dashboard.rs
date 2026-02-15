@@ -20,9 +20,7 @@ use std::time::{Duration, Instant};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
-use crossterm::terminal::{
-    self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 
 use crate::daemon::self_monitor::{DaemonState, SelfMonitor};
@@ -171,11 +169,7 @@ impl RateHistory {
             return Vec::new();
         }
 
-        let max_abs = self
-            .values
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0f64, f64::max);
+        let max_abs = self.values.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
         if max_abs == 0.0 {
             return vec![0.5; self.values.len()];
         }
@@ -318,15 +312,9 @@ fn render_frame(
     let uptime_str = state
         .map(|s| human_duration(s.uptime_seconds))
         .unwrap_or_else(|| "N/A".to_string());
-    let mode = if state.is_some() {
-        "LIVE"
-    } else {
-        "DEGRADED"
-    };
+    let mode = if state.is_some() { "LIVE" } else { "DEGRADED" };
 
-    let header = format!(
-        " Storage Ballast Helper v{version}  [{mode}]"
-    );
+    let header = format!(" Storage Ballast Helper v{version}  [{mode}]");
     let right = format!("uptime: {uptime_str} ");
     let pad = width.saturating_sub(header.len() + right.len());
 
@@ -336,12 +324,7 @@ fn render_frame(
         SetForegroundColor(Color::Cyan),
         SetAttribute(Attribute::Bold),
     )?;
-    write!(
-        stdout,
-        "┌─{header}{:─<pad$}{right}─┐",
-        "",
-        pad = pad,
-    )?;
+    write!(stdout, "┌─{header}{:─<pad$}{right}─┐", "", pad = pad,)?;
     queue!(stdout, SetAttribute(Attribute::Reset))?;
     row += 1;
 
@@ -367,11 +350,7 @@ fn render_frame(
             let free_str = format!("{:.1}% free", mount.free_pct);
             let level_str = level_label(&mount.level);
 
-            queue!(
-                stdout,
-                MoveTo(3, row),
-                SetForegroundColor(Color::White),
-            )?;
+            queue!(stdout, MoveTo(3, row), SetForegroundColor(Color::White),)?;
             write!(stdout, "{:<12}", mount.path)?;
             queue!(stdout, SetForegroundColor(level_color(&mount.level)))?;
             write!(stdout, "{gauge}  ({free_str})  {level_str}")?;
@@ -561,18 +540,16 @@ fn render_frame(
         write!(
             stdout,
             "Scans: {}  |  Deleted: {} ({:.1} GB freed)  |  Errors: {}  |  RSS: {} MB  |  PID: {}",
-            s.counters.scans,
-            s.counters.deletions,
-            gb_freed,
-            s.counters.errors,
-            rss_mb,
-            s.pid,
+            s.counters.scans, s.counters.deletions, gb_freed, s.counters.errors, rss_mb, s.pid,
         )?;
         queue!(stdout, SetAttribute(Attribute::Reset))?;
         row += 1;
     } else {
         queue!(stdout, MoveTo(3, row), SetForegroundColor(Color::DarkGrey))?;
-        write!(stdout, "(daemon not running — showing static filesystem stats)")?;
+        write!(
+            stdout,
+            "(daemon not running — showing static filesystem stats)"
+        )?;
         queue!(stdout, SetAttribute(Attribute::Reset))?;
         row += 1;
     }
@@ -581,18 +558,19 @@ fn render_frame(
     row += 1;
     let footer = " Press q or Esc to exit ";
     let pad = width.saturating_sub(footer.len() + 4);
-    queue!(
-        stdout,
-        MoveTo(0, row),
-        SetForegroundColor(Color::Cyan),
-    )?;
+    queue!(stdout, MoveTo(0, row), SetForegroundColor(Color::Cyan),)?;
     write!(stdout, "└─{footer}{:─<pad$}──┘", "", pad = pad)?;
     queue!(stdout, SetAttribute(Attribute::Reset))?;
 
     stdout.flush()
 }
 
-fn write_padded_line(stdout: &mut io::Stdout, row: u16, content: &str, _width: usize) -> io::Result<()> {
+fn write_padded_line(
+    stdout: &mut io::Stdout,
+    row: u16,
+    content: &str,
+    _width: usize,
+) -> io::Result<()> {
     queue!(stdout, MoveTo(0, row))?;
     write!(stdout, "│ {content}")
 }

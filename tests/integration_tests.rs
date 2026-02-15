@@ -6,23 +6,19 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use storage_ballast_helper::ballast::manager::BallastManager;
 use storage_ballast_helper::core::config::{BallastConfig, Config};
+use storage_ballast_helper::daemon::notifications::{NotificationEvent, NotificationManager};
 use storage_ballast_helper::monitor::ewma::DiskRateEstimator;
-use storage_ballast_helper::monitor::pid::{
-    PidPressureController, PressureLevel, PressureReading,
-};
+use storage_ballast_helper::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
 use storage_ballast_helper::monitor::predictive::{PredictiveActionPolicy, PredictiveConfig};
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor};
 use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
 };
+use storage_ballast_helper::scanner::protection::ProtectionRegistry;
 use storage_ballast_helper::scanner::scoring::{CandidateInput, DecisionAction, ScoringEngine};
 use storage_ballast_helper::scanner::walker::{DirectoryWalker, WalkerConfig};
-use storage_ballast_helper::scanner::protection::ProtectionRegistry;
-use storage_ballast_helper::ballast::manager::BallastManager;
-use storage_ballast_helper::daemon::notifications::{
-    NotificationEvent, NotificationManager,
-};
 
 #[test]
 fn help_command_prints_usage() {
@@ -60,9 +56,22 @@ fn version_command_prints_version() {
 fn subcommand_help_flags_work() {
     // Verify that each subcommand accepts --help without crashing.
     let subcommands = [
-        "install", "uninstall", "status", "stats", "scan", "clean",
-        "ballast", "config", "daemon", "emergency", "protect",
-        "unprotect", "tune", "check", "blame", "dashboard",
+        "install",
+        "uninstall",
+        "status",
+        "stats",
+        "scan",
+        "clean",
+        "ballast",
+        "config",
+        "daemon",
+        "emergency",
+        "protect",
+        "unprotect",
+        "tune",
+        "check",
+        "blame",
+        "dashboard",
     ];
 
     for subcmd in subcommands {
@@ -83,10 +92,7 @@ fn subcommand_help_flags_work() {
 
 #[test]
 fn json_flag_accepted_by_status() {
-    let result = common::run_cli_case(
-        "json_flag_accepted_by_status",
-        &["status", "--json"],
-    );
+    let result = common::run_cli_case("json_flag_accepted_by_status", &["status", "--json"]);
     // Status may succeed or fail depending on system state, but
     // it should produce some output (not crash).
     let combined = format!("{}{}", result.stdout, result.stderr);
@@ -125,8 +131,16 @@ fn completions_command_generates_shell_script() {
 fn green_pressure_no_deletions() {
     let env = common::TestEnvironment::new();
     // Create some files that look like normal project files.
-    env.create_file("project/src/main.rs", b"fn main() {}", Duration::from_secs(3600));
-    env.create_file("project/Cargo.toml", b"[package]", Duration::from_secs(3600));
+    env.create_file(
+        "project/src/main.rs",
+        b"fn main() {}",
+        Duration::from_secs(3600),
+    );
+    env.create_file(
+        "project/Cargo.toml",
+        b"[package]",
+        Duration::from_secs(3600),
+    );
 
     let cfg = Config::default();
     let scoring = ScoringEngine::from_config(&cfg.scoring, cfg.scanner.min_file_age_minutes);
@@ -155,18 +169,26 @@ fn green_pressure_no_deletions() {
 #[test]
 fn pressure_escalation_through_levels() {
     let mut pid = PidPressureController::new(
-        0.25, 0.08, 0.02, 100.0, 18.0, 1.0,
-        20.0, 14.0, 10.0, 6.0,
+        0.25,
+        0.08,
+        0.02,
+        100.0,
+        18.0,
+        1.0,
+        20.0,
+        14.0,
+        10.0,
+        6.0,
         Duration::from_secs(2),
     );
     let t0 = Instant::now();
 
     // Simulate declining free space over time.
     let readings = [
-        (50, PressureLevel::Green),   // 50% free
-        (12, PressureLevel::Yellow),  // 12% free
-        (8,  PressureLevel::Orange),  // 8% free
-        (4,  PressureLevel::Red),     // 4% free
+        (50, PressureLevel::Green),  // 50% free
+        (12, PressureLevel::Yellow), // 12% free
+        (8, PressureLevel::Orange),  // 8% free
+        (4, PressureLevel::Red),     // 4% free
     ];
 
     for (i, (free_pct, expected_level)) in readings.iter().enumerate() {
@@ -221,7 +243,10 @@ fn ballast_lifecycle() {
 
     // Replenish.
     let replenish = manager.replenish(None).expect("replenish");
-    assert_eq!(replenish.files_created, 2, "should recreate 2 released files");
+    assert_eq!(
+        replenish.files_created, 2,
+        "should recreate 2 released files"
+    );
     assert_eq!(manager.available_count(), 3);
 }
 
@@ -252,10 +277,7 @@ fn walker_discovers_entries_in_tree() {
         .iter()
         .map(|e| e.path.to_string_lossy().to_string())
         .collect();
-    assert!(
-        !entries.is_empty(),
-        "should discover at least some entries"
-    );
+    assert!(!entries.is_empty(), "should discover at least some entries");
     // Directory "a" should be discovered.
     assert!(
         paths.iter().any(|p| p.ends_with("/a")),
@@ -274,7 +296,7 @@ fn scoring_pipeline_ranks_artifacts_above_source() {
     // High-confidence Rust target artifact with strong structural signals.
     let target_input = CandidateInput {
         path: PathBuf::from("/tmp/project/target"),
-        size_bytes: 500_000_000, // 500 MB
+        size_bytes: 500_000_000,            // 500 MB
         age: Duration::from_secs(4 * 3600), // 4 hours
         classification: ArtifactClassification {
             pattern_name: "cargo-target".to_string(),
@@ -342,17 +364,23 @@ fn dry_run_deletes_nothing() {
     let scoring = ScoringEngine::from_config(&cfg.scoring, cfg.scanner.min_file_age_minutes);
     let registry = ArtifactPatternRegistry::default();
 
-    let class = registry.classify(&artifact, StructuralSignals {
-        has_deps: true,
-        ..Default::default()
-    });
+    let class = registry.classify(
+        &artifact,
+        StructuralSignals {
+            has_deps: true,
+            ..Default::default()
+        },
+    );
 
     let candidate = CandidateInput {
         path: artifact.clone(),
         size_bytes: 1024,
         age: Duration::from_secs(86400),
         classification: class,
-        signals: StructuralSignals { has_deps: true, ..Default::default() },
+        signals: StructuralSignals {
+            has_deps: true,
+            ..Default::default()
+        },
         is_open: false,
         excluded: false,
     };
@@ -494,10 +522,7 @@ fn pattern_registry_classifies_rust_target() {
         ..Default::default()
     };
 
-    let class = registry.classify(
-        std::path::Path::new("/data/projects/myapp/target"),
-        signals,
-    );
+    let class = registry.classify(std::path::Path::new("/data/projects/myapp/target"), signals);
     assert_eq!(class.category, ArtifactCategory::RustTarget);
     assert!(class.combined_confidence > 0.5);
 }

@@ -298,10 +298,7 @@ impl PolicyEngine {
             self.check_guard_triggers(diag);
         }
 
-        let budget = self
-            .config
-            .max_candidates_per_loop
-            .min(candidates.len());
+        let budget = self.config.max_candidates_per_loop.min(candidates.len());
         let policy_mode = self.mode.to_policy_mode();
 
         let mut records = Vec::with_capacity(budget);
@@ -325,12 +322,9 @@ impl PolicyEngine {
                 None
             };
 
-            let record = self.builder.build(
-                candidate,
-                policy_mode,
-                guard,
-                comparator,
-            );
+            let record = self
+                .builder
+                .build(candidate, policy_mode, guard, comparator);
             self.total_decisions += 1;
 
             // Count hypothetical outcomes.
@@ -436,7 +430,12 @@ impl PolicyEngine {
             self.fallback_reason = Some(reason);
             self.total_fallback_entries += 1;
             self.consecutive_clean_windows = 0;
-            self.log_transition("fallback", self.mode, ActiveMode::FallbackSafe, Some(reason_str));
+            self.log_transition(
+                "fallback",
+                self.mode,
+                ActiveMode::FallbackSafe,
+                Some(reason_str),
+            );
             self.mode = ActiveMode::FallbackSafe;
         }
     }
@@ -573,8 +572,7 @@ mod tests {
     use crate::monitor::guardrails::GuardDiagnostics;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
     use crate::scanner::scoring::{
-        CandidacyScore, DecisionAction, DecisionOutcome, EvidenceLedger, EvidenceTerm,
-        ScoreFactors,
+        CandidacyScore, DecisionAction, DecisionOutcome, EvidenceLedger, EvidenceTerm, ScoreFactors,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -1003,10 +1001,7 @@ mod tests {
         let mut engine = PolicyEngine::new(default_config());
         let candidates = vec![sample_candidate(DecisionAction::Delete, 2.5)];
         let decision = engine.evaluate(&candidates, None);
-        assert_eq!(
-            decision.records[0].policy_mode,
-            PolicyMode::Shadow
-        );
+        assert_eq!(decision.records[0].policy_mode, PolicyMode::Shadow);
     }
 
     #[test]
@@ -1016,10 +1011,7 @@ mod tests {
         engine.promote();
         let candidates = vec![sample_candidate(DecisionAction::Delete, 2.5)];
         let decision = engine.evaluate(&candidates, None);
-        assert_eq!(
-            decision.records[0].policy_mode,
-            PolicyMode::Live
-        );
+        assert_eq!(decision.records[0].policy_mode, PolicyMode::Live);
     }
 
     #[test]

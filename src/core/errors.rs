@@ -143,80 +143,180 @@ mod tests {
     #[test]
     fn error_codes_are_unique() {
         let errors: Vec<SbhError> = vec![
-            SbhError::InvalidConfig { details: String::new() },
-            SbhError::MissingConfig { path: PathBuf::new() },
-            SbhError::ConfigParse { context: "", details: String::new() },
-            SbhError::UnsupportedPlatform { details: String::new() },
-            SbhError::FsStats { path: PathBuf::new(), details: String::new() },
-            SbhError::MountParse { details: String::new() },
-            SbhError::SafetyVeto { path: PathBuf::new(), reason: String::new() },
-            SbhError::Serialization { context: "", details: String::new() },
-            SbhError::Sql { context: "", details: String::new() },
-            SbhError::PermissionDenied { path: PathBuf::new() },
-            SbhError::Io { path: PathBuf::new(), source: std::io::Error::new(std::io::ErrorKind::Other, "test") },
+            SbhError::InvalidConfig {
+                details: String::new(),
+            },
+            SbhError::MissingConfig {
+                path: PathBuf::new(),
+            },
+            SbhError::ConfigParse {
+                context: "",
+                details: String::new(),
+            },
+            SbhError::UnsupportedPlatform {
+                details: String::new(),
+            },
+            SbhError::FsStats {
+                path: PathBuf::new(),
+                details: String::new(),
+            },
+            SbhError::MountParse {
+                details: String::new(),
+            },
+            SbhError::SafetyVeto {
+                path: PathBuf::new(),
+                reason: String::new(),
+            },
+            SbhError::Serialization {
+                context: "",
+                details: String::new(),
+            },
+            SbhError::Sql {
+                context: "",
+                details: String::new(),
+            },
+            SbhError::PermissionDenied {
+                path: PathBuf::new(),
+            },
+            SbhError::Io {
+                path: PathBuf::new(),
+                source: std::io::Error::new(std::io::ErrorKind::Other, "test"),
+            },
             SbhError::ChannelClosed { component: "" },
-            SbhError::Runtime { details: String::new() },
+            SbhError::Runtime {
+                details: String::new(),
+            },
         ];
 
         let codes: Vec<&str> = errors.iter().map(|e| e.code()).collect();
         let unique: std::collections::HashSet<&&str> = codes.iter().collect();
-        assert_eq!(codes.len(), unique.len(), "error codes must be unique: {codes:?}");
+        assert_eq!(
+            codes.len(),
+            unique.len(),
+            "error codes must be unique: {codes:?}"
+        );
     }
 
     #[test]
     fn error_codes_have_sbh_prefix() {
         let errors: Vec<SbhError> = vec![
-            SbhError::InvalidConfig { details: String::new() },
-            SbhError::Runtime { details: String::new() },
-            SbhError::Io { path: PathBuf::new(), source: std::io::Error::new(std::io::ErrorKind::Other, "test") },
+            SbhError::InvalidConfig {
+                details: String::new(),
+            },
+            SbhError::Runtime {
+                details: String::new(),
+            },
+            SbhError::Io {
+                path: PathBuf::new(),
+                source: std::io::Error::new(std::io::ErrorKind::Other, "test"),
+            },
         ];
 
         for err in &errors {
-            assert!(err.code().starts_with("SBH-"), "code {} must start with SBH-", err.code());
+            assert!(
+                err.code().starts_with("SBH-"),
+                "code {} must start with SBH-",
+                err.code()
+            );
         }
     }
 
     #[test]
     fn error_display_includes_code() {
-        let err = SbhError::InvalidConfig { details: "bad value".to_string() };
+        let err = SbhError::InvalidConfig {
+            details: "bad value".to_string(),
+        };
         let msg = err.to_string();
-        assert!(msg.contains("SBH-1001"), "display should contain error code: {msg}");
-        assert!(msg.contains("bad value"), "display should contain details: {msg}");
+        assert!(
+            msg.contains("SBH-1001"),
+            "display should contain error code: {msg}"
+        );
+        assert!(
+            msg.contains("bad value"),
+            "display should contain details: {msg}"
+        );
     }
 
     #[test]
     fn retryable_errors_are_correct() {
         // Retryable.
-        assert!(SbhError::Io {
-            path: PathBuf::new(),
-            source: std::io::Error::new(std::io::ErrorKind::Other, "test"),
-        }.is_retryable());
+        assert!(
+            SbhError::Io {
+                path: PathBuf::new(),
+                source: std::io::Error::new(std::io::ErrorKind::Other, "test"),
+            }
+            .is_retryable()
+        );
         assert!(SbhError::ChannelClosed { component: "test" }.is_retryable());
-        assert!(SbhError::FsStats { path: PathBuf::new(), details: String::new() }.is_retryable());
-        assert!(SbhError::Sql { context: "", details: String::new() }.is_retryable());
-        assert!(SbhError::Runtime { details: String::new() }.is_retryable());
+        assert!(
+            SbhError::FsStats {
+                path: PathBuf::new(),
+                details: String::new()
+            }
+            .is_retryable()
+        );
+        assert!(
+            SbhError::Sql {
+                context: "",
+                details: String::new()
+            }
+            .is_retryable()
+        );
+        assert!(
+            SbhError::Runtime {
+                details: String::new()
+            }
+            .is_retryable()
+        );
 
         // Not retryable.
-        assert!(!SbhError::InvalidConfig { details: String::new() }.is_retryable());
-        assert!(!SbhError::MissingConfig { path: PathBuf::new() }.is_retryable());
-        assert!(!SbhError::SafetyVeto { path: PathBuf::new(), reason: String::new() }.is_retryable());
-        assert!(!SbhError::PermissionDenied { path: PathBuf::new() }.is_retryable());
-        assert!(!SbhError::UnsupportedPlatform { details: String::new() }.is_retryable());
+        assert!(
+            !SbhError::InvalidConfig {
+                details: String::new()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !SbhError::MissingConfig {
+                path: PathBuf::new()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !SbhError::SafetyVeto {
+                path: PathBuf::new(),
+                reason: String::new()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !SbhError::PermissionDenied {
+                path: PathBuf::new()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !SbhError::UnsupportedPlatform {
+                details: String::new()
+            }
+            .is_retryable()
+        );
     }
 
     #[test]
     fn io_convenience_constructor() {
-        let err = SbhError::io("/tmp/test.txt", std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
+        let err = SbhError::io(
+            "/tmp/test.txt",
+            std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
+        );
         assert_eq!(err.code(), "SBH-3002");
         assert!(err.to_string().contains("/tmp/test.txt"));
     }
 
     #[test]
     fn from_rusqlite_error() {
-        let sql_err = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(1),
-            Some("test".to_string()),
-        );
+        let sql_err =
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(1), Some("test".to_string()));
         let err: SbhError = sql_err.into();
         assert_eq!(err.code(), "SBH-2102");
     }

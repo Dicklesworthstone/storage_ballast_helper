@@ -283,13 +283,11 @@ impl MonitoringDaemon {
             self.logger_handle.clone(),
             Arc::clone(&self.scanner_heartbeat),
         ));
-        let mut executor_join: Option<thread::JoinHandle<()>> = Some(
-            self.spawn_executor_thread(
-                del_rx.clone(),
-                self.logger_handle.clone(),
-                Arc::clone(&self.executor_heartbeat),
-            ),
-        );
+        let mut executor_join: Option<thread::JoinHandle<()>> = Some(self.spawn_executor_thread(
+            del_rx.clone(),
+            self.logger_handle.clone(),
+            Arc::clone(&self.executor_heartbeat),
+        ));
 
         let mut last_health_check = Instant::now();
 
@@ -729,7 +727,14 @@ impl MonitoringDaemon {
         thread::Builder::new()
             .name("sbh-scanner".to_string())
             .spawn(move || {
-                scanner_thread_main(scan_rx, del_tx, logger, scoring_config, min_file_age, heartbeat);
+                scanner_thread_main(
+                    scan_rx,
+                    del_tx,
+                    logger,
+                    scoring_config,
+                    min_file_age,
+                    heartbeat,
+                );
             })
             .expect("failed to spawn scanner thread")
     }

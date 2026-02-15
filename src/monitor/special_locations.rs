@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn needs_attention_when_below_buffer() {
-        use super::{FsStats, SpecialLocation, SpecialKind};
+        use super::{FsStats, SpecialKind, SpecialLocation};
         use std::time::Duration;
 
         let loc = SpecialLocation {
@@ -221,7 +221,7 @@ mod tests {
         };
         let stats_low = FsStats {
             total_bytes: 1000,
-            free_bytes: 100,    // 10% free — below buffer_pct 15
+            free_bytes: 100, // 10% free — below buffer_pct 15
             available_bytes: 100,
             fs_type: "tmpfs".to_string(),
             mount_point: PathBuf::from("/tmp"),
@@ -231,7 +231,7 @@ mod tests {
 
         let stats_ok = FsStats {
             total_bytes: 1000,
-            free_bytes: 200,    // 20% free — above buffer_pct 15
+            free_bytes: 200, // 20% free — above buffer_pct 15
             available_bytes: 200,
             fs_type: "tmpfs".to_string(),
             mount_point: PathBuf::from("/tmp"),
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn scan_due_when_never_scanned() {
-        use super::{SpecialLocation, SpecialKind};
+        use super::{SpecialKind, SpecialLocation};
         use std::time::{Duration, Instant};
 
         let loc = SpecialLocation {
@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn scan_not_due_when_recently_scanned() {
-        use super::{SpecialLocation, SpecialKind};
+        use super::{SpecialKind, SpecialLocation};
         use std::time::{Duration, Instant};
 
         let loc = SpecialLocation {
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn registry_deduplicates_paths() {
-        use super::{SpecialLocation, SpecialKind};
+        use super::{SpecialKind, SpecialLocation};
         use std::time::Duration;
 
         let locations = vec![
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn registry_sorts_by_priority_descending() {
-        use super::{SpecialLocation, SpecialKind};
+        use super::{SpecialKind, SpecialLocation};
         use std::time::Duration;
 
         let locations = vec![
@@ -334,10 +334,13 @@ mod tests {
     #[test]
     fn discover_adds_tmp_fallback_when_no_tmpfs_mount() {
         let platform = TestPlatform { mounts: vec![] };
-        let registry = SpecialLocationRegistry::discover(&platform, &[])
-            .expect("discovery should succeed");
+        let registry =
+            SpecialLocationRegistry::discover(&platform, &[]).expect("discovery should succeed");
         assert!(
-            registry.all().iter().any(|loc| loc.path == Path::new("/tmp")),
+            registry
+                .all()
+                .iter()
+                .any(|loc| loc.path == Path::new("/tmp")),
             "/tmp should be added as fallback"
         );
     }

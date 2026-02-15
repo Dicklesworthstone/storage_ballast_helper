@@ -18,9 +18,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::scanner::scoring::{
-    CandidacyScore, DecisionAction, EvidenceLedger, ScoreFactors,
-};
+use crate::scanner::scoring::{CandidacyScore, DecisionAction, EvidenceLedger, ScoreFactors};
 
 // ──────────────────── explain level ────────────────────
 
@@ -275,8 +273,7 @@ impl DecisionRecordBuilder {
         self.next_id += 1;
 
         let trace_id = format!("sbh-{id:08x}");
-        let timestamp =
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         let contributions = ledger_to_contributions(&score.ledger);
 
@@ -526,9 +523,8 @@ impl DecisionRecord {
                 "vetoed": self.vetoed,
                 "veto_reason": self.veto_reason,
             }),
-            ExplainLevel::L3 => {
-                serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({"error": "serialize"}))
-            }
+            ExplainLevel::L3 => serde_json::to_value(self)
+                .unwrap_or_else(|_| serde_json::json!({"error": "serialize"})),
         }
     }
 }
@@ -768,7 +764,10 @@ mod tests {
             Some(DecisionAction::Keep),
         );
 
-        assert_eq!(record.path, PathBuf::from("/data/projects/foo/.target_opus"));
+        assert_eq!(
+            record.path,
+            PathBuf::from("/data/projects/foo/.target_opus")
+        );
         assert_eq!(record.size_bytes, 3_500_000_000);
         assert_eq!(record.age_secs, 5 * 3600);
         assert_eq!(record.total_score, 2.15);
@@ -809,11 +808,7 @@ mod tests {
 
         assert!(record.fallback_active);
         assert!(record.fallback_reason.is_some());
-        assert!(record
-            .fallback_reason
-            .as_ref()
-            .unwrap()
-            .contains("0.350"));
+        assert!(record.fallback_reason.as_ref().unwrap().contains("0.350"));
     }
 
     #[test]
@@ -1079,7 +1074,12 @@ mod tests {
         assert_eq!(parsed.posterior_abandoned, record.posterior_abandoned);
 
         // Explain at all levels.
-        for level in [ExplainLevel::L0, ExplainLevel::L1, ExplainLevel::L2, ExplainLevel::L3] {
+        for level in [
+            ExplainLevel::L0,
+            ExplainLevel::L1,
+            ExplainLevel::L2,
+            ExplainLevel::L3,
+        ] {
             let text = format_explain(&record, level);
             assert!(!text.is_empty());
         }

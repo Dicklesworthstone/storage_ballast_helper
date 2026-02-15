@@ -657,7 +657,9 @@ mod tests {
     fn ballast_zero_count_rejected() {
         let mut cfg = Config::default();
         cfg.ballast.file_count = 0;
-        let err = cfg.validate().expect_err("expected ballast validation error");
+        let err = cfg
+            .validate()
+            .expect_err("expected ballast validation error");
         assert!(err.to_string().contains("ballast"));
     }
 
@@ -682,11 +684,14 @@ mod tests {
         use super::BallastConfig;
         use std::collections::HashMap;
         let mut overrides = HashMap::new();
-        overrides.insert("/data".to_string(), super::BallastVolumeOverride {
-            enabled: true,
-            file_count: Some(20),
-            file_size_bytes: None,
-        });
+        overrides.insert(
+            "/data".to_string(),
+            super::BallastVolumeOverride {
+                enabled: true,
+                file_count: Some(20),
+                file_size_bytes: None,
+            },
+        );
         let cfg = BallastConfig {
             file_count: 10,
             file_size_bytes: 1_000_000,
@@ -703,11 +708,14 @@ mod tests {
         use super::BallastConfig;
         use std::collections::HashMap;
         let mut overrides = HashMap::new();
-        overrides.insert("/tmp".to_string(), super::BallastVolumeOverride {
-            enabled: false,
-            file_count: None,
-            file_size_bytes: None,
-        });
+        overrides.insert(
+            "/tmp".to_string(),
+            super::BallastVolumeOverride {
+                enabled: false,
+                file_count: None,
+                file_size_bytes: None,
+            },
+        );
         let cfg = BallastConfig {
             file_count: 10,
             file_size_bytes: 1_000_000,

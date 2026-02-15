@@ -575,11 +575,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
                 .map_err(|e| CliError::User(format!("wizard cancelled: {e}")))?
         };
 
-        let config_path = answers
-            .to_config()
-            .paths
-            .config_file
-            .clone();
+        let config_path = answers.to_config().paths.config_file.clone();
 
         let config_written = write_config(&answers, &config_path)
             .map_err(|e| CliError::Runtime(format!("failed to write config: {e}")))?;
@@ -703,7 +699,9 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
         }
 
         if !report.success {
-            return Err(CliError::Runtime("install orchestration failed".to_string()));
+            return Err(CliError::Runtime(
+                "install orchestration failed".to_string(),
+            ));
         }
 
         if args.dry_run {

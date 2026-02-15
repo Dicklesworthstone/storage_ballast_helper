@@ -352,7 +352,9 @@ impl SelfMonitor {
             scan_count: self.scan_count,
             avg_scan_duration: self.avg_scan_duration(),
             last_scan_at: self.last_scan_at.as_ref().and_then(|ts| {
-                chrono::DateTime::parse_from_rfc3339(ts).ok().map(|_| Instant::now())
+                chrono::DateTime::parse_from_rfc3339(ts)
+                    .ok()
+                    .map(|_| Instant::now())
             }),
             deletions_total: self.deletions_total,
             bytes_freed_total: self.bytes_freed_total,

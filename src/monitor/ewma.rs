@@ -282,12 +282,17 @@ mod tests {
                 assert!(
                     reading.confidence >= prev_conf - 0.01,
                     "confidence should increase: {} >= {} at sample {}",
-                    reading.confidence, prev_conf, i
+                    reading.confidence,
+                    prev_conf,
+                    i
                 );
             }
             prev_conf = reading.confidence;
         }
-        assert!(prev_conf > 0.5, "confidence should be high after many steady samples");
+        assert!(
+            prev_conf > 0.5,
+            "confidence should be high after many steady samples"
+        );
     }
 
     #[test]
@@ -305,7 +310,11 @@ mod tests {
                 10_000,
             );
             if i >= 10 {
-                assert_eq!(reading.trend, Trend::Stable, "should be stable at sample {i}");
+                assert_eq!(
+                    reading.trend,
+                    Trend::Stable,
+                    "should be stable at sample {i}"
+                );
             }
         }
     }
@@ -328,7 +337,10 @@ mod tests {
         let _ = estimator.update(50_000, t0 + Duration::from_secs(1), 5_000);
         let reading = estimator.update(50_000, t0 + Duration::from_secs(2), 5_000);
         // No consumption → rate ~0 → infinite exhaustion time.
-        assert!(reading.seconds_to_exhaustion > 1_000_000.0 || reading.seconds_to_exhaustion.is_infinite());
+        assert!(
+            reading.seconds_to_exhaustion > 1_000_000.0
+                || reading.seconds_to_exhaustion.is_infinite()
+        );
     }
 
     #[test]

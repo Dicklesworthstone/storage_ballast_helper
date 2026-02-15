@@ -437,11 +437,7 @@ fn remove_directory_contents(dir: &Path) -> std::io::Result<u64> {
 pub fn format_install_report(report: &InstallReport) -> String {
     let mut out = String::new();
 
-    let mode = if report.dry_run {
-        "dry-run"
-    } else {
-        "install"
-    };
+    let mode = if report.dry_run { "dry-run" } else { "install" };
     let _ = writeln!(out, "sbh {mode} report:\n");
 
     for step in &report.steps {

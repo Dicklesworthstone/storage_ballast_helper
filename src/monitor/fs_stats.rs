@@ -281,7 +281,9 @@ mod tests {
         }];
         let platform = Arc::new(CountingPlatform::new(mounts, HashMap::new()));
         let collector = FsStatsCollector::new(platform.clone(), Duration::from_secs(5));
-        let out = collector.collect_many(&[]).expect("empty collect_many should succeed");
+        let out = collector
+            .collect_many(&[])
+            .expect("empty collect_many should succeed");
         assert!(out.is_empty());
         assert_eq!(platform.fs_stats_calls.load(Ordering::SeqCst), 0);
     }
@@ -298,7 +300,9 @@ mod tests {
             HashMap::new(),
         ));
         let collector = FsStatsCollector::new(platform, Duration::from_secs(5));
-        let err = collector.collect(Path::new("/unknown/path")).expect_err("should fail");
+        let err = collector
+            .collect(Path::new("/unknown/path"))
+            .expect_err("should fail");
         assert!(err.to_string().contains("does not belong to known mount"));
     }
 
@@ -324,12 +328,16 @@ mod tests {
         ));
         // Use zero TTL so everything expires immediately.
         let collector = FsStatsCollector::new(platform.clone(), Duration::ZERO);
-        let _ = collector.collect(Path::new("/tmp/foo")).expect("first collect");
+        let _ = collector
+            .collect(Path::new("/tmp/foo"))
+            .expect("first collect");
         // Wait a tiny bit for expiry.
         std::thread::sleep(Duration::from_millis(1));
         collector.prune_expired_cache();
         // After prune, next collect should call platform again.
-        let _ = collector.collect(Path::new("/tmp/foo")).expect("second collect");
+        let _ = collector
+            .collect(Path::new("/tmp/foo"))
+            .expect("second collect");
         assert_eq!(platform.fs_stats_calls.load(Ordering::SeqCst), 2);
     }
 }
