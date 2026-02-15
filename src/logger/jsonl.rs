@@ -15,7 +15,7 @@
 use std::fs::{self, File, OpenOptions, rename};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -178,6 +178,7 @@ pub struct JsonlWriter {
     state: WriterState,
     bytes_written: u64,
     last_fsync: SystemTime,
+    last_recover_attempt: SystemTime,
     lines_since_fsync: u64,
 }
 
@@ -190,6 +191,7 @@ impl JsonlWriter {
             state: WriterState::Discard,
             bytes_written: 0,
             last_fsync: SystemTime::now(),
+            last_recover_attempt: UNIX_EPOCH,
             lines_since_fsync: 0,
         };
         w.try_open_primary();
@@ -245,6 +247,8 @@ impl JsonlWriter {
     // ──────────────────────── internals ────────────────────────
 
     fn write_line(&mut self, line: &str) {
+        self.maybe_try_recover();
+
         // Check if rotation is needed before writing.
         if self.bytes_written + line.len() as u64 > self.config.max_size_bytes
             && matches!(self.state, WriterState::Normal | WriterState::Fallback)
@@ -284,6 +288,21 @@ impl JsonlWriter {
         if elapsed.as_secs() >= self.config.fsync_interval_secs {
             self.fsync();
         }
+    }
+
+    fn maybe_try_recover(&mut self) {
+        if self.state == WriterState::Normal {
+            return;
+        }
+        let now = SystemTime::now();
+        let elapsed = now
+            .duration_since(self.last_recover_attempt)
+            .unwrap_or(Duration::ZERO);
+        if elapsed < Duration::from_secs(30) {
+            return;
+        }
+        self.last_recover_attempt = now;
+        self.try_recover();
     }
 
     fn try_open_primary(&mut self) {
@@ -581,5 +600,30 @@ mod tests {
         assert!(!line.contains("\"path\""));
         assert!(!line.contains("\"size\""));
         assert!(!line.contains("\"score\""));
+    }
+
+    #[test]
+    fn degraded_writer_attempts_and_applies_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let recovery_path = dir.path().join("recovered.jsonl");
+        let config = JsonlConfig {
+            path: PathBuf::from("/nonexistent_sbh_test_dir_12345/primary.jsonl"),
+            fallback_path: None,
+            max_size_bytes: 1024 * 1024,
+            max_rotated_files: 3,
+            fsync_interval_secs: 60,
+        };
+        let mut writer = JsonlWriter::open(config);
+
+        assert_ne!(writer.state(), "normal");
+
+        writer.config.path = recovery_path.clone();
+        writer.last_recover_attempt = UNIX_EPOCH;
+
+        writer.write_entry(&LogEntry::new(EventType::ScanComplete, Severity::Info));
+        writer.flush();
+
+        assert_eq!(writer.state(), "normal");
+        assert!(recovery_path.exists());
     }
 }

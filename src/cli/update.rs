@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rand::random;
 use serde::Serialize;
 
 use crate::core::update_cache::{CachedUpdateMetadata, UpdateMetadataCache};
@@ -1089,17 +1090,25 @@ fn extract_and_install(
 }
 
 fn tempdir_for_update() -> std::result::Result<PathBuf, String> {
-    let base = std::env::temp_dir().join("sbh_update");
-    std::fs::create_dir_all(&base).map_err(|e| format!("failed to create temp dir: {e}"))?;
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let dir = base.join(format!("{ts}"));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create temp subdir: {e}"))?;
+    for _attempt in 0..32 {
+        let nonce = random::<u128>();
+        let dir = base.join(format!("sbh_update-{pid}-{nonce:032x}"));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to create temp update dir {}: {err}",
+                    dir.display()
+                ));
+            }
+        }
+    }
 
-    Ok(dir)
+    Err("failed to allocate unique temp update directory after 32 attempts".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,6 +1194,19 @@ mod tests {
         )
         .unwrap();
         manifest_path
+    }
+
+    #[test]
+    fn tempdir_for_update_creates_unique_directories() {
+        let one = tempdir_for_update().unwrap();
+        let two = tempdir_for_update().unwrap();
+
+        assert_ne!(one, two);
+        assert!(one.exists());
+        assert!(two.exists());
+
+        let _ = std::fs::remove_dir_all(&one);
+        let _ = std::fs::remove_dir_all(&two);
     }
 
     #[test]
