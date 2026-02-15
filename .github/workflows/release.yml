@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+permissions:
+  contents: write
+
+jobs:
+  quality-gate:
+    name: Quality Gate
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: quality-gate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.xz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.xz
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.xz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.xz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (if needed)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build release binary
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package archive
+        run: |
+          cd target/${{ matrix.target }}/release
+          # Artifact naming contract: sbh-{target}.tar.xz
+          # The installer script (scripts/install.sh) expects this exact format.
+          ARCHIVE_NAME="sbh-${{ matrix.target }}.${{ matrix.archive }}"
+          tar cJf "../../../${ARCHIVE_NAME}" sbh
+          cd ../../..
+          sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbh-${{ matrix.target }}
+          path: |
+            sbh-*.tar.xz
+            sbh-*.sha256
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Collect provenance
+        run: |
+          echo "{" > release-provenance.json
+          echo "  \"tag\": \"${GITHUB_REF_NAME}\"," >> release-provenance.json
+          echo "  \"sha\": \"${{ github.sha }}\"," >> release-provenance.json
+          echo "  \"run_id\": \"${{ github.run_id }}\"," >> release-provenance.json
+          echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"," >> release-provenance.json
+          echo "  \"rustc_version\": \"$(rustc --version)\"" >> release-provenance.json
+          echo "}" >> release-provenance.json
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-artifacts/sbh-*.tar.xz
+            release-artifacts/sbh-*.sha256
+            release-provenance.json

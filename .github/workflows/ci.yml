@@ -1,0 +1,190 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: Format + Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run unit tests
+        run: cargo test --lib -- --nocapture 2>&1 | tee unit-test-output.txt
+      - name: Run binary tests
+        run: cargo test --bin sbh -- --nocapture 2>&1 | tee bin-test-output.txt
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-logs
+          path: |
+            unit-test-output.txt
+            bin-test-output.txt
+          retention-days: 14
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run integration tests
+        run: cargo test --test integration_tests -- --nocapture 2>&1 | tee integration-output.txt
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-logs
+          path: integration-output.txt
+          retention-days: 14
+
+  decision-plane:
+    name: Decision Plane Tests
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run proof harness
+        run: cargo test --test proof_harness -- --nocapture 2>&1 | tee proof-harness-output.txt
+      - name: Run decision plane e2e
+        run: cargo test --test decision_plane_e2e -- --nocapture 2>&1 | tee decision-plane-e2e-output.txt
+      - name: Upload decision plane logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decision-plane-logs
+          path: |
+            proof-harness-output.txt
+            decision-plane-e2e-output.txt
+          retention-days: 30
+
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release
+      - name: Run E2E test suite
+        run: |
+          chmod +x scripts/e2e_test.sh
+          ./scripts/e2e_test.sh 2>&1 | tee e2e-output.txt
+        env:
+          SBH_E2E_BIN: ./target/release/sbh
+      - name: Upload E2E logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-logs
+          path: |
+            e2e-output.txt
+            /tmp/sbh_e2e_*/
+          retention-days: 14
+
+  stress:
+    name: Stress Tests
+    runs-on: ubuntu-latest
+    needs: unit
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run stress tests
+        run: cargo test --test stress_tests -- --nocapture 2>&1 | tee stress-output.txt
+      - name: Upload stress logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-test-logs
+          path: stress-output.txt
+          retention-days: 14
+
+  artifact-contract:
+    name: Artifact Contract Validation
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run artifact contract tests
+        run: |
+          cargo test --lib -- cli::tests::ci_release_targets --nocapture
+          cargo test --lib -- cli::tests::builds_expected_asset_names --nocapture
+          cargo test --lib -- cli::tests::validates_release_asset_contract --nocapture
+      - name: Validate archive naming matches contract
+        run: |
+          cargo build --release
+          # Build archive using contract naming and verify structure.
+          TARGET=$(rustc -vV | grep host | awk '{print $2}')
+          ARCHIVE="sbh-${TARGET}.tar.xz"
+          cd target/release && tar cJf "../../${ARCHIVE}" sbh && cd ../..
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          # Verify archive contains the binary.
+          tar -tJf "${ARCHIVE}" | grep -q "^sbh$"
+          # Verify checksum file is valid.
+          sha256sum -c "${ARCHIVE}.sha256"
+          echo "Artifact contract validated: ${ARCHIVE}"
+
+  provenance:
+    name: Provenance Metadata
+    runs-on: ubuntu-latest
+    needs: [unit, integration, decision-plane, e2e, stress, artifact-contract]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Collect provenance
+        run: |
+          mkdir -p provenance
+          echo "{" > provenance/ci-metadata.json
+          echo "  \"git_sha\": \"${{ github.sha }}\"," >> provenance/ci-metadata.json
+          echo "  \"git_ref\": \"${{ github.ref }}\"," >> provenance/ci-metadata.json
+          echo "  \"run_id\": \"${{ github.run_id }}\"," >> provenance/ci-metadata.json
+          echo "  \"run_number\": ${{ github.run_number }}," >> provenance/ci-metadata.json
+          echo "  \"runner_os\": \"${{ runner.os }}\"," >> provenance/ci-metadata.json
+          echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"," >> provenance/ci-metadata.json
+          echo "  \"rustc_version\": \"$(rustc --version)\"," >> provenance/ci-metadata.json
+          echo "  \"cargo_version\": \"$(cargo --version)\"" >> provenance/ci-metadata.json
+          echo "}" >> provenance/ci-metadata.json
+          cargo tree --depth 1 > provenance/dependency-tree.txt
+          cat provenance/ci-metadata.json
+      - name: Upload provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: provenance
+          path: provenance/
+          retention-days: 90

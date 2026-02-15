@@ -97,6 +97,9 @@ enum Command {
     Dashboard(DashboardArgs),
     /// Generate shell completions.
     Completions(CompletionsArgs),
+    /// Check for and apply updates.
+    Update(UpdateArgs),
+
     /// Post-install setup: PATH, completions, and verification.
     Setup(SetupArgs),
 }
@@ -433,6 +436,45 @@ struct CompletionsArgs {
     shell: CompletionShell,
 }
 
+#[derive(Debug, Clone, Args, Serialize)]
+struct UpdateArgs {
+    /// Check only, don't apply updates.
+    #[arg(long)]
+    check: bool,
+    /// Pin to a specific version tag (e.g. "0.2.1" or "v0.2.1").
+    #[arg(long, value_name = "VERSION")]
+    version: Option<String>,
+    /// Force re-download even if already at the target version.
+    #[arg(long)]
+    force: bool,
+    /// Install to system-wide location (requires root/sudo).
+    #[arg(long, conflicts_with = "user")]
+    system: bool,
+    /// Install to user-local location (~/.local/bin). Default on non-root.
+    #[arg(long, conflicts_with = "system")]
+    user: bool,
+    /// Skip integrity verification (unsafe; for debugging only).
+    #[arg(long)]
+    no_verify: bool,
+    /// Print what would be done without making changes.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+impl Default for UpdateArgs {
+    fn default() -> Self {
+        Self {
+            check: false,
+            version: None,
+            force: false,
+            system: false,
+            user: false,
+            no_verify: false,
+            dry_run: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 struct SetupArgs {
     /// Add sbh to shell PATH (appends to profile if not already present).
@@ -531,6 +573,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
             generate(args.shell, &mut command, binary_name, &mut io::stdout());
             Ok(())
         }
+        Command::Update(args) => run_update(cli, args),
         Command::Setup(args) => run_setup(cli, args),
     }
 }
@@ -4122,6 +4165,50 @@ fn resolve_output_mode(json_flag: bool, env_mode: Option<&str>, stdout_is_tty: b
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Update command
+// ---------------------------------------------------------------------------
+
+fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<(), CliError> {
+    use storage_ballast_helper::cli::update::{
+        UpdateOptions, default_install_dir, format_update_report, run_update_sequence,
+    };
+
+    let install_dir = if args.system {
+        default_install_dir(true)
+    } else {
+        default_install_dir(false)
+    };
+
+    let opts = UpdateOptions {
+        check_only: args.check,
+        pinned_version: args.version.clone(),
+        force: args.force,
+        install_dir,
+        no_verify: args.no_verify,
+        dry_run: args.dry_run,
+    };
+
+    let report = run_update_sequence(&opts);
+
+    match output_mode(cli) {
+        OutputMode::Human => {
+            print!("{}", format_update_report(&report));
+        }
+        OutputMode::Json => {
+            let payload = serde_json::to_value(&report)?;
+            write_json_line(&payload)?;
+        }
+    }
+
+    if report.success {
+        Ok(())
+    } else {
+        Err(CliError::Runtime("update failed".to_string()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Setup command: PATH, completions, verification
 // ---------------------------------------------------------------------------
@@ -4917,6 +5004,7 @@ mod tests {
             "blame",
             "dashboard",
             "completions",
+            "update",
             "setup",
         ] {
             assert!(
@@ -4924,5 +5012,43 @@ mod tests {
                 "help output missing command: {keyword}"
             );
         }
+    }
+
+    #[test]
+    fn update_command_parses_with_flags() {
+        let cases = [
+            vec!["sbh", "update", "--check"],
+            vec!["sbh", "update", "--check", "--json"],
+            vec!["sbh", "update", "--version", "v0.2.0"],
+            vec!["sbh", "update", "--version", "0.2.0", "--force"],
+            vec!["sbh", "update", "--dry-run"],
+            vec!["sbh", "update", "--no-verify", "--force"],
+            vec!["sbh", "update", "--system"],
+            vec!["sbh", "update", "--user"],
+            vec![
+                "sbh", "update", "--version", "v1.0.0", "--dry-run", "--user",
+            ],
+        ];
+        for case in cases {
+            let parsed = Cli::try_parse_from(case.clone());
+            assert!(parsed.is_ok(), "failed to parse update case: {case:?}");
+        }
+    }
+
+    #[test]
+    fn update_system_and_user_conflict() {
+        assert!(Cli::try_parse_from(["sbh", "update", "--system", "--user"]).is_err());
+    }
+
+    #[test]
+    fn update_args_default_is_check_false() {
+        let args = UpdateArgs::default();
+        assert!(!args.check);
+        assert!(!args.force);
+        assert!(!args.no_verify);
+        assert!(!args.dry_run);
+        assert!(!args.system);
+        assert!(!args.user);
+        assert!(args.version.is_none());
     }
 }

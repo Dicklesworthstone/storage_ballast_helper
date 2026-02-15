@@ -8,6 +8,7 @@ pub mod from_source;
 pub mod install;
 pub mod integrations;
 pub mod uninstall;
+pub mod update;
 pub mod wizard;
 
 use std::fmt;
@@ -24,6 +25,18 @@ pub const RELEASE_REPOSITORY: &str = "Dicklesworthstone/storage_ballast_helper";
 
 /// Canonical binary name used in release artifact names.
 pub const RELEASE_BINARY_NAME: &str = "sbh";
+
+/// CI/CD target triples built and published in release workflows.
+///
+/// The release.yml matrix MUST match this list exactly. Tests in this module
+/// validate the contract: every CI target resolves to a valid artifact, and
+/// the naming scheme matches what the installer expects.
+pub const CI_RELEASE_TARGETS: &[&str] = &[
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+];
 
 /// Release channels supported by installer/update flows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -911,5 +924,57 @@ mod tests {
         hasher.update(contents);
         let digest = hasher.finalize();
         format!("{digest:x}")
+    }
+
+    #[test]
+    fn ci_release_targets_resolve_to_valid_contracts() {
+        // Every CI target triple must produce a valid ReleaseArtifactContract
+        // with the expected asset naming scheme: sbh-{target}.tar.xz
+        for triple in CI_RELEASE_TARGETS {
+            // Parse the triple to find the matching host specifier.
+            let (os, arch, abi) = match *triple {
+                "x86_64-unknown-linux-gnu" => ("linux", "x86_64", Some("gnu")),
+                "aarch64-unknown-linux-gnu" => ("linux", "aarch64", Some("gnu")),
+                "x86_64-apple-darwin" => ("macos", "x86_64", None),
+                "aarch64-apple-darwin" => ("macos", "aarch64", None),
+                other => panic!("unknown CI target: {other}"),
+            };
+
+            let host = HostSpecifier::from_parts(os, arch, abi).unwrap();
+            let contract =
+                resolve_installer_artifact_contract(host, ReleaseChannel::Stable, None).unwrap();
+
+            assert_eq!(contract.target.triple, *triple);
+            assert_eq!(contract.binary_name, RELEASE_BINARY_NAME);
+            assert_eq!(contract.repository, RELEASE_REPOSITORY);
+
+            // Verify naming contract matches installer expectation.
+            let expected_asset = format!("sbh-{triple}.tar.xz");
+            assert_eq!(contract.asset_name(), expected_asset);
+            assert_eq!(contract.checksum_name(), format!("{expected_asset}.sha256"));
+
+            // Validate contract round-trips through validation.
+            let assets = contract.expected_release_assets().to_vec();
+            assert!(validate_release_assets(&contract, &assets).is_ok());
+        }
+    }
+
+    #[test]
+    fn ci_release_targets_are_not_empty() {
+        assert!(
+            !CI_RELEASE_TARGETS.is_empty(),
+            "CI_RELEASE_TARGETS must contain at least one target"
+        );
+    }
+
+    #[test]
+    fn ci_release_targets_have_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for target in CI_RELEASE_TARGETS {
+            assert!(
+                seen.insert(target),
+                "duplicate CI target: {target}"
+            );
+        }
     }
 }
