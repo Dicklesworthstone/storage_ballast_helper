@@ -25,7 +25,7 @@ use storage_ballast_helper::cli::install::{
     run_install_sequence_with_bundle, run_uninstall_cleanup,
 };
 use storage_ballast_helper::cli::integrations::{
-    ALL_TOOLS, AiTool, BootstrapOptions, IntegrationStatus, run_bootstrap,
+    ALL_TOOLS, BootstrapOptions, IntegrationStatus, run_bootstrap,
 };
 use storage_ballast_helper::cli::update::{BackupStore, UpdateOptions, run_update_sequence};
 use storage_ballast_helper::cli::wizard::{
@@ -333,22 +333,23 @@ fn e2e_backup_store_create_list_rollback_prune() {
     std::fs::write(&original, b"version-1-binary").unwrap();
 
     // Create backup.
-    let snap = store.create(&original, "0.1.0", "backup-test").unwrap();
+    let snap = store.create(&original, "0.1.0").unwrap();
     assert!(snap.path.exists());
     assert_eq!(snap.version, "0.1.0");
 
     // List should show 1 backup.
     let inventory = store.inventory();
-    assert_eq!(inventory.snapshots.len(), 1);
+    assert_eq!(inventory.backups.len(), 1);
 
-    // Create a second backup.
+    // Create a second backup — sleep briefly so timestamp differs.
+    std::thread::sleep(std::time::Duration::from_secs(1));
     std::fs::write(&original, b"version-2-binary").unwrap();
-    let snap2 = store.create(&original, "0.2.0", "upgrade-test").unwrap();
+    let snap2 = store.create(&original, "0.2.0").unwrap();
     assert_eq!(snap2.version, "0.2.0");
-    assert_eq!(store.inventory().snapshots.len(), 2);
+    assert_eq!(store.inventory().backups.len(), 2);
 
     // Rollback to first backup.
-    let rollback_result = store.rollback(Some(&snap.id), &original).unwrap();
+    let rollback_result = store.rollback(&original, Some(&snap.id)).unwrap();
     assert!(rollback_result.success);
     let content = std::fs::read_to_string(&original).unwrap();
     assert_eq!(content, "version-1-binary");
@@ -356,7 +357,7 @@ fn e2e_backup_store_create_list_rollback_prune() {
     // Prune to keep only 1 backup.
     let prune_result = store.prune(1).unwrap();
     assert_eq!(prune_result.removed, 1);
-    assert_eq!(store.inventory().snapshots.len(), 1);
+    assert_eq!(store.inventory().backups.len(), 1);
 }
 
 #[test]
@@ -369,15 +370,16 @@ fn e2e_backup_store_rollback_to_latest() {
 
     // Create multiple backups.
     std::fs::write(&original, b"v1").unwrap();
-    store.create(&original, "0.1.0", "test").unwrap();
+    store.create(&original, "0.1.0").unwrap();
 
+    std::thread::sleep(std::time::Duration::from_secs(1));
     std::fs::write(&original, b"v2").unwrap();
-    store.create(&original, "0.2.0", "test").unwrap();
+    store.create(&original, "0.2.0").unwrap();
 
     std::fs::write(&original, b"v3-broken").unwrap();
 
     // Rollback with None → latest backup (v2).
-    let result = store.rollback(None, &original).unwrap();
+    let result = store.rollback(&original, None).unwrap();
     assert!(result.success);
     let content = std::fs::read_to_string(&original).unwrap();
     assert_eq!(content, "v2");
@@ -393,14 +395,16 @@ fn e2e_update_dry_run_no_side_effects() {
     let opts = UpdateOptions {
         check_only: false,
         dry_run: true,
-        system: false,
         pinned_version: None,
-        install_dir: Some(tmp.path().to_path_buf()),
+        install_dir: tmp.path().to_path_buf(),
         force: false,
         no_verify: false,
-        channel: None,
         max_backups: 5,
         notices_enabled: true,
+        metadata_cache_file: tmp.path().join("cache.json"),
+        metadata_cache_ttl: std::time::Duration::from_secs(60),
+        refresh_cache: false,
+        offline_bundle_manifest: None,
     };
     let report = run_update_sequence(&opts);
     assert!(report.dry_run, "should be dry_run");
@@ -412,14 +416,16 @@ fn e2e_update_check_only_reports_availability() {
     let opts = UpdateOptions {
         check_only: true,
         dry_run: false,
-        system: false,
         pinned_version: None,
-        install_dir: Some(tmp.path().to_path_buf()),
+        install_dir: tmp.path().to_path_buf(),
         force: false,
         no_verify: false,
-        channel: None,
         max_backups: 5,
         notices_enabled: true,
+        metadata_cache_file: tmp.path().join("cache.json"),
+        metadata_cache_ttl: std::time::Duration::from_secs(60),
+        refresh_cache: false,
+        offline_bundle_manifest: None,
     };
     let report = run_update_sequence(&opts);
     assert!(report.check_only, "should be check_only");

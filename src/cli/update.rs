@@ -497,10 +497,10 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
 
         TargetMetadata {
             target_tag,
-            artifact_url: bundle_archive_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| String::from("<bundle-archive>")),
+            artifact_url: bundle_archive_path.as_ref().map_or_else(
+                || String::from("<bundle-archive>"),
+                |path| path.display().to_string(),
+            ),
             source: TargetMetadataSource::OfflineBundle,
             bundle_archive_path,
             bundle_checksum_path,
