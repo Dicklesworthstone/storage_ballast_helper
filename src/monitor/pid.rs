@@ -110,9 +110,9 @@ impl PidPressureController {
     pub fn set_action_horizon_minutes(&mut self, action_horizon_minutes: f64) {
         let horizon_secs = action_horizon_minutes * 60.0;
         self.urgency_thresholds = [
-            (horizon_secs / 30.0).max(30.0),   // critical ~1min for 30min horizon
-            (horizon_secs / 6.0).max(60.0),    // high ~5min for 30min horizon
-            (horizon_secs / 2.0).max(120.0),   // moderate ~15min for 30min horizon
+            (horizon_secs / 30.0).max(30.0), // critical ~1min for 30min horizon
+            (horizon_secs / 6.0).max(60.0),  // high ~5min for 30min horizon
+            (horizon_secs / 2.0).max(120.0), // moderate ~15min for 30min horizon
         ];
     }
 
@@ -142,7 +142,9 @@ impl PidPressureController {
             .max(1e-6);
 
         let error = self.target_free_pct - free_pct;
-        self.integral = error.mul_add(dt, self.integral).clamp(-self.integral_cap, self.integral_cap);
+        self.integral = error
+            .mul_add(dt, self.integral)
+            .clamp(-self.integral_cap, self.integral_cap);
         let derivative = (error - self.last_error) / dt;
         self.last_error = error;
         self.last_update = Some(now);

@@ -465,9 +465,9 @@ impl MonitoringDaemon {
         let red_threshold_bytes =
             (stats.total_bytes as f64 * self.config.pressure.red_min_free_pct / 100.0) as u64;
         let now = Instant::now();
-        let rate_estimate = self
-            .rate_estimator
-            .update(stats.available_bytes, now, red_threshold_bytes);
+        let rate_estimate =
+            self.rate_estimator
+                .update(stats.available_bytes, now, red_threshold_bytes);
 
         // Predicted time to red threshold.
         let predicted_seconds = if rate_estimate.seconds_to_threshold.is_finite()

@@ -235,7 +235,7 @@ impl SqliteLogger {
     }
 
     /// Borrow the underlying connection (for stats/query engines).
-    pub fn connection(&self) -> &rusqlite::Connection {
+    pub(crate) fn connection(&self) -> &rusqlite::Connection {
         &self.conn
     }
 
@@ -306,6 +306,11 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
          PRAGMA temp_store = MEMORY;
          PRAGMA busy_timeout = 5000;",
     )?;
+    // Verify WAL mode is active (I12).
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        eprintln!("[SBH-SQLITE] WARNING: requested WAL mode but got '{mode}'");
+    }
     Ok(())
 }
 

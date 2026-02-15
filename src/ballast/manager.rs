@@ -192,7 +192,9 @@ impl BallastManager {
             match self.create_ballast_file(index) {
                 Ok(()) => {
                     report.files_created += 1;
-                    let actual_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(self.config.file_size_bytes);
+                    let actual_size = fs::metadata(&path)
+                        .map(|m| m.len())
+                        .unwrap_or(self.config.file_size_bytes);
                     report.total_bytes += actual_size;
                 }
                 Err(e) => {
@@ -323,7 +325,9 @@ impl BallastManager {
             match self.create_ballast_file(index) {
                 Ok(()) => {
                     report.files_created += 1;
-                    let actual_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(self.config.file_size_bytes);
+                    let actual_size = fs::metadata(&path)
+                        .map(|m| m.len())
+                        .unwrap_or(self.config.file_size_bytes);
                     report.total_bytes += actual_size;
                     // Only create one file per call.
                     break;
@@ -430,9 +434,7 @@ impl BallastManager {
 
         if size < HEADER_SIZE as u64 {
             return Err(SbhError::InvalidConfig {
-                details: format!(
-                    "file_size_bytes ({size}) must be >= HEADER_SIZE ({HEADER_SIZE})"
-                ),
+                details: format!("file_size_bytes ({size}) must be >= HEADER_SIZE ({HEADER_SIZE})"),
             });
         }
 
