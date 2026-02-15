@@ -5,11 +5,16 @@ mod common;
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use storage_ballast_helper::ballast::manager::BallastManager;
+use storage_ballast_helper::cli::{
+    HostSpecifier, OfflineBundleArtifact, OfflineBundleManifest, RELEASE_REPOSITORY,
+    ReleaseChannel, resolve_updater_artifact_contract,
+};
 use storage_ballast_helper::core::config::{BallastConfig, Config, ScoringConfig};
 use storage_ballast_helper::daemon::notifications::{NotificationEvent, NotificationManager};
 use storage_ballast_helper::daemon::policy::{
@@ -134,6 +139,45 @@ fn completions_command_generates_shell_script() {
         "expected completion script contents; log: {}",
         result.log_path.display()
     );
+}
+
+fn create_offline_update_bundle(bundle_root: &Path, release_tag: &str) -> (PathBuf, String) {
+    let host = HostSpecifier::detect().expect("detect host");
+    let contract =
+        resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some(release_tag))
+            .expect("resolve updater contract");
+    let archive_name = contract.asset_name();
+    let checksum_name = contract.checksum_name();
+
+    let archive_bytes = b"integration-offline-update-bundle";
+    fs::write(bundle_root.join(&archive_name), archive_bytes).expect("write bundle archive");
+    let checksum_hex = format!("{:x}", Sha256::digest(archive_bytes));
+    fs::write(
+        bundle_root.join(&checksum_name),
+        format!("{checksum_hex}  {archive_name}\n"),
+    )
+    .expect("write bundle checksum");
+
+    let manifest = OfflineBundleManifest {
+        version: String::from("1"),
+        repository: RELEASE_REPOSITORY.to_string(),
+        release_tag: release_tag.to_string(),
+        artifacts: vec![OfflineBundleArtifact {
+            target: contract.target.triple.to_string(),
+            archive: archive_name,
+            checksum: checksum_name,
+            sigstore_bundle: None,
+        }],
+    };
+    let manifest_path = bundle_root.join("bundle-manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).expect("serialize bundle manifest"),
+    )
+    .expect("write bundle manifest");
+
+    let expected_tag = format!("v{}", release_tag.trim_start_matches('v'));
+    (manifest_path, expected_tag)
 }
 
 #[test]
@@ -380,6 +424,165 @@ fn update_check_uses_fresh_cache_when_offline_and_path_disabled() {
     assert!(
         used_cache,
         "expected cache-hit step in update report; log: {}",
+        result.log_path.display()
+    );
+}
+
+#[test]
+fn update_check_with_offline_bundle_manifest_reports_target_json() {
+    let home = tempfile::tempdir().expect("create temp home");
+    let bundle = tempfile::tempdir().expect("create temp bundle dir");
+    let (manifest_path, expected_tag) = create_offline_update_bundle(bundle.path(), "99.77.55");
+
+    let home_str = home.path().to_string_lossy().to_string();
+    let manifest_path_str = manifest_path.to_string_lossy().to_string();
+    let result = common::run_cli_case_with_env(
+        "update_check_with_offline_bundle_manifest_reports_target_json",
+        &[
+            "update",
+            "--check",
+            "--offline",
+            &manifest_path_str,
+            "--json",
+        ],
+        &[("HOME", &home_str), ("PATH", "")],
+    );
+    assert!(
+        result.status.success(),
+        "expected success; stderr={:?}; log: {}",
+        result.stderr,
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON output, parse failed: {err}; stdout={:?}; log={}",
+            result.stdout,
+            result.log_path.display()
+        )
+    });
+    assert_eq!(
+        payload["success"],
+        true,
+        "expected success=true; log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["check_only"],
+        true,
+        "expected check_only=true; log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["target_version"],
+        expected_tag,
+        "unexpected target_version; log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["update_available"],
+        true,
+        "expected update_available=true; log: {}",
+        result.log_path.display()
+    );
+
+    let resolved_bundle_artifact = payload["steps"].as_array().is_some_and(|steps| {
+        steps.iter().any(|step| {
+            step.get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|desc| desc.contains("Resolved offline bundle artifact"))
+        })
+    });
+    assert!(
+        resolved_bundle_artifact,
+        "expected bundle artifact resolution step; log: {}",
+        result.log_path.display()
+    );
+
+    let loaded_bundle_metadata = payload["steps"].as_array().is_some_and(|steps| {
+        steps.iter().any(|step| {
+            step.get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|desc| desc.contains("Loaded update metadata from offline bundle"))
+        })
+    });
+    assert!(
+        loaded_bundle_metadata,
+        "expected offline bundle metadata source step; log: {}",
+        result.log_path.display()
+    );
+}
+
+#[test]
+fn update_check_with_offline_bundle_and_pinned_tag_mismatch_fails_json() {
+    let home = tempfile::tempdir().expect("create temp home");
+    let bundle = tempfile::tempdir().expect("create temp bundle dir");
+    let (manifest_path, expected_tag) = create_offline_update_bundle(bundle.path(), "9.9.9");
+
+    let home_str = home.path().to_string_lossy().to_string();
+    let manifest_path_str = manifest_path.to_string_lossy().to_string();
+    let result = common::run_cli_case_with_env(
+        "update_check_with_offline_bundle_and_pinned_tag_mismatch_fails_json",
+        &[
+            "update",
+            "--check",
+            "--offline",
+            &manifest_path_str,
+            "--version",
+            "1.0.0",
+            "--json",
+        ],
+        &[("HOME", &home_str), ("PATH", "")],
+    );
+    assert!(
+        !result.status.success(),
+        "expected failure due to pinned tag mismatch; log: {}",
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON output, parse failed: {err}; stdout={:?}; log={}",
+            result.stdout,
+            result.log_path.display()
+        )
+    });
+    assert_eq!(
+        payload["success"],
+        false,
+        "expected success=false; log: {}",
+        result.log_path.display()
+    );
+
+    let mismatch_error = payload["steps"]
+        .as_array()
+        .and_then(|steps| {
+            steps.iter().find_map(|step| {
+                let is_resolve_step = step
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .is_some_and(|desc| desc.contains("Resolve target version"));
+                if is_resolve_step {
+                    step.get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_default();
+    assert!(
+        mismatch_error.contains("offline bundle tag mismatch"),
+        "expected mismatch diagnostic, got {:?}; log: {}",
+        mismatch_error,
+        result.log_path.display()
+    );
+    assert!(
+        mismatch_error.contains(&expected_tag),
+        "expected mismatch to reference bundle tag {:?}; got {:?}; log: {}",
+        expected_tag,
+        mismatch_error,
         result.log_path.display()
     );
 }
