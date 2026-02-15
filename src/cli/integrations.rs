@@ -532,11 +532,12 @@ fn inject_json_hook(path: &Path, tool: AiTool) -> std::io::Result<()> {
         ));
     }
 
-    // Find the last `}` in the file (validated above as present).
-    let Some(last_brace) = contents.rfind('}') else {
+    // I30: Find the root-level closing `}` by tracking nesting depth and string
+    // context, rather than rfind('}') which can match inside string values.
+    let Some(last_brace) = find_root_close_brace(&contents) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "config file does not contain a closing brace",
+            "config file does not contain a root-level closing brace",
         ));
     };
 
@@ -557,6 +558,53 @@ fn inject_json_hook(path: &Path, tool: AiTool) -> std::io::Result<()> {
 
     fs::write(path, result)?;
     Ok(())
+}
+
+/// Find the byte offset of the root-level closing `}` by scanning forward
+/// through the content, tracking JSON nesting depth and string context.
+/// Handles `}` inside string values and JSONC-style `//` line comments.
+fn find_root_close_brace(contents: &str) -> Option<usize> {
+    let bytes = contents.as_bytes();
+    let len = bytes.len();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut last_root_close = None;
+    let mut i = 0;
+
+    while i < len {
+        let ch = bytes[i];
+        if in_string {
+            if ch == b'\\' {
+                i += 2; // skip escaped character
+                continue;
+            }
+            if ch == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        // Skip JSONC line comments.
+        if ch == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        match ch {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    last_root_close = Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    last_root_close
 }
 
 /// Inject a hook line into a text config file (YAML, etc.).

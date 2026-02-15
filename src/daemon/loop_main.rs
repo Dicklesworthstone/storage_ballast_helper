@@ -309,7 +309,7 @@ impl MonitoringDaemon {
 
             // 2. Check config reload signal.
             if self.signal_handler.should_reload() {
-                self.handle_config_reload();
+                self.handle_config_reload(&scan_tx);
             }
 
             // 3. Collect filesystem stats and run pressure analysis.
@@ -714,7 +714,7 @@ impl MonitoringDaemon {
 
     // ──────────────────── config reload ────────────────────
 
-    fn handle_config_reload(&mut self) {
+    fn handle_config_reload(&mut self, scan_tx: &Sender<ScanRequest>) {
         eprintln!("[SBH-DAEMON] config reload requested (SIGHUP)");
 
         match Config::load(Some(&self.config.paths.config_file)) {
@@ -743,6 +743,19 @@ impl MonitoringDaemon {
                             new_config.pressure.prediction.action_horizon_minutes,
                         );
                     }
+
+                    // Propagate scoring config to scanner thread (I3/I4).
+                    let config_update = ScanRequest {
+                        paths: Vec::new(),
+                        urgency: 0.0,
+                        pressure_level: PressureLevel::Green,
+                        max_delete_batch: 0,
+                        scoring_config_update: Some((
+                            new_config.scoring.clone(),
+                            new_config.scanner.min_file_age_minutes,
+                        )),
+                    };
+                    let _ = scan_tx.try_send(config_update);
 
                     self.logger_handle.send(ActivityEvent::ConfigReloaded {
                         details: format!("config hash: {old_hash} -> {new_hash}"),

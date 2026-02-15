@@ -1972,20 +1972,21 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
     }
 
     // Show what will be applied.
-    if !args.yes && output_mode(cli) == OutputMode::Human {
-        println!("The following changes will be applied:");
-        println!();
-        for rec in &recs {
-            println!(
-                "  {} = {} -> {} ({})",
-                rec.config_key, rec.current_value, rec.suggested_value, rec.risk,
-            );
+    // I25: Always require --yes for --apply, regardless of output mode.
+    if !args.yes {
+        if output_mode(cli) == OutputMode::Human {
+            println!("The following changes will be applied:");
+            println!();
+            for rec in &recs {
+                println!(
+                    "  {} = {} -> {} ({})",
+                    rec.config_key, rec.current_value, rec.suggested_value, rec.risk,
+                );
+            }
+            println!();
+            println!("  Config file: {}", config.paths.config_file.display());
+            println!();
         }
-        println!();
-        println!("  Config file: {}", config.paths.config_file.display());
-        println!();
-
-        // Non-interactive: require --yes.
         return Err(CliError::User(
             "use --yes to confirm, or review recommendations with `sbh tune` first".to_string(),
         ));
