@@ -38,6 +38,7 @@ use storage_ballast_helper::scanner::walker::{
     long_about = None,
     arg_required_else_help = true
 )]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Cli {
     /// Override config file path.
     #[arg(long, global = true, value_name = "PATH")]
@@ -118,6 +119,7 @@ struct DaemonArgs {
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct InstallArgs {
     /// Install systemd service units (Linux).
     #[arg(long, conflicts_with = "launchd")]
@@ -180,7 +182,7 @@ struct StatusArgs {
     watch: bool,
 }
 
-#[derive(Debug, Clone, Args, Serialize)]
+#[derive(Debug, Clone, Args, Serialize, Default)]
 struct StatsArgs {
     /// Time window (for example: `15m`, `24h`, `7d`). Omit for all standard windows.
     #[arg(long, value_name = "WINDOW")]
@@ -194,17 +196,6 @@ struct StatsArgs {
     /// Show pressure level timeline.
     #[arg(long)]
     pressure_history: bool,
-}
-
-impl Default for StatsArgs {
-    fn default() -> Self {
-        Self {
-            window: None,
-            top_patterns: 0,
-            top_deletions: 0,
-            pressure_history: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -379,7 +370,7 @@ struct TuneArgs {
     yes: bool,
 }
 
-#[derive(Debug, Clone, Args, Serialize)]
+#[derive(Debug, Clone, Args, Serialize, Default)]
 struct CheckArgs {
     /// Path to evaluate (defaults to cwd).
     #[arg(value_name = "PATH")]
@@ -393,17 +384,6 @@ struct CheckArgs {
     /// Predict if space will last for this many minutes (requires running daemon).
     #[arg(long, value_name = "MINUTES")]
     predict: Option<u64>,
-}
-
-impl Default for CheckArgs {
-    fn default() -> Self {
-        Self {
-            path: None,
-            target_free: None,
-            need: None,
-            predict: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Args, Serialize)]
@@ -440,6 +420,7 @@ struct CompletionsArgs {
 }
 
 #[derive(Debug, Clone, Args, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 struct UpdateArgs {
     /// Check only, don't apply updates.
     #[arg(long)]
@@ -469,6 +450,7 @@ struct UpdateArgs {
     #[arg(long, value_name = "PATH")]
     offline: Option<PathBuf>,
     /// Roll back to the most recent backup (or a specific backup by ID).
+    #[allow(clippy::option_option)]
     #[arg(long, value_name = "BACKUP_ID")]
     rollback: Option<Option<String>>,
     /// List available backup snapshots.
@@ -503,6 +485,7 @@ impl Default for UpdateArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+#[allow(clippy::struct_excessive_bools)]
 struct SetupArgs {
     /// Add sbh to shell PATH (appends to profile if not already present).
     #[arg(long)]
@@ -630,6 +613,7 @@ fn config_command_label(args: &ConfigArgs) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     // -- wizard / auto mode ---------------------------------------------------
     if args.wizard || args.auto {
@@ -898,6 +882,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
     if !args.systemd && !args.launchd {
         return Err(CliError::User("specify --systemd or --launchd".to_string()));
@@ -1095,6 +1080,7 @@ fn parse_window_duration(s: &str) -> Result<std::time::Duration, CliError> {
     Ok(std::time::Duration::from_secs(n * multiplier))
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_stats(cli: &Cli, args: &StatsArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -1205,8 +1191,8 @@ fn run_stats(cli: &Cli, args: &StatsArgs) -> Result<(), CliError> {
             println!("  (none)");
         } else {
             println!(
-                "  {:>10}  {:>6}  {:<40}  {}",
-                "Size", "Score", "Path", "When"
+                "  {:>10}  {:>6}  {:<40}  When",
+                "Size", "Score", "Path"
             );
             println!("  {}", "-".repeat(75));
             for d in &deletions {
@@ -1269,7 +1255,7 @@ fn run_stats_json(
             .unwrap_or_default();
         let matched: Vec<_> = windows
             .into_iter()
-            .filter(|w| w.get("window_secs").and_then(|s| s.as_u64()) == Some(window.as_secs()))
+            .filter(|w| w.get("window_secs").and_then(Value::as_u64) == Some(window.as_secs()))
             .collect();
         if matched.is_empty() {
             // Build from the queried stats directly.
@@ -1401,16 +1387,17 @@ fn print_window_stats_human(ws: &storage_ballast_helper::logger::stats::WindowSt
     println!("    Transitions: {}", ws.pressure.transitions);
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn print_pressure_bar(label: &str, pct: f64) {
     let bar_width = 30;
     let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
     let bar: String = "#".repeat(filled.min(bar_width));
     println!(
-        "    {:<9} {:>5.1}% |{:<width$}|",
-        label,
-        pct,
-        bar,
-        width = bar_width
+        "    {label:<9} {pct:>5.1}% |{bar:<bar_width$}|"
     );
 }
 
@@ -1483,6 +1470,7 @@ fn collect_process_info() -> Vec<ProcessBlameInfo> {
     procs
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -1532,10 +1520,10 @@ fn run_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
         // Find the process whose CWD is a prefix of this artifact's path.
         let owner = processes.iter().find(|p| entry.path.starts_with(&p.cwd));
 
-        let (label, pid) = match owner {
-            Some(proc) => (format!("{} (PID {})", proc.comm, proc.pid), Some(proc.pid)),
-            None => ("(orphaned)".to_string(), None),
-        };
+        let (label, pid) = owner.map_or_else(
+            || ("(orphaned)".to_string(), None),
+            |proc| (format!("{} (PID {})", proc.comm, proc.pid), Some(proc.pid)),
+        );
 
         let group = groups.entry(label.clone()).or_insert_with(|| BlameGroup {
             label,
@@ -1550,14 +1538,8 @@ fn run_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
         group.total_bytes += entry.metadata.size_bytes;
 
         let mtime = entry.metadata.modified;
-        group.oldest = Some(match group.oldest {
-            Some(prev) => prev.min(mtime),
-            None => mtime,
-        });
-        group.newest = Some(match group.newest {
-            Some(prev) => prev.max(mtime),
-            None => mtime,
-        });
+        group.oldest = Some(group.oldest.map_or(mtime, |prev| prev.min(mtime)));
+        group.newest = Some(group.newest.map_or(mtime, |prev| prev.max(mtime)));
     }
 
     // Sort groups by total size descending.
@@ -1661,7 +1643,7 @@ fn run_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
                 "groups": groups_json,
                 "total_dirs": total_dirs,
                 "total_bytes": total_bytes,
-                "elapsed_ms": elapsed.as_millis() as u64,
+                "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                 "processes_scanned": processes.len(),
             });
             write_json_line(&payload)?;
@@ -1719,6 +1701,12 @@ struct Recommendation {
     risk: TuningRisk,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn generate_recommendations(
     config: &Config,
     stats: &[storage_ballast_helper::logger::stats::WindowStats],
@@ -1755,33 +1743,32 @@ fn generate_recommendations(
         }
 
         // If ballast was never used in 7 days and there were pressure events.
-        if let Some(week) = week_stats {
-            if week.ballast.files_released == 0
-                && week.pressure.transitions > 0
-                && config.ballast.file_count > 3
-            {
-                let pool_gb = (config.ballast.file_count as u64 * config.ballast.file_size_bytes)
-                    as f64
-                    / 1_073_741_824.0;
-                let suggested = (config.ballast.file_count / 2).max(3);
-                recs.push(Recommendation {
-                    category: TuningCategory::Ballast,
-                    config_key: "ballast.file_count".to_string(),
-                    current_value: config.ballast.file_count.to_string(),
-                    suggested_value: suggested.to_string(),
-                    rationale: format!(
-                        "Ballast never released in 7 days despite {} pressure transitions. \
+        if let Some(week) = week_stats
+            && week.ballast.files_released == 0
+            && week.pressure.transitions > 0
+            && config.ballast.file_count > 3
+        {
+            let pool_gb = (config.ballast.file_count as u64 * config.ballast.file_size_bytes)
+                as f64
+                / 1_073_741_824.0;
+            let suggested = (config.ballast.file_count / 2).max(3);
+            recs.push(Recommendation {
+                category: TuningCategory::Ballast,
+                config_key: "ballast.file_count".to_string(),
+                current_value: config.ballast.file_count.to_string(),
+                suggested_value: suggested.to_string(),
+                rationale: format!(
+                    "Ballast never released in 7 days despite {} pressure transitions. \
                          {pool_gb:.1} GB is reserved but unused. Reducing to {suggested} files \
                          frees {:.1} GB.",
-                        week.pressure.transitions,
-                        ((config.ballast.file_count - suggested) as u64
-                            * config.ballast.file_size_bytes) as f64
-                            / 1_073_741_824.0,
-                    ),
-                    confidence: 0.7,
-                    risk: TuningRisk::Medium,
-                });
-            }
+                    week.pressure.transitions,
+                    ((config.ballast.file_count - suggested) as u64
+                        * config.ballast.file_size_bytes) as f64
+                        / 1_073_741_824.0,
+                ),
+                confidence: 0.7,
+                risk: TuningRisk::Medium,
+            });
         }
     }
 
@@ -1889,6 +1876,7 @@ fn generate_recommendations(
     recs
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -2072,6 +2060,7 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
     match &args.command {
         None | Some(ConfigCommand::Path) => {
@@ -2381,6 +2370,7 @@ fn print_json_diff(prefix: &str, default: &Value, effective: &Value) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -2662,6 +2652,7 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_status(cli: &Cli, _args: &StatusArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -2684,13 +2675,12 @@ fn run_status(cli: &Cli, _args: &StatusArgs) -> Result<(), CliError> {
     let db_stats = if config.paths.sqlite_db.exists() {
         SqliteLogger::open(&config.paths.sqlite_db)
             .ok()
-            .map(|db| {
+            .and_then(|db| {
                 let engine = StatsEngine::new(&db);
                 engine
                     .window_stats(std::time::Duration::from_secs(3600))
                     .ok()
             })
-            .flatten()
     } else {
         None
     };
@@ -2715,9 +2705,8 @@ fn run_status(cli: &Cli, _args: &StatusArgs) -> Result<(), CliError> {
 
             let mut overall_level = "green";
             for mount in &mounts {
-                let stats = match platform.fs_stats(&mount.path) {
-                    Ok(s) => s,
-                    Err(_) => continue,
+                let Ok(stats) = platform.fs_stats(&mount.path) else {
+                    continue;
                 };
 
                 let free_pct = stats.free_pct();
@@ -2743,31 +2732,31 @@ fn run_status(cli: &Cli, _args: &StatusArgs) -> Result<(), CliError> {
             }
 
             // Rate estimates from daemon state.
-            if let Some(state) = &daemon_state {
-                if let Some(rates) = state.get("rates").and_then(|r| r.as_object()) {
-                    if !rates.is_empty() {
-                        println!("\nRate Estimates:");
-                        for (mount, rate_obj) in rates {
-                            let bps = rate_obj
-                                .get("bytes_per_sec")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0);
-                            let trend = if bps > 0.0 {
-                                "filling"
-                            } else if bps < 0.0 {
-                                "recovering"
-                            } else {
-                                "stable"
-                            };
-                            let rate_str = if bps.abs() > 0.0 {
-                                format!("{}/s", format_bytes(bps.abs() as u64))
-                            } else {
-                                "0 B/s".to_string()
-                            };
-                            let sign = if bps > 0.0 { "+" } else { "" };
-                            println!("  {mount:<20}  {sign}{rate_str:<15} ({trend})");
-                        }
-                    }
+            if let Some(state) = &daemon_state
+                && let Some(rates) = state.get("rates").and_then(Value::as_object)
+                && !rates.is_empty()
+            {
+                println!("\nRate Estimates:");
+                for (mount, rate_obj) in rates {
+                    let bps = rate_obj
+                        .get("bytes_per_sec")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let trend = if bps > 0.0 {
+                        "filling"
+                    } else if bps < 0.0 {
+                        "recovering"
+                    } else {
+                        "stable"
+                    };
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    let rate_str = if bps.abs() > 0.0 {
+                        format!("{}/s", format_bytes(bps.abs() as u64))
+                    } else {
+                        "0 B/s".to_string()
+                    };
+                    let sign = if bps > 0.0 { "+" } else { "" };
+                    println!("  {mount:<20}  {sign}{rate_str:<15} ({trend})");
                 }
             }
 
@@ -2806,9 +2795,8 @@ fn run_status(cli: &Cli, _args: &StatusArgs) -> Result<(), CliError> {
             let mut overall_level = "green";
 
             for mount in &mounts {
-                let stats = match platform.fs_stats(&mount.path) {
-                    Ok(s) => s,
-                    Err(_) => continue,
+                let Ok(stats) = platform.fs_stats(&mount.path) else {
+                    continue;
                 };
                 let free_pct = stats.free_pct();
                 let level = pressure_level_str(free_pct, &config);
@@ -2876,7 +2864,6 @@ fn pressure_level_str(free_pct: f64, config: &Config) -> &'static str {
 /// Severity ordering for pressure levels.
 fn pressure_severity(level: &str) -> u8 {
     match level {
-        "green" => 0,
         "yellow" => 1,
         "orange" => 2,
         "red" => 3,
@@ -3007,6 +2994,7 @@ fn run_unprotect(cli: &Cli, args: &UnprotectArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -3132,8 +3120,10 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
 
             // Show protected paths if requested.
             if args.show_protected {
-                let prot = walker.protection().read();
-                let protections = prot.list_protections();
+                let protections = {
+                    let prot = walker.protection().read();
+                    prot.list_protections()
+                };
                 if !protections.is_empty() {
                     println!("\n  Protected paths ({}):", protections.len());
                     for entry in &protections {
@@ -3187,6 +3177,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -3404,7 +3395,7 @@ fn build_pressure_check(
 }
 
 /// Interactive clean: prompt user for each candidate.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_interactive_clean(
     cli: &Cli,
     plan: &DeletionPlan,
@@ -3430,15 +3421,13 @@ fn run_interactive_clean(
 
     for (i, candidate) in plan.candidates.iter().enumerate() {
         // Check target_free stop condition.
-        if let Some(target) = args.target_free {
-            if let Some(first_root) = root_paths.first() {
-                if let Ok(stats) = platform.fs_stats(first_root) {
-                    if stats.free_pct() >= target {
-                        println!("  Target free space ({target:.1}%) achieved. Stopping.");
-                        break;
-                    }
-                }
-            }
+        if let Some(target) = args.target_free
+            && let Some(first_root) = root_paths.first()
+            && let Ok(stats) = platform.fs_stats(first_root)
+            && stats.free_pct() >= target
+        {
+            println!("  Target free space ({target:.1}%) achieved. Stopping.");
+            break;
         }
 
         let action = if delete_all {
@@ -3605,6 +3594,12 @@ fn emit_clean_report_json(
     write_json_line(&payload)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
     let platform = LinuxPlatform::new();
 
@@ -3625,9 +3620,10 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         .unwrap_or(default_config.pressure.yellow_min_free_pct);
 
     // Check 1: absolute free space requirement.
-    if let Some(need_bytes) = args.need {
-        if stats.available_bytes < need_bytes {
-            match output_mode(cli) {
+    if let Some(need_bytes) = args.need
+        && stats.available_bytes < need_bytes
+    {
+        match output_mode(cli) {
                 OutputMode::Human => {
                     eprintln!(
                         "sbh: {} has {} free but {} required. Run: sbh emergency {}",
@@ -3651,8 +3647,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     write_json_line(&payload)?;
                 }
             }
-            return Err(CliError::Runtime("insufficient disk space".to_string()));
-        }
+        return Err(CliError::Runtime("insufficient disk space".to_string()));
     }
 
     // Check 2: percentage threshold.
@@ -3774,6 +3769,7 @@ fn read_daemon_prediction(state_path: &Path, mount_point: &Path) -> Option<f64> 
     rate_obj.get("bytes_per_sec")?.as_f64()
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     let start = std::time::Instant::now();
 
@@ -3929,6 +3925,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
 }
 
 /// Interactive emergency cleanup — like interactive clean but with emergency messaging.
+#[allow(clippy::too_many_lines)]
 fn run_interactive_emergency(
     cli: &Cli,
     plan: &DeletionPlan,
@@ -3950,16 +3947,15 @@ fn run_interactive_emergency(
 
     for (i, candidate) in plan.candidates.iter().enumerate() {
         // Check target_free stop condition.
-        if let Some(first_root) = root_paths.first() {
-            if let Ok(stats) = platform.fs_stats(first_root) {
-                if stats.free_pct() >= args.target_free {
-                    eprintln!(
-                        "  Target free space ({:.1}%) achieved. Stopping.",
-                        args.target_free,
-                    );
-                    break;
-                }
-            }
+        if let Some(first_root) = root_paths.first()
+            && let Ok(stats) = platform.fs_stats(first_root)
+            && stats.free_pct() >= args.target_free
+        {
+            eprintln!(
+                "  Target free space ({:.1}%) achieved. Stopping.",
+                args.target_free,
+            );
+            break;
         }
 
         let action = if delete_all {
@@ -4054,6 +4050,7 @@ fn run_interactive_emergency(
     Ok(())
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn format_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
@@ -4185,8 +4182,7 @@ fn resolve_output_mode(json_flag: bool, env_mode: Option<&str>, stdout_is_tty: b
     {
         Some("json") => OutputMode::Json,
         Some("human") => OutputMode::Human,
-        Some("auto") | None => fallback,
-        Some(_) => fallback,
+        _ => fallback,
     }
 }
 
@@ -4417,6 +4413,7 @@ fn resolve_bin_dir(args: &SetupArgs) -> Result<PathBuf, CliError> {
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 fn setup_path(bin_dir: &Path, args: &SetupArgs, mode: OutputMode) -> SetupStepResult {
     let profile_path = args
         .profile
@@ -4842,8 +4839,8 @@ mod tests {
             vec!["sbh", "version", "--verbose"],
         ];
 
-        for case in cases {
-            let parsed = Cli::try_parse_from(case.clone());
+        for case in &cases {
+            let parsed = Cli::try_parse_from(case.iter().copied());
             assert!(parsed.is_ok(), "failed to parse case: {case:?}");
         }
     }
@@ -4939,8 +4936,8 @@ mod tests {
                 "--pressure-history",
             ],
         ];
-        for case in cases {
-            let parsed = Cli::try_parse_from(case.clone());
+        for case in &cases {
+            let parsed = Cli::try_parse_from(case.iter().copied());
             assert!(parsed.is_ok(), "failed to parse stats case: {case:?}");
         }
     }
@@ -4952,8 +4949,8 @@ mod tests {
             vec!["sbh", "tune", "--apply"],
             vec!["sbh", "tune", "--apply", "--yes"],
         ];
-        for case in cases {
-            let parsed = Cli::try_parse_from(case.clone());
+        for case in &cases {
+            let parsed = Cli::try_parse_from(case.iter().copied());
             assert!(parsed.is_ok(), "failed to parse tune case: {case:?}");
         }
         // --yes without --apply should fail.
@@ -5075,8 +5072,8 @@ mod tests {
                 "--dry-run",
             ],
         ];
-        for case in cases {
-            let parsed = Cli::try_parse_from(case.clone());
+        for case in &cases {
+            let parsed = Cli::try_parse_from(case.iter().copied());
             assert!(parsed.is_ok(), "failed to parse setup case: {case:?}");
         }
     }
@@ -5131,8 +5128,8 @@ mod tests {
             vec!["sbh", "update", "--prune", "3"],
             vec!["sbh", "update", "--max-backups", "10"],
         ];
-        for case in cases {
-            let parsed = Cli::try_parse_from(case.clone());
+        for case in &cases {
+            let parsed = Cli::try_parse_from(case.iter().copied());
             assert!(parsed.is_ok(), "failed to parse update case: {case:?}");
         }
     }
