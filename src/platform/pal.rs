@@ -294,18 +294,22 @@ fn parse_meminfo(raw: &str) -> Result<MemoryInfo> {
         let Some(rest) = parts.next() else {
             continue;
         };
-        let first_token = rest
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| SbhError::MountParse {
-                details: format!("invalid /proc/meminfo line: {line}"),
-            })?;
-        let kib = first_token
+        let mut tokens = rest.split_whitespace();
+        let first_token = tokens.next().ok_or_else(|| SbhError::MountParse {
+            details: format!("invalid /proc/meminfo line: {line}"),
+        })?;
+        let raw_value = first_token
             .parse::<u64>()
             .map_err(|error| SbhError::MountParse {
                 details: format!("invalid meminfo value in line {line:?}: {error}"),
             })?;
-        values.insert(key.trim(), kib.saturating_mul(1024));
+        let multiplier = match tokens.next() {
+            Some("kB") => 1024,
+            Some("mB") => 1024 * 1024,
+            Some("gB") => 1024 * 1024 * 1024,
+            _ => 1,
+        };
+        values.insert(key.trim(), raw_value.saturating_mul(multiplier));
     }
 
     Ok(MemoryInfo {
@@ -401,6 +405,21 @@ mod tests {
         assert_eq!(info.available_bytes, 16_777_216_000);
         assert_eq!(info.swap_total_bytes, 8_388_608_000);
         assert_eq!(info.swap_free_bytes, 4_194_304_000);
+    }
+
+    #[test]
+    fn parses_meminfo_without_unit_suffix() {
+        let info = parse_meminfo(
+            "MemTotal:       1024 kB\n\
+             MemAvailable:   512 kB\n\
+             SwapTotal:      0\n\
+             SwapFree:       0\n",
+        )
+        .expect("meminfo should parse");
+        assert_eq!(info.total_bytes, 1_048_576);
+        assert_eq!(info.available_bytes, 524_288);
+        assert_eq!(info.swap_total_bytes, 0);
+        assert_eq!(info.swap_free_bytes, 0);
     }
 
     #[test]
