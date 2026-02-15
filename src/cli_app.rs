@@ -3029,30 +3029,36 @@ fn run_protect(cli: &Cli, args: &ProtectArgs) -> Result<(), CliError> {
             }
         }
     } else if let Some(path) = &args.path {
-        // Create a .sbh-protect marker.
-        if !path.is_dir() {
+        // Canonicalize to resolve symlinks and relative components before creating
+        // the marker, preventing symlink-based traversal attacks.
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| CliError::User(format!("cannot resolve path {}: {e}", path.display())))?;
+
+        if !canonical.is_dir() {
             return Err(CliError::User(format!(
                 "path is not a directory: {}",
-                path.display(),
+                canonical.display(),
             )));
         }
 
-        protection::create_marker(path, None).map_err(|e| CliError::Runtime(e.to_string()))?;
+        protection::create_marker(&canonical, None)
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
 
         match output_mode(cli) {
             OutputMode::Human => {
                 println!(
                     "Protected: {} (created {})",
-                    path.display(),
-                    path.join(protection::MARKER_FILENAME).display(),
+                    canonical.display(),
+                    canonical.join(protection::MARKER_FILENAME).display(),
                 );
             }
             OutputMode::Json => {
                 let payload = json!({
                     "command": "protect",
                     "action": "create",
-                    "path": path.to_string_lossy(),
-                    "marker": path.join(protection::MARKER_FILENAME).to_string_lossy(),
+                    "path": canonical.to_string_lossy(),
+                    "marker": canonical.join(protection::MARKER_FILENAME).to_string_lossy(),
                 });
                 write_json_line(&payload)?;
             }
@@ -3063,24 +3069,30 @@ fn run_protect(cli: &Cli, args: &ProtectArgs) -> Result<(), CliError> {
 }
 
 fn run_unprotect(cli: &Cli, args: &UnprotectArgs) -> Result<(), CliError> {
+    // Canonicalize to resolve symlinks and relative components.
+    let canonical = args
+        .path
+        .canonicalize()
+        .map_err(|e| CliError::User(format!("cannot resolve path {}: {e}", args.path.display())))?;
+
     let removed =
-        protection::remove_marker(&args.path).map_err(|e| CliError::Runtime(e.to_string()))?;
+        protection::remove_marker(&canonical).map_err(|e| CliError::Runtime(e.to_string()))?;
 
     match output_mode(cli) {
         OutputMode::Human => {
             if removed {
-                println!("Unprotected: {} (marker removed)", args.path.display());
+                println!("Unprotected: {} (marker removed)", canonical.display());
             } else {
                 println!(
                     "No protection marker found at {}",
-                    args.path.join(protection::MARKER_FILENAME).display(),
+                    canonical.join(protection::MARKER_FILENAME).display(),
                 );
             }
         }
         OutputMode::Json => {
             let payload = json!({
                 "command": "unprotect",
-                "path": args.path.to_string_lossy(),
+                "path": canonical.to_string_lossy(),
                 "removed": removed,
             });
             write_json_line(&payload)?;
