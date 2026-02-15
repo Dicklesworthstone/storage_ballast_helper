@@ -1,4 +1,4 @@
-# AGENTS.md — dcg (Destructive Command Guard)
+# AGENTS.md — storage_ballast_helper (`sbh`)
 
 > Guidelines for AI coding agents working in this Rust codebase.
 
@@ -20,8 +20,6 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ## Irreversible Git & Filesystem Actions — DO NOT EVER BREAK GLASS
 
-> **Note:** This project exists specifically to block these dangerous commands for AI agents. Practice what we preach.
-
 1. **Absolutely forbidden commands:** `git reset --hard`, `git clean -fd`, `rm -rf`, or any command that can delete or overwrite code/data must never be run unless the user explicitly provides the exact command and states, in the same message, that they understand and want the irreversible consequences.
 2. **No guessing:** If there is any uncertainty about what a command might delete or overwrite, stop immediately and ask the user for specific approval. "I think it's safe" is never acceptable.
 3. **Safer alternatives first:** When cleanup or rollbacks are needed, request permission to use non-destructive options (`git status`, `git diff`, `git stash`, copying to backups) before ever considering a destructive command.
@@ -38,14 +36,27 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 - **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
 - **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
   ```bash
-  git push origin main:master
+  git push origin main main:master
   ```
 
-**Why this matters:** The `dcg update` command and install URLs historically referenced `master`. If `master` falls behind `main`, users get stale code. We had a bug where `master` was **497 commits behind**, causing users to see old installer behavior.
+**Why this matters:** Install URLs and update checks may reference `master`. If `master` falls behind `main`, users get stale code.
 
 **If you see `master` referenced anywhere:**
 1. Update it to `main`
-2. Ensure `master` is synchronized: `git push origin main:master`
+2. Ensure `master` is synchronized: `git push origin main main:master`
+
+---
+
+## Multi-Agent Environment
+
+Multiple agents work on this codebase simultaneously. This is normal and expected.
+
+**How to handle other agents' changes:**
+- You will regularly see modified files you didn't touch in `git status`. This is expected.
+- **NEVER** stash, revert, overwrite, or otherwise disturb other agents' changes.
+- Treat those changes identically to changes you yourself made. Commit them alongside your own work.
+- If another agent's code causes compilation errors, fix them as part of your normal workflow.
+- Never stop to ask about "unexpected changes" — they are always from concurrent agents.
 
 ---
 
@@ -53,24 +64,33 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We only use **Cargo** in this project, NEVER any other package manager.
 
-- **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
+- **Edition:** Rust 2024 (see `Cargo.toml`)
+- **Toolchain:** Stable (see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml only
-- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
+- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` in both `lib.rs` and `main.rs`)
 
 ### Key Dependencies
 
 | Crate | Purpose |
 |-------|---------|
-| `serde` + `serde_json` | JSON parsing for Claude Code hook protocol |
-| `fancy-regex` | Advanced regex with lookahead/lookbehind |
-| `memchr` | SIMD-accelerated substring search |
+| `clap` + `clap_complete` | CLI parsing with derive macros and shell completion generation |
+| `serde` + `serde_json` + `toml` | Serialization for config (TOML), structured output (JSON) |
+| `rusqlite` (bundled) | SQLite for activity logging and stats queries |
+| `chrono` | Timestamps for events and log entries |
 | `colored` | Terminal colors with TTY detection |
-| `vergen-gix` | Build metadata embedding (build.rs) |
+| `thiserror` | Structured error types with stable error codes |
+| `parking_lot` + `crossbeam-channel` | Concurrency primitives (no tokio) |
+| `memchr` | Fast byte scanning for pattern matching |
+| `regex` | Artifact classification patterns |
+| `sha2` | SHA-256 checksums for supply-chain verification |
+| `signal-hook` | Signal handling for graceful daemon shutdown |
+| `rand` | Ballast file generation and randomized test fixtures |
+| `nix` + `libc` | Unix-specific filesystem and signal operations |
+| `tempfile` | Test fixtures (dev-dependency) |
+| `proptest` | Property-based testing (dev-dependency) |
 
 ### Release Profile
-
-The release build optimizes for binary size:
 
 ```toml
 [profile.release]
@@ -79,6 +99,22 @@ lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead
 strip = true        # Remove debug symbols
+```
+
+### Clippy Configuration
+
+Pedantic + nursery lints are enabled project-wide with select exceptions:
+
+```toml
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
+missing_const_for_fn = "allow"
+doc_markdown = "allow"
 ```
 
 ---
@@ -116,20 +152,24 @@ We do not care about backwards compatibility—we're in early development with n
 
 ---
 
-## Output Style
+## Remote Compilation (CRITICAL)
 
-This tool has two output modes:
+**All CPU-intensive operations MUST use `rch` (Remote Compilation Helper)** to offload work to remote workers. This includes `cargo check`, `cargo test`, `cargo clippy`, and `cargo build`.
 
-- **JSON to stdout:** For Claude Code hook protocol (`hookSpecificOutput` with `permissionDecision: "deny"`)
-- **Colorful warning to stderr:** For human visibility when commands are blocked
+```bash
+# CORRECT: use rch for all compilation
+rch exec "cargo check --all-targets"
+rch exec "cargo test --lib"
+rch exec "cargo test --bin sbh -- test_name"
+rch exec "cargo clippy --all-targets -- -D warnings"
+rch exec "cargo fmt --check"
 
-Output behavior:
-- **Deny:** Colorful warning to stderr + JSON to stdout
-- **Allow:** No output (silent exit)
-- **--version/-V:** Version info with build metadata to stderr
-- **--help/-h:** Usage information to stderr
+# WRONG: never run cargo directly
+cargo check   # DO NOT DO THIS
+cargo test    # DO NOT DO THIS
+```
 
-Colors are automatically disabled when stderr is not a TTY (e.g., piped to file).
+**Exceptions:** `cargo fmt` (formatting only, no compilation) can run locally.
 
 ---
 
@@ -139,10 +179,10 @@ Colors are automatically disabled when stderr is not a TTY (e.g., piped to file)
 
 ```bash
 # Check for compiler errors and warnings
-cargo check --all-targets
+rch exec "cargo check --all-targets"
 
 # Check for clippy lints (pedantic + nursery are enabled)
-cargo clippy --all-targets -- -D warnings
+rch exec "cargo clippy --all-targets -- -D warnings"
 
 # Verify formatting
 cargo fmt --check
@@ -150,237 +190,394 @@ cargo fmt --check
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
 
+**Note:** Clippy errors in other agents' code are expected in a multi-agent environment. Only fix errors in files you are actively working on, unless they block compilation.
+
+---
+
+## sbh — This Project
+
+**This is the project you're working on.** `sbh` (Storage Ballast Helper) is a cross-platform disk-pressure defense system for AI coding workloads. It continuously monitors storage pressure, predicts exhaustion, and safely reclaims space using layered controls.
+
+### Three-Pronged Defense
+
+1. **Ballast files** — pre-allocated sacrificial space released under pressure
+2. **Artifact scanner** — multi-factor scoring to find and delete stale build artifacts
+3. **Special location monitor** — surveillance of /tmp, /dev/shm, and other volatile paths
+
+### Design Principles
+
+1. **Safety before aggressiveness:** hard vetoes always win over reclaim pressure
+2. **Predict, then act:** pressure trends and controller outputs drive timing and scope
+3. **Deterministic decisions:** identical inputs produce identical ranking and policy outcomes
+4. **Explainability is mandatory:** every action has traceable evidence and rationale
+5. **Fail conservative:** policy/guard failures force fallback-safe behavior
+
+---
+
+## Architecture
+
+```text
+Pressure Inputs
+  fs stats + special location probes
+        |
+        v
+EWMA Forecaster --> PID Controller --> Action Planner
+        |                                 |
+        |                                 v
+        |                         Scan Scheduler (VOI-aware)
+        |                                 |
+        v                                 v
+                    Parallel Walker -> Pattern Registry
+                                   -> Deterministic Scoring
+                                   -> Policy Engine (shadow/canary/enforce)
+                                   -> Guardrails (conformal/e-process)
+                                   -> Ranked Deletion + Ballast Release
+                                                    |
+                                                    v
+                                  Dual Logging (SQLite + JSONL)
+                                  Evidence Ledger + Explain API
+```
+
+### Data Flow
+
+1. **Monitor**: `fs_stats` samples disk usage; `ewma` computes rate trends; `predictive` forecasts exhaustion
+2. **Controller**: `pid` computes pressure response; `voi_scheduler` allocates scan budget
+3. **Scanner**: `walker` traverses directories; `patterns` classifies artifacts; `scoring` ranks candidates
+4. **Safety**: `protection` enforces `.sbh-protect` markers and config globs; `deletion` runs pre-flight checks (path exists, not open, writable, no `.git/`)
+5. **Execute**: `deletion` applies circuit-breaker-guarded removal; `ballast/release` frees pre-allocated space
+6. **Log**: `dual` writes to both SQLite (queryable) and JSONL (append-only, sync-safe)
+
+---
+
+## Module Structure
+
+```
+src/
+  lib.rs              # Crate root: re-exports all modules
+  main.rs             # Binary entry point: CLI parse + dispatch
+  cli_app.rs          # Full CLI definition (clap derive) + command handlers
+
+  core/
+    config.rs         # TOML config model + env var overrides + defaults
+    errors.rs         # SbhError enum with SBH-XXXX error codes
+
+  monitor/
+    fs_stats.rs       # Filesystem stats collection (statvfs/platform)
+    ewma.rs           # Exponentially weighted moving average rate estimator
+    pid.rs            # PID pressure controller
+    predictive.rs     # Predictive action pipeline with early warning
+    special_locations.rs  # /tmp, /dev/shm, swap monitoring
+    voi_scheduler.rs  # Value-of-Information scan budget allocator
+
+  scanner/
+    walker.rs         # Parallel directory walker with open-file detection
+    patterns.rs       # Artifact pattern registry (build dirs, caches, etc.)
+    scoring.rs        # Multi-factor candidacy scoring engine
+    deletion.rs       # Circuit-breaker-guarded deletion executor
+    protection.rs     # .sbh-protect markers + config glob patterns
+    merkle.rs         # Incremental Merkle scan index
+
+  ballast/
+    manager.rs        # Ballast pool lifecycle (provision, verify, inventory)
+    release.rs        # Pressure-responsive ballast release
+    coordinator.rs    # Multi-volume ballast coordination
+
+  daemon/
+    loop_main.rs      # Main monitoring loop (poll → decide → act → log)
+    signals.rs        # Signal handling (SIGTERM, SIGHUP, SIGUSR1)
+    self_monitor.rs   # Daemon health self-checks (RSS, state writes)
+    service.rs        # systemd + launchd service management
+    notifications.rs  # Multi-channel notification system
+
+  logger/
+    dual.rs           # Dual-write logger (SQLite + JSONL)
+    sqlite.rs         # SQLite WAL-mode activity logger
+    jsonl.rs          # JSONL append-only log writer
+    stats.rs          # Stats engine for time-window queries
+
+  cli/
+    mod.rs            # Shared installer/update contracts and types
+    bootstrap.rs      # Bootstrap migration and self-healing
+    integrations.rs   # AI tool integration bootstrap
+    assets.rs         # Asset manifest download/verify/cache pipeline
+    from_source.rs    # From-source build fallback mode
+    uninstall.rs      # Uninstall with safe cleanup modes
+    wizard.rs         # Guided first-run install wizard
+
+  platform/
+    pal.rs            # Platform Abstraction Layer trait
+```
+
+---
+
+## Key Files Reference
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `src/cli_app.rs` | ~4800 | CLI definition (clap derive) and all command handlers |
+| `src/cli/bootstrap.rs` | ~1660 | Bootstrap migration with 13 migration reason types |
+| `src/cli/assets.rs` | ~1240 | Asset manifest pipeline with SHA-256 verification |
+| `src/daemon/loop_main.rs` | ~1170 | Main daemon monitoring loop |
+| `src/scanner/merkle.rs` | ~1080 | Incremental Merkle scan index with full-scan fallback |
+| `src/cli/uninstall.rs` | ~1020 | Uninstall parity with 5 cleanup modes |
+| `src/daemon/notifications.rs` | ~1020 | Multi-channel notification system |
+| `src/cli/mod.rs` | ~910 | Shared installer/update contracts |
+| `src/cli/integrations.rs` | ~910 | AI tool integration with backup-first safety |
+| `src/logger/stats.rs` | ~900 | Stats engine with time-window aggregation |
+| `src/daemon/service.rs` | ~890 | systemd + launchd service management |
+| `src/monitor/voi_scheduler.rs` | ~880 | VOI scan budget allocator |
+| `src/ballast/coordinator.rs` | ~870 | Multi-volume ballast coordination |
+| `src/monitor/predictive.rs` | ~780 | Predictive action pipeline |
+| `src/cli/wizard.rs` | ~750 | Guided first-run wizard + --auto mode |
+| `src/cli/from_source.rs` | ~740 | From-source fallback build mode |
+| `src/logger/dual.rs` | ~720 | Dual-write activity logger |
+| `src/scanner/protection.rs` | ~710 | Protection registry (markers + globs) |
+| `src/scanner/walker.rs` | ~700 | Parallel directory walker |
+| `src/scanner/deletion.rs` | ~680 | Deletion executor with circuit breaker |
+| `src/ballast/manager.rs` | ~650 | Ballast pool lifecycle management |
+| `src/core/config.rs` | ~640 | Config model with nested sections |
+| `src/daemon/self_monitor.rs` | ~630 | Daemon health self-monitoring |
+| `src/scanner/scoring.rs` | ~600 | Multi-factor scoring engine |
+| `src/logger/jsonl.rs` | ~590 | JSONL append-only logger |
+| `src/logger/sqlite.rs` | ~540 | SQLite WAL-mode logger |
+| `src/scanner/patterns.rs` | ~420 | Artifact pattern registry |
+| `src/platform/pal.rs` | ~390 | Platform abstraction trait |
+
+---
+
+## CLI Command Reference
+
+### Core Commands
+
+| Command | Purpose |
+|---------|---------|
+| `sbh daemon` | Run the monitoring loop and policy engine |
+| `sbh status [--watch]` | Real-time health, pressure, and controller state |
+| `sbh check [--target-free N] [--need N] [--predict N]` | Pre-flight space check and recommendations |
+| `sbh scan [PATHS...] [--top N] [--min-score N]` | Manual candidate discovery and scoring |
+| `sbh clean [PATHS...] [--target-free N] [--dry-run] [--yes]` | Manual cleanup with confirmation |
+| `sbh emergency [PATHS...] [--target-free N] [--yes]` | Zero-write recovery mode for critically full disks |
+
+### Ballast Commands
+
+| Command | Purpose |
+|---------|---------|
+| `sbh ballast status` | Show per-volume ballast inventory |
+| `sbh ballast provision` | Create/rebuild ballast files idempotently |
+| `sbh ballast release <COUNT>` | Release N ballast files on demand |
+| `sbh ballast replenish` | Rebuild previously released ballast |
+| `sbh ballast verify` | Verify ballast file integrity |
+
+### Observability Commands
+
+| Command | Purpose |
+|---------|---------|
+| `sbh stats [--window WINDOW] [--top-patterns N] [--top-deletions N]` | Time-window activity statistics |
+| `sbh blame [--top N]` | Attribute disk pressure by process/agent |
+| `sbh dashboard` | Live TUI dashboard with pressure visualization |
+| `sbh explain --id <decision-id>` | Explain policy decision evidence |
+
+### Configuration and Lifecycle
+
+| Command | Purpose |
+|---------|---------|
+| `sbh config path\|show\|validate\|diff\|reset\|set` | Manage configuration |
+| `sbh install [--systemd\|--launchd] [--user] [--from-source] [--wizard\|--auto]` | Install as system service |
+| `sbh uninstall [--systemd\|--launchd] [--purge]` | Remove service integration |
+| `sbh setup [--all] [--path] [--verify] [--completions SHELLS]` | Post-install PATH/completions setup |
+| `sbh tune [--apply] [--yes]` | Show/apply tuning recommendations |
+| `sbh protect <PATH>\|--list` | Protect path subtree from cleanup |
+| `sbh unprotect <PATH>` | Remove protection marker |
+| `sbh version [--verbose]` | Show version and build metadata |
+| `sbh completions <SHELL>` | Generate shell completions |
+
+### Global Flags
+
+| Flag | Purpose |
+|------|---------|
+| `--config <PATH>` | Override config file path |
+| `--json` | Force JSON output mode |
+| `--no-color` | Disable colored output |
+| `-v, --verbose` | Increase verbosity |
+| `-q, --quiet` | Quiet mode (errors only) |
+
+---
+
+## Configuration
+
+### Default Paths
+
+| Path | Purpose |
+|------|---------|
+| `~/.config/sbh/config.toml` | User configuration file |
+| `~/.local/share/sbh/state.json` | Runtime state |
+| `~/.local/share/sbh/activity.sqlite3` | SQLite activity log |
+| `~/.local/share/sbh/activity.jsonl` | JSONL activity log |
+| `~/.local/share/sbh/ballast/` | Ballast file pool |
+
+### Config Sections
+
+| Section | Key Settings |
+|---------|-------------|
+| `[pressure]` | `green_min_free_pct`, `yellow_min_free_pct`, `orange_min_free_pct`, `red_min_free_pct`, `poll_interval_ms` |
+| `[pressure.prediction]` | `enabled`, `action_horizon_minutes`, `warning_horizon_minutes`, `min_confidence`, `min_samples` |
+| `[scanner]` | `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run` |
+| `[scoring]` | `min_score`, `location_weight`, `name_weight`, `age_weight`, `size_weight`, `structure_weight` |
+| `[scoring]` (decision-theoretic) | `false_positive_loss`, `false_negative_loss`, `calibration_floor` |
+| `[ballast]` | `file_count`, `file_size_bytes`, `replenish_cooldown_minutes` |
+| `[telemetry]` | Structured logging and observability settings |
+| `[paths]` | Override default config/data/log paths |
+| `[notifications]` | Multi-channel notification settings |
+
+---
+
+## Error Codes
+
+SBH uses structured error codes in the format `SBH-XXXX`:
+
+| Range | Category | Description |
+|-------|----------|-------------|
+| SBH-1xxx | Configuration | Config loading, parsing, and validation errors |
+| SBH-2xxx | Runtime/IO | Filesystem, serialization, SQL, and safety errors |
+| SBH-3xxx | System | Permission, IO, channel, and runtime errors |
+
+### Common Error Codes
+
+| Code | Error | Typical Cause |
+|------|-------|---------------|
+| `SBH-1001` | Invalid config | Bad config values or structure |
+| `SBH-1002` | Missing config | Config file not found at expected path |
+| `SBH-1003` | Config parse failure | Invalid TOML syntax |
+| `SBH-1101` | Unsupported platform | Feature unavailable on current OS |
+| `SBH-2001` | Filesystem stats failure | Cannot stat a watched path |
+| `SBH-2003` | Safety veto | Hard veto prevented deletion |
+| `SBH-2102` | SQL failure | SQLite query or schema error |
+| `SBH-3001` | Permission denied | Insufficient filesystem permissions |
+| `SBH-3002` | IO failure | File read/write error |
+
+All errors implement `code()` for stable machine-parseable codes and `is_retryable()` to indicate whether retry might help.
+
+---
+
+## Scoring Engine
+
+The artifact scoring system uses five weighted factors to rank deletion candidates:
+
+| Factor | Default Weight | What It Measures |
+|--------|---------------|-----------------|
+| `location` | 0.25 | How "safe" the directory is (temp > build > source) |
+| `name` | 0.25 | Pattern match against known artifact names (`.o`, `node_modules`, `target/`) |
+| `age` | 0.20 | Time since last access/modification |
+| `size` | 0.15 | Bytes reclaimable (larger = higher score) |
+| `structure` | 0.15 | Directory structure signals (depth, sibling count) |
+
+**Decision-theoretic tuning:** `false_positive_loss` and `false_negative_loss` control the cost asymmetry between wrongly deleting (expensive) vs. missing a candidate (less costly). `calibration_floor` sets the minimum acceptable calibration level for adaptive actions.
+
+---
+
+## Pressure Levels
+
+| Level | Default Threshold | Daemon Response |
+|-------|------------------|-----------------|
+| Green | > 35% free | Normal monitoring, no action |
+| Yellow | 20-35% free | Increase scan frequency |
+| Orange | 10-20% free | Begin ballast release + cleanup |
+| Red | < 5% free | Emergency mode: aggressive cleanup |
+
+The PID controller smooths transitions between levels. EWMA rate estimation predicts when the next level will be reached.
+
+---
+
+## Ballast System
+
+Ballast files are pre-allocated sacrificial space that can be instantly released when disk pressure spikes:
+
+- **Provision:** Creates random-data files in `<data_dir>/ballast/` per configured volume
+- **Release:** Removes ballast files to free space immediately (no scanning needed)
+- **Replenish:** Rebuilds released ballast files when pressure returns to green
+- **Verify:** Checks integrity of existing ballast files
+- **Per-volume overrides:** Different file count/size per mount point
+
+---
+
+## Dual Logging System
+
+Every significant event is logged to both backends:
+
+| Backend | Format | Purpose |
+|---------|--------|---------|
+| **SQLite** (WAL mode) | Structured rows | Queryable stats, time-window aggregation, blame attribution |
+| **JSONL** (append-only) | One JSON object per line | Portable, grep-friendly, safe during crashes |
+
+The `DualLogger` writes to both backends and degrades gracefully if one fails. The `StatsEngine` queries SQLite for `sbh stats` reports.
+
+---
+
+## Protection System
+
+Two protection modes prevent accidental cleanup of important files:
+
+1. **Marker files:** Place `.sbh-protect` in any directory to protect it and all children
+2. **Config patterns:** Shell-style globs in `scanner.protected_paths` (e.g., `/data/projects/production-*`)
+
+Additional hard safety vetoes in the deletion executor:
+- Path must still exist at deletion time
+- Path must not be currently open by any process (Linux: `/proc/*/fd` check)
+- Parent directory must be writable
+- Directory must not contain `.git/` (final safety net)
+- Circuit breaker: 3 consecutive failures trigger 30s cooldown
+
 ---
 
 ## Testing
 
 ### Unit Tests
 
-The test suite includes 80+ tests covering all functionality:
+Each module contains inline `#[cfg(test)]` tests. Tests for binary-crate code (in `cli_app.rs`) require the `--bin sbh` flag:
 
 ```bash
-# Run all tests
-cargo test
+# Run all library tests
+rch exec "cargo test --lib"
 
-# Run with output
-cargo test -- --nocapture
+# Run specific module tests
+rch exec "cargo test --lib scoring"
+rch exec "cargo test --lib bootstrap"
+rch exec "cargo test --lib assets"
 
-# Run specific test module
-cargo test normalize_command_tests
-cargo test safe_pattern_tests
-cargo test destructive_pattern_tests
+# Run binary crate tests (cli_app.rs)
+rch exec "cargo test --bin sbh"
+
+# Run a specific binary test
+rch exec "cargo test --bin sbh -- setup_command_parses_with_flags"
 ```
+
+### Integration Tests
+
+Located in `tests/integration_tests.rs` with shared helpers in `tests/common/mod.rs`:
+
+```bash
+rch exec "cargo test --test integration_tests"
+```
+
+The test harness:
+- Resolves the `sbh` binary path via `CARGO_BIN_EXE_sbh` or fallback search
+- Logs each test case output to timestamped files for debugging
+- Verifies CLI scaffolding and subcommand handlers
 
 ### End-to-End Testing
 
 ```bash
-# Run the E2E test script
 ./scripts/e2e_test.sh
-
-# Or test manually
-echo '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}' | cargo run --release
-# Should output JSON denial
-
-echo '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | cargo run --release
-# Should output nothing (allowed)
 ```
 
-### Test Categories
+The E2E script runs real CLI invocations with per-case logging.
 
-| Module | Tests | Purpose |
-|--------|-------|---------|
-| `normalize_command_tests` | 8 | Path stripping for git/rm binaries |
-| `quick_reject_tests` | 5 | Fast-path filtering for non-git/rm commands |
-| `safe_pattern_tests` | 16 | Whitelist accuracy |
-| `destructive_pattern_tests` | 20 | Blacklist coverage |
-| `input_parsing_tests` | 8 | JSON parsing robustness |
-| `deny_output_tests` | 2 | Output format validation |
-| `integration_tests` | 4 | End-to-end pipeline |
-| `optimization_tests` | 9 | Performance paths |
-| `edge_case_tests` | 24 | Real-world edge cases |
+### Test Conventions
 
----
-
-## CI/CD Pipeline
-
-### Jobs Overview
-
-| Job | Trigger | Purpose | Blocking |
-|-----|---------|---------|----------|
-| `check` | PR, push | Format, clippy, UBS, tests | Yes |
-| `coverage` | PR, push | Coverage thresholds | Yes |
-| `memory-tests` | PR, push | Memory leak detection | Yes |
-| `benchmarks` | push to master | Performance budgets | Warn only |
-| `e2e` | PR, push | End-to-end shell tests | Yes |
-| `scan-regression` | PR, push | Scan output stability | Yes |
-| `perf-regression` | PR, push | Process-per-invocation perf | Yes |
-
-### Check Job
-
-Runs format, clippy, UBS static analysis, and unit tests. Includes:
-- `cargo fmt --check` - Code formatting
-- `cargo clippy --all-targets -- -D warnings` - Lints (pedantic + nursery enabled)
-- UBS analysis on changed Rust files (warning-only, non-blocking)
-- `cargo nextest run` - Full test suite with JUnit XML report
-
-### Coverage Job
-
-Runs `cargo llvm-cov` and enforces thresholds:
-- **Overall:** ≥ 70%
-- **src/evaluator.rs:** ≥ 80%
-- **src/hook.rs:** ≥ 80%
-
-Coverage is uploaded to Codecov for trend tracking. Dashboard: https://codecov.io/gh/Dicklesworthstone/destructive_command_guard
-
-### Memory Tests Job
-
-Runs dedicated memory leak tests with:
-- `--test-threads=1` for accurate measurements
-- Release mode for realistic performance
-- 1-2MB growth budgets per test
-
-Tests include: hook input parsing, pattern evaluation, heredoc extraction, file extractors, full pipeline, and a self-test that verifies the framework catches leaks.
-
-### Benchmarks Job
-
-Runs on push to master only (benchmarks are noisy on PRs). Checks performance budgets from `src/perf.rs`:
-- Quick reject: < 50μs panic
-- Fast path: < 500μs panic
-- Pattern match: < 1ms panic
-- Heredoc extract: < 2ms panic
-- Full pipeline: < 50ms panic
-
-### UBS Static Analysis
-
-Ultimate Bug Scanner runs on changed Rust files. Currently warning-only (non-blocking) to tune for false positives. Configuration in `.ubsignore` excludes test/bench/fuzz directories.
-
-### Dependabot
-
-Automated dependency updates configured in `.github/dependabot.yml`:
-- **Cargo dependencies:** Weekly (Monday 9am EST), 5 PR limit
-- **GitHub Actions:** Weekly (Monday 9am EST), 3 PR limit
-- **Grouping:** Minor/patch updates grouped; serde updates separate (more careful review)
-
-### Debugging CI Failures
-
-#### Coverage Threshold Failure
-1. Check which file(s) dropped below threshold in CI output
-2. Run `cargo llvm-cov --html` locally to see uncovered lines
-3. Add tests for uncovered code paths
-4. Download `coverage-report` artifact for full details
-
-#### Memory Test Failure
-1. Download `memory-test-output` artifact
-2. Check which test failed and growth amount
-3. Run locally: `cargo test --test memory_tests --release -- --nocapture --test-threads=1`
-4. Profile with valgrind if needed
-
-#### UBS Warnings
-1. Check ubs-output.log in CI summary
-2. Review flagged issues - may be false positives
-3. If valid issues, fix them; if false positives, add to `.ubsignore`
-
-#### E2E Test Failure
-1. Download `e2e-artifacts` artifact
-2. Check `e2e_output.json` for failing test details
-3. Run locally: `./scripts/e2e_test.sh --verbose`
-4. The step summary shows the first failure with output
-
-#### Benchmark Regression
-1. Download `benchmark-results` artifact
-2. Compare against budgets in `src/perf.rs`
-3. Profile locally with `cargo bench --bench heredoc_perf`
-4. Check for algorithmic regressions in hot path
-
----
-
-## Release Process
-
-When fixes are ready for release, follow this process:
-
-### 1. Verify CI Passes Locally
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --lib
-```
-
-### 2. Commit Changes
-
-```bash
-git add -A
-git commit -m "fix: description of fixes
-
-- List specific fixes
-- Include any breaking changes
-
-Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
-```
-
-### 3. Bump Version (if needed)
-
-The version in `Cargo.toml` determines the release tag. If the current version already has a failed release, you can reuse it. Otherwise bump appropriately:
-
-- **Patch** (0.2.10 → 0.2.11): Bug fixes, no new features
-- **Minor** (0.2.x → 0.3.0): New features, backward compatible
-- **Major** (0.x → 1.0): Breaking changes
-
-### 4. Push and Trigger Release
-
-```bash
-git push origin main
-git push origin main:master  # Keep master in sync
-```
-
-The `release-automation.yml` workflow will:
-1. Detect version change in `Cargo.toml`
-2. Create an annotated git tag (e.g., `v0.2.13`)
-3. Push the tag, which triggers `dist.yml`
-
-The `dist.yml` workflow will:
-1. Run tests and clippy
-2. Build binaries for all platforms (Linux x86/ARM, macOS Intel/Apple Silicon, Windows)
-3. Create `.tar.xz` archives with SHA256 checksums
-4. Sign artifacts with Sigstore (cosign) - creates `.sigstore.json` bundles
-5. Upload everything to GitHub Releases
-
-### 5. Verify Release
-
-```bash
-gh release list --limit 5
-gh release view v0.2.13  # Check assets were uploaded
-```
-
-Expected assets per release:
-- `dcg-{target}.tar.xz` - Binary archive
-- `dcg-{target}.tar.xz.sha256` - Checksum
-- `dcg-{target}.tar.xz.sigstore.json` - Sigstore signature bundle
-- `install.sh`, `install.ps1` - Install scripts
-
-### Troubleshooting Failed Releases
-
-If CI fails:
-1. Check workflow run: `gh run list --workflow=dist.yml --limit=5`
-2. View failed job: `gh run view <run-id>`
-3. Fix issues locally, commit, and push again
-4. The same version tag will be updated on successful build
-
-Common failures:
-- **Clippy errors**: Fix lints, ensure `cargo clippy -- -D warnings` passes
-- **Test failures**: Run `cargo test --lib` to reproduce
-- **Format errors**: Run `cargo fmt` to fix
-
----
-
-## Heredoc Detection Notes (for contributors)
-
-- **Rule IDs**: Heredoc patterns use stable IDs like `heredoc.python.shutil_rmtree` for allowlisting.
-- **Fail-open**: In hook mode, heredoc parse errors/timeouts must allow (do not block).
-- **Tests**: Prefer targeted tests in `src/ast_matcher.rs` and `src/heredoc.rs`.
-  - `cargo test ast_matcher`
-  - `cargo test heredoc`
-  - Add positive and negative fixtures for each new pattern.
+- **Table-driven tests:** Use arrays of test cases with descriptive names
+- **Temporary directories:** Use `tempfile::TempDir` for filesystem tests — paths auto-clean on drop
+- **Backup-first:** Tests that mutate files should verify backup creation
+- **Idempotency:** Tests should verify that re-running an operation produces the same result
 
 ---
 
@@ -390,334 +587,14 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ---
 
-## dcg (Destructive Command Guard) — This Project
+## Output Style
 
-**This is the project you're working on.** dcg is a high-performance Claude Code hook that blocks destructive commands before they execute. It protects against dangerous git commands, filesystem operations, database queries, container commands, and more through a modular pack system.
+sbh supports two output modes:
 
-### Architecture
+- **Human-readable to stderr/stdout:** Colorful terminal output with tables and status indicators
+- **JSON to stdout:** Machine-parseable output when `--json` is passed
 
-```
-JSON Input → Parse → Quick Reject (memchr) → Normalize → Safe Patterns → Destructive Patterns → Default Allow
-```
-
-### Key Files
-
-| File | Purpose |
-|------|---------|
-| `src/main.rs` | Complete implementation (~40KB) + 80 tests |
-| `Cargo.toml` | Dependencies and release optimizations |
-| `build.rs` | Build script for version metadata (vergen) |
-| `rust-toolchain.toml` | Nightly toolchain requirement |
-| `scripts/e2e_test.sh` | End-to-end test script (120 tests) |
-
-### Pattern System
-
-- **34 safe patterns** (whitelist, checked first)
-- **16 destructive patterns** (blacklist, checked second)
-- **Default allow** for unmatched commands
-
-### Adding New Patterns
-
-1. Identify the command to block/allow
-2. Write a regex using `fancy-regex` syntax (supports lookahead/lookbehind)
-3. Add to `SAFE_PATTERNS` or `DESTRUCTIVE_PATTERNS` using the macros:
-
-```rust
-// Safe pattern (whitelist)
-pattern!("pattern-name", r"regex-here")
-
-// Destructive pattern (blacklist)
-destructive!(
-    r"regex-here",
-    "Human-readable reason for blocking"
-)
-```
-
-4. Add tests for all variants
-5. Run `cargo test` and `./scripts/e2e_test.sh`
-
-### Performance Requirements
-
-Every Bash command passes through this hook. Performance is critical:
-
-- Quick rejection filter eliminates 99%+ of commands before regex
-- Lazy-initialized static regex patterns (compiled once, reused)
-- Sub-millisecond execution for typical commands
-- Zero allocations on the hot path for safe commands
-
----
-
-<!-- dcg-machine-readable-v1 -->
-
-## DCG Hook Protocol (Machine-Readable Reference)
-
-> This section provides structured documentation for AI agents integrating with dcg.
-
-### JSON Input Format
-
-dcg reads from stdin in Claude Code's `PreToolUse` hook format:
-
-```json
-{
-  "tool_name": "Bash",
-  "tool_input": {
-    "command": "git reset --hard HEAD~5"
-  }
-}
-```
-
-**Required fields:**
-- `tool_name`: Must be `"Bash"` for dcg to process (other tools are ignored)
-- `tool_input.command`: The shell command string to evaluate
-
-### JSON Output Format (Denial)
-
-When a command is blocked, dcg outputs JSON to stdout:
-
-```json
-{
-  "hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
-    "permissionDecision": "deny",
-    "permissionDecisionReason": "BLOCKED by dcg\n\nTip: dcg explain \"git reset --hard HEAD~5\"\n\nReason: git reset --hard destroys uncommitted changes\n\nExplanation: Rewrites history and discards uncommitted changes.\n\nRule: core.git:reset-hard\n\nCommand: git reset --hard HEAD~5\n\nIf this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
-    "ruleId": "core.git:reset-hard",
-    "packId": "core.git",
-    "severity": "critical",
-    "confidence": 0.95,
-    "allowOnceCode": "a1b2c3",
-    "allowOnceFullHash": "sha256:abc123...",
-    "remediation": {
-      "safeAlternative": "git stash",
-      "explanation": "Use git stash to save your changes first.",
-      "allowOnceCommand": "dcg allow-once a1b2c3"
-    }
-  }
-}
-```
-
-**Key fields for agent parsing:**
-| Field | Type | Description |
-|-------|------|-------------|
-| `permissionDecision` | `"allow"` \| `"deny"` | The decision |
-| `ruleId` | `string` | Stable pattern ID (e.g., `"core.git:reset-hard"`) for allowlisting |
-| `packId` | `string` | Pack that matched (e.g., `"core.git"`) |
-| `severity` | `string` | `"critical"`, `"high"`, `"medium"`, or `"low"` |
-| `confidence` | `number` | Match confidence 0.0-1.0 |
-| `allowOnceCode` | `string` | Short code for `dcg allow-once` |
-| `remediation.safeAlternative` | `string?` | Suggested safe command |
-
-### JSON Output Format (Allow)
-
-When a command is allowed: **no output** (silent exit 0).
-
----
-
-## Exit Codes Reference
-
-| Code | Meaning | Agent Action |
-|------|---------|--------------|
-| `0` | Command allowed OR denied (check stdout for JSON) | Parse stdout; if empty, command was allowed |
-| `1` | Parse error or invalid input | Retry with corrected input |
-| `2` | Configuration error | Check config file syntax |
-
-**Detection logic for agents:**
-```bash
-output=$(echo "$hook_input" | dcg 2>/dev/null)
-if [ -z "$output" ]; then
-  echo "ALLOWED"
-else
-  echo "DENIED: $output"
-fi
-```
-
----
-
-## Error Codes Reference
-
-DCG uses standardized error codes in the format `DCG-XXXX` for machine-parseable error handling.
-
-### Error Categories
-
-| Range | Category | Description |
-|-------|----------|-------------|
-| DCG-1xxx | `pattern_match` | Pattern matching and evaluation errors |
-| DCG-2xxx | `configuration` | Configuration loading and parsing errors |
-| DCG-3xxx | `runtime` | Runtime and execution errors |
-| DCG-4xxx | `external` | External integration errors |
-
-### Common Error Codes
-
-| Code | Description | Typical Cause |
-|------|-------------|---------------|
-| `DCG-1001` | Pattern compilation failed | Invalid regex syntax in pattern |
-| `DCG-1002` | Pattern match timeout | Complex pattern taking too long |
-| `DCG-2001` | Config file not found | Missing configuration file |
-| `DCG-2002` | Config parse error | Invalid TOML/JSON syntax |
-| `DCG-2004` | Allowlist load error | Invalid allowlist file |
-| `DCG-3001` | JSON parse error | Malformed JSON input |
-| `DCG-3002` | IO error | File read/write failure |
-| `DCG-4001` | External pack load failed | Invalid external pack YAML |
-
-### Error JSON Structure
-
-When errors are returned in JSON format, they follow this structure:
-
-```json
-{
-  "error": {
-    "code": "DCG-3001",
-    "category": "runtime",
-    "message": "JSON parse error: unexpected token at position 15",
-    "context": {
-      "position": 15,
-      "input_preview": "{ \"tool_name\": ..."
-    }
-  }
-}
-```
-
-**Fields:**
-- `code`: Stable error code for programmatic handling
-- `category`: Error category (`pattern_match`, `configuration`, `runtime`, `external`)
-- `message`: Human-readable error description
-- `context`: Additional details (optional, varies by error type)
-
----
-
-## Allowlist & Bypass Instructions
-
-### Temporary Bypass (24-hour allow-once)
-
-When a command is blocked, the output includes an `allowOnceCode`. Use it:
-
-```bash
-dcg allow-once <code>
-```
-
-This allows the specific command for 24 hours in the current directory scope.
-
-### Permanent Allowlist (by rule ID)
-
-Add a rule to the project allowlist:
-
-```bash
-dcg allowlist add <ruleId> --project
-# Example: dcg allowlist add core.git:reset-hard --project
-```
-
-Allowlist files (in priority order):
-1. `.dcg/allowlist.toml` (project)
-2. `~/.config/dcg/allowlist.toml` (user)
-3. `/etc/dcg/allowlist.toml` (system)
-
-### Bypass Environment Variable
-
-For emergency bypass (use sparingly):
-
-```bash
-DCG_BYPASS=1 <command>
-```
-
-**Warning:** This disables all protection. Log and justify any usage.
-
----
-
-## Pattern Quick Reference
-
-### Core Git Patterns (Always Enabled)
-
-| Pattern ID | Blocks | Severity |
-|------------|--------|----------|
-| `core.git:reset-hard` | `git reset --hard` | Critical |
-| `core.git:reset-merge` | `git reset --merge` | High |
-| `core.git:checkout-discard` | `git checkout -- <file>` | High |
-| `core.git:restore-discard` | `git restore <file>` (without `--staged`) | High |
-| `core.git:clean-force` | `git clean -f`, `git clean -fd` | High |
-| `core.git:force-push` | `git push --force`, `git push -f` | High |
-| `core.git:branch-force-delete` | `git branch -D` | High |
-| `core.git:stash-drop` | `git stash drop`, `git stash clear` | High |
-
-### Core Filesystem Patterns (Always Enabled)
-
-| Pattern ID | Blocks | Severity |
-|------------|--------|----------|
-| `core.filesystem:rm-rf-root` | `rm -rf /`, `rm -rf ~` | Critical |
-| `core.filesystem:rm-rf-general` | `rm -rf` outside temp dirs | High |
-
-### Safe Patterns (Whitelist - Always Allowed)
-
-| Pattern | Command | Why Safe |
-|---------|---------|----------|
-| `git-checkout-branch` | `git checkout -b <branch>` | Creates new branch |
-| `git-checkout-orphan` | `git checkout --orphan <branch>` | Creates orphan branch |
-| `git-restore-staged` | `git restore --staged <file>` | Only unstages, doesn't discard |
-| `git-clean-dry-run` | `git clean -n`, `git clean --dry-run` | Preview only |
-| `rm-tmp` | `rm -rf /tmp/*`, `/var/tmp/*` | Temp directory cleanup |
-
-### Pack Enable/Disable Examples
-
-```toml
-# ~/.config/dcg/config.toml
-[packs]
-enabled = [
-    "database.postgresql",    # Blocks DROP TABLE, TRUNCATE
-    "kubernetes.kubectl",     # Blocks kubectl delete namespace
-    "cloud.aws",              # Blocks aws ec2 terminate-instances
-]
-
-disabled = [
-    "containers.docker",      # Disable Docker protection
-]
-```
-
-List all packs: `dcg packs --verbose`
-
----
-
-## CLI Quick Reference for Agents
-
-| Command | Purpose |
-|---------|---------|
-| `dcg explain "<command>"` | Detailed trace of why command is blocked/allowed |
-| `dcg allow-once <code>` | Allow a blocked command for 24 hours |
-| `dcg allowlist add <ruleId> --project` | Permanently allow a rule |
-| `dcg packs` | List enabled packs |
-| `dcg packs --verbose` | List all packs with pattern counts |
-| `dcg scan .` | Scan codebase for destructive patterns |
-| `dcg --version` | Show version and build info |
-
----
-
-## Agent Integration Checklist
-
-When integrating with dcg, ensure your agent:
-
-- [ ] Parses stdout for JSON denial responses
-- [ ] Handles empty stdout as "command allowed"
-- [ ] Uses `ruleId` for stable allowlisting (not pattern text)
-- [ ] Displays `remediation.safeAlternative` to users when available
-- [ ] Respects `severity` for prioritization (critical > high > medium > low)
-- [ ] Uses `dcg explain` before asking users to bypass
-
----
-
-## JSON Schema Reference
-
-Formal JSON Schema definitions (Draft 2020-12) for all dcg output formats are available in `docs/json-schema/`:
-
-| Schema | Purpose |
-|--------|---------|
-| [`hook-output.json`](docs/json-schema/hook-output.json) | PreToolUse hook denial response format |
-| [`scan-results.json`](docs/json-schema/scan-results.json) | `dcg scan` command output format |
-| [`stats-output.json`](docs/json-schema/stats-output.json) | `dcg stats` command output format |
-| [`error.json`](docs/json-schema/error.json) | Error response formats for various commands |
-
-Use these schemas for:
-- Validating dcg output in automated pipelines
-- Generating type-safe client code
-- Understanding the complete output contract
-
-<!-- end-dcg-machine-readable -->
+Colors are automatically disabled when stdout is not a TTY.
 
 ---
 
@@ -928,22 +805,13 @@ ubs .                                   # Whole project (ignores target/, Cargo.
 ### Output Format
 
 ```
-⚠️  Category (N errors)
-    file.rs:42:5 – Issue description
-    💡 Suggested fix
+  Category (N errors)
+    file.rs:42:5 - Issue description
+    Suggested fix
 Exit code: 1
 ```
 
-Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
-
-### Fix Workflow
-
-1. Read finding → category + fix suggestion
-2. Navigate `file:line:col` → view context
-3. Verify real issue (not false positive)
-4. Fix root cause (not symptom)
-5. Re-run `ubs <file>` → exit 0
-6. Commit
+Parse: `file:line:col` -> location | fix suggestion | Exit 0/1 -> pass/fail
 
 ### Bug Severity
 
@@ -953,81 +821,7 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 
 ---
 
-## ast-grep vs ripgrep
-
-**Use `ast-grep` when structure matters.** It parses code and matches AST nodes, ignoring comments/strings, and can **safely rewrite** code.
-
-- Refactors/codemods: rename APIs, change import forms
-- Policy checks: enforce patterns across a repo
-- Editor/automation: LSP mode, `--json` output
-
-**Use `ripgrep` when text is enough.** Fastest way to grep literals/regex.
-
-- Recon: find strings, TODOs, log lines, config values
-- Pre-filter: narrow candidate files before ast-grep
-
-### Rule of Thumb
-
-- Need correctness or **applying changes** → `ast-grep`
-- Need raw speed or **hunting text** → `rg`
-- Often combine: `rg` to shortlist files, then `ast-grep` to match/modify
-
-### Rust Examples
-
-```bash
-# Find structured code (ignores comments)
-ast-grep run -l Rust -p 'fn $NAME($$$ARGS) -> $RET { $$$BODY }'
-
-# Find all unwrap() calls
-ast-grep run -l Rust -p '$EXPR.unwrap()'
-
-# Quick textual hunt
-rg -n 'println!' -t rust
-
-# Combine speed + precision
-rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
-```
-
----
-
-## Morph Warp Grep — AI-Powered Code Search
-
-**Use `mcp__morph-mcp__warp_grep` for exploratory "how does X work?" questions.** An AI agent expands your query, greps the codebase, reads relevant files, and returns precise line ranges with full context.
-
-**Use `ripgrep` for targeted searches.** When you know exactly what you're looking for.
-
-**Use `ast-grep` for structural patterns.** When you need AST precision for matching/rewriting.
-
-### When to Use What
-
-| Scenario | Tool | Why |
-|----------|------|-----|
-| "How is pattern matching implemented?" | `warp_grep` | Exploratory; don't know where to start |
-| "Where is the quick reject filter?" | `warp_grep` | Need to understand architecture |
-| "Find all uses of `Regex::new`" | `ripgrep` | Targeted literal search |
-| "Find files with `println!`" | `ripgrep` | Simple pattern |
-| "Replace all `unwrap()` with `expect()`" | `ast-grep` | Structural refactor |
-
-### warp_grep Usage
-
-```
-mcp__morph-mcp__warp_grep(
-  repoPath: "/path/to/dcg",
-  query: "How does the safe pattern whitelist work?"
-)
-```
-
-Returns structured results with file paths, line ranges, and extracted code snippets.
-
-### Anti-Patterns
-
-- **Don't** use `warp_grep` to find a specific function name → use `ripgrep`
-- **Don't** use `ripgrep` to understand "how does X work" → wastes time with manual reads
-- **Don't** use `ripgrep` for codemods → risks collateral edits
-
 <!-- bv-agent-instructions-v1 -->
-
----
 
 ## Beads Workflow Integration
 
@@ -1077,13 +871,13 @@ git add <files>         # Stage code changes
 br sync --flush-only    # Export beads to JSONL
 git add .beads/         # Stage beads changes
 git commit -m "..."     # Commit everything together
-git push                # Push to remote
+git push origin main main:master  # Push to both branches
 ```
 
 ### Best Practices
 
 - Check `br ready` at session start to find available work
-- Update status as you work (in_progress → closed)
+- Update status as you work (in_progress -> closed)
 - Create new issues with `br create` when you discover tasks
 - Use descriptive titles and set appropriate priority/type
 - Always `br sync --flush-only && git add .beads/` before ending session
@@ -1097,7 +891,7 @@ git push                # Push to remote
 **MANDATORY WORKFLOW:**
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
+2. **Run quality gates** (if code changed) - Tests, linters, builds via `rch`
 3. **Update issue status** - Close finished work, update in-progress items
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
@@ -1106,7 +900,7 @@ git push                # Push to remote
    git add .beads/         # Stage beads changes
    git add <other files>   # Stage code changes
    git commit -m "..."     # Commit everything
-   git push
+   git push origin main main:master  # Push to BOTH branches
    git status  # MUST show "up to date with origin"
    ```
 5. **Clean up** - Clear stashes, prune remote branches
@@ -1135,7 +929,7 @@ Next steps (pick one)
 
 1. Decide how to handle the unrelated modified files above so we can resume cleanly.
 2. Triage beads_rust-orko (clippy/cargo warnings) and beads_rust-ydqr (rustfmt failures).
-3. If you want a full suite run later, fix conformance/clippy blockers and re‑run cargo test --all.
+3. If you want a full suite run later, fix conformance/clippy blockers and re-run cargo test --all.
 ```
 
 NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.

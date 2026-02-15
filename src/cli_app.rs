@@ -140,6 +140,18 @@ struct InstallArgs {
     /// Non-interactive mode: apply smart defaults without prompts.
     #[arg(long, conflicts_with = "wizard")]
     auto: bool,
+    /// Number of ballast files to create.
+    #[arg(long, default_value_t = 10, value_name = "N")]
+    ballast_count: usize,
+    /// Size of each ballast file in MB.
+    #[arg(long, default_value_t = 1024, value_name = "MB")]
+    ballast_size: u64,
+    /// Directory for ballast files.
+    #[arg(long, value_name = "PATH")]
+    ballast_path: Option<PathBuf>,
+    /// Show what would be done without executing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -663,6 +675,48 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
         // Otherwise, fall through to service installation below.
     }
 
+    // -- install orchestration (data dir, config, ballast) ----------------------
+    {
+        use storage_ballast_helper::cli::install::{
+            InstallOptions, format_install_report, run_install_sequence,
+        };
+
+        let config = Config::load(cli.config.as_deref()).unwrap_or_default();
+        let opts = InstallOptions {
+            config,
+            ballast_count: args.ballast_count,
+            ballast_size_bytes: args.ballast_size * 1024 * 1024,
+            ballast_path: args.ballast_path.clone(),
+            dry_run: args.dry_run,
+        };
+
+        let report = run_install_sequence(&opts);
+
+        match output_mode(cli) {
+            OutputMode::Human => {
+                print!("{}", format_install_report(&report));
+            }
+            OutputMode::Json => {
+                let payload = serde_json::to_value(&report)?;
+                write_json_line(&payload)?;
+            }
+        }
+
+        if !report.success {
+            return Err(CliError::Runtime("install orchestration failed".to_string()));
+        }
+
+        if args.dry_run {
+            return Ok(());
+        }
+    }
+
+    // -- service registration -------------------------------------------------
+    if !args.systemd && !args.launchd {
+        // No service registration requested; orchestration-only install is done.
+        return Ok(());
+    }
+
     if args.launchd {
         let mgr = LaunchdServiceManager::from_env(args.user)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -820,6 +874,11 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
                         write_json_line(&payload)?;
                     }
                 }
+
+                if args.purge {
+                    run_uninstall_purge(cli)?;
+                }
+
                 return Ok(());
             }
             Err(e) => {
@@ -880,15 +939,18 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
                 OutputMode::Human => {
                     println!("Uninstalled systemd service ({scope} scope).");
                     println!("  Removed: {}", unit_path.display());
-                    if args.purge {
-                        println!("  Note: --purge removes state/logs (not yet implemented).");
-                    }
                 }
                 OutputMode::Json => {
                     let payload = serde_json::to_value(&result)?;
                     write_json_line(&payload)?;
                 }
             }
+
+            // Run data/ballast cleanup if --purge was requested.
+            if args.purge {
+                run_uninstall_purge(cli)?;
+            }
+
             Ok(())
         }
         Err(e) => {
@@ -913,6 +975,38 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
             Err(CliError::Runtime(format!("uninstall failed: {e}")))
         }
     }
+}
+
+fn run_uninstall_purge(cli: &Cli) -> Result<(), CliError> {
+    use storage_ballast_helper::cli::install::{
+        UninstallOptions, format_uninstall_report, run_uninstall_cleanup,
+    };
+    use storage_ballast_helper::core::config::PathsConfig;
+
+    let opts = UninstallOptions {
+        keep_data: false,
+        keep_ballast: false,
+        dry_run: false,
+        paths: PathsConfig::default(),
+    };
+
+    let report = run_uninstall_cleanup(&opts);
+
+    match output_mode(cli) {
+        OutputMode::Human => {
+            print!("{}", format_uninstall_report(&report));
+        }
+        OutputMode::Json => {
+            let payload = serde_json::to_value(&report)?;
+            write_json_line(&payload)?;
+        }
+    }
+
+    if !report.success {
+        return Err(CliError::Runtime("purge cleanup failed".to_string()));
+    }
+
+    Ok(())
 }
 
 fn parse_window_duration(s: &str) -> Result<std::time::Duration, CliError> {

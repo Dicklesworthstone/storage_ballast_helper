@@ -11,11 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::core::config::{
-    BallastConfig, Config, PathsConfig, PressureConfig, ScannerConfig, ScoringConfig,
-    TelemetryConfig,
-};
-use crate::daemon::notifications::NotificationConfig;
+use crate::core::config::Config;
 
 // ---------------------------------------------------------------------------
 // Wizard choices
@@ -61,9 +57,8 @@ impl BallastPreset {
     pub const fn file_count(self) -> usize {
         match self {
             Self::Small => 5,
-            Self::Medium => 10,
+            Self::Medium | Self::Custom => 10,
             Self::Large => 20,
-            Self::Custom => 10, // fallback
         }
     }
 
@@ -127,7 +122,7 @@ impl WizardAnswers {
         let mut config = Config::default();
 
         // Override scanner root paths with wizard selections.
-        config.scanner.root_paths = self.watched_paths.clone();
+        config.scanner.root_paths.clone_from(&self.watched_paths);
 
         // Override ballast settings.
         config.ballast.file_count = self.ballast_file_count;
@@ -237,10 +232,10 @@ pub fn run_interactive<R: BufRead, W: Write>(
     let service = prompt_service(reader, writer)?;
 
     // Step 2: User vs system scope.
-    let user_scope = if service != ServiceChoice::None {
-        prompt_user_scope(reader, writer)?
-    } else {
+    let user_scope = if service == ServiceChoice::None {
         true
+    } else {
+        prompt_user_scope(reader, writer)?
     };
 
     // Step 3: Watched paths.

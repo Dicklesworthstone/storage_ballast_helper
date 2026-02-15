@@ -4,6 +4,7 @@
 pub mod assets;
 pub mod bootstrap;
 pub mod from_source;
+pub mod install;
 pub mod integrations;
 pub mod uninstall;
 pub mod wizard;
