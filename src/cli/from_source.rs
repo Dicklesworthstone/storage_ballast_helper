@@ -741,4 +741,171 @@ mod tests {
         assert!(json.contains("\"prerequisite\":\"Cargo\""));
         assert!(json.contains("\"available\":true"));
     }
+
+    // bd-2j5.19 — SourceCheckout Tag equality
+    #[test]
+    fn source_checkout_tag_equality() {
+        let a = SourceCheckout::Tag("v1.0.0".into());
+        let b = SourceCheckout::Tag("v1.0.0".into());
+        let c = SourceCheckout::Tag("v2.0.0".into());
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(SourceCheckout::Head, SourceCheckout::Head);
+        assert_ne!(SourceCheckout::Head, SourceCheckout::Tag("v1.0.0".into()));
+    }
+
+    // bd-2j5.19 — all_prerequisites_met with empty list
+    #[test]
+    fn all_prerequisites_met_empty_list() {
+        assert!(
+            all_prerequisites_met(&[]),
+            "empty list should vacuously be met"
+        );
+    }
+
+    // bd-2j5.19 — format_prerequisite_failures with all available
+    #[test]
+    fn format_prerequisite_failures_all_available() {
+        let statuses = vec![PrerequisiteStatus {
+            prerequisite: Prerequisite::Cargo,
+            available: true,
+            version: Some("1.78.0".into()),
+            path: Some(PathBuf::from("/usr/bin/cargo")),
+            remediation: None,
+        }];
+        let output = format_prerequisite_failures(&statuses);
+        // Should only contain the header, no tool-specific lines.
+        assert!(output.contains("Missing prerequisites"));
+        assert!(
+            !output.contains("cargo"),
+            "should not list available tools as missing"
+        );
+    }
+
+    // bd-2j5.19 — remediation for rustc and cargo are the same
+    #[test]
+    fn remediation_rustc_and_cargo_share_message() {
+        let rustc_fix = remediation_for(Prerequisite::Rustc);
+        let cargo_fix = remediation_for(Prerequisite::Cargo);
+        assert_eq!(
+            rustc_fix, cargo_fix,
+            "rustc and cargo share rustup remediation"
+        );
+    }
+
+    // bd-2j5.19 — which_binary returns None for empty string
+    #[test]
+    fn which_binary_empty_name() {
+        let path = which_binary("");
+        assert!(path.is_none(), "empty binary name should not be found");
+    }
+
+    // bd-2j5.19 — probe_version on nonexistent binary
+    #[test]
+    fn probe_version_nonexistent() {
+        let version = probe_version("sbh_nonexistent_binary_xyz_12345");
+        assert!(
+            version.is_none(),
+            "nonexistent binary should yield no version"
+        );
+    }
+
+    // bd-2j5.19 — SourceInstallResult serialization with error field
+    #[test]
+    fn result_serializes_with_error() {
+        let result = SourceInstallResult {
+            success: false,
+            binary_path: None,
+            checkout: "HEAD".into(),
+            build_profile: "release".into(),
+            prerequisites: vec![],
+            error: Some("build failed".into()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"success\":false"));
+        assert!(json.contains("build failed"));
+    }
+
+    // bd-2j5.19 — PrerequisiteStatus serialization with None values
+    #[test]
+    fn prerequisite_status_serializes_with_none_values() {
+        let status = PrerequisiteStatus {
+            prerequisite: Prerequisite::Git,
+            available: false,
+            version: None,
+            path: None,
+            remediation: Some("install git".into()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"available\":false"));
+        assert!(json.contains("\"version\":null"));
+        assert!(json.contains("\"path\":null"));
+        assert!(json.contains("install git"));
+    }
+
+    // bd-2j5.19 — SourceInstallConfig expected_binary_path
+    #[test]
+    fn expected_binary_path_follows_convention() {
+        let config =
+            SourceInstallConfig::new(SourceCheckout::Head, Some(PathBuf::from("/opt/prefix")));
+        assert_eq!(
+            config.expected_binary_path(),
+            PathBuf::from("/opt/prefix/bin/sbh")
+        );
+    }
+
+    // bd-2j5.19 — all Prerequisite variants have unique display
+    #[test]
+    fn prerequisite_display_all_unique() {
+        let displays: Vec<String> = [Prerequisite::Rustc, Prerequisite::Cargo, Prerequisite::Git]
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        for (i, a) in displays.iter().enumerate() {
+            for (j, b) in displays.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "prerequisites should have unique display");
+                }
+            }
+        }
+    }
+
+    // bd-2j5.19 — format_result_human shows all prerequisite statuses
+    #[test]
+    fn format_result_human_shows_all_prereq_statuses() {
+        let result = SourceInstallResult {
+            success: false,
+            binary_path: None,
+            checkout: "HEAD".into(),
+            build_profile: "release".into(),
+            prerequisites: vec![
+                PrerequisiteStatus {
+                    prerequisite: Prerequisite::Rustc,
+                    available: true,
+                    version: Some("1.80.0".into()),
+                    path: Some(PathBuf::from("/usr/bin/rustc")),
+                    remediation: None,
+                },
+                PrerequisiteStatus {
+                    prerequisite: Prerequisite::Cargo,
+                    available: true,
+                    version: Some("1.80.0".into()),
+                    path: Some(PathBuf::from("/usr/bin/cargo")),
+                    remediation: None,
+                },
+                PrerequisiteStatus {
+                    prerequisite: Prerequisite::Git,
+                    available: false,
+                    version: None,
+                    path: None,
+                    remediation: Some("install git".into()),
+                },
+            ],
+            error: Some("missing prerequisites".into()),
+        };
+        let output = format_result_human(&result);
+        assert!(output.contains("[OK] rustc"));
+        assert!(output.contains("[OK] cargo"));
+        assert!(output.contains("[MISSING] git"));
+    }
 }

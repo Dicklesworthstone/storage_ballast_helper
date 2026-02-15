@@ -770,4 +770,188 @@ mod tests {
         assert!(text.contains("Watched paths"), "should prompt for paths");
         assert!(text.contains("Ballast"), "should prompt for ballast");
     }
+
+    // bd-2j5.19 — BallastPreset::Custom file_count and total_gb
+    #[test]
+    fn ballast_preset_custom_values() {
+        assert_eq!(BallastPreset::Custom.file_count(), 10);
+        assert_eq!(BallastPreset::Custom.total_gb(), 0);
+        assert_eq!(BallastPreset::Custom.file_size_bytes(), 1_073_741_824);
+    }
+
+    // bd-2j5.19 — prompt_service with "s" shorthand
+    #[test]
+    fn interactive_wizard_service_shorthand_s() {
+        let input = "s\n\n\n\n\n";
+        let mut reader = io::Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        let answers = run_interactive(&mut reader, &mut output).unwrap();
+        assert_eq!(answers.service, ServiceChoice::Systemd);
+    }
+
+    // bd-2j5.19 — prompt_service with "l" shorthand
+    #[test]
+    fn interactive_wizard_service_shorthand_l() {
+        let input = "l\n\n\n\n\n";
+        let mut reader = io::Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        let answers = run_interactive(&mut reader, &mut output).unwrap();
+        assert_eq!(answers.service, ServiceChoice::Launchd);
+    }
+
+    // bd-2j5.19 — prompt_service with invalid input falls back to default
+    #[test]
+    fn interactive_wizard_service_invalid_falls_back() {
+        let input = "invalid_service\n\n\n\n\n";
+        let mut reader = io::Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        let answers = run_interactive(&mut reader, &mut output).unwrap();
+        // Should fall back to platform default.
+        if cfg!(target_os = "linux") {
+            assert_eq!(answers.service, ServiceChoice::Systemd);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(answers.service, ServiceChoice::Launchd);
+        } else {
+            assert_eq!(answers.service, ServiceChoice::None);
+        }
+    }
+
+    // bd-2j5.19 — prompt_user_scope with "n" for system scope
+    #[test]
+    fn interactive_wizard_system_scope() {
+        // systemd + "n" for system scope + defaults for rest
+        let input = "systemd\nn\n\n\n\n";
+        let mut reader = io::Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        let answers = run_interactive(&mut reader, &mut output).unwrap();
+        assert!(!answers.user_scope, "should be system scope");
+    }
+
+    // bd-2j5.19 — prompt_watched_paths with empty parts
+    #[test]
+    fn interactive_wizard_empty_path_parts_filtered() {
+        let input = "none\n/opt,,/srv,\n\n\n";
+        let mut reader = io::Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        let answers = run_interactive(&mut reader, &mut output).unwrap();
+        // Empty parts from consecutive commas should be filtered.
+        for path in &answers.watched_paths {
+            assert!(
+                !path.as_os_str().is_empty(),
+                "empty paths should be filtered"
+            );
+        }
+        assert!(answers.watched_paths.contains(&PathBuf::from("/opt")));
+        assert!(answers.watched_paths.contains(&PathBuf::from("/srv")));
+    }
+
+    // bd-2j5.19 — prompt_ballast with "m" explicitly
+    #[test]
+    fn interactive_wizard_ballast_explicit_m() {
+        let input = "none\n\nm\n\n";
+        let mut reader = io::Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        let answers = run_interactive(&mut reader, &mut output).unwrap();
+        assert_eq!(answers.ballast_preset, BallastPreset::Medium);
+    }
+
+    // bd-2j5.19 — prompt_ballast with invalid input falls back to medium
+    #[test]
+    fn interactive_wizard_ballast_invalid_falls_back() {
+        let input = "none\n\nxyz\n\n";
+        let mut reader = io::Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        let answers = run_interactive(&mut reader, &mut output).unwrap();
+        assert_eq!(answers.ballast_preset, BallastPreset::Medium);
+        let output_text = String::from_utf8(output).unwrap();
+        assert!(output_text.contains("Unrecognized"));
+    }
+
+    // bd-2j5.19 — write_config overwrites existing file
+    #[test]
+    fn write_config_overwrites_existing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "old content").unwrap();
+
+        let answers = auto_answers();
+        write_config(&answers, &config_path).unwrap();
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!contents.contains("old content"), "should overwrite");
+        assert!(contents.contains("[scanner]"));
+    }
+
+    // bd-2j5.19 — WizardAnswers serialization
+    #[test]
+    fn wizard_answers_serializes_to_json() {
+        let answers = auto_answers();
+        let json = serde_json::to_string(&answers).unwrap();
+        assert!(json.contains("\"auto_mode\":true"));
+        assert!(json.contains("\"ballast_preset\":\"Medium\""));
+        assert!(json.contains("\"user_scope\":true"));
+    }
+
+    // bd-2j5.19 — format_summary with warnings
+    #[test]
+    fn format_summary_with_multiple_warnings() {
+        let summary = WizardSummary {
+            answers: auto_answers(),
+            config_path: PathBuf::from("/tmp/config.toml"),
+            config_written: true,
+            warnings: vec![
+                "Low disk space detected".into(),
+                "Ballast pool may be too large".into(),
+            ],
+        };
+        let output = format_summary(&summary);
+        assert!(output.contains("Low disk space detected"));
+        assert!(output.contains("Ballast pool may be too large"));
+    }
+
+    // bd-2j5.19 — to_config preserves defaults for non-overridden fields
+    #[test]
+    fn to_config_preserves_defaults() {
+        let answers = WizardAnswers {
+            service: ServiceChoice::None,
+            user_scope: true,
+            watched_paths: vec![PathBuf::from("/data")],
+            ballast_preset: BallastPreset::Large,
+            ballast_file_count: 20,
+            ballast_file_size_bytes: 1_073_741_824,
+            auto_mode: false,
+        };
+        let config = answers.to_config();
+        // Non-overridden fields should remain at default.
+        assert_eq!(config.scanner.root_paths, vec![PathBuf::from("/data")]);
+        assert_eq!(config.ballast.file_count, 20);
+    }
+
+    // bd-2j5.19 — ServiceChoice PartialEq coverage
+    #[test]
+    fn service_choice_equality() {
+        assert_eq!(ServiceChoice::Systemd, ServiceChoice::Systemd);
+        assert_ne!(ServiceChoice::Systemd, ServiceChoice::Launchd);
+        assert_ne!(ServiceChoice::Launchd, ServiceChoice::None);
+    }
+
+    // bd-2j5.19 — auto_detect_service platform logic
+    #[test]
+    fn auto_detect_service_matches_platform() {
+        let service = auto_detect_service();
+        if cfg!(target_os = "linux") {
+            assert_eq!(service, ServiceChoice::Systemd);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(service, ServiceChoice::Launchd);
+        } else {
+            assert_eq!(service, ServiceChoice::None);
+        }
+    }
 }

@@ -1658,4 +1658,617 @@ mod tests {
                 .all(|f| f.kind == FootprintKind::BackupFile)
         );
     }
+
+    // -----------------------------------------------------------------------
+    // bd-2j5.19 — shell profile mutation edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_path_dir_unquoted_returns_none() {
+        // Unquoted PATH= (no "export" prefix) should not match.
+        assert_eq!(extract_path_dir_from_export("PATH=/usr/bin:$PATH"), None);
+    }
+
+    #[test]
+    fn extract_path_dir_spaces_in_path() {
+        let line = r#"export PATH="/home/my user/.local/bin:$PATH""#;
+        assert_eq!(
+            extract_path_dir_from_export(line),
+            Some("/home/my user/.local/bin".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_path_dir_empty_dir() {
+        // export PATH=":$PATH" — empty directory component.
+        let line = r#"export PATH=":$PATH""#;
+        assert_eq!(extract_path_dir_from_export(line), Some(String::new()));
+    }
+
+    #[test]
+    fn extract_path_dir_with_leading_whitespace() {
+        let line = r#"  export PATH="/opt/sbh/bin:$PATH""#;
+        assert_eq!(
+            extract_path_dir_from_export(line),
+            Some("/opt/sbh/bin".to_string())
+        );
+    }
+
+    #[test]
+    fn profile_health_single_valid_entry() {
+        // A single healthy entry pointing to a directory that exists
+        // (but doesn't contain sbh) is still technically stale.
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join(".bashrc");
+        let empty_dir = tmp.path().join("empty_bin");
+        fs::create_dir(&empty_dir).unwrap();
+        let line = format!(r#"export PATH="{}:$PATH""#, empty_dir.display());
+        let lines = vec![line.as_str()];
+        let (healthy, issue, _) = check_profile_health(&profile, &lines);
+        assert!(!healthy, "dir without sbh binary should be stale");
+        assert_eq!(issue, Some(MigrationReason::StalePathEntry));
+    }
+
+    #[test]
+    fn profile_health_three_duplicates() {
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join(".bashrc");
+        let lines = vec![
+            r#"export PATH="/a:$PATH"  # sbh"#,
+            r#"export PATH="/b:$PATH"  # sbh"#,
+            r#"export PATH="/c:$PATH"  # sbh"#,
+        ];
+        let (healthy, issue, detail) = check_profile_health(&profile, &lines);
+        assert!(!healthy);
+        assert_eq!(issue, Some(MigrationReason::DuplicatePathEntries));
+        assert!(detail.unwrap().contains("3"));
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2j5.19 — config health edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_health_multiple_deprecated_keys() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        fs::write(&cfg, "scan_interval_secs = 30\nmax_ballast_mb = 1024\n").unwrap();
+        let (healthy, issue, detail) = check_config_health(&cfg);
+        assert!(!healthy);
+        assert_eq!(issue, Some(MigrationReason::DeprecatedConfigKey));
+        // Should mention the first deprecated key found.
+        assert!(detail.unwrap().contains("scan_interval_secs"));
+    }
+
+    #[test]
+    fn config_health_valid_with_comments() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        fs::write(
+            &cfg,
+            "# Configuration\n[pressure]\ngreen_min_free_pct = 35.0\n# end\n",
+        )
+        .unwrap();
+        let (healthy, issue, _) = check_config_health(&cfg);
+        assert!(healthy);
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn config_health_nonexistent_file() {
+        let (healthy, issue, detail) = check_config_health(Path::new("/nonexistent/config.toml"));
+        assert!(!healthy);
+        assert_eq!(issue, Some(MigrationReason::DeprecatedConfigKey));
+        assert!(detail.unwrap().contains("cannot read config"));
+    }
+
+    #[test]
+    fn config_health_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        fs::write(&cfg, "").unwrap();
+        let (healthy, issue, _) = check_config_health(&cfg);
+        assert!(
+            healthy,
+            "empty config should be healthy (no deprecated keys)"
+        );
+        assert!(issue.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2j5.19 — systemd/launchd health edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn systemd_health_nonexistent_unit_file() {
+        let (healthy, issue, detail) = check_systemd_health(Path::new("/nonexistent/sbh.service"));
+        assert!(!healthy);
+        assert_eq!(issue, Some(MigrationReason::SystemdUnitStaleBinary));
+        assert!(detail.unwrap().contains("cannot read unit file"));
+    }
+
+    #[test]
+    fn systemd_health_no_exec_start_line() {
+        let tmp = TempDir::new().unwrap();
+        let unit = tmp.path().join("sbh.service");
+        fs::write(&unit, "[Unit]\nDescription=Test\n").unwrap();
+        let (healthy, issue, _) = check_systemd_health(&unit);
+        assert!(
+            healthy,
+            "unit without ExecStart should be OK (no stale ref)"
+        );
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn systemd_health_multiple_exec_start_first_valid() {
+        let tmp = TempDir::new().unwrap();
+        let existing = std::env::current_exe().unwrap();
+        let unit = tmp.path().join("sbh.service");
+        fs::write(
+            &unit,
+            format!(
+                "[Service]\nExecStart={}\nExecStartPre=/nonexistent/check\n",
+                existing.display()
+            ),
+        )
+        .unwrap();
+        let (healthy, issue, _) = check_systemd_health(&unit);
+        assert!(healthy, "valid ExecStart should make unit healthy");
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn launchd_health_nonexistent_plist() {
+        let (healthy, issue, detail) =
+            check_launchd_health(Path::new("/nonexistent/com.sbh.plist"));
+        assert!(!healthy);
+        assert_eq!(issue, Some(MigrationReason::LaunchdPlistStaleBinary));
+        assert!(detail.unwrap().contains("cannot read plist"));
+    }
+
+    #[test]
+    fn launchd_health_valid_binary() {
+        let tmp = TempDir::new().unwrap();
+        let plist = tmp.path().join("com.sbh.daemon.plist");
+        let existing = std::env::current_exe().unwrap();
+        let xml = format!(
+            r#"<?xml version="1.0"?>
+<plist version="1.0">
+<dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+        <string>daemon</string>
+    </array>
+</dict>
+</plist>"#,
+            existing.display()
+        );
+        fs::write(&plist, xml).unwrap();
+        let (healthy, issue, _) = check_launchd_health(&plist);
+        assert!(healthy, "plist with valid binary should be healthy");
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn launchd_health_no_program_arguments() {
+        let tmp = TempDir::new().unwrap();
+        let plist = tmp.path().join("com.sbh.daemon.plist");
+        let xml = r#"<?xml version="1.0"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sbh.daemon</string>
+</dict>
+</plist>"#;
+        fs::write(&plist, xml).unwrap();
+        let (healthy, issue, _) = check_launchd_health(&plist);
+        assert!(healthy, "plist without ProgramArguments should be OK");
+        assert!(issue.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2j5.19 — migration action planning edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plan_actions_stale_path_generates_remove_profile_line() {
+        let footprints = vec![Footprint {
+            kind: FootprintKind::ShellProfile,
+            path: PathBuf::from("/home/test/.bashrc"),
+            healthy: false,
+            issue: Some(MigrationReason::StalePathEntry),
+            detail: Some("stale entry".into()),
+        }];
+        let opts = MigrateOptions::default();
+        let actions = plan_actions(&footprints, &opts);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ActionKind::RemoveProfileLine);
+        assert_eq!(actions[0].reason, MigrationReason::StalePathEntry);
+    }
+
+    #[test]
+    fn plan_actions_duplicate_generates_deduplicate() {
+        let footprints = vec![Footprint {
+            kind: FootprintKind::ShellProfile,
+            path: PathBuf::from("/home/test/.bashrc"),
+            healthy: false,
+            issue: Some(MigrationReason::DuplicatePathEntries),
+            detail: None,
+        }];
+        let opts = MigrateOptions::default();
+        let actions = plan_actions(&footprints, &opts);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ActionKind::DeduplicateProfile);
+    }
+
+    #[test]
+    fn plan_actions_binary_permissions_generates_fix() {
+        let footprints = vec![Footprint {
+            kind: FootprintKind::Binary,
+            path: PathBuf::from("/usr/local/bin/sbh"),
+            healthy: false,
+            issue: Some(MigrationReason::BinaryPermissions),
+            detail: None,
+        }];
+        let opts = MigrateOptions::default();
+        let actions = plan_actions(&footprints, &opts);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ActionKind::FixPermissions);
+    }
+
+    #[test]
+    fn plan_actions_missing_state_generates_init() {
+        let footprints = vec![Footprint {
+            kind: FootprintKind::StateFile,
+            path: PathBuf::from("/home/test/.local/share/sbh/state.json"),
+            healthy: false,
+            issue: Some(MigrationReason::MissingStateFile),
+            detail: None,
+        }];
+        let opts = MigrateOptions::default();
+        let actions = plan_actions(&footprints, &opts);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ActionKind::InitStateFile);
+    }
+
+    #[test]
+    fn plan_actions_healthy_footprint_no_action() {
+        let footprints = vec![Footprint {
+            kind: FootprintKind::Binary,
+            path: PathBuf::from("/usr/local/bin/sbh"),
+            healthy: true,
+            issue: None,
+            detail: None,
+        }];
+        let opts = MigrateOptions::default();
+        let actions = plan_actions(&footprints, &opts);
+        assert!(
+            actions.is_empty(),
+            "healthy footprint should generate no actions"
+        );
+    }
+
+    #[test]
+    fn plan_actions_systemd_stale_generates_update_service() {
+        let footprints = vec![Footprint {
+            kind: FootprintKind::SystemdUnit,
+            path: PathBuf::from("/etc/systemd/system/sbh.service"),
+            healthy: false,
+            issue: Some(MigrationReason::SystemdUnitStaleBinary),
+            detail: None,
+        }];
+        let opts = MigrateOptions::default();
+        let actions = plan_actions(&footprints, &opts);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ActionKind::UpdateServicePath);
+    }
+
+    #[test]
+    fn plan_actions_orphaned_completion_generates_remove() {
+        let footprints = vec![Footprint {
+            kind: FootprintKind::ShellCompletion,
+            path: PathBuf::from("/home/test/.zfunc/_sbh"),
+            healthy: false,
+            issue: Some(MigrationReason::OrphanedCompletion),
+            detail: None,
+        }];
+        let opts = MigrateOptions::default();
+        let actions = plan_actions(&footprints, &opts);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ActionKind::RemoveOrphanedFile);
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2j5.19 — backup edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_backup_nonexistent_file_fails() {
+        let result = create_backup(Path::new("/nonexistent/file.txt"), None);
+        assert!(result.is_err(), "backup of nonexistent file should fail");
+    }
+
+    #[test]
+    fn create_backup_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let original = tmp.path().join("empty.txt");
+        fs::write(&original, "").unwrap();
+        let backup = create_backup(&original, None).unwrap();
+        assert!(backup.exists());
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2j5.19 — assess_health edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assess_health_degraded_with_actions() {
+        let footprints = vec![Footprint {
+            kind: FootprintKind::Binary,
+            path: PathBuf::from("/usr/local/bin/sbh"),
+            healthy: true,
+            issue: None,
+            detail: None,
+        }];
+        let actions = vec![MigrationAction {
+            kind: ActionKind::RemoveProfileLine,
+            reason: MigrationReason::StalePathEntry,
+            target: PathBuf::from("/home/test/.bashrc"),
+            description: "remove stale entry".into(),
+            applied: false,
+            backup_path: None,
+            error: None,
+        }];
+        assert_eq!(
+            assess_health(&footprints, &actions),
+            EnvironmentHealth::Degraded,
+            "unapplied action should yield Degraded"
+        );
+    }
+
+    #[test]
+    fn assess_health_healthy_after_all_actions_applied() {
+        let footprints = vec![Footprint {
+            kind: FootprintKind::Binary,
+            path: PathBuf::from("/usr/local/bin/sbh"),
+            healthy: true,
+            issue: None,
+            detail: None,
+        }];
+        let actions = vec![MigrationAction {
+            kind: ActionKind::RemoveProfileLine,
+            reason: MigrationReason::StalePathEntry,
+            target: PathBuf::from("/home/test/.bashrc"),
+            description: "remove stale entry".into(),
+            applied: true,
+            backup_path: None,
+            error: None,
+        }];
+        assert_eq!(
+            assess_health(&footprints, &actions),
+            EnvironmentHealth::Healthy,
+            "all actions applied => healthy"
+        );
+    }
+
+    #[test]
+    fn assess_health_broken_when_action_has_error() {
+        let footprints = vec![Footprint {
+            kind: FootprintKind::Binary,
+            path: PathBuf::from("/usr/local/bin/sbh"),
+            healthy: false,
+            issue: Some(MigrationReason::BinaryPermissions),
+            detail: None,
+        }];
+        let actions = vec![MigrationAction {
+            kind: ActionKind::FixPermissions,
+            reason: MigrationReason::BinaryPermissions,
+            target: PathBuf::from("/usr/local/bin/sbh"),
+            description: "fix perms".into(),
+            applied: true,
+            backup_path: None,
+            error: Some("permission denied".into()),
+        }];
+        assert_eq!(
+            assess_health(&footprints, &actions),
+            EnvironmentHealth::Broken,
+            "unhealthy binary => Broken"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2j5.19 — display/serialization coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_migration_reasons_display_unique() {
+        let reasons = [
+            MigrationReason::BinaryNotOnPath,
+            MigrationReason::StalePathEntry,
+            MigrationReason::DuplicatePathEntries,
+            MigrationReason::SystemdUnitStaleBinary,
+            MigrationReason::LaunchdPlistStaleBinary,
+            MigrationReason::DeprecatedConfigKey,
+            MigrationReason::MissingStateFile,
+            MigrationReason::OrphanedCompletion,
+            MigrationReason::StaleCompletion,
+            MigrationReason::EmptyBallastPool,
+            MigrationReason::BinaryPermissions,
+            MigrationReason::StaleBackupFile,
+            MigrationReason::InterruptedInstall,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for r in &reasons {
+            let s = r.to_string();
+            assert!(!s.is_empty(), "display should not be empty");
+            assert!(seen.insert(s.clone()), "duplicate display: {s}");
+        }
+        assert_eq!(seen.len(), 13, "should cover all 13 reason codes");
+    }
+
+    #[test]
+    fn all_action_kinds_display_unique() {
+        let kinds = [
+            ActionKind::RemoveProfileLine,
+            ActionKind::DeduplicateProfile,
+            ActionKind::FixPermissions,
+            ActionKind::UpdateServicePath,
+            ActionKind::RemoveOrphanedFile,
+            ActionKind::CleanupBackup,
+            ActionKind::CreateDirectory,
+            ActionKind::InitStateFile,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for k in &kinds {
+            let s = k.to_string();
+            assert!(seen.insert(s.clone()), "duplicate display: {s}");
+        }
+        assert_eq!(seen.len(), 8, "should cover all 8 action kinds");
+    }
+
+    #[test]
+    fn all_footprint_kinds_display_unique() {
+        let kinds = [
+            FootprintKind::Binary,
+            FootprintKind::ConfigFile,
+            FootprintKind::DataDirectory,
+            FootprintKind::StateFile,
+            FootprintKind::SqliteDb,
+            FootprintKind::JsonlLog,
+            FootprintKind::ShellProfile,
+            FootprintKind::SystemdUnit,
+            FootprintKind::LaunchdPlist,
+            FootprintKind::ShellCompletion,
+            FootprintKind::BallastPool,
+            FootprintKind::BackupFile,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for k in &kinds {
+            let s = k.to_string();
+            assert!(seen.insert(s.clone()), "duplicate display: {s}");
+        }
+        assert_eq!(seen.len(), 12, "should cover all 12 footprint kinds");
+    }
+
+    #[test]
+    fn migration_action_serializes_to_json() {
+        let action = MigrationAction {
+            kind: ActionKind::RemoveProfileLine,
+            reason: MigrationReason::StalePathEntry,
+            target: PathBuf::from("/home/test/.bashrc"),
+            description: "remove stale entry".into(),
+            applied: true,
+            backup_path: Some(PathBuf::from("/home/test/.bashrc.sbh-backup-123")),
+            error: None,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("\"kind\":\"RemoveProfileLine\""));
+        assert!(json.contains("\"applied\":true"));
+        assert!(json.contains("sbh-backup-123"));
+    }
+
+    #[test]
+    fn scan_backups_in_empty_dir_finds_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let mut footprints = Vec::new();
+        scan_backups_in(tmp.path(), &mut footprints);
+        assert!(footprints.is_empty());
+    }
+
+    #[test]
+    fn scan_backups_in_nonexistent_dir() {
+        let mut footprints = Vec::new();
+        scan_backups_in(Path::new("/nonexistent/dir"), &mut footprints);
+        assert!(
+            footprints.is_empty(),
+            "nonexistent dir should yield nothing"
+        );
+    }
+
+    #[test]
+    fn deduplicate_profile_no_sbh_lines_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join(".bashrc");
+        let original = "# header\nalias ls='ls -la'\n# footer\n";
+        fs::write(&profile, original).unwrap();
+
+        let mut action = MigrationAction {
+            kind: ActionKind::DeduplicateProfile,
+            reason: MigrationReason::DuplicatePathEntries,
+            target: profile.clone(),
+            description: String::new(),
+            applied: false,
+            backup_path: None,
+            error: None,
+        };
+
+        apply_deduplicate_profile(&mut action, None).unwrap();
+        let contents = fs::read_to_string(&profile).unwrap();
+        assert_eq!(contents, original, "no sbh lines means content unchanged");
+    }
+
+    #[test]
+    fn remove_stale_profile_line_preserves_non_sbh_path_entries() {
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join(".bashrc");
+        fs::write(
+            &profile,
+            "export PATH=\"/usr/local/go/bin:$PATH\"\nexport PATH=\"/nonexistent/sbh:$PATH\"\n",
+        )
+        .unwrap();
+
+        let mut action = MigrationAction {
+            kind: ActionKind::RemoveProfileLine,
+            reason: MigrationReason::StalePathEntry,
+            target: profile.clone(),
+            description: String::new(),
+            applied: false,
+            backup_path: None,
+            error: None,
+        };
+
+        apply_remove_profile_line(&mut action, None).unwrap();
+        let contents = fs::read_to_string(&profile).unwrap();
+        assert!(
+            contents.contains("/usr/local/go/bin"),
+            "non-sbh PATH entry should be preserved"
+        );
+        assert!(
+            !contents.contains("sbh"),
+            "sbh PATH entry should be removed"
+        );
+    }
+
+    #[test]
+    fn init_state_file_creates_valid_json() {
+        let tmp = TempDir::new().unwrap();
+        let state = tmp.path().join("state.json");
+
+        let mut action = MigrationAction {
+            kind: ActionKind::InitStateFile,
+            reason: MigrationReason::MissingStateFile,
+            target: state.clone(),
+            description: String::new(),
+            applied: false,
+            backup_path: None,
+            error: None,
+        };
+
+        apply_init_state_file(&mut action).unwrap();
+        let contents = fs::read_to_string(&state).unwrap();
+        // Should be valid JSON.
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert!(parsed.is_object(), "state file should be a JSON object");
+    }
+
+    #[test]
+    fn migrate_options_default_values() {
+        let opts = MigrateOptions::default();
+        assert!(!opts.dry_run);
+        assert!(opts.backup_dir.is_none());
+        assert_eq!(opts.cleanup_backups_older_than, 7 * 24 * 3600);
+    }
 }

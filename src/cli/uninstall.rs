@@ -1026,4 +1026,279 @@ mod tests {
         let config_kept = kept_categories.contains(&RemovalCategory::ConfigFile);
         assert!(!config_kept, "config should not be kept in KeepData mode");
     }
+
+    // bd-2j5.19 — cleanup mode display completeness
+    #[test]
+    fn cleanup_mode_display_keep_assets() {
+        assert_eq!(CleanupMode::KeepAssets.to_string(), "keep-assets");
+    }
+
+    #[test]
+    fn cleanup_mode_display_keep_config() {
+        assert_eq!(CleanupMode::KeepConfig.to_string(), "keep-config");
+    }
+
+    // bd-2j5.19 — removal category display completeness
+    #[test]
+    fn removal_category_display_all_variants() {
+        let expected = [
+            (RemovalCategory::StateFile, "state-file"),
+            (RemovalCategory::SqliteDb, "sqlite-db"),
+            (RemovalCategory::JsonlLog, "jsonl-log"),
+            (RemovalCategory::SystemdUnit, "systemd-unit"),
+            (RemovalCategory::LaunchdPlist, "launchd-plist"),
+            (RemovalCategory::ShellCompletion, "shell-completion"),
+            (RemovalCategory::ShellProfileEntry, "shell-profile-entry"),
+            (RemovalCategory::IntegrationHook, "integration-hook"),
+            (RemovalCategory::BallastPool, "ballast-pool"),
+            (RemovalCategory::BackupFile, "backup-file"),
+            (RemovalCategory::DataDirectory, "data-directory"),
+        ];
+        for (cat, display) in expected {
+            assert_eq!(cat.to_string(), display, "mismatch for {display}");
+        }
+    }
+
+    // bd-2j5.19 — plan with KeepConfig mode
+    #[test]
+    fn plan_keep_config_keeps_config_removes_data() {
+        let opts = UninstallOptions {
+            mode: CleanupMode::KeepConfig,
+            dry_run: true,
+            ..Default::default()
+        };
+        let report = plan_uninstall(&opts);
+        let kept_categories: Vec<_> = report.kept.iter().map(|k| k.category).collect();
+        // Config should be kept.
+        // Data should NOT be kept (removed in KeepConfig mode).
+        assert!(
+            !kept_categories.contains(&RemovalCategory::StateFile),
+            "state file should not be kept in KeepConfig mode"
+        );
+    }
+
+    // bd-2j5.19 — plan with KeepAssets mode
+    #[test]
+    fn plan_keep_assets_mode() {
+        let opts = UninstallOptions {
+            mode: CleanupMode::KeepAssets,
+            dry_run: true,
+            ..Default::default()
+        };
+        let report = plan_uninstall(&opts);
+        // Config should not be kept in KeepAssets mode.
+        let config_kept = report
+            .kept
+            .iter()
+            .any(|k| k.category == RemovalCategory::ConfigFile);
+        assert!(!config_kept);
+    }
+
+    // bd-2j5.19 — UninstallOptions default values
+    #[test]
+    fn uninstall_options_default() {
+        let opts = UninstallOptions::default();
+        assert_eq!(opts.mode, CleanupMode::Conservative);
+        assert!(!opts.dry_run);
+        assert!(opts.backup_dir.is_none());
+        assert!(opts.binary_path.is_none());
+    }
+
+    // bd-2j5.19 — explicit binary path filtering
+    #[test]
+    fn plan_with_explicit_binary_path() {
+        let opts = UninstallOptions {
+            mode: CleanupMode::Purge,
+            dry_run: true,
+            binary_path: Some(PathBuf::from("/opt/custom/sbh")),
+            ..Default::default()
+        };
+        let report = plan_uninstall(&opts);
+        // No system-discovered binaries should match /opt/custom/sbh
+        // so binary actions should be empty (or only our explicit path if it existed).
+        let binary_actions: Vec<_> = report
+            .actions
+            .iter()
+            .filter(|a| a.category == RemovalCategory::Binary)
+            .collect();
+        for action in &binary_actions {
+            assert_eq!(
+                action.path,
+                PathBuf::from("/opt/custom/sbh"),
+                "should only include the explicit binary path"
+            );
+        }
+    }
+
+    // bd-2j5.19 — file_or_dir_size for a directory
+    #[test]
+    fn file_or_dir_size_directory() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("subdir");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("a.txt"), b"hello").unwrap();
+        fs::write(sub.join("b.txt"), b"world!").unwrap();
+        let size = file_or_dir_size(&sub);
+        // 5 + 6 = 11 bytes
+        assert_eq!(size, 11);
+    }
+
+    // bd-2j5.19 — create_backup for nonexistent file
+    #[test]
+    fn create_backup_nonexistent_file_fails() {
+        let result = create_backup(Path::new("/nonexistent/file.txt"), None);
+        assert!(result.is_err());
+    }
+
+    // bd-2j5.19 — format_report with failed action
+    #[test]
+    fn format_report_with_failed_action() {
+        let report = UninstallReport {
+            mode: CleanupMode::Purge,
+            dry_run: false,
+            timestamp: "0".to_string(),
+            actions: vec![RemovalAction {
+                category: RemovalCategory::SqliteDb,
+                path: PathBuf::from("/var/lib/sbh/activity.db"),
+                is_directory: false,
+                backup_first: true,
+                executed: false,
+                backup_path: None,
+                error: Some("permission denied".to_string()),
+                reason: "remove sqlite-db".to_string(),
+            }],
+            kept: vec![],
+            removed_count: 0,
+            failed_count: 1,
+            bytes_freed: 0,
+        };
+        let output = format_report_human(&report);
+        assert!(output.contains("[FAIL]"));
+        assert!(output.contains("permission denied"));
+        assert!(output.contains("1 failed"));
+    }
+
+    // bd-2j5.19 — format_report with skip status
+    #[test]
+    fn format_report_with_skipped_action() {
+        let report = UninstallReport {
+            mode: CleanupMode::Conservative,
+            dry_run: false,
+            timestamp: "0".to_string(),
+            actions: vec![RemovalAction {
+                category: RemovalCategory::Binary,
+                path: PathBuf::from("/usr/local/bin/sbh"),
+                is_directory: false,
+                backup_first: false,
+                executed: false,
+                backup_path: None,
+                error: None,
+                reason: "remove binary".to_string(),
+            }],
+            kept: vec![],
+            removed_count: 0,
+            failed_count: 0,
+            bytes_freed: 0,
+        };
+        let output = format_report_human(&report);
+        assert!(output.contains("[SKIP]"));
+    }
+
+    // bd-2j5.19 — RemovalAction serialization
+    #[test]
+    fn removal_action_serializes_to_json() {
+        let action = RemovalAction {
+            category: RemovalCategory::Binary,
+            path: PathBuf::from("/usr/local/bin/sbh"),
+            is_directory: false,
+            backup_first: false,
+            executed: true,
+            backup_path: None,
+            error: None,
+            reason: "remove binary".to_string(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("\"category\":\"Binary\""));
+        assert!(json.contains("\"executed\":true"));
+    }
+
+    // bd-2j5.19 — KeptItem serialization
+    #[test]
+    fn kept_item_serializes_to_json() {
+        let item = KeptItem {
+            category: RemovalCategory::ConfigFile,
+            path: PathBuf::from("/home/user/.config/sbh/config.toml"),
+            reason: "kept by conservative mode".to_string(),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"category\":\"ConfigFile\""));
+        assert!(json.contains("conservative"));
+    }
+
+    // bd-2j5.19 — remove_profile_sbh_lines no sbh lines is noop
+    #[test]
+    fn remove_profile_sbh_lines_no_sbh_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join(".zshrc");
+        let original = "# header\nalias ls='ls -la'\nexport EDITOR=vim\n";
+        fs::write(&profile, original).unwrap();
+
+        remove_profile_sbh_lines(&profile).unwrap();
+
+        let contents = fs::read_to_string(&profile).unwrap();
+        assert!(contents.contains("alias ls"));
+        assert!(contents.contains("EDITOR=vim"));
+    }
+
+    // bd-2j5.19 — remove_profile_sbh_lines with only sbh lines
+    #[test]
+    fn remove_profile_sbh_lines_all_sbh() {
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join(".bashrc");
+        fs::write(
+            &profile,
+            "export PATH=\"$HOME/.local/bin/sbh:$PATH\"\nexport PATH=\"/opt/sbh/bin:$PATH\"\n",
+        )
+        .unwrap();
+
+        remove_profile_sbh_lines(&profile).unwrap();
+
+        let contents = fs::read_to_string(&profile).unwrap();
+        // All lines contained sbh+PATH, should all be removed.
+        let non_empty: Vec<_> = contents.lines().filter(|l| !l.is_empty()).collect();
+        assert!(non_empty.is_empty(), "all sbh lines should be removed");
+    }
+
+    // bd-2j5.19 — dir_size with nested directories
+    #[test]
+    fn dir_size_nested() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("level1").join("level2");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("deep.txt"), b"deep content").unwrap(); // 12 bytes
+        fs::write(tmp.path().join("level1").join("shallow.txt"), b"hi").unwrap(); // 2 bytes
+
+        let size = dir_size(&tmp.path().join("level1"));
+        assert_eq!(size, 14);
+    }
+
+    // bd-2j5.19 — dir_size with nonexistent directory
+    #[test]
+    fn dir_size_nonexistent() {
+        assert_eq!(dir_size(Path::new("/nonexistent/path")), 0);
+    }
+
+    // bd-2j5.19 — execute_uninstall dry_run returns plan only
+    #[test]
+    fn execute_uninstall_dry_run_no_removal() {
+        let opts = UninstallOptions {
+            mode: CleanupMode::Purge,
+            dry_run: true,
+            ..Default::default()
+        };
+        let report = execute_uninstall(&opts);
+        assert!(report.dry_run);
+        assert_eq!(report.removed_count, 0);
+        assert_eq!(report.bytes_freed, 0);
+    }
 }

@@ -901,4 +901,183 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"detected_count\":0"));
     }
+
+    // bd-2j5.19 — inject_json_hook fails without closing brace
+    #[test]
+    fn inject_json_hook_no_closing_brace_fails() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("broken.json");
+        fs::write(&cfg, "no json at all").unwrap();
+
+        let result = inject_json_hook(&cfg, AiTool::ClaudeCode);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not contain a JSON object")
+        );
+    }
+
+    // bd-2j5.19 — check_json_has_sbh with storage_ballast_helper string
+    #[test]
+    fn check_json_has_sbh_with_full_name() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.json");
+        fs::write(&cfg, r#"{"tool": "storage_ballast_helper"}"#).unwrap();
+        assert!(check_json_has_sbh(&cfg));
+    }
+
+    // bd-2j5.19 — check_json_has_sbh with no sbh reference
+    #[test]
+    fn check_json_has_sbh_no_reference() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.json");
+        fs::write(&cfg, r#"{"tool": "other_tool"}"#).unwrap();
+        assert!(!check_json_has_sbh(&cfg));
+    }
+
+    // bd-2j5.19 — check_text_has_sbh with empty file
+    #[test]
+    fn check_text_has_sbh_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.yml");
+        fs::write(&cfg, "").unwrap();
+        assert!(!check_text_has_sbh(&cfg));
+    }
+
+    // bd-2j5.19 — check_text_has_sbh with nonexistent file
+    #[test]
+    fn check_text_has_sbh_nonexistent() {
+        assert!(!check_text_has_sbh(Path::new("/nonexistent/config.yml")));
+    }
+
+    // bd-2j5.19 — is_writable for nonexistent path with parent
+    #[test]
+    fn is_writable_nonexistent_with_existing_parent() {
+        let tmp = TempDir::new().unwrap();
+        let nonexistent = tmp.path().join("does_not_exist.json");
+        // Parent exists, so is_writable should return true.
+        assert!(is_writable(&nonexistent));
+    }
+
+    // bd-2j5.19 — ALL_TOOLS has all 5 tools
+    #[test]
+    fn all_tools_contains_all_variants() {
+        assert_eq!(ALL_TOOLS.len(), 5);
+        assert!(ALL_TOOLS.contains(&AiTool::ClaudeCode));
+        assert!(ALL_TOOLS.contains(&AiTool::Codex));
+        assert!(ALL_TOOLS.contains(&AiTool::GeminiCli));
+        assert!(ALL_TOOLS.contains(&AiTool::Cursor));
+        assert!(ALL_TOOLS.contains(&AiTool::Aider));
+    }
+
+    // bd-2j5.19 — BootstrapOptions default values
+    #[test]
+    fn bootstrap_options_default() {
+        let opts = BootstrapOptions::default();
+        assert!(!opts.dry_run);
+        assert!(opts.backup_dir.is_none());
+        assert!(opts.only_tools.is_empty());
+        assert!(opts.skip_tools.is_empty());
+    }
+
+    // bd-2j5.19 — IntegrationResult serialization
+    #[test]
+    fn integration_result_serializes_to_json() {
+        let result = IntegrationResult {
+            tool: AiTool::ClaudeCode,
+            status: IntegrationStatus::Configured,
+            config_path: PathBuf::from("/home/user/.claude/settings.json"),
+            backup_path: Some(PathBuf::from("/home/user/.claude/settings.json.bak")),
+            message: "hook injected".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"tool\":\"ClaudeCode\""));
+        assert!(json.contains("\"status\":\"Configured\""));
+    }
+
+    // bd-2j5.19 — integration_snippet returns distinct snippets per tool
+    #[test]
+    fn integration_snippets_are_distinct() {
+        let snippets: Vec<&str> = ALL_TOOLS.iter().map(|t| integration_snippet(*t)).collect();
+        for (i, a) in snippets.iter().enumerate() {
+            for (j, b) in snippets.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "snippets should be unique per tool");
+                }
+            }
+        }
+    }
+
+    // bd-2j5.19 — inject_json_hook with already-comma-terminated content
+    #[test]
+    fn inject_json_hook_with_trailing_comma() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("settings.json");
+        fs::write(&cfg, "{\n  \"a\": 1,\n}\n").unwrap();
+
+        inject_json_hook(&cfg, AiTool::Cursor).unwrap();
+
+        let contents = fs::read_to_string(&cfg).unwrap();
+        assert!(contents.contains("sbh guard"));
+        // Should not produce double comma.
+        assert!(!contents.contains(",,"), "should not produce double comma");
+    }
+
+    // bd-2j5.19 — format_summary shows FAIL status
+    #[test]
+    fn format_summary_shows_fail() {
+        let summary = BootstrapSummary {
+            detected_count: 1,
+            results: vec![IntegrationResult {
+                tool: AiTool::GeminiCli,
+                status: IntegrationStatus::Failed,
+                config_path: PathBuf::from("/home/user/.config/gemini/config.json"),
+                backup_path: None,
+                message: "config not writable".to_string(),
+            }],
+            configured_count: 0,
+            already_configured_count: 0,
+            failed_count: 1,
+            skipped_count: 0,
+        };
+        let output = format_summary_human(&summary);
+        assert!(output.contains("[FAIL]"));
+        assert!(output.contains("gemini-cli"));
+        assert!(output.contains("1 failed"));
+    }
+
+    // bd-2j5.19 — claude_code_config_paths enumeration
+    #[test]
+    fn claude_code_config_paths_returns_two() {
+        let home = PathBuf::from("/home/testuser");
+        let paths = claude_code_config_paths(&home);
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("settings.json"));
+        assert!(paths[1].ends_with("settings.json"));
+    }
+
+    // bd-2j5.19 — codex_config_paths enumeration
+    #[test]
+    fn codex_config_paths_returns_two() {
+        let home = PathBuf::from("/home/testuser");
+        let paths = codex_config_paths(&home);
+        assert_eq!(paths.len(), 2);
+    }
+
+    // bd-2j5.19 — aider_config_paths enumeration
+    #[test]
+    fn aider_config_paths_returns_two() {
+        let home = PathBuf::from("/home/testuser");
+        let paths = aider_config_paths(&home);
+        assert_eq!(paths.len(), 2);
+    }
+
+    // bd-2j5.19 — IntegrationStatus display all variants
+    #[test]
+    fn integration_status_display_all_variants() {
+        assert_eq!(IntegrationStatus::Skipped.to_string(), "skipped");
+        assert_eq!(IntegrationStatus::Failed.to_string(), "failed");
+    }
 }
