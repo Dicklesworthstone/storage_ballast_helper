@@ -33,7 +33,7 @@ Goal: map each dcg installer/update capability to explicit `sbh`/`fsfs` behavior
 | Uninstall parity | Safe cleanup + optional purge | `sbh uninstall` supports dry-run/confirm/purge tiers and rollback-safe teardown | planned | `bd-2j5.17` | unit: `bd-2j5.19`; e2e: `bd-2j5.14`; logs: `bd-2j5.18` |
 | Structured observability | Phase-level diagnostics | Trace-ID correlated start/success/failure events for install/update flows | planned | `bd-2j5.18` | unit: `bd-2j5.19`; e2e: `bd-2j5.14`; logs: `bd-2j5.18` |
 | Unit-test matrix | Coverage of installer/update internals | Dedicated deterministic unit suite with explicit schema/behavior contracts | planned | `bd-2j5.19` | unit: `bd-2j5.19` |
-| Offline/airgapped mode | Limited parity in dcg; desired for sbh | Offline bundle flow for installer/update/assets using local artifact manifests | planned | `bd-2j5.20` | unit: `bd-2j5.19`; e2e: `bd-2j5.14` |
+| Offline/airgapped mode | Limited parity in dcg; desired for sbh | Offline bundle flow for installer/update/assets using local artifact manifests, deterministic layout fallback (nested then flat), and strict path-safety checks (`..`, absolute, prefix rejected) | planned | `bd-2j5.20` | unit: `bd-2j5.19`; e2e: `bd-2j5.14` |
 | Migration + self-heal | Repair stale footprints | Detect and repair partial/legacy installs with backup-first mutation model | planned | `bd-2j5.21` | unit: `bd-2j5.19`; e2e: `bd-2j5.14`; logs: `bd-2j5.18` |
 
 ## Explicit CLI/Flag Contract
@@ -87,6 +87,15 @@ All flags below are contract-level and must be kept stable unless the parity mat
 | `--keep-config` | Preserve configs | Removes binaries/services while retaining user config |
 | `--rollback` | Restore previous install state | Reinstalls from latest valid backup snapshot |
 | `--json` | Machine output mode | Structured uninstall events and reason codes |
+
+## Offline Bundle Contract (bd-2j5.20)
+
+The offline bundle contract is intentionally strict so airgapped installs stay deterministic and safe:
+
+1. Bundle lookups prefer nested layout `<bundle>/<asset-name>/<asset-version>/<filename>` and then fall back to flat layout `<bundle>/<filename>`.
+2. Bundle path components must be relative and normal-path only; parent traversal (`..`), root/prefix paths, and other non-normal components are rejected.
+3. Restored assets must pass SHA-256 verification before being copied into cache/install paths.
+4. If bundle lookup or verification fails, offline mode must fail fast with actionable diagnostics (no silent network fallback in explicit offline mode).
 
 ## Security Policy Contract
 

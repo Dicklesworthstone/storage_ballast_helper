@@ -9,7 +9,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -412,6 +412,52 @@ pub struct FetchSummary {
     pub total_bytes_downloaded: u64,
 }
 
+/// Status of an asset entry while building an offline bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BundleAssetStatus {
+    /// Asset was copied into the bundle.
+    Copied,
+    /// Asset was not available in cache (or only partial).
+    Missing,
+    /// Asset exists in cache but failed integrity checks.
+    Corrupt,
+}
+
+impl fmt::Display for BundleAssetStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Copied => f.write_str("copied"),
+            Self::Missing => f.write_str("missing"),
+            Self::Corrupt => f.write_str("corrupt"),
+        }
+    }
+}
+
+/// Per-asset result row from [`build_offline_bundle`].
+#[derive(Debug, Clone, Serialize)]
+pub struct BundleAssetResult {
+    pub name: String,
+    pub version: String,
+    pub required: bool,
+    pub status: BundleAssetStatus,
+    pub source_path: Option<PathBuf>,
+    pub destination_path: Option<PathBuf>,
+    pub bytes_copied: u64,
+    pub message: String,
+}
+
+/// Summary report from offline bundle build.
+#[derive(Debug, Clone, Serialize)]
+pub struct BundleBuildReport {
+    pub manifest_path: PathBuf,
+    pub results: Vec<BundleAssetResult>,
+    pub copied_count: usize,
+    pub missing_count: usize,
+    pub corrupt_count: usize,
+    pub total_bytes_copied: u64,
+    pub ready: bool,
+}
+
 /// Run the fetch pipeline for all manifest assets.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -580,6 +626,134 @@ pub fn fetch_assets(
     }
 }
 
+/// Build a deterministic offline bundle from local cache + manifest.
+///
+/// Files are copied to `<bundle_root>/<name>/<version>/<filename>`. A normalized
+/// manifest snapshot is written at `<bundle_root>/manifest.json`.
+///
+/// # Errors
+/// Returns an error when directory creation, manifest serialization/writing, or
+/// file copies fail.
+#[allow(clippy::too_many_lines)]
+pub fn build_offline_bundle(
+    manifest: &AssetManifest,
+    cache: &AssetCache,
+    bundle_root: &Path,
+) -> io::Result<BundleBuildReport> {
+    fs::create_dir_all(bundle_root)?;
+
+    let mut sorted_assets = manifest.assets.clone();
+    sorted_assets.sort_by(|left, right| {
+        (
+            left.name.as_str(),
+            left.version.as_str(),
+            left.url.as_str(),
+            left.required,
+        )
+            .cmp(&(
+                right.name.as_str(),
+                right.version.as_str(),
+                right.url.as_str(),
+                right.required,
+            ))
+    });
+
+    let manifest_snapshot = AssetManifest {
+        version: manifest.version.clone(),
+        assets: sorted_assets.clone(),
+    };
+    let manifest_path = bundle_manifest_path(bundle_root);
+    let manifest_json = serde_json::to_string_pretty(&manifest_snapshot).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to serialize bundle manifest: {e}"),
+        )
+    })?;
+    fs::write(&manifest_path, manifest_json)?;
+
+    let mut results = Vec::with_capacity(sorted_assets.len());
+    let mut total_bytes_copied = 0_u64;
+    let mut copied_count = 0_usize;
+    let mut missing_count = 0_usize;
+    let mut corrupt_count = 0_usize;
+
+    for entry in &sorted_assets {
+        let source_path = cache.asset_path(entry);
+        match cache.is_cached(entry) {
+            CacheStatus::Valid => {
+                let filename = url_filename(&entry.url);
+                let relative = Path::new(&entry.name).join(&entry.version).join(&filename);
+                let Some(safe_relative) = sanitize_relative_bundle_path(&relative) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "bundle destination path is unsafe for asset '{}' v{}",
+                            entry.name, entry.version
+                        ),
+                    ));
+                };
+                let destination_path = bundle_root.join(safe_relative);
+                if let Some(parent) = destination_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let bytes_copied = fs::copy(&source_path, &destination_path)?;
+                total_bytes_copied += bytes_copied;
+                copied_count += 1;
+                results.push(BundleAssetResult {
+                    name: entry.name.clone(),
+                    version: entry.version.clone(),
+                    required: entry.required,
+                    status: BundleAssetStatus::Copied,
+                    source_path: Some(source_path),
+                    destination_path: Some(destination_path),
+                    bytes_copied,
+                    message: format!("copied to bundle ({bytes_copied} bytes)"),
+                });
+            }
+            CacheStatus::Missing | CacheStatus::Partial { .. } => {
+                missing_count += 1;
+                results.push(BundleAssetResult {
+                    name: entry.name.clone(),
+                    version: entry.version.clone(),
+                    required: entry.required,
+                    status: BundleAssetStatus::Missing,
+                    source_path: None,
+                    destination_path: None,
+                    bytes_copied: 0,
+                    message: "asset missing from cache".to_string(),
+                });
+            }
+            CacheStatus::Corrupt { expected, actual } => {
+                corrupt_count += 1;
+                results.push(BundleAssetResult {
+                    name: entry.name.clone(),
+                    version: entry.version.clone(),
+                    required: entry.required,
+                    status: BundleAssetStatus::Corrupt,
+                    source_path: Some(source_path),
+                    destination_path: None,
+                    bytes_copied: 0,
+                    message: format!("cache integrity mismatch: expected {expected} got {actual}"),
+                });
+            }
+        }
+    }
+
+    let ready = results
+        .iter()
+        .all(|result| !result.required || matches!(result.status, BundleAssetStatus::Copied));
+
+    Ok(BundleBuildReport {
+        manifest_path,
+        results,
+        copied_count,
+        missing_count,
+        corrupt_count,
+        total_bytes_copied,
+        ready,
+    })
+}
+
 #[derive(Debug)]
 enum BundleRestoreOutcome {
     Copied { source: PathBuf, bytes: u64 },
@@ -611,20 +785,44 @@ fn restore_from_bundle(
 
 fn resolve_bundle_source(entry: &AssetEntry, bundle_root: &Path) -> Option<PathBuf> {
     let filename = url_filename(&entry.url);
-    let nested = bundle_root
-        .join(&entry.name)
-        .join(&entry.version)
-        .join(&filename);
-    if nested.is_file() {
-        return Some(nested);
+
+    let nested_rel = Path::new(&entry.name).join(&entry.version).join(&filename);
+    if let Some(safe_nested_rel) = sanitize_relative_bundle_path(&nested_rel) {
+        let nested = bundle_root.join(safe_nested_rel);
+        if nested.is_file() {
+            return Some(nested);
+        }
     }
 
-    let flat = bundle_root.join(filename);
-    if flat.is_file() {
-        return Some(flat);
+    if let Some(safe_filename) = sanitize_relative_bundle_path(Path::new(&filename)) {
+        let flat = bundle_root.join(safe_filename);
+        if flat.is_file() {
+            return Some(flat);
+        }
     }
 
     None
+}
+
+fn sanitize_relative_bundle_path(path: &Path) -> Option<PathBuf> {
+    let mut sanitized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => sanitized.push(segment),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return None;
+            }
+        }
+    }
+
+    if sanitized.as_os_str().is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
 }
 
 /// Download an asset and verify its integrity.
@@ -728,6 +926,27 @@ fn url_filename(url: &str) -> String {
         .to_string()
 }
 
+/// Canonical manifest location inside an offline bundle root.
+#[must_use]
+pub fn bundle_manifest_path(bundle_root: &Path) -> PathBuf {
+    bundle_root.join("manifest.json")
+}
+
+/// Load an offline bundle manifest from `bundle_root/manifest.json`.
+///
+/// # Errors
+/// Returns an error if manifest file cannot be read or parsed.
+pub fn load_offline_bundle_manifest(bundle_root: &Path) -> io::Result<AssetManifest> {
+    let path = bundle_manifest_path(bundle_root);
+    let raw = fs::read_to_string(&path)?;
+    AssetManifest::from_json(&raw).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid offline bundle manifest {}: {e}", path.display()),
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Offline diagnostics
 // ---------------------------------------------------------------------------
@@ -781,6 +1000,36 @@ pub fn offline_readiness_with_bundle(
 
     let ready = missing_required.is_empty() && corrupt.is_empty();
 
+    OfflineReport {
+        ready,
+        missing_required,
+        missing_optional,
+        corrupt,
+    }
+}
+
+/// Check offline readiness using bundle files only (ignores local cache).
+#[must_use]
+pub fn offline_bundle_readiness(manifest: &AssetManifest, bundle_root: &Path) -> OfflineReport {
+    let mut missing_required = Vec::new();
+    let mut missing_optional = Vec::new();
+    let mut corrupt = Vec::new();
+
+    for entry in &manifest.assets {
+        match bundle_cache_status(entry, bundle_root) {
+            CacheStatus::Valid => {}
+            CacheStatus::Missing | CacheStatus::Partial { .. } => {
+                if entry.required {
+                    missing_required.push(entry.name.clone());
+                } else {
+                    missing_optional.push(entry.name.clone());
+                }
+            }
+            CacheStatus::Corrupt { .. } => corrupt.push(entry.name.clone()),
+        }
+    }
+
+    let ready = missing_required.is_empty() && corrupt.is_empty();
     OfflineReport {
         ready,
         missing_required,
@@ -1095,6 +1344,128 @@ mod tests {
     }
 
     #[test]
+    fn build_offline_bundle_writes_sorted_manifest_and_copies_assets() {
+        let cache_tmp = TempDir::new().unwrap();
+        let bundle_tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(cache_tmp.path().to_path_buf());
+
+        let alpha_bytes = b"alpha-model";
+        let zeta_bytes = b"zeta-model";
+        let alpha = AssetEntry {
+            name: "alpha-model".to_string(),
+            version: "1.0.0".to_string(),
+            sha256: sha256_of(alpha_bytes),
+            url: "https://example.com/alpha-model.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: alpha_bytes.len() as u64,
+            required: true,
+            description: String::new(),
+        };
+        let zeta = AssetEntry {
+            name: "zeta-model".to_string(),
+            version: "1.0.0".to_string(),
+            sha256: sha256_of(zeta_bytes),
+            url: "https://example.com/zeta-model.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: zeta_bytes.len() as u64,
+            required: true,
+            description: String::new(),
+        };
+
+        seed_cache_entry(&cache, &alpha, alpha_bytes);
+        seed_cache_entry(&cache, &zeta, zeta_bytes);
+
+        // Intentionally unsorted input to validate deterministic output order.
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![zeta.clone(), alpha.clone()],
+        };
+
+        let report = build_offline_bundle(&manifest, &cache, bundle_tmp.path()).unwrap();
+        assert!(report.ready);
+        assert_eq!(report.copied_count, 2);
+        assert_eq!(report.missing_count, 0);
+        assert_eq!(report.corrupt_count, 0);
+        assert_eq!(report.results[0].name, "alpha-model");
+        assert_eq!(report.results[1].name, "zeta-model");
+
+        let alpha_bundle_path = bundle_tmp
+            .path()
+            .join("alpha-model")
+            .join("1.0.0")
+            .join("alpha-model.bin");
+        let zeta_bundle_path = bundle_tmp
+            .path()
+            .join("zeta-model")
+            .join("1.0.0")
+            .join("zeta-model.bin");
+        assert_eq!(fs::read(alpha_bundle_path).unwrap(), alpha_bytes);
+        assert_eq!(fs::read(zeta_bundle_path).unwrap(), zeta_bytes);
+
+        let loaded = load_offline_bundle_manifest(bundle_tmp.path()).unwrap();
+        assert_eq!(loaded.assets.len(), 2);
+        assert_eq!(loaded.assets[0].name, "alpha-model");
+        assert_eq!(loaded.assets[1].name, "zeta-model");
+        assert_eq!(
+            report.manifest_path,
+            bundle_manifest_path(bundle_tmp.path())
+        );
+    }
+
+    #[test]
+    fn build_offline_bundle_reports_missing_and_corrupt_assets() {
+        let cache_tmp = TempDir::new().unwrap();
+        let bundle_tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(cache_tmp.path().to_path_buf());
+
+        let required_missing = AssetEntry {
+            name: "required-model".to_string(),
+            version: "1.0.0".to_string(),
+            sha256: sha256_of(b"required"),
+            url: "https://example.com/required-model.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: 8,
+            required: true,
+            description: String::new(),
+        };
+        let optional_corrupt = AssetEntry {
+            name: "optional-model".to_string(),
+            version: "1.0.0".to_string(),
+            sha256: sha256_of(b"expected"),
+            url: "https://example.com/optional-model.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: 8,
+            required: false,
+            description: String::new(),
+        };
+
+        // Seed corrupt cache content for optional entry.
+        seed_cache_entry(&cache, &optional_corrupt, b"actual");
+
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![required_missing.clone(), optional_corrupt.clone()],
+        };
+
+        let report = build_offline_bundle(&manifest, &cache, bundle_tmp.path()).unwrap();
+        assert!(
+            !report.ready,
+            "required missing entry should fail readiness"
+        );
+        assert_eq!(report.copied_count, 0);
+        assert_eq!(report.missing_count, 1);
+        assert_eq!(report.corrupt_count, 1);
+        assert!(report.results.iter().any(|result| {
+            result.name == required_missing.name
+                && matches!(result.status, BundleAssetStatus::Missing)
+        }));
+        assert!(report.results.iter().any(|result| {
+            result.name == optional_corrupt.name
+                && matches!(result.status, BundleAssetStatus::Corrupt)
+        }));
+    }
+
+    #[test]
     fn fetch_dry_run_does_not_create_files() {
         let tmp = TempDir::new().unwrap();
         let cache = AssetCache::new(tmp.path().to_path_buf());
@@ -1262,6 +1633,52 @@ mod tests {
                 .message
                 .contains("bundle integrity check failed")
         );
+    }
+
+    #[test]
+    fn fetch_offline_rejects_bundle_parent_dir_escape() {
+        let root_tmp = TempDir::new().unwrap();
+        let bundle_root = root_tmp.path().join("bundle");
+        fs::create_dir_all(&bundle_root).unwrap();
+        let cache_tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(cache_tmp.path().to_path_buf());
+
+        let bytes = b"escaped-bundle-asset";
+        let entry = AssetEntry {
+            name: "../outside".to_string(),
+            version: "2.0.0".to_string(),
+            sha256: sha256_of(bytes),
+            url: "https://example.com/scoring-model-2.0.0.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: bytes.len() as u64,
+            required: true,
+            description: String::new(),
+        };
+        let filename = url_filename(&entry.url);
+        let escaped_path = root_tmp
+            .path()
+            .join("outside")
+            .join(&entry.version)
+            .join(filename);
+        fs::create_dir_all(escaped_path.parent().unwrap()).unwrap();
+        fs::write(&escaped_path, bytes).unwrap();
+
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![entry.clone()],
+        };
+        let opts = FetchOptions {
+            offline: true,
+            bundle_root: Some(bundle_root),
+            ..Default::default()
+        };
+
+        let summary = fetch_assets(&manifest, &cache, &opts);
+        assert_eq!(summary.failed_count, 1);
+        assert_eq!(summary.downloaded_count, 0);
+        assert_eq!(summary.results[0].status, FetchStatus::Failed);
+        assert!(summary.results[0].message.contains("offline mode"));
+        assert!(!cache.asset_path(&entry).exists());
     }
 
     #[test]
@@ -1479,6 +1896,94 @@ mod tests {
     }
 
     #[test]
+    fn offline_readiness_rejects_bundle_parent_dir_escape() {
+        let cache_tmp = TempDir::new().unwrap();
+        let root_tmp = TempDir::new().unwrap();
+        let bundle_root = root_tmp.path().join("bundle");
+        fs::create_dir_all(&bundle_root).unwrap();
+        let cache = AssetCache::new(cache_tmp.path().to_path_buf());
+
+        let bytes = b"escaped-bundle-model";
+        let entry = AssetEntry {
+            name: "../outside".to_string(),
+            version: "1.0.0".to_string(),
+            sha256: sha256_of(bytes),
+            url: "https://example.com/model.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: bytes.len() as u64,
+            required: true,
+            description: String::new(),
+        };
+        let filename = url_filename(&entry.url);
+        let escaped_path = root_tmp
+            .path()
+            .join("outside")
+            .join(&entry.version)
+            .join(filename);
+        fs::create_dir_all(escaped_path.parent().unwrap()).unwrap();
+        fs::write(&escaped_path, bytes).unwrap();
+
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![entry.clone()],
+        };
+
+        let report = offline_readiness_with_bundle(&manifest, &cache, Some(&bundle_root));
+        assert!(!report.ready);
+        assert!(report.missing_required.contains(&entry.name));
+        assert!(report.corrupt.is_empty());
+    }
+
+    #[test]
+    fn offline_bundle_readiness_ignores_cache_and_uses_bundle_only() {
+        let cache_tmp = TempDir::new().unwrap();
+        let bundle_tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(cache_tmp.path().to_path_buf());
+
+        let bytes = b"bundle-only-model";
+        let entry = AssetEntry {
+            name: "model".to_string(),
+            version: "1.0.0".to_string(),
+            sha256: sha256_of(bytes),
+            url: "https://example.com/model.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: bytes.len() as u64,
+            required: true,
+            description: String::new(),
+        };
+
+        let bundle_path = bundle_tmp
+            .path()
+            .join("model")
+            .join("1.0.0")
+            .join("model.bin");
+        fs::create_dir_all(bundle_path.parent().unwrap()).unwrap();
+        fs::write(bundle_path, bytes).unwrap();
+
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![entry.clone()],
+        };
+
+        let cache_report = offline_readiness(&manifest, &cache);
+        assert!(!cache_report.ready);
+
+        let bundle_report = offline_bundle_readiness(&manifest, bundle_tmp.path());
+        assert!(bundle_report.ready);
+        assert!(bundle_report.missing_required.is_empty());
+    }
+
+    #[test]
+    fn load_offline_bundle_manifest_invalid_json_errors() {
+        let bundle_tmp = TempDir::new().unwrap();
+        fs::write(bundle_manifest_path(bundle_tmp.path()), "{ invalid json ").unwrap();
+
+        let err = load_offline_bundle_manifest(bundle_tmp.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid offline bundle manifest"));
+    }
+
+    #[test]
     fn url_filename_extraction() {
         assert_eq!(
             url_filename("https://example.com/path/model.bin"),
@@ -1527,6 +2032,12 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         hex_encode(&hasher.finalize())
+    }
+
+    fn seed_cache_entry(cache: &AssetCache, entry: &AssetEntry, bytes: &[u8]) {
+        let path = cache.asset_path(entry);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
     }
 
     #[test]
