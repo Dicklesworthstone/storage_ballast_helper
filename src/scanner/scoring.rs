@@ -448,7 +448,11 @@ fn decide_action(
     } else if delete_loss < keep_loss {
         let min_delete_posterior =
             (1.0 - calibration.clamp(0.0, 1.0)).mul_add(0.20, 0.20f64.mul_add(uncertainty, 0.60));
-        if posterior_abandoned >= min_delete_posterior.clamp(0.60, 0.95) {
+        let delete_advantage = delete_advantage_ratio(keep_loss, delete_loss);
+        let required_advantage = min_delete_advantage(calibration, uncertainty);
+        if posterior_abandoned >= min_delete_posterior.clamp(0.60, 0.95)
+            && delete_advantage >= required_advantage
+        {
             DecisionAction::Delete
         } else {
             DecisionAction::Review
@@ -456,6 +460,23 @@ fn decide_action(
     } else {
         DecisionAction::Keep
     }
+}
+
+fn delete_advantage_ratio(keep_loss: f64, delete_loss: f64) -> f64 {
+    let safe_keep = keep_loss.max(0.0);
+    let safe_delete = delete_loss.max(0.0);
+    if safe_delete <= f64::EPSILON {
+        f64::INFINITY
+    } else {
+        safe_keep / safe_delete
+    }
+}
+
+fn min_delete_advantage(calibration: f64, uncertainty: f64) -> f64 {
+    let calibration_penalty = 1.0 - calibration.clamp(0.0, 1.0);
+    uncertainty
+        .mul_add(1.6, calibration_penalty.mul_add(0.9, 1.2))
+        .clamp(1.2, 4.0)
 }
 
 fn epistemic_uncertainty(posterior_abandoned: f64, calibration: f64) -> f64 {
@@ -529,13 +550,28 @@ fn build_ledger(
             value: uncertainty,
             contribution: uncertainty,
         },
+        EvidenceTerm {
+            name: "delete_advantage_ratio",
+            weight: 1.0,
+            value: delete_advantage_ratio(expected_loss_keep, expected_loss_delete),
+            contribution: delete_advantage_ratio(expected_loss_keep, expected_loss_delete),
+        },
+        EvidenceTerm {
+            name: "required_delete_advantage",
+            weight: 1.0,
+            value: min_delete_advantage(calibration, uncertainty),
+            contribution: min_delete_advantage(calibration, uncertainty),
+        },
     ];
     let decision_margin = expected_loss_keep - expected_loss_delete;
+    let delete_advantage = delete_advantage_ratio(expected_loss_keep, expected_loss_delete);
+    let required_delete_advantage = min_delete_advantage(calibration, uncertainty);
     let summary = format!(
         "posterior_abandoned={posterior_abandoned:.3}; keep_loss={expected_loss_keep:.2}; \
 delete_loss={expected_loss_delete:.2}; base_keep_loss={base_expected_loss_keep:.2}; \
 base_delete_loss={base_expected_loss_delete:.2}; loss_margin={decision_margin:.2}; \
-uncertainty={uncertainty:.3}; calibration={calibration:.3}; action={action:?}"
+uncertainty={uncertainty:.3}; calibration={calibration:.3}; delete_advantage={delete_advantage:.2}; \
+required_delete_advantage={required_delete_advantage:.2}; action={action:?}"
     );
     EvidenceLedger { terms, summary }
 }
@@ -713,6 +749,18 @@ mod tests {
     #[test]
     fn decision_boundary_allows_delete_when_margin_and_confidence_are_strong() {
         let action = super::decide_action(1.6, 0.45, 28.0, 4.0, 0.93, 0.90, false);
+        assert_eq!(action, DecisionAction::Delete);
+    }
+
+    #[test]
+    fn decision_boundary_reviews_when_advantage_ratio_is_too_weak_for_risk() {
+        let action = super::decide_action(1.6, 0.45, 30.0, 20.0, 0.90, 0.55, false);
+        assert_eq!(action, DecisionAction::Review);
+    }
+
+    #[test]
+    fn decision_boundary_deletes_when_advantage_ratio_clears_risk_threshold() {
+        let action = super::decide_action(1.6, 0.45, 30.0, 4.0, 0.92, 0.75, false);
         assert_eq!(action, DecisionAction::Delete);
     }
 
