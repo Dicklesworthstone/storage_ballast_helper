@@ -1483,9 +1483,11 @@ fn replay_canary_budget_exhaustion() {
         candidates.push(c);
     }
 
-    let mut config = PolicyConfig::default();
-    config.max_canary_deletes_per_hour = 3; // Low budget to trigger exhaustion.
-    config.initial_mode = ActiveMode::Canary;
+    let config = PolicyConfig {
+        max_canary_deletes_per_hour: 3, // Low budget to trigger exhaustion.
+        initial_mode: ActiveMode::Canary,
+        ..PolicyConfig::default()
+    };
 
     let mut engine = ReplayEngine::with_policy_config(seed, config);
 
@@ -1840,8 +1842,10 @@ fn replay_recovery_after_serialization_fault() {
     let mut rng = SeededRng::new(seed);
     let candidates = random_candidates(&mut rng, 10);
 
-    let mut config = PolicyConfig::default();
-    config.recovery_clean_windows = 2;
+    let config = PolicyConfig {
+        recovery_clean_windows: 2,
+        ..PolicyConfig::default()
+    };
 
     let mut engine = ReplayEngine::with_policy_config(seed, config);
 
@@ -1924,8 +1928,10 @@ fn replay_multi_fault_sequence() {
     let mut rng = SeededRng::new(seed);
     let candidates = random_candidates(&mut rng, 10);
 
-    let mut config = PolicyConfig::default();
-    config.recovery_clean_windows = 1;
+    let config = PolicyConfig {
+        recovery_clean_windows: 1,
+        ..PolicyConfig::default()
+    };
 
     let mut engine = ReplayEngine::with_policy_config(seed, config);
 
@@ -1991,13 +1997,10 @@ fn replay_multi_fault_sequence() {
     // Recover again.
     engine.execute_step(&ReplayStep {
         label: "recover-2".to_string(),
-        candidates: candidates.clone(),
+        candidates,
         urgency: 0.3,
         guard_observations: Vec::new(),
-        ops: vec![
-            PolicyOp::ObserveWindow(clean_diag.clone()),
-            PolicyOp::Evaluate,
-        ],
+        ops: vec![PolicyOp::ObserveWindow(clean_diag), PolicyOp::Evaluate],
     });
 
     // Should be back to enforce.
