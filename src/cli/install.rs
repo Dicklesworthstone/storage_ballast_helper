@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use super::{
+    HostSpecifier, IntegrityDecision, SigstorePolicy, VerificationMode,
+    resolve_bundle_artifact_contract, verify_artifact_supply_chain,
+};
 use crate::ballast::manager::BallastManager;
 use crate::core::config::{BallastConfig, Config, PathsConfig};
 // errors module available but not directly used in this module.
@@ -134,8 +138,23 @@ impl Default for InstallOptions {
 ///
 /// Service registration (systemd/launchd) is handled separately in `cli_app.rs`.
 pub fn run_install_sequence(opts: &InstallOptions) -> InstallReport {
+    run_install_sequence_with_bundle(opts, None)
+}
+
+/// Run install sequence with optional offline bundle preflight.
+///
+/// When `bundle_manifest_path` is provided, this validates the host-specific
+/// bundle contract and verifies artifact integrity before continuing.
+pub fn run_install_sequence_with_bundle(
+    opts: &InstallOptions,
+    bundle_manifest_path: Option<&Path>,
+) -> InstallReport {
     let mut report = InstallReport::new(opts.dry_run);
     let paths = &opts.config.paths;
+
+    if !run_bundle_preflight(bundle_manifest_path, opts.dry_run, &mut report) {
+        return report;
+    }
 
     // Step 1: Create data directory.
     let data_dir = paths
@@ -237,6 +256,88 @@ pub fn run_install_sequence(opts: &InstallOptions) -> InstallReport {
     // Mark overall success: config was written (or dry-run planned).
     report.success = report.steps.iter().all(|s| s.error.is_none());
     report
+}
+
+fn run_bundle_preflight(
+    bundle_manifest_path: Option<&Path>,
+    dry_run: bool,
+    report: &mut InstallReport,
+) -> bool {
+    let Some(manifest_path) = bundle_manifest_path else {
+        return true;
+    };
+
+    if dry_run {
+        report.step_plan(format!(
+            "Validate offline bundle manifest: {}",
+            manifest_path.display()
+        ));
+        report.step_plan("Verify offline bundle artifact integrity");
+        return true;
+    }
+
+    let host = match HostSpecifier::detect() {
+        Ok(host) => host,
+        Err(error) => {
+            report.step_fail("Detect host for offline bundle", error.to_string());
+            return false;
+        }
+    };
+
+    let resolution = match resolve_bundle_artifact_contract(host, manifest_path) {
+        Ok(resolution) => {
+            report.step_ok(format!(
+                "Validated offline bundle for target {}",
+                resolution.contract.target.triple
+            ));
+            resolution
+        }
+        Err(error) => {
+            report.step_fail("Validate offline bundle manifest", error.to_string());
+            return false;
+        }
+    };
+
+    let expected_checksum = match std::fs::read_to_string(&resolution.checksum_path) {
+        Ok(value) => value,
+        Err(error) => {
+            report.step_fail(
+                "Read offline bundle checksum",
+                format!("{}: {error}", resolution.checksum_path.display()),
+            );
+            return false;
+        }
+    };
+
+    match verify_artifact_supply_chain(
+        &resolution.archive_path,
+        &expected_checksum,
+        VerificationMode::Enforce,
+        SigstorePolicy::Disabled,
+        None,
+    ) {
+        Ok(outcome) if matches!(outcome.decision, IntegrityDecision::Allow) => {
+            report.step_ok(format!(
+                "Verified offline bundle artifact: {}",
+                resolution.archive_path.display()
+            ));
+            true
+        }
+        Ok(outcome) => {
+            report.step_fail(
+                "Verify offline bundle artifact integrity",
+                format!("denied: {:?}", outcome.reason_codes),
+            );
+            false
+        }
+        Err(error) => {
+            report.step_fail(
+                "Verify offline bundle artifact integrity",
+                error.to_string(),
+            );
+            false
+        }
+    }
 }
 
 fn write_config(config: &Config, path: &Path) -> std::io::Result<()> {
@@ -517,7 +618,13 @@ pub fn format_uninstall_report(report: &UninstallReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
+
+    use crate::cli::{
+        HostSpecifier, OfflineBundleArtifact, OfflineBundleManifest, RELEASE_REPOSITORY,
+        ReleaseChannel, resolve_installer_artifact_contract,
+    };
 
     #[test]
     fn install_dry_run_generates_plan() {
@@ -790,5 +897,193 @@ mod tests {
         };
         let report = run_uninstall_cleanup(&opts);
         assert!(report.success, "should handle missing dirs gracefully");
+    }
+
+    #[test]
+    fn install_sequence_with_bundle_preflight_validates_integrity() {
+        let tmp = TempDir::new().unwrap();
+        let host = HostSpecifier::detect().unwrap();
+        let contract =
+            resolve_installer_artifact_contract(host, ReleaseChannel::Stable, Some("0.9.1"))
+                .unwrap();
+
+        let archive_name = contract.asset_name();
+        let checksum_name = contract.checksum_name();
+        let archive_path = tmp.path().join(&archive_name);
+        let archive_bytes = b"offline-bundle-archive";
+        std::fs::write(&archive_path, archive_bytes).unwrap();
+
+        let checksum = Sha256::digest(archive_bytes);
+        let checksum_hex = format!("{checksum:x}");
+        std::fs::write(
+            tmp.path().join(&checksum_name),
+            format!("{checksum_hex}  {archive_name}\n"),
+        )
+        .unwrap();
+
+        let manifest = OfflineBundleManifest {
+            version: "1".to_string(),
+            repository: RELEASE_REPOSITORY.to_string(),
+            release_tag: "0.9.1".to_string(),
+            artifacts: vec![OfflineBundleArtifact {
+                target: contract.target.triple.to_string(),
+                archive: archive_name,
+                checksum: checksum_name,
+                sigstore_bundle: None,
+            }],
+        };
+        let manifest_path = tmp.path().join("bundle-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.paths.config_file = tmp.path().join("config").join("config.toml");
+        config.paths.state_file = tmp.path().join("data").join("state.json");
+        config.paths.ballast_dir = tmp.path().join("ballast");
+        config.ballast.file_count = 0;
+
+        let opts = InstallOptions {
+            config,
+            ballast_count: 0,
+            ballast_size_bytes: 0,
+            ballast_path: None,
+            dry_run: false,
+        };
+
+        let report = run_install_sequence_with_bundle(&opts, Some(&manifest_path));
+        assert!(
+            report.success,
+            "bundle preflight should succeed: {report:?}"
+        );
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.description.contains("Validated offline bundle")),
+            "report should include bundle validation step"
+        );
+        assert!(
+            report.steps.iter().any(|step| step
+                .description
+                .contains("Verified offline bundle artifact")),
+            "report should include bundle integrity verification step"
+        );
+    }
+
+    #[test]
+    fn install_sequence_with_bundle_preflight_rejects_bad_checksum() {
+        let tmp = TempDir::new().unwrap();
+        let host = HostSpecifier::detect().unwrap();
+        let contract =
+            resolve_installer_artifact_contract(host, ReleaseChannel::Stable, Some("0.9.1"))
+                .unwrap();
+
+        let archive_name = contract.asset_name();
+        let checksum_name = contract.checksum_name();
+        std::fs::write(tmp.path().join(&archive_name), b"offline-bundle-archive").unwrap();
+        std::fs::write(
+            tmp.path().join(&checksum_name),
+            "0000000000000000000000000000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+
+        let manifest = OfflineBundleManifest {
+            version: "1".to_string(),
+            repository: RELEASE_REPOSITORY.to_string(),
+            release_tag: "0.9.1".to_string(),
+            artifacts: vec![OfflineBundleArtifact {
+                target: contract.target.triple.to_string(),
+                archive: archive_name,
+                checksum: checksum_name,
+                sigstore_bundle: None,
+            }],
+        };
+        let manifest_path = tmp.path().join("bundle-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.paths.config_file = tmp.path().join("config").join("config.toml");
+        config.paths.state_file = tmp.path().join("data").join("state.json");
+        config.paths.ballast_dir = tmp.path().join("ballast");
+        config.ballast.file_count = 0;
+
+        let opts = InstallOptions {
+            config,
+            ballast_count: 0,
+            ballast_size_bytes: 0,
+            ballast_path: None,
+            dry_run: false,
+        };
+
+        let report = run_install_sequence_with_bundle(&opts, Some(&manifest_path));
+        assert!(!report.success, "bundle preflight should fail: {report:?}");
+        assert!(
+            report.steps.iter().any(|step| step
+                .description
+                .contains("Verify offline bundle artifact integrity")
+                && step.error.is_some()),
+            "report should include failed integrity verification step"
+        );
+    }
+
+    #[test]
+    fn install_sequence_with_bundle_preflight_dry_run_is_plan_only() {
+        let opts = InstallOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let missing_manifest = PathBuf::from("/tmp/does-not-exist-bundle-manifest.json");
+
+        let report = run_install_sequence_with_bundle(&opts, Some(&missing_manifest));
+        assert!(report.success, "dry-run should stay successful: {report:?}");
+        assert!(
+            report.steps.iter().any(|step| step
+                .description
+                .contains("Validate offline bundle manifest")),
+            "dry-run should include bundle validation plan step"
+        );
+        assert!(
+            report
+                .steps
+                .iter()
+                .all(|step| !step.done && step.error.is_none()),
+            "dry-run should not execute steps"
+        );
+    }
+
+    #[test]
+    fn install_sequence_with_bundle_preflight_fails_on_missing_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.paths.config_file = tmp.path().join("config").join("config.toml");
+        config.paths.state_file = tmp.path().join("data").join("state.json");
+        config.paths.ballast_dir = tmp.path().join("ballast");
+        config.ballast.file_count = 0;
+
+        let opts = InstallOptions {
+            config,
+            ballast_count: 0,
+            ballast_size_bytes: 0,
+            ballast_path: None,
+            dry_run: false,
+        };
+        let missing_manifest = tmp.path().join("missing-bundle-manifest.json");
+
+        let report = run_install_sequence_with_bundle(&opts, Some(&missing_manifest));
+        assert!(!report.success, "missing bundle manifest should fail");
+        assert!(
+            report.steps.iter().any(
+                |step| step.description == "Validate offline bundle manifest"
+                    && step.error.is_some()
+            ),
+            "report should include missing manifest failure"
+        );
     }
 }

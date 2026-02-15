@@ -432,6 +432,20 @@ fn run_cargo_install(source_dir: &Path, install_root: &Path) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[cfg(unix)]
+    fn write_test_script(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script_path = dir.path().join("probe-script.sh");
+        std::fs::write(&script_path, contents).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        (dir, script_path)
+    }
 
     #[test]
     fn prerequisite_display() {
@@ -566,7 +580,7 @@ mod tests {
         assert_eq!(config.repository, RELEASE_REPOSITORY);
         assert!(
             config.install_root.to_string_lossy().contains(".local")
-                || config.install_root == PathBuf::from("/usr/local"),
+                || config.install_root == Path::new("/usr/local"),
             "default install root should be ~/.local or /usr/local"
         );
     }
@@ -589,7 +603,11 @@ mod tests {
         let config = SourceInstallConfig::new(SourceCheckout::Head, None);
         let url = config.clone_url();
         assert!(url.starts_with("https://github.com/"));
-        assert!(url.ends_with(".git"));
+        assert!(
+            Path::new(&url)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("git"))
+        );
         assert!(url.contains(RELEASE_REPOSITORY));
     }
 
@@ -711,6 +729,24 @@ mod tests {
         assert!(version.is_some(), "should extract cargo version");
         let ver = version.unwrap();
         assert!(ver.contains('.'), "version should contain dots: got {ver}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_version_returns_none_when_command_fails() {
+        let (_tmp, script_path) = write_test_script("#!/bin/sh\nexit 2\n");
+        let version = probe_version(&script_path.to_string_lossy());
+        assert!(version.is_none(), "failing command should return None");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_version_falls_back_to_first_line_without_semver() {
+        let (_tmp, script_path) = write_test_script(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"custom tool version\"\n  exit 0\nfi\nexit 0\n",
+        );
+        let version = probe_version(&script_path.to_string_lossy());
+        assert_eq!(version, Some("custom tool version".to_string()));
     }
 
     #[test]
@@ -859,7 +895,7 @@ mod tests {
     fn prerequisite_display_all_unique() {
         let displays: Vec<String> = [Prerequisite::Rustc, Prerequisite::Cargo, Prerequisite::Git]
             .iter()
-            .map(|p| p.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         for (i, a) in displays.iter().enumerate() {
             for (j, b) in displays.iter().enumerate() {

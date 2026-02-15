@@ -353,6 +353,15 @@ pub fn resolve_bundle_artifact_contract(
 ) -> Result<BundleArtifactResolution> {
     let manifest = OfflineBundleManifest::from_path(bundle_manifest_path)?;
 
+    if manifest.version.trim() != "1" {
+        return Err(SbhError::InvalidConfig {
+            details: format!(
+                "unsupported bundle manifest version '{}'; expected '1'",
+                manifest.version
+            ),
+        });
+    }
+
     if manifest.repository != RELEASE_REPOSITORY {
         return Err(SbhError::InvalidConfig {
             details: format!(
@@ -1381,5 +1390,47 @@ mod tests {
         let err = resolve_bundle_artifact_contract(host, &manifest_path).unwrap_err();
         assert_eq!(err.code(), "SBH-1001");
         assert!(err.to_string().contains("cannot contain '..'"));
+    }
+
+    #[test]
+    fn bundle_contract_rejects_unsupported_manifest_version() {
+        let tmp = TempDir::new().unwrap();
+        let host = HostSpecifier {
+            os: HostOs::Linux,
+            arch: HostArch::X86_64,
+            abi: HostAbi::Gnu,
+        };
+        let expected =
+            resolve_installer_artifact_contract(host, ReleaseChannel::Stable, Some("0.9.1"))
+                .unwrap();
+        let archive = expected.asset_name();
+        let checksum = expected.checksum_name();
+        std::fs::write(tmp.path().join(&archive), b"archive").unwrap();
+        std::fs::write(tmp.path().join(&checksum), b"checksum").unwrap();
+
+        let manifest = OfflineBundleManifest {
+            version: "2".to_string(),
+            repository: RELEASE_REPOSITORY.to_string(),
+            release_tag: "0.9.1".to_string(),
+            artifacts: vec![OfflineBundleArtifact {
+                target: expected.target.triple.to_string(),
+                archive,
+                checksum,
+                sigstore_bundle: None,
+            }],
+        };
+        let manifest_path = tmp.path().join("bundle-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = resolve_bundle_artifact_contract(host, &manifest_path).unwrap_err();
+        assert_eq!(err.code(), "SBH-1001");
+        assert!(
+            err.to_string()
+                .contains("unsupported bundle manifest version")
+        );
     }
 }

@@ -7,12 +7,16 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::core::update_cache::{CachedUpdateMetadata, UpdateMetadataCache};
+
 use super::{
-    HostSpecifier, IntegrityDecision, ReleaseArtifactContract, ReleaseChannel, SigstorePolicy,
-    VerificationMode, resolve_updater_artifact_contract, verify_artifact_supply_chain,
+    HostSpecifier, IntegrityDecision, ReleaseArtifactContract, ReleaseChannel, ReleaseLocator,
+    SigstorePolicy, VerificationMode, resolve_bundle_artifact_contract,
+    resolve_updater_artifact_contract, verify_artifact_supply_chain,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,6 +41,16 @@ pub struct UpdateOptions {
     pub dry_run: bool,
     /// Maximum number of backups to retain after update.
     pub max_backups: usize,
+    /// Path to update metadata cache.
+    pub metadata_cache_file: PathBuf,
+    /// TTL for update metadata cache entries.
+    pub metadata_cache_ttl: Duration,
+    /// Force refresh of metadata cache before checking.
+    pub refresh_cache: bool,
+    /// Emit update notices/follow-up prompts in human output.
+    pub notices_enabled: bool,
+    /// Optional offline bundle manifest path for airgapped updates.
+    pub offline_bundle_manifest: Option<PathBuf>,
 }
 
 /// A single backup snapshot of a previous binary version.
@@ -90,6 +104,7 @@ pub struct UpdateReport {
     pub check_only: bool,
     pub dry_run: bool,
     pub artifact_url: Option<String>,
+    pub notices_enabled: bool,
     pub install_path: Option<PathBuf>,
     pub backup_id: Option<String>,
     pub steps: Vec<UpdateStep>,
@@ -106,7 +121,7 @@ pub struct UpdateStep {
 }
 
 impl UpdateReport {
-    fn new(current_version: &str, check_only: bool, dry_run: bool) -> Self {
+    fn new(current_version: &str, check_only: bool, dry_run: bool, notices_enabled: bool) -> Self {
         Self {
             current_version: current_version.to_string(),
             target_version: None,
@@ -115,6 +130,7 @@ impl UpdateReport {
             check_only,
             dry_run,
             artifact_url: None,
+            notices_enabled,
             install_path: None,
             backup_id: None,
             steps: Vec::new(),
@@ -245,30 +261,31 @@ impl BackupStore {
             let meta_path = entry_path.join("backup.json");
 
             if let Ok(meta_str) = std::fs::read_to_string(&meta_path)
-                && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
-                    let version = meta
-                        .get("version")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let timestamp = meta
-                        .get("timestamp")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    let binary_size = meta
-                        .get("binary_size")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
+                && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str)
+            {
+                let version = meta
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let timestamp = meta
+                    .get("timestamp")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let binary_size = meta
+                    .get("binary_size")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
 
-                    entries.push(BackupSnapshot {
-                        id,
-                        version,
-                        timestamp,
-                        binary_size,
-                        path: binary_path,
-                    });
-                    continue;
-                }
+                entries.push(BackupSnapshot {
+                    id,
+                    version,
+                    timestamp,
+                    binary_size,
+                    path: binary_path,
+                });
+                continue;
+            }
 
             // Fallback: no valid metadata file.
             let binary_size = std::fs::metadata(&binary_path)
@@ -336,8 +353,7 @@ impl BackupStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(install_path, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::set_permissions(install_path, std::fs::Permissions::from_mode(0o755));
         }
 
         Ok(RollbackResult {
@@ -381,7 +397,8 @@ impl BackupStore {
 
 /// Default backup directory.
 fn default_backup_dir() -> PathBuf {
-    let base = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/var/lib/sbh"), PathBuf::from);
+    let base =
+        std::env::var_os("HOME").map_or_else(|| PathBuf::from("/var/lib/sbh"), PathBuf::from);
     base.join(".local/share/sbh/backups")
 }
 
@@ -393,7 +410,12 @@ fn default_backup_dir() -> PathBuf {
 #[allow(clippy::too_many_lines)]
 pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
     let current = current_version();
-    let mut report = UpdateReport::new(&current, opts.check_only, opts.dry_run);
+    let mut report = UpdateReport::new(
+        &current,
+        opts.check_only,
+        opts.dry_run,
+        opts.notices_enabled,
+    );
 
     // Step 1: Resolve host platform.
     let host = match HostSpecifier::detect() {
@@ -407,46 +429,137 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
         }
     };
 
-    // Step 2: Resolve artifact contract (shared with installer).
-    let contract = match resolve_updater_artifact_contract(
-        host,
-        ReleaseChannel::Stable,
-        opts.pinned_version.as_deref(),
-    ) {
-        Ok(c) => {
-            report.step_ok(format!("Resolved artifact: {}", c.asset_name()));
-            report.artifact_url = Some(c.asset_url());
-            c
+    // Step 2: Resolve artifact contract (shared with installer) or offline bundle contract.
+    let mut bundle_archive_path = None;
+    let mut bundle_checksum_path = None;
+    let contract = if let Some(bundle_manifest_path) = opts.offline_bundle_manifest.as_deref() {
+        match resolve_bundle_artifact_contract(host, bundle_manifest_path) {
+            Ok(resolution) => {
+                report.step_ok(format!(
+                    "Resolved offline bundle artifact: {}",
+                    resolution.contract.asset_name()
+                ));
+                bundle_archive_path = Some(resolution.archive_path.clone());
+                bundle_checksum_path = Some(resolution.checksum_path.clone());
+                resolution.contract
+            }
+            Err(e) => {
+                report.step_fail("Resolve offline bundle contract", e.to_string());
+                return report;
+            }
         }
-        Err(e) => {
-            report.step_fail("Resolve artifact contract", e.to_string());
-            return report;
+    } else {
+        match resolve_updater_artifact_contract(
+            host,
+            ReleaseChannel::Stable,
+            opts.pinned_version.as_deref(),
+        ) {
+            Ok(c) => {
+                report.step_ok(format!("Resolved artifact: {}", c.asset_name()));
+                c
+            }
+            Err(e) => {
+                report.step_fail("Resolve artifact contract", e.to_string());
+                return report;
+            }
         }
     };
 
     // Step 3: Resolve target version tag.
-    let target_tag = match resolve_target_tag(&contract, opts.pinned_version.as_deref()) {
-        Ok(tag) => {
-            report.target_version = Some(tag.clone());
-            report.step_ok(format!("Target version: {tag}"));
-            tag
+    let target = if opts.offline_bundle_manifest.is_some() {
+        if opts.refresh_cache {
+            report.step_ok("Ignored --refresh-cache in offline bundle mode");
         }
-        Err(e) => {
-            report.step_fail("Resolve target version", e);
-            return report;
+
+        let target_tag = match &contract.locator {
+            ReleaseLocator::Tag(tag) => tag.clone(),
+            ReleaseLocator::Latest => {
+                report.step_fail(
+                    "Resolve target version",
+                    "offline bundle contract must pin a release tag",
+                );
+                return report;
+            }
+        };
+
+        if let Some(pinned) = opts.pinned_version.as_deref() {
+            let normalized = normalize_tag(pinned);
+            if normalized != target_tag {
+                report.step_fail(
+                    "Resolve target version",
+                    format!(
+                        "offline bundle tag mismatch: requested '{normalized}', bundle provides '{target_tag}'"
+                    ),
+                );
+                return report;
+            }
+        }
+
+        TargetMetadata {
+            target_tag,
+            artifact_url: bundle_archive_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| String::from("<bundle-archive>")),
+            source: TargetMetadataSource::OfflineBundle,
+            bundle_archive_path,
+            bundle_checksum_path,
+        }
+    } else {
+        let cache =
+            UpdateMetadataCache::new(opts.metadata_cache_file.clone(), opts.metadata_cache_ttl);
+        match resolve_target_metadata_with_cache(
+            &contract,
+            opts.pinned_version.as_deref(),
+            &cache,
+            opts.refresh_cache,
+            SystemTime::now(),
+            |release_contract| resolve_target_tag(release_contract, None),
+        ) {
+            Ok(target) => target,
+            Err(e) => {
+                report.step_fail("Resolve target version", e);
+                return report;
+            }
         }
     };
 
+    match target.source {
+        TargetMetadataSource::Pinned => {}
+        TargetMetadataSource::Cache => {
+            report.step_ok("Loaded update metadata from cache");
+        }
+        TargetMetadataSource::Network => {
+            if opts.refresh_cache {
+                report.step_ok("Refreshed update metadata from network");
+            } else {
+                report.step_ok("Fetched update metadata from network");
+            }
+        }
+        TargetMetadataSource::OfflineBundle => {
+            report.step_ok("Loaded update metadata from offline bundle");
+        }
+    }
+    report.target_version = Some(target.target_tag.clone());
+    report.artifact_url = Some(target.artifact_url.clone());
+    report.step_ok(format!("Target version: {}", target.target_tag));
+
     // Step 4: Compare versions.
     let current_tag = format!("v{current}");
-    if current_tag == target_tag && !opts.force {
+    if current_tag == target.target_tag && !opts.force {
         report.update_available = false;
-        report.step_ok(format!("Already at {target_tag}, no update needed"));
+        report.step_ok(format!(
+            "Already at {}, no update needed",
+            target.target_tag
+        ));
         report.success = true;
         return report;
     }
     report.update_available = true;
-    report.step_ok(format!("Update available: {current_tag} -> {target_tag}"));
+    report.step_ok(format!(
+        "Update available: {current_tag} -> {}",
+        target.target_tag
+    ));
 
     if opts.check_only {
         report.success = true;
@@ -458,16 +571,25 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
     report.install_path = Some(install_path.clone());
 
     if opts.dry_run {
-        report.step_plan(format!("Would download {}", contract.asset_url()));
+        if matches!(target.source, TargetMetadataSource::OfflineBundle) {
+            report.step_plan(format!(
+                "Would use offline bundle artifact {}",
+                target.artifact_url
+            ));
+        } else {
+            report.step_plan(format!("Would download {}", target.artifact_url));
+        }
         report.step_plan(format!("Would install to {}", install_path.display()));
         report.step_plan(format!(
             "Would verify integrity: {}",
             if opts.no_verify { "skip" } else { "sha256" }
         ));
         report.success = true;
-        report
-            .follow_up
-            .push("After update, restart the sbh service.".to_string());
+        if opts.notices_enabled {
+            report
+                .follow_up
+                .push("After update, restart the sbh service.".to_string());
+        }
         return report;
     }
 
@@ -482,22 +604,47 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
 
     let archive_path = tmp_dir.join(contract.asset_name());
     let checksum_path = tmp_dir.join(contract.checksum_name());
-    let archive_url = contract.asset_url();
-    let checksum_url = format!("{archive_url}.sha256");
+    if let (Some(source_archive), Some(source_checksum)) = (
+        target.bundle_archive_path.as_ref(),
+        target.bundle_checksum_path.as_ref(),
+    ) {
+        if let Err(e) = std::fs::copy(source_archive, &archive_path) {
+            report.step_fail("Load offline bundle artifact", e.to_string());
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return report;
+        }
+        report.step_ok(format!(
+            "Loaded bundle artifact {}",
+            source_archive.display()
+        ));
 
-    if let Err(e) = curl_download(&archive_url, &archive_path) {
-        report.step_fail("Download artifact", e);
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return report;
-    }
-    report.step_ok(format!("Downloaded {}", contract.asset_name()));
+        if let Err(e) = std::fs::copy(source_checksum, &checksum_path) {
+            report.step_fail("Load offline bundle checksum", e.to_string());
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return report;
+        }
+        report.step_ok(format!(
+            "Loaded bundle checksum {}",
+            source_checksum.display()
+        ));
+    } else {
+        let archive_url = target.artifact_url;
+        let checksum_url = format!("{archive_url}.sha256");
 
-    if let Err(e) = curl_download(&checksum_url, &checksum_path) {
-        report.step_fail("Download checksum", e);
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return report;
+        if let Err(e) = curl_download(&archive_url, &archive_path) {
+            report.step_fail("Download artifact", e);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return report;
+        }
+        report.step_ok(format!("Downloaded {}", contract.asset_name()));
+
+        if let Err(e) = curl_download(&checksum_url, &checksum_path) {
+            report.step_fail("Download checksum", e);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return report;
+        }
+        report.step_ok(format!("Downloaded {}", contract.checksum_name()));
     }
-    report.step_ok(format!("Downloaded {}", contract.checksum_name()));
 
     // Step 7: Verify integrity (shared code path with installer).
     let verification_mode = if opts.no_verify {
@@ -571,9 +718,12 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
     report.success = true;
-    report.follow_up.push(format!(
-        "Updated {current_tag} -> {target_tag}. Restart the sbh service to use the new version.",
-    ));
+    if opts.notices_enabled {
+        report.follow_up.push(format!(
+            "Updated {current_tag} -> {}. Restart the sbh service to use the new version.",
+            target.target_tag
+        ));
+    }
     report
 }
 
@@ -609,7 +759,9 @@ pub fn format_update_report(report: &UpdateReport) -> String {
                     "Update available: v{} -> {target}",
                     report.current_version
                 );
-                let _ = writeln!(out, "Run `sbh update` to apply.");
+                if report.notices_enabled {
+                    let _ = writeln!(out, "Run `sbh update` to apply.");
+                }
             }
         } else {
             let _ = writeln!(out, "Already up to date (v{}).", report.current_version);
@@ -684,11 +836,7 @@ pub fn format_rollback_result(result: &RollbackResult) -> String {
 pub fn format_prune_result(result: &PruneResult) -> String {
     let mut out = String::new();
     if result.removed == 0 {
-        let _ = writeln!(
-            out,
-            "No backups needed pruning ({} total).",
-            result.kept
-        );
+        let _ = writeln!(out, "No backups needed pruning ({} total).", result.kept);
     } else {
         for id in &result.removed_ids {
             let _ = writeln!(out, "  Removed backup {id}");
@@ -719,9 +867,10 @@ pub fn default_install_dir(system: bool) -> PathBuf {
         PathBuf::from("/usr/local/bin")
     } else {
         if let Ok(exe) = std::env::current_exe()
-            && let Some(parent) = exe.parent() {
-                return parent.to_path_buf();
-            }
+            && let Some(parent) = exe.parent()
+        {
+            return parent.to_path_buf();
+        }
         std::env::var_os("HOME")
             .map_or_else(|| PathBuf::from("/usr/local/bin"), PathBuf::from)
             .join(".local/bin")
@@ -736,19 +885,110 @@ fn current_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetMetadataSource {
+    Pinned,
+    Cache,
+    Network,
+    OfflineBundle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetMetadata {
+    target_tag: String,
+    artifact_url: String,
+    source: TargetMetadataSource,
+    bundle_archive_path: Option<PathBuf>,
+    bundle_checksum_path: Option<PathBuf>,
+}
+
+fn resolve_target_metadata_with_cache<F>(
+    contract: &ReleaseArtifactContract,
+    pinned: Option<&str>,
+    cache: &UpdateMetadataCache,
+    refresh_cache: bool,
+    now: SystemTime,
+    mut fetch_latest_tag: F,
+) -> std::result::Result<TargetMetadata, String>
+where
+    F: FnMut(&ReleaseArtifactContract) -> std::result::Result<String, String>,
+{
+    if let Some(version) = pinned {
+        let tag = normalize_tag(version);
+        return Ok(TargetMetadata {
+            target_tag: tag.clone(),
+            artifact_url: artifact_url_for_tag(contract, &tag),
+            source: TargetMetadataSource::Pinned,
+            bundle_archive_path: None,
+            bundle_checksum_path: None,
+        });
+    }
+
+    if !refresh_cache && let Ok(Some(entry)) = cache.load_fresh(now) {
+        return Ok(TargetMetadata {
+            target_tag: entry.target_tag,
+            artifact_url: entry.artifact_url,
+            source: TargetMetadataSource::Cache,
+            bundle_archive_path: None,
+            bundle_checksum_path: None,
+        });
+    }
+
+    let target_tag = fetch_latest_tag(contract)?;
+    let artifact_url = artifact_url_for_tag(contract, &target_tag);
+    let cache_entry = CachedUpdateMetadata {
+        target_tag: target_tag.clone(),
+        artifact_url: artifact_url.clone(),
+        fetched_at_unix_secs: unix_seconds(now),
+    };
+    let _ = cache.store(&cache_entry);
+
+    Ok(TargetMetadata {
+        target_tag,
+        artifact_url,
+        source: TargetMetadataSource::Network,
+        bundle_archive_path: None,
+        bundle_checksum_path: None,
+    })
+}
+
+fn artifact_url_for_tag(contract: &ReleaseArtifactContract, target_tag: &str) -> String {
+    format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        contract.repository,
+        target_tag,
+        contract.asset_name()
+    )
+}
+
+fn normalize_tag(version: &str) -> String {
+    if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{version}")
+    }
+}
+
+fn unix_seconds(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
+
 fn resolve_target_tag(
     contract: &ReleaseArtifactContract,
     pinned: Option<&str>,
 ) -> std::result::Result<String, String> {
     if let Some(version) = pinned {
-        let tag = if version.starts_with('v') {
-            version.to_string()
-        } else {
-            format!("v{version}")
-        };
-        return Ok(tag);
+        return Ok(normalize_tag(version));
     }
 
+    resolve_latest_release_tag(contract)
+}
+
+fn resolve_latest_release_tag(
+    contract: &ReleaseArtifactContract,
+) -> std::result::Result<String, String> {
     let api_url = format!(
         "https://api.github.com/repos/{}/releases/latest",
         contract.repository
@@ -772,7 +1012,7 @@ fn resolve_target_tag(
 
     json.get("tag_name")
         .and_then(|v| v.as_str())
-        .map(String::from)
+        .map(normalize_tag)
         .ok_or_else(|| "no tag_name in GitHub API response".to_string())
 }
 
@@ -869,6 +1109,9 @@ fn tempdir_for_update() -> std::result::Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    use super::super::{OfflineBundleArtifact, OfflineBundleManifest, RELEASE_REPOSITORY};
 
     fn test_store(name: &str) -> (BackupStore, PathBuf) {
         let base = std::env::temp_dir()
@@ -894,6 +1137,19 @@ mod tests {
         path
     }
 
+    fn test_contract() -> ReleaseArtifactContract {
+        resolve_updater_artifact_contract(
+            HostSpecifier {
+                os: super::super::HostOs::Linux,
+                arch: super::super::HostArch::X86_64,
+                abi: super::super::HostAbi::Gnu,
+            },
+            ReleaseChannel::Stable,
+            None,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn current_version_is_not_empty() {
         assert!(!current_version().is_empty());
@@ -911,7 +1167,7 @@ mod tests {
 
     #[test]
     fn report_step_tracking() {
-        let mut r = UpdateReport::new("0.1.0", false, false);
+        let mut r = UpdateReport::new("0.1.0", false, false, true);
         r.step_ok("Step 1");
         r.step_fail("Step 2", "error");
         r.step_plan("Step 3");
@@ -923,7 +1179,7 @@ mod tests {
 
     #[test]
     fn format_check_only_up_to_date() {
-        let mut r = UpdateReport::new("0.1.0", true, false);
+        let mut r = UpdateReport::new("0.1.0", true, false, true);
         r.update_available = false;
         r.success = true;
         assert!(format_update_report(&r).contains("up to date"));
@@ -931,18 +1187,30 @@ mod tests {
 
     #[test]
     fn format_check_only_update_available() {
-        let mut r = UpdateReport::new("0.1.0", true, false);
+        let mut r = UpdateReport::new("0.1.0", true, false, true);
         r.update_available = true;
         r.target_version = Some("v0.2.0".to_string());
         r.success = true;
         let out = format_update_report(&r);
         assert!(out.contains("Update available"));
         assert!(out.contains("v0.2.0"));
+        assert!(out.contains("Run `sbh update` to apply."));
+    }
+
+    #[test]
+    fn format_check_only_update_available_notice_suppressed() {
+        let mut r = UpdateReport::new("0.1.0", true, false, false);
+        r.update_available = true;
+        r.target_version = Some("v0.2.0".to_string());
+        r.success = true;
+        let out = format_update_report(&r);
+        assert!(out.contains("Update available"));
+        assert!(!out.contains("Run `sbh update` to apply."));
     }
 
     #[test]
     fn format_applied() {
-        let mut r = UpdateReport::new("0.1.0", false, false);
+        let mut r = UpdateReport::new("0.1.0", false, false, true);
         r.applied = true;
         r.success = true;
         assert!(format_update_report(&r).contains("applied successfully"));
@@ -950,7 +1218,7 @@ mod tests {
 
     #[test]
     fn format_dry_run() {
-        let mut r = UpdateReport::new("0.1.0", false, true);
+        let mut r = UpdateReport::new("0.1.0", false, true, true);
         r.success = true;
         r.step_plan("Would download artifact");
         let out = format_update_report(&r);
@@ -960,7 +1228,7 @@ mod tests {
 
     #[test]
     fn format_follow_up() {
-        let mut r = UpdateReport::new("0.1.0", false, false);
+        let mut r = UpdateReport::new("0.1.0", false, false, true);
         r.applied = true;
         r.success = true;
         r.follow_up.push("Restart the service".to_string());
@@ -1000,6 +1268,222 @@ mod tests {
         assert_eq!(
             resolve_target_tag(&contract, Some("v0.3.0")).unwrap(),
             "v0.3.0"
+        );
+    }
+
+    #[test]
+    fn target_metadata_uses_cache_when_refresh_disabled() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = UpdateMetadataCache::new(
+            cache_dir.path().join("update-metadata.json"),
+            Duration::from_secs(300),
+        );
+        let now = UNIX_EPOCH + Duration::from_secs(2_000);
+        let cached = CachedUpdateMetadata {
+            target_tag: "v0.9.0".to_string(),
+            artifact_url: "https://example.invalid/v0.9.0/sbh.tar.xz".to_string(),
+            fetched_at_unix_secs: 1_900,
+        };
+        cache.store(&cached).unwrap();
+
+        let mut fetch_calls = 0usize;
+        let metadata =
+            resolve_target_metadata_with_cache(&test_contract(), None, &cache, false, now, |_| {
+                fetch_calls += 1;
+                Ok("v9.9.9".to_string())
+            })
+            .unwrap();
+
+        assert_eq!(metadata.source, TargetMetadataSource::Cache);
+        assert_eq!(metadata.target_tag, "v0.9.0");
+        assert_eq!(
+            metadata.artifact_url,
+            "https://example.invalid/v0.9.0/sbh.tar.xz"
+        );
+        assert_eq!(fetch_calls, 0);
+    }
+
+    #[test]
+    fn target_metadata_refresh_bypasses_cache_and_writes_new_entry() {
+        let contract = test_contract();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = UpdateMetadataCache::new(
+            cache_dir.path().join("update-metadata.json"),
+            Duration::from_secs(300),
+        );
+        let now = UNIX_EPOCH + Duration::from_secs(5_000);
+        cache
+            .store(&CachedUpdateMetadata {
+                target_tag: "v0.1.0".to_string(),
+                artifact_url: "https://example.invalid/old.tar.xz".to_string(),
+                fetched_at_unix_secs: 4_900,
+            })
+            .unwrap();
+
+        let mut fetch_calls = 0usize;
+        let metadata =
+            resolve_target_metadata_with_cache(&contract, None, &cache, true, now, |_| {
+                fetch_calls += 1;
+                Ok("v1.2.3".to_string())
+            })
+            .unwrap();
+
+        assert_eq!(metadata.source, TargetMetadataSource::Network);
+        assert_eq!(metadata.target_tag, "v1.2.3");
+        assert_eq!(
+            metadata.artifact_url,
+            artifact_url_for_tag(&contract, "v1.2.3")
+        );
+        assert_eq!(fetch_calls, 1);
+
+        let cached = cache
+            .load_fresh(now)
+            .unwrap()
+            .expect("fresh cache expected");
+        assert_eq!(cached.target_tag, "v1.2.3");
+        assert_eq!(
+            cached.artifact_url,
+            artifact_url_for_tag(&contract, "v1.2.3")
+        );
+    }
+
+    #[test]
+    fn run_update_sequence_check_only_uses_offline_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = HostSpecifier::detect().unwrap();
+        let contract =
+            resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some("9.9.9")).unwrap();
+        let archive_name = contract.asset_name();
+        let checksum_name = contract.checksum_name();
+        let archive_path = tmp.path().join(&archive_name);
+        let archive_bytes = b"offline-update-archive";
+        std::fs::write(&archive_path, archive_bytes).unwrap();
+        let checksum_hex = format!("{:x}", Sha256::digest(archive_bytes));
+        std::fs::write(
+            tmp.path().join(&checksum_name),
+            format!("{checksum_hex}  {archive_name}\n"),
+        )
+        .unwrap();
+
+        let manifest = OfflineBundleManifest {
+            version: "1".to_string(),
+            repository: RELEASE_REPOSITORY.to_string(),
+            release_tag: "9.9.9".to_string(),
+            artifacts: vec![OfflineBundleArtifact {
+                target: contract.target.triple.to_string(),
+                archive: archive_name,
+                checksum: checksum_name,
+                sigstore_bundle: None,
+            }],
+        };
+        let manifest_path = tmp.path().join("bundle-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let opts = UpdateOptions {
+            check_only: true,
+            pinned_version: None,
+            force: false,
+            install_dir: default_install_dir(false),
+            no_verify: false,
+            dry_run: false,
+            max_backups: 5,
+            metadata_cache_file: tmp.path().join("update-cache.json"),
+            metadata_cache_ttl: Duration::from_secs(60),
+            refresh_cache: false,
+            notices_enabled: true,
+            offline_bundle_manifest: Some(manifest_path),
+        };
+
+        let report = run_update_sequence(&opts);
+        assert!(
+            report.success,
+            "offline check-only should succeed: {report:?}"
+        );
+        assert!(
+            report.update_available,
+            "bundle target should be newer than current"
+        );
+        assert!(
+            report.steps.iter().any(|step| step
+                .description
+                .contains("Resolved offline bundle artifact")),
+            "report should show offline bundle contract resolution"
+        );
+        assert!(
+            report.steps.iter().any(|step| step
+                .description
+                .contains("Loaded update metadata from offline bundle")),
+            "report should indicate offline metadata source"
+        );
+    }
+
+    #[test]
+    fn run_update_sequence_offline_bundle_rejects_pinned_tag_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = HostSpecifier::detect().unwrap();
+        let contract =
+            resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some("9.9.9")).unwrap();
+        let archive_name = contract.asset_name();
+        let checksum_name = contract.checksum_name();
+        std::fs::write(tmp.path().join(&archive_name), b"offline-update-archive").unwrap();
+        std::fs::write(
+            tmp.path().join(&checksum_name),
+            "0000000000000000000000000000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+
+        let manifest = OfflineBundleManifest {
+            version: "1".to_string(),
+            repository: RELEASE_REPOSITORY.to_string(),
+            release_tag: "9.9.9".to_string(),
+            artifacts: vec![OfflineBundleArtifact {
+                target: contract.target.triple.to_string(),
+                archive: archive_name,
+                checksum: checksum_name,
+                sigstore_bundle: None,
+            }],
+        };
+        let manifest_path = tmp.path().join("bundle-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let opts = UpdateOptions {
+            check_only: true,
+            pinned_version: Some("1.0.0".to_string()),
+            force: false,
+            install_dir: default_install_dir(false),
+            no_verify: false,
+            dry_run: false,
+            max_backups: 5,
+            metadata_cache_file: tmp.path().join("update-cache.json"),
+            metadata_cache_ttl: Duration::from_secs(60),
+            refresh_cache: false,
+            notices_enabled: true,
+            offline_bundle_manifest: Some(manifest_path),
+        };
+
+        let report = run_update_sequence(&opts);
+        assert!(
+            !report.success,
+            "mismatched pinned version should fail in offline bundle mode"
+        );
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.description.contains("Resolve target version")
+                    && step
+                        .error
+                        .as_deref()
+                        .is_some_and(|err| err.contains("offline bundle tag mismatch"))),
+            "report should include offline bundle pin mismatch diagnostic"
         );
     }
 

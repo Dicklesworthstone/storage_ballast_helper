@@ -59,20 +59,27 @@ fn resolve_bin_path() -> PathBuf {
     }
 }
 
-pub fn run_cli_case(case_name: &str, args: &[&str]) -> CmdResult {
+fn run_cli_case_with_env_inner(
+    case_name: &str,
+    args: &[&str],
+    env_overrides: &[(&str, &str)],
+) -> CmdResult {
     let root = std::env::temp_dir().join("sbh-test-logs");
     fs::create_dir_all(&root).expect("create temp test log dir");
 
     let log_path = root.join(format!("{}-{}.log", sanitize(case_name), now_millis()));
     let bin_path = resolve_bin_path();
 
-    let output = Command::new(&bin_path)
+    let mut command = Command::new(&bin_path);
+    command
         .args(args)
         .env("SBH_TEST_VERBOSE", "1")
         .env("SBH_OUTPUT_FORMAT", "human")
-        .env("RUST_BACKTRACE", "1")
-        .output()
-        .expect("execute sbh command");
+        .env("RUST_BACKTRACE", "1");
+    for (key, value) in env_overrides {
+        command.env(key, value);
+    }
+    let output = command.output().expect("execute sbh command");
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -81,6 +88,7 @@ pub fn run_cli_case(case_name: &str, args: &[&str]) -> CmdResult {
     log_content.push_str(&format!("case={case_name}\n"));
     log_content.push_str(&format!("bin={}\n", bin_path.display()));
     log_content.push_str(&format!("args={args:?}\n"));
+    log_content.push_str(&format!("env_overrides={env_overrides:?}\n"));
     log_content.push_str(&format!("status={}\n", output.status));
     log_content.push_str("----- stdout -----\n");
     log_content.push_str(&stdout);
@@ -96,6 +104,18 @@ pub fn run_cli_case(case_name: &str, args: &[&str]) -> CmdResult {
         stderr,
         log_path,
     }
+}
+
+pub fn run_cli_case(case_name: &str, args: &[&str]) -> CmdResult {
+    run_cli_case_with_env_inner(case_name, args, &[])
+}
+
+pub fn run_cli_case_with_env(
+    case_name: &str,
+    args: &[&str],
+    env_overrides: &[(&str, &str)],
+) -> CmdResult {
+    run_cli_case_with_env_inner(case_name, args, env_overrides)
 }
 
 // ──────────────────── MockPlatform ────────────────────

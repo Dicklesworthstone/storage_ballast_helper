@@ -188,7 +188,6 @@ pub struct PathsConfig {
     pub jsonl_log: PathBuf,
 }
 
-
 impl Default for PressureConfig {
     fn default() -> Self {
         Self {
@@ -508,11 +507,12 @@ impl Config {
 
         // Global opt-out: disables checks, background refresh, and update notices.
         if let Some(raw) = lookup("SBH_UPDATE_OPT_OUT")
-            && parse_env_bool("SBH_UPDATE_OPT_OUT", &raw)? {
-                self.update.enabled = false;
-                self.update.background_refresh = false;
-                self.update.notices_enabled = false;
-            }
+            && parse_env_bool("SBH_UPDATE_OPT_OUT", &raw)?
+        {
+            self.update.enabled = false;
+            self.update.background_refresh = false;
+            self.update.notices_enabled = false;
+        }
 
         Ok(())
     }

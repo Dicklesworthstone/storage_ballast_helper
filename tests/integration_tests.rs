@@ -4,8 +4,9 @@
 mod common;
 
 use std::collections::HashSet;
+use std::fs;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use storage_ballast_helper::ballast::manager::BallastManager;
@@ -303,6 +304,249 @@ fn update_system_and_user_flags_conflict_in_cli_integration() {
         result.stderr.contains("cannot be used with") || result.stderr.contains("conflicts with"),
         "expected clap conflict error; stderr={:?}; log={}",
         result.stderr,
+        result.log_path.display()
+    );
+}
+
+#[test]
+fn update_check_uses_fresh_cache_when_offline_and_path_disabled() {
+    let home = tempfile::tempdir().expect("create temp home");
+    let cache_path = home.path().join(".local/share/sbh/update-metadata.json");
+    let cache_parent = cache_path
+        .parent()
+        .expect("cache path should have parent directory");
+    fs::create_dir_all(cache_parent).expect("create cache parent directory");
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_secs();
+    let cache_entry = serde_json::json!({
+        "target_tag": "v99.88.77",
+        "artifact_url": "https://example.invalid/sbh-x86_64-unknown-linux-gnu.tar.xz",
+        "fetched_at_unix_secs": now_secs,
+    });
+    fs::write(
+        &cache_path,
+        serde_json::to_vec_pretty(&cache_entry).expect("serialize cache entry"),
+    )
+    .expect("write cache file");
+
+    let home_str = home.path().to_string_lossy().to_string();
+    let result = common::run_cli_case_with_env(
+        "update_check_uses_fresh_cache_when_offline_and_path_disabled",
+        &["update", "--check", "--json"],
+        &[("HOME", &home_str), ("PATH", "")],
+    );
+    assert!(
+        result.status.success(),
+        "expected success; stderr={:?}; log: {}",
+        result.stderr,
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON output, parse failed: {err}; stdout={:?}; log={}",
+            result.stdout,
+            result.log_path.display()
+        )
+    });
+    assert_eq!(
+        payload["success"],
+        true,
+        "log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["target_version"],
+        "v99.88.77",
+        "log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["update_available"],
+        true,
+        "log: {}",
+        result.log_path.display()
+    );
+    let used_cache = payload["steps"].as_array().is_some_and(|steps| {
+        steps.iter().any(|step| {
+            step.get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|desc| desc.contains("Loaded update metadata from cache"))
+        })
+    });
+    assert!(
+        used_cache,
+        "expected cache-hit step in update report; log: {}",
+        result.log_path.display()
+    );
+}
+
+#[test]
+fn update_check_with_stale_cache_fails_offline_when_network_is_required() {
+    let home = tempfile::tempdir().expect("create temp home");
+    let cache_path = home.path().join(".local/share/sbh/update-metadata.json");
+    let cache_parent = cache_path
+        .parent()
+        .expect("cache path should have parent directory");
+    fs::create_dir_all(cache_parent).expect("create cache parent directory");
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_secs();
+    let stale_cache_entry = serde_json::json!({
+        "target_tag": "v1.2.3",
+        "artifact_url": "https://example.invalid/sbh-x86_64-unknown-linux-gnu.tar.xz",
+        "fetched_at_unix_secs": now_secs.saturating_sub(7_200),
+    });
+    fs::write(
+        &cache_path,
+        serde_json::to_vec_pretty(&stale_cache_entry).expect("serialize stale cache entry"),
+    )
+    .expect("write stale cache file");
+
+    let home_str = home.path().to_string_lossy().to_string();
+    let result = common::run_cli_case_with_env(
+        "update_check_with_stale_cache_fails_offline_when_network_is_required",
+        &["update", "--check", "--json"],
+        &[("HOME", &home_str), ("PATH", "")],
+    );
+    assert!(
+        !result.status.success(),
+        "expected failure; log: {}",
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON output, parse failed: {err}; stdout={:?}; log={}",
+            result.stdout,
+            result.log_path.display()
+        )
+    });
+    assert_eq!(
+        payload["success"],
+        false,
+        "log: {}",
+        result.log_path.display()
+    );
+    let resolve_step_err = payload["steps"]
+        .as_array()
+        .and_then(|steps| {
+            steps.iter().find_map(|step| {
+                let is_resolve_step = step
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .is_some_and(|desc| desc.contains("Resolve target version"));
+                if is_resolve_step {
+                    step.get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_default();
+    assert!(
+        resolve_step_err.contains("curl")
+            || resolve_step_err.contains("GitHub API")
+            || resolve_step_err.contains("failed"),
+        "expected network-resolution error for stale cache path; got {:?}; log: {}",
+        resolve_step_err,
+        result.log_path.display()
+    );
+}
+
+#[test]
+fn update_list_backups_with_isolated_home_reports_empty_json_inventory() {
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_str = home.path().to_string_lossy().to_string();
+
+    let result = common::run_cli_case_with_env(
+        "update_list_backups_with_isolated_home_reports_empty_json_inventory",
+        &["update", "--list-backups", "--json"],
+        &[("HOME", &home_str), ("PATH", "")],
+    );
+    assert!(
+        result.status.success(),
+        "expected success; stderr={:?}; log: {}",
+        result.stderr,
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON output, parse failed: {err}; stdout={:?}; log={}",
+            result.stdout,
+            result.log_path.display()
+        )
+    });
+    let backups = payload["backups"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected backups array; log: {}", result.log_path.display()));
+    assert!(
+        backups.is_empty(),
+        "expected empty inventory in isolated home; log: {}",
+        result.log_path.display()
+    );
+    let backup_dir = payload["backup_dir"].as_str().unwrap_or_default();
+    assert!(
+        backup_dir.contains(".local/share/sbh/backups"),
+        "expected canonical backup dir path; got {:?}; log: {}",
+        backup_dir,
+        result.log_path.display()
+    );
+}
+
+#[test]
+fn update_prune_with_isolated_home_reports_zero_removed_json() {
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_str = home.path().to_string_lossy().to_string();
+
+    let result = common::run_cli_case_with_env(
+        "update_prune_with_isolated_home_reports_zero_removed_json",
+        &["update", "--prune", "3", "--json"],
+        &[("HOME", &home_str), ("PATH", "")],
+    );
+    assert!(
+        result.status.success(),
+        "expected success; stderr={:?}; log: {}",
+        result.stderr,
+        result.log_path.display()
+    );
+
+    let payload: Value = serde_json::from_str(result.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "expected JSON output, parse failed: {err}; stdout={:?}; log={}",
+            result.stdout,
+            result.log_path.display()
+        )
+    });
+    assert_eq!(
+        payload["kept"],
+        0,
+        "expected zero kept in empty isolated store; log: {}",
+        result.log_path.display()
+    );
+    assert_eq!(
+        payload["removed"],
+        0,
+        "expected zero removed in empty isolated store; log: {}",
+        result.log_path.display()
+    );
+    let removed_ids = payload["removed_ids"].as_array().unwrap_or_else(|| {
+        panic!(
+            "expected removed_ids array in prune output; log: {}",
+            result.log_path.display()
+        )
+    });
+    assert!(
+        removed_ids.is_empty(),
+        "expected no removed ids; log: {}",
         result.log_path.display()
     );
 }

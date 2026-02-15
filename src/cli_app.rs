@@ -152,6 +152,9 @@ struct InstallArgs {
     /// Directory for ballast files.
     #[arg(long, value_name = "PATH")]
     ballast_path: Option<PathBuf>,
+    /// Use offline bundle manifest for airgapped preflight checks.
+    #[arg(long, value_name = "PATH")]
+    offline: Option<PathBuf>,
     /// Show what would be done without executing.
     #[arg(long)]
     dry_run: bool,
@@ -459,6 +462,12 @@ struct UpdateArgs {
     /// Print what would be done without making changes.
     #[arg(long)]
     dry_run: bool,
+    /// Bypass local metadata cache and fetch fresh update metadata.
+    #[arg(long)]
+    refresh_cache: bool,
+    /// Use offline bundle manifest for airgapped updates.
+    #[arg(long, value_name = "PATH")]
+    offline: Option<PathBuf>,
     /// Roll back to the most recent backup (or a specific backup by ID).
     #[arg(long, value_name = "BACKUP_ID")]
     rollback: Option<Option<String>>,
@@ -483,6 +492,8 @@ impl Default for UpdateArgs {
             user: false,
             no_verify: false,
             dry_run: false,
+            refresh_cache: false,
+            offline: None,
             rollback: None,
             list_backups: false,
             prune: None,
@@ -735,7 +746,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     // -- install orchestration (data dir, config, ballast) ----------------------
     {
         use storage_ballast_helper::cli::install::{
-            InstallOptions, format_install_report, run_install_sequence,
+            InstallOptions, format_install_report, run_install_sequence_with_bundle,
         };
 
         let config = Config::load(cli.config.as_deref()).unwrap_or_default();
@@ -747,7 +758,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             dry_run: args.dry_run,
         };
 
-        let report = run_install_sequence(&opts);
+        let report = run_install_sequence_with_bundle(&opts, args.offline.as_deref());
 
         match output_mode(cli) {
             OutputMode::Human => {
@@ -4187,11 +4198,33 @@ fn resolve_output_mode(json_flag: bool, env_mode: Option<&str>, stdout_is_tty: b
 // Update command
 // ---------------------------------------------------------------------------
 
+fn build_update_options(
+    args: &UpdateArgs,
+    config: &Config,
+    install_dir: PathBuf,
+) -> storage_ballast_helper::cli::update::UpdateOptions {
+    storage_ballast_helper::cli::update::UpdateOptions {
+        check_only: args.check,
+        pinned_version: args.version.clone(),
+        force: args.force,
+        install_dir,
+        no_verify: args.no_verify,
+        dry_run: args.dry_run,
+        max_backups: args.max_backups,
+        metadata_cache_file: config.update.metadata_cache_file.clone(),
+        metadata_cache_ttl: std::time::Duration::from_secs(
+            config.update.metadata_cache_ttl_seconds,
+        ),
+        refresh_cache: args.refresh_cache,
+        notices_enabled: config.update.notices_enabled,
+        offline_bundle_manifest: args.offline.clone(),
+    }
+}
+
 fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<(), CliError> {
     use storage_ballast_helper::cli::update::{
-        BackupStore, UpdateOptions, default_install_dir, format_backup_list,
-        format_prune_result, format_rollback_result, format_update_report,
-        run_update_sequence,
+        BackupStore, default_install_dir, format_backup_list, format_prune_result,
+        format_rollback_result, format_update_report, run_update_sequence,
     };
 
     let install_dir = if args.system {
@@ -4255,15 +4288,8 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<(), CliError> {
     }
 
     // Normal update flow.
-    let opts = UpdateOptions {
-        check_only: args.check,
-        pinned_version: args.version.clone(),
-        force: args.force,
-        install_dir,
-        no_verify: args.no_verify,
-        dry_run: args.dry_run,
-        max_backups: args.max_backups,
-    };
+    let config = Config::load(cli.config.as_deref()).unwrap_or_default();
+    let opts = build_update_options(args, &config, install_dir);
 
     let report = run_update_sequence(&opts);
 
@@ -5097,6 +5123,8 @@ mod tests {
             vec!["sbh", "update", "--version", "v0.2.0"],
             vec!["sbh", "update", "--version", "0.2.0", "--force"],
             vec!["sbh", "update", "--dry-run"],
+            vec!["sbh", "update", "--offline", "/tmp/bundle-manifest.json"],
+            vec!["sbh", "update", "--refresh-cache", "--check"],
             vec!["sbh", "update", "--no-verify", "--force"],
             vec!["sbh", "update", "--system"],
             vec!["sbh", "update", "--user"],
@@ -5132,6 +5160,8 @@ mod tests {
         assert!(!args.force);
         assert!(!args.no_verify);
         assert!(!args.dry_run);
+        assert!(!args.refresh_cache);
+        assert!(args.offline.is_none());
         assert!(!args.system);
         assert!(!args.user);
         assert!(args.version.is_none());
@@ -5139,5 +5169,39 @@ mod tests {
         assert!(!args.list_backups);
         assert!(args.prune.is_none());
         assert_eq!(args.max_backups, 5);
+    }
+
+    #[test]
+    fn update_options_include_cache_and_notice_config() {
+        let mut config = Config::default();
+        config.update.metadata_cache_ttl_seconds = 42;
+        config.update.metadata_cache_file = PathBuf::from("/tmp/custom-update-cache.json");
+        config.update.notices_enabled = false;
+
+        let mut args = UpdateArgs::default();
+        args.check = true;
+        args.force = true;
+        args.refresh_cache = true;
+        args.offline = Some(PathBuf::from("/tmp/offline-bundle.json"));
+        args.version = Some("v1.2.3".to_string());
+
+        let install_dir = PathBuf::from("/tmp/bin");
+        let opts = build_update_options(&args, &config, install_dir.clone());
+
+        assert!(opts.check_only);
+        assert_eq!(opts.pinned_version, Some("v1.2.3".to_string()));
+        assert!(opts.force);
+        assert_eq!(opts.install_dir, install_dir);
+        assert!(opts.refresh_cache);
+        assert_eq!(
+            opts.offline_bundle_manifest,
+            Some(PathBuf::from("/tmp/offline-bundle.json"))
+        );
+        assert_eq!(
+            opts.metadata_cache_file,
+            PathBuf::from("/tmp/custom-update-cache.json")
+        );
+        assert_eq!(opts.metadata_cache_ttl, std::time::Duration::from_secs(42));
+        assert!(!opts.notices_enabled);
     }
 }
