@@ -14,9 +14,7 @@ use std::time::{Duration, Instant};
 
 use storage_ballast_helper::ballast::manager::BallastManager;
 use storage_ballast_helper::core::config::{BallastConfig, ScoringConfig};
-use storage_ballast_helper::daemon::policy::{
-    ActiveMode, PolicyConfig, PolicyEngine,
-};
+use storage_ballast_helper::daemon::policy::{ActiveMode, PolicyConfig, PolicyEngine};
 use storage_ballast_helper::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
 use storage_ballast_helper::monitor::ewma::DiskRateEstimator;
 use storage_ballast_helper::monitor::guardrails::{

@@ -119,7 +119,9 @@ impl PidPressureController {
         self.last_error = error;
         self.last_update = Some(now);
 
-        let raw = self.kd.mul_add(derivative, self.kp.mul_add(error, self.ki * self.integral));
+        let raw = self
+            .kd
+            .mul_add(derivative, self.kp.mul_add(error, self.ki * self.integral));
         let mut urgency = (1.0 - (-raw.max(0.0)).exp()).clamp(0.0, 1.0);
 
         if let Some(seconds) = predicted_seconds_to_red {

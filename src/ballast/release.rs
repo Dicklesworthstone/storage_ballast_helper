@@ -135,9 +135,10 @@ impl BallastReleaseController {
 
         // Rate limit: one file every replenish_interval.
         if let Some(last) = self.last_replenish_time
-            && now.duration_since(last) < self.replenish_interval {
-                return Ok(false);
-            }
+            && now.duration_since(last) < self.replenish_interval
+        {
+            return Ok(false);
+        }
 
         // Replenish one file (provision is idempotent — creates missing files).
         let report = manager.replenish(Some(free_pct_check))?;

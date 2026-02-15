@@ -237,15 +237,16 @@ fn run_inner(stdout: &mut io::Stdout, config: &DashboardConfig) -> io::Result<()
     loop {
         // Poll for keyboard events.
         if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(());
-                    }
-                    _ => {}
+            && let Event::Key(key) = event::read()?
+        {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(());
                 }
+                _ => {}
             }
+        }
 
         // Refresh at configured interval.
         if last_render.elapsed() < config.refresh {
@@ -355,11 +356,13 @@ fn render_frame(
 
             // Time-to-exhaustion hint if rate is positive.
             if let Some(rate) = mount.rate_bps
-                && rate > 0.0 && mount.free_pct > 0.0 {
-                    // rough estimate — free_bytes not available, use percentage
-                    queue!(stdout, SetForegroundColor(Color::Yellow))?;
-                    write!(stdout, "  ⚠")?;
-                }
+                && rate > 0.0
+                && mount.free_pct > 0.0
+            {
+                // rough estimate — free_bytes not available, use percentage
+                queue!(stdout, SetForegroundColor(Color::Yellow))?;
+                write!(stdout, "  ⚠")?;
+            }
 
             queue!(stdout, SetAttribute(Attribute::Reset))?;
             row += 1;

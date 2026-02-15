@@ -373,7 +373,9 @@ impl MonitoringDaemon {
             if last_health_check.elapsed() >= THREAD_HEALTH_CHECK_INTERVAL {
                 last_health_check = Instant::now();
 
-                let scanner_dead = scanner_join.as_ref().is_some_and(std::thread::JoinHandle::is_finished);
+                let scanner_dead = scanner_join
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished);
                 if scanner_dead {
                     eprintln!("[SBH-DAEMON] scanner thread exited unexpectedly");
                     if let Some(handle) = scanner_join.take() {
@@ -396,7 +398,9 @@ impl MonitoringDaemon {
                     }
                 }
 
-                let executor_dead = executor_join.as_ref().is_some_and(std::thread::JoinHandle::is_finished);
+                let executor_dead = executor_join
+                    .as_ref()
+                    .is_some_and(std::thread::JoinHandle::is_finished);
                 if executor_dead {
                     eprintln!("[SBH-DAEMON] executor thread exited unexpectedly");
                     if let Some(handle) = executor_join.take() {

@@ -150,12 +150,16 @@ impl ThreadHeartbeat {
         if elapsed_ms > threshold_ms {
             ThreadStatus::Stalled {
                 name: self.name.clone(),
-                stalled_since: Instant::now().checked_sub(Duration::from_millis(elapsed_ms)).unwrap(),
+                stalled_since: Instant::now()
+                    .checked_sub(Duration::from_millis(elapsed_ms))
+                    .unwrap(),
             }
         } else {
             ThreadStatus::Running {
                 name: self.name.clone(),
-                last_heartbeat: Instant::now().checked_sub(Duration::from_millis(elapsed_ms)).unwrap(),
+                last_heartbeat: Instant::now()
+                    .checked_sub(Duration::from_millis(elapsed_ms))
+                    .unwrap(),
             }
         }
     }
@@ -248,9 +252,10 @@ impl SelfMonitor {
     ) -> u64 {
         let now = Instant::now();
         if let Some(last) = self.last_write
-            && now.duration_since(last) < self.write_interval {
-                return 0;
-            }
+            && now.duration_since(last) < self.write_interval
+        {
+            return 0;
+        }
 
         self.last_write = Some(now);
         let rss = read_rss_bytes();
@@ -415,8 +420,7 @@ fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let json = serde_json::to_string_pretty(state)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
     fs::write(&tmp_path, json)?;
     fs::rename(&tmp_path, path)?;
 
@@ -449,9 +453,10 @@ fn read_rss_linux() -> u64 {
         if line.starts_with("VmRSS:") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2
-                && let Ok(kb) = parts[1].parse::<u64>() {
-                    return kb * 1024; // kB to bytes
-                }
+                && let Ok(kb) = parts[1].parse::<u64>()
+            {
+                return kb * 1024; // kB to bytes
+            }
         }
     }
 

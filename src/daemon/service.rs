@@ -329,9 +329,10 @@ pub struct ServiceActionResult {
 fn resolve_sbh_binary() -> Result<PathBuf> {
     // First try: the currently running executable.
     if let Ok(exe) = env::current_exe()
-        && exe.exists() {
-            return Ok(exe);
-        }
+        && exe.exists()
+    {
+        return Ok(exe);
+    }
     // Fallback: search PATH.
     for candidate in &["/usr/local/bin/sbh", "/usr/bin/sbh"] {
         let p = Path::new(candidate);
