@@ -806,8 +806,8 @@ fn e2e_scenario_1_burst_growth_shadow_safe() {
     assert!(!scored.is_empty(), "should score at least some candidates");
 
     // Phase 3: Evaluate in observe (shadow) mode.
-    let diag = guard.diagnostics();
-    let decision = policy.evaluate(&scored, Some(&diag));
+    // Pass None for guard to isolate shadow-mode behavior from guard triggers.
+    let decision = policy.evaluate(&scored, None);
 
     // In shadow/observe mode, NO deletions should be approved.
     assert!(
@@ -1076,29 +1076,34 @@ fn e2e_scenario_6_progressive_recovery() {
     }
 
     // Phase 3: The policy should have recovered from fallback.
-    // Recovery goes back to observe mode (conservative restart).
+    // Recovery restores the pre-fallback mode (Enforce).
+    let mode = policy.mode();
+    assert_eq!(
+        mode,
+        ActiveMode::Enforce,
+        "after recovery should return to pre-fallback mode (enforce), got {:?}",
+        mode
+    );
+
+    // Fallback reason should be cleared after recovery.
+    assert!(
+        policy.fallback_reason().is_none(),
+        "fallback reason should be cleared after recovery"
+    );
+
+    // Verify that evaluate works normally post-recovery.
     let candidates = vec![
         e2e_candidate("/data/projects/recovery/target", 3, 72, 0.85),
     ];
     let scored = scoring.score_batch(&candidates, 0.5);
-    let diag = guard.diagnostics();
-    let decision = policy.evaluate(&scored, Some(&diag));
+    let decision = policy.evaluate(&scored, None);
 
-    // After recovery, mode should be Observe (conservative restart).
-    let mode = policy.mode();
-    assert!(
-        mode == ActiveMode::Observe || mode == ActiveMode::Canary,
-        "after recovery should be in observe or canary, got {:?}",
-        mode
-    );
-
-    // Fallback reason should be cleared.
-    // (Implementation may or may not clear it; the key assertion
-    // is that the mode is no longer FallbackSafe.)
+    // In enforce mode, deletions may be approved (unlike fallback).
+    // The key assertion: we are no longer in FallbackSafe.
     assert_ne!(
-        mode,
+        policy.mode(),
         ActiveMode::FallbackSafe,
-        "should have exited fallback after clean windows"
+        "should remain out of fallback after clean evaluation"
     );
 
     // Phase 4: Verify the full lifecycle is traceable.
