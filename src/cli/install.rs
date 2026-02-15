@@ -214,7 +214,8 @@ pub fn run_install_sequence_with_bundle(
     };
 
     if opts.dry_run {
-        let total_gb = (opts.ballast_count as u64 * opts.ballast_size_bytes) / 1_073_741_824;
+        let total_gb =
+            (opts.ballast_count as u64).saturating_mul(opts.ballast_size_bytes) / 1_073_741_824;
         report.step_plan(format!(
             "Provision ballast: {} files x {} MB = {} GB in {}",
             opts.ballast_count,

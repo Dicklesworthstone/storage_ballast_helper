@@ -756,10 +756,16 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
         };
 
         let config = Config::load(cli.config.as_deref()).unwrap_or_default();
+        let ballast_size_bytes = args.ballast_size.checked_mul(1024 * 1024).ok_or_else(|| {
+            CliError::User(format!(
+                "ballast size {} MB overflows u64 when converted to bytes",
+                args.ballast_size
+            ))
+        })?;
         let opts = InstallOptions {
             config,
             ballast_count: args.ballast_count,
-            ballast_size_bytes: args.ballast_size * 1024 * 1024,
+            ballast_size_bytes,
             ballast_path: args.ballast_path.clone(),
             dry_run: args.dry_run,
         };
