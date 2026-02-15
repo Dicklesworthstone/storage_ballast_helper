@@ -9,7 +9,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{BufReader, BufWriter, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -577,7 +577,17 @@ impl MerkleScanIndex {
             fs::create_dir_all(parent).map_err(|e| SbhError::io(parent, e))?;
         }
 
-        let file = fs::File::create(&temp_path).map_err(|e| SbhError::io(&temp_path, e))?;
+        let file = {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            opts.open(&temp_path)
+                .map_err(|e| SbhError::io(&temp_path, e))?
+        };
 
         let mut writer = BufWriter::new(file);
         serde_json::to_writer(&mut writer, &checkpoint).map_err(|e| SbhError::Serialization {
