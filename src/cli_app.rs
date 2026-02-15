@@ -1774,8 +1774,10 @@ fn generate_recommendations(
             && week.pressure.transitions > 0
             && config.ballast.file_count > 3
         {
-            let pool_gb = (config.ballast.file_count as u64 * config.ballast.file_size_bytes)
-                as f64
+            let pool_gb = ballast_total_pool_bytes(
+                config.ballast.file_count,
+                config.ballast.file_size_bytes,
+            ) as f64
                 / 1_073_741_824.0;
             let suggested = (config.ballast.file_count / 2).max(3);
             recs.push(Recommendation {
@@ -1788,8 +1790,10 @@ fn generate_recommendations(
                          {pool_gb:.1} GB is reserved but unused. Reducing to {suggested} files \
                          frees {:.1} GB.",
                     week.pressure.transitions,
-                    ((config.ballast.file_count - suggested) as u64
-                        * config.ballast.file_size_bytes) as f64
+                    ballast_total_pool_bytes(
+                        config.ballast.file_count.saturating_sub(suggested),
+                        config.ballast.file_size_bytes,
+                    ) as f64
                         / 1_073_741_824.0,
                 ),
                 confidence: 0.7,
@@ -2422,9 +2426,10 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                     );
                     println!(
                         "  Total pool: {}",
-                        format_bytes(
-                            config.ballast.file_count as u64 * config.ballast.file_size_bytes
-                        )
+                        format_bytes(ballast_total_pool_bytes(
+                            config.ballast.file_count,
+                            config.ballast.file_size_bytes,
+                        ))
                     );
                     println!(
                         "  Available: {available} files ({} releasable)",
@@ -2477,9 +2482,10 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                         "directory": config.paths.ballast_dir.to_string_lossy(),
                         "configured_count": config.ballast.file_count,
                         "configured_size_bytes": config.ballast.file_size_bytes,
-                        "total_pool_bytes":
-                            config.ballast.file_count as u64
-                                * config.ballast.file_size_bytes,
+                        "total_pool_bytes": ballast_total_pool_bytes(
+                            config.ballast.file_count,
+                            config.ballast.file_size_bytes,
+                        ),
                         "available_count": available,
                         "releasable_bytes": releasable,
                         "missing_count":
@@ -2865,7 +2871,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             );
             println!(
                 "  Total pool: {}",
-                format_bytes(config.ballast.file_count as u64 * config.ballast.file_size_bytes),
+                format_bytes(ballast_total_pool_bytes(
+                    config.ballast.file_count,
+                    config.ballast.file_size_bytes,
+                )),
             );
 
             // Recent activity from database.
