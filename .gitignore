@@ -11,6 +11,7 @@
 # OS files
 .DS_Store
 Thumbs.db
+._*
 
 # Local environment / secrets
 .env

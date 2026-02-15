@@ -1,5 +1,9 @@
 # storage_ballast_helper (`sbh`)
 
+<div align="center">
+  <img src="sbh_illustration.webp" alt="sbh - Storage Ballast Helper illustration">
+</div>
+
 Cross-platform disk-pressure defense for AI coding workloads: predictive monitoring, safe cleanup, ballast release, and explainable policy decisions.
 
 ## TL;DR
