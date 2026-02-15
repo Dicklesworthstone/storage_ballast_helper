@@ -6,6 +6,7 @@
 //! local cache layout, offline diagnostics, and cache cleanup.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -57,11 +58,17 @@ pub struct AssetManifest {
 
 impl AssetManifest {
     /// Parse a manifest from JSON.
+    ///
+    /// # Errors
+    /// Returns an error if the JSON is invalid or cannot be deserialized.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
 
     /// Serialize to pretty JSON.
+    ///
+    /// # Errors
+    /// Returns an error if serialization fails.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
@@ -100,8 +107,7 @@ impl AssetCache {
     #[must_use]
     pub fn default_root() -> PathBuf {
         std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
             .join(".local")
             .join("share")
             .join("sbh")
@@ -180,6 +186,9 @@ impl AssetCache {
     }
 
     /// Remove all cached files for assets not in the manifest (old versions).
+    ///
+    /// # Errors
+    /// Returns an error if directory traversal or removal fails.
     pub fn cleanup_stale(&self, manifest: &AssetManifest) -> io::Result<CleanupReport> {
         let mut removed_count = 0u64;
         let mut removed_bytes = 0u64;
@@ -381,7 +390,7 @@ impl fmt::Display for FetchStatus {
 }
 
 /// Options for the fetch pipeline.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FetchOptions {
     /// Only report, do not download.
     pub dry_run: bool,
@@ -389,16 +398,6 @@ pub struct FetchOptions {
     pub required_only: bool,
     /// Offline mode: fail fast if any required asset is missing.
     pub offline: bool,
-}
-
-impl Default for FetchOptions {
-    fn default() -> Self {
-        Self {
-            dry_run: false,
-            required_only: false,
-            offline: false,
-        }
-    }
 }
 
 /// Full fetch/prefetch summary.
@@ -412,6 +411,7 @@ pub struct FetchSummary {
 }
 
 /// Run the fetch pipeline for all manifest assets.
+#[must_use]
 pub fn fetch_assets(
     manifest: &AssetManifest,
     cache: &AssetCache,
@@ -576,6 +576,9 @@ fn download_and_verify(entry: &AssetEntry, cache: &AssetCache) -> io::Result<u64
 }
 
 /// Verify a single cached asset's integrity.
+///
+/// # Errors
+/// Returns an error if the asset is not in the cache or cannot be read.
 pub fn verify_cached_asset(entry: &AssetEntry, cache: &AssetCache) -> io::Result<bool> {
     let path = cache.asset_path(entry);
     if !path.exists() {
@@ -593,6 +596,9 @@ pub fn verify_cached_asset(entry: &AssetEntry, cache: &AssetCache) -> io::Result
 // ---------------------------------------------------------------------------
 
 /// Compute SHA-256 hex digest of a file.
+///
+/// # Errors
+/// Returns an error if the file cannot be read.
 pub fn compute_sha256(path: &Path) -> io::Result<String> {
     let data = fs::read(path)?;
     let mut hasher = Sha256::new();
@@ -688,16 +694,18 @@ pub fn format_fetch_summary(summary: &FetchSummary) -> String {
             FetchStatus::DryRun => "[PLAN]",
             FetchStatus::Skipped => "[SKIP]",
         };
-        out.push_str(&format!(
-            "  {status_label} {} v{}: {}\n",
+        let _ = writeln!(
+            out,
+            "  {status_label} {} v{}: {}",
             result.name, result.version, result.message
-        ));
+        );
     }
 
-    out.push_str(&format!(
-        "\nSummary: {} downloaded, {} cached, {} failed\n",
+    let _ = writeln!(
+        out,
+        "\nSummary: {} downloaded, {} cached, {} failed",
         summary.downloaded_count, summary.cached_count, summary.failed_count,
-    ));
+    );
 
     out
 }
@@ -714,13 +722,13 @@ pub fn format_offline_report(report: &OfflineReport) -> String {
         if !report.missing_required.is_empty() {
             out.push_str("  Missing required assets:\n");
             for name in &report.missing_required {
-                out.push_str(&format!("    - {name}\n"));
+                let _ = writeln!(out, "    - {name}");
             }
         }
         if !report.corrupt.is_empty() {
             out.push_str("  Corrupt cached assets (re-download needed):\n");
             for name in &report.corrupt {
-                out.push_str(&format!("    - {name}\n"));
+                let _ = writeln!(out, "    - {name}");
             }
         }
     }
@@ -728,7 +736,7 @@ pub fn format_offline_report(report: &OfflineReport) -> String {
     if !report.missing_optional.is_empty() {
         out.push_str("  Missing optional assets:\n");
         for name in &report.missing_optional {
-            out.push_str(&format!("    - {name}\n"));
+            let _ = writeln!(out, "    - {name}");
         }
     }
 

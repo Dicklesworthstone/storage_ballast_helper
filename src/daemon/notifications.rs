@@ -35,7 +35,7 @@ pub enum NotificationLevel {
 impl NotificationLevel {
     /// Convert from a pressure level.
     #[must_use]
-    pub fn from_pressure(level: PressureLevel) -> Self {
+    pub const fn from_pressure(level: PressureLevel) -> Self {
         match level {
             PressureLevel::Green => Self::Info,
             PressureLevel::Yellow => Self::Warning,
@@ -337,7 +337,7 @@ struct DesktopChannel {
 }
 
 impl DesktopChannel {
-    fn new(config: &DesktopConfig) -> Self {
+    const fn new(config: &DesktopConfig) -> Self {
         Self {
             min_level: config.min_level,
         }
@@ -443,7 +443,7 @@ struct JournalChannel {
 }
 
 impl JournalChannel {
-    fn new(config: &JournalConfig) -> Self {
+    const fn new(config: &JournalConfig) -> Self {
         Self {
             min_level: config.min_level,
         }
@@ -636,7 +636,7 @@ impl NotificationManager {
 
     /// Whether the manager is enabled.
     #[must_use]
-    pub fn is_enabled(&self) -> bool {
+    pub const fn is_enabled(&self) -> bool {
         self.enabled
     }
 

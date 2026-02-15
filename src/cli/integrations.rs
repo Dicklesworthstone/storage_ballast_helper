@@ -5,6 +5,7 @@
 //! mutation.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -20,7 +21,7 @@ use serde::Serialize;
 pub enum AiTool {
     /// Anthropic Claude Code CLI.
     ClaudeCode,
-    /// OpenAI Codex CLI.
+    /// `OpenAI` Codex CLI.
     Codex,
     /// Google Gemini CLI.
     GeminiCli,
@@ -171,7 +172,7 @@ fn is_writable(path: &Path) -> bool {
             .map(|m| !m.permissions().readonly())
             .unwrap_or(false)
     } else {
-        path.parent().map(|p| p.exists()).unwrap_or(false)
+        path.parent().is_some_and(Path::exists)
     }
 }
 
@@ -211,7 +212,7 @@ pub fn integration_snippet(tool: AiTool) -> &'static str {
     }
 }
 
-/// Claude Code: PreToolUse hook that checks destructive operations via sbh.
+/// Claude Code: `PreToolUse` hook that checks destructive operations via sbh.
 const CLAUDE_CODE_HOOK_SNIPPET: &str = r#"
   "hooks": {
     "PreToolUse": [
@@ -350,7 +351,7 @@ fn create_timestamped_backup(path: &Path, backup_dir: Option<&Path>) -> std::io:
 // ---------------------------------------------------------------------------
 
 /// Options for running integration bootstrap.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BootstrapOptions {
     /// Only report, do not apply changes.
     pub dry_run: bool,
@@ -362,18 +363,8 @@ pub struct BootstrapOptions {
     pub skip_tools: Vec<AiTool>,
 }
 
-impl Default for BootstrapOptions {
-    fn default() -> Self {
-        Self {
-            dry_run: false,
-            backup_dir: None,
-            only_tools: Vec::new(),
-            skip_tools: Vec::new(),
-        }
-    }
-}
-
 /// Run integration bootstrap: detect tools, inject hooks, report results.
+#[must_use]
 pub fn run_bootstrap(opts: &BootstrapOptions) -> BootstrapSummary {
     let detected = detect_tools();
     let mut results = Vec::new();
@@ -583,10 +574,11 @@ fn inject_text_hook(path: &Path, tool: AiTool) -> std::io::Result<()> {
 pub fn format_summary_human(summary: &BootstrapSummary) -> String {
     let mut out = String::new();
 
-    out.push_str(&format!(
-        "AI tool integration bootstrap: {} tool(s) detected\n\n",
+    let _ = writeln!(
+        out,
+        "AI tool integration bootstrap: {} tool(s) detected\n",
         summary.detected_count
-    ));
+    );
 
     for result in &summary.results {
         let status_label = match result.status {
@@ -596,27 +588,30 @@ pub fn format_summary_human(summary: &BootstrapSummary) -> String {
             IntegrationStatus::Failed => "[FAIL]",
             IntegrationStatus::DryRun => "[PLAN]",
         };
-        out.push_str(&format!(
-            "  {status_label} {}: {}\n",
+        let _ = writeln!(
+            out,
+            "  {status_label} {}: {}",
             result.tool, result.message
-        ));
+        );
         if let Some(backup) = &result.backup_path {
-            out.push_str(&format!("         backup: {}\n", backup.display()));
-            out.push_str(&format!(
-                "         restore: cp {} {}\n",
+            let _ = writeln!(out, "         backup: {}", backup.display());
+            let _ = writeln!(
+                out,
+                "         restore: cp {} {}",
                 backup.display(),
                 result.config_path.display()
-            ));
+            );
         }
     }
 
-    out.push_str(&format!(
-        "\nSummary: {} configured, {} already configured, {} skipped, {} failed\n",
+    let _ = writeln!(
+        out,
+        "\nSummary: {} configured, {} already configured, {} skipped, {} failed",
         summary.configured_count,
         summary.already_configured_count,
         summary.skipped_count,
         summary.failed_count,
-    ));
+    );
 
     out
 }

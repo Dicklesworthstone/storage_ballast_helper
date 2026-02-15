@@ -238,10 +238,10 @@ fn logger_thread_main(
         if let Some(db) = &sqlite {
             let activity_ok = activity_row
                 .as_ref()
-                .map_or(true, |row| db.log_activity(row).is_ok());
+                .is_none_or(|row| db.log_activity(row).is_ok());
             let pressure_ok = pressure_row
                 .as_ref()
-                .map_or(true, |row| db.log_pressure(row).is_ok());
+                .is_none_or(|row| db.log_pressure(row).is_ok());
             if activity_ok && pressure_ok {
                 sqlite_failures = 0;
             } else {

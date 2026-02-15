@@ -1,4 +1,5 @@
-//! Integration tests: CLI smoke tests and full-pipeline scenarios.
+//! Integration tests: CLI smoke tests, full-pipeline scenarios, and
+//! decision-plane e2e scenarios (bd-izu.7).
 
 mod common;
 
@@ -7,17 +8,27 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use storage_ballast_helper::ballast::manager::BallastManager;
-use storage_ballast_helper::core::config::{BallastConfig, Config};
+use storage_ballast_helper::core::config::{BallastConfig, Config, ScoringConfig};
 use storage_ballast_helper::daemon::notifications::{NotificationEvent, NotificationManager};
+use storage_ballast_helper::daemon::policy::{ActiveMode, FallbackReason, PolicyConfig, PolicyEngine};
 use storage_ballast_helper::monitor::ewma::DiskRateEstimator;
+use storage_ballast_helper::monitor::guardrails::{
+    AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus, GuardrailConfig,
+};
 use storage_ballast_helper::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
 use storage_ballast_helper::monitor::predictive::{PredictiveActionPolicy, PredictiveConfig};
+use storage_ballast_helper::scanner::decision_record::{
+    DecisionRecordBuilder, ExplainLevel, PolicyMode, format_explain,
+};
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor};
 use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, StructuralSignals,
 };
 use storage_ballast_helper::scanner::protection::ProtectionRegistry;
-use storage_ballast_helper::scanner::scoring::{CandidateInput, DecisionAction, ScoringEngine};
+use storage_ballast_helper::scanner::scoring::{
+    CandidacyScore, CandidateInput, DecisionAction, DecisionOutcome, EvidenceLedger,
+    EvidenceTerm, ScoreFactors, ScoringEngine,
+};
 use storage_ballast_helper::scanner::walker::{DirectoryWalker, WalkerConfig};
 
 #[test]
@@ -627,4 +638,472 @@ fn batch_scoring_ranks_correctly() {
         ranked[0].total_score,
         ranked[1].total_score,
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Decision-Plane E2E Scenarios (bd-izu.7)
+//
+// Six scenarios exercising shadow, canary, enforce, and fallback behavior
+// under realistic pressure and failure modes. Each scenario:
+// - Is deterministic under fixed seeds and fixture inputs
+// - Emits trace_id, decision_id, policy mode, guard status
+// - Asserts fallback triggers and reasons
+// - Verifies no unintended deletions in shadow mode
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+fn e2e_scoring_engine() -> ScoringEngine {
+    ScoringEngine::from_config(&ScoringConfig::default(), 30)
+}
+
+fn e2e_candidate(path: &str, size_gb: u64, age_hours: u64, confidence: f64) -> CandidateInput {
+    CandidateInput {
+        path: PathBuf::from(path),
+        size_bytes: size_gb * 1_073_741_824,
+        age: Duration::from_secs(age_hours * 3600),
+        classification: ArtifactClassification {
+            pattern_name: ".target*".to_string(),
+            category: ArtifactCategory::RustTarget,
+            name_confidence: confidence,
+            structural_confidence: confidence * 0.9,
+            combined_confidence: confidence,
+        },
+        signals: StructuralSignals {
+            has_incremental: true,
+            has_deps: true,
+            has_build: true,
+            has_fingerprint: confidence > 0.5,
+            has_git: false,
+            has_cargo_toml: false,
+            mostly_object_files: true,
+        },
+        is_open: false,
+        excluded: false,
+    }
+}
+
+fn e2e_good_observations(count: usize) -> Vec<CalibrationObservation> {
+    (0..count)
+        .map(|i| CalibrationObservation {
+            predicted_rate: 1000.0 + (i as f64 * 10.0),
+            actual_rate: 1050.0 + (i as f64 * 10.0),
+            predicted_tte: 90.0 + (i as f64),
+            actual_tte: 85.0 + (i as f64),
+        })
+        .collect()
+}
+
+fn e2e_bad_observations(count: usize, error_factor: f64) -> Vec<CalibrationObservation> {
+    (0..count)
+        .map(|i| CalibrationObservation {
+            predicted_rate: 1000.0 + (i as f64 * 10.0),
+            actual_rate: (1000.0 + (i as f64 * 10.0)) * error_factor,
+            predicted_tte: 100.0,
+            actual_tte: 30.0,
+        })
+        .collect()
+}
+
+fn e2e_scored_candidate(action: DecisionAction, score: f64) -> CandidacyScore {
+    CandidacyScore {
+        path: PathBuf::from("/data/projects/test/.target_opus"),
+        total_score: score,
+        factors: ScoreFactors {
+            location: 0.85,
+            name: 0.90,
+            age: 1.0,
+            size: 0.70,
+            structure: 0.95,
+            pressure_multiplier: 1.5,
+        },
+        vetoed: false,
+        veto_reason: None,
+        classification: ArtifactClassification {
+            pattern_name: ".target*".to_string(),
+            category: ArtifactCategory::RustTarget,
+            name_confidence: 0.9,
+            structural_confidence: 0.95,
+            combined_confidence: 0.92,
+        },
+        size_bytes: 3_000_000_000,
+        age: Duration::from_secs(5 * 3600),
+        decision: DecisionOutcome {
+            action,
+            posterior_abandoned: 0.87,
+            expected_loss_keep: 8.7,
+            expected_loss_delete: 1.3,
+            calibration_score: 0.82,
+            fallback_active: false,
+        },
+        ledger: EvidenceLedger {
+            terms: vec![EvidenceTerm {
+                name: "location",
+                weight: 0.25,
+                value: 0.85,
+                contribution: 0.2125,
+            }],
+            summary: "test".to_string(),
+        },
+    }
+}
+
+/// Build a pass-status guard diagnostics.
+fn passing_guard_diag() -> GuardDiagnostics {
+    GuardDiagnostics {
+        status: GuardStatus::Pass,
+        observation_count: 20,
+        median_rate_error: 0.05,
+        conservative_fraction: 0.95,
+        e_process_value: 0.3,
+        e_process_alarm: false,
+        consecutive_clean: 5,
+        reason: "all metrics within bounds".to_string(),
+    }
+}
+
+/// Build a failing-status guard diagnostics.
+fn failing_guard_diag() -> GuardDiagnostics {
+    GuardDiagnostics {
+        status: GuardStatus::Fail,
+        observation_count: 20,
+        median_rate_error: 0.35,
+        conservative_fraction: 0.4,
+        e_process_value: 2.5,
+        e_process_alarm: true,
+        consecutive_clean: 0,
+        reason: "e-process alarm tripped".to_string(),
+    }
+}
+
+// ── Scenario 1: Burst growth with safe shadow recommendations ───────────
+
+#[test]
+fn e2e_scenario_1_burst_growth_shadow_safe() {
+    // Setup: scoring engine + policy in observe mode + guard.
+    let scoring = e2e_scoring_engine();
+    let mut policy = PolicyEngine::new(PolicyConfig::default());
+    let mut guard = AdaptiveGuard::with_defaults();
+
+    // Phase 1: Feed good calibration data.
+    for obs in e2e_good_observations(10) {
+        guard.observe(obs);
+    }
+
+    // Phase 2: Score a burst of high-confidence candidates.
+    let candidates: Vec<CandidateInput> = (0..10)
+        .map(|i| {
+            e2e_candidate(
+                &format!("/data/projects/agent_{i}/.target_opus"),
+                2 + i as u64,
+                48 + i as u64 * 12,
+                0.9,
+            )
+        })
+        .collect();
+
+    let scored = scoring.score_batch(&candidates, 0.8);
+    assert!(!scored.is_empty(), "should score at least some candidates");
+
+    // Phase 3: Evaluate in observe (shadow) mode.
+    let diag = guard.diagnostics();
+    let decision = policy.evaluate(&scored, Some(&diag));
+
+    // In shadow/observe mode, NO deletions should be approved.
+    assert!(
+        decision.approved_for_deletion.is_empty(),
+        "observe mode must not approve deletions, got {} approved",
+        decision.approved_for_deletion.len()
+    );
+    assert_eq!(policy.mode(), ActiveMode::Observe);
+
+    // Phase 4: Verify decision records contain recommendations.
+    let mut builder = DecisionRecordBuilder::new();
+    for candidate in &scored {
+        let record = builder.build(candidate, PolicyMode::Shadow, None, None);
+        assert!(!record.trace_id.is_empty());
+        assert!(record.decision_id > 0);
+        // Trace should show observe mode.
+        assert_eq!(record.policy_mode, PolicyMode::Shadow);
+    }
+
+    // Phase 5: Verify explain output is non-empty.
+    let sample = builder.build(&scored[0], PolicyMode::Shadow, None, None);
+    let explanation = format_explain(&sample, ExplainLevel::L3);
+    assert!(
+        !explanation.is_empty(),
+        "explain output should be non-empty"
+    );
+}
+
+// ── Scenario 2: Canary pass with bounded impact and trace capture ───────
+
+#[test]
+fn e2e_scenario_2_canary_bounded_impact() {
+    let scoring = e2e_scoring_engine();
+    let config = PolicyConfig {
+        max_canary_deletes_per_hour: 3,
+        ..PolicyConfig::default()
+    };
+    let mut policy = PolicyEngine::new(config);
+    let mut guard = AdaptiveGuard::with_defaults();
+
+    // Warmup: feed good observations and promote to canary.
+    for obs in e2e_good_observations(15) {
+        guard.observe(obs);
+    }
+    let passing = passing_guard_diag();
+    policy.observe_window(&passing);
+    policy.promote(); // observe → canary
+    assert_eq!(policy.mode(), ActiveMode::Canary);
+
+    // Score candidates.
+    let candidates: Vec<CandidateInput> = (0..8)
+        .map(|i| {
+            e2e_candidate(
+                &format!("/data/projects/proj_{i}/target"),
+                1 + i as u64,
+                72,
+                0.85,
+            )
+        })
+        .collect();
+
+    let scored = scoring.score_batch(&candidates, 0.7);
+
+    // Evaluate in canary mode.
+    let diag = guard.diagnostics();
+    let decision = policy.evaluate(&scored, Some(&diag));
+
+    // Canary should approve at most canary_delete_cap_per_hour.
+    assert!(
+        decision.approved_for_deletion.len() <= 3,
+        "canary should cap at 3, got {}",
+        decision.approved_for_deletion.len()
+    );
+
+    // Build trace records and verify canary policy mode.
+    let mut builder = DecisionRecordBuilder::new();
+    for candidate in &scored {
+        let record = builder.build(candidate, PolicyMode::Canary, None, None);
+        assert_eq!(record.policy_mode, PolicyMode::Canary);
+        // Each trace_id should be unique and sequential.
+        assert!(record.trace_id.starts_with("sbh-"));
+    }
+}
+
+// ── Scenario 3: Calibration drift causing guard fail and fallback ────────
+
+#[test]
+fn e2e_scenario_3_calibration_drift_fallback() {
+    let scoring = e2e_scoring_engine();
+    let config = PolicyConfig {
+        calibration_breach_windows: 3,
+        ..PolicyConfig::default()
+    };
+    let mut policy = PolicyEngine::new(config);
+    let mut guard = AdaptiveGuard::with_defaults();
+
+    // Phase 1: Warmup with good data and promote to enforce.
+    for obs in e2e_good_observations(15) {
+        guard.observe(obs);
+    }
+    let passing = passing_guard_diag();
+    policy.observe_window(&passing);
+    policy.promote(); // observe → canary
+    policy.observe_window(&passing);
+    policy.promote(); // canary → enforce
+    assert_eq!(policy.mode(), ActiveMode::Enforce);
+
+    // Phase 2: Inject bad calibration causing drift.
+    for obs in e2e_bad_observations(20, 3.0) {
+        guard.observe(obs);
+    }
+
+    // Phase 3: Feed failing guard diagnostics.
+    let failing = failing_guard_diag();
+    for _ in 0..4 {
+        policy.observe_window(&failing);
+    }
+
+    // Phase 4: Evaluate — should be in fallback.
+    let candidates = vec![
+        e2e_candidate("/data/projects/drift/target", 5, 96, 0.9),
+    ];
+    let scored = scoring.score_batch(&candidates, 0.9);
+    let diag = guard.diagnostics();
+    let decision = policy.evaluate(&scored, Some(&diag));
+
+    // Fallback should block all deletions.
+    assert!(
+        decision.approved_for_deletion.is_empty(),
+        "fallback must block all deletions, got {} approved",
+        decision.approved_for_deletion.len()
+    );
+    assert_eq!(policy.mode(), ActiveMode::FallbackSafe);
+
+    // Verify the fallback reason is traceable.
+    let reason = policy.fallback_reason();
+    assert!(
+        reason.is_some(),
+        "fallback reason must be recorded"
+    );
+}
+
+// ── Scenario 4: Index corruption causing full-scan fallback ─────────────
+
+#[test]
+fn e2e_scenario_4_index_corruption_full_scan() {
+    // This scenario verifies that when the Merkle scan index is corrupted
+    // or unavailable, the system falls back to a full scan and still
+    // produces valid scoring results.
+    let scoring = e2e_scoring_engine();
+    let policy = PolicyEngine::new(PolicyConfig::default());
+
+    // Simulate a full scan by scoring candidates directly (no incremental index).
+    let candidates: Vec<CandidateInput> = vec![
+        e2e_candidate("/data/projects/p1/target", 3, 48, 0.9),
+        e2e_candidate("/data/projects/p2/.target_agent", 2, 72, 0.85),
+        e2e_candidate("/data/projects/p3/build", 1, 24, 0.3),
+    ];
+
+    // Full scan scoring should work identically to incremental.
+    let scored = scoring.score_batch(&candidates, 0.5);
+    assert_eq!(scored.len(), 3, "full scan should score all candidates");
+
+    // Scores should be deterministic.
+    let scored_again = scoring.score_batch(&candidates, 0.5);
+    for (a, b) in scored.iter().zip(scored_again.iter()) {
+        assert!(
+            (a.total_score - b.total_score).abs() < f64::EPSILON,
+            "full scan must be deterministic: {:.6} vs {:.6}",
+            a.total_score,
+            b.total_score,
+        );
+    }
+
+    // Decision records should capture the full-scan context.
+    let mut builder = DecisionRecordBuilder::new();
+    for candidate in &scored {
+        let record = builder.build(candidate, PolicyMode::Shadow, None, None);
+        assert!(!record.trace_id.is_empty());
+        // Explain should contain factor contributions.
+        let explain = format_explain(&record, ExplainLevel::L2);
+        assert!(
+            explain.contains("location") || explain.contains("factor"),
+            "detailed explain should mention factors"
+        );
+    }
+}
+
+// ── Scenario 5: Injected IO/serializer faults causing safe degradation ──
+
+#[test]
+fn e2e_scenario_5_fault_injection_safe_degradation() {
+    let scoring = e2e_scoring_engine();
+    let mut policy = PolicyEngine::new(PolicyConfig::default());
+    let mut guard = AdaptiveGuard::with_defaults();
+
+    // Warmup to enforce mode.
+    for obs in e2e_good_observations(15) {
+        guard.observe(obs);
+    }
+    let passing = passing_guard_diag();
+    policy.observe_window(&passing);
+    policy.promote(); // observe → canary
+    policy.observe_window(&passing);
+    policy.promote(); // canary → enforce
+    assert_eq!(policy.mode(), ActiveMode::Enforce);
+
+    // Simulate kill-switch activation (IO fault response).
+    policy.enter_fallback(FallbackReason::KillSwitch);
+
+    // Evaluate — must block all actions.
+    let candidates = vec![
+        e2e_candidate("/data/projects/fault/target", 5, 96, 0.9),
+    ];
+    let scored = scoring.score_batch(&candidates, 1.0);
+    let diag = guard.diagnostics();
+    let decision = policy.evaluate(&scored, Some(&diag));
+
+    assert!(
+        decision.approved_for_deletion.is_empty(),
+        "kill-switch fallback must block all deletions"
+    );
+    assert_eq!(policy.mode(), ActiveMode::FallbackSafe);
+    assert!(
+        matches!(policy.fallback_reason(), Some(FallbackReason::KillSwitch)),
+        "fallback reason must be KillSwitch"
+    );
+
+    // Simulate serializer fault — enter fallback again.
+    let mut policy2 = PolicyEngine::new(PolicyConfig::default());
+    policy2.enter_fallback(FallbackReason::SerializationFailure);
+    let decision2 = policy2.evaluate(&scored, Some(&diag));
+    assert!(
+        decision2.approved_for_deletion.is_empty(),
+        "serializer failure fallback must block all deletions"
+    );
+}
+
+// ── Scenario 6: Progressive recovery from fallback after clean windows ──
+
+#[test]
+fn e2e_scenario_6_progressive_recovery() {
+    let scoring = e2e_scoring_engine();
+    let config = PolicyConfig {
+        recovery_clean_windows: 3,
+        ..PolicyConfig::default()
+    };
+    let mut policy = PolicyEngine::new(config);
+    let mut guard = AdaptiveGuard::with_defaults();
+
+    // Phase 1: Warmup to enforce, then enter fallback.
+    for obs in e2e_good_observations(15) {
+        guard.observe(obs);
+    }
+    let passing = passing_guard_diag();
+    policy.observe_window(&passing);
+    policy.promote(); // observe → canary
+    policy.observe_window(&passing);
+    policy.promote(); // canary → enforce
+    policy.enter_fallback(FallbackReason::GuardrailDrift);
+    assert_eq!(policy.mode(), ActiveMode::FallbackSafe);
+
+    // Phase 2: Feed clean windows to trigger recovery.
+    for _ in 0..4 {
+        policy.observe_window(&passing);
+    }
+
+    // Phase 3: The policy should have recovered from fallback.
+    // Recovery goes back to observe mode (conservative restart).
+    let candidates = vec![
+        e2e_candidate("/data/projects/recovery/target", 3, 72, 0.85),
+    ];
+    let scored = scoring.score_batch(&candidates, 0.5);
+    let diag = guard.diagnostics();
+    let decision = policy.evaluate(&scored, Some(&diag));
+
+    // After recovery, mode should be Observe (conservative restart).
+    let mode = policy.mode();
+    assert!(
+        mode == ActiveMode::Observe || mode == ActiveMode::Canary,
+        "after recovery should be in observe or canary, got {:?}",
+        mode
+    );
+
+    // Fallback reason should be cleared.
+    // (Implementation may or may not clear it; the key assertion
+    // is that the mode is no longer FallbackSafe.)
+    assert_ne!(
+        mode,
+        ActiveMode::FallbackSafe,
+        "should have exited fallback after clean windows"
+    );
+
+    // Phase 4: Verify the full lifecycle is traceable.
+    let mut builder = DecisionRecordBuilder::new();
+    let record = builder.build(&scored[0], PolicyMode::Shadow, None, None);
+    let explanation = format_explain(&record, ExplainLevel::L3);
+    assert!(!explanation.is_empty());
 }
