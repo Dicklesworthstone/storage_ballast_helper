@@ -375,7 +375,7 @@ fn e2e_uninstall_dry_run_no_changes() {
 fn e2e_backup_store_create_list_rollback_prune() {
     let tmp = tempfile::tempdir().unwrap();
     let store_dir = tmp.path().join("backup-store");
-    let store = BackupStore::open(store_dir.clone());
+    let store = BackupStore::open(store_dir);
 
     // Create a file to back up.
     let original = tmp.path().join("sbh-binary");
@@ -1143,8 +1143,7 @@ fn e2e_install_failure_produces_deterministic_error() {
     let error_msg = report
         .steps
         .iter()
-        .filter_map(|s| s.error.as_ref())
-        .next()
+        .find_map(|s| s.error.as_ref())
         .expect("should have at least one error");
     assert!(!error_msg.is_empty(), "error message should not be empty");
 }

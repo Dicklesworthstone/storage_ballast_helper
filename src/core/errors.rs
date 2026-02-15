@@ -181,7 +181,7 @@ mod tests {
             },
             SbhError::Io {
                 path: PathBuf::new(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, "test"),
+                source: std::io::Error::other("test"),
             },
             SbhError::ChannelClosed { component: "" },
             SbhError::Runtime {
@@ -189,7 +189,7 @@ mod tests {
             },
         ];
 
-        let codes: Vec<&str> = errors.iter().map(|e| e.code()).collect();
+        let codes: Vec<&str> = errors.iter().map(SbhError::code).collect();
         let unique: std::collections::HashSet<&&str> = codes.iter().collect();
         assert_eq!(
             codes.len(),
@@ -209,7 +209,7 @@ mod tests {
             },
             SbhError::Io {
                 path: PathBuf::new(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, "test"),
+                source: std::io::Error::other("test"),
             },
         ];
 
@@ -244,7 +244,7 @@ mod tests {
         assert!(
             SbhError::Io {
                 path: PathBuf::new(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, "test"),
+                source: std::io::Error::other("test"),
             }
             .is_retryable()
         );

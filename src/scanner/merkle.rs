@@ -283,7 +283,11 @@ impl MerkleScanIndex {
     ///
     /// Returns an `IncrementalDiff` describing what changed. If budget is
     /// exhausted, some paths are deferred to full scan.
-    pub fn diff(&self, fresh_entries: &[WalkEntry], budget: &mut ScanBudget) -> IncrementalDiff {
+    pub fn diff(
+        &mut self,
+        fresh_entries: &[WalkEntry],
+        budget: &mut ScanBudget,
+    ) -> IncrementalDiff {
         if self.health == IndexHealth::Corrupt || self.health == IndexHealth::Uninitialized {
             return IncrementalDiff {
                 changed_paths: fresh_entries.iter().map(|e| e.path.clone()).collect(),
@@ -354,6 +358,7 @@ impl MerkleScanIndex {
         } else {
             IndexHealth::Healthy
         };
+        self.health = health;
 
         IncrementalDiff {
             changed_paths: changed,
@@ -488,7 +493,7 @@ impl MerkleScanIndex {
 
         ancestors_to_refresh.sort();
         ancestors_to_refresh.dedup();
-        ancestors_to_refresh.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        ancestors_to_refresh.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
 
         for path in ancestors_to_refresh {
             let has_snapshot = self.snapshots.contains_key(&path);
@@ -932,6 +937,34 @@ mod tests {
         assert!(diff.budget_exhausted);
         assert_eq!(diff.deferred_paths.len(), 2);
         assert_eq!(diff.health, IndexHealth::Degraded);
+        assert_eq!(index.health(), IndexHealth::Degraded);
+    }
+
+    #[test]
+    fn diff_recovery_restores_healthy_index_state() {
+        let original = vec![
+            make_entry("/data/a", 4096, 1000, 1),
+            make_entry("/data/b", 4096, 1000, 1),
+            make_entry("/data/c", 4096, 1000, 1),
+        ];
+        let roots = vec![PathBuf::from("/data")];
+
+        let mut index = MerkleScanIndex::new();
+        index.build_from_entries(&original, &roots);
+
+        let fresh = vec![
+            make_entry("/data/a", 4096, 2000, 1),
+            make_entry("/data/b", 4096, 2000, 1),
+            make_entry("/data/c", 4096, 2000, 1),
+        ];
+
+        let mut tight_budget = ScanBudget::new(1, 0);
+        let _ = index.diff(&fresh, &mut tight_budget);
+        assert_eq!(index.health(), IndexHealth::Degraded);
+
+        let mut ample_budget = ScanBudget::new(10, 0);
+        let _ = index.diff(&fresh, &mut ample_budget);
+        assert_eq!(index.health(), IndexHealth::Healthy);
     }
 
     #[test]

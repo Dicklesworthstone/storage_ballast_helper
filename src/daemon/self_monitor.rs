@@ -416,7 +416,11 @@ fn parse_last_scan_instant(timestamp: &str) -> Option<Instant> {
         return Some(Instant::now());
     }
     let age_std = age.to_std().ok()?;
-    Some(Instant::now().checked_sub(age_std).unwrap_or_else(Instant::now))
+    Some(
+        Instant::now()
+            .checked_sub(age_std)
+            .unwrap_or_else(Instant::now),
+    )
 }
 
 // ──────────────────── atomic state file write ────────────────────

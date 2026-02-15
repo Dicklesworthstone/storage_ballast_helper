@@ -133,13 +133,13 @@ fn stress_rapid_fill_burst() {
     let mut max_urgency: f64 = 0.0;
     let mut red_reached_at: Option<usize> = None;
     let mut critical_reached_at: Option<usize> = None;
-    let mut levels_seen = Vec::new();
 
     for i in 0..60 {
         // Consume space at burst rate.
         free = free.saturating_sub(burst_rate * tick.as_secs());
 
-        let t = start + tick * i as u32;
+        let tick_index = u32::try_from(i).expect("tick index fits u32");
+        let t = start + tick * tick_index;
         let estimate = ewma.update(free, t, total / 10);
         let reading = PressureReading {
             free_bytes: free,
@@ -148,7 +148,6 @@ fn stress_rapid_fill_burst() {
         let response = pid.update(reading, Some(estimate.seconds_to_exhaustion), t);
 
         max_urgency = max_urgency.max(response.urgency);
-        levels_seen.push(response.level);
 
         if response.level == PressureLevel::Red && red_reached_at.is_none() {
             red_reached_at = Some(i);
@@ -184,9 +183,7 @@ fn stress_rapid_fill_burst() {
     report.metric("red_reached_at_tick", red_tick);
     report.metric(
         "critical_reached_at_tick",
-        critical_reached_at
-            .map(|t| t.to_string())
-            .unwrap_or("never".to_string()),
+        critical_reached_at.map_or_else(|| "never".to_string(), |tick_idx| tick_idx.to_string()),
     );
     report.metric("final_free_bytes", free);
     report.metric("ticks_simulated", report.steps);
@@ -227,10 +224,12 @@ fn stress_sustained_low_pressure() {
         } else {
             -300_000_000
         };
-        free = (free as i64 + jitter).max(0) as u64;
+        let jittered_free = i128::from(free) + i128::from(jitter);
+        free = u64::try_from(jittered_free.max(0)).expect("clamped free space is non-negative");
         free = free.min(total);
 
-        let t = start + tick * i as u32;
+        let tick_index = u32::try_from(i).expect("tick index fits u32");
+        let t = start + tick * tick_index;
         let estimate = ewma.update(free, t, total / 10);
         let reading = PressureReading {
             free_bytes: free,
@@ -312,7 +311,8 @@ fn stress_flash_fill_ram_backed() {
     for i in 0..40 {
         free = free.saturating_sub(flash_rate / 2); // per half-second
 
-        let t = start + tick * i as u32;
+        let tick_index = u32::try_from(i).expect("tick index fits u32");
+        let t = start + tick * tick_index;
         let estimate = ewma.update(free, t, total / 10);
         let reading = PressureReading {
             free_bytes: free,
@@ -322,10 +322,10 @@ fn stress_flash_fill_ram_backed() {
 
         max_urgency = max_urgency.max(response.urgency);
 
-        if response.level == PressureLevel::Critical || response.level == PressureLevel::Red {
-            if ticks_to_critical == 0 {
-                ticks_to_critical = i + 1;
-            }
+        if (response.level == PressureLevel::Critical || response.level == PressureLevel::Red)
+            && ticks_to_critical == 0
+        {
+            ticks_to_critical = i + 1;
         }
         report.steps += 1;
 
@@ -399,7 +399,8 @@ fn stress_recovery_under_write_pressure() {
             _ => {}
         }
 
-        let t = start + tick * i as u32;
+        let tick_index = u32::try_from(i).expect("tick index fits u32");
+        let t = start + tick * tick_index;
         let estimate = ewma.update(free, t, total / 10);
         let reading = PressureReading {
             free_bytes: free,
@@ -443,9 +444,7 @@ fn stress_recovery_under_write_pressure() {
     report.metric("recovery_start_tick", recovery_start_tick.unwrap());
     report.metric(
         "first_deescalation_tick",
-        first_deescalation
-            .map(|t| t.to_string())
-            .unwrap_or("never".to_string()),
+        first_deescalation.map_or_else(|| "never".to_string(), |tick_idx| tick_idx.to_string()),
     );
 
     eprintln!("{}", report.emit());
@@ -475,11 +474,8 @@ fn stress_thread_health_overload() {
     healthy_beat.beat();
 
     // Don't beat stalled ones — they'll appear as stalled.
-    let heartbeats: Vec<Arc<ThreadHeartbeat>> = vec![
-        healthy_beat.clone(),
-        stalled_beat.clone(),
-        also_stalled.clone(),
-    ];
+    let heartbeats: Vec<Arc<ThreadHeartbeat>> =
+        vec![healthy_beat.clone(), stalled_beat, also_stalled];
 
     // Wait briefly, then check health.
     std::thread::sleep(Duration::from_millis(50));
@@ -492,11 +488,11 @@ fn stress_thread_health_overload() {
     );
 
     // The healthy thread should be healthy.
-    let healthy_threads: Vec<_> = health
+    let healthy_thread_count = health
         .thread_status
         .iter()
         .filter(|t| t.is_healthy())
-        .collect();
+        .count();
     let unhealthy_threads: Vec<_> = health
         .thread_status
         .iter()
@@ -504,7 +500,7 @@ fn stress_thread_health_overload() {
         .collect();
 
     let overall_healthy = unhealthy_threads.is_empty();
-    report.metric("healthy_threads", healthy_threads.len());
+    report.metric("healthy_threads", healthy_thread_count);
     report.metric("unhealthy_threads", unhealthy_threads.len());
     report.metric("overall_healthy", overall_healthy);
 
@@ -596,9 +592,10 @@ fn stress_decision_plane_drift() {
     let mut drift_steps = 0;
     let mut guard_fail_at: Option<usize> = None;
     for i in 0..50 {
+        let drift_idx = f64::from(u32::try_from(i).expect("drift index fits in u32"));
         guard.observe(CalibrationObservation {
             predicted_rate: 1000.0,
-            actual_rate: 3000.0 + i as f64 * 100.0,
+            actual_rate: drift_idx.mul_add(100.0, 3000.0),
             predicted_tte: 100.0,
             actual_tte: 15.0,
         });
@@ -733,7 +730,9 @@ fn stress_guard_integrity_failure() {
 
     // Conservative behavior check: approval rate should be low.
     if total_evaluated > 0 {
-        let approval_rate = total_approved as f64 / total_evaluated as f64;
+        let approved_count = u32::try_from(total_approved).expect("approved count fits in u32");
+        let evaluated_count = u32::try_from(total_evaluated).expect("evaluated count fits in u32");
+        let approval_rate = f64::from(approved_count) / f64::from(evaluated_count);
         report.metric("approval_rate", format!("{approval_rate:.4}"));
         assert!(
             approval_rate < 0.5,
@@ -811,13 +810,13 @@ fn stress_multi_agent_swarm() {
     let scored = scoring.score_batch(&all_candidates, 0.7);
 
     // Count vetoed candidates.
-    let vetoed: Vec<_> = scored.iter().filter(|s| s.vetoed).collect();
-    let open_vetoed: Vec<_> = all_candidates.iter().filter(|c| c.is_open).collect();
-    let git_excluded: Vec<_> = all_candidates.iter().filter(|c| c.excluded).collect();
+    let vetoed_count = scored.iter().filter(|s| s.vetoed).count();
+    let open_vetoed_count = all_candidates.iter().filter(|c| c.is_open).count();
+    let git_excluded_count = all_candidates.iter().filter(|c| c.excluded).count();
 
-    report.metric("vetoed_count", vetoed.len());
-    report.metric("open_file_candidates", open_vetoed.len());
-    report.metric("git_excluded", git_excluded.len());
+    report.metric("vetoed_count", vetoed_count);
+    report.metric("open_file_candidates", open_vetoed_count);
+    report.metric("git_excluded", git_excluded_count);
 
     // Evaluate through policy.
     let guard_diag = storage_ballast_helper::monitor::guardrails::GuardDiagnostics {
@@ -849,9 +848,12 @@ fn stress_multi_agent_swarm() {
     let decision2 = engine2.evaluate(&scored2, Some(&guard_diag));
 
     // Scores must be identical.
-    let scores1: Vec<f64> = decision.records.iter().map(|r| r.total_score).collect();
-    let scores2: Vec<f64> = decision2.records.iter().map(|r| r.total_score).collect();
-    assert_eq!(scores1, scores2, "scoring must be deterministic");
+    let run_one_scores: Vec<f64> = decision.records.iter().map(|r| r.total_score).collect();
+    let run_two_scores: Vec<f64> = decision2.records.iter().map(|r| r.total_score).collect();
+    assert_eq!(
+        run_one_scores, run_two_scores,
+        "scoring must be deterministic"
+    );
 
     // Actions must be identical.
     let actions1: Vec<ActionRecord> = decision.records.iter().map(|r| r.action).collect();
@@ -898,9 +900,9 @@ fn stress_ewma_convergence() {
     let mut negative_tte_count = 0usize;
 
     // Phase 1: Steady consumption (100 ticks).
-    for i in 0..100 {
+    for i in 0_u32..100 {
         free = free.saturating_sub(1_000_000_000); // 1 GB/tick
-        let t = start + tick * i as u32;
+        let t = start + tick * i;
         let est = ewma.update(free, t, threshold);
         if est.bytes_per_second.is_nan() {
             nan_count += 1;
@@ -914,9 +916,9 @@ fn stress_ewma_convergence() {
     }
 
     // Phase 2: Sudden burst (50 ticks at 10x rate).
-    for i in 100..150 {
+    for i in 100_u32..150 {
         free = free.saturating_sub(10_000_000_000); // 10 GB/tick
-        let t = start + tick * i as u32;
+        let t = start + tick * i;
         let est = ewma.update(free, t, threshold);
         if est.bytes_per_second.is_nan() {
             nan_count += 1;
@@ -927,9 +929,9 @@ fn stress_ewma_convergence() {
     }
 
     // Phase 3: Recovery — free space increases (cleanup, 100 ticks).
-    for i in 150..250 {
+    for i in 150_u32..250 {
         free = free.saturating_add(2_000_000_000).min(total); // 2 GB/tick recovered
-        let t = start + tick * i as u32;
+        let t = start + tick * i;
         let est = ewma.update(free, t, threshold);
         if est.bytes_per_second.is_nan() {
             nan_count += 1;
@@ -941,15 +943,16 @@ fn stress_ewma_convergence() {
     }
 
     // Phase 4: Plateau (100 ticks, stable).
-    for i in 250..350 {
+    for i in 250_u32..350 {
         // Tiny jitter.
         let jitter: i64 = if i % 2 == 0 {
             100_000_000
         } else {
             -100_000_000
         };
-        free = (free as i64 + jitter).max(0) as u64;
-        let t = start + tick * i as u32;
+        let jittered_free = i128::from(free) + i128::from(jitter);
+        free = u64::try_from(jittered_free.max(0)).expect("clamped free space is non-negative");
+        let t = start + tick * i;
         let est = ewma.update(free, t, threshold);
         if est.bytes_per_second.is_nan() {
             nan_count += 1;
@@ -960,9 +963,9 @@ fn stress_ewma_convergence() {
     }
 
     // Phase 5: Another fill (100 ticks, moderate).
-    for i in 350..450 {
+    for i in 350_u32..450 {
         free = free.saturating_sub(500_000_000); // 500 MB/tick
-        let t = start + tick * i as u32;
+        let t = start + tick * i;
         let est = ewma.update(free, t, threshold);
         if est.bytes_per_second.is_nan() {
             nan_count += 1;
@@ -1003,14 +1006,14 @@ fn stress_pid_stability_oscillation() {
     let mut urgency_values = Vec::new();
 
     // Oscillate between 8% and 22% free rapidly.
-    for i in 0..200 {
+    for i in 0_u32..200 {
         let free = if i % 2 == 0 {
-            (total as f64 * 0.08) as u64
+            total.saturating_mul(8).saturating_div(100)
         } else {
-            (total as f64 * 0.22) as u64
+            total.saturating_mul(22).saturating_div(100)
         };
 
-        let t = start + tick * i as u32;
+        let t = start + tick * i;
         let reading = PressureReading {
             free_bytes: free,
             total_bytes: total,
@@ -1021,7 +1024,7 @@ fn stress_pid_stability_oscillation() {
     }
 
     // Check: urgency should not grow without bound.
-    let max_urgency = urgency_values.iter().cloned().fold(0.0f64, f64::max);
+    let max_urgency = urgency_values.iter().copied().fold(0.0f64, f64::max);
     assert!(
         max_urgency <= 1.0,
         "PID urgency should be clamped to 1.0, got {max_urgency}"
@@ -1062,7 +1065,7 @@ fn stress_ballast_lifecycle() {
         file_size_bytes: 1024 * 1024, // 1 MB each (small for test speed)
         replenish_cooldown_minutes: 0,
         auto_provision: true,
-        overrides: Default::default(),
+        overrides: std::collections::HashMap::default(),
     };
 
     let mut manager = BallastManager::new(ballast_dir, config).unwrap();
@@ -1123,6 +1126,7 @@ fn stress_ballast_lifecycle() {
 // a realistic multi-phase pressure scenario with 500 ticks.
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn stress_full_pipeline() {
     let total: u64 = 1_000_000_000_000;
     let mut free: u64 = 300_000_000_000;
@@ -1171,7 +1175,7 @@ fn stress_full_pipeline() {
     engine.promote(); // observe → canary
     engine.promote(); // canary → enforce
 
-    for i in 0..500 {
+    for i in 0_u32..500 {
         // Simulate varied pressure phases.
         let consumption = match i {
             0..=99 => 500_000_000,      // moderate: 500 MB/tick
@@ -1193,16 +1197,17 @@ fn stress_full_pipeline() {
         free = free.saturating_sub(consumption);
         free = free.min(total);
 
-        let t = start + tick * i as u32;
+        let t = start + tick * i;
         let estimate = ewma.update(free, t, threshold);
+        let consumption_rate = u64_to_f64(consumption);
 
         // Update guard with calibration observation.
         let obs = CalibrationObservation {
             predicted_rate: estimate.bytes_per_second.max(1.0),
-            actual_rate: consumption as f64 / tick.as_secs_f64(),
+            actual_rate: consumption_rate / tick.as_secs_f64(),
             predicted_tte: estimate.seconds_to_exhaustion.max(1.0),
             actual_tte: if consumption > 0 {
-                free as f64 / consumption as f64 * tick.as_secs_f64()
+                u64_to_f64(free) / consumption_rate * tick.as_secs_f64()
             } else {
                 f64::MAX
             },
@@ -1221,8 +1226,13 @@ fn stress_full_pipeline() {
 
         // Score candidates when urgency is high enough.
         if response.urgency > 0.3 {
-            let candidates: Vec<CandidateInput> =
-                (0..5).map(|j| make_candidate(i * 5 + j, 24, 2)).collect();
+            let candidates: Vec<CandidateInput> = (0..5)
+                .map(|j| {
+                    let candidate_idx =
+                        usize::try_from(i * 5 + j).expect("candidate index fits in usize");
+                    make_candidate(candidate_idx, 24, 2)
+                })
+                .collect();
             let scored = scoring.score_batch(&candidates, response.urgency);
             let decision = engine.evaluate(&scored, Some(&diag));
             total_approved += decision.approved_for_deletion.len();
@@ -1272,7 +1282,14 @@ fn variance(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let sample_count = f64::from(u32::try_from(values.len()).expect("sample count fits in u32"));
+    let mean = values.iter().sum::<f64>() / sample_count;
     let sq_sum: f64 = values.iter().map(|v| (v - mean).powi(2)).sum();
-    sq_sum / values.len() as f64
+    sq_sum / sample_count
+}
+
+fn u64_to_f64(value: u64) -> f64 {
+    let upper = u32::try_from(value >> 32).expect("upper half fits in u32");
+    let lower = u32::try_from(value & u64::from(u32::MAX)).expect("lower half fits in u32");
+    f64::from(upper) * 4_294_967_296.0 + f64::from(lower)
 }

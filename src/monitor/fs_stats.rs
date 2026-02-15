@@ -37,7 +37,8 @@ impl FsStatsCollector {
 
     pub fn collect(&self, path: &Path) -> Result<FsStats> {
         let mounts = self.platform.mount_points()?;
-        let mount = find_mount(path, &mounts).ok_or_else(|| SbhError::FsStats {
+        let lookup_path = resolve_lookup_path(path);
+        let mount = find_mount(&lookup_path, &mounts).ok_or_else(|| SbhError::FsStats {
             path: path.to_path_buf(),
             details: "path does not belong to known mount".to_string(),
         })?;
@@ -49,9 +50,11 @@ impl FsStatsCollector {
             return Ok(HashMap::new());
         }
         let mounts = self.platform.mount_points()?;
+        let resolved_paths: Vec<PathBuf> =
+            paths.iter().map(|path| resolve_lookup_path(path)).collect();
         let mut mounts_needed = HashSet::<PathBuf>::new();
-        for path in paths {
-            let Some(mount) = find_mount(path, &mounts) else {
+        for (path, resolved_path) in paths.iter().zip(&resolved_paths) {
+            let Some(mount) = find_mount(resolved_path, &mounts) else {
                 return Err(SbhError::FsStats {
                     path: path.clone(),
                     details: "path does not belong to known mount".to_string(),
@@ -67,8 +70,8 @@ impl FsStatsCollector {
         }
 
         let mut out = HashMap::with_capacity(paths.len());
-        for path in paths {
-            let mount = find_mount(path, &mounts).ok_or_else(|| SbhError::FsStats {
+        for (path, resolved_path) in paths.iter().zip(&resolved_paths) {
+            let mount = find_mount(resolved_path, &mounts).ok_or_else(|| SbhError::FsStats {
                 path: path.clone(),
                 details: "path does not belong to known mount".to_string(),
             })?;
@@ -126,6 +129,16 @@ fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoin
         .iter()
         .filter(|mount| path.starts_with(&mount.path))
         .max_by_key(|mount| mount.path.as_os_str().len())
+}
+
+fn resolve_lookup_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+
+    std::fs::canonicalize(&absolute).unwrap_or(absolute)
 }
 
 #[cfg(test)]
@@ -340,5 +353,44 @@ mod tests {
             .collect(Path::new("/tmp/foo"))
             .expect("second collect");
         assert_eq!(platform.fs_stats_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_resolves_symlink_path_to_mount() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mount_real = tmp.path().join("mount-real");
+        std::fs::create_dir_all(&mount_real).expect("create mount");
+        let link_mount = tmp.path().join("mount-link");
+        symlink(&mount_real, &link_mount).expect("create symlink");
+        std::fs::create_dir_all(link_mount.join("work")).expect("create child");
+
+        let mounts = vec![MountPoint {
+            path: mount_real.clone(),
+            device: "dev".to_string(),
+            fs_type: "ext4".to_string(),
+            is_ram_backed: false,
+        }];
+        let stats = FsStats {
+            total_bytes: 100,
+            free_bytes: 60,
+            available_bytes: 60,
+            fs_type: "ext4".to_string(),
+            mount_point: mount_real.clone(),
+            is_readonly: false,
+        };
+        let platform = Arc::new(CountingPlatform::new(
+            mounts,
+            HashMap::from([(mount_real, stats.clone())]),
+        ));
+        let collector = FsStatsCollector::new(platform.clone(), Duration::from_secs(5));
+
+        let observed = collector
+            .collect(&link_mount.join("work"))
+            .expect("symlink path should resolve to mount");
+        assert_eq!(observed, stats);
+        assert_eq!(platform.fs_stats_calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -63,7 +63,8 @@ impl SeededRng {
     }
 
     fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        let bits = 0x3FF0_0000_0000_0000_u64 | (self.next_u64() >> 12);
+        f64::from_bits(bits) - 1.0
     }
 
     fn range_u64(&mut self, lo: u64, hi: u64) -> u64 {
@@ -101,23 +102,25 @@ impl PercentileStats {
         let mut sorted = values.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = sorted.len();
-        let mean = sorted.iter().sum::<f64>() / n as f64;
+        let mean = sorted.iter().sum::<f64>() / usize_to_f64(n);
         Self {
             min: sorted[0],
             max: sorted[n - 1],
             mean,
-            p50: percentile(&sorted, 50.0),
-            p95: percentile(&sorted, 95.0),
-            p99: percentile(&sorted, 99.0),
+            p50: percentile(&sorted, 50),
+            p95: percentile(&sorted, 95),
+            p99: percentile(&sorted, 99),
         }
     }
 }
 
-fn percentile(sorted: &[f64], pct: f64) -> f64 {
+fn percentile(sorted: &[f64], pct: u32) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
-    let idx = (pct / 100.0 * (sorted.len() - 1) as f64).round() as usize;
+    let max_idx = sorted.len() - 1;
+    let pct_usize = usize::try_from(pct).unwrap_or(0);
+    let idx = max_idx.saturating_mul(pct_usize).saturating_add(50) / 100;
     sorted[idx.min(sorted.len() - 1)]
 }
 
@@ -154,11 +157,45 @@ struct ScenarioMetrics {
 // ──────────────────── mode switching ────────────────────
 
 fn is_full_mode() -> bool {
-    std::env::var("SBH_STRESS_FULL").map_or(false, |v| v == "1")
+    std::env::var("SBH_STRESS_FULL").is_ok_and(|v| v == "1")
 }
 
 fn fast_or_full(fast: usize, full: usize) -> usize {
     if is_full_mode() { full } else { fast }
+}
+
+fn elapsed_millis_u64(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn u64_from_usize(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn usize_from_u64(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn u32_from_u64(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn usize_to_f64(value: usize) -> f64 {
+    value as f64
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn u64_to_f64(value: u64) -> f64 {
+    value as f64
+}
+
+fn free_pct(free_bytes: u64, total_bytes: u64) -> f64 {
+    if total_bytes == 0 {
+        0.0
+    } else {
+        (u64_to_f64(free_bytes) / u64_to_f64(total_bytes)) * 100.0
+    }
 }
 
 // ──────────────────── shared helpers ────────────────────
@@ -247,7 +284,7 @@ fn make_walk_entry(path: &str, size: u64, depth: usize) -> WalkEntry {
             modified: SystemTime::now() - Duration::from_secs(3600),
             created: None,
             is_dir: true,
-            inode: 1000 + depth as u64,
+            inode: 1000 + u64_from_usize(depth),
             device_id: 1,
             permissions: 0o755,
         },
@@ -269,14 +306,14 @@ fn run_scenario_a(seed: u64, iterations: usize) -> ScenarioResult {
     let mut fallback_counts = Vec::new();
 
     for iter in 0..iterations {
-        let mut rng = SeededRng::new(seed.wrapping_add(iter as u64));
+        let mut rng = SeededRng::new(seed.wrapping_add(u64_from_usize(iter)));
         // Use a 100 GB disk to make percentage changes significant per tick.
         let total = 100_000_000_000u64; // 100 GB
         let initial_free = 25_000_000_000u64; // 25 GB (25% free → Green)
         let normal_rate = 100_000_000u64; // 100 MB/tick (slow normal)
         let burst_rate = 5_000_000_000u64; // 5 GB/tick (compile-like burst)
-        let normal_ticks = 5 + (rng.next_u64() % 3) as usize;
-        let burst_ticks = 8 + (rng.next_u64() % 5) as usize;
+        let normal_ticks = 5 + usize_from_u64(rng.next_u64() % 3);
+        let burst_ticks = 8 + usize_from_u64(rng.next_u64() % 5);
 
         let series = SyntheticTimeSeries::burst(
             initial_free,
@@ -290,14 +327,14 @@ fn run_scenario_a(seed: u64, iterations: usize) -> ScenarioResult {
         let mut ewma = make_ewma();
         let predictive = make_predictive();
         let t0 = Instant::now();
-        let threshold_bytes = (total as f64 * 0.06) as u64; // red threshold
+        let threshold_bytes = total.saturating_mul(6) / 100; // red threshold
 
         let mut detection_tick: Option<usize> = None;
         let mut max_urgency = 0.0f64;
         let mut hit_preemptive = false;
 
         for (tick, &free_bytes) in series.values.iter().enumerate() {
-            let now = t0 + Duration::from_secs(tick as u64);
+            let now = t0 + Duration::from_secs(u64_from_usize(tick));
             let estimate = ewma.update(free_bytes, now, threshold_bytes);
             let pid_response = pid.update(
                 PressureReading {
@@ -310,20 +347,21 @@ fn run_scenario_a(seed: u64, iterations: usize) -> ScenarioResult {
 
             let action = predictive.evaluate(
                 &estimate,
-                (free_bytes as f64 / total as f64) * 100.0,
+                free_pct(free_bytes, total),
                 PathBuf::from("/data"),
             );
 
             max_urgency = max_urgency.max(pid_response.urgency);
 
             // Detect burst onset (after normal_ticks).
-            if tick >= normal_ticks && detection_tick.is_none() {
-                if matches!(
+            if tick >= normal_ticks
+                && detection_tick.is_none()
+                && matches!(
                     pid_response.level,
                     PressureLevel::Red | PressureLevel::Critical
-                ) {
-                    detection_tick = Some(tick - normal_ticks);
-                }
+                )
+            {
+                detection_tick = Some(tick - normal_ticks);
             }
 
             if matches!(
@@ -335,10 +373,10 @@ fn run_scenario_a(seed: u64, iterations: usize) -> ScenarioResult {
             }
         }
 
-        let latency = detection_tick.unwrap_or(burst_ticks) as f64;
+        let latency = usize_to_f64(detection_tick.unwrap_or(burst_ticks));
         detection_latencies.push(latency);
 
-        if detection_tick.map_or(true, |t| t > 5) {
+        if detection_tick.is_none_or(|t| t > 5) {
             failures.push(format!(
                 "iter {iter}: PID didn't reach Red/Critical within 5 ticks of burst (took {latency})"
             ));
@@ -372,13 +410,14 @@ fn run_scenario_a(seed: u64, iterations: usize) -> ScenarioResult {
             guard_state_changes: PercentileStats::from_values(&guard_changes),
             fallback_count: PercentileStats::from_values(&fallback_counts),
         },
-        duration_ms: start.elapsed().as_millis() as u64,
+        duration_ms: elapsed_millis_u64(start),
         failures,
     }
 }
 
 // ──────────────────── Scenario B: Sustained Low-Free-Space ────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
     let start = Instant::now();
     let mut failures = Vec::new();
@@ -389,16 +428,16 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
     let mut fallback_counts = Vec::new();
 
     for iter in 0..iterations {
-        let mut rng = SeededRng::new(seed.wrapping_add(iter as u64 * 7));
+        let mut rng = SeededRng::new(seed.wrapping_add(u64_from_usize(iter).saturating_mul(7)));
         let total = 1_000_000_000_000u64;
         let free_5pct = total / 20; // 50 GB
-        let plateau_ticks = 40 + (rng.next_u64() % 20) as usize;
-        let drop_ticks = 15 + (rng.next_u64() % 10) as usize;
+        let plateau_ticks = 40 + usize_from_u64(rng.next_u64() % 20);
+        let drop_ticks = 15 + usize_from_u64(rng.next_u64() % 10);
 
         // Phase 1: plateau at 5% free.
         let plateau = SyntheticTimeSeries::plateau(free_5pct, plateau_ticks);
         // Phase 2: steady drop from 5% to ~3%.
-        let drop_rate = (free_5pct - total * 3 / 100) / drop_ticks as u64;
+        let drop_rate = (free_5pct - total * 3 / 100) / u64_from_usize(drop_ticks);
         let drop = SyntheticTimeSeries::steady_consumption(free_5pct, drop_rate.max(1), drop_ticks);
 
         let mut pid = make_pid();
@@ -410,7 +449,7 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
         policy.promote(); // canary -> enforce
 
         let t0 = Instant::now();
-        let threshold_bytes = (total as f64 * 0.06) as u64;
+        let threshold_bytes = total.saturating_mul(6) / 100;
 
         let mut levels: Vec<PressureLevel> = Vec::new();
         let mut urgencies: Vec<f64> = Vec::new();
@@ -425,7 +464,7 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
             .collect();
 
         for (tick, &free_bytes) in combined.iter().enumerate() {
-            let now = t0 + Duration::from_secs(tick as u64);
+            let now = t0 + Duration::from_secs(u64_from_usize(tick));
             let estimate = ewma.update(free_bytes, now, threshold_bytes);
             let pid_response = pid.update(
                 PressureReading {
@@ -442,9 +481,13 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
             // Feed guard with calibration observations.
             guard.observe(CalibrationObservation {
                 predicted_rate: estimate.bytes_per_second,
-                actual_rate: estimate.bytes_per_second * (0.9 + rng.next_f64() * 0.2),
+                actual_rate: estimate
+                    .bytes_per_second
+                    .mul_add(rng.next_f64().mul_add(0.2, 0.9), 0.0),
                 predicted_tte: estimate.seconds_to_exhaustion,
-                actual_tte: estimate.seconds_to_exhaustion * (1.0 + rng.next_f64() * 0.1),
+                actual_tte: estimate
+                    .seconds_to_exhaustion
+                    .mul_add(rng.next_f64().mul_add(0.1, 1.0), 0.0),
             });
 
             let diag = guard.diagnostics();
@@ -470,7 +513,7 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
         let avg_urgency = if plateau_urgencies.is_empty() {
             0.0
         } else {
-            plateau_urgencies.iter().sum::<f64>() / plateau_urgencies.len() as f64
+            plateau_urgencies.iter().sum::<f64>() / usize_to_f64(plateau_urgencies.len())
         };
         if avg_urgency < 0.3 {
             failures.push(format!(
@@ -483,7 +526,7 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
                 .iter()
                 .map(|u| (u - avg_urgency).powi(2))
                 .sum::<f64>()
-                / plateau_urgencies.len() as f64;
+                / usize_to_f64(plateau_urgencies.len());
             if variance > 0.05 {
                 failures.push(format!(
                     "iter {iter}: urgency variance {variance:.4} too high during plateau"
@@ -497,8 +540,7 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
             && guard.diagnostics().observation_count >= 5
         {
             failures.push(format!(
-                "iter {iter}: guard status {:?} instead of Pass",
-                guard_status
+                "iter {iter}: guard status {guard_status:?} instead of Pass"
             ));
         }
 
@@ -509,9 +551,9 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
             ));
         }
 
-        detection_latencies.push(oscillations as f64);
+        detection_latencies.push(usize_to_f64(oscillations));
         reclaim_efficiencies.push(avg_urgency);
-        mode_transitions_counts.push(policy_transitions as f64);
+        mode_transitions_counts.push(usize_to_f64(policy_transitions));
         guard_changes.push(0.0);
         fallback_counts.push(if policy.mode() == ActiveMode::FallbackSafe {
             1.0
@@ -532,7 +574,7 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
             guard_state_changes: PercentileStats::from_values(&guard_changes),
             fallback_count: PercentileStats::from_values(&fallback_counts),
         },
-        duration_ms: start.elapsed().as_millis() as u64,
+        duration_ms: elapsed_millis_u64(start),
         failures,
     }
 }
@@ -549,7 +591,7 @@ fn run_scenario_c(seed: u64, iterations: usize) -> ScenarioResult {
     let mut fallback_counts = Vec::new();
 
     for iter in 0..iterations {
-        let _rng = SeededRng::new(seed.wrapping_add(iter as u64 * 13));
+        let _rng = SeededRng::new(seed.wrapping_add(u64_from_usize(iter).saturating_mul(13)));
         let total = 4_000_000_000u64; // 4 GB tmpfs
         let initial_free = 4_000_000_000u64;
         let fill_rate = 1_000_000_000u64; // 1 GB/tick
@@ -562,14 +604,14 @@ fn run_scenario_c(seed: u64, iterations: usize) -> ScenarioResult {
         let mut ewma = make_ewma();
         let predictive = make_predictive();
         let t0 = Instant::now();
-        let threshold_bytes = (total as f64 * 0.06) as u64;
+        let threshold_bytes = total.saturating_mul(6) / 100;
 
         let mut critical_tick: Option<usize> = None;
         let mut hit_imminent = false;
         let mut max_urgency = 0.0f64;
 
         for (tick, &free_bytes) in series.values.iter().enumerate() {
-            let now = t0 + Duration::from_secs(tick as u64);
+            let now = t0 + Duration::from_secs(u64_from_usize(tick));
             let estimate = ewma.update(free_bytes, now, threshold_bytes);
             let pid_response = pid.update(
                 PressureReading {
@@ -582,7 +624,7 @@ fn run_scenario_c(seed: u64, iterations: usize) -> ScenarioResult {
 
             let action = predictive.evaluate(
                 &estimate,
-                (free_bytes as f64 / total as f64) * 100.0,
+                free_pct(free_bytes, total),
                 PathBuf::from("/tmp"),
             );
 
@@ -597,10 +639,10 @@ fn run_scenario_c(seed: u64, iterations: usize) -> ScenarioResult {
             }
         }
 
-        let latency = critical_tick.unwrap_or(10) as f64;
+        let latency = usize_to_f64(critical_tick.unwrap_or(10));
         detection_latencies.push(latency);
 
-        if critical_tick.map_or(true, |t| t > 8) {
+        if critical_tick.is_none_or(|t| t > 8) {
             failures.push(format!(
                 "iter {iter}: PID didn't reach Critical within 8 ticks (took {latency})"
             ));
@@ -639,13 +681,14 @@ fn run_scenario_c(seed: u64, iterations: usize) -> ScenarioResult {
             guard_state_changes: PercentileStats::from_values(&guard_changes),
             fallback_count: PercentileStats::from_values(&fallback_counts),
         },
-        duration_ms: start.elapsed().as_millis() as u64,
+        duration_ms: elapsed_millis_u64(start),
         failures,
     }
 }
 
 // ──────────────────── Scenario D: Recovery Under Pressure ────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
     let start = Instant::now();
     let mut failures = Vec::new();
@@ -656,7 +699,7 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
     let mut fallback_counts = Vec::new();
 
     for iter in 0..iterations {
-        let mut rng = SeededRng::new(seed.wrapping_add(iter as u64 * 17));
+        let mut rng = SeededRng::new(seed.wrapping_add(u64_from_usize(iter).saturating_mul(17)));
         let total = 1_000_000_000_000u64;
         let initial_free = 250_000_000_000u64;
         let consume_rate = 200_000_000u64 + (rng.next_u64() % 50_000_000);
@@ -681,7 +724,7 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
         policy.promote(); // canary -> enforce
 
         let t0 = Instant::now();
-        let threshold_bytes = (total as f64 * 0.06) as u64;
+        let threshold_bytes = total.saturating_mul(6) / 100;
 
         let mut consume_max_urgency = 0.0f64;
         let mut recovery_detected = false;
@@ -689,7 +732,7 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
         let mut detection_tick: Option<usize> = None;
 
         for (tick, &free_bytes) in series.values.iter().enumerate() {
-            let now = t0 + Duration::from_secs(tick as u64);
+            let now = t0 + Duration::from_secs(u64_from_usize(tick));
             let estimate = ewma.update(free_bytes, now, threshold_bytes);
             let pid_response = pid.update(
                 PressureReading {
@@ -702,7 +745,7 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
 
             let action = predictive.evaluate(
                 &estimate,
-                (free_bytes as f64 / total as f64) * 100.0,
+                free_pct(free_bytes, total),
                 PathBuf::from("/data"),
             );
 
@@ -744,9 +787,13 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
             // Feed guard.
             guard.observe(CalibrationObservation {
                 predicted_rate: estimate.bytes_per_second,
-                actual_rate: estimate.bytes_per_second * (0.85 + rng.next_f64() * 0.3),
+                actual_rate: estimate
+                    .bytes_per_second
+                    .mul_add(rng.next_f64().mul_add(0.3, 0.85), 0.0),
                 predicted_tte: estimate.seconds_to_exhaustion,
-                actual_tte: estimate.seconds_to_exhaustion * (0.9 + rng.next_f64() * 0.2),
+                actual_tte: estimate
+                    .seconds_to_exhaustion
+                    .mul_add(rng.next_f64().mul_add(0.2, 0.9), 0.0),
             });
             let diag = guard.diagnostics();
             let prev_mode = policy.mode();
@@ -772,9 +819,9 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
             failures.push(format!("iter {iter}: policy unexpectedly in FallbackSafe"));
         }
 
-        detection_latencies.push(detection_tick.unwrap_or(consume_ticks) as f64);
+        detection_latencies.push(usize_to_f64(detection_tick.unwrap_or(consume_ticks)));
         reclaim_efficiencies.push(consume_max_urgency);
-        mode_transitions_counts.push(policy_transitions as f64);
+        mode_transitions_counts.push(usize_to_f64(policy_transitions));
         guard_changes.push(0.0);
         fallback_counts.push(if policy.mode() == ActiveMode::FallbackSafe {
             1.0
@@ -795,7 +842,7 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
             guard_state_changes: PercentileStats::from_values(&guard_changes),
             fallback_count: PercentileStats::from_values(&fallback_counts),
         },
-        duration_ms: start.elapsed().as_millis() as u64,
+        duration_ms: elapsed_millis_u64(start),
         failures,
     }
 }
@@ -812,7 +859,7 @@ fn run_scenario_e(seed: u64, iterations: usize) -> ScenarioResult {
     let mut fallback_counts = Vec::new();
 
     for iter in 0..iterations {
-        let mut rng = SeededRng::new(seed.wrapping_add(iter as u64 * 23));
+        let mut rng = SeededRng::new(seed.wrapping_add(u64_from_usize(iter).saturating_mul(23)));
         let total = 1_000_000_000_000u64;
         let rate_bytes_per_sec = 100_000_000u64; // 100 MB/s
 
@@ -839,7 +886,7 @@ fn run_scenario_e(seed: u64, iterations: usize) -> ScenarioResult {
         }
 
         let t0 = Instant::now();
-        let threshold_bytes = (total as f64 * 0.06) as u64;
+        let threshold_bytes = total.saturating_mul(6) / 100;
         let mut elapsed_secs = 0u64;
         let mut free = 500_000_000_000u64; // 500 GB
 
@@ -892,18 +939,18 @@ fn run_scenario_e(seed: u64, iterations: usize) -> ScenarioResult {
         let avg_rate = if final_rates.is_empty() {
             0.0
         } else {
-            final_rates.iter().sum::<f64>() / final_rates.len() as f64
+            final_rates.iter().sum::<f64>() / usize_to_f64(final_rates.len())
         };
 
         // Allow 50% tolerance for convergence.
-        if avg_rate < 50_000_000.0 || avg_rate > 200_000_000.0 {
+        if !(50_000_000.0..=200_000_000.0).contains(&avg_rate) {
             failures.push(format!(
                 "iter {iter}: EWMA rate {avg_rate:.0} didn't converge near 100 MB/s"
             ));
         }
 
         detection_latencies.push(0.0);
-        reclaim_efficiencies.push(avg_rate / rate_bytes_per_sec as f64);
+        reclaim_efficiencies.push(avg_rate / u64_to_f64(rate_bytes_per_sec));
         mode_transitions_counts.push(0.0);
         guard_changes.push(0.0);
         fallback_counts.push(0.0);
@@ -921,13 +968,14 @@ fn run_scenario_e(seed: u64, iterations: usize) -> ScenarioResult {
             guard_state_changes: PercentileStats::from_values(&guard_changes),
             fallback_count: PercentileStats::from_values(&fallback_counts),
         },
-        duration_ms: start.elapsed().as_millis() as u64,
+        duration_ms: elapsed_millis_u64(start),
         failures,
     }
 }
 
 // ──────────────────── Scenario F: Decision-Plane Drift ────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
     let start = Instant::now();
     let mut failures = Vec::new();
@@ -938,7 +986,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
     let mut fallback_counts = Vec::new();
 
     for iter in 0..iterations {
-        let mut rng = SeededRng::new(seed.wrapping_add(iter as u64 * 31));
+        let mut rng = SeededRng::new(seed.wrapping_add(u64_from_usize(iter).saturating_mul(31)));
         let mut guard = make_guard();
         let mut policy = make_policy();
         policy.promote(); // observe -> canary
@@ -953,9 +1001,9 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
         for _ in 0..10 {
             guard.observe(CalibrationObservation {
                 predicted_rate: 1000.0,
-                actual_rate: 1000.0 * (0.9 + rng.next_f64() * 0.15),
+                actual_rate: 1000.0 * rng.next_f64().mul_add(0.15, 0.9),
                 predicted_tte: 600.0,
-                actual_tte: 600.0 * (1.0 + rng.next_f64() * 0.1),
+                actual_tte: 600.0 * rng.next_f64().mul_add(0.1, 1.0),
             });
             let diag = guard.diagnostics();
             let prev = policy.mode();
@@ -971,9 +1019,9 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
         for _ in 0..15 {
             guard.observe(CalibrationObservation {
                 predicted_rate: 1000.0,
-                actual_rate: 3000.0 + rng.next_f64() * 2000.0, // 3x-5x error
+                actual_rate: rng.next_f64().mul_add(2000.0, 3000.0), // 3x-5x error
                 predicted_tte: 600.0,
-                actual_tte: 100.0 + rng.next_f64() * 50.0, // way off
+                actual_tte: rng.next_f64().mul_add(50.0, 100.0), // way off
             });
             let diag = guard.diagnostics();
             let prev = policy.mode();
@@ -1007,9 +1055,9 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
         for _ in 0..10 {
             guard.observe(CalibrationObservation {
                 predicted_rate: 1000.0,
-                actual_rate: 1000.0 * (0.92 + rng.next_f64() * 0.16),
+                actual_rate: 1000.0 * rng.next_f64().mul_add(0.16, 0.92),
                 predicted_tte: 600.0,
-                actual_tte: 600.0 * (1.0 + rng.next_f64() * 0.08),
+                actual_tte: 600.0 * rng.next_f64().mul_add(0.08, 1.0),
             });
             let diag = guard.diagnostics();
             let prev = policy.mode();
@@ -1060,7 +1108,7 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
 
         detection_latencies.push(0.0);
         reclaim_efficiencies.push(0.0);
-        mode_transitions_counts.push(transition_count as f64);
+        mode_transitions_counts.push(usize_to_f64(transition_count));
         guard_changes.push(0.0);
         fallback_counts.push(if entered_fallback { 1.0 } else { 0.0 });
     }
@@ -1077,13 +1125,14 @@ fn run_scenario_f(seed: u64, iterations: usize) -> ScenarioResult {
             guard_state_changes: PercentileStats::from_values(&guard_changes),
             fallback_count: PercentileStats::from_values(&fallback_counts),
         },
-        duration_ms: start.elapsed().as_millis() as u64,
+        duration_ms: elapsed_millis_u64(start),
         failures,
     }
 }
 
 // ──────────────────── Scenario G: Index Integrity Failure ────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn run_scenario_g(seed: u64, iterations: usize) -> ScenarioResult {
     let start = Instant::now();
     let mut failures = Vec::new();
@@ -1094,7 +1143,7 @@ fn run_scenario_g(seed: u64, iterations: usize) -> ScenarioResult {
     let mut fallback_counts = Vec::new();
 
     for iter in 0..iterations {
-        let _rng = SeededRng::new(seed.wrapping_add(iter as u64 * 37));
+        let _rng = SeededRng::new(seed.wrapping_add(u64_from_usize(iter).saturating_mul(37)));
         let env = common::TestEnvironment::new();
 
         // Build 20 walk entries.
@@ -1107,11 +1156,12 @@ fn run_scenario_g(seed: u64, iterations: usize) -> ScenarioResult {
                 WalkEntry {
                     path,
                     metadata: EntryMetadata {
-                        size_bytes: 1024 * (i as u64 + 1),
-                        modified: SystemTime::now() - Duration::from_secs(3600 * (i as u64 + 1)),
+                        size_bytes: 1024 * (u64_from_usize(i) + 1),
+                        modified: SystemTime::now()
+                            - Duration::from_secs(3600 * (u64_from_usize(i) + 1)),
                         created: None,
                         is_dir: true,
-                        inode: 2000 + i as u64,
+                        inode: 2000 + u64_from_usize(i),
                         device_id: 1,
                         permissions: 0o755,
                     },
@@ -1128,7 +1178,7 @@ fn run_scenario_g(seed: u64, iterations: usize) -> ScenarioResult {
 
         // Build index.
         let mut index = MerkleScanIndex::new();
-        index.build_from_entries(&entries, &[root.clone()]);
+        index.build_from_entries(&entries, std::slice::from_ref(&root));
         assert_eq!(index.health(), IndexHealth::Healthy);
 
         // Save checkpoint.
@@ -1151,42 +1201,39 @@ fn run_scenario_g(seed: u64, iterations: usize) -> ScenarioResult {
         }
 
         // Reload corrupted checkpoint should fail or produce corrupt index.
-        match MerkleScanIndex::load_checkpoint(&checkpoint_path) {
-            Ok(mut loaded) => {
-                // If it loads despite corruption, verify it detects the issue
-                // during a diff operation or that mark_corrupt works.
-                loaded.mark_corrupt();
-                if loaded.health() != IndexHealth::Corrupt {
-                    failures.push(format!(
-                        "iter {iter}: mark_corrupt didn't set health to Corrupt"
-                    ));
-                }
-                if !loaded.requires_full_scan() {
-                    failures.push(format!(
-                        "iter {iter}: corrupted index doesn't require full scan"
-                    ));
-                }
+        if let Ok(mut loaded) = MerkleScanIndex::load_checkpoint(&checkpoint_path) {
+            // If it loads despite corruption, verify it detects the issue
+            // during a diff operation or that mark_corrupt works.
+            loaded.mark_corrupt();
+            if loaded.health() != IndexHealth::Corrupt {
+                failures.push(format!(
+                    "iter {iter}: mark_corrupt didn't set health to Corrupt"
+                ));
+            }
+            if !loaded.requires_full_scan() {
+                failures.push(format!(
+                    "iter {iter}: corrupted index doesn't require full scan"
+                ));
+            }
 
-                // Diff on corrupt index should return all entries as changed.
-                let mut budget = ScanBudget::new(1000, 0);
-                let diff = loaded.diff(&entries, &mut budget);
-                // Corrupt index: all paths should show up in changed or new.
-                let total_flagged = diff.changed_paths.len() + diff.new_paths.len();
-                if total_flagged == 0 {
-                    failures.push(format!(
-                        "iter {iter}: diff on corrupt index returned no changes"
-                    ));
-                }
+            // Diff on corrupt index should return all entries as changed.
+            let mut budget = ScanBudget::new(1000, 0);
+            let diff = loaded.diff(&entries, &mut budget);
+            // Corrupt index: all paths should show up in changed or new.
+            let total_flagged = diff.changed_paths.len() + diff.new_paths.len();
+            if total_flagged == 0 {
+                failures.push(format!(
+                    "iter {iter}: diff on corrupt index returned no changes"
+                ));
             }
-            Err(_) => {
-                // Expected: corrupted checkpoint fails to load.
-                // This is fine — verify rebuild works.
-            }
+        } else {
+            // Expected: corrupted checkpoint fails to load.
+            // This is fine — verify rebuild works.
         }
 
         // Rebuild restores Healthy.
         let mut rebuilt = MerkleScanIndex::new();
-        rebuilt.build_from_entries(&entries, &[root.clone()]);
+        rebuilt.build_from_entries(&entries, std::slice::from_ref(&root));
         if rebuilt.health() != IndexHealth::Healthy {
             failures.push(format!(
                 "iter {iter}: rebuilt index not Healthy ({:?})",
@@ -1232,13 +1279,14 @@ fn run_scenario_g(seed: u64, iterations: usize) -> ScenarioResult {
             guard_state_changes: PercentileStats::from_values(&guard_changes),
             fallback_count: PercentileStats::from_values(&fallback_counts),
         },
-        duration_ms: start.elapsed().as_millis() as u64,
+        duration_ms: elapsed_millis_u64(start),
         failures,
     }
 }
 
 // ──────────────────── Scenario H: Multi-Agent Swarm ────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
     let start = Instant::now();
     let mut failures = Vec::new();
@@ -1249,7 +1297,7 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
     let mut fallback_counts = Vec::new();
 
     for iter in 0..iterations {
-        let mut rng = SeededRng::new(seed.wrapping_add(iter as u64 * 41));
+        let mut rng = SeededRng::new(seed.wrapping_add(u64_from_usize(iter).saturating_mul(41)));
         // 10 simulated agent paths: 3 heavy, 4 moderate, 3 light.
         let agent_paths: Vec<PathBuf> = (0..10)
             .map(|i| PathBuf::from(format!("/data/agent{i}/target")))
@@ -1289,9 +1337,9 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
                 voi.record_scan_result(
                     path,
                     reclaim,
-                    (reclaim / 1_000_000) as u32,
-                    (rng.next_u64() % 3) as u32,
-                    1000.0 + rng.next_f64() * 500.0,
+                    u32_from_u64(reclaim / 1_000_000),
+                    u32_from_u64(rng.next_u64() % 3),
+                    rng.next_f64().mul_add(500.0, 1000.0),
                     now,
                 );
             }
@@ -1299,13 +1347,12 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
         }
 
         // Main scheduling rounds.
-        let rounds = 10;
+        let rounds: usize = 10;
         let mut heavy_in_top5 = Vec::new();
         let mut light_explored = Vec::new();
-        let mut all_visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
         for round in 0..rounds {
-            let now = t0 + Duration::from_secs(80 + round * 10);
+            let now = t0 + Duration::from_secs(80 + u64_from_usize(round) * 10);
             let plan = voi.schedule(now);
 
             // Budget check.
@@ -1334,10 +1381,6 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
                 .count();
             light_explored.push(light_explored_this_round);
 
-            for entry in &plan.paths {
-                all_visited.insert(entry.path.clone());
-            }
-
             // Feed results back.
             for entry in &plan.paths {
                 let idx = agent_paths
@@ -1348,7 +1391,7 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
                 voi.record_scan_result(
                     &entry.path,
                     reclaim,
-                    (reclaim / 1_000_000) as u32,
+                    u32_from_u64(reclaim / 1_000_000),
                     0,
                     1000.0,
                     now,
@@ -1358,7 +1401,7 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
         }
 
         // Assert: exploitation picks include >= 2 heavy paths in top-5 on average.
-        let avg_heavy = heavy_in_top5.iter().sum::<usize>() as f64 / rounds as f64;
+        let avg_heavy = usize_to_f64(heavy_in_top5.iter().sum::<usize>()) / usize_to_f64(rounds);
         if avg_heavy < 1.5 {
             failures.push(format!(
                 "iter {iter}: avg heavy paths in selection {avg_heavy:.1} < 1.5"
@@ -1415,7 +1458,8 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
             let mut rr_visited: std::collections::HashSet<PathBuf> =
                 std::collections::HashSet::new();
             for round in 0..10 {
-                let plan = fallback_voi.schedule(now + Duration::from_secs(100 + round));
+                let plan =
+                    fallback_voi.schedule(now + Duration::from_secs(100 + u64_from_usize(round)));
                 for entry in &plan.paths {
                     rr_visited.insert(entry.path.clone());
                 }
@@ -1429,7 +1473,7 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
         }
 
         detection_latencies.push(avg_heavy);
-        reclaim_efficiencies.push(total_light_explored as f64);
+        reclaim_efficiencies.push(usize_to_f64(total_light_explored));
         mode_transitions_counts.push(0.0);
         guard_changes.push(0.0);
         fallback_counts.push(if fallback_voi.is_fallback_active() {
@@ -1451,7 +1495,7 @@ fn run_scenario_h(seed: u64, iterations: usize) -> ScenarioResult {
             guard_state_changes: PercentileStats::from_values(&guard_changes),
             fallback_count: PercentileStats::from_values(&fallback_counts),
         },
-        duration_ms: start.elapsed().as_millis() as u64,
+        duration_ms: elapsed_millis_u64(start),
         failures,
     }
 }
@@ -1492,11 +1536,7 @@ fn stress_a_rapid_fill_burst() {
 
     // Determinism check.
     let mismatches = verify_determinism("A", DEFAULT_SEED, run_scenario_a);
-    assert!(
-        mismatches.is_empty(),
-        "Determinism failed: {:?}",
-        mismatches
-    );
+    assert!(mismatches.is_empty(), "Determinism failed: {mismatches:?}");
 }
 
 #[test]
@@ -1510,11 +1550,7 @@ fn stress_b_sustained_low_free() {
     );
 
     let mismatches = verify_determinism("B", DEFAULT_SEED, run_scenario_b);
-    assert!(
-        mismatches.is_empty(),
-        "Determinism failed: {:?}",
-        mismatches
-    );
+    assert!(mismatches.is_empty(), "Determinism failed: {mismatches:?}");
 }
 
 #[test]
@@ -1528,11 +1564,7 @@ fn stress_c_flash_fill() {
     );
 
     let mismatches = verify_determinism("C", DEFAULT_SEED, run_scenario_c);
-    assert!(
-        mismatches.is_empty(),
-        "Determinism failed: {:?}",
-        mismatches
-    );
+    assert!(mismatches.is_empty(), "Determinism failed: {mismatches:?}");
 }
 
 #[test]
@@ -1546,11 +1578,7 @@ fn stress_d_recovery_under_pressure() {
     );
 
     let mismatches = verify_determinism("D", DEFAULT_SEED, run_scenario_d);
-    assert!(
-        mismatches.is_empty(),
-        "Determinism failed: {:?}",
-        mismatches
-    );
+    assert!(mismatches.is_empty(), "Determinism failed: {mismatches:?}");
 }
 
 #[test]
@@ -1564,11 +1592,7 @@ fn stress_e_irregular_sampling() {
     );
 
     let mismatches = verify_determinism("E", DEFAULT_SEED, run_scenario_e);
-    assert!(
-        mismatches.is_empty(),
-        "Determinism failed: {:?}",
-        mismatches
-    );
+    assert!(mismatches.is_empty(), "Determinism failed: {mismatches:?}");
 }
 
 #[test]
@@ -1582,11 +1606,7 @@ fn stress_f_decision_plane_drift() {
     );
 
     let mismatches = verify_determinism("F", DEFAULT_SEED, run_scenario_f);
-    assert!(
-        mismatches.is_empty(),
-        "Determinism failed: {:?}",
-        mismatches
-    );
+    assert!(mismatches.is_empty(), "Determinism failed: {mismatches:?}");
 }
 
 #[test]
@@ -1654,7 +1674,7 @@ fn stress_aggregate_report() {
         seed,
         scenarios,
         all_passed,
-        total_duration_ms: start.elapsed().as_millis() as u64,
+        total_duration_ms: elapsed_millis_u64(start),
     };
 
     let json = serde_json::to_string_pretty(&report).expect("serialize stress report");

@@ -54,7 +54,8 @@ impl SeededRng {
     }
 
     fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        let bits = 0x3FF0_0000_0000_0000_u64 | (self.next_u64() >> 12);
+        f64::from_bits(bits) - 1.0
     }
 
     fn next_range(&mut self, lo: u64, hi: u64) -> u64 {
@@ -67,13 +68,23 @@ impl SeededRng {
 }
 
 fn is_full_mode() -> bool {
-    std::env::var("SBH_PROOF_FULL")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
+    std::env::var("SBH_PROOF_FULL").is_ok_and(|v| v == "1" || v == "true")
 }
 
 fn fast_or_full(fast: usize, full: usize) -> usize {
     if is_full_mode() { full } else { fast }
+}
+
+fn u64_from_usize(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn usize_from_u64(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn elapsed_micros_u64(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 // ════════════════════════════════════════════════════════════
@@ -117,7 +128,7 @@ fn random_candidates(rng: &mut SeededRng, count: usize) -> Vec<CandidateInput> {
         .map(|i| {
             let age = rng.next_range(1, 48);
             let size = rng.next_range(1, 10);
-            let conf = 0.5 + rng.next_f64() * 0.45;
+            let conf = rng.next_f64().mul_add(0.45, 0.5);
             let suffix = rng.next_u64() % 1000;
             make_candidate_input(
                 rng,
@@ -293,6 +304,7 @@ struct ReplayMismatch {
 // ════════════════════════════════════════════════════════════
 
 /// Execute a trace and collect outcomes.
+#[allow(clippy::too_many_lines)]
 fn execute_trace(trace: &[TraceOp]) -> Vec<TraceOutcome> {
     let mut engine = PolicyEngine::new(PolicyConfig::default());
     let scoring = default_engine();
@@ -455,14 +467,7 @@ fn compare_outcomes(
                 actual: format!("{:?}", a.guard_status),
             });
         }
-        if e.scores.len() != a.scores.len() {
-            mismatches.push(ReplayMismatch {
-                step: e.step,
-                field: "scores_len".to_string(),
-                expected: e.scores.len().to_string(),
-                actual: a.scores.len().to_string(),
-            });
-        } else {
+        if e.scores.len() == a.scores.len() {
             for (i, (es, as_)) in e.scores.iter().zip(a.scores.iter()).enumerate() {
                 if (es - as_).abs() > f64::EPSILON {
                     mismatches.push(ReplayMismatch {
@@ -473,6 +478,13 @@ fn compare_outcomes(
                     });
                 }
             }
+        } else {
+            mismatches.push(ReplayMismatch {
+                step: e.step,
+                field: "scores_len".to_string(),
+                expected: e.scores.len().to_string(),
+                actual: a.scores.len().to_string(),
+            });
         }
         if e.actions != a.actions {
             mismatches.push(ReplayMismatch {
@@ -532,7 +544,7 @@ fn assert_replay_pass(report: &ReplayReport) {
 #[test]
 fn replay_scoring_is_deterministic_across_runs() {
     let seeds = fast_or_full(5, 50);
-    for seed in 0..seeds as u64 {
+    for seed in 0..u64_from_usize(seeds) {
         let trace = vec![
             TraceOp::ScoreBatch {
                 seed,
@@ -581,7 +593,7 @@ fn replay_policy_lifecycle_trace() {
         // Fallback.
         TraceOp::PolicyFallback(FallbackReason::GuardrailDrift),
         TraceOp::PolicyEvaluate {
-            candidates: candidates.clone(),
+            candidates,
             guard: Some(good_guard()),
         },
         // Recovery.
@@ -639,7 +651,7 @@ fn replay_guard_state_machine_trace() {
 #[test]
 fn replay_mixed_operations_seeded() {
     let iterations = fast_or_full(5, 30);
-    for seed in 0..iterations as u64 {
+    for seed in 0..u64_from_usize(iterations) {
         let mut rng = SeededRng::new(seed * 31 + 7);
         let mut trace = Vec::new();
 
@@ -648,7 +660,7 @@ fn replay_mixed_operations_seeded() {
             match op {
                 0 => trace.push(TraceOp::ScoreBatch {
                     seed: rng.next_u64(),
-                    count: rng.next_range(5, 20) as usize,
+                    count: usize_from_u64(rng.next_range(5, 20)),
                     urgency: rng.next_f64(),
                 }),
                 1 => trace.push(TraceOp::PolicyPromote),
@@ -773,8 +785,10 @@ fn fault_eprocess_drift_forces_fallback() {
 
 #[test]
 fn fault_canary_budget_exhaustion() {
-    let mut config = PolicyConfig::default();
-    config.max_canary_deletes_per_hour = 2;
+    let config = PolicyConfig {
+        max_canary_deletes_per_hour: 2,
+        ..PolicyConfig::default()
+    };
     let mut engine = PolicyEngine::new(config);
     engine.promote(); // canary
 
@@ -803,9 +817,11 @@ fn fault_canary_budget_exhaustion() {
 
 #[test]
 fn fault_kill_switch_blocks_everything() {
-    let mut config = PolicyConfig::default();
-    config.kill_switch = true;
-    config.initial_mode = ActiveMode::Enforce;
+    let config = PolicyConfig {
+        kill_switch: true,
+        initial_mode: ActiveMode::Enforce,
+        ..PolicyConfig::default()
+    };
     let engine = PolicyEngine::new(config);
 
     assert_eq!(
@@ -819,8 +835,10 @@ fn fault_kill_switch_blocks_everything() {
 
 #[test]
 fn fault_calibration_breach_cascade() {
-    let mut config = PolicyConfig::default();
-    config.calibration_breach_windows = 3;
+    let config = PolicyConfig {
+        calibration_breach_windows: 3,
+        ..PolicyConfig::default()
+    };
     let mut engine = PolicyEngine::new(config);
     engine.promote(); // canary
 
@@ -857,8 +875,10 @@ fn fault_calibration_breach_cascade() {
 
 #[test]
 fn fault_recovery_after_drift() {
-    let mut config = PolicyConfig::default();
-    config.recovery_clean_windows = 2;
+    let config = PolicyConfig {
+        recovery_clean_windows: 2,
+        ..PolicyConfig::default()
+    };
     let mut engine = PolicyEngine::new(config);
     engine.promote();
     engine.promote(); // enforce
@@ -1049,11 +1069,11 @@ fn build_env_record() -> EnvRecord {
     EnvRecord {
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        rust_version: env!("CARGO_PKG_RUST_VERSION", "unknown").to_string(),
+        rust_version: std::env::var("CARGO_PKG_RUST_VERSION")
+            .unwrap_or_else(|_| "unknown".to_string()),
         timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs().to_string())
-            .unwrap_or_else(|_| "0".to_string()),
+            .map_or_else(|_| "0".to_string(), |d| d.as_secs().to_string()),
         hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
     }
 }
@@ -1067,7 +1087,11 @@ fn outcomes_to_bundle(outcomes: &[TraceOutcome]) -> TraceBundle {
             mode_after: o.policy_mode.map(|m| m.to_string()),
             guard_after: o.guard_status.map(|s| s.to_string()),
             scores: o.scores.clone(),
-            actions: o.actions.iter().map(|a| a.to_string()).collect(),
+            actions: o
+                .actions
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             approved_count: o.approved_count,
         })
         .collect();
@@ -1144,7 +1168,7 @@ fn repro_pack_generates_valid_json() {
     assert_eq!(value["manifest"]["seed"], 42);
     assert_eq!(
         value["trace_bundle"]["invariants_checked"],
-        trace.len() as u64,
+        u64_from_usize(trace.len()),
     );
 }
 
@@ -1283,11 +1307,14 @@ struct BenchmarkReport {
     mean_us: u64,
 }
 
-fn compute_percentile(sorted: &[u64], percentile: f64) -> u64 {
+fn compute_percentile(sorted: &[u64], percentile: u32) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
-    let idx = ((sorted.len() as f64 * percentile / 100.0).ceil() as usize).saturating_sub(1);
+    let len = sorted.len();
+    let pct = usize::try_from(percentile).unwrap_or(0);
+    let idx = len.saturating_mul(pct).saturating_add(99) / 100;
+    let idx = idx.saturating_sub(1);
     sorted[idx.min(sorted.len() - 1)]
 }
 
@@ -1302,7 +1329,7 @@ fn benchmark_operation<F: FnMut()>(name: &str, iterations: usize, mut op: F) -> 
     for _ in 0..iterations {
         let start = Instant::now();
         op();
-        timings.push(start.elapsed().as_micros() as u64);
+        timings.push(elapsed_micros_u64(start));
     }
 
     timings.sort_unstable();
@@ -1311,12 +1338,12 @@ fn benchmark_operation<F: FnMut()>(name: &str, iterations: usize, mut op: F) -> 
     BenchmarkReport {
         operation: name.to_string(),
         sample_count: iterations,
-        p50_us: compute_percentile(&timings, 50.0),
-        p95_us: compute_percentile(&timings, 95.0),
-        p99_us: compute_percentile(&timings, 99.0),
+        p50_us: compute_percentile(&timings, 50),
+        p95_us: compute_percentile(&timings, 95),
+        p99_us: compute_percentile(&timings, 99),
         min_us: timings[0],
         max_us: *timings.last().unwrap(),
-        mean_us: sum / iterations as u64,
+        mean_us: sum / u64_from_usize(iterations),
     }
 }
 
@@ -1431,9 +1458,9 @@ fn benchmark_report_comparison() {
     });
 
     // Build a comparison report.
-    let delta_p50 = report2.p50_us as i64 - report1.p50_us as i64;
-    let delta_p95 = report2.p95_us as i64 - report1.p95_us as i64;
-    let delta_p99 = report2.p99_us as i64 - report1.p99_us as i64;
+    let delta_p50 = i128::from(report2.p50_us) - i128::from(report1.p50_us);
+    let delta_p95 = i128::from(report2.p95_us) - i128::from(report1.p95_us);
+    let delta_p99 = i128::from(report2.p99_us) - i128::from(report1.p99_us);
 
     let comparison = serde_json::json!({
         "baseline": {
@@ -1472,7 +1499,7 @@ fn invariant_fallback_always_dominates() {
     // 4. Records carry shadow policy mode
     let iterations = fast_or_full(5, 20);
 
-    for seed in 0..iterations as u64 {
+    for seed in 0..u64_from_usize(iterations) {
         let mut rng = SeededRng::new(seed * 13 + 5);
 
         let faults = [
@@ -1541,7 +1568,7 @@ fn invariant_decision_ids_are_globally_monotonic() {
 fn invariant_all_records_serialize_and_roundtrip() {
     let iterations = fast_or_full(10, 50);
 
-    for seed in 0..iterations as u64 {
+    for seed in 0..u64_from_usize(iterations) {
         let mut rng = SeededRng::new(seed * 7 + 3);
         let engine = default_engine();
         let inputs = random_candidates(&mut rng, 20);
@@ -1643,7 +1670,7 @@ fn full_mode_exhaustive_seed_replay() {
             match op {
                 0 => trace.push(TraceOp::ScoreBatch {
                     seed: rng.next_u64(),
-                    count: rng.next_range(5, 30) as usize,
+                    count: usize_from_u64(rng.next_range(5, 30)),
                     urgency: rng.next_f64(),
                 }),
                 1 => trace.push(TraceOp::PolicyPromote),
@@ -1668,7 +1695,7 @@ fn full_mode_exhaustive_seed_replay() {
                     trace.push(TraceOp::PolicyObserveWindow(diag));
                 }
                 _ => {
-                    let count = rng.next_range(1, 5) as usize;
+                    let count = usize_from_u64(rng.next_range(1, 5));
                     let candidates: Vec<CandidacyScore> = (0..count)
                         .map(|_| {
                             if rng.next_bool(0.6) {

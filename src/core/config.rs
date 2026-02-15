@@ -717,7 +717,7 @@ mod tests {
     fn stable_hash_changes_when_config_changes() {
         let cfg = Config::default();
         let hash_before = cfg.stable_hash().expect("hash should compute");
-        let mut modified = cfg.clone();
+        let mut modified = Config::default();
         modified.scanner.max_depth += 1;
         let hash_after = modified.stable_hash().expect("hash should compute");
         assert_ne!(hash_before, hash_after);

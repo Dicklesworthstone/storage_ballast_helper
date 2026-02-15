@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -47,14 +47,19 @@ pub struct SpecialLocationRegistry {
 impl SpecialLocationRegistry {
     #[must_use]
     pub fn new(locations: Vec<SpecialLocation>) -> Self {
-        let mut unique = Vec::new();
-        let mut seen = HashSet::<PathBuf>::new();
+        let mut deduped = HashMap::<PathBuf, SpecialLocation>::new();
         for location in locations {
-            if seen.insert(location.path.clone()) {
-                unique.push(location);
-            }
+            // Later entries intentionally win so operator-provided custom paths
+            // can override auto-discovered defaults for the same location.
+            deduped.insert(location.path.clone(), location);
         }
-        unique.sort_by(|left, right| right.priority.cmp(&left.priority));
+        let mut unique: Vec<SpecialLocation> = deduped.into_values().collect();
+        unique.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.path.cmp(&right.path))
+        });
         Self { locations: unique }
     }
 
@@ -294,6 +299,7 @@ mod tests {
         ];
         let registry = SpecialLocationRegistry::new(locations);
         assert_eq!(registry.all().len(), 1);
+        assert!(matches!(registry.all()[0].kind, SpecialKind::UserTmp));
     }
 
     #[test]
@@ -343,5 +349,27 @@ mod tests {
                 .any(|loc| loc.path == Path::new("/tmp")),
             "/tmp should be added as fallback"
         );
+    }
+
+    #[test]
+    fn discover_custom_path_overrides_mount_defaults() {
+        let platform = TestPlatform {
+            mounts: vec![MountPoint {
+                path: PathBuf::from("/tmp"),
+                device: "tmpfs".to_string(),
+                fs_type: "tmpfs".to_string(),
+                is_ram_backed: true,
+            }],
+        };
+        let registry = SpecialLocationRegistry::discover(&platform, &[PathBuf::from("/tmp")])
+            .expect("discovery should succeed");
+
+        let tmp = registry
+            .all()
+            .iter()
+            .find(|location| location.path == Path::new("/tmp"))
+            .expect("/tmp entry should exist");
+        assert!(matches!(tmp.kind, SpecialKind::Custom(_)));
+        assert_eq!(tmp.priority, 140);
     }
 }

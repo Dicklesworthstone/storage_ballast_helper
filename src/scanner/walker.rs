@@ -61,7 +61,7 @@ type WorkItem = (PathBuf, usize, u64);
 /// Parallel directory walker with safety guards.
 ///
 /// Safety invariants:
-/// - Never follows symlinks (uses `symlink_metadata` / lstat)
+/// - Honors `follow_symlinks` config during traversal
 /// - Never crosses filesystem boundaries unless configured
 /// - Skips excluded and protected paths
 /// - Deduplicates via inode tracking to handle hardlink cycles
@@ -95,7 +95,7 @@ impl DirectoryWalker {
 
         // Seed work queue with root paths.
         for root in &self.config.root_paths {
-            let meta = match fs::symlink_metadata(root) {
+            let meta = match metadata_for_path(root, self.config.follow_symlinks) {
                 Ok(m) => m,
                 Err(err) if err.kind() == ErrorKind::NotFound => continue,
                 Err(err) if err.kind() == ErrorKind::PermissionDenied => continue,
@@ -239,13 +239,12 @@ fn process_directory(
 
         let child_path = entry.path();
 
-        // Always use lstat (symlink_metadata) — never follow symlinks.
-        let Ok(meta) = fs::symlink_metadata(&child_path) else {
+        let Ok(meta) = metadata_for_path(&child_path, config.follow_symlinks) else {
             continue;
         };
 
-        // Skip symlinks entirely.
-        if meta.file_type().is_symlink() {
+        // Skip symlinks entirely unless following symlinks is explicitly enabled.
+        if !config.follow_symlinks && meta.file_type().is_symlink() {
             continue;
         }
 
@@ -261,7 +260,7 @@ fn process_directory(
 
     // Emit a WalkEntry for this directory itself (the scanner scores directories).
     if depth > 0
-        && let Ok(dir_meta) = fs::symlink_metadata(dir_path)
+        && let Ok(dir_meta) = metadata_for_path(dir_path, config.follow_symlinks)
     {
         let _ = result_tx.send(WalkEntry {
             path: dir_path.to_path_buf(),
@@ -361,6 +360,14 @@ fn entry_metadata(meta: &fs::Metadata) -> EntryMetadata {
     }
 }
 
+fn metadata_for_path(path: &Path, follow_symlinks: bool) -> std::io::Result<fs::Metadata> {
+    if follow_symlinks {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    }
+}
+
 /// Get device ID from metadata (for cross-device detection).
 fn device_id(meta: &fs::Metadata) -> u64 {
     #[cfg(unix)]
@@ -436,7 +443,22 @@ pub fn is_path_open<S: std::hash::BuildHasher>(
     path: &Path,
     open_files: &HashSet<PathBuf, S>,
 ) -> bool {
-    open_files.iter().any(|open| open.starts_with(path))
+    let normalized = normalize_path_for_open_check(path);
+    open_files.iter().any(|open| {
+        open.starts_with(path)
+            || normalized
+                .as_ref()
+                .is_some_and(|normalized_path| open.starts_with(normalized_path))
+    })
+}
+
+fn normalize_path_for_open_check(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    Some(fs::canonicalize(&absolute).unwrap_or(absolute))
 }
 
 #[cfg(test)]
@@ -585,6 +607,26 @@ mod tests {
         assert!(!paths.contains(&link_dir));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn follows_symlinks_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let real_dir = tmp.path().join("real");
+        let link_dir = tmp.path().join("link");
+        fs::create_dir_all(real_dir.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        let mut config = test_config(tmp.path());
+        config.follow_symlinks = true;
+        let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+        let entries = walker.walk().unwrap();
+
+        let paths: Vec<_> = entries.iter().map(|e| e.path.clone()).collect();
+        assert!(paths.contains(&real_dir));
+        assert!(paths.contains(&link_dir));
+        assert!(paths.contains(&link_dir.join("nested")));
+    }
+
     #[test]
     fn handles_empty_directory() {
         let tmp = TempDir::new().unwrap();
@@ -651,6 +693,21 @@ mod tests {
 
         assert!(is_path_open(Path::new("/data/projects/foo/target"), &open));
         assert!(!is_path_open(Path::new("/data/projects/bar/target"), &open));
+    }
+
+    #[test]
+    fn is_path_open_handles_relative_candidate_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("walker-open-relative-")
+            .tempdir_in(&cwd)
+            .unwrap();
+
+        let rel = tmp.path().strip_prefix(&cwd).unwrap();
+        let mut open = HashSet::new();
+        open.insert(tmp.path().join("debug").join("libfoo.rlib"));
+
+        assert!(is_path_open(rel, &open));
     }
 
     #[test]

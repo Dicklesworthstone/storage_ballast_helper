@@ -48,7 +48,8 @@ impl SeededRng {
         self.state
     }
     fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        let bits = 0x3FF0_0000_0000_0000_u64 | (self.next_u64() >> 12);
+        f64::from_bits(bits) - 1.0
     }
     fn next_range(&mut self, lo: u64, hi: u64) -> u64 {
         lo + self.next_u64() % (hi - lo + 1)
@@ -65,7 +66,7 @@ fn make_candidate(
     size_gib: u64,
 ) -> CandidateInput {
     let suffix = rng.next_u64() % 1000;
-    let conf = 0.5 + rng.next_f64() * 0.45;
+    let conf = rng.next_f64().mul_add(0.45, 0.5);
     CandidateInput {
         path: PathBuf::from(format!("/data/p{idx}/.target_{suffix}")),
         size_bytes: size_gib * 1_073_741_824,
@@ -213,6 +214,7 @@ impl ScenarioTrace {
 // deletion plan, but never approve actual deletions.
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_burst_growth_shadow_mode() {
     let seed = 42;
     let mut rng = SeededRng::new(seed);
@@ -341,6 +343,7 @@ fn e2e_burst_growth_shadow_mode() {
 // - Budget exhaustion triggers fallback
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_canary_bounded_impact() {
     let seed = 99;
     let mut rng = SeededRng::new(seed);
@@ -442,8 +445,7 @@ fn e2e_canary_bounded_impact() {
             decision.approved_for_deletion.len() + decision2.approved_for_deletion.len();
         assert!(total_approved <= 3);
         step.assertions.push(format!(
-            "total approved {} ≤ 3 across batches",
-            total_approved
+            "total approved {total_approved} ≤ 3 across batches"
         ));
     }
     trace.steps.push(step);
@@ -485,6 +487,7 @@ fn e2e_canary_bounded_impact() {
 // policy fallback.
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_calibration_drift_fallback() {
     let seed = 303;
     let mut rng = SeededRng::new(seed);
@@ -857,6 +860,7 @@ fn e2e_io_fault_safe_degradation() {
 // until the engine recovers to its pre-fallback mode.
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_progressive_recovery() {
     let seed = 666;
     let mut rng = SeededRng::new(seed);
@@ -919,11 +923,10 @@ fn e2e_progressive_recovery() {
     } else if recovered_mode == ActiveMode::FallbackSafe {
         // Some configs may require more windows.
         step_assertions.push(format!(
-            "still FallbackSafe — config may require more clean windows (mode={:?})",
-            recovered_mode
+            "still FallbackSafe — config may require more clean windows (mode={recovered_mode:?})"
         ));
     } else {
-        step_assertions.push(format!("unexpected recovery mode: {:?}", recovered_mode));
+        step_assertions.push(format!("unexpected recovery mode: {recovered_mode:?}"));
     }
     trace.steps.push(StepTrace {
         label: "recovery_window_3".to_string(),
@@ -1008,11 +1011,11 @@ fn e2e_all_scenarios_deterministic() {
             let scored = scoring.score_batch(&inputs, 0.5);
             let decision = engine.evaluate(&scored, Some(&good_guard()));
 
-            let scores: Vec<f64> = decision.records.iter().map(|r| r.total_score).collect();
+            let score_values: Vec<f64> = decision.records.iter().map(|r| r.total_score).collect();
             let actions: Vec<ActionRecord> = decision.records.iter().map(|r| r.action).collect();
             let ids: Vec<u64> = decision.records.iter().map(|r| r.decision_id).collect();
 
-            results.push((scores, actions, ids));
+            results.push((score_values, actions, ids));
         }
 
         // Compare the two runs.

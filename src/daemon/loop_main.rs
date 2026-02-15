@@ -1097,7 +1097,7 @@ mod tests {
             max_delete_batch: 10,
         };
         assert_eq!(request.paths.len(), 2);
-        assert_eq!(request.urgency, 0.7);
+        assert_eq!(request.urgency.to_bits(), 0.7_f64.to_bits());
     }
 
     #[test]
@@ -1194,7 +1194,7 @@ mod tests {
         };
         scan_tx.send(request).unwrap();
         let received = scan_rx.recv().unwrap();
-        assert_eq!(received.urgency, 0.5);
+        assert_eq!(received.urgency.to_bits(), 0.5_f64.to_bits());
 
         // Send a deletion batch.
         let batch = DeletionBatch {
@@ -1204,7 +1204,7 @@ mod tests {
         };
         del_tx.send(batch).unwrap();
         let received_batch = del_rx.recv().unwrap();
-        assert_eq!(received_batch.urgency, 0.5);
+        assert_eq!(received_batch.urgency.to_bits(), 0.5_f64.to_bits());
     }
 
     #[test]
