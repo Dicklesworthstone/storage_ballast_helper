@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::{
-    HostSpecifier, IntegrityDecision, SigstorePolicy, VerificationMode,
-    resolve_bundle_artifact_contract, verify_artifact_supply_chain,
+    HostSpecifier, IntegrityDecision, VerificationMode, resolve_bundle_artifact_contract,
+    sigstore_policy_and_probe_for_bundle, verify_artifact_supply_chain,
 };
 use crate::ballast::manager::BallastManager;
 use crate::core::config::{BallastConfig, Config, PathsConfig};
@@ -309,12 +309,16 @@ fn run_bundle_preflight(
         }
     };
 
+    let (sigstore_policy, sigstore_probe) = sigstore_policy_and_probe_for_bundle(
+        &resolution.archive_path,
+        resolution.sigstore_bundle_path.as_deref(),
+    );
     match verify_artifact_supply_chain(
         &resolution.archive_path,
         &expected_checksum,
         VerificationMode::Enforce,
-        SigstorePolicy::Disabled,
-        None,
+        sigstore_policy,
+        sigstore_probe,
     ) {
         Ok(outcome) if matches!(outcome.decision, IntegrityDecision::Allow) => {
             report.step_ok(format!(
@@ -970,6 +974,79 @@ mod tests {
                 .description
                 .contains("Verified offline bundle artifact")),
             "report should include bundle integrity verification step"
+        );
+    }
+
+    #[test]
+    fn install_sequence_with_bundle_preflight_requires_sigstore_when_bundle_present() {
+        let tmp = TempDir::new().unwrap();
+        let host = HostSpecifier::detect().unwrap();
+        let contract =
+            resolve_installer_artifact_contract(host, ReleaseChannel::Stable, Some("0.9.1"))
+                .unwrap();
+
+        let archive_name = contract.asset_name();
+        let checksum_name = contract.checksum_name();
+        let sigstore_name = contract.sigstore_bundle_name();
+        let archive_path = tmp.path().join(&archive_name);
+        let archive_bytes = b"offline-bundle-archive";
+        std::fs::write(&archive_path, archive_bytes).unwrap();
+        std::fs::write(tmp.path().join(&sigstore_name), "{\"invalid\":true}\n").unwrap();
+
+        let checksum = Sha256::digest(archive_bytes);
+        let checksum_hex = format!("{checksum:x}");
+        std::fs::write(
+            tmp.path().join(&checksum_name),
+            format!("{checksum_hex}  {archive_name}\n"),
+        )
+        .unwrap();
+
+        let manifest = OfflineBundleManifest {
+            version: "1".to_string(),
+            repository: RELEASE_REPOSITORY.to_string(),
+            release_tag: "0.9.1".to_string(),
+            artifacts: vec![OfflineBundleArtifact {
+                target: contract.target.triple.to_string(),
+                archive: archive_name,
+                checksum: checksum_name,
+                sigstore_bundle: Some(sigstore_name),
+            }],
+        };
+        let manifest_path = tmp.path().join("bundle-manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.paths.config_file = tmp.path().join("config").join("config.toml");
+        config.paths.state_file = tmp.path().join("data").join("state.json");
+        config.paths.ballast_dir = tmp.path().join("ballast");
+        config.ballast.file_count = 0;
+
+        let opts = InstallOptions {
+            config,
+            ballast_count: 0,
+            ballast_size_bytes: 0,
+            ballast_path: None,
+            dry_run: false,
+        };
+
+        let report = run_install_sequence_with_bundle(&opts, Some(&manifest_path));
+        assert!(
+            !report.success,
+            "sigstore bundle should be enforced in preflight: {report:?}"
+        );
+        assert!(
+            report.steps.iter().any(|step| step
+                .description
+                .contains("Verify offline bundle artifact integrity")
+                && step
+                    .error
+                    .as_deref()
+                    .is_some_and(|err| err.contains("sigstore_required_"))),
+            "report should include required sigstore integrity denial"
         );
     }
 

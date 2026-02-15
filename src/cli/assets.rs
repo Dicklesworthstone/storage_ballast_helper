@@ -198,8 +198,7 @@ impl AssetCache {
             .assets
             .iter()
             .map(|a| {
-                PathBuf::from(safe_cache_component(&a.name))
-                    .join(safe_cache_component(&a.version))
+                PathBuf::from(safe_cache_component(&a.name)).join(safe_cache_component(&a.version))
             })
             .collect();
 
@@ -1592,10 +1591,11 @@ mod tests {
         };
         let filename = url_filename(&entry.url);
         fs::write(bundle_tmp.path().join(filename), bytes).unwrap();
+        let expected_cache_path = cache.asset_path(&entry);
 
         let manifest = AssetManifest {
             version: "1.0.0".to_string(),
-            assets: vec![entry.clone()],
+            assets: vec![entry],
         };
         let opts = FetchOptions {
             offline: true,
@@ -1607,7 +1607,7 @@ mod tests {
         assert_eq!(summary.failed_count, 0);
         assert_eq!(summary.downloaded_count, 1);
         assert_eq!(summary.results[0].status, FetchStatus::Downloaded);
-        assert_eq!(fs::read(cache.asset_path(&entry)).unwrap(), bytes);
+        assert_eq!(fs::read(expected_cache_path).unwrap(), bytes);
     }
 
     #[test]
@@ -1682,10 +1682,11 @@ mod tests {
             .join(filename);
         fs::create_dir_all(escaped_path.parent().unwrap()).unwrap();
         fs::write(&escaped_path, bytes).unwrap();
+        let cache_asset_path = cache.asset_path(&entry);
 
         let manifest = AssetManifest {
             version: "1.0.0".to_string(),
-            assets: vec![entry.clone()],
+            assets: vec![entry],
         };
         let opts = FetchOptions {
             offline: true,
@@ -1698,7 +1699,7 @@ mod tests {
         assert_eq!(summary.downloaded_count, 0);
         assert_eq!(summary.results[0].status, FetchStatus::Failed);
         assert!(summary.results[0].message.contains("offline mode"));
-        assert!(!cache.asset_path(&entry).exists());
+        assert!(!cache_asset_path.exists());
     }
 
     #[test]
@@ -1982,7 +1983,7 @@ mod tests {
 
         let manifest = AssetManifest {
             version: "1.0.0".to_string(),
-            assets: vec![entry.clone()],
+            assets: vec![entry],
         };
 
         let cache_report = offline_readiness(&manifest, &cache);

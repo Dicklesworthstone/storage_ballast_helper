@@ -18,6 +18,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Component;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::core::errors::{Result, SbhError};
 use serde::{Deserialize, Serialize};
@@ -504,6 +505,55 @@ pub fn verify_artifact_supply_chain(
         reason_codes,
         warnings,
     })
+}
+
+/// Resolve sigstore policy/probe for offline bundle verification.
+///
+/// If a bundle path is present, signature verification is required and a probe
+/// is executed immediately. If no bundle path is present, signature checks are
+/// disabled for this verification pass.
+#[must_use]
+pub fn sigstore_policy_and_probe_for_bundle(
+    artifact_path: &Path,
+    sigstore_bundle_path: Option<&Path>,
+) -> (SigstorePolicy, Option<SigstoreProbe>) {
+    sigstore_bundle_path.map_or((SigstorePolicy::Disabled, None), |bundle_path| {
+        (
+            SigstorePolicy::Required,
+            Some(probe_sigstore_bundle(artifact_path, bundle_path)),
+        )
+    })
+}
+
+fn probe_sigstore_bundle(artifact_path: &Path, bundle_path: &Path) -> SigstoreProbe {
+    match Command::new("cosign")
+        .arg("verify-blob")
+        .arg("--bundle")
+        .arg(bundle_path)
+        .arg(artifact_path)
+        .output()
+    {
+        Ok(output) if output.status.success() => SigstoreProbe::Verified,
+        Ok(output) => SigstoreProbe::Failed {
+            details: command_output_details("cosign verify-blob failed", &output),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => SigstoreProbe::MissingCosign,
+        Err(err) => SigstoreProbe::Failed {
+            details: format!("failed to execute cosign: {err}"),
+        },
+    }
+}
+
+fn command_output_details(prefix: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stderr.is_empty() {
+        format!("{prefix}: {stderr}")
+    } else if !stdout.is_empty() {
+        format!("{prefix}: {stdout}")
+    } else {
+        format!("{prefix}: status {}", output.status)
+    }
 }
 
 fn evaluate_sigstore_policy(
@@ -1085,6 +1135,26 @@ mod tests {
             vec![String::from("sigstore_required_unavailable")]
         );
         assert!(matches!(outcome.signature, SignatureStatus::Failed { .. }));
+    }
+
+    #[test]
+    fn sigstore_policy_requires_probe_when_bundle_path_present() {
+        let artifact = temp_artifact(b"artifact data");
+        let bundle = temp_artifact(b"{\"invalid\":true}");
+        let (policy, probe) =
+            sigstore_policy_and_probe_for_bundle(artifact.path(), Some(bundle.path()));
+
+        assert_eq!(policy, SigstorePolicy::Required);
+        assert!(probe.is_some());
+    }
+
+    #[test]
+    fn sigstore_policy_is_disabled_without_bundle_path() {
+        let artifact = temp_artifact(b"artifact data");
+        let (policy, probe) = sigstore_policy_and_probe_for_bundle(artifact.path(), None);
+
+        assert_eq!(policy, SigstorePolicy::Disabled);
+        assert!(probe.is_none());
     }
 
     #[test]

@@ -1011,20 +1011,14 @@ mod tests {
             ..Default::default()
         };
         let report = plan_uninstall(&opts);
-        let kept_categories: Vec<_> = report.kept.iter().map(|k| k.category).collect();
-        // Should keep data-related items.
-        for cat in [
-            RemovalCategory::StateFile,
-            RemovalCategory::SqliteDb,
-            RemovalCategory::JsonlLog,
-        ] {
-            if kept_categories.contains(&cat) {
-                // Good — data is kept.
-            }
-        }
         // Config should be removed in KeepData mode.
-        let config_kept = kept_categories.contains(&RemovalCategory::ConfigFile);
-        assert!(!config_kept, "config should not be kept in KeepData mode");
+        assert!(
+            !report
+                .kept
+                .iter()
+                .any(|k| k.category == RemovalCategory::ConfigFile),
+            "config should not be kept in KeepData mode"
+        );
     }
 
     // bd-2j5.19 — cleanup mode display completeness
@@ -1068,11 +1062,13 @@ mod tests {
             ..Default::default()
         };
         let report = plan_uninstall(&opts);
-        let kept_categories: Vec<_> = report.kept.iter().map(|k| k.category).collect();
         // Config should be kept.
         // Data should NOT be kept (removed in KeepConfig mode).
         assert!(
-            !kept_categories.contains(&RemovalCategory::StateFile),
+            !report
+                .kept
+                .iter()
+                .any(|k| k.category == RemovalCategory::StateFile),
             "state file should not be kept in KeepConfig mode"
         );
     }
@@ -1265,8 +1261,10 @@ mod tests {
 
         let contents = fs::read_to_string(&profile).unwrap();
         // All lines contained sbh+PATH, should all be removed.
-        let non_empty: Vec<_> = contents.lines().filter(|l| !l.is_empty()).collect();
-        assert!(non_empty.is_empty(), "all sbh lines should be removed");
+        assert!(
+            !contents.lines().any(|l| !l.is_empty()),
+            "all sbh lines should be removed"
+        );
     }
 
     // bd-2j5.19 — dir_size with nested directories

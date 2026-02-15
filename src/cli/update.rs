@@ -16,8 +16,8 @@ use crate::core::update_cache::{CachedUpdateMetadata, UpdateMetadataCache};
 
 use super::{
     HostSpecifier, IntegrityDecision, ReleaseArtifactContract, ReleaseChannel, ReleaseLocator,
-    SigstorePolicy, VerificationMode, resolve_bundle_artifact_contract,
-    resolve_updater_artifact_contract, verify_artifact_supply_chain,
+    VerificationMode, resolve_bundle_artifact_contract, resolve_updater_artifact_contract,
+    sigstore_policy_and_probe_for_bundle, verify_artifact_supply_chain,
 };
 
 // ---------------------------------------------------------------------------
@@ -433,6 +433,7 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
     // Step 2: Resolve artifact contract (shared with installer) or offline bundle contract.
     let mut bundle_archive_path = None;
     let mut bundle_checksum_path = None;
+    let mut bundle_sigstore_path = None;
     let contract = if let Some(bundle_manifest_path) = opts.offline_bundle_manifest.as_deref() {
         match resolve_bundle_artifact_contract(host, bundle_manifest_path) {
             Ok(resolution) => {
@@ -442,6 +443,7 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
                 ));
                 bundle_archive_path = Some(resolution.archive_path.clone());
                 bundle_checksum_path = Some(resolution.checksum_path.clone());
+                bundle_sigstore_path.clone_from(&resolution.sigstore_bundle_path);
                 resolution.contract
             }
             Err(e) => {
@@ -505,6 +507,7 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
             source: TargetMetadataSource::OfflineBundle,
             bundle_archive_path,
             bundle_checksum_path,
+            bundle_sigstore_path,
         }
     } else {
         let cache =
@@ -662,13 +665,15 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
             return report;
         }
     };
+    let (sigstore_policy, sigstore_probe) =
+        sigstore_policy_and_probe_for_bundle(&archive_path, target.bundle_sigstore_path.as_deref());
 
     match verify_artifact_supply_chain(
         &archive_path,
         &expected_checksum,
         verification_mode,
-        SigstorePolicy::Disabled,
-        None,
+        sigstore_policy,
+        sigstore_probe,
     ) {
         Ok(outcome) => {
             if matches!(outcome.decision, IntegrityDecision::Allow) {
@@ -901,6 +906,7 @@ struct TargetMetadata {
     source: TargetMetadataSource,
     bundle_archive_path: Option<PathBuf>,
     bundle_checksum_path: Option<PathBuf>,
+    bundle_sigstore_path: Option<PathBuf>,
 }
 
 fn resolve_target_metadata_with_cache<F>(
@@ -922,6 +928,7 @@ where
             source: TargetMetadataSource::Pinned,
             bundle_archive_path: None,
             bundle_checksum_path: None,
+            bundle_sigstore_path: None,
         });
     }
 
@@ -932,6 +939,7 @@ where
             source: TargetMetadataSource::Cache,
             bundle_archive_path: None,
             bundle_checksum_path: None,
+            bundle_sigstore_path: None,
         });
     }
 
@@ -950,6 +958,7 @@ where
         source: TargetMetadataSource::Network,
         bundle_archive_path: None,
         bundle_checksum_path: None,
+        bundle_sigstore_path: None,
     })
 }
 
@@ -1098,7 +1107,7 @@ fn tempdir_for_update() -> std::result::Result<PathBuf, String> {
         let dir = base.join(format!("sbh_update-{pid}-{nonce:032x}"));
         match std::fs::create_dir(&dir) {
             Ok(()) => return Ok(dir),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => {
                 return Err(format!(
                     "failed to create temp update dir {}: {err}",
@@ -1165,8 +1174,25 @@ mod tests {
         release_tag: &str,
         archive_bytes: &[u8],
     ) -> PathBuf {
+        write_offline_bundle_manifest_with_sigstore(
+            root,
+            contract,
+            release_tag,
+            archive_bytes,
+            None,
+        )
+    }
+
+    fn write_offline_bundle_manifest_with_sigstore(
+        root: &Path,
+        contract: &ReleaseArtifactContract,
+        release_tag: &str,
+        archive_bytes: &[u8],
+        sigstore_bundle_contents: Option<&[u8]>,
+    ) -> PathBuf {
         let archive_name = contract.asset_name();
         let checksum_name = contract.checksum_name();
+        let sigstore_name = contract.sigstore_bundle_name();
         let archive_path = root.join(&archive_name);
         std::fs::write(&archive_path, archive_bytes).unwrap();
         let checksum_hex = format!("{:x}", Sha256::digest(archive_bytes));
@@ -1175,6 +1201,10 @@ mod tests {
             format!("{checksum_hex}  {archive_name}\n"),
         )
         .unwrap();
+        let sigstore_bundle = sigstore_bundle_contents.map_or(None, |contents| {
+            std::fs::write(root.join(&sigstore_name), contents).unwrap();
+            Some(sigstore_name)
+        });
 
         let manifest = OfflineBundleManifest {
             version: "1".to_string(),
@@ -1184,7 +1214,7 @@ mod tests {
                 target: contract.target.triple.to_string(),
                 archive: archive_name,
                 checksum: checksum_name,
-                sigstore_bundle: None,
+                sigstore_bundle,
             }],
         };
         let manifest_path = root.join("bundle-manifest.json");
@@ -1454,6 +1484,53 @@ mod tests {
                 .description
                 .contains("Loaded update metadata from offline bundle")),
             "report should indicate offline metadata source"
+        );
+    }
+
+    #[test]
+    fn run_update_sequence_offline_bundle_requires_sigstore_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = HostSpecifier::detect().unwrap();
+        let contract =
+            resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some("9.9.9")).unwrap();
+        let manifest_path = write_offline_bundle_manifest_with_sigstore(
+            tmp.path(),
+            &contract,
+            "9.9.9",
+            b"offline-update-archive",
+            Some(b"{\"invalid\":true}\n"),
+        );
+
+        let opts = UpdateOptions {
+            check_only: false,
+            pinned_version: None,
+            force: true,
+            install_dir: tmp.path().join("bin"),
+            no_verify: false,
+            dry_run: false,
+            max_backups: 5,
+            metadata_cache_file: tmp.path().join("update-cache.json"),
+            metadata_cache_ttl: Duration::from_secs(60),
+            refresh_cache: false,
+            notices_enabled: true,
+            offline_bundle_manifest: Some(manifest_path),
+        };
+
+        let report = run_update_sequence(&opts);
+        assert!(
+            !report.success,
+            "offline update should fail when required sigstore verification fails: {report:?}"
+        );
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.description.contains("Integrity verification")
+                    && step
+                        .error
+                        .as_deref()
+                        .is_some_and(|err| err.contains("sigstore_required_"))),
+            "report should include required sigstore integrity denial"
         );
     }
 

@@ -1730,11 +1730,11 @@ fn generate_recommendations(
     let mut recs = Vec::new();
 
     // Use the 24-hour window for most analysis (index 4 in STANDARD_WINDOWS).
-    let day_stats = stats.iter().find(|ws| ws.window.as_secs() == 86400);
+    let day_stats = stats.iter().find(|ws| ws.window.as_secs() == 86_400);
     // Use the 7-day window for trend analysis.
-    let week_stats = stats.iter().find(|ws| ws.window.as_secs() == 604800);
+    let week_stats = stats.iter().find(|ws| ws.window.as_secs() == 604_800);
     // Use the 1-hour window for recent activity.
-    let hour_stats = stats.iter().find(|ws| ws.window.as_secs() == 3600);
+    let hour_stats = stats.iter().find(|ws| ws.window.as_secs() == 3_600);
 
     // ── Ballast sizing recommendations ──
     if let Some(ws) = day_stats {
@@ -4402,10 +4402,10 @@ fn resolve_bin_dir(args: &SetupArgs) -> Result<PathBuf, CliError> {
     }
 
     // Auto-detect from current executable path.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return Ok(parent.to_path_buf());
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        return Ok(parent.to_path_buf());
     }
 
     // Fallback to ~/.local/bin on Unix.
@@ -4422,10 +4422,10 @@ fn resolve_bin_dir(args: &SetupArgs) -> Result<PathBuf, CliError> {
 }
 
 fn setup_path(bin_dir: &Path, args: &SetupArgs, mode: OutputMode) -> SetupStepResult {
-    let profile_path = match &args.profile {
-        Some(p) => p.clone(),
-        None => detect_shell_profile(),
-    };
+    let profile_path = args
+        .profile
+        .as_ref()
+        .map_or_else(detect_shell_profile, Clone::clone);
 
     if mode == OutputMode::Human {
         println!("PATH setup: checking {}", profile_path.display());
@@ -4475,18 +4475,18 @@ fn setup_path(bin_dir: &Path, args: &SetupArgs, mode: OutputMode) -> SetupStepRe
     }
 
     // Check if the profile already contains this exact line (idempotent).
-    if let Ok(contents) = std::fs::read_to_string(&profile_path) {
-        if contents.contains(&format!("export PATH=\"{}:$PATH\"", bin_dir.display())) {
-            if mode == OutputMode::Human {
-                println!("  PATH entry already present in {}", profile_path.display());
-            }
-            return SetupStepResult {
-                step: "path".to_string(),
-                success: true,
-                message: format!("PATH entry already present in {}", profile_path.display()),
-                remediation: None,
-            };
+    if let Ok(contents) = std::fs::read_to_string(&profile_path)
+        && contents.contains(&format!("export PATH=\"{}:$PATH\"", bin_dir.display()))
+    {
+        if mode == OutputMode::Human {
+            println!("  PATH entry already present in {}", profile_path.display());
         }
+        return SetupStepResult {
+            step: "path".to_string(),
+            success: true,
+            message: format!("PATH entry already present in {}", profile_path.display()),
+            remediation: None,
+        };
     }
 
     // Back up existing profile.
@@ -4572,22 +4572,18 @@ fn setup_completions(
 ) -> SetupStepResult {
     let step_name = format!("completions-{shell:?}");
 
-    let completion_dir = match shell_completion_dir(shell) {
-        Some(dir) => dir,
-        None => {
-            return SetupStepResult {
-                step: step_name,
-                success: false,
-                message: format!("cannot determine completion directory for {shell:?}"),
-                remediation: Some(format!(
-                    "Generate completions manually:\n  sbh completions {shell:?} > <completion-dir>/sbh",
-                )),
-            };
-        }
+    let Some(completion_dir) = shell_completion_dir(shell) else {
+        return SetupStepResult {
+            step: step_name,
+            success: false,
+            message: format!("cannot determine completion directory for {shell:?}"),
+            remediation: Some(format!(
+                "Generate completions manually:\n  sbh completions {shell:?} > <completion-dir>/sbh",
+            )),
+        };
     };
 
     let completion_file = match shell {
-        CompletionShell::Bash => completion_dir.join("sbh"),
         CompletionShell::Zsh => completion_dir.join("_sbh"),
         CompletionShell::Fish => completion_dir.join("sbh.fish"),
         _ => completion_dir.join("sbh"),
@@ -4622,23 +4618,22 @@ fn setup_completions(
     generate(shell, &mut command, binary_name, &mut buf);
 
     // Create directory if needed.
-    if let Some(parent) = completion_file.parent() {
-        if !parent.exists() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return SetupStepResult {
-                    step: step_name,
-                    success: false,
-                    message: format!(
-                        "cannot create completion directory {}: {e}",
-                        parent.display()
-                    ),
-                    remediation: Some(format!(
-                        "Generate completions manually:\n  sbh completions {shell:?} > {}",
-                        completion_file.display()
-                    )),
-                };
-            }
-        }
+    if let Some(parent) = completion_file.parent()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return SetupStepResult {
+            step: step_name,
+            success: false,
+            message: format!(
+                "cannot create completion directory {}: {e}",
+                parent.display()
+            ),
+            remediation: Some(format!(
+                "Generate completions manually:\n  sbh completions {shell:?} > {}",
+                completion_file.display()
+            )),
+        };
     }
 
     match std::fs::write(&completion_file, &buf) {
@@ -4750,9 +4745,7 @@ fn detect_shell_profile() -> PathBuf {
     let shell = std::env::var("SHELL").unwrap_or_default();
 
     if shell.ends_with("/zsh") {
-        let zdotdir = std::env::var("ZDOTDIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home.clone());
+        let zdotdir = std::env::var("ZDOTDIR").map_or_else(|_| home.clone(), PathBuf::from);
         return zdotdir.join(".zshrc");
     }
 
@@ -4900,15 +4893,15 @@ mod tests {
     fn parse_window_duration_valid_inputs() {
         let cases = [
             ("10m", 600),
-            ("30m", 1800),
-            ("1h", 3600),
-            ("24h", 86400),
-            ("7d", 604800),
+            ("30m", 1_800),
+            ("1h", 3_600),
+            ("24h", 86_400),
+            ("7d", 604_800),
             ("90s", 90),
             ("15min", 900),
-            ("2hr", 7200),
-            ("1day", 86400),
-            ("60", 3600), // bare number defaults to minutes
+            ("2hr", 7_200),
+            ("1day", 86_400),
+            ("60", 3_600), // bare number defaults to minutes
         ];
         for (input, expected_secs) in cases {
             let d = parse_window_duration(input).unwrap_or_else(|e| {
@@ -5178,12 +5171,14 @@ mod tests {
         config.update.metadata_cache_file = PathBuf::from("/tmp/custom-update-cache.json");
         config.update.notices_enabled = false;
 
-        let mut args = UpdateArgs::default();
-        args.check = true;
-        args.force = true;
-        args.refresh_cache = true;
-        args.offline = Some(PathBuf::from("/tmp/offline-bundle.json"));
-        args.version = Some("v1.2.3".to_string());
+        let args = UpdateArgs {
+            check: true,
+            force: true,
+            refresh_cache: true,
+            offline: Some(PathBuf::from("/tmp/offline-bundle.json")),
+            version: Some("v1.2.3".to_string()),
+            ..UpdateArgs::default()
+        };
 
         let install_dir = PathBuf::from("/tmp/bin");
         let opts = build_update_options(&args, &config, install_dir.clone());

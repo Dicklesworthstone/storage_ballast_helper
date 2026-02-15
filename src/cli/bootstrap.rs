@@ -1407,11 +1407,11 @@ mod tests {
 
         apply_deduplicate_profile(&mut action, None).unwrap();
         let contents = fs::read_to_string(&profile).unwrap();
-        let sbh_lines: Vec<&str> = contents
+        let sbh_line_count = contents
             .lines()
             .filter(|l| l.contains("sbh") && l.contains("PATH"))
-            .collect();
-        assert_eq!(sbh_lines.len(), 1, "should keep exactly one sbh PATH entry");
+            .count();
+        assert_eq!(sbh_line_count, 1, "should keep exactly one sbh PATH entry");
         assert!(action.backup_path.is_some());
     }
 
@@ -1450,7 +1450,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state = tmp.path().join("sub").join("state.json");
 
-        let mut action = MigrationAction {
+        let action = MigrationAction {
             kind: ActionKind::InitStateFile,
             reason: MigrationReason::MissingStateFile,
             target: state.clone(),
@@ -1460,7 +1460,7 @@ mod tests {
             error: None,
         };
 
-        apply_init_state_file(&mut action).unwrap();
+        apply_init_state_file(&action).unwrap();
         assert!(state.exists());
         let contents = fs::read_to_string(&state).unwrap();
         assert!(contents.contains("version"));
@@ -1572,7 +1572,7 @@ mod tests {
 
         let footprints = vec![Footprint {
             kind: FootprintKind::BackupFile,
-            path: backup.clone(),
+            path: backup,
             healthy: true,
             issue: Some(MigrationReason::StaleBackupFile),
             detail: None,
@@ -1624,7 +1624,7 @@ mod tests {
         let perms = std::fs::Permissions::from_mode(0o644);
         fs::set_permissions(&binary, perms).unwrap();
 
-        let mut action = MigrationAction {
+        let action = MigrationAction {
             kind: ActionKind::FixPermissions,
             reason: MigrationReason::BinaryPermissions,
             target: binary.clone(),
@@ -1634,7 +1634,7 @@ mod tests {
             error: None,
         };
 
-        apply_fix_permissions(&mut action).unwrap();
+        apply_fix_permissions(&action).unwrap();
         let meta = fs::metadata(&binary).unwrap();
         assert!(
             meta.permissions().mode() & 0o111 != 0,
@@ -1721,7 +1721,7 @@ mod tests {
         let (healthy, issue, detail) = check_profile_health(&profile, &lines);
         assert!(!healthy);
         assert_eq!(issue, Some(MigrationReason::DuplicatePathEntries));
-        assert!(detail.unwrap().contains("3"));
+        assert!(detail.unwrap().contains('3'));
     }
 
     // -----------------------------------------------------------------------
@@ -2247,7 +2247,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state = tmp.path().join("state.json");
 
-        let mut action = MigrationAction {
+        let action = MigrationAction {
             kind: ActionKind::InitStateFile,
             reason: MigrationReason::MissingStateFile,
             target: state.clone(),
@@ -2257,7 +2257,7 @@ mod tests {
             error: None,
         };
 
-        apply_init_state_file(&mut action).unwrap();
+        apply_init_state_file(&action).unwrap();
         let contents = fs::read_to_string(&state).unwrap();
         // Should be valid JSON.
         let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
