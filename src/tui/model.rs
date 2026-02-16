@@ -528,6 +528,12 @@ pub struct DashboardModel {
     /// Diagnostic message from the data source.
     pub ballast_diagnostics: String,
 
+    // ── Command palette state ──
+    /// Current search query in the command palette.
+    pub palette_query: String,
+    /// Cursor position in the palette results list.
+    pub palette_selected: usize,
+
     // ── Diagnostics screen (S7) state ──
     /// Toggle for verbose diagnostics output.
     pub diagnostics_verbose: bool,
@@ -592,6 +598,8 @@ impl DashboardModel {
             ballast_source: DataSource::None,
             ballast_partial: false,
             ballast_diagnostics: String::new(),
+            palette_query: String::new(),
+            palette_selected: 0,
             diagnostics_verbose: false,
             frame_times: RateHistory::new(60),
             missed_ticks: 0,
@@ -817,6 +825,14 @@ impl DashboardModel {
         self.ballast_volumes.get(self.ballast_selected)
     }
 
+    // ── Command palette methods ──
+
+    /// Reset palette state (query and selection).
+    pub fn palette_reset(&mut self) {
+        self.palette_query.clear();
+        self.palette_selected = 0;
+    }
+
     // ── Diagnostics (S7) methods ──
 
     /// Toggle verbose diagnostics mode.
@@ -845,7 +861,7 @@ impl DashboardModel {
 // ──────────────────── messages ────────────────────
 
 /// Events that drive state transitions in the dashboard model.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DashboardMsg {
     /// Periodic timer tick — triggers data refresh and re-render.
     Tick,
