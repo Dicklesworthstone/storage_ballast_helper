@@ -1466,7 +1466,8 @@ fn truncate_path(path: &str, max_len: usize) -> &str {
     if path.len() <= max_len {
         path
     } else {
-        let start = path.len() - max_len;
+        // Clamp to a valid UTF-8 char boundary before slicing.
+        let start = path.ceil_char_boundary(path.len() - max_len);
         // Find the next '/' boundary to avoid cutting mid-component.
         path[start..]
             .find('/')

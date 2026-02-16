@@ -399,9 +399,10 @@ impl BackupStore {
 
 /// Default backup directory.
 fn default_backup_dir() -> PathBuf {
-    let base =
-        std::env::var_os("HOME").map_or_else(|| PathBuf::from("/var/lib/sbh"), PathBuf::from);
-    base.join(".local/share/sbh/backups")
+    std::env::var_os("HOME").map_or_else(
+        || PathBuf::from("/var/lib/sbh/backups"),
+        |home| PathBuf::from(home).join(".local/share/sbh/backups"),
+    )
 }
 
 // ---------------------------------------------------------------------------

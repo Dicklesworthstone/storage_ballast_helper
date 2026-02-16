@@ -366,9 +366,10 @@ pub struct RateHistory {
 }
 
 impl RateHistory {
-    /// Create a new ring buffer with the given capacity.
+    /// Create a new ring buffer with the given capacity (minimum 1).
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             values: Vec::with_capacity(capacity),
             capacity,
