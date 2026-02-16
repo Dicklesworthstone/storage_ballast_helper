@@ -809,8 +809,7 @@ mod tests {
         let config = tiny_ballast_config();
 
         // Discover but do NOT provision.
-        let coordinator =
-            BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        let coordinator = BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
 
         let inv = coordinator.inventory();
         assert_eq!(inv.len(), 2);

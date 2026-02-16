@@ -518,7 +518,12 @@ fn s<T: std::fmt::Display + ?Sized>(val: &T) -> Option<String> {
 }
 
 #[allow(dead_code)]
-fn assert_record(label: &str, passed: bool, expected: &str, actual: Option<&str>) -> AssertionRecord {
+fn assert_record(
+    label: &str,
+    passed: bool,
+    expected: &str,
+    actual: Option<&str>,
+) -> AssertionRecord {
     AssertionRecord {
         label: label.into(),
         passed,
@@ -536,8 +541,8 @@ fn assert_record(label: &str, passed: bool, expected: &str, actual: Option<&str>
 
 #[test]
 fn drill_pressure_escalation_triage() {
-    let mut collector = ArtifactCollector::new("scenario-drills")
-        .with_run_id("drill-pressure-escalation");
+    let mut collector =
+        ArtifactCollector::new("scenario-drills").with_run_id("drill-pressure-escalation");
 
     let mut h = DashboardHarness::default();
 
@@ -547,7 +552,8 @@ fn drill_pressure_escalation_triage() {
     let green_ok = frame.text.contains("GREEN");
     assert!(green_ok, "overview should show GREEN at startup");
 
-    collector.start_case("phase1_green_startup")
+    collector
+        .start_case("phase1_green_startup")
         .section("pressure_escalation")
         .tags(["pressure", "startup"])
         .frame(capture_frame(&h))
@@ -576,13 +582,24 @@ fn drill_pressure_escalation_triage() {
     let timeline_count = model.timeline_events.len();
     assert_eq!(timeline_count, 4);
 
-    collector.start_case("phase2_yellow_with_timeline")
+    collector
+        .start_case("phase2_yellow_with_timeline")
         .section("pressure_escalation")
         .tags(["pressure", "timeline", "yellow"])
         .frame(capture_frame(&h))
         .assertion("overview shows YELLOW", yellow_ok, "YELLOW in frame", None)
-        .assertion("timeline has 4 events", timeline_count == 4, "4", s(&timeline_count))
-        .assertion("on timeline screen", h.screen() == Screen::Timeline, "Timeline", s(&format!("{:?}", h.screen())))
+        .assertion(
+            "timeline has 4 events",
+            timeline_count == 4,
+            "4",
+            s(&timeline_count),
+        )
+        .assertion(
+            "on timeline screen",
+            h.screen() == Screen::Timeline,
+            "Timeline",
+            s(&format!("{:?}", h.screen())),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -602,12 +619,18 @@ fn drill_pressure_escalation_triage() {
     let ballast_available = state.ballast.available;
     assert_eq!(ballast_available, 1);
 
-    collector.start_case("phase3_red_escalation")
+    collector
+        .start_case("phase3_red_escalation")
         .section("pressure_escalation")
         .tags(["pressure", "red", "ballast"])
         .frame(capture_frame(&h))
         .assertion("overview shows RED", red_ok, "RED in frame", None)
-        .assertion("ballast nearly depleted", ballast_available == 1, "1", s(&ballast_available))
+        .assertion(
+            "ballast nearly depleted",
+            ballast_available == 1,
+            "1",
+            s(&ballast_available),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -625,12 +648,18 @@ fn drill_pressure_escalation_triage() {
     let ballast_avail = state.ballast.available;
     assert_eq!(ballast_avail, 10);
 
-    collector.start_case("phase4_recovery")
+    collector
+        .start_case("phase4_recovery")
         .section("pressure_escalation")
         .tags(["pressure", "recovery", "green"])
         .frame(fc)
         .assertion("overview shows GREEN", green_again, "GREEN in frame", None)
-        .assertion("ballast fully replenished", ballast_avail == 10, "10", s(&ballast_avail))
+        .assertion(
+            "ballast fully replenished",
+            ballast_avail == 10,
+            "10",
+            s(&ballast_avail),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -661,9 +690,20 @@ fn drill_pressure_escalation_is_deterministic() {
         h.tick();
     };
 
-    let d1 = { let mut h = DashboardHarness::default(); run(&mut h); h.trace_digest() };
-    let d2 = { let mut h = DashboardHarness::default(); run(&mut h); h.trace_digest() };
-    assert_eq!(d1, d2, "pressure escalation triage drill must be deterministic");
+    let d1 = {
+        let mut h = DashboardHarness::default();
+        run(&mut h);
+        h.trace_digest()
+    };
+    let d2 = {
+        let mut h = DashboardHarness::default();
+        run(&mut h);
+        h.trace_digest()
+    };
+    assert_eq!(
+        d1, d2,
+        "pressure escalation triage drill must be deterministic"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -674,8 +714,7 @@ fn drill_pressure_escalation_is_deterministic() {
 
 #[test]
 fn drill_ballast_operations_under_pressure() {
-    let mut collector = ArtifactCollector::new("scenario-drills")
-        .with_run_id("drill-ballast-ops");
+    let mut collector = ArtifactCollector::new("scenario-drills").with_run_id("drill-ballast-ops");
 
     let mut h = DashboardHarness::default();
     h.startup_with_state(sample_healthy_state());
@@ -705,7 +744,8 @@ fn drill_ballast_operations_under_pressure() {
     let status = model.ballast_volumes[0].status_level();
     assert_eq!(status, "OK");
 
-    collector.start_case("phase1_full_ballast")
+    collector
+        .start_case("phase1_full_ballast")
         .section("ballast_operations")
         .tags(["ballast", "healthy"])
         .frame(capture_frame(&h))
@@ -736,7 +776,8 @@ fn drill_ballast_operations_under_pressure() {
     let status = model.ballast_volumes[0].status_level();
     assert_eq!(status, "LOW");
 
-    collector.start_case("phase2_ballast_depleting")
+    collector
+        .start_case("phase2_ballast_depleting")
         .section("ballast_operations")
         .tags(["ballast", "pressure", "low"])
         .frame(capture_frame(&h))
@@ -757,11 +798,17 @@ fn drill_ballast_operations_under_pressure() {
     let files_avail = model.ballast_volumes[0].files_available;
     assert_eq!(status, "CRITICAL");
 
-    collector.start_case("phase3_ballast_critical")
+    collector
+        .start_case("phase3_ballast_critical")
         .section("ballast_operations")
         .tags(["ballast", "critical", "depleted"])
         .frame(fc)
-        .assertion("status is CRITICAL", status == "CRITICAL", "CRITICAL", s(&status))
+        .assertion(
+            "status is CRITICAL",
+            status == "CRITICAL",
+            "CRITICAL",
+            s(&status),
+        )
         .assertion("0 files available", files_avail == 0, "0", s(&files_avail))
         .status(CaseStatus::Pass)
         .finish();
@@ -782,12 +829,23 @@ fn drill_ballast_operations_under_pressure() {
     let top_score = model.candidates_list[0].total_score;
     assert!(top_score > 0.9);
 
-    collector.start_case("phase4_candidates_review")
+    collector
+        .start_case("phase4_candidates_review")
         .section("ballast_operations")
         .tags(["candidates", "scoring"])
         .frame(capture_frame(&h))
-        .assertion("3 candidates loaded", candidate_count == 3, "3", s(&candidate_count))
-        .assertion("top candidate score > 0.9", top_score > 0.9, "> 0.9", s(&format!("{top_score:.2}")))
+        .assertion(
+            "3 candidates loaded",
+            candidate_count == 3,
+            "3",
+            s(&candidate_count),
+        )
+        .assertion(
+            "top candidate score > 0.9",
+            top_score > 0.9,
+            "> 0.9",
+            s(&format!("{top_score:.2}")),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -814,7 +872,8 @@ fn drill_ballast_operations_under_pressure() {
     let status = model.ballast_volumes[0].status_level();
     assert_eq!(status, "OK");
 
-    collector.start_case("phase5_ballast_recovery")
+    collector
+        .start_case("phase5_ballast_recovery")
         .section("ballast_operations")
         .tags(["ballast", "recovery"])
         .frame(capture_frame(&h))
@@ -841,8 +900,16 @@ fn drill_ballast_operations_is_deterministic() {
         h.tick();
     };
 
-    let d1 = { let mut h = DashboardHarness::default(); run(&mut h); h.trace_digest() };
-    let d2 = { let mut h = DashboardHarness::default(); run(&mut h); h.trace_digest() };
+    let d1 = {
+        let mut h = DashboardHarness::default();
+        run(&mut h);
+        h.trace_digest()
+    };
+    let d2 = {
+        let mut h = DashboardHarness::default();
+        run(&mut h);
+        h.trace_digest()
+    };
     assert_eq!(d1, d2, "ballast operations drill must be deterministic");
 }
 
@@ -855,8 +922,8 @@ fn drill_ballast_operations_is_deterministic() {
 
 #[test]
 fn drill_explainability_audit_trail() {
-    let mut collector = ArtifactCollector::new("scenario-drills")
-        .with_run_id("drill-explainability");
+    let mut collector =
+        ArtifactCollector::new("scenario-drills").with_run_id("drill-explainability");
 
     let mut h = DashboardHarness::default();
     h.startup_with_state(sample_healthy_state());
@@ -876,16 +943,30 @@ fn drill_explainability_audit_trail() {
     let mode = model.explainability_decisions[0].policy_mode.clone();
     assert_eq!(mode, "observe");
     let effective = model.explainability_decisions[0]
-        .effective_action.as_deref().unwrap_or("").to_owned();
+        .effective_action
+        .as_deref()
+        .unwrap_or("")
+        .to_owned();
     assert_eq!(effective, "observe");
 
-    collector.start_case("phase1_observe_mode")
+    collector
+        .start_case("phase1_observe_mode")
         .section("explainability")
         .tags(["explainability", "observe", "policy"])
         .frame(fc)
         .assertion("1 observe decision", dec_count == 1, "1", s(&dec_count))
-        .assertion("policy mode is observe", mode == "observe", "observe", s(&mode))
-        .assertion("effective action is observe", effective == "observe", "observe", s(&effective))
+        .assertion(
+            "policy mode is observe",
+            mode == "observe",
+            "observe",
+            s(&mode),
+        )
+        .assertion(
+            "effective action is observe",
+            effective == "observe",
+            "observe",
+            s(&effective),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -901,28 +982,59 @@ fn drill_explainability_audit_trail() {
 
     // Verify veto is present.
     let vetoed_dec = model.explainability_decisions.iter().find(|d| d.vetoed);
-    assert!(vetoed_dec.is_some(), "should have at least one vetoed decision");
-    let veto_reason = vetoed_dec.unwrap().veto_reason.as_deref().unwrap_or("").to_string();
-    assert!(veto_reason.contains("recently active"), "veto reason should explain why");
+    assert!(
+        vetoed_dec.is_some(),
+        "should have at least one vetoed decision"
+    );
+    let veto_reason = vetoed_dec
+        .unwrap()
+        .veto_reason
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        veto_reason.contains("recently active"),
+        "veto reason should explain why"
+    );
 
     // Verify non-vetoed decisions have high confidence.
-    let delete_count = model.explainability_decisions.iter()
+    let delete_count = model
+        .explainability_decisions
+        .iter()
         .filter(|d| !d.vetoed && d.action == "delete")
         .count();
     assert_eq!(delete_count, 2);
-    for d in model.explainability_decisions.iter().filter(|d| !d.vetoed && d.action == "delete") {
-        assert!(d.total_score > 0.9, "delete decisions should have high confidence");
+    for d in model
+        .explainability_decisions
+        .iter()
+        .filter(|d| !d.vetoed && d.action == "delete")
+    {
+        assert!(
+            d.total_score > 0.9,
+            "delete decisions should have high confidence"
+        );
     }
     let has_vetoed = vetoed_dec.is_some();
 
-    collector.start_case("phase2_enforce_with_veto")
+    collector
+        .start_case("phase2_enforce_with_veto")
         .section("explainability")
         .tags(["explainability", "enforce", "veto"])
         .frame(fc)
         .assertion("3 enforce decisions", dec_count == 3, "3", s(&dec_count))
         .assertion("has vetoed decision", has_vetoed, "true", None)
-        .assertion("veto reason explains", veto_reason.contains("recently active"), "recently active", s(&veto_reason))
-        .assertion("2 high-confidence deletes", delete_count == 2, "2", s(&delete_count))
+        .assertion(
+            "veto reason explains",
+            veto_reason.contains("recently active"),
+            "recently active",
+            s(&veto_reason),
+        )
+        .assertion(
+            "2 high-confidence deletes",
+            delete_count == 2,
+            "2",
+            s(&delete_count),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -936,22 +1048,35 @@ fn drill_explainability_audit_trail() {
     )));
 
     let model = h.model_mut();
-    let timeline_paths: Vec<_> = model.timeline_events.iter()
+    let timeline_paths: Vec<_> = model
+        .timeline_events
+        .iter()
         .filter_map(|e| e.path.as_deref())
         .collect();
-    let decision_paths: Vec<_> = model.explainability_decisions.iter()
+    let decision_paths: Vec<_> = model
+        .explainability_decisions
+        .iter()
         .map(|d| d.path.as_str())
         .collect();
 
     // At least one path should appear in both timeline and decisions.
     let cross_referenced = timeline_paths.iter().any(|tp| decision_paths.contains(tp));
-    assert!(cross_referenced, "at least one path should appear in both timeline and decisions");
+    assert!(
+        cross_referenced,
+        "at least one path should appear in both timeline and decisions"
+    );
 
-    collector.start_case("phase3_cross_reference")
+    collector
+        .start_case("phase3_cross_reference")
         .section("explainability")
         .tags(["explainability", "timeline", "cross-reference"])
         .frame(capture_frame(&h))
-        .assertion("cross-referenced path exists", cross_referenced, "true", None)
+        .assertion(
+            "cross-referenced path exists",
+            cross_referenced,
+            "true",
+            None,
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -965,7 +1090,8 @@ fn drill_explainability_audit_trail() {
     let expanded = model.explainability_detail;
     assert!(expanded, "detail should be expanded after Enter");
 
-    collector.start_case("phase4_factor_breakdown")
+    collector
+        .start_case("phase4_factor_breakdown")
         .section("explainability")
         .tags(["explainability", "detail", "factors"])
         .frame(capture_frame(&h))
@@ -998,8 +1124,16 @@ fn drill_explainability_audit_is_deterministic() {
         h.inject_keycode(ftui_core::event::KeyCode::Enter);
     };
 
-    let d1 = { let mut h = DashboardHarness::default(); run(&mut h); h.trace_digest() };
-    let d2 = { let mut h = DashboardHarness::default(); run(&mut h); h.trace_digest() };
+    let d1 = {
+        let mut h = DashboardHarness::default();
+        run(&mut h);
+        h.trace_digest()
+    };
+    let d2 = {
+        let mut h = DashboardHarness::default();
+        run(&mut h);
+        h.trace_digest()
+    };
     assert_eq!(d1, d2, "explainability audit drill must be deterministic");
 }
 
@@ -1012,8 +1146,8 @@ fn drill_explainability_audit_is_deterministic() {
 
 #[test]
 fn drill_degraded_dashboard_recovery() {
-    let mut collector = ArtifactCollector::new("scenario-drills")
-        .with_run_id("drill-degraded-recovery");
+    let mut collector =
+        ArtifactCollector::new("scenario-drills").with_run_id("drill-degraded-recovery");
 
     let mut h = DashboardHarness::default();
     h.tick(); // Initial tick to capture a frame.
@@ -1022,7 +1156,8 @@ fn drill_degraded_dashboard_recovery() {
     let degraded = h.is_degraded();
     assert!(degraded, "dashboard should start degraded");
 
-    collector.start_case("phase1_initial_degraded")
+    collector
+        .start_case("phase1_initial_degraded")
         .section("degraded_recovery")
         .tags(["degraded", "startup"])
         .frame(capture_frame(&h))
@@ -1050,13 +1185,19 @@ fn drill_degraded_dashboard_recovery() {
     let diag_str = model.timeline_diagnostics.clone();
     assert!(diag_ok);
 
-    collector.start_case("phase2_partial_telemetry")
+    collector
+        .start_case("phase2_partial_telemetry")
         .section("degraded_recovery")
         .tags(["degraded", "partial", "schema-shield"])
         .frame(fc)
         .assertion("timeline is partial", partial, "true", s(&partial))
         .assertion("source is JSONL", source_is_jsonl, "Jsonl", s(&source_str))
-        .assertion("diagnostics mention schema-shield", diag_ok, "schema-shield", s(&diag_str))
+        .assertion(
+            "diagnostics mention schema-shield",
+            diag_ok,
+            "schema-shield",
+            s(&diag_str),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -1069,7 +1210,8 @@ fn drill_degraded_dashboard_recovery() {
     let errors = model.adapter_errors;
     assert!(errors >= 1);
 
-    collector.start_case("phase3_daemon_unavailable")
+    collector
+        .start_case("phase3_daemon_unavailable")
         .section("degraded_recovery")
         .tags(["degraded", "unavailable"])
         .frame(capture_frame(&h))
@@ -1094,12 +1236,18 @@ fn drill_degraded_dashboard_recovery() {
     let source_str = format!("{:?}", model.timeline_source);
     assert!(source_is_sqlite);
 
-    collector.start_case("phase4_full_recovery")
+    collector
+        .start_case("phase4_full_recovery")
         .section("degraded_recovery")
         .tags(["recovery", "clean-telemetry"])
         .frame(fc)
         .assertion("not partial after recovery", !partial, "false", s(&partial))
-        .assertion("source is Sqlite", source_is_sqlite, "Sqlite", s(&source_str))
+        .assertion(
+            "source is Sqlite",
+            source_is_sqlite,
+            "Sqlite",
+            s(&source_str),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -1111,7 +1259,8 @@ fn drill_degraded_dashboard_recovery() {
     let reads = model.adapter_reads;
     let errors = model.adapter_errors;
 
-    collector.start_case("phase5_diagnostics_counters")
+    collector
+        .start_case("phase5_diagnostics_counters")
         .section("degraded_recovery")
         .tags(["diagnostics", "adapters"])
         .frame(capture_frame(&h))
@@ -1141,8 +1290,16 @@ fn drill_degraded_recovery_is_deterministic() {
         h.navigate_to_number(7);
     };
 
-    let d1 = { let mut h = DashboardHarness::default(); run(&mut h); h.trace_digest() };
-    let d2 = { let mut h = DashboardHarness::default(); run(&mut h); h.trace_digest() };
+    let d1 = {
+        let mut h = DashboardHarness::default();
+        run(&mut h);
+        h.trace_digest()
+    };
+    let d2 = {
+        let mut h = DashboardHarness::default();
+        run(&mut h);
+        h.trace_digest()
+    };
     assert_eq!(d1, d2, "degraded recovery drill must be deterministic");
 }
 
@@ -1154,8 +1311,7 @@ fn drill_degraded_recovery_is_deterministic() {
 
 #[test]
 fn drill_multi_mount_incident_response() {
-    let mut collector = ArtifactCollector::new("scenario-drills")
-        .with_run_id("drill-multi-mount");
+    let mut collector = ArtifactCollector::new("scenario-drills").with_run_id("drill-multi-mount");
 
     let mut h = DashboardHarness::default();
     h.startup_with_state(multi_mount_state());
@@ -1167,7 +1323,8 @@ fn drill_multi_mount_incident_response() {
     assert!(has_red, "should show RED for /data");
     assert!(has_green, "should show GREEN for /");
 
-    collector.start_case("phase1_divergent_pressure")
+    collector
+        .start_case("phase1_divergent_pressure")
         .section("multi_mount_incident")
         .tags(["multi-mount", "pressure"])
         .frame(capture_frame(&h))
@@ -1182,11 +1339,17 @@ fn drill_multi_mount_incident_response() {
     let has_playbook = overlay == Some(Overlay::IncidentPlaybook);
     assert!(has_playbook, "! should open incident playbook");
 
-    collector.start_case("phase2_incident_playbook")
+    collector
+        .start_case("phase2_incident_playbook")
         .section("multi_mount_incident")
         .tags(["incident", "playbook"])
         .frame(capture_frame(&h))
-        .assertion("playbook overlay open", has_playbook, "IncidentPlaybook", overlay.as_ref().map(|o| format!("{o:?}")))
+        .assertion(
+            "playbook overlay open",
+            has_playbook,
+            "IncidentPlaybook",
+            overlay.as_ref().map(|o| format!("{o:?}")),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -1208,7 +1371,10 @@ fn drill_multi_mount_incident_response() {
 
     // / should be OK (5/5), /data should be LOW (1/5).
     let root_vol = model.ballast_volumes.iter().find(|v| v.mount_point == "/");
-    let data_vol = model.ballast_volumes.iter().find(|v| v.mount_point == "/data");
+    let data_vol = model
+        .ballast_volumes
+        .iter()
+        .find(|v| v.mount_point == "/data");
     assert!(root_vol.is_some());
     assert!(data_vol.is_some());
     let root_status = root_vol.unwrap().status_level();
@@ -1216,7 +1382,8 @@ fn drill_multi_mount_incident_response() {
     assert_eq!(root_status, "OK");
     assert_eq!(data_status, "LOW");
 
-    collector.start_case("phase3_per_mount_ballast")
+    collector
+        .start_case("phase3_per_mount_ballast")
         .section("multi_mount_incident")
         .tags(["ballast", "multi-mount", "per-volume"])
         .frame(capture_frame(&h))
@@ -1234,17 +1401,28 @@ fn drill_multi_mount_incident_response() {
 
     let fc = capture_frame(&h);
     let model = h.model_mut();
-    let data_decisions: Vec<_> = model.explainability_decisions.iter()
+    let data_decisions: Vec<_> = model
+        .explainability_decisions
+        .iter()
         .filter(|d| d.path.starts_with("/data"))
         .collect();
-    assert!(!data_decisions.is_empty(), "should have decisions for /data paths");
+    assert!(
+        !data_decisions.is_empty(),
+        "should have decisions for /data paths"
+    );
     let data_dec_count = data_decisions.len();
 
-    collector.start_case("phase4_data_mount_decisions")
+    collector
+        .start_case("phase4_data_mount_decisions")
         .section("multi_mount_incident")
         .tags(["explainability", "multi-mount"])
         .frame(fc)
-        .assertion("/data decisions exist", data_dec_count > 0, "non-empty", s(&data_dec_count))
+        .assertion(
+            "/data decisions exist",
+            data_dec_count > 0,
+            "non-empty",
+            s(&data_dec_count),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -1262,8 +1440,8 @@ fn drill_multi_mount_incident_response() {
 
 #[test]
 fn drill_full_incident_to_resolution() {
-    let mut collector = ArtifactCollector::new("scenario-drills")
-        .with_run_id("drill-full-incident");
+    let mut collector =
+        ArtifactCollector::new("scenario-drills").with_run_id("drill-full-incident");
 
     let mut h = DashboardHarness::default();
 
@@ -1272,11 +1450,17 @@ fn drill_full_incident_to_resolution() {
     assert_eq!(h.screen(), Screen::Overview);
     assert!(!h.is_degraded());
 
-    collector.start_case("step1_green_startup")
+    collector
+        .start_case("step1_green_startup")
         .section("full_incident")
         .tags(["incident", "startup", "green"])
         .frame(capture_frame(&h))
-        .assertion("starts on Overview", h.screen() == Screen::Overview, "Overview", None)
+        .assertion(
+            "starts on Overview",
+            h.screen() == Screen::Overview,
+            "Overview",
+            None,
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -1289,7 +1473,8 @@ fn drill_full_incident_to_resolution() {
     let frame = h.last_frame();
     assert!(frame.text.contains("RED"));
 
-    collector.start_case("step2_pressure_escalation")
+    collector
+        .start_case("step2_pressure_escalation")
         .section("full_incident")
         .tags(["incident", "pressure", "red"])
         .frame(capture_frame(&h))
@@ -1301,11 +1486,17 @@ fn drill_full_incident_to_resolution() {
     h.inject_char('!');
     assert_eq!(h.overlay(), Some(Overlay::IncidentPlaybook));
 
-    collector.start_case("step3_playbook_opened")
+    collector
+        .start_case("step3_playbook_opened")
         .section("full_incident")
         .tags(["incident", "playbook"])
         .frame(capture_frame(&h))
-        .assertion("playbook open", h.overlay() == Some(Overlay::IncidentPlaybook), "IncidentPlaybook", None)
+        .assertion(
+            "playbook open",
+            h.overlay() == Some(Overlay::IncidentPlaybook),
+            "IncidentPlaybook",
+            None,
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -1327,11 +1518,17 @@ fn drill_full_incident_to_resolution() {
     let model = h.model_mut();
     let cursor = model.explainability_selected;
 
-    collector.start_case("step4_explainability_review")
+    collector
+        .start_case("step4_explainability_review")
         .section("full_incident")
         .tags(["incident", "explainability"])
         .frame(capture_frame(&h))
-        .assertion("3 decisions loaded", total_decisions == 3, "3", s(&total_decisions))
+        .assertion(
+            "3 decisions loaded",
+            total_decisions == 3,
+            "3",
+            s(&total_decisions),
+        )
         .assertion("cursor navigated", cursor > 0, "> 0", s(&cursor))
         .status(CaseStatus::Pass)
         .finish();
@@ -1344,12 +1541,23 @@ fn drill_full_incident_to_resolution() {
     let on_ballast = screen == Screen::Ballast;
     let has_confirm = matches!(overlay, Some(Overlay::Confirmation(_)));
 
-    collector.start_case("step5_quick_release")
+    collector
+        .start_case("step5_quick_release")
         .section("full_incident")
         .tags(["incident", "quick-release", "ballast"])
         .frame(capture_frame(&h))
-        .assertion("on Ballast screen", on_ballast, "Ballast", s(&format!("{screen:?}")))
-        .assertion("confirmation overlay", has_confirm, "Confirmation", overlay.as_ref().map(|o| format!("{o:?}")))
+        .assertion(
+            "on Ballast screen",
+            on_ballast,
+            "Ballast",
+            s(&format!("{screen:?}")),
+        )
+        .assertion(
+            "confirmation overlay",
+            has_confirm,
+            "Confirmation",
+            overlay.as_ref().map(|o| format!("{o:?}")),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -1362,15 +1570,23 @@ fn drill_full_incident_to_resolution() {
     )));
 
     let model = h.model_mut();
-    let has_ballast_event = model.timeline_events.iter()
+    let has_ballast_event = model
+        .timeline_events
+        .iter()
         .any(|e| e.event_type == "ballast_release");
     assert!(has_ballast_event);
 
-    collector.start_case("step6_timeline_verification")
+    collector
+        .start_case("step6_timeline_verification")
         .section("full_incident")
         .tags(["incident", "timeline", "ballast-release"])
         .frame(capture_frame(&h))
-        .assertion("ballast_release event in timeline", has_ballast_event, "true", s(&has_ballast_event))
+        .assertion(
+            "ballast_release event in timeline",
+            has_ballast_event,
+            "true",
+            s(&has_ballast_event),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -1391,13 +1607,24 @@ fn drill_full_incident_to_resolution() {
     assert_eq!(ballast_avail, 10);
     assert_eq!(pressure_overall, "green");
 
-    collector.start_case("step7_resolution")
+    collector
+        .start_case("step7_resolution")
         .section("full_incident")
         .tags(["incident", "resolution", "recovery"])
         .frame(fc)
         .assertion("GREEN after recovery", recovered, "GREEN", None)
-        .assertion("ballast fully replenished", ballast_avail == 10, "10", s(&ballast_avail))
-        .assertion("pressure is green", pressure_overall == "green", "green", s(&pressure_overall))
+        .assertion(
+            "ballast fully replenished",
+            ballast_avail == 10,
+            "10",
+            s(&ballast_avail),
+        )
+        .assertion(
+            "pressure is green",
+            pressure_overall == "green",
+            "green",
+            s(&pressure_overall),
+        )
         .status(CaseStatus::Pass)
         .finish();
 
@@ -1407,7 +1634,10 @@ fn drill_full_incident_to_resolution() {
 
     // Verify drill logs are rich enough for post-mortem.
     let json = serde_json::to_string_pretty(&bundle).unwrap();
-    assert!(json.contains("drill-full-incident"), "bundle should have correct run_id");
+    assert!(
+        json.contains("drill-full-incident"),
+        "bundle should have correct run_id"
+    );
     assert!(json.contains("full_incident"), "cases should have section");
     // Every case should have at least one frame capture.
     for case in &bundle.cases {
@@ -1419,11 +1649,7 @@ fn drill_full_incident_to_resolution() {
     }
     // All cases should have tags.
     for case in &bundle.cases {
-        assert!(
-            !case.tags.is_empty(),
-            "case {} missing tags",
-            case.name
-        );
+        assert!(!case.tags.is_empty(), "case {} missing tags", case.name);
     }
 }
 
@@ -1454,8 +1680,16 @@ fn drill_full_incident_is_deterministic() {
         h.navigate_to_number(1);
     };
 
-    let d1 = { let mut h = DashboardHarness::default(); run(&mut h); h.trace_digest() };
-    let d2 = { let mut h = DashboardHarness::default(); run(&mut h); h.trace_digest() };
+    let d1 = {
+        let mut h = DashboardHarness::default();
+        run(&mut h);
+        h.trace_digest()
+    };
+    let d2 = {
+        let mut h = DashboardHarness::default();
+        run(&mut h);
+        h.trace_digest()
+    };
     assert_eq!(d1, d2, "full incident drill must be deterministic");
 }
 
@@ -1467,14 +1701,15 @@ fn drill_full_incident_is_deterministic() {
 
 #[test]
 fn drill_artifact_bundle_structural_validation() {
-    let mut collector = ArtifactCollector::new("structural-validation")
-        .with_run_id("drill-validation");
+    let mut collector =
+        ArtifactCollector::new("structural-validation").with_run_id("drill-validation");
 
     let mut h = DashboardHarness::default();
     h.startup_with_state(sample_healthy_state());
 
     // Case 1: Passing case with assertions.
-    collector.start_case("passing_case")
+    collector
+        .start_case("passing_case")
         .section("validation")
         .tags(["structural"])
         .frame(capture_frame(&h))
@@ -1487,7 +1722,8 @@ fn drill_artifact_bundle_structural_validation() {
     h.feed_state(red_state());
     h.tick();
 
-    collector.start_case("diagnostics_case")
+    collector
+        .start_case("diagnostics_case")
         .section("validation")
         .tags(["structural", "diagnostics"])
         .frame(capture_frame(&h))
@@ -1509,9 +1745,21 @@ fn drill_artifact_bundle_structural_validation() {
 
     // Every case must have a trace_id and case_id.
     for case in &roundtrip.cases {
-        assert!(!case.trace_id.is_empty(), "case {} missing trace_id", case.name);
-        assert!(!case.case_id.is_empty(), "case {} missing case_id", case.name);
-        assert!(!case.started_at.is_empty(), "case {} missing started_at", case.name);
+        assert!(
+            !case.trace_id.is_empty(),
+            "case {} missing trace_id",
+            case.name
+        );
+        assert!(
+            !case.case_id.is_empty(),
+            "case {} missing case_id",
+            case.name
+        );
+        assert!(
+            !case.started_at.is_empty(),
+            "case {} missing started_at",
+            case.name
+        );
     }
 
     // Diagnostics are preserved in roundtrip.
@@ -1519,8 +1767,5 @@ fn drill_artifact_bundle_structural_validation() {
     assert_eq!(diag_case.diagnostics.len(), 2);
     assert_eq!(diag_case.diagnostics[0].level, "warn");
     assert_eq!(diag_case.diagnostics[1].level, "error");
-    assert_eq!(
-        diag_case.diagnostics[1].source.as_deref(),
-        Some("drill")
-    );
+    assert_eq!(diag_case.diagnostics[1].source.as_deref(), Some("drill"));
 }
