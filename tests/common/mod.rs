@@ -119,6 +119,66 @@ pub fn run_cli_case_with_env(
     run_cli_case_with_env_inner(case_name, args, env_overrides)
 }
 
+// ──────────────────── E2E Artifact Helpers ────────────────────
+
+#[cfg(feature = "tui")]
+pub use storage_ballast_helper::tui::e2e_artifact;
+
+/// Convert a [`CmdResult`] into an e2e artifact [`TestCaseArtifact`] for structured reporting.
+///
+/// Automatically populates trace ID, captured output, exit code, and status.
+/// Tag with `"cli"` for CLI-spawned tests.
+#[cfg(feature = "tui")]
+pub fn cmd_result_to_artifact(
+    name: &str,
+    result: &CmdResult,
+) -> e2e_artifact::TestCaseArtifact {
+    let status = if result.status.success() {
+        e2e_artifact::CaseStatus::Pass
+    } else {
+        e2e_artifact::CaseStatus::Fail
+    };
+
+    let mut diagnostics = Vec::new();
+    if !result.status.success() {
+        diagnostics.push(e2e_artifact::DiagnosticEntry::error(format!(
+            "exit code: {}",
+            result.status.code().unwrap_or(-1)
+        )).with_source("cli"));
+        if !result.stderr.is_empty() {
+            diagnostics.push(
+                e2e_artifact::DiagnosticEntry::info(
+                    if result.stderr.len() > 500 {
+                        format!("{}... (truncated)", &result.stderr[..500])
+                    } else {
+                        result.stderr.clone()
+                    }
+                ).with_source("stderr")
+            );
+        }
+    }
+
+    e2e_artifact::TestCaseArtifact {
+        case_id: format!("cli-{}", sanitize(name)),
+        trace_id: e2e_artifact::generate_trace_id(),
+        name: name.to_string(),
+        section: Some("cli".into()),
+        started_at: String::new(), // CLI runner doesn't track start time
+        finished_at: None,
+        elapsed_ms: 0,
+        status,
+        exit_code: result.status.code(),
+        output: e2e_artifact::CapturedOutput::new(
+            result.stdout.clone(),
+            result.stderr.clone(),
+        ),
+        assertions: Vec::new(),
+        frames: Vec::new(),
+        diagnostics,
+        tags: vec!["cli".into()],
+    }
+}
+
 // ──────────────────── MockPlatform ────────────────────
 
 use storage_ballast_helper::core::errors::{Result, SbhError};
