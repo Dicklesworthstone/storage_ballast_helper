@@ -323,7 +323,7 @@ impl BallastPoolCoordinator {
                 fs_type: pool.fs_type.clone(),
                 strategy: pool.strategy,
                 files_available: pool.available_count(),
-                files_total: pool.manager.inventory().len(),
+                files_total: pool.expected_count(),
                 releasable_bytes: pool.releasable_bytes(),
                 skipped: false,
                 skip_reason: None,

@@ -46,10 +46,10 @@ use crate::scanner::walker::{DirectoryWalker, WalkerConfig};
 
 // ──────────────────── channel capacities ────────────────────
 
-/// Monitor → Scanner: bounded(0). Rendezvous channel.
-/// Scanner only accepts work when idle. If busy, monitor drops the request
-/// and retries next tick with fresh urgency. This prevents staleness.
-const SCANNER_CHANNEL_CAP: usize = 0;
+/// Monitor → Scanner: bounded(2). Allows one buffered request while scanner
+/// processes another. Monitor drops the request if the channel is full and
+/// retries next tick with fresh urgency, bounding data staleness.
+const SCANNER_CHANNEL_CAP: usize = 2;
 /// Scanner → Executor: bounded(64). Natural backpressure — scanner blocks on send.
 const EXECUTOR_CHANNEL_CAP: usize = 64;
 
@@ -1597,14 +1597,21 @@ mod tests {
     fn scanner_channel_defers_when_full() {
         let (tx, _rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
 
-        // With capacity 0, even the first send fails if no receiver.
-        let result = tx.try_send(ScanRequest {
+        let make_request = || ScanRequest {
             paths: vec![],
             urgency: 0.9,
             pressure_level: PressureLevel::Critical,
             max_delete_batch: 40,
             config_update: None,
-        });
+        };
+
+        // Fill the channel to capacity.
+        for _ in 0..SCANNER_CHANNEL_CAP {
+            tx.try_send(make_request()).expect("should buffer within capacity");
+        }
+
+        // One more should fail — channel is full.
+        let result = tx.try_send(make_request());
         assert!(matches!(result, Err(TrySendError::Full(_))));
     }
 }
