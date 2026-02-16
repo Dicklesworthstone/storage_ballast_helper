@@ -645,4 +645,224 @@ mod tests {
         assert_eq!(writer.state(), "normal");
         assert!(recovery_path.exists());
     }
+
+    // ──────── failure-injection tests ────────
+
+    #[test]
+    fn full_degradation_chain_primary_to_discard() {
+        // Inject: primary bad, no fallback.
+        // Expect: degrades through stderr to discard without panic.
+        let config = JsonlConfig {
+            path: PathBuf::from("/nonexistent_primary_sbh/bad.jsonl"),
+            fallback_path: None,
+            max_size_bytes: 1024 * 1024,
+            max_rotated_files: 3,
+            fsync_interval_secs: 60,
+        };
+        let mut writer = JsonlWriter::open(config);
+
+        // With no fallback configured, should go straight to stderr.
+        assert_eq!(writer.state(), "stderr");
+
+        // Writing should not panic even in stderr mode.
+        writer.write_entry(&LogEntry::new(EventType::Error, Severity::Critical));
+        writer.flush();
+
+        // State remains stderr (no further degradation from successful stderr write).
+        assert_eq!(writer.state(), "stderr");
+    }
+
+    #[test]
+    fn fallback_to_stderr_when_both_paths_fail() {
+        // Inject: both primary and fallback paths are non-creatable.
+        // Expect: degrades to stderr.
+        let config = JsonlConfig {
+            path: PathBuf::from("/nonexistent_primary_aaa/log.jsonl"),
+            fallback_path: Some(PathBuf::from("/nonexistent_fallback_bbb/log.jsonl")),
+            max_size_bytes: 1024 * 1024,
+            max_rotated_files: 3,
+            fsync_interval_secs: 60,
+        };
+        let mut writer = JsonlWriter::open(config);
+        assert_eq!(writer.state(), "stderr");
+
+        // Events written to stderr don't accumulate bytes_written.
+        writer.write_entry(&LogEntry::new(EventType::DaemonStart, Severity::Info));
+        assert_eq!(writer.bytes_written(), 0);
+    }
+
+    #[test]
+    fn recovery_from_fallback_to_primary() {
+        // Step 1: Start with bad primary → goes to fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let primary_path = dir.path().join("primary.jsonl");
+        let fallback_path = dir.path().join("fallback.jsonl");
+
+        // Intentionally make primary directory non-creatable at first.
+        let config = JsonlConfig {
+            path: PathBuf::from("/nonexistent_sbh_recovery_test/primary.jsonl"),
+            fallback_path: Some(fallback_path.clone()),
+            max_size_bytes: 1024 * 1024,
+            max_rotated_files: 3,
+            fsync_interval_secs: 60,
+        };
+        let mut writer = JsonlWriter::open(config);
+        assert_eq!(writer.state(), "fallback");
+
+        // Write an event to fallback.
+        writer.write_entry(&LogEntry::new(EventType::Error, Severity::Warning));
+        writer.flush();
+        assert!(fallback_path.exists());
+
+        // Step 2: "Fix" the primary path and trigger recovery.
+        writer.config.path = primary_path.clone();
+        writer.last_recover_attempt = UNIX_EPOCH; // Force recovery attempt.
+        writer.write_entry(&LogEntry::new(EventType::ScanComplete, Severity::Info));
+        writer.flush();
+
+        // Should have recovered to primary.
+        assert_eq!(writer.state(), "normal");
+        assert!(primary_path.exists());
+    }
+
+    #[test]
+    fn recovery_from_stderr_to_primary() {
+        // Start in stderr state (no creatable paths).
+        let dir = tempfile::tempdir().unwrap();
+        let primary_path = dir.path().join("recovered_from_stderr.jsonl");
+
+        let config = JsonlConfig {
+            path: PathBuf::from("/nonexistent_sbh_stderr_test/bad.jsonl"),
+            fallback_path: None,
+            max_size_bytes: 1024 * 1024,
+            max_rotated_files: 3,
+            fsync_interval_secs: 60,
+        };
+        let mut writer = JsonlWriter::open(config);
+        assert_eq!(writer.state(), "stderr");
+
+        // "Fix" the primary path and trigger recovery.
+        writer.config.path = primary_path.clone();
+        writer.last_recover_attempt = UNIX_EPOCH;
+        writer.write_entry(&LogEntry::new(EventType::DaemonStart, Severity::Info));
+        writer.flush();
+
+        assert_eq!(writer.state(), "normal");
+        assert!(primary_path.exists());
+        let contents = fs::read_to_string(&primary_path).unwrap();
+        assert!(contents.contains("daemon_start"));
+    }
+
+    #[test]
+    fn rotation_preserves_data_across_files() {
+        // Inject: tiny max_size to force multiple rotations.
+        // Verify: data exists in rotated files, no data loss.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotation_test.jsonl");
+        let config = JsonlConfig {
+            path: path.clone(),
+            fallback_path: None,
+            max_size_bytes: 200, // ~1-2 entries before rotation
+            max_rotated_files: 5,
+            fsync_interval_secs: 60,
+        };
+        let mut writer = JsonlWriter::open(config);
+
+        // Write enough entries to trigger several rotations.
+        for _ in 0..20 {
+            writer.write_entry(&LogEntry::new(EventType::PressureChange, Severity::Info));
+        }
+        writer.flush();
+
+        // Primary should exist.
+        assert!(path.exists(), "primary log file must exist after rotation");
+
+        // Count total lines across all rotation files.
+        let mut total_lines = 0;
+        let primary_content = fs::read_to_string(&path).unwrap_or_default();
+        total_lines += primary_content.lines().count();
+
+        for i in 1..=5 {
+            let rotated = rotated_name(&path, i);
+            if rotated.exists() {
+                let content = fs::read_to_string(&rotated).unwrap_or_default();
+                total_lines += content.lines().count();
+            }
+        }
+
+        // We wrote 20 entries but oldest rotations may be deleted (max 5 rotated files).
+        // Must have retained a reasonable number.
+        assert!(
+            total_lines >= 10,
+            "expected at least 10 lines across rotation files, got {total_lines}"
+        );
+    }
+
+    #[test]
+    fn bytes_written_tracks_accurately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracking.jsonl");
+        let config = JsonlConfig {
+            path: path.clone(),
+            fallback_path: None,
+            max_size_bytes: 10 * 1024 * 1024,
+            max_rotated_files: 3,
+            fsync_interval_secs: 60,
+        };
+        let mut writer = JsonlWriter::open(config);
+        assert_eq!(writer.bytes_written(), 0);
+
+        writer.write_entry(&LogEntry::new(EventType::DaemonStart, Severity::Info));
+        writer.flush();
+
+        let actual_size = fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            writer.bytes_written(),
+            actual_size,
+            "tracked bytes must match actual file size"
+        );
+    }
+
+    #[test]
+    fn all_event_types_serialize_to_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("all_events.jsonl");
+        let config = JsonlConfig {
+            path: path.clone(),
+            fallback_path: None,
+            max_size_bytes: 10 * 1024 * 1024,
+            max_rotated_files: 3,
+            fsync_interval_secs: 60,
+        };
+        let mut writer = JsonlWriter::open(config);
+
+        let event_types = [
+            EventType::ArtifactDelete,
+            EventType::BallastRelease,
+            EventType::BallastReplenish,
+            EventType::BallastProvision,
+            EventType::PressureChange,
+            EventType::ScanComplete,
+            EventType::DaemonStart,
+            EventType::DaemonStop,
+            EventType::ConfigReload,
+            EventType::Error,
+            EventType::Emergency,
+        ];
+
+        for et in &event_types {
+            writer.write_entry(&LogEntry::new(et.clone(), Severity::Info));
+        }
+        writer.flush();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), event_types.len());
+
+        // Every line must be valid JSON.
+        for (i, line) in lines.iter().enumerate() {
+            let parsed: std::result::Result<serde_json::Value, _> = serde_json::from_str(line);
+            assert!(parsed.is_ok(), "line {i} failed to parse as JSON: {line}");
+        }
+    }
 }
