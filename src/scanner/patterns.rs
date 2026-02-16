@@ -182,9 +182,16 @@ impl ArtifactPatternRegistry {
         }
 
         let structural = structural_score(best.category, signals);
-        let combined = 0.70f64
+        let mut combined = 0.70f64
             .mul_add(best.name_confidence, 0.30 * structural)
             .clamp(0.0, 1.0);
+
+        // Structural safety override: if the structural score is very low (indicating
+        // a project root signal like Cargo.toml or .git), we must severely penalize
+        // the combined score to prevent deletion, even if the name matches a pattern.
+        if structural < 0.1 {
+            combined *= 0.1;
+        }
 
         ArtifactClassification {
             structural_confidence: structural,
@@ -494,5 +501,24 @@ mod tests {
         assert_eq!(classification.pattern_name, "my-cache");
         assert_eq!(classification.category, ArtifactCategory::CacheDir);
         assert!(classification.combined_confidence > 0.60);
+    }
+
+    #[test]
+    fn cargo_toml_presence_penalizes_score() {
+        let registry = ArtifactPatternRegistry::default();
+        // A name that would normally get 0.94 confidence ("cargo-target-...")
+        let classification = registry.classify(
+            Path::new("cargo-target-project"),
+            StructuralSignals {
+                has_cargo_toml: true,
+                ..StructuralSignals::default()
+            },
+        );
+        // Should be crushed to < 0.1 despite the name match.
+        assert!(
+            classification.combined_confidence < 0.1,
+            "score {} was not penalized enough",
+            classification.combined_confidence
+        );
     }
 }

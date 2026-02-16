@@ -913,8 +913,13 @@ impl MonitoringDaemon {
                 let inventory = self.ballast_coordinator.inventory();
 
                 for pool_info in inventory {
-                    if pool_info.files_available < pool_info.files_total {
-                        let mount_path = pool_info.mount_point.clone();
+                    let mount_path = pool_info.mount_point.clone();
+                    if self.release_controller.is_ready_for_replenish(
+                        &mount_path,
+                        response.level,
+                        pool_info.files_available,
+                        pool_info.files_total,
+                    ) {
                         let free_check = || {
                             collector
                                 .collect(&mount_path)
@@ -928,6 +933,8 @@ impl MonitoringDaemon {
                             .replenish_for_mount(&mount_path, Some(&free_check))
                             && report.files_created > 0
                         {
+                            self.release_controller
+                                .on_replenished(&mount_path, report.files_created);
                             self.notification_manager.notify(
                                 &NotificationEvent::BallastReplenished {
                                     mount: mount_path.to_string_lossy().to_string(),
@@ -998,13 +1005,21 @@ impl MonitoringDaemon {
         let available = pool.available_count();
         let count = self
             .release_controller
-            .files_to_release(response, available);
+            .files_to_release(mount, response, available);
 
-        if count > 0
-            && let Some(report) = self.ballast_coordinator.release_for_mount(mount, count)?
-        {
-            self.notification_manager
-                .notify(&NotificationEvent::BallastReleased {
+                if count > 0
+
+                    && let Some(report) = self.ballast_coordinator.release_for_mount(mount, count)?
+
+                {
+
+                    self.release_controller
+
+                        .on_released(mount, report.files_released);
+
+                    self.notification_manager
+
+                        .notify(&NotificationEvent::BallastReleased {
                     mount: mount.to_string_lossy().to_string(),
                     files_released: report.files_released,
                     bytes_freed: report.bytes_freed,
