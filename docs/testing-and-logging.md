@@ -2,6 +2,16 @@
 
 This document defines the baseline conventions for adding tests and structured logs in `storage_ballast_helper`.
 
+## Dashboard and Status Contract Baseline (bd-xzt.1.1)
+
+Source of truth: `docs/dashboard-status-contract-baseline.md`
+
+For TUI/dashboard overhaul work (`bd-xzt.*`):
+
+- Implementation tasks must name the contract IDs they change.
+- Test tasks must map each new assertion to at least one contract ID.
+- Release/signoff tasks must report contract pass/fail status, not just aggregate test counts.
+
 ## Test Registration
 
 ### 1. Unit and Property Tests
@@ -68,6 +78,17 @@ rch exec "cargo test --lib"
 rch exec "cargo test --test integration_tests"
 ./scripts/e2e_test.sh
 ```
+
+## FrankentUI Code Reuse Compliance (bd-xzt.1.6)
+
+Source of truth: `docs/frankentui-compliance-plan.md`
+
+For any PR importing FrankentUI-derived code:
+
+- Follow the import review checklist in the compliance plan.
+- Verify stable toolchain compilation before merging.
+- Add attribution comments to files with substantial copied code.
+- Audit new transitive dependencies for permissive licensing.
 
 ## Contribution Checklist for New Modules
 

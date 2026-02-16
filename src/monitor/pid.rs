@@ -140,6 +140,14 @@ impl PidPressureController {
         self.red_min_free_pct = red;
     }
 
+    /// Reset internal state (integral, derivative).
+    /// Call this when switching monitored targets to avoid state pollution.
+    pub fn reset(&mut self) {
+        self.integral = 0.0;
+        self.last_error = 0.0;
+        self.last_update = None;
+    }
+
     /// Update controller state.
     ///
     /// `predicted_seconds_to_red` comes from EWMA and boosts urgency when time-to-red is short.

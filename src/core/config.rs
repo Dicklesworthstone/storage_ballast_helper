@@ -21,6 +21,7 @@ pub struct Config {
     pub scanner: ScannerConfig,
     pub scoring: ScoringConfig,
     pub ballast: BallastConfig,
+    pub scheduler: VoiConfig,
     pub update: UpdateConfig,
     pub telemetry: TelemetryConfig,
     pub paths: PathsConfig,
@@ -154,6 +155,52 @@ impl BallastConfig {
     pub fn is_volume_enabled(&self, mount_path: &str) -> bool {
         let key = strip_trailing_separator(mount_path);
         self.overrides.get(key).is_none_or(|o| o.enabled)
+    }
+}
+
+/// Tuning knobs for the VOI scan scheduler.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct VoiConfig {
+    /// Master switch.
+    pub enabled: bool,
+    /// Maximum number of paths to scan per scheduling interval.
+    pub scan_budget_per_interval: usize,
+    /// Minimum fraction of budget reserved for exploration (round-robin of least-scanned paths).
+    pub exploration_quota_fraction: f64,
+    /// Weight for IO cost penalty (bytes estimated per scan).
+    pub io_cost_weight: f64,
+    /// Weight for false-positive risk penalty.
+    pub fp_risk_weight: f64,
+    /// Weight for exploration bonus.
+    pub exploration_weight: f64,
+    /// Forecast-error threshold: if MAPE exceeds this, switch to fallback.
+    pub forecast_error_threshold: f64,
+    /// Number of consecutive windows with high forecast error before triggering fallback.
+    pub fallback_trigger_windows: u32,
+    /// Number of consecutive windows with acceptable error to exit fallback.
+    pub recovery_trigger_windows: u32,
+    /// Minimum scans of a path before its forecast is considered reliable.
+    pub min_observations_for_forecast: u32,
+    /// Alpha value for EWMA smoothing of per-path statistics.
+    pub ewma_alpha: f64,
+}
+
+impl Default for VoiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scan_budget_per_interval: 5,
+            exploration_quota_fraction: 0.20,
+            io_cost_weight: 0.1,
+            fp_risk_weight: 0.15,
+            exploration_weight: 0.25,
+            forecast_error_threshold: 0.5,
+            fallback_trigger_windows: 3,
+            recovery_trigger_windows: 5,
+            min_observations_for_forecast: 3,
+            ewma_alpha: 0.3,
+        }
     }
 }
 
@@ -694,6 +741,32 @@ impl Config {
                 details: "scoring.false_positive_loss and false_negative_loss must be >= 0.0"
                     .to_string(),
             });
+        }
+
+        validate_prob(
+            "scheduler.exploration_quota_fraction",
+            self.scheduler.exploration_quota_fraction,
+        )?;
+        validate_prob("scheduler.ewma_alpha", self.scheduler.ewma_alpha)?;
+        if self.scheduler.scan_budget_per_interval == 0 {
+            return Err(SbhError::InvalidConfig {
+                details: "scheduler.scan_budget_per_interval must be >= 1".to_string(),
+            });
+        }
+        for (name, val) in [
+            ("io_cost_weight", self.scheduler.io_cost_weight),
+            ("fp_risk_weight", self.scheduler.fp_risk_weight),
+            ("exploration_weight", self.scheduler.exploration_weight),
+            (
+                "forecast_error_threshold",
+                self.scheduler.forecast_error_threshold,
+            ),
+        ] {
+            if val < 0.0 {
+                return Err(SbhError::InvalidConfig {
+                    details: format!("scheduler.{name} must be >= 0.0, got {val}"),
+                });
+            }
         }
 
         let sum = self.scoring.location_weight

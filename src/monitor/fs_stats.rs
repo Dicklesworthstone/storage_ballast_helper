@@ -108,6 +108,10 @@ impl FsStatsCollector {
         }
     }
 
+    pub fn set_ttl(&mut self, ttl: Duration) {
+        self.cache_ttl = ttl;
+    }
+
     fn cached_mounts(&self) -> Result<Vec<MountPoint>> {
         {
             let mc = self.mount_cache.read();

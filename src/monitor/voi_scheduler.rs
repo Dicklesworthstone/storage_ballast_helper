@@ -30,55 +30,9 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
+pub use crate::core::config::VoiConfig;
 
 // ──────────────────── configuration ────────────────────
-
-/// Tuning knobs for the VOI scan scheduler.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct VoiConfig {
-    /// Master switch.
-    pub enabled: bool,
-    /// Maximum number of paths to scan per scheduling interval.
-    pub scan_budget_per_interval: usize,
-    /// Minimum fraction of budget reserved for exploration (round-robin of least-scanned paths).
-    pub exploration_quota_fraction: f64,
-    /// Weight for IO cost penalty (bytes estimated per scan).
-    pub io_cost_weight: f64,
-    /// Weight for false-positive risk penalty.
-    pub fp_risk_weight: f64,
-    /// Weight for exploration bonus.
-    pub exploration_weight: f64,
-    /// Forecast-error threshold: if MAPE exceeds this, switch to fallback.
-    pub forecast_error_threshold: f64,
-    /// Number of consecutive windows with high forecast error before triggering fallback.
-    pub fallback_trigger_windows: u32,
-    /// Number of consecutive windows with acceptable error to exit fallback.
-    pub recovery_trigger_windows: u32,
-    /// Minimum scans of a path before its forecast is considered reliable.
-    pub min_observations_for_forecast: u32,
-    /// Alpha value for EWMA smoothing of per-path statistics.
-    pub ewma_alpha: f64,
-}
-
-impl Default for VoiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            scan_budget_per_interval: 5,
-            exploration_quota_fraction: 0.20,
-            io_cost_weight: 0.1,
-            fp_risk_weight: 0.15,
-            exploration_weight: 0.25,
-            forecast_error_threshold: 0.5,
-            fallback_trigger_windows: 3,
-            recovery_trigger_windows: 5,
-            min_observations_for_forecast: 3,
-            ewma_alpha: 0.3,
-        }
-    }
-}
 
 // ──────────────────── per-path statistics ────────────────────
 
@@ -292,6 +246,11 @@ impl VoiScheduler {
     /// Register a path for tracking. Idempotent.
     pub fn register_path(&mut self, path: PathBuf) {
         self.path_stats.entry(path).or_insert_with(PathStats::new);
+    }
+
+    /// Update configuration at runtime.
+    pub fn update_config(&mut self, config: VoiConfig) {
+        self.config = config;
     }
 
     /// Record the results of a completed scan for a path.

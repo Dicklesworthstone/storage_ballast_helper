@@ -815,4 +815,230 @@ mod tests {
         // but the counter initializes correctly.
         handle.shutdown();
     }
+
+    // ──────── failure-injection tests ────────
+
+    #[test]
+    fn sqlite_bad_path_still_logs_to_jsonl() {
+        // Inject: SQLite path in a non-creatable directory → SQLite disabled at init.
+        // Expect: all events still reach the JSONL backend.
+        let dir = tempfile::tempdir().unwrap();
+        let config = DualLoggerConfig {
+            sqlite_path: Some(std::path::PathBuf::from(
+                "/nonexistent_sbh_test_readonly_dir/impossible.db",
+            )),
+            jsonl_config: JsonlConfig {
+                path: dir.path().join("fallback_only.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 10 * 1024 * 1024,
+                max_rotated_files: 3,
+                fsync_interval_secs: 60,
+            },
+            channel_capacity: 64,
+        };
+        let (handle, join) = spawn_logger(config).unwrap();
+
+        handle.send(ActivityEvent::DaemonStarted {
+            version: "0.1.0-test".to_string(),
+            config_hash: "failure_test".to_string(),
+        });
+        handle.send(ActivityEvent::Error {
+            code: "SBH-9999".to_string(),
+            message: "injected failure".to_string(),
+        });
+        handle.send(ActivityEvent::ScanCompleted {
+            paths_scanned: 42,
+            candidates_found: 7,
+            duration_ms: 100,
+        });
+        handle.shutdown();
+        join.join().unwrap();
+
+        // JSONL must contain all 3 events despite SQLite being unavailable.
+        let contents = std::fs::read_to_string(dir.path().join("fallback_only.jsonl")).unwrap();
+        assert_eq!(
+            contents.lines().count(),
+            3,
+            "all events must be logged to JSONL when SQLite is unavailable"
+        );
+        assert!(contents.contains("daemon_start"));
+        assert!(contents.contains("SBH-9999"));
+        assert!(contents.contains("scan_complete"));
+    }
+
+    #[test]
+    fn both_backends_unavailable_no_panic() {
+        // Inject: SQLite path bad, JSONL primary bad, no fallback.
+        // Expect: logger thread does not panic; shutdown completes cleanly.
+        let config = DualLoggerConfig {
+            sqlite_path: Some(std::path::PathBuf::from("/nonexistent_dir_1/bad.db")),
+            jsonl_config: JsonlConfig {
+                path: std::path::PathBuf::from("/nonexistent_dir_2/bad.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 10 * 1024 * 1024,
+                max_rotated_files: 3,
+                fsync_interval_secs: 60,
+            },
+            channel_capacity: 64,
+        };
+        let (handle, join) = spawn_logger(config).unwrap();
+
+        // Fire events into the void — must not panic.
+        for _ in 0..10 {
+            handle.send(ActivityEvent::Error {
+                code: "SBH-0000".to_string(),
+                message: "total backend failure".to_string(),
+            });
+        }
+        handle.shutdown();
+        join.join()
+            .expect("logger thread must not panic even with all backends failed");
+    }
+
+    #[test]
+    fn jsonl_fallback_used_when_primary_fails() {
+        // Inject: JSONL primary path bad, fallback path good.
+        // Expect: events land in fallback file.
+        let dir = tempfile::tempdir().unwrap();
+        let fallback_path = dir.path().join("fallback.jsonl");
+        let config = DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: JsonlConfig {
+                path: std::path::PathBuf::from("/nonexistent_primary_dir/bad.jsonl"),
+                fallback_path: Some(fallback_path.clone()),
+                max_size_bytes: 10 * 1024 * 1024,
+                max_rotated_files: 3,
+                fsync_interval_secs: 60,
+            },
+            channel_capacity: 64,
+        };
+        let (handle, join) = spawn_logger(config).unwrap();
+
+        handle.send(ActivityEvent::BallastReleased {
+            path: "/data/ballast/01.dat".to_string(),
+            size_bytes: 1_073_741_824,
+            pressure: "orange".to_string(),
+            free_pct: 8.5,
+        });
+        handle.shutdown();
+        join.join().unwrap();
+
+        let contents = std::fs::read_to_string(&fallback_path).unwrap();
+        assert!(
+            contents.contains("ballast_release"),
+            "event must appear in JSONL fallback"
+        );
+    }
+
+    #[test]
+    fn high_event_volume_under_degraded_backend() {
+        // Inject: SQLite disabled, high event volume.
+        // Expect: JSONL captures all events, no data loss.
+        let dir = tempfile::tempdir().unwrap();
+        let config = DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: JsonlConfig {
+                path: dir.path().join("volume.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 50 * 1024 * 1024,
+                max_rotated_files: 3,
+                fsync_interval_secs: 60,
+            },
+            channel_capacity: 256,
+        };
+        let (handle, join) = spawn_logger(config).unwrap();
+
+        let event_count = 200;
+        for i in 0..event_count {
+            handle.send(ActivityEvent::ScanCompleted {
+                paths_scanned: i,
+                candidates_found: i / 2,
+                duration_ms: 50,
+            });
+        }
+        handle.shutdown();
+        join.join().unwrap();
+
+        let contents = std::fs::read_to_string(dir.path().join("volume.jsonl")).unwrap();
+        let line_count = contents.lines().count();
+        // Allow for potential back-pressure drops, but most must arrive.
+        assert!(
+            line_count >= event_count - 10,
+            "expected ~{event_count} lines, got {line_count}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_and_jsonl_consistency_under_mixed_events() {
+        // Verify: both backends receive the same events that have SQLite mappings.
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join) = spawn_logger(test_config(dir.path())).unwrap();
+
+        handle.send(ActivityEvent::DaemonStarted {
+            version: "1.0.0".to_string(),
+            config_hash: "hash123".to_string(),
+        });
+        handle.send(ActivityEvent::ArtifactDeleted {
+            path: "/data/target/debug".to_string(),
+            size_bytes: 500_000_000,
+            score: 0.92,
+            factors: ScoreFactorsRecord {
+                location: 0.80,
+                name: 0.90,
+                age: 1.0,
+                size: 0.70,
+                structure: 0.95,
+            },
+            pressure: "red".to_string(),
+            free_pct: 3.2,
+            duration_ms: 200,
+        });
+        handle.send(ActivityEvent::ArtifactDeletionFailed {
+            path: "/data/protected/.target".to_string(),
+            error_code: "SBH-2003".to_string(),
+            error_message: "safety veto: .git present".to_string(),
+        });
+        handle.send(ActivityEvent::PressureChanged {
+            from: "orange".to_string(),
+            to: "red".to_string(),
+            free_pct: 3.2,
+            rate_bps: Some(-80_000_000.0),
+            mount_point: "/data".to_string(),
+            total_bytes: 2_000_000_000_000,
+            free_bytes: 64_000_000_000,
+            ewma_rate: Some(-75_000_000.0),
+            pid_output: Some(0.91),
+        });
+        handle.shutdown();
+        join.join().unwrap();
+
+        // JSONL: 4 events (all logged).
+        let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        assert_eq!(jsonl.lines().count(), 4);
+
+        // SQLite: daemon_start + artifact_delete (success) + artifact_delete (fail) = 3 activity rows.
+        // PressureChanged goes to pressure_history, not activity_log.
+        let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
+
+        let start_count = db
+            .count_events_since("daemon_start", "2020-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(start_count, 1, "daemon_start should appear in activity_log");
+
+        let delete_count = db
+            .count_events_since("artifact_delete", "2020-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            delete_count, 2,
+            "both successful and failed deletions should be in activity_log"
+        );
+
+        // Verify pressure went to pressure_history.
+        let pressure = db
+            .pressure_since("/data", "2020-01-01T00:00:00Z", 10)
+            .unwrap();
+        assert_eq!(pressure.len(), 1);
+        assert_eq!(pressure[0].pressure_level, "red");
+    }
 }

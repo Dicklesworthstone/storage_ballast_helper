@@ -296,7 +296,7 @@ fn factor_location(path: &Path) -> f64 {
         0.60
     } else if text.contains("/projects/") {
         0.40
-    } else if text.contains("/documents/") {
+    } else if contains_ci(&text, "/documents/") {
         0.10
     } else if is_system_path(path) {
         0.0
@@ -316,7 +316,8 @@ fn factor_name(path: &Path, classification: &ArtifactClassification) -> f64 {
     if classification.category == ArtifactCategory::RustTarget {
         score += 0.15;
     }
-    if name.contains("backup") || name.contains("save") || name.contains("important") {
+    if contains_ci(&name, "backup") || contains_ci(&name, "save") || contains_ci(&name, "important")
+    {
         score -= 0.30;
     }
     score.clamp(0.0, 1.0)
@@ -579,6 +580,14 @@ uncertainty={uncertainty:.3}; calibration={calibration:.3}; delete_advantage={de
 required_delete_advantage={required_delete_advantage:.2}; action={action:?}"
     );
     EvidenceLedger { terms, summary }
+}
+
+/// ASCII case-insensitive substring search (zero-allocation).
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn has_git_component(path: &Path) -> bool {

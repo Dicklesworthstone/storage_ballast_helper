@@ -102,6 +102,8 @@ pub struct DecisionRecord {
     pub veto_reason: Option<String>,
     /// The selected action.
     pub action: ActionRecord,
+    /// The effective action taken after policy enforcement (if different).
+    pub effective_action: Option<ActionRecord>,
     /// Guard status at decision time.
     pub guard_status: Option<GuardStatusRecord>,
     /// Comparator action for shadow/canary diffing.
@@ -268,6 +270,7 @@ impl DecisionRecordBuilder {
         policy_mode: PolicyMode,
         guard_status: Option<&crate::monitor::guardrails::GuardDiagnostics>,
         comparator_action: Option<DecisionAction>,
+        effective_action: Option<DecisionAction>,
     ) -> DecisionRecord {
         let id = self.next_id;
         self.next_id += 1;
@@ -311,6 +314,7 @@ impl DecisionRecordBuilder {
             vetoed: score.vetoed,
             veto_reason: score.veto_reason.as_ref().map(ToString::to_string),
             action: ActionRecord::from(score.decision.action),
+            effective_action: effective_action.map(ActionRecord::from),
             guard_status: guard_status.map(GuardStatusRecord::from_diagnostics),
             comparator_action: comparator_action.map(ActionRecord::from),
             summary: score.ledger.summary.clone(),
@@ -746,8 +750,8 @@ mod tests {
     fn builder_assigns_sequential_ids() {
         let mut builder = DecisionRecordBuilder::new();
         let score = sample_score();
-        let r1 = builder.build(&score, PolicyMode::Live, None, None);
-        let r2 = builder.build(&score, PolicyMode::Live, None, None);
+        let r1 = builder.build(&score, PolicyMode::Live, None, None, None);
+        let r2 = builder.build(&score, PolicyMode::Live, None, None, None);
         assert_eq!(r1.decision_id, 1);
         assert_eq!(r2.decision_id, 2);
     }
@@ -762,6 +766,7 @@ mod tests {
             PolicyMode::Shadow,
             Some(&diag),
             Some(DecisionAction::Keep),
+            None,
         );
 
         assert_eq!(
@@ -789,7 +794,7 @@ mod tests {
     fn builder_captures_veto() {
         let mut builder = DecisionRecordBuilder::new();
         let score = vetoed_score();
-        let record = builder.build(&score, PolicyMode::Live, None, None);
+        let record = builder.build(&score, PolicyMode::Live, None, None, None);
 
         assert!(record.vetoed);
         assert_eq!(record.veto_reason.as_deref(), Some("path contains .git"));
@@ -804,7 +809,7 @@ mod tests {
         let mut score = sample_score();
         score.decision.fallback_active = true;
         score.decision.calibration_score = 0.35;
-        let record = builder.build(&score, PolicyMode::Live, None, None);
+        let record = builder.build(&score, PolicyMode::Live, None, None, None);
 
         assert!(record.fallback_active);
         assert!(record.fallback_reason.is_some());
@@ -814,7 +819,7 @@ mod tests {
     #[test]
     fn explain_l0_concise() {
         let mut builder = DecisionRecordBuilder::new();
-        let record = builder.build(&sample_score(), PolicyMode::Live, None, None);
+        let record = builder.build(&sample_score(), PolicyMode::Live, None, None, None);
         let text = format_explain(&record, ExplainLevel::L0);
 
         assert!(text.contains("DELETE"));
@@ -827,7 +832,7 @@ mod tests {
     #[test]
     fn explain_l0_vetoed() {
         let mut builder = DecisionRecordBuilder::new();
-        let record = builder.build(&vetoed_score(), PolicyMode::Live, None, None);
+        let record = builder.build(&vetoed_score(), PolicyMode::Live, None, None, None);
         let text = format_explain(&record, ExplainLevel::L0);
 
         assert!(text.contains("KEEP"));
@@ -838,7 +843,7 @@ mod tests {
     #[test]
     fn explain_l1_includes_factors() {
         let mut builder = DecisionRecordBuilder::new();
-        let record = builder.build(&sample_score(), PolicyMode::Live, None, None);
+        let record = builder.build(&sample_score(), PolicyMode::Live, None, None, None);
         let text = format_explain(&record, ExplainLevel::L1);
 
         assert!(text.contains("Factor"));
@@ -860,6 +865,7 @@ mod tests {
             PolicyMode::Shadow,
             Some(&diag),
             Some(DecisionAction::Keep),
+            None,
         );
         let text = format_explain(&record, ExplainLevel::L2);
 
@@ -874,7 +880,7 @@ mod tests {
     #[test]
     fn explain_l3_includes_json() {
         let mut builder = DecisionRecordBuilder::new();
-        let record = builder.build(&sample_score(), PolicyMode::DryRun, None, None);
+        let record = builder.build(&sample_score(), PolicyMode::DryRun, None, None, None);
         let text = format_explain(&record, ExplainLevel::L3);
 
         assert!(text.contains("Full trace payload"));
@@ -887,7 +893,7 @@ mod tests {
     #[test]
     fn json_compact_roundtrips() {
         let mut builder = DecisionRecordBuilder::new();
-        let record = builder.build(&sample_score(), PolicyMode::Live, None, None);
+        let record = builder.build(&sample_score(), PolicyMode::Live, None, None, None);
         let json = record.to_json_compact();
         let parsed: DecisionRecord = serde_json::from_str(&json).unwrap();
 
@@ -911,6 +917,7 @@ mod tests {
             PolicyMode::Live,
             Some(&diag),
             Some(DecisionAction::Review),
+            None,
         );
 
         let l0 = record.to_json_at_level(ExplainLevel::L0);
@@ -981,7 +988,7 @@ mod tests {
     #[test]
     fn parse_decision_from_details_roundtrip() {
         let mut builder = DecisionRecordBuilder::new();
-        let record = builder.build(&sample_score(), PolicyMode::Live, None, None);
+        let record = builder.build(&sample_score(), PolicyMode::Live, None, None, None);
         let json = record.to_json_compact();
         let parsed = parse_decision_from_details(&json).unwrap();
         assert_eq!(parsed.decision_id, record.decision_id);
@@ -997,7 +1004,7 @@ mod tests {
     #[test]
     fn decision_summary_line_format() {
         let mut builder = DecisionRecordBuilder::new();
-        let record = builder.build(&sample_score(), PolicyMode::Live, None, None);
+        let record = builder.build(&sample_score(), PolicyMode::Live, None, None, None);
         let line = decision_summary_line(&record);
         assert!(line.contains("sbh-00000001"));
         assert!(line.contains("DELETE"));
@@ -1067,7 +1074,7 @@ mod tests {
 
         let scored = engine.score_candidate(&input, 0.5);
         let mut builder = DecisionRecordBuilder::new();
-        let record = builder.build(&scored, PolicyMode::Live, None, None);
+        let record = builder.build(&scored, PolicyMode::Live, None, None, None);
 
         // Roundtrip through JSON.
         let json = record.to_json_compact();

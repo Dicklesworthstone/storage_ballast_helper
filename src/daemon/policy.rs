@@ -15,9 +15,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::guardrails::{GuardDiagnostics, GuardStatus};
-use crate::scanner::decision_record::{
-    ActionRecord, DecisionRecord, DecisionRecordBuilder, PolicyMode,
-};
+use crate::scanner::decision_record::{DecisionRecord, DecisionRecordBuilder, PolicyMode};
 use crate::scanner::scoring::{CandidacyScore, DecisionAction};
 
 // ──────────────────── policy mode ────────────────────
@@ -314,6 +312,9 @@ impl PolicyEngine {
                 break;
             }
 
+            // Determine effective action by applying policy rules.
+            let effective_action = self.enforce_policy(candidate, guard);
+
             // Build the evidence record.
             let comparator = if self.mode == ActiveMode::Observe {
                 // In observe mode, the "comparator" is the enforce-mode action.
@@ -322,20 +323,24 @@ impl PolicyEngine {
                 None
             };
 
-            let record = self
-                .builder
-                .build(candidate, policy_mode, guard, comparator);
+            let record = self.builder.build(
+                candidate,
+                policy_mode,
+                guard,
+                comparator,
+                Some(effective_action),
+            );
             self.total_decisions += 1;
 
-            // Count hypothetical outcomes.
-            match record.action {
-                ActionRecord::Delete => hypothetical_deletes += 1,
-                ActionRecord::Keep => hypothetical_keeps += 1,
-                ActionRecord::Review => hypothetical_reviews += 1,
+            // Count hypothetical outcomes based on the candidate's inherent score action.
+            match candidate.decision.action {
+                DecisionAction::Delete => hypothetical_deletes += 1,
+                DecisionAction::Keep => hypothetical_keeps += 1,
+                DecisionAction::Review => hypothetical_reviews += 1,
             }
 
-            // Decide whether to approve for actual deletion.
-            if self.should_approve_deletion(candidate, guard) {
+            // Approve for actual deletion if effective action is Delete.
+            if effective_action == DecisionAction::Delete {
                 approved.push(candidate.clone());
             }
 
@@ -458,19 +463,21 @@ impl PolicyEngine {
 
     // ──────────── private helpers ────────────
 
-    fn should_approve_deletion(
+    fn enforce_policy(
         &mut self,
         candidate: &CandidacyScore,
         guard: Option<&GuardDiagnostics>,
-    ) -> bool {
-        // FallbackSafe and Observe never delete.
-        if !self.mode.allows_deletion() {
-            return false;
+    ) -> DecisionAction {
+        let proposed = candidate.decision.action;
+
+        // If not a deletion candidate, no policy to enforce.
+        if proposed != DecisionAction::Delete {
+            return proposed;
         }
 
-        // Only approve candidates with Delete action.
-        if candidate.decision.action != DecisionAction::Delete {
-            return false;
+        // FallbackSafe and Observe never delete.
+        if !self.mode.allows_deletion() {
+            return DecisionAction::Keep;
         }
 
         // Apply guard penalty check.
@@ -480,7 +487,7 @@ impl PolicyEngine {
             let penalized_delete_loss =
                 candidate.decision.expected_loss_delete + self.config.guard_penalty;
             if penalized_delete_loss >= candidate.decision.expected_loss_keep {
-                return false;
+                return DecisionAction::Keep;
             }
         }
 
@@ -489,12 +496,12 @@ impl PolicyEngine {
             self.rotate_canary_hour();
             if self.canary_deletes_this_hour >= self.config.max_canary_deletes_per_hour {
                 self.enter_fallback(FallbackReason::CanaryBudgetExhausted);
-                return false;
+                return DecisionAction::Keep;
             }
             self.canary_deletes_this_hour += 1;
         }
 
-        true
+        DecisionAction::Delete
     }
 
     fn check_guard_triggers(&mut self, diag: &GuardDiagnostics) {
@@ -579,6 +586,7 @@ pub struct PolicyDiagnostics {
 mod tests {
     use super::*;
     use crate::monitor::guardrails::GuardDiagnostics;
+    use crate::scanner::decision_record::ActionRecord;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::scoring::{
         CandidacyScore, DecisionAction, DecisionOutcome, EvidenceLedger, EvidenceTerm, ScoreFactors,
@@ -924,6 +932,11 @@ mod tests {
 
         let decision = engine.evaluate(&[candidate], Some(&guard));
         assert!(decision.approved_for_deletion.is_empty());
+        // Verify effective action is recorded as Keep.
+        assert_eq!(
+            decision.records[0].effective_action,
+            Some(ActionRecord::Keep)
+        );
     }
 
     #[test]
@@ -939,6 +952,10 @@ mod tests {
 
         assert!(decision.approved_for_deletion.is_empty());
         assert_eq!(decision.mode, ActiveMode::FallbackSafe);
+        assert_eq!(
+            decision.records[0].effective_action,
+            Some(ActionRecord::Keep)
+        );
     }
 
     // ──── diagnostics tests ────

@@ -35,6 +35,7 @@ use crate::monitor::ewma::DiskRateEstimator;
 use crate::monitor::fs_stats::FsStatsCollector;
 use crate::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
 use crate::monitor::special_locations::SpecialLocationRegistry;
+use crate::monitor::voi_scheduler::VoiScheduler;
 use crate::platform::pal::{Platform, detect_platform};
 use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
 use crate::scanner::patterns::ArtifactPatternRegistry;
@@ -133,11 +134,21 @@ pub struct DeletionBatch {
 
 /// Results reported from worker threads back to the main monitoring loop.
 #[derive(Debug)]
+struct RootScanResult {
+    path: PathBuf,
+    candidates_found: usize,
+    potential_bytes: u64,
+    false_positives: usize,
+    duration: Duration,
+}
+
+#[derive(Debug)]
 enum WorkerReport {
     /// Scanner completed a scan pass.
     ScanCompleted {
         candidates: usize,
         duration: Duration,
+        root_stats: Vec<RootScanResult>,
     },
     /// Executor completed a deletion batch.
     DeletionCompleted {
@@ -191,12 +202,15 @@ pub struct MonitoringDaemon {
     ballast_coordinator: BallastPoolCoordinator,
     release_controller: BallastReleaseController,
     scoring_engine: ScoringEngine,
+    voi_scheduler: VoiScheduler,
     shared_executor_config: Arc<SharedExecutorConfig>,
     shared_scoring_config: Arc<RwLock<crate::core::config::ScoringConfig>>,
     shared_scanner_config: Arc<RwLock<crate::core::config::ScannerConfig>>,
     cached_primary_path: PathBuf,
     start_time: Instant,
     last_pressure_level: PressureLevel,
+    #[allow(dead_code)] // Planned: track worst mount point across iterations.
+    last_worst_mount: Option<PathBuf>,
     last_special_scan: HashMap<PathBuf, Instant>,
     self_monitor: SelfMonitor,
     scanner_heartbeat: Arc<ThreadHeartbeat>,
@@ -214,6 +228,7 @@ fn compute_primary_path(config: &Config) -> PathBuf {
 
 impl MonitoringDaemon {
     /// Build and initialize the daemon from configuration.
+    #[allow(clippy::too_many_lines)]
     pub fn init(config: Config, args: &DaemonArgs) -> Result<Self> {
         let platform = detect_platform()?;
         let start_time = Instant::now();
@@ -296,6 +311,12 @@ impl MonitoringDaemon {
         let scoring_engine =
             ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
 
+        // 10a. VOI Scheduler.
+        let mut voi_scheduler = VoiScheduler::new(config.scheduler.clone());
+        for root in &config.scanner.root_paths {
+            voi_scheduler.register_path(root.clone());
+        }
+
         // 10b. Shared executor config (atomics for live reload propagation).
         let shared_executor_config = Arc::new(SharedExecutorConfig::new(
             config.scanner.dry_run,
@@ -330,11 +351,13 @@ impl MonitoringDaemon {
             ballast_coordinator,
             release_controller,
             scoring_engine,
+            voi_scheduler,
             shared_executor_config,
             shared_scoring_config,
             shared_scanner_config,
             start_time,
             last_pressure_level: PressureLevel::Green,
+            last_worst_mount: None,
             last_special_scan: HashMap::new(),
             self_monitor,
             scanner_heartbeat,
@@ -442,8 +465,25 @@ impl MonitoringDaemon {
                     WorkerReport::ScanCompleted {
                         candidates,
                         duration,
+                        root_stats,
                     } => {
                         self.self_monitor.record_scan(candidates, 0, duration);
+                        self.voi_scheduler.end_window(); // TODO: end_window timing?
+                        // Actually end_window is for forecast accuracy.
+                        // We should record individual scans first.
+                        let now = Instant::now();
+                        #[allow(clippy::cast_possible_truncation)]
+                        for stat in root_stats {
+                            self.voi_scheduler.record_scan_result(
+                                &stat.path,
+                                stat.potential_bytes,
+                                stat.candidates_found as u32,
+                                stat.false_positives as u32,
+                                stat.duration.as_millis() as f64,
+                                now,
+                            );
+                        }
+                        self.voi_scheduler.end_window();
                     }
                     WorkerReport::DeletionCompleted {
                         deleted,
@@ -622,6 +662,21 @@ impl MonitoringDaemon {
             details: "no filesystem stats available for any root path".to_string(),
         })?;
 
+        if self.last_worst_mount.as_ref() != Some(&stats.mount_point) {
+            eprintln!(
+                "[SBH-DAEMON] worst pressure mount switched to {}, resetting controller state",
+                stats.mount_point.display()
+            );
+            self.rate_estimator = DiskRateEstimator::new(
+                self.config.telemetry.ewma_base_alpha,
+                self.config.telemetry.ewma_min_alpha,
+                self.config.telemetry.ewma_max_alpha,
+                self.config.telemetry.ewma_min_samples,
+            );
+            self.pressure_controller.reset();
+            self.last_worst_mount = Some(stats.mount_point.clone());
+        }
+
         // Update EWMA rate estimator.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let red_threshold_bytes =
@@ -689,6 +744,34 @@ impl MonitoringDaemon {
         response: &crate::monitor::pid::PressureResponse,
         scan_tx: &Sender<ScanRequest>,
     ) {
+        // Determine scan targets: routine maintenance (Green) scans everything;
+        // elevated pressure targets only the causing volume to maximize ROI.
+        let scan_paths = if response.level == PressureLevel::Green {
+            self.config.scanner.root_paths.clone()
+        } else {
+            let collector = &self.fs_collector;
+            let target = &response.causing_mount;
+            self.config
+                .scanner
+                .root_paths
+                .iter()
+                .filter(|p| {
+                    collector
+                        .collect(p)
+                        .ok()
+                        .is_some_and(|s| s.mount_point == *target)
+                })
+                .cloned()
+                .collect()
+        };
+
+        // Fallback to all paths if filtering somehow yielded nothing (e.g. config drift).
+        let paths_to_scan = if scan_paths.is_empty() {
+            self.config.scanner.root_paths.clone()
+        } else {
+            scan_paths
+        };
+
         match response.level {
             PressureLevel::Green => {
                 // Maybe replenish ballast.
@@ -724,7 +807,7 @@ impl MonitoringDaemon {
                 // we MUST start scanning even if the current static level is Green.
                 // 0.8 corresponds to ~high urgency threshold (e.g. < 5 mins to saturation).
                 if response.urgency > 0.8 {
-                    self.send_scan_request(scan_tx, response);
+                    self.send_scan_request(scan_tx, response, paths_to_scan);
                 }
             }
             PressureLevel::Yellow => {
@@ -733,22 +816,22 @@ impl MonitoringDaemon {
                 if response.release_ballast_files > 0 {
                     let _ = self.release_ballast(&response.causing_mount, response);
                 }
-                self.send_scan_request(scan_tx, response);
+                self.send_scan_request(scan_tx, response, paths_to_scan);
             }
             PressureLevel::Orange => {
                 // Start scanning + gentle cleanup + early ballast release.
                 let _ = self.release_ballast(&response.causing_mount, response);
-                self.send_scan_request(scan_tx, response);
+                self.send_scan_request(scan_tx, response, paths_to_scan);
             }
             PressureLevel::Red => {
                 // Release ballast + aggressive scan + delete.
                 let _ = self.release_ballast(&response.causing_mount, response);
-                self.send_scan_request(scan_tx, response);
+                self.send_scan_request(scan_tx, response, paths_to_scan);
             }
             PressureLevel::Critical => {
                 // Emergency: release all ballast + delete everything safe.
                 let _ = self.release_ballast(&response.causing_mount, response);
-                self.send_scan_request(scan_tx, response);
+                self.send_scan_request(scan_tx, response, paths_to_scan);
 
                 let primary = self.primary_path();
                 let actual_free_pct = self
@@ -786,13 +869,15 @@ impl MonitoringDaemon {
         Ok(())
     }
 
+    #[allow(clippy::unused_self)]
     fn send_scan_request(
         &self,
         scan_tx: &Sender<ScanRequest>,
         response: &crate::monitor::pid::PressureResponse,
+        paths: Vec<PathBuf>,
     ) {
         let request = ScanRequest {
-            paths: self.config.scanner.root_paths.clone(),
+            paths,
             urgency: response.urgency,
             pressure_level: response.level,
             max_delete_batch: response.max_delete_batch,
@@ -932,6 +1017,17 @@ impl MonitoringDaemon {
                         .store(new_config.scanner.max_delete_batch, Ordering::Relaxed);
                     self.shared_executor_config
                         .set_min_score(new_config.scoring.min_score);
+
+                    // Update FS collector TTL.
+                    self.fs_collector
+                        .set_ttl(Duration::from_millis(new_config.telemetry.fs_cache_ttl_ms));
+
+                    // Update VOI scheduler.
+                    self.voi_scheduler
+                        .update_config(new_config.scheduler.clone());
+                    for root in &new_config.scanner.root_paths {
+                        self.voi_scheduler.register_path(root.clone());
+                    }
 
                     // Update shared configs for scanner thread.
                     *self.shared_scoring_config.write() = new_config.scoring.clone();
@@ -1135,6 +1231,21 @@ fn scanner_thread_main(
         // instead of the O(tree_size) recursive inode scan.
         let open_files = crate::scanner::walker::collect_open_path_ancestors(&request.paths);
 
+        // Initialize per-root stats.
+        let mut root_stats_map: HashMap<PathBuf, RootScanResult> = HashMap::new();
+        for root in &request.paths {
+            root_stats_map.insert(
+                root.clone(),
+                RootScanResult {
+                    path: root.clone(),
+                    candidates_found: 0,
+                    potential_bytes: 0,
+                    false_positives: 0,
+                    duration: Duration::ZERO,
+                },
+            );
+        }
+
         // Process entries.
         for entry in rx {
             paths_scanned += 1;
@@ -1148,10 +1259,11 @@ fn scanner_thread_main(
                 continue;
             }
 
-            let is_open = crate::scanner::walker::is_path_open_by_ancestor(&entry.path, &open_files);
+            let is_open =
+                crate::scanner::walker::is_path_open_by_ancestor(&entry.path, &open_files);
 
             let input = crate::scanner::scoring::CandidateInput {
-                path: entry.path,
+                path: entry.path.clone(), // Clone needed for input
                 size_bytes: entry.metadata.size_bytes,
                 age,
                 classification,
@@ -1161,11 +1273,26 @@ fn scanner_thread_main(
             };
 
             let score = engine.score_candidate(&input, request.urgency);
+
+            // Attribute to root.
+            let root_path = request.paths.iter().find(|r| entry.path.starts_with(r));
+
             if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
                 && !score.vetoed
             {
                 candidates_found += 1;
                 scored.push(score);
+                if let Some(root) = root_path
+                    && let Some(stat) = root_stats_map.get_mut(root)
+                {
+                    stat.candidates_found += 1;
+                    stat.potential_bytes += input.size_bytes;
+                }
+            } else if score.vetoed
+                && let Some(root) = root_path
+                && let Some(stat) = root_stats_map.get_mut(root)
+            {
+                stat.false_positives += 1;
             }
         }
 
@@ -1183,6 +1310,7 @@ fn scanner_thread_main(
         let _ = report_tx.try_send(WorkerReport::ScanCompleted {
             candidates: candidates_found,
             duration: scan_start.elapsed(),
+            root_stats: root_stats_map.into_values().collect(),
         });
 
         // Send scored candidates to executor.

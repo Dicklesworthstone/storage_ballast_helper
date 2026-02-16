@@ -210,6 +210,7 @@ sbh dashboard
 ## Operator Docs
 
 - Installer/update parity contract and security policy: `docs/installer-dx-parity-matrix.md`
+- Dashboard/status baseline contract (pre-overhaul): `docs/dashboard-status-contract-baseline.md`
 - Testing + log registration guide: `docs/testing-and-logging.md`
 
 For installer/update changes, use the parity matrix as the source of truth for
