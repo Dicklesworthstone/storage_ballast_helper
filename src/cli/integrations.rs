@@ -984,7 +984,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("does not contain a JSON object")
+                .contains("does not contain a root-level closing brace")
         );
     }
 
