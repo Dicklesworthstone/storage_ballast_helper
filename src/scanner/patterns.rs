@@ -73,6 +73,7 @@ impl ArtifactClassification {
 enum MatchKind {
     Exact(&'static str),
     Prefix(&'static str),
+    #[allow(dead_code)] // variant exists for future pattern use
     Suffix(&'static str),
     #[allow(dead_code)] // match arm exists but no patterns use this variant yet
     Contains(&'static str),
@@ -259,7 +260,138 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             confidence: 0.70,
             category: ArtifactCategory::RustTarget,
         },
-        // ... (rest of builtin_patterns)
+        ArtifactPattern {
+            name: "dot-target-prefix",
+            kind: MatchKind::Prefix(".target"),
+            confidence: 0.92,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "underscore-target-prefix",
+            kind: MatchKind::Prefix("_target_"),
+            confidence: 0.88,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "cargo-target-prefix",
+            kind: MatchKind::Prefix("cargo-target-"),
+            confidence: 0.94,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "cargo-prefix",
+            kind: MatchKind::Prefix("cargo_"),
+            confidence: 0.84,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "target-prefix",
+            kind: MatchKind::Prefix("target-"),
+            confidence: 0.82,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "tmp-cargo-home",
+            kind: MatchKind::Prefix(".tmp_cargo_home_"),
+            confidence: 0.90,
+            category: ArtifactCategory::TempDir,
+        },
+        ArtifactPattern {
+            name: "tmp-codex",
+            kind: MatchKind::Prefix(".tmp-codex-"),
+            confidence: 0.86,
+            category: ArtifactCategory::AgentWorkspace,
+        },
+        ArtifactPattern {
+            name: "tmp-pijs",
+            kind: MatchKind::Prefix(".tmp-pijs-"),
+            confidence: 0.86,
+            category: ArtifactCategory::AgentWorkspace,
+        },
+        ArtifactPattern {
+            name: "tmp-ext",
+            kind: MatchKind::Prefix(".tmp-ext-"),
+            confidence: 0.82,
+            category: ArtifactCategory::AgentWorkspace,
+        },
+        ArtifactPattern {
+            name: "pi-agent",
+            kind: MatchKind::Prefix("pi_agent_"),
+            confidence: 0.85,
+            category: ArtifactCategory::AgentWorkspace,
+        },
+        ArtifactPattern {
+            name: "pi-target",
+            kind: MatchKind::Prefix("pi_target_"),
+            confidence: 0.85,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "pi-opus",
+            kind: MatchKind::Prefix("pi_opus_"),
+            confidence: 0.84,
+            category: ArtifactCategory::AgentWorkspace,
+        },
+        ArtifactPattern {
+            name: "br-build",
+            kind: MatchKind::Prefix("br-build"),
+            confidence: 0.82,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "cass-target",
+            kind: MatchKind::Prefix("cass-target"),
+            confidence: 0.82,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "node-modules",
+            kind: MatchKind::Exact("node_modules"),
+            confidence: 0.97,
+            category: ArtifactCategory::NodeModules,
+        },
+        ArtifactPattern {
+            name: "next-build",
+            kind: MatchKind::Exact(".next"),
+            confidence: 0.90,
+            category: ArtifactCategory::BuildOutput,
+        },
+        ArtifactPattern {
+            name: "python-pycache",
+            kind: MatchKind::Exact("__pycache__"),
+            confidence: 0.96,
+            category: ArtifactCategory::PythonCache,
+        },
+        ArtifactPattern {
+            name: "python-venv",
+            kind: MatchKind::Exact(".venv"),
+            confidence: 0.85,
+            category: ArtifactCategory::PythonCache,
+        },
+        ArtifactPattern {
+            name: "pytest-cache",
+            kind: MatchKind::Exact(".pytest_cache"),
+            confidence: 0.84,
+            category: ArtifactCategory::PythonCache,
+        },
+        ArtifactPattern {
+            name: "generic-cache-prefix",
+            kind: MatchKind::Prefix("cache"),
+            confidence: 0.60,
+            category: ArtifactCategory::CacheDir,
+        },
+        ArtifactPattern {
+            name: "dot-cache",
+            kind: MatchKind::Prefix(".cache"),
+            confidence: 0.62,
+            category: ArtifactCategory::CacheDir,
+        },
+        ArtifactPattern {
+            name: "generic-tmp-prefix",
+            kind: MatchKind::Prefix("tmp"),
+            confidence: 0.58,
+            category: ArtifactCategory::TempDir,
+        },
         ArtifactPattern {
             name: "dot-tmp",
             kind: MatchKind::Prefix(".tmp"),

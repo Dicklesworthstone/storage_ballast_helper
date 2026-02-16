@@ -412,11 +412,29 @@ struct DashboardArgs {
     /// Refresh interval for live view.
     #[arg(long, default_value_t = 1_000, value_name = "MILLISECONDS")]
     refresh_ms: u64,
+
+    /// Use the new Elm-style TUI dashboard (canary).
+    #[cfg(feature = "tui")]
+    #[arg(long, conflicts_with = "legacy_dashboard")]
+    #[serde(skip)]
+    new_dashboard: bool,
+
+    /// Force the legacy dashboard path (fallback).
+    #[cfg(feature = "tui")]
+    #[arg(long, conflicts_with = "new_dashboard")]
+    #[serde(skip)]
+    legacy_dashboard: bool,
 }
 
 impl Default for DashboardArgs {
     fn default() -> Self {
-        Self { refresh_ms: 1_000 }
+        Self {
+            refresh_ms: 1_000,
+            #[cfg(feature = "tui")]
+            new_dashboard: false,
+            #[cfg(feature = "tui")]
+            legacy_dashboard: false,
+        }
     }
 }
 
@@ -2724,6 +2742,23 @@ fn run_live_status_loop(
 }
 
 fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
+    #[cfg(feature = "tui")]
+    if args.new_dashboard {
+        use storage_ballast_helper::tui::{run_new_dashboard, NewDashboardConfig};
+
+        let config =
+            Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+        let state_file = config.state_file_path();
+        let monitor_paths = config.monitor_paths();
+
+        let tui_config = NewDashboardConfig {
+            state_file,
+            refresh: std::time::Duration::from_millis(normalize_refresh_ms(args.refresh_ms)),
+            monitor_paths,
+        };
+        return run_new_dashboard(&tui_config).map_err(|e| CliError::Runtime(e.to_string()));
+    }
+
     run_live_status_loop(cli, args.refresh_ms, "dashboard", false)
 }
 
