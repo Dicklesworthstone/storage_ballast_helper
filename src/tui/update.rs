@@ -30,7 +30,10 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             // Request telemetry data when on a screen that needs it.
             if matches!(
                 model.screen,
-                Screen::Timeline | Screen::Explainability | Screen::Candidates
+                Screen::Timeline
+                    | Screen::Explainability
+                    | Screen::Candidates
+                    | Screen::Ballast
             ) {
                 cmds.push(DashboardCmd::FetchTelemetry);
             }
@@ -268,6 +271,7 @@ fn handle_screen_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent
         Screen::Explainability => handle_explainability_key(model, key),
         Screen::Candidates => handle_candidates_key(model, key),
         Screen::Diagnostics => handle_diagnostics_key(model, key),
+        Screen::Ballast => handle_ballast_key(model, key),
         _ => DashboardCmd::None,
     }
 }
@@ -365,6 +369,38 @@ fn handle_candidates_key(
         // s: cycle sort order.
         KeyCode::Char('s') => {
             model.candidates_cycle_sort();
+            DashboardCmd::None
+        }
+        _ => DashboardCmd::None,
+    }
+}
+
+/// Handle keys specific to the Ballast screen (S5).
+fn handle_ballast_key(
+    model: &mut DashboardModel,
+    key: ftui_core::event::KeyEvent,
+) -> DashboardCmd {
+    match key.code {
+        // Up/k: move cursor up in the volumes list.
+        KeyCode::Up | KeyCode::Char('k') => {
+            model.ballast_cursor_up();
+            DashboardCmd::None
+        }
+        // Down/j: move cursor down in the volumes list.
+        KeyCode::Down | KeyCode::Char('j') => {
+            model.ballast_cursor_down();
+            DashboardCmd::None
+        }
+        // Enter/Space: toggle detail pane for selected volume.
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            model.ballast_toggle_detail();
+            DashboardCmd::None
+        }
+        // d: close detail pane (if open).
+        KeyCode::Char('d') => {
+            if model.ballast_detail {
+                model.ballast_detail = false;
+            }
             DashboardCmd::None
         }
         _ => DashboardCmd::None,
@@ -1696,6 +1732,199 @@ mod tests {
                 !has_telemetry,
                 "Tick on S7 should not include FetchTelemetry"
             );
+        }
+    }
+
+    // ── S5 Ballast key handling tests ──
+
+    use crate::tui::model::BallastVolume;
+
+    fn sample_volume(mount: &str, available: usize, total: usize) -> BallastVolume {
+        BallastVolume {
+            mount_point: mount.to_string(),
+            ballast_dir: format!("{mount}/.sbh/ballast"),
+            fs_type: "ext4".to_string(),
+            strategy: "fallocate".to_string(),
+            files_available: available,
+            files_total: total,
+            releasable_bytes: available as u64 * 1_073_741_824,
+            skipped: false,
+            skip_reason: None,
+        }
+    }
+
+    #[test]
+    fn ballast_j_k_navigate_cursor() {
+        let mut model = test_model();
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![
+            sample_volume("/", 3, 5),
+            sample_volume("/data", 2, 5),
+            sample_volume("/home", 4, 5),
+        ];
+        assert_eq!(model.ballast_selected, 0);
+
+        // j moves down
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.ballast_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.ballast_selected, 2);
+
+        // j at bottom is clamped
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.ballast_selected, 2);
+
+        // k moves up
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
+        assert_eq!(model.ballast_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
+        assert_eq!(model.ballast_selected, 0);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
+        assert_eq!(model.ballast_selected, 0);
+    }
+
+    #[test]
+    fn ballast_arrows_navigate_cursor() {
+        let mut model = test_model();
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![sample_volume("/", 3, 5), sample_volume("/data", 2, 5)];
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Down)));
+        assert_eq!(model.ballast_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Up)));
+        assert_eq!(model.ballast_selected, 0);
+    }
+
+    #[test]
+    fn ballast_enter_toggles_detail() {
+        let mut model = test_model();
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![sample_volume("/", 3, 5)];
+        assert!(!model.ballast_detail);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(model.ballast_detail);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(!model.ballast_detail);
+    }
+
+    #[test]
+    fn ballast_space_toggles_detail() {
+        let mut model = test_model();
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![sample_volume("/", 3, 5)];
+        assert!(!model.ballast_detail);
+
+        update(
+            &mut model,
+            DashboardMsg::Key(make_key(KeyCode::Char(' '))),
+        );
+        assert!(model.ballast_detail);
+    }
+
+    #[test]
+    fn ballast_d_closes_detail() {
+        let mut model = test_model();
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![sample_volume("/", 3, 5)];
+        model.ballast_detail = true;
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('d'))));
+        assert!(!model.ballast_detail);
+    }
+
+    #[test]
+    fn ballast_d_noop_when_detail_closed() {
+        let mut model = test_model();
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![sample_volume("/", 3, 5)];
+        assert!(!model.ballast_detail);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('d'))));
+        assert!(!model.ballast_detail);
+    }
+
+    #[test]
+    fn ballast_keys_noop_on_other_screens() {
+        let mut model = test_model();
+        model.screen = Screen::Overview;
+        model.ballast_volumes = vec![sample_volume("/", 3, 5), sample_volume("/data", 2, 5)];
+
+        // j should not move ballast cursor on overview
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.ballast_selected, 0);
+    }
+
+    #[test]
+    fn telemetry_ballast_msg_updates_model() {
+        let mut model = test_model();
+        let result = TelemetryResult {
+            data: vec![sample_volume("/", 3, 5), sample_volume("/data", 2, 5)],
+            source: DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        };
+
+        let cmd = update(&mut model, DashboardMsg::TelemetryBallast(result));
+        assert!(matches!(cmd, DashboardCmd::None));
+        assert_eq!(model.ballast_volumes.len(), 2);
+        assert_eq!(model.ballast_source, DataSource::Sqlite);
+        assert!(!model.ballast_partial);
+    }
+
+    #[test]
+    fn telemetry_ballast_clamps_cursor() {
+        let mut model = test_model();
+        model.ballast_selected = 5; // out of range
+
+        let result = TelemetryResult {
+            data: vec![sample_volume("/", 3, 5), sample_volume("/data", 2, 5)],
+            source: DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        };
+
+        update(&mut model, DashboardMsg::TelemetryBallast(result));
+        assert_eq!(model.ballast_selected, 1); // clamped to last
+    }
+
+    #[test]
+    fn telemetry_ballast_empty_resets_state() {
+        let mut model = test_model();
+        model.ballast_selected = 3;
+        model.ballast_detail = true;
+
+        let result = TelemetryResult {
+            data: vec![],
+            source: DataSource::None,
+            partial: true,
+            diagnostics: String::from("no ballast data"),
+        };
+
+        update(&mut model, DashboardMsg::TelemetryBallast(result));
+        assert_eq!(model.ballast_selected, 0);
+        assert!(!model.ballast_detail);
+        assert!(model.ballast_partial);
+    }
+
+    #[test]
+    fn tick_on_ballast_requests_telemetry() {
+        let mut model = test_model();
+        model.screen = Screen::Ballast;
+
+        let cmd = update(&mut model, DashboardMsg::Tick);
+        if let DashboardCmd::Batch(cmds) = cmd {
+            let has_telemetry = cmds
+                .iter()
+                .any(|c| matches!(c, DashboardCmd::FetchTelemetry));
+            assert!(has_telemetry, "Tick on S5 should include FetchTelemetry");
+        } else {
+            panic!("Expected Batch command from Tick");
         }
     }
 }

@@ -367,6 +367,140 @@ fn build_wide_timeline(cols: u16, rows: u16) -> TimelineLayout {
     }
 }
 
+// ──────────────────── ballast layout (S5) ────────────────────
+
+/// Panes for the ballast operations screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BallastPane {
+    /// Per-volume inventory list (main area).
+    VolumeList,
+    /// Detail panel for the selected volume (shown in wide layout).
+    VolumeDetail,
+    /// Status footer with data-source indicator and volume count.
+    StatusFooter,
+}
+
+impl BallastPane {
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::VolumeList => "bl-volume-list",
+            Self::VolumeDetail => "bl-volume-detail",
+            Self::StatusFooter => "bl-status-footer",
+        }
+    }
+}
+
+/// Placement for a ballast pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BallastPlacement {
+    pub pane: BallastPane,
+    pub priority: PanePriority,
+    pub rect: PaneRect,
+    pub visible: bool,
+}
+
+impl BallastPlacement {
+    #[must_use]
+    pub const fn new(
+        pane: BallastPane,
+        priority: PanePriority,
+        rect: PaneRect,
+        visible: bool,
+    ) -> Self {
+        Self {
+            pane,
+            priority,
+            rect,
+            visible,
+        }
+    }
+}
+
+/// Complete ballast layout plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BallastLayout {
+    pub class: LayoutClass,
+    pub placements: Vec<BallastPlacement>,
+}
+
+/// Build pane placements for the ballast screen.
+#[must_use]
+pub fn build_ballast_layout(cols: u16, rows: u16) -> BallastLayout {
+    match classify_layout(cols) {
+        LayoutClass::Narrow => build_narrow_ballast(cols, rows),
+        LayoutClass::Wide => build_wide_ballast(cols, rows),
+    }
+}
+
+fn build_narrow_ballast(cols: u16, rows: u16) -> BallastLayout {
+    let w = cols.max(1);
+    let footer_row = rows.saturating_sub(1);
+    let list_height = footer_row.max(1);
+
+    let placements = vec![
+        BallastPlacement::new(
+            BallastPane::VolumeList,
+            PanePriority::P0,
+            PaneRect::new(0, 0, w, list_height),
+            true,
+        ),
+        // Detail panel hidden in narrow layout.
+        BallastPlacement::new(
+            BallastPane::VolumeDetail,
+            PanePriority::P2,
+            PaneRect::new(0, 0, 0, 0),
+            false,
+        ),
+        BallastPlacement::new(
+            BallastPane::StatusFooter,
+            PanePriority::P0,
+            PaneRect::new(0, footer_row, w, 1),
+            true,
+        ),
+    ];
+
+    BallastLayout {
+        class: LayoutClass::Narrow,
+        placements,
+    }
+}
+
+fn build_wide_ballast(cols: u16, rows: u16) -> BallastLayout {
+    let full_width = cols.max(1);
+    let (list_width, detail_width) = split_columns(full_width, 1);
+    let detail_col = list_width.saturating_add(1);
+    let footer_row = rows.saturating_sub(1);
+    let body_height = footer_row.max(1);
+    let detail_visible = rows >= 10;
+
+    let placements = vec![
+        BallastPlacement::new(
+            BallastPane::VolumeList,
+            PanePriority::P0,
+            PaneRect::new(0, 0, list_width, body_height),
+            true,
+        ),
+        BallastPlacement::new(
+            BallastPane::VolumeDetail,
+            PanePriority::P1,
+            PaneRect::new(detail_col, 0, detail_width, body_height),
+            detail_visible,
+        ),
+        BallastPlacement::new(
+            BallastPane::StatusFooter,
+            PanePriority::P0,
+            PaneRect::new(0, footer_row, full_width, 1),
+            true,
+        ),
+    ];
+
+    BallastLayout {
+        class: LayoutClass::Wide,
+        placements,
+    }
+}
+
 fn split_columns(cols: u16, gutter: u16) -> (u16, u16) {
     let usable = cols.saturating_sub(gutter);
     let left = (usable.saturating_mul(3) / 5).max(1);
@@ -465,6 +599,72 @@ mod tests {
             TimelinePane::EventList,
             TimelinePane::EventDetail,
             TimelinePane::StatusFooter,
+        ];
+        let ids: Vec<_> = panes.iter().map(|p| p.id()).collect();
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    // ── Ballast layout ──
+
+    #[test]
+    fn narrow_ballast_hides_detail_panel() {
+        let layout = build_ballast_layout(80, 24);
+        assert_eq!(layout.class, LayoutClass::Narrow);
+        let detail = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == BallastPane::VolumeDetail);
+        assert!(detail.is_some_and(|p| !p.visible));
+    }
+
+    #[test]
+    fn narrow_ballast_has_list_and_footer() {
+        let layout = build_ballast_layout(80, 24);
+        let list = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == BallastPane::VolumeList);
+        assert!(list.is_some_and(|p| p.visible && p.rect.height > 0));
+        let footer = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == BallastPane::StatusFooter);
+        assert!(footer.is_some_and(|p| p.visible));
+    }
+
+    #[test]
+    fn wide_ballast_shows_detail_panel() {
+        let layout = build_ballast_layout(140, 30);
+        assert_eq!(layout.class, LayoutClass::Wide);
+        let detail = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == BallastPane::VolumeDetail)
+            .expect("detail pane");
+        assert!(detail.visible);
+        assert!(detail.rect.col > 0);
+    }
+
+    #[test]
+    fn wide_ballast_detail_hidden_on_short_terminal() {
+        let layout = build_ballast_layout(140, 8);
+        let detail = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == BallastPane::VolumeDetail);
+        assert!(detail.is_some_and(|p| !p.visible));
+    }
+
+    #[test]
+    fn ballast_pane_ids_are_unique() {
+        let panes = [
+            BallastPane::VolumeList,
+            BallastPane::VolumeDetail,
+            BallastPane::StatusFooter,
         ];
         let ids: Vec<_> = panes.iter().map(|p| p.id()).collect();
         for (i, a) in ids.iter().enumerate() {
