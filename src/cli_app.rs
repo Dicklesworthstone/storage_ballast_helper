@@ -613,31 +613,6 @@ fn run_daemon(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Runtime(format!("daemon runtime failure: {e}")))
 }
 
-#[allow(dead_code)]
-fn ballast_command_label(args: &BallastArgs) -> &'static str {
-    match args.command {
-        None => "ballast",
-        Some(BallastCommand::Status) => "ballast status",
-        Some(BallastCommand::Provision) => "ballast provision",
-        Some(BallastCommand::Release(_)) => "ballast release",
-        Some(BallastCommand::Replenish) => "ballast replenish",
-        Some(BallastCommand::Verify) => "ballast verify",
-    }
-}
-
-#[allow(dead_code)]
-fn config_command_label(args: &ConfigArgs) -> &'static str {
-    match args.command {
-        None => "config",
-        Some(ConfigCommand::Path) => "config path",
-        Some(ConfigCommand::Show) => "config show",
-        Some(ConfigCommand::Validate) => "config validate",
-        Some(ConfigCommand::Diff) => "config diff",
-        Some(ConfigCommand::Reset) => "config reset",
-        Some(ConfigCommand::Set(_)) => "config set",
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     // -- wizard / auto mode ---------------------------------------------------

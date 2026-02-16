@@ -119,9 +119,6 @@ impl MultiProvisionReport {
 /// Release targets the exact volume under pressure.
 pub struct BallastPoolCoordinator {
     pools: HashMap<PathBuf, BallastPool>,
-    /// Retained for dynamic reconfiguration and `inventory()` reporting.
-    #[allow(dead_code)]
-    config: BallastConfig,
 }
 
 impl BallastPoolCoordinator {
@@ -209,10 +206,7 @@ impl BallastPoolCoordinator {
             );
         }
 
-        Ok(Self {
-            pools,
-            config: config.clone(),
-        })
+        Ok(Self { pools })
     }
 
     /// Provision all pools (idempotent: skips existing valid files).
