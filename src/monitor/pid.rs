@@ -244,14 +244,14 @@ fn classify_with_hysteresis(
         return raw;
     }
 
-    // Slow decay: if the new level is less severe, only switch if we've
-    // cleared the hysteresis threshold for the CURRENT level.
-    // This prevents rapid oscillation at boundaries.
+    // Slow decay: if the new level is less severe, only step DOWN one level
+    // per tick if we've cleared the hysteresis threshold for the CURRENT level.
+    // This prevents rapid oscillation at boundaries and ensures gradual recovery.
     match current {
         PressureLevel::Critical => {
             // To leave Critical, we must be above the Red threshold + hysteresis.
             if free_pct >= red_min + hysteresis {
-                raw
+                PressureLevel::Red
             } else {
                 PressureLevel::Critical
             }
@@ -259,7 +259,7 @@ fn classify_with_hysteresis(
         PressureLevel::Red => {
             // To leave Red, we must be above the Orange threshold + hysteresis.
             if free_pct >= orange_min + hysteresis {
-                raw
+                PressureLevel::Orange
             } else {
                 PressureLevel::Red
             }
@@ -267,7 +267,7 @@ fn classify_with_hysteresis(
         PressureLevel::Orange => {
             // To leave Orange, we must be above the Yellow threshold + hysteresis.
             if free_pct >= yellow_min + hysteresis {
-                raw
+                PressureLevel::Yellow
             } else {
                 PressureLevel::Orange
             }
@@ -275,7 +275,7 @@ fn classify_with_hysteresis(
         PressureLevel::Yellow => {
             // To leave Yellow, we must be above the Green threshold + hysteresis.
             if free_pct >= green_min + hysteresis {
-                raw
+                PressureLevel::Green
             } else {
                 PressureLevel::Yellow
             }
@@ -752,8 +752,8 @@ mod tests {
         assert!(pid.integral < 0.0);
         let integral_before = pid.integral;
 
-        // 2. Drop to Yellow (current=12%). Level changes Green -> Yellow.
-        // This should trigger the reset logic.
+        // 2. Drop to Orange (current=12%). Level changes Green -> Orange via fast-attack.
+        // 12% < yellow_min(14%) so raw_classify => Orange. This should trigger the reset logic.
         let response = pid.update(
             PressureReading {
                 free_bytes: 12,
@@ -764,7 +764,7 @@ mod tests {
             t0 + Duration::from_secs(1),
         );
 
-        assert_eq!(response.level, PressureLevel::Yellow);
+        assert_eq!(response.level, PressureLevel::Orange);
         // Integral accumulates the new error first, then resets to 0.0 on level change.
         // This clears the windup from the previous state. The fresh error (18 - 12 = 6)
         // will be accumulated on the NEXT update call, starting from a clean slate.

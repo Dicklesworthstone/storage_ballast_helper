@@ -3970,7 +3970,8 @@ fn run_interactive_clean(
 
         if action == 'y' {
             // Re-check if path is still in use before deleting.
-            let (fresh_open_paths, _) = collect_open_path_ancestors(std::slice::from_ref(&candidate.path));
+            let (fresh_open_paths, _) =
+                collect_open_path_ancestors(std::slice::from_ref(&candidate.path));
             if is_path_open_by_ancestor(&candidate.path, &fresh_open_paths) {
                 eprintln!("    Skipped (now in use): {}", candidate.path.display());
                 items_skipped += 1;
