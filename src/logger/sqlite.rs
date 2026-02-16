@@ -7,8 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags, params};
 use rusqlite::functions::FunctionFlags;
+use rusqlite::{Connection, OpenFlags, params};
 
 use crate::core::errors::{Result, SbhError};
 

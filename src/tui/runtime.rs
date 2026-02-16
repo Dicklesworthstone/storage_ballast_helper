@@ -76,7 +76,10 @@ mod tests {
 
     #[test]
     fn runtime_mode_defaults_to_new_cockpit() {
-        assert_eq!(DashboardRuntimeMode::default(), DashboardRuntimeMode::NewCockpit);
+        assert_eq!(
+            DashboardRuntimeMode::default(),
+            DashboardRuntimeMode::NewCockpit
+        );
     }
 
     #[test]

@@ -12,7 +12,11 @@ pub struct TelemetrySample {
 
 impl TelemetrySample {
     #[must_use]
-    pub fn new(source: impl Into<String>, kind: impl Into<String>, detail: impl Into<String>) -> Self {
+    pub fn new(
+        source: impl Into<String>,
+        kind: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             source: source.into(),
             kind: kind.into(),

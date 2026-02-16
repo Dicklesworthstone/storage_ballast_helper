@@ -413,16 +413,12 @@ struct DashboardArgs {
     #[arg(long, default_value_t = 1_000, value_name = "MILLISECONDS")]
     refresh_ms: u64,
 
-    /// Use the new Elm-style TUI dashboard (canary).
-    #[cfg(feature = "tui")]
+    /// Route through the new canonical dashboard runtime (canary path).
     #[arg(long, conflicts_with = "legacy_dashboard")]
-    #[serde(skip)]
     new_dashboard: bool,
 
-    /// Force the legacy dashboard path (fallback).
-    #[cfg(feature = "tui")]
+    /// Force legacy dashboard behavior during migration or incident fallback.
     #[arg(long, conflicts_with = "new_dashboard")]
-    #[serde(skip)]
     legacy_dashboard: bool,
 }
 
@@ -430,9 +426,7 @@ impl Default for DashboardArgs {
     fn default() -> Self {
         Self {
             refresh_ms: 1_000,
-            #[cfg(feature = "tui")]
             new_dashboard: false,
-            #[cfg(feature = "tui")]
             legacy_dashboard: false,
         }
     }
@@ -1516,7 +1510,21 @@ fn run_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
     let processes = collect_process_info();
 
     // Walk the configured roots for build artifacts.
-    let root_paths = config.scanner.root_paths.clone();
+    // Canonicalize to ensure absolute paths for system protection checks.
+    let raw_roots = config.scanner.root_paths.clone();
+    let root_paths: Vec<PathBuf> = raw_roots
+        .into_iter()
+        .filter_map(|p| match p.canonicalize() {
+            Ok(abs) => Some(abs),
+            Err(e) => {
+                if output_mode(cli) == OutputMode::Human {
+                    eprintln!("Warning: skipping invalid configured path {}: {}", p.display(), e);
+                }
+                None
+            }
+        })
+        .collect();
+
     let protection_patterns = if config.scanner.protected_paths.is_empty() {
         None
     } else {
@@ -2741,25 +2749,77 @@ fn run_live_status_loop(
     }
 }
 
-fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
-    #[cfg(feature = "tui")]
-    if args.new_dashboard {
-        use storage_ballast_helper::tui::{run_new_dashboard, NewDashboardConfig};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardRuntimeSelection {
+    Legacy,
+    New,
+}
 
-        let config =
-            Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
-        let state_file = config.state_file_path();
-        let monitor_paths = config.monitor_paths();
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
+struct DashboardRuntimeRequest {
+    refresh_ms: u64,
+    state_file: PathBuf,
+    monitor_paths: Vec<PathBuf>,
+    selection: DashboardRuntimeSelection,
+}
 
-        let tui_config = NewDashboardConfig {
-            state_file,
-            refresh: std::time::Duration::from_millis(normalize_refresh_ms(args.refresh_ms)),
-            monitor_paths,
-        };
-        return run_new_dashboard(&tui_config).map_err(|e| CliError::Runtime(e.to_string()));
+fn resolve_dashboard_runtime(args: &DashboardArgs) -> DashboardRuntimeSelection {
+    if args.legacy_dashboard {
+        DashboardRuntimeSelection::Legacy
+    } else if args.new_dashboard {
+        DashboardRuntimeSelection::New
+    } else {
+        DashboardRuntimeSelection::Legacy
     }
+}
 
-    run_live_status_loop(cli, args.refresh_ms, "dashboard", false)
+fn run_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Result<(), CliError> {
+    match request.selection {
+        DashboardRuntimeSelection::Legacy => {
+            run_live_status_loop(cli, request.refresh_ms, "dashboard", false)
+        }
+        DashboardRuntimeSelection::New => run_new_dashboard_runtime(request),
+    }
+}
+
+#[cfg(feature = "tui")]
+fn run_new_dashboard_runtime(request: &DashboardRuntimeRequest) -> Result<(), CliError> {
+    use storage_ballast_helper::tui::{
+        self, DashboardRuntimeConfig as NewDashboardRuntimeConfig, DashboardRuntimeMode,
+    };
+
+    let config = NewDashboardRuntimeConfig {
+        state_file: request.state_file.clone(),
+        refresh: std::time::Duration::from_millis(request.refresh_ms),
+        monitor_paths: request.monitor_paths.clone(),
+        mode: DashboardRuntimeMode::NewCockpit,
+    };
+    tui::run_dashboard(&config)
+        .map_err(|e| CliError::Runtime(format!("dashboard runtime failure: {e}")))
+}
+
+#[cfg(not(feature = "tui"))]
+fn run_new_dashboard_runtime(_request: &DashboardRuntimeRequest) -> Result<(), CliError> {
+    Err(CliError::User(
+        "dashboard: --new-dashboard requires a binary built with `--features tui`".to_string(),
+    ))
+}
+
+fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
+    let mode = output_mode(cli);
+    validate_live_mode_output(mode, "dashboard", false)?;
+
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let request = DashboardRuntimeRequest {
+        refresh_ms: normalize_refresh_ms(args.refresh_ms),
+        state_file: config.paths.state_file.clone(),
+        monitor_paths: config.scanner.root_paths.clone(),
+        selection: resolve_dashboard_runtime(args),
+    };
+
+    run_dashboard_runtime(cli, &request)
 }
 
 fn run_status(cli: &Cli, args: &StatusArgs) -> Result<(), CliError> {
@@ -3156,11 +3216,29 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let start = std::time::Instant::now();
 
     // Determine scan roots: CLI paths or configured watched paths.
-    let root_paths = if args.paths.is_empty() {
+    // Canonicalize to ensure absolute paths for system protection checks.
+    let raw_roots = if args.paths.is_empty() {
         config.scanner.root_paths.clone()
     } else {
         args.paths.clone()
     };
+
+    let root_paths: Vec<PathBuf> = raw_roots
+        .into_iter()
+        .filter_map(|p| match p.canonicalize() {
+            Ok(abs) => Some(abs),
+            Err(e) => {
+                if output_mode(cli) == OutputMode::Human {
+                    eprintln!("Warning: skipping invalid path {}: {}", p.display(), e);
+                }
+                None
+            }
+        })
+        .collect();
+
+    if root_paths.is_empty() {
+        return Err(CliError::User("no valid scan paths found".to_string()));
+    }
 
     // Build protection registry from config patterns.
     let protection_patterns = if config.scanner.protected_paths.is_empty() {
@@ -3353,11 +3431,29 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let start = std::time::Instant::now();
 
     // Determine scan roots: CLI paths or configured watched paths.
-    let root_paths = if args.paths.is_empty() {
+    // Canonicalize to ensure absolute paths for system protection checks.
+    let raw_roots = if args.paths.is_empty() {
         config.scanner.root_paths.clone()
     } else {
         args.paths.clone()
     };
+
+    let root_paths: Vec<PathBuf> = raw_roots
+        .into_iter()
+        .filter_map(|p| match p.canonicalize() {
+            Ok(abs) => Some(abs),
+            Err(e) => {
+                if output_mode(cli) == OutputMode::Human {
+                    eprintln!("Warning: skipping invalid path {}: {}", p.display(), e);
+                }
+                None
+            }
+        })
+        .collect();
+
+    if root_paths.is_empty() {
+        return Err(CliError::User("no valid scan paths found".to_string()));
+    }
 
     // Build protection registry.
     let protection_patterns = if config.scanner.protected_paths.is_empty() {
@@ -4003,11 +4099,29 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     let config = Config::default();
 
     // Determine scan roots: CLI paths, then fall back to defaults.
-    let root_paths = if args.paths.is_empty() {
+    // Canonicalize to ensure absolute paths for system protection checks.
+    let raw_roots = if args.paths.is_empty() {
         config.scanner.root_paths.clone()
     } else {
         args.paths.clone()
     };
+
+    let root_paths: Vec<PathBuf> = raw_roots
+        .into_iter()
+        .filter_map(|p| match p.canonicalize() {
+            Ok(abs) => Some(abs),
+            Err(e) => {
+                if output_mode(cli) == OutputMode::Human {
+                    eprintln!("Warning: skipping invalid path {}: {}", p.display(), e);
+                }
+                None
+            }
+        })
+        .collect();
+
+    if root_paths.is_empty() {
+        return Err(CliError::User("no valid scan paths found".to_string()));
+    }
 
     // Marker-only protection: honors .sbh-protect files on disk, no config patterns.
     let protection = ProtectionRegistry::marker_only();
@@ -5059,6 +5173,8 @@ mod tests {
             vec!["sbh", "check", "/data", "--target-free", "20"],
             vec!["sbh", "blame", "--top", "10"],
             vec!["sbh", "dashboard", "--refresh-ms", "250"],
+            vec!["sbh", "dashboard", "--new-dashboard"],
+            vec!["sbh", "dashboard", "--legacy-dashboard"],
             vec!["sbh", "ballast", "status"],
             vec!["sbh", "ballast", "release", "2"],
             vec!["sbh", "config", "path"],
@@ -5127,6 +5243,53 @@ mod tests {
         let err_text = result.err().map_or_else(String::new, |e| e.to_string());
         assert!(err_text.contains("dashboard"));
         assert!(err_text.contains("does not support --json"));
+    }
+
+    #[test]
+    fn dashboard_runtime_flags_conflict() {
+        assert!(
+            Cli::try_parse_from(["sbh", "dashboard", "--new-dashboard", "--legacy-dashboard"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_dashboard_runtime_prefers_explicit_flags() {
+        let defaults = DashboardArgs::default();
+        assert_eq!(
+            resolve_dashboard_runtime(&defaults),
+            DashboardRuntimeSelection::Legacy
+        );
+
+        let mut new_args = DashboardArgs::default();
+        new_args.new_dashboard = true;
+        assert_eq!(
+            resolve_dashboard_runtime(&new_args),
+            DashboardRuntimeSelection::New
+        );
+
+        let mut legacy_args = DashboardArgs::default();
+        legacy_args.legacy_dashboard = true;
+        assert_eq!(
+            resolve_dashboard_runtime(&legacy_args),
+            DashboardRuntimeSelection::Legacy
+        );
+    }
+
+    #[cfg(not(feature = "tui"))]
+    #[test]
+    fn new_dashboard_requires_tui_feature() {
+        let request = DashboardRuntimeRequest {
+            refresh_ms: 1_000,
+            state_file: PathBuf::from("/tmp/state.json"),
+            monitor_paths: vec![PathBuf::from("/tmp")],
+            selection: DashboardRuntimeSelection::New,
+        };
+
+        let err_text = run_new_dashboard_runtime(&request)
+            .err()
+            .map_or_else(String::new, |e| e.to_string());
+        assert!(err_text.contains("--features tui"));
     }
 
     #[test]

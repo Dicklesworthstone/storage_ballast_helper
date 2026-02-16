@@ -21,7 +21,7 @@ required-features = ["cli"]
 default = ["cli", "daemon", "sqlite"]
 cli = ["dep:clap", "dep:clap_complete", "dep:colored", "sqlite", "daemon"]
 daemon = ["dep:signal-hook"]
-tui = ["dep:crossterm"]
+tui = ["dep:crossterm", "cli"]
 sqlite = ["dep:rusqlite"]
 
 [dependencies]

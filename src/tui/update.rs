@@ -123,6 +123,7 @@ mod tests {
             uptime_seconds: 3600,
             last_updated: String::from("2026-02-16T01:00:00Z"),
             pressure: PressureState {
+                overall: String::from("yellow"),
                 mounts: vec![MountPressure {
                     path: String::from("/"),
                     free_pct: 45.0,
@@ -191,10 +192,7 @@ mod tests {
     #[test]
     fn unknown_key_is_noop() {
         let mut model = test_model();
-        let cmd = update(
-            &mut model,
-            DashboardMsg::Key(make_key(KeyCode::Char('z'))),
-        );
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('z'))));
         assert!(!model.quit);
         assert!(matches!(cmd, DashboardCmd::None));
     }
@@ -273,10 +271,7 @@ mod tests {
         // Second update with no mounts at all.
         let mut empty_state = sample_daemon_state();
         empty_state.pressure.mounts.clear();
-        update(
-            &mut model,
-            DashboardMsg::DataUpdate(Some(empty_state)),
-        );
+        update(&mut model, DashboardMsg::DataUpdate(Some(empty_state)));
         assert!(model.rate_histories.is_empty());
     }
 
