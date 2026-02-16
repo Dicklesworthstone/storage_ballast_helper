@@ -5,7 +5,7 @@
 use super::layout::{
     OverviewPane, PanePriority, TimelinePane, build_overview_layout, build_timeline_layout,
 };
-use super::model::{BallastVolume, DashboardModel, NotificationLevel, Screen, SeverityFilter};
+use super::model::{BallastVolume, DashboardModel, NotificationLevel, Screen};
 use super::theme::{AccessibilityProfile, Theme, ThemePalette};
 use super::widgets::{
     extract_time, gauge, human_bytes, human_duration, human_rate, section_header, sparkline,
@@ -36,8 +36,8 @@ pub fn render(model: &DashboardModel) -> String {
     let _ = writeln!(
         out,
         "theme={} spacing={}",
-        color_mode_label(theme),
-        spacing_mode_label(theme),
+        color_mode_label(&theme),
+        spacing_mode_label(&theme),
     );
 
     if let Some(ref overlay) = model.active_overlay {
@@ -46,13 +46,13 @@ pub fn render(model: &DashboardModel) -> String {
 
     // Screen-specific content.
     match model.screen {
-        Screen::Overview => render_overview(model, theme, &mut out),
-        Screen::Timeline => render_timeline(model, theme, &mut out),
-        Screen::Explainability => render_explainability(model, theme, &mut out),
-        Screen::Candidates => render_candidates(model, theme, &mut out),
-        Screen::Diagnostics => render_diagnostics(model, theme, &mut out),
-        Screen::Ballast => render_ballast(model, theme, &mut out),
-        screen => render_screen_stub(screen_label(screen), theme, &mut out),
+        Screen::Overview => render_overview(model, &theme, &mut out),
+        Screen::Timeline => render_timeline(model, &theme, &mut out),
+        Screen::Explainability => render_explainability(model, &theme, &mut out),
+        Screen::Candidates => render_candidates(model, &theme, &mut out),
+        Screen::Diagnostics => render_diagnostics(model, &theme, &mut out),
+        Screen::Ballast => render_ballast(model, &theme, &mut out),
+        screen => render_screen_stub(screen_label(screen), &theme, &mut out),
     }
 
     // Notification toasts (O4).
@@ -76,7 +76,7 @@ fn screen_label(screen: Screen) -> &'static str {
     }
 }
 
-fn color_mode_label(theme: Theme) -> &'static str {
+fn color_mode_label(theme: &Theme) -> &'static str {
     if theme.accessibility.no_color() {
         "mono"
     } else {
@@ -84,7 +84,7 @@ fn color_mode_label(theme: Theme) -> &'static str {
     }
 }
 
-fn spacing_mode_label(theme: Theme) -> &'static str {
+fn spacing_mode_label(theme: &Theme) -> &'static str {
     if theme.spacing.outer_padding == 0 {
         "compact"
     } else {
@@ -92,7 +92,7 @@ fn spacing_mode_label(theme: Theme) -> &'static str {
     }
 }
 
-fn render_overview(model: &DashboardModel, theme: Theme, out: &mut String) {
+fn render_overview(model: &DashboardModel, theme: &Theme, out: &mut String) {
     use std::fmt::Write as _;
     let layout = build_overview_layout(model.terminal_size.0, model.terminal_size.1);
     let visible = layout.placements.iter().filter(|pane| pane.visible).count();
@@ -142,7 +142,7 @@ fn pane_priority_label(priority: PanePriority) -> &'static str {
     }
 }
 
-fn render_pressure_summary(model: &DashboardModel, theme: Theme, pane_width: u16) -> String {
+fn render_pressure_summary(model: &DashboardModel, theme: &Theme, pane_width: u16) -> String {
     use std::fmt::Write as _;
 
     if let Some(ref state) = model.daemon_state {
@@ -257,7 +257,7 @@ fn render_recent_activity(model: &DashboardModel) -> String {
     }
 }
 
-fn render_ballast_quick(model: &DashboardModel, theme: Theme) -> String {
+fn render_ballast_quick(model: &DashboardModel, theme: &Theme) -> String {
     if let Some(ref state) = model.daemon_state {
         let (palette, label) = if state.ballast.total > 0 && state.ballast.available == 0 {
             (theme.palette.critical, "CRITICAL")
@@ -294,7 +294,7 @@ fn render_extended_counters(model: &DashboardModel) -> String {
 
 // ──────────────────── S2: Timeline ────────────────────
 
-fn render_timeline(model: &DashboardModel, theme: Theme, out: &mut String) {
+fn render_timeline(model: &DashboardModel, theme: &Theme, out: &mut String) {
     use std::fmt::Write as _;
     let layout = build_timeline_layout(model.terminal_size.0, model.terminal_size.1);
 
@@ -413,7 +413,7 @@ fn render_timeline(model: &DashboardModel, theme: Theme, out: &mut String) {
     }
 }
 
-fn render_event_row(cursor: &str, event: &TimelineEvent, theme: Theme, out: &mut String) {
+fn render_event_row(cursor: &str, event: &TimelineEvent, theme: &Theme, out: &mut String) {
     use std::fmt::Write as _;
     let time = extract_time(&event.timestamp);
     let sev_badge = severity_badge(&event.severity, theme);
@@ -435,7 +435,7 @@ fn render_event_row(cursor: &str, event: &TimelineEvent, theme: Theme, out: &mut
     );
 }
 
-fn render_event_detail(event: &TimelineEvent, theme: Theme, out: &mut String) {
+fn render_event_detail(event: &TimelineEvent, theme: &Theme, out: &mut String) {
     use std::fmt::Write as _;
     let _ = writeln!(out, "  timestamp:  {}", event.timestamp);
     let _ = writeln!(out, "  event-type: {}", event.event_type);
@@ -475,7 +475,7 @@ fn render_event_detail(event: &TimelineEvent, theme: Theme, out: &mut String) {
     }
 }
 
-fn severity_badge(severity: &str, theme: Theme) -> String {
+fn severity_badge(severity: &str, theme: &Theme) -> String {
     let (palette, label) = match severity {
         "critical" => (theme.palette.critical, "CRITICAL"),
         "warning" => (theme.palette.warning, "WARNING"),
@@ -487,7 +487,7 @@ fn severity_badge(severity: &str, theme: Theme) -> String {
 
 // ──────────────────── S3: Explainability ────────────────────
 
-fn render_explainability(model: &DashboardModel, theme: Theme, out: &mut String) {
+fn render_explainability(model: &DashboardModel, theme: &Theme, out: &mut String) {
     use std::fmt::Write as _;
     let width = usize::from(model.terminal_size.0).max(40);
 
@@ -591,7 +591,7 @@ fn render_explainability(model: &DashboardModel, theme: Theme, out: &mut String)
 
 fn render_decision_detail(
     decision: &DecisionEvidence,
-    theme: Theme,
+    theme: &Theme,
     width: usize,
     out: &mut String,
 ) {
@@ -1212,7 +1212,7 @@ fn render_diagnostics(model: &DashboardModel, theme: &Theme, out: &mut String) {
 
 // ──────────────────── S5: Ballast Operations ────────────────────
 
-fn render_ballast(model: &DashboardModel, theme: Theme, out: &mut String) {
+fn render_ballast(model: &DashboardModel, theme: &Theme, out: &mut String) {
     use std::fmt::Write as _;
     let width = usize::from(model.terminal_size.0).max(40);
 
@@ -1353,7 +1353,7 @@ fn render_ballast(model: &DashboardModel, theme: Theme, out: &mut String) {
     );
 }
 
-fn render_volume_detail(vol: &BallastVolume, theme: Theme, out: &mut String) {
+fn render_volume_detail(vol: &BallastVolume, theme: &Theme, out: &mut String) {
     use std::fmt::Write as _;
 
     let _ = writeln!(out, "  mount:      {}", vol.mount_point);
@@ -1398,7 +1398,7 @@ fn render_volume_detail(vol: &BallastVolume, theme: Theme, out: &mut String) {
     }
 }
 
-fn render_screen_stub(name: &str, theme: Theme, out: &mut String) {
+fn render_screen_stub(name: &str, theme: &Theme, out: &mut String) {
     use std::fmt::Write as _;
     let pending = status_badge("PENDING", theme.palette.muted, theme.accessibility);
     let _ = writeln!(
@@ -1429,6 +1429,7 @@ mod tests {
     use crate::daemon::self_monitor::{
         BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
     };
+    use crate::tui::model::SeverityFilter;
 
     fn sample_state(level: &str, free_pct: f64) -> DaemonState {
         DaemonState {
