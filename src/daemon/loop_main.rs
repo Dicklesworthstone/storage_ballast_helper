@@ -468,9 +468,6 @@ impl MonitoringDaemon {
                         root_stats,
                     } => {
                         self.self_monitor.record_scan(candidates, 0, duration);
-                        self.voi_scheduler.end_window(); // TODO: end_window timing?
-                        // Actually end_window is for forecast accuracy.
-                        // We should record individual scans first.
                         let now = Instant::now();
                         #[allow(clippy::cast_possible_truncation)]
                         for stat in root_stats {

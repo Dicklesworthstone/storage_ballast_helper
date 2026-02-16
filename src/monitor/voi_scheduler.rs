@@ -228,6 +228,8 @@ pub struct VoiScheduler {
     config: VoiConfig,
     path_stats: HashMap<PathBuf, PathStats>,
     calibration: CalibrationState,
+    /// Errors observed in the current window (for calibration).
+    pending_errors: Vec<f64>,
     /// Round-robin cursor for exploration and fallback.
     rr_cursor: usize,
 }
@@ -239,6 +241,7 @@ impl VoiScheduler {
             config,
             path_stats: HashMap::new(),
             calibration: CalibrationState::new(),
+            pending_errors: Vec::new(),
             rr_cursor: 0,
         }
     }
@@ -272,24 +275,25 @@ impl VoiScheduler {
                 now,
                 self.config.ewma_alpha,
             );
+
+            // Accumulate forecast error for this specific scan if valid.
+            if stats.scan_count >= self.config.min_observations_for_forecast
+                && let Some(error) = stats.forecast_error()
+            {
+                self.pending_errors.push(error);
+            }
         }
     }
 
     /// End the current scheduling window: compute forecast accuracy and update calibration.
     pub fn end_window(&mut self) {
-        let errors: Vec<f64> = self
-            .path_stats
-            .values()
-            .filter(|s| s.scan_count >= self.config.min_observations_for_forecast)
-            .filter_map(PathStats::forecast_error)
-            .collect();
-
-        if errors.is_empty() {
+        if self.pending_errors.is_empty() {
             return;
         }
 
-        let mape = errors.iter().sum::<f64>() / errors.len() as f64;
+        let mape = self.pending_errors.iter().sum::<f64>() / self.pending_errors.len() as f64;
         self.calibration.record_window(mape, &self.config);
+        self.pending_errors.clear();
     }
 
     /// Whether the scheduler is currently in fallback (round-robin) mode.
@@ -371,8 +375,12 @@ impl VoiScheduler {
             })
             .collect();
 
-        // Sort descending by utility.
-        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort descending by utility, using path as tie-breaker for determinism.
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(b.0))
+        });
 
         // 2. Pick exploitation targets (top utility, up to exploitation_budget).
         let mut selected: Vec<ScanPlanEntry> = Vec::with_capacity(budget);

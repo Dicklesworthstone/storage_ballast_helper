@@ -44,6 +44,7 @@ pub struct PressureResponse {
     pub max_delete_batch: usize,
     pub fallback_active: bool,
     pub causing_mount: PathBuf,
+    pub predicted_seconds: Option<f64>,
 }
 
 /// PID controller with hysteresis and anti-windup.
@@ -210,6 +211,7 @@ impl PidPressureController {
             max_delete_batch,
             fallback_active: false,
             causing_mount: reading.mount,
+            predicted_seconds: predicted_seconds_to_red,
         }
     }
 }
@@ -274,7 +276,7 @@ fn response_policy(
     urgency: f64,
 ) -> (Duration, usize, usize) {
     #[allow(clippy::cast_possible_truncation)]
-    let base_ms = base_poll.as_millis() as u64;
+    let base_ms = base_poll.as_millis().min(u128::from(u64::MAX)) as u64;
     match level {
         PressureLevel::Green => (Duration::from_millis(base_ms.max(1)), 0, 2),
         PressureLevel::Yellow => (

@@ -216,16 +216,16 @@ fn process_directory(
     config: &WalkerConfig,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
 ) {
+    // Check exclusion list.
+    if config.excluded_paths.contains(dir_path) {
+        return;
+    }
+
     // Check for .sbh-protect marker before reading directory.
     let marker_path = dir_path.join(protection::MARKER_FILENAME);
     if fs::symlink_metadata(&marker_path).is_ok() {
         protection.write().register_marker(dir_path);
         return; // Skip entire protected subtree.
-    }
-
-    // Check exclusion list.
-    if config.excluded_paths.contains(dir_path) {
-        return;
     }
 
     // Check protection registry (covers config patterns and previously discovered markers).
@@ -253,16 +253,8 @@ fn process_directory(
 
         let child_path = entry.path();
 
-        let Ok(meta) = metadata_for_path(&child_path, config.follow_symlinks) else {
-            continue;
-        };
-
-        // Skip symlinks entirely unless following symlinks is explicitly enabled.
-        if !config.follow_symlinks && meta.file_type().is_symlink() {
-            continue;
-        }
-
         // ─── Incremental Signal Collection ───
+        // We can check signals purely from the name without stat-ing the file.
         if let Some(name_os) = child_path.file_name() {
             let name = name_os.to_string_lossy();
             total_count += 1;
@@ -277,20 +269,49 @@ fn process_directory(
                 _ => {}
             }
 
-            // Check extension for object file heuristics via byte suffix.
-            let name_bytes = name_os.as_encoded_bytes();
-            if name_bytes.ends_with(b".o")
-                || name_bytes.ends_with(b".rlib")
-                || name_bytes.ends_with(b".rmeta")
-                || name_bytes.ends_with(b".d")
-            {
-                object_count += 1;
+            // Check extension for object file heuristics.
+            if let Some(ext) = Path::new(name_os).extension() {
+                let ext_str = ext.to_string_lossy();
+                if ext_str.eq_ignore_ascii_case("o")
+                    || ext_str.eq_ignore_ascii_case("rlib")
+                    || ext_str.eq_ignore_ascii_case("rmeta")
+                    || ext_str.eq_ignore_ascii_case("d")
+                {
+                    object_count += 1;
+                }
             }
         }
 
+        // ─── Type Check & Symlink Handling ───
+        // Use file_type() which is often free (cached in directory entry).
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+
+        // Skip symlinks entirely unless following symlinks is explicitly enabled.
+        // We do this AFTER collecting signals so that a symlinked .git or Cargo.toml
+        // still counts as a signal for the parent directory.
+        if !config.follow_symlinks && ft.is_symlink() {
+            continue;
+        }
+
+        // Determine if we should recurse.
+        // If following symlinks, we must stat to see if the target is a dir.
+        let is_dir = if config.follow_symlinks && ft.is_symlink() {
+            metadata_for_path(&child_path, true)
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+        } else {
+            ft.is_dir()
+        };
+
         // ─── Recursion Dispatch ───
         // Only recurse if it's a directory and within depth limits.
-        if depth < config.max_depth && meta.is_dir() {
+        if depth < config.max_depth && is_dir {
+            // We need metadata now to check device ID.
+            let Ok(meta) = metadata_for_path(&child_path, config.follow_symlinks) else {
+                continue;
+            };
             let child_dev = device_id(&meta);
 
             // Cross-device guard: don't cross filesystem boundaries.
@@ -963,5 +984,33 @@ mod tests {
         assert!(paths.contains(&staging));
         // Production should be skipped by config pattern.
         assert!(!paths.iter().any(|p| p.starts_with(&prod)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signals_detects_symlinked_markers() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("symlinked_signal_project");
+        fs::create_dir(&project).unwrap();
+
+        // Create a real file elsewhere
+        let real_git = tmp.path().join("real_git");
+        fs::write(&real_git, "gitdir: ...").unwrap();
+
+        // Symlink .git -> real_git
+        symlink(&real_git, project.join(".git")).unwrap();
+
+        // Config with follow_symlinks = false
+        let config = test_config(tmp.path());
+        let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+        let entries = walker.walk().unwrap();
+
+        let proj_entry = entries.iter().find(|e| e.path == project).unwrap();
+        assert!(
+            proj_entry.structural_signals.has_git,
+            "should detect symlinked .git"
+        );
     }
 }
