@@ -590,7 +590,7 @@ impl PolicyEngine {
         reason: Option<String>,
     ) {
         if self.transition_log.len() >= 1000 {
-            self.transition_log.drain(..1);
+            self.transition_log.drain(..500);
         }
         self.transition_log.push(TransitionEntry {
             transition: kind.to_string(),

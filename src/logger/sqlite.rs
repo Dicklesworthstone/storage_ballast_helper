@@ -344,7 +344,8 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
          PRAGMA cache_size = -8000;
          PRAGMA mmap_size = 67108864;
          PRAGMA temp_store = MEMORY;
-         PRAGMA busy_timeout = 5000;",
+         PRAGMA busy_timeout = 5000;
+         PRAGMA auto_vacuum = FULL;",
     )?;
     // Verify WAL mode is active (I12).
     let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;

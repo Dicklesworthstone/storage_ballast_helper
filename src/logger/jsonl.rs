@@ -394,19 +394,53 @@ impl JsonlWriter {
             _ => return,
         };
 
-        // Delete the oldest rotation first, then shift: .4→.5, .3→.4, …, .1→.2.
-        // Deleting before shifting prevents silent overwrite of the oldest file.
+        // Delete the oldest rotation first.
         let oldest = rotated_name(base, self.config.max_rotated_files);
-        let _ = fs::remove_file(&oldest);
+        if oldest.exists() {
+            if let Err(e) = fs::remove_file(&oldest) {
+                let _ = writeln!(
+                    io::stderr(),
+                    "[SBH-JSONL] rotation warning: failed to delete oldest log {}: {}",
+                    oldest.display(),
+                    e
+                );
+            }
+        }
 
         for i in (1..self.config.max_rotated_files).rev() {
             let from = rotated_name(base, i);
             let to = rotated_name(base, i + 1);
-            let _ = rename(&from, &to);
+            if from.exists() {
+                // Ensure target is gone before rename (essential for Windows).
+                if to.exists() {
+                    let _ = fs::remove_file(&to);
+                }
+                if let Err(e) = rename(&from, &to) {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "[SBH-JSONL] rotation warning: failed to shift {} -> {}: {}",
+                        from.display(),
+                        to.display(),
+                        e
+                    );
+                }
+            }
         }
 
         // Rename current → .1
-        let _ = rename(base, rotated_name(base, 1));
+        let target = rotated_name(base, 1);
+        if target.exists() {
+            let _ = fs::remove_file(&target);
+        }
+        if let Err(e) = rename(base, &target) {
+            let _ = writeln!(
+                io::stderr(),
+                "[SBH-JSONL] rotation warning: failed to rotate primary {} -> {}: {}",
+                base.display(),
+                target.display(),
+                e
+            );
+        }
 
         // Reopen a fresh file.
         match open_append(base) {
@@ -414,7 +448,12 @@ impl JsonlWriter {
                 self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
                 self.bytes_written = 0;
             }
-            Err(_) => {
+            Err(e) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "[SBH-JSONL] critical: failed to reopen log after rotation: {}",
+                    e
+                );
                 self.degrade();
             }
         }

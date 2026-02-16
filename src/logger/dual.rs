@@ -267,19 +267,27 @@ fn logger_thread_main(
             if let Some(db) = &sqlite {
                 let activity_ok = activity_row
                     .as_ref()
-                    .is_none_or(|row| db.log_activity(row).is_ok());
+                    .map(|row| db.log_activity(row).is_ok());
                 let pressure_ok = pressure_row
                     .as_ref()
-                    .is_none_or(|row| db.log_pressure(row).is_ok());
-                if activity_ok && pressure_ok {
-                    sqlite_failures = 0;
-                } else {
-                    sqlite_failures += 1;
-                    if sqlite_failures >= 3 {
-                        eprintln!(
-                            "[SBH-DUAL] SQLite write failed {sqlite_failures} times, disabling"
-                        );
-                        sqlite = None;
+                    .map(|row| db.log_pressure(row).is_ok());
+                // Only update the failure counter when at least one write was
+                // attempted.  Events that produce no SQLite rows (e.g.
+                // ConfigReloaded) must not reset the consecutive-failure
+                // counter, otherwise the circuit breaker can never trip.
+                let any_attempted = activity_ok.is_some() || pressure_ok.is_some();
+                let all_ok = activity_ok.unwrap_or(true) && pressure_ok.unwrap_or(true);
+                if any_attempted {
+                    if all_ok {
+                        sqlite_failures = 0;
+                    } else {
+                        sqlite_failures += 1;
+                        if sqlite_failures >= 3 {
+                            eprintln!(
+                                "[SBH-DUAL] SQLite write failed {sqlite_failures} times, disabling"
+                            );
+                            sqlite = None;
+                        }
                     }
                 }
                 // Periodic retention pruning.

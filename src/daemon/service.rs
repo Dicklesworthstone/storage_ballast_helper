@@ -101,8 +101,9 @@ impl SystemdServiceManager {
             .iter()
             .map(|p| {
                 let s = p.display().to_string();
-                if s.contains(' ') {
-                    format!("\"{s}\"")
+                if s.contains(' ') || s.contains('"') {
+                    // Systemd quote escaping: escape internal quotes and wrap in quotes.
+                    format!("\"{}\"", s.replace('"', "\\\""))
                 } else {
                     s
                 }
