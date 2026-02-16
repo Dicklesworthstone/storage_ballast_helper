@@ -10,7 +10,9 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::model::{DashboardCmd, DashboardModel, DashboardMsg, RateHistory};
+use super::model::{
+    DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, Overlay, RateHistory, Screen,
+};
 
 /// Apply a message to the model and return the next command for the runtime.
 ///
@@ -26,18 +28,16 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             ])
         }
 
-        DashboardMsg::Key(key) => match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                model.quit = true;
-                DashboardCmd::Quit
+        DashboardMsg::Key(key) => {
+            // Input precedence (IA §4.2):
+            // 1. Overlay keys (if overlay is active)
+            // 2. Global navigation keys
+            if model.active_overlay.is_some() {
+                handle_overlay_key(model, key)
+            } else {
+                handle_global_key(model, key)
             }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                model.quit = true;
-                DashboardCmd::Quit
-            }
-            // Future: screen navigation keys will be handled here.
-            _ => DashboardCmd::None,
-        },
+        }
 
         DashboardMsg::Resize { cols, rows } => {
             model.terminal_size = (cols, rows);
@@ -71,6 +71,160 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             model.daemon_state = state.map(|s| *s);
             DashboardCmd::None
         }
+
+        DashboardMsg::Navigate(screen) => {
+            model.navigate_to(screen);
+            DashboardCmd::None
+        }
+
+        DashboardMsg::NavigateBack => {
+            model.navigate_back();
+            DashboardCmd::None
+        }
+
+        DashboardMsg::ToggleOverlay(overlay) => {
+            if model.active_overlay.as_ref() == Some(&overlay) {
+                model.active_overlay = None;
+            } else {
+                model.active_overlay = Some(overlay);
+            }
+            DashboardCmd::None
+        }
+
+        DashboardMsg::CloseOverlay => {
+            model.active_overlay = None;
+            DashboardCmd::None
+        }
+
+        DashboardMsg::ForceRefresh => DashboardCmd::FetchData,
+
+        DashboardMsg::NotificationExpired(id) => {
+            model.notifications.retain(|n| n.id != id);
+            DashboardCmd::None
+        }
+
+        DashboardMsg::Error(err) => {
+            let id = model.push_notification(NotificationLevel::Error, err.message);
+            DashboardCmd::ScheduleNotificationExpiry {
+                id,
+                after: std::time::Duration::from_secs(10),
+            }
+        }
+    }
+}
+
+// ──────────────────── key handlers ────────────────────
+
+/// Handle keys when an overlay is active (IA §4.2 precedence level 2).
+///
+/// Overlays consume most keys. Only Esc (close), Ctrl-C (quit), and the
+/// overlay's own toggle key pass through.
+fn handle_overlay_key(model: &mut DashboardModel, key: crossterm::event::KeyEvent) -> DashboardCmd {
+    match key.code {
+        // Ctrl-C always quits, regardless of overlay state.
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.quit = true;
+            DashboardCmd::Quit
+        }
+        // Esc closes the active overlay.
+        KeyCode::Esc => {
+            model.active_overlay = None;
+            DashboardCmd::None
+        }
+        // Toggle keys: pressing the same overlay key closes it.
+        KeyCode::Char('?') if model.active_overlay == Some(Overlay::Help) => {
+            model.active_overlay = None;
+            DashboardCmd::None
+        }
+        KeyCode::Char('v') if model.active_overlay == Some(Overlay::Voi) => {
+            model.active_overlay = None;
+            DashboardCmd::None
+        }
+        KeyCode::Char('p')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && model.active_overlay == Some(Overlay::CommandPalette) =>
+        {
+            model.active_overlay = None;
+            DashboardCmd::None
+        }
+        // All other keys are consumed by the overlay (no screen passthrough).
+        _ => DashboardCmd::None,
+    }
+}
+
+/// Handle global keys when no overlay is active (IA §4.1 + §4.2 level 4).
+fn handle_global_key(model: &mut DashboardModel, key: crossterm::event::KeyEvent) -> DashboardCmd {
+    match key.code {
+        // ── Exit keys ──
+        // Ctrl-C: always immediate quit.
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.quit = true;
+            DashboardCmd::Quit
+        }
+        // q: quit from any non-overlay state.
+        KeyCode::Char('q') => {
+            model.quit = true;
+            DashboardCmd::Quit
+        }
+        // Esc: cascade — navigate back first, quit only if nowhere to go.
+        KeyCode::Esc => {
+            if model.navigate_back() {
+                DashboardCmd::None
+            } else {
+                model.quit = true;
+                DashboardCmd::Quit
+            }
+        }
+
+        // ── Screen navigation: number keys 1-7 (IA §4.1) ──
+        KeyCode::Char(c @ '1'..='7') => {
+            if let Some(screen) = Screen::from_number(c as u8 - b'0') {
+                model.navigate_to(screen);
+            }
+            DashboardCmd::None
+        }
+
+        // ── Screen navigation: [/] for prev/next (IA §4.1) ──
+        KeyCode::Char('[') => {
+            let prev = model.screen.prev();
+            model.navigate_to(prev);
+            DashboardCmd::None
+        }
+        KeyCode::Char(']') => {
+            let next = model.screen.next();
+            model.navigate_to(next);
+            DashboardCmd::None
+        }
+
+        // ── Overlay toggles ──
+        KeyCode::Char('?') => {
+            model.active_overlay = Some(Overlay::Help);
+            DashboardCmd::None
+        }
+        KeyCode::Char('v') => {
+            model.active_overlay = Some(Overlay::Voi);
+            DashboardCmd::None
+        }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.active_overlay = Some(Overlay::CommandPalette);
+            DashboardCmd::None
+        }
+        KeyCode::Char(':') => {
+            model.active_overlay = Some(Overlay::CommandPalette);
+            DashboardCmd::None
+        }
+
+        // ── Quick actions ──
+        // b: jump to ballast screen (J-2 fast path, IA §4.1).
+        KeyCode::Char('b') => {
+            model.navigate_to(Screen::Ballast);
+            DashboardCmd::None
+        }
+        // r: force refresh (bypass timer).
+        KeyCode::Char('r') => DashboardCmd::FetchData,
+
+        // Unhandled keys are no-ops.
+        _ => DashboardCmd::None,
     }
 }
 
@@ -87,6 +241,7 @@ mod tests {
     use crate::daemon::self_monitor::{
         BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
     };
+    use crate::tui::model::DashboardError;
 
     fn test_model() -> DashboardModel {
         DashboardModel::new(
@@ -152,6 +307,8 @@ mod tests {
         }
     }
 
+    // ── Tick / timer ──
+
     #[test]
     fn tick_increments_counter_and_fetches_data() {
         let mut model = test_model();
@@ -163,6 +320,16 @@ mod tests {
     }
 
     #[test]
+    fn tick_wraps_at_u64_max() {
+        let mut model = test_model();
+        model.tick = u64::MAX;
+        update(&mut model, DashboardMsg::Tick);
+        assert_eq!(model.tick, 0);
+    }
+
+    // ── Exit keys ──
+
+    #[test]
     fn quit_on_q_key() {
         let mut model = test_model();
         let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('q'))));
@@ -171,15 +338,51 @@ mod tests {
     }
 
     #[test]
-    fn quit_on_esc() {
+    fn esc_quits_when_no_history() {
         let mut model = test_model();
+        assert!(model.screen_history.is_empty());
         let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Esc)));
         assert!(model.quit);
         assert!(matches!(cmd, DashboardCmd::Quit));
     }
 
     #[test]
-    fn quit_on_ctrl_c() {
+    fn esc_navigates_back_when_history_exists() {
+        let mut model = test_model();
+        model.navigate_to(Screen::Timeline);
+        assert_eq!(model.screen, Screen::Timeline);
+        assert!(!model.screen_history.is_empty());
+
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Esc)));
+        assert!(!model.quit);
+        assert_eq!(model.screen, Screen::Overview);
+        assert!(matches!(cmd, DashboardCmd::None));
+    }
+
+    #[test]
+    fn esc_cascade_back_then_quit() {
+        let mut model = test_model();
+        model.navigate_to(Screen::Timeline);
+        model.navigate_to(Screen::Candidates);
+
+        // First Esc: back to Timeline.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Esc)));
+        assert_eq!(model.screen, Screen::Timeline);
+        assert!(!model.quit);
+
+        // Second Esc: back to Overview.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Esc)));
+        assert_eq!(model.screen, Screen::Overview);
+        assert!(!model.quit);
+
+        // Third Esc: quit (no more history).
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Esc)));
+        assert!(model.quit);
+        assert!(matches!(cmd, DashboardCmd::Quit));
+    }
+
+    #[test]
+    fn ctrl_c_always_quits() {
         let mut model = test_model();
         let cmd = update(
             &mut model,
@@ -190,28 +393,282 @@ mod tests {
     }
 
     #[test]
-    fn unknown_key_is_noop() {
+    fn ctrl_c_quits_even_with_overlay_active() {
         let mut model = test_model();
-        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('z'))));
+        model.active_overlay = Some(Overlay::Help);
+
+        let cmd = update(
+            &mut model,
+            DashboardMsg::Key(make_key_ctrl(KeyCode::Char('c'))),
+        );
+        assert!(model.quit);
+        assert!(matches!(cmd, DashboardCmd::Quit));
+    }
+
+    // ── Screen navigation: number keys ──
+
+    #[test]
+    fn number_keys_navigate_to_screens() {
+        let mut model = test_model();
+        for (key, expected) in [
+            ('1', Screen::Overview),
+            ('2', Screen::Timeline),
+            ('3', Screen::Explainability),
+            ('4', Screen::Candidates),
+            ('5', Screen::Ballast),
+            ('6', Screen::LogSearch),
+            ('7', Screen::Diagnostics),
+        ] {
+            model.screen = Screen::Overview;
+            model.screen_history.clear();
+            update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(key))));
+            assert_eq!(
+                model.screen, expected,
+                "key '{key}' should navigate to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn number_key_same_screen_is_noop() {
+        let mut model = test_model();
+        assert_eq!(model.screen, Screen::Overview);
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('1'))));
+        assert_eq!(model.screen, Screen::Overview);
+        assert!(model.screen_history.is_empty());
+    }
+
+    #[test]
+    fn number_key_pushes_history() {
+        let mut model = test_model();
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('3'))));
+        assert_eq!(model.screen, Screen::Explainability);
+        assert_eq!(model.screen_history, vec![Screen::Overview]);
+    }
+
+    // ── Screen navigation: [/] bracket keys ──
+
+    #[test]
+    fn bracket_right_navigates_next() {
+        let mut model = test_model();
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(']'))));
+        assert_eq!(model.screen, Screen::Timeline);
+    }
+
+    #[test]
+    fn bracket_left_navigates_prev() {
+        let mut model = test_model();
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('['))));
+        assert_eq!(model.screen, Screen::Diagnostics); // wraps S1 → S7
+    }
+
+    #[test]
+    fn bracket_keys_wrap_around() {
+        let mut model = test_model();
+        model.screen = Screen::Diagnostics;
+        model.screen_history.clear();
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(']'))));
+        assert_eq!(model.screen, Screen::Overview); // wraps S7 → S1
+    }
+
+    // ── Overlay toggles ──
+
+    #[test]
+    fn question_mark_opens_help_overlay() {
+        let mut model = test_model();
+        assert!(model.active_overlay.is_none());
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('?'))));
+        assert_eq!(model.active_overlay, Some(Overlay::Help));
+    }
+
+    #[test]
+    fn v_opens_voi_overlay() {
+        let mut model = test_model();
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('v'))));
+        assert_eq!(model.active_overlay, Some(Overlay::Voi));
+    }
+
+    #[test]
+    fn ctrl_p_opens_command_palette() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            DashboardMsg::Key(make_key_ctrl(KeyCode::Char('p'))),
+        );
+        assert_eq!(model.active_overlay, Some(Overlay::CommandPalette));
+    }
+
+    #[test]
+    fn colon_opens_command_palette() {
+        let mut model = test_model();
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(':'))));
+        assert_eq!(model.active_overlay, Some(Overlay::CommandPalette));
+    }
+
+    // ── Overlay key handling (input precedence) ──
+
+    #[test]
+    fn overlay_esc_closes_overlay_without_quit() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::Help);
+
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Esc)));
+        assert!(model.active_overlay.is_none());
         assert!(!model.quit);
         assert!(matches!(cmd, DashboardCmd::None));
     }
 
     #[test]
-    fn resize_updates_terminal_size() {
+    fn overlay_consumes_navigation_keys() {
         let mut model = test_model();
-        assert_eq!(model.terminal_size, (80, 24));
+        model.active_overlay = Some(Overlay::Help);
 
+        // Number keys should NOT navigate when overlay is active.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('3'))));
+        assert_eq!(model.screen, Screen::Overview);
+        assert!(model.active_overlay.is_some());
+    }
+
+    #[test]
+    fn overlay_consumes_q_key() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::Voi);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('q'))));
+        assert!(!model.quit);
+        assert!(model.active_overlay.is_some());
+    }
+
+    #[test]
+    fn help_overlay_toggle_closes_with_question_mark() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::Help);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('?'))));
+        assert!(model.active_overlay.is_none());
+    }
+
+    #[test]
+    fn voi_overlay_toggle_closes_with_v() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::Voi);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('v'))));
+        assert!(model.active_overlay.is_none());
+    }
+
+    #[test]
+    fn command_palette_toggle_closes_with_ctrl_p() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+
+        update(
+            &mut model,
+            DashboardMsg::Key(make_key_ctrl(KeyCode::Char('p'))),
+        );
+        assert!(model.active_overlay.is_none());
+    }
+
+    // ── Quick actions ──
+
+    #[test]
+    fn b_key_jumps_to_ballast_screen() {
+        let mut model = test_model();
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('b'))));
+        assert_eq!(model.screen, Screen::Ballast);
+        assert_eq!(model.screen_history, vec![Screen::Overview]);
+    }
+
+    #[test]
+    fn r_key_forces_data_refresh() {
+        let mut model = test_model();
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('r'))));
+        assert!(matches!(cmd, DashboardCmd::FetchData));
+    }
+
+    // ── Message-based navigation ──
+
+    #[test]
+    fn navigate_msg_changes_screen() {
+        let mut model = test_model();
+        update(&mut model, DashboardMsg::Navigate(Screen::LogSearch));
+        assert_eq!(model.screen, Screen::LogSearch);
+        assert_eq!(model.screen_history, vec![Screen::Overview]);
+    }
+
+    #[test]
+    fn navigate_back_msg_pops_history() {
+        let mut model = test_model();
+        model.navigate_to(Screen::Diagnostics);
+        update(&mut model, DashboardMsg::NavigateBack);
+        assert_eq!(model.screen, Screen::Overview);
+    }
+
+    #[test]
+    fn toggle_overlay_msg() {
+        let mut model = test_model();
+        update(&mut model, DashboardMsg::ToggleOverlay(Overlay::Help));
+        assert_eq!(model.active_overlay, Some(Overlay::Help));
+
+        // Toggle again closes it.
+        update(&mut model, DashboardMsg::ToggleOverlay(Overlay::Help));
+        assert!(model.active_overlay.is_none());
+    }
+
+    #[test]
+    fn close_overlay_msg() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::Voi);
+        update(&mut model, DashboardMsg::CloseOverlay);
+        assert!(model.active_overlay.is_none());
+    }
+
+    #[test]
+    fn force_refresh_msg_returns_fetch_data() {
+        let mut model = test_model();
+        let cmd = update(&mut model, DashboardMsg::ForceRefresh);
+        assert!(matches!(cmd, DashboardCmd::FetchData));
+    }
+
+    // ── Notifications ──
+
+    #[test]
+    fn error_msg_creates_notification() {
+        let mut model = test_model();
         let cmd = update(
             &mut model,
-            DashboardMsg::Resize {
-                cols: 120,
-                rows: 40,
-            },
+            DashboardMsg::Error(DashboardError {
+                message: "adapter failed".into(),
+                source: "state_file".into(),
+            }),
         );
-        assert_eq!(model.terminal_size, (120, 40));
-        assert!(matches!(cmd, DashboardCmd::None));
+        assert_eq!(model.notifications.len(), 1);
+        assert_eq!(model.notifications[0].message, "adapter failed");
+        assert!(matches!(
+            cmd,
+            DashboardCmd::ScheduleNotificationExpiry { .. }
+        ));
     }
+
+    #[test]
+    fn notification_expired_removes_notification() {
+        let mut model = test_model();
+        let id = model.push_notification(NotificationLevel::Info, "test".into());
+        assert_eq!(model.notifications.len(), 1);
+
+        update(&mut model, DashboardMsg::NotificationExpired(id));
+        assert!(model.notifications.is_empty());
+    }
+
+    #[test]
+    fn notification_expired_with_wrong_id_is_noop() {
+        let mut model = test_model();
+        model.push_notification(NotificationLevel::Info, "test".into());
+        update(&mut model, DashboardMsg::NotificationExpired(999));
+        assert_eq!(model.notifications.len(), 1);
+    }
+
+    // ── Data updates ──
 
     #[test]
     fn data_update_with_state_clears_degraded() {
@@ -231,14 +688,12 @@ mod tests {
     #[test]
     fn data_update_none_sets_degraded() {
         let mut model = test_model();
-        // First make it non-degraded.
         update(
             &mut model,
             DashboardMsg::DataUpdate(Some(Box::new(sample_daemon_state()))),
         );
         assert!(!model.degraded);
 
-        // Now send None.
         update(&mut model, DashboardMsg::DataUpdate(None));
         assert!(model.degraded);
         assert!(model.daemon_state.is_none());
@@ -261,14 +716,12 @@ mod tests {
     fn stale_mounts_pruned_on_data_update() {
         let mut model = test_model();
 
-        // First update with mount "/".
         update(
             &mut model,
             DashboardMsg::DataUpdate(Some(Box::new(sample_daemon_state()))),
         );
         assert!(model.rate_histories.contains_key("/"));
 
-        // Second update with no mounts at all.
         let mut empty_state = sample_daemon_state();
         empty_state.pressure.mounts.clear();
         update(
@@ -279,10 +732,83 @@ mod tests {
     }
 
     #[test]
-    fn tick_wraps_at_u64_max() {
+    fn resize_updates_terminal_size() {
         let mut model = test_model();
-        model.tick = u64::MAX;
-        update(&mut model, DashboardMsg::Tick);
-        assert_eq!(model.tick, 0);
+        let cmd = update(
+            &mut model,
+            DashboardMsg::Resize {
+                cols: 120,
+                rows: 40,
+            },
+        );
+        assert_eq!(model.terminal_size, (120, 40));
+        assert!(matches!(cmd, DashboardCmd::None));
+    }
+
+    #[test]
+    fn unknown_key_is_noop() {
+        let mut model = test_model();
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('z'))));
+        assert!(!model.quit);
+        assert!(matches!(cmd, DashboardCmd::None));
+    }
+
+    // ── Determinism: same input → same output ──
+
+    #[test]
+    fn deterministic_navigation_sequence() {
+        // Two models given the same message sequence must end in the same state.
+        let msgs: Vec<DashboardMsg> = vec![
+            DashboardMsg::Key(make_key(KeyCode::Char('3'))),
+            DashboardMsg::Key(make_key(KeyCode::Char('5'))),
+            DashboardMsg::Key(make_key(KeyCode::Esc)),
+            DashboardMsg::Key(make_key(KeyCode::Char('['))),
+            DashboardMsg::Key(make_key(KeyCode::Char('?'))),
+            DashboardMsg::Key(make_key(KeyCode::Esc)),
+            DashboardMsg::Key(make_key(KeyCode::Char('1'))),
+        ];
+
+        let mut m1 = test_model();
+        let mut m2 = test_model();
+
+        for (msg1, msg2) in msgs.into_iter().zip({
+            // Reconstruct the same sequence.
+            vec![
+                DashboardMsg::Key(make_key(KeyCode::Char('3'))),
+                DashboardMsg::Key(make_key(KeyCode::Char('5'))),
+                DashboardMsg::Key(make_key(KeyCode::Esc)),
+                DashboardMsg::Key(make_key(KeyCode::Char('['))),
+                DashboardMsg::Key(make_key(KeyCode::Char('?'))),
+                DashboardMsg::Key(make_key(KeyCode::Esc)),
+                DashboardMsg::Key(make_key(KeyCode::Char('1'))),
+            ]
+        }) {
+            update(&mut m1, msg1);
+            update(&mut m2, msg2);
+        }
+
+        assert_eq!(m1.screen, m2.screen);
+        assert_eq!(m1.screen_history, m2.screen_history);
+        assert_eq!(m1.active_overlay, m2.active_overlay);
+        assert_eq!(m1.quit, m2.quit);
+        assert_eq!(m1.tick, m2.tick);
+    }
+
+    #[test]
+    fn deterministic_full_cycle() {
+        // Navigate through all screens, end at Overview.
+        let mut model = test_model();
+        for n in b'2'..=b'7' {
+            update(
+                &mut model,
+                DashboardMsg::Key(make_key(KeyCode::Char(n as char))),
+            );
+        }
+        assert_eq!(model.screen, Screen::Diagnostics);
+        assert_eq!(model.screen_history.len(), 6);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('1'))));
+        assert_eq!(model.screen, Screen::Overview);
+        assert_eq!(model.screen_history.len(), 7);
     }
 }

@@ -12,6 +12,7 @@ pub mod model;
 pub mod render;
 pub mod runtime;
 pub mod telemetry;
+pub mod terminal_guard;
 pub mod update;
 pub mod widgets;
 

@@ -34,7 +34,7 @@ pub const DAEMON_STATE_STALE_THRESHOLD_SECS: u64 = 90;
 // ──────────────────── state file schema ────────────────────
 
 /// Top-level state written to `state.json` for CLI consumption.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonState {
     pub version: String,
     pub pid: u32,
@@ -49,14 +49,14 @@ pub struct DaemonState {
 }
 
 /// Current pressure across monitored mounts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PressureState {
     pub overall: String,
     pub mounts: Vec<MountPressure>,
 }
 
 /// Pressure info for a single mount.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MountPressure {
     pub path: String,
     pub free_pct: f64,
@@ -65,7 +65,7 @@ pub struct MountPressure {
 }
 
 /// Current ballast file state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BallastState {
     pub available: usize,
     pub total: usize,
@@ -73,7 +73,7 @@ pub struct BallastState {
 }
 
 /// Last scan summary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastScanState {
     pub at: Option<String>,
     pub candidates: usize,
@@ -81,7 +81,7 @@ pub struct LastScanState {
 }
 
 /// Cumulative counters since daemon start.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Counters {
     pub scans: u64,
     pub deletions: u64,
@@ -322,13 +322,17 @@ impl SelfMonitor {
             memory_rss_bytes: rss,
         };
 
-        if let Err(e) = write_state_atomic(&self.state_file_path, &state) {
+        let result = write_state_atomic(&self.state_file_path, &state);
+        if let Err(e) = &result {
             eprintln!("[SBH-SELFMON] failed to write state file: {e}");
-            // Do NOT update last_write — retry on next call instead of
-            // serving stale state for an entire write_interval.
+        }
+        // Update last_write regardless of success to respect the interval
+        // and prevent log spam on persistent errors (e.g. permission denied).
+        self.last_write = Some(now);
+
+        if result.is_err() {
             return rss;
         }
-        self.last_write = Some(now);
 
         rss
     }
@@ -988,13 +992,16 @@ mod tests {
 
         // First write fails (bad path).
         monitor.maybe_write_state(PressureLevel::Green, 30.0, "/data", 5, 5, 0);
-        // last_write should still be None since the write failed.
+        // last_write should be set to prevent busy-looping.
         assert!(
-            monitor.last_write.is_none(),
-            "last_write must not be set when state write fails"
+            monitor.last_write.is_some(),
+            "last_write must be set even when state write fails (to prevent log spam)"
         );
 
         // Move to a valid path and verify it works on next call.
+        // First, reset last_write so we don't have to wait for the interval in the test.
+        monitor.last_write = None;
+
         let dir = tempfile::tempdir().unwrap();
         let good_path = dir.path().join("recovered_state.json");
         monitor.state_file_path = good_path.clone();
