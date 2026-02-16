@@ -865,7 +865,7 @@ fn future_daemon_state_parses_with_unknown_fields_ignored() {
         "version": "99.0.0",
         "pid": 9999,
         "started_at": "2030-01-01T00:00:00Z",
-        "uptime_seconds": 999999,
+        "uptime_seconds": 999_999,
         "last_updated": "2030-01-01T12:00:00Z",
         "pressure": {
             "overall": "green",
@@ -893,12 +893,12 @@ fn future_daemon_state_parses_with_unknown_fields_ignored() {
         "counters": {
             "scans": 5000,
             "deletions": 100,
-            "bytes_freed": 1099511627776_u64,
+            "bytes_freed": 1_099_511_627_776_u64,
             "errors": 0,
             "dropped_log_events": 0,
             "successful_predictions": 42
         },
-        "memory_rss_bytes": 104857600,
+        "memory_rss_bytes": 104_857_600,
         "gpu_memory_bytes": 0,
         "cluster_mode": false
     });

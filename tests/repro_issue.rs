@@ -1,3 +1,5 @@
+//! Regression tests for specific reported issues.
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -7,7 +9,7 @@ mod tests {
     use storage_ballast_helper::scanner::patterns::{
         ArtifactCategory, ArtifactClassification, StructuralSignals,
     };
-    use storage_ballast_helper::scanner::scoring::{CandidateInput, DecisionAction, ScoringEngine};
+    use storage_ballast_helper::scanner::scoring::{CandidateInput, ScoringEngine};
 
     fn default_engine() -> ScoringEngine {
         ScoringEngine::from_config(&ScoringConfig::default(), 30)

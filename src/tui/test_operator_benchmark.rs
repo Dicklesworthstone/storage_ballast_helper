@@ -1,3 +1,4 @@
+#![allow(clippy::cast_precision_loss)]
 //! Operator workflow benchmark validation (bd-xzt.3.10).
 //!
 //! Defines real-incident operator workflows and validates that the new TUI

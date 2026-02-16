@@ -2792,7 +2792,7 @@ struct DashboardRuntimeRequest {
     state_file: PathBuf,
     monitor_paths: Vec<PathBuf>,
     selection: DashboardRuntimeSelection,
-    reason: DashboardSelectionReason,
+    _reason: DashboardSelectionReason,
 }
 
 /// Resolve dashboard runtime using priority chain:
@@ -2926,7 +2926,7 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
         state_file: config.paths.state_file.clone(),
         monitor_paths: config.scanner.root_paths,
         selection,
-        reason,
+        _reason: reason,
     };
 
     run_dashboard_runtime(cli, &request)
@@ -5479,7 +5479,7 @@ mod tests {
             state_file: PathBuf::from("/tmp/state.json"),
             monitor_paths: vec![PathBuf::from("/tmp")],
             selection: DashboardRuntimeSelection::New,
-            reason: DashboardSelectionReason::CliFlagNew,
+            _reason: DashboardSelectionReason::CliFlagNew,
         };
 
         let err_text = run_new_dashboard_runtime(&request)
