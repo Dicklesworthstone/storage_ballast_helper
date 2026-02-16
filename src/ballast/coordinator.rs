@@ -418,7 +418,7 @@ mod tests {
             file_size_bytes: 4096 + 4096, // header + 4KB data
             replenish_cooldown_minutes: 0,
             auto_provision: true,
-            overrides: HashMap::new(),
+            overrides: BTreeMap::new(),
         }
     }
 

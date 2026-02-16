@@ -172,6 +172,8 @@ impl BallastReleaseController {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::ballast::manager::BallastManager;
     use crate::core::config::BallastConfig;
@@ -182,7 +184,7 @@ mod tests {
             file_size_bytes: 4096 + 4096, // tiny files for tests
             replenish_cooldown_minutes: 0,
             auto_provision: true,
-            overrides: std::collections::HashMap::new(),
+            overrides: std::collections::BTreeMap::new(),
         }
     }
 
@@ -194,6 +196,7 @@ mod tests {
             release_ballast_files: release,
             max_delete_batch: 10,
             fallback_active: false,
+            causing_mount: PathBuf::from("/test"),
         }
     }
 

@@ -336,6 +336,7 @@ fn process_directory(
 }
 
 /// Build `StructuralSignals` by checking presence of well-known child names.
+#[allow(dead_code)]
 fn signals_from_children(child_names: &[String]) -> StructuralSignals {
     let mut signals = StructuralSignals::default();
     let mut object_count = 0u32;

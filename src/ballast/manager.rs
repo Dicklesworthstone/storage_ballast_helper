@@ -600,7 +600,7 @@ mod tests {
             file_size_bytes: HEADER_SIZE as u64 + 8192, // header + 8KB data
             replenish_cooldown_minutes: 0,
             auto_provision: true,
-            overrides: std::collections::HashMap::new(),
+            overrides: std::collections::BTreeMap::new(),
         }
     }
 

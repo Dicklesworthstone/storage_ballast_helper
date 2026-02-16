@@ -791,7 +791,7 @@ fn stress_multi_agent_swarm() {
             let size_gib = 1 + (artifact_idx as u64 % 5);
             let mut candidate = make_candidate(agent_idx * 100 + artifact_idx, age_hours, size_gib);
             candidate.path = PathBuf::from(format!("/data/p{agent_idx}/{name}_{artifact_idx}"));
-            candidate.classification.pattern_name = format!("{name}*");
+            candidate.classification.pattern_name = format!("{name}*").into();
 
             // Some agents have .git (should be vetoed via excluded flag).
             if agent_idx == 3 && artifact_idx == 0 {
@@ -1070,7 +1070,7 @@ fn stress_ballast_lifecycle() {
         file_size_bytes: 1024 * 1024, // 1 MB each (small for test speed)
         replenish_cooldown_minutes: 0,
         auto_provision: true,
-        overrides: std::collections::HashMap::default(),
+        overrides: std::collections::BTreeMap::default(),
     };
 
     let mut manager = BallastManager::new(ballast_dir, config).unwrap();
@@ -1084,7 +1084,7 @@ fn stress_ballast_lifecycle() {
     report.metric("provisioned_bytes", prov.total_bytes);
 
     // Phase 2: Verify.
-    let verify = manager.verify();
+    let verify = manager.verify().unwrap();
     assert_eq!(verify.files_ok, 5);
     assert_eq!(verify.files_corrupted, 0);
     report.metric("verified_ok", verify.files_ok);
@@ -1114,7 +1114,7 @@ fn stress_ballast_lifecycle() {
     }
 
     // Final verify.
-    let final_verify = manager.verify();
+    let final_verify = manager.verify().unwrap();
     assert_eq!(final_verify.files_corrupted, 0);
     report.metric("final_files_ok", final_verify.files_ok);
     report.metric("final_available", manager.available_count());

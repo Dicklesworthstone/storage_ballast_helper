@@ -59,8 +59,9 @@ fn main() {
         let reading = PressureReading {
             free_bytes: stats.free_bytes,
             total_bytes: stats.total_bytes,
+            mount: monitor_path.clone(),
         };
-        let response = controller.update(reading, Some(estimate.seconds_to_threshold), now);
+        let response = controller.update(reading.clone(), Some(estimate.seconds_to_threshold), now);
 
         println!(
             "[{i}] free={:.1}% rate={:+.0} B/s trend={:?} level={:?} urgency={:.2} poll={:?}",

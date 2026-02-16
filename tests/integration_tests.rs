@@ -866,7 +866,7 @@ fn ballast_lifecycle() {
     assert!(manager.releasable_bytes() > 0);
 
     // Verify integrity.
-    let verify = manager.verify();
+    let verify = manager.verify().unwrap();
     assert_eq!(verify.files_ok, 3);
     assert_eq!(verify.files_corrupted, 0);
 
