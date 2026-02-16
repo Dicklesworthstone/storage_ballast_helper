@@ -904,6 +904,166 @@ impl TelemetryQueryAdapter for CompositeTelemetryAdapter {
     }
 }
 
+fn parse_jsonl_entry_with_schema_shield(line: &str) -> ParseOutcome {
+    if let Ok(entry) = serde_json::from_str::<crate::logger::jsonl::LogEntry>(line) {
+        return ParseOutcome::Exact(entry);
+    }
+
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return ParseOutcome::Dropped;
+    };
+    let Some(object) = value.as_object() else {
+        return ParseOutcome::Dropped;
+    };
+
+    let Some(ts) = read_string_field(object, &["ts", "timestamp", "time"]) else {
+        return ParseOutcome::Dropped;
+    };
+
+    let raw_event = read_string_field(object, &["event", "event_type", "kind"]);
+    let event = raw_event
+        .as_deref()
+        .and_then(parse_event_type)
+        .unwrap_or(crate::logger::jsonl::EventType::Error);
+    let severity = read_string_field(object, &["severity", "level"])
+        .as_deref()
+        .and_then(parse_severity)
+        .unwrap_or(crate::logger::jsonl::Severity::Warning);
+
+    let mut details = read_string_field(object, &["details", "summary", "message"]);
+    if let Some(raw) = raw_event.filter(|token| parse_event_type(token).is_none()) {
+        details = Some(match details {
+            Some(existing) => format!("schema-shield unknown-event={raw}; {existing}"),
+            None => format!("schema-shield unknown-event={raw}"),
+        });
+    }
+
+    ParseOutcome::Recovered(crate::logger::jsonl::LogEntry {
+        ts,
+        event,
+        severity,
+        path: read_string_field(object, &["path", "target_path"]),
+        size: read_u64_field(object, &["size", "size_bytes"]),
+        score: read_f64_field(object, &["score", "total_score"]),
+        factors: None,
+        pressure: read_string_field(object, &["pressure", "pressure_level"]),
+        free_pct: read_f64_field(object, &["free_pct", "free_percent"]),
+        rate_bps: read_f64_field(object, &["rate_bps", "ewma_rate"]),
+        duration_ms: read_u64_field(object, &["duration_ms", "durationMillis"]),
+        ok: read_bool_field(object, &["ok", "success"]),
+        error_code: read_string_field(object, &["error_code"]),
+        error_message: read_string_field(object, &["error_message", "error"]),
+        mount_point: read_string_field(object, &["mount_point", "mount"]),
+        details,
+    })
+}
+
+fn schema_shield_diagnostics(recovered: usize, dropped: usize) -> String {
+    if recovered == 0 && dropped == 0 {
+        return String::new();
+    }
+    format!("jsonl schema-shield recovered={recovered} dropped={dropped}")
+}
+
+fn parse_event_type(input: &str) -> Option<crate::logger::jsonl::EventType> {
+    let normalized = normalize_token(input);
+    let compact = normalized.replace('_', "");
+    match normalized.as_str() {
+        "artifact_delete" => Some(crate::logger::jsonl::EventType::ArtifactDelete),
+        "ballast_release" => Some(crate::logger::jsonl::EventType::BallastRelease),
+        "ballast_replenish" => Some(crate::logger::jsonl::EventType::BallastReplenish),
+        "ballast_provision" => Some(crate::logger::jsonl::EventType::BallastProvision),
+        "pressure_change" => Some(crate::logger::jsonl::EventType::PressureChange),
+        "scan_complete" => Some(crate::logger::jsonl::EventType::ScanComplete),
+        "daemon_start" => Some(crate::logger::jsonl::EventType::DaemonStart),
+        "daemon_stop" => Some(crate::logger::jsonl::EventType::DaemonStop),
+        "config_reload" => Some(crate::logger::jsonl::EventType::ConfigReload),
+        "error" => Some(crate::logger::jsonl::EventType::Error),
+        "emergency" => Some(crate::logger::jsonl::EventType::Emergency),
+        _ => match compact.as_str() {
+            "artifactdelete" => Some(crate::logger::jsonl::EventType::ArtifactDelete),
+            "ballastrelease" => Some(crate::logger::jsonl::EventType::BallastRelease),
+            "ballastreplenish" => Some(crate::logger::jsonl::EventType::BallastReplenish),
+            "ballastprovision" => Some(crate::logger::jsonl::EventType::BallastProvision),
+            "pressurechange" => Some(crate::logger::jsonl::EventType::PressureChange),
+            "scancomplete" => Some(crate::logger::jsonl::EventType::ScanComplete),
+            "daemonstart" => Some(crate::logger::jsonl::EventType::DaemonStart),
+            "daemonstop" => Some(crate::logger::jsonl::EventType::DaemonStop),
+            "configreload" => Some(crate::logger::jsonl::EventType::ConfigReload),
+            _ => None,
+        },
+    }
+}
+
+fn parse_severity(input: &str) -> Option<crate::logger::jsonl::Severity> {
+    match normalize_token(input).as_str() {
+        "info" => Some(crate::logger::jsonl::Severity::Info),
+        "warning" | "warn" => Some(crate::logger::jsonl::Severity::Warning),
+        "critical" | "error" | "fatal" => Some(crate::logger::jsonl::Severity::Critical),
+        _ => None,
+    }
+}
+
+fn normalize_token(input: &str) -> String {
+    input.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+fn read_value<'a>(object: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|key| object.get(*key))
+}
+
+fn read_string_field(object: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    read_value(object, keys).and_then(|value| match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    })
+}
+
+fn read_u64_field(object: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    read_value(object, keys).and_then(|value| match value {
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| {
+                number
+                    .as_i64()
+                    .and_then(|signed| u64::try_from(signed).ok())
+            })
+            .or_else(|| {
+                number.as_f64().and_then(|float| {
+                    if float.is_sign_negative() || !float.is_finite() {
+                        None
+                    } else {
+                        Some(float.round() as u64)
+                    }
+                })
+            }),
+        Value::String(text) => text.parse::<u64>().ok(),
+        _ => None,
+    })
+}
+
+fn read_f64_field(object: &Map<String, Value>, keys: &[&str]) -> Option<f64> {
+    read_value(object, keys).and_then(|value| match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
+    })
+}
+
+fn read_bool_field(object: &Map<String, Value>, keys: &[&str]) -> Option<bool> {
+    read_value(object, keys).and_then(|value| match value {
+        Value::Bool(flag) => Some(*flag),
+        Value::String(text) => match normalize_token(text).as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
 // ──────────────────── conversion helpers ────────────────────
 
 /// Convert a JSONL `LogEntry` to a `TimelineEvent`.
@@ -1261,6 +1421,56 @@ mod tests {
         let result = adapter.recent_events(10, &critical_filter);
         assert_eq!(result.data.len(), 1);
         assert_eq!(result.data[0].severity, "critical");
+    }
+
+    #[test]
+    fn jsonl_schema_shield_recovers_legacy_alias_fields() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("activity.jsonl");
+        let content = [
+            r#"{"timestamp":"2026-02-16T00:00:10Z","event_type":"artifact_delete","level":"warning","target_path":"/tmp/legacy","size_bytes":1234,"total_score":0.42,"pressure_level":"orange","free_percent":11.5,"ewma_rate":128.0,"durationMillis":21,"success":false,"mount":"/","message":"legacy schema line"}"#,
+            r#"{"ts":"2026-02-16T00:00:11Z","event":"daemon_start","severity":"info","details":"normal line"}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, content).expect("write jsonl");
+
+        let adapter = JsonlTelemetryAdapter::open(&path).expect("open");
+        let result = adapter.recent_events(10, &EventFilter::default());
+
+        assert_eq!(result.source, DataSource::Jsonl);
+        assert_eq!(result.data.len(), 2);
+        assert!(result.diagnostics.contains("recovered=1"));
+        assert!(!result.partial);
+
+        let recovered = result
+            .data
+            .iter()
+            .find(|event| event.path.as_deref() == Some("/tmp/legacy"))
+            .expect("recovered legacy event");
+        assert_eq!(recovered.event_type, "artifact_delete");
+        assert_eq!(recovered.severity, "warning");
+        assert_eq!(recovered.size_bytes, Some(1234));
+    }
+
+    #[test]
+    fn jsonl_schema_shield_marks_partial_when_lines_are_dropped() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("activity.jsonl");
+        let content = [
+            r#"{"ts":"2026-02-16T00:00:11Z","event":"daemon_start","severity":"info","details":"normal line"}"#,
+            r#"{"timestamp":"missing-event-and-severity-only"}"#,
+            "not-json-at-all",
+        ]
+        .join("\n");
+        std::fs::write(&path, content).expect("write jsonl");
+
+        let adapter = JsonlTelemetryAdapter::open(&path).expect("open");
+        let result = adapter.recent_events(10, &EventFilter::default());
+
+        assert_eq!(result.data.len(), 2);
+        assert!(result.partial);
+        assert!(result.diagnostics.contains("recovered=1"));
+        assert!(result.diagnostics.contains("dropped=1"));
     }
 
     #[test]

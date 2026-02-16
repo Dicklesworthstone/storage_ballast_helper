@@ -481,6 +481,99 @@ mod tests {
     }
 
     #[test]
+    fn fresh_state_reports_schema_drift_without_failing_load() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state_path = tmp.path().join("state.json");
+
+        let mut value = serde_json::to_value(sample_daemon_state()).expect("state value");
+        let object = value.as_object_mut().expect("state object");
+        object.remove("memory_rss_bytes");
+        object.insert(
+            "future_schema_field".to_string(),
+            serde_json::Value::String("preview".to_string()),
+        );
+        std::fs::write(
+            &state_path,
+            serde_json::to_string(&value).expect("state json"),
+        )
+        .expect("write state");
+
+        let adapter = DashboardStateAdapter::new(
+            mock_platform(),
+            Duration::from_secs(90),
+            Duration::from_secs(1),
+        );
+        let snapshot = adapter.load_snapshot(&state_path, &[PathBuf::from("/tmp/work")]);
+
+        assert_eq!(snapshot.freshness, StateFreshness::Fresh);
+        assert_eq!(snapshot.source, SnapshotSource::DaemonState);
+        assert!(snapshot.daemon_state.is_some());
+        assert!(snapshot.warnings.has_drift());
+        assert!(
+            snapshot
+                .warnings
+                .unknown_fields
+                .iter()
+                .any(|field| field == "future_schema_field")
+        );
+        assert!(
+            snapshot
+                .warnings
+                .missing_fields
+                .iter()
+                .any(|field| field == "memory_rss_bytes")
+        );
+    }
+
+    #[test]
+    fn stale_state_keeps_schema_drift_metadata() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state_path = tmp.path().join("state.json");
+
+        let mut value = serde_json::to_value(sample_daemon_state()).expect("state value");
+        let object = value.as_object_mut().expect("state object");
+        object.remove("pressure");
+        object.insert(
+            "future_only_key".to_string(),
+            serde_json::Value::String("next".to_string()),
+        );
+        std::fs::write(
+            &state_path,
+            serde_json::to_string(&value).expect("state json"),
+        )
+        .expect("write state");
+
+        let stale_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(3600));
+        set_file_mtime(&state_path, stale_mtime).expect("set stale mtime");
+
+        let adapter = DashboardStateAdapter::new(
+            mock_platform(),
+            Duration::from_secs(90),
+            Duration::from_secs(1),
+        );
+        let snapshot = adapter.load_snapshot(&state_path, &[PathBuf::from("/tmp/work")]);
+
+        assert!(matches!(snapshot.freshness, StateFreshness::Stale { .. }));
+        assert_eq!(snapshot.source, SnapshotSource::FilesystemFallback);
+        assert!(snapshot.daemon_state.is_some());
+        assert!(snapshot.warnings.has_drift());
+        assert!(
+            snapshot
+                .warnings
+                .unknown_fields
+                .iter()
+                .any(|field| field == "future_only_key")
+        );
+        assert!(
+            snapshot
+                .warnings
+                .missing_fields
+                .iter()
+                .any(|field| field == "pressure")
+        );
+    }
+
+    #[test]
     fn malformed_state_falls_back() {
         let tmp = TempDir::new().expect("tempdir");
         let state_path = tmp.path().join("state.json");
