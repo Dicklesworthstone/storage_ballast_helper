@@ -166,11 +166,18 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn is_writable(path: &Path) -> bool {
-    // Check if the file (or its parent directory) is writable.
+    // Check if the file (or its parent directory) is writable using access(W_OK).
     if path.exists() {
-        fs::metadata(path)
-            .map(|m| !m.permissions().readonly())
-            .unwrap_or(false)
+        #[cfg(unix)]
+        {
+            nix::unistd::access(path, nix::unistd::AccessFlags::W_OK).is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            fs::metadata(path)
+                .map(|m| !m.permissions().readonly())
+                .unwrap_or(false)
+        }
     } else {
         path.parent().is_some_and(Path::exists)
     }

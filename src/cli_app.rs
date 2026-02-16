@@ -2793,6 +2793,8 @@ struct DashboardRuntimeRequest {
     monitor_paths: Vec<PathBuf>,
     selection: DashboardRuntimeSelection,
     _reason: DashboardSelectionReason,
+    sqlite_db: Option<PathBuf>,
+    jsonl_log: Option<PathBuf>,
 }
 
 /// Resolve dashboard runtime using priority chain:
@@ -2897,6 +2899,8 @@ fn run_new_dashboard_runtime(request: &DashboardRuntimeRequest) -> Result<(), Cl
         refresh: std::time::Duration::from_millis(request.refresh_ms),
         monitor_paths: request.monitor_paths.clone(),
         mode: DashboardRuntimeMode::NewCockpit,
+        sqlite_db: request.sqlite_db.clone(),
+        jsonl_log: request.jsonl_log.clone(),
     };
     tui::run_dashboard(&config)
         .map_err(|e| CliError::Runtime(format!("dashboard runtime failure: {e}")))
@@ -2927,6 +2931,8 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
         monitor_paths: config.scanner.root_paths,
         selection,
         _reason: reason,
+        sqlite_db: Some(config.paths.sqlite_db.clone()),
+        jsonl_log: Some(config.paths.jsonl_log.clone()),
     };
 
     run_dashboard_runtime(cli, &request)
@@ -4486,7 +4492,7 @@ fn run_interactive_emergency(
     cli: &Cli,
     plan: &DeletionPlan,
     args: &EmergencyArgs,
-    root_paths: &[PathBuf],
+    _root_paths: &[PathBuf],
     dir_count: usize,
     scan_elapsed: std::time::Duration,
 ) -> Result<(), CliError> {
@@ -4498,13 +4504,13 @@ fn run_interactive_emergency(
     let mut delete_all = false;
 
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let collector = FsStatsCollector::new(platform, std::time::Duration::from_millis(500));
 
     eprintln!("Proceed with deletion? [y/N/a(ll)/s(kip)/q(uit)]");
 
     for (i, candidate) in plan.candidates.iter().enumerate() {
-        // Check target_free stop condition.
-        if let Some(first_root) = root_paths.first()
-            && let Ok(stats) = platform.fs_stats(first_root)
+        // Check target_free stop condition using the candidate's actual mount point.
+        if let Ok(stats) = collector.collect(&candidate.path)
             && stats.free_pct() >= args.target_free
         {
             eprintln!(

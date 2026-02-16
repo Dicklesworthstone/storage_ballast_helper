@@ -179,7 +179,6 @@ pub struct JsonlWriter {
     bytes_written: u64,
     last_fsync: SystemTime,
     last_recover_attempt: SystemTime,
-    last_rotate_attempt: SystemTime,
     lines_since_fsync: u64,
 }
 
@@ -193,7 +192,6 @@ impl JsonlWriter {
             bytes_written: 0,
             last_fsync: SystemTime::now(),
             last_recover_attempt: UNIX_EPOCH,
-            last_rotate_attempt: UNIX_EPOCH,
             lines_since_fsync: 0,
         };
         w.try_open_primary();
@@ -256,13 +254,8 @@ impl JsonlWriter {
 
         // Check if rotation is needed before writing.
         if self.bytes_written + line.len() as u64 > self.config.max_size_bytes
+            && self.bytes_written > 0
             && matches!(self.state, WriterState::Normal | WriterState::Fallback)
-            && self
-                .last_rotate_attempt
-                .elapsed()
-                .unwrap_or(Duration::ZERO)
-                .as_secs()
-                > 10
         {
             self.rotate();
         }
@@ -377,8 +370,6 @@ impl JsonlWriter {
     }
 
     fn rotate(&mut self) {
-        self.last_rotate_attempt = SystemTime::now();
-
         // Flush and drop current file.
         if let Some(w) = self.writer.as_mut() {
             let _ = w.flush();
@@ -396,15 +387,14 @@ impl JsonlWriter {
 
         // Delete the oldest rotation first.
         let oldest = rotated_name(base, self.config.max_rotated_files);
-        if oldest.exists() {
-            if let Err(e) = fs::remove_file(&oldest) {
-                let _ = writeln!(
-                    io::stderr(),
-                    "[SBH-JSONL] rotation warning: failed to delete oldest log {}: {}",
-                    oldest.display(),
-                    e
-                );
-            }
+        if oldest.exists()
+            && let Err(e) = fs::remove_file(&oldest)
+        {
+            let _ = writeln!(
+                io::stderr(),
+                "[SBH-JSONL] rotation warning: failed to delete oldest log {}: {e}",
+                oldest.display(),
+            );
         }
 
         for i in (1..self.config.max_rotated_files).rev() {
@@ -442,6 +432,15 @@ impl JsonlWriter {
             );
         }
 
+        if let Err(e) = sync_parent_directory(base) {
+            let _ = writeln!(
+                io::stderr(),
+                "[SBH-JSONL] rotation warning: failed to sync parent directory for {}: {}",
+                base.display(),
+                e
+            );
+        }
+
         // Reopen a fresh file.
         match open_append(base) {
             Ok((file, _)) => {
@@ -451,8 +450,7 @@ impl JsonlWriter {
             Err(e) => {
                 let _ = writeln!(
                     io::stderr(),
-                    "[SBH-JSONL] critical: failed to reopen log after rotation: {}",
-                    e
+                    "[SBH-JSONL] critical: failed to reopen log after rotation: {e}",
                 );
                 self.degrade();
             }
@@ -467,6 +465,7 @@ impl JsonlWriter {
         if self.state == WriterState::Normal {
             return;
         }
+
         if let Ok((file, size)) = open_append(&self.config.path) {
             self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
             self.state = WriterState::Normal;
@@ -475,6 +474,20 @@ impl JsonlWriter {
                 io::stderr(),
                 "[SBH-JSONL] recovered to primary path: {}",
                 self.config.path.display()
+            );
+            return;
+        }
+
+        if let Some(fallback) = &self.config.fallback_path
+            && let Ok((file, size)) = open_append(fallback)
+        {
+            self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
+            self.state = WriterState::Fallback;
+            self.bytes_written = size;
+            let _ = writeln!(
+                io::stderr(),
+                "[SBH-JSONL] recovered to fallback path: {}",
+                fallback.display()
             );
         }
     }
@@ -511,6 +524,21 @@ fn rotated_name(base: &Path, index: u32) -> PathBuf {
     let mut name = base.as_os_str().to_owned();
     name.push(format!(".{index}"));
     PathBuf::from(name)
+}
+
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+    Ok(())
 }
 
 /// Format current UTC time as ISO 8601.
@@ -793,6 +821,34 @@ mod tests {
     }
 
     #[test]
+    fn recovery_from_stderr_to_fallback_when_primary_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback_path = dir.path().join("recovered_fallback.jsonl");
+
+        let config = JsonlConfig {
+            path: PathBuf::from("/nonexistent_sbh_stderr_to_fallback/primary.jsonl"),
+            fallback_path: Some(PathBuf::from(
+                "/nonexistent_sbh_stderr_to_fallback/fallback.jsonl",
+            )),
+            max_size_bytes: 1024 * 1024,
+            max_rotated_files: 3,
+            fsync_interval_secs: 60,
+        };
+        let mut writer = JsonlWriter::open(config);
+        assert_eq!(writer.state(), "stderr");
+
+        // Keep primary unavailable, but make fallback available.
+        writer.config.fallback_path = Some(fallback_path.clone());
+        writer.last_recover_attempt = UNIX_EPOCH;
+
+        writer.write_entry(&LogEntry::new(EventType::Error, Severity::Warning));
+        writer.flush();
+
+        assert_eq!(writer.state(), "fallback");
+        assert!(fallback_path.exists());
+    }
+
+    #[test]
     fn rotation_preserves_data_across_files() {
         // Inject: tiny max_size to force multiple rotations.
         // Verify: data exists in rotated files, no data loss.
@@ -834,6 +890,31 @@ mod tests {
         assert!(
             total_lines >= 10,
             "expected at least 10 lines across rotation files, got {total_lines}"
+        );
+    }
+
+    #[test]
+    fn rotation_happens_without_backoff_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rapid_rotation.jsonl");
+        let config = JsonlConfig {
+            path: path.clone(),
+            fallback_path: None,
+            max_size_bytes: 180,
+            max_rotated_files: 4,
+            fsync_interval_secs: 60,
+        };
+        let mut writer = JsonlWriter::open(config);
+
+        for _ in 0..30 {
+            writer.write_entry(&LogEntry::new(EventType::PressureChange, Severity::Info));
+        }
+        writer.flush();
+
+        assert!(rotated_name(&path, 1).exists());
+        assert!(
+            rotated_name(&path, 2).exists(),
+            "expected back-to-back rotations to create .2 quickly"
         );
     }
 

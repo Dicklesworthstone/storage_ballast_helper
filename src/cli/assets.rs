@@ -153,7 +153,7 @@ impl AssetCache {
 
         // Verify checksum.
         match compute_sha256(&path) {
-            Ok(hash) if hash == entry.sha256 => CacheStatus::Valid,
+            Ok(hash) if sha256_matches(&hash, &entry.sha256) => CacheStatus::Valid,
             Ok(hash) => CacheStatus::Corrupt {
                 expected: entry.sha256.clone(),
                 actual: hash,
@@ -549,7 +549,7 @@ pub fn fetch_assets(
             }
         }
 
-        // Offline mode: fail fast.
+        // Offline mode: fail fast for required assets, but do not fail optional assets.
         if opts.offline {
             let bundle_hint = opts
                 .bundle_root
@@ -557,16 +557,27 @@ pub fn fetch_assets(
                 .map_or_else(String::new, |root| {
                     format!(" and not present in bundle {}", root.display())
                 });
+            let (status, message) = if entry.required {
+                (
+                    FetchStatus::Failed,
+                    format!(
+                        "offline mode: required asset not in cache{bundle_hint}. Download manually:\n  curl -Lo {} {}",
+                        cache.asset_path(entry).display(),
+                        entry.url
+                    ),
+                )
+            } else {
+                (
+                    FetchStatus::Skipped,
+                    format!("offline mode: optional asset not in cache{bundle_hint}; skipping"),
+                )
+            };
             results.push(FetchResult {
                 name: entry.name.clone(),
                 version: entry.version.clone(),
-                status: FetchStatus::Failed,
+                status,
                 path: cache.asset_path(entry),
-                message: format!(
-                    "offline mode: asset not in cache{bundle_hint}. Download manually:\n  curl -Lo {} {}",
-                    cache.asset_path(entry).display(),
-                    entry.url
-                ),
+                message,
             });
             continue;
         }
@@ -774,7 +785,7 @@ fn restore_from_bundle(
     };
 
     let actual = compute_sha256(&source)?;
-    if actual != entry.sha256 {
+    if !sha256_matches(&actual, &entry.sha256) {
         return Ok(BundleRestoreOutcome::IntegrityFailed { source, actual });
     }
 
@@ -864,7 +875,7 @@ fn download_and_verify(entry: &AssetEntry, cache: &AssetCache) -> io::Result<u64
 
     // Verify integrity.
     let (hash, size) = compute_sha256_and_size(&partial)?;
-    if hash != entry.sha256 {
+    if !sha256_matches(&hash, &entry.sha256) {
         // Remove corrupt partial.
         let _ = fs::remove_file(&partial);
         return Err(io::Error::new(
@@ -894,7 +905,7 @@ pub fn verify_cached_asset(entry: &AssetEntry, cache: &AssetCache) -> io::Result
         ));
     }
     let hash = compute_sha256(&path)?;
-    Ok(hash == entry.sha256)
+    Ok(sha256_matches(&hash, &entry.sha256))
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,7 +1099,7 @@ fn bundle_cache_status(entry: &AssetEntry, bundle_root: &Path) -> CacheStatus {
     };
 
     match compute_sha256(&source) {
-        Ok(hash) if hash == entry.sha256 => CacheStatus::Valid,
+        Ok(hash) if sha256_matches(&hash, &entry.sha256) => CacheStatus::Valid,
         Ok(hash) => CacheStatus::Corrupt {
             expected: entry.sha256.clone(),
             actual: hash,
@@ -1098,6 +1109,10 @@ fn bundle_cache_status(entry: &AssetEntry, bundle_root: &Path) -> CacheStatus {
             actual: String::new(),
         },
     }
+}
+
+fn sha256_matches(actual: &str, expected: &str) -> bool {
+    actual.trim().eq_ignore_ascii_case(expected.trim())
 }
 
 /// Offline readiness report.
@@ -1291,6 +1306,29 @@ mod tests {
         let path = cache.asset_path(&entry);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"").unwrap(); // Empty file has the known hash.
+
+        assert_eq!(cache.is_cached(&entry), CacheStatus::Valid);
+    }
+
+    #[test]
+    fn cache_status_valid_is_case_insensitive() {
+        let tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(tmp.path().to_path_buf());
+
+        let entry = AssetEntry {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            sha256: "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855".to_string(),
+            url: "https://example.com/test.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: 0,
+            required: true,
+            description: String::new(),
+        };
+
+        let path = cache.asset_path(&entry);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"").unwrap();
 
         assert_eq!(cache.is_cached(&entry), CacheStatus::Valid);
     }
@@ -1552,6 +1590,35 @@ mod tests {
     }
 
     #[test]
+    fn fetch_offline_skips_missing_optional_assets() {
+        let tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(tmp.path().to_path_buf());
+        let manifest = AssetManifest {
+            version: "1.0.0".to_string(),
+            assets: vec![AssetEntry {
+                name: "optional-db".to_string(),
+                version: "1.0.0".to_string(),
+                sha256: "deadbeef".to_string(),
+                url: "https://example.com/optional-db.bin".to_string(),
+                mirrors: vec![],
+                size_bytes: 0,
+                required: false,
+                description: String::new(),
+            }],
+        };
+
+        let opts = FetchOptions {
+            offline: true,
+            ..Default::default()
+        };
+        let summary = fetch_assets(&manifest, &cache, &opts);
+        assert_eq!(summary.failed_count, 0);
+        assert_eq!(summary.results.len(), 1);
+        assert_eq!(summary.results[0].status, FetchStatus::Skipped);
+        assert!(summary.results[0].message.contains("optional asset"));
+    }
+
+    #[test]
     fn fetch_offline_restores_from_bundle() {
         let cache_tmp = TempDir::new().unwrap();
         let bundle_tmp = TempDir::new().unwrap();
@@ -1758,6 +1825,29 @@ mod tests {
             name: "test".to_string(),
             version: "1.0".to_string(),
             sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            url: "https://example.com/test.bin".to_string(),
+            mirrors: vec![],
+            size_bytes: 0,
+            required: true,
+            description: String::new(),
+        };
+
+        let path = cache.asset_path(&entry);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"").unwrap();
+
+        assert!(verify_cached_asset(&entry, &cache).unwrap());
+    }
+
+    #[test]
+    fn verify_cached_asset_valid_is_case_insensitive() {
+        let tmp = TempDir::new().unwrap();
+        let cache = AssetCache::new(tmp.path().to_path_buf());
+
+        let entry = AssetEntry {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            sha256: "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855".to_string(),
             url: "https://example.com/test.bin".to_string(),
             mirrors: vec![],
             size_bytes: 0,

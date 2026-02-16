@@ -602,10 +602,15 @@ fn check_binary_health(path: &Path) -> (bool, Option<MigrationReason>, Option<St
 fn check_config_health(path: &Path) -> (bool, Option<MigrationReason>, Option<String>) {
     match fs::read_to_string(path) {
         Ok(contents) => {
-            // Check for known deprecated keys.
+            // Check for known deprecated keys as TOML key assignments (not substrings).
             let deprecated_keys = ["scan_interval_secs", "max_ballast_mb", "log_level"];
             for key in &deprecated_keys {
-                if contents.contains(key) {
+                let is_toml_key = contents.lines().any(|line| {
+                    let trimmed = line.trim_start();
+                    // Match: `key = ...` or `key=...` (TOML key assignment).
+                    trimmed.starts_with(key) && trimmed[key.len()..].starts_with(['=', ' ', '\t'])
+                });
+                if is_toml_key {
                     return (
                         false,
                         Some(MigrationReason::DeprecatedConfigKey),

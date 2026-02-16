@@ -21,7 +21,10 @@ use super::model::{
     PreferenceProfileMode, Screen,
 };
 use super::preferences::{self, ResolvedPreferences, UserPreferences};
-use super::telemetry::{NullTelemetryHook, TelemetryHook, TelemetrySample};
+use super::telemetry::{
+    CompositeTelemetryAdapter, NullTelemetryHook, TelemetryHook, TelemetryQueryAdapter,
+    TelemetrySample,
+};
 use super::theme::AccessibilityProfile;
 use super::{input, render, update};
 use crate::cli::dashboard::{self, DashboardConfig as LegacyDashboardConfig};
@@ -46,6 +49,8 @@ pub struct DashboardRuntimeConfig {
     pub refresh: Duration,
     pub monitor_paths: Vec<PathBuf>,
     pub mode: DashboardRuntimeMode,
+    pub sqlite_db: Option<PathBuf>,
+    pub jsonl_log: Option<PathBuf>,
 }
 
 impl DashboardRuntimeConfig {
@@ -350,6 +355,10 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
     let (mut preference_state, preference_warning) = PreferenceRuntimeState::load();
     preference_state.apply_to_model(&mut model, true, true);
 
+    // Initialize telemetry adapter.
+    let telemetry_adapter =
+        CompositeTelemetryAdapter::new(config.sqlite_db.as_deref(), config.jsonl_log.as_deref());
+
     // Pending notification auto-dismiss timers: (notification_id, expires_at).
     let mut notification_timers: Vec<(u64, Instant)> = Vec::new();
     if let Some(warning) = preference_warning {
@@ -422,6 +431,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
                     cmd,
                     &mut notification_timers,
                     &mut preference_state,
+                    &telemetry_adapter,
                 );
 
                 if model.quit {
@@ -437,6 +447,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
                 cmd,
                 &mut notification_timers,
                 &mut preference_state,
+                &telemetry_adapter,
             );
         }
 
@@ -458,20 +469,67 @@ fn execute_cmd(
     cmd: DashboardCmd,
     timers: &mut Vec<(u64, Instant)>,
     preference_state: &mut PreferenceRuntimeState,
+    telemetry: &dyn TelemetryQueryAdapter,
 ) {
     match cmd {
-        DashboardCmd::None | DashboardCmd::ScheduleTick(_) | DashboardCmd::FetchTelemetry => {}
+        DashboardCmd::None | DashboardCmd::ScheduleTick(_) => {}
         DashboardCmd::FetchData => {
             let state = read_state_file(state_file);
             let inner_cmd = update::update(model, DashboardMsg::DataUpdate(state));
-            execute_cmd(model, state_file, inner_cmd, timers, preference_state);
+            execute_cmd(
+                model,
+                state_file,
+                inner_cmd,
+                timers,
+                preference_state,
+                telemetry,
+            );
+        }
+        DashboardCmd::FetchTelemetry => {
+            let inner_cmd = match model.screen {
+                Screen::Timeline => {
+                    let result =
+                        telemetry.recent_events(50, &model.timeline_filter.to_event_filter());
+                    update::update(model, DashboardMsg::TelemetryTimeline(result))
+                }
+                Screen::Explainability => {
+                    let result = telemetry.recent_decisions(20);
+                    update::update(model, DashboardMsg::TelemetryDecisions(result))
+                }
+                Screen::Candidates => {
+                    // Candidates are not yet persisted to DB in a queryable way for the screen.
+                    // For now, we return empty/unavailable.
+                    // (Scanner state lives in memory/JSONL mostly).
+                    // This matches current architecture.
+                    let result = crate::tui::telemetry::TelemetryResult::unavailable(
+                        "live candidates not yet queryable".to_string(),
+                    );
+                    update::update(model, DashboardMsg::TelemetryCandidates(result))
+                }
+                Screen::Ballast => {
+                    // Ballast inventory is in DaemonState (handled by FetchData),
+                    // but we might want history or other details.
+                    // For now, FetchData handles the inventory list.
+                    // If we needed historical ballast ops, we'd query here.
+                    DashboardCmd::None
+                }
+                _ => DashboardCmd::None,
+            };
+            execute_cmd(
+                model,
+                state_file,
+                inner_cmd,
+                timers,
+                preference_state,
+                telemetry,
+            );
         }
         DashboardCmd::Quit => {
             model.quit = true;
         }
         DashboardCmd::Batch(cmds) => {
             for c in cmds {
-                execute_cmd(model, state_file, c, timers, preference_state);
+                execute_cmd(model, state_file, c, timers, preference_state, telemetry);
             }
         }
         DashboardCmd::ScheduleNotificationExpiry { id, after } => {
@@ -564,6 +622,8 @@ mod tests {
             refresh: Duration::from_millis(750),
             monitor_paths: vec![PathBuf::from("/tmp"), PathBuf::from("/data/projects")],
             mode: DashboardRuntimeMode::LegacyFallback,
+            sqlite_db: None,
+            jsonl_log: None,
         };
 
         let legacy = cfg.as_legacy_config();

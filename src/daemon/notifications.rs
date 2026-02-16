@@ -363,13 +363,20 @@ impl Channel for DesktopChannel {
 
         #[cfg(target_os = "linux")]
         {
-            let _ = Command::new("notify-send")
+            if let Ok(child) = Command::new("notify-send")
                 .arg("--urgency")
                 .arg(urgency)
                 .arg("--app-name=sbh")
                 .arg("Storage Ballast Helper")
                 .arg(&summary)
-                .spawn();
+                .spawn()
+            {
+                // Reap the child in a detached thread to prevent zombie accumulation.
+                std::thread::spawn(move || {
+                    let mut c = child;
+                    let _ = c.wait();
+                });
+            }
         }
 
         #[cfg(target_os = "macos")]
@@ -379,7 +386,12 @@ impl Channel for DesktopChannel {
             let script = format!(
                 "display notification \"{escaped}\" with title \"sbh\" subtitle \"Storage Ballast Helper\"",
             );
-            let _ = Command::new("osascript").arg("-e").arg(&script).spawn();
+            if let Ok(child) = Command::new("osascript").arg("-e").arg(&script).spawn() {
+                std::thread::spawn(move || {
+                    let mut c = child;
+                    let _ = c.wait();
+                });
+            }
         }
 
         // Suppress unused-variable warnings on platforms that don't use all locals.
@@ -535,7 +547,8 @@ impl WebhookChannel {
             } => (mount.clone(), format!("{free_pct:.1}")),
             NotificationEvent::PredictiveWarning { mount, .. }
             | NotificationEvent::CleanupCompleted { mount, .. }
-            | NotificationEvent::BallastReleased { mount, .. } => {
+            | NotificationEvent::BallastReleased { mount, .. }
+            | NotificationEvent::BallastReplenished { mount, .. } => {
                 (mount.clone(), "N/A".to_string())
             }
             _ => ("N/A".to_string(), "N/A".to_string()),
@@ -596,7 +609,8 @@ impl Channel for WebhookChannel {
 
         // Fire-and-forget via curl. Timeout of 5 seconds to avoid blocking.
         // Use "--" to prevent URL from being interpreted as a curl option.
-        let _ = Command::new("curl")
+        // Reap the child in a detached thread to prevent zombie accumulation.
+        if let Ok(child) = Command::new("curl")
             .arg("--silent")
             .arg("--max-time")
             .arg("5")
@@ -606,7 +620,13 @@ impl Channel for WebhookChannel {
             .arg(&body)
             .arg("--")
             .arg(&self.url)
-            .spawn();
+            .spawn()
+        {
+            std::thread::spawn(move || {
+                let mut c = child;
+                let _ = c.wait();
+            });
+        }
     }
 }
 

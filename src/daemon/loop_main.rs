@@ -28,14 +28,17 @@ use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::Config;
 use crate::core::errors::{Result, SbhError};
-use crate::daemon::notifications::{NotificationEvent, NotificationManager, NotificationLevel};
+use crate::daemon::notifications::{NotificationEvent, NotificationLevel, NotificationManager};
 use crate::daemon::policy::PolicyEngine;
 use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, spawn_logger};
 use crate::logger::jsonl::JsonlConfig;
-use crate::monitor::ewma::DiskRateEstimator;
+use crate::monitor::ewma::{DiskRateEstimator, RateEstimate};
 use crate::monitor::fs_stats::FsStatsCollector;
+use crate::monitor::guardrails::{
+    AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus,
+};
 use crate::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
 use crate::monitor::special_locations::SpecialLocationRegistry;
 use crate::monitor::voi_scheduler::VoiScheduler;
@@ -230,6 +233,15 @@ impl Default for DaemonArgs {
 struct MountMonitor {
     rate_estimator: DiskRateEstimator,
     pressure_controller: PidPressureController,
+    guard: AdaptiveGuard,
+    last_guard_sample: Option<GuardSample>,
+}
+
+struct GuardSample {
+    at: Instant,
+    available_bytes: u64,
+    predicted_rate: f64,
+    predicted_tte: f64,
 }
 
 impl MountMonitor {
@@ -262,7 +274,59 @@ impl MountMonitor {
         Self {
             rate_estimator,
             pressure_controller,
+            guard: AdaptiveGuard::with_defaults(),
+            last_guard_sample: None,
         }
+    }
+
+    fn observe_guard(
+        &mut self,
+        now: Instant,
+        available_bytes: u64,
+        threshold_bytes: u64,
+        rate_estimate: &RateEstimate,
+    ) -> GuardDiagnostics {
+        if let Some(previous) = &self.last_guard_sample
+            && let Some(dt) = now.checked_duration_since(previous.at)
+        {
+            let dt_seconds = dt.as_secs_f64();
+            if dt_seconds > 1e-6 {
+                let consumed_bytes = previous.available_bytes as f64 - available_bytes as f64;
+                let actual_rate = consumed_bytes / dt_seconds;
+                let actual_tte = if available_bytes <= threshold_bytes {
+                    dt_seconds
+                } else {
+                    f64::INFINITY
+                };
+                self.guard.observe(CalibrationObservation {
+                    predicted_rate: previous.predicted_rate,
+                    actual_rate,
+                    predicted_tte: previous.predicted_tte,
+                    actual_tte,
+                });
+            }
+        }
+
+        let predicted_rate = if rate_estimate.bytes_per_second.is_finite() {
+            rate_estimate.bytes_per_second
+        } else {
+            0.0
+        };
+        let predicted_tte = if rate_estimate.seconds_to_threshold.is_finite()
+            && rate_estimate.seconds_to_threshold >= 0.0
+        {
+            rate_estimate.seconds_to_threshold
+        } else {
+            f64::INFINITY
+        };
+        self.last_guard_sample = Some(GuardSample {
+            at: now,
+            available_bytes,
+            predicted_rate,
+            predicted_tte,
+        });
+
+        self.guard.diagnostics()
     }
 }
 
@@ -299,6 +363,7 @@ pub struct MonitoringDaemon {
     swap_thrash_active: bool,
     self_monitor: SelfMonitor,
     policy_engine: Arc<Mutex<PolicyEngine>>,
+    shared_guard_diagnostics: Arc<RwLock<Option<GuardDiagnostics>>>,
     scanner_heartbeat: Arc<ThreadHeartbeat>,
     executor_heartbeat: Arc<ThreadHeartbeat>,
 }
@@ -570,6 +635,7 @@ impl MonitoringDaemon {
 
         // 14. Policy engine (progressive delivery gates for deletion pipeline).
         let policy_engine = Arc::new(Mutex::new(PolicyEngine::new(config.policy.clone())));
+        let shared_guard_diagnostics = Arc::new(RwLock::new(None));
 
         let cached_primary_path = compute_primary_path(&config);
 
@@ -604,6 +670,7 @@ impl MonitoringDaemon {
             self_monitor,
             scanner_heartbeat,
             executor_heartbeat,
+            shared_guard_diagnostics,
         })
     }
 
@@ -926,6 +993,7 @@ impl MonitoringDaemon {
 
         let now = Instant::now();
         let mut worst_response: Option<crate::monitor::pid::PressureResponse> = None;
+        let mut worst_guard_diag: Option<GuardDiagnostics> = None;
 
         // Update monitors for each active mount.
         for (mount_path, stats) in stats_by_mount {
@@ -943,6 +1011,12 @@ impl MonitoringDaemon {
                 monitor
                     .rate_estimator
                     .update(stats.available_bytes, now, red_threshold_bytes);
+            let guard_diag = monitor.observe_guard(
+                now,
+                stats.available_bytes,
+                red_threshold_bytes,
+                &rate_estimate,
+            );
 
             // Predicted time to red threshold.
             let predicted_seconds = if rate_estimate.seconds_to_threshold.is_finite()
@@ -967,6 +1041,7 @@ impl MonitoringDaemon {
             match worst_response {
                 None => {
                     worst_response = Some(response);
+                    worst_guard_diag = Some(guard_diag);
                     self.last_ewma_confidence = rate_estimate.confidence;
                 }
                 Some(ref worst) => {
@@ -976,11 +1051,17 @@ impl MonitoringDaemon {
                         || (response.level == worst.level && response.urgency > worst.urgency)
                     {
                         worst_response = Some(response);
+                        worst_guard_diag = Some(guard_diag);
                         self.last_ewma_confidence = rate_estimate.confidence;
                     }
                 }
             }
         }
+
+        if let Some(diag) = worst_guard_diag.as_ref() {
+            self.policy_engine.lock().observe_window(diag);
+        }
+        *self.shared_guard_diagnostics.write() = worst_guard_diag;
 
         // Clean up monitors for unmounted/disappeared volumes?
         // For now we keep them; volume churn is rare in typical operation.
@@ -1633,6 +1714,7 @@ impl MonitoringDaemon {
     ) -> Result<thread::JoinHandle<()>> {
         let shared_config = Arc::clone(&self.shared_executor_config);
         let policy_engine = Arc::clone(&self.policy_engine);
+        let shared_guard_diagnostics = Arc::clone(&self.shared_guard_diagnostics);
 
         thread::Builder::new()
             .name("sbh-executor".to_string())
@@ -1644,6 +1726,7 @@ impl MonitoringDaemon {
                     &heartbeat,
                     &report_tx,
                     &policy_engine,
+                    &shared_guard_diagnostics,
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -2137,6 +2220,7 @@ fn executor_thread_main(
     heartbeat: &Arc<ThreadHeartbeat>,
     report_tx: &Sender<WorkerReport>,
     policy_engine: &Arc<Mutex<PolicyEngine>>,
+    shared_guard_diagnostics: &Arc<RwLock<Option<GuardDiagnostics>>>,
 ) {
     let mut tracker = RepeatDeletionTracker::new(
         Duration::from_secs(shared_config.repeat_base_cooldown_secs()),
@@ -2157,7 +2241,13 @@ fn executor_thread_main(
         // Gate candidates through the policy engine. The lock is held only for
         // the duration of evaluate() (pure computation, no I/O).
         let (approved_candidates, policy_mode) = {
-            let decision = policy_engine.lock().evaluate(&batch.candidates, None);
+            let guard_snapshot = shared_guard_diagnostics.read().clone();
+            let guard_for_policy = guard_snapshot
+                .as_ref()
+                .filter(|diag| diag.status != GuardStatus::Unknown);
+            let decision = policy_engine
+                .lock()
+                .evaluate(&batch.candidates, guard_for_policy);
             (decision.approved_for_deletion, decision.mode)
         };
 

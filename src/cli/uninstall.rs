@@ -578,7 +578,7 @@ pub fn execute_uninstall(opts: &UninstallOptions) -> UninstallReport {
         }
 
         // Execute removal.
-        let size = file_or_dir_size(&action.path);
+        let size_before = file_or_dir_size(&action.path);
         let result = if action.category == RemovalCategory::ShellProfileEntry {
             remove_profile_sbh_lines(&action.path)
         } else if action.is_directory {
@@ -591,7 +591,10 @@ pub fn execute_uninstall(opts: &UninstallOptions) -> UninstallReport {
             Ok(()) => {
                 action.executed = true;
                 removed_count += 1;
-                bytes_freed += size;
+                // For profile edits, report only the bytes actually removed (delta),
+                // not the entire file size.
+                let size_after = file_or_dir_size(&action.path);
+                bytes_freed += size_before.saturating_sub(size_after);
             }
             Err(e) => {
                 action.executed = false;
