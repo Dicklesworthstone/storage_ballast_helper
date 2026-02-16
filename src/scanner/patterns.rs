@@ -136,7 +136,7 @@ impl ArtifactPatternRegistry {
         let Some(name_os) = path.file_name() else {
             return ArtifactClassification::unknown();
         };
-        let normalized = name_os.to_string_lossy();
+        let normalized = name_os.to_string_lossy().to_lowercase();
 
         let mut best = ArtifactClassification::unknown();
         for pattern in &self.builtins {

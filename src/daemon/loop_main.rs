@@ -1131,7 +1131,9 @@ fn scanner_thread_main(
         let mut scored: Vec<CandidacyScore> = Vec::with_capacity(1024);
 
         // Snapshot open files once per scan for fast filtering.
-        let open_files = crate::scanner::walker::collect_open_files();
+        // We use the ancestor-set approach which is O(1) per candidate check
+        // instead of the O(tree_size) recursive inode scan.
+        let open_files = crate::scanner::walker::collect_open_path_ancestors(&request.paths);
 
         // Process entries.
         for entry in rx {
@@ -1146,7 +1148,7 @@ fn scanner_thread_main(
                 continue;
             }
 
-            let is_open = crate::scanner::walker::is_path_open(&entry.path, &open_files);
+            let is_open = crate::scanner::walker::is_path_open_by_ancestor(&entry.path, &open_files);
 
             let input = crate::scanner::scoring::CandidateInput {
                 path: entry.path,

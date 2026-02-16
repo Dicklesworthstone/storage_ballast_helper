@@ -387,6 +387,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_activity_event_type ON activity_log(event_type);
+        CREATE INDEX IF NOT EXISTS idx_activity_type_time ON activity_log(event_type, timestamp);
         CREATE INDEX IF NOT EXISTS idx_pressure_timestamp ON pressure_history(timestamp);
         CREATE INDEX IF NOT EXISTS idx_pressure_mount ON pressure_history(mount_point);
         CREATE INDEX IF NOT EXISTS idx_pressure_mount_timestamp

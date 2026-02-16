@@ -405,6 +405,9 @@ fn run_git_clone(url: &str, dest: &Path, checkout: &SourceCheckout) -> Result<()
     // For a specific tag, use --branch to fetch only that tag.
     let tag_string;
     if let SourceCheckout::Tag(tag) = checkout {
+        if tag.starts_with('-') {
+            return Err(format!("invalid tag '{tag}': cannot start with hyphen"));
+        }
         tag_string = tag.clone();
         args.push("--branch");
         args.push(&tag_string);
