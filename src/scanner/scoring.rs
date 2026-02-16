@@ -292,12 +292,12 @@ fn factor_location(path: &Path) -> f64 {
 
     if text.starts_with("/tmp") || text.starts_with("/var/tmp") || text.starts_with("/dev/shm") {
         0.95
-    } else if text.contains("/data/projects/") && text.contains("/target") {
-        0.80
-    } else if text.contains("/data/projects/") && text.contains("/.target") {
-        0.85
     } else if text.contains("/data/projects/") && text.contains("/.tmp_") {
         0.90
+    } else if text.contains("/data/projects/") && text.contains("/.target") {
+        0.85
+    } else if text.contains("/data/projects/") && text.contains("/target") {
+        0.80
     } else if text.contains("/.cache/") {
         0.60
     } else if text.contains("/projects/") {
