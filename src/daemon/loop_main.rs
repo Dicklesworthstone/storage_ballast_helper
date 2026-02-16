@@ -760,8 +760,9 @@ impl MonitoringDaemon {
                     self.release_controller.reset();
 
                     // Propagate pressure thresholds to PID controller.
+                    // Target must be green_min (the recovery level), consistent with init.
                     self.pressure_controller
-                        .set_target_free_pct(new_config.pressure.yellow_min_free_pct);
+                        .set_target_free_pct(new_config.pressure.green_min_free_pct);
                     self.pressure_controller.set_pressure_thresholds(
                         new_config.pressure.green_min_free_pct,
                         new_config.pressure.yellow_min_free_pct,

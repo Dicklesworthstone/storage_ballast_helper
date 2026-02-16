@@ -96,6 +96,7 @@ pub enum SkipReason {
     NotWritable,
     Vetoed,
     BelowThreshold,
+    Symlink,
 }
 
 // ──────────────────── executor ────────────────────
@@ -248,24 +249,31 @@ impl DeletionExecutor {
     // ──────────────────── pre-flight checks ────────────────────
 
     fn preflight_check(&self, path: &Path) -> std::result::Result<(), SkipReason> {
-        // 1. Path still exists.
-        if !path.exists() {
-            return Err(SkipReason::PathGone);
+        // 1. Path still exists (use symlink_metadata to not follow symlinks).
+        let meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(_) => return Err(SkipReason::PathGone),
+        };
+
+        // 2. Reject symlinks — remove_dir_all follows symlinks into the target,
+        //    which could destroy data outside watched directories.
+        if meta.file_type().is_symlink() {
+            return Err(SkipReason::Symlink);
         }
 
-        // 2. Parent directory is writable (effective permission for this process).
+        // 3. Parent directory is writable (effective permission for this process).
         if let Some(parent) = path.parent()
             && !is_writable(parent)
         {
             return Err(SkipReason::NotWritable);
         }
 
-        // 3. Does not contain .git (safety net).
-        if path.is_dir() && path.join(".git").exists() {
+        // 4. Does not contain .git (safety net).
+        if meta.is_dir() && path.join(".git").exists() {
             return Err(SkipReason::ContainsGit);
         }
 
-        // 4. Not currently open by any process (Linux /proc check).
+        // 5. Not currently open by any process (Linux /proc check).
         if self.config.check_open_files && is_path_open(path) {
             return Err(SkipReason::FileOpen);
         }

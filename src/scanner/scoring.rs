@@ -466,7 +466,9 @@ fn delete_advantage_ratio(keep_loss: f64, delete_loss: f64) -> f64 {
     let safe_keep = keep_loss.max(0.0);
     let safe_delete = delete_loss.max(0.0);
     if safe_delete <= f64::EPSILON {
-        f64::INFINITY
+        // Cap at a large finite value to avoid f64::INFINITY flowing into
+        // JSON serialization (where "inf" is not valid JSON).
+        1e6
     } else {
         safe_keep / safe_delete
     }
@@ -590,13 +592,22 @@ fn is_system_path(path: &Path) -> bool {
     }
     // Check prefixes for protected system directories.
     [
-        Path::new("/boot"),
-        Path::new("/etc"),
-        Path::new("/usr"),
         Path::new("/bin"),
-        Path::new("/sbin"),
+        Path::new("/boot"),
+        Path::new("/dev"),
+        Path::new("/etc"),
+        Path::new("/home"),
+        Path::new("/lib"),
+        Path::new("/lib64"),
+        Path::new("/opt"),
         Path::new("/proc"),
+        Path::new("/root"),
+        Path::new("/run"),
+        Path::new("/sbin"),
+        Path::new("/snap"),
         Path::new("/sys"),
+        Path::new("/usr"),
+        Path::new("/var"),
     ]
     .iter()
     .any(|root| path == *root || path.starts_with(root))
@@ -642,6 +653,39 @@ mod tests {
         assert!(score.vetoed);
         assert!(score.total_score.abs() < f64::EPSILON);
         assert_eq!(score.decision.action, DecisionAction::Keep);
+    }
+
+    #[test]
+    fn system_paths_are_vetoed() {
+        let engine = default_engine();
+        for system_dir in [
+            "/lib/x86_64-linux-gnu/libc.so",
+            "/lib64/ld-linux.so",
+            "/var/lib/dpkg/status",
+            "/dev/shm/test",
+            "/run/systemd/private",
+            "/home/user/Documents",
+            "/root/.bashrc",
+            "/opt/myapp/bin",
+            "/snap/core/current",
+        ] {
+            let score = engine.score_candidate(
+                &CandidateInput {
+                    path: PathBuf::from(system_dir),
+                    size_bytes: 1_073_741_824,
+                    age: Duration::from_secs(6 * 3600),
+                    classification: classification(0.95, ArtifactCategory::RustTarget),
+                    signals: StructuralSignals::default(),
+                    is_open: false,
+                    excluded: false,
+                },
+                0.9,
+            );
+            assert!(
+                score.vetoed,
+                "system path {system_dir} should be hard-vetoed"
+            );
+        }
     }
 
     #[test]

@@ -221,8 +221,31 @@ fn project_time(rate: f64, accel: f64, distance_bytes: f64) -> f64 {
         return f64::INFINITY;
     }
     let root = discriminant.sqrt();
-    let numerator = -rate + root;
-    let t = numerator / accel;
+
+    // Use the numerically stable form to avoid catastrophic cancellation.
+    // When accel is small and negative, `(-rate + root)` suffers precision loss
+    // because root ≈ rate. Instead, multiply both sides by the conjugate:
+    //   t = (-rate + root) / accel = 2*distance / (rate + root)
+    // The latter avoids subtracting nearly-equal quantities.
+    let t = if accel < 0.0 {
+        let denom = rate + root;
+        if denom.abs() < f64::EPSILON {
+            return f64::INFINITY;
+        }
+        2.0 * distance_bytes / denom
+    } else {
+        (-rate + root) / accel
+    };
+
+    // Reject results where the rate would have reached zero before t
+    // (unphysical: rate can't go negative).
+    if accel < 0.0 {
+        let t_zero = -rate / accel; // time when rate reaches zero
+        if t > t_zero {
+            return f64::INFINITY;
+        }
+    }
+
     if t.is_finite() && t > 0.0 {
         t
     } else {

@@ -121,6 +121,8 @@ impl PidPressureController {
     pub fn set_target_free_pct(&mut self, target: f64) {
         if (target - self.prev_target_free_pct).abs() > f64::EPSILON {
             self.last_error = 0.0; // reset derivative to avoid spike
+            self.integral = 0.0; // reset integral — stale accumulation is invalid for new target
+            self.last_update = None; // treat next update as fresh start
             self.prev_target_free_pct = target;
         }
         self.target_free_pct = target;

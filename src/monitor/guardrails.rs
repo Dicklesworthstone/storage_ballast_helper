@@ -198,9 +198,15 @@ impl AdaptiveGuard {
             self.config.e_process_penalty.ln()
         };
         self.e_process_log += lr;
-        // Clamp to prevent numerical underflow.
+        // Clamp to prevent numerical underflow / overflow.
+        // Without an upper bound the accumulator grows without limit after a
+        // long streak of good observations, making the guard effectively
+        // impossible to trip even after a sudden regime change.
         if self.e_process_log < -50.0 {
             self.e_process_log = -50.0;
+        }
+        if self.e_process_log > 50.0 {
+            self.e_process_log = 50.0;
         }
 
         // Recompute guard status.

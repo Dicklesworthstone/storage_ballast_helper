@@ -261,9 +261,10 @@ fn parse_proc_mounts(raw: &str) -> Result<Vec<MountPoint>> {
     for line in raw.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 3 {
-            return Err(SbhError::MountParse {
-                details: format!("invalid /proc/self/mounts line: {line}"),
-            });
+            // Skip malformed lines (pseudo-filesystems or kernel artifacts)
+            // rather than failing the entire mount parse.
+            eprintln!("[sbh] warning: skipping malformed /proc/self/mounts line: {line}");
+            continue;
         }
         let mount_path = unescape_mount_field(fields[1]);
         let fs_type = fields[2].to_string();

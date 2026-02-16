@@ -1054,7 +1054,7 @@ fn apply_fix_permissions(action: &MigrationAction) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let meta = fs::metadata(&action.target)?;
     let mut perms = meta.permissions();
-    let mode = perms.mode() | 0o755;
+    let mode = perms.mode() | 0o111; // add execute bits only, preserve existing rw
     perms.set_mode(mode);
     fs::set_permissions(&action.target, perms)?;
     Ok(())
@@ -1085,24 +1085,30 @@ fn apply_update_service_path(
     // Track whether we are inside the ProgramArguments array to scope
     // <string> replacements to only that section.
     let mut in_program_args = false;
+    let mut binary_replaced = false;
     let updated: Vec<String> = contents
         .lines()
         .map(|line| {
             let trimmed = line.trim();
             if trimmed.starts_with("ExecStart=") {
-                format!("ExecStart={exe_str} daemon run")
+                format!("ExecStart={exe_str} daemon")
             } else if trimmed == "<key>ProgramArguments</key>" {
                 in_program_args = true;
+                binary_replaced = false;
                 line.to_string()
             } else if in_program_args && trimmed == "</array>" {
                 in_program_args = false;
                 line.to_string()
             } else if in_program_args
+                && !binary_replaced
                 && trimmed.starts_with("<string>")
                 && trimmed.ends_with("</string>")
             {
                 let inner = &trimmed[8..trimmed.len() - 9];
+                // Only replace the first <string> entry (the binary path).
+                // Per launchd schema, the first ProgramArguments entry is always the executable.
                 if inner.contains("sbh") || inner.starts_with('/') {
+                    binary_replaced = true;
                     format!("        <string>{exe_str}</string>")
                 } else {
                     line.to_string()
