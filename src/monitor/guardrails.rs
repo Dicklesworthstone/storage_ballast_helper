@@ -198,11 +198,12 @@ impl AdaptiveGuard {
             self.config.e_process_penalty.ln()
         };
         self.e_process_log += lr;
-        // Clamp to prevent numerical underflow / overflow.
-        // Without an upper bound the accumulator grows without limit after a
-        // long streak of good observations, making the guard effectively
-        // impossible to trip even after a sudden regime change.
-        self.e_process_log = self.e_process_log.clamp(-50.0, 50.0);
+        // Clamp to ensure responsiveness.
+        // - Lower bound (-5.0): prevents "banking" too much credit (exp(-5) ~ 0.0067),
+        //   ensuring we can detect drift within ~10-15 bad observations.
+        // - Upper bound (5.0): prevents runaway alarm state (exp(5) ~ 148),
+        //   ensuring we can recover within ~10 good observations after the anomaly passes.
+        self.e_process_log = self.e_process_log.clamp(-5.0, 5.0);
 
         // Recompute guard status.
         self.recompute_status(obs_good);

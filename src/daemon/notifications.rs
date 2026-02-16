@@ -381,10 +381,10 @@ impl Channel for DesktopChannel {
             let _ = Command::new("osascript").arg("-e").arg(&script).spawn();
         }
 
-        // On other platforms, desktop notifications are a no-op.
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        // Suppress unused-variable warnings on platforms that don't use all locals.
+        #[cfg(not(target_os = "linux"))]
         {
-            let _ = (urgency, summary);
+            let _ = urgency;
         }
     }
 }

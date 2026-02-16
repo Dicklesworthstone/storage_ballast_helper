@@ -64,6 +64,21 @@ sbh emergency /data --target-free 10 --yes
 4. **Explainability is mandatory:** every action has traceable evidence and rationale.
 5. **Fail conservative:** policy/guard failures force fallback-safe behavior.
 
+## The Problem in Depth
+
+AI coding agents (Claude Code, Codex, Gemini CLI, etc.) spawn parallel build processes, download dependencies, generate intermediate artifacts, and write logs continuously. A single agent can produce gigabytes of build artifacts per hour. Run a dozen agents across multiple projects on the same machine, and disk consumption becomes unpredictable and bursty in ways that traditional monitoring tools were never designed for.
+
+The failure mode is severe: when a disk hits 100%, everything breaks simultaneously. Builds fail mid-compilation, SQLite databases corrupt, daemon state files can't be written, and even basic shell operations stop working. Recovery from a completely full disk is painful because most cleanup tools themselves need to write temporary files.
+
+Existing solutions fall short in specific ways:
+
+- **Cron + rm scripts** are fragile, have no pressure awareness, and can't distinguish a 2-hour-old build artifact from a 2-hour-old source file. They run on fixed schedules regardless of whether the disk is at 10% or 99%.
+- **Generic temp cleaners** (tmpreaper, systemd-tmpfiles) only handle `/tmp` and similar well-known paths. They don't understand build artifact structures, can't score candidates by reclaimability, and have no concept of project protection.
+- **Filesystem quotas** prevent individual users from consuming too much space but don't help when the problem is aggregate consumption across legitimate workloads on the same volume.
+- **Manual cleanup** doesn't scale and can't react faster than a human can type `du -sh` and decide what to delete.
+
+`sbh` was designed specifically for this environment: multiple concurrent agents, bursty disk consumption, safety-critical deletion decisions, and the need to react in seconds rather than minutes.
+
 ## How `sbh` Compares
 
 | Capability | `sbh` | Cron + `rm` scripts | Generic temp cleaners | Manual cleanup |

@@ -145,11 +145,11 @@ impl DeletionExecutor {
     /// Execute a deletion plan, deleting up to `max_batch_size` candidates.
     ///
     /// Returns a report summarizing what was deleted, skipped, or failed.
-    /// If `pressure_check` returns `true`, deletion stops early (pressure resolved).
+    /// If `should_skip` returns `true` for a candidate path, it is skipped.
     pub fn execute(
         &self,
         plan: &DeletionPlan,
-        pressure_check: Option<&dyn Fn() -> bool>,
+        should_skip: Option<&dyn Fn(&Path) -> bool>,
     ) -> DeletionReport {
         let start = Instant::now();
         let mut report = DeletionReport {
@@ -181,11 +181,13 @@ impl DeletionExecutor {
                 break;
             }
 
-            // Pressure check: if pressure has resolved, stop deleting.
-            if let Some(check) = pressure_check
-                && check()
+            // Dynamic skip check (e.g. target free space met).
+            if let Some(skip) = should_skip
+                && skip(&candidate.path)
             {
-                break;
+                report.items_skipped += 1;
+                // We don't log an error event for this skip as it's a success condition (target met).
+                continue;
             }
 
             // Pre-flight safety checks.

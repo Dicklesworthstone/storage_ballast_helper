@@ -23,6 +23,7 @@ use storage_ballast_helper::daemon::service::{
 };
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
+use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
 use storage_ballast_helper::platform::pal::{ServiceManager, detect_platform};
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
 use storage_ballast_helper::scanner::patterns::ArtifactPatternRegistry;
@@ -725,12 +726,12 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     }
 
     // -- install orchestration (data dir, config, ballast) ----------------------
+    let config = Config::load(cli.config.as_deref()).unwrap_or_default();
     {
         use storage_ballast_helper::cli::install::{
             InstallOptions, format_install_report, run_install_sequence_with_bundle,
         };
 
-        let config = Config::load(cli.config.as_deref()).unwrap_or_default();
         let ballast_size_bytes = args.ballast_size.checked_mul(1024 * 1024).ok_or_else(|| {
             CliError::User(format!(
                 "ballast size {} MB overflows u64 when converted to bytes",
@@ -738,7 +739,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             ))
         })?;
         let opts = InstallOptions {
-            config,
+            config: config.clone(),
             ballast_count: args.ballast_count,
             ballast_size_bytes,
             ballast_path: args.ballast_path.clone(),
@@ -830,8 +831,20 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     }
 
     // -- systemd install --------------------------------------------------
-    let mgr =
-        SystemdServiceManager::from_env(args.user).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let mut systemd_config = storage_ballast_helper::daemon::service::SystemdConfig::from_env(args.user)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    
+    // Add configured paths to ReadWritePaths to satisfy ProtectSystem=strict
+    for path in &config.scanner.root_paths {
+        systemd_config.read_write_paths.push(path.clone());
+    }
+    systemd_config.read_write_paths.push(config.paths.ballast_dir.clone());
+    // Also allow writing to the log/state directory if it's custom
+    if let Some(parent) = config.paths.sqlite_db.parent() {
+        systemd_config.read_write_paths.push(parent.to_path_buf());
+    }
+
+    let mgr = SystemdServiceManager::new(systemd_config);
     let unit_path = mgr.config().unit_path();
     let scope = if args.user { "user" } else { "system" };
 
@@ -1421,6 +1434,7 @@ struct BlameGroup {
     newest: Option<SystemTime>,
 }
 
+#[allow(unused_mut)]
 fn collect_process_info() -> Vec<ProcessBlameInfo> {
     let mut procs = Vec::new();
 
@@ -3449,10 +3463,15 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
         ));
     } else if args.yes || !io::stdout().is_terminal() {
         // Automatic mode: confirmed via --yes.
-        let pressure_check = build_pressure_check(args.target_free, &root_paths);
+        let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+        let collector = std::sync::Arc::new(FsStatsCollector::new(
+            platform,
+            std::time::Duration::from_millis(500),
+        ));
+        let pressure_check = build_pressure_check(args.target_free, collector);
         let report = executor.execute(
             &plan,
-            pressure_check.as_ref().map(|f| f as &dyn Fn() -> bool),
+            pressure_check.as_ref().map(|f| f as &dyn Fn(&std::path::Path) -> bool),
         );
 
         match output_mode(cli) {
@@ -3500,14 +3519,12 @@ fn print_deletion_plan(plan: &DeletionPlan) {
 /// Build a pressure check closure if --target-free was specified.
 fn build_pressure_check(
     target_free: Option<f64>,
-    root_paths: &[PathBuf],
-) -> Option<Box<dyn Fn() -> bool>> {
+    collector: std::sync::Arc<FsStatsCollector>,
+) -> Option<Box<dyn Fn(&Path) -> bool>> {
     let target = target_free?;
-    let check_path = root_paths.first()?.clone();
-    let platform = detect_platform().ok()?;
-    Some(Box::new(move || {
-        platform
-            .fs_stats(&check_path)
+    Some(Box::new(move |path: &Path| {
+        collector
+            .collect(path)
             .map(|stats| stats.free_pct() >= target)
             .unwrap_or(false)
     }))
@@ -3519,7 +3536,7 @@ fn run_interactive_clean(
     cli: &Cli,
     plan: &DeletionPlan,
     args: &CleanArgs,
-    root_paths: &[PathBuf],
+    _root_paths: &[PathBuf],
     dir_count: usize,
     scan_elapsed: std::time::Duration,
     protected_count: usize,
@@ -3532,6 +3549,12 @@ fn run_interactive_clean(
     let mut delete_all = false;
 
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    // Interactive mode is slow enough that we can use short TTL or no cache,
+    // but FsStatsCollector handles mount resolution which is what we need.
+    let collector = std::sync::Arc::new(FsStatsCollector::new(
+        platform,
+        std::time::Duration::from_millis(500),
+    ));
 
     println!("Proceed with deletion? [y/N/a(ll)/s(kip)/q(uit)]");
     println!("  y - delete this item    a - delete all remaining");
@@ -3539,14 +3562,18 @@ fn run_interactive_clean(
     println!("  q - quit\n");
 
     for (i, candidate) in plan.candidates.iter().enumerate() {
-        // Check target_free stop condition.
-        if let Some(target) = args.target_free
-            && let Some(first_root) = root_paths.first()
-            && let Ok(stats) = platform.fs_stats(first_root)
-            && stats.free_pct() >= target
-        {
-            println!("  Target free space ({target:.1}%) achieved. Stopping.");
-            break;
+        // Check target_free skip condition.
+        if let Some(target) = args.target_free {
+            if let Ok(stats) = collector.collect(&candidate.path) {
+                if stats.free_pct() >= target {
+                    println!(
+                        "  Target free space ({target:.1}%) achieved on {}. Skipping.",
+                        stats.mount_point.display()
+                    );
+                    items_skipped += 1;
+                    continue;
+                }
+            }
         }
 
         let action = if delete_all {
@@ -4041,10 +4068,15 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
 
     // Execute based on flags.
     if args.yes || !io::stdout().is_terminal() {
-        let pressure_check = build_pressure_check(Some(args.target_free), &root_paths);
+        let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+        let collector = std::sync::Arc::new(FsStatsCollector::new(
+            platform,
+            std::time::Duration::from_millis(500),
+        ));
+        let pressure_check = build_pressure_check(Some(args.target_free), collector);
         let report = executor.execute(
             &plan,
-            pressure_check.as_ref().map(|f| f as &dyn Fn() -> bool),
+            pressure_check.as_ref().map(|f| f as &dyn Fn(&std::path::Path) -> bool),
         );
 
         match output_mode(cli) {
