@@ -5,6 +5,7 @@
 use ftui_core::event::{KeyCode, KeyEvent};
 
 use super::model::{DashboardMsg, Overlay, Screen};
+use super::preferences::{DensityMode, HintVerbosity, StartScreen};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InputContext {
@@ -33,6 +34,11 @@ pub enum InputAction {
     ToggleOverlay(Overlay),
     ForceRefresh,
     JumpBallast,
+    SetStartScreen(StartScreen),
+    SetDensity(DensityMode),
+    SetHintVerbosity(HintVerbosity),
+    ResetPreferencesToPersisted,
+    RevertPreferencesToDefaults,
     PaletteType(char),
     PaletteBackspace,
     PaletteExecute,
@@ -427,7 +433,7 @@ const GLOBAL_HELP_BINDINGS: [HelpBinding; 11] = [
     },
 ];
 
-const PALETTE_ACTIONS: [PaletteAction; 15] = [
+const PALETTE_ACTIONS: [PaletteAction; 30] = [
     PaletteAction {
         id: "nav.overview",
         title: "Go to Overview",
@@ -517,6 +523,96 @@ const PALETTE_ACTIONS: [PaletteAction; 15] = [
         title: "Quit dashboard",
         shortcut: "q",
         action: InputAction::Quit,
+    },
+    PaletteAction {
+        id: "pref.start.overview",
+        title: "Set default start screen: Overview",
+        shortcut: "prefs",
+        action: InputAction::SetStartScreen(StartScreen::Overview),
+    },
+    PaletteAction {
+        id: "pref.start.timeline",
+        title: "Set default start screen: Timeline",
+        shortcut: "prefs",
+        action: InputAction::SetStartScreen(StartScreen::Timeline),
+    },
+    PaletteAction {
+        id: "pref.start.explainability",
+        title: "Set default start screen: Explainability",
+        shortcut: "prefs",
+        action: InputAction::SetStartScreen(StartScreen::Explainability),
+    },
+    PaletteAction {
+        id: "pref.start.candidates",
+        title: "Set default start screen: Candidates",
+        shortcut: "prefs",
+        action: InputAction::SetStartScreen(StartScreen::Candidates),
+    },
+    PaletteAction {
+        id: "pref.start.ballast",
+        title: "Set default start screen: Ballast",
+        shortcut: "prefs",
+        action: InputAction::SetStartScreen(StartScreen::Ballast),
+    },
+    PaletteAction {
+        id: "pref.start.logs",
+        title: "Set default start screen: Log Search",
+        shortcut: "prefs",
+        action: InputAction::SetStartScreen(StartScreen::LogSearch),
+    },
+    PaletteAction {
+        id: "pref.start.diagnostics",
+        title: "Set default start screen: Diagnostics",
+        shortcut: "prefs",
+        action: InputAction::SetStartScreen(StartScreen::Diagnostics),
+    },
+    PaletteAction {
+        id: "pref.start.remember",
+        title: "Set default start screen: Remember Last",
+        shortcut: "prefs",
+        action: InputAction::SetStartScreen(StartScreen::Remember),
+    },
+    PaletteAction {
+        id: "pref.density.compact",
+        title: "Set density: Compact",
+        shortcut: "prefs",
+        action: InputAction::SetDensity(DensityMode::Compact),
+    },
+    PaletteAction {
+        id: "pref.density.comfortable",
+        title: "Set density: Comfortable",
+        shortcut: "prefs",
+        action: InputAction::SetDensity(DensityMode::Comfortable),
+    },
+    PaletteAction {
+        id: "pref.hints.full",
+        title: "Set hints: Full",
+        shortcut: "prefs",
+        action: InputAction::SetHintVerbosity(HintVerbosity::Full),
+    },
+    PaletteAction {
+        id: "pref.hints.minimal",
+        title: "Set hints: Minimal",
+        shortcut: "prefs",
+        action: InputAction::SetHintVerbosity(HintVerbosity::Minimal),
+    },
+    PaletteAction {
+        id: "pref.hints.off",
+        title: "Set hints: Off",
+        shortcut: "prefs",
+        action: InputAction::SetHintVerbosity(HintVerbosity::Off),
+    },
+    PaletteAction {
+        id: "pref.reset.persisted",
+        title: "Reset session to persisted preferences",
+        shortcut: "prefs",
+        action: InputAction::ResetPreferencesToPersisted,
+    },
+    PaletteAction {
+        id: "pref.reset.defaults",
+        title: "Revert preferences to defaults",
+        shortcut: "prefs",
+        action: InputAction::RevertPreferencesToDefaults,
     },
 ];
 
@@ -670,6 +766,18 @@ mod tests {
     #[test]
     fn route_palette_query_supports_fuzzy_subsequence() {
         assert_eq!(route_palette_query("jbal"), Some(InputAction::JumpBallast));
+    }
+
+    #[test]
+    fn route_palette_query_matches_preference_actions() {
+        assert_eq!(
+            route_palette_query("pref.density.compact"),
+            Some(InputAction::SetDensity(DensityMode::Compact))
+        );
+        assert_eq!(
+            route_palette_query("pref.reset.defaults"),
+            Some(InputAction::RevertPreferencesToDefaults)
+        );
     }
 
     #[test]

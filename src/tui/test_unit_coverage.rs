@@ -1111,3 +1111,32 @@ fn palette_search_limit_exceeds_catalog_returns_all_matches() {
     // All 9 nav actions should match.
     assert!(results.len() >= 9);
 }
+
+#[test]
+fn palette_includes_preference_controls() {
+    let actions = input::command_palette_actions();
+    for id in [
+        "pref.start.overview",
+        "pref.start.remember",
+        "pref.density.compact",
+        "pref.density.comfortable",
+        "pref.hints.full",
+        "pref.hints.off",
+        "pref.reset.persisted",
+        "pref.reset.defaults",
+    ] {
+        assert!(
+            actions.iter().any(|entry| entry.id == id),
+            "missing preference action id: {id}"
+        );
+    }
+}
+
+#[test]
+fn palette_preference_lookup_is_deterministic() {
+    let first = input::search_palette_actions("pref.density", 5);
+    let second = input::search_palette_actions("pref.density", 5);
+    let first_ids: Vec<&str> = first.iter().map(|entry| entry.id).collect();
+    let second_ids: Vec<&str> = second.iter().map(|entry| entry.id).collect();
+    assert_eq!(first_ids, second_ids);
+}

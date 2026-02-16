@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use ftui_core::event::KeyEvent;
 
 use crate::daemon::self_monitor::DaemonState;
+use crate::tui::preferences::{DensityMode, HintVerbosity, StartScreen};
 use crate::tui::telemetry::{
     DataSource, DecisionEvidence, EventFilter, TelemetryResult, TimelineEvent,
 };
@@ -128,6 +129,32 @@ pub enum ConfirmAction {
     BallastRelease,
     /// Release all ballast files on the selected mount.
     BallastReleaseAll,
+}
+
+/// Source tier for the currently applied dashboard preference profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreferenceProfileMode {
+    /// Built-in defaults are active (no persisted profile).
+    Defaults,
+    /// Persisted profile loaded from disk.
+    Persisted,
+    /// In-session edits were applied (and persisted) via cockpit controls.
+    SessionOverride,
+}
+
+/// Preference mutations requested by key/palette actions and executed by runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreferenceAction {
+    /// Set startup screen preference.
+    SetStartScreen(StartScreen),
+    /// Set density preference.
+    SetDensity(DensityMode),
+    /// Set hint verbosity preference.
+    SetHintVerbosity(HintVerbosity),
+    /// Reload and apply persisted preferences from disk.
+    ResetToPersisted,
+    /// Revert to compiled defaults and persist them.
+    RevertToDefaults,
 }
 
 // ──────────────────── candidates sort ────────────────────
@@ -528,6 +555,16 @@ pub struct DashboardModel {
     /// Diagnostic message from the data source.
     pub ballast_diagnostics: String,
 
+    // ── Preference profile state ──
+    /// Start screen preference currently in effect.
+    pub preferred_start_screen: StartScreen,
+    /// Density preference currently in effect.
+    pub density: DensityMode,
+    /// Hint verbosity currently in effect.
+    pub hint_verbosity: HintVerbosity,
+    /// Source tier for the active preference profile.
+    pub preference_profile_mode: PreferenceProfileMode,
+
     // ── Command palette state ──
     /// Current search query in the command palette.
     pub palette_query: String,
@@ -598,6 +635,10 @@ impl DashboardModel {
             ballast_source: DataSource::None,
             ballast_partial: false,
             ballast_diagnostics: String::new(),
+            preferred_start_screen: StartScreen::default(),
+            density: DensityMode::default(),
+            hint_verbosity: HintVerbosity::default(),
+            preference_profile_mode: PreferenceProfileMode::Defaults,
             palette_query: String::new(),
             palette_selected: 0,
             diagnostics_verbose: false,
@@ -630,6 +671,20 @@ impl DashboardModel {
         self.screen_history.push(self.screen);
         self.screen = target;
         true
+    }
+
+    /// Set active profile values without changing navigation history.
+    pub fn set_preference_profile(
+        &mut self,
+        start_screen: StartScreen,
+        density: DensityMode,
+        hint_verbosity: HintVerbosity,
+        profile_mode: PreferenceProfileMode,
+    ) {
+        self.preferred_start_screen = start_screen;
+        self.density = density;
+        self.hint_verbosity = hint_verbosity;
+        self.preference_profile_mode = profile_mode;
     }
 
     // ── Timeline (S2) methods ──
@@ -919,6 +974,8 @@ pub enum DashboardCmd {
     FetchTelemetry,
     /// Schedule a notification auto-dismiss after the given duration.
     ScheduleNotificationExpiry { id: u64, after: Duration },
+    /// Execute a preference mutation and apply updated profile values.
+    ExecutePreferenceAction(PreferenceAction),
 }
 
 // ──────────────────── tests ────────────────────
@@ -1575,6 +1632,10 @@ mod tests {
         assert!(!model.ballast_detail);
         assert_eq!(model.ballast_source, DataSource::None);
         assert!(!model.ballast_partial);
+        assert_eq!(model.preferred_start_screen, StartScreen::Overview);
+        assert_eq!(model.density, DensityMode::Comfortable);
+        assert_eq!(model.hint_verbosity, HintVerbosity::Full);
+        assert_eq!(model.preference_profile_mode, PreferenceProfileMode::Defaults);
     }
 
     #[test]
@@ -1639,6 +1700,24 @@ mod tests {
         let mut model = test_model();
         assert!(!model.ballast_cursor_down());
         assert!(!model.ballast_cursor_up());
+    }
+
+    #[test]
+    fn set_preference_profile_updates_active_values() {
+        let mut model = test_model();
+        model.set_preference_profile(
+            StartScreen::Diagnostics,
+            DensityMode::Compact,
+            HintVerbosity::Minimal,
+            PreferenceProfileMode::SessionOverride,
+        );
+        assert_eq!(model.preferred_start_screen, StartScreen::Diagnostics);
+        assert_eq!(model.density, DensityMode::Compact);
+        assert_eq!(model.hint_verbosity, HintVerbosity::Minimal);
+        assert_eq!(
+            model.preference_profile_mode,
+            PreferenceProfileMode::SessionOverride
+        );
     }
 
     #[test]

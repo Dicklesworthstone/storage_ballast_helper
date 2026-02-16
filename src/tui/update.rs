@@ -12,7 +12,8 @@ use ftui_core::event::KeyCode;
 
 use super::input::{InputAction, InputContext};
 use super::model::{
-    DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, RateHistory, Screen,
+    DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, PreferenceAction, RateHistory,
+    Screen,
 };
 
 /// Apply a message to the model and return the next command for the runtime.
@@ -264,6 +265,21 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
         InputAction::JumpBallast => {
             model.navigate_to(Screen::Ballast);
             DashboardCmd::None
+        }
+        InputAction::SetStartScreen(start_screen) => {
+            DashboardCmd::ExecutePreferenceAction(PreferenceAction::SetStartScreen(start_screen))
+        }
+        InputAction::SetDensity(density) => {
+            DashboardCmd::ExecutePreferenceAction(PreferenceAction::SetDensity(density))
+        }
+        InputAction::SetHintVerbosity(hint_verbosity) => DashboardCmd::ExecutePreferenceAction(
+            PreferenceAction::SetHintVerbosity(hint_verbosity),
+        ),
+        InputAction::ResetPreferencesToPersisted => {
+            DashboardCmd::ExecutePreferenceAction(PreferenceAction::ResetToPersisted)
+        }
+        InputAction::RevertPreferencesToDefaults => {
+            DashboardCmd::ExecutePreferenceAction(PreferenceAction::RevertToDefaults)
         }
         InputAction::PaletteType(c) => {
             model.palette_query.push(c);
@@ -830,6 +846,34 @@ mod tests {
         let mut model = test_model();
         let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('r'))));
         assert!(matches!(cmd, DashboardCmd::FetchData));
+    }
+
+    #[test]
+    fn palette_preference_density_action_dispatches_runtime_command() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+        model.palette_query = "pref.density.compact".to_string();
+
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(matches!(
+            cmd,
+            DashboardCmd::ExecutePreferenceAction(PreferenceAction::SetDensity(
+                crate::tui::preferences::DensityMode::Compact
+            ))
+        ));
+    }
+
+    #[test]
+    fn palette_preference_reset_defaults_dispatches_runtime_command() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+        model.palette_query = "pref.reset.defaults".to_string();
+
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(matches!(
+            cmd,
+            DashboardCmd::ExecutePreferenceAction(PreferenceAction::RevertToDefaults)
+        ));
     }
 
     // ── Message-based navigation ──

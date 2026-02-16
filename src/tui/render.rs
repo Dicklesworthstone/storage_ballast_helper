@@ -5,9 +5,11 @@
 use super::layout::{
     OverviewPane, PanePriority, TimelinePane, build_overview_layout, build_timeline_layout,
 };
-use super::input::search_palette_actions;
-use super::model::{BallastVolume, DashboardModel, NotificationLevel, Overlay, Screen};
-use super::theme::{AccessibilityProfile, Theme, ThemePalette};
+use super::model::{
+    BallastVolume, DashboardModel, NotificationLevel, PreferenceProfileMode, Screen,
+};
+use super::preferences::{DensityMode, HintVerbosity, StartScreen};
+use super::theme::{AccessibilityProfile, SpacingScale, Theme, ThemePalette};
 use super::widgets::{
     extract_time, gauge, human_bytes, human_duration, human_rate, section_header, sparkline,
     status_badge, trend_label,
@@ -24,7 +26,11 @@ pub fn render(model: &DashboardModel) -> String {
 
     let mut out = String::new();
     let accessibility = AccessibilityProfile::from_environment();
-    let theme = Theme::for_terminal(model.terminal_size.0, accessibility);
+    let mut theme = Theme::for_terminal(model.terminal_size.0, accessibility);
+    theme.spacing = match model.density {
+        DensityMode::Compact => SpacingScale::compact(),
+        DensityMode::Comfortable => SpacingScale::comfortable(),
+    };
 
     // Always-on header: mode indicator, active screen, overlay status.
     let mode = if model.degraded { "DEGRADED" } else { "NORMAL" };
@@ -40,6 +46,14 @@ pub fn render(model: &DashboardModel) -> String {
         color_mode_label(&theme),
         spacing_mode_label(&theme),
     );
+    let _ = writeln!(
+        out,
+        "prefs mode={} start={} density={} hints={}",
+        preference_profile_mode_label(model.preference_profile_mode),
+        start_screen_label(model.preferred_start_screen),
+        model.density,
+        model.hint_verbosity,
+    );
 
     if let Some(ref overlay) = model.active_overlay {
         let _ = writeln!(out, "[overlay: {overlay:?}]");
@@ -53,7 +67,7 @@ pub fn render(model: &DashboardModel) -> String {
         Screen::Candidates => render_candidates(model, &theme, &mut out),
         Screen::Diagnostics => render_diagnostics(model, &theme, &mut out),
         Screen::Ballast => render_ballast(model, &theme, &mut out),
-        screen => render_screen_stub(screen_label(screen), &theme, &mut out),
+        screen => render_screen_stub(model, screen_label(screen), &theme, &mut out),
     }
 
     // Notification toasts (O4).
@@ -90,6 +104,47 @@ fn spacing_mode_label(theme: &Theme) -> &'static str {
         "compact"
     } else {
         "comfortable"
+    }
+}
+
+fn preference_profile_mode_label(mode: PreferenceProfileMode) -> &'static str {
+    match mode {
+        PreferenceProfileMode::Defaults => "defaults",
+        PreferenceProfileMode::Persisted => "persisted",
+        PreferenceProfileMode::SessionOverride => "session",
+    }
+}
+
+fn start_screen_label(start_screen: StartScreen) -> &'static str {
+    match start_screen {
+        StartScreen::Overview => "overview",
+        StartScreen::Timeline => "timeline",
+        StartScreen::Explainability => "explainability",
+        StartScreen::Candidates => "candidates",
+        StartScreen::Ballast => "ballast",
+        StartScreen::LogSearch => "log_search",
+        StartScreen::Diagnostics => "diagnostics",
+        StartScreen::Remember => "remember",
+    }
+}
+
+fn write_navigation_hint(
+    model: &DashboardModel,
+    out: &mut String,
+    full: &str,
+    minimal: &str,
+) {
+    use std::fmt::Write as _;
+    // Safety floor: only optional navigation/help hints are hidden.
+    // Pressure/veto/safety indicators remain always visible in all modes.
+    let line = match model.hint_verbosity {
+        HintVerbosity::Full => Some(full),
+        HintVerbosity::Minimal => Some(minimal),
+        HintVerbosity::Off => None,
+    };
+    if let Some(line) = line {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{line}");
     }
 }
 
@@ -134,11 +189,11 @@ fn render_overview(model: &DashboardModel, theme: &Theme, out: &mut String) {
         }
     }
 
-    // ── Navigation hint ──
-    let _ = writeln!(out);
-    let _ = writeln!(
+    write_navigation_hint(
+        model,
         out,
-        "1-7 screens  [/] prev/next  b ballast  r refresh  ? help  : palette"
+        "1-7 screens  [/] prev/next  b ballast  r refresh  ? help  : palette",
+        "1-7 screens  [/] prev/next  b ballast  ? help",
     );
 }
 
@@ -413,10 +468,11 @@ fn render_timeline(model: &DashboardModel, theme: &Theme, out: &mut String) {
         .iter()
         .any(|p| p.pane == TimelinePane::StatusFooter && p.visible);
     if footer_visible {
-        let _ = writeln!(out);
-        let _ = writeln!(
+        write_navigation_hint(
+            model,
             out,
-            "j/k or \u{2191}/\u{2193} navigate  f filter  F follow  r refresh  ? help"
+            "j/k or \u{2191}/\u{2193} navigate  f filter  F follow  r refresh  ? help",
+            "j/k navigate  f filter  F follow  r refresh",
         );
     }
 }
@@ -589,11 +645,11 @@ fn render_explainability(model: &DashboardModel, theme: &Theme, out: &mut String
         let _ = writeln!(out, "Press Enter to expand detail for selected decision");
     }
 
-    // ── Navigation hint ──
-    let _ = writeln!(out);
-    let _ = writeln!(
+    write_navigation_hint(
+        model,
         out,
-        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close detail  r refresh"
+        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close detail  r refresh",
+        "j/k navigate  Enter detail  d close  r refresh",
     );
 }
 
@@ -886,11 +942,11 @@ fn render_candidates(model: &DashboardModel, theme: &Theme, out: &mut String) {
         let _ = writeln!(out, "Press Enter to expand detail for selected candidate");
     }
 
-    // ── Navigation hint ──
-    let _ = writeln!(out);
-    let _ = writeln!(
+    write_navigation_hint(
+        model,
         out,
-        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  s sort  r refresh"
+        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  s sort  r refresh",
+        "j/k navigate  Enter detail  s sort  r refresh",
     );
 }
 
@@ -1215,10 +1271,11 @@ fn render_diagnostics(model: &DashboardModel, theme: &Theme, out: &mut String) {
     } else {
         "off"
     };
-    let _ = writeln!(out);
-    let _ = writeln!(
+    write_navigation_hint(
+        model,
         out,
-        "V verbose ({verbose_label})  r refresh  ? help  q quit"
+        &format!("V verbose ({verbose_label})  r refresh  ? help  q quit"),
+        "V verbose  r refresh  q quit",
     );
 }
 
@@ -1357,11 +1414,11 @@ fn render_ballast(model: &DashboardModel, theme: &Theme, out: &mut String) {
         let _ = writeln!(out, "Press Enter to expand detail for selected volume");
     }
 
-    // ── Navigation hint ──
-    let _ = writeln!(out);
-    let _ = writeln!(
+    write_navigation_hint(
+        model,
         out,
-        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  r refresh  ? help  : palette"
+        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  r refresh  ? help  : palette",
+        "j/k navigate  Enter detail  d close  r refresh",
     );
 }
 
@@ -1410,14 +1467,19 @@ fn render_volume_detail(vol: &BallastVolume, theme: &Theme, out: &mut String) {
     }
 }
 
-fn render_screen_stub(name: &str, theme: &Theme, out: &mut String) {
+fn render_screen_stub(model: &DashboardModel, name: &str, theme: &Theme, out: &mut String) {
     use std::fmt::Write as _;
     let pending = status_badge("PENDING", theme.palette.muted, theme.accessibility);
     let _ = writeln!(
         out,
         "{name} {pending} — implementation pending (bd-xzt.3.*)"
     );
-    let _ = writeln!(out, "Press 1-7 to navigate, ? for help, q to quit");
+    write_navigation_hint(
+        model,
+        out,
+        "Press 1-7 to navigate, ? for help, q to quit",
+        "Press 1-7 to navigate, q to quit",
+    );
 }
 
 fn notification_badge(
@@ -1497,6 +1559,46 @@ mod tests {
         assert!(frame.contains("120x42"));
         assert!(frame.contains("[S1 Overview]"));
         assert!(frame.contains("theme="));
+    }
+
+    #[test]
+    fn render_header_includes_active_preference_profile() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 42),
+        );
+        model.set_preference_profile(
+            StartScreen::Timeline,
+            DensityMode::Compact,
+            HintVerbosity::Off,
+            PreferenceProfileMode::SessionOverride,
+        );
+        let frame = render(&model);
+        assert!(frame.contains("prefs mode=session"));
+        assert!(frame.contains("start=timeline"));
+        assert!(frame.contains("density=compact"));
+        assert!(frame.contains("hints=off"));
+    }
+
+    #[test]
+    fn hint_verbosity_off_hides_navigation_hints_but_keeps_safety_signal() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 40),
+        );
+        model.degraded = false;
+        model.daemon_state = Some(sample_state("red", 4.2));
+        model.hint_verbosity = HintVerbosity::Off;
+        model.screen = Screen::Overview;
+
+        let frame = render(&model);
+        assert!(!frame.contains("? help"));
+        assert!(frame.contains("pressure"));
+        assert!(frame.contains("RED"));
     }
 
     #[test]
