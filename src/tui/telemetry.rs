@@ -24,6 +24,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 // ──────────────────── recording (existing scaffold) ────────────────────
 
@@ -602,6 +603,20 @@ pub struct JsonlTelemetryAdapter {
     path: PathBuf,
 }
 
+#[derive(Debug)]
+enum ParseOutcome {
+    Exact(crate::logger::jsonl::LogEntry),
+    Recovered(crate::logger::jsonl::LogEntry),
+    Dropped,
+}
+
+#[derive(Debug, Default)]
+struct TailEntries {
+    entries: Vec<crate::logger::jsonl::LogEntry>,
+    recovered_lines: usize,
+    dropped_lines: usize,
+}
+
 impl JsonlTelemetryAdapter {
     /// Create a new adapter for the given JSONL log file.
     ///
@@ -616,9 +631,9 @@ impl JsonlTelemetryAdapter {
     }
 
     /// Read the last `n` lines from the JSONL file and parse them.
-    fn tail_entries(&self, n: usize) -> Vec<crate::logger::jsonl::LogEntry> {
+    fn tail_entries(&self, n: usize) -> TailEntries {
         let Ok(file) = std::fs::File::open(&self.path) else {
-            return Vec::new();
+            return TailEntries::default();
         };
 
         let reader = BufReader::new(file);
@@ -635,12 +650,25 @@ impl JsonlTelemetryAdapter {
         let tail = &all_lines[start..];
 
         let mut entries = Vec::with_capacity(tail.len());
+        let mut recovered_lines = 0;
+        let mut dropped_lines = 0;
         for line in tail.iter().rev() {
-            if let Ok(entry) = serde_json::from_str::<crate::logger::jsonl::LogEntry>(line) {
-                entries.push(entry);
+            match parse_jsonl_entry_with_schema_shield(line) {
+                ParseOutcome::Exact(entry) => entries.push(entry),
+                ParseOutcome::Recovered(entry) => {
+                    recovered_lines += 1;
+                    entries.push(entry);
+                }
+                ParseOutcome::Dropped => {
+                    dropped_lines += 1;
+                }
             }
         }
-        entries
+        TailEntries {
+            entries,
+            recovered_lines,
+            dropped_lines,
+        }
     }
 }
 
@@ -653,8 +681,11 @@ impl TelemetryQueryAdapter for JsonlTelemetryAdapter {
         // Read more than limit to account for filtering.
         let read_count = if filter.is_empty() { limit } else { limit * 4 };
         let entries = self.tail_entries(read_count);
+        let diagnostics = schema_shield_diagnostics(entries.recovered_lines, entries.dropped_lines);
+        let partial = entries.dropped_lines > 0;
 
         let events: Vec<TimelineEvent> = entries
+            .entries
             .into_iter()
             .filter(|entry| {
                 let sev = format!("{:?}", entry.severity).to_lowercase();
@@ -669,16 +700,19 @@ impl TelemetryQueryAdapter for JsonlTelemetryAdapter {
             .collect();
 
         TelemetryResult {
-            partial: false,
+            partial,
             source: DataSource::Jsonl,
-            diagnostics: String::new(),
+            diagnostics,
             data: events,
         }
     }
 
     fn recent_decisions(&self, limit: usize) -> TelemetryResult<Vec<DecisionEvidence>> {
         let entries = self.tail_entries(limit * 4);
+        let diagnostics = schema_shield_diagnostics(entries.recovered_lines, entries.dropped_lines);
+        let partial = entries.dropped_lines > 0;
         let evidence: Vec<DecisionEvidence> = entries
+            .entries
             .into_iter()
             .filter(|e| matches!(e.event, crate::logger::jsonl::EventType::ArtifactDelete))
             .take(limit)
@@ -692,8 +726,8 @@ impl TelemetryQueryAdapter for JsonlTelemetryAdapter {
         TelemetryResult {
             data: evidence,
             source: DataSource::Jsonl,
-            partial: false,
-            diagnostics: String::new(),
+            partial,
+            diagnostics,
         }
     }
 
@@ -704,7 +738,10 @@ impl TelemetryQueryAdapter for JsonlTelemetryAdapter {
         limit: usize,
     ) -> TelemetryResult<Vec<PressurePoint>> {
         let entries = self.tail_entries(limit * 4);
+        let diagnostics = schema_shield_diagnostics(entries.recovered_lines, entries.dropped_lines);
+        let partial = entries.dropped_lines > 0;
         let points: Vec<PressurePoint> = entries
+            .entries
             .into_iter()
             .filter(|e| {
                 matches!(e.event, crate::logger::jsonl::EventType::PressureChange)
@@ -724,8 +761,8 @@ impl TelemetryQueryAdapter for JsonlTelemetryAdapter {
         TelemetryResult {
             data: points,
             source: DataSource::Jsonl,
-            partial: false,
-            diagnostics: String::new(),
+            partial,
+            diagnostics,
         }
     }
 
