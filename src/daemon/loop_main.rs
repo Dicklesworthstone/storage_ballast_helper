@@ -26,7 +26,7 @@ use crate::ballast::release::BallastReleaseController;
 use crate::core::config::Config;
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
-use crate::daemon::signals::{ShutdownCoordinator, SignalHandler, WatchdogHeartbeat};
+use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, spawn_logger};
 use crate::logger::jsonl::JsonlConfig;
 use crate::monitor::ewma::DiskRateEstimator;
@@ -856,12 +856,7 @@ impl MonitoringDaemon {
         drop(scan_tx);
         drop(del_tx);
 
-        let coordinator = ShutdownCoordinator::new();
-        let tasks: Vec<(&str, &dyn Fn() -> bool)> =
-            vec![("scanner thread", &|| true), ("executor thread", &|| true)];
-        coordinator.execute(&tasks);
-
-        // 2. Wait for worker threads (bounded by coordinator timeout).
+        // 2. Wait for worker threads.
         if let Some(h) = scanner_join {
             let _ = h.join();
         }
@@ -1141,18 +1136,42 @@ fn classify_by_name(name: &str) -> crate::scanner::patterns::ArtifactClassificat
     }
 }
 
-/// Rough directory size estimate (sum of immediate children sizes).
+/// Bounded recursive directory size estimate.
+///
+/// Walks up to `MAX_DEPTH` levels deep and `MAX_ENTRIES` total to avoid
+/// spending too long on huge trees. Returns a lower bound on actual size.
 fn dir_size_estimate(path: &std::path::Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
+    const MAX_DEPTH: usize = 4;
+    const MAX_ENTRIES: usize = 500;
 
-    entries
-        .flatten()
-        .take(100) // cap iteration for speed
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum()
+    let mut total: u64 = 0;
+    let mut entries_seen: usize = 0;
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(path.to_path_buf(), 0)];
+
+    while let Some((dir, depth)) = stack.pop() {
+        if entries_seen >= MAX_ENTRIES {
+            break;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            entries_seen += 1;
+            if entries_seen > MAX_ENTRIES {
+                break;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            } else if meta.is_dir() && depth < MAX_DEPTH {
+                stack.push((entry.path(), depth + 1));
+            }
+        }
+    }
+
+    total
 }
 
 // ──────────────────── tests ────────────────────
@@ -1255,6 +1274,22 @@ mod tests {
 
         let size = dir_size_estimate(dir.path());
         assert!(size >= 10); // at least the bytes we wrote
+    }
+
+    #[test]
+    fn dir_size_estimate_recurses_into_subdirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub").join("deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.path().join("top.txt"), "12345").unwrap();
+        std::fs::write(sub.join("nested.txt"), "1234567890").unwrap();
+
+        let size = dir_size_estimate(dir.path());
+        // Should include both files: 5 + 10 = 15 bytes minimum.
+        assert!(
+            size >= 15,
+            "recursive estimate should include nested files, got {size}"
+        );
     }
 
     #[test]
