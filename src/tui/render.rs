@@ -706,10 +706,10 @@ fn render_decision_detail(
 }
 
 /// Render a horizontal bar for a single scoring factor (0.0..=1.0).
-fn render_factor_bar(out: &mut String, label: &str, value: f64, width: usize, _theme: Theme) {
+fn render_factor_bar(out: &mut String, label: &str, value: f64, width: usize, _theme: &Theme) {
     use std::fmt::Write as _;
     let clamped = value.clamp(0.0, 1.0);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
     let filled = (clamped * width as f64).round() as usize;
     let empty = width.saturating_sub(filled);
     let _ = writeln!(
@@ -721,7 +721,7 @@ fn render_factor_bar(out: &mut String, label: &str, value: f64, width: usize, _t
     );
 }
 
-fn action_badge(action: &str, theme: Theme) -> String {
+fn action_badge(action: &str, theme: &Theme) -> String {
     let (palette, label) = match action {
         "delete" => (theme.palette.danger, "DELETE"),
         "keep" => (theme.palette.success, "KEEP"),
@@ -746,7 +746,8 @@ fn truncate_path(path: &str, max_len: usize) -> &str {
 
 // ──────────────────── S4: Candidates ────────────────────
 
-fn render_candidates(model: &DashboardModel, theme: Theme, out: &mut String) {
+#[allow(clippy::too_many_lines)]
+fn render_candidates(model: &DashboardModel, theme: &Theme, out: &mut String) {
     use std::fmt::Write as _;
     let width = usize::from(model.terminal_size.0).max(40);
 
@@ -813,8 +814,8 @@ fn render_candidates(model: &DashboardModel, theme: Theme, out: &mut String) {
     // Column headers.
     let _ = writeln!(
         out,
-        "  {:<4} {:<8} {:<6} {:<10} {:<8} {:<6} {}",
-        "#", "ACTION", "SCORE", "SIZE", "AGE", "VETO", "PATH"
+        "  {:<4} {:<8} {:<6} {:<10} {:<8} {:<6} PATH",
+        "#", "ACTION", "SCORE", "SIZE", "AGE", "VETO"
     );
 
     for (i, candidate) in model.candidates_list.iter().enumerate() {
@@ -883,7 +884,7 @@ fn render_candidates(model: &DashboardModel, theme: Theme, out: &mut String) {
 
 fn render_candidate_detail(
     candidate: &DecisionEvidence,
-    theme: Theme,
+    theme: &Theme,
     width: usize,
     out: &mut String,
 ) {
@@ -1006,7 +1007,8 @@ fn render_candidate_detail(
 
 // ──────────────────── S7: Diagnostics ────────────────────
 
-fn render_diagnostics(model: &DashboardModel, theme: Theme, out: &mut String) {
+#[allow(clippy::too_many_lines)]
+fn render_diagnostics(model: &DashboardModel, theme: &Theme, out: &mut String) {
     use std::fmt::Write as _;
     let width = usize::from(model.terminal_size.0).max(40);
 
