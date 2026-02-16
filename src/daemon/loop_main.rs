@@ -1562,6 +1562,7 @@ impl MonitoringDaemon {
 
     // ──────────────────── config reload ────────────────────
 
+    #[allow(clippy::too_many_lines)]
     fn handle_config_reload(&mut self, _scan_tx: &Sender<ScanRequest>) {
         eprintln!("[SBH-DAEMON] config reload requested (SIGHUP)");
 

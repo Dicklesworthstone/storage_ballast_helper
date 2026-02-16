@@ -317,8 +317,8 @@ fn process_directory(
             total_count += 1;
 
             // Per-directory iteration budget: avoid spending seconds iterating
-            // directories with 8K-60K+ entries. Structural markers appear early;
-            // 2000 entries is generous enough to capture them reliably.
+            // directories with tens of thousands of entries. Structural markers
+            // appear early; MAX_ENTRIES_PER_DIR (65 536) is generous.
             if total_count >= MAX_ENTRIES_PER_DIR {
                 break;
             }

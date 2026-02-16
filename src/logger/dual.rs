@@ -126,13 +126,15 @@ impl ActivityLoggerHandle {
         self.dropped_events.load(Ordering::Relaxed)
     }
 
-    /// Request graceful shutdown and wait for the logger thread to finish.
+    /// Request graceful shutdown of the logger thread.
+    ///
+    /// Uses a blocking send so the sentinel is never silently dropped when
+    /// the channel is full.  The caller should `.join()` the thread handle
+    /// returned by [`spawn_logger`] after calling this.
     pub fn shutdown(&self) {
-        if self.tx.try_send(ActivityEvent::Shutdown).is_err() {
-            // Channel full or disconnected — brief drain then retry.
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let _ = self.tx.try_send(ActivityEvent::Shutdown);
-        }
+        // Blocking send: acceptable during shutdown — we *must* deliver the
+        // sentinel even if the channel is temporarily full.
+        let _ = self.tx.send(ActivityEvent::Shutdown);
     }
 }
 

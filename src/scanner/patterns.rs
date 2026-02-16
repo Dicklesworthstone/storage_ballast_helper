@@ -230,13 +230,7 @@ fn structural_score(category: ArtifactCategory, signals: StructuralSignals) -> f
                 0.40
             }
         }
-        ArtifactCategory::NodeModules => {
-            if signals.has_git {
-                0.0
-            } else {
-                0.80
-            }
-        }
+        ArtifactCategory::NodeModules => 0.80,
         ArtifactCategory::PythonCache => 0.75,
         ArtifactCategory::BuildOutput | ArtifactCategory::CacheDir | ArtifactCategory::TempDir => {
             if signals.mostly_object_files {
@@ -293,6 +287,12 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             name: "target-suffix",
             kind: MatchKind::Suffix("-target"),
             confidence: 0.88,
+            category: ArtifactCategory::RustTarget,
+        },
+        ArtifactPattern {
+            name: "tmp-target-prefix",
+            kind: MatchKind::Prefix(".tmp_target"),
+            confidence: 0.90,
             category: ArtifactCategory::RustTarget,
         },
         ArtifactPattern {

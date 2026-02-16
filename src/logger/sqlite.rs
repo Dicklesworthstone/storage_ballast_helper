@@ -338,15 +338,31 @@ pub struct BallastRow {
 // ──────────────────── schema & pragmas ────────────────────
 
 fn apply_pragmas(conn: &Connection) -> Result<()> {
+    // auto_vacuum can only be changed before the first table is created.
+    // For existing databases the PRAGMA is silently ignored, so we check
+    // the current value and run VACUUM to convert if needed.  This must
+    // happen before setting WAL mode because VACUUM resets journal_mode.
+    let current_av: i32 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+    if current_av != 1 {
+        // 1 = FULL.  Setting it and running VACUUM converts the database
+        // in-place so future page frees actually reclaim space.
+        if conn
+            .execute_batch("PRAGMA auto_vacuum = FULL; VACUUM;")
+            .is_err()
+        {
+            eprintln!("[SBH-SQLITE] WARNING: failed to enable auto_vacuum (current={current_av})");
+        }
+    }
+
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA cache_size = -8000;
          PRAGMA mmap_size = 67108864;
          PRAGMA temp_store = MEMORY;
-         PRAGMA busy_timeout = 5000;
-         PRAGMA auto_vacuum = FULL;",
+         PRAGMA busy_timeout = 5000;",
     )?;
+
     // Verify WAL mode is active (I12).
     let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
