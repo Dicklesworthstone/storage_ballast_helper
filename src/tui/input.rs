@@ -33,6 +33,11 @@ pub enum InputAction {
     ToggleOverlay(Overlay),
     ForceRefresh,
     JumpBallast,
+    PaletteType(char),
+    PaletteBackspace,
+    PaletteExecute,
+    PaletteCursorUp,
+    PaletteCursorDown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +196,21 @@ fn resolve_overlay_key(key: &KeyEvent, overlay: Overlay) -> InputResolution {
         }
         KeyCode::Char('p') if key.ctrl() && overlay == Overlay::CommandPalette => {
             InputResolution::action(InputAction::ToggleOverlay(Overlay::CommandPalette))
+        }
+        KeyCode::Enter if overlay == Overlay::CommandPalette => {
+            InputResolution::action(InputAction::PaletteExecute)
+        }
+        KeyCode::Backspace if overlay == Overlay::CommandPalette => {
+            InputResolution::action(InputAction::PaletteBackspace)
+        }
+        KeyCode::Up if overlay == Overlay::CommandPalette => {
+            InputResolution::action(InputAction::PaletteCursorUp)
+        }
+        KeyCode::Down if overlay == Overlay::CommandPalette => {
+            InputResolution::action(InputAction::PaletteCursorDown)
+        }
+        KeyCode::Char(c) if overlay == Overlay::CommandPalette => {
+            InputResolution::action(InputAction::PaletteType(c))
         }
         _ => InputResolution::consumed_without_action(),
     }
@@ -673,5 +693,81 @@ mod tests {
                 .iter()
                 .any(|line| line.description.contains("Close help overlay"))
         );
+    }
+
+    // ── Command palette key resolution tests ──
+
+    #[test]
+    fn palette_enter_resolves_to_execute() {
+        let ctx = InputContext {
+            screen: Screen::Overview,
+            active_overlay: Some(Overlay::CommandPalette),
+        };
+        let res = resolve_key_event(&key(KeyCode::Enter), ctx);
+        assert_eq!(res.action, Some(InputAction::PaletteExecute));
+        assert!(res.consumed);
+    }
+
+    #[test]
+    fn palette_backspace_resolves_to_backspace() {
+        let ctx = InputContext {
+            screen: Screen::Overview,
+            active_overlay: Some(Overlay::CommandPalette),
+        };
+        let res = resolve_key_event(&key(KeyCode::Backspace), ctx);
+        assert_eq!(res.action, Some(InputAction::PaletteBackspace));
+    }
+
+    #[test]
+    fn palette_up_down_resolve_to_cursor() {
+        let ctx = InputContext {
+            screen: Screen::Overview,
+            active_overlay: Some(Overlay::CommandPalette),
+        };
+        let up = resolve_key_event(&key(KeyCode::Up), ctx);
+        let down = resolve_key_event(&key(KeyCode::Down), ctx);
+        assert_eq!(up.action, Some(InputAction::PaletteCursorUp));
+        assert_eq!(down.action, Some(InputAction::PaletteCursorDown));
+    }
+
+    #[test]
+    fn palette_char_resolves_to_type() {
+        let ctx = InputContext {
+            screen: Screen::Overview,
+            active_overlay: Some(Overlay::CommandPalette),
+        };
+        let res = resolve_key_event(&key(KeyCode::Char('n')), ctx);
+        assert_eq!(res.action, Some(InputAction::PaletteType('n')));
+        assert!(res.consumed);
+    }
+
+    #[test]
+    fn palette_q_does_not_quit() {
+        let ctx = InputContext {
+            screen: Screen::Overview,
+            active_overlay: Some(Overlay::CommandPalette),
+        };
+        let res = resolve_key_event(&key(KeyCode::Char('q')), ctx);
+        assert_eq!(res.action, Some(InputAction::PaletteType('q')));
+    }
+
+    #[test]
+    fn palette_esc_still_closes() {
+        let ctx = InputContext {
+            screen: Screen::Overview,
+            active_overlay: Some(Overlay::CommandPalette),
+        };
+        let res = resolve_key_event(&key(KeyCode::Escape), ctx);
+        assert_eq!(res.action, Some(InputAction::CloseOverlay));
+    }
+
+    #[test]
+    fn palette_ctrl_c_still_quits() {
+        let ctx = InputContext {
+            screen: Screen::Overview,
+            active_overlay: Some(Overlay::CommandPalette),
+        };
+        let res = resolve_key_event(&ctrl(KeyCode::Char('c')), ctx);
+        assert_eq!(res.action, Some(InputAction::Quit));
     }
 }

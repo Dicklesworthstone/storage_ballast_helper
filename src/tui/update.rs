@@ -12,7 +12,7 @@ use ftui_core::event::KeyCode;
 
 use super::input::{InputAction, InputContext};
 use super::model::{
-    DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, RateHistory, Screen,
+    DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, Overlay, RateHistory, Screen,
 };
 
 /// Apply a message to the model and return the next command for the runtime.
@@ -227,6 +227,7 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
             }
         }
         InputAction::CloseOverlay => {
+            model.palette_reset();
             model.active_overlay = None;
             DashboardCmd::None
         }
@@ -245,13 +246,16 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
             DashboardCmd::None
         }
         InputAction::OpenOverlay(overlay) => {
+            model.palette_reset();
             model.active_overlay = Some(overlay);
             DashboardCmd::None
         }
         InputAction::ToggleOverlay(overlay) => {
             if model.active_overlay.as_ref() == Some(&overlay) {
+                model.palette_reset();
                 model.active_overlay = None;
             } else {
+                model.palette_reset();
                 model.active_overlay = Some(overlay);
             }
             DashboardCmd::None
@@ -261,6 +265,55 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
             model.navigate_to(Screen::Ballast);
             DashboardCmd::None
         }
+        InputAction::PaletteType(c) => {
+            model.palette_query.push(c);
+            palette_clamp_cursor(model);
+            DashboardCmd::None
+        }
+        InputAction::PaletteBackspace => {
+            model.palette_query.pop();
+            palette_clamp_cursor(model);
+            DashboardCmd::None
+        }
+        InputAction::PaletteExecute => {
+            let results =
+                super::input::search_palette_actions(&model.palette_query, PALETTE_RESULT_LIMIT);
+            if let Some(selected) = results.get(model.palette_selected) {
+                let action = selected.action;
+                model.active_overlay = None;
+                model.palette_reset();
+                apply_input_action(model, action)
+            } else {
+                DashboardCmd::None
+            }
+        }
+        InputAction::PaletteCursorUp => {
+            if model.palette_selected > 0 {
+                model.palette_selected -= 1;
+            }
+            DashboardCmd::None
+        }
+        InputAction::PaletteCursorDown => {
+            let result_count =
+                super::input::search_palette_actions(&model.palette_query, PALETTE_RESULT_LIMIT)
+                    .len();
+            if result_count > 0 && model.palette_selected < result_count - 1 {
+                model.palette_selected += 1;
+            }
+            DashboardCmd::None
+        }
+    }
+}
+
+const PALETTE_RESULT_LIMIT: usize = 15;
+
+fn palette_clamp_cursor(model: &mut DashboardModel) {
+    let count =
+        super::input::search_palette_actions(&model.palette_query, PALETTE_RESULT_LIMIT).len();
+    if count == 0 {
+        model.palette_selected = 0;
+    } else if model.palette_selected >= count {
+        model.palette_selected = count - 1;
     }
 }
 
@@ -435,7 +488,7 @@ mod tests {
     use crate::daemon::self_monitor::{
         BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
     };
-    use crate::tui::model::{DashboardError, Overlay};
+    use crate::tui::model::DashboardError;
     use crate::tui::telemetry::DataSource;
 
     fn test_model() -> DashboardModel {
@@ -1926,5 +1979,215 @@ mod tests {
         } else {
             panic!("Expected Batch command from Tick");
         }
+    }
+
+    // ── Command palette interaction tests ──
+
+    #[test]
+    fn palette_opens_with_clean_state() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            DashboardMsg::Key(make_key_ctrl(KeyCode::Char('p'))),
+        );
+        assert_eq!(model.active_overlay, Some(Overlay::CommandPalette));
+        assert!(model.palette_query.is_empty());
+        assert_eq!(model.palette_selected, 0);
+    }
+
+    #[test]
+    fn palette_opens_with_colon() {
+        let mut model = test_model();
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(':'))));
+        assert_eq!(model.active_overlay, Some(Overlay::CommandPalette));
+        assert!(model.palette_query.is_empty());
+        assert_eq!(model.palette_selected, 0);
+    }
+
+    #[test]
+    fn palette_typing_builds_query() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('n'))));
+        assert_eq!(model.palette_query, "n");
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('a'))));
+        assert_eq!(model.palette_query, "na");
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('v'))));
+        assert_eq!(model.palette_query, "nav");
+    }
+
+    #[test]
+    fn palette_backspace_removes_character() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('a'))));
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('b'))));
+        assert_eq!(model.palette_query, "ab");
+
+        update(
+            &mut model,
+            DashboardMsg::Key(make_key(KeyCode::Backspace)),
+        );
+        assert_eq!(model.palette_query, "a");
+    }
+
+    #[test]
+    fn palette_backspace_on_empty_is_noop() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+        assert!(model.palette_query.is_empty());
+
+        update(
+            &mut model,
+            DashboardMsg::Key(make_key(KeyCode::Backspace)),
+        );
+        assert!(model.palette_query.is_empty());
+    }
+
+    #[test]
+    fn palette_cursor_navigation() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+        // Empty query shows all 15 palette actions.
+        assert_eq!(model.palette_selected, 0);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Down)));
+        assert_eq!(model.palette_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Down)));
+        assert_eq!(model.palette_selected, 2);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Up)));
+        assert_eq!(model.palette_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Up)));
+        assert_eq!(model.palette_selected, 0);
+
+        // Up at top is clamped.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Up)));
+        assert_eq!(model.palette_selected, 0);
+    }
+
+    #[test]
+    fn palette_execute_navigates_and_closes() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+        // Empty query, first result is nav.overview (already there), second is nav.timeline.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Down)));
+        assert_eq!(model.palette_selected, 1);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert_eq!(model.screen, Screen::Timeline);
+        assert!(model.active_overlay.is_none());
+        assert!(model.palette_query.is_empty());
+        assert_eq!(model.palette_selected, 0);
+    }
+
+    #[test]
+    fn palette_execute_with_search() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+
+        // Type "ballast" to narrow results.
+        for c in "ballast".chars() {
+            update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(c))));
+        }
+
+        // First result should be nav.ballast or action.jump_ballast.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert_eq!(model.screen, Screen::Ballast);
+        assert!(model.active_overlay.is_none());
+    }
+
+    #[test]
+    fn palette_esc_closes_and_resets() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('x'))));
+        assert_eq!(model.palette_query, "x");
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Escape)));
+        assert!(model.active_overlay.is_none());
+        assert!(model.palette_query.is_empty());
+        assert_eq!(model.palette_selected, 0);
+    }
+
+    #[test]
+    fn palette_toggle_closes_and_resets() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('a'))));
+        assert_eq!(model.palette_query, "a");
+
+        update(
+            &mut model,
+            DashboardMsg::Key(make_key_ctrl(KeyCode::Char('p'))),
+        );
+        assert!(model.active_overlay.is_none());
+        assert!(model.palette_query.is_empty());
+        assert_eq!(model.palette_selected, 0);
+    }
+
+    #[test]
+    fn palette_cursor_clamps_on_query_change() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+
+        // Move cursor to a high position with empty query (15 results).
+        for _ in 0..10 {
+            update(&mut model, DashboardMsg::Key(make_key(KeyCode::Down)));
+        }
+        assert_eq!(model.palette_selected, 10);
+
+        // Type a very specific query that produces fewer results.
+        for c in "action.quit".chars() {
+            update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(c))));
+        }
+        // Cursor should be clamped to the result count.
+        assert!(model.palette_selected < 15);
+    }
+
+    #[test]
+    fn palette_ctrl_c_still_quits() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('a'))));
+
+        let cmd = update(
+            &mut model,
+            DashboardMsg::Key(make_key_ctrl(KeyCode::Char('c'))),
+        );
+        assert!(model.quit);
+        assert!(matches!(cmd, DashboardCmd::Quit));
+    }
+
+    #[test]
+    fn palette_typing_does_not_trigger_global_keys() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+
+        // 'q' in palette types, does not quit.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('q'))));
+        assert!(!model.quit);
+        assert_eq!(model.palette_query, "q");
+    }
+
+    #[test]
+    fn palette_execute_on_no_results_is_noop() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+
+        // Type gibberish that matches nothing.
+        for c in "zzzzzzzzz".chars() {
+            update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(c))));
+        }
+
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(matches!(cmd, DashboardCmd::None));
+        assert_eq!(model.active_overlay, Some(Overlay::CommandPalette));
     }
 }
