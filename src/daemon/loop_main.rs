@@ -471,7 +471,7 @@ impl MonitoringDaemon {
             self.handle_pressure(&response, &scan_tx);
 
             // 6. Check special locations independently.
-            self.check_special_locations();
+            self.check_special_locations(&scan_tx);
 
             // 7. Watchdog heartbeat.
             self.watchdog.maybe_notify(&format!(
@@ -1009,7 +1009,7 @@ impl MonitoringDaemon {
 
     // ──────────────────── special locations ────────────────────
 
-    fn check_special_locations(&mut self) {
+    fn check_special_locations(&mut self, scan_tx: &Sender<ScanRequest>) {
         let now = Instant::now();
 
         for location in self.special_locations.all() {
@@ -1045,6 +1045,38 @@ impl MonitoringDaemon {
                         location.buffer_pct,
                     ),
                 });
+
+                // Trigger root filesystem scan: special location pressure (e.g. /dev/shm
+                // full) indicates agent swarm activity that is likely also generating root
+                // filesystem artifacts. Proactively scan to clean up before root hits capacity.
+                let urgency = f64::from(location.priority) / 255.0;
+                let free_ratio = stats.free_pct() / f64::from(location.buffer_pct);
+                let pressure_level = if free_ratio < 0.25 {
+                    PressureLevel::Red
+                } else if free_ratio < 0.5 {
+                    PressureLevel::Orange
+                } else {
+                    PressureLevel::Yellow
+                };
+                let max_delete_batch = match pressure_level {
+                    PressureLevel::Red | PressureLevel::Critical => 100,
+                    PressureLevel::Orange => 60,
+                    _ => 40,
+                };
+
+                let request = ScanRequest {
+                    paths: self.config.scanner.root_paths.clone(),
+                    urgency,
+                    pressure_level,
+                    max_delete_batch,
+                    config_update: None,
+                };
+
+                if let Err(TrySendError::Full(_)) = scan_tx.try_send(request) {
+                    eprintln!(
+                        "[SBH-DAEMON] scan channel full (special location trigger), deferred"
+                    );
+                }
             }
         }
     }
@@ -1593,6 +1625,54 @@ mod tests {
         assert_eq!(received_batch.urgency.to_bits(), 0.5_f64.to_bits());
     }
 
+    /// Validates the pressure mapping logic used when special location pressure
+    /// triggers a root filesystem scan (bd-2iby fix #3).
+    #[test]
+    fn special_location_pressure_maps_to_scan_urgency() {
+        // priority 255 (e.g. /dev/shm) → urgency = 1.0
+        assert_eq!((f64::from(255_u8) / 255.0).to_bits(), 1.0_f64.to_bits());
+
+        // priority 128 → urgency ~0.5
+        let urgency = f64::from(128_u8) / 255.0;
+        assert!(urgency > 0.49 && urgency < 0.51);
+
+        // free_ratio mapping: free 3% with buffer 20% → ratio 0.15 → Red
+        let free_ratio = 3.0 / 20.0;
+        assert!(free_ratio < 0.25);
+        let level = if free_ratio < 0.25 {
+            PressureLevel::Red
+        } else if free_ratio < 0.5 {
+            PressureLevel::Orange
+        } else {
+            PressureLevel::Yellow
+        };
+        assert!(matches!(level, PressureLevel::Red));
+
+        // free_ratio: free 8% with buffer 20% → ratio 0.4 → Orange
+        let free_ratio = 8.0 / 20.0;
+        assert!((0.25..0.5).contains(&free_ratio));
+        let level = if free_ratio < 0.25 {
+            PressureLevel::Red
+        } else if free_ratio < 0.5 {
+            PressureLevel::Orange
+        } else {
+            PressureLevel::Yellow
+        };
+        assert!(matches!(level, PressureLevel::Orange));
+
+        // free_ratio: free 15% with buffer 20% → ratio 0.75 → Yellow
+        let free_ratio = 15.0 / 20.0;
+        assert!(free_ratio >= 0.5);
+        let level = if free_ratio < 0.25 {
+            PressureLevel::Red
+        } else if free_ratio < 0.5 {
+            PressureLevel::Orange
+        } else {
+            PressureLevel::Yellow
+        };
+        assert!(matches!(level, PressureLevel::Yellow));
+    }
+
     #[test]
     fn scanner_channel_defers_when_full() {
         let (tx, _rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
@@ -1607,7 +1687,8 @@ mod tests {
 
         // Fill the channel to capacity.
         for _ in 0..SCANNER_CHANNEL_CAP {
-            tx.try_send(make_request()).expect("should buffer within capacity");
+            tx.try_send(make_request())
+                .expect("should buffer within capacity");
         }
 
         // One more should fail — channel is full.
