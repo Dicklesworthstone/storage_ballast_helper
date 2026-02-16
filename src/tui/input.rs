@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use ftui_core::event::{KeyCode, KeyEvent};
+use ftui::{KeyCode, KeyEvent};
 
 use super::model::{DashboardMsg, Overlay, Screen};
 use super::preferences::{DensityMode, HintVerbosity, StartScreen};
@@ -706,7 +706,7 @@ fn screen_hint(screen: Screen) -> &'static str {
 mod tests {
     use std::collections::HashSet;
 
-    use ftui_core::event::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
+    use ftui::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
 
     use super::*;
 

@@ -6,12 +6,12 @@
 
 #![allow(missing_docs)]
 
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ftui_backend::BackendEventSource;
-use ftui_core::event::{Event, KeyEventKind};
+use ftui::{Buffer, BufferDiff, Event, Frame, GraphemePool, KeyEventKind};
+use ftui_backend::{Backend, BackendEventSource, BackendPresenter};
 use ftui_tty::{TtyBackend, TtySessionOptions};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -26,10 +26,6 @@ use super::theme::AccessibilityProfile;
 use super::{input, render, update};
 use crate::cli::dashboard::{self, DashboardConfig as LegacyDashboardConfig};
 use crate::daemon::self_monitor::DaemonState;
-
-/// ANSI escape sequences for screen control.
-const CLEAR_SCREEN: &[u8] = b"\x1b[2J";
-const CURSOR_HOME: &[u8] = b"\x1b[H";
 
 /// Which runtime path to execute.
 ///
@@ -365,15 +361,30 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
     let initial = read_state_file(&config.state_file);
     update::update(&mut model, DashboardMsg::DataUpdate(initial));
 
-    let mut stdout = io::stdout();
+    let mut pool = GraphemePool::new();
+    let mut prev_buffer = Buffer::new(cols, rows);
+    let mut first_frame = true;
 
     loop {
-        // Render current frame.
-        let frame = render::render(&model);
-        stdout.write_all(CLEAR_SCREEN)?;
-        stdout.write_all(CURSOR_HOME)?;
-        stdout.write_all(frame.as_bytes())?;
-        stdout.flush()?;
+        // Render current frame via Frame-based widget pipeline.
+        let (render_cols, render_rows) = (model.terminal_size.0, model.terminal_size.1);
+        let mut frame = Frame::new(render_cols, render_rows, &mut pool);
+        render::render_frame(&model, &mut frame);
+
+        // Compute diff and present. Force full repaint on size change or first frame.
+        let size_changed =
+            prev_buffer.width() != render_cols || prev_buffer.height() != render_rows;
+        let full_repaint = first_frame || size_changed;
+        let diff = if full_repaint {
+            BufferDiff::full(render_cols, render_rows)
+        } else {
+            BufferDiff::compute(&prev_buffer, &frame.buffer)
+        };
+        backend
+            .presenter()
+            .present_ui(&frame.buffer, Some(&diff), full_repaint)?;
+        first_frame = false;
+        prev_buffer = frame.buffer.clone();
 
         // Check for expired notification timers.
         let now = Instant::now();

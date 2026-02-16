@@ -19,7 +19,7 @@
 //! separate CLI commands, and re-enter the dashboard for most triage tasks.
 //! Baseline step counts reflect: quit dashboard + run CLI + re-open dashboard.
 
-use ftui_core::event::KeyCode;
+use ftui::KeyCode;
 
 use super::incident::{IncidentSeverity, incident_hints, playbook_for_severity};
 use super::model::{ConfirmAction, Overlay, Screen};

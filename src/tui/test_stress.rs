@@ -703,7 +703,7 @@ fn overlay_with_screen_switching() {
         // Keys while overlay is open should not navigate.
         h.inject_char('3');
         assert_eq!(h.overlay(), Some(super::model::Overlay::Help));
-        h.inject_keycode(ftui_core::event::KeyCode::Escape);
+        h.inject_keycode(ftui::KeyCode::Escape);
         assert!(h.overlay().is_none());
     }
 }

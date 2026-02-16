@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use ftui_core::event::KeyCode;
+use ftui::KeyCode;
 
 use super::input::{InputAction, InputContext};
 use super::model::{
@@ -375,7 +375,7 @@ fn palette_clamp_cursor(model: &mut DashboardModel) {
 }
 
 /// Dispatch screen-specific keys that are not global navigation.
-fn handle_screen_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent) -> DashboardCmd {
+fn handle_screen_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> DashboardCmd {
     match model.screen {
         Screen::Timeline => handle_timeline_key(model, key),
         Screen::Explainability => handle_explainability_key(model, key),
@@ -387,10 +387,7 @@ fn handle_screen_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent
 }
 
 /// Handle keys specific to the Timeline screen (S2).
-fn handle_timeline_key(
-    model: &mut DashboardModel,
-    key: ftui_core::event::KeyEvent,
-) -> DashboardCmd {
+fn handle_timeline_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> DashboardCmd {
     match key.code {
         // Up/k: move cursor up in the event list.
         KeyCode::Up | KeyCode::Char('k') => {
@@ -417,10 +414,7 @@ fn handle_timeline_key(
 }
 
 /// Handle keys specific to the Explainability screen (S3).
-fn handle_explainability_key(
-    model: &mut DashboardModel,
-    key: ftui_core::event::KeyEvent,
-) -> DashboardCmd {
+fn handle_explainability_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> DashboardCmd {
     match key.code {
         // Up/k: move cursor up in the decisions list.
         KeyCode::Up | KeyCode::Char('k') => {
@@ -449,10 +443,7 @@ fn handle_explainability_key(
 }
 
 /// Handle keys specific to the Candidates screen (S4).
-fn handle_candidates_key(
-    model: &mut DashboardModel,
-    key: ftui_core::event::KeyEvent,
-) -> DashboardCmd {
+fn handle_candidates_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> DashboardCmd {
     match key.code {
         // Up/k: move cursor up in the candidates list.
         KeyCode::Up | KeyCode::Char('k') => {
@@ -486,7 +477,7 @@ fn handle_candidates_key(
 }
 
 /// Handle keys specific to the Ballast screen (S5).
-fn handle_ballast_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent) -> DashboardCmd {
+fn handle_ballast_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> DashboardCmd {
     match key.code {
         // Up/k: move cursor up in the volumes list.
         KeyCode::Up | KeyCode::Char('k') => {
@@ -515,10 +506,7 @@ fn handle_ballast_key(model: &mut DashboardModel, key: ftui_core::event::KeyEven
 }
 
 /// Handle keys specific to the Diagnostics screen (S7).
-fn handle_diagnostics_key(
-    model: &mut DashboardModel,
-    key: ftui_core::event::KeyEvent,
-) -> DashboardCmd {
+fn handle_diagnostics_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> DashboardCmd {
     match key.code {
         // V (shift-v): toggle verbose diagnostics mode.
         KeyCode::Char('V') => {
@@ -536,7 +524,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use ftui_core::event::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
+    use ftui::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
 
     use super::*;
     use crate::daemon::self_monitor::{

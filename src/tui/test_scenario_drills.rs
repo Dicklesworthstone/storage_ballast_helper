@@ -1089,7 +1089,7 @@ fn drill_explainability_audit_trail() {
     // expand detail on the top decision.
     h.navigate_to_number(3);
     h.inject_char('j'); // Move to first decision.
-    h.inject_keycode(ftui_core::event::KeyCode::Enter); // Expand detail.
+    h.inject_keycode(ftui::KeyCode::Enter); // Expand detail.
 
     let model = h.model_mut();
     let expanded = model.explainability_detail;
@@ -1126,7 +1126,7 @@ fn drill_explainability_audit_is_deterministic() {
         )));
         h.navigate_to_number(3);
         h.inject_char('j');
-        h.inject_keycode(ftui_core::event::KeyCode::Enter);
+        h.inject_keycode(ftui::KeyCode::Enter);
     };
 
     let d1 = {
@@ -1359,7 +1359,7 @@ fn drill_multi_mount_incident_response() {
         .finish();
 
     // Phase 3: Close playbook, navigate to ballast.
-    h.inject_keycode(ftui_core::event::KeyCode::Escape);
+    h.inject_keycode(ftui::KeyCode::Escape);
     assert!(h.overlay().is_none());
 
     h.navigate_to_number(5);
@@ -1506,7 +1506,7 @@ fn drill_full_incident_to_resolution() {
         .finish();
 
     // Step 4: Close playbook, examine explainability.
-    h.inject_keycode(ftui_core::event::KeyCode::Escape);
+    h.inject_keycode(ftui::KeyCode::Escape);
     h.navigate_to_number(3);
 
     h.inject_msg(DashboardMsg::TelemetryDecisions(decisions_result(
@@ -1567,7 +1567,7 @@ fn drill_full_incident_to_resolution() {
         .finish();
 
     // Step 6: Dismiss confirmation, check timeline for ballast event.
-    h.inject_keycode(ftui_core::event::KeyCode::Escape);
+    h.inject_keycode(ftui::KeyCode::Escape);
     h.navigate_to_number(2);
 
     h.inject_msg(DashboardMsg::TelemetryTimeline(timeline_result(
@@ -1667,7 +1667,7 @@ fn drill_full_incident_is_deterministic() {
         h.feed_state(red_state());
         h.tick();
         h.inject_char('!');
-        h.inject_keycode(ftui_core::event::KeyCode::Escape);
+        h.inject_keycode(ftui::KeyCode::Escape);
         h.navigate_to_number(3);
         h.inject_msg(DashboardMsg::TelemetryDecisions(decisions_result(
             enforce_decisions(),
@@ -1675,7 +1675,7 @@ fn drill_full_incident_is_deterministic() {
         h.inject_char('j');
         h.inject_char('j');
         h.inject_char('x');
-        h.inject_keycode(ftui_core::event::KeyCode::Escape);
+        h.inject_keycode(ftui::KeyCode::Escape);
         h.navigate_to_number(2);
         h.inject_msg(DashboardMsg::TelemetryTimeline(timeline_result(
             escalation_timeline(),

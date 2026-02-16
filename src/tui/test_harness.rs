@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ftui_core::event::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
+use ftui::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
 use sha2::{Digest, Sha256};
 
 use super::model::{DashboardCmd, DashboardError, DashboardModel, DashboardMsg, Overlay, Screen};

@@ -3360,6 +3360,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     if root_paths.is_empty() {
         return Err(CliError::User("no valid scan paths found".to_string()));
     }
+    let scan_roots = root_paths.clone();
 
     // Build protection registry from config patterns.
     let protection_patterns = if config.scanner.protected_paths.is_empty() {
@@ -3414,18 +3415,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 is_open: false,
                 excluded: false,
             };
-            let score = engine.score_candidate(&candidate, 0.0); // No pressure urgency for manual scan.
-            // DEBUG: trace ALL scoring on key target dirs
-            if entry.path.to_string_lossy().ends_with("/target")
-                || entry.path.to_string_lossy().ends_with("/target/debug")
-                || entry.path.to_string_lossy().ends_with("/target/release")
-            {
-                let p = entry.path.display();
-                eprintln!("SCORE: {p} — vetoed={} veto_reason={:?} total={:.3} age={}s size_bytes={} signals={:?}",
-                    score.vetoed, score.veto_reason, score.total_score, age.as_secs(),
-                    entry.metadata.content_size_bytes, entry.structural_signals);
-            }
-            score
+            engine.score_candidate(&candidate, 0.0) // No pressure urgency for manual scan.
         })
         .filter(|score| !score.vetoed && score.total_score >= args.min_score)
         .collect();
@@ -3440,12 +3430,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     // Evaluate in rank order and stop once we have enough results.
     let mut candidates: Vec<_> = Vec::with_capacity(args.top.min(preliminary.len()));
     if args.top > 0 && !preliminary.is_empty() {
-        let open_paths = collect_open_path_ancestors(
-            &preliminary
-                .iter()
-                .map(|score| score.path.clone())
-                .collect::<Vec<_>>(),
-        );
+        let open_paths = collect_open_path_ancestors(&scan_roots);
         for score in preliminary {
             if is_path_open_by_ancestor(&score.path, &open_paths) {
                 continue;
@@ -3655,12 +3640,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
 
     // Filter open files from survivors.
     if !scored.is_empty() {
-        let open_paths = collect_open_path_ancestors(
-            &scored
-                .iter()
-                .map(|candidate| candidate.path.clone())
-                .collect::<Vec<_>>(),
-        );
+        let open_paths = collect_open_path_ancestors(&root_paths);
         scored.retain(|candidate| !is_path_open_by_ancestor(&candidate.path, &open_paths));
     }
 

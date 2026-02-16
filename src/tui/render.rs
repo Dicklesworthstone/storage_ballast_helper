@@ -1,4 +1,9 @@
 //! Render-surface scaffolding for the new dashboard runtime.
+//!
+//! Two entrypoints:
+//! - `render_frame()` — Frame-based widget rendering (production path).
+//! - `render_to_string()` — legacy String-returning path (used by tests and
+//!   the headless harness that asserts on text content).
 
 #![allow(missing_docs)]
 #![allow(clippy::too_many_lines)]
@@ -17,12 +22,34 @@ use super::widgets::{
 };
 use crate::tui::telemetry::{DataSource, DecisionEvidence, TimelineEvent};
 
-/// Stable render entrypoint for screen dispatch.
+#[cfg(feature = "tui")]
+use ftui::core::geometry::Rect;
+#[cfg(feature = "tui")]
+use ftui::layout::{Constraint, Flex};
+#[cfg(feature = "tui")]
+use ftui::text::{Line, Span, Text};
+#[cfg(feature = "tui")]
+use ftui::widgets::Widget;
+#[cfg(feature = "tui")]
+use ftui::widgets::block::Block;
+#[cfg(feature = "tui")]
+use ftui::widgets::borders::BorderType;
+#[cfg(feature = "tui")]
+use ftui::widgets::paragraph::Paragraph;
+#[cfg(feature = "tui")]
+use ftui::{Frame, PackedRgba, Style};
+
+/// Legacy string-returning render path for test compatibility.
 ///
-/// The implementation here remains intentionally minimal until screen-specific
-/// beads (`bd-xzt.3.*`) populate real widgets and layouts.
+/// Production code should use `render_frame()` instead.
 #[must_use]
 pub fn render(model: &DashboardModel) -> String {
+    render_to_string(model)
+}
+
+/// Legacy string-returning render for the headless test harness.
+#[must_use]
+pub fn render_to_string(model: &DashboardModel) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -105,6 +132,588 @@ pub fn render(model: &DashboardModel) -> String {
     }
 
     out
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Frame-based widget rendering (production path)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Render the dashboard into a Frame using proper ftui widgets.
+///
+/// This is the production rendering path that produces colored, bordered,
+/// Flex-layout output through the ftui widget system.
+#[cfg(feature = "tui")]
+pub fn render_frame(model: &DashboardModel, frame: &mut Frame) {
+    let area = Rect::new(0, 0, model.terminal_size.0, model.terminal_size.1);
+    let accessibility = AccessibilityProfile::from_environment();
+    let mut theme = Theme::for_terminal(model.terminal_size.0, accessibility);
+    theme.spacing = match model.density {
+        DensityMode::Compact => SpacingScale::compact(),
+        DensityMode::Comfortable => SpacingScale::comfortable(),
+    };
+
+    // Fill background.
+    let bg_color = theme.palette.surface_bg();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                cell.bg = bg_color;
+            }
+        }
+    }
+
+    // Split: header (3 rows) | body (fill) | footer (1 row) | notifications.
+    let notif_rows = model.notifications.len().min(3) as u16;
+    let chunks = Flex::vertical()
+        .constraints([
+            Constraint::Fixed(3),
+            Constraint::Fill,
+            Constraint::Fixed(1),
+            Constraint::Fixed(notif_rows),
+        ])
+        .split(area);
+
+    let header_area = chunks[0];
+    let body_area = chunks[1];
+    let footer_area = chunks[2];
+    let notif_area = chunks[3];
+
+    // ── Header ──
+    frame_render_header(model, &theme, header_area, frame);
+
+    // ── Body (screen-specific content) ──
+    if let Some(ref overlay) = model.active_overlay {
+        // Render screen content first, then overlay on top.
+        frame_render_screen(model, &theme, body_area, frame);
+        frame_render_overlay(model, overlay, &theme, body_area, frame);
+    } else {
+        frame_render_screen(model, &theme, body_area, frame);
+    }
+
+    // ── Footer keybindings ──
+    frame_render_footer(model, &theme, footer_area, frame);
+
+    // ── Notification toasts ──
+    frame_render_notifications(model, &theme, notif_area, frame);
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_header(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    let mode_str = if model.degraded { "DEGRADED" } else { "NORMAL" };
+    let mode_color = if model.degraded {
+        theme.palette.warning_color()
+    } else {
+        theme.palette.success_color()
+    };
+    let label = screen_label(model.screen);
+
+    let title_spans = vec![
+        Span::styled(
+            " SBH Dashboard ",
+            Style::default().fg(theme.palette.accent_color()).bold(),
+        ),
+        Span::styled(
+            format!(" {mode_str} "),
+            Style::default()
+                .fg(PackedRgba::rgb(20, 20, 30))
+                .bg(mode_color)
+                .bold(),
+        ),
+        Span::raw("  "),
+        Span::styled(label, Style::default().fg(theme.palette.text_primary())),
+    ];
+
+    let header_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.palette.border_color()))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = header_block.inner(area);
+    header_block.render(area, frame);
+
+    // Render title line inside the block.
+    let title_line = Line::from_spans(title_spans);
+    let paragraph = Paragraph::new(Text::from(title_line));
+    paragraph.render(inner, frame);
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_screen(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    match model.screen {
+        Screen::Overview => frame_render_overview(model, theme, area, frame),
+        Screen::Timeline => frame_render_list_screen(model, theme, area, frame, "S2 Timeline"),
+        Screen::Explainability => frame_render_list_screen(model, theme, area, frame, "S3 Explain"),
+        Screen::Candidates => frame_render_list_screen(model, theme, area, frame, "S4 Candidates"),
+        Screen::Ballast => frame_render_list_screen(model, theme, area, frame, "S5 Ballast"),
+        Screen::Diagnostics => frame_render_diagnostics_frame(model, theme, area, frame),
+        Screen::LogSearch => frame_render_stub(theme, area, frame, "S6 Logs"),
+    }
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_overview(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    // Split overview into rows: pressure | ewma+actions | ballast+counters.
+    let chunks = Flex::vertical()
+        .constraints([
+            Constraint::Fixed(6), // pressure panel
+            Constraint::Fixed(5), // ewma + actions row
+            Constraint::Fill,     // ballast + counters
+        ])
+        .split(area);
+
+    // ── Pressure panel ──
+    frame_render_pressure_panel(model, theme, chunks[0], frame);
+
+    // ── EWMA + Actions row ──
+    let mid_chunks = Flex::horizontal()
+        .constraints([Constraint::Percentage(60.0), Constraint::Fill])
+        .split(chunks[1]);
+    frame_render_ewma_panel(model, theme, mid_chunks[0], frame);
+    frame_render_actions_panel(model, theme, mid_chunks[1], frame);
+
+    // ── Ballast + Counters row ──
+    let bot_chunks = Flex::horizontal()
+        .constraints([Constraint::Percentage(50.0), Constraint::Fill])
+        .split(chunks[2]);
+    frame_render_ballast_quick_panel(model, theme, bot_chunks[0], frame);
+    frame_render_counters_panel(model, theme, bot_chunks[1], frame);
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_pressure_panel(
+    model: &DashboardModel,
+    theme: &Theme,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title("Pressure")
+        .border_style(Style::default().fg(theme.palette.border_color()))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = block.inner(area);
+    block.render(area, frame);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    if let Some(ref state) = model.daemon_state {
+        let mut lines = Vec::new();
+        let level_color = theme.palette.pressure_color(&state.pressure.overall);
+        let worst_free = state
+            .pressure
+            .mounts
+            .iter()
+            .map(|m| m.free_pct)
+            .reduce(f64::min)
+            .unwrap_or(100.0);
+        lines.push(Line::from_spans([
+            Span::raw("  Overall: "),
+            Span::styled(
+                state.pressure.overall.to_ascii_uppercase(),
+                Style::default().fg(level_color).bold(),
+            ),
+            Span::raw(format!(
+                "  worst-free={worst_free:.1}%  mounts={}",
+                state.pressure.mounts.len()
+            )),
+        ]));
+
+        for mount in &state.pressure.mounts {
+            let used_pct = 100.0 - mount.free_pct;
+            let mount_color = theme.palette.pressure_color(&mount.level);
+            let bar = gauge(used_pct, 15);
+            lines.push(Line::from_spans([
+                Span::raw(format!("  {:<14} ", mount.path)),
+                Span::styled(bar, Style::default().fg(mount_color)),
+                Span::raw(format!(" ({:.1}% free)", mount.free_pct)),
+            ]));
+        }
+        let text = Text::from_lines(lines);
+        Paragraph::new(text).render(inner, frame);
+    } else {
+        let msg = if model.degraded {
+            "  Daemon state unavailable (DEGRADED)"
+        } else {
+            "  Awaiting daemon connection..."
+        };
+        Paragraph::new(msg)
+            .style(Style::default().fg(theme.palette.muted_color()))
+            .render(inner, frame);
+    }
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_ewma_panel(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title("EWMA Trend")
+        .border_style(Style::default().fg(theme.palette.border_color()))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = block.inner(area);
+    block.render(area, frame);
+
+    if model.rate_histories.is_empty() {
+        Paragraph::new("  No rate data")
+            .style(Style::default().fg(theme.palette.muted_color()))
+            .render(inner, frame);
+        return;
+    }
+
+    let mut lines = Vec::new();
+    let mut sorted: Vec<_> = model.rate_histories.iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    for (path, history) in &sorted {
+        let normalized = history.normalized();
+        let trace = sparkline(&normalized);
+        let latest = history.latest().unwrap_or(0.0);
+        let rate_str = human_rate(latest);
+        let trend = trend_label(latest);
+        lines.push(Line::from_spans([
+            Span::raw(format!("  {path:<14} ")),
+            Span::styled(trace, Style::default().fg(theme.palette.accent_color())),
+            Span::raw(format!(" {rate_str} {trend}")),
+        ]));
+    }
+    Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_actions_panel(
+    model: &DashboardModel,
+    theme: &Theme,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title("Actions")
+        .border_style(Style::default().fg(theme.palette.border_color()))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = block.inner(area);
+    block.render(area, frame);
+
+    let content = if let Some(ref state) = model.daemon_state {
+        format!(
+            "  Scans: {}  Deleted: {}  Freed: {}",
+            state.counters.scans,
+            state.counters.deletions,
+            human_bytes(state.counters.bytes_freed),
+        )
+    } else {
+        String::from("  Awaiting daemon connection")
+    };
+    Paragraph::new(content)
+        .style(Style::default().fg(theme.palette.text_secondary()))
+        .render(inner, frame);
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_ballast_quick_panel(
+    model: &DashboardModel,
+    theme: &Theme,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title("Ballast")
+        .border_style(Style::default().fg(theme.palette.border_color()))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = block.inner(area);
+    block.render(area, frame);
+
+    if let Some(ref state) = model.daemon_state {
+        let (badge_text, badge_color) = if state.ballast.total > 0 && state.ballast.available == 0 {
+            ("CRITICAL", theme.palette.critical_color())
+        } else if state.ballast.available.saturating_mul(2) < state.ballast.total {
+            ("LOW", theme.palette.warning_color())
+        } else {
+            ("OK", theme.palette.success_color())
+        };
+        let line = Line::from_spans([
+            Span::raw("  "),
+            Span::styled(badge_text, Style::default().fg(badge_color).bold()),
+            Span::raw(format!(
+                "  available={}/{}  released={}",
+                state.ballast.available, state.ballast.total, state.ballast.released,
+            )),
+        ]);
+        Paragraph::new(Text::from(line)).render(inner, frame);
+    } else {
+        Paragraph::new("  Ballast data unavailable")
+            .style(Style::default().fg(theme.palette.muted_color()))
+            .render(inner, frame);
+    }
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_counters_panel(
+    model: &DashboardModel,
+    theme: &Theme,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title("Counters")
+        .border_style(Style::default().fg(theme.palette.border_color()))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = block.inner(area);
+    block.render(area, frame);
+
+    let content = if let Some(ref state) = model.daemon_state {
+        format!(
+            "  errors={}  dropped={}  rss={}  pid={}  uptime={}",
+            state.counters.errors,
+            state.counters.dropped_log_events,
+            human_bytes(state.memory_rss_bytes),
+            state.pid,
+            human_duration(state.uptime_seconds),
+        )
+    } else {
+        String::from("  Counters unavailable")
+    };
+    Paragraph::new(content)
+        .style(Style::default().fg(theme.palette.text_secondary()))
+        .render(inner, frame);
+}
+
+/// Generic list-screen renderer for Timeline, Explainability, Candidates, Ballast.
+///
+/// Uses the legacy `render_to_string()` content inside a bordered Block.
+/// Full per-screen widget breakdowns will follow in subsequent iterations.
+#[cfg(feature = "tui")]
+fn frame_render_list_screen(
+    model: &DashboardModel,
+    theme: &Theme,
+    area: Rect,
+    frame: &mut Frame,
+    title: &str,
+) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .border_style(Style::default().fg(theme.palette.border_color()))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = block.inner(area);
+    block.render(area, frame);
+
+    // Render the legacy text content of this screen into the block.
+    let legacy = render_to_string(model);
+    // Extract just the screen-specific content (skip the header lines).
+    let content_lines: Vec<&str> = legacy.lines().skip(3).collect();
+    let text = content_lines.join("\n");
+    Paragraph::new(text)
+        .style(Style::default().fg(theme.palette.text_primary()))
+        .render(inner, frame);
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_diagnostics_frame(
+    model: &DashboardModel,
+    theme: &Theme,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title("S7 Diagnostics")
+        .border_style(Style::default().fg(theme.palette.border_color()))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = block.inner(area);
+    block.render(area, frame);
+
+    let mut lines = Vec::new();
+
+    // Dashboard health.
+    let mode_badge = if model.degraded { "DEGRADED" } else { "NORMAL" };
+    let mode_color = if model.degraded {
+        theme.palette.warning_color()
+    } else {
+        theme.palette.success_color()
+    };
+    lines.push(Line::from_spans([
+        Span::raw("  Mode: "),
+        Span::styled(mode_badge, Style::default().fg(mode_color).bold()),
+        Span::raw(format!(
+            "  tick={}  refresh={}ms  missed={}",
+            model.tick,
+            model.refresh.as_millis(),
+            model.missed_ticks,
+        )),
+    ]));
+
+    // Frame timing.
+    if let Some((current, avg, min, max)) = model.frame_time_stats() {
+        lines.push(Line::from(format!(
+            "  Frame: {current:.1}ms avg={avg:.1}ms min={min:.1}ms max={max:.1}ms",
+        )));
+    } else {
+        lines.push(Line::from("  Frame: no data yet"));
+    }
+
+    // Terminal.
+    lines.push(Line::from(format!(
+        "  Terminal: {}x{}",
+        model.terminal_size.0, model.terminal_size.1,
+    )));
+
+    // Notifications.
+    lines.push(Line::from(format!(
+        "  Notifications: {} active",
+        model.notifications.len(),
+    )));
+
+    Paragraph::new(Text::from_lines(lines))
+        .style(Style::default().fg(theme.palette.text_secondary()))
+        .render(inner, frame);
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_stub(theme: &Theme, area: Rect, frame: &mut Frame, title: &str) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .border_style(Style::default().fg(theme.palette.border_color()))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    Paragraph::new("  Implementation pending")
+        .style(Style::default().fg(theme.palette.muted_color()))
+        .render(inner, frame);
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_footer(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    let hints = match model.screen {
+        Screen::Overview => {
+            "1-7 screens  [/] prev/next  b ballast  r refresh  ? help  : palette  q quit"
+        }
+        Screen::Timeline => "j/k navigate  f filter  F follow  r refresh  ? help  : palette",
+        Screen::Explainability => {
+            "j/k navigate  Enter expand  d close  r refresh  ? help  : palette"
+        }
+        Screen::Candidates => "j/k navigate  Enter expand  s sort  r refresh  ? help  : palette",
+        Screen::Ballast => "j/k navigate  Enter expand  d close  r refresh  ? help  : palette",
+        Screen::LogSearch => "1-7 screens  ? help  : palette  q quit",
+        Screen::Diagnostics => "V verbose  r refresh  ? help  : palette  q quit",
+    };
+    Paragraph::new(hints)
+        .style(
+            Style::default()
+                .fg(theme.palette.muted_color())
+                .bg(theme.palette.surface_bg()),
+        )
+        .render(area, frame);
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_notifications(
+    model: &DashboardModel,
+    theme: &Theme,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    let mut lines = Vec::new();
+    for notif in model.notifications.iter().take(3) {
+        let (badge, color) = match notif.level {
+            NotificationLevel::Info => ("INFO", theme.palette.accent_color()),
+            NotificationLevel::Warning => ("WARN", theme.palette.warning_color()),
+            NotificationLevel::Error => ("ERROR", theme.palette.critical_color()),
+        };
+        lines.push(Line::from_spans([
+            Span::styled(
+                format!(" {badge} "),
+                Style::default()
+                    .fg(PackedRgba::rgb(20, 20, 30))
+                    .bg(color)
+                    .bold(),
+            ),
+            Span::raw(format!(" {}", notif.message)),
+        ]));
+    }
+    if !lines.is_empty() {
+        Paragraph::new(Text::from_lines(lines))
+            .style(Style::default().fg(theme.palette.text_primary()))
+            .render(area, frame);
+    }
+}
+
+#[cfg(feature = "tui")]
+fn frame_render_overlay(
+    model: &DashboardModel,
+    overlay: &super::model::Overlay,
+    theme: &Theme,
+    body_area: Rect,
+    frame: &mut Frame,
+) {
+    // Center a panel in the body area.
+    let overlay_w = body_area.width.min(60).max(30);
+    let overlay_h = body_area.height.min(20).max(8);
+    let x = body_area.x + (body_area.width.saturating_sub(overlay_w)) / 2;
+    let y = body_area.y + (body_area.height.saturating_sub(overlay_h)) / 2;
+    let overlay_area = Rect::new(x, y, overlay_w, overlay_h);
+
+    let title = match overlay {
+        super::model::Overlay::CommandPalette => "Command Palette",
+        super::model::Overlay::Help => "Help",
+        super::model::Overlay::Voi => "VOI Scheduler",
+        super::model::Overlay::Confirmation { .. } => "Confirm",
+        super::model::Overlay::IncidentPlaybook => "Incident Playbook",
+    };
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .border_style(Style::default().fg(theme.palette.accent_color()))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = block.inner(overlay_area);
+    block.render(overlay_area, frame);
+
+    match overlay {
+        super::model::Overlay::CommandPalette => {
+            let mut lines = Vec::new();
+            lines.push(Line::from_spans([
+                Span::styled("> ", Style::default().fg(theme.palette.accent_color())),
+                Span::raw(&model.palette_query),
+            ]));
+            let results = super::input::search_palette_actions(&model.palette_query, 50);
+            let shown = results.len().min(PALETTE_DISPLAY_LIMIT);
+            lines.push(Line::from(format!(
+                "  matches: {shown} / {}",
+                results.len()
+            )));
+            for (i, action) in results.iter().take(PALETTE_DISPLAY_LIMIT).enumerate() {
+                let cursor = if i == model.palette_selected {
+                    "> "
+                } else {
+                    "  "
+                };
+                let style = if i == model.palette_selected {
+                    Style::default().fg(theme.palette.accent_color())
+                } else {
+                    Style::default().fg(theme.palette.text_secondary())
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{cursor}{}: {}", action.id, action.title),
+                    style,
+                )));
+            }
+            Paragraph::new(Text::from_lines(lines)).render(inner, frame);
+        }
+        super::model::Overlay::Help => {
+            let help_text = "  ?     toggle help\n  :     command palette\n  1-7   screens\n  [/]   prev/next screen\n  j/k   navigate lists\n  r     refresh\n  q     quit";
+            Paragraph::new(help_text)
+                .style(Style::default().fg(theme.palette.text_primary()))
+                .render(inner, frame);
+        }
+        _ => {
+            Paragraph::new(format!("  {title} overlay"))
+                .style(Style::default().fg(theme.palette.text_secondary()))
+                .render(inner, frame);
+        }
+    }
 }
 
 const PALETTE_DISPLAY_LIMIT: usize = 10;

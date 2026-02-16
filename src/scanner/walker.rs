@@ -644,12 +644,16 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> HashSet<PathBuf>
         return ancestors;
     };
 
-    let normalized_roots: Vec<PathBuf> = if root_paths.is_empty() {
+    let normalized_roots: Vec<(PathBuf, usize)> = if root_paths.is_empty() {
         Vec::new()
     } else {
         root_paths
             .iter()
-            .map(|path| crate::core::paths::resolve_absolute_path(path))
+            .map(|path| {
+                let normalized = crate::core::paths::resolve_absolute_path(path);
+                let depth = normalized.components().count();
+                (normalized, depth)
+            })
             .collect()
     };
 
@@ -659,11 +663,6 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> HashSet<PathBuf>
     for proc_entry in proc_dir.flatten() {
         // Budget checks: stop if we've exceeded time or PID limits.
         if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
-            eprintln!(
-                "[SBH-SCANNER] open-files scan budget reached ({pids_scanned} PIDs, \
-                 {} ancestors) — partial results used for veto",
-                ancestors.len()
-            );
             break;
         }
 
@@ -689,24 +688,34 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> HashSet<PathBuf>
             if let Some(stripped) = target.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
                 target = PathBuf::from(stripped);
             }
-            if !normalized_roots.is_empty()
-                && !normalized_roots.iter().any(|r| target.starts_with(r))
-            {
-                continue;
-            }
-
-            let mut current = Some(target.as_path());
-            while let Some(path) = current {
-                if !ancestors.insert(path.to_path_buf()) {
-                    break; // Already seen this ancestor chain — skip rest.
+            let stop_at = if normalized_roots.is_empty() {
+                None
+            } else {
+                normalized_roots
+                    .iter()
+                    .filter(|(root, _)| target.starts_with(root))
+                    // Stop at the outermost matching root so nested-root callers
+                    // still get ancestor coverage for parent candidates.
+                    .min_by_key(|(_, depth)| *depth)
+                    .map(|(root, _)| root.as_path())
+            };
+            if normalized_roots.is_empty() || stop_at.is_some() {
+                let mut current = Some(target.as_path());
+                while let Some(path) = current {
+                    if !ancestors.insert(path.to_path_buf()) {
+                        break; // Already seen this ancestor chain — skip rest.
+                    }
+                    if Some(path) == stop_at {
+                        break;
+                    }
+                    let Some(parent) = path.parent() else {
+                        break;
+                    };
+                    if parent == path {
+                        break;
+                    }
+                    current = Some(parent);
                 }
-                let Some(parent) = path.parent() else {
-                    break;
-                };
-                if parent == path {
-                    break;
-                }
-                current = Some(parent);
             }
         }
     }
@@ -1095,6 +1104,58 @@ mod tests {
 
         let rel = tmp.path().strip_prefix(&cwd).unwrap();
         assert!(is_path_open(rel, &open));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_ancestor_check_does_not_mark_sibling_subtree_open() {
+        let tmp = TempDir::new().unwrap();
+        let open_dir = tmp.path().join("open");
+        let sibling_dir = tmp.path().join("sibling");
+        fs::create_dir_all(&open_dir).unwrap();
+        fs::create_dir_all(&sibling_dir).unwrap();
+
+        let file = open_dir.join("in_use.bin");
+        fs::write(&file, b"data").unwrap();
+        let handle = fs::File::open(&file).unwrap();
+
+        let open_ancestors = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
+
+        // Guard: skip if /proc doesn't expose our own FDs (hidepid=2, containers).
+        if !open_ancestors.contains(&file) {
+            drop(handle);
+            return;
+        }
+
+        assert!(is_path_open_by_ancestor(&open_dir, &open_ancestors));
+        assert!(!is_path_open_by_ancestor(&sibling_dir, &open_ancestors));
+        drop(handle);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_ancestor_check_handles_nested_roots_with_child_first() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&child).unwrap();
+
+        let file = child.join("in_use.bin");
+        fs::write(&file, b"data").unwrap();
+        let handle = fs::File::open(&file).unwrap();
+
+        // Child first exercises nested-root ordering.
+        let open_ancestors = collect_open_path_ancestors(&[child.clone(), parent.clone()]);
+
+        // Guard: skip if /proc doesn't expose our own FDs (hidepid=2, containers).
+        if !open_ancestors.contains(&file) {
+            drop(handle);
+            return;
+        }
+
+        assert!(is_path_open_by_ancestor(&child, &open_ancestors));
+        assert!(is_path_open_by_ancestor(&parent, &open_ancestors));
+        drop(handle);
     }
 
     #[test]

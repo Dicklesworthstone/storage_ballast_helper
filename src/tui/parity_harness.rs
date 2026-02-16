@@ -698,7 +698,7 @@ fn check_c16() -> ContractResult {
 
     // Test Esc quits from Overview (no history).
     let mut h = DashboardHarness::default();
-    h.inject_keycode(ftui_core::event::KeyCode::Escape);
+    h.inject_keycode(ftui::KeyCode::Escape);
     if !h.is_quit() {
         regressions.push("Esc from Overview (no history) should trigger quit");
     }

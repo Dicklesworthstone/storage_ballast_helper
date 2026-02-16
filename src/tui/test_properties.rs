@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ftui_core::event::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
+use ftui::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
 use proptest::prelude::*;
 
 use super::model::{

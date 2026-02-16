@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ftui_core::event::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
+use ftui::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
 
 use super::input::{self, InputAction, InputContext};
 use super::model::{

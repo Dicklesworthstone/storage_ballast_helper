@@ -960,7 +960,7 @@ fn replay_full_operator_workflow() {
     // Step 5: Open and close help overlay.
     h.open_help();
     assert!(h.overlay().is_some());
-    h.inject_keycode(ftui_core::event::KeyCode::Escape);
+    h.inject_keycode(ftui::KeyCode::Escape);
     assert!(h.overlay().is_none());
 
     // Step 6: Navigate to timeline, inject events.
@@ -1002,7 +1002,7 @@ fn replay_full_operator_workflow_is_deterministic() {
         h.feed_state(yellow_pressure_state());
         h.tick();
         h.open_help();
-        h.inject_keycode(ftui_core::event::KeyCode::Escape);
+        h.inject_keycode(ftui::KeyCode::Escape);
         h.navigate_to_number(2);
         h.inject_msg(DashboardMsg::TelemetryTimeline(timeline_result(
             sample_timeline_events(),

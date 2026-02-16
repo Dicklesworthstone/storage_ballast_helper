@@ -126,7 +126,7 @@ fn model_pressured_at(cols: u16, rows: u16) -> DashboardModel {
 
 /// Navigate model to a specific screen.
 fn navigate_to(model: &mut DashboardModel, screen: Screen) {
-    use ftui_core::event::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
+    use ftui::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
     let key = match screen {
         Screen::Overview => '1',
         Screen::Timeline => '2',

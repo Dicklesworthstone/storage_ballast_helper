@@ -250,7 +250,7 @@ impl ArtifactRecorder {
     }
 
     /// Inject a key code, recording the step.
-    pub fn inject_keycode(&mut self, code: ftui_core::event::KeyCode) {
+    pub fn inject_keycode(&mut self, code: ftui::KeyCode) {
         let screen_before = screen_name(self.harness.screen());
         self.harness.inject_keycode(code);
         self.record_step_from_last(format!("KeyCode({code:?})"), screen_before);
@@ -545,7 +545,7 @@ pub fn validate_minimum_payload(trace: &DashboardTestTrace) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::tui::test_harness::{sample_healthy_state, sample_pressured_state};
-    use ftui_core::event::KeyCode;
+    use ftui::KeyCode;
 
     #[test]
     fn trace_id_format_is_correct() {

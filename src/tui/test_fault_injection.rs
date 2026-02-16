@@ -841,7 +841,7 @@ fn navigation_works_during_degraded_mode() {
     assert_eq!(h.screen(), Screen::Explainability);
     h.navigate_to_number(5);
     assert_eq!(h.screen(), Screen::Ballast);
-    h.inject_keycode(ftui_core::event::KeyCode::Escape);
+    h.inject_keycode(ftui::KeyCode::Escape);
     assert_eq!(h.screen(), Screen::Explainability);
 }
 

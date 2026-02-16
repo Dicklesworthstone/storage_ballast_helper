@@ -21,7 +21,7 @@ required-features = ["cli"]
 default = ["cli", "daemon", "sqlite", "tui"]
 cli = ["dep:clap", "dep:clap_complete", "dep:colored", "dep:crossterm", "sqlite", "daemon"]
 daemon = ["dep:signal-hook"]
-tui = ["dep:ftui-core", "dep:ftui-backend", "dep:ftui-tty", "cli"]
+tui = ["dep:ftui", "dep:ftui-backend", "dep:ftui-tty", "cli"]
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
@@ -39,7 +39,7 @@ rusqlite = { version = "0.33", features = ["bundled", "functions"], optional = t
 # Error handling (core)
 thiserror = "2.0"
 # TUI (optional — gated behind "tui" feature)
-ftui-core = { path = "/dp/frankentui/crates/ftui-core", optional = true }
+ftui = { path = "/dp/frankentui/crates/ftui", default-features = false, optional = true }
 ftui-backend = { path = "/dp/frankentui/crates/ftui-backend", optional = true }
 ftui-tty = { path = "/dp/frankentui/crates/ftui-tty", optional = true }
 # Timestamps (core)
