@@ -14,7 +14,7 @@
 #![allow(clippy::cast_precision_loss)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use parking_lot::RwLock;
 
-use crate::ballast::manager::BallastManager;
+use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::Config;
 use crate::core::errors::{Result, SbhError};
@@ -40,7 +40,7 @@ use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
 use crate::scanner::patterns::ArtifactPatternRegistry;
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::{CandidacyScore, ScoringEngine};
-use crate::scanner::walker::{DirectoryWalker, WalkerConfig};
+use crate::scanner::walker::{DirectoryWalker, OpenPathCache, WalkerConfig};
 
 // ──────────────────── channel capacities ────────────────────
 
@@ -188,18 +188,28 @@ pub struct MonitoringDaemon {
     rate_estimator: DiskRateEstimator,
     pressure_controller: PidPressureController,
     special_locations: SpecialLocationRegistry,
-    ballast_manager: BallastManager,
+    ballast_coordinator: BallastPoolCoordinator,
     release_controller: BallastReleaseController,
     scoring_engine: ScoringEngine,
     shared_executor_config: Arc<SharedExecutorConfig>,
     shared_scoring_config: Arc<RwLock<crate::core::config::ScoringConfig>>,
     shared_scanner_config: Arc<RwLock<crate::core::config::ScannerConfig>>,
+    cached_primary_path: PathBuf,
     start_time: Instant,
     last_pressure_level: PressureLevel,
     last_special_scan: HashMap<PathBuf, Instant>,
     self_monitor: SelfMonitor,
     scanner_heartbeat: Arc<ThreadHeartbeat>,
     executor_heartbeat: Arc<ThreadHeartbeat>,
+}
+
+fn compute_primary_path(config: &Config) -> PathBuf {
+    config
+        .scanner
+        .root_paths
+        .first()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 impl MonitoringDaemon {
@@ -271,9 +281,12 @@ impl MonitoringDaemon {
             &[], // custom paths from config can be added later
         )?;
 
-        // 8. Initialize ballast manager.
-        let ballast_manager =
-            BallastManager::new(config.paths.ballast_dir.clone(), config.ballast.clone())?;
+        // 8. Initialize ballast coordinator (multi-volume).
+        let ballast_coordinator = BallastPoolCoordinator::discover(
+            &config.ballast,
+            &config.scanner.root_paths,
+            platform.as_ref(),
+        )?;
 
         // 9. Release controller.
         let release_controller =
@@ -300,8 +313,11 @@ impl MonitoringDaemon {
         let scanner_heartbeat = ThreadHeartbeat::new("sbh-scanner");
         let executor_heartbeat = ThreadHeartbeat::new("sbh-executor");
 
+        let cached_primary_path = compute_primary_path(&config);
+
         Ok(Self {
             config,
+            cached_primary_path,
             platform,
             logger_handle,
             logger_join: Some(logger_join),
@@ -311,7 +327,7 @@ impl MonitoringDaemon {
             rate_estimator,
             pressure_controller,
             special_locations,
-            ballast_manager,
+            ballast_coordinator,
             release_controller,
             scoring_engine,
             shared_executor_config,
@@ -447,12 +463,22 @@ impl MonitoringDaemon {
                 let primary_path = self.primary_path();
                 let free_pct = self
                     .fs_collector
-                    .collect(&primary_path)
+                    .collect(primary_path)
                     .map(|s| s.free_pct())
                     .unwrap_or(0.0);
-                let mount_str = primary_path.to_string_lossy();
-                let ballast_available = self.ballast_manager.available_count();
-                let ballast_total = self.ballast_manager.inventory().len();
+                let mount_str = primary_path.to_string_lossy().into_owned();
+                let ballast_available = self
+                    .ballast_coordinator
+                    .inventory()
+                    .iter()
+                    .map(|i| i.files_available)
+                    .sum();
+                let ballast_total = self
+                    .ballast_coordinator
+                    .inventory()
+                    .iter()
+                    .map(|i| i.files_total)
+                    .sum();
                 let dropped_log_events = self.logger_handle.dropped_events();
 
                 self.self_monitor.maybe_write_state(
@@ -562,29 +588,26 @@ impl MonitoringDaemon {
     // ──────────────────── helpers ────────────────────
 
     /// Return the first configured root path, or `/` as fallback.
-    fn primary_path(&self) -> PathBuf {
-        self.config
-            .scanner
-            .root_paths
-            .first()
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from("/"))
+    fn primary_path(&self) -> &Path {
+        &self.cached_primary_path
     }
 
     // ──────────────────── pressure monitoring ────────────────────
 
     fn check_pressure(&mut self) -> Result<crate::monitor::pid::PressureResponse> {
         // Collect stats for all root paths and find the most-pressured volume.
+        let default_paths;
         let paths = if self.config.scanner.root_paths.is_empty() {
-            vec![PathBuf::from("/")]
+            default_paths = [PathBuf::from("/")];
+            &default_paths[..]
         } else {
-            self.config.scanner.root_paths.clone()
+            &self.config.scanner.root_paths
         };
 
         let mut worst_stats = None;
         let mut worst_free_pct = f64::MAX;
 
-        for path in &paths {
+        for path in paths {
             if let Ok(stats) = self.fs_collector.collect(path) {
                 let pct = stats.free_pct();
                 if pct < worst_free_pct {
@@ -621,6 +644,7 @@ impl MonitoringDaemon {
         let reading = PressureReading {
             free_bytes: stats.available_bytes,
             total_bytes: stats.total_bytes,
+            mount: stats.mount_point.clone(),
         };
         let response = self
             .pressure_controller
@@ -633,7 +657,7 @@ impl MonitoringDaemon {
         let primary_path = self.primary_path();
         // Best-effort: collect fresh stats for the log entry.
         let (free_pct, mount, total, free) =
-            if let Ok(stats) = self.fs_collector.collect(&primary_path) {
+            if let Ok(stats) = self.fs_collector.collect(primary_path) {
                 #[allow(clippy::cast_possible_wrap)]
                 (
                     stats.free_pct(),
@@ -668,18 +692,34 @@ impl MonitoringDaemon {
         match response.level {
             PressureLevel::Green => {
                 // Maybe replenish ballast.
-                let primary_path = self.primary_path();
+                // We must find a pool that needs replenishment.
+                // Iterating all pools and trying to replenish one is safe because
+                // ReleaseController enforces global rate limits.
                 let collector = &self.fs_collector;
-                let _ = self.release_controller.maybe_replenish(
-                    &mut self.ballast_manager,
-                    response.level,
-                    &|| {
-                        collector
-                            .collect(&primary_path)
-                            .map(|s| s.free_pct())
-                            .unwrap_or(0.0)
-                    },
-                );
+                let inventory = self.ballast_coordinator.inventory();
+                
+                for pool_info in inventory {
+                    if pool_info.files_available < pool_info.files_total {
+                        let mount_path = pool_info.mount_point.clone();
+                        let free_check = || {
+                            collector
+                                .collect(&mount_path)
+                                .map(|s| s.free_pct())
+                                .unwrap_or(0.0)
+                        };
+                        
+                        // Try to replenish this pool.
+                        if let Ok(Some(report)) = self.ballast_coordinator.replenish_for_mount(
+                            &mount_path, 
+                            Some(&free_check)
+                        ) {
+                            if report.files_created > 0 {
+                                // One file replenished globally per tick is sufficient.
+                                break; 
+                            }
+                        }
+                    }
+                }
 
                 // Predictive Safety Net: if urgency is high (prediction says we will crash soon),
                 // we MUST start scanning even if the current static level is Green.
@@ -692,37 +732,29 @@ impl MonitoringDaemon {
                 // Increase scan frequency (handled by PID interval).
                 // Light scanning.
                 if response.release_ballast_files > 0 {
-                    let _ = self
-                        .release_controller
-                        .maybe_release(&mut self.ballast_manager, response);
+                    let _ = self.release_ballast(&response.causing_mount, response);
                 }
                 self.send_scan_request(scan_tx, response);
             }
             PressureLevel::Orange => {
                 // Start scanning + gentle cleanup + early ballast release.
-                let _ = self
-                    .release_controller
-                    .maybe_release(&mut self.ballast_manager, response);
+                let _ = self.release_ballast(&response.causing_mount, response);
                 self.send_scan_request(scan_tx, response);
             }
             PressureLevel::Red => {
                 // Release ballast + aggressive scan + delete.
-                let _ = self
-                    .release_controller
-                    .maybe_release(&mut self.ballast_manager, response);
+                let _ = self.release_ballast(&response.causing_mount, response);
                 self.send_scan_request(scan_tx, response);
             }
             PressureLevel::Critical => {
                 // Emergency: release all ballast + delete everything safe.
-                let _ = self
-                    .release_controller
-                    .maybe_release(&mut self.ballast_manager, response);
+                let _ = self.release_ballast(&response.causing_mount, response);
                 self.send_scan_request(scan_tx, response);
 
                 let primary = self.primary_path();
                 let actual_free_pct = self
                     .fs_collector
-                    .collect(&primary)
+                    .collect(primary)
                     .map_or(0.0, |s| s.free_pct());
                 self.logger_handle.send(ActivityEvent::Emergency {
                     details: format!(
@@ -733,6 +765,24 @@ impl MonitoringDaemon {
                 });
             }
         }
+    }
+
+    /// Helper to release ballast from the causing mount using the global controller logic.
+    fn release_ballast(
+        &mut self,
+        mount: &std::path::Path,
+        response: &crate::monitor::pid::PressureResponse,
+    ) -> Result<()> {
+        let Some(pool) = self.ballast_coordinator.pool_for_mount(mount) else {
+            return Ok(());
+        };
+        let available = pool.available_count();
+        let count = self.release_controller.files_to_release(response, available);
+        
+        if count > 0 {
+            self.ballast_coordinator.release_for_mount(mount, count)?;
+        }
+        Ok(())
     }
 
     fn send_scan_request(
@@ -809,26 +859,20 @@ impl MonitoringDaemon {
     // ──────────────────── ballast ────────────────────
 
     fn provision_ballast(&mut self) -> Result<()> {
-        let primary_path = self.primary_path();
-        let collector = &self.fs_collector;
-        let report = self.ballast_manager.provision(Some(&|| {
-            collector
-                .collect(&primary_path)
-                .map(|s| s.free_pct())
-                .unwrap_or(0.0)
-        }))?;
+        let report = self.ballast_coordinator.provision_all(self.platform.as_ref())?;
 
-        if report.files_created > 0 {
+        let total_files = report.total_files_created();
+        let total_bytes = report.total_bytes();
+
+        if total_files > 0 {
             eprintln!(
                 "[SBH-DAEMON] provisioned {} ballast files ({} bytes total)",
-                report.files_created, report.total_bytes
+                total_files, total_bytes
             );
         }
 
-        if !report.errors.is_empty() {
-            for err in &report.errors {
-                eprintln!("[SBH-DAEMON] ballast provision warning: {err}");
-            }
+        for (path, err) in &report.skipped_volumes {
+            eprintln!("[SBH-DAEMON] ballast provision skipped for {}: {}", path.display(), err);
         }
 
         Ok(())
@@ -891,6 +935,7 @@ impl MonitoringDaemon {
                         details: format!("config hash: {old_hash} -> {new_hash}"),
                     });
                     self.config = new_config;
+                    self.cached_primary_path = compute_primary_path(&self.config);
                     eprintln!("[SBH-DAEMON] config reloaded successfully");
                 }
             }
@@ -1058,11 +1103,15 @@ fn scanner_thread_main(
                 }
             };
 
-        let walker = DirectoryWalker::new(walker_config, protection);
+        let walker = DirectoryWalker::new(walker_config, protection)
+            .with_heartbeat({
+                let hb = Arc::clone(heartbeat);
+                move || hb.beat()
+            });
 
         // Perform the walk (blocking).
-        // TODO: For very large trees, this might block too long without heartbeats.
-        // Consider making walker yield periodically or run in chunks.
+        // The walker now beats the heartbeat from its worker threads,
+        // preventing this thread from being marked as stalled during long scans.
         let entries = match walker.walk() {
             Ok(e) => e,
             Err(e) => {
@@ -1080,6 +1129,7 @@ fn scanner_thread_main(
 
         // Snapshot open files once per scan for fast filtering.
         let open_files = crate::scanner::walker::collect_open_files();
+        let mut open_checker = OpenPathCache::new(&open_files);
 
         // Process entries.
         for entry in entries {
@@ -1093,7 +1143,7 @@ fn scanner_thread_main(
                 continue;
             }
 
-            let is_open = crate::scanner::walker::is_path_open(&entry.path, &open_files);
+            let is_open = open_checker.is_path_open(&entry.path);
 
             let input = crate::scanner::scoring::CandidateInput {
                 path: entry.path,

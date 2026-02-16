@@ -14,6 +14,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -22,6 +23,7 @@ use crate::core::errors::{Result, SbhError};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
 use crate::logger::jsonl::ScoreFactorsRecord;
 use crate::scanner::scoring::{CandidacyScore, DecisionAction, ScoreFactors};
+use crate::scanner::walker;
 
 // ──────────────────── configuration ────────────────────
 
@@ -163,6 +165,13 @@ impl DeletionExecutor {
             circuit_breaker_tripped: false,
         };
 
+        // Collect open files once per batch to avoid repeated /proc scans.
+        let open_files = if self.config.check_open_files {
+            Some(walker::collect_open_files())
+        } else {
+            None
+        };
+
         let mut consecutive_failures: u32 = 0;
         let limit = plan.candidates.len().min(self.config.max_batch_size);
 
@@ -191,7 +200,7 @@ impl DeletionExecutor {
             }
 
             // Pre-flight safety checks.
-            match self.preflight_check(&candidate.path) {
+            match self.preflight_check(&candidate.path, open_files.as_ref()) {
                 Ok(()) => {}
                 Err(skip) => {
                     report.items_skipped += 1;
@@ -250,7 +259,11 @@ impl DeletionExecutor {
 
     // ──────────────────── pre-flight checks ────────────────────
 
-    fn preflight_check(&self, path: &Path) -> std::result::Result<(), SkipReason> {
+    fn preflight_check(
+        &self,
+        path: &Path,
+        open_files: Option<&HashSet<(u64, u64)>>,
+    ) -> std::result::Result<(), SkipReason> {
         // 1. Path still exists (use symlink_metadata to not follow symlinks).
         let Ok(meta) = fs::symlink_metadata(path) else {
             return Err(SkipReason::PathGone);
@@ -275,8 +288,10 @@ impl DeletionExecutor {
         }
 
         // 5. Not currently open by any process (Linux /proc check).
-        if self.config.check_open_files && is_path_open(path) {
-            return Err(SkipReason::FileOpen);
+        if let Some(open) = open_files {
+            if walker::is_path_open(path, open) {
+                return Err(SkipReason::FileOpen);
+            }
         }
 
         Ok(())
@@ -349,108 +364,6 @@ fn is_writable(path: &Path) -> bool {
     }
 }
 
-// ──────────────────── open-file check ────────────────────
-
-/// Check if a path (or any path under it) is currently open by any process.
-///
-/// On Linux, reads `/proc/*/fd` symlinks. Returns false on non-Linux platforms
-/// or if /proc is unavailable.
-fn is_path_open(target: &Path) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        is_path_open_linux(target)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = target;
-        false
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn is_path_open_linux(target: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    // Collect inode+device pairs for the target and its immediate children.
-    let target_ids = collect_inode_set(target);
-    if target_ids.is_empty() {
-        return false;
-    }
-
-    let proc = Path::new("/proc");
-    let Ok(entries) = fs::read_dir(proc) else {
-        return false;
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !name_str.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-
-        let fd_dir = entry.path().join("fd");
-        let Ok(fds) = fs::read_dir(&fd_dir) else {
-            continue;
-        };
-
-        for fd_entry in fds.flatten() {
-            if let Ok(meta) = fd_entry.path().metadata() {
-                let key = (meta.dev(), meta.ino());
-                if target_ids.contains(&key) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-/// Collect (device, inode) pairs for target path and its descendants.
-#[cfg(target_os = "linux")]
-fn collect_inode_set(target: &Path) -> std::collections::HashSet<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-
-    const MAX_INODE_SCAN_ENTRIES: usize = 20_000;
-
-    let mut ids = std::collections::HashSet::new();
-    let mut visited_dirs = std::collections::HashSet::new();
-    let mut stack = vec![target.to_path_buf()];
-
-    while let Some(path) = stack.pop() {
-        let Ok(meta) = fs::metadata(&path) else {
-            continue;
-        };
-        let key = (meta.dev(), meta.ino());
-        ids.insert(key);
-
-        if ids.len() >= MAX_INODE_SCAN_ENTRIES {
-            break;
-        }
-
-        if !meta.is_dir() {
-            continue;
-        }
-
-        // Avoid symlink/directory cycles and redundant rescans.
-        if !visited_dirs.insert(key) {
-            continue;
-        }
-
-        let Ok(entries) = fs::read_dir(&path) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            stack.push(entry.path());
-            if stack.len() + ids.len() >= MAX_INODE_SCAN_ENTRIES {
-                break;
-            }
-        }
-    }
-    ids
-}
-
 // ──────────────────── conversions ────────────────────
 
 fn factors_to_record(f: &ScoreFactors) -> ScoreFactorsRecord {
@@ -470,6 +383,7 @@ mod tests {
     use super::*;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::scoring::{DecisionOutcome, EvidenceLedger, ScoreFactors};
+    use std::borrow::Cow;
 
     fn make_candidate(path: &Path, size: u64, score: f64) -> CandidacyScore {
         CandidacyScore {
@@ -486,7 +400,7 @@ mod tests {
             vetoed: false,
             veto_reason: None,
             classification: ArtifactClassification {
-                pattern_name: "target".to_string(),
+                pattern_name: Cow::Borrowed("target"),
                 category: ArtifactCategory::RustTarget,
                 name_confidence: 0.95,
                 structural_confidence: 0.90,
@@ -681,7 +595,7 @@ mod tests {
         let call_count = std::sync::atomic::AtomicU32::new(0);
         let report = executor.execute(
             &plan,
-            Some(&|| {
+            Some(&|_path| {
                 let count = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 count >= 1 // Resolved after first
             }),
@@ -692,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn circuit_breaker_on_consecutive_failures() {
+    fn successful_batch_does_not_trip_breaker() {
         let dir = tempfile::tempdir().unwrap();
         let mut candidates = Vec::new();
         // Create paths that don't exist (will fail deletion) but pass preflight
@@ -815,6 +729,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn nested_open_file_is_detected_for_parent_directory() {
+        use crate::scanner::walker;
+
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("a").join("b").join("c");
         fs::create_dir_all(&nested).unwrap();
@@ -822,8 +738,11 @@ mod tests {
         fs::write(&file_path, "payload").unwrap();
 
         let handle = fs::File::open(&file_path).unwrap();
+        
+        let open_files = walker::collect_open_files();
+        
         assert!(
-            is_path_open(dir.path()),
+            walker::is_path_open(dir.path(), &open_files),
             "open file in nested subtree should mark parent as open"
         );
         drop(handle);

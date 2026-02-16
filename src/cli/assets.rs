@@ -8,7 +8,7 @@
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -900,9 +900,19 @@ pub fn verify_cached_asset(entry: &AssetEntry, cache: &AssetCache) -> io::Result
 /// # Errors
 /// Returns an error if the file cannot be read.
 pub fn compute_sha256(path: &Path) -> io::Result<String> {
-    let data = fs::read(path)?;
+    let file = fs::File::open(path)?;
+    let mut reader = io::BufReader::new(file);
     let mut hasher = Sha256::new();
-    hasher.update(&data);
+    let mut buffer = [0; 8192];
+
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+
     let result = hasher.finalize();
     Ok(hex_encode(&result))
 }

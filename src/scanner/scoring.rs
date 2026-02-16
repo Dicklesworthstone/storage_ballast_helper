@@ -4,6 +4,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -67,7 +68,7 @@ pub struct CandidacyScore {
     pub total_score: f64,
     pub factors: ScoreFactors,
     pub vetoed: bool,
-    pub veto_reason: Option<String>,
+    pub veto_reason: Option<Cow<'static, str>>,
     pub classification: ArtifactClassification,
     pub size_bytes: u64,
     pub age: Duration,
@@ -169,6 +170,7 @@ impl ScoringEngine {
             posterior_abandoned,
             calibration,
             fallback_active,
+            uncertainty,
         );
 
         let ledger = build_ledger(
@@ -214,7 +216,7 @@ impl ScoringEngine {
             .iter()
             .map(|candidate| self.score_candidate(candidate, urgency))
             .collect::<Vec<_>>();
-        scores.sort_by(|left, right| {
+        scores.sort_unstable_by(|left, right| {
             right
                 .total_score
                 .partial_cmp(&left.total_score)
@@ -224,30 +226,30 @@ impl ScoringEngine {
         scores
     }
 
-    fn veto_reason(&self, input: &CandidateInput) -> Option<String> {
+    fn veto_reason(&self, input: &CandidateInput) -> Option<Cow<'static, str>> {
         if has_git_component(&input.path) || input.signals.has_git {
-            return Some("path contains .git".to_string());
+            return Some(Cow::Borrowed("path contains .git"));
         }
         if is_system_path(&input.path) {
-            return Some("system path is never deletable".to_string());
+            return Some(Cow::Borrowed("system path is never deletable"));
         }
         if input.age < self.min_file_age {
-            return Some(format!(
+            return Some(Cow::Owned(format!(
                 "age {}s below minimum {}s",
                 input.age.as_secs(),
                 self.min_file_age.as_secs()
-            ));
+            )));
         }
         if input.excluded {
-            return Some("matched user exclusion".to_string());
+            return Some(Cow::Borrowed("matched user exclusion"));
         }
         if input.is_open {
-            return Some("currently open by another process".to_string());
+            return Some(Cow::Borrowed("currently open by another process"));
         }
         None
     }
 
-    fn vetoed(&self, input: &CandidateInput, reason: String) -> CandidacyScore {
+    fn vetoed(&self, input: &CandidateInput, reason: Cow<'static, str>) -> CandidacyScore {
         CandidacyScore {
             path: input.path.clone(),
             total_score: 0.0,
@@ -281,7 +283,7 @@ impl ScoringEngine {
 }
 
 fn factor_location(path: &Path) -> f64 {
-    let text = path.to_string_lossy().to_lowercase();
+    let text = path.to_string_lossy();
     if text.starts_with("/tmp") || text.starts_with("/var/tmp") || text.starts_with("/dev/shm") {
         0.95
     } else if text.contains("/data/projects/") && text.contains("/target") {
@@ -306,7 +308,7 @@ fn factor_location(path: &Path) -> f64 {
 fn factor_name(path: &Path, classification: &ArtifactClassification) -> f64 {
     let name = path
         .file_name()
-        .map_or_else(String::new, |value| value.to_string_lossy().to_lowercase());
+        .map_or_else(|| Cow::Borrowed(""), |value| value.to_string_lossy());
     let mut score = classification.combined_confidence;
     if name.contains("tmp") || name.contains("temp") || name.contains("cache") {
         score += 0.10;
@@ -436,11 +438,11 @@ fn decide_action(
     posterior_abandoned: f64,
     calibration: f64,
     fallback_active: bool,
+    uncertainty: f64,
 ) -> DecisionAction {
     if total_score < min_score || fallback_active {
         return DecisionAction::Keep;
     }
-    let uncertainty = epistemic_uncertainty(posterior_abandoned, calibration);
     let decision_margin = (keep_loss - delete_loss).abs();
     let review_band = (1.0 - calibration).mul_add(2.0, 5.0f64.mul_add(uncertainty, 1.0));
     if decision_margin <= review_band {
@@ -590,13 +592,20 @@ fn is_system_path(path: &Path) -> bool {
     if path == Path::new("/") {
         return true;
     }
+
+    // Explicitly allow specific subdirectories that would otherwise be caught
+    // by parent protections.
+    if path.starts_with("/var/tmp") || path.starts_with("/dev/shm") {
+        return false;
+    }
+
     // Check prefixes for protected system directories.
     [
         Path::new("/bin"),
         Path::new("/boot"),
         Path::new("/dev"),
         Path::new("/etc"),
-        Path::new("/home"),
+        // /home is intentionally omitted to allow cleaning user artifacts
         Path::new("/lib"),
         Path::new("/lib64"),
         Path::new("/opt"),
@@ -618,6 +627,7 @@ mod tests {
     use super::{CandidateInput, DecisionAction, ScoringEngine};
     use crate::core::config::ScoringConfig;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
+    use std::borrow::Cow;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -627,7 +637,7 @@ mod tests {
 
     fn classification(confidence: f64, category: ArtifactCategory) -> ArtifactClassification {
         ArtifactClassification {
-            pattern_name: "test".to_string(),
+            pattern_name: Cow::Borrowed("test"),
             category,
             name_confidence: confidence,
             structural_confidence: confidence,
@@ -662,9 +672,7 @@ mod tests {
             "/lib/x86_64-linux-gnu/libc.so",
             "/lib64/ld-linux.so",
             "/var/lib/dpkg/status",
-            "/dev/shm/test",
             "/run/systemd/private",
-            "/home/user/Documents",
             "/root/.bashrc",
             "/opt/myapp/bin",
             "/snap/core/current",
@@ -684,6 +692,33 @@ mod tests {
             assert!(
                 score.vetoed,
                 "system path {system_dir} should be hard-vetoed"
+            );
+        }
+    }
+
+    #[test]
+    fn user_paths_are_not_vetoed() {
+        let engine = default_engine();
+        for user_dir in [
+            "/home/user/Documents",
+            "/dev/shm/test",
+            "/var/tmp/test_build",
+        ] {
+            let score = engine.score_candidate(
+                &CandidateInput {
+                    path: PathBuf::from(user_dir),
+                    size_bytes: 1_073_741_824,
+                    age: Duration::from_secs(6 * 3600),
+                    classification: classification(0.95, ArtifactCategory::RustTarget),
+                    signals: StructuralSignals::default(),
+                    is_open: false,
+                    excluded: false,
+                },
+                0.9,
+            );
+            assert!(
+                !score.vetoed,
+                "user path {user_dir} should NOT be hard-vetoed"
             );
         }
     }
@@ -786,25 +821,29 @@ mod tests {
 
     #[test]
     fn decision_boundary_prefers_review_when_margin_is_thin_and_uncertain() {
-        let action = super::decide_action(1.2, 0.45, 24.0, 22.5, 0.78, 0.56, false);
+        let u = super::epistemic_uncertainty(0.78, 0.56);
+        let action = super::decide_action(1.2, 0.45, 24.0, 22.5, 0.78, 0.56, false, u);
         assert_eq!(action, DecisionAction::Review);
     }
 
     #[test]
     fn decision_boundary_allows_delete_when_margin_and_confidence_are_strong() {
-        let action = super::decide_action(1.6, 0.45, 28.0, 4.0, 0.93, 0.90, false);
+        let u = super::epistemic_uncertainty(0.93, 0.90);
+        let action = super::decide_action(1.6, 0.45, 28.0, 4.0, 0.93, 0.90, false, u);
         assert_eq!(action, DecisionAction::Delete);
     }
 
     #[test]
     fn decision_boundary_reviews_when_advantage_ratio_is_too_weak_for_risk() {
-        let action = super::decide_action(1.6, 0.45, 30.0, 20.0, 0.90, 0.55, false);
+        let u = super::epistemic_uncertainty(0.90, 0.55);
+        let action = super::decide_action(1.6, 0.45, 30.0, 20.0, 0.90, 0.55, false, u);
         assert_eq!(action, DecisionAction::Review);
     }
 
     #[test]
     fn decision_boundary_deletes_when_advantage_ratio_clears_risk_threshold() {
-        let action = super::decide_action(1.6, 0.45, 30.0, 4.0, 0.92, 0.75, false);
+        let u = super::epistemic_uncertainty(0.92, 0.75);
+        let action = super::decide_action(1.6, 0.45, 30.0, 4.0, 0.92, 0.75, false, u);
         assert_eq!(action, DecisionAction::Delete);
     }
 

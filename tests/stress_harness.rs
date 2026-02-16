@@ -253,7 +253,7 @@ fn make_candidate(path: &str, size: u64, age_secs: u64) -> CandidateInput {
         size_bytes: size,
         age: Duration::from_secs(age_secs),
         classification: ArtifactClassification {
-            pattern_name: "target".to_string(),
+            pattern_name: "target".into(),
             category: ArtifactCategory::RustTarget,
             name_confidence: 0.9,
             structural_confidence: 0.8,
@@ -340,6 +340,7 @@ fn run_scenario_a(seed: u64, iterations: usize) -> ScenarioResult {
                 PressureReading {
                     free_bytes,
                     total_bytes: total,
+                    mount: PathBuf::from("/"),
                 },
                 Some(estimate.seconds_to_exhaustion),
                 now,
@@ -470,6 +471,7 @@ fn run_scenario_b(seed: u64, iterations: usize) -> ScenarioResult {
                 PressureReading {
                     free_bytes,
                     total_bytes: total,
+                    mount: PathBuf::from("/"),
                 },
                 Some(estimate.seconds_to_exhaustion),
                 now,
@@ -617,6 +619,7 @@ fn run_scenario_c(seed: u64, iterations: usize) -> ScenarioResult {
                 PressureReading {
                     free_bytes,
                     total_bytes: total,
+                    mount: PathBuf::from("/"),
                 },
                 Some(estimate.seconds_to_exhaustion),
                 now,
@@ -738,6 +741,7 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
                 PressureReading {
                     free_bytes,
                     total_bytes: total,
+                    mount: PathBuf::from("/"),
                 },
                 Some(estimate.seconds_to_exhaustion),
                 now,
@@ -904,6 +908,7 @@ fn run_scenario_e(seed: u64, iterations: usize) -> ScenarioResult {
                 PressureReading {
                     free_bytes: free,
                     total_bytes: total,
+                    mount: PathBuf::from("/"),
                 },
                 Some(estimate.seconds_to_exhaustion),
                 now,

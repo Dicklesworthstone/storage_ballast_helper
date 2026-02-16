@@ -1080,16 +1080,29 @@ fn extract_and_install(
     // Keep a `.old` safety net in addition to the backup store snapshot.
     let backup_path = install_path.with_extension("old");
     if install_path.exists() {
-        std::fs::copy(install_path, &backup_path)
-            .map_err(|e| format!("failed to backup current binary: {e}"))?;
+        // Try rename first (atomic, works if running), fall back to copy.
+        if std::fs::rename(install_path, &backup_path).is_err() {
+             std::fs::copy(install_path, &backup_path)
+                .map_err(|e| format!("failed to backup current binary: {e}"))?;
+        }
     }
 
-    if let Err(e) = std::fs::copy(&new_binary, install_path) {
-        if backup_path.exists() {
-            let _ = std::fs::copy(&backup_path, install_path);
-        }
+    // Atomic install: copy to .new alongside target, then rename.
+    // This ensures we are on the same filesystem for the final rename.
+    let temp_install_path = install_path.with_extension("new");
+    if let Err(e) = std::fs::copy(&new_binary, &temp_install_path) {
         let _ = std::fs::remove_dir_all(&extract_dir);
-        return Err(format!("failed to install new binary (rolled back): {e}"));
+        return Err(format!("failed to copy new binary to temp location: {e}"));
+    }
+
+    if let Err(e) = std::fs::rename(&temp_install_path, install_path) {
+        // Rollback: restore from backup if it exists.
+        if backup_path.exists() {
+            let _ = std::fs::rename(&backup_path, install_path);
+        }
+        let _ = std::fs::remove_file(&temp_install_path);
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        return Err(format!("failed to atomically replace binary (rolled back): {e}"));
     }
 
     #[cfg(unix)]

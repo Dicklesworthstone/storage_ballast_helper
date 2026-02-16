@@ -829,6 +829,7 @@ fn pressure_escalation_through_levels() {
             PressureReading {
                 free_bytes: *free_pct,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             t0 + Duration::from_secs(i as u64),
@@ -931,7 +932,7 @@ fn scoring_pipeline_ranks_artifacts_above_source() {
         size_bytes: 500_000_000,            // 500 MB
         age: Duration::from_secs(4 * 3600), // 4 hours
         classification: ArtifactClassification {
-            pattern_name: "cargo-target".to_string(),
+            pattern_name: "cargo-target".into(),
             category: ArtifactCategory::RustTarget,
             name_confidence: 0.9,
             structural_confidence: 0.95,
@@ -1216,7 +1217,7 @@ fn batch_scoring_ranks_correctly() {
             size_bytes: 500_000_000,
             age: Duration::from_secs(4 * 3600), // 4 hours
             classification: ArtifactClassification {
-                pattern_name: "cargo-target".to_string(),
+                pattern_name: "cargo-target".into(),
                 category: ArtifactCategory::RustTarget,
                 name_confidence: 0.9,
                 structural_confidence: 0.95,
@@ -1283,7 +1284,7 @@ fn e2e_candidate(path: &str, size_gb: u64, age_hours: u64, confidence: f64) -> C
         size_bytes: size_gb * 1_073_741_824,
         age: Duration::from_secs(age_hours * 3600),
         classification: ArtifactClassification {
-            pattern_name: ".target*".to_string(),
+            pattern_name: ".target*".into(),
             category: ArtifactCategory::RustTarget,
             name_confidence: confidence,
             structural_confidence: confidence * 0.9,
@@ -1348,7 +1349,7 @@ fn e2e_scored_candidate(action: DecisionAction, score: f64) -> CandidacyScore {
         vetoed: false,
         veto_reason: None,
         classification: ArtifactClassification {
-            pattern_name: ".target*".to_string(),
+            pattern_name: ".target*".into(),
             category: ArtifactCategory::RustTarget,
             name_confidence: 0.9,
             structural_confidence: 0.95,

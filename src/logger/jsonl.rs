@@ -179,6 +179,7 @@ pub struct JsonlWriter {
     bytes_written: u64,
     last_fsync: SystemTime,
     last_recover_attempt: SystemTime,
+    last_rotate_attempt: SystemTime,
     lines_since_fsync: u64,
 }
 
@@ -192,6 +193,7 @@ impl JsonlWriter {
             bytes_written: 0,
             last_fsync: SystemTime::now(),
             last_recover_attempt: UNIX_EPOCH,
+            last_rotate_attempt: UNIX_EPOCH,
             lines_since_fsync: 0,
         };
         w.try_open_primary();
@@ -201,7 +203,10 @@ impl JsonlWriter {
     /// Write a single log entry as one atomic JSONL line.
     pub fn write_entry(&mut self, entry: &LogEntry) {
         let line = match serde_json::to_string(entry) {
-            Ok(json) => format!("{json}\n"),
+            Ok(mut json) => {
+                json.push('\n');
+                json
+            }
             Err(e) => {
                 // Serialization failure is a programming error; log to stderr and bail.
                 let _ = writeln!(io::stderr(), "[SBH-JSONL] serialize error: {e}");
@@ -252,6 +257,12 @@ impl JsonlWriter {
         // Check if rotation is needed before writing.
         if self.bytes_written + line.len() as u64 > self.config.max_size_bytes
             && matches!(self.state, WriterState::Normal | WriterState::Fallback)
+            && self
+                .last_rotate_attempt
+                .elapsed()
+                .unwrap_or(Duration::ZERO)
+                .as_secs()
+                > 10
         {
             self.rotate();
         }
@@ -366,6 +377,8 @@ impl JsonlWriter {
     }
 
     fn rotate(&mut self) {
+        self.last_rotate_attempt = SystemTime::now();
+
         // Flush and drop current file.
         if let Some(w) = self.writer.as_mut() {
             let _ = w.flush();

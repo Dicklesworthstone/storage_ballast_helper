@@ -295,7 +295,7 @@ impl DecisionRecordBuilder {
             size_bytes: score.size_bytes,
             age_secs: score.age.as_secs(),
             classification: ClassificationRecord {
-                pattern_name: score.classification.pattern_name.clone(),
+                pattern_name: score.classification.pattern_name.to_string(),
                 category: format!("{:?}", score.classification.category),
                 combined_confidence: score.classification.combined_confidence,
             },
@@ -309,7 +309,7 @@ impl DecisionRecordBuilder {
             fallback_active: score.decision.fallback_active,
             fallback_reason,
             vetoed: score.vetoed,
-            veto_reason: score.veto_reason.clone(),
+            veto_reason: score.veto_reason.as_ref().map(ToString::to_string),
             action: ActionRecord::from(score.decision.action),
             guard_status: guard_status.map(GuardStatusRecord::from_diagnostics),
             comparator_action: comparator_action.map(ActionRecord::from),
@@ -635,7 +635,7 @@ mod tests {
             vetoed: false,
             veto_reason: None,
             classification: ArtifactClassification {
-                pattern_name: ".target*".to_string(),
+                pattern_name: ".target*".into(),
                 category: ArtifactCategory::RustTarget,
                 name_confidence: 0.90,
                 structural_confidence: 0.95,
@@ -717,9 +717,9 @@ mod tests {
                 pressure_multiplier: 1.0,
             },
             vetoed: true,
-            veto_reason: Some("path contains .git".to_string()),
+            veto_reason: Some("path contains .git".into()),
             classification: ArtifactClassification {
-                pattern_name: "unknown".to_string(),
+                pattern_name: "unknown".into(),
                 category: ArtifactCategory::RustTarget,
                 name_confidence: 0.5,
                 structural_confidence: 0.0,
@@ -1046,7 +1046,7 @@ mod tests {
             size_bytes: 2_000_000_000,
             age: Duration::from_secs(4 * 3600),
             classification: ArtifactClassification {
-                pattern_name: "cargo-target-*".to_string(),
+                pattern_name: "cargo-target-*".into(),
                 category: ArtifactCategory::RustTarget,
                 name_confidence: 0.9,
                 structural_confidence: 0.85,

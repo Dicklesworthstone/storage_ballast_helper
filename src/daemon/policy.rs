@@ -605,7 +605,7 @@ mod tests {
             vetoed: false,
             veto_reason: None,
             classification: ArtifactClassification {
-                pattern_name: ".target*".to_string(),
+                pattern_name: ".target*".into(),
                 category: ArtifactCategory::RustTarget,
                 name_confidence: 0.9,
                 structural_confidence: 0.95,

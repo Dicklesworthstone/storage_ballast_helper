@@ -26,7 +26,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -58,6 +58,8 @@ pub struct VoiConfig {
     pub recovery_trigger_windows: u32,
     /// Minimum scans of a path before its forecast is considered reliable.
     pub min_observations_for_forecast: u32,
+    /// Alpha value for EWMA smoothing of per-path statistics.
+    pub ewma_alpha: f64,
 }
 
 impl Default for VoiConfig {
@@ -73,6 +75,7 @@ impl Default for VoiConfig {
             fallback_trigger_windows: 3,
             recovery_trigger_windows: 5,
             min_observations_for_forecast: 3,
+            ewma_alpha: 0.3,
         }
     }
 }
@@ -125,8 +128,8 @@ impl PathStats {
         false_positives: u32,
         io_cost_estimate: f64,
         now: Instant,
+        alpha: f64,
     ) {
-        let alpha = 0.3;
         self.total_reclaimed_bytes = self.total_reclaimed_bytes.saturating_add(reclaimed_bytes);
         self.total_items_deleted = self.total_items_deleted.saturating_add(items_deleted);
         self.false_positive_count = self.false_positive_count.saturating_add(false_positives);
@@ -214,7 +217,7 @@ struct CalibrationState {
     /// Whether we are in fallback mode.
     fallback_active: bool,
     /// History of window-level mean absolute percentage error.
-    window_mapes: Vec<f64>,
+    window_mapes: VecDeque<f64>,
 }
 
 impl CalibrationState {
@@ -223,16 +226,16 @@ impl CalibrationState {
             consecutive_bad_windows: 0,
             consecutive_good_windows: 0,
             fallback_active: false,
-            window_mapes: Vec::new(),
+            window_mapes: VecDeque::new(),
         }
     }
 
     /// Record a window's mean forecast error and update fallback state.
     fn record_window(&mut self, mape: f64, config: &VoiConfig) {
-        self.window_mapes.push(mape);
+        self.window_mapes.push_back(mape);
         // Keep last 50 windows for diagnostics.
         if self.window_mapes.len() > 50 {
-            self.window_mapes.remove(0);
+            self.window_mapes.pop_front();
         }
 
         if mape > config.forecast_error_threshold {
@@ -301,6 +304,7 @@ impl VoiScheduler {
                 false_positives,
                 io_cost_estimate,
                 now,
+                self.config.ewma_alpha,
             );
         }
     }
@@ -332,9 +336,8 @@ impl VoiScheduler {
     #[must_use]
     pub fn schedule(&mut self, now: Instant) -> ScanPlan {
         let budget = self.config.scan_budget_per_interval;
-        let paths: Vec<PathBuf> = self.path_stats.keys().cloned().collect();
 
-        if paths.is_empty() || budget == 0 {
+        if self.path_stats.is_empty() || budget == 0 {
             return ScanPlan {
                 paths: Vec::new(),
                 fallback_active: self.is_fallback_active(),
@@ -344,9 +347,11 @@ impl VoiScheduler {
         }
 
         if self.is_fallback_active() {
+            let paths: Vec<PathBuf> = self.path_stats.keys().cloned().collect();
             return self.schedule_round_robin(&paths, budget);
         }
 
+        let paths: Vec<&PathBuf> = self.path_stats.keys().collect();
         self.schedule_voi(&paths, budget, now)
     }
 
@@ -384,7 +389,7 @@ impl VoiScheduler {
     }
 
     /// VOI-prioritized scheduler with exploration quota.
-    fn schedule_voi(&self, paths: &[PathBuf], budget: usize, now: Instant) -> ScanPlan {
+    fn schedule_voi(&self, paths: &[&PathBuf], budget: usize, now: Instant) -> ScanPlan {
         // Split budget: exploration vs exploitation.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let exploration_budget =
@@ -392,44 +397,44 @@ impl VoiScheduler {
         let exploitation_budget = budget.saturating_sub(exploration_budget);
 
         // 1. Score all paths by utility.
-        let mut scored: Vec<(PathBuf, f64)> = paths
+        let mut scored: Vec<(&PathBuf, f64)> = paths
             .iter()
             .map(|p| {
                 let utility = self.compute_utility(p, now);
-                (p.clone(), utility)
+                (*p, utility)
             })
             .collect();
 
         // Sort descending by utility.
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // 2. Pick exploitation targets (top utility, up to exploitation_budget).
         let mut selected: Vec<ScanPlanEntry> = Vec::with_capacity(budget);
-        let mut selected_set: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut selected_set: std::collections::HashSet<&PathBuf> = std::collections::HashSet::new();
 
         for (path, utility) in scored.iter().take(exploitation_budget) {
             let forecast = self
                 .path_stats
-                .get(path)
+                .get(*path)
                 .map_or(0.0, |s| s.forecast_reclaim);
             selected.push(ScanPlanEntry {
-                path: path.clone(),
+                path: (*path).clone(),
                 utility: *utility,
                 is_exploration: false,
                 forecast_reclaim_bytes: forecast,
             });
-            selected_set.insert(path.clone());
+            selected_set.insert(path);
         }
 
         // 3. Pick exploration targets: least-scanned paths not already selected.
-        let mut exploration_candidates: Vec<(PathBuf, u32, f64)> = paths
+        let mut exploration_candidates: Vec<(&PathBuf, u32, f64)> = paths
             .iter()
             .filter(|p| !selected_set.contains(*p))
             .map(|p| {
-                let stats = self.path_stats.get(p);
+                let stats = self.path_stats.get(*p);
                 let count = stats.map_or(0, |s| s.scan_count);
                 let staleness = stats.map_or(f64::INFINITY, |s| s.staleness(now));
-                (p.clone(), count, staleness)
+                (*p, count, staleness)
             })
             .collect();
 
@@ -442,11 +447,11 @@ impl VoiScheduler {
         for (path, _, _) in exploration_candidates.iter().take(exploration_budget) {
             let forecast = self
                 .path_stats
-                .get(path)
+                .get(*path)
                 .map_or(0.0, |s| s.forecast_reclaim);
             let utility = self.compute_utility(path, now);
             selected.push(ScanPlanEntry {
-                path: path.clone(),
+                path: (*path).clone(),
                 utility,
                 is_exploration: true,
                 forecast_reclaim_bytes: forecast,
@@ -511,7 +516,7 @@ impl VoiScheduler {
             fallback_active: self.calibration.fallback_active,
             consecutive_bad_windows: self.calibration.consecutive_bad_windows,
             consecutive_good_windows: self.calibration.consecutive_good_windows,
-            recent_mapes: self.calibration.window_mapes.clone(),
+            recent_mapes: self.calibration.window_mapes.iter().copied().collect(),
             total_paths_tracked: self.path_stats.len(),
         }
     }

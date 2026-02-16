@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::core::config::PathsConfig;
@@ -111,13 +113,45 @@ impl ServiceManager for NoopServiceManager {
 }
 
 /// Linux platform implementation using `/proc` + `statvfs`.
-#[derive(Debug, Default)]
-pub struct LinuxPlatform;
+#[derive(Debug)]
+pub struct LinuxPlatform {
+    mounts_cache: RwLock<Option<(Vec<MountPoint>, Instant)>>,
+    cache_ttl: Duration,
+}
+
+impl Default for LinuxPlatform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LinuxPlatform {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            mounts_cache: RwLock::new(None),
+            cache_ttl: Duration::from_secs(5),
+        }
+    }
+
+    fn get_cached_mounts(&self) -> Result<Vec<MountPoint>> {
+        {
+            let cache = self.mounts_cache.read();
+            if let Some((mounts, collected_at)) = &*cache {
+                if collected_at.elapsed() < self.cache_ttl {
+                    return Ok(mounts.clone());
+                }
+            }
+        }
+
+        let raw = fs::read_to_string("/proc/self/mounts").map_err(|source| SbhError::Io {
+            path: PathBuf::from("/proc/self/mounts"),
+            source,
+        })?;
+        let mounts = parse_proc_mounts(&raw);
+
+        *self.mounts_cache.write() = Some((mounts.clone(), Instant::now()));
+        Ok(mounts)
     }
 }
 
@@ -144,12 +178,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn mount_points(&self) -> Result<Vec<MountPoint>> {
-        let raw = fs::read_to_string("/proc/self/mounts").map_err(|source| SbhError::Io {
-            path: PathBuf::from("/proc/self/mounts"),
-            source,
-        })?;
-        let mounts = parse_proc_mounts(&raw);
-        Ok(mounts)
+        self.get_cached_mounts()
     }
 
     fn is_ram_backed(&self, path: &Path) -> Result<bool> {

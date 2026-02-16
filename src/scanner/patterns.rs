@@ -3,6 +3,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
+use std::borrow::Cow;
 use std::path::Path;
 
 /// High-level artifact category used by the scorer and CLI reports.
@@ -48,7 +49,7 @@ impl StructuralSignals {
 /// Classification output for one path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArtifactClassification {
-    pub pattern_name: String,
+    pub pattern_name: Cow<'static, str>,
     pub category: ArtifactCategory,
     pub name_confidence: f64,
     pub structural_confidence: f64,
@@ -59,7 +60,7 @@ impl ArtifactClassification {
     #[must_use]
     pub fn unknown() -> Self {
         Self {
-            pattern_name: "unknown".to_string(),
+            pattern_name: Cow::Borrowed("unknown"),
             category: ArtifactCategory::Unknown,
             name_confidence: 0.0,
             structural_confidence: 0.0,
@@ -94,11 +95,17 @@ pub struct CustomPattern {
     pub category: ArtifactCategory,
 }
 
+#[derive(Debug, Clone)]
+struct NormalizedCustomPattern {
+    pattern: CustomPattern,
+    lowercase_needle: String,
+}
+
 /// Registry of built-in and custom patterns.
 #[derive(Debug, Clone)]
 pub struct ArtifactPatternRegistry {
     builtins: Vec<ArtifactPattern>,
-    custom: Vec<CustomPattern>,
+    custom: Vec<NormalizedCustomPattern>,
 }
 
 impl Default for ArtifactPatternRegistry {
@@ -113,7 +120,13 @@ impl Default for ArtifactPatternRegistry {
 impl ArtifactPatternRegistry {
     #[must_use]
     pub fn with_custom(mut self, custom: Vec<CustomPattern>) -> Self {
-        self.custom = custom;
+        self.custom = custom
+            .into_iter()
+            .map(|pattern| NormalizedCustomPattern {
+                lowercase_needle: pattern.needle.to_lowercase(),
+                pattern,
+            })
+            .collect();
         self
     }
 
@@ -123,7 +136,7 @@ impl ArtifactPatternRegistry {
         let Some(name_os) = path.file_name() else {
             return ArtifactClassification::unknown();
         };
-        let normalized = name_os.to_string_lossy().to_lowercase();
+        let normalized = name_os.to_string_lossy();
 
         let mut best = ArtifactClassification::unknown();
         for pattern in &self.builtins {
@@ -131,7 +144,7 @@ impl ArtifactPatternRegistry {
                 && pattern.confidence > best.name_confidence
             {
                 best = ArtifactClassification {
-                    pattern_name: pattern.name.to_string(),
+                    pattern_name: Cow::Borrowed(pattern.name),
                     category: pattern.category,
                     name_confidence: pattern.confidence,
                     structural_confidence: 0.0,
@@ -140,16 +153,16 @@ impl ArtifactPatternRegistry {
             }
         }
 
-        for pattern in &self.custom {
-            if normalized.contains(&pattern.needle.to_lowercase())
-                && pattern.confidence > best.name_confidence
+        for custom in &self.custom {
+            if normalized.contains(&custom.lowercase_needle)
+                && custom.pattern.confidence > best.name_confidence
             {
                 best = ArtifactClassification {
-                    pattern_name: pattern.name.clone(),
-                    category: pattern.category,
-                    name_confidence: pattern.confidence,
+                    pattern_name: Cow::Owned(custom.pattern.name.clone()),
+                    category: custom.pattern.category,
+                    name_confidence: custom.pattern.confidence,
                     structural_confidence: 0.0,
-                    combined_confidence: pattern.confidence,
+                    combined_confidence: custom.pattern.confidence,
                 };
             }
         }
@@ -159,7 +172,7 @@ impl ArtifactPatternRegistry {
             && (signals.has_fingerprint || (signals.has_incremental && signals.has_deps))
         {
             best = ArtifactClassification {
-                pattern_name: "structural-rust-target".to_string(),
+                pattern_name: Cow::Borrowed("structural-rust-target"),
                 category: ArtifactCategory::RustTarget,
                 name_confidence: 0.55,
                 structural_confidence: 0.0,

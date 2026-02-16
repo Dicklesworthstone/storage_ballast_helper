@@ -176,6 +176,8 @@ pub struct WatchdogHeartbeat {
     last_beat: Instant,
     /// Whether systemd watchdog integration is enabled.
     enabled: bool,
+    /// Cached socket path (NOTIFY_SOCKET) to avoid repeated env lookups.
+    socket_path: Option<String>,
 }
 
 impl WatchdogHeartbeat {
@@ -185,10 +187,12 @@ impl WatchdogHeartbeat {
     /// will fire at half that interval.
     #[must_use]
     pub fn new(watchdog_sec: u64) -> Self {
+        let socket_path = std::env::var("NOTIFY_SOCKET").ok().filter(|s| !s.is_empty());
         Self {
             interval: Duration::from_secs(watchdog_sec / 2),
             last_beat: Instant::now(),
-            enabled: watchdog_sec > 0,
+            enabled: watchdog_sec > 0 && socket_path.is_some(),
+            socket_path,
         }
     }
 
@@ -199,6 +203,7 @@ impl WatchdogHeartbeat {
             interval: Duration::from_secs(30),
             last_beat: Instant::now(),
             enabled: false,
+            socket_path: None,
         }
     }
 
@@ -215,7 +220,7 @@ impl WatchdogHeartbeat {
         }
 
         self.last_beat = Instant::now();
-        sd_notify_watchdog(status);
+        sd_notify_watchdog(status, self.socket_path.as_deref());
         true
     }
 
@@ -227,34 +232,30 @@ impl WatchdogHeartbeat {
 }
 
 /// Send `sd_notify(WATCHDOG=1)` + STATUS=<msg> to systemd.
-///
-/// Uses the `NOTIFY_SOCKET` environment variable. If not set, this is a no-op.
-fn sd_notify_watchdog(status: &str) {
+fn sd_notify_watchdog(status: &str, socket_path: Option<&str>) {
     #[cfg(target_os = "linux")]
     {
-        sd_notify_linux(status);
+        if let Some(path) = socket_path {
+            sd_notify_linux(status, path);
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = status;
+        let _ = socket_path;
     }
 }
 
 #[cfg(target_os = "linux")]
-fn sd_notify_linux(status: &str) {
+fn sd_notify_linux(status: &str, socket_path: &str) {
     use std::os::unix::net::UnixDatagram;
-
-    let socket_path = match std::env::var("NOTIFY_SOCKET") {
-        Ok(p) if !p.is_empty() => p,
-        _ => return,
-    };
 
     let msg = format!("WATCHDOG=1\nSTATUS={status}\n");
     let Ok(sock) = UnixDatagram::unbound() else {
         return;
     };
 
-    let _ = sock.send_to(msg.as_bytes(), &socket_path);
+    let _ = sock.send_to(msg.as_bytes(), socket_path);
 }
 
 // ──────────────────── tests ────────────────────
@@ -359,10 +360,12 @@ mod tests {
 
     #[test]
     fn watchdog_respects_interval() {
+        // Construct directly with enabled=true — no env var mutation needed.
         let mut wd = WatchdogHeartbeat {
             interval: Duration::from_secs(60),
             last_beat: Instant::now(),
             enabled: true,
+            socket_path: Some("/tmp/test.sock".to_string()),
         };
         // Just beat, so shouldn't fire again immediately.
         assert!(!wd.maybe_notify("test"));
@@ -370,14 +373,16 @@ mod tests {
 
     #[test]
     fn watchdog_fires_after_interval() {
+        // Construct directly with enabled=true — no env var mutation needed.
         let mut wd = WatchdogHeartbeat {
             interval: Duration::from_millis(1),
             last_beat: Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .expect("1s subtraction should be representable"),
             enabled: true,
+            socket_path: Some("/tmp/test.sock".to_string()),
         };
-        // Interval has elapsed, should fire (sd_notify is no-op without NOTIFY_SOCKET).
+        // Interval has elapsed, should fire (sd_notify handles failure gracefully).
         assert!(wd.maybe_notify("test"));
     }
 }

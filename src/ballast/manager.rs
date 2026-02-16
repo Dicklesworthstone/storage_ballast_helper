@@ -18,6 +18,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
 use crate::core::config::BallastConfig;
 use crate::core::errors::{Result, SbhError};
 
@@ -147,6 +152,32 @@ impl BallastManager {
         self.inventory.len()
     }
 
+    // ──────────────────── locking ────────────────────
+
+    #[cfg(unix)]
+    fn acquire_lock(&self) -> Result<File> {
+        let lock_path = self.ballast_dir.join(".lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|e| SbhError::io(&lock_path, e))?;
+
+        nix::fcntl::flock(file.as_raw_fd(), nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|e| SbhError::Runtime {
+                details: format!("failed to lock ballast dir: {e}"),
+            })?;
+
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    fn acquire_lock(&self) -> Result<()> {
+        Ok(())
+    }
+
     // ──────────────────── provision ────────────────────
 
     /// Create all ballast files (idempotent: skips existing valid files).
@@ -157,6 +188,7 @@ impl BallastManager {
         &mut self,
         free_pct_check: Option<&dyn Fn() -> f64>,
     ) -> Result<ProvisionReport> {
+        let _lock = self.acquire_lock()?;
         let mut report = ProvisionReport {
             files_created: 0,
             files_skipped: 0,
@@ -211,6 +243,7 @@ impl BallastManager {
 
     /// Release N ballast files (delete highest-index first).
     pub fn release(&mut self, count: usize) -> Result<ReleaseReport> {
+        let _lock = self.acquire_lock()?;
         let mut report = ReleaseReport {
             files_released: 0,
             bytes_freed: 0,
@@ -244,7 +277,8 @@ impl BallastManager {
     // ──────────────────── verify ────────────────────
 
     /// Verify integrity of all expected ballast files.
-    pub fn verify(&mut self) -> VerifyReport {
+    pub fn verify(&mut self) -> Result<VerifyReport> {
+        let _lock = self.acquire_lock()?;
         let mut report = VerifyReport {
             files_checked: 0,
             files_ok: 0,
@@ -273,7 +307,7 @@ impl BallastManager {
             }
         }
 
-        report
+        Ok(report)
     }
 
     // ──────────────────── replenish ────────────────────
@@ -292,6 +326,7 @@ impl BallastManager {
         &mut self,
         free_pct_check: Option<&dyn Fn() -> f64>,
     ) -> Result<ProvisionReport> {
+        let _lock = self.acquire_lock()?;
         let mut report = ProvisionReport {
             files_created: 0,
             files_skipped: 0,
@@ -461,6 +496,14 @@ impl BallastManager {
         // Write header (4096 bytes, null-padded).
         let header = BallastHeader::new(index, size);
         let header_json = serde_json::to_string(&header)?;
+        if header_json.len() > HEADER_SIZE {
+            return Err(SbhError::Runtime {
+                details: format!(
+                    "ballast header JSON ({} bytes) exceeds HEADER_SIZE ({HEADER_SIZE})",
+                    header_json.len()
+                ),
+            });
+        }
         let mut header_buf = vec![0u8; HEADER_SIZE];
         header_buf[..header_json.len()].copy_from_slice(header_json.as_bytes());
         file.write_all(&header_buf)
@@ -493,7 +536,13 @@ impl BallastManager {
         let mut bytes_since_fsync: u64 = 0;
 
         while written < data_size {
-            let to_write = CHUNK_SIZE.min((data_size - written) as usize);
+            let remaining = data_size - written;
+            let to_write = if remaining > CHUNK_SIZE as u64 {
+                CHUNK_SIZE
+            } else {
+                remaining as usize
+            };
+
             rng.fill_bytes(&mut chunk[..to_write]);
             file.write_all(&chunk[..to_write])
                 .map_err(|e| SbhError::io(path, e))?;
@@ -596,7 +645,7 @@ mod tests {
         let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
         mgr.provision(None).unwrap();
 
-        let report = mgr.verify();
+        let report = mgr.verify().unwrap();
         assert_eq!(report.files_checked, 3);
         assert_eq!(report.files_ok, 3);
         assert_eq!(report.files_corrupted, 0);
@@ -609,7 +658,7 @@ mod tests {
         let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
         // Don't provision — all files are missing.
 
-        let report = mgr.verify();
+        let report = mgr.verify().unwrap();
         assert_eq!(report.files_missing, 3);
     }
 
@@ -625,7 +674,7 @@ mod tests {
         data[0..5].copy_from_slice(b"JUNK!");
         fs::write(&path, &data).unwrap();
 
-        let report = mgr.verify();
+        let report = mgr.verify().unwrap();
         assert_eq!(report.files_ok, 2);
         assert_eq!(report.files_corrupted, 1);
     }
@@ -700,7 +749,7 @@ mod tests {
         assert_eq!(p.files_created, 3);
 
         // 2. Verify
-        let v = mgr.verify();
+        let v = mgr.verify().unwrap();
         assert_eq!(v.files_ok, 3);
 
         // 3. Release 2
@@ -709,7 +758,7 @@ mod tests {
         assert_eq!(mgr.available_count(), 1);
 
         // 4. Verify again (2 missing now)
-        let v2 = mgr.verify();
+        let v2 = mgr.verify().unwrap();
         assert_eq!(v2.files_ok, 1);
         assert_eq!(v2.files_missing, 2);
 
@@ -718,7 +767,7 @@ mod tests {
         assert_eq!(rep.files_created, 2);
 
         // 6. Final verify
-        let v3 = mgr.verify();
+        let v3 = mgr.verify().unwrap();
         assert_eq!(v3.files_ok, 3);
     }
 

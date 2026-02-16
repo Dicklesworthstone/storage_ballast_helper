@@ -78,7 +78,7 @@ impl EntrySnapshot {
     /// Compute the metadata hash for this entry.
     pub fn metadata_hash(&self) -> MerkleHash {
         let mut hasher = Sha256::new();
-        hasher.update(self.path.to_string_lossy().as_bytes());
+        hasher.update(self.path.as_os_str().as_encoded_bytes());
         hasher.update(self.size_bytes.to_le_bytes());
         hasher.update(self.modified_nanos.to_le_bytes());
         hasher.update(self.inode.to_le_bytes());

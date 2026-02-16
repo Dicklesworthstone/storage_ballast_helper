@@ -7,7 +7,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::ballast::manager::{BallastManager, ProvisionReport, ReleaseReport, VerifyReport};
@@ -167,8 +167,12 @@ impl BallastPoolCoordinator {
                 continue;
             }
 
-            // Check read-only via platform.
-            let stats = platform.fs_stats(mount_path)?;
+            // Check read-only via platform. Skip volumes where fs_stats fails
+            // (e.g. permission denied) rather than aborting discovery for all.
+            let stats = match platform.fs_stats(mount_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
             if stats.is_readonly {
                 continue;
             }
@@ -189,7 +193,7 @@ impl BallastPoolCoordinator {
                 file_size_bytes,
                 replenish_cooldown_minutes: config.replenish_cooldown_minutes,
                 auto_provision: config.auto_provision,
-                overrides: HashMap::new(), // per-pool doesn't need nested overrides
+                overrides: BTreeMap::new(),
             };
 
             let manager = BallastManager::new(ballast_dir.clone(), pool_config)?;
@@ -294,7 +298,19 @@ impl BallastPoolCoordinator {
     pub fn verify_all(&mut self) -> Vec<(PathBuf, VerifyReport)> {
         self.pools
             .iter_mut()
-            .map(|(mount, pool)| (mount.clone(), pool.manager.verify()))
+            .map(|(mount, pool)| {
+                let report = match pool.manager.verify() {
+                    Ok(r) => r,
+                    Err(e) => VerifyReport {
+                        files_checked: 0,
+                        files_ok: 0,
+                        files_corrupted: 0,
+                        files_missing: 0,
+                        details: vec![format!("verification failed: {e}")],
+                    },
+                };
+                (mount.clone(), report)
+            })
             .collect()
     }
 

@@ -89,7 +89,7 @@ fn make_candidate(idx: usize, age_hours: u64, size_gib: u64) -> CandidateInput {
         size_bytes: size_gib * 1_073_741_824,
         age: Duration::from_secs(age_hours * 3600),
         classification: ArtifactClassification {
-            pattern_name: ".target*".to_string(),
+            pattern_name: ".target*".into(),
             category: ArtifactCategory::RustTarget,
             name_confidence: 0.85,
             structural_confidence: 0.75,
@@ -144,6 +144,7 @@ fn stress_rapid_fill_burst() {
         let reading = PressureReading {
             free_bytes: free,
             total_bytes: total,
+            mount: PathBuf::from("/"),
         };
         let response = pid.update(reading, Some(estimate.seconds_to_exhaustion), t);
 
@@ -234,6 +235,7 @@ fn stress_sustained_low_pressure() {
         let reading = PressureReading {
             free_bytes: free,
             total_bytes: total,
+            mount: PathBuf::from("/"),
         };
         let response = pid.update(reading, Some(estimate.seconds_to_exhaustion), t);
 
@@ -317,6 +319,7 @@ fn stress_flash_fill_ram_backed() {
         let reading = PressureReading {
             free_bytes: free,
             total_bytes: total,
+            mount: PathBuf::from("/"),
         };
         let response = pid.update(reading, Some(estimate.seconds_to_exhaustion), t);
 
@@ -405,6 +408,7 @@ fn stress_recovery_under_write_pressure() {
         let reading = PressureReading {
             free_bytes: free,
             total_bytes: total,
+            mount: PathBuf::from("/"),
         };
         let response = pid.update(reading, Some(estimate.seconds_to_exhaustion), t);
 
@@ -1017,6 +1021,7 @@ fn stress_pid_stability_oscillation() {
         let reading = PressureReading {
             free_bytes: free,
             total_bytes: total,
+            mount: PathBuf::from("/"),
         };
         let response = pid.update(reading, None, t);
         urgency_values.push(response.urgency);
@@ -1221,6 +1226,7 @@ fn stress_full_pipeline() {
         let reading = PressureReading {
             free_bytes: free,
             total_bytes: total,
+            mount: PathBuf::from("/"),
         };
         let response = pid.update(reading, Some(estimate.seconds_to_exhaustion), t);
 

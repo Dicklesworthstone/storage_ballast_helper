@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -101,8 +101,9 @@ pub struct BallastConfig {
     /// Automatically provision ballast pools on each monitored volume.
     pub auto_provision: bool,
     /// Per-volume overrides keyed by mount-point path (e.g., "/data").
+    /// Uses BTreeMap for stable ordering in hash generation.
     #[serde(default)]
-    pub overrides: HashMap<String, BallastVolumeOverride>,
+    pub overrides: BTreeMap<String, BallastVolumeOverride>,
 }
 
 /// Per-volume override for ballast pool settings.
@@ -131,7 +132,7 @@ impl BallastConfig {
     /// Resolve effective file_count for a given mount point, applying overrides.
     #[must_use]
     pub fn effective_file_count(&self, mount_path: &str) -> usize {
-        let key = mount_path.strip_suffix('/').unwrap_or(mount_path);
+        let key = strip_trailing_separator(mount_path);
         self.overrides
             .get(key)
             .and_then(|o| o.file_count)
@@ -141,7 +142,7 @@ impl BallastConfig {
     /// Resolve effective file_size_bytes for a given mount point, applying overrides.
     #[must_use]
     pub fn effective_file_size_bytes(&self, mount_path: &str) -> u64 {
-        let key = mount_path.strip_suffix('/').unwrap_or(mount_path);
+        let key = strip_trailing_separator(mount_path);
         self.overrides
             .get(key)
             .and_then(|o| o.file_size_bytes)
@@ -151,7 +152,7 @@ impl BallastConfig {
     /// Check whether a volume is enabled for ballast (disabled via override).
     #[must_use]
     pub fn is_volume_enabled(&self, mount_path: &str) -> bool {
-        let key = mount_path.strip_suffix('/').unwrap_or(mount_path);
+        let key = strip_trailing_separator(mount_path);
         self.overrides.get(key).is_none_or(|o| o.enabled)
     }
 }
@@ -267,7 +268,7 @@ impl Default for BallastConfig {
             file_size_bytes: 1_073_741_824,
             replenish_cooldown_minutes: 30,
             auto_provision: true,
-            overrides: HashMap::new(),
+            overrides: BTreeMap::new(),
         }
     }
 }
@@ -543,12 +544,12 @@ impl Config {
     /// Normalize paths for consistent comparison (M27).
     fn normalize_paths(&mut self) {
         // Strip trailing slashes from ballast override keys.
-        let normalized: HashMap<String, BallastVolumeOverride> = self
-            .ballast
-            .overrides
-            .drain()
+        // Uses BTreeMap for stable iteration order.
+        let old_overrides = std::mem::take(&mut self.ballast.overrides);
+        let normalized: BTreeMap<String, BallastVolumeOverride> = old_overrides
+            .into_iter()
             .map(|(k, v)| {
-                let key = k.strip_suffix('/').unwrap_or(&k).to_string();
+                let key = strip_trailing_separator(&k).to_string();
                 (key, v)
             })
             .collect();
@@ -557,10 +558,15 @@ impl Config {
         // Strip trailing slashes from scanner root_paths.
         for path in &mut self.scanner.root_paths {
             let s = path.to_string_lossy();
-            if s.len() > 1
-                && let Some(stripped) = s.strip_suffix('/')
-            {
-                *path = PathBuf::from(stripped);
+            // Don't strip if it looks like a root ("/" or "C:\").
+            let is_unix_root = s.len() == 1;
+            let is_win_root = s.len() == 3 && s.chars().nth(1) == Some(':');
+
+            if !is_unix_root && !is_win_root {
+                let stripped = strip_trailing_separator(&s);
+                if stripped.len() != s.len() {
+                    *path = PathBuf::from(stripped);
+                }
             }
         }
     }
@@ -826,6 +832,10 @@ fn parse_env_bool(name: &str, raw: &str) -> Result<bool> {
     })
 }
 
+fn strip_trailing_separator(s: &str) -> &str {
+    s.strip_suffix('/').or_else(|| s.strip_suffix('\\')).unwrap_or(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Config, SbhError};
@@ -1003,8 +1013,8 @@ mod tests {
     #[test]
     fn ballast_volume_override_effective_file_count() {
         use super::BallastConfig;
-        use std::collections::HashMap;
-        let mut overrides = HashMap::new();
+        use std::collections::BTreeMap;
+        let mut overrides = BTreeMap::new();
         overrides.insert(
             "/data".to_string(),
             super::BallastVolumeOverride {
@@ -1027,8 +1037,8 @@ mod tests {
     #[test]
     fn ballast_volume_disabled_override() {
         use super::BallastConfig;
-        use std::collections::HashMap;
-        let mut overrides = HashMap::new();
+        use std::collections::BTreeMap;
+        let mut overrides = BTreeMap::new();
         overrides.insert(
             "/tmp".to_string(),
             super::BallastVolumeOverride {
@@ -1063,6 +1073,33 @@ mod tests {
         assert!(!cfg.ballast.overrides.contains_key("/data/"));
         assert!(cfg.scanner.root_paths.contains(&PathBuf::from("/")));
         assert!(cfg.scanner.root_paths.contains(&PathBuf::from("/data")));
+    }
+
+    #[test]
+    fn windows_path_normalization() {
+        let mut cfg = Config::default();
+        // Override with Windows-style trailing slash
+        cfg.ballast.overrides.insert(
+            "C:\\Data\\".to_string(),
+            super::BallastVolumeOverride::default(),
+        );
+        // Root path with Windows-style trailing slash
+        cfg.scanner.root_paths = vec![
+            PathBuf::from("C:\\"),
+            PathBuf::from("C:\\Data\\"),
+        ];
+
+        cfg.normalize_paths();
+
+        // Key should be stripped
+        assert!(cfg.ballast.overrides.contains_key("C:\\Data"));
+        assert!(!cfg.ballast.overrides.contains_key("C:\\Data\\"));
+
+        // Roots check
+        // C:\ is root, should be preserved (len=3)
+        assert!(cfg.scanner.root_paths.contains(&PathBuf::from("C:\\")));
+        // C:\Data\ is not root, should be stripped
+        assert!(cfg.scanner.root_paths.contains(&PathBuf::from("C:\\Data")));
     }
 
     #[test]

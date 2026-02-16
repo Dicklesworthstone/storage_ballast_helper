@@ -53,12 +53,13 @@ impl SqliteLogger {
 
     /// Insert a row into `activity_log`.
     pub fn log_activity(&self, row: &ActivityRow) -> Result<()> {
-        self.conn.execute(
+        self.conn.prepare_cached(
             "INSERT INTO activity_log (
                 timestamp, event_type, severity, path, size_bytes, score,
                 score_factors, pressure_level, free_pct, duration_ms,
                 success, error_code, error_message, details
             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        )?.execute(
             params![
                 row.timestamp,
                 row.event_type,
@@ -81,7 +82,7 @@ impl SqliteLogger {
 
     /// Query recent activity entries, newest first.
     pub fn recent_activity(&self, limit: u32) -> Result<Vec<ActivityRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT timestamp, event_type, severity, path, size_bytes, score,
                     score_factors, pressure_level, free_pct, duration_ms,
                     success, error_code, error_message, details
@@ -114,11 +115,12 @@ impl SqliteLogger {
 
     /// Insert a pressure sample.
     pub fn log_pressure(&self, row: &PressureRow) -> Result<()> {
-        self.conn.execute(
+        self.conn.prepare_cached(
             "INSERT INTO pressure_history (
                 timestamp, mount_point, total_bytes, free_bytes, free_pct,
                 rate_bytes_per_sec, pressure_level, ewma_rate, pid_output
             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        )?.execute(
             params![
                 row.timestamp,
                 row.mount_point,
@@ -141,7 +143,7 @@ impl SqliteLogger {
         since: &str,
         limit: u32,
     ) -> Result<Vec<PressureRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT timestamp, mount_point, total_bytes, free_bytes, free_pct,
                     rate_bytes_per_sec, pressure_level, ewma_rate, pid_output
              FROM pressure_history
@@ -195,11 +197,12 @@ impl SqliteLogger {
 
     /// Upsert a ballast file record.
     pub fn upsert_ballast(&self, row: &BallastRow) -> Result<()> {
-        self.conn.execute(
+        self.conn.prepare_cached(
             "INSERT OR REPLACE INTO ballast_inventory (
                 file_index, path, size_bytes, created_at, released_at,
                 replenished_at, integrity_hash
             ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        )?.execute(
             params![
                 row.file_index,
                 row.path,
@@ -215,7 +218,7 @@ impl SqliteLogger {
 
     /// Get all ballast file records.
     pub fn ballast_inventory(&self) -> Result<Vec<BallastRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT file_index, path, size_bytes, created_at, released_at,
                     replenished_at, integrity_hash
              FROM ballast_inventory ORDER BY file_index ASC",

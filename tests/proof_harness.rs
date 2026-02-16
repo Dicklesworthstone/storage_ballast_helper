@@ -103,7 +103,7 @@ fn make_candidate_input(
         size_bytes: size_gib * 1_073_741_824,
         age: Duration::from_secs(age_hours * 3600),
         classification: ArtifactClassification {
-            pattern_name: ".target*".to_string(),
+            pattern_name: ".target*".into(),
             category: ArtifactCategory::RustTarget,
             name_confidence: confidence,
             structural_confidence: confidence * 0.9,
@@ -156,7 +156,7 @@ fn make_scored(action: DecisionAction, score: f64) -> CandidacyScore {
         vetoed: false,
         veto_reason: None,
         classification: ArtifactClassification {
-            pattern_name: ".target*".to_string(),
+            pattern_name: ".target*".into(),
             category: ArtifactCategory::RustTarget,
             name_confidence: 0.9,
             structural_confidence: 0.95,

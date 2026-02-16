@@ -72,7 +72,7 @@ fn make_candidate(
         size_bytes: size_gib * 1_073_741_824,
         age: Duration::from_secs(age_hours * 3600),
         classification: ArtifactClassification {
-            pattern_name: ".target*".to_string(),
+            pattern_name: ".target*".into(),
             category: ArtifactCategory::RustTarget,
             name_confidence: conf,
             structural_confidence: conf * 0.9,

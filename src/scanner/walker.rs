@@ -7,7 +7,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_possible_truncation)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -68,6 +68,7 @@ type WorkItem = (PathBuf, usize, u64);
 pub struct DirectoryWalker {
     config: WalkerConfig,
     protection: Arc<parking_lot::RwLock<ProtectionRegistry>>,
+    heartbeat: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl DirectoryWalker {
@@ -75,7 +76,17 @@ impl DirectoryWalker {
         Self {
             config,
             protection: Arc::new(parking_lot::RwLock::new(protection)),
+            heartbeat: None,
         }
+    }
+
+    /// Set a heartbeat callback to be called periodically by worker threads.
+    pub fn with_heartbeat<F>(mut self, callback: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.heartbeat = Some(Arc::new(callback));
+        self
     }
 
     /// Perform a full parallel walk of all root paths.
@@ -110,7 +121,7 @@ impl DirectoryWalker {
                 continue;
             }
             let dev = device_id(&meta);
-            in_flight.fetch_add(1, Ordering::SeqCst);
+            in_flight.fetch_add(1, Ordering::Release);
             let _ = work_tx.send((root.clone(), 0, dev));
         }
 
@@ -123,6 +134,7 @@ impl DirectoryWalker {
                 let in_flight = Arc::clone(&in_flight);
                 let config = self.config.clone();
                 let protection = Arc::clone(&self.protection);
+                let heartbeat = self.heartbeat.clone();
 
                 thread::spawn(move || {
                     walker_thread(
@@ -132,6 +144,7 @@ impl DirectoryWalker {
                         &in_flight,
                         &config,
                         &protection,
+                        &heartbeat,
                     );
                 })
             })
@@ -167,22 +180,28 @@ fn walker_thread(
     in_flight: &AtomicUsize,
     config: &WalkerConfig,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
+    heartbeat: &Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     loop {
+        // Beat the heart if configured.
+        if let Some(hb) = heartbeat {
+            hb();
+        }
+
         match work_rx.recv_timeout(Duration::from_millis(50)) {
             Ok((dir_path, depth, root_dev)) => {
                 process_directory(
                     &dir_path, depth, root_dev, work_tx, result_tx, in_flight, config, protection,
                 );
                 // Mark this work item as completed.
-                let remaining = in_flight.fetch_sub(1, Ordering::SeqCst);
+                let remaining = in_flight.fetch_sub(1, Ordering::AcqRel);
                 if remaining == 1 {
                     // We were the last in-flight item. Signal termination by
                     // dropping our sender (happens when thread exits).
                 }
             }
             Err(channel::RecvTimeoutError::Timeout) => {
-                if in_flight.load(Ordering::SeqCst) == 0 {
+                if in_flight.load(Ordering::Acquire) == 0 {
                     return;
                 }
             }
@@ -228,9 +247,10 @@ fn process_directory(
         Err(_) => return, // Other errors: skip gracefully.
     };
 
-    // Collect child names for structural marker detection.
-    let mut child_names: Vec<String> = Vec::new();
-    let mut child_entries: Vec<(PathBuf, fs::Metadata)> = Vec::new();
+    // State for structural signals (incremental accumulation).
+    let mut signals = StructuralSignals::default();
+    let mut object_count = 0u32;
+    let mut total_count = 0u32;
 
     for entry_result in entries {
         let Ok(entry) = entry_result else {
@@ -248,36 +268,35 @@ fn process_directory(
             continue;
         }
 
-        if let Some(name) = child_path.file_name() {
-            child_names.push(name.to_string_lossy().to_lowercase());
-        }
+        // ─── Incremental Signal Collection ───
+        if let Some(name_os) = child_path.file_name() {
+            let name = name_os.to_string_lossy();
+            total_count += 1;
 
-        child_entries.push((child_path, meta));
-    }
-
-    // Build structural signals from child names (for scoring the parent directory).
-    let signals = signals_from_children(&child_names);
-
-    // Emit a WalkEntry for this directory itself (the scanner scores directories).
-    if depth > 0
-        && let Ok(dir_meta) = metadata_for_path(dir_path, config.follow_symlinks)
-    {
-        let _ = result_tx.send(WalkEntry {
-            path: dir_path.to_path_buf(),
-            metadata: entry_metadata(&dir_meta),
-            depth,
-            structural_signals: signals,
-            is_open: false, // Caller sets this after walk using /proc scan.
-        });
-    }
-
-    // Enqueue subdirectories for further walking.
-    if depth < config.max_depth {
-        for (child_path, meta) in child_entries {
-            if !meta.is_dir() {
-                continue;
+            match name.as_ref() {
+                "incremental" => signals.has_incremental = true,
+                "deps" => signals.has_deps = true,
+                "build" => signals.has_build = true,
+                ".fingerprint" => signals.has_fingerprint = true,
+                ".git" => signals.has_git = true,
+                "cargo.toml" | "Cargo.toml" => signals.has_cargo_toml = true,
+                _ => {}
             }
 
+            // Check extension for object file heuristics via byte suffix.
+            let name_bytes = name_os.as_encoded_bytes();
+            if name_bytes.ends_with(b".o")
+                || name_bytes.ends_with(b".rlib")
+                || name_bytes.ends_with(b".rmeta")
+                || name_bytes.ends_with(b".d")
+            {
+                object_count += 1;
+            }
+        }
+
+        // ─── Recursion Dispatch ───
+        // Only recurse if it's a directory and within depth limits.
+        if depth < config.max_depth && meta.is_dir() {
             let child_dev = device_id(&meta);
 
             // Cross-device guard: don't cross filesystem boundaries.
@@ -290,11 +309,29 @@ fn process_directory(
                 continue;
             }
 
-            in_flight.fetch_add(1, Ordering::SeqCst);
+            in_flight.fetch_add(1, Ordering::Release);
             if work_tx.send((child_path, depth + 1, root_dev)).is_err() {
-                in_flight.fetch_sub(1, Ordering::SeqCst);
+                in_flight.fetch_sub(1, Ordering::Release);
             }
         }
+    }
+
+    // Finalize structural signals.
+    if total_count > 0 && object_count > 0 {
+        signals.mostly_object_files = object_count * 2 >= total_count;
+    }
+
+    // Emit a WalkEntry for this directory itself.
+    if depth > 0
+        && let Ok(dir_meta) = metadata_for_path(dir_path, config.follow_symlinks)
+    {
+        let _ = result_tx.send(WalkEntry {
+            path: dir_path.to_path_buf(),
+            metadata: entry_metadata(&dir_meta),
+            depth,
+            structural_signals: signals,
+            is_open: false, // Caller sets this after walk using /proc scan.
+        });
     }
 }
 
@@ -382,11 +419,11 @@ fn device_id(meta: &fs::Metadata) -> u64 {
     }
 }
 
-/// Collect all file paths currently open by any process.
+/// Collect all open files as (device, inode) pairs.
 ///
-/// On Linux, reads `/proc/*/fd/*` symlinks. Returns an empty set on non-Linux
-/// or if /proc is unavailable. This is intentionally best-effort.
-pub fn collect_open_files() -> HashSet<PathBuf> {
+/// On Linux, scans /proc. Returns an empty set on non-Linux
+/// or if /proc is unavailable.
+pub fn collect_open_files() -> HashSet<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
         collect_open_files_linux()
@@ -398,39 +435,33 @@ pub fn collect_open_files() -> HashSet<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn collect_open_files_linux() -> HashSet<PathBuf> {
-    let mut open = HashSet::new();
+fn collect_open_files_linux() -> HashSet<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut open = HashSet::with_capacity(4096);
 
     let Ok(proc_dir) = fs::read_dir("/proc") else {
         return open;
     };
 
-    for proc_entry in proc_dir {
-        let Ok(proc_entry) = proc_entry else {
-            continue;
-        };
-        let name = proc_entry.file_name();
-        let name_str = name.to_string_lossy();
+    for proc_entry in proc_dir.flatten() {
+        let pid_name = proc_entry.file_name();
+        let pid_bytes = pid_name.as_bytes();
 
         // Only numeric directories (PIDs).
-        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+        if pid_bytes.is_empty() || !pid_bytes.iter().all(|byte| byte.is_ascii_digit()) {
             continue;
         }
 
-        let fd_dir = proc_entry.path().join("fd");
-        let Ok(fd_entries) = fs::read_dir(&fd_dir) else {
+        let Ok(fd_entries) = fs::read_dir(proc_entry.path().join("fd")) else {
             continue;
         };
 
-        for fd_entry in fd_entries {
-            let Ok(fd_entry) = fd_entry else {
-                continue;
-            };
-            // readlink on /proc/PID/fd/N gives the actual file path.
-            if let Ok(target) = fs::read_link(fd_entry.path())
-                && target.is_absolute()
-            {
-                open.insert(target);
+        for fd_entry in fd_entries.flatten() {
+            // DirEntry::metadata follows the /proc/<pid>/fd symlink to the target.
+            if let Ok(meta) = fd_entry.metadata() {
+                open.insert((meta.dev(), meta.ino()));
             }
         }
     }
@@ -438,15 +469,101 @@ fn collect_open_files_linux() -> HashSet<PathBuf> {
     open
 }
 
-/// Check if any open file path is under the given candidate directory.
+/// Memoized open-file detector for repeated path checks during one scan pass.
+pub struct OpenPathCache<'a, S = std::collections::hash_map::RandomState> {
+    open_inodes: &'a HashSet<(u64, u64), S>,
+    dir_cache: HashMap<PathBuf, bool>,
+}
+
+impl<'a, S: std::hash::BuildHasher> OpenPathCache<'a, S> {
+    #[must_use]
+    pub fn new(open_inodes: &'a HashSet<(u64, u64), S>) -> Self {
+        Self {
+            open_inodes,
+            dir_cache: HashMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_path_open(&mut self, path: &Path) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.is_path_open_linux(path)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            false
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_path_open_linux(&mut self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        if let Some(cached) = self.dir_cache.get(path).copied() {
+            return cached;
+        }
+
+        const MAX_SCAN: usize = 20_000;
+        let mut stack = vec![path.to_path_buf()];
+        let mut checked = 0usize;
+        let mut visited_dirs: Vec<PathBuf> = Vec::new();
+
+        while let Some(p) = stack.pop() {
+            if let Some(cached) = self.dir_cache.get(&p).copied() {
+                if cached {
+                    self.dir_cache.insert(path.to_path_buf(), true);
+                    return true;
+                }
+                continue;
+            }
+
+            let Ok(meta) = fs::metadata(&p) else {
+                continue;
+            };
+
+            if self.open_inodes.contains(&(meta.dev(), meta.ino())) {
+                self.dir_cache.insert(path.to_path_buf(), true);
+                return true;
+            }
+
+            checked += 1;
+            if checked >= MAX_SCAN {
+                // Limit reached, assume unsafe.
+                self.dir_cache.insert(path.to_path_buf(), true);
+                return true;
+            }
+
+            if meta.is_dir() {
+                visited_dirs.push(p.clone());
+                if let Ok(entries) = fs::read_dir(&p) {
+                    for entry in entries.flatten() {
+                        stack.push(entry.path());
+                    }
+                }
+            }
+        }
+
+        // Fully explored with no open inode hit: every visited directory is safe to cache false.
+        for dir in visited_dirs {
+            self.dir_cache.insert(dir, false);
+        }
+        self.dir_cache.insert(path.to_path_buf(), false);
+        false
+    }
+}
+
+/// Check if any file under `path` is currently open (inode match).
+///
+/// Returns `true` if an open file is found OR if the scan limit is reached
+/// (fail conservative).
 pub fn is_path_open<S: std::hash::BuildHasher>(
     path: &Path,
-    open_files: &HashSet<PathBuf, S>,
+    open_inodes: &HashSet<(u64, u64), S>,
 ) -> bool {
-    let normalized = crate::core::paths::resolve_absolute_path(path);
-    open_files
-        .iter()
-        .any(|open| open.starts_with(path) || open.starts_with(&normalized))
+    let mut checker = OpenPathCache::new(open_inodes);
+    checker.is_path_open(path)
 }
 
 #[cfg(test)]
@@ -676,25 +793,45 @@ mod tests {
 
     #[test]
     fn is_path_open_works() {
-        let mut open = HashSet::new();
-        open.insert(PathBuf::from("/data/projects/foo/target/debug/libfoo.rlib"));
+        use std::os::unix::fs::MetadataExt;
 
-        assert!(is_path_open(Path::new("/data/projects/foo/target"), &open));
-        assert!(!is_path_open(Path::new("/data/projects/bar/target"), &open));
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("target").join("debug");
+        fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("libfoo.rlib");
+        fs::write(&file, b"data").unwrap();
+
+        let meta = fs::metadata(&file).unwrap();
+        let mut open = HashSet::new();
+        open.insert((meta.dev(), meta.ino()));
+
+        assert!(is_path_open(tmp.path().join("target").as_path(), &open));
+        // A different path with no matching inodes should return false.
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        assert!(!is_path_open(&other, &open));
     }
 
     #[test]
     fn is_path_open_handles_relative_candidate_paths() {
+        use std::os::unix::fs::MetadataExt;
+
         let cwd = std::env::current_dir().unwrap();
         let tmp = tempfile::Builder::new()
             .prefix("walker-open-relative-")
             .tempdir_in(&cwd)
             .unwrap();
 
-        let rel = tmp.path().strip_prefix(&cwd).unwrap();
-        let mut open = HashSet::new();
-        open.insert(tmp.path().join("debug").join("libfoo.rlib"));
+        let child = tmp.path().join("debug");
+        fs::create_dir_all(&child).unwrap();
+        let file = child.join("libfoo.rlib");
+        fs::write(&file, b"data").unwrap();
 
+        let meta = fs::metadata(&file).unwrap();
+        let mut open = HashSet::new();
+        open.insert((meta.dev(), meta.ino()));
+
+        let rel = tmp.path().strip_prefix(&cwd).unwrap();
         assert!(is_path_open(rel, &open));
     }
 

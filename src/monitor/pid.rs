@@ -3,6 +3,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Coarse pressure state exposed to scanners/cleanup pipeline.
@@ -16,15 +17,16 @@ pub enum PressureLevel {
 }
 
 /// Current filesystem pressure reading.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PressureReading {
     pub free_bytes: u64,
     pub total_bytes: u64,
+    pub mount: PathBuf,
 }
 
 impl PressureReading {
     #[must_use]
-    pub fn free_pct(self) -> f64 {
+    pub fn free_pct(&self) -> f64 {
         if self.total_bytes == 0 {
             return 0.0;
         }
@@ -33,7 +35,7 @@ impl PressureReading {
 }
 
 /// Controller output used by orchestrator threads.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PressureResponse {
     pub level: PressureLevel,
     pub urgency: f64,
@@ -41,6 +43,7 @@ pub struct PressureResponse {
     pub release_ballast_files: usize,
     pub max_delete_batch: usize,
     pub fallback_active: bool,
+    pub causing_mount: PathBuf,
 }
 
 /// PID controller with hysteresis and anti-windup.
@@ -149,7 +152,7 @@ impl PidPressureController {
         let free_pct = reading.free_pct();
         let dt = self
             .last_update
-            .map_or(1.0, |prev| now.duration_since(prev).as_secs_f64())
+            .map_or(1.0, |prev| now.saturating_duration_since(prev).as_secs_f64())
             .max(1e-6);
 
         let error = self.target_free_pct - free_pct;
@@ -196,6 +199,7 @@ impl PidPressureController {
             release_ballast_files,
             max_delete_batch,
             fallback_active: false,
+            causing_mount: reading.mount,
         }
     }
 }
@@ -285,6 +289,7 @@ fn response_policy(
 #[cfg(test)]
 mod tests {
     use super::{PidPressureController, PressureLevel, PressureReading};
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -307,6 +312,7 @@ mod tests {
             PressureReading {
                 free_bytes: 5,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             Some(120.0),
             now,
@@ -341,6 +347,7 @@ mod tests {
             PressureReading {
                 free_bytes: 12,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             t0,
@@ -349,6 +356,7 @@ mod tests {
             PressureReading {
                 free_bytes: 20,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             t0 + Duration::from_secs(1),
@@ -358,6 +366,7 @@ mod tests {
             PressureReading {
                 free_bytes: 23,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             t0 + Duration::from_secs(2),
@@ -385,6 +394,7 @@ mod tests {
             PressureReading {
                 free_bytes: 16,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             now,
@@ -393,6 +403,7 @@ mod tests {
             PressureReading {
                 free_bytes: 16,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             Some(45.0),
             now + Duration::from_secs(1),
@@ -406,6 +417,7 @@ mod tests {
         let reading = PressureReading {
             free_bytes: 100,
             total_bytes: 0,
+            mount: PathBuf::from("/"),
         };
         assert!(reading.free_pct().abs() < f64::EPSILON);
     }
@@ -415,6 +427,7 @@ mod tests {
         let reading = PressureReading {
             free_bytes: 25,
             total_bytes: 100,
+            mount: PathBuf::from("/"),
         };
         assert!((reading.free_pct() - 25.0).abs() < 1e-6);
     }
@@ -439,6 +452,7 @@ mod tests {
             PressureReading {
                 free_bytes: 50,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             now,
@@ -467,6 +481,7 @@ mod tests {
             PressureReading {
                 free_bytes: 12,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             t0,
@@ -475,6 +490,7 @@ mod tests {
             PressureReading {
                 free_bytes: 8,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             t0 + Duration::from_secs(1),
@@ -483,6 +499,7 @@ mod tests {
             PressureReading {
                 free_bytes: 4,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             t0 + Duration::from_secs(2),
@@ -491,6 +508,7 @@ mod tests {
             PressureReading {
                 free_bytes: 1,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             t0 + Duration::from_secs(3),
@@ -518,6 +536,7 @@ mod tests {
             PressureReading {
                 free_bytes: 50,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             t0,
@@ -540,6 +559,7 @@ mod tests {
             PressureReading {
                 free_bytes: 12,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             t0,
@@ -548,6 +568,7 @@ mod tests {
             PressureReading {
                 free_bytes: 12,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             t0 + Duration::from_secs(1),
@@ -579,6 +600,7 @@ mod tests {
             PressureReading {
                 free_bytes: 50,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             None,
             Instant::now(),
@@ -605,11 +627,12 @@ mod tests {
             PressureReading {
                 free_bytes: 16,
                 total_bytes: 100,
+                mount: PathBuf::from("/"),
             },
             Some(200.0),
             Instant::now(),
         );
-        assert!(response.urgency >= 0.70);
+        assert!(response.urgency >= 0.90);
     }
 
     #[test]

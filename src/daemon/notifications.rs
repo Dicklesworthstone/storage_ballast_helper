@@ -374,9 +374,10 @@ impl Channel for DesktopChannel {
 
         #[cfg(target_os = "macos")]
         {
+            // Escape backslashes first, then double quotes, to prevent injection.
+            let escaped = summary.replace('\\', "\\\\").replace('"', "\\\"");
             let script = format!(
-                "display notification \"{}\" with title \"sbh\" subtitle \"Storage Ballast Helper\"",
-                summary.replace('"', "\\\"")
+                "display notification \"{escaped}\" with title \"sbh\" subtitle \"Storage Ballast Helper\"",
             );
             let _ = Command::new("osascript").arg("-e").arg(&script).spawn();
         }
@@ -518,17 +519,34 @@ impl WebhookChannel {
         };
 
         // JSON-escape values to prevent injection in webhook payloads.
-        let esc = |s: &str| {
-            s.replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n")
-        };
+        // Inline escaping avoids 4× serde_json::to_string allocations per notification.
+        fn json_escape(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            for ch in s.chars() {
+                match ch {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if c.is_control() => {
+                        // \u00XX for control characters
+                        for unit in c.encode_utf16(&mut [0; 2]) {
+                            use std::fmt::Write;
+                            let _ = write!(out, "\\u{unit:04x}");
+                        }
+                    }
+                    c => out.push(c),
+                }
+            }
+            out
+        }
 
         self.template
-            .replace("${SUMMARY}", &esc(&summary))
-            .replace("${LEVEL}", &esc(&level))
-            .replace("${MOUNT}", &esc(&mount))
-            .replace("${FREE_PCT}", &esc(&free_pct))
+            .replace("${SUMMARY}", &json_escape(&summary))
+            .replace("${LEVEL}", &json_escape(&level))
+            .replace("${MOUNT}", &json_escape(&mount))
+            .replace("${FREE_PCT}", &json_escape(&free_pct))
     }
 }
 
@@ -549,6 +567,7 @@ impl Channel for WebhookChannel {
         let body = self.render_body(event);
 
         // Fire-and-forget via curl. Timeout of 5 seconds to avoid blocking.
+        // Use "--" to prevent URL from being interpreted as a curl option.
         let _ = Command::new("curl")
             .arg("--silent")
             .arg("--max-time")
@@ -557,6 +576,7 @@ impl Channel for WebhookChannel {
             .arg("Content-Type: application/json")
             .arg("--data")
             .arg(&body)
+            .arg("--")
             .arg(&self.url)
             .spawn();
     }
@@ -940,6 +960,44 @@ mod tests {
         assert!(body.contains("/data"));
         assert!(body.contains("4.5"));
         assert!(body.contains("sbh:"));
+    }
+
+    #[test]
+    fn webhook_channel_prevents_recursive_injection() {
+        let channel = WebhookChannel {
+            url: "https://example.com".to_string(),
+            min_level: NotificationLevel::Info,
+            // Template uses LEVEL after SUMMARY
+            template: r#"{"msg": "${SUMMARY}", "lvl": "${LEVEL}"}"#.to_string(),
+        };
+
+        let event = NotificationEvent::PressureChanged {
+            from: "green".to_string(),
+            to: "red".to_string(),
+            mount: "/data".to_string(),
+            free_pct: 10.0,
+        };
+
+        // If SUMMARY contains "${LEVEL}", the naive approach would replace it.
+        // But render_body uses the event's summary() method which constructs a string.
+        // We can't easily inject "${LEVEL}" into the summary() output unless we control
+        // one of the fields. 'mount' is user-controlled via config or discovery.
+        
+        // Let's create an event with a malicious mount path.
+        let malicious_event = NotificationEvent::PressureChanged {
+            from: "green".to_string(),
+            to: "red".to_string(),
+            mount: "/data/${LEVEL}".to_string(),
+            free_pct: 10.0,
+        };
+
+        let body = channel.render_body(&malicious_event);
+        // The summary will be: "Pressure green -> red on /data/${LEVEL} (10.0% free)"
+        // In the body, we expect: "msg": "... /data/${LEVEL} ...", "lvl": "red"
+        // We do NOT want: "msg": "... /data/red ...", "lvl": "red"
+        
+        assert!(body.contains("/data/${LEVEL}"), "should not recursively replace placeholders");
+        assert!(body.contains(r#""lvl": "red""#));
     }
 
     #[test]

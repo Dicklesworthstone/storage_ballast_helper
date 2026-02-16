@@ -30,7 +30,7 @@ use storage_ballast_helper::scanner::patterns::ArtifactPatternRegistry;
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
 use storage_ballast_helper::scanner::scoring::{CandidacyScore, CandidateInput, ScoringEngine};
 use storage_ballast_helper::scanner::walker::{
-    DirectoryWalker, WalkerConfig, collect_open_files, is_path_open,
+    DirectoryWalker, OpenPathCache, WalkerConfig, collect_open_files, is_path_open,
 };
 
 const LIVE_REFRESH_MIN_MS: u64 = 100;
@@ -2625,7 +2625,9 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
             }
         }
         Some(BallastCommand::Verify) => {
-            let report = manager.verify();
+            let report = manager
+                .verify()
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
 
             match output_mode(cli) {
                 OutputMode::Human => {
@@ -3155,6 +3157,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
 
     // Collect open files for is_open detection.
     let open_files = collect_open_files();
+    let mut open_checker = OpenPathCache::new(&open_files);
 
     // Classify and score each entry.
     let registry = ArtifactPatternRegistry::default();
@@ -3174,7 +3177,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 age,
                 classification,
                 signals: entry.structural_signals,
-                is_open: is_path_open(&entry.path, &open_files),
+                is_open: open_checker.is_path_open(&entry.path),
                 excluded: false,
             };
             engine.score_candidate(&candidate, 0.0) // No pressure urgency for manual scan.
@@ -3339,6 +3342,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
 
     // Collect open files for is_open detection.
     let open_files = collect_open_files();
+    let mut open_checker = OpenPathCache::new(&open_files);
 
     // Classify and score each entry.
     let registry = ArtifactPatternRegistry::default();
@@ -3358,7 +3362,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 age,
                 classification,
                 signals: entry.structural_signals,
-                is_open: is_path_open(&entry.path, &open_files),
+                is_open: open_checker.is_path_open(&entry.path),
                 excluded: false,
             };
             engine.score_candidate(&candidate, 0.0)
@@ -3976,6 +3980,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
 
     // Collect open files.
     let open_files = collect_open_files();
+    let mut open_checker = OpenPathCache::new(&open_files);
 
     // Classify and score using default weights.
     let registry = ArtifactPatternRegistry::default();
@@ -3995,7 +4000,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 age,
                 classification,
                 signals: entry.structural_signals,
-                is_open: is_path_open(&entry.path, &open_files),
+                is_open: open_checker.is_path_open(&entry.path),
                 excluded: false,
             };
             // High urgency (0.8) for emergency mode — aggressive scoring.
@@ -4067,7 +4072,13 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     }
 
     // Execute based on flags.
-    if args.yes || !io::stdout().is_terminal() {
+    // Non-interactive (piped/cron) MUST pass --yes explicitly to avoid silent mass-deletion.
+    if !args.yes && !io::stdout().is_terminal() {
+        return Err(CliError::User(
+            "emergency mode in non-interactive context requires --yes flag".to_string(),
+        ));
+    }
+    if args.yes {
         let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
         let collector = std::sync::Arc::new(FsStatsCollector::new(
             platform,

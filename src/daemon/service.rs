@@ -156,7 +156,7 @@ impl SystemdServiceManager {
             // user-session sandboxing and cannot use ProtectSystem.
             writeln!(unit, "ProtectSystem=strict").ok();
             writeln!(unit, "ReadWritePaths={rw_paths}").ok();
-            writeln!(unit, "ProtectHome=read-only").ok();
+            writeln!(unit, "ProtectHome=false").ok();
             writeln!(unit, "PrivateTmp=false").ok();
             writeln!(unit, "ProtectKernelTunables=true").ok();
             writeln!(unit, "ProtectControlGroups=true").ok();
