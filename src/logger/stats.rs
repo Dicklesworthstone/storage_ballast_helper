@@ -7,7 +7,6 @@
 #![allow(missing_docs)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use rusqlite::params;
@@ -209,8 +208,9 @@ impl<'a> StatsEngine<'a> {
              LIMIT ?2",
         )?;
 
+        let limit = i64::try_from(n).unwrap_or(i64::MAX);
         let patterns = stmt
-            .query_map(params![since, n as i64], |row| {
+            .query_map(params![since, limit], |row| {
                 Ok(PatternStat {
                     pattern: row.get(0)?,
                     count: row.get(1)?,
@@ -233,8 +233,9 @@ impl<'a> StatsEngine<'a> {
              ORDER BY COALESCE(size_bytes, 0) DESC LIMIT ?2",
         )?;
 
+        let limit = i64::try_from(n).unwrap_or(i64::MAX);
         let details = stmt
-            .query_map(params![since, n as i64], |row| {
+            .query_map(params![since, limit], |row| {
                 Ok(DeletionDetail {
                     path: row.get(0)?,
                     size_bytes: row.get::<_, i64>(1).map(|v| v as u64).unwrap_or(0),

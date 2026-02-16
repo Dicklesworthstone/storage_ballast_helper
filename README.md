@@ -211,6 +211,8 @@ sbh dashboard
 
 - Installer/update parity contract and security policy: `docs/installer-dx-parity-matrix.md`
 - Dashboard/status baseline contract (pre-overhaul): `docs/dashboard-status-contract-baseline.md`
+- Dashboard IA + navigation map (overhaul design baseline): `docs/dashboard-information-architecture.md`
+- TUI acceptance gates + performance/error budgets: `docs/tui-acceptance-gates-and-budgets.md`
 - Testing + log registration guide: `docs/testing-and-logging.md`
 
 For installer/update changes, use the parity matrix as the source of truth for

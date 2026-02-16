@@ -12,6 +12,16 @@ For TUI/dashboard overhaul work (`bd-xzt.*`):
 - Test tasks must map each new assertion to at least one contract ID.
 - Release/signoff tasks must report contract pass/fail status, not just aggregate test counts.
 
+## TUI Acceptance Gates and Budgets (bd-xzt.1.5)
+
+Source of truth: `docs/tui-acceptance-gates-and-budgets.md`
+
+For TUI/dashboard overhaul rollout work:
+
+- Treat `HARD` gates as release blockers.
+- Keep performance and error budget reporting trace-linked to test artifacts.
+- Use the required `rch` command sequence as the canonical gate order.
+
 ## Test Registration
 
 ### 1. Unit and Property Tests
