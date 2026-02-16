@@ -271,7 +271,11 @@ fn process_directory(
     let mut signals = StructuralSignals::default();
     let mut object_count = 0u32;
     let mut total_count = 0u32;
-    let mut child_dirs_queued = 0usize;
+
+    // Collect child directories during iteration; queue them AFTER the loop.
+    // This prevents a race where a child dir is queued and processed by another
+    // thread before we discover a .sbh-protect marker later in the listing.
+    let mut pending_children: Vec<PathBuf> = Vec::new();
 
     for entry_result in entries {
         let Ok(entry) = entry_result else {
@@ -286,10 +290,16 @@ fn process_directory(
             let name = name_os.to_string_lossy();
             total_count += 1;
 
+            // Per-directory iteration budget: avoid spending seconds iterating
+            // directories with 8K-60K+ entries. Structural markers appear early;
+            // 2000 entries is generous enough to capture them reliably.
+            if total_count >= MAX_ENTRIES_PER_DIR {
+                break;
+            }
+
             match name.as_ref() {
-                // Detect .sbh-protect marker during iteration instead of a
-                // separate lstat before read_dir. This saves one syscall per
-                // directory (the marker almost never exists).
+                // Detect .sbh-protect marker during iteration. If found,
+                // register the marker and bail — no children get queued.
                 ".sbh-protect" => {
                     protection.write().register_marker(dir_path);
                     return; // Skip rest of directory — protected subtree.
@@ -339,27 +349,26 @@ fn process_directory(
             ft.is_dir()
         };
 
-        // ─── Recursion Dispatch ───
-        // Only recurse if it's a directory, within depth limits, and under
-        // the per-directory child cap. The cap prevents a single huge directory
-        // (e.g. /data/tmp with 60K+ child dirs) from monopolizing the work
-        // queue and starving other root paths of scan coverage.
-        if depth < config.max_depth && is_dir && child_dirs_queued < MAX_CHILDREN_QUEUED {
-            // Don't re-enter excluded paths.
-            if config.excluded_paths.contains(&child_path) {
-                continue;
+        // ─── Collect Child Dirs ───
+        // Deferred dispatch: collect child dirs but don't queue yet. Queueing
+        // happens after the loop, ensuring .sbh-protect markers are discovered
+        // before any children are dispatched to other worker threads.
+        if depth < config.max_depth && is_dir && pending_children.len() < MAX_CHILDREN_QUEUED {
+            if !config.excluded_paths.contains(&child_path) {
+                pending_children.push(child_path);
             }
+        }
+    }
 
-            in_flight.fetch_add(1, Ordering::Release);
-            // Use try_send to avoid blocking on a full work queue.
-            match work_tx.try_send((child_path.clone(), depth + 1, root_dev)) {
-                Ok(()) => {
-                    child_dirs_queued += 1;
-                }
-                Err(_) => {
-                    // Queue full or disconnected — skip this subdirectory.
-                    in_flight.fetch_sub(1, Ordering::Release);
-                }
+    // ─── Deferred Recursion Dispatch ───
+    // Now that we've confirmed no .sbh-protect marker exists (we would have
+    // returned above), queue collected child dirs for worker threads.
+    for child_path in pending_children {
+        in_flight.fetch_add(1, Ordering::Release);
+        match work_tx.try_send((child_path, depth + 1, root_dev)) {
+            Ok(()) => {}
+            Err(_) => {
+                in_flight.fetch_sub(1, Ordering::Release);
             }
         }
     }
@@ -537,6 +546,15 @@ fn collect_open_files_linux() -> HashSet<(u64, u64)> {
 /// monopolizing the work queue and starving other scan roots. Children beyond
 /// this cap are skipped; the next scan pass will rediscover them.
 const MAX_CHILDREN_QUEUED: usize = 512;
+
+/// Maximum child entries iterated per directory for signal collection.
+/// Directories with huge child counts (e.g. /data/tmp with 8K+ entries or
+/// target/release/deps/ with 10K+ files) cause the walker to spend seconds
+/// iterating entries that don't contribute useful signals. Structural markers
+/// like `.fingerprint`, `deps`, `incremental` appear within the first few
+/// hundred entries; 2000 is generous enough to capture them reliably while
+/// capping per-directory cost at ~1ms instead of 50-100ms.
+const MAX_ENTRIES_PER_DIR: u32 = 2000;
 
 /// Maximum time to spend scanning /proc for open file ancestors.
 /// On agent swarms with many processes, /proc scanning can take minutes.
