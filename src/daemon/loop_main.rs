@@ -240,6 +240,7 @@ pub struct MonitoringDaemon {
     special_locations: SpecialLocationRegistry,
     ballast_coordinator: BallastPoolCoordinator,
     release_controller: BallastReleaseController,
+    notification_manager: NotificationManager,
     scoring_engine: ScoringEngine,
     voi_scheduler: VoiScheduler,
     notification_manager: NotificationManager,
@@ -364,6 +365,7 @@ impl MonitoringDaemon {
             special_locations,
             ballast_coordinator,
             release_controller,
+            notification_manager,
             scoring_engine,
             voi_scheduler,
             notification_manager,
@@ -508,6 +510,17 @@ impl MonitoringDaemon {
                         failed,
                     } => {
                         self.self_monitor.record_deletions(deleted, bytes_freed);
+                        if deleted > 0 {
+                            // Best effort: we don't have the mount point here easily without tracking
+                            // it through the batch. Use "primary" or "various".
+                            self.notification_manager.notify(
+                                &NotificationEvent::CleanupCompleted {
+                                    items_deleted: deleted as usize,
+                                    bytes_freed,
+                                    mount: "various".to_string(),
+                                },
+                            );
+                        }
                         for _ in 0..failed {
                             self.self_monitor.record_error();
                         }
