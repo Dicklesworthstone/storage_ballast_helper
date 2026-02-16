@@ -1445,8 +1445,7 @@ mod tests {
     fn candidates_j_k_navigate_cursor() {
         let mut model = test_model();
         model.screen = Screen::Candidates;
-        model.candidates_list =
-            vec![sample_decision(1), sample_decision(2), sample_decision(3)];
+        model.candidates_list = vec![sample_decision(1), sample_decision(2), sample_decision(3)];
         assert_eq!(model.candidates_selected, 0);
 
         update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
@@ -1607,6 +1606,128 @@ mod tests {
             assert!(has_telemetry, "Tick on S4 should include FetchTelemetry");
         } else {
             panic!("Expected Batch command from Tick");
+        }
+    }
+
+    // ── S7 Diagnostics key handling tests ──
+
+    #[test]
+    fn diagnostics_shift_v_toggles_verbose() {
+        let mut model = test_model();
+        model.screen = Screen::Diagnostics;
+        assert!(!model.diagnostics_verbose);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('V'))));
+        assert!(model.diagnostics_verbose);
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('V'))));
+        assert!(!model.diagnostics_verbose);
+    }
+
+    #[test]
+    fn diagnostics_v_noop_on_other_screens() {
+        let mut model = test_model();
+        model.screen = Screen::Overview;
+
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('V'))));
+        assert!(!model.diagnostics_verbose);
+    }
+
+    #[test]
+    fn diagnostics_other_keys_are_noop() {
+        let mut model = test_model();
+        model.screen = Screen::Diagnostics;
+
+        // j/k/s should do nothing on diagnostics screen.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('s'))));
+        assert!(!model.diagnostics_verbose);
+    }
+
+    #[test]
+    fn frame_metrics_msg_records_duration() {
+        let mut model = test_model();
+        assert!(model.frame_times.is_empty());
+
+        let cmd = update(&mut model, DashboardMsg::FrameMetrics { duration_ms: 16.5 });
+        assert!(matches!(cmd, DashboardCmd::None));
+        assert_eq!(model.frame_times.len(), 1);
+        assert_eq!(model.frame_times.latest(), Some(16.5));
+    }
+
+    #[test]
+    fn frame_metrics_accumulates() {
+        let mut model = test_model();
+        update(&mut model, DashboardMsg::FrameMetrics { duration_ms: 10.0 });
+        update(&mut model, DashboardMsg::FrameMetrics { duration_ms: 20.0 });
+        update(&mut model, DashboardMsg::FrameMetrics { duration_ms: 15.0 });
+        assert_eq!(model.frame_times.len(), 3);
+        assert_eq!(model.frame_times.latest(), Some(15.0));
+    }
+
+    #[test]
+    fn data_update_success_increments_adapter_reads() {
+        let mut model = test_model();
+        assert_eq!(model.adapter_reads, 0);
+
+        update(
+            &mut model,
+            DashboardMsg::DataUpdate(Some(Box::new(sample_daemon_state()))),
+        );
+        assert_eq!(model.adapter_reads, 1);
+        assert_eq!(model.adapter_errors, 0);
+
+        update(
+            &mut model,
+            DashboardMsg::DataUpdate(Some(Box::new(sample_daemon_state()))),
+        );
+        assert_eq!(model.adapter_reads, 2);
+    }
+
+    #[test]
+    fn data_update_none_increments_adapter_errors() {
+        let mut model = test_model();
+        assert_eq!(model.adapter_errors, 0);
+
+        update(&mut model, DashboardMsg::DataUpdate(None));
+        assert_eq!(model.adapter_errors, 1);
+        assert_eq!(model.adapter_reads, 0);
+
+        update(&mut model, DashboardMsg::DataUpdate(None));
+        assert_eq!(model.adapter_errors, 2);
+    }
+
+    #[test]
+    fn data_update_mixed_tracks_both_counters() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            DashboardMsg::DataUpdate(Some(Box::new(sample_daemon_state()))),
+        );
+        update(&mut model, DashboardMsg::DataUpdate(None));
+        update(
+            &mut model,
+            DashboardMsg::DataUpdate(Some(Box::new(sample_daemon_state()))),
+        );
+        assert_eq!(model.adapter_reads, 2);
+        assert_eq!(model.adapter_errors, 1);
+    }
+
+    #[test]
+    fn tick_on_diagnostics_does_not_request_telemetry() {
+        let mut model = test_model();
+        model.screen = Screen::Diagnostics;
+
+        let cmd = update(&mut model, DashboardMsg::Tick);
+        if let DashboardCmd::Batch(cmds) = cmd {
+            let has_telemetry = cmds
+                .iter()
+                .any(|c| matches!(c, DashboardCmd::FetchTelemetry));
+            assert!(
+                !has_telemetry,
+                "Tick on S7 should not include FetchTelemetry"
+            );
         }
     }
 }

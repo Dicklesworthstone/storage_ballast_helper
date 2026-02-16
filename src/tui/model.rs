@@ -1429,4 +1429,79 @@ mod tests {
         assert_eq!(model.candidates_list[1].decision_id, 2); // /test/2
         assert_eq!(model.candidates_list[2].decision_id, 3); // /test/3
     }
+
+    // ── Diagnostics state tests ──
+
+    #[test]
+    fn new_model_diagnostics_defaults() {
+        let model = test_model();
+        assert!(!model.diagnostics_verbose);
+        assert!(model.frame_times.is_empty());
+        assert_eq!(model.missed_ticks, 0);
+        assert_eq!(model.adapter_reads, 0);
+        assert_eq!(model.adapter_errors, 0);
+    }
+
+    #[test]
+    fn diagnostics_toggle_verbose() {
+        let mut model = test_model();
+        assert!(!model.diagnostics_verbose);
+        model.diagnostics_toggle_verbose();
+        assert!(model.diagnostics_verbose);
+        model.diagnostics_toggle_verbose();
+        assert!(!model.diagnostics_verbose);
+    }
+
+    #[test]
+    fn frame_time_stats_empty_returns_none() {
+        let model = test_model();
+        assert!(model.frame_time_stats().is_none());
+    }
+
+    #[test]
+    fn frame_time_stats_with_data() {
+        let mut model = test_model();
+        model.frame_times.push(10.0);
+        model.frame_times.push(20.0);
+        model.frame_times.push(30.0);
+
+        let (current, avg, min, max) = model.frame_time_stats().unwrap();
+        assert!((current - 30.0).abs() < 0.01);
+        assert!((avg - 20.0).abs() < 0.01);
+        assert!((min - 10.0).abs() < 0.01);
+        assert!((max - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn frame_times_ring_buffer_capacity() {
+        let mut model = test_model();
+        // Ring buffer capacity is 60 (set in new()).
+        for i in 0..100 {
+            #[allow(clippy::cast_precision_loss)]
+            model.frame_times.push(i as f64);
+        }
+        assert_eq!(model.frame_times.len(), 60);
+        // Latest should be the last pushed value.
+        assert_eq!(model.frame_times.latest(), Some(99.0));
+    }
+
+    #[test]
+    fn frame_time_stats_single_value() {
+        let mut model = test_model();
+        model.frame_times.push(16.7);
+        let (current, avg, min, max) = model.frame_time_stats().unwrap();
+        assert!((current - 16.7).abs() < 0.01);
+        assert!((avg - 16.7).abs() < 0.01);
+        assert!((min - 16.7).abs() < 0.01);
+        assert!((max - 16.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn adapter_counters_independent() {
+        let mut model = test_model();
+        model.adapter_reads = 42;
+        model.adapter_errors = 3;
+        assert_eq!(model.adapter_reads, 42);
+        assert_eq!(model.adapter_errors, 3);
+    }
 }
