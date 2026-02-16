@@ -945,7 +945,7 @@ fn unmapped_key_on_overview_is_passthrough() {
         screen: Screen::Overview,
         active_overlay: None,
     };
-    let res = input::resolve_key_event(&make_key(KeyCode::Char('x')), ctx);
+    let res = input::resolve_key_event(&make_key(KeyCode::Char('z')), ctx);
     assert!(!res.consumed);
     assert!(res.action.is_none());
 }
