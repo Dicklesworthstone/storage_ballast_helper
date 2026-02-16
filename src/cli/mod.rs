@@ -530,6 +530,13 @@ fn probe_sigstore_bundle(artifact_path: &Path, bundle_path: &Path) -> SigstorePr
         .arg("verify-blob")
         .arg("--bundle")
         .arg(bundle_path)
+        .arg("--certificate-oidc-issuer")
+        .arg("https://token.actions.githubusercontent.com")
+        .arg("--certificate-identity-regexp")
+        .arg(format!(
+            "https://github\\.com/{}/\\.github/workflows/.*",
+            RELEASE_REPOSITORY.replace('/', "\\/")
+        ))
         .arg(artifact_path)
         .output()
     {

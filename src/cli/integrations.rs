@@ -179,7 +179,16 @@ fn is_writable(path: &Path) -> bool {
                 .unwrap_or(false)
         }
     } else {
-        path.parent().is_some_and(Path::exists)
+        path.parent().is_some_and(|p| {
+            #[cfg(unix)]
+            {
+                nix::unistd::access(p, nix::unistd::AccessFlags::W_OK).is_ok()
+            }
+            #[cfg(not(unix))]
+            {
+                p.exists()
+            }
+        })
     }
 }
 
