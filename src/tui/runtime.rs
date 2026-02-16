@@ -13,12 +13,15 @@ use std::time::{Duration, Instant};
 use ftui_backend::BackendEventSource;
 use ftui_core::event::{Event, KeyEventKind};
 use ftui_tty::{TtyBackend, TtySessionOptions};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::model::{
     DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, Overlay, PreferenceAction,
     PreferenceProfileMode, Screen,
 };
 use super::preferences::{self, ResolvedPreferences, UserPreferences};
+use super::telemetry::{NullTelemetryHook, TelemetryHook, TelemetrySample};
 use super::theme::AccessibilityProfile;
 use super::{input, render, update};
 use crate::cli::dashboard::{self, DashboardConfig as LegacyDashboardConfig};
@@ -67,18 +70,27 @@ struct PreferenceRuntimeState {
     prefs: UserPreferences,
     profile_mode: PreferenceProfileMode,
     env_accessibility: AccessibilityProfile,
+    telemetry_hook: Box<dyn TelemetryHook + Send>,
 }
 
 impl PreferenceRuntimeState {
     fn load() -> (Self, Option<String>) {
-        Self::load_from_path(preferences::default_preferences_path())
+        Self::load_with_hook(Box::<NullTelemetryHook>::default())
     }
 
-    fn load_from_path(path: Option<PathBuf>) -> (Self, Option<String>) {
+    fn load_with_hook(telemetry_hook: Box<dyn TelemetryHook + Send>) -> (Self, Option<String>) {
+        Self::load_from_path_with_hook(preferences::default_preferences_path(), telemetry_hook)
+    }
+
+    fn load_from_path_with_hook(
+        path: Option<PathBuf>,
+        telemetry_hook: Box<dyn TelemetryHook + Send>,
+    ) -> (Self, Option<String>) {
         let env_accessibility = AccessibilityProfile::from_environment();
         let mut warning = None;
-        let (prefs, profile_mode) = match path.as_deref() {
-            Some(path) => match preferences::load(path) {
+        let (prefs, profile_mode) = path.as_deref().map_or_else(
+            || (UserPreferences::default(), PreferenceProfileMode::Defaults),
+            |path| match preferences::load(path) {
                 preferences::LoadOutcome::Loaded { prefs, report } => {
                     if !report.is_clean() {
                         warning = Some("preferences loaded with validation warnings".to_string());
@@ -93,18 +105,20 @@ impl PreferenceRuntimeState {
                     (UserPreferences::default(), PreferenceProfileMode::Defaults)
                 }
                 preferences::LoadOutcome::IoError { details, .. } => {
-                    warning = Some(format!("preferences read failed; using defaults: {details}"));
+                    warning = Some(format!(
+                        "preferences read failed; using defaults: {details}"
+                    ));
                     (UserPreferences::default(), PreferenceProfileMode::Defaults)
                 }
             },
-            None => (UserPreferences::default(), PreferenceProfileMode::Defaults),
-        };
+        );
         (
             Self {
                 path,
                 prefs,
                 profile_mode,
                 env_accessibility,
+                telemetry_hook,
             },
             warning,
         )
@@ -142,11 +156,9 @@ impl PreferenceRuntimeState {
     }
 
     fn persist(&self) -> io::Result<()> {
-        if let Some(path) = self.path.as_deref() {
+        self.path.as_deref().map_or(Ok(()), |path| {
             preferences::save(&self.prefs, path).map(|_| ())
-        } else {
-            Ok(())
-        }
+        })
     }
 
     fn execute_action(
@@ -160,7 +172,10 @@ impl PreferenceRuntimeState {
                 self.profile_mode = PreferenceProfileMode::SessionOverride;
                 self.persist()?;
                 self.apply_to_model(model, true, false);
-                format!("default start screen set to {}", start_screen_label(start_screen))
+                format!(
+                    "default start screen set to {}",
+                    start_screen_label(start_screen)
+                )
             }
             PreferenceAction::SetDensity(density) => {
                 self.prefs.density = density;
@@ -219,7 +234,39 @@ impl PreferenceRuntimeState {
                 "reverted preferences to defaults".to_string()
             }
         };
+        self.record_action_outcome(action, "ok", None);
         Ok(message)
+    }
+
+    fn record_action_failure(&mut self, action: PreferenceAction, err: &io::Error) {
+        let error = err.to_string();
+        self.record_action_outcome(action, "error", Some(error.as_str()));
+    }
+
+    fn record_action_outcome(
+        &mut self,
+        action: PreferenceAction,
+        result: &str,
+        error: Option<&str>,
+    ) {
+        let profile_hash =
+            preference_profile_hash(&self.prefs).unwrap_or_else(|_| String::from("unavailable"));
+        let detail = json!({
+            "actor": "tui-dashboard",
+            "action": preference_action_kind(action),
+            "target": preference_action_target(action),
+            "result": result,
+            "profile_mode": preference_profile_mode_label(self.profile_mode),
+            "schema_version": self.prefs.schema_version,
+            "profile_hash": profile_hash,
+            "error": error,
+        })
+        .to_string();
+        self.telemetry_hook.record(TelemetrySample::new(
+            "dashboard.preferences",
+            preference_action_kind(action),
+            detail,
+        ));
     }
 }
 
@@ -234,6 +281,44 @@ fn start_screen_label(start_screen: preferences::StartScreen) -> &'static str {
         preferences::StartScreen::Diagnostics => "diagnostics",
         preferences::StartScreen::Remember => "remember",
     }
+}
+
+fn preference_profile_mode_label(mode: PreferenceProfileMode) -> &'static str {
+    match mode {
+        PreferenceProfileMode::Defaults => "defaults",
+        PreferenceProfileMode::Persisted => "persisted",
+        PreferenceProfileMode::SessionOverride => "session_override",
+    }
+}
+
+fn preference_action_kind(action: PreferenceAction) -> &'static str {
+    match action {
+        PreferenceAction::SetStartScreen(_) => "set_start_screen",
+        PreferenceAction::SetDensity(_) => "set_density",
+        PreferenceAction::SetHintVerbosity(_) => "set_hint_verbosity",
+        PreferenceAction::ResetToPersisted => "reset_to_persisted",
+        PreferenceAction::RevertToDefaults => "revert_to_defaults",
+    }
+}
+
+fn preference_action_target(action: PreferenceAction) -> String {
+    match action {
+        PreferenceAction::SetStartScreen(start_screen) => {
+            format!("start_screen={}", start_screen_label(start_screen))
+        }
+        PreferenceAction::SetDensity(density) => format!("density={density}"),
+        PreferenceAction::SetHintVerbosity(hint_verbosity) => {
+            format!("hint_verbosity={hint_verbosity}")
+        }
+        PreferenceAction::ResetToPersisted => String::from("profile=persisted"),
+        PreferenceAction::RevertToDefaults => String::from("profile=defaults"),
+    }
+}
+
+fn preference_profile_hash(prefs: &UserPreferences) -> Result<String, serde_json::Error> {
+    let encoded = serde_json::to_vec(prefs)?;
+    let digest = Sha256::digest(encoded);
+    Ok(format!("{digest:x}"))
 }
 
 /// Run dashboard runtime via one canonical entrypoint.
@@ -388,6 +473,7 @@ fn execute_cmd(
                     timers.push((id, Instant::now() + Duration::from_secs(8)));
                 }
                 Err(err) => {
+                    preference_state.record_action_failure(action, &err);
                     let id = model.push_notification(
                         NotificationLevel::Error,
                         format!("preference update failed: {err}"),
@@ -413,8 +499,9 @@ fn run_legacy_fallback(config: &DashboardRuntimeConfig) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::preferences::{DensityMode, HintVerbosity, StartScreen, UserPreferences};
-    use super::super::telemetry::DataSource;
+    use super::super::telemetry::{DataSource, NullTelemetryHook, TelemetryHook, TelemetrySample};
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     fn test_model() -> DashboardModel {
@@ -424,6 +511,31 @@ mod tests {
             Duration::from_secs(1),
             (120, 40),
         )
+    }
+
+    #[derive(Debug)]
+    struct CapturingTelemetryHook {
+        samples: Arc<Mutex<Vec<TelemetrySample>>>,
+    }
+
+    impl TelemetryHook for CapturingTelemetryHook {
+        fn record(&mut self, sample: TelemetrySample) {
+            self.samples
+                .lock()
+                .expect("capture telemetry sample")
+                .push(sample);
+        }
+    }
+
+    fn capture_hook() -> (
+        Box<dyn TelemetryHook + Send>,
+        Arc<Mutex<Vec<TelemetrySample>>>,
+    ) {
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let hook = CapturingTelemetryHook {
+            samples: Arc::clone(&samples),
+        };
+        (Box::new(hook), samples)
     }
 
     #[test]
@@ -461,7 +573,10 @@ mod tests {
         };
         preferences::save(&persisted, &pref_path).expect("save prefs");
 
-        let (state, warning) = PreferenceRuntimeState::load_from_path(Some(pref_path));
+        let (state, warning) = PreferenceRuntimeState::load_from_path_with_hook(
+            Some(pref_path),
+            Box::<NullTelemetryHook>::default(),
+        );
         assert!(warning.is_none());
         assert_eq!(state.profile_mode, PreferenceProfileMode::Persisted);
 
@@ -478,7 +593,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let pref_path = dir.path().join("preferences.json");
         let mut state = PreferenceRuntimeState {
-            path: Some(pref_path.clone()),
+            path: Some(pref_path),
             prefs: UserPreferences {
                 start_screen: StartScreen::Diagnostics,
                 density: DensityMode::Compact,
@@ -487,6 +602,7 @@ mod tests {
             },
             profile_mode: PreferenceProfileMode::SessionOverride,
             env_accessibility: AccessibilityProfile::default(),
+            telemetry_hook: Box::<NullTelemetryHook>::default(),
         };
         let mut model = test_model();
         model.screen = Screen::Diagnostics;
@@ -500,6 +616,45 @@ mod tests {
         assert_eq!(model.preferred_start_screen, StartScreen::Overview);
         assert_eq!(model.density, DensityMode::Comfortable);
         assert_eq!(model.hint_verbosity, HintVerbosity::Full);
-        assert_eq!(model.preference_profile_mode, PreferenceProfileMode::Defaults);
+        assert_eq!(
+            model.preference_profile_mode,
+            PreferenceProfileMode::Defaults
+        );
+    }
+
+    #[test]
+    fn preference_action_emits_structured_telemetry() {
+        let (telemetry_hook, samples) = capture_hook();
+        let (mut state, warning) =
+            PreferenceRuntimeState::load_from_path_with_hook(None, telemetry_hook);
+        assert!(warning.is_none());
+        let mut model = test_model();
+
+        state
+            .execute_action(
+                PreferenceAction::SetDensity(DensityMode::Compact),
+                &mut model,
+            )
+            .expect("set density");
+
+        let captured = samples.lock().expect("read captured samples").clone();
+        assert_eq!(captured.len(), 1);
+        let sample = &captured[0];
+        assert_eq!(sample.source, "dashboard.preferences");
+        assert_eq!(sample.kind, "set_density");
+
+        let detail_json = sample.detail.clone();
+        let detail: serde_json::Value =
+            serde_json::from_str(&detail_json).expect("detail json payload");
+        assert_eq!(detail["actor"], "tui-dashboard");
+        assert_eq!(detail["action"], "set_density");
+        assert_eq!(detail["target"], "density=compact");
+        assert_eq!(detail["result"], "ok");
+        assert_eq!(detail["profile_mode"], "session_override");
+        assert_eq!(detail["schema_version"], 1);
+        assert!(detail["profile_hash"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+        assert!(detail["error"].is_null());
     }
 }

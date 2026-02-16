@@ -3,7 +3,7 @@
 #![allow(missing_docs)]
 
 use super::layout::{
-    OverviewPane, PanePriority, TimelinePane, build_overview_layout, build_timeline_layout,
+    build_overview_layout, build_timeline_layout, OverviewPane, PanePriority, TimelinePane,
 };
 use super::model::{
     BallastVolume, DashboardModel, NotificationLevel, PreferenceProfileMode, Screen,
@@ -128,12 +128,7 @@ fn start_screen_label(start_screen: StartScreen) -> &'static str {
     }
 }
 
-fn write_navigation_hint(
-    model: &DashboardModel,
-    out: &mut String,
-    full: &str,
-    minimal: &str,
-) {
+fn write_navigation_hint(model: &DashboardModel, out: &mut String, full: &str, minimal: &str) {
     use std::fmt::Write as _;
     // Safety floor: only optional navigation/help hints are hidden.
     // Pressure/veto/safety indicators remain always visible in all modes.

@@ -26,6 +26,7 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     pub paths: PathsConfig,
     pub notifications: NotificationConfig,
+    pub dashboard: DashboardConfig,
 }
 
 /// Pressure thresholds and control knobs.
@@ -224,6 +225,73 @@ pub struct UpdateConfig {
     pub metadata_cache_file: PathBuf,
     pub background_refresh: bool,
     pub notices_enabled: bool,
+}
+
+/// Dashboard runtime selection mode.
+///
+/// Controls which TUI implementation `sbh dashboard` uses during phased rollout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DashboardMode {
+    /// Use the legacy crossterm-based dashboard (pre-overhaul).
+    #[default]
+    Legacy,
+    /// Use the new FrankentUI-based cockpit (post-overhaul).
+    New,
+}
+
+impl std::fmt::Display for DashboardMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy => f.write_str("legacy"),
+            Self::New => f.write_str("new"),
+        }
+    }
+}
+
+impl std::str::FromStr for DashboardMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "new" => Ok(Self::New),
+            other => Err(format!(
+                "invalid dashboard mode {other:?}: expected \"legacy\" or \"new\""
+            )),
+        }
+    }
+}
+
+/// Dashboard rollout controls.
+///
+/// Provides phased rollout semantics for the TUI overhaul:
+/// - `mode`: selects runtime (legacy vs new) as the config-level default
+/// - `kill_switch`: emergency override that forces legacy regardless of other settings
+///
+/// Resolution priority (highest wins):
+/// 1. `SBH_DASHBOARD_KILL_SWITCH=true` env var → Legacy
+/// 2. `--legacy-dashboard` CLI flag → Legacy
+/// 3. `--new-dashboard` CLI flag → New
+/// 4. `SBH_DASHBOARD_MODE` env var → parsed mode
+/// 5. `dashboard.mode` config field → configured mode
+/// 6. Hardcoded default → Legacy
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DashboardConfig {
+    /// Default runtime mode when no CLI flag or env var overrides.
+    pub mode: DashboardMode,
+    /// Emergency kill switch: forces legacy dashboard regardless of all other settings.
+    pub kill_switch: bool,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            mode: DashboardMode::Legacy,
+            kill_switch: false,
+        }
+    }
 }
 
 /// Filesystem paths used by sbh.
@@ -547,6 +615,17 @@ impl Config {
 
         // update
         self.apply_update_env_overrides_from(env_var)?;
+
+        // dashboard
+        if let Some(raw) = env_var("SBH_DASHBOARD_MODE") {
+            self.dashboard.mode = raw.parse::<DashboardMode>().map_err(|details| {
+                SbhError::ConfigParse {
+                    context: "env",
+                    details: format!("SBH_DASHBOARD_MODE={raw:?}: {details}"),
+                }
+            })?;
+        }
+        set_env_bool("SBH_DASHBOARD_KILL_SWITCH", &mut self.dashboard.kill_switch)?;
 
         Ok(())
     }
@@ -1232,5 +1311,60 @@ mod tests {
         let h1 = cfg.stable_hash().expect("hash");
         let h2 = cfg.stable_hash().expect("hash");
         assert_eq!(h1, h2);
+    }
+
+    // ── Dashboard rollout config ─────────────────────────────────
+
+    #[test]
+    fn dashboard_mode_default_is_legacy() {
+        let cfg = Config::default();
+        assert_eq!(cfg.dashboard.mode, super::DashboardMode::Legacy);
+        assert!(!cfg.dashboard.kill_switch);
+    }
+
+    #[test]
+    fn dashboard_mode_parse_roundtrip() {
+        use super::DashboardMode;
+        for (input, expected) in [("legacy", DashboardMode::Legacy), ("new", DashboardMode::New)] {
+            let parsed: DashboardMode = input.parse().unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.to_string(), input);
+        }
+    }
+
+    #[test]
+    fn dashboard_mode_parse_case_insensitive() {
+        use super::DashboardMode;
+        for input in ["LEGACY", "Legacy", "NEW", "New", "  new  "] {
+            let parsed: DashboardMode = input.parse().unwrap();
+            assert!(parsed == DashboardMode::Legacy || parsed == DashboardMode::New);
+        }
+    }
+
+    #[test]
+    fn dashboard_mode_parse_invalid_rejected() {
+        use super::DashboardMode;
+        let err = "auto".parse::<DashboardMode>().unwrap_err();
+        assert!(err.contains("invalid dashboard mode"));
+    }
+
+    #[test]
+    fn dashboard_config_deserializes_from_toml() {
+        let toml_str = r#"
+[dashboard]
+mode = "new"
+kill_switch = true
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("should parse");
+        assert_eq!(cfg.dashboard.mode, super::DashboardMode::New);
+        assert!(cfg.dashboard.kill_switch);
+    }
+
+    #[test]
+    fn dashboard_config_defaults_when_absent_from_toml() {
+        let toml_str = "[pressure]\npoll_interval_ms = 500\n";
+        let cfg: Config = toml::from_str(toml_str).expect("should parse");
+        assert_eq!(cfg.dashboard.mode, super::DashboardMode::Legacy);
+        assert!(!cfg.dashboard.kill_switch);
     }
 }
