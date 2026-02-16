@@ -226,6 +226,14 @@ fn logger_thread_main(
     #[cfg(feature = "sqlite")]
     let mut sqlite_disabled_cycles: u32 = 0;
 
+    // Retention: prune old rows every PRUNE_INTERVAL events (~1 hour at typical rates).
+    #[cfg(feature = "sqlite")]
+    const PRUNE_INTERVAL: u64 = 3600;
+    #[cfg(feature = "sqlite")]
+    const RETENTION_DAYS: u32 = 30;
+    #[cfg(feature = "sqlite")]
+    let mut events_since_prune: u64 = 0;
+
     // Process events until Shutdown or channel disconnect.
     let mut last_reported_drops: u64 = 0;
     while let Ok(event) = rx.recv() {
@@ -272,6 +280,15 @@ fn logger_thread_main(
                             "[SBH-DUAL] SQLite write failed {sqlite_failures} times, disabling"
                         );
                         sqlite = None;
+                    }
+                }
+                // Periodic retention pruning.
+                events_since_prune += 1;
+                if events_since_prune >= PRUNE_INTERVAL {
+                    events_since_prune = 0;
+                    if let Some(db) = &sqlite {
+                        let _ = db.prune_pressure_history(RETENTION_DAYS);
+                        let _ = db.prune_activity_log(RETENTION_DAYS);
                     }
                 }
             } else {

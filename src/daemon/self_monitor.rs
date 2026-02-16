@@ -274,7 +274,6 @@ impl SelfMonitor {
             return 0;
         }
 
-        self.last_write = Some(now);
         let rss = read_rss_bytes();
 
         // Check RSS limit.
@@ -323,7 +322,11 @@ impl SelfMonitor {
 
         if let Err(e) = write_state_atomic(&self.state_file_path, &state) {
             eprintln!("[SBH-SELFMON] failed to write state file: {e}");
+            // Do NOT update last_write — retry on next call instead of
+            // serving stale state for an entire write_interval.
+            return rss;
         }
+        self.last_write = Some(now);
 
         rss
     }

@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,10 +43,41 @@ use crate::scanner::walker::{DirectoryWalker, WalkerConfig};
 
 // ──────────────────── channel capacities ────────────────────
 
-/// Monitor → Scanner: bounded(16). If scanner falls behind, old events are dropped (latest-wins).
-const SCANNER_CHANNEL_CAP: usize = 16;
+/// Monitor → Scanner: bounded(2). Small buffer keeps at most 1 queued request while
+/// scanner processes another, bounding data staleness. If full, newest is deferred
+/// to the next monitor tick (typically 5-10s).
+const SCANNER_CHANNEL_CAP: usize = 2;
 /// Scanner → Executor: bounded(64). Natural backpressure — scanner blocks on send.
 const EXECUTOR_CHANNEL_CAP: usize = 64;
+
+// ──────────────────── shared executor config ────────────────────
+
+/// Config shared between main thread and executor via atomics.
+/// Updated by config reload, read by executor at batch start.
+struct SharedExecutorConfig {
+    dry_run: AtomicBool,
+    max_batch_size: AtomicUsize,
+    /// f64 stored as u64 bits (to_bits/from_bits).
+    min_score_bits: AtomicU64,
+}
+
+impl SharedExecutorConfig {
+    fn new(dry_run: bool, max_batch_size: usize, min_score: f64) -> Self {
+        Self {
+            dry_run: AtomicBool::new(dry_run),
+            max_batch_size: AtomicUsize::new(max_batch_size),
+            min_score_bits: AtomicU64::new(min_score.to_bits()),
+        }
+    }
+
+    fn min_score(&self) -> f64 {
+        f64::from_bits(self.min_score_bits.load(Ordering::Relaxed))
+    }
+
+    fn set_min_score(&self, val: f64) {
+        self.min_score_bits.store(val.to_bits(), Ordering::Relaxed);
+    }
+}
 
 // ──────────────────── thread panic tracking ────────────────────
 
@@ -139,6 +171,7 @@ pub struct MonitoringDaemon {
     ballast_manager: BallastManager,
     release_controller: BallastReleaseController,
     scoring_engine: ScoringEngine,
+    shared_executor_config: Arc<SharedExecutorConfig>,
     start_time: Instant,
     last_pressure_level: PressureLevel,
     last_special_scan: HashMap<PathBuf, Instant>,
@@ -228,6 +261,13 @@ impl MonitoringDaemon {
         let scoring_engine =
             ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
 
+        // 10b. Shared executor config (atomics for live reload propagation).
+        let shared_executor_config = Arc::new(SharedExecutorConfig::new(
+            config.scanner.dry_run,
+            config.scanner.max_delete_batch,
+            config.scoring.min_score,
+        ));
+
         // 11. Self-monitor (writes state.json for CLI, tracks health).
         let self_monitor = SelfMonitor::new(config.paths.state_file.clone());
 
@@ -249,6 +289,7 @@ impl MonitoringDaemon {
             ballast_manager,
             release_controller,
             scoring_engine,
+            shared_executor_config,
             start_time,
             last_pressure_level: PressureLevel::Green,
             last_special_scan: HashMap::new(),
@@ -653,9 +694,12 @@ impl MonitoringDaemon {
             config_update: None,
         };
 
-        // Latest-wins: if the channel is full, drop old events.
+        // Non-blocking send: if the channel is full, the newest request is dropped.
+        // With capacity=2 this means at most 1 buffered request while scanner processes
+        // another. The next monitor iteration (typically 5-10s later) will send a fresh
+        // request with current urgency, so data staleness is bounded.
         if let Err(TrySendError::Full(_)) = scan_tx.try_send(request) {
-            // Scanner is behind. The latest pressure state will be sent next iteration.
+            eprintln!("[SBH-DAEMON] scan channel full, request deferred to next tick");
         }
     }
 
@@ -775,6 +819,16 @@ impl MonitoringDaemon {
                         );
                     }
 
+                    // Propagate executor-critical settings via shared atomics.
+                    self.shared_executor_config
+                        .dry_run
+                        .store(new_config.scanner.dry_run, Ordering::Relaxed);
+                    self.shared_executor_config
+                        .max_batch_size
+                        .store(new_config.scanner.max_delete_batch, Ordering::Relaxed);
+                    self.shared_executor_config
+                        .set_min_score(new_config.scoring.min_score);
+
                     // Propagate scoring and scanner config to scanner thread.
                     let config_update = ScanRequest {
                         paths: Vec::new(),
@@ -840,14 +894,12 @@ impl MonitoringDaemon {
         logger: ActivityLoggerHandle,
         heartbeat: Arc<ThreadHeartbeat>,
     ) -> Result<thread::JoinHandle<()>> {
-        let dry_run = self.config.scanner.dry_run;
-        let max_batch = self.config.scanner.max_delete_batch;
-        let min_score = self.config.scoring.min_score;
+        let shared_config = Arc::clone(&self.shared_executor_config);
 
         thread::Builder::new()
             .name("sbh-executor".to_string())
             .spawn(move || {
-                executor_thread_main(&del_rx, &logger, dry_run, max_batch, min_score, &heartbeat);
+                executor_thread_main(&del_rx, &logger, &shared_config, &heartbeat);
             })
             .map_err(|source| SbhError::Runtime {
                 details: format!("failed to spawn executor thread: {source}"),
@@ -1062,27 +1114,34 @@ fn scanner_thread_main(
 // ──────────────────── executor thread ────────────────────
 
 /// Executor thread: receives deletion batches and safely removes artifacts.
+///
+/// Reads `dry_run`, `max_batch_size`, and `min_score` from shared atomics on each
+/// batch, so config reloads (SIGHUP) take effect without respawning the thread.
 fn executor_thread_main(
     del_rx: &Receiver<DeletionBatch>,
     logger: &ActivityLoggerHandle,
-    dry_run: bool,
-    max_batch_size: usize,
-    min_score: f64,
+    shared_config: &Arc<SharedExecutorConfig>,
     heartbeat: &Arc<ThreadHeartbeat>,
 ) {
-    let executor = DeletionExecutor::new(
-        DeletionConfig {
-            max_batch_size,
-            dry_run,
-            min_score,
-            check_open_files: true,
-            ..Default::default()
-        },
-        Some(logger.clone()),
-    );
-
     while let Ok(batch) = del_rx.recv() {
         heartbeat.beat();
+
+        // Read latest config from shared atomics (updated by config reload).
+        let dry_run = shared_config.dry_run.load(Ordering::Relaxed);
+        let max_batch_size = shared_config.max_batch_size.load(Ordering::Relaxed);
+        let min_score = shared_config.min_score();
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                max_batch_size,
+                dry_run,
+                min_score,
+                check_open_files: true,
+                ..Default::default()
+            },
+            Some(logger.clone()),
+        );
+
         let plan = executor.plan(batch.candidates);
 
         if plan.candidates.is_empty() {
@@ -1178,11 +1237,11 @@ mod tests {
     }
 
     #[test]
-    fn scanner_channel_latest_wins_on_full() {
-        let (tx, _rx) = bounded::<ScanRequest>(2);
+    fn scanner_channel_defers_when_full() {
+        let (tx, _rx) = bounded::<ScanRequest>(SCANNER_CHANNEL_CAP);
 
-        // Fill the channel.
-        for _ in 0..2 {
+        // Fill the channel to capacity.
+        for _ in 0..SCANNER_CHANNEL_CAP {
             tx.try_send(ScanRequest {
                 paths: vec![],
                 urgency: 0.1,
@@ -1193,7 +1252,7 @@ mod tests {
             .unwrap();
         }
 
-        // Third send should fail (full).
+        // Next send is deferred (channel full) — will be retried next tick.
         let result = tx.try_send(ScanRequest {
             paths: vec![],
             urgency: 0.9,

@@ -64,7 +64,7 @@ type WorkItem = (PathBuf, usize, u64);
 /// - Honors `follow_symlinks` config during traversal
 /// - Never crosses filesystem boundaries unless configured
 /// - Skips excluded and protected paths
-/// - Deduplicates via inode tracking to handle hardlink cycles
+/// - Bounded by `max_depth` to prevent runaway traversal
 pub struct DirectoryWalker {
     config: WalkerConfig,
     protection: Arc<parking_lot::RwLock<ProtectionRegistry>>,

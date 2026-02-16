@@ -166,6 +166,33 @@ impl SqliteLogger {
         Ok(rows)
     }
 
+    /// Delete pressure_history rows older than `retention_days`.
+    ///
+    /// Returns the number of rows deleted. Should be called periodically
+    /// (e.g., once per hour) to prevent unbounded table growth.
+    pub fn prune_pressure_history(&self, retention_days: u32) -> Result<usize> {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::days(i64::from(retention_days));
+        let cutoff_str = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let deleted = self.conn.execute(
+            "DELETE FROM pressure_history WHERE timestamp < ?1",
+            params![cutoff_str],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Delete activity_log rows older than `retention_days`.
+    pub fn prune_activity_log(&self, retention_days: u32) -> Result<usize> {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::days(i64::from(retention_days));
+        let cutoff_str = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let deleted = self.conn.execute(
+            "DELETE FROM activity_log WHERE timestamp < ?1",
+            params![cutoff_str],
+        )?;
+        Ok(deleted)
+    }
+
     // ──────────────────── ballast_inventory ────────────────────
 
     /// Upsert a ballast file record.
