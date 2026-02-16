@@ -52,6 +52,8 @@ pub struct DaemonState {
     pub last_scan: LastScanState,
     pub counters: Counters,
     pub memory_rss_bytes: u64,
+    /// Active policy engine mode (enforce/observe/canary/fallback_safe).
+    pub policy_mode: String,
 }
 
 /// Current pressure across monitored mounts.
@@ -278,6 +280,7 @@ impl SelfMonitor {
         ballast_available: usize,
         ballast_total: usize,
         dropped_log_events: u64,
+        policy_mode: &str,
     ) -> u64 {
         let now = Instant::now();
         if let Some(last) = self.last_write
@@ -330,6 +333,7 @@ impl SelfMonitor {
                 dropped_log_events,
             },
             memory_rss_bytes: rss,
+            policy_mode: policy_mode.to_string(),
         };
 
         let result = write_state_atomic(&self.state_file_path, &state);
@@ -580,6 +584,7 @@ mod tests {
                 dropped_log_events: 0,
             },
             memory_rss_bytes: 44_040_192,
+            policy_mode: "enforce".into(),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -628,6 +633,7 @@ mod tests {
                 dropped_log_events: 0,
             },
             memory_rss_bytes: 0,
+            policy_mode: String::new(),
         };
 
         write_state_atomic(&path, &state).unwrap();
@@ -678,6 +684,7 @@ mod tests {
                 dropped_log_events: 0,
             },
             memory_rss_bytes: 0,
+            policy_mode: String::new(),
         };
 
         write_state_atomic(&path, &state).unwrap();
@@ -697,19 +704,20 @@ mod tests {
         monitor.write_interval = Duration::from_millis(50);
 
         // First write always happens.
-        let _rss = monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10, 0);
+        let _rss =
+            monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10, 0, "enforce");
         assert!(path.exists());
 
         // Immediate second write is skipped (within interval).
         let content_before = fs::read_to_string(&path).unwrap();
-        monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10, 0);
+        monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10, 0, "enforce");
         let content_after = fs::read_to_string(&path).unwrap();
         // Content should be identical (no rewrite).
         assert_eq!(content_before, content_after);
 
         // After interval, write happens again.
         std::thread::sleep(Duration::from_millis(60));
-        monitor.maybe_write_state(PressureLevel::Yellow, 12.0, "/data", 8, 10, 0);
+        monitor.maybe_write_state(PressureLevel::Yellow, 12.0, "/data", 8, 10, 0, "enforce");
         let updated = fs::read_to_string(&path).unwrap();
         assert!(updated.contains("yellow"));
     }
@@ -724,7 +732,7 @@ mod tests {
         monitor.bytes_freed_total = 1_000_000;
         monitor.record_scan(5, 3, Duration::from_millis(200));
 
-        monitor.maybe_write_state(PressureLevel::Green, 30.0, "/data", 10, 10, 0);
+        monitor.maybe_write_state(PressureLevel::Green, 30.0, "/data", 10, 10, 0, "enforce");
 
         let state = SelfMonitor::read_state(&path).unwrap();
         assert_eq!(state.counters.scans, 43);
@@ -1009,7 +1017,7 @@ mod tests {
         let mut monitor = SelfMonitor::new(bad_path);
 
         // First write fails (bad path).
-        monitor.maybe_write_state(PressureLevel::Green, 30.0, "/data", 5, 5, 0);
+        monitor.maybe_write_state(PressureLevel::Green, 30.0, "/data", 5, 5, 0, "enforce");
         // last_write should be set to prevent busy-looping.
         assert!(
             monitor.last_write.is_some(),
@@ -1024,7 +1032,7 @@ mod tests {
         let good_path = dir.path().join("recovered_state.json");
         monitor.state_file_path = good_path.clone();
 
-        monitor.maybe_write_state(PressureLevel::Yellow, 15.0, "/data", 3, 5, 0);
+        monitor.maybe_write_state(PressureLevel::Yellow, 15.0, "/data", 3, 5, 0, "enforce");
         assert!(
             good_path.exists(),
             "state file must be written after path recovery"
@@ -1044,7 +1052,7 @@ mod tests {
         let path = dir.path().join("clean_state.json");
         let mut monitor = SelfMonitor::new(path.clone());
 
-        monitor.maybe_write_state(PressureLevel::Green, 40.0, "/data", 10, 10, 0);
+        monitor.maybe_write_state(PressureLevel::Green, 40.0, "/data", 10, 10, 0, "enforce");
 
         assert!(path.exists());
         assert!(
@@ -1069,7 +1077,7 @@ mod tests {
                 PressureLevel::Yellow
             };
             let free = if i % 2 == 0 { 30.0 } else { 15.0 };
-            monitor.maybe_write_state(level, free, "/data", 10, 10, 0);
+            monitor.maybe_write_state(level, free, "/data", 10, 10, 0, "enforce");
 
             // Read back — must always be valid JSON.
             if path.exists() {

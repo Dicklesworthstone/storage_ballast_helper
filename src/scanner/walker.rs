@@ -380,9 +380,7 @@ fn process_directory(
         // so 2000 children ≈ 2ms — acceptable for accurate scoring.
         // For child dirs: skip (their recursive size will be computed when they
         // are processed as their own WalkEntry).
-        if !is_dir
-            && let Ok(child_meta) = entry.metadata()
-        {
+        if !is_dir && let Ok(child_meta) = entry.metadata() {
             content_size = content_size.saturating_add(child_meta.len());
         }
 
@@ -415,12 +413,6 @@ fn process_directory(
     // Finalize structural signals.
     if total_count > 0 && object_count > 0 {
         signals.mostly_object_files = object_count * 2 >= total_count;
-    }
-
-    // DEBUG: trace target dirs
-    if dir_path.to_string_lossy().contains("pi_agent_rust/target") {
-        let p = dir_path.display();
-        eprintln!("WALKER: {p} depth={depth} dir_meta={} total_count={total_count} content_size={content_size} signals={signals:?}", dir_meta.is_some());
     }
 
     // Emit a WalkEntry for this directory itself (reuse stat from top of function).

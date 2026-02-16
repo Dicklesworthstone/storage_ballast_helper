@@ -26,6 +26,14 @@ use crate::scanner::scoring::{
     ScoreFactors, ScoringEngine,
 };
 
+/// Returns a PolicyConfig starting in Observe mode (for lifecycle tests).
+fn observe_config() -> PolicyConfig {
+    PolicyConfig {
+        initial_mode: ActiveMode::Observe,
+        ..PolicyConfig::default()
+    }
+}
+
 // ──────────────────── seeded RNG ────────────────────
 
 /// Simple seeded LCG for reproducible test fixtures.
@@ -375,7 +383,7 @@ fn guard_no_unsafe_transition_from_unknown_to_fail_without_data() {
 
 #[test]
 fn policy_observe_canary_enforce_promotion_order() {
-    let mut engine = PolicyEngine::new(PolicyConfig::default());
+    let mut engine = PolicyEngine::new(observe_config());
     assert_eq!(engine.mode(), ActiveMode::Observe);
     assert!(engine.promote());
     assert_eq!(engine.mode(), ActiveMode::Canary);
@@ -386,7 +394,7 @@ fn policy_observe_canary_enforce_promotion_order() {
 
 #[test]
 fn policy_enforce_canary_observe_demotion_order() {
-    let mut engine = PolicyEngine::new(PolicyConfig::default());
+    let mut engine = PolicyEngine::new(observe_config());
     engine.promote();
     engine.promote();
     assert!(engine.demote());
@@ -398,7 +406,7 @@ fn policy_enforce_canary_observe_demotion_order() {
 
 #[test]
 fn policy_fallback_idempotent() {
-    let mut engine = PolicyEngine::new(PolicyConfig::default());
+    let mut engine = PolicyEngine::new(observe_config());
     engine.promote(); // canary
     engine.enter_fallback(FallbackReason::GuardrailDrift);
     let entries_1 = engine.total_fallback_entries();
@@ -414,6 +422,7 @@ fn policy_fallback_idempotent() {
 fn policy_fallback_recovery_restores_mode() {
     let config = PolicyConfig {
         recovery_clean_windows: 1,
+        initial_mode: ActiveMode::Observe,
         ..PolicyConfig::default()
     };
     let mut engine = PolicyEngine::new(config);
@@ -468,7 +477,7 @@ fn policy_fallback_from_any_active_mode() {
 
 #[test]
 fn fallback_blocks_all_deletions() {
-    let mut engine = PolicyEngine::new(PolicyConfig::default());
+    let mut engine = PolicyEngine::new(observe_config());
     engine.promote();
     engine.promote(); // enforce
     engine.enter_fallback(FallbackReason::PolicyError {
@@ -485,7 +494,7 @@ fn fallback_blocks_all_deletions() {
 
 #[test]
 fn observe_mode_never_approves_deletions() {
-    let mut engine = PolicyEngine::new(PolicyConfig::default());
+    let mut engine = PolicyEngine::new(observe_config());
     let mut rng = SeededRng::new(500);
     let scoring_engine = default_engine();
     let candidates_input = random_candidates(&mut rng, 20);
@@ -504,7 +513,7 @@ fn observe_mode_never_approves_deletions() {
 
 #[test]
 fn fallback_dominates_guard_pass() {
-    let mut engine = PolicyEngine::new(PolicyConfig::default());
+    let mut engine = PolicyEngine::new(observe_config());
     engine.promote();
     engine.promote();
     engine.enter_fallback(FallbackReason::SerializationFailure);
@@ -688,6 +697,7 @@ fn property_policy_engine_invariants_under_random_operations() {
             recovery_clean_windows: 2,
             calibration_breach_windows: 2,
             max_canary_deletes_per_hour: 5,
+            initial_mode: ActiveMode::Observe,
             ..PolicyConfig::default()
         };
         let mut engine = PolicyEngine::new(config);
@@ -839,7 +849,7 @@ impl ReplayEngine {
     fn new(seed: u64) -> Self {
         Self {
             scoring: default_engine(),
-            policy: PolicyEngine::new(PolicyConfig::default()),
+            policy: PolicyEngine::new(observe_config()),
             guard: AdaptiveGuard::with_defaults(),
             trace: Vec::new(),
             seed,
@@ -860,7 +870,7 @@ impl ReplayEngine {
     fn with_guard_config(seed: u64, guard_config: GuardrailConfig) -> Self {
         Self {
             scoring: default_engine(),
-            policy: PolicyEngine::new(PolicyConfig::default()),
+            policy: PolicyEngine::new(observe_config()),
             guard: AdaptiveGuard::new(guard_config),
             trace: Vec::new(),
             seed,
@@ -1315,7 +1325,7 @@ impl BenchmarkReport {
     /// Run a benchmark over N iterations.
     fn run(seed: u64, iterations: usize, candidates_per_iter: usize) -> Self {
         let engine = default_engine();
-        let mut policy = PolicyEngine::new(PolicyConfig::default());
+        let mut policy = PolicyEngine::new(observe_config());
         // Promote to enforce mode for realistic evaluation.
         policy.promote();
         policy.promote();
@@ -1873,6 +1883,7 @@ fn replay_recovery_after_serialization_fault() {
 
     let config = PolicyConfig {
         recovery_clean_windows: 2,
+        initial_mode: ActiveMode::Observe,
         ..PolicyConfig::default()
     };
 
@@ -1961,6 +1972,7 @@ fn replay_multi_fault_sequence() {
     let config = PolicyConfig {
         recovery_clean_windows: 1,
         max_canary_deletes_per_hour: 100, // High cap so canary budget doesn't trip during recovery test
+        initial_mode: ActiveMode::Observe,
         ..PolicyConfig::default()
     };
 

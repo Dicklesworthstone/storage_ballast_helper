@@ -70,6 +70,7 @@ fn sample_daemon_state() -> DaemonState {
             errors: 0,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 1_048_576,
     }
 }
@@ -201,7 +202,7 @@ kill_switch = true
 fn config_without_dashboard_section_uses_defaults() {
     let toml_str = "[pressure]\npoll_interval_ms = 1000\n";
     let cfg: Config = toml::from_str(toml_str).expect("parse config without dashboard");
-    assert_eq!(cfg.dashboard.mode, DashboardMode::Legacy);
+    assert_eq!(cfg.dashboard.mode, DashboardMode::New);
     assert!(!cfg.dashboard.kill_switch);
 }
 

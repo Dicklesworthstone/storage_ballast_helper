@@ -881,6 +881,7 @@ fn rapid_data_updates_track_counters_correctly() {
             errors: 0,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 0,
     };
 

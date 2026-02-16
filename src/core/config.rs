@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::notifications::NotificationConfig;
+use crate::daemon::policy::PolicyConfig;
 
 /// Full SBH configuration model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -27,6 +28,7 @@ pub struct Config {
     pub paths: PathsConfig,
     pub notifications: NotificationConfig,
     pub dashboard: DashboardConfig,
+    pub policy: PolicyConfig,
 }
 
 /// Pressure thresholds and control knobs.
@@ -672,6 +674,9 @@ impl Config {
                     })?;
         }
         set_env_bool("SBH_DASHBOARD_KILL_SWITCH", &mut self.dashboard.kill_switch)?;
+
+        // policy
+        set_env_bool("SBH_POLICY_KILL_SWITCH", &mut self.policy.kill_switch)?;
 
         Ok(())
     }

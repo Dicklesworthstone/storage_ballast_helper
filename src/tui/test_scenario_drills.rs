@@ -62,6 +62,7 @@ fn yellow_state() -> DaemonState {
             errors: 0,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 48_000_000,
     }
 }
@@ -100,6 +101,7 @@ fn red_state() -> DaemonState {
             errors: 1,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 72_000_000,
     }
 }
@@ -138,6 +140,7 @@ fn recovery_state() -> DaemonState {
             errors: 1,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 40_000_000,
     }
 }
@@ -176,6 +179,7 @@ fn depleted_state() -> DaemonState {
             errors: 3,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 80_000_000,
     }
 }
@@ -222,6 +226,7 @@ fn multi_mount_state() -> DaemonState {
             errors: 0,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 52_000_000,
     }
 }

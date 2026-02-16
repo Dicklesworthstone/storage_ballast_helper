@@ -30,7 +30,7 @@ use storage_ballast_helper::scanner::patterns::ArtifactPatternRegistry;
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
 use storage_ballast_helper::scanner::scoring::{CandidacyScore, CandidateInput, ScoringEngine};
 use storage_ballast_helper::scanner::walker::{
-    DirectoryWalker, OpenPathCache, WalkerConfig, collect_open_files, is_path_open,
+    DirectoryWalker, WalkerConfig, collect_open_path_ancestors, is_path_open_by_ancestor,
 };
 
 const LIVE_REFRESH_MIN_MS: u64 = 100;
@@ -3440,10 +3440,14 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     // Evaluate in rank order and stop once we have enough results.
     let mut candidates: Vec<_> = Vec::with_capacity(args.top.min(preliminary.len()));
     if args.top > 0 && !preliminary.is_empty() {
-        let open_files = collect_open_files();
-        let mut open_checker = OpenPathCache::new(&open_files);
+        let open_paths = collect_open_path_ancestors(
+            &preliminary
+                .iter()
+                .map(|score| score.path.clone())
+                .collect::<Vec<_>>(),
+        );
         for score in preliminary {
-            if open_checker.is_path_open(&score.path) {
+            if is_path_open_by_ancestor(&score.path, &open_paths) {
                 continue;
             }
             candidates.push(score);
@@ -3651,9 +3655,13 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
 
     // Filter open files from survivors.
     if !scored.is_empty() {
-        let open_files = collect_open_files();
-        let mut open_checker = OpenPathCache::new(&open_files);
-        scored.retain(|c| !open_checker.is_path_open(&c.path));
+        let open_paths = collect_open_path_ancestors(
+            &scored
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .collect::<Vec<_>>(),
+        );
+        scored.retain(|candidate| !is_path_open_by_ancestor(&candidate.path, &open_paths));
     }
 
     let scan_elapsed = start.elapsed();
@@ -3907,8 +3915,8 @@ fn run_interactive_clean(
 
         if action == 'y' {
             // Re-check if path is still in use before deleting.
-            let fresh_open_files = collect_open_files();
-            if is_path_open(&candidate.path, &fresh_open_files) {
+            let fresh_open_paths = collect_open_path_ancestors(&[candidate.path.clone()]);
+            if is_path_open_by_ancestor(&candidate.path, &fresh_open_paths) {
                 eprintln!("    Skipped (now in use): {}", candidate.path.display());
                 items_skipped += 1;
             } else {
@@ -4284,9 +4292,8 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Runtime(e.to_string()))?;
     let dir_count = entries.len();
 
-    // Collect open files.
-    let open_files = collect_open_files();
-    let mut open_checker = OpenPathCache::new(&open_files);
+    // Collect open path ancestors under emergency roots (single /proc scan).
+    let open_paths = collect_open_path_ancestors(&root_paths);
 
     // Classify and score using default weights.
     let registry = ArtifactPatternRegistry::default();
@@ -4306,7 +4313,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 age,
                 classification,
                 signals: entry.structural_signals,
-                is_open: open_checker.is_path_open(&entry.path),
+                is_open: is_path_open_by_ancestor(&entry.path, &open_paths),
                 excluded: false,
             };
             // High urgency (0.8) for emergency mode — aggressive scoring.

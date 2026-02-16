@@ -100,6 +100,7 @@ fn arb_daemon_state() -> impl Strategy<Value = DaemonState> {
             errors: 0,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 32_000_000,
     })
 }
@@ -443,7 +444,8 @@ proptest! {
                         scans: 0, deletions: 0, bytes_freed: 0, errors: 0,
                         dropped_log_events: 0,
                     },
-                    memory_rss_bytes: 0,
+                    policy_mode: "enforce".into(),
+        memory_rss_bytes: 0,
                 };
                 update::update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state))));
             } else {
@@ -1052,6 +1054,7 @@ fn degraded_state_toggles_with_data_updates() {
                 errors: 0,
                 dropped_log_events: 0,
             },
+            policy_mode: "enforce".into(),
             memory_rss_bytes: 0,
         }))),
     );

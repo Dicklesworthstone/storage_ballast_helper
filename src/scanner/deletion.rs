@@ -165,15 +165,21 @@ impl DeletionExecutor {
             circuit_breaker_tripped: false,
         };
 
-        // Collect open files once per batch to avoid repeated /proc scans.
-        let open_files = if self.config.check_open_files {
-            Some(walker::collect_open_files())
+        let mut consecutive_failures: u32 = 0;
+        let limit = plan.candidates.len().min(self.config.max_batch_size);
+        // Build an open-path ancestor index once per batch to avoid deep per-candidate
+        // inode-tree scans on large artifact directories.
+        let open_paths = if self.config.check_open_files {
+            let roots = plan
+                .candidates
+                .iter()
+                .take(limit)
+                .map(|candidate| candidate.path.clone())
+                .collect::<Vec<_>>();
+            Some(walker::collect_open_path_ancestors(&roots))
         } else {
             None
         };
-
-        let mut consecutive_failures: u32 = 0;
-        let limit = plan.candidates.len().min(self.config.max_batch_size);
 
         for candidate in plan.candidates.iter().take(limit) {
             // Circuit breaker: stop immediately on consecutive failures.
@@ -200,7 +206,7 @@ impl DeletionExecutor {
             }
 
             // Pre-flight safety checks.
-            match self.preflight_check(&candidate.path, open_files.as_ref()) {
+            match self.preflight_check(&candidate.path, open_paths.as_ref()) {
                 Ok(()) => {}
                 Err(skip) => {
                     report.items_skipped += 1;
@@ -263,7 +269,7 @@ impl DeletionExecutor {
     fn preflight_check(
         &self,
         path: &Path,
-        open_files: Option<&HashSet<(u64, u64)>>,
+        open_paths: Option<&HashSet<PathBuf>>,
     ) -> std::result::Result<(), SkipReason> {
         // 1. Path still exists (use symlink_metadata to not follow symlinks).
         let Ok(meta) = fs::symlink_metadata(path) else {
@@ -289,8 +295,8 @@ impl DeletionExecutor {
         }
 
         // 5. Not currently open by any process (Linux /proc check).
-        if let Some(open) = open_files
-            && walker::is_path_open(path, open)
+        if let Some(open) = open_paths
+            && walker::is_path_open_by_ancestor(path, open)
         {
             return Err(SkipReason::FileOpen);
         }
@@ -763,7 +769,6 @@ mod tests {
     #[test]
     fn nested_open_file_is_detected_for_parent_directory() {
         use crate::scanner::walker;
-        use std::os::unix::fs::MetadataExt;
 
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("a").join("b").join("c");
@@ -773,17 +778,17 @@ mod tests {
 
         let handle = fs::File::open(&file_path).unwrap();
 
-        let open_files = walker::collect_open_files();
+        let open_paths = walker::collect_open_path_ancestors(&[dir.path().to_path_buf()]);
 
-        // Guard: skip if /proc doesn't expose our own fds (hidepid=2, containers).
-        let file_meta = fs::metadata(&file_path).unwrap();
-        if !open_files.contains(&(file_meta.dev(), file_meta.ino())) {
+        // Guard: skip if /proc doesn't expose our own fds (hidepid=2, containers)
+        // or if budget limits produce no ancestor data for this path.
+        if !open_paths.contains(&file_path) {
             drop(handle);
             return;
         }
 
         assert!(
-            walker::is_path_open(dir.path(), &open_files),
+            walker::is_path_open_by_ancestor(dir.path(), &open_paths),
             "open file in nested subtree should mark parent as open"
         );
         drop(handle);

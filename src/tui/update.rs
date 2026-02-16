@@ -603,6 +603,7 @@ mod tests {
                 errors: 0,
                 dropped_log_events: 0,
             },
+            policy_mode: "enforce".into(),
             memory_rss_bytes: 52_428_800,
         }
     }

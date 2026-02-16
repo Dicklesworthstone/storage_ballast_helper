@@ -64,6 +64,7 @@ fn yellow_pressure_state() -> DaemonState {
             errors: 0,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 48_000_000,
     }
 }
@@ -102,6 +103,7 @@ fn red_critical_state() -> DaemonState {
             errors: 1,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 72_000_000,
     }
 }
@@ -140,6 +142,7 @@ fn recovery_state() -> DaemonState {
             errors: 1,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 40_000_000,
     }
 }
@@ -178,6 +181,7 @@ fn ballast_depleted_state() -> DaemonState {
             errors: 3,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 80_000_000,
     }
 }
@@ -224,6 +228,7 @@ fn multi_mount_divergent_state() -> DaemonState {
             errors: 0,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 52_000_000,
     }
 }

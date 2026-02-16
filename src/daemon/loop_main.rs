@@ -21,13 +21,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::Config;
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::notifications::{NotificationEvent, NotificationManager};
+use crate::daemon::policy::PolicyEngine;
 use crate::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, spawn_logger};
@@ -266,6 +267,7 @@ pub struct MonitoringDaemon {
     last_special_scan: HashMap<PathBuf, Instant>,
     last_predictive_warning: Option<Instant>,
     self_monitor: SelfMonitor,
+    policy_engine: Arc<Mutex<PolicyEngine>>,
     scanner_heartbeat: Arc<ThreadHeartbeat>,
     executor_heartbeat: Arc<ThreadHeartbeat>,
 }
@@ -422,6 +424,9 @@ impl MonitoringDaemon {
         // 13. Notification manager.
         let notification_manager = NotificationManager::from_config(&config.notifications);
 
+        // 14. Policy engine (progressive delivery gates for deletion pipeline).
+        let policy_engine = Arc::new(Mutex::new(PolicyEngine::new(config.policy.clone())));
+
         let cached_primary_path = compute_primary_path(&config);
 
         Ok(Self {
@@ -438,6 +443,7 @@ impl MonitoringDaemon {
             ballast_coordinator,
             release_controller,
             notification_manager,
+            policy_engine,
             scoring_engine,
             voi_scheduler,
             shared_executor_config,
@@ -623,6 +629,7 @@ impl MonitoringDaemon {
                     .sum();
                 let dropped_log_events = self.logger_handle.dropped_events();
 
+                let policy_mode = self.policy_engine.lock().mode().to_string();
                 self.self_monitor.maybe_write_state(
                     response.level,
                     free_pct,
@@ -630,6 +637,7 @@ impl MonitoringDaemon {
                     ballast_available,
                     ballast_total,
                     dropped_log_events,
+                    &policy_mode,
                 );
             }
 
@@ -1390,11 +1398,19 @@ impl MonitoringDaemon {
         report_tx: Sender<WorkerReport>,
     ) -> Result<thread::JoinHandle<()>> {
         let shared_config = Arc::clone(&self.shared_executor_config);
+        let policy_engine = Arc::clone(&self.policy_engine);
 
         thread::Builder::new()
             .name("sbh-executor".to_string())
             .spawn(move || {
-                executor_thread_main(&del_rx, &logger, &shared_config, &heartbeat, &report_tx);
+                executor_thread_main(
+                    &del_rx,
+                    &logger,
+                    &shared_config,
+                    &heartbeat,
+                    &report_tx,
+                    &policy_engine,
+                );
             })
             .map_err(|source| SbhError::Runtime {
                 details: format!("failed to spawn executor thread: {source}"),
@@ -1643,7 +1659,11 @@ fn scanner_thread_main(
                 break;
             }
 
-            let age = entry.metadata.effective_age_timestamp().elapsed().unwrap_or(Duration::ZERO);
+            let age = entry
+                .metadata
+                .effective_age_timestamp()
+                .elapsed()
+                .unwrap_or(Duration::ZERO);
 
             // Classify.
             let classification = pattern_registry.classify(&entry.path, entry.structural_signals);
@@ -1761,6 +1781,10 @@ fn scanner_thread_main(
 
 /// Executor thread: receives deletion batches and safely removes artifacts.
 ///
+/// Gates all deletions through the `PolicyEngine` before execution. In Observe
+/// or FallbackSafe modes, the policy engine blocks all deletions. In Canary mode,
+/// a capped subset is allowed. In Enforce mode, all scored candidates proceed.
+///
 /// Reads `dry_run`, `max_batch_size`, and `min_score` from shared atomics on each
 /// batch, so config reloads (SIGHUP) take effect without respawning the thread.
 fn executor_thread_main(
@@ -1769,9 +1793,30 @@ fn executor_thread_main(
     shared_config: &Arc<SharedExecutorConfig>,
     heartbeat: &Arc<ThreadHeartbeat>,
     report_tx: &Sender<WorkerReport>,
+    policy_engine: &Arc<Mutex<PolicyEngine>>,
 ) {
     while let Ok(batch) = del_rx.recv() {
         heartbeat.beat();
+
+        // Gate candidates through the policy engine. The lock is held only for
+        // the duration of evaluate() (pure computation, no I/O).
+        let approved_candidates = {
+            let mut policy = policy_engine.lock();
+            let decision = policy.evaluate(&batch.candidates, None);
+            if !decision.approved_for_deletion.is_empty() {
+                eprintln!(
+                    "[SBH-EXECUTOR] policy engine approved {}/{} candidates (mode={})",
+                    decision.approved_for_deletion.len(),
+                    batch.candidates.len(),
+                    decision.mode,
+                );
+            }
+            decision.approved_for_deletion
+        };
+
+        if approved_candidates.is_empty() {
+            continue;
+        }
 
         // Read latest config from shared atomics (updated by config reload).
         let dry_run = shared_config.dry_run.load(Ordering::Relaxed);
@@ -1789,7 +1834,7 @@ fn executor_thread_main(
             Some(logger.clone()),
         );
 
-        let plan = executor.plan(batch.candidates);
+        let plan = executor.plan(approved_candidates);
 
         if plan.candidates.is_empty() {
             continue;

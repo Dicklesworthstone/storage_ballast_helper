@@ -332,6 +332,7 @@ const EXPECTED_STATE_KEYS: &[&str] = &[
     "last_scan",
     "counters",
     "memory_rss_bytes",
+    "policy_mode",
 ];
 
 /// Compare JSON keys against expected `DaemonState` fields.
@@ -692,6 +693,7 @@ mod tests {
                 errors: 0,
                 dropped_log_events: 0,
             },
+            policy_mode: "enforce".into(),
             memory_rss_bytes: 1024 * 1024,
         }
     }

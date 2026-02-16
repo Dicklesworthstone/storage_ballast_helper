@@ -409,6 +409,7 @@ pub fn sample_healthy_state() -> DaemonState {
             errors: 0,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 32_000_000,
     }
 }
@@ -447,6 +448,7 @@ pub fn sample_pressured_state() -> DaemonState {
             errors: 2,
             dropped_log_events: 0,
         },
+        policy_mode: "enforce".into(),
         memory_rss_bytes: 64_000_000,
     }
 }

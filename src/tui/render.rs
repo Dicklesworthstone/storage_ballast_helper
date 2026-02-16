@@ -1596,6 +1596,7 @@ mod tests {
                 errors: 1,
                 dropped_log_events: 0,
             },
+            policy_mode: "enforce".into(),
             memory_rss_bytes: 52_428_800,
         }
     }
@@ -1744,6 +1745,7 @@ mod tests {
                 errors: 3,
                 dropped_log_events: 1,
             },
+            policy_mode: "enforce".into(),
             memory_rss_bytes: 104_857_600,
         }
     }

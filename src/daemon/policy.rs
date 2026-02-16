@@ -107,7 +107,7 @@ impl fmt::Display for FallbackReason {
 // ──────────────────── policy config ────────────────────
 
 /// Configuration for the policy engine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PolicyConfig {
     /// Initial mode on daemon start.
     pub initial_mode: ActiveMode,
@@ -136,7 +136,7 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            initial_mode: ActiveMode::Observe,
+            initial_mode: ActiveMode::Enforce,
             max_candidates_per_loop: 100,
             max_hypothetical_deletes: 25,
             max_canary_deletes_per_hour: 10,
@@ -595,7 +595,10 @@ mod tests {
     use std::time::Duration;
 
     fn default_config() -> PolicyConfig {
-        PolicyConfig::default()
+        PolicyConfig {
+            initial_mode: ActiveMode::Observe,
+            ..PolicyConfig::default()
+        }
     }
 
     fn sample_candidate(action: DecisionAction, score: f64) -> CandidacyScore {
@@ -670,9 +673,9 @@ mod tests {
     // ──── mode lifecycle tests ────
 
     #[test]
-    fn starts_in_observe_by_default() {
-        let engine = PolicyEngine::new(default_config());
-        assert_eq!(engine.mode(), ActiveMode::Observe);
+    fn starts_in_enforce_by_default() {
+        let engine = PolicyEngine::new(PolicyConfig::default());
+        assert_eq!(engine.mode(), ActiveMode::Enforce);
     }
 
     #[test]
