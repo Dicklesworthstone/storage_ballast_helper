@@ -22,7 +22,7 @@ pub fn sparkline(values: &[f64]) -> String {
 
 /// Render a horizontal gauge with percentage label.
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
 pub fn gauge(used_pct: f64, width: usize) -> String {
     let clamped_pct = used_pct.clamp(0.0, 100.0);
     let filled = ((clamped_pct / 100.0) * width as f64).round() as usize;

@@ -932,10 +932,10 @@ fn parse_jsonl_entry_with_schema_shield(line: &str) -> ParseOutcome {
 
     let mut details = read_string_field(object, &["details", "summary", "message"]);
     if let Some(raw) = raw_event.filter(|token| parse_event_type(token).is_none()) {
-        details = Some(match details {
-            Some(existing) => format!("schema-shield unknown-event={raw}; {existing}"),
-            None => format!("schema-shield unknown-event={raw}"),
-        });
+        details = Some(details.map_or_else(
+            || format!("schema-shield unknown-event={raw}"),
+            |existing| format!("schema-shield unknown-event={raw}; {existing}"),
+        ));
     }
 
     ParseOutcome::Recovered(crate::logger::jsonl::LogEntry {
@@ -1035,6 +1035,10 @@ fn read_u64_field(object: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
                     if float.is_sign_negative() || !float.is_finite() {
                         None
                     } else {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss
+                        )]
                         Some(float.round() as u64)
                     }
                 })
@@ -1299,7 +1303,7 @@ mod tests {
         assert_eq!(evidence.decision_id, 42);
         assert_eq!(evidence.path, "/tmp/build");
         assert_eq!(evidence.action, "delete");
-        assert_eq!(evidence.total_score, 0.75);
+        assert!((evidence.total_score - 0.75).abs() < f64::EPSILON);
         assert_eq!(evidence.age_secs, 0);
         assert!(!evidence.vetoed);
         assert_eq!(evidence.summary, "cleanup");
@@ -1843,7 +1847,7 @@ mod tests {
         let result = adapter.recent_decisions(10);
         assert_eq!(result.data.len(), 1);
         assert_eq!(result.data[0].path, "/tmp/target");
-        assert_eq!(result.data[0].total_score, 0.92);
+        assert!((result.data[0].total_score - 0.92).abs() < f64::EPSILON);
         assert_eq!(result.data[0].action, "delete");
     }
 

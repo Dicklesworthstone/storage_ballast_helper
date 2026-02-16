@@ -53,7 +53,7 @@ fn mock_platform() -> Arc<dyn crate::platform::pal::Platform> {
     };
     Arc::new(MockPlatform::new(
         vec![mount.clone()],
-        HashMap::from([(mount.path.clone(), stats)]),
+        HashMap::from([(mount.path, stats)]),
         MemoryInfo {
             total_bytes: 1,
             available_bytes: 1,
@@ -184,7 +184,7 @@ fn state_empty_file_yields_malformed() {
 fn state_binary_garbage_yields_malformed() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("state.json");
-    std::fs::write(&path, &[0xFF, 0xFE, 0x00, 0x01, 0x80]).unwrap();
+    std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x01, 0x80]).unwrap();
 
     let adapter = make_adapter(90);
     let snap = adapter.load_snapshot(&path, &[]);
@@ -565,7 +565,7 @@ fn prefs_load_empty_file_returns_corrupt() {
 fn prefs_load_binary_garbage_returns_corrupt() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("prefs.json");
-    std::fs::write(&path, &[0xFF, 0xFE, 0x00, 0x80, 0x90]).unwrap();
+    std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x80, 0x90]).unwrap();
 
     match preferences::load(&path) {
         LoadOutcome::Corrupt { .. } => {}
@@ -577,8 +577,10 @@ fn prefs_load_binary_garbage_returns_corrupt() {
 fn prefs_load_future_schema_version_warns_but_loads() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("prefs.json");
-    let mut prefs = UserPreferences::default();
-    prefs.schema_version = 999;
+    let prefs = UserPreferences {
+        schema_version: 999,
+        ..UserPreferences::default()
+    };
     preferences::save(&prefs, &path).unwrap();
 
     match preferences::load(&path) {

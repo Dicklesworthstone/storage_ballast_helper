@@ -178,7 +178,7 @@ impl CandidatesSortOrder {
 ///
 /// A TUI-friendly projection of `PoolInventory` from the coordinator module.
 /// String fields are used instead of `PathBuf`/enums for render simplicity.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BallastVolume {
     /// Mount point this pool manages.
     pub mount_point: String,
@@ -405,8 +405,8 @@ impl RateHistory {
         let sum: f64 = self.values.iter().sum();
         #[allow(clippy::cast_precision_loss)]
         let avg = sum / self.values.len() as f64;
-        let min = self.values.iter().cloned().reduce(f64::min).unwrap_or(0.0);
-        let max = self.values.iter().cloned().reduce(f64::max).unwrap_or(0.0);
+        let min = self.values.iter().copied().reduce(f64::min).unwrap_or(0.0);
+        let max = self.values.iter().copied().reduce(f64::max).unwrap_or(0.0);
         Some((latest, avg, min, max))
     }
 
@@ -435,6 +435,7 @@ const MAX_NOTIFICATIONS: usize = 3;
 /// This struct is the single source of truth for the view layer. The update
 /// function produces a new model; the render function reads it immutably.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct DashboardModel {
     /// Active screen.
     pub screen: Screen,
@@ -1699,8 +1700,7 @@ mod tests {
         let mut model = test_model();
         // Ring buffer capacity is 60 (set in new()).
         for i in 0..100 {
-            #[allow(clippy::cast_precision_loss)]
-            model.frame_times.push(i as f64);
+            model.frame_times.push(f64::from(i));
         }
         assert_eq!(model.frame_times.len(), 60);
         // Latest should be the last pushed value.

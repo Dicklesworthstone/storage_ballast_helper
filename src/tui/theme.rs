@@ -156,8 +156,7 @@ impl ThemePalette {
         match level {
             "green" => self.success,
             "yellow" => self.warning,
-            "orange" => self.danger,
-            "red" => self.danger,
+            "orange" | "red" => self.danger,
             "critical" => self.critical,
             _ => self.neutral,
         }

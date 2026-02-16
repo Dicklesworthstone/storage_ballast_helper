@@ -174,10 +174,9 @@ pub fn route_palette_query(query: &str) -> Option<InputAction> {
 /// Build contextual help entries for the current screen/overlay state.
 #[must_use]
 pub fn contextual_help(context: InputContext) -> ContextualHelp {
-    match context.active_overlay {
-        Some(overlay) => overlay_help(overlay),
-        None => screen_help(context.screen),
-    }
+    context
+        .active_overlay
+        .map_or_else(|| screen_help(context.screen), overlay_help)
 }
 
 fn resolve_overlay_key(key: &KeyEvent, overlay: Overlay) -> InputResolution {
@@ -202,10 +201,10 @@ fn resolve_global_key(key: &KeyEvent) -> InputResolution {
         KeyCode::Char('c') if key.ctrl() => InputResolution::action(InputAction::Quit),
         KeyCode::Char('q') => InputResolution::action(InputAction::Quit),
         KeyCode::Escape => InputResolution::action(InputAction::BackOrQuit),
-        KeyCode::Char(c @ '1'..='7') => match Screen::from_number(c as u8 - b'0') {
-            Some(screen) => InputResolution::action(InputAction::Navigate(screen)),
-            None => InputResolution::passthrough(),
-        },
+        KeyCode::Char(c @ '1'..='7') => Screen::from_number(c as u8 - b'0').map_or_else(
+            InputResolution::passthrough,
+            |screen| InputResolution::action(InputAction::Navigate(screen)),
+        ),
         KeyCode::Char('[') => InputResolution::action(InputAction::NavigatePrev),
         KeyCode::Char(']') => InputResolution::action(InputAction::NavigateNext),
         KeyCode::Char('?') => InputResolution::action(InputAction::OpenOverlay(Overlay::Help)),
@@ -265,9 +264,8 @@ fn is_fuzzy_subsequence(haystack: &str, needle: &str) -> bool {
     }
 
     let mut needle_chars = needle.chars();
-    let mut wanted = match needle_chars.next() {
-        Some(ch) => ch,
-        None => return true,
+    let Some(mut wanted) = needle_chars.next() else {
+        return true;
     };
 
     for ch in haystack.chars() {

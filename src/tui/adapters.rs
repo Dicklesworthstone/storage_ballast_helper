@@ -438,7 +438,7 @@ mod tests {
     fn fresh_state_prefers_daemon_data() {
         let tmp = TempDir::new().expect("tempdir");
         let state_path = tmp.path().join("state.json");
-        write_state_file(&state_path, sample_daemon_state()).expect("write state");
+        write_state_file(&state_path, &sample_daemon_state()).expect("write state");
 
         let adapter = DashboardStateAdapter::new(
             mock_platform(),
@@ -458,7 +458,7 @@ mod tests {
     fn stale_state_falls_back_to_filesystem_stats() {
         let tmp = TempDir::new().expect("tempdir");
         let state_path = tmp.path().join("state.json");
-        write_state_file(&state_path, sample_daemon_state()).expect("write state");
+        write_state_file(&state_path, &sample_daemon_state()).expect("write state");
 
         let stale_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(3600));
         set_file_mtime(&state_path, stale_mtime).expect("set stale mtime");
@@ -615,7 +615,7 @@ mod tests {
     fn read_state_only_accepts_fresh_state() {
         let tmp = TempDir::new().expect("tempdir");
         let state_path = tmp.path().join("state.json");
-        write_state_file(&state_path, sample_daemon_state()).expect("write state");
+        write_state_file(&state_path, &sample_daemon_state()).expect("write state");
 
         let fresh_adapter = DashboardStateAdapter::new(
             mock_platform(),
@@ -654,8 +654,8 @@ mod tests {
         assert_eq!(snapshot.mounts[0].path, "/tmp");
     }
 
-    fn write_state_file(path: &Path, state: DaemonState) -> std::io::Result<()> {
-        let encoded = serde_json::to_string(&state).expect("state json");
+    fn write_state_file(path: &Path, state: &DaemonState) -> std::io::Result<()> {
+        let encoded = serde_json::to_string(state).expect("state json");
         std::fs::write(path, encoded)
     }
 
@@ -713,7 +713,7 @@ mod tests {
         };
         Arc::new(MockPlatform::new(
             vec![mount.clone()],
-            HashMap::from([(mount.path.clone(), stats)]),
+            HashMap::from([(mount.path, stats)]),
             MemoryInfo {
                 total_bytes: 1,
                 available_bytes: 1,
@@ -730,7 +730,7 @@ mod tests {
     fn fresh_state_has_no_schema_warnings() {
         let tmp = TempDir::new().expect("tempdir");
         let state_path = tmp.path().join("state.json");
-        write_state_file(&state_path, sample_daemon_state()).expect("write");
+        write_state_file(&state_path, &sample_daemon_state()).expect("write");
 
         let adapter = DashboardStateAdapter::new(
             mock_platform(),

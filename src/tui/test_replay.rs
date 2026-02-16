@@ -350,7 +350,7 @@ fn observe_mode_decisions() -> Vec<DecisionEvidence> {
         timestamp: "2026-02-16T01:00:00Z".into(),
         path: "/data/old-target".into(),
         size_bytes: 1_000_000_000,
-        age_secs: 172800,
+        age_secs: 172_800,
         action: "delete".into(),
         effective_action: Some("observe".into()),
         policy_mode: "observe".into(),
@@ -382,7 +382,7 @@ fn canary_mode_decisions() -> Vec<DecisionEvidence> {
         timestamp: "2026-02-16T01:30:00Z".into(),
         path: "/data/stale-cache".into(),
         size_bytes: 800_000_000,
-        age_secs: 259200,
+        age_secs: 259_200,
         action: "delete".into(),
         effective_action: Some("delete".into()),
         policy_mode: "canary".into(),
@@ -434,6 +434,7 @@ fn decisions_result(decisions: Vec<DecisionEvidence>) -> TelemetryResult<Vec<Dec
     }
 }
 
+#[allow(dead_code)]
 fn unavailable_timeline() -> TelemetryResult<Vec<TimelineEvent>> {
     TelemetryResult::unavailable("no telemetry backend available".into())
 }

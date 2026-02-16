@@ -175,6 +175,7 @@ fn screen_name(s: Screen) -> String {
     format!("{s:?}")
 }
 
+#[allow(clippy::single_option_map)]
 fn overlay_name(o: Option<Overlay>) -> Option<String> {
     o.map(|v| format!("{v:?}"))
 }
@@ -387,9 +388,11 @@ impl ArtifactRecorder {
 
     /// Finalize the trace and return the artifact. Optionally writes to disk.
     pub fn finish(self, passed: bool) -> DashboardTestTrace {
+        #[allow(clippy::cast_possible_truncation)]
         let duration_us = self.start_instant.elapsed().as_micros() as u64;
         let include_text = self.include_frame_text || !passed;
 
+        #[allow(clippy::cast_possible_truncation)]
         let frames: Vec<FrameRecord> = self
             .harness
             .frames()
@@ -463,7 +466,7 @@ fn write_artifact(trace: &DashboardTestTrace, dir: &Path) -> std::io::Result<Pat
     let filename = format!("{}_{slug}.json", trace.trace_id);
     let path = dir.join(filename);
     let json = serde_json::to_string_pretty(trace)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     std::fs::write(&path, json)?;
     Ok(path)
 }
@@ -475,6 +478,7 @@ fn snapshot_to_record(snap: &FrameSnapshot, seq: u32, include_text: bool) -> Fra
         tick: snap.tick,
         degraded: snap.degraded,
         overlay: overlay_name(snap.overlay),
+        #[allow(clippy::cast_possible_truncation)]
         text_lines: snap.text.lines().count() as u32,
         text_hash: hash_text(&snap.text),
         text: if include_text {

@@ -842,9 +842,7 @@ mod tests {
     #[test]
     fn parity_matrix_has_no_regressions() {
         let report = run_parity_matrix();
-        if !report.is_clean() {
-            panic!("parity regressions detected:\n{}", report.summary());
-        }
+        assert!(report.is_clean(), "parity regressions detected:\n{}", report.summary());
     }
 
     #[test]
