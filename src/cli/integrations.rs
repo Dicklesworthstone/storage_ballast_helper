@@ -577,6 +577,7 @@ fn find_root_close_brace(contents: &str) -> Option<usize> {
 
     while i < len {
         let ch = bytes[i];
+
         if in_string {
             if ch == b'\\' {
                 i += 2; // skip escaped character
@@ -588,13 +589,27 @@ fn find_root_close_brace(contents: &str) -> Option<usize> {
             i += 1;
             continue;
         }
-        // Skip JSONC line comments.
-        if ch == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
+
+        // Handle comments
+        if ch == b'/' && i + 1 < len {
+            if bytes[i + 1] == b'/' {
+                // Line comment
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            } else if bytes[i + 1] == b'*' {
+                // Block comment
+                i += 2;
+                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2; // skip ending */
+                continue;
             }
-            continue;
         }
+
         match ch {
             b'"' => in_string = true,
             b'{' => depth += 1,
@@ -1141,5 +1156,24 @@ mod tests {
     fn integration_status_display_all_variants() {
         assert_eq!(IntegrationStatus::Skipped.to_string(), "skipped");
         assert_eq!(IntegrationStatus::Failed.to_string(), "failed");
+    }
+
+    #[test]
+    fn find_root_close_brace_ignores_block_comments() {
+        let json = r#"
+        {
+            "key": "value",
+            /* } */
+            "nested": {
+                "a": 1
+            }
+        }
+        "#;
+        let pos = find_root_close_brace(json).unwrap();
+        // The last } is at the end.
+        let slice = &json[pos..];
+        assert!(slice.starts_with('}'));
+        // Ensure it didn't pick the one inside the comment.
+        assert!(pos > json.find("/* } */").unwrap() + 7);
     }
 }
