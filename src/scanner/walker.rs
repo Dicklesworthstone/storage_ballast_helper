@@ -81,6 +81,7 @@ impl DirectoryWalker {
     }
 
     /// Set a heartbeat callback to be called periodically by worker threads.
+    #[must_use]
     pub fn with_heartbeat<F>(mut self, callback: F) -> Self
     where
         F: Fn() + Send + Sync + 'static,
@@ -95,6 +96,13 @@ impl DirectoryWalker {
     /// score them. Open-file set should be collected separately and matched
     /// against results afterward.
     pub fn walk(&self) -> Result<Vec<WalkEntry>> {
+        Ok(self.stream()?.into_iter().collect())
+    }
+
+    /// Stream entries as they are discovered.
+    ///
+    /// Returns a receiver that yields entries. The walk runs in background threads.
+    pub fn stream(&self) -> Result<channel::Receiver<WalkEntry>> {
         let parallelism = self.config.parallelism.max(1);
 
         // Channels: work items (bounded) and results (unbounded for throughput).
@@ -126,43 +134,29 @@ impl DirectoryWalker {
         }
 
         // Clone sender for workers; drop original so channel closes when workers finish.
-        let workers: Vec<_> = (0..parallelism)
-            .map(|_| {
-                let work_rx = work_rx.clone();
-                let work_tx = work_tx.clone();
-                let result_tx = result_tx.clone();
-                let in_flight = Arc::clone(&in_flight);
-                let config = self.config.clone();
-                let protection = Arc::clone(&self.protection);
-                let heartbeat = self.heartbeat.clone();
+        for _ in 0..parallelism {
+            let work_rx = work_rx.clone();
+            let work_tx = work_tx.clone();
+            let result_tx = result_tx.clone();
+            let in_flight = Arc::clone(&in_flight);
+            let config = self.config.clone();
+            let protection = Arc::clone(&self.protection);
+            let heartbeat = self.heartbeat.clone();
 
-                thread::spawn(move || {
-                    walker_thread(
-                        &work_rx,
-                        &work_tx,
-                        &result_tx,
-                        &in_flight,
-                        &config,
-                        &protection,
-                        &heartbeat,
-                    );
-                })
-            })
-            .collect();
-
-        // Drop our copies of the senders.
-        drop(work_tx);
-        drop(result_tx);
-
-        // Collect results.
-        let entries: Vec<WalkEntry> = result_rx.iter().collect();
-
-        // Wait for all workers to finish.
-        for handle in workers {
-            let _ = handle.join();
+            thread::spawn(move || {
+                walker_thread(
+                    &work_rx,
+                    &work_tx,
+                    &result_tx,
+                    &in_flight,
+                    &config,
+                    &protection,
+                    heartbeat.as_ref(),
+                );
+            });
         }
 
-        Ok(entries)
+        Ok(result_rx)
     }
 
     /// Access the protection registry (e.g. to list discovered markers).
@@ -180,7 +174,7 @@ fn walker_thread(
     in_flight: &AtomicUsize,
     config: &WalkerConfig,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
-    heartbeat: &Option<Arc<dyn Fn() + Send + Sync>>,
+    heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
 ) {
     loop {
         // Beat the heart if configured.
@@ -451,7 +445,7 @@ fn collect_open_files_linux() -> HashSet<(u64, u64)> {
         let pid_bytes = pid_name.as_bytes();
 
         // Only numeric directories (PIDs).
-        if pid_bytes.is_empty() || !pid_bytes.iter().all(|byte| byte.is_ascii_digit()) {
+        if pid_bytes.is_empty() || !pid_bytes.iter().all(u8::is_ascii_digit) {
             continue;
         }
 
@@ -468,6 +462,100 @@ fn collect_open_files_linux() -> HashSet<(u64, u64)> {
     }
 
     open
+}
+
+/// Collect absolute open-path ancestors for open file descriptors under `root_paths`.
+///
+/// For each open file path, all ancestors are inserted, allowing O(1) subtree-open
+/// checks with `is_path_open_by_ancestor`.
+pub fn collect_open_path_ancestors(root_paths: &[PathBuf]) -> HashSet<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        collect_open_path_ancestors_linux(root_paths)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root_paths;
+        HashSet::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> HashSet<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut ancestors = HashSet::with_capacity(4096);
+    let Ok(proc_dir) = fs::read_dir("/proc") else {
+        return ancestors;
+    };
+
+    let normalized_roots: Vec<PathBuf> = if root_paths.is_empty() {
+        Vec::new()
+    } else {
+        root_paths
+            .iter()
+            .map(|path| crate::core::paths::resolve_absolute_path(path))
+            .collect()
+    };
+
+    for proc_entry in proc_dir.flatten() {
+        let pid_name = proc_entry.file_name();
+        let pid_bytes = pid_name.as_bytes();
+        if pid_bytes.is_empty() || !pid_bytes.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+
+        let Ok(fd_entries) = fs::read_dir(proc_entry.path().join("fd")) else {
+            continue;
+        };
+
+        for fd_entry in fd_entries.flatten() {
+            let Ok(mut target) = fs::read_link(fd_entry.path()) else {
+                continue;
+            };
+            if !target.is_absolute() {
+                continue;
+            }
+            if let Some(stripped) = target.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+                target = PathBuf::from(stripped);
+            }
+            if !normalized_roots.is_empty()
+                && !normalized_roots.iter().any(|r| target.starts_with(r))
+            {
+                continue;
+            }
+
+            let mut current = Some(target.as_path());
+            while let Some(path) = current {
+                ancestors.insert(path.to_path_buf());
+                let Some(parent) = path.parent() else {
+                    break;
+                };
+                if parent == path {
+                    break;
+                }
+                current = Some(parent);
+            }
+        }
+    }
+
+    ancestors
+}
+
+/// Check if `path` is present in the open-ancestor index.
+#[must_use]
+pub fn is_path_open_by_ancestor<S: std::hash::BuildHasher>(
+    path: &Path,
+    open_ancestors: &HashSet<PathBuf, S>,
+) -> bool {
+    if open_ancestors.contains(path) {
+        return true;
+    }
+    if path.is_absolute() {
+        return false;
+    }
+    let normalized = crate::core::paths::resolve_absolute_path(path);
+    open_ancestors.contains(&normalized)
 }
 
 /// Memoized open-file detector for repeated path checks during one scan pass.
@@ -501,12 +589,12 @@ impl<'a, S: std::hash::BuildHasher> OpenPathCache<'a, S> {
     #[cfg(target_os = "linux")]
     fn is_path_open_linux(&mut self, path: &Path) -> bool {
         use std::os::unix::fs::MetadataExt;
+        const MAX_SCAN: usize = 20_000;
 
         if let Some(cached) = self.dir_cache.get(path).copied() {
             return cached;
         }
 
-        const MAX_SCAN: usize = 20_000;
         let mut stack = vec![path.to_path_buf()];
         let mut checked = 0usize;
         let mut visited_dirs: Vec<PathBuf> = Vec::new();

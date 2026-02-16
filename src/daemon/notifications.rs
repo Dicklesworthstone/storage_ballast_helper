@@ -502,24 +502,7 @@ impl WebhookChannel {
     }
 
     fn render_body(&self, event: &NotificationEvent) -> String {
-        let summary = event.summary();
-        let level = event.level().to_string();
-
-        // Extract mount and free_pct from relevant events, or use defaults.
-        let (mount, free_pct) = match event {
-            NotificationEvent::PressureChanged {
-                mount, free_pct, ..
-            } => (mount.clone(), format!("{free_pct:.1}")),
-            NotificationEvent::PredictiveWarning { mount, .. }
-            | NotificationEvent::CleanupCompleted { mount, .. }
-            | NotificationEvent::BallastReleased { mount, .. } => {
-                (mount.clone(), "N/A".to_string())
-            }
-            _ => ("N/A".to_string(), "N/A".to_string()),
-        };
-
         // JSON-escape values to prevent injection in webhook payloads.
-        // Inline escaping avoids 4× serde_json::to_string allocations per notification.
         fn json_escape(s: &str) -> String {
             let mut out = String::with_capacity(s.len());
             for ch in s.chars() {
@@ -542,11 +525,56 @@ impl WebhookChannel {
             out
         }
 
-        self.template
-            .replace("${SUMMARY}", &json_escape(&summary))
-            .replace("${LEVEL}", &json_escape(&level))
-            .replace("${MOUNT}", &json_escape(&mount))
-            .replace("${FREE_PCT}", &json_escape(&free_pct))
+        let summary = event.summary();
+        let level = event.level().to_string();
+
+        // Extract mount and free_pct from relevant events, or use defaults.
+        let (mount, free_pct) = match event {
+            NotificationEvent::PressureChanged {
+                mount, free_pct, ..
+            } => (mount.clone(), format!("{free_pct:.1}")),
+            NotificationEvent::PredictiveWarning { mount, .. }
+            | NotificationEvent::CleanupCompleted { mount, .. }
+            | NotificationEvent::BallastReleased { mount, .. } => {
+                (mount.clone(), "N/A".to_string())
+            }
+            _ => ("N/A".to_string(), "N/A".to_string()),
+        };
+
+        let summary_esc = json_escape(&summary);
+        let level_esc = json_escape(&level);
+        let mount_esc = json_escape(&mount);
+        let free_pct_esc = json_escape(&free_pct);
+
+        let mut result = String::with_capacity(self.template.len() * 2);
+        let mut remainder = self.template.as_str();
+
+        while let Some(start) = remainder.find("${") {
+            result.push_str(&remainder[..start]);
+            let rest = &remainder[start + 2..];
+            if let Some(end) = rest.find('}') {
+                let key = &rest[..end];
+                match key {
+                    "SUMMARY" => result.push_str(&summary_esc),
+                    "LEVEL" => result.push_str(&level_esc),
+                    "MOUNT" => result.push_str(&mount_esc),
+                    "FREE_PCT" => result.push_str(&free_pct_esc),
+                    _ => {
+                        // Unknown key, keep literal
+                        result.push_str("${");
+                        result.push_str(key);
+                        result.push('}');
+                    }
+                }
+                remainder = &rest[end + 1..];
+            } else {
+                // Unclosed ${
+                result.push_str(&remainder[start..]);
+                remainder = "";
+            }
+        }
+        result.push_str(remainder);
+        result
     }
 }
 
@@ -971,18 +999,13 @@ mod tests {
             template: r#"{"msg": "${SUMMARY}", "lvl": "${LEVEL}"}"#.to_string(),
         };
 
-        let event = NotificationEvent::PressureChanged {
+        let _event = NotificationEvent::PressureChanged {
             from: "green".to_string(),
             to: "red".to_string(),
             mount: "/data".to_string(),
             free_pct: 10.0,
         };
 
-        // If SUMMARY contains "${LEVEL}", the naive approach would replace it.
-        // But render_body uses the event's summary() method which constructs a string.
-        // We can't easily inject "${LEVEL}" into the summary() output unless we control
-        // one of the fields. 'mount' is user-controlled via config or discovery.
-        
         // Let's create an event with a malicious mount path.
         let malicious_event = NotificationEvent::PressureChanged {
             from: "green".to_string(),
@@ -995,8 +1018,12 @@ mod tests {
         // The summary will be: "Pressure green -> red on /data/${LEVEL} (10.0% free)"
         // In the body, we expect: "msg": "... /data/${LEVEL} ...", "lvl": "red"
         // We do NOT want: "msg": "... /data/red ...", "lvl": "red"
-        
-        assert!(body.contains("/data/${LEVEL}"), "should not recursively replace placeholders");
+
+        // This test now passes with the new non-recursive parser!
+        assert!(
+            body.contains("/data/${LEVEL}"),
+            "should not recursively replace placeholders"
+        );
         assert!(body.contains(r#""lvl": "red""#));
     }
 

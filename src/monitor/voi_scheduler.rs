@@ -101,6 +101,8 @@ pub struct PathStats {
     pub ewma_io_cost_per_scan: f64,
     /// Forecast: predicted reclaim for next scan.
     pub forecast_reclaim: f64,
+    /// Forecast that was in effect before the most recent scan (for error computation).
+    last_pre_scan_forecast: f64,
     /// Last actual reclaim (for forecast error tracking).
     pub last_actual_reclaim: u64,
 }
@@ -116,6 +118,7 @@ impl PathStats {
             ewma_reclaim_per_scan: 0.0,
             ewma_io_cost_per_scan: 1000.0, // default assumption: 1000 reads per scan
             forecast_reclaim: 0.0,
+            last_pre_scan_forecast: 0.0,
             last_actual_reclaim: 0,
         }
     }
@@ -137,6 +140,10 @@ impl PathStats {
         self.last_scanned = Some(now);
         self.last_actual_reclaim = reclaimed_bytes;
 
+        // Snapshot the pre-update forecast so forecast_error() compares the actual
+        // result against the prediction that was made *before* seeing this observation.
+        self.last_pre_scan_forecast = self.forecast_reclaim;
+
         let reclaim_f = reclaimed_bytes as f64;
         self.ewma_reclaim_per_scan = ewma(alpha, self.ewma_reclaim_per_scan, reclaim_f);
         self.ewma_io_cost_per_scan = ewma(alpha, self.ewma_io_cost_per_scan, io_cost_estimate);
@@ -151,7 +158,7 @@ impl PathStats {
             return None;
         }
         let actual = self.last_actual_reclaim as f64;
-        let forecast = self.forecast_reclaim;
+        let forecast = self.last_pre_scan_forecast;
         if !actual.is_finite() || !forecast.is_finite() {
             return None;
         }
@@ -410,7 +417,8 @@ impl VoiScheduler {
 
         // 2. Pick exploitation targets (top utility, up to exploitation_budget).
         let mut selected: Vec<ScanPlanEntry> = Vec::with_capacity(budget);
-        let mut selected_set: std::collections::HashSet<&PathBuf> = std::collections::HashSet::new();
+        let mut selected_set: std::collections::HashSet<&PathBuf> =
+            std::collections::HashSet::new();
 
         for (path, utility) in scored.iter().take(exploitation_budget) {
             let forecast = self

@@ -281,12 +281,13 @@ fn remove_dir_contents(path: &Path) -> io::Result<(u64, u64)> {
 
     if path.is_dir() {
         for entry in fs::read_dir(path)?.flatten() {
-            if entry.path().is_dir() {
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
                 let (c, b) = remove_dir_contents(&entry.path())?;
                 count += c;
                 bytes += b;
             } else {
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let size = entry.metadata()?.len();
                 fs::remove_file(entry.path())?;
                 count += 1;
                 bytes += size;

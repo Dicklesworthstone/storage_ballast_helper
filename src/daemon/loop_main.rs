@@ -40,7 +40,7 @@ use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
 use crate::scanner::patterns::ArtifactPatternRegistry;
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::{CandidacyScore, ScoringEngine};
-use crate::scanner::walker::{DirectoryWalker, OpenPathCache, WalkerConfig};
+use crate::scanner::walker::{DirectoryWalker, WalkerConfig};
 
 // ──────────────────── channel capacities ────────────────────
 
@@ -644,7 +644,7 @@ impl MonitoringDaemon {
         let reading = PressureReading {
             free_bytes: stats.available_bytes,
             total_bytes: stats.total_bytes,
-            mount: stats.mount_point.clone(),
+            mount: stats.mount_point,
         };
         let response = self
             .pressure_controller
@@ -697,7 +697,7 @@ impl MonitoringDaemon {
                 // ReleaseController enforces global rate limits.
                 let collector = &self.fs_collector;
                 let inventory = self.ballast_coordinator.inventory();
-                
+
                 for pool_info in inventory {
                     if pool_info.files_available < pool_info.files_total {
                         let mount_path = pool_info.mount_point.clone();
@@ -707,16 +707,15 @@ impl MonitoringDaemon {
                                 .map(|s| s.free_pct())
                                 .unwrap_or(0.0)
                         };
-                        
+
                         // Try to replenish this pool.
-                        if let Ok(Some(report)) = self.ballast_coordinator.replenish_for_mount(
-                            &mount_path, 
-                            Some(&free_check)
-                        ) {
-                            if report.files_created > 0 {
-                                // One file replenished globally per tick is sufficient.
-                                break; 
-                            }
+                        if let Ok(Some(report)) = self
+                            .ballast_coordinator
+                            .replenish_for_mount(&mount_path, Some(&free_check))
+                            && report.files_created > 0
+                        {
+                            // One file replenished globally per tick is sufficient.
+                            break;
                         }
                     }
                 }
@@ -777,8 +776,10 @@ impl MonitoringDaemon {
             return Ok(());
         };
         let available = pool.available_count();
-        let count = self.release_controller.files_to_release(response, available);
-        
+        let count = self
+            .release_controller
+            .files_to_release(response, available);
+
         if count > 0 {
             self.ballast_coordinator.release_for_mount(mount, count)?;
         }
@@ -859,20 +860,25 @@ impl MonitoringDaemon {
     // ──────────────────── ballast ────────────────────
 
     fn provision_ballast(&mut self) -> Result<()> {
-        let report = self.ballast_coordinator.provision_all(self.platform.as_ref())?;
+        let report = self
+            .ballast_coordinator
+            .provision_all(self.platform.as_ref())?;
 
         let total_files = report.total_files_created();
         let total_bytes = report.total_bytes();
 
         if total_files > 0 {
             eprintln!(
-                "[SBH-DAEMON] provisioned {} ballast files ({} bytes total)",
-                total_files, total_bytes
+                "[SBH-DAEMON] provisioned {total_files} ballast files ({total_bytes} bytes total)"
             );
         }
 
         for (path, err) in &report.skipped_volumes {
-            eprintln!("[SBH-DAEMON] ballast provision skipped for {}: {}", path.display(), err);
+            eprintln!(
+                "[SBH-DAEMON] ballast provision skipped for {}: {}",
+                path.display(),
+                err
+            );
         }
 
         Ok(())
@@ -1103,17 +1109,14 @@ fn scanner_thread_main(
                 }
             };
 
-        let walker = DirectoryWalker::new(walker_config, protection)
-            .with_heartbeat({
-                let hb = Arc::clone(heartbeat);
-                move || hb.beat()
-            });
+        let walker = DirectoryWalker::new(walker_config, protection).with_heartbeat({
+            let hb = Arc::clone(heartbeat);
+            move || hb.beat()
+        });
 
-        // Perform the walk (blocking).
-        // The walker now beats the heartbeat from its worker threads,
-        // preventing this thread from being marked as stalled during long scans.
-        let entries = match walker.walk() {
-            Ok(e) => e,
+        // Perform the walk (streaming).
+        let rx = match walker.stream() {
+            Ok(r) => r,
             Err(e) => {
                 logger.send(ActivityEvent::Error {
                     code: e.code().to_string(),
@@ -1123,16 +1126,16 @@ fn scanner_thread_main(
             }
         };
 
-        let paths_scanned = entries.len();
+        let mut paths_scanned = 0;
         let mut candidates_found = 0;
-        let mut scored: Vec<CandidacyScore> = Vec::with_capacity(paths_scanned / 10);
+        let mut scored: Vec<CandidacyScore> = Vec::with_capacity(1024);
 
         // Snapshot open files once per scan for fast filtering.
         let open_files = crate::scanner::walker::collect_open_files();
-        let mut open_checker = OpenPathCache::new(&open_files);
 
         // Process entries.
-        for entry in entries {
+        for entry in rx {
+            paths_scanned += 1;
             let age = entry.metadata.modified.elapsed().unwrap_or(Duration::ZERO);
 
             // Classify.
@@ -1143,7 +1146,7 @@ fn scanner_thread_main(
                 continue;
             }
 
-            let is_open = open_checker.is_path_open(&entry.path);
+            let is_open = crate::scanner::walker::is_path_open(&entry.path, &open_files);
 
             let input = crate::scanner::scoring::CandidateInput {
                 path: entry.path,

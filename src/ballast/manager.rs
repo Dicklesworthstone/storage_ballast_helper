@@ -20,8 +20,6 @@ use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 
 use crate::core::config::BallastConfig;
 use crate::core::errors::{Result, SbhError};
@@ -155,22 +153,23 @@ impl BallastManager {
     // ──────────────────── locking ────────────────────
 
     #[cfg(unix)]
-    fn acquire_lock(&self) -> Result<File> {
+    fn acquire_lock(&self) -> Result<nix::fcntl::Flock<File>> {
         let lock_path = self.ballast_dir.join(".lock");
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .mode(0o600)
             .open(&lock_path)
             .map_err(|e| SbhError::io(&lock_path, e))?;
 
-        nix::fcntl::flock(file.as_raw_fd(), nix::fcntl::FlockArg::LockExclusive)
-            .map_err(|e| SbhError::Runtime {
+        #[allow(deprecated)]
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive).map_err(|(_file, e)| {
+            SbhError::Runtime {
                 details: format!("failed to lock ballast dir: {e}"),
-            })?;
-
-        Ok(file)
+            }
+        })
     }
 
     #[cfg(not(unix))]

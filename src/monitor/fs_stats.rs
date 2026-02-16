@@ -101,20 +101,20 @@ impl FsStatsCollector {
 
         // Also clear mount cache if expired.
         let mut mc = self.mount_cache.write();
-        if let Some((_, cached_at)) = mc.as_ref() {
-            if now.duration_since(*cached_at) > ttl {
-                *mc = None;
-            }
+        if let Some((_, cached_at)) = mc.as_ref()
+            && now.duration_since(*cached_at) > ttl
+        {
+            *mc = None;
         }
     }
 
     fn cached_mounts(&self) -> Result<Vec<MountPoint>> {
         {
             let mc = self.mount_cache.read();
-            if let Some((ref mounts, cached_at)) = *mc {
-                if cached_at.elapsed() <= self.cache_ttl {
-                    return Ok(mounts.clone());
-                }
+            if let Some((ref mounts, cached_at)) = *mc
+                && cached_at.elapsed() <= self.cache_ttl
+            {
+                return Ok(mounts.clone());
             }
         }
         let fresh = self.platform.mount_points()?;

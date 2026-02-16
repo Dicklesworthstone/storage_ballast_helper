@@ -1053,8 +1053,9 @@ fn extract_and_install(
     std::fs::create_dir_all(&extract_dir)
         .map_err(|e| format!("failed to create extract dir: {e}"))?;
 
+    // Use 'xf' for auto-detection of compression format (xz, gz, etc).
     let tar_status = Command::new("tar")
-        .args(["xJf"])
+        .args(["xf"])
         .arg(archive_path)
         .arg("-C")
         .arg(&extract_dir)
@@ -1078,13 +1079,16 @@ fn extract_and_install(
     }
 
     // Keep a `.old` safety net in addition to the backup store snapshot.
-    let backup_path = install_path.with_extension("old");
+    // Use a unique name to avoid collisions and allow Windows self-update
+    // (renaming a running binary is allowed, but overwriting/renaming-over is not).
+    let nonce = random::<u32>();
+    let backup_path = install_path.with_extension(format!("old.{nonce}"));
+
     if install_path.exists() {
-        // Try rename first (atomic, works if running), fall back to copy.
-        if std::fs::rename(install_path, &backup_path).is_err() {
-             std::fs::copy(install_path, &backup_path)
-                .map_err(|e| format!("failed to backup current binary: {e}"))?;
-        }
+        // Must rename (move) the current binary. Copying leaves the locked binary
+        // in place on Windows, causing the subsequent install rename to fail.
+        std::fs::rename(install_path, &backup_path)
+            .map_err(|e| format!("failed to move current binary to backup location: {e}"))?;
     }
 
     // Atomic install: copy to .new alongside target, then rename.
@@ -1092,6 +1096,10 @@ fn extract_and_install(
     let temp_install_path = install_path.with_extension("new");
     if let Err(e) = std::fs::copy(&new_binary, &temp_install_path) {
         let _ = std::fs::remove_dir_all(&extract_dir);
+        // Try to restore backup if we moved it.
+        if backup_path.exists() {
+            let _ = std::fs::rename(&backup_path, install_path);
+        }
         return Err(format!("failed to copy new binary to temp location: {e}"));
     }
 
@@ -1102,7 +1110,9 @@ fn extract_and_install(
         }
         let _ = std::fs::remove_file(&temp_install_path);
         let _ = std::fs::remove_dir_all(&extract_dir);
-        return Err(format!("failed to atomically replace binary (rolled back): {e}"));
+        return Err(format!(
+            "failed to atomically replace binary (rolled back): {e}"
+        ));
     }
 
     #[cfg(unix)]
@@ -1111,6 +1121,10 @@ fn extract_and_install(
         let _ = std::fs::set_permissions(install_path, std::fs::Permissions::from_mode(0o755));
     }
 
+    // Best-effort cleanup of the running-binary backup.
+    // On Windows this will fail because the process is still running from this file.
+    // That's acceptable; it's a temp file in the bin dir.
+    let _ = std::fs::remove_file(&backup_path);
     let _ = std::fs::remove_dir_all(&extract_dir);
     Ok(())
 }

@@ -831,14 +831,17 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     }
 
     // -- systemd install --------------------------------------------------
-    let mut systemd_config = storage_ballast_helper::daemon::service::SystemdConfig::from_env(args.user)
-        .map_err(|e| CliError::Runtime(e.to_string()))?;
-    
+    let mut systemd_config =
+        storage_ballast_helper::daemon::service::SystemdConfig::from_env(args.user)
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
+
     // Add configured paths to ReadWritePaths to satisfy ProtectSystem=strict
     for path in &config.scanner.root_paths {
         systemd_config.read_write_paths.push(path.clone());
     }
-    systemd_config.read_write_paths.push(config.paths.ballast_dir.clone());
+    systemd_config
+        .read_write_paths
+        .push(config.paths.ballast_dir.clone());
     // Also allow writing to the log/state directory if it's custom
     if let Some(parent) = config.paths.sqlite_db.parent() {
         systemd_config.read_write_paths.push(parent.to_path_buf());
@@ -1526,7 +1529,7 @@ fn run_blame(cli: &Cli, args: &BlameArgs) -> Result<(), CliError> {
     // Only consider directories (build artifact roots).
     let dir_entries: Vec<_> = entries.iter().filter(|e| e.metadata.is_dir).collect();
 
-    // Build a map: process label → BlameGroup.
+    // Build a map: process label --> BlameGroup.
     let mut groups: std::collections::HashMap<String, BlameGroup> =
         std::collections::HashMap::new();
     let now = SystemTime::now();
@@ -3475,7 +3478,9 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
         let pressure_check = build_pressure_check(args.target_free, collector);
         let report = executor.execute(
             &plan,
-            pressure_check.as_ref().map(|f| f as &dyn Fn(&std::path::Path) -> bool),
+            pressure_check
+                .as_ref()
+                .map(|f| f as &dyn Fn(&std::path::Path) -> bool),
         );
 
         match output_mode(cli) {
@@ -3521,6 +3526,7 @@ fn print_deletion_plan(plan: &DeletionPlan) {
 }
 
 /// Build a pressure check closure if --target-free was specified.
+#[allow(clippy::type_complexity)]
 fn build_pressure_check(
     target_free: Option<f64>,
     collector: std::sync::Arc<FsStatsCollector>,
@@ -3567,17 +3573,16 @@ fn run_interactive_clean(
 
     for (i, candidate) in plan.candidates.iter().enumerate() {
         // Check target_free skip condition.
-        if let Some(target) = args.target_free {
-            if let Ok(stats) = collector.collect(&candidate.path) {
-                if stats.free_pct() >= target {
-                    println!(
-                        "  Target free space ({target:.1}%) achieved on {}. Skipping.",
-                        stats.mount_point.display()
-                    );
-                    items_skipped += 1;
-                    continue;
-                }
-            }
+        if let Some(target) = args.target_free
+            && let Ok(stats) = collector.collect(&candidate.path)
+            && stats.free_pct() >= target
+        {
+            println!(
+                "  Target free space ({target:.1}%) achieved on {}. Skipping.",
+                stats.mount_point.display()
+            );
+            items_skipped += 1;
+            continue;
         }
 
         let action = if delete_all {
@@ -4087,7 +4092,9 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         let pressure_check = build_pressure_check(Some(args.target_free), collector);
         let report = executor.execute(
             &plan,
-            pressure_check.as_ref().map(|f| f as &dyn Fn(&std::path::Path) -> bool),
+            pressure_check
+                .as_ref()
+                .map(|f| f as &dyn Fn(&std::path::Path) -> bool),
         );
 
         match output_mode(cli) {

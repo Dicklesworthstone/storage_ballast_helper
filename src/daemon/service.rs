@@ -99,7 +99,14 @@ impl SystemdServiceManager {
             .config
             .read_write_paths
             .iter()
-            .map(|p| p.display().to_string())
+            .map(|p| {
+                let s = p.display().to_string();
+                if s.contains(' ') {
+                    format!("\"{s}\"")
+                } else {
+                    s
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ");
 
@@ -443,9 +450,9 @@ impl LaunchdServiceManager {
     /// Generate the launchd plist XML content.
     #[must_use]
     pub fn generate_plist(&self) -> String {
-        let binary = self.config.binary_path.display();
-        let stdout_log = self.config.stdout_log.display();
-        let stderr_log = self.config.stderr_log.display();
+        let binary = escape_xml(&self.config.binary_path.to_string_lossy());
+        let stdout_log = escape_xml(&self.config.stdout_log.to_string_lossy());
+        let stderr_log = escape_xml(&self.config.stderr_log.to_string_lossy());
 
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -590,6 +597,22 @@ impl ServiceManager for LaunchdServiceManager {
     }
 }
 
+/// Minimal XML escaping for plist values.
+fn escape_xml(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Default log file paths for launchd service.
 fn default_launchd_log_paths(user_scope: bool) -> (PathBuf, PathBuf) {
     if user_scope {
@@ -660,7 +683,7 @@ mod tests {
         assert!(unit.contains("NoNewPrivileges=true"));
         assert!(unit.contains("ProtectSystem=strict"));
         assert!(unit.contains("ReadWritePaths="));
-        assert!(unit.contains("ProtectHome=read-only"));
+        assert!(unit.contains("ProtectHome=false"));
         assert!(unit.contains("ProtectKernelTunables=true"));
         assert!(unit.contains("ProtectControlGroups=true"));
         assert!(unit.contains("RestrictSUIDSGID=true"));

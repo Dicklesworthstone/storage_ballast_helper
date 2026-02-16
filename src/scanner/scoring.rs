@@ -430,6 +430,7 @@ fn uncertainty_adjusted_losses(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decide_action(
     total_score: f64,
     min_score: f64,

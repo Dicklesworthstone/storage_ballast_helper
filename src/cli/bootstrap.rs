@@ -265,6 +265,14 @@ fn create_backup(path: &Path, backup_dir: Option<&Path>) -> std::io::Result<Path
 // Scanner: detect footprints
 // ---------------------------------------------------------------------------
 
+fn is_sbh_path_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    // Heuristic: line must assign to PATH and contain "sbh".
+    // Matches: "export PATH=...", "PATH=..."
+    // Avoids: "alias x=...", "# comment...", "export CLASSPATH=..."
+    (trimmed.starts_with("export PATH=") || trimmed.starts_with("PATH=")) && line.contains("sbh")
+}
+
 /// Known locations to probe for sbh binaries.
 fn candidate_binary_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -450,10 +458,7 @@ pub fn scan_footprints() -> Vec<Footprint> {
     // -- Shell profiles (PATH entries).
     for profile in candidate_profile_paths() {
         if let Ok(contents) = fs::read_to_string(&profile) {
-            let sbh_lines: Vec<&str> = contents
-                .lines()
-                .filter(|l| l.contains("sbh") && l.contains("PATH"))
-                .collect();
+            let sbh_lines: Vec<&str> = contents.lines().filter(|l| is_sbh_path_line(l)).collect();
             if !sbh_lines.is_empty() {
                 let (healthy, issue, detail) = check_profile_health(&profile, &sbh_lines);
                 footprints.push(Footprint {
@@ -1016,10 +1021,7 @@ fn apply_remove_profile_line(
     action.backup_path = Some(backup);
 
     let contents = fs::read_to_string(&action.target)?;
-    let filtered: Vec<&str> = contents
-        .lines()
-        .filter(|l| !(l.contains("sbh") && l.contains("PATH")))
-        .collect();
+    let filtered: Vec<&str> = contents.lines().filter(|l| !is_sbh_path_line(l)).collect();
     fs::write(&action.target, filtered.join("\n") + "\n")?;
     Ok(())
 }
@@ -1036,7 +1038,7 @@ fn apply_deduplicate_profile(
     let filtered: Vec<&str> = contents
         .lines()
         .filter(|l| {
-            if l.contains("sbh") && l.contains("PATH") {
+            if is_sbh_path_line(l) {
                 if seen_sbh_path {
                     return false; // Remove duplicate.
                 }
@@ -1251,6 +1253,19 @@ mod tests {
         assert_eq!(EnvironmentHealth::Healthy.to_string(), "healthy");
         assert_eq!(EnvironmentHealth::Broken.to_string(), "broken");
         assert_eq!(EnvironmentHealth::NotInstalled.to_string(), "not-installed");
+    }
+
+    #[test]
+    fn is_sbh_path_line_correctness() {
+        assert!(is_sbh_path_line("export PATH=\"/home/user/sbh:$PATH\""));
+        assert!(is_sbh_path_line("PATH=$PATH:/opt/sbh/bin"));
+        assert!(is_sbh_path_line("  export PATH=/foo/sbh:$PATH"));
+
+        // Should NOT match:
+        assert!(!is_sbh_path_line("# sbh PATH comment"));
+        assert!(!is_sbh_path_line("alias check='echo PATH sbh'"));
+        assert!(!is_sbh_path_line("export CLASSPATH=/opt/sbh/lib"));
+        assert!(!is_sbh_path_line("export MY_VAR=\"sbh path\""));
     }
 
     #[test]

@@ -53,14 +53,15 @@ impl SqliteLogger {
 
     /// Insert a row into `activity_log`.
     pub fn log_activity(&self, row: &ActivityRow) -> Result<()> {
-        self.conn.prepare_cached(
-            "INSERT INTO activity_log (
+        self.conn
+            .prepare_cached(
+                "INSERT INTO activity_log (
                 timestamp, event_type, severity, path, size_bytes, score,
                 score_factors, pressure_level, free_pct, duration_ms,
                 success, error_code, error_message, details
             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-        )?.execute(
-            params![
+            )?
+            .execute(params![
                 row.timestamp,
                 row.event_type,
                 row.severity,
@@ -75,8 +76,7 @@ impl SqliteLogger {
                 row.error_code,
                 row.error_message,
                 row.details,
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -115,13 +115,14 @@ impl SqliteLogger {
 
     /// Insert a pressure sample.
     pub fn log_pressure(&self, row: &PressureRow) -> Result<()> {
-        self.conn.prepare_cached(
-            "INSERT INTO pressure_history (
+        self.conn
+            .prepare_cached(
+                "INSERT INTO pressure_history (
                 timestamp, mount_point, total_bytes, free_bytes, free_pct,
                 rate_bytes_per_sec, pressure_level, ewma_rate, pid_output
             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-        )?.execute(
-            params![
+            )?
+            .execute(params![
                 row.timestamp,
                 row.mount_point,
                 row.total_bytes,
@@ -131,8 +132,7 @@ impl SqliteLogger {
                 row.pressure_level,
                 row.ewma_rate,
                 row.pid_output,
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -197,13 +197,14 @@ impl SqliteLogger {
 
     /// Upsert a ballast file record.
     pub fn upsert_ballast(&self, row: &BallastRow) -> Result<()> {
-        self.conn.prepare_cached(
-            "INSERT OR REPLACE INTO ballast_inventory (
+        self.conn
+            .prepare_cached(
+                "INSERT OR REPLACE INTO ballast_inventory (
                 file_index, path, size_bytes, created_at, released_at,
                 replenished_at, integrity_hash
             ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-        )?.execute(
-            params![
+            )?
+            .execute(params![
                 row.file_index,
                 row.path,
                 row.size_bytes,
@@ -211,8 +212,7 @@ impl SqliteLogger {
                 row.released_at,
                 row.replenished_at,
                 row.integrity_hash,
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 

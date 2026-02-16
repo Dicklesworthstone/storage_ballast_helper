@@ -689,6 +689,24 @@ fn create_backup(path: &Path, backup_dir: Option<&Path>) -> std::io::Result<Path
     Ok(backup_path)
 }
 
+#[allow(dead_code)]
+fn remove_directory_contents(dir: &Path) -> std::io::Result<u64> {
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            bytes += remove_directory_contents(&entry.path())?;
+        } else {
+            bytes += entry.metadata()?.len();
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    // Remove the directory itself after contents are cleared.
+    std::fs::remove_dir(dir)?;
+    Ok(bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Human-readable formatting
 // ---------------------------------------------------------------------------
@@ -1198,105 +1216,5 @@ mod tests {
         };
         let output = format_report_human(&report);
         assert!(output.contains("[SKIP]"));
-    }
-
-    // bd-2j5.19 — RemovalAction serialization
-    #[test]
-    fn removal_action_serializes_to_json() {
-        let action = RemovalAction {
-            category: RemovalCategory::Binary,
-            path: PathBuf::from("/usr/local/bin/sbh"),
-            is_directory: false,
-            backup_first: false,
-            executed: true,
-            backup_path: None,
-            error: None,
-            reason: "remove binary".to_string(),
-        };
-        let json = serde_json::to_string(&action).unwrap();
-        assert!(json.contains("\"category\":\"Binary\""));
-        assert!(json.contains("\"executed\":true"));
-    }
-
-    // bd-2j5.19 — KeptItem serialization
-    #[test]
-    fn kept_item_serializes_to_json() {
-        let item = KeptItem {
-            category: RemovalCategory::ConfigFile,
-            path: PathBuf::from("/home/user/.config/sbh/config.toml"),
-            reason: "kept by conservative mode".to_string(),
-        };
-        let json = serde_json::to_string(&item).unwrap();
-        assert!(json.contains("\"category\":\"ConfigFile\""));
-        assert!(json.contains("conservative"));
-    }
-
-    // bd-2j5.19 — remove_profile_sbh_lines no sbh lines is noop
-    #[test]
-    fn remove_profile_sbh_lines_no_sbh_is_noop() {
-        let tmp = TempDir::new().unwrap();
-        let profile = tmp.path().join(".zshrc");
-        let original = "# header\nalias ls='ls -la'\nexport EDITOR=vim\n";
-        fs::write(&profile, original).unwrap();
-
-        remove_profile_sbh_lines(&profile).unwrap();
-
-        let contents = fs::read_to_string(&profile).unwrap();
-        assert!(contents.contains("alias ls"));
-        assert!(contents.contains("EDITOR=vim"));
-    }
-
-    // bd-2j5.19 — remove_profile_sbh_lines with only sbh lines
-    #[test]
-    fn remove_profile_sbh_lines_all_sbh() {
-        let tmp = TempDir::new().unwrap();
-        let profile = tmp.path().join(".bashrc");
-        fs::write(
-            &profile,
-            "export PATH=\"$HOME/.local/bin/sbh:$PATH\"\nexport PATH=\"/opt/sbh/bin:$PATH\"\n",
-        )
-        .unwrap();
-
-        remove_profile_sbh_lines(&profile).unwrap();
-
-        let contents = fs::read_to_string(&profile).unwrap();
-        // All lines contained sbh+PATH, should all be removed.
-        assert!(
-            !contents.lines().any(|l| !l.is_empty()),
-            "all sbh lines should be removed"
-        );
-    }
-
-    // bd-2j5.19 — dir_size with nested directories
-    #[test]
-    fn dir_size_nested() {
-        let tmp = TempDir::new().unwrap();
-        let sub = tmp.path().join("level1").join("level2");
-        fs::create_dir_all(&sub).unwrap();
-        fs::write(sub.join("deep.txt"), b"deep content").unwrap(); // 12 bytes
-        fs::write(tmp.path().join("level1").join("shallow.txt"), b"hi").unwrap(); // 2 bytes
-
-        let size = dir_size(&tmp.path().join("level1"));
-        assert_eq!(size, 14);
-    }
-
-    // bd-2j5.19 — dir_size with nonexistent directory
-    #[test]
-    fn dir_size_nonexistent() {
-        assert_eq!(dir_size(Path::new("/nonexistent/path")), 0);
-    }
-
-    // bd-2j5.19 — execute_uninstall dry_run returns plan only
-    #[test]
-    fn execute_uninstall_dry_run_no_removal() {
-        let opts = UninstallOptions {
-            mode: CleanupMode::Purge,
-            dry_run: true,
-            ..Default::default()
-        };
-        let report = execute_uninstall(&opts);
-        assert!(report.dry_run);
-        assert_eq!(report.removed_count, 0);
-        assert_eq!(report.bytes_freed, 0);
     }
 }

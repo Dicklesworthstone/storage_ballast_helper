@@ -137,10 +137,10 @@ impl LinuxPlatform {
     fn get_cached_mounts(&self) -> Result<Vec<MountPoint>> {
         {
             let cache = self.mounts_cache.read();
-            if let Some((mounts, collected_at)) = &*cache {
-                if collected_at.elapsed() < self.cache_ttl {
-                    return Ok(mounts.clone());
-                }
+            if let Some((mounts, collected_at)) = &*cache
+                && collected_at.elapsed() < self.cache_ttl
+            {
+                return Ok(mounts.clone());
             }
         }
 
@@ -166,11 +166,11 @@ impl Platform for LinuxPlatform {
             path: path.to_path_buf(),
             details: error.to_string(),
         })?;
-        let fragment = u64::from(stat.fragment_size());
+        let fragment = stat.fragment_size();
         Ok(FsStats {
-            total_bytes: u64::from(stat.blocks()).saturating_mul(fragment),
-            free_bytes: u64::from(stat.blocks_free()).saturating_mul(fragment),
-            available_bytes: u64::from(stat.blocks_available()).saturating_mul(fragment),
+            total_bytes: stat.blocks().saturating_mul(fragment),
+            free_bytes: stat.blocks_free().saturating_mul(fragment),
+            available_bytes: stat.blocks_available().saturating_mul(fragment),
             fs_type: mount.fs_type.clone(),
             mount_point: mount.path.clone(),
             is_readonly: stat.flags().contains(nix::sys::statvfs::FsFlags::ST_RDONLY),

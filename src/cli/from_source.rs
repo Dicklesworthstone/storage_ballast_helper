@@ -312,6 +312,8 @@ pub fn install_from_source(config: &SourceInstallConfig) -> SourceInstallResult 
             };
         }
     };
+    // Ensure cleanup on return (success or failure).
+    let _guard = BuildDirGuard(clone_dir.clone());
 
     // Clone the repository.
     let clone_url = config.clone_url();
@@ -361,6 +363,16 @@ pub fn install_from_source(config: &SourceInstallConfig) -> SourceInstallResult 
         build_profile: String::from("release"),
         prerequisites,
         error: None,
+    }
+}
+
+struct BuildDirGuard(PathBuf);
+
+impl Drop for BuildDirGuard {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 

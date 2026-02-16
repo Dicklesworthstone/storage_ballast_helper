@@ -833,7 +833,9 @@ fn parse_env_bool(name: &str, raw: &str) -> Result<bool> {
 }
 
 fn strip_trailing_separator(s: &str) -> &str {
-    s.strip_suffix('/').or_else(|| s.strip_suffix('\\')).unwrap_or(s)
+    s.strip_suffix('/')
+        .or_else(|| s.strip_suffix('\\'))
+        .unwrap_or(s)
 }
 
 #[cfg(test)]
@@ -1084,10 +1086,7 @@ mod tests {
             super::BallastVolumeOverride::default(),
         );
         // Root path with Windows-style trailing slash
-        cfg.scanner.root_paths = vec![
-            PathBuf::from("C:\\"),
-            PathBuf::from("C:\\Data\\"),
-        ];
+        cfg.scanner.root_paths = vec![PathBuf::from("C:\\"), PathBuf::from("C:\\Data\\")];
 
         cfg.normalize_paths();
 

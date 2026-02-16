@@ -259,6 +259,7 @@ impl DeletionExecutor {
 
     // ──────────────────── pre-flight checks ────────────────────
 
+    #[allow(clippy::unused_self)]
     fn preflight_check(
         &self,
         path: &Path,
@@ -282,16 +283,16 @@ impl DeletionExecutor {
             return Err(SkipReason::NotWritable);
         }
 
-        // 4. Does not contain .git (safety net).
-        if meta.is_dir() && path.join(".git").exists() {
+        // 4. Does not contain .git (safety net — checks 3 levels deep).
+        if meta.is_dir() && contains_nested_git(path, 3) {
             return Err(SkipReason::ContainsGit);
         }
 
         // 5. Not currently open by any process (Linux /proc check).
-        if let Some(open) = open_files {
-            if walker::is_path_open(path, open) {
-                return Err(SkipReason::FileOpen);
-            }
+        if let Some(open) = open_files
+            && walker::is_path_open(path, open)
+        {
+            return Err(SkipReason::FileOpen);
         }
 
         Ok(())
@@ -301,14 +302,23 @@ impl DeletionExecutor {
 
     #[allow(clippy::unused_self)]
     fn delete_path(&self, path: &Path) -> Result<()> {
-        if path.is_dir() {
+        // Re-check with symlink_metadata (not metadata/is_dir which follow symlinks)
+        // to close the TOCTOU window between preflight_check and actual deletion.
+        let meta = fs::symlink_metadata(path).map_err(|e| SbhError::io(path, e))?;
+        if meta.file_type().is_symlink() {
+            return Err(SbhError::Runtime {
+                details: format!("path became a symlink before deletion: {}", path.display()),
+            });
+        }
+
+        if meta.is_dir() {
             fs::remove_dir_all(path).map_err(|e| SbhError::io(path, e))?;
         } else {
             fs::remove_file(path).map_err(|e| SbhError::io(path, e))?;
         }
 
-        // Post-deletion verification: path should be gone.
-        if path.exists() {
+        // Post-deletion verification (symlink_metadata to avoid following dangling symlinks).
+        if fs::symlink_metadata(path).is_ok() {
             return Err(SbhError::Runtime {
                 details: format!("path still exists after deletion: {}", path.display()),
             });
@@ -362,6 +372,29 @@ fn is_writable(path: &Path) -> bool {
             .map(|m| !m.permissions().readonly())
             .unwrap_or(false)
     }
+}
+
+/// Shallow recursive check for `.git` directories within `path`.
+///
+/// Walks at most `max_depth` levels to catch nested git repositories
+/// that the immediate `path.join(".git").exists()` check would miss.
+fn contains_nested_git(path: &Path, max_depth: usize) -> bool {
+    if max_depth == 0 {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() == ".git" {
+            return true;
+        }
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() && !ft.is_symlink() && contains_nested_git(&entry.path(), max_depth - 1) {
+            return true;
+        }
+    }
+    false
 }
 
 // ──────────────────── conversions ────────────────────
@@ -730,6 +763,7 @@ mod tests {
     #[test]
     fn nested_open_file_is_detected_for_parent_directory() {
         use crate::scanner::walker;
+        use std::os::unix::fs::MetadataExt;
 
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("a").join("b").join("c");
@@ -738,9 +772,16 @@ mod tests {
         fs::write(&file_path, "payload").unwrap();
 
         let handle = fs::File::open(&file_path).unwrap();
-        
+
         let open_files = walker::collect_open_files();
-        
+
+        // Guard: skip if /proc doesn't expose our own fds (hidepid=2, containers).
+        let file_meta = fs::metadata(&file_path).unwrap();
+        if !open_files.contains(&(file_meta.dev(), file_meta.ino())) {
+            drop(handle);
+            return;
+        }
+
         assert!(
             walker::is_path_open(dir.path(), &open_files),
             "open file in nested subtree should mark parent as open"

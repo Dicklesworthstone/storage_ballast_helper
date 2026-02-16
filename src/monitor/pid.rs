@@ -152,7 +152,9 @@ impl PidPressureController {
         let free_pct = reading.free_pct();
         let dt = self
             .last_update
-            .map_or(1.0, |prev| now.saturating_duration_since(prev).as_secs_f64())
+            .map_or(1.0, |prev| {
+                now.saturating_duration_since(prev).as_secs_f64()
+            })
             .max(1e-6);
 
         let error = self.target_free_pct - free_pct;

@@ -773,12 +773,12 @@ mod tests {
         };
         let mut guard = AdaptiveGuard::new(config);
 
-        // Many good observations should drive e_process_log down but not below -50.
+        // Many good observations should drive e_process_log down but not below the clamp floor.
         for _ in 0..200 {
             guard.observe(good_obs());
         }
 
-        assert!(guard.e_process_log >= -50.0);
+        assert!(guard.e_process_log >= -5.0, "e_process_log should be clamped at -5.0");
     }
 
     #[test]

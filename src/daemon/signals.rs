@@ -187,7 +187,9 @@ impl WatchdogHeartbeat {
     /// will fire at half that interval.
     #[must_use]
     pub fn new(watchdog_sec: u64) -> Self {
-        let socket_path = std::env::var("NOTIFY_SOCKET").ok().filter(|s| !s.is_empty());
+        let socket_path = std::env::var("NOTIFY_SOCKET")
+            .ok()
+            .filter(|s| !s.is_empty());
         Self {
             interval: Duration::from_secs(watchdog_sec / 2),
             last_beat: Instant::now(),

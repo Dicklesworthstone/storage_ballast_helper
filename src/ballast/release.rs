@@ -59,23 +59,32 @@ impl BallastReleaseController {
             return 0;
         }
 
-        // Use the PID controller's own recommendation first.
-        if response.release_ballast_files > 0 {
-            return response.release_ballast_files.min(available);
-        }
+        let pid_recommendation = response.release_ballast_files;
 
         // Graduated fallback based on urgency.
-        let urgency = response.urgency;
-        if urgency < 0.3 {
+        let urgency_recommendation = if response.urgency < 0.3 {
             0
-        } else if urgency < 0.6 {
-            1_usize.min(available)
-        } else if urgency < 0.9 {
-            3_usize.min(available)
+        } else if response.urgency < 0.6 {
+            1
+        } else if response.urgency < 0.9 {
+            3
         } else {
-            // Emergency: release everything.
-            available
-        }
+            available // Emergency
+        };
+
+        // Safety floor based on pressure level.
+        let level_floor = match response.level {
+            PressureLevel::Critical => available, // Always release all on Critical
+            PressureLevel::Red => 3,              // Always release at least 3 on Red
+            PressureLevel::Orange => 1,           // Always release at least 1 on Orange
+            _ => 0,
+        };
+
+        // Take the maximum of all signals to ensure safety.
+        pid_recommendation
+            .max(urgency_recommendation)
+            .max(level_floor)
+            .min(available)
     }
 
     /// Execute a pressure-driven release cycle.

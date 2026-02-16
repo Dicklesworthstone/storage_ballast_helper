@@ -169,9 +169,8 @@ impl BallastPoolCoordinator {
 
             // Check read-only via platform. Skip volumes where fs_stats fails
             // (e.g. permission denied) rather than aborting discovery for all.
-            let stats = match platform.fs_stats(mount_path) {
-                Ok(s) => s,
-                Err(_) => continue,
+            let Ok(stats) = platform.fs_stats(mount_path) else {
+                continue;
             };
             if stats.is_readonly {
                 continue;

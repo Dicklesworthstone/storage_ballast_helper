@@ -549,6 +549,10 @@ fn inject_json_hook(path: &Path, tool: AiTool) -> std::io::Result<()> {
     result.push_str(&contents[..last_brace]);
 
     if needs_comma {
+        // Ensure comma is on a new line to avoid being commented out by trailing // comments.
+        if !result.trim_end().ends_with('\n') {
+            result.push('\n');
+        }
         result.push(',');
     }
     result.push('\n');

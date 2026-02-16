@@ -13,6 +13,7 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -229,7 +230,7 @@ fn initial_last_render(refresh: Duration) -> Instant {
 }
 
 fn run_inner(stdout: &mut io::Stdout, config: &DashboardConfig) -> io::Result<()> {
-    let mut rate_histories: Vec<(String, RateHistory)> = Vec::new();
+    let mut rate_histories: HashMap<String, RateHistory> = HashMap::new();
 
     // For degraded mode: use live fs stats.
     let platform = detect_platform().ok();
@@ -268,18 +269,16 @@ fn run_inner(stdout: &mut io::Stdout, config: &DashboardConfig) -> io::Result<()
 
         // Update rate histories from state.
         if let Some(ref s) = state {
+            let mut active_mounts = Vec::new();
             for mount in &s.pressure.mounts {
-                let entry = rate_histories
-                    .iter_mut()
-                    .find(|(path, _)| *path == mount.path);
-                if let Some((_, history)) = entry {
-                    history.push(mount.rate_bps.unwrap_or(0.0));
-                } else {
-                    let mut h = RateHistory::new(30);
-                    h.push(mount.rate_bps.unwrap_or(0.0));
-                    rate_histories.push((mount.path.clone(), h));
-                }
+                active_mounts.push(mount.path.clone());
+                rate_histories
+                    .entry(mount.path.clone())
+                    .or_insert_with(|| RateHistory::new(30))
+                    .push(mount.rate_bps.unwrap_or(0.0));
             }
+            // Prune stale mounts (e.g. unmounted volumes).
+            rate_histories.retain(|k, _| active_mounts.contains(k));
         }
 
         // Render.
@@ -303,7 +302,7 @@ fn render_frame(
     width: usize,
     _rows: usize,
     state: Option<&DaemonState>,
-    rate_histories: &[(String, RateHistory)],
+    rate_histories: &HashMap<String, RateHistory>,
     monitor_paths: &[PathBuf],
     fs_collector: Option<&FsStatsCollector>,
 ) -> io::Result<()> {
@@ -423,7 +422,11 @@ fn render_frame(
         queue!(stdout, SetAttribute(Attribute::Reset))?;
         row += 1;
     } else {
-        for (path, history) in rate_histories {
+        let mut sorted_keys: Vec<_> = rate_histories.keys().collect();
+        sorted_keys.sort();
+
+        for path in sorted_keys {
+            let history = &rate_histories[path];
             let spark = render_sparkline(&history.normalized());
             let latest = history.latest().unwrap_or(0.0);
             let rate_str = if latest.abs() < 1024.0 {
