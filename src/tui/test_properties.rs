@@ -760,19 +760,19 @@ proptest! {
     /// ScheduleNotificationExpiry commands.
     #[test]
     fn tick_never_produces_invalid_commands(screen in arb_screen()) {
-        let mut model = fresh_model();
-        model.screen = screen;
-        let cmd = update::update(&mut model, DashboardMsg::Tick);
-
         fn check_no_invalid(cmd: &super::model::DashboardCmd) -> bool {
             match cmd {
-                super::model::DashboardCmd::Quit => false,
-                super::model::DashboardCmd::ExecutePreferenceAction(_) => false,
-                super::model::DashboardCmd::ScheduleNotificationExpiry { .. } => false,
-                super::model::DashboardCmd::Batch(cmds) => cmds.iter().all(|c| check_no_invalid(c)),
+                super::model::DashboardCmd::Quit
+                | super::model::DashboardCmd::ExecutePreferenceAction(_)
+                | super::model::DashboardCmd::ScheduleNotificationExpiry { .. } => false,
+                super::model::DashboardCmd::Batch(cmds) => cmds.iter().all(check_no_invalid),
                 _ => true,
             }
         }
+
+        let mut model = fresh_model();
+        model.screen = screen;
+        let cmd = update::update(&mut model, DashboardMsg::Tick);
         prop_assert!(check_no_invalid(&cmd), "Tick on {screen:?} produced invalid command");
     }
 
@@ -921,7 +921,7 @@ proptest! {
         // Collections must remain bounded.
         assert_model_invariants(&model);
         prop_assert!(model.frame_times.len() <= 60);
-        for (_, rh) in &model.rate_histories {
+        for rh in model.rate_histories.values() {
             prop_assert!(rh.len() <= 30);
         }
     }

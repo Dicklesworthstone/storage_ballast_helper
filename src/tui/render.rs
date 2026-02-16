@@ -1,6 +1,7 @@
 //! Render-surface scaffolding for the new dashboard runtime.
 
 #![allow(missing_docs)]
+#![allow(clippy::too_many_lines)]
 
 use super::layout::{
     OverviewPane, PanePriority, TimelinePane, build_overview_layout, build_timeline_layout,
@@ -55,8 +56,33 @@ pub fn render(model: &DashboardModel) -> String {
         model.hint_verbosity,
     );
 
+    // Breadcrumb navigation trail.
+    if !model.screen_history.is_empty() {
+        let max_crumbs = 5;
+        let history = &model.screen_history;
+        let start = if history.len() > max_crumbs {
+            history.len() - max_crumbs
+        } else {
+            0
+        };
+        let mut crumb = String::from("nav:");
+        for s in &history[start..] {
+            let _ = write!(crumb, " {} >", screen_label(*s));
+        }
+        let _ = write!(crumb, " {}", screen_label(model.screen));
+        let _ = writeln!(out, "{crumb}");
+    }
+
+    // Overlay rendering.
     if let Some(ref overlay) = model.active_overlay {
-        let _ = writeln!(out, "[overlay: {overlay:?}]");
+        match overlay {
+            super::model::Overlay::CommandPalette => {
+                render_command_palette(model, &mut out);
+            }
+            other => {
+                let _ = writeln!(out, "[overlay: {other:?}]");
+            }
+        }
     }
 
     // Screen-specific content.
@@ -67,16 +93,41 @@ pub fn render(model: &DashboardModel) -> String {
         Screen::Candidates => render_candidates(model, &theme, &mut out),
         Screen::Diagnostics => render_diagnostics(model, &theme, &mut out),
         Screen::Ballast => render_ballast(model, &theme, &mut out),
-        screen => render_screen_stub(model, screen_label(screen), &theme, &mut out),
+        screen @ Screen::LogSearch => render_screen_stub(model, screen_label(screen), &theme, &mut out),
     }
 
     // Notification toasts (O4).
     for notif in &model.notifications {
-        let badge = notification_badge(theme.palette, theme.accessibility, notif.level);
+        let badge = notification_badge(&theme.palette, theme.accessibility, notif.level);
         let _ = writeln!(out, "[toast#{}] {} {}", notif.id, badge, notif.message);
     }
 
     out
+}
+
+const PALETTE_DISPLAY_LIMIT: usize = 10;
+
+fn render_command_palette(model: &DashboardModel, out: &mut String) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(out, "Command Palette");
+    let _ = writeln!(out, "> {}", model.palette_query);
+
+    let all_results = super::input::search_palette_actions(&model.palette_query, 50);
+    let total = all_results.len();
+    let shown = total.min(PALETTE_DISPLAY_LIMIT);
+    let _ = writeln!(out, "matches: {shown} / {total}");
+
+    for (i, action) in all_results.iter().take(PALETTE_DISPLAY_LIMIT).enumerate() {
+        let cursor = if i == model.palette_selected {
+            ">"
+        } else {
+            " "
+        };
+        let _ = writeln!(out, "{cursor} {}: {}", action.id, action.title);
+    }
+
+    let _ = writeln!(out, "Enter execute  Esc close");
 }
 
 fn screen_label(screen: Screen) -> &'static str {
@@ -200,6 +251,7 @@ fn pane_priority_label(priority: PanePriority) -> &'static str {
     }
 }
 
+#[allow(clippy::option_if_let_else)]
 fn render_pressure_summary(model: &DashboardModel, theme: &Theme, pane_width: u16) -> String {
     use std::fmt::Write as _;
 
@@ -258,6 +310,7 @@ fn gauge_width_for(pane_width: u16) -> usize {
     usize::from(pane_width).clamp(28, 64) / 3
 }
 
+#[allow(clippy::option_if_let_else)]
 fn render_action_lane(model: &DashboardModel) -> String {
     if let Some(ref state) = model.daemon_state {
         format!(
@@ -298,14 +351,14 @@ fn render_ewma_trend(model: &DashboardModel) -> String {
     out
 }
 
+#[allow(clippy::option_if_let_else)]
 fn render_recent_activity(model: &DashboardModel) -> String {
     if let Some(ref state) = model.daemon_state {
         let at_str = state
             .last_scan
             .at
             .as_deref()
-            .map(extract_time)
-            .unwrap_or("never");
+            .map_or("never", |s| extract_time(s));
         format!(
             "activity last-scan={at_str} candidates={} deleted={} errors={}",
             state.last_scan.candidates, state.last_scan.deleted, state.counters.errors,
@@ -315,6 +368,7 @@ fn render_recent_activity(model: &DashboardModel) -> String {
     }
 }
 
+#[allow(clippy::option_if_let_else)]
 fn render_ballast_quick(model: &DashboardModel, theme: &Theme) -> String {
     if let Some(ref state) = model.daemon_state {
         let (palette, label) = if state.ballast.total > 0 && state.ballast.available == 0 {
@@ -335,6 +389,7 @@ fn render_ballast_quick(model: &DashboardModel, theme: &Theme) -> String {
     }
 }
 
+#[allow(clippy::option_if_let_else)]
 fn render_extended_counters(model: &DashboardModel) -> String {
     if let Some(ref state) = model.daemon_state {
         format!(
@@ -399,8 +454,8 @@ fn render_timeline(model: &DashboardModel, theme: &Theme, out: &mut String) {
     let shown = filtered.len();
     let _ = writeln!(out, "events={shown}/{total}");
 
+    let _ = writeln!(out);
     if filtered.is_empty() {
-        let _ = writeln!(out);
         if total == 0 {
             let _ = writeln!(
                 out,
@@ -416,14 +471,11 @@ fn render_timeline(model: &DashboardModel, theme: &Theme, out: &mut String) {
             let _ = writeln!(out, "Press f to cycle the severity filter.");
         }
     } else {
-        let _ = writeln!(out);
         let list_visible = layout
             .placements
             .iter()
             .find(|p| p.pane == TimelinePane::EventList && p.visible);
-        let max_rows = list_visible
-            .map(|p| usize::from(p.rect.height))
-            .unwrap_or(shown);
+        let max_rows = list_visible.map_or(shown, |p| usize::from(p.rect.height));
 
         // Compute visible window around selected item.
         let window_start = model
@@ -448,13 +500,11 @@ fn render_timeline(model: &DashboardModel, theme: &Theme, out: &mut String) {
         .placements
         .iter()
         .any(|p| p.pane == TimelinePane::EventDetail && p.visible);
-    if detail_visible {
-        if let Some(event) = model.timeline_selected_event() {
-            let _ = writeln!(out);
-            let width = usize::from(model.terminal_size.0).max(40);
-            let _ = writeln!(out, "{}", section_header("Event Detail", width));
-            render_event_detail(event, theme, out);
-        }
+    if detail_visible && let Some(event) = model.timeline_selected_event() {
+        let _ = writeln!(out);
+        let width = usize::from(model.terminal_size.0).max(40);
+        let _ = writeln!(out, "{}", section_header("Event Detail", width));
+        render_event_detail(event, theme, out);
     }
 
     // ── Status footer ──
@@ -476,11 +526,7 @@ fn render_event_row(cursor: &str, event: &TimelineEvent, theme: &Theme, out: &mu
     use std::fmt::Write as _;
     let time = extract_time(&event.timestamp);
     let sev_badge = severity_badge(&event.severity, theme);
-    let path_short = event
-        .path
-        .as_deref()
-        .map(|p| truncate_path(p, 30))
-        .unwrap_or("-");
+    let path_short = event.path.as_deref().map_or("-", |p| truncate_path(p, 30));
     let size_str = event.size_bytes.map(human_bytes).unwrap_or_default();
     let success_marker = match event.success {
         Some(true) => " \u{2713}",
@@ -1104,13 +1150,10 @@ fn render_diagnostics(model: &DashboardModel, theme: &Theme, out: &mut String) {
     let _ = writeln!(out, "  missed-ticks:  {}", model.missed_ticks);
 
     // ── Last fetch staleness ──
-    let fetch_label = match model.last_fetch {
-        Some(t) => {
-            let elapsed = t.elapsed();
-            format!("{}ms ago", elapsed.as_millis())
-        }
-        None => String::from("never"),
-    };
+    let fetch_label = model.last_fetch.map_or_else(
+        || String::from("never"),
+        |t| format!("{}ms ago", t.elapsed().as_millis()),
+    );
     let _ = writeln!(out, "  last-fetch:    {fetch_label}");
     let _ = writeln!(out, "  notifications: {} active", model.notifications.len(),);
 
@@ -1364,8 +1407,8 @@ fn render_ballast(model: &DashboardModel, theme: &Theme, out: &mut String) {
     // Column headers.
     let _ = writeln!(
         out,
-        "  {:<4} {:<12} {:<20} {:<8} {:<8} {:<10} {}",
-        "#", "STATUS", "MOUNT", "FILES", "FS", "STRATEGY", "RELEASABLE"
+        "  {:<4} {:<12} {:<20} {:<8} {:<8} {:<10} RELEASABLE",
+        "#", "STATUS", "MOUNT", "FILES", "FS", "STRATEGY"
     );
 
     for (i, vol) in model.ballast_volumes.iter().enumerate() {
@@ -1465,10 +1508,10 @@ fn render_volume_detail(vol: &BallastVolume, theme: &Theme, out: &mut String) {
     let badge = status_badge(status, status_color, theme.accessibility);
     let _ = writeln!(out, "  status:     {badge}");
 
-    if vol.skipped {
-        if let Some(ref reason) = vol.skip_reason {
-            let _ = writeln!(out, "  skip-reason: {reason}");
-        }
+    if vol.skipped
+        && let Some(ref reason) = vol.skip_reason
+    {
+        let _ = writeln!(out, "  skip-reason: {reason}");
     }
 
     // File fill gauge.
@@ -1496,7 +1539,7 @@ fn render_screen_stub(model: &DashboardModel, name: &str, theme: &Theme, out: &m
 }
 
 fn notification_badge(
-    palette: ThemePalette,
+    palette: &ThemePalette,
     accessibility: AccessibilityProfile,
     level: NotificationLevel,
 ) -> String {
@@ -2380,7 +2423,7 @@ mod tests {
 
         let frame = render(&model);
         let lines: Vec<&str> = frame.lines().collect();
-        let cursor_line = lines.iter().find(|l| l.contains("2") && l.starts_with('>'));
+        let cursor_line = lines.iter().find(|l| l.contains('2') && l.starts_with('>'));
         assert!(cursor_line.is_some(), "cursor should be on candidate #2");
     }
 
@@ -3039,8 +3082,12 @@ mod tests {
         model.active_overlay = Some(Overlay::CommandPalette);
 
         let frame = render(&model);
-        // Empty query shows all 15 actions (up to 10).
-        assert!(frame.contains("matches: 10 / 15"));
+        // Empty query shows all actions (up to 10 displayed).
+        let total = super::super::input::command_palette_actions().len();
+        assert!(
+            frame.contains(&format!("matches: 10 / {total}")),
+            "expected 'matches: 10 / {total}' in frame"
+        );
         assert!(frame.contains("nav.overview"));
         assert!(frame.contains("Enter execute"));
         assert!(frame.contains("Esc close"));
@@ -3059,12 +3106,11 @@ mod tests {
 
         let frame = render(&model);
         // Third action should have cursor ">"
-        let palette_lines: Vec<_> = frame
+        let has_palette_lines = frame
             .lines()
             .filter(|l| l.starts_with("> ") || l.starts_with("  "))
-            .filter(|l| l.contains("nav.") || l.contains("overlay.") || l.contains("action."))
-            .collect();
-        assert!(!palette_lines.is_empty());
+            .any(|l| l.contains("nav.") || l.contains("overlay.") || l.contains("action."));
+        assert!(has_palette_lines);
     }
 
     #[test]
