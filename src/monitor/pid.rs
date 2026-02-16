@@ -159,12 +159,16 @@ impl PidPressureController {
         now: Instant,
     ) -> PressureResponse {
         let free_pct = reading.free_pct();
+
+        // Robust dt calculation: handle backward clock jumps and tiny intervals.
+        // If time went backward or dt is negligible (< 100µs), fall back to the
+        // configured base poll interval to prevent the derivative term from exploding.
         let dt = self
             .last_update
-            .map_or(1.0, |prev| {
-                now.saturating_duration_since(prev).as_secs_f64()
-            })
-            .max(1e-6);
+            .and_then(|prev| now.checked_duration_since(prev))
+            .map(|d| d.as_secs_f64())
+            .filter(|&d| d > 1e-4)
+            .unwrap_or_else(|| self.base_poll_interval.as_secs_f64().max(0.1));
 
         let error = self.target_free_pct - free_pct;
         self.integral = error
@@ -231,48 +235,72 @@ fn classify_with_hysteresis(
     orange_min: f64,
     red_min: f64,
 ) -> PressureLevel {
+    let raw = raw_classify(free_pct, green_min, yellow_min, orange_min, red_min);
+
+    // Fast attack: if the new level is more severe than the current level,
+    // switch immediately. This ensures we respond to sudden pressure spikes
+    // (e.g. Green -> Critical) in a single tick.
+    if raw > current {
+        return raw;
+    }
+
+    // Slow decay: if the new level is less severe, only switch if we've
+    // cleared the hysteresis threshold for the CURRENT level.
+    // This prevents rapid oscillation at boundaries.
     match current {
-        PressureLevel::Green => {
-            if free_pct < green_min {
-                PressureLevel::Yellow
+        PressureLevel::Critical => {
+            // To leave Critical, we must be above the Red threshold + hysteresis.
+            if free_pct >= red_min + hysteresis {
+                raw
             } else {
-                PressureLevel::Green
-            }
-        }
-        PressureLevel::Yellow => {
-            if free_pct >= green_min + hysteresis {
-                PressureLevel::Green
-            } else if free_pct < yellow_min {
-                PressureLevel::Orange
-            } else {
-                PressureLevel::Yellow
-            }
-        }
-        PressureLevel::Orange => {
-            if free_pct >= yellow_min + hysteresis {
-                PressureLevel::Yellow
-            } else if free_pct < orange_min {
-                PressureLevel::Red
-            } else {
-                PressureLevel::Orange
+                PressureLevel::Critical
             }
         }
         PressureLevel::Red => {
+            // To leave Red, we must be above the Orange threshold + hysteresis.
             if free_pct >= orange_min + hysteresis {
+                raw
+            } else {
+                PressureLevel::Red
+            }
+        }
+        PressureLevel::Orange => {
+            // To leave Orange, we must be above the Yellow threshold + hysteresis.
+            if free_pct >= yellow_min + hysteresis {
+                raw
+            } else {
                 PressureLevel::Orange
-            } else if free_pct < red_min {
-                PressureLevel::Critical
-            } else {
-                PressureLevel::Red
             }
         }
-        PressureLevel::Critical => {
-            if free_pct >= red_min + hysteresis {
-                PressureLevel::Red
+        PressureLevel::Yellow => {
+            // To leave Yellow, we must be above the Green threshold + hysteresis.
+            if free_pct >= green_min + hysteresis {
+                raw
             } else {
-                PressureLevel::Critical
+                PressureLevel::Yellow
             }
         }
+        PressureLevel::Green => PressureLevel::Green,
+    }
+}
+
+fn raw_classify(
+    free_pct: f64,
+    green_min: f64,
+    yellow_min: f64,
+    orange_min: f64,
+    red_min: f64,
+) -> PressureLevel {
+    if free_pct < red_min {
+        PressureLevel::Critical
+    } else if free_pct < orange_min {
+        PressureLevel::Red
+    } else if free_pct < yellow_min {
+        PressureLevel::Orange
+    } else if free_pct < green_min {
+        PressureLevel::Yellow
+    } else {
+        PressureLevel::Green
     }
 }
 

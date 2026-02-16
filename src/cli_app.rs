@@ -3248,6 +3248,9 @@ fn bytes_to_pct(value: u64, total: u64) -> f64 {
 }
 
 fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
+    const THRASH_SWAP_USED_PCT: f64 = 70.0;
+    const MIN_AVAILABLE_RAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
     if memory.swap_total_bytes == 0 {
         return false;
     }
@@ -3258,8 +3261,6 @@ fn is_swap_thrash_risk(memory: &MemoryInfo) -> bool {
     let swap_used_pct = bytes_to_pct(swap_used_bytes, memory.swap_total_bytes);
     // If swap is heavily used while plenty of RAM is still available, the host
     // likely experienced pressure and is now paging memory back in slowly.
-    const THRASH_SWAP_USED_PCT: f64 = 70.0;
-    const MIN_AVAILABLE_RAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
     swap_used_pct >= THRASH_SWAP_USED_PCT && memory.available_bytes >= MIN_AVAILABLE_RAM_BYTES
 }
 
@@ -3504,7 +3505,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     // Evaluate in rank order and stop once we have enough results.
     let mut candidates: Vec<_> = Vec::with_capacity(args.top.min(preliminary.len()));
     if args.top > 0 && !preliminary.is_empty() {
-        let open_paths = collect_open_path_ancestors(&scan_roots);
+        let (open_paths, _) = collect_open_path_ancestors(&scan_roots);
         for score in preliminary {
             if is_path_open_by_ancestor(&score.path, &open_paths) {
                 continue;
@@ -3714,7 +3715,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
 
     // Filter open files from survivors.
     if !scored.is_empty() {
-        let open_paths = collect_open_path_ancestors(&root_paths);
+        let (open_paths, _) = collect_open_path_ancestors(&root_paths);
         scored.retain(|candidate| !is_path_open_by_ancestor(&candidate.path, &open_paths));
     }
 
@@ -3969,7 +3970,7 @@ fn run_interactive_clean(
 
         if action == 'y' {
             // Re-check if path is still in use before deleting.
-            let fresh_open_paths = collect_open_path_ancestors(&[candidate.path.clone()]);
+            let (fresh_open_paths, _) = collect_open_path_ancestors(std::slice::from_ref(&candidate.path));
             if is_path_open_by_ancestor(&candidate.path, &fresh_open_paths) {
                 eprintln!("    Skipped (now in use): {}", candidate.path.display());
                 items_skipped += 1;
@@ -4347,7 +4348,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     let dir_count = entries.len();
 
     // Collect open path ancestors under emergency roots (single /proc scan).
-    let open_paths = collect_open_path_ancestors(&root_paths);
+    let (open_paths, _) = collect_open_path_ancestors(&root_paths);
 
     // Classify and score using default weights.
     let registry = ArtifactPatternRegistry::default();
@@ -5927,6 +5928,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn bytes_to_pct_handles_zero_total() {
         assert_eq!(bytes_to_pct(100, 0), 0.0);
         assert_eq!(bytes_to_pct(50, 200), 25.0);

@@ -71,6 +71,16 @@ impl SpecialLocationRegistry {
             if !mount.is_ram_backed {
                 continue;
             }
+            // Skip systemd runtime dirs — these are small credential/session tmpfs
+            // mounts that are always "full" by design and not actionable.
+            let path_str = mount.path.to_string_lossy();
+            if path_str.starts_with("/run/credentials/")
+                || path_str.starts_with("/run/user/")
+                || path_str == "/run/lock"
+                || path_str == "/run"
+            {
+                continue;
+            }
             let kind = match mount.path.as_path() {
                 p if p == Path::new("/dev/shm") => SpecialKind::DevShm,
                 p if p == Path::new("/tmp") => SpecialKind::Tmpfs,

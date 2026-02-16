@@ -293,6 +293,7 @@ pub struct MonitoringDaemon {
     last_pressure_level: PressureLevel,
     last_special_scan: HashMap<PathBuf, Instant>,
     last_predictive_warning: Option<Instant>,
+    last_ewma_confidence: f64,
     last_swap_thrash_warning: Option<Instant>,
     swap_thrash_active: bool,
     self_monitor: SelfMonitor,
@@ -375,6 +376,10 @@ fn should_fast_track_temp_age(
         ArtifactCategory::NodeModules | ArtifactCategory::PythonCache
     ) {
         return false;
+    }
+
+    if classification.name_confidence >= 0.85 {
+        return true;
     }
 
     matches!(
@@ -591,6 +596,7 @@ impl MonitoringDaemon {
             last_pressure_level: PressureLevel::Green,
             last_special_scan: HashMap::new(),
             last_predictive_warning: None,
+            last_ewma_confidence: 0.0,
             last_swap_thrash_warning: None,
             swap_thrash_active: false,
             self_monitor,
@@ -957,7 +963,10 @@ impl MonitoringDaemon {
 
             // Track worst response (highest urgency/severity).
             match worst_response {
-                None => worst_response = Some(response),
+                None => {
+                    worst_response = Some(response);
+                    self.last_ewma_confidence = rate_estimate.confidence;
+                }
                 Some(ref worst) => {
                     // Critical > Red > ... > Green.
                     // If levels equal, higher urgency wins.
@@ -965,6 +974,7 @@ impl MonitoringDaemon {
                         || (response.level == worst.level && response.urgency > worst.urgency)
                     {
                         worst_response = Some(response);
+                        self.last_ewma_confidence = rate_estimate.confidence;
                     }
                 }
             }
@@ -989,7 +999,7 @@ impl MonitoringDaemon {
                     stats.free_pct(),
                     stats.mount_point.to_string_lossy().to_string(),
                     stats.total_bytes as i64,
-                    stats.free_bytes as i64,
+                    stats.available_bytes as i64,
                 )
             } else {
                 (0.0, "/".to_string(), 0, 0)
@@ -1247,7 +1257,7 @@ impl MonitoringDaemon {
             .notify(&NotificationEvent::PredictiveWarning {
                 mount: response.causing_mount.to_string_lossy().to_string(),
                 minutes_remaining: seconds / 60.0,
-                confidence: 0.0, // Placeholder as PressureResponse doesn't carry confidence yet
+                confidence: self.last_ewma_confidence,
             });
     }
 
@@ -1801,7 +1811,7 @@ fn scanner_thread_main(
         let open_files_paths = request.paths.clone();
         let mut open_files_handle: Option<std::thread::JoinHandle<_>> = std::thread::Builder::new()
             .name("sbh-open-files".into())
-            .spawn(move || crate::scanner::walker::collect_open_path_ancestors(&open_files_paths))
+            .spawn(move || crate::scanner::walker::collect_open_path_ancestors(&open_files_paths).0)
             .ok();
         // Join lazily — we only need results when classifying candidates.
         let mut open_files_joined: Option<std::collections::HashSet<std::path::PathBuf>> = None;
@@ -2590,6 +2600,25 @@ mod tests {
     }
 
     #[test]
+    fn temp_artifact_age_fast_track_accepts_high_confidence_patterns() {
+        let classification = ArtifactClassification {
+            pattern_name: "unknown-temp-pattern".into(),
+            category: ArtifactCategory::AgentWorkspace,
+            name_confidence: 0.90,
+            structural_confidence: 0.30,
+            combined_confidence: 0.60,
+        };
+        let adjusted = adjusted_candidate_age(
+            Duration::from_secs(5 * 60),
+            30,
+            PressureLevel::Red,
+            Path::new("/tmp/random-agent-build-cache"),
+            &classification,
+        );
+        assert_eq!(adjusted, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
     fn temp_artifact_age_fast_track_keeps_very_fresh_paths() {
         let classification = ArtifactClassification {
             pattern_name: "agent-ft-suffix".into(),
@@ -2658,7 +2687,7 @@ mod tests {
 
         let low_swap = MemoryInfo {
             swap_free_bytes: 40 * 1024 * 1024 * 1024,
-            ..risky.clone()
+            ..risky
         };
         assert!(!is_swap_thrash_risk(&low_swap));
 

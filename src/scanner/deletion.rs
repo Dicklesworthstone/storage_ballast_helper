@@ -149,6 +149,7 @@ impl DeletionExecutor {
     ///
     /// Returns a report summarizing what was deleted, skipped, or failed.
     /// If `should_skip` returns `true` for a candidate path, it is skipped.
+    #[allow(clippy::too_many_lines)]
     pub fn execute(
         &self,
         plan: &DeletionPlan,
@@ -178,7 +179,31 @@ impl DeletionExecutor {
                 .take(limit)
                 .map(|candidate| candidate.path.clone())
                 .collect::<Vec<_>>();
-            Some(walker::collect_open_path_ancestors(&roots))
+            let (paths, complete) = walker::collect_open_path_ancestors(&roots);
+
+            if !complete {
+                self.log_event(ActivityEvent::Error {
+                    code: "SBH-3003".to_string(),
+                    message:
+                        "open file scan incomplete due to system load - aborting batch for safety"
+                            .to_string(),
+                });
+                // Fail safe: abort the entire batch because we cannot guarantee
+                // that any candidate is safe to delete.
+                report.duration = start.elapsed();
+                // Mark all candidates as skipped/failed due to safety check.
+                report.items_failed = limit;
+                for candidate in plan.candidates.iter().take(limit) {
+                    report.errors.push(DeletionError {
+                        path: candidate.path.clone(),
+                        error: "safety check incomplete".to_string(),
+                        error_code: "SBH-3003".to_string(),
+                        recoverable: true,
+                    });
+                }
+                return report;
+            }
+            Some(paths)
         } else {
             None
         };
@@ -781,7 +806,7 @@ mod tests {
 
         let handle = fs::File::open(&file_path).unwrap();
 
-        let open_paths = walker::collect_open_path_ancestors(&[dir.path().to_path_buf()]);
+        let (open_paths, _) = walker::collect_open_path_ancestors(&[dir.path().to_path_buf()]);
 
         // Guard: skip if /proc doesn't expose our own fds (hidepid=2, containers)
         // or if budget limits produce no ancestor data for this path.

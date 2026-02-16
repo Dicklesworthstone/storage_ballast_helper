@@ -69,9 +69,14 @@ impl BallastReleaseController {
             return 0;
         }
 
+        // Get current state for this mount so targets can be cumulative.
+        let state = self.states.entry(mount_path.to_path_buf()).or_default();
+        let already_released = state.files_released_since_green;
+        let total_pool = already_released + available;
+
         let pid_recommendation = response.release_ballast_files;
 
-        // Graduated fallback based on urgency.
+        // Graduated fallback based on urgency (cumulative target since last green).
         let urgency_recommendation = if response.urgency < 0.3 {
             0
         } else if response.urgency < 0.6 {
@@ -79,14 +84,14 @@ impl BallastReleaseController {
         } else if response.urgency < 0.9 {
             3
         } else {
-            available // Emergency
+            total_pool // Emergency: release everything
         };
 
-        // Safety floor based on pressure level.
+        // Safety floor based on pressure level (cumulative target since last green).
         let level_floor = match response.level {
-            PressureLevel::Critical => available, // Always release all on Critical
-            PressureLevel::Red => 3,              // Always release at least 3 on Red
-            PressureLevel::Orange => 1,           // Always release at least 1 on Orange
+            PressureLevel::Critical => total_pool, // Always release all on Critical
+            PressureLevel::Red => 3,               // Always release at least 3 on Red
+            PressureLevel::Orange => 1,            // Always release at least 1 on Orange
             _ => 0,
         };
 
@@ -95,11 +100,8 @@ impl BallastReleaseController {
             .max(urgency_recommendation)
             .max(level_floor);
 
-        // Get current state for this mount.
-        let state = self.states.entry(mount_path.to_path_buf()).or_default();
-
         // Calculate how many MORE files need to be released to reach the target state.
-        let needed = target_released.saturating_sub(state.files_released_since_green);
+        let needed = target_released.saturating_sub(already_released);
 
         needed.min(available)
     }

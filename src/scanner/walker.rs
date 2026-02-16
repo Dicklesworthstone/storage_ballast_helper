@@ -388,11 +388,7 @@ fn process_directory(
         // Deferred dispatch: collect child dirs but don't queue yet. Queueing
         // happens after the loop, ensuring .sbh-protect markers are discovered
         // before any children are dispatched to other worker threads.
-        if depth < config.max_depth
-            && is_dir
-            && pending_children.len() < MAX_CHILDREN_QUEUED
-            && !config.excluded_paths.contains(&child_path)
-        {
+        if depth < config.max_depth && is_dir && !config.excluded_paths.contains(&child_path) {
             pending_children.push(child_path);
         }
     }
@@ -402,11 +398,10 @@ fn process_directory(
     // returned above), queue collected child dirs for worker threads.
     for child_path in pending_children {
         in_flight.fetch_add(1, Ordering::Release);
-        match work_tx.try_send((child_path, depth + 1, root_dev)) {
-            Ok(()) => {}
-            Err(_) => {
-                in_flight.fetch_sub(1, Ordering::Release);
-            }
+        if work_tx.send((child_path, depth + 1, root_dev)).is_err() {
+            // Channel disconnected (shutdown).
+            in_flight.fetch_sub(1, Ordering::Release);
+            return;
         }
     }
 
@@ -590,20 +585,11 @@ fn collect_open_files_linux() -> HashSet<(u64, u64)> {
     open
 }
 
-/// Maximum child directories queued per parent directory.
-/// Prevents a single huge directory (e.g. /data/tmp with 60K+ children) from
-/// monopolizing the work queue and starving other scan roots. Children beyond
-/// this cap are skipped; the next scan pass will rediscover them.
-const MAX_CHILDREN_QUEUED: usize = 512;
-
 /// Maximum child entries iterated per directory for signal collection.
-/// Directories with huge child counts (e.g. /data/tmp with 8K+ entries or
-/// target/release/deps/ with 10K+ files) cause the walker to spend seconds
-/// iterating entries that don't contribute useful signals. Structural markers
-/// like `.fingerprint`, `deps`, `incremental` appear within the first few
-/// hundred entries; 2000 is generous enough to capture them reliably while
-/// capping per-directory cost at ~1ms instead of 50-100ms.
-const MAX_ENTRIES_PER_DIR: u32 = 2000;
+/// Increased to 65536 to ensure full coverage of large project directories (e.g.
+/// node_modules or flat object directories). Iteration is reasonably cheap; missing
+/// entries causes permanent blind spots.
+const MAX_ENTRIES_PER_DIR: u32 = 65_536;
 
 /// Maximum time to spend scanning /proc for open file ancestors.
 /// On agent swarms with many processes, /proc scanning can take minutes.
@@ -611,18 +597,17 @@ const MAX_ENTRIES_PER_DIR: u32 = 2000;
 const OPEN_FILES_SCAN_BUDGET: Duration = Duration::from_secs(5);
 
 /// Maximum number of PIDs to scan before bailing out.
-/// Prevents pathological O(n * m) behavior on swarm machines with hundreds of agents.
-const OPEN_FILES_MAX_PIDS: usize = 500;
+/// Increased to 50,000 to handle busy swarm machines without false-negative open checks.
+const OPEN_FILES_MAX_PIDS: usize = 50_000;
 
 /// Collect absolute open-path ancestors for open file descriptors under `root_paths`.
 ///
 /// For each open file path, all ancestors are inserted, allowing O(1) subtree-open
 /// checks with `is_path_open_by_ancestor`.
 ///
-/// This function is budgeted: it will stop scanning /proc after `OPEN_FILES_SCAN_BUDGET`
-/// or `OPEN_FILES_MAX_PIDS` processes, whichever comes first. Partial results are still
-/// useful for veto decisions (most open files are captured within the first few hundred PIDs).
-pub fn collect_open_path_ancestors(root_paths: &[PathBuf]) -> HashSet<PathBuf> {
+/// Returns `(ancestors, is_complete)`. If `is_complete` is false, scanning was
+/// truncated due to budget limits, and open checks may yield false negatives.
+pub fn collect_open_path_ancestors(root_paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
     #[cfg(target_os = "linux")]
     {
         collect_open_path_ancestors_linux(root_paths)
@@ -630,18 +615,18 @@ pub fn collect_open_path_ancestors(root_paths: &[PathBuf]) -> HashSet<PathBuf> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = root_paths;
-        HashSet::new()
+        (HashSet::new(), true)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> HashSet<PathBuf> {
+fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
     use std::os::unix::ffi::OsStrExt;
     use std::time::Instant;
 
     let mut ancestors = HashSet::with_capacity(4096);
     let Ok(proc_dir) = fs::read_dir("/proc") else {
-        return ancestors;
+        return (ancestors, true);
     };
 
     let normalized_roots: Vec<(PathBuf, usize)> = if root_paths.is_empty() {
@@ -659,10 +644,12 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> HashSet<PathBuf>
 
     let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
     let mut pids_scanned: usize = 0;
+    let mut incomplete = false;
 
     for proc_entry in proc_dir.flatten() {
         // Budget checks: stop if we've exceeded time or PID limits.
         if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
+            incomplete = true;
             break;
         }
 
@@ -720,7 +707,7 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> HashSet<PathBuf>
         }
     }
 
-    ancestors
+    (ancestors, !incomplete)
 }
 
 /// Check if `path` is present in the open-ancestor index.
@@ -1119,7 +1106,7 @@ mod tests {
         fs::write(&file, b"data").unwrap();
         let handle = fs::File::open(&file).unwrap();
 
-        let open_ancestors = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
+        let (open_ancestors, _) = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
 
         // Guard: skip if /proc doesn't expose our own FDs (hidepid=2, containers).
         if !open_ancestors.contains(&file) {
@@ -1145,7 +1132,7 @@ mod tests {
         let handle = fs::File::open(&file).unwrap();
 
         // Child first exercises nested-root ordering.
-        let open_ancestors = collect_open_path_ancestors(&[child.clone(), parent.clone()]);
+        let (open_ancestors, _) = collect_open_path_ancestors(&[child.clone(), parent.clone()]);
 
         // Guard: skip if /proc doesn't expose our own FDs (hidepid=2, containers).
         if !open_ancestors.contains(&file) {

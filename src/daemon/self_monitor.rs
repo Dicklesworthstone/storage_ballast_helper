@@ -272,6 +272,7 @@ impl SelfMonitor {
     /// Check if it's time to write the state file. If so, write it.
     ///
     /// Returns the current RSS in bytes (0 if unavailable).
+    #[allow(clippy::too_many_arguments)]
     pub fn maybe_write_state(
         &mut self,
         pressure_level: PressureLevel,

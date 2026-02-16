@@ -848,6 +848,23 @@ impl Config {
                 details: "scanner.max_depth must be >= 1".to_string(),
             });
         }
+        if self.scanner.repeat_deletion_base_cooldown_secs == 0 {
+            return Err(SbhError::InvalidConfig {
+                details: "scanner.repeat_deletion_base_cooldown_secs must be >= 1".to_string(),
+            });
+        }
+        if self.scanner.repeat_deletion_max_cooldown_secs == 0 {
+            return Err(SbhError::InvalidConfig {
+                details: "scanner.repeat_deletion_max_cooldown_secs must be >= 1".to_string(),
+            });
+        }
+        if self.scanner.repeat_deletion_max_cooldown_secs
+            < self.scanner.repeat_deletion_base_cooldown_secs
+        {
+            return Err(SbhError::InvalidConfig {
+                details: "scanner.repeat_deletion_max_cooldown_secs must be >= scanner.repeat_deletion_base_cooldown_secs".to_string(),
+            });
+        }
 
         validate_prob("scoring.min_score", self.scoring.min_score)?;
         validate_prob("scoring.calibration_floor", self.scoring.calibration_floor)?;
@@ -862,7 +879,7 @@ impl Config {
             });
         }
 
-        // I32: Individual scoring weights must be non-negative.
+        // I32: Individual scoring weights must be finite and non-negative.
         for (name, val) in [
             ("location_weight", self.scoring.location_weight),
             ("name_weight", self.scoring.name_weight),
@@ -870,17 +887,21 @@ impl Config {
             ("size_weight", self.scoring.size_weight),
             ("structure_weight", self.scoring.structure_weight),
         ] {
-            if val < 0.0 {
+            if !val.is_finite() || val < 0.0 {
                 return Err(SbhError::InvalidConfig {
-                    details: format!("scoring.{name} must be >= 0.0, got {val}"),
+                    details: format!("scoring.{name} must be a finite value >= 0.0, got {val}"),
                 });
             }
         }
 
-        // M13: Loss values must be non-negative.
-        if self.scoring.false_positive_loss < 0.0 || self.scoring.false_negative_loss < 0.0 {
+        // M13: Loss values must be finite and non-negative.
+        if !self.scoring.false_positive_loss.is_finite()
+            || !self.scoring.false_negative_loss.is_finite()
+            || self.scoring.false_positive_loss < 0.0
+            || self.scoring.false_negative_loss < 0.0
+        {
             return Err(SbhError::InvalidConfig {
-                details: "scoring.false_positive_loss and false_negative_loss must be >= 0.0"
+                details: "scoring.false_positive_loss and false_negative_loss must be finite values >= 0.0"
                     .to_string(),
             });
         }
@@ -904,9 +925,9 @@ impl Config {
                 self.scheduler.forecast_error_threshold,
             ),
         ] {
-            if val < 0.0 {
+            if !val.is_finite() || val < 0.0 {
                 return Err(SbhError::InvalidConfig {
-                    details: format!("scheduler.{name} must be >= 0.0, got {val}"),
+                    details: format!("scheduler.{name} must be a finite value >= 0.0, got {val}"),
                 });
             }
         }
@@ -957,6 +978,34 @@ impl Config {
                     self.ballast.file_size_bytes,
                 ),
             });
+        }
+
+        // Per-volume overrides must also satisfy the same constraints.
+        for (mount, ovr) in &self.ballast.overrides {
+            if let Some(count) = ovr.file_count {
+                if count == 0 {
+                    return Err(SbhError::InvalidConfig {
+                        details: format!("ballast.overrides[\"{mount}\"].file_count must be > 0"),
+                    });
+                }
+                if count > u32::MAX as usize {
+                    return Err(SbhError::InvalidConfig {
+                        details: format!(
+                            "ballast.overrides[\"{mount}\"].file_count ({count}) exceeds maximum ({})",
+                            u32::MAX,
+                        ),
+                    });
+                }
+            }
+            if let Some(size) = ovr.file_size_bytes
+                && size < 4096
+            {
+                return Err(SbhError::InvalidConfig {
+                    details: format!(
+                        "ballast.overrides[\"{mount}\"].file_size_bytes ({size}) must be >= 4096 (header size)"
+                    ),
+                });
+            }
         }
 
         if self.update.metadata_cache_ttl_seconds == 0 {
@@ -1217,6 +1266,39 @@ mod tests {
         cfg.scanner.parallelism = 0;
         let err = cfg.validate().expect_err("expected parallelism error");
         assert!(err.to_string().contains("parallelism"));
+    }
+
+    #[test]
+    fn scanner_repeat_deletion_base_cooldown_must_be_positive() {
+        let mut cfg = Config::default();
+        cfg.scanner.repeat_deletion_base_cooldown_secs = 0;
+        let err = cfg.validate().expect_err("expected base cooldown error");
+        assert!(
+            err.to_string()
+                .contains("repeat_deletion_base_cooldown_secs")
+        );
+    }
+
+    #[test]
+    fn scanner_repeat_deletion_max_cooldown_must_be_positive() {
+        let mut cfg = Config::default();
+        cfg.scanner.repeat_deletion_max_cooldown_secs = 0;
+        let err = cfg.validate().expect_err("expected max cooldown error");
+        assert!(
+            err.to_string()
+                .contains("repeat_deletion_max_cooldown_secs")
+        );
+    }
+
+    #[test]
+    fn scanner_repeat_deletion_max_cooldown_must_not_be_lower_than_base() {
+        let mut cfg = Config::default();
+        cfg.scanner.repeat_deletion_base_cooldown_secs = 600;
+        cfg.scanner.repeat_deletion_max_cooldown_secs = 60;
+        let err = cfg
+            .validate()
+            .expect_err("expected cooldown ordering validation error");
+        assert!(err.to_string().contains("must be >="));
     }
 
     #[test]

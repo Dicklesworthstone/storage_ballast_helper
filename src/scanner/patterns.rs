@@ -238,15 +238,13 @@ fn structural_score(category: ArtifactCategory, signals: StructuralSignals) -> f
             }
         }
         ArtifactCategory::PythonCache => 0.75,
-        ArtifactCategory::BuildOutput => {
+        ArtifactCategory::BuildOutput | ArtifactCategory::CacheDir | ArtifactCategory::TempDir => {
             if signals.mostly_object_files {
                 0.80
             } else {
-                0.55
+                0.40
             }
         }
-        ArtifactCategory::CacheDir => 0.65,
-        ArtifactCategory::TempDir => 0.70,
         ArtifactCategory::AgentWorkspace => 0.78,
         ArtifactCategory::Unknown => {
             if signals.has_fingerprint || (signals.has_incremental && signals.has_deps) {
@@ -412,8 +410,20 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             category: ArtifactCategory::PythonCache,
         },
         ArtifactPattern {
-            name: "generic-cache-prefix",
-            kind: MatchKind::Prefix("cache"),
+            name: "generic-cache-prefix-hyphen",
+            kind: MatchKind::Prefix("cache-"),
+            confidence: 0.60,
+            category: ArtifactCategory::CacheDir,
+        },
+        ArtifactPattern {
+            name: "generic-cache-prefix-underscore",
+            kind: MatchKind::Prefix("cache_"),
+            confidence: 0.60,
+            category: ArtifactCategory::CacheDir,
+        },
+        ArtifactPattern {
+            name: "generic-cache-exact",
+            kind: MatchKind::Exact("cache"),
             confidence: 0.60,
             category: ArtifactCategory::CacheDir,
         },
@@ -424,8 +434,20 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             category: ArtifactCategory::CacheDir,
         },
         ArtifactPattern {
-            name: "generic-tmp-prefix",
-            kind: MatchKind::Prefix("tmp"),
+            name: "generic-tmp-prefix-hyphen",
+            kind: MatchKind::Prefix("tmp-"),
+            confidence: 0.58,
+            category: ArtifactCategory::TempDir,
+        },
+        ArtifactPattern {
+            name: "generic-tmp-prefix-underscore",
+            kind: MatchKind::Prefix("tmp_"),
+            confidence: 0.58,
+            category: ArtifactCategory::TempDir,
+        },
+        ArtifactPattern {
+            name: "generic-tmp-exact",
+            kind: MatchKind::Exact("tmp"),
             confidence: 0.58,
             category: ArtifactCategory::TempDir,
         },

@@ -433,15 +433,29 @@ impl<'a> StatsEngine<'a> {
     fn pressure_stats(&self, since: &str) -> Result<PressureStats> {
         let conn = self.db.connection();
 
-        // Get pressure history samples ordered by time.
+        // On multi-mount systems, pressure samples from different mount points
+        // are interleaved.  Pick the mount with the most samples in the window
+        // (the "primary" monitored volume) so percentages are coherent.
+        let primary_mount: Option<String> = conn
+            .query_row(
+                "SELECT mount_point FROM pressure_history
+                 WHERE timestamp >= ?1
+                 GROUP BY mount_point ORDER BY COUNT(*) DESC LIMIT 1",
+                params![since],
+                |row| row.get(0),
+            )
+            .ok();
+
+        // Get pressure history samples ordered by time, filtered to primary mount.
         let mut stmt = conn.prepare(
             "SELECT timestamp, pressure_level, free_pct FROM pressure_history
-             WHERE timestamp >= ?1
+             WHERE timestamp >= ?1 AND (?2 IS NULL OR mount_point = ?2)
              ORDER BY timestamp ASC",
         )?;
 
+        let mount_param = primary_mount.as_deref();
         let samples: Vec<(String, String, f64)> = stmt
-            .query_map(params![since], |row| {
+            .query_map(params![since, mount_param], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

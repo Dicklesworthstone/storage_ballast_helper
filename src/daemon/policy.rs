@@ -225,16 +225,11 @@ impl PolicyEngine {
     #[must_use]
     pub fn new(config: PolicyConfig) -> Self {
         let intended = config.initial_mode;
-        let (active, reason) = if config.kill_switch {
-            (ActiveMode::FallbackSafe, Some(FallbackReason::KillSwitch))
-        } else {
-            (intended, None)
-        };
-        Self {
+        let mut engine = Self {
             config,
-            mode: active,
+            mode: intended,
             pre_fallback_mode: intended,
-            fallback_reason: reason,
+            fallback_reason: None,
             builder: DecisionRecordBuilder::new(),
             consecutive_clean_windows: 0,
             consecutive_breach_windows: 0,
@@ -243,7 +238,27 @@ impl PolicyEngine {
             total_decisions: 0,
             total_fallback_entries: 0,
             transition_log: Vec::new(),
+        };
+
+        if engine.config.kill_switch {
+            if engine.mode == ActiveMode::FallbackSafe {
+                // Already in fallback by initial_mode, but still record kill-switch cause.
+                let reason = FallbackReason::KillSwitch;
+                let reason_str = reason.to_string();
+                engine.fallback_reason = Some(reason);
+                engine.total_fallback_entries = 1;
+                engine.log_transition(
+                    "fallback",
+                    ActiveMode::FallbackSafe,
+                    ActiveMode::FallbackSafe,
+                    Some(reason_str),
+                );
+            } else {
+                engine.enter_fallback(FallbackReason::KillSwitch);
+            }
         }
+
+        engine
     }
 
     /// Current active mode.
@@ -457,8 +472,22 @@ impl PolicyEngine {
         self.config = new_config;
 
         // Kill-switch engaged: force fallback_safe.
-        if !old_kill && new_kill && self.mode != ActiveMode::FallbackSafe {
-            self.enter_fallback(FallbackReason::KillSwitch);
+        if !old_kill && new_kill {
+            if self.mode != ActiveMode::FallbackSafe {
+                self.enter_fallback(FallbackReason::KillSwitch);
+            } else if self.fallback_reason.is_none() {
+                // Already in fallback (e.g., configured initial mode); still record kill-switch cause.
+                let reason = FallbackReason::KillSwitch;
+                let reason_str = reason.to_string();
+                self.fallback_reason = Some(reason);
+                self.total_fallback_entries += 1;
+                self.log_transition(
+                    "fallback",
+                    ActiveMode::FallbackSafe,
+                    ActiveMode::FallbackSafe,
+                    Some(reason_str),
+                );
+            }
         }
         // Kill-switch disengaged: recover if we were in fallback *due to* kill-switch.
         if old_kill
@@ -709,6 +738,23 @@ mod tests {
         config.kill_switch = true;
         let engine = PolicyEngine::new(config);
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+        assert_eq!(engine.fallback_reason(), Some(&FallbackReason::KillSwitch));
+        assert_eq!(engine.total_fallback_entries(), 1);
+        assert_eq!(engine.transition_log().len(), 1);
+        assert_eq!(engine.transition_log()[0].transition, "fallback");
+    }
+
+    #[test]
+    fn kill_switch_in_fallback_initial_mode_still_records_reason_and_entry() {
+        let mut config = default_config();
+        config.initial_mode = ActiveMode::FallbackSafe;
+        config.kill_switch = true;
+
+        let engine = PolicyEngine::new(config);
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+        assert_eq!(engine.fallback_reason(), Some(&FallbackReason::KillSwitch));
+        assert_eq!(engine.total_fallback_entries(), 1);
+        assert_eq!(engine.transition_log().len(), 1);
     }
 
     #[test]
@@ -1125,10 +1171,25 @@ mod tests {
         engine.update_config(new);
 
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
-        assert_eq!(
-            engine.fallback_reason(),
-            Some(&FallbackReason::KillSwitch)
-        );
+        assert_eq!(engine.fallback_reason(), Some(&FallbackReason::KillSwitch));
+    }
+
+    #[test]
+    fn update_config_engages_kill_switch_while_already_in_fallback_records_reason() {
+        let mut config = default_config();
+        config.initial_mode = ActiveMode::FallbackSafe;
+        let mut engine = PolicyEngine::new(config);
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+        assert!(engine.fallback_reason().is_none());
+
+        let mut new = default_config();
+        new.initial_mode = ActiveMode::FallbackSafe;
+        new.kill_switch = true;
+        engine.update_config(new);
+
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+        assert_eq!(engine.fallback_reason(), Some(&FallbackReason::KillSwitch));
+        assert_eq!(engine.total_fallback_entries(), 1);
     }
 
     #[test]

@@ -318,7 +318,9 @@ impl BallastPoolCoordinator {
         Ok(Some(report))
     }
 
-    /// Replenish ballast on a specific mount point after pressure subsides.
+    /// Replenish at most one ballast file on a specific mount point after
+    /// pressure subsides.  Gradual one-file-at-a-time replenishment avoids a
+    /// burst of disk I/O at the moment the system is recovering from pressure.
     pub fn replenish_for_mount(
         &mut self,
         mount_path: &Path,
@@ -328,7 +330,7 @@ impl BallastPoolCoordinator {
             return Ok(None);
         };
 
-        let report = pool.manager.replenish(free_pct_check)?;
+        let report = pool.manager.replenish_one(free_pct_check)?;
         Ok(Some(report))
     }
 
@@ -831,12 +833,16 @@ mod tests {
             0
         );
 
-        // Replenish volume A.
-        let report = coordinator
-            .replenish_for_mount(dir_a.path(), None)
-            .unwrap()
-            .expect("should have provision report");
-        assert_eq!(report.files_created, 3);
+        // Replenish volume A (one file per call, matching daemon tick behavior).
+        let mut total_created = 0;
+        for _ in 0..3 {
+            let report = coordinator
+                .replenish_for_mount(dir_a.path(), None)
+                .unwrap()
+                .expect("should have provision report");
+            total_created += report.files_created;
+        }
+        assert_eq!(total_created, 3);
         assert_eq!(
             coordinator
                 .pool_for_mount(dir_a.path())
