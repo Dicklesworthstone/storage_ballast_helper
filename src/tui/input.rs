@@ -157,6 +157,20 @@ pub fn search_palette_actions(query: &str, limit: usize) -> Vec<&'static Palette
         .collect()
 }
 
+/// Route a palette query to the best-matching action.
+///
+/// Returns `None` for blank or non-matching queries.
+#[must_use]
+pub fn route_palette_query(query: &str) -> Option<InputAction> {
+    if normalize(query).is_empty() {
+        return None;
+    }
+    search_palette_actions(query, 1)
+        .first()
+        .copied()
+        .map(|action| action.action)
+}
+
 /// Build contextual help entries for the current screen/overlay state.
 #[must_use]
 pub fn contextual_help(context: InputContext) -> ContextualHelp {
@@ -234,12 +248,38 @@ fn match_score(action: &PaletteAction, query: &str) -> Option<u8> {
     if title.contains(query) {
         return Some(10);
     }
+    if is_fuzzy_subsequence(&id, query) || is_fuzzy_subsequence(&title, query) {
+        return Some(5);
+    }
 
     None
 }
 
 fn normalize(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
+}
+
+fn is_fuzzy_subsequence(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+
+    let mut needle_chars = needle.chars();
+    let mut wanted = match needle_chars.next() {
+        Some(ch) => ch,
+        None => return true,
+    };
+
+    for ch in haystack.chars() {
+        if ch == wanted {
+            match needle_chars.next() {
+                Some(next) => wanted = next,
+                None => return true,
+            }
+        }
+    }
+
+    false
 }
 
 fn overlay_help(overlay: Overlay) -> ContextualHelp {
@@ -597,6 +637,21 @@ mod tests {
 
         let none = search_palette_actions("nav", 0);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn route_palette_query_returns_best_action() {
+        assert_eq!(
+            route_palette_query("nav.ballast"),
+            Some(InputAction::Navigate(Screen::Ballast))
+        );
+        assert_eq!(route_palette_query("   "), None);
+        assert_eq!(route_palette_query("definitely-unknown"), None);
+    }
+
+    #[test]
+    fn route_palette_query_supports_fuzzy_subsequence() {
+        assert_eq!(route_palette_query("jbal"), Some(InputAction::JumpBallast));
     }
 
     #[test]

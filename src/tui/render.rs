@@ -1034,11 +1034,7 @@ fn render_diagnostics(model: &DashboardModel, theme: Theme, out: &mut String) {
         None => String::from("never"),
     };
     let _ = writeln!(out, "  last-fetch:    {fetch_label}");
-    let _ = writeln!(
-        out,
-        "  notifications: {} active",
-        model.notifications.len(),
-    );
+    let _ = writeln!(out, "  notifications: {} active", model.notifications.len(),);
 
     // ── Frame timing ──
     let _ = writeln!(out);
@@ -1159,11 +1155,7 @@ fn render_diagnostics(model: &DashboardModel, theme: Theme, out: &mut String) {
         if let Some(ref state) = model.daemon_state {
             let _ = writeln!(out, "  version: {}", state.version);
             let _ = writeln!(out, "  pid:     {}", state.pid);
-            let _ = writeln!(
-                out,
-                "  uptime:  {}",
-                human_duration(state.uptime_seconds),
-            );
+            let _ = writeln!(out, "  uptime:  {}", human_duration(state.uptime_seconds),);
             let _ = writeln!(out, "  rss:     {}", human_bytes(state.memory_rss_bytes));
             let _ = writeln!(
                 out,
@@ -1181,16 +1173,8 @@ fn render_diagnostics(model: &DashboardModel, theme: Theme, out: &mut String) {
         let _ = writeln!(out);
         let _ = writeln!(out, "{}", section_header("Screen State", width));
         let _ = writeln!(out, "  active:      {}", screen_label(model.screen));
-        let _ = writeln!(
-            out,
-            "  history:     {} entries",
-            model.screen_history.len(),
-        );
-        let _ = writeln!(
-            out,
-            "  rate-mounts: {} tracked",
-            model.rate_histories.len(),
-        );
+        let _ = writeln!(out, "  history:     {} entries", model.screen_history.len(),);
+        let _ = writeln!(out, "  rate-mounts: {} tracked", model.rate_histories.len(),);
         let _ = writeln!(
             out,
             "  timeline:    {} events (filter={})",
@@ -2174,5 +2158,253 @@ mod tests {
         let frame = render(&model);
         // calibration_score = 0.82 => MODERATE confidence
         assert!(frame.contains("MODERATE"));
+    }
+
+    // ── S7 Diagnostics screen tests ──
+
+    #[test]
+    fn diagnostics_shows_health_section() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Diagnostics;
+        model.tick = 42;
+
+        let frame = render(&model);
+        assert!(frame.contains("[S7 Diagnostics]"));
+        assert!(frame.contains("Dashboard Health"));
+        assert!(frame.contains("DEGRADED")); // starts degraded
+        assert!(frame.contains("tick:"));
+        assert!(frame.contains("42"));
+        assert!(frame.contains("refresh=1000ms"));
+        assert!(frame.contains("missed-ticks:"));
+    }
+
+    #[test]
+    fn diagnostics_shows_normal_mode_when_not_degraded() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Diagnostics;
+        model.degraded = false;
+
+        let frame = render(&model);
+        assert!(frame.contains("NORMAL"));
+    }
+
+    #[test]
+    fn diagnostics_shows_frame_timing_with_data() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Diagnostics;
+        for ms in [2.0, 3.0, 1.5, 4.0, 2.5] {
+            model.frame_times.push(ms);
+        }
+
+        let frame = render(&model);
+        assert!(frame.contains("Frame Timing"));
+        assert!(frame.contains("current: 2.5ms"));
+        assert!(frame.contains("avg:"));
+        assert!(frame.contains("budget:"));
+        assert!(frame.contains("5 samples"));
+    }
+
+    #[test]
+    fn diagnostics_no_frame_data_message() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Diagnostics;
+
+        let frame = render(&model);
+        assert!(frame.contains("no frame data yet"));
+    }
+
+    #[test]
+    fn diagnostics_shows_adapter_health() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Diagnostics;
+        model.adapter_reads = 95;
+        model.adapter_errors = 5;
+
+        let frame = render(&model);
+        assert!(frame.contains("Data Adapters"));
+        assert!(frame.contains("reads=95"));
+        assert!(frame.contains("errors=5"));
+        assert!(frame.contains("DEGRADED")); // 5% error rate < 10%
+    }
+
+    #[test]
+    fn diagnostics_adapter_ok_with_zero_errors() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Diagnostics;
+        model.degraded = false;
+        model.adapter_reads = 100;
+        model.adapter_errors = 0;
+
+        let frame = render(&model);
+        // Should show "OK" for adapter health (not DEGRADED from dashboard mode)
+        let adapter_line = frame
+            .lines()
+            .find(|l| l.contains("state-adapter:"))
+            .expect("adapter line");
+        assert!(adapter_line.contains("OK") || adapter_line.contains("ok"));
+    }
+
+    #[test]
+    fn diagnostics_shows_telemetry_sources() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Diagnostics;
+        model.timeline_source = DataSource::Sqlite;
+        model.explainability_source = DataSource::Jsonl;
+        model.explainability_partial = true;
+
+        let frame = render(&model);
+        assert!(frame.contains("timeline"));
+        assert!(frame.contains("SQLite"));
+        assert!(frame.contains("explainability"));
+        assert!(frame.contains("JSONL"));
+        assert!(frame.contains("PARTIAL"));
+        assert!(frame.contains("candidates"));
+        assert!(frame.contains("INACTIVE")); // candidates still DataSource::None
+    }
+
+    #[test]
+    fn diagnostics_shows_terminal_info() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Diagnostics;
+
+        let frame = render(&model);
+        assert!(frame.contains("Terminal"));
+        assert!(frame.contains("120x30"));
+    }
+
+    #[test]
+    fn diagnostics_verbose_shows_daemon_and_screen_state() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 40),
+        );
+        model.screen = Screen::Diagnostics;
+        model.diagnostics_verbose = true;
+        model.daemon_state = Some(sample_state("green", 80.0));
+
+        let frame = render(&model);
+        assert!(frame.contains("Daemon Process"));
+        assert!(frame.contains("pid:"));
+        assert!(frame.contains("1234"));
+        assert!(frame.contains("rss:"));
+        assert!(frame.contains("Screen State"));
+        assert!(frame.contains("active:"));
+        assert!(frame.contains("S7 Diagnostics"));
+    }
+
+    #[test]
+    fn diagnostics_verbose_off_hides_daemon_section() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Diagnostics;
+        model.diagnostics_verbose = false;
+        model.daemon_state = Some(sample_state("green", 80.0));
+
+        let frame = render(&model);
+        assert!(!frame.contains("Daemon Process"));
+        assert!(!frame.contains("Screen State"));
+    }
+
+    #[test]
+    fn diagnostics_navigation_hint() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Diagnostics;
+
+        let frame = render(&model);
+        assert!(frame.contains("V verbose"));
+        assert!(frame.contains("(off)"));
+
+        model.diagnostics_verbose = true;
+        let frame = render(&model);
+        assert!(frame.contains("(on)"));
+    }
+
+    #[test]
+    fn diagnostics_budget_badge_reflects_load() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Diagnostics;
+        // avg = 900ms, budget = 1000ms → 90% → OVER badge
+        for _ in 0..10 {
+            model.frame_times.push(900.0);
+        }
+
+        let frame = render(&model);
+        assert!(frame.contains("OVER"));
+    }
+
+    #[test]
+    fn diagnostics_adapter_failing_at_high_error_rate() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Diagnostics;
+        model.adapter_reads = 5;
+        model.adapter_errors = 15; // 75% error rate
+
+        let frame = render(&model);
+        let adapter_line = frame
+            .lines()
+            .find(|l| l.contains("state-adapter:"))
+            .expect("adapter line");
+        assert!(adapter_line.contains("FAILING"));
     }
 }

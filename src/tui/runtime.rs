@@ -15,7 +15,7 @@ use ftui_core::event::{Event, KeyEventKind};
 use ftui_tty::{TtyBackend, TtySessionOptions};
 
 use super::model::{DashboardCmd, DashboardModel, DashboardMsg};
-use super::{render, update};
+use super::{input, render, update};
 use crate::cli::dashboard::{self, DashboardConfig as LegacyDashboardConfig};
 use crate::daemon::self_monitor::DaemonState;
 
@@ -123,7 +123,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
             while let Some(event) = backend.read_event()? {
                 let cmd = match event {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        update::update(&mut model, DashboardMsg::Key(key))
+                        update::update(&mut model, input::map_key_event(key))
                     }
                     Event::Resize { width, height } => update::update(
                         &mut model,

@@ -28,5 +28,7 @@ mod test_artifact;
 mod test_fault_injection;
 #[cfg(test)]
 mod test_harness;
+#[cfg(test)]
+mod test_replay;
 
 pub use runtime::{DashboardRuntimeConfig, DashboardRuntimeMode, run_dashboard};

@@ -19,9 +19,7 @@ use std::time::Duration;
 use filetime::{FileTime, set_file_mtime};
 use tempfile::TempDir;
 
-use super::adapters::{
-    DashboardStateAdapter, SchemaWarnings, SnapshotSource, StateFreshness,
-};
+use super::adapters::{DashboardStateAdapter, SchemaWarnings, SnapshotSource, StateFreshness};
 use super::model::Screen;
 use super::preferences::{self, DebouncedWriter, LoadOutcome, UserPreferences};
 use super::telemetry::{
