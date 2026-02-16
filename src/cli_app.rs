@@ -3158,16 +3158,13 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Runtime(e.to_string()))?;
     let dir_count = entries.len();
 
-    // Collect open files for is_open detection.
-    let open_files = collect_open_files();
-    let mut open_checker = OpenPathCache::new(&open_files);
-
-    // Classify and score each entry.
+    // Classify and score each entry first. Open-file checks are expensive and only
+    // needed for candidates that survive score/veto filters.
     let registry = ArtifactPatternRegistry::default();
     let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
     let now = SystemTime::now();
 
-    let mut candidates: Vec<_> = entries
+    let mut preliminary: Vec<_> = entries
         .iter()
         .map(|entry| {
             let classification = registry.classify(&entry.path, entry.structural_signals);
@@ -3180,7 +3177,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 age,
                 classification,
                 signals: entry.structural_signals,
-                is_open: open_checker.is_path_open(&entry.path),
+                is_open: false,
                 excluded: false,
             };
             engine.score_candidate(&candidate, 0.0) // No pressure urgency for manual scan.
@@ -3188,12 +3185,28 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
         .filter(|score| !score.vetoed && score.total_score >= args.min_score)
         .collect();
 
-    candidates.sort_by(|a, b| {
+    preliminary.sort_by(|a, b| {
         b.total_score
             .partial_cmp(&a.total_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    candidates.truncate(args.top);
+
+    // Open-file checks can only veto candidates, never improve scores.
+    // Evaluate in rank order and stop once we have enough results.
+    let mut candidates: Vec<_> = Vec::with_capacity(args.top.min(preliminary.len()));
+    if args.top > 0 && !preliminary.is_empty() {
+        let open_files = collect_open_files();
+        let mut open_checker = OpenPathCache::new(&open_files);
+        for score in preliminary {
+            if open_checker.is_path_open(&score.path) {
+                continue;
+            }
+            candidates.push(score);
+            if candidates.len() >= args.top {
+                break;
+            }
+        }
+    }
 
     let elapsed = start.elapsed();
     let total_reclaimable: u64 = candidates.iter().map(|c| c.size_bytes).sum();
