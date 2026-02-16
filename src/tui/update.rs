@@ -2,6 +2,8 @@
 //!
 //! `update()` takes the current model and a message, mutates the model, and
 //! returns a command describing any side-effects the runtime should execute.
+
+#![allow(clippy::too_many_lines)]
 //!
 //! **Design invariant:** this module performs zero I/O. All effects are
 //! described as [`DashboardCmd`] values.
@@ -12,8 +14,8 @@ use ftui_core::event::KeyCode;
 
 use super::input::{InputAction, InputContext};
 use super::model::{
-    DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, PreferenceAction, RateHistory,
-    Screen,
+    ConfirmAction, DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, Overlay,
+    PreferenceAction, RateHistory, Screen,
 };
 
 /// Apply a message to the model and return the next command for the runtime.
@@ -312,6 +314,50 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
                     .len();
             if result_count > 0 && model.palette_selected < result_count - 1 {
                 model.palette_selected += 1;
+            }
+            DashboardCmd::None
+        }
+        // ── Incident workflow shortcuts (bd-xzt.3.9) ──
+        InputAction::IncidentShowPlaybook => {
+            model.incident_playbook_selected = 0;
+            model.active_overlay = Some(Overlay::IncidentPlaybook);
+            DashboardCmd::None
+        }
+        InputAction::IncidentQuickRelease => {
+            // Jump directly to ballast screen and open release confirmation.
+            model.navigate_to(Screen::Ballast);
+            model.active_overlay = Some(Overlay::Confirmation(ConfirmAction::BallastRelease));
+            model.push_notification(
+                NotificationLevel::Warning,
+                "Quick-release: confirm ballast release on selected volume".to_string(),
+            );
+            DashboardCmd::None
+        }
+        InputAction::IncidentPlaybookNavigate => {
+            let severity = super::incident::IncidentSeverity::from_daemon_state(
+                model.daemon_state.as_ref(),
+            );
+            let entries = super::incident::playbook_for_severity(severity);
+            if let Some(entry) = entries.get(model.incident_playbook_selected) {
+                let target = entry.target;
+                model.active_overlay = None;
+                model.navigate_to(target);
+            }
+            DashboardCmd::None
+        }
+        InputAction::IncidentPlaybookUp => {
+            if model.incident_playbook_selected > 0 {
+                model.incident_playbook_selected -= 1;
+            }
+            DashboardCmd::None
+        }
+        InputAction::IncidentPlaybookDown => {
+            let severity = super::incident::IncidentSeverity::from_daemon_state(
+                model.daemon_state.as_ref(),
+            );
+            let entry_count = super::incident::playbook_for_severity(severity).len();
+            if entry_count > 0 && model.incident_playbook_selected < entry_count - 1 {
+                model.incident_playbook_selected += 1;
             }
             DashboardCmd::None
         }

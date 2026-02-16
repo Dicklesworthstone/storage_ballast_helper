@@ -44,6 +44,16 @@ pub enum InputAction {
     PaletteExecute,
     PaletteCursorUp,
     PaletteCursorDown,
+    /// Show incident triage playbook overlay (bd-xzt.3.9).
+    IncidentShowPlaybook,
+    /// Quick-release ballast: jump to ballast screen with release confirmation.
+    IncidentQuickRelease,
+    /// Navigate to the playbook entry at the cursor position.
+    IncidentPlaybookNavigate,
+    /// Move playbook cursor up.
+    IncidentPlaybookUp,
+    /// Move playbook cursor down.
+    IncidentPlaybookDown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +213,9 @@ fn resolve_overlay_key(key: &KeyEvent, overlay: Overlay) -> InputResolution {
         KeyCode::Char('p') if key.ctrl() && overlay == Overlay::CommandPalette => {
             InputResolution::action(InputAction::ToggleOverlay(Overlay::CommandPalette))
         }
+        KeyCode::Char('!') if overlay == Overlay::IncidentPlaybook => {
+            InputResolution::action(InputAction::ToggleOverlay(Overlay::IncidentPlaybook))
+        }
         KeyCode::Enter if overlay == Overlay::CommandPalette => {
             InputResolution::action(InputAction::PaletteExecute)
         }
@@ -217,6 +230,16 @@ fn resolve_overlay_key(key: &KeyEvent, overlay: Overlay) -> InputResolution {
         }
         KeyCode::Char(c) if overlay == Overlay::CommandPalette => {
             InputResolution::action(InputAction::PaletteType(c))
+        }
+        // ── Incident playbook overlay (O7) ──
+        KeyCode::Up | KeyCode::Char('k') if overlay == Overlay::IncidentPlaybook => {
+            InputResolution::action(InputAction::IncidentPlaybookUp)
+        }
+        KeyCode::Down | KeyCode::Char('j') if overlay == Overlay::IncidentPlaybook => {
+            InputResolution::action(InputAction::IncidentPlaybookDown)
+        }
+        KeyCode::Enter if overlay == Overlay::IncidentPlaybook => {
+            InputResolution::action(InputAction::IncidentPlaybookNavigate)
         }
         _ => InputResolution::consumed_without_action(),
     }
@@ -243,6 +266,8 @@ fn resolve_global_key(key: &KeyEvent) -> InputResolution {
         }
         KeyCode::Char('b') => InputResolution::action(InputAction::JumpBallast),
         KeyCode::Char('r') => InputResolution::action(InputAction::ForceRefresh),
+        KeyCode::Char('!') => InputResolution::action(InputAction::IncidentShowPlaybook),
+        KeyCode::Char('x') => InputResolution::action(InputAction::IncidentQuickRelease),
         _ => InputResolution::passthrough(),
     }
 }
@@ -368,6 +393,28 @@ fn overlay_help(overlay: Overlay) -> ContextualHelp {
                 },
             ],
         },
+        Overlay::IncidentPlaybook => ContextualHelp {
+            title: "Incident Playbook",
+            screen_hint: "Guided triage steps ordered by urgency.",
+            bindings: vec![
+                HelpBinding {
+                    keys: "j/k or Up/Down",
+                    description: "Navigate playbook steps",
+                },
+                HelpBinding {
+                    keys: "Enter",
+                    description: "Jump to selected step's screen",
+                },
+                HelpBinding {
+                    keys: "Esc",
+                    description: "Close playbook",
+                },
+                HelpBinding {
+                    keys: "!",
+                    description: "Toggle playbook",
+                },
+            ],
+        },
     }
 }
 
@@ -386,7 +433,7 @@ fn screen_help(screen: Screen) -> ContextualHelp {
     }
 }
 
-const GLOBAL_HELP_BINDINGS: [HelpBinding; 11] = [
+const GLOBAL_HELP_BINDINGS: [HelpBinding; 13] = [
     HelpBinding {
         keys: "1..7",
         description: "Jump directly to screen",
@@ -428,12 +475,20 @@ const GLOBAL_HELP_BINDINGS: [HelpBinding; 11] = [
         description: "Force data refresh",
     },
     HelpBinding {
+        keys: "!",
+        description: "Show incident triage playbook",
+    },
+    HelpBinding {
+        keys: "x",
+        description: "Quick-release ballast (incident shortcut)",
+    },
+    HelpBinding {
         keys: "status",
         description: "Overlay keys consume input before screen keys",
     },
 ];
 
-const PALETTE_ACTIONS: [PaletteAction; 30] = [
+const PALETTE_ACTIONS: [PaletteAction; 33] = [
     PaletteAction {
         id: "nav.overview",
         title: "Go to Overview",
@@ -614,6 +669,25 @@ const PALETTE_ACTIONS: [PaletteAction; 30] = [
         shortcut: "prefs",
         action: InputAction::RevertPreferencesToDefaults,
     },
+    // ── Incident workflow shortcuts (bd-xzt.3.9) ──
+    PaletteAction {
+        id: "incident.playbook",
+        title: "Show incident triage playbook",
+        shortcut: "!",
+        action: InputAction::IncidentShowPlaybook,
+    },
+    PaletteAction {
+        id: "incident.quick-release",
+        title: "Quick-release ballast (incident)",
+        shortcut: "x",
+        action: InputAction::IncidentQuickRelease,
+    },
+    PaletteAction {
+        id: "incident.triage",
+        title: "Start incident triage (overview)",
+        shortcut: "!",
+        action: InputAction::IncidentShowPlaybook,
+    },
 ];
 
 fn screen_hint(screen: Screen) -> &'static str {
@@ -671,7 +745,7 @@ mod tests {
         let ctx = InputContext::default();
         let nav = resolve_key_event(&key(KeyCode::Char('5')), ctx);
         let refresh = resolve_key_event(&key(KeyCode::Char('r')), ctx);
-        let unknown = resolve_key_event(&key(KeyCode::Char('x')), ctx);
+        let unknown = resolve_key_event(&key(KeyCode::Char('z')), ctx);
 
         assert_eq!(nav.action, Some(InputAction::Navigate(Screen::Ballast)));
         assert_eq!(refresh.action, Some(InputAction::ForceRefresh));

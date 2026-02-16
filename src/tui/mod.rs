@@ -8,6 +8,7 @@
 
 pub mod adapters;
 pub mod e2e_artifact;
+pub mod incident;
 pub mod input;
 pub mod layout;
 pub mod model;
@@ -34,6 +35,8 @@ mod test_properties;
 mod test_replay;
 #[cfg(test)]
 mod test_stress;
+#[cfg(test)]
+mod test_snapshot_golden;
 #[cfg(test)]
 mod test_unit_coverage;
 

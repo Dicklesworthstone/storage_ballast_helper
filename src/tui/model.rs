@@ -120,6 +120,8 @@ pub enum Overlay {
     Voi,
     /// O6: Modal confirmation for mutating actions.
     Confirmation(ConfirmAction),
+    /// O7: Incident triage playbook with guided navigation shortcuts.
+    IncidentPlaybook,
 }
 
 /// Actions that require modal confirmation before execution.
@@ -571,6 +573,10 @@ pub struct DashboardModel {
     /// Cursor position in the palette results list.
     pub palette_selected: usize,
 
+    // ── Incident playbook (O7) state ──
+    /// Cursor position in the incident playbook overlay.
+    pub incident_playbook_selected: usize,
+
     // ── Diagnostics screen (S7) state ──
     /// Toggle for verbose diagnostics output.
     pub diagnostics_verbose: bool,
@@ -641,6 +647,7 @@ impl DashboardModel {
             preference_profile_mode: PreferenceProfileMode::Defaults,
             palette_query: String::new(),
             palette_selected: 0,
+            incident_playbook_selected: 0,
             diagnostics_verbose: false,
             frame_times: RateHistory::new(60),
             missed_ticks: 0,
