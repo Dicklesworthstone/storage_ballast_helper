@@ -417,6 +417,12 @@ fn process_directory(
         signals.mostly_object_files = object_count * 2 >= total_count;
     }
 
+    // DEBUG: trace target dirs
+    if dir_path.to_string_lossy().contains("pi_agent_rust/target") {
+        let p = dir_path.display();
+        eprintln!("WALKER: {p} depth={depth} dir_meta={} total_count={total_count} content_size={content_size} signals={signals:?}", dir_meta.is_some());
+    }
+
     // Emit a WalkEntry for this directory itself (reuse stat from top of function).
     if depth > 0
         && let Some(meta) = dir_meta

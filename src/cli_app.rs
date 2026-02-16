@@ -3414,7 +3414,18 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 is_open: false,
                 excluded: false,
             };
-            engine.score_candidate(&candidate, 0.0) // No pressure urgency for manual scan.
+            let score = engine.score_candidate(&candidate, 0.0); // No pressure urgency for manual scan.
+            // DEBUG: trace ALL scoring on key target dirs
+            if entry.path.to_string_lossy().ends_with("/target")
+                || entry.path.to_string_lossy().ends_with("/target/debug")
+                || entry.path.to_string_lossy().ends_with("/target/release")
+            {
+                let p = entry.path.display();
+                eprintln!("SCORE: {p} — vetoed={} veto_reason={:?} total={:.3} age={}s size_bytes={} signals={:?}",
+                    score.vetoed, score.veto_reason, score.total_score, age.as_secs(),
+                    entry.metadata.content_size_bytes, entry.structural_signals);
+            }
+            score
         })
         .filter(|score| !score.vetoed && score.total_score >= args.min_score)
         .collect();
