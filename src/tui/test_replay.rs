@@ -455,7 +455,10 @@ fn run_and_digest(f: impl Fn(&mut DashboardHarness)) -> String {
 fn assert_deterministic(f: impl Fn(&mut DashboardHarness)) {
     let d1 = run_and_digest(&f);
     let d2 = run_and_digest(&f);
-    assert_eq!(d1, d2, "trace digest mismatch: reducer is non-deterministic");
+    assert_eq!(
+        d1, d2,
+        "trace digest mismatch: reducer is non-deterministic"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -472,7 +475,10 @@ fn replay_pressure_escalation_green_to_red() {
     assert_eq!(h.screen(), Screen::Overview);
 
     let frame = h.last_frame();
-    assert!(frame.text.contains("GREEN"), "expected GREEN level in overview");
+    assert!(
+        frame.text.contains("GREEN"),
+        "expected GREEN level in overview"
+    );
 
     // Phase 2: pressure rises to yellow.
     h.feed_state(yellow_pressure_state());
@@ -1081,7 +1087,10 @@ fn replay_frame_metrics_accumulation() {
     let model = h.model_mut();
     assert_eq!(model.frame_times.len(), 5);
     let stats = model.frame_times.stats().unwrap();
-    assert!((stats.0 - 15.0).abs() < f64::EPSILON, "latest should be 15.0");
+    assert!(
+        (stats.0 - 15.0).abs() < f64::EPSILON,
+        "latest should be 15.0"
+    );
     assert!((stats.2 - 14.0).abs() < f64::EPSILON, "min should be 14.0");
     assert!((stats.3 - 20.0).abs() < f64::EPSILON, "max should be 20.0");
 }
@@ -1186,12 +1195,12 @@ fn replay_scripted_sequence_via_run_script() {
         HarnessStep::Tick,
         HarnessStep::FeedHealthyState,
         HarnessStep::Tick,
-        HarnessStep::Char('2'),              // Navigate to Timeline
-        HarnessStep::Char('['),              // Prev → Overview
-        HarnessStep::FeedPressuredState,     // Pressure spike
+        HarnessStep::Char('2'),          // Navigate to Timeline
+        HarnessStep::Char('['),          // Prev → Overview
+        HarnessStep::FeedPressuredState, // Pressure spike
         HarnessStep::Tick,
-        HarnessStep::Char('5'),              // Navigate to Ballast
-        HarnessStep::FeedHealthyState,       // Recovery
+        HarnessStep::Char('5'),        // Navigate to Ballast
+        HarnessStep::FeedHealthyState, // Recovery
         HarnessStep::Tick,
         HarnessStep::Error {
             message: "scripted error".into(),

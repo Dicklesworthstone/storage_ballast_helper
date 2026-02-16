@@ -1321,21 +1321,14 @@ fn render_ballast(model: &DashboardModel, theme: Theme, out: &mut String) {
         .map(|v| v.releasable_bytes)
         .sum();
     if total_releasable > 0 {
-        let _ = writeln!(
-            out,
-            "total releasable: {}",
-            human_bytes(total_releasable)
-        );
+        let _ = writeln!(out, "total releasable: {}", human_bytes(total_releasable));
     }
 
     // ── Skipped summary ──
     let skipped_count = model.ballast_volumes.iter().filter(|v| v.skipped).count();
     if skipped_count > 0 {
         let skip_badge = status_badge("SKIPPED", theme.palette.muted, theme.accessibility);
-        let _ = writeln!(
-            out,
-            "{skipped_count} volume(s) {skip_badge}"
-        );
+        let _ = writeln!(out, "{skipped_count} volume(s) {skip_badge}");
     }
 
     // ── Detail pane ──
@@ -2747,7 +2740,9 @@ mod tests {
 
         let frame = render(&model);
         let lines: Vec<&str> = frame.lines().collect();
-        let cursor_line = lines.iter().find(|l| l.contains("/data") && l.starts_with('>'));
+        let cursor_line = lines
+            .iter()
+            .find(|l| l.contains("/data") && l.starts_with('>'));
         assert!(cursor_line.is_some(), "cursor should be on /data volume");
     }
 
@@ -2760,9 +2755,7 @@ mod tests {
             (120, 40),
         );
         model.screen = Screen::Ballast;
-        model.ballast_volumes = vec![
-            sample_ballast_volume("/", 3, 5, 3_221_225_472, false),
-        ];
+        model.ballast_volumes = vec![sample_ballast_volume("/", 3, 5, 3_221_225_472, false)];
         model.ballast_detail = true;
 
         let frame = render(&model);
@@ -2786,9 +2779,7 @@ mod tests {
             (120, 40),
         );
         model.screen = Screen::Ballast;
-        model.ballast_volumes = vec![
-            sample_ballast_volume("/mnt/nfs", 0, 0, 0, true),
-        ];
+        model.ballast_volumes = vec![sample_ballast_volume("/mnt/nfs", 0, 0, 0, true)];
         model.ballast_detail = true;
 
         let frame = render(&model);
@@ -2805,9 +2796,7 @@ mod tests {
             (120, 30),
         );
         model.screen = Screen::Ballast;
-        model.ballast_volumes = vec![
-            sample_ballast_volume("/", 3, 5, 3_221_225_472, false),
-        ];
+        model.ballast_volumes = vec![sample_ballast_volume("/", 3, 5, 3_221_225_472, false)];
         model.ballast_source = DataSource::Jsonl;
         model.ballast_partial = true;
         model.ballast_diagnostics = "SQLite unavailable, using JSONL fallback".into();
@@ -2827,9 +2816,7 @@ mod tests {
             (120, 30),
         );
         model.screen = Screen::Ballast;
-        model.ballast_volumes = vec![
-            sample_ballast_volume("/", 3, 5, 3_221_225_472, false),
-        ];
+        model.ballast_volumes = vec![sample_ballast_volume("/", 3, 5, 3_221_225_472, false)];
         model.daemon_state = Some(sample_state("green", 80.0));
 
         let frame = render(&model);

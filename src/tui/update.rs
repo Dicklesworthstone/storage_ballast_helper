@@ -10,10 +10,10 @@ use std::time::Instant;
 
 use ftui_core::event::KeyCode;
 
+use super::input::{InputAction, InputContext};
 use super::model::{
-    DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, Overlay, RateHistory, Screen,
+    DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, RateHistory, Screen,
 };
-use crate::tui::telemetry::DataSource;
 
 /// Apply a message to the model and return the next command for the runtime.
 ///
@@ -38,13 +38,21 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
         }
 
         DashboardMsg::Key(key) => {
-            // Input precedence (IA §4.2):
-            // 1. Overlay keys (if overlay is active)
-            // 2. Global navigation keys
-            if model.active_overlay.is_some() {
-                handle_overlay_key(model, key)
+            // Route through the centralized input layer (IA §4.2).
+            // Overlay keys → global keys → screen-specific keys.
+            let context = InputContext {
+                screen: model.screen,
+                active_overlay: model.active_overlay,
+            };
+            let resolution = super::input::resolve_key_event(&key, context);
+            if let Some(action) = resolution.action {
+                apply_input_action(model, action)
+            } else if resolution.consumed {
+                // Overlay consumed the key without producing an action.
+                DashboardCmd::None
             } else {
-                handle_global_key(model, key)
+                // Passthrough: delegate to screen-specific handlers.
+                handle_screen_key(model, key)
             }
         }
 
@@ -197,58 +205,17 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
 
 // ──────────────────── key handlers ────────────────────
 
-/// Handle keys when an overlay is active (IA §4.2 precedence level 2).
+/// Translate a resolved [`InputAction`] into model mutations and a command.
 ///
-/// Overlays consume most keys. Only Esc (close), Ctrl-C (quit), and the
-/// overlay's own toggle key pass through.
-fn handle_overlay_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent) -> DashboardCmd {
-    match key.code {
-        // Ctrl-C always quits, regardless of overlay state.
-        KeyCode::Char('c') if key.ctrl() => {
+/// This is the single authority for global key-action semantics. Screen-specific
+/// keys (j/k/f/s/etc.) are handled separately in [`handle_screen_key`].
+fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> DashboardCmd {
+    match action {
+        InputAction::Quit => {
             model.quit = true;
             DashboardCmd::Quit
         }
-        // Esc closes the active overlay.
-        KeyCode::Escape => {
-            model.active_overlay = None;
-            DashboardCmd::None
-        }
-        // Toggle keys: pressing the same overlay key closes it.
-        KeyCode::Char('?') if model.active_overlay == Some(Overlay::Help) => {
-            model.active_overlay = None;
-            DashboardCmd::None
-        }
-        KeyCode::Char('v') if model.active_overlay == Some(Overlay::Voi) => {
-            model.active_overlay = None;
-            DashboardCmd::None
-        }
-        KeyCode::Char('p')
-            if key.ctrl() && model.active_overlay == Some(Overlay::CommandPalette) =>
-        {
-            model.active_overlay = None;
-            DashboardCmd::None
-        }
-        // All other keys are consumed by the overlay (no screen passthrough).
-        _ => DashboardCmd::None,
-    }
-}
-
-/// Handle global keys when no overlay is active (IA §4.1 + §4.2 level 4).
-fn handle_global_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent) -> DashboardCmd {
-    match key.code {
-        // ── Exit keys ──
-        // Ctrl-C: always immediate quit.
-        KeyCode::Char('c') if key.ctrl() => {
-            model.quit = true;
-            DashboardCmd::Quit
-        }
-        // q: quit from any non-overlay state.
-        KeyCode::Char('q') => {
-            model.quit = true;
-            DashboardCmd::Quit
-        }
-        // Esc: cascade — navigate back first, quit only if nowhere to go.
-        KeyCode::Escape => {
+        InputAction::BackOrQuit => {
             if model.navigate_back() {
                 DashboardCmd::None
             } else {
@@ -256,56 +223,41 @@ fn handle_global_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent
                 DashboardCmd::Quit
             }
         }
-
-        // ── Screen navigation: number keys 1-7 (IA §4.1) ──
-        KeyCode::Char(c @ '1'..='7') => {
-            if let Some(screen) = Screen::from_number(c as u8 - b'0') {
-                model.navigate_to(screen);
-            }
+        InputAction::CloseOverlay => {
+            model.active_overlay = None;
             DashboardCmd::None
         }
-
-        // ── Screen navigation: [/] for prev/next (IA §4.1) ──
-        KeyCode::Char('[') => {
+        InputAction::Navigate(screen) => {
+            model.navigate_to(screen);
+            DashboardCmd::None
+        }
+        InputAction::NavigatePrev => {
             let prev = model.screen.prev();
             model.navigate_to(prev);
             DashboardCmd::None
         }
-        KeyCode::Char(']') => {
+        InputAction::NavigateNext => {
             let next = model.screen.next();
             model.navigate_to(next);
             DashboardCmd::None
         }
-
-        // ── Overlay toggles ──
-        KeyCode::Char('?') => {
-            model.active_overlay = Some(Overlay::Help);
+        InputAction::OpenOverlay(overlay) => {
+            model.active_overlay = Some(overlay);
             DashboardCmd::None
         }
-        KeyCode::Char('v') => {
-            model.active_overlay = Some(Overlay::Voi);
+        InputAction::ToggleOverlay(overlay) => {
+            if model.active_overlay.as_ref() == Some(&overlay) {
+                model.active_overlay = None;
+            } else {
+                model.active_overlay = Some(overlay);
+            }
             DashboardCmd::None
         }
-        KeyCode::Char('p') if key.ctrl() => {
-            model.active_overlay = Some(Overlay::CommandPalette);
-            DashboardCmd::None
-        }
-        KeyCode::Char(':') => {
-            model.active_overlay = Some(Overlay::CommandPalette);
-            DashboardCmd::None
-        }
-
-        // ── Quick actions ──
-        // b: jump to ballast screen (J-2 fast path, IA §4.1).
-        KeyCode::Char('b') => {
+        InputAction::ForceRefresh => DashboardCmd::FetchData,
+        InputAction::JumpBallast => {
             model.navigate_to(Screen::Ballast);
             DashboardCmd::None
         }
-        // r: force refresh (bypass timer).
-        KeyCode::Char('r') => DashboardCmd::FetchData,
-
-        // ── Screen-specific keys ──
-        _ => handle_screen_key(model, key),
     }
 }
 
@@ -447,7 +399,8 @@ mod tests {
     use crate::daemon::self_monitor::{
         BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
     };
-    use crate::tui::model::DashboardError;
+    use crate::tui::model::{DashboardError, Overlay};
+    use crate::tui::telemetry::DataSource;
 
     fn test_model() -> DashboardModel {
         DashboardModel::new(
