@@ -371,6 +371,13 @@ pub fn load(path: &Path) -> LoadOutcome {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return LoadOutcome::Missing,
+        // Binary garbage / invalid UTF-8 is corrupt content, not an I/O error.
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            return LoadOutcome::Corrupt {
+                details: format!("{e}"),
+                defaults: UserPreferences::default(),
+            };
+        }
         Err(e) => {
             return LoadOutcome::IoError {
                 details: format!("{e}"),

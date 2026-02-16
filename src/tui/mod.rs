@@ -30,5 +30,7 @@ mod test_fault_injection;
 mod test_harness;
 #[cfg(test)]
 mod test_replay;
+#[cfg(test)]
+mod test_stress;
 
 pub use runtime::{DashboardRuntimeConfig, DashboardRuntimeMode, run_dashboard};

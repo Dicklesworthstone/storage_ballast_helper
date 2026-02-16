@@ -5,7 +5,7 @@
 use super::layout::{
     OverviewPane, PanePriority, TimelinePane, build_overview_layout, build_timeline_layout,
 };
-use super::model::{DashboardModel, NotificationLevel, Screen, SeverityFilter};
+use super::model::{BallastVolume, DashboardModel, NotificationLevel, Screen, SeverityFilter};
 use super::theme::{AccessibilityProfile, Theme, ThemePalette};
 use super::widgets::{
     extract_time, gauge, human_bytes, human_duration, human_rate, section_header, sparkline,
@@ -51,6 +51,7 @@ pub fn render(model: &DashboardModel) -> String {
         Screen::Explainability => render_explainability(model, theme, &mut out),
         Screen::Candidates => render_candidates(model, theme, &mut out),
         Screen::Diagnostics => render_diagnostics(model, theme, &mut out),
+        Screen::Ballast => render_ballast(model, theme, &mut out),
         screen => render_screen_stub(screen_label(screen), theme, &mut out),
     }
 
@@ -1207,6 +1208,201 @@ fn render_diagnostics(model: &DashboardModel, theme: Theme, out: &mut String) {
     );
 }
 
+// ──────────────────── S5: Ballast Operations ────────────────────
+
+fn render_ballast(model: &DashboardModel, theme: Theme, out: &mut String) {
+    use std::fmt::Write as _;
+    let width = usize::from(model.terminal_size.0).max(40);
+
+    // ── Data-source header ──
+    let source_label = match model.ballast_source {
+        DataSource::Sqlite => "SQLite",
+        DataSource::Jsonl => "JSONL",
+        DataSource::None => "none",
+    };
+    let health_badge = if model.ballast_source == DataSource::None {
+        status_badge("NO DATA", theme.palette.muted, theme.accessibility)
+    } else if model.ballast_partial {
+        status_badge("PARTIAL", theme.palette.warning, theme.accessibility)
+    } else {
+        status_badge("OK", theme.palette.success, theme.accessibility)
+    };
+
+    let _ = writeln!(
+        out,
+        "data-source={source_label} {health_badge} volumes={}",
+        model.ballast_volumes.len(),
+    );
+
+    if !model.ballast_diagnostics.is_empty() {
+        let _ = writeln!(out, "  diag: {}", model.ballast_diagnostics);
+    }
+
+    // ── Aggregate ballast state from daemon ──
+    if let Some(ref state) = model.daemon_state {
+        let avail = state.ballast.available;
+        let total = state.ballast.total;
+        let released = state.ballast.released;
+        let aggregate_badge = if total == 0 {
+            status_badge("UNCONFIGURED", theme.palette.muted, theme.accessibility)
+        } else if avail == 0 {
+            status_badge("CRITICAL", theme.palette.critical, theme.accessibility)
+        } else if avail.saturating_mul(2) < total {
+            status_badge("LOW", theme.palette.warning, theme.accessibility)
+        } else {
+            status_badge("OK", theme.palette.success, theme.accessibility)
+        };
+        let _ = writeln!(
+            out,
+            "ballast: {avail}/{total} available, {released} released {aggregate_badge}",
+        );
+    }
+
+    // ── Empty state ──
+    if model.ballast_volumes.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "No ballast volume data available. The daemon must be running with"
+        );
+        let _ = writeln!(out, "ballast pools configured to populate this screen.");
+        let _ = writeln!(
+            out,
+            "Press r to force refresh, or check daemon status with key 1."
+        );
+        return;
+    }
+
+    // ── Volume inventory table ──
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", section_header("Ballast Volumes", width));
+
+    // Column headers.
+    let _ = writeln!(
+        out,
+        "  {:<4} {:<12} {:<20} {:<8} {:<8} {:<10} {}",
+        "#", "STATUS", "MOUNT", "FILES", "FS", "STRATEGY", "RELEASABLE"
+    );
+
+    for (i, vol) in model.ballast_volumes.iter().enumerate() {
+        let cursor = if i == model.ballast_selected {
+            ">"
+        } else {
+            " "
+        };
+        let status = vol.status_level();
+        let status_color = match status {
+            "OK" => theme.palette.success,
+            "LOW" => theme.palette.warning,
+            "CRITICAL" => theme.palette.critical,
+            _ => theme.palette.muted,
+        };
+        let badge = status_badge(status, status_color, theme.accessibility);
+        let files = format!("{}/{}", vol.files_available, vol.files_total);
+        let mount_short = truncate_path(&vol.mount_point, 20);
+        let releasable = human_bytes(vol.releasable_bytes);
+        let _ = writeln!(
+            out,
+            "{cursor} {:<4} {badge} {:<20} {:<8} {:<8} {:<10} {}",
+            i + 1,
+            mount_short,
+            files,
+            vol.fs_type,
+            vol.strategy,
+            releasable,
+        );
+    }
+
+    // ── Total releasable ──
+    let total_releasable: u64 = model
+        .ballast_volumes
+        .iter()
+        .filter(|v| !v.skipped)
+        .map(|v| v.releasable_bytes)
+        .sum();
+    if total_releasable > 0 {
+        let _ = writeln!(
+            out,
+            "total releasable: {}",
+            human_bytes(total_releasable)
+        );
+    }
+
+    // ── Skipped summary ──
+    let skipped_count = model.ballast_volumes.iter().filter(|v| v.skipped).count();
+    if skipped_count > 0 {
+        let skip_badge = status_badge("SKIPPED", theme.palette.muted, theme.accessibility);
+        let _ = writeln!(
+            out,
+            "{skipped_count} volume(s) {skip_badge}"
+        );
+    }
+
+    // ── Detail pane ──
+    if model.ballast_detail {
+        if let Some(vol) = model.ballast_selected_volume() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "{}", section_header("Volume Detail", width));
+            render_volume_detail(vol, theme, out);
+        }
+    } else {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Press Enter to expand detail for selected volume");
+    }
+
+    // ── Navigation hint ──
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  r refresh"
+    );
+}
+
+fn render_volume_detail(vol: &BallastVolume, theme: Theme, out: &mut String) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(out, "  mount:      {}", vol.mount_point);
+    let _ = writeln!(out, "  ballast:    {}", vol.ballast_dir);
+    let _ = writeln!(out, "  fs-type:    {}", vol.fs_type);
+    let _ = writeln!(out, "  strategy:   {}", vol.strategy);
+    let _ = writeln!(
+        out,
+        "  files:      {}/{}",
+        vol.files_available, vol.files_total
+    );
+    let _ = writeln!(
+        out,
+        "  releasable: {} ({} bytes)",
+        human_bytes(vol.releasable_bytes),
+        vol.releasable_bytes
+    );
+
+    // Status badge.
+    let status = vol.status_level();
+    let status_color = match status {
+        "OK" => theme.palette.success,
+        "LOW" => theme.palette.warning,
+        "CRITICAL" => theme.palette.critical,
+        _ => theme.palette.muted,
+    };
+    let badge = status_badge(status, status_color, theme.accessibility);
+    let _ = writeln!(out, "  status:     {badge}");
+
+    if vol.skipped {
+        if let Some(ref reason) = vol.skip_reason {
+            let _ = writeln!(out, "  skip-reason: {reason}");
+        }
+    }
+
+    // File fill gauge.
+    if vol.files_total > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let fill_pct = (vol.files_available as f64 / vol.files_total as f64) * 100.0;
+        let bar = gauge(fill_pct, 20);
+        let _ = writeln!(out, "  fill: {bar}");
+    }
+}
+
 fn render_screen_stub(name: &str, theme: Theme, out: &mut String) {
     use std::fmt::Write as _;
     let pending = status_badge("PENDING", theme.palette.muted, theme.accessibility);
@@ -1303,9 +1499,9 @@ mod tests {
             Duration::from_secs(1),
             (80, 24),
         );
-        model.screen = Screen::Ballast;
+        model.screen = Screen::LogSearch;
         let frame = render(&model);
-        assert!(frame.contains("[S5 Ballast]"));
+        assert!(frame.contains("[S6 Logs]"));
         assert!(frame.contains("pending"));
     }
 
@@ -2406,5 +2602,239 @@ mod tests {
             .find(|l| l.contains("state-adapter:"))
             .expect("adapter line");
         assert!(adapter_line.contains("FAILING"));
+    }
+
+    // ── S5 Ballast screen tests ──
+
+    use crate::tui::model::BallastVolume;
+
+    fn sample_ballast_volume(
+        mount: &str,
+        available: usize,
+        total: usize,
+        releasable: u64,
+        skipped: bool,
+    ) -> BallastVolume {
+        BallastVolume {
+            mount_point: mount.to_string(),
+            ballast_dir: format!("{mount}/.sbh/ballast"),
+            fs_type: String::from("ext4"),
+            strategy: String::from("fallocate"),
+            files_available: available,
+            files_total: total,
+            releasable_bytes: releasable,
+            skipped,
+            skip_reason: if skipped {
+                Some(String::from("unsupported filesystem"))
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn ballast_empty_shows_no_data_message() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Ballast;
+
+        let frame = render(&model);
+        assert!(frame.contains("[S5 Ballast]"));
+        assert!(frame.contains("NO DATA") || frame.contains("no data"));
+        assert!(frame.contains("No ballast volume data available"));
+    }
+
+    #[test]
+    fn ballast_shows_volume_list() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![
+            sample_ballast_volume("/", 3, 5, 3_221_225_472, false),
+            sample_ballast_volume("/data", 2, 5, 2_147_483_648, false),
+        ];
+        model.ballast_source = DataSource::Sqlite;
+
+        let frame = render(&model);
+        assert!(frame.contains("[S5 Ballast]"));
+        assert!(frame.contains("data-source=SQLite"));
+        assert!(frame.contains("volumes=2"));
+        assert!(frame.contains("Ballast Volumes"));
+        assert!(frame.contains("ext4"));
+        assert!(frame.contains("fallocate"));
+    }
+
+    #[test]
+    fn ballast_shows_status_badges() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![
+            sample_ballast_volume("/", 4, 5, 4_294_967_296, false),
+            sample_ballast_volume("/data", 1, 5, 1_073_741_824, false),
+            sample_ballast_volume("/mnt/nfs", 0, 0, 0, true),
+        ];
+
+        let frame = render(&model);
+        assert!(frame.contains("OK"));
+        assert!(frame.contains("LOW"));
+        assert!(frame.contains("SKIPPED"));
+    }
+
+    #[test]
+    fn ballast_shows_total_releasable() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![
+            sample_ballast_volume("/", 3, 5, 1_073_741_824, false),
+            sample_ballast_volume("/data", 2, 5, 2_147_483_648, false),
+        ];
+
+        let frame = render(&model);
+        assert!(frame.contains("total releasable: 3.0 GB"));
+    }
+
+    #[test]
+    fn ballast_shows_skipped_summary() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![
+            sample_ballast_volume("/", 3, 5, 3_221_225_472, false),
+            sample_ballast_volume("/mnt/nfs", 0, 0, 0, true),
+        ];
+
+        let frame = render(&model);
+        assert!(frame.contains("1 volume(s)"));
+        assert!(frame.contains("SKIPPED"));
+    }
+
+    #[test]
+    fn ballast_cursor_indicator() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![
+            sample_ballast_volume("/", 3, 5, 3_221_225_472, false),
+            sample_ballast_volume("/data", 2, 5, 2_147_483_648, false),
+        ];
+        model.ballast_selected = 1;
+
+        let frame = render(&model);
+        let lines: Vec<&str> = frame.lines().collect();
+        let cursor_line = lines.iter().find(|l| l.contains("/data") && l.starts_with('>'));
+        assert!(cursor_line.is_some(), "cursor should be on /data volume");
+    }
+
+    #[test]
+    fn ballast_detail_shows_volume_info() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 40),
+        );
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![
+            sample_ballast_volume("/", 3, 5, 3_221_225_472, false),
+        ];
+        model.ballast_detail = true;
+
+        let frame = render(&model);
+        assert!(frame.contains("Volume Detail"));
+        assert!(frame.contains("mount:"));
+        assert!(frame.contains("ballast:"));
+        assert!(frame.contains("/.sbh/ballast"));
+        assert!(frame.contains("fs-type:"));
+        assert!(frame.contains("strategy:"));
+        assert!(frame.contains("files:"));
+        assert!(frame.contains("3/5"));
+        assert!(frame.contains("fill:"));
+    }
+
+    #[test]
+    fn ballast_detail_shows_skip_reason() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 40),
+        );
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![
+            sample_ballast_volume("/mnt/nfs", 0, 0, 0, true),
+        ];
+        model.ballast_detail = true;
+
+        let frame = render(&model);
+        assert!(frame.contains("SKIPPED"));
+        assert!(frame.contains("unsupported filesystem"));
+    }
+
+    #[test]
+    fn ballast_partial_data_shows_warning() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![
+            sample_ballast_volume("/", 3, 5, 3_221_225_472, false),
+        ];
+        model.ballast_source = DataSource::Jsonl;
+        model.ballast_partial = true;
+        model.ballast_diagnostics = "SQLite unavailable, using JSONL fallback".into();
+
+        let frame = render(&model);
+        assert!(frame.contains("PARTIAL"));
+        assert!(frame.contains("JSONL"));
+        assert!(frame.contains("SQLite unavailable"));
+    }
+
+    #[test]
+    fn ballast_aggregate_from_daemon_state() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![
+            sample_ballast_volume("/", 3, 5, 3_221_225_472, false),
+        ];
+        model.daemon_state = Some(sample_state("green", 80.0));
+
+        let frame = render(&model);
+        assert!(frame.contains("ballast:"));
+        assert!(frame.contains("available"));
+        assert!(frame.contains("released"));
     }
 }
