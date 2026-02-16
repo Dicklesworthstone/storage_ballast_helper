@@ -243,7 +243,6 @@ pub struct MonitoringDaemon {
     notification_manager: NotificationManager,
     scoring_engine: ScoringEngine,
     voi_scheduler: VoiScheduler,
-    notification_manager: NotificationManager,
     shared_executor_config: Arc<SharedExecutorConfig>,
     shared_scoring_config: Arc<RwLock<crate::core::config::ScoringConfig>>,
     shared_scanner_config: Arc<RwLock<crate::core::config::ScannerConfig>>,
@@ -368,7 +367,6 @@ impl MonitoringDaemon {
             notification_manager,
             scoring_engine,
             voi_scheduler,
-            notification_manager,
             shared_executor_config,
             shared_scoring_config,
             shared_scanner_config,
@@ -1027,6 +1025,16 @@ impl MonitoringDaemon {
 
             if location.needs_attention(&stats) {
                 self.logger_handle.send(ActivityEvent::Error {
+                    code: "SBH-2001".to_string(),
+                    message: format!(
+                        "special location {:?} ({}) at {:.1}% free (buffer={}%)",
+                        location.kind,
+                        location.path.display(),
+                        stats.free_pct(),
+                        location.buffer_pct,
+                    ),
+                });
+                self.notification_manager.notify(&NotificationEvent::Error {
                     code: "SBH-2001".to_string(),
                     message: format!(
                         "special location {:?} ({}) at {:.1}% free (buffer={}%)",

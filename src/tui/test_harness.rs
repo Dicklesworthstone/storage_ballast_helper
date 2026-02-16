@@ -14,13 +14,13 @@
 //! assert!(h.last_frame().contains("S1 Overview"));
 //! ```
 
-#![cfg(test)]
 #![allow(dead_code)] // Harness API surface — methods/fields used by future test modules.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use ftui_core::event::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
+use sha2::{Digest, Sha256};
 
 use super::model::{DashboardCmd, DashboardError, DashboardModel, DashboardMsg, Overlay, Screen};
 use super::render;
@@ -46,6 +46,20 @@ pub struct FrameSnapshot {
     pub tick: u64,
     /// The command returned by the last update call.
     pub last_cmd_debug: String,
+}
+
+/// Scriptable input step for deterministic harness replay.
+#[derive(Debug, Clone)]
+pub enum HarnessStep {
+    Tick,
+    Char(char),
+    KeyCode(KeyCode),
+    Ctrl(char),
+    Resize { cols: u16, rows: u16 },
+    FeedHealthyState,
+    FeedPressuredState,
+    FeedUnavailable,
+    Error { message: String, source: String },
 }
 
 impl FrameSnapshot {
@@ -134,7 +148,7 @@ impl DashboardHarness {
     /// Inject any dashboard message, returning the captured frame.
     pub fn inject_msg(&mut self, msg: DashboardMsg) -> &FrameSnapshot {
         let cmd = update::update(&mut self.model, msg);
-        self.capture_frame(cmd)
+        self.capture_frame(&cmd)
     }
 
     /// Inject a tick.
@@ -172,6 +186,41 @@ impl DashboardHarness {
         self.tick();
         self.feed_state(state);
         self.tick();
+    }
+
+    /// Replay a deterministic script of dashboard interactions.
+    pub fn run_script(&mut self, steps: &[HarnessStep]) {
+        for step in steps {
+            match step {
+                HarnessStep::Tick => {
+                    self.tick();
+                }
+                HarnessStep::Char(c) => {
+                    self.inject_char(*c);
+                }
+                HarnessStep::KeyCode(code) => {
+                    self.inject_keycode(*code);
+                }
+                HarnessStep::Ctrl(c) => {
+                    self.inject_ctrl(*c);
+                }
+                HarnessStep::Resize { cols, rows } => {
+                    self.resize(*cols, *rows);
+                }
+                HarnessStep::FeedHealthyState => {
+                    self.feed_state(sample_healthy_state());
+                }
+                HarnessStep::FeedPressuredState => {
+                    self.feed_state(sample_pressured_state());
+                }
+                HarnessStep::FeedUnavailable => {
+                    self.feed_unavailable();
+                }
+                HarnessStep::Error { message, source } => {
+                    self.inject_error(message, source);
+                }
+            }
+        }
     }
 
     /// Navigate to a screen by number key (1-7).
@@ -259,9 +308,32 @@ impl DashboardHarness {
         self.frames.len()
     }
 
+    /// Returns the emitted command debug trace, one entry per frame.
+    pub fn command_trace(&self) -> Vec<&str> {
+        self.frames
+            .iter()
+            .map(|frame| frame.last_cmd_debug.as_str())
+            .collect()
+    }
+
+    /// Returns a stable digest of command/state transitions.
+    ///
+    /// This intentionally excludes rendered text because frame text may include
+    /// relative timing values that are not relevant to reducer determinism.
+    pub fn trace_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        for frame in &self.frames {
+            hasher.update(format!(
+                "{:?}|{:?}|{}|{}|{}\n",
+                frame.screen, frame.overlay, frame.degraded, frame.tick, frame.last_cmd_debug
+            ));
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
     // ── Internal ──
 
-    fn capture_frame(&mut self, cmd: DashboardCmd) -> &FrameSnapshot {
+    fn capture_frame(&mut self, cmd: &DashboardCmd) -> &FrameSnapshot {
         let text = render::render(&self.model);
         self.frames.push(FrameSnapshot {
             text,
@@ -675,5 +747,58 @@ mod tests {
         for (f1, f2) in h1.frames().iter().zip(h2.frames().iter()) {
             assert_eq!(f1.text, f2.text);
         }
+    }
+
+    #[test]
+    fn scripted_replay_yields_stable_transition_digest() {
+        let script = vec![
+            HarnessStep::Tick,
+            HarnessStep::FeedHealthyState,
+            HarnessStep::Char('3'),
+            HarnessStep::Char('?'),
+            HarnessStep::KeyCode(KeyCode::Escape),
+            HarnessStep::Char('r'),
+            HarnessStep::FeedPressuredState,
+            HarnessStep::Error {
+                message: "state adapter failed".to_string(),
+                source: "adapter".to_string(),
+            },
+            HarnessStep::Resize {
+                cols: 140,
+                rows: 42,
+            },
+            HarnessStep::Char('q'),
+        ];
+
+        let mut h1 = DashboardHarness::default();
+        let mut h2 = DashboardHarness::default();
+        h1.run_script(&script);
+        h2.run_script(&script);
+
+        assert_eq!(h1.trace_digest(), h2.trace_digest());
+        assert_eq!(h1.command_trace(), h2.command_trace());
+    }
+
+    #[test]
+    fn script_command_trace_exposes_effect_boundaries() {
+        let script = vec![
+            HarnessStep::Tick,
+            HarnessStep::Char('r'),
+            HarnessStep::Error {
+                message: "disk read failed".to_string(),
+                source: "adapter".to_string(),
+            },
+            HarnessStep::FeedUnavailable,
+        ];
+
+        let mut h = DashboardHarness::default();
+        h.run_script(&script);
+
+        let trace = h.command_trace();
+        assert_eq!(trace.len(), script.len());
+        assert!(trace[0].contains("Batch([FetchData, ScheduleTick("));
+        assert_eq!(trace[1], "FetchData");
+        assert!(trace[2].contains("ScheduleNotificationExpiry"));
+        assert_eq!(trace[3], "None");
     }
 }

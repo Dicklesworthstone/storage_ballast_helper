@@ -14,7 +14,6 @@
 //! - JSON output follows the same compact/pretty conventions as the stress and
 //!   proof harnesses.
 
-#![cfg(test)]
 #![allow(dead_code)] // Schema surface — consumed by downstream test modules.
 
 use std::collections::hash_map::DefaultHasher;
