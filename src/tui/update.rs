@@ -12,7 +12,7 @@ use ftui_core::event::KeyCode;
 
 use super::input::{InputAction, InputContext};
 use super::model::{
-    DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, Overlay, RateHistory, Screen,
+    DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, RateHistory, Screen,
 };
 
 /// Apply a message to the model and return the next command for the runtime.
@@ -488,7 +488,7 @@ mod tests {
     use crate::daemon::self_monitor::{
         BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
     };
-    use crate::tui::model::DashboardError;
+    use crate::tui::model::{DashboardError, Overlay};
     use crate::tui::telemetry::DataSource;
 
     fn test_model() -> DashboardModel {
