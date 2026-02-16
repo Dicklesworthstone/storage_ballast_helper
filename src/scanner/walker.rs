@@ -20,7 +20,7 @@ use crossbeam_channel as channel;
 
 use crate::core::errors::{Result, SbhError};
 use crate::scanner::patterns::StructuralSignals;
-use crate::scanner::protection::{self, ProtectionRegistry};
+use crate::scanner::protection::ProtectionRegistry;
 
 /// Walker configuration derived from `ScannerConfig`.
 #[derive(Debug, Clone)]
@@ -205,7 +205,13 @@ fn walker_thread(
 }
 
 /// Process one directory: read entries, emit WalkEntry results, enqueue subdirectories.
-#[allow(clippy::too_many_arguments)]
+///
+/// Performance: the hot path avoids per-child stat() calls. The directory is stat'd
+/// once at the start for device-check and WalkEntry metadata. Child directories are
+/// dispatched without stat — the device check is deferred to when each child is
+/// processed. On directories with 60K+ children (e.g. /data/tmp), this eliminates
+/// tens of thousands of syscalls per scan pass.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn process_directory(
     dir_path: &Path,
     depth: usize,
@@ -221,15 +227,32 @@ fn process_directory(
         return;
     }
 
-    // Check for .sbh-protect marker before reading directory.
-    let marker_path = dir_path.join(protection::MARKER_FILENAME);
-    if fs::symlink_metadata(&marker_path).is_ok() {
-        protection.write().register_marker(dir_path);
-        return; // Skip entire protected subtree.
+    // Check protection registry (covers config patterns and previously discovered markers).
+    // Note: .sbh-protect marker files are detected during child iteration below,
+    // avoiding a separate lstat per directory.
+    if protection.read().is_protected(dir_path) {
+        return;
     }
 
-    // Check protection registry (covers config patterns and previously discovered markers).
-    if protection.read().is_protected(dir_path) {
+    // Stat the directory once (at depth > 0) — used for both cross-device guard
+    // and WalkEntry emission. At depth 0 (root paths), device was already checked
+    // at seed time in stream().
+    let dir_meta = if depth > 0 {
+        match metadata_for_path(dir_path, config.follow_symlinks) {
+            Ok(m) => Some(m),
+            Err(_) => return,
+        }
+    } else {
+        None
+    };
+
+    // Cross-device guard: if this directory is on a different filesystem than
+    // its root path, skip the entire subtree. This catches mount points that
+    // were queued by the parent (which doesn't per-child stat for device).
+    if !config.cross_devices
+        && let Some(ref meta) = dir_meta
+        && device_id(meta) != root_dev
+    {
         return;
     }
 
@@ -260,6 +283,13 @@ fn process_directory(
             total_count += 1;
 
             match name.as_ref() {
+                // Detect .sbh-protect marker during iteration instead of a
+                // separate lstat before read_dir. This saves one syscall per
+                // directory (the marker almost never exists).
+                ".sbh-protect" => {
+                    protection.write().register_marker(dir_path);
+                    return; // Skip rest of directory — protected subtree.
+                }
                 "incremental" => signals.has_incremental = true,
                 "deps" => signals.has_deps = true,
                 "build" => signals.has_build = true,
@@ -307,41 +337,27 @@ fn process_directory(
 
         // ─── Recursion Dispatch ───
         // Only recurse if it's a directory and within depth limits.
+        // No per-child stat for device check: if THIS directory is on root_dev
+        // (checked above), children are too. Mount points inside are caught
+        // when the child directory is processed (device check at top of this fn).
         if depth < config.max_depth && is_dir {
-            // We need metadata now to check device ID.
-            let Ok(meta) = metadata_for_path(&child_path, config.follow_symlinks) else {
-                continue;
-            };
-            let child_dev = device_id(&meta);
-
-            // Cross-device guard: don't cross filesystem boundaries.
-            if !config.cross_devices && child_dev != root_dev {
-                continue;
-            }
-
             // Don't re-enter excluded paths.
             if config.excluded_paths.contains(&child_path) {
                 continue;
             }
 
             in_flight.fetch_add(1, Ordering::Release);
-            // Use send_timeout to prevent deadlock when both worker threads
-            // are inside process_directory and the work queue is full.
-            // With bounded(1024) and parallelism=2, both workers can block
-            // on send() simultaneously, creating a classic deadlock.
-            match work_tx.send_timeout(
-                (child_path.clone(), depth + 1, root_dev),
-                Duration::from_millis(100),
-            ) {
+            // Use try_send to avoid blocking on a full work queue.
+            // Blocking (send or send_timeout) causes catastrophic slowdown
+            // when processing huge directories (e.g. /data/tmp with 60K+
+            // child dirs): the thread spends the entire scan budget waiting
+            // on timeouts instead of making progress. With try_send, excess
+            // children are skipped — the next scan pass rediscovers them.
+            match work_tx.try_send((child_path.clone(), depth + 1, root_dev)) {
                 Ok(()) => {}
                 Err(_) => {
                     // Queue full or disconnected — skip this subdirectory.
-                    // The next scan pass will pick it up if needed.
                     in_flight.fetch_sub(1, Ordering::Release);
-                    eprintln!(
-                        "[SBH-WALKER] work queue full, skipping subdirectory: {}",
-                        child_path.display()
-                    );
                 }
             }
         }
@@ -352,13 +368,13 @@ fn process_directory(
         signals.mostly_object_files = object_count * 2 >= total_count;
     }
 
-    // Emit a WalkEntry for this directory itself.
+    // Emit a WalkEntry for this directory itself (reuse stat from top of function).
     if depth > 0
-        && let Ok(dir_meta) = metadata_for_path(dir_path, config.follow_symlinks)
+        && let Some(meta) = dir_meta
     {
         let _ = result_tx.send(WalkEntry {
             path: dir_path.to_path_buf(),
-            metadata: entry_metadata(&dir_meta),
+            metadata: entry_metadata(&meta),
             depth,
             structural_signals: signals,
             is_open: false, // Caller sets this after walk using /proc scan.
@@ -740,6 +756,7 @@ pub fn is_path_open<S: std::hash::BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::protection;
     use std::fs;
     use tempfile::TempDir;
 

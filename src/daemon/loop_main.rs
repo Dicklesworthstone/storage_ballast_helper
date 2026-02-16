@@ -1586,10 +1586,19 @@ fn scanner_thread_main(
             .saturating_mul(EARLY_DISPATCH_MULTIPLIER);
         let mut next_dispatch_deadline = scan_start + EARLY_DISPATCH_MAX_WAIT;
 
-        // Snapshot open files once per scan for fast filtering.
-        // We use the ancestor-set approach which is O(1) per candidate check
-        // instead of the O(tree_size) recursive inode scan.
-        let open_files = crate::scanner::walker::collect_open_path_ancestors(&request.paths);
+        // Snapshot open files in a background thread so the ~5s /proc scan
+        // overlaps with the walker's initial directory reads instead of
+        // blocking the scanner thread.
+        let open_files_paths = request.paths.clone();
+        let mut open_files_handle: Option<std::thread::JoinHandle<_>> =
+            std::thread::Builder::new()
+                .name("sbh-open-files".into())
+                .spawn(move || {
+                    crate::scanner::walker::collect_open_path_ancestors(&open_files_paths)
+                })
+                .ok();
+        // Join lazily — we only need results when classifying candidates.
+        let mut open_files_joined: Option<std::collections::HashSet<std::path::PathBuf>> = None;
 
         // Initialize per-root stats.
         let mut root_stats_map: HashMap<PathBuf, RootScanResult> = HashMap::new();
@@ -1652,8 +1661,17 @@ fn scanner_thread_main(
                 continue;
             }
 
+            // Lazy-join the /proc scan thread on first classified entry.
+            // This gives the /proc scan the full walker startup period to run
+            // in parallel instead of blocking the scanner up front.
+            let open_files = open_files_joined.get_or_insert_with(|| {
+                open_files_handle
+                    .take()
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or_default()
+            });
             let is_open =
-                crate::scanner::walker::is_path_open_by_ancestor(&entry.path, &open_files);
+                crate::scanner::walker::is_path_open_by_ancestor(&entry.path, open_files);
 
             let input = crate::scanner::scoring::CandidateInput {
                 path: entry.path.clone(), // Clone needed for input
