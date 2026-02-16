@@ -473,9 +473,9 @@ impl<'a> StatsEngine<'a> {
 
         for i in 0..samples.len().saturating_sub(1) {
             let current_level = PressureLevel::from_str(&samples[i].1);
-            let dt = timestamp_delta_secs(&samples[i].0, &samples[i + 1].0);
-
-            *level_time.entry(current_level).or_insert(0.0) += dt;
+            if let Some(dt) = timestamp_delta_secs(&samples[i].0, &samples[i + 1].0) {
+                *level_time.entry(current_level).or_insert(0.0) += dt;
+            }
 
             let next_level = PressureLevel::from_str(&samples[i + 1].1);
             if next_level != current_level {
@@ -494,9 +494,10 @@ impl<'a> StatsEngine<'a> {
 
         // Account for time from last sample to now (M7).
         let now_str = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let last_dt = timestamp_delta_secs(&samples[samples.len() - 1].0, &now_str);
-        if last_dt > 0.0 {
-            *level_time.entry(prev_level).or_insert(0.0) += last_dt;
+        if let Some(last_dt) = timestamp_delta_secs(&samples[samples.len() - 1].0, &now_str) {
+            if last_dt > 0.0 {
+                *level_time.entry(prev_level).or_insert(0.0) += last_dt;
+            }
         }
 
         let total_time: f64 = level_time.values().sum();
@@ -544,12 +545,10 @@ fn since_timestamp(window: Duration) -> String {
 
 /// Compute approximate seconds between two ISO 8601 timestamps.
 #[allow(clippy::cast_precision_loss)]
-fn timestamp_delta_secs(a: &str, b: &str) -> f64 {
-    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
-    match (parse(a), parse(b)) {
-        (Some(ta), Some(tb)) => (tb - ta).num_milliseconds() as f64 / 1000.0,
-        _ => 0.0,
-    }
+fn timestamp_delta_secs(a: &str, b: &str) -> Option<f64> {
+    let ta = chrono::DateTime::parse_from_rfc3339(a).ok()?;
+    let tb = chrono::DateTime::parse_from_rfc3339(b).ok()?;
+    Some((tb - ta).num_milliseconds() as f64 / 1000.0)
 }
 
 /// Human-readable label for a duration.

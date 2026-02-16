@@ -527,6 +527,8 @@ fn remove_directory_contents(dir: &Path) -> std::io::Result<u64> {
         if meta.is_file() {
             bytes += meta.len();
             std::fs::remove_file(entry.path())?;
+        } else if meta.is_dir() {
+            bytes += remove_directory_contents(&entry.path())?;
         }
     }
     // Remove the directory itself after contents are cleared.
