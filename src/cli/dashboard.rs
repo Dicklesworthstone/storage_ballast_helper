@@ -300,7 +300,7 @@ fn run_inner(stdout: &mut io::Stdout, config: &DashboardConfig) -> io::Result<()
 fn render_frame(
     stdout: &mut io::Stdout,
     width: usize,
-    _rows: usize,
+    rows: usize,
     state: Option<&DaemonState>,
     rate_histories: &HashMap<String, RateHistory>,
     monitor_paths: &[PathBuf],
@@ -308,10 +308,15 @@ fn render_frame(
 ) -> io::Result<()> {
     let gauge_width = 20.min(width.saturating_sub(50));
     let mut row = 0u16;
+    // Prevent writing past the last line (rows - 1).
+    let max_row = rows.saturating_sub(1) as u16;
 
     queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
 
     // ── Header ──
+    if row > max_row {
+        return Ok(());
+    }
     let version = state
         .map(|s| s.version.as_str())
         .unwrap_or(env!("CARGO_PKG_VERSION"));
@@ -333,8 +338,10 @@ fn render_frame(
     row += 1;
 
     // Blank separator.
-    write_padded_line(stdout, row, "", width)?;
-    row += 1;
+    if row <= max_row {
+        write_padded_line(stdout, row, "", width)?;
+        row += 1;
+    }
 
     // ── Pressure Gauges ──
     queue!(
@@ -564,11 +571,13 @@ fn render_frame(
 
     // ── Footer ──
     row += 1;
-    let footer = " Press q or Esc to exit ";
-    let pad = width.saturating_sub(footer.len() + 4);
-    queue!(stdout, MoveTo(0, row), SetForegroundColor(Color::Cyan),)?;
-    write!(stdout, "└─{footer}{:─<pad$}──┘", "", pad = pad)?;
-    queue!(stdout, SetAttribute(Attribute::Reset))?;
+    if row <= max_row {
+        let footer = " Press q or Esc to exit ";
+        let pad = width.saturating_sub(footer.len() + 4);
+        queue!(stdout, MoveTo(0, row), SetForegroundColor(Color::Cyan),)?;
+        write!(stdout, "└─{footer}{:─<pad$}──┘", "", pad = pad)?;
+        queue!(stdout, SetAttribute(Attribute::Reset))?;
+    }
 
     stdout.flush()
 }

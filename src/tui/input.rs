@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use crossterm::event::KeyEvent;
+use ftui_core::event::KeyEvent;
 
 use super::model::DashboardMsg;
 
@@ -14,7 +14,7 @@ pub fn map_key_event(key: KeyEvent) -> DashboardMsg {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ftui_core::event::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
 
     use super::*;
 
@@ -22,16 +22,15 @@ mod tests {
     fn key_mapping_preserves_event() {
         let event = KeyEvent {
             code: KeyCode::Char('q'),
-            modifiers: KeyModifiers::CONTROL,
+            modifiers: Modifiers::CTRL,
             kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
         };
 
         let msg = map_key_event(event);
         match msg {
             DashboardMsg::Key(inner) => {
                 assert_eq!(inner.code, KeyCode::Char('q'));
-                assert!(inner.modifiers.contains(KeyModifiers::CONTROL));
+                assert!(inner.ctrl());
             }
             _ => panic!("expected key event"),
         }

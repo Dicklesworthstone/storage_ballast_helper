@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::KeyEvent;
+use ftui_core::event::KeyEvent;
 
 use crate::daemon::self_monitor::DaemonState;
 

@@ -8,7 +8,7 @@
 
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyModifiers};
+use ftui_core::event::KeyCode;
 
 use super::model::{
     DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, Overlay, RateHistory, Screen,
@@ -119,15 +119,15 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
 ///
 /// Overlays consume most keys. Only Esc (close), Ctrl-C (quit), and the
 /// overlay's own toggle key pass through.
-fn handle_overlay_key(model: &mut DashboardModel, key: crossterm::event::KeyEvent) -> DashboardCmd {
+fn handle_overlay_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent) -> DashboardCmd {
     match key.code {
         // Ctrl-C always quits, regardless of overlay state.
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('c') if key.ctrl() => {
             model.quit = true;
             DashboardCmd::Quit
         }
         // Esc closes the active overlay.
-        KeyCode::Esc => {
+        KeyCode::Escape => {
             model.active_overlay = None;
             DashboardCmd::None
         }
@@ -141,8 +141,7 @@ fn handle_overlay_key(model: &mut DashboardModel, key: crossterm::event::KeyEven
             DashboardCmd::None
         }
         KeyCode::Char('p')
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && model.active_overlay == Some(Overlay::CommandPalette) =>
+            if key.ctrl() && model.active_overlay == Some(Overlay::CommandPalette) =>
         {
             model.active_overlay = None;
             DashboardCmd::None
@@ -153,11 +152,11 @@ fn handle_overlay_key(model: &mut DashboardModel, key: crossterm::event::KeyEven
 }
 
 /// Handle global keys when no overlay is active (IA §4.1 + §4.2 level 4).
-fn handle_global_key(model: &mut DashboardModel, key: crossterm::event::KeyEvent) -> DashboardCmd {
+fn handle_global_key(model: &mut DashboardModel, key: ftui_core::event::KeyEvent) -> DashboardCmd {
     match key.code {
         // ── Exit keys ──
         // Ctrl-C: always immediate quit.
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('c') if key.ctrl() => {
             model.quit = true;
             DashboardCmd::Quit
         }
@@ -167,7 +166,7 @@ fn handle_global_key(model: &mut DashboardModel, key: crossterm::event::KeyEvent
             DashboardCmd::Quit
         }
         // Esc: cascade — navigate back first, quit only if nowhere to go.
-        KeyCode::Esc => {
+        KeyCode::Escape => {
             if model.navigate_back() {
                 DashboardCmd::None
             } else {
@@ -205,7 +204,7 @@ fn handle_global_key(model: &mut DashboardModel, key: crossterm::event::KeyEvent
             model.active_overlay = Some(Overlay::Voi);
             DashboardCmd::None
         }
-        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('p') if key.ctrl() => {
             model.active_overlay = Some(Overlay::CommandPalette);
             DashboardCmd::None
         }
@@ -235,7 +234,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ftui_core::event::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
 
     use super::*;
     use crate::daemon::self_monitor::{
@@ -255,18 +254,16 @@ mod tests {
     fn make_key(code: KeyCode) -> KeyEvent {
         KeyEvent {
             code,
-            modifiers: KeyModifiers::NONE,
+            modifiers: Modifiers::NONE,
             kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
         }
     }
 
     fn make_key_ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent {
             code,
-            modifiers: KeyModifiers::CONTROL,
+            modifiers: Modifiers::CTRL,
             kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
         }
     }
 
@@ -341,7 +338,7 @@ mod tests {
     fn esc_quits_when_no_history() {
         let mut model = test_model();
         assert!(model.screen_history.is_empty());
-        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Esc)));
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Escape)));
         assert!(model.quit);
         assert!(matches!(cmd, DashboardCmd::Quit));
     }
@@ -353,7 +350,7 @@ mod tests {
         assert_eq!(model.screen, Screen::Timeline);
         assert!(!model.screen_history.is_empty());
 
-        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Esc)));
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Escape)));
         assert!(!model.quit);
         assert_eq!(model.screen, Screen::Overview);
         assert!(matches!(cmd, DashboardCmd::None));
@@ -366,17 +363,17 @@ mod tests {
         model.navigate_to(Screen::Candidates);
 
         // First Esc: back to Timeline.
-        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Esc)));
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Escape)));
         assert_eq!(model.screen, Screen::Timeline);
         assert!(!model.quit);
 
         // Second Esc: back to Overview.
-        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Esc)));
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Escape)));
         assert_eq!(model.screen, Screen::Overview);
         assert!(!model.quit);
 
         // Third Esc: quit (no more history).
-        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Esc)));
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Escape)));
         assert!(model.quit);
         assert!(matches!(cmd, DashboardCmd::Quit));
     }
@@ -512,7 +509,7 @@ mod tests {
         let mut model = test_model();
         model.active_overlay = Some(Overlay::Help);
 
-        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Esc)));
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Escape)));
         assert!(model.active_overlay.is_none());
         assert!(!model.quit);
         assert!(matches!(cmd, DashboardCmd::None));
@@ -761,10 +758,10 @@ mod tests {
         let msgs: Vec<DashboardMsg> = vec![
             DashboardMsg::Key(make_key(KeyCode::Char('3'))),
             DashboardMsg::Key(make_key(KeyCode::Char('5'))),
-            DashboardMsg::Key(make_key(KeyCode::Esc)),
+            DashboardMsg::Key(make_key(KeyCode::Escape)),
             DashboardMsg::Key(make_key(KeyCode::Char('['))),
             DashboardMsg::Key(make_key(KeyCode::Char('?'))),
-            DashboardMsg::Key(make_key(KeyCode::Esc)),
+            DashboardMsg::Key(make_key(KeyCode::Escape)),
             DashboardMsg::Key(make_key(KeyCode::Char('1'))),
         ];
 
@@ -776,10 +773,10 @@ mod tests {
             vec![
                 DashboardMsg::Key(make_key(KeyCode::Char('3'))),
                 DashboardMsg::Key(make_key(KeyCode::Char('5'))),
-                DashboardMsg::Key(make_key(KeyCode::Esc)),
+                DashboardMsg::Key(make_key(KeyCode::Escape)),
                 DashboardMsg::Key(make_key(KeyCode::Char('['))),
                 DashboardMsg::Key(make_key(KeyCode::Char('?'))),
-                DashboardMsg::Key(make_key(KeyCode::Esc)),
+                DashboardMsg::Key(make_key(KeyCode::Escape)),
                 DashboardMsg::Key(make_key(KeyCode::Char('1'))),
             ]
         }) {

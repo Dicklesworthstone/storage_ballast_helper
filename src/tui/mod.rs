@@ -7,15 +7,20 @@
 #![allow(missing_docs)]
 
 pub mod adapters;
+pub mod e2e_artifact;
 pub mod input;
+pub mod layout;
 pub mod model;
 pub mod render;
 pub mod runtime;
 pub mod telemetry;
 pub mod terminal_guard;
+pub mod theme;
 pub mod update;
 pub mod widgets;
 
+#[cfg(test)]
+mod test_artifact;
 #[cfg(test)]
 mod test_harness;
 

@@ -524,7 +524,7 @@ impl<'a> StatsEngine<'a> {
 #[allow(clippy::cast_possible_wrap)]
 fn since_timestamp(window: Duration) -> String {
     let now = chrono::Utc::now();
-    let since = now - chrono::Duration::seconds(window.as_secs() as i64);
+    let since = now - chrono::Duration::from_std(window).unwrap_or(chrono::Duration::max_value());
     since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 

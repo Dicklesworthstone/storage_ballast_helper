@@ -1,31 +1,33 @@
-//! RAII terminal lifecycle guard for panic-safe raw mode and alternate screen.
+//! RAII terminal lifecycle guard backed by ftui-tty.
 //!
-//! [`TerminalGuard`] enters raw mode and (optionally) the alternate screen on
-//! construction, and restores the terminal on [`Drop`] — even during panics or
-//! early error returns. A custom panic hook is installed to ensure terminal
-//! restoration happens *before* the default panic message is printed, so the
-//! backtrace is readable on a normal terminal.
+//! [`TerminalGuard`] enters raw mode and the alternate screen on construction,
+//! and restores the terminal on [`Drop`] — even during panics or early error
+//! returns. A custom panic hook is installed to ensure terminal restoration
+//! happens *before* the default panic message is printed, so the backtrace is
+//! readable on a normal terminal.
 
 use std::io::{self, Write};
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossterm::cursor;
-use crossterm::execute;
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use ftui_tty::TtyBackend;
 
 /// Global flag indicating raw mode is active. Checked by the panic hook to
 /// decide whether terminal restoration is needed.
 static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// RAII guard that manages the terminal lifecycle.
+/// Escape sequences for terminal lifecycle management.
+const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
+const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
+
+/// RAII guard that manages the terminal lifecycle via ftui-tty.
 ///
-/// On creation: enables raw mode and enters alternate screen.
-/// On drop: leaves alternate screen, disables raw mode, and shows the cursor.
-///
-/// A custom panic hook is installed on creation and removed on drop so that
-/// panics always produce readable output on a restored terminal.
+/// On creation: enables raw mode and enters alternate screen via `TtyBackend`.
+/// On drop: the backend restores the terminal. A panic hook provides
+/// best-effort cleanup even on unwind.
 pub struct TerminalGuard {
+    /// The ftui-tty backend owns the raw mode guard and terminal state.
+    _backend: TtyBackend,
     /// Whether we installed a custom panic hook (so drop knows to remove it).
     hook_installed: bool,
 }
@@ -37,12 +39,13 @@ impl TerminalGuard {
     /// Returns I/O errors if terminal setup fails. On partial failure the guard
     /// still cleans up whatever was successfully set up.
     pub fn new() -> io::Result<Self> {
-        terminal::enable_raw_mode()?;
-        RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
+        let options = ftui_tty::TtySessionOptions {
+            alternate_screen: true,
+            ..Default::default()
+        };
 
-        // Enter alternate screen. If this fails, drop will still disable raw mode.
-        let mut stdout = io::stdout();
-        let _ = execute!(stdout, EnterAlternateScreen);
+        let backend = TtyBackend::open(80, 24, options)?;
+        RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
 
         // Install panic hook that restores terminal before printing the panic.
         let prev = panic::take_hook();
@@ -55,6 +58,7 @@ impl TerminalGuard {
         }));
 
         Ok(Self {
+            _backend: backend,
             hook_installed: true,
         })
     }
@@ -64,13 +68,24 @@ impl TerminalGuard {
     /// Falls back to (80, 24) if the query fails.
     #[must_use]
     pub fn terminal_size() -> (u16, u16) {
-        terminal::size().unwrap_or((80, 24))
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            if let Ok(tty) = std::fs::File::open("/dev/tty") {
+                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                let ret = unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
+                if ret == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                    return (ws.ws_col, ws.ws_row);
+                }
+            }
+        }
+        (80, 24)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        restore_terminal_best_effort();
+        RAW_MODE_ACTIVE.store(false, Ordering::SeqCst);
 
         if self.hook_installed {
             // Remove our panic hook. The previous hook was moved into the
@@ -78,6 +93,9 @@ impl Drop for TerminalGuard {
             // This is safe because the guard's lifetime brackets all TUI usage.
             let _ = panic::take_hook();
         }
+
+        // TtyBackend::drop handles terminal restoration (raw mode, alt screen,
+        // cursor, features).
     }
 }
 
@@ -86,10 +104,12 @@ impl Drop for TerminalGuard {
 fn restore_terminal_best_effort() {
     if RAW_MODE_ACTIVE.swap(false, Ordering::SeqCst) {
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen);
-        let _ = execute!(stdout, cursor::Show);
-        let _ = terminal::disable_raw_mode();
+        let _ = stdout.write_all(ALT_SCREEN_LEAVE);
+        let _ = stdout.write_all(CURSOR_SHOW);
         let _ = stdout.flush();
+        // Note: we cannot restore termios from the panic hook because we
+        // don't own the RawModeGuard here. TtyBackend::drop will handle it
+        // when the guard is dropped after the panic hook runs.
     }
 }
 

@@ -1,7 +1,8 @@
 //! Canonical runtime entrypoint for dashboard execution.
 //!
-//! The new cockpit path uses [`TerminalGuard`] for panic-safe terminal
-//! lifecycle management. The legacy fallback retains its own cleanup logic.
+//! The new cockpit path uses ftui-tty's [`TtyBackend`] for panic-safe terminal
+//! lifecycle management and native event polling. The legacy fallback retains
+//! its own cleanup logic.
 
 #![allow(missing_docs)]
 
@@ -9,16 +10,18 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crossterm::cursor;
-use crossterm::event::{self, Event};
-use crossterm::execute;
-use crossterm::terminal::{self, ClearType};
+use ftui_backend::BackendEventSource;
+use ftui_core::event::{Event, KeyEventKind};
+use ftui_tty::{TtyBackend, TtySessionOptions};
 
 use super::model::{DashboardCmd, DashboardModel, DashboardMsg};
-use super::terminal_guard::TerminalGuard;
 use super::{render, update};
 use crate::cli::dashboard::{self, DashboardConfig as LegacyDashboardConfig};
 use crate::daemon::self_monitor::DaemonState;
+
+/// ANSI escape sequences for screen control.
+const CLEAR_SCREEN: &[u8] = b"\x1b[2J";
+const CURSOR_HOME: &[u8] = b"\x1b[H";
 
 /// Which runtime path to execute.
 ///
@@ -68,11 +71,15 @@ pub fn run_dashboard(config: &DashboardRuntimeConfig) -> io::Result<()> {
 }
 
 fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
-    // TerminalGuard handles raw mode + alternate screen with panic safety.
+    // TtyBackend handles raw mode + alternate screen with RAII cleanup.
     // Drop restores the terminal even on panic or early return.
-    let _guard = TerminalGuard::new()?;
+    let options = TtySessionOptions {
+        alternate_screen: true,
+        ..Default::default()
+    };
+    let mut backend = TtyBackend::open(80, 24, options)?;
 
-    let (cols, rows) = TerminalGuard::terminal_size();
+    let (cols, rows) = backend.size()?;
     let mut model = DashboardModel::new(
         config.state_file.clone(),
         config.monitor_paths.clone(),
@@ -92,11 +99,8 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
     loop {
         // Render current frame.
         let frame = render::render(&model);
-        execute!(
-            stdout,
-            terminal::Clear(ClearType::All),
-            cursor::MoveTo(0, 0)
-        )?;
+        stdout.write_all(CLEAR_SCREEN)?;
+        stdout.write_all(CURSOR_HOME)?;
         stdout.write_all(frame.as_bytes())?;
         stdout.flush()?;
 
@@ -114,22 +118,33 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
 
         // Poll for terminal events (timeout = refresh interval).
         let poll_timeout = model.refresh;
-        if event::poll(poll_timeout)? {
-            let cmd = match event::read()? {
-                Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
-                    update::update(&mut model, DashboardMsg::Key(key))
+        if backend.poll_event(poll_timeout)? {
+            // Drain all available events.
+            while let Some(event) = backend.read_event()? {
+                let cmd = match event {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        update::update(&mut model, DashboardMsg::Key(key))
+                    }
+                    Event::Resize { width, height } => update::update(
+                        &mut model,
+                        DashboardMsg::Resize {
+                            cols: width,
+                            rows: height,
+                        },
+                    ),
+                    _ => DashboardCmd::None,
+                };
+                execute_cmd(
+                    &mut model,
+                    &config.state_file,
+                    cmd,
+                    &mut notification_timers,
+                );
+
+                if model.quit {
+                    break;
                 }
-                Event::Resize(c, r) => {
-                    update::update(&mut model, DashboardMsg::Resize { cols: c, rows: r })
-                }
-                _ => DashboardCmd::None,
-            };
-            execute_cmd(
-                &mut model,
-                &config.state_file,
-                cmd,
-                &mut notification_timers,
-            );
+            }
         } else {
             // Timeout = tick (periodic refresh).
             let cmd = update::update(&mut model, DashboardMsg::Tick);
@@ -146,7 +161,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
         }
     }
 
-    // TerminalGuard Drop handles cleanup.
+    // TtyBackend Drop handles cleanup.
     Ok(())
 }
 

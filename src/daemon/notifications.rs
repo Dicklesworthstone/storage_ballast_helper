@@ -602,7 +602,7 @@ impl Channel for WebhookChannel {
             .arg("5")
             .arg("--header")
             .arg("Content-Type: application/json")
-            .arg("--data")
+            .arg("--data-raw")
             .arg(&body)
             .arg("--")
             .arg(&self.url)

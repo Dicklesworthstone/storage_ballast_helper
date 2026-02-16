@@ -9,7 +9,7 @@
 //! ```rust,ignore
 //! let mut h = DashboardHarness::default();
 //! h.inject_key('3');           // navigate to Explainability
-//! h.inject_key(KeyCode::Esc);  // back to Overview
+//! h.inject_key(KeyCode::Escape);  // back to Overview
 //! assert_eq!(h.screen(), Screen::Overview);
 //! assert!(h.last_frame().contains("S1 Overview"));
 //! ```
@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+use ftui_core::event::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
 
 use super::model::{DashboardCmd, DashboardError, DashboardModel, DashboardMsg, Overlay, Screen};
 use super::render;
@@ -280,18 +280,16 @@ impl DashboardHarness {
 fn make_key(code: KeyCode) -> KeyEvent {
     KeyEvent {
         code,
-        modifiers: KeyModifiers::NONE,
+        modifiers: Modifiers::NONE,
         kind: KeyEventKind::Press,
-        state: KeyEventState::NONE,
     }
 }
 
 fn make_key_ctrl(code: KeyCode) -> KeyEvent {
     KeyEvent {
         code,
-        modifiers: KeyModifiers::CONTROL,
+        modifiers: Modifiers::CTRL,
         kind: KeyEventKind::Press,
-        state: KeyEventState::NONE,
     }
 }
 
@@ -457,15 +455,15 @@ mod tests {
         h.navigate_to_number(5); // Explainability -> Ballast
         assert_eq!(h.history_depth(), 2);
 
-        h.inject_keycode(KeyCode::Esc);
+        h.inject_keycode(KeyCode::Escape);
         assert_eq!(h.screen(), Screen::Explainability);
         assert!(!h.is_quit());
 
-        h.inject_keycode(KeyCode::Esc);
+        h.inject_keycode(KeyCode::Escape);
         assert_eq!(h.screen(), Screen::Overview);
         assert!(!h.is_quit());
 
-        h.inject_keycode(KeyCode::Esc);
+        h.inject_keycode(KeyCode::Escape);
         assert!(h.is_quit());
     }
 
@@ -494,7 +492,7 @@ mod tests {
         assert_eq!(h.overlay(), Some(Overlay::Help)); // still open
 
         // Esc closes the overlay.
-        h.inject_keycode(KeyCode::Esc);
+        h.inject_keycode(KeyCode::Escape);
         assert!(h.overlay().is_none());
         assert!(!h.is_quit());
     }
@@ -566,7 +564,7 @@ mod tests {
 
         h.tick();
         h.inject_char('2');
-        h.inject_keycode(KeyCode::Esc);
+        h.inject_keycode(KeyCode::Escape);
         assert_eq!(h.frame_count(), 3);
     }
 
@@ -617,7 +615,7 @@ mod tests {
         assert_eq!(h.overlay(), Some(Overlay::Help));
 
         // 4. Closes help with Esc.
-        h.inject_keycode(KeyCode::Esc);
+        h.inject_keycode(KeyCode::Escape);
         assert!(h.overlay().is_none());
 
         // 5. Navigates to diagnostics.
@@ -641,7 +639,7 @@ mod tests {
 
         // 10. Esc back through history, then quit.
         while !h.is_quit() {
-            h.inject_keycode(KeyCode::Esc);
+            h.inject_keycode(KeyCode::Escape);
         }
 
         // Verify we captured a complete session.
@@ -656,10 +654,10 @@ mod tests {
             h.tick();
             h.inject_char('3');
             h.inject_char('?');
-            h.inject_keycode(KeyCode::Esc);
+            h.inject_keycode(KeyCode::Escape);
             h.inject_char('[');
             h.inject_char('b');
-            h.inject_keycode(KeyCode::Esc);
+            h.inject_keycode(KeyCode::Escape);
         };
 
         let mut h1 = DashboardHarness::default();

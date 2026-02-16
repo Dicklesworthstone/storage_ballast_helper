@@ -19,9 +19,9 @@ required-features = ["cli"]
 
 [features]
 default = ["cli", "daemon", "sqlite"]
-cli = ["dep:clap", "dep:clap_complete", "dep:colored", "sqlite", "daemon"]
+cli = ["dep:clap", "dep:clap_complete", "dep:colored", "dep:crossterm", "sqlite", "daemon"]
 daemon = ["dep:signal-hook"]
-tui = ["dep:crossterm", "cli"]
+tui = ["dep:ftui-core", "dep:ftui-tty", "cli"]
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
@@ -29,6 +29,7 @@ sqlite = ["dep:rusqlite"]
 clap = { version = "4.5", features = ["derive"], optional = true }
 clap_complete = { version = "4.5", optional = true }
 colored = { version = "3.0", optional = true }
+crossterm = { version = "0.28", optional = true }
 # Serialization (core)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -38,7 +39,8 @@ rusqlite = { version = "0.33", features = ["bundled", "functions"], optional = t
 # Error handling (core)
 thiserror = "2.0"
 # TUI (optional — gated behind "tui" feature)
-crossterm = { version = "0.28", optional = true }
+ftui-core = { path = "/dp/frankentui/crates/ftui-core", optional = true }
+ftui-tty = { path = "/dp/frankentui/crates/ftui-tty", optional = true }
 # Timestamps (core)
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Concurrency (core — used by scanner walker, not just daemon)

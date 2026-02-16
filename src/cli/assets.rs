@@ -857,7 +857,7 @@ fn download_and_verify(entry: &AssetEntry, cache: &AssetCache) -> io::Result<u64
     }
 
     // Verify integrity.
-    let hash = compute_sha256(&partial)?;
+    let (hash, size) = compute_sha256_and_size(&partial)?;
     if hash != entry.sha256 {
         // Remove corrupt partial.
         let _ = fs::remove_file(&partial);
@@ -871,7 +871,6 @@ fn download_and_verify(entry: &AssetEntry, cache: &AssetCache) -> io::Result<u64
     }
 
     // Atomic rename from partial to final.
-    let size = fs::metadata(&partial)?.len();
     fs::rename(&partial, &target)?;
     Ok(size)
 }
@@ -901,10 +900,19 @@ pub fn verify_cached_asset(entry: &AssetEntry, cache: &AssetCache) -> io::Result
 /// # Errors
 /// Returns an error if the file cannot be read.
 pub fn compute_sha256(path: &Path) -> io::Result<String> {
+    compute_sha256_and_size(path).map(|(hash, _)| hash)
+}
+
+/// Compute SHA-256 hex digest and size of a file.
+///
+/// # Errors
+/// Returns an error if the file cannot be read.
+pub fn compute_sha256_and_size(path: &Path) -> io::Result<(String, u64)> {
     let file = fs::File::open(path)?;
     let mut reader = io::BufReader::new(file);
     let mut hasher = Sha256::new();
     let mut buffer = [0; 8192];
+    let mut total_size = 0u64;
 
     loop {
         let count = reader.read(&mut buffer)?;
@@ -912,10 +920,11 @@ pub fn compute_sha256(path: &Path) -> io::Result<String> {
             break;
         }
         hasher.update(&buffer[..count]);
+        total_size += count as u64;
     }
 
     let result = hasher.finalize();
-    Ok(hex_encode(&result))
+    Ok((hex_encode(&result), total_size))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
