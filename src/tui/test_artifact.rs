@@ -295,10 +295,7 @@ impl ArtifactRecorder {
     pub fn inject_error(&mut self, message: &str, source: &str) {
         let screen_before = screen_name(self.harness.screen());
         self.harness.inject_error(message, source);
-        self.record_step_from_last(
-            format!("Error({message:?}, {source:?})"),
-            screen_before,
-        );
+        self.record_step_from_last(format!("Error({message:?}, {source:?})"), screen_before);
     }
 
     /// Run the standard startup sequence.
@@ -774,9 +771,15 @@ mod tests {
     fn pressure_scenario_produces_rich_trace() {
         let mut rec = ArtifactRecorder::new("test::pressure_scenario");
         rec.startup_with_state(sample_healthy_state());
-        rec.assert_true("not degraded after healthy state", !rec.harness().is_degraded());
+        rec.assert_true(
+            "not degraded after healthy state",
+            !rec.harness().is_degraded(),
+        );
         rec.feed_state(sample_pressured_state());
-        rec.assert_true("still not degraded (daemon reachable)", !rec.harness().is_degraded());
+        rec.assert_true(
+            "still not degraded (daemon reachable)",
+            !rec.harness().is_degraded(),
+        );
         rec.navigate_to_number(5);
         rec.assert_eq("screen", &rec.harness().screen(), &Screen::Ballast);
         rec.quit();

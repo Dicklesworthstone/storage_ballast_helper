@@ -521,7 +521,7 @@ mod tests {
         let mut h = DashboardHarness::default();
         h.feed_state(sample_healthy_state());
         assert!(!h.is_degraded());
-        h.last_frame().assert_contains("green");
+        h.last_frame().assert_contains("GREEN");
     }
 
     #[test]
@@ -539,10 +539,10 @@ mod tests {
     fn pressure_transition_visible_in_frames() {
         let mut h = DashboardHarness::default();
         h.feed_state(sample_healthy_state());
-        h.last_frame().assert_contains("green");
+        h.last_frame().assert_contains("GREEN");
 
         h.feed_state(sample_pressured_state());
-        h.last_frame().assert_contains("red");
+        h.last_frame().assert_contains("RED");
     }
 
     // ── Error / notification flows ──
@@ -628,7 +628,7 @@ mod tests {
 
         // 7. Goes back to overview.
         h.navigate_to_number(1);
-        h.last_frame().assert_contains("red");
+        h.last_frame().assert_contains("RED");
 
         // 8. Forces a refresh.
         h.inject_char('r');

@@ -129,10 +129,7 @@ pub use storage_ballast_helper::tui::e2e_artifact;
 /// Automatically populates trace ID, captured output, exit code, and status.
 /// Tag with `"cli"` for CLI-spawned tests.
 #[cfg(feature = "tui")]
-pub fn cmd_result_to_artifact(
-    name: &str,
-    result: &CmdResult,
-) -> e2e_artifact::TestCaseArtifact {
+pub fn cmd_result_to_artifact(name: &str, result: &CmdResult) -> e2e_artifact::TestCaseArtifact {
     let status = if result.status.success() {
         e2e_artifact::CaseStatus::Pass
     } else {
@@ -141,19 +138,21 @@ pub fn cmd_result_to_artifact(
 
     let mut diagnostics = Vec::new();
     if !result.status.success() {
-        diagnostics.push(e2e_artifact::DiagnosticEntry::error(format!(
-            "exit code: {}",
-            result.status.code().unwrap_or(-1)
-        )).with_source("cli"));
+        diagnostics.push(
+            e2e_artifact::DiagnosticEntry::error(format!(
+                "exit code: {}",
+                result.status.code().unwrap_or(-1)
+            ))
+            .with_source("cli"),
+        );
         if !result.stderr.is_empty() {
             diagnostics.push(
-                e2e_artifact::DiagnosticEntry::info(
-                    if result.stderr.len() > 500 {
-                        format!("{}... (truncated)", &result.stderr[..500])
-                    } else {
-                        result.stderr.clone()
-                    }
-                ).with_source("stderr")
+                e2e_artifact::DiagnosticEntry::info(if result.stderr.len() > 500 {
+                    format!("{}... (truncated)", &result.stderr[..500])
+                } else {
+                    result.stderr.clone()
+                })
+                .with_source("stderr"),
             );
         }
     }
@@ -168,10 +167,7 @@ pub fn cmd_result_to_artifact(
         elapsed_ms: 0,
         status,
         exit_code: result.status.code(),
-        output: e2e_artifact::CapturedOutput::new(
-            result.stdout.clone(),
-            result.stderr.clone(),
-        ),
+        output: e2e_artifact::CapturedOutput::new(result.stdout.clone(), result.stderr.clone()),
         assertions: Vec::new(),
         frames: Vec::new(),
         diagnostics,
