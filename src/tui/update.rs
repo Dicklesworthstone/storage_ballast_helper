@@ -13,11 +13,19 @@ use std::time::Instant;
 use ftui::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 
 use super::input::{InputAction, InputContext};
-use super::layout::{build_overview_layout, OverviewPane};
+use super::layout::{
+    BallastPane, CandidatesPane, ExplainabilityPane, LogSearchPane, OverviewPane, TimelinePane,
+    build_ballast_layout, build_candidates_layout, build_explainability_layout,
+    build_log_search_layout, build_overview_layout, build_timeline_layout,
+};
 use super::model::{
     ConfirmAction, DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, Overlay,
     PreferenceAction, RateHistory, Screen,
 };
+
+const FRAME_HEADER_ROWS: u16 = 6;
+const FRAME_FOOTER_ROWS: u16 = 1;
+const HEADER_TAB_ROW: u16 = 2;
 
 /// Apply a message to the model and return the next command for the runtime.
 ///
@@ -65,7 +73,8 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
         }
 
         DashboardMsg::Resize { cols, rows } => {
-            model.terminal_size = (cols, rows);
+            // Clamp to 1×1: zero dimensions cause Buffer/Frame panics.
+            model.terminal_size = (cols.max(1), rows.max(1));
             DashboardCmd::None
         }
 
@@ -401,7 +410,8 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
     }
 }
 
-const PALETTE_RESULT_LIMIT: usize = 15;
+// Keep command execution and cursor movement aligned with the rendered list.
+const PALETTE_RESULT_LIMIT: usize = 10;
 
 fn palette_clamp_cursor(model: &mut DashboardModel) {
     let count =
@@ -558,15 +568,38 @@ fn handle_diagnostics_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> Da
 
 fn handle_mouse_event(model: &mut DashboardModel, event: MouseEvent) -> DashboardCmd {
     if model.active_overlay.is_some() {
-        return DashboardCmd::None;
+        return handle_overlay_mouse(model, event);
     }
-    if model.screen != Screen::Overview {
+
+    if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some(screen) = header_tab_hit_screen(model, event.x, event.y)
+    {
+        model.navigate_to(screen);
         return DashboardCmd::None;
     }
 
+    match model.screen {
+        Screen::Overview => handle_overview_mouse(model, event),
+        Screen::Timeline => handle_timeline_mouse(model, event),
+        Screen::Explainability => handle_explainability_mouse(model, event),
+        Screen::Candidates => handle_candidates_mouse(model, event),
+        Screen::Ballast => handle_ballast_mouse(model, event),
+        Screen::LogSearch => handle_log_search_mouse(model, event),
+        Screen::Diagnostics => DashboardCmd::None,
+    }
+}
+
+fn handle_overlay_mouse(model: &mut DashboardModel, event: MouseEvent) -> DashboardCmd {
+    if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+        model.palette_reset();
+        model.active_overlay = None;
+    }
+    DashboardCmd::None
+}
+
+fn handle_overview_mouse(model: &mut DashboardModel, event: MouseEvent) -> DashboardCmd {
     let hovered = overview_pane_at(model, event.x, event.y);
     model.overview_set_hover(hovered);
-
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(pane) = hovered {
@@ -592,18 +625,280 @@ fn handle_mouse_event(model: &mut DashboardModel, event: MouseEvent) -> Dashboar
     }
 }
 
-fn overview_body_height(model: &DashboardModel) -> u16 {
+fn handle_timeline_mouse(model: &mut DashboardModel, event: MouseEvent) -> DashboardCmd {
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(idx) = timeline_row_hit(model, event.x, event.y) {
+                model.timeline_selected = idx;
+                model.timeline_follow = false;
+            }
+            DashboardCmd::None
+        }
+        MouseEventKind::ScrollUp if point_in_body(model, event.x, event.y) => {
+            model.timeline_cursor_up();
+            DashboardCmd::None
+        }
+        MouseEventKind::ScrollDown if point_in_body(model, event.x, event.y) => {
+            model.timeline_cursor_down();
+            DashboardCmd::None
+        }
+        _ => DashboardCmd::None,
+    }
+}
+
+fn handle_explainability_mouse(model: &mut DashboardModel, event: MouseEvent) -> DashboardCmd {
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(idx) = explainability_row_hit(model, event.x, event.y) {
+                model.explainability_selected = idx;
+                model.explainability_detail = true;
+            }
+            DashboardCmd::None
+        }
+        MouseEventKind::ScrollUp if point_in_body(model, event.x, event.y) => {
+            model.explainability_cursor_up();
+            DashboardCmd::None
+        }
+        MouseEventKind::ScrollDown if point_in_body(model, event.x, event.y) => {
+            model.explainability_cursor_down();
+            DashboardCmd::None
+        }
+        _ => DashboardCmd::None,
+    }
+}
+
+fn handle_candidates_mouse(model: &mut DashboardModel, event: MouseEvent) -> DashboardCmd {
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(idx) = candidates_row_hit(model, event.x, event.y) {
+                model.candidates_selected = idx;
+                model.candidates_detail = true;
+            }
+            DashboardCmd::None
+        }
+        MouseEventKind::ScrollUp if point_in_body(model, event.x, event.y) => {
+            model.candidates_cursor_up();
+            DashboardCmd::None
+        }
+        MouseEventKind::ScrollDown if point_in_body(model, event.x, event.y) => {
+            model.candidates_cursor_down();
+            DashboardCmd::None
+        }
+        _ => DashboardCmd::None,
+    }
+}
+
+fn handle_ballast_mouse(model: &mut DashboardModel, event: MouseEvent) -> DashboardCmd {
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(idx) = ballast_row_hit(model, event.x, event.y) {
+                model.ballast_selected = idx;
+                model.ballast_detail = true;
+            }
+            DashboardCmd::None
+        }
+        MouseEventKind::ScrollUp if point_in_body(model, event.x, event.y) => {
+            model.ballast_cursor_up();
+            DashboardCmd::None
+        }
+        MouseEventKind::ScrollDown if point_in_body(model, event.x, event.y) => {
+            model.ballast_cursor_down();
+            DashboardCmd::None
+        }
+        _ => DashboardCmd::None,
+    }
+}
+
+fn handle_log_search_mouse(model: &mut DashboardModel, event: MouseEvent) -> DashboardCmd {
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(idx) = log_search_row_hit(model, event.x, event.y) {
+                model.timeline_selected = idx;
+                model.timeline_follow = false;
+            }
+            DashboardCmd::None
+        }
+        MouseEventKind::ScrollUp if point_in_body(model, event.x, event.y) => {
+            model.timeline_cursor_up();
+            DashboardCmd::None
+        }
+        MouseEventKind::ScrollDown if point_in_body(model, event.x, event.y) => {
+            model.timeline_cursor_down();
+            DashboardCmd::None
+        }
+        _ => DashboardCmd::None,
+    }
+}
+
+fn dashboard_body_height(model: &DashboardModel) -> u16 {
     let notif_rows = u16::try_from(model.notifications.len().min(3)).unwrap_or(3);
     model
         .terminal_size
         .1
-        .saturating_sub(3)
-        .saturating_sub(1)
+        .saturating_sub(FRAME_HEADER_ROWS)
+        .saturating_sub(FRAME_FOOTER_ROWS)
         .saturating_sub(notif_rows)
 }
 
+fn body_local_y(model: &DashboardModel, y: u16) -> Option<u16> {
+    if y < FRAME_HEADER_ROWS {
+        return None;
+    }
+    let local_y = y.saturating_sub(FRAME_HEADER_ROWS);
+    (local_y < dashboard_body_height(model)).then_some(local_y)
+}
+
+fn point_in_body(model: &DashboardModel, x: u16, y: u16) -> bool {
+    let cols = model.terminal_size.0;
+    x < cols && body_local_y(model, y).is_some()
+}
+
+fn centered_window(selected: usize, total: usize, rows: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    let rows = rows.max(1).min(total);
+    let start = selected
+        .saturating_sub(rows / 2)
+        .min(total.saturating_sub(rows));
+    let end = (start + rows).min(total);
+    (start, end)
+}
+
+fn pane_content_row(x: u16, local_y: u16, rect: super::layout::PaneRect) -> Option<usize> {
+    if rect.width < 3 || rect.height < 3 {
+        return None;
+    }
+    let content_col_start = rect.col.saturating_add(1);
+    let content_col_end = rect.col.saturating_add(rect.width).saturating_sub(1);
+    let content_row_start = rect.row.saturating_add(1);
+    let content_row_end = rect.row.saturating_add(rect.height).saturating_sub(1);
+    if x < content_col_start
+        || x >= content_col_end
+        || local_y < content_row_start
+        || local_y >= content_row_end
+    {
+        return None;
+    }
+    Some(usize::from(local_y.saturating_sub(content_row_start)))
+}
+
+fn timeline_row_hit(model: &DashboardModel, x: u16, y: u16) -> Option<usize> {
+    let local_y = body_local_y(model, y)?;
+    let layout = build_timeline_layout(model.terminal_size.0, dashboard_body_height(model));
+    let list = layout
+        .placements
+        .into_iter()
+        .find(|p| p.visible && p.pane == TimelinePane::EventList)?;
+    let rel_row = pane_content_row(x, local_y, list.rect)?;
+    let total = model.timeline_filtered_events().len();
+    let rows = usize::from(list.rect.height.saturating_sub(2).max(1));
+    let (start, end) = centered_window(model.timeline_selected, total, rows);
+    let visible = end.saturating_sub(start);
+    (rel_row < visible).then_some(start + rel_row)
+}
+
+fn explainability_row_hit(model: &DashboardModel, x: u16, y: u16) -> Option<usize> {
+    let local_y = body_local_y(model, y)?;
+    let layout = build_explainability_layout(model.terminal_size.0, dashboard_body_height(model));
+    let list = layout
+        .placements
+        .into_iter()
+        .find(|p| p.visible && p.pane == ExplainabilityPane::FactorBreakdown)?;
+    let rel_row = pane_content_row(x, local_y, list.rect)?;
+    let total = model.explainability_decisions.len();
+    let rows = usize::from(list.rect.height.saturating_sub(2).max(1));
+    let (start, end) = centered_window(model.explainability_selected, total, rows);
+    let visible = end.saturating_sub(start);
+    (rel_row < visible).then_some(start + rel_row)
+}
+
+fn candidates_row_hit(model: &DashboardModel, x: u16, y: u16) -> Option<usize> {
+    let local_y = body_local_y(model, y)?;
+    let layout = build_candidates_layout(model.terminal_size.0, dashboard_body_height(model));
+    let list = layout
+        .placements
+        .into_iter()
+        .find(|p| p.visible && p.pane == CandidatesPane::CandidateList)?;
+    let rel_row = pane_content_row(x, local_y, list.rect)?;
+    let total = model.candidates_list.len();
+    let rows = usize::from(list.rect.height.saturating_sub(2).max(1));
+    let (start, end) = centered_window(model.candidates_selected, total, rows);
+    let visible = end.saturating_sub(start);
+    (rel_row < visible).then_some(start + rel_row)
+}
+
+fn ballast_row_hit(model: &DashboardModel, x: u16, y: u16) -> Option<usize> {
+    let local_y = body_local_y(model, y)?;
+    let layout = build_ballast_layout(model.terminal_size.0, dashboard_body_height(model));
+    let list = layout
+        .placements
+        .into_iter()
+        .find(|p| p.visible && p.pane == BallastPane::VolumeList)?;
+    let rel_row = pane_content_row(x, local_y, list.rect)?;
+    let total = model.ballast_volumes.len();
+    let rows = usize::from(list.rect.height.saturating_sub(2).max(1));
+    let (start, end) = centered_window(model.ballast_selected, total, rows);
+    let visible = end.saturating_sub(start);
+    (rel_row < visible).then_some(start + rel_row)
+}
+
+fn log_search_row_hit(model: &DashboardModel, x: u16, y: u16) -> Option<usize> {
+    let local_y = body_local_y(model, y)?;
+    let layout = build_log_search_layout(model.terminal_size.0, dashboard_body_height(model));
+    let list = layout
+        .placements
+        .into_iter()
+        .find(|p| p.visible && p.pane == LogSearchPane::LogList)?;
+    let rel_row = pane_content_row(x, local_y, list.rect)?;
+    let total = model.timeline_events.len();
+    let rows = usize::from(list.rect.height.saturating_sub(2).max(1));
+    let (start, end) = centered_window(model.timeline_selected, total, rows);
+    let visible = end.saturating_sub(start);
+    (rel_row < visible).then_some(start + rel_row)
+}
+
+fn screen_tab_label(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Overview => "Overview",
+        Screen::Timeline => "Timeline",
+        Screen::Explainability => "Explain",
+        Screen::Candidates => "Candidates",
+        Screen::Ballast => "Ballast",
+        Screen::LogSearch => "Logs",
+        Screen::Diagnostics => "Diagnostics",
+    }
+}
+
+fn header_tab_hit_screen(model: &DashboardModel, x: u16, y: u16) -> Option<Screen> {
+    if y != HEADER_TAB_ROW || x < 1 || x >= model.terminal_size.0.saturating_sub(1) {
+        return None;
+    }
+
+    let screens = [
+        Screen::Overview,
+        Screen::Timeline,
+        Screen::Explainability,
+        Screen::Candidates,
+        Screen::Ballast,
+        Screen::LogSearch,
+        Screen::Diagnostics,
+    ];
+    let mut cursor_x = 1u16;
+    for screen in screens {
+        let label = format!(" {}:{} ", screen.number(), screen_tab_label(screen));
+        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+        let end = cursor_x.saturating_add(width);
+        if x >= cursor_x && x < end {
+            return Some(screen);
+        }
+        cursor_x = end.saturating_add(1);
+    }
+    None
+}
+
 fn overview_visible_panes(model: &DashboardModel) -> Vec<OverviewPane> {
-    let body_height = overview_body_height(model);
+    let body_height = dashboard_body_height(model);
     build_overview_layout(model.terminal_size.0, body_height)
         .placements
         .into_iter()
@@ -641,8 +936,8 @@ fn overview_focus_step(model: &mut DashboardModel, forward: bool) {
 }
 
 fn overview_pane_at(model: &DashboardModel, x: u16, y: u16) -> Option<OverviewPane> {
-    let body_top = 3;
-    let body_height = overview_body_height(model);
+    let body_top = FRAME_HEADER_ROWS;
+    let body_height = dashboard_body_height(model);
     if y < body_top || y >= body_top.saturating_add(body_height) {
         return None;
     }
@@ -676,7 +971,7 @@ mod tests {
     use crate::daemon::self_monitor::{
         BallastState, Counters, DaemonState, LastScanState, MountPressure, PressureState,
     };
-    use crate::tui::layout::OverviewPane;
+    use crate::tui::layout::{OverviewPane, PaneRect};
     use crate::tui::model::{DashboardError, Overlay};
     use crate::tui::telemetry::DataSource;
 
@@ -712,6 +1007,102 @@ mod tests {
             y,
             modifiers: Modifiers::NONE,
         }
+    }
+
+    fn overview_pane_center(model: &DashboardModel, pane: OverviewPane) -> (u16, u16) {
+        let body_height = dashboard_body_height(model);
+        let placement = build_overview_layout(model.terminal_size.0, body_height)
+            .placements
+            .into_iter()
+            .find(|p| p.visible && p.pane == pane)
+            .expect("overview pane should be visible");
+        let x = placement.rect.col.saturating_add(placement.rect.width / 2);
+        let y = FRAME_HEADER_ROWS
+            .saturating_add(placement.rect.row)
+            .saturating_add(placement.rect.height / 2);
+        (x, y)
+    }
+
+    fn header_tab_center(target: Screen) -> (u16, u16) {
+        let screens = [
+            Screen::Overview,
+            Screen::Timeline,
+            Screen::Explainability,
+            Screen::Candidates,
+            Screen::Ballast,
+            Screen::LogSearch,
+            Screen::Diagnostics,
+        ];
+        let mut cursor_x = 1u16;
+        for screen in screens {
+            let label = format!(" {}:{} ", screen.number(), screen_tab_label(screen));
+            let width = u16::try_from(label.chars().count()).unwrap_or(0);
+            if screen == target {
+                return (cursor_x.saturating_add(width / 2), HEADER_TAB_ROW);
+            }
+            cursor_x = cursor_x.saturating_add(width).saturating_add(1);
+        }
+        (1, HEADER_TAB_ROW)
+    }
+
+    fn timeline_list_rect(model: &DashboardModel) -> PaneRect {
+        let layout = build_timeline_layout(model.terminal_size.0, dashboard_body_height(model));
+        layout
+            .placements
+            .into_iter()
+            .find(|p| p.visible && p.pane == TimelinePane::EventList)
+            .expect("timeline list pane")
+            .rect
+    }
+
+    fn explainability_list_rect(model: &DashboardModel) -> PaneRect {
+        let layout =
+            build_explainability_layout(model.terminal_size.0, dashboard_body_height(model));
+        layout
+            .placements
+            .into_iter()
+            .find(|p| p.visible && p.pane == ExplainabilityPane::FactorBreakdown)
+            .expect("explainability list pane")
+            .rect
+    }
+
+    fn candidates_list_rect(model: &DashboardModel) -> PaneRect {
+        let layout = build_candidates_layout(model.terminal_size.0, dashboard_body_height(model));
+        layout
+            .placements
+            .into_iter()
+            .find(|p| p.visible && p.pane == CandidatesPane::CandidateList)
+            .expect("candidates list pane")
+            .rect
+    }
+
+    fn ballast_list_rect(model: &DashboardModel) -> PaneRect {
+        let layout = build_ballast_layout(model.terminal_size.0, dashboard_body_height(model));
+        layout
+            .placements
+            .into_iter()
+            .find(|p| p.visible && p.pane == BallastPane::VolumeList)
+            .expect("ballast list pane")
+            .rect
+    }
+
+    fn log_list_rect(model: &DashboardModel) -> PaneRect {
+        let layout = build_log_search_layout(model.terminal_size.0, dashboard_body_height(model));
+        layout
+            .placements
+            .into_iter()
+            .find(|p| p.visible && p.pane == LogSearchPane::LogList)
+            .expect("log list pane")
+            .rect
+    }
+
+    fn pane_row_click(rect: PaneRect, row: u16) -> (u16, u16) {
+        let x = rect.col.saturating_add(2);
+        let y = FRAME_HEADER_ROWS
+            .saturating_add(rect.row)
+            .saturating_add(1)
+            .saturating_add(row);
+        (x, y)
     }
 
     fn sample_daemon_state() -> DaemonState {
@@ -868,16 +1259,7 @@ mod tests {
     fn mouse_click_on_overview_pane_navigates_to_target_screen() {
         let mut model = test_model();
         model.screen = Screen::Overview;
-        let body_height = overview_body_height(&model);
-        let pressure = build_overview_layout(model.terminal_size.0, body_height)
-            .placements
-            .into_iter()
-            .find(|p| p.visible && p.pane == OverviewPane::PressureSummary)
-            .expect("pressure pane should be visible");
-        let click_x = pressure.rect.col.saturating_add(pressure.rect.width / 2);
-        let click_y = 3u16
-            .saturating_add(pressure.rect.row)
-            .saturating_add(pressure.rect.height / 2);
+        let (click_x, click_y) = overview_pane_center(&model, OverviewPane::PressureSummary);
         let cmd = update(
             &mut model,
             DashboardMsg::Mouse(make_mouse(
@@ -894,11 +1276,161 @@ mod tests {
     fn mouse_move_updates_overview_hover_state() {
         let mut model = test_model();
         model.screen = Screen::Overview;
+        let (x, y) = overview_pane_center(&model, OverviewPane::PressureSummary);
         update(
             &mut model,
-            DashboardMsg::Mouse(make_mouse(MouseEventKind::Moved, 1, 4)),
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::Moved, x, y)),
         );
         assert!(model.overview_hover_pane.is_some());
+    }
+
+    #[test]
+    fn mouse_wheel_on_hotlist_moves_candidate_selection() {
+        let mut model = test_model();
+        model.screen = Screen::Overview;
+        model.terminal_size = (140, 42);
+        model.candidates_list = vec![sample_decision(1), sample_decision(2)];
+        model.candidates_selected = 0;
+        let (x, y) = overview_pane_center(&model, OverviewPane::CandidateHotlist);
+
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::ScrollDown, x, y)),
+        );
+        assert_eq!(model.candidates_selected, 1);
+
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::ScrollUp, x, y)),
+        );
+        assert_eq!(model.candidates_selected, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_outside_hotlist_does_not_move_candidates() {
+        let mut model = test_model();
+        model.screen = Screen::Overview;
+        model.terminal_size = (140, 42);
+        model.candidates_list = vec![sample_decision(1), sample_decision(2)];
+        model.candidates_selected = 1;
+        let (x, y) = overview_pane_center(&model, OverviewPane::PressureSummary);
+
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::ScrollDown, x, y)),
+        );
+        assert_eq!(model.candidates_selected, 1);
+    }
+
+    #[test]
+    fn mouse_click_on_header_tab_navigates_to_screen() {
+        let mut model = test_model();
+        model.screen = Screen::Overview;
+        let (x, y) = header_tab_center(Screen::Ballast);
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::Down(MouseButton::Left), x, y)),
+        );
+        assert_eq!(model.screen, Screen::Ballast);
+    }
+
+    #[test]
+    fn timeline_mouse_wheel_scrolls_anywhere_in_body() {
+        let mut model = test_model();
+        model.screen = Screen::Timeline;
+        model.timeline_events = vec![
+            sample_timeline_event("info", "a"),
+            sample_timeline_event("warning", "b"),
+            sample_timeline_event("critical", "c"),
+        ];
+        model.timeline_selected = 1;
+        let rect = timeline_list_rect(&model);
+        let (x, y) = pane_row_click(rect, 0);
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::ScrollDown, x, y)),
+        );
+        assert_eq!(model.timeline_selected, 2);
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::ScrollUp, x, y)),
+        );
+        assert_eq!(model.timeline_selected, 1);
+    }
+
+    #[test]
+    fn explainability_click_row_selects_and_opens_detail() {
+        let mut model = test_model();
+        model.screen = Screen::Explainability;
+        model.explainability_decisions = vec![sample_decision(1), sample_decision(2)];
+        model.explainability_selected = 0;
+        model.explainability_detail = false;
+        let rect = explainability_list_rect(&model);
+        let (x, y) = pane_row_click(rect, 1);
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::Down(MouseButton::Left), x, y)),
+        );
+        assert_eq!(model.explainability_selected, 1);
+        assert!(model.explainability_detail);
+    }
+
+    #[test]
+    fn candidates_click_row_selects_and_opens_detail() {
+        let mut model = test_model();
+        model.screen = Screen::Candidates;
+        model.candidates_list = vec![sample_decision(1), sample_decision(2)];
+        model.candidates_selected = 0;
+        model.candidates_detail = false;
+        let rect = candidates_list_rect(&model);
+        let (x, y) = pane_row_click(rect, 1);
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::Down(MouseButton::Left), x, y)),
+        );
+        assert_eq!(model.candidates_selected, 1);
+        assert!(model.candidates_detail);
+    }
+
+    #[test]
+    fn ballast_click_row_selects_and_opens_detail() {
+        let mut model = test_model();
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![sample_volume("/", 3, 5), sample_volume("/data", 2, 5)];
+        model.ballast_selected = 0;
+        model.ballast_detail = false;
+        let rect = ballast_list_rect(&model);
+        let (x, y) = pane_row_click(rect, 1);
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::Down(MouseButton::Left), x, y)),
+        );
+        assert_eq!(model.ballast_selected, 1);
+        assert!(model.ballast_detail);
+    }
+
+    #[test]
+    fn log_search_wheel_scrolls_timeline_selection() {
+        let mut model = test_model();
+        model.screen = Screen::LogSearch;
+        model.timeline_events = vec![
+            sample_timeline_event("info", "a"),
+            sample_timeline_event("warning", "b"),
+            sample_timeline_event("critical", "c"),
+        ];
+        model.timeline_selected = 1;
+        let rect = log_list_rect(&model);
+        let (x, y) = pane_row_click(rect, 0);
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::ScrollDown, x, y)),
+        );
+        assert_eq!(model.timeline_selected, 2);
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::ScrollUp, x, y)),
+        );
+        assert_eq!(model.timeline_selected, 1);
     }
 
     #[test]
@@ -1025,6 +1557,36 @@ mod tests {
         assert!(model.active_overlay.is_none());
         assert!(!model.quit);
         assert!(matches!(cmd, DashboardCmd::None));
+    }
+
+    #[test]
+    fn overlay_mouse_click_closes_overlay_without_quit() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::Help);
+
+        let cmd = update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::Down(MouseButton::Left), 10, 10)),
+        );
+        assert!(model.active_overlay.is_none());
+        assert!(!model.quit);
+        assert!(matches!(cmd, DashboardCmd::None));
+    }
+
+    #[test]
+    fn overlay_mouse_click_closes_palette_and_resets_query() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+        model.palette_query = String::from("diag");
+        model.palette_selected = 4;
+
+        update(
+            &mut model,
+            DashboardMsg::Mouse(make_mouse(MouseEventKind::Down(MouseButton::Left), 20, 8)),
+        );
+        assert!(model.active_overlay.is_none());
+        assert!(model.palette_query.is_empty());
+        assert_eq!(model.palette_selected, 0);
     }
 
     #[test]
@@ -2331,7 +2893,7 @@ mod tests {
     fn palette_cursor_navigation() {
         let mut model = test_model();
         model.active_overlay = Some(Overlay::CommandPalette);
-        // Empty query shows all 15 palette actions.
+        // Empty query shows the first page of palette actions.
         assert_eq!(model.palette_selected, 0);
 
         update(&mut model, DashboardMsg::Key(make_key(KeyCode::Down)));
@@ -2349,6 +2911,18 @@ mod tests {
         // Up at top is clamped.
         update(&mut model, DashboardMsg::Key(make_key(KeyCode::Up)));
         assert_eq!(model.palette_selected, 0);
+    }
+
+    #[test]
+    fn palette_cursor_clamps_to_rendered_page_limit() {
+        let mut model = test_model();
+        model.active_overlay = Some(Overlay::CommandPalette);
+
+        for _ in 0..50 {
+            update(&mut model, DashboardMsg::Key(make_key(KeyCode::Down)));
+        }
+
+        assert_eq!(model.palette_selected, PALETTE_RESULT_LIMIT - 1);
     }
 
     #[test]
@@ -2416,18 +2990,18 @@ mod tests {
         let mut model = test_model();
         model.active_overlay = Some(Overlay::CommandPalette);
 
-        // Move cursor to a high position with empty query (15 results).
+        // Move cursor to the bottom of the rendered page with empty query.
         for _ in 0..10 {
             update(&mut model, DashboardMsg::Key(make_key(KeyCode::Down)));
         }
-        assert_eq!(model.palette_selected, 10);
+        assert_eq!(model.palette_selected, PALETTE_RESULT_LIMIT - 1);
 
         // Type a very specific query that produces fewer results.
         for c in "action.quit".chars() {
             update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(c))));
         }
         // Cursor should be clamped to the result count.
-        assert!(model.palette_selected < 15);
+        assert!(model.palette_selected < PALETTE_RESULT_LIMIT);
     }
 
     #[test]

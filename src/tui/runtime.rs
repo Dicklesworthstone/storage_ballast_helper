@@ -349,7 +349,8 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
     };
     let mut backend = TtyBackend::open(80, 24, options)?;
 
-    let (cols, rows) = backend.size()?;
+    let (raw_cols, raw_rows) = backend.size()?;
+    let (cols, rows) = (raw_cols.max(1), raw_rows.max(1));
     let mut model = DashboardModel::new(
         config.state_file.clone(),
         config.monitor_paths.clone(),
@@ -380,7 +381,9 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
 
     loop {
         // Render current frame via Frame-based widget pipeline.
-        let (render_cols, render_rows) = (model.terminal_size.0, model.terminal_size.1);
+        // Clamp to 1×1 minimum: Buffer/Frame panic on zero dimensions.
+        let render_cols = model.terminal_size.0.max(1);
+        let render_rows = model.terminal_size.1.max(1);
         let mut frame = Frame::new(render_cols, render_rows, &mut pool);
         render::render_frame(&model, &mut frame);
 
@@ -397,7 +400,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
             .presenter()
             .present_ui(&frame.buffer, Some(&diff), full_repaint)?;
         first_frame = false;
-        prev_buffer = std::mem::replace(&mut frame.buffer, Buffer::new(0, 0));
+        prev_buffer = std::mem::replace(&mut frame.buffer, Buffer::new(1, 1));
 
         // Check for expired notification timers.
         let now = Instant::now();
