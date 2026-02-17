@@ -1,0 +1,59 @@
+# SBH Configuration Template
+# Copy to ~/.config/sbh/config.toml and adjust for your environment.
+
+[pressure]
+green_min_free_pct = 20.0      # Healthy threshold
+yellow_min_free_pct = 14.0     # Increased monitoring
+orange_min_free_pct = 10.0     # Begin cleanup + ballast release
+red_min_free_pct = 6.0         # Aggressive cleanup
+poll_interval_ms = 1000        # Check every 1 second
+
+[pressure.prediction]
+enabled = true
+action_horizon_minutes = 30.0  # Pre-emptive scan window
+warning_horizon_minutes = 60.0 # Early notification window
+min_confidence = 0.7
+min_samples = 5
+
+[scanner]
+root_paths = ["/data/projects"]
+excluded_paths = []
+protected_paths = []
+min_file_age_minutes = 10      # Never delete files younger than this
+max_depth = 10
+# parallelism = 4             # Auto-detected if omitted
+follow_symlinks = false
+cross_devices = false
+dry_run = false
+max_delete_batch = 20
+
+[scoring]
+min_score = 0.45
+location_weight = 0.25
+name_weight = 0.25
+age_weight = 0.20
+size_weight = 0.15
+structure_weight = 0.15
+false_positive_loss = 50.0     # Cost of wrongly deleting
+false_negative_loss = 30.0     # Cost of missing a candidate
+
+[ballast]
+file_count = 10
+file_size_bytes = 1073741824   # 1 GiB per file
+replenish_cooldown_minutes = 30
+auto_provision = true
+
+# Per-volume overrides (optional):
+# [ballast.overrides."/data"]
+# file_count = 20
+# file_size_bytes = 2147483648
+
+[notifications]
+# [notifications.desktop]
+# enabled = true
+# min_level = "Orange"
+
+# [notifications.webhook]
+# enabled = true
+# url = "https://hooks.example.com/sbh"
+# min_level = "Red"
