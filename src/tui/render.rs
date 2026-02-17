@@ -21,8 +21,9 @@ use super::model::{
 use super::preferences::{DensityMode, HintVerbosity, StartScreen};
 use super::theme::{AccessibilityProfile, PaletteEntry, SpacingScale, Theme, ThemePalette};
 use super::widgets::{
-    extract_time, gauge, human_bytes, human_duration, human_rate, section_header, sparkline,
-    status_badge, trend_label,
+    colored_sparkline, extract_time, gauge, human_bytes, human_duration, human_rate, key_hint,
+    mini_bar_chart, section_header, segmented_gauge, separator_line, sparkline, status_badge,
+    styled_badge, trend_label,
 };
 use crate::tui::telemetry::{DataSource, DecisionEvidence, TimelineEvent};
 
@@ -35,7 +36,7 @@ use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Frame, PackedRgba, Style};
 
-const FRAME_HEADER_ROWS: u16 = 6;
+const FRAME_HEADER_ROWS: u16 = 4;
 const FRAME_FOOTER_ROWS: u16 = 1;
 
 /// Legacy string-returning render path for test compatibility.
@@ -227,26 +228,28 @@ fn frame_render_too_small(model: &DashboardModel, theme: &Theme, area: Rect, fra
 }
 
 fn frame_render_header(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
-    let label = screen_label(model.screen);
+    // Paint header background.
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                cell.bg = theme.palette.panel_bg();
+            }
+        }
+    }
+
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let mut lines = Vec::new();
+
+    // ── Row 1: Title + mode pill + policy pill ──
     let mode_str = if model.degraded { "DEGRADED" } else { "NORMAL" };
     let mode_color = if model.degraded {
         theme.palette.warning_color()
     } else {
         theme.palette.success_color()
     };
-
-    let header_block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.palette.border_color()))
-        .style(Style::default().bg(theme.palette.panel_bg()));
-    let inner = header_block.inner(area);
-    header_block.render(area, frame);
-
-    if inner.height == 0 || inner.width == 0 {
-        return;
-    }
-
-    let mut lines = Vec::new();
 
     let mut title_spans = vec![
         Span::styled(
@@ -274,13 +277,9 @@ fn frame_render_header(model: &DashboardModel, theme: &Theme, area: Rect, frame:
                 .bold(),
         ));
     }
-    title_spans.push(Span::raw("  "));
-    title_spans.push(Span::styled(
-        label,
-        Style::default().fg(theme.palette.text_primary()),
-    ));
     lines.push(Line::from_spans(title_spans));
 
+    // ── Row 2: Tab strip with per-screen accent on active tab ──
     let screens = [
         Screen::Overview,
         Screen::Timeline,
@@ -291,13 +290,14 @@ fn frame_render_header(model: &DashboardModel, theme: &Theme, area: Rect, frame:
         Screen::Diagnostics,
     ];
     let mut nav_spans = Vec::new();
+    nav_spans.push(Span::raw(" "));
     for (idx, screen) in screens.iter().enumerate() {
         let active = *screen == model.screen;
         let label = format!(" {}:{} ", screen.number(), screen_tab_label(*screen));
         let style = if active {
             Style::default()
                 .fg(PackedRgba::rgb(20, 20, 30))
-                .bg(theme.palette.accent_color())
+                .bg(theme.palette.tab_active_bg(screen.number()))
                 .bold()
         } else {
             Style::default().fg(theme.palette.text_secondary())
@@ -309,35 +309,40 @@ fn frame_render_header(model: &DashboardModel, theme: &Theme, area: Rect, frame:
     }
     lines.push(Line::from_spans(nav_spans));
 
-    let overlay_label = model.active_overlay.map_or("none", overlay_name);
-    let profile_mode = preference_profile_mode_label(model.preference_profile_mode);
-    let history_hint = "Esc overlay->detail->back->quit";
-    lines.push(Line::from(format!(
-        "start={} density={} hints={} overlay={} profile={} history={} ({history_hint})",
-        start_screen_label(model.preferred_start_screen),
-        model.density,
-        model.hint_verbosity,
-        overlay_label,
-        profile_mode,
-        model.screen_history.len(),
-    )));
-
+    // ── Row 3: Breadcrumb trail (only when history exists) ──
     if model.screen_history.is_empty() {
-        lines.push(Line::from(format!("nav: {}", screen_label(model.screen))));
+        // Thin separator line when no breadcrumbs.
+        lines.push(separator_line(
+            usize::from(area.width),
+            theme.palette.border_color(),
+        ));
     } else {
-        use std::fmt::Write as _;
         let max_crumbs = 6;
         let history = &model.screen_history;
         let start = history.len().saturating_sub(max_crumbs);
-        let mut crumb = String::from("nav:");
+        let mut crumb_spans: Vec<Span> = vec![Span::styled(
+            " \u{25B8} ",
+            Style::default().fg(theme.palette.muted_color()),
+        )];
         for s in &history[start..] {
-            let _ = write!(crumb, " {} >", screen_label(*s));
+            crumb_spans.push(Span::styled(
+                screen_tab_label(*s),
+                Style::default().fg(theme.palette.text_secondary()),
+            ));
+            crumb_spans.push(Span::styled(
+                " \u{203A} ",
+                Style::default().fg(theme.palette.muted_color()),
+            ));
         }
-        let _ = write!(crumb, " {}", screen_label(model.screen));
-        lines.push(Line::from(crumb));
+        crumb_spans.push(Span::styled(
+            screen_tab_label(model.screen),
+            Style::default().fg(theme.palette.accent_color()).bold(),
+        ));
+        lines.push(Line::from_spans(crumb_spans));
     }
 
-    let visible_lines = usize::from(inner.height);
+    let visible_lines = usize::from(area.height);
+    let inner = Rect::new(area.x, area.y, area.width, area.height);
     Paragraph::new(Text::from_lines(lines.into_iter().take(visible_lines)))
         .style(Style::default().fg(theme.palette.text_primary()))
         .render(inner, frame);
@@ -352,16 +357,6 @@ fn screen_tab_label(screen: Screen) -> &'static str {
         Screen::Ballast => "Ballast",
         Screen::LogSearch => "Logs",
         Screen::Diagnostics => "Diagnostics",
-    }
-}
-
-fn overlay_name(overlay: super::model::Overlay) -> &'static str {
-    match overlay {
-        super::model::Overlay::CommandPalette => "palette",
-        super::model::Overlay::Help => "help",
-        super::model::Overlay::Voi => "voi",
-        super::model::Overlay::Confirmation(_) => "confirm",
-        super::model::Overlay::IncidentPlaybook => "playbook",
     }
 }
 
@@ -430,7 +425,7 @@ fn frame_render_overview_card(
     let show_target_hint = (model.overview_focus_pane == pane
         || model.overview_hover_pane == Some(pane))
         && model.hint_verbosity != HintVerbosity::Off;
-    let content = overview_pane_text(model, theme, pane, inner.width, show_target_hint);
+    let content = overview_pane_styled(model, theme, pane, inner.width, show_target_hint);
     Paragraph::new(content)
         .style(Style::default().fg(theme.palette.text_secondary()))
         .render(inner, frame);
@@ -478,6 +473,403 @@ fn overview_pane_text(
     }
 }
 
+/// Styled version of overview pane content, returning `Text` with colored spans.
+fn overview_pane_styled(
+    model: &DashboardModel,
+    theme: &Theme,
+    pane: OverviewPane,
+    pane_width: u16,
+    show_target_hint: bool,
+) -> Text {
+    let mut lines = match pane {
+        OverviewPane::PressureSummary => styled_pressure_summary(model, theme, pane_width),
+        OverviewPane::ForecastHorizon => styled_forecast_horizon(model, theme),
+        OverviewPane::EwmaTrend => styled_ewma_trend(model, theme),
+        OverviewPane::DecisionPulse => styled_decision_pulse(model, theme),
+        OverviewPane::CandidateHotlist => styled_candidate_hotlist(model, theme, pane_width),
+        OverviewPane::BallastQuick => styled_ballast_quick(model, theme),
+        _ => {
+            // Fallback: use plain text rendering for remaining panes.
+            let plain = overview_pane_text(model, theme, pane, pane_width, false);
+            plain.lines().map(|l| Line::from(l.to_string())).collect()
+        }
+    };
+    if show_target_hint {
+        lines.push(Line::from_spans([
+            Span::styled(
+                "  \u{2192} ",
+                Style::default().fg(theme.palette.muted_color()),
+            ),
+            Span::styled(
+                format!("Enter/Space opens {}", overview_pane_target_label(pane)),
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+        ]));
+    }
+    Text::from_lines(lines)
+}
+
+#[allow(clippy::option_if_let_else)]
+fn styled_pressure_summary(model: &DashboardModel, theme: &Theme, pane_width: u16) -> Vec<Line> {
+    if let Some(ref state) = model.daemon_state {
+        let mut lines = Vec::new();
+        let level_color = theme.palette.pressure_color(&state.pressure.overall);
+
+        // Header line with styled badge.
+        let mut header = vec![
+            Span::styled(
+                "pressure ",
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+            styled_badge(&state.pressure.overall.to_ascii_uppercase(), level_color),
+        ];
+        if !state.policy_mode.is_empty() {
+            let policy_color = policy_mode_color(&state.policy_mode, &theme.palette);
+            header.push(Span::raw(" "));
+            header.push(styled_badge(
+                &state.policy_mode.to_ascii_uppercase(),
+                policy_color,
+            ));
+        }
+        lines.push(Line::from_spans(header));
+
+        // Mount rows with segmented gauges.
+        let gauge_w = gauge_width_for(pane_width).max(8);
+        for mount in &state.pressure.mounts {
+            let used_pct = 100.0 - mount.free_pct;
+            let mount_path = truncate_path(&mount.path, 16);
+            let mut row = vec![Span::styled(
+                format!("  {mount_path:<16} "),
+                Style::default().fg(theme.palette.text_secondary()),
+            )];
+            row.extend(segmented_gauge(used_pct, gauge_w, &theme.palette));
+
+            let rate_str = mount.rate_bps.map_or_else(String::new, |r| {
+                let s = human_rate(r);
+                if r > 0.0 {
+                    format!(" {s} \u{26a0}")
+                } else {
+                    format!(" {s}")
+                }
+            });
+            if !rate_str.is_empty() {
+                let rate_color = if mount.rate_bps.is_some_and(|r| r > 0.0) {
+                    theme.palette.warning_color()
+                } else {
+                    theme.palette.text_secondary()
+                };
+                row.push(Span::styled(rate_str, Style::default().fg(rate_color)));
+            }
+            lines.push(Line::from_spans(row));
+        }
+        lines
+    } else {
+        let plain = render_pressure_summary(model, theme, pane_width);
+        plain.lines().map(|l| Line::from(l.to_string())).collect()
+    }
+}
+
+fn styled_forecast_horizon(model: &DashboardModel, theme: &Theme) -> Vec<Line> {
+    if let Some(ref state) = model.daemon_state {
+        let worst = state
+            .pressure
+            .mounts
+            .iter()
+            .min_by(|a, b| a.free_pct.total_cmp(&b.free_pct));
+        if let Some(worst) = worst {
+            let level_color = theme.palette.pressure_color(&worst.level);
+            let eta = worst.rate_bps.and_then(|rate| {
+                if rate <= 0.0 || worst.free_pct <= 0.0 {
+                    None
+                } else {
+                    let bytes_left = (worst.free_pct / 100.0) * 100.0 * 1024.0 * 1024.0 * 1024.0;
+                    Some((bytes_left / rate).max(0.0))
+                }
+            });
+            let eta_str = eta.map_or_else(|| "N/A".to_string(), eta_label);
+            let urgency_color = if worst.free_pct < 10.0 {
+                theme.palette.danger_color()
+            } else if worst.free_pct < 25.0 {
+                theme.palette.warning_color()
+            } else {
+                theme.palette.success_color()
+            };
+
+            return vec![
+                Line::from_spans([
+                    Span::styled(
+                        "forecast ",
+                        Style::default().fg(theme.palette.text_secondary()),
+                    ),
+                    styled_badge(&worst.level.to_ascii_uppercase(), level_color),
+                ]),
+                Line::from_spans([
+                    Span::styled(
+                        "  worst=",
+                        Style::default().fg(theme.palette.text_secondary()),
+                    ),
+                    Span::styled(
+                        &*worst.path,
+                        Style::default().fg(theme.palette.text_primary()),
+                    ),
+                ]),
+                Line::from_spans([
+                    Span::styled(
+                        format!("  free={:.1}%", worst.free_pct),
+                        Style::default().fg(urgency_color),
+                    ),
+                    Span::styled(
+                        format!("  eta\u{2248}{eta_str}"),
+                        Style::default().fg(urgency_color).bold(),
+                    ),
+                ]),
+            ];
+        }
+    }
+    vec![Line::from(Span::styled(
+        "forecast awaiting daemon trend inputs",
+        Style::default().fg(theme.palette.muted_color()),
+    ))]
+}
+
+fn styled_ewma_trend(model: &DashboardModel, theme: &Theme) -> Vec<Line> {
+    if model.rate_histories.is_empty() {
+        return vec![Line::from(Span::styled(
+            "ewma no rate data",
+            Style::default().fg(theme.palette.muted_color()),
+        ))];
+    }
+
+    let mut sorted: Vec<_> = model.rate_histories.iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+
+    let mut lines = vec![Line::from(Span::styled(
+        format!("ewma {} mounts", sorted.len()),
+        Style::default().fg(theme.palette.text_secondary()),
+    ))];
+
+    for (path, history) in &sorted {
+        let normalized = history.normalized();
+        let latest = history.latest().unwrap_or(0.0);
+        let rate_str = human_rate(latest);
+        let trend = trend_label(latest);
+
+        let mut row: Vec<Span> = vec![Span::styled(
+            format!("  {path:<14} "),
+            Style::default().fg(theme.palette.text_secondary()),
+        )];
+        // Colored sparkline instead of monochrome.
+        row.extend(colored_sparkline(&normalized, &theme.palette));
+        let rate_color = if latest > 1_000_000.0 {
+            theme.palette.danger_color()
+        } else if latest > 0.0 {
+            theme.palette.warning_color()
+        } else {
+            theme.palette.success_color()
+        };
+        row.push(Span::styled(
+            format!(" {rate_str} {trend}"),
+            Style::default().fg(rate_color),
+        ));
+        if latest > 1_000_000.0 {
+            row.push(Span::styled(
+                " \u{26a0}",
+                Style::default().fg(theme.palette.danger_color()),
+            ));
+        }
+        lines.push(Line::from_spans(row));
+    }
+    lines
+}
+
+fn styled_decision_pulse(model: &DashboardModel, theme: &Theme) -> Vec<Line> {
+    if model.explainability_decisions.is_empty() {
+        return vec![Line::from(Span::styled(
+            "decision-pulse no evidence loaded yet",
+            Style::default().fg(theme.palette.muted_color()),
+        ))];
+    }
+    let total = model.explainability_decisions.len();
+    let total_u32 = u32::try_from(total).unwrap_or(u32::MAX);
+    let vetoed = model
+        .explainability_decisions
+        .iter()
+        .filter(|d| d.vetoed)
+        .count();
+    let avg = model
+        .explainability_decisions
+        .iter()
+        .map(|d| d.total_score)
+        .sum::<f64>()
+        / f64::from(total_u32.max(1));
+
+    let (badge_label, badge_color) = if vetoed > 0 {
+        ("VETOES", theme.palette.warning_color())
+    } else {
+        ("CLEAR", theme.palette.success_color())
+    };
+
+    vec![
+        Line::from_spans([
+            Span::styled(
+                "decision-pulse ",
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+            styled_badge(badge_label, badge_color),
+        ]),
+        Line::from_spans([
+            Span::styled(
+                "  decisions=",
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+            styled_badge(&total.to_string(), theme.palette.accent_color()),
+            Span::styled(
+                "  vetoed=",
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+            styled_badge(
+                &vetoed.to_string(),
+                if vetoed > 0 {
+                    theme.palette.warning_color()
+                } else {
+                    theme.palette.success_color()
+                },
+            ),
+            Span::styled(
+                format!("  avg={avg:.2}"),
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+        ]),
+    ]
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn styled_candidate_hotlist(model: &DashboardModel, theme: &Theme, pane_width: u16) -> Vec<Line> {
+    if model.candidates_list.is_empty() {
+        return vec![Line::from(Span::styled(
+            "hotlist no candidate ranking loaded yet",
+            Style::default().fg(theme.palette.muted_color()),
+        ))];
+    }
+    let pane_w = usize::from(pane_width);
+    let path_w = pane_w.saturating_sub(36).clamp(12, 46);
+    let mut lines = vec![Line::from(Span::styled(
+        format!("hotlist total={}", model.candidates_list.len()),
+        Style::default().fg(theme.palette.text_secondary()),
+    ))];
+
+    for (idx, candidate) in model.candidates_list.iter().take(5).enumerate() {
+        let (badge_label, badge_color) = if candidate.total_score >= 0.8 {
+            ("HOT", theme.palette.critical_color())
+        } else if candidate.total_score >= 0.6 {
+            ("WARM", theme.palette.warning_color())
+        } else {
+            ("MILD", theme.palette.accent_color())
+        };
+        let cursor_char = if idx == model.candidates_selected {
+            "\u{25B8}"
+        } else {
+            " "
+        };
+        let cursor_color = if idx == model.candidates_selected {
+            theme.palette.accent_color()
+        } else {
+            theme.palette.muted_color()
+        };
+        let score_color = theme.palette.gauge_gradient(candidate.total_score);
+        let mut row = vec![
+            Span::styled(
+                format!("{cursor_char} {:>2}.", idx + 1),
+                Style::default().fg(cursor_color),
+            ),
+            Span::raw(" "),
+            mini_bar_chart(candidate.total_score, score_color),
+            Span::styled(
+                format!(" {:.2}", candidate.total_score),
+                Style::default().fg(score_color),
+            ),
+            Span::raw(" "),
+            styled_badge(badge_label, badge_color),
+            Span::styled(
+                format!(" {:>8} ", human_bytes(candidate.size_bytes)),
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+            Span::styled(
+                truncate_path(&candidate.path, path_w),
+                Style::default().fg(theme.palette.text_primary()),
+            ),
+        ];
+        if candidate.vetoed {
+            row.push(Span::styled(
+                " VETO",
+                Style::default().fg(theme.palette.danger_color()).bold(),
+            ));
+        }
+        lines.push(Line::from_spans(row));
+    }
+    lines
+}
+
+#[allow(clippy::option_if_let_else)]
+fn styled_ballast_quick(model: &DashboardModel, theme: &Theme) -> Vec<Line> {
+    if let Some(ref state) = model.daemon_state {
+        let (badge_label, badge_color) = if state.ballast.total > 0 && state.ballast.available == 0
+        {
+            ("CRITICAL", theme.palette.critical_color())
+        } else if state.ballast.available.saturating_mul(2) < state.ballast.total {
+            ("LOW", theme.palette.warning_color())
+        } else {
+            ("OK", theme.palette.success_color())
+        };
+
+        let ratio = if state.ballast.total > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let pct = (state.ballast.available as f64 / state.ballast.total as f64) * 100.0;
+            pct
+        } else {
+            0.0
+        };
+
+        vec![
+            Line::from_spans([
+                Span::styled(
+                    "ballast ",
+                    Style::default().fg(theme.palette.text_secondary()),
+                ),
+                styled_badge(badge_label, badge_color),
+            ]),
+            Line::from_spans([Span::styled(
+                format!(
+                    "  available={}/{} released={}",
+                    state.ballast.available, state.ballast.total, state.ballast.released,
+                ),
+                Style::default().fg(theme.palette.text_secondary()),
+            )]),
+            {
+                let gauge_w = 20;
+                let mut row = vec![Span::styled(
+                    "  ",
+                    Style::default().fg(theme.palette.text_secondary()),
+                )];
+                row.extend(segmented_gauge(100.0 - ratio, gauge_w, &theme.palette));
+                Line::from_spans(row)
+            },
+        ]
+    } else {
+        vec![Line::from_spans([
+            Span::styled(
+                "ballast ",
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+            styled_badge("UNKNOWN", theme.palette.muted_color()),
+            Span::styled(
+                " unavailable",
+                Style::default().fg(theme.palette.muted_color()),
+            ),
+        ])]
+    }
+}
+
 fn overview_pane_target_label(pane: OverviewPane) -> &'static str {
     match pane {
         OverviewPane::ActionLane | OverviewPane::DecisionPulse => "Explainability",
@@ -496,6 +888,41 @@ fn frame_render_text_pane(
     area: Rect,
     title: &str,
     content: String,
+    emphasis: bool,
+    frame: &mut Frame,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if area.height < 3 || area.width < 6 {
+        Paragraph::new(content)
+            .style(Style::default().fg(theme.palette.text_primary()))
+            .render(area, frame);
+        return;
+    }
+
+    let border_color = if emphasis {
+        theme.palette.accent_color()
+    } else {
+        theme.palette.border_color()
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = block.inner(area);
+    block.render(area, frame);
+    Paragraph::new(content)
+        .style(Style::default().fg(theme.palette.text_secondary()))
+        .render(inner, frame);
+}
+
+fn frame_render_styled_pane(
+    theme: &Theme,
+    area: Rect,
+    title: &str,
+    content: Text,
     emphasis: bool,
     frame: &mut Frame,
 ) {
@@ -642,7 +1069,7 @@ fn frame_timeline_list_text(model: &DashboardModel, theme: &Theme, rows: usize) 
     for (offset, event) in filtered[start..end].iter().enumerate() {
         let idx = start + offset;
         let cursor = if idx == model.timeline_selected {
-            ">"
+            "\u{25B8}"
         } else {
             " "
         };
@@ -746,7 +1173,7 @@ fn frame_explainability_list_text(model: &DashboardModel, theme: &Theme, rows: u
     for idx in start..end {
         let decision = &model.explainability_decisions[idx];
         let cursor = if idx == model.explainability_selected {
-            ">"
+            "\u{25B8}"
         } else {
             " "
         };
@@ -871,7 +1298,7 @@ fn frame_candidates_list_text(model: &DashboardModel, theme: &Theme, rows: usize
     for idx in start..end {
         let candidate = &model.candidates_list[idx];
         let cursor = if idx == model.candidates_selected {
-            ">"
+            "\u{25B8}"
         } else {
             " "
         };
@@ -958,7 +1385,7 @@ fn frame_ballast_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -
     for idx in start..end {
         let vol = &model.ballast_volumes[idx];
         let cursor = if idx == model.ballast_selected {
-            ">"
+            "\u{25B8}"
         } else {
             " "
         };
@@ -1070,7 +1497,7 @@ fn frame_log_search_list_text(model: &DashboardModel, theme: &Theme, rows: usize
     let (start, end) = centered_window(selected, entries.len(), rows);
     for (idx, event) in entries.iter().enumerate().take(end).skip(start) {
         let event = *event;
-        let cursor = if idx == selected { ">" } else { " " };
+        let cursor = if idx == selected { "\u{25B8}" } else { " " };
         let _ = writeln!(
             out,
             "{cursor} {} {} {:<18} {}",
@@ -1119,11 +1546,11 @@ fn frame_render_diagnostics(model: &DashboardModel, theme: &Theme, area: Rect, f
                 true,
                 frame,
             ),
-            DiagnosticsPane::PerfPanel => frame_render_text_pane(
+            DiagnosticsPane::PerfPanel => frame_render_styled_pane(
                 theme,
                 pane_area,
                 "S7 Performance",
-                frame_diagnostics_perf_text(model),
+                frame_diagnostics_perf_styled(model, theme),
                 true,
                 frame,
             ),
@@ -1214,51 +1641,133 @@ fn frame_diagnostics_runtime_text(model: &DashboardModel) -> String {
     out
 }
 
-fn frame_diagnostics_perf_text(model: &DashboardModel) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
+fn frame_diagnostics_perf_styled(model: &DashboardModel, theme: &Theme) -> Text {
+    let mut lines = Vec::new();
     if let Some((current, avg, min, max)) = model.frame_time_stats() {
-        let _ = write!(
-            out,
-            "frame current={current:.1}ms avg={avg:.1}ms min={min:.1}ms max={max:.1}ms",
-        );
+        let current_color = if current > 16.0 {
+            theme.palette.danger_color()
+        } else if current > 8.0 {
+            theme.palette.warning_color()
+        } else {
+            theme.palette.success_color()
+        };
+        lines.push(Line::from_spans([
+            Span::styled(
+                "frame ",
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+            Span::styled(
+                format!("{current:.1}ms"),
+                Style::default().fg(current_color).bold(),
+            ),
+            Span::styled(
+                format!("  avg={avg:.1}ms  min={min:.1}ms  max={max:.1}ms"),
+                Style::default().fg(theme.palette.text_secondary()),
+            ),
+        ]));
     } else {
-        out.push_str("frame no data yet");
+        lines.push(Line::from(Span::styled(
+            "frame no data yet",
+            Style::default().fg(theme.palette.muted_color()),
+        )));
     }
     let normalized = model.frame_times.normalized();
     if !normalized.is_empty() {
-        let _ = write!(out, "\ntrace {}", sparkline(&normalized));
+        let mut trace_spans = vec![Span::styled(
+            "trace ",
+            Style::default().fg(theme.palette.text_secondary()),
+        )];
+        trace_spans.extend(colored_sparkline(&normalized, &theme.palette));
+        lines.push(Line::from_spans(trace_spans));
     }
-    let _ = write!(
-        out,
-        "\nterminal={}x{}",
-        model.terminal_size.0, model.terminal_size.1
-    );
-    out
+    lines.push(Line::from(Span::styled(
+        format!(
+            "terminal={}x{}",
+            model.terminal_size.0, model.terminal_size.1
+        ),
+        Style::default().fg(theme.palette.text_secondary()),
+    )));
+    Text::from_lines(lines)
 }
 
 fn frame_render_footer(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
-    let hints = match model.screen {
-        Screen::Overview => {
-            "mouse tab click navigates  Tab focus panes  Enter/Space/click open  wheel on hotlist  1-7 [/] b  r  ? help  : palette  Esc overlay->detail->back->quit"
-        }
-        Screen::Timeline => {
-            "mouse tab click + row click  wheel/j/k navigate  f filter  F follow  r  ? help  : palette  Esc overlay->detail->back->quit"
-        }
-        Screen::Explainability | Screen::Ballast => {
-            "mouse tab click + row click-open  wheel/j/k navigate  Enter/Space toggle detail  d close  r  ? help  : palette  Esc overlay->detail->back->quit"
-        }
-        Screen::Candidates => {
-            "mouse tab click + row click-open  wheel/j/k navigate  Enter/Space detail  s sort  d close  r  ? help  : palette  Esc overlay->detail->back->quit"
-        }
-        Screen::LogSearch => {
-            "mouse tab click + row focus  wheel scroll logs  1-7 [/]  r  ? help  : palette  Esc overlay->back->quit"
-        }
-        Screen::Diagnostics => {
-            "mouse tab click  Shift-V verbose  r refresh  1-7 [/]  ? help  : palette  Esc overlay->back->quit"
-        }
+    let accent = theme.palette.tab_active_bg(model.screen.number());
+
+    let mut spans: Vec<Span> = Vec::new();
+
+    // Screen-specific key hints (most important bindings only).
+    let bindings: &[(&str, &str)] = match model.screen {
+        Screen::Overview => &[
+            ("Tab", "focus"),
+            ("\u{23CE}", "open"),
+            ("1-7", "screen"),
+            ("?", "help"),
+            (":", "cmd"),
+            ("Esc", "back"),
+        ],
+        Screen::Timeline => &[
+            ("j/k", "nav"),
+            ("f", "filter"),
+            ("F", "follow"),
+            ("r", "refresh"),
+            ("?", "help"),
+            ("Esc", "back"),
+        ],
+        Screen::Explainability | Screen::Ballast => &[
+            ("j/k", "nav"),
+            ("\u{23CE}", "detail"),
+            ("d", "close"),
+            ("r", "refresh"),
+            ("?", "help"),
+            ("Esc", "back"),
+        ],
+        Screen::Candidates => &[
+            ("j/k", "nav"),
+            ("\u{23CE}", "detail"),
+            ("s", "sort"),
+            ("d", "close"),
+            ("?", "help"),
+            ("Esc", "back"),
+        ],
+        Screen::LogSearch => &[
+            ("j/k", "nav"),
+            ("1-7", "screen"),
+            ("r", "refresh"),
+            ("?", "help"),
+            ("Esc", "back"),
+        ],
+        Screen::Diagnostics => &[
+            ("V", "verbose"),
+            ("r", "refresh"),
+            ("1-7", "screen"),
+            ("?", "help"),
+            ("Esc", "back"),
+        ],
     };
-    Paragraph::new(hints)
+
+    for (key, label) in bindings {
+        spans.extend(key_hint(key, label, accent));
+    }
+
+    // Right-align screen position indicator.
+    let position = format!(
+        " {}/7 {} ",
+        model.screen.number(),
+        screen_tab_label(model.screen)
+    );
+    let used_width: usize = spans.iter().map(|s| s.content.len()).sum();
+    let pad = usize::from(area.width).saturating_sub(used_width + position.len());
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    spans.push(Span::styled(
+        position,
+        Style::default()
+            .fg(theme.palette.text_secondary())
+            .bg(theme.palette.panel_bg()),
+    ));
+
+    Paragraph::new(Line::from_spans(spans))
         .style(
             Style::default()
                 .fg(theme.palette.muted_color())
@@ -1281,6 +1790,7 @@ fn frame_render_notifications(
             NotificationLevel::Error => ("ERROR", theme.palette.critical_color()),
         };
         lines.push(Line::from_spans([
+            Span::styled("\u{2502}", Style::default().fg(color)),
             Span::styled(
                 format!(" {badge} "),
                 Style::default()
@@ -1288,7 +1798,11 @@ fn frame_render_notifications(
                     .bg(color)
                     .bold(),
             ),
-            Span::raw(format!(" {}", notif.message)),
+            Span::raw("  "),
+            Span::styled(
+                &*notif.message,
+                Style::default().fg(theme.palette.text_primary()),
+            ),
         ]));
     }
     if !lines.is_empty() {
@@ -1306,10 +1820,11 @@ fn frame_render_overlay(
     frame: &mut Frame,
 ) {
     // Soft scrim behind overlays so context remains visible but de-emphasized.
+    let scrim = theme.palette.scrim_bg();
     for y in body_area.y..body_area.y.saturating_add(body_area.height) {
         for x in body_area.x..body_area.x.saturating_add(body_area.width) {
             if let Some(cell) = frame.buffer.get_mut(x, y) {
-                cell.bg = theme.palette.surface_bg();
+                cell.bg = scrim;
                 cell.fg = theme.palette.muted_color();
             }
         }
@@ -1336,39 +1851,103 @@ fn frame_render_overlay(
     match overlay {
         super::model::Overlay::CommandPalette => {
             let mut lines = Vec::new();
+            // Search input with styled prompt.
             lines.push(Line::from_spans([
-                Span::styled("> ", Style::default().fg(theme.palette.accent_color())),
-                Span::raw(&model.palette_query),
+                Span::styled(
+                    " \u{25B8} ",
+                    Style::default()
+                        .fg(PackedRgba::rgb(20, 20, 30))
+                        .bg(theme.palette.accent_color())
+                        .bold(),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    &*model.palette_query,
+                    Style::default().fg(theme.palette.text_primary()),
+                ),
             ]));
             let results = super::input::search_palette_actions(&model.palette_query, 50);
             let shown = results.len().min(PALETTE_DISPLAY_LIMIT);
-            lines.push(Line::from(format!(
-                "  matches: {shown} / {}",
-                results.len()
-            )));
+            lines.push(Line::from_spans([
+                Span::styled(
+                    format!("  {shown}/{}", results.len()),
+                    Style::default().fg(theme.palette.muted_color()),
+                ),
+                Span::styled(" matches", Style::default().fg(theme.palette.muted_color())),
+            ]));
+            lines.push(separator_line(
+                usize::from(inner.width).min(60),
+                theme.palette.border_color(),
+            ));
             for (i, action) in results.iter().take(PALETTE_DISPLAY_LIMIT).enumerate() {
-                let cursor = if i == model.palette_selected {
-                    "> "
+                let selected = i == model.palette_selected;
+                let cursor_span = if selected {
+                    Span::styled(
+                        " \u{25B8} ",
+                        Style::default().fg(theme.palette.accent_color()).bold(),
+                    )
                 } else {
-                    "  "
+                    Span::raw("   ")
                 };
-                let style = if i == model.palette_selected {
-                    Style::default().fg(theme.palette.accent_color())
+                let (id_style, title_style) = if selected {
+                    (
+                        Style::default()
+                            .fg(theme.palette.accent_color())
+                            .bg(theme.palette.highlight_bg())
+                            .bold(),
+                        Style::default()
+                            .fg(theme.palette.text_primary())
+                            .bg(theme.palette.highlight_bg()),
+                    )
                 } else {
-                    Style::default().fg(theme.palette.text_secondary())
+                    (
+                        Style::default().fg(theme.palette.text_secondary()),
+                        Style::default().fg(theme.palette.text_secondary()),
+                    )
                 };
-                lines.push(Line::from(Span::styled(
-                    format!("{cursor}{}: {}", action.id, action.title),
-                    style,
-                )));
+                lines.push(Line::from_spans([
+                    cursor_span,
+                    Span::styled(format!("{:<12}", action.id), id_style),
+                    Span::styled(action.title, title_style),
+                ]));
             }
             Paragraph::new(Text::from_lines(lines)).render(inner, frame);
         }
         super::model::Overlay::Help => {
-            let help_text = "  ?     toggle help\n  :     command palette\n  1-7   screens\n  [/]   prev/next screen\n  Tab   next overview pane\n  S-Tab prev overview pane\n  Enter/Space open focused pane\n  mouse tab click + row click/wheel\n  Esc   close overlay -> detail -> back -> quit\n  click closes overlay\n  r     refresh\n  q     quit";
-            Paragraph::new(help_text)
-                .style(Style::default().fg(theme.palette.text_primary()))
-                .render(inner, frame);
+            let accent = theme.palette.accent_color();
+            let help_bindings: &[(&str, &str, &str)] = &[
+                // (category, key, description)
+                ("Navigation", "?", "toggle help"),
+                ("Navigation", ":", "command palette"),
+                ("Navigation", "1-7", "jump to screen"),
+                ("Navigation", "[/]", "prev/next screen"),
+                ("Screen", "Tab", "next overview pane"),
+                ("Screen", "S-Tab", "prev overview pane"),
+                ("Screen", "\u{23CE}", "open focused pane"),
+                ("Screen", "j/k", "navigate list items"),
+                ("Overlay", "Esc", "close \u{2192} back \u{2192} quit"),
+                ("Overlay", "click", "close overlay"),
+                ("General", "r", "refresh data"),
+                ("General", "q", "quit dashboard"),
+            ];
+            let mut lines = Vec::new();
+            let mut last_category = "";
+            for (category, key, desc) in help_bindings {
+                if *category != last_category {
+                    if !last_category.is_empty() {
+                        lines.push(Line::from(""));
+                    }
+                    lines.push(Line::from(Span::styled(
+                        format!(" {category}"),
+                        Style::default().fg(theme.palette.text_primary()).bold(),
+                    )));
+                    last_category = category;
+                }
+                let mut row = vec![Span::raw("  ")];
+                row.extend(key_hint(key, desc, accent));
+                lines.push(Line::from_spans(row));
+            }
+            Paragraph::new(Text::from_lines(lines)).render(inner, frame);
         }
         super::model::Overlay::Voi => {
             let voi_text = concat!(

@@ -2,7 +2,10 @@
 
 #![allow(missing_docs)]
 
-use super::theme::{AccessibilityProfile, PaletteEntry};
+use super::theme::{AccessibilityProfile, PaletteEntry, ThemePalette};
+
+use ftui::text::{Line, Span};
+use ftui::{PackedRgba, Style};
 
 /// Sparkline glyph ramp shared across screens.
 pub const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -53,6 +56,137 @@ pub fn status_badge(
     } else {
         format!("[{}:{label}]", palette.text_tag)
     }
+}
+
+// ──────────────────── styled widget primitives ────────────────────
+
+/// Sparkline with color gradient: green at low values, yellow mid, red high.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn colored_sparkline<'a>(values: &[f64], palette: &ThemePalette) -> Vec<Span<'a>> {
+    values
+        .iter()
+        .map(|value| {
+            let v = value.clamp(0.0, 1.0);
+            let idx = (v * 7.0).round() as usize;
+            let ch = SPARK_CHARS[idx.min(7)];
+            let color = palette.gauge_gradient(v);
+            Span::styled(String::from(ch), Style::default().fg(color))
+        })
+        .collect()
+}
+
+/// Segmented gauge with color zones: green <50%, yellow 50-75%, orange 75-90%, red >90%.
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+pub fn segmented_gauge<'a>(used_pct: f64, width: usize, palette: &ThemePalette) -> Vec<Span<'a>> {
+    let clamped = used_pct.clamp(0.0, 100.0);
+    let filled = ((clamped / 100.0) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let empty = width.saturating_sub(filled);
+
+    let mut spans = vec![Span::styled(
+        "[",
+        Style::default().fg(palette.muted_color()),
+    )];
+
+    // Each filled cell gets a color based on its position in the bar.
+    for i in 0..filled {
+        #[allow(clippy::cast_precision_loss)]
+        let pos_pct = (i as f64 / width as f64) * 100.0;
+        let color = if pos_pct < 50.0 {
+            palette.success_color()
+        } else if pos_pct < 75.0 {
+            palette.warning_color()
+        } else if pos_pct < 90.0 {
+            palette.orange_color()
+        } else {
+            palette.danger_color()
+        };
+        spans.push(Span::styled("\u{2588}", Style::default().fg(color)));
+    }
+
+    if empty > 0 {
+        spans.push(Span::styled(
+            "\u{2591}".repeat(empty),
+            Style::default().fg(palette.muted_color()),
+        ));
+    }
+
+    spans.push(Span::styled(
+        format!("] {clamped:.0}%"),
+        Style::default().fg(palette.text_secondary()),
+    ));
+
+    spans
+}
+
+/// Vertical mini-bar chart using block characters for inline metrics.
+const BAR_CHARS: [char; 8] = [
+    '\u{258F}', '\u{258E}', '\u{258D}', '\u{258C}', '\u{258B}', '\u{258A}', '\u{2589}', '\u{2588}',
+];
+
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn mini_bar_chart<'a>(value: f64, color: PackedRgba) -> Span<'a> {
+    let v = value.clamp(0.0, 1.0);
+    let idx = (v * 7.0).round() as usize;
+    Span::styled(
+        String::from(BAR_CHARS[idx.min(7)]),
+        Style::default().fg(color),
+    )
+}
+
+/// Pill-style badge with background color and contrasting foreground.
+#[must_use]
+pub fn styled_badge<'a>(label: &str, bg: PackedRgba) -> Span<'a> {
+    Span::styled(
+        format!(" {label} "),
+        Style::default()
+            .fg(PackedRgba::rgb(20, 20, 30))
+            .bg(bg)
+            .bold(),
+    )
+}
+
+/// Animated progress indicator keyed to tick count.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn progress_indicator<'a>(tick: u64, color: PackedRgba) -> Span<'a> {
+    const FRAMES: [&str; 4] = ["\u{25CB}", "\u{25D4}", "\u{25D1}", "\u{25D5}"];
+    let frame = FRAMES[(tick as usize) % FRAMES.len()];
+    Span::styled(String::from(frame), Style::default().fg(color))
+}
+
+/// Styled key hint with inverted key label for footer bars.
+#[must_use]
+pub fn key_hint<'a>(key: &str, label: &str, accent: PackedRgba) -> Vec<Span<'a>> {
+    vec![
+        Span::styled(
+            format!(" {key} "),
+            Style::default()
+                .fg(PackedRgba::rgb(20, 20, 30))
+                .bg(accent)
+                .bold(),
+        ),
+        Span::styled(
+            format!(" {label} "),
+            Style::default().fg(PackedRgba::rgb(160, 160, 160)),
+        ),
+    ]
+}
+
+/// Styled horizontal separator line using box-drawing characters.
+#[must_use]
+pub fn separator_line(width: usize, color: PackedRgba) -> Line {
+    Line::from(Span::styled(
+        "\u{2500}".repeat(width),
+        Style::default().fg(color),
+    ))
 }
 
 // ──────────────────── formatting helpers ────────────────────
