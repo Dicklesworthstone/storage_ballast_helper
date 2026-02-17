@@ -3025,7 +3025,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 // Skip pseudo/virtual/read-only filesystems (squashfs snap
                 // mounts, proc, sysfs, etc.) — they can't fill up and don't
                 // represent actionable storage pressure.
-                if stats.total_bytes == 0 || stats.is_readonly {
+                if stats.total_bytes == 0
+                    || stats.is_readonly
+                    || !is_actionable_pressure_fs_type(&stats.fs_type)
+                {
                     continue;
                 }
 
@@ -3155,7 +3158,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     continue;
                 };
                 // Skip pseudo/virtual/read-only filesystems.
-                if stats.total_bytes == 0 || stats.is_readonly {
+                if stats.total_bytes == 0
+                    || stats.is_readonly
+                    || !is_actionable_pressure_fs_type(&stats.fs_type)
+                {
                     continue;
                 }
                 let free_pct = stats.free_pct();
@@ -3246,6 +3252,15 @@ fn pressure_severity(level: &str) -> u8 {
         "critical" => 4,
         _ => 0,
     }
+}
+
+fn is_actionable_pressure_fs_type(fs_type: &str) -> bool {
+    // Pseudo filesystems with non-meaningful capacity can report 0 or tiny
+    // free space and should not influence overall disk pressure.
+    !matches!(
+        fs_type.to_ascii_lowercase().as_str(),
+        "devfs" | "proc" | "procfs" | "sysfs" | "autofs"
+    )
 }
 
 fn bytes_to_pct(value: u64, total: u64) -> f64 {

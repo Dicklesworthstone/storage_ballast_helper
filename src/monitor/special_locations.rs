@@ -71,6 +71,12 @@ impl SpecialLocationRegistry {
             if !mount.is_ram_backed {
                 continue;
             }
+            // Ignore pseudo runtime mounts that are not actionable for pressure control.
+            // On macOS, `/dev` (devfs) reports 0 free by design and would otherwise
+            // create permanent critical alerts.
+            if should_ignore_ram_backed_mount(mount.path.as_path(), &mount.fs_type) {
+                continue;
+            }
             // Skip systemd runtime dirs — these are small credential/session tmpfs
             // mounts that are always "full" by design and not actionable.
             let path_str = mount.path.to_string_lossy();
@@ -145,6 +151,11 @@ impl SpecialLocationRegistry {
     pub fn all(&self) -> &[SpecialLocation] {
         &self.locations
     }
+}
+
+fn should_ignore_ram_backed_mount(path: &Path, fs_type: &str) -> bool {
+    let path_str = path.to_string_lossy();
+    path_str == "/dev" || fs_type.eq_ignore_ascii_case("devfs")
 }
 
 #[cfg(test)]
@@ -385,6 +396,27 @@ mod tests {
                 .iter()
                 .any(|loc| loc.path == Path::new("/data/tmp")),
             "/data/tmp should be added as fallback"
+        );
+    }
+
+    #[test]
+    fn discover_ignores_devfs_mounts() {
+        let platform = TestPlatform {
+            mounts: vec![MountPoint {
+                path: PathBuf::from("/dev"),
+                device: "devfs".to_string(),
+                fs_type: "devfs".to_string(),
+                is_ram_backed: true,
+            }],
+        };
+        let registry =
+            SpecialLocationRegistry::discover(&platform, &[]).expect("discovery should succeed");
+        assert!(
+            registry
+                .all()
+                .iter()
+                .all(|location| location.path != Path::new("/dev")),
+            "/dev should not be treated as a pressure-managed special location",
         );
     }
 
