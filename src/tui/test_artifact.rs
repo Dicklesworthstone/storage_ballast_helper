@@ -86,9 +86,7 @@ impl TestEnv {
             pkg_version: env!("CARGO_PKG_VERSION"),
             features: {
                 let mut f = Vec::new();
-                if cfg!(feature = "tui") {
-                    f.push("tui");
-                }
+                f.push("tui"); // always present
                 if cfg!(feature = "sqlite") {
                     f.push("sqlite");
                 }

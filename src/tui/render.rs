@@ -9,36 +9,34 @@
 #![allow(clippy::too_many_lines)]
 
 use super::layout::{
+    BallastPane, CandidatesPane, DiagnosticsPane, ExplainabilityPane, LogSearchPane,
     MIN_USABLE_COLS, MIN_USABLE_ROWS, OverviewPane, PanePriority, TimelinePane,
-    build_overview_layout, build_timeline_layout, is_terminal_too_small,
+    build_ballast_layout, build_candidates_layout, build_diagnostics_layout,
+    build_explainability_layout, build_log_search_layout, build_overview_layout,
+    build_timeline_layout, is_terminal_too_small,
 };
 use super::model::{
     BallastVolume, DashboardModel, NotificationLevel, PreferenceProfileMode, Screen,
 };
 use super::preferences::{DensityMode, HintVerbosity, StartScreen};
-use super::theme::{AccessibilityProfile, SpacingScale, Theme, ThemePalette};
+use super::theme::{AccessibilityProfile, PaletteEntry, SpacingScale, Theme, ThemePalette};
 use super::widgets::{
     extract_time, gauge, human_bytes, human_duration, human_rate, section_header, sparkline,
     status_badge, trend_label,
 };
 use crate::tui::telemetry::{DataSource, DecisionEvidence, TimelineEvent};
 
-#[cfg(feature = "tui")]
 use ftui::core::geometry::Rect;
-#[cfg(feature = "tui")]
 use ftui::layout::{Constraint, Flex};
-#[cfg(feature = "tui")]
 use ftui::text::{Line, Span, Text};
-#[cfg(feature = "tui")]
 use ftui::widgets::Widget;
-#[cfg(feature = "tui")]
 use ftui::widgets::block::Block;
-#[cfg(feature = "tui")]
 use ftui::widgets::borders::BorderType;
-#[cfg(feature = "tui")]
 use ftui::widgets::paragraph::Paragraph;
-#[cfg(feature = "tui")]
 use ftui::{Frame, PackedRgba, Style};
+
+const FRAME_HEADER_ROWS: u16 = 6;
+const FRAME_FOOTER_ROWS: u16 = 1;
 
 /// Legacy string-returning render path for test compatibility.
 ///
@@ -128,11 +126,9 @@ pub fn render_to_string(model: &DashboardModel) -> String {
         Screen::Timeline => render_timeline(model, &theme, &mut out),
         Screen::Explainability => render_explainability(model, &theme, &mut out),
         Screen::Candidates => render_candidates(model, &theme, &mut out),
+        Screen::LogSearch => render_log_search(model, &theme, &mut out),
         Screen::Diagnostics => render_diagnostics(model, &theme, &mut out),
         Screen::Ballast => render_ballast(model, &theme, &mut out),
-        screen @ Screen::LogSearch => {
-            render_screen_stub(model, screen_label(screen), &theme, &mut out);
-        }
     }
 
     // Notification toasts (O4).
@@ -152,7 +148,6 @@ pub fn render_to_string(model: &DashboardModel) -> String {
 ///
 /// This is the production rendering path that produces colored, bordered,
 /// Flex-layout output through the ftui widget system.
-#[cfg(feature = "tui")]
 pub fn render_frame(model: &DashboardModel, frame: &mut Frame) {
     let area = Rect::new(0, 0, model.terminal_size.0, model.terminal_size.1);
     let accessibility = AccessibilityProfile::from_environment();
@@ -177,13 +172,13 @@ pub fn render_frame(model: &DashboardModel, frame: &mut Frame) {
         return;
     }
 
-    // Split: header (3 rows) | body (fill) | footer (1 row) | notifications.
+    // Split: header (persistent nav + status) | body | footer | notifications.
     let notif_rows = u16::try_from(model.notifications.len().min(3)).unwrap_or(3);
     let chunks = Flex::vertical()
         .constraints([
-            Constraint::Fixed(3),
+            Constraint::Fixed(FRAME_HEADER_ROWS),
             Constraint::Fill,
-            Constraint::Fixed(1),
+            Constraint::Fixed(FRAME_FOOTER_ROWS),
             Constraint::Fixed(notif_rows),
         ])
         .split(area);
@@ -209,7 +204,6 @@ pub fn render_frame(model: &DashboardModel, frame: &mut Frame) {
     frame_render_notifications(model, &theme, notif_area, frame);
 }
 
-#[cfg(feature = "tui")]
 fn frame_render_too_small(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -232,17 +226,29 @@ fn frame_render_too_small(model: &DashboardModel, theme: &Theme, area: Rect, fra
         .render(inner, frame);
 }
 
-#[cfg(feature = "tui")]
 fn frame_render_header(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    let label = screen_label(model.screen);
     let mode_str = if model.degraded { "DEGRADED" } else { "NORMAL" };
     let mode_color = if model.degraded {
         theme.palette.warning_color()
     } else {
         theme.palette.success_color()
     };
-    let label = screen_label(model.screen);
 
-    let title_spans = vec![
+    let header_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.palette.border_color()))
+        .style(Style::default().bg(theme.palette.panel_bg()));
+    let inner = header_block.inner(area);
+    header_block.render(area, frame);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let mut lines = Vec::new();
+
+    let mut title_spans = vec![
         Span::styled(
             " SBH Dashboard ",
             Style::default().fg(theme.palette.accent_color()).bold(),
@@ -254,37 +260,123 @@ fn frame_render_header(model: &DashboardModel, theme: &Theme, area: Rect, frame:
                 .bg(mode_color)
                 .bold(),
         ),
-        Span::raw("  "),
-        Span::styled(label, Style::default().fg(theme.palette.text_primary())),
     ];
+    if let Some(ref state) = model.daemon_state
+        && !state.policy_mode.is_empty()
+    {
+        let policy_color = policy_mode_color(&state.policy_mode, &theme.palette);
+        title_spans.push(Span::raw(" "));
+        title_spans.push(Span::styled(
+            format!(" {} ", state.policy_mode.to_ascii_uppercase()),
+            Style::default()
+                .fg(PackedRgba::rgb(20, 20, 30))
+                .bg(policy_color)
+                .bold(),
+        ));
+    }
+    title_spans.push(Span::raw("  "));
+    title_spans.push(Span::styled(
+        label,
+        Style::default().fg(theme.palette.text_primary()),
+    ));
+    lines.push(Line::from_spans(title_spans));
 
-    let header_block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.palette.border_color()))
-        .style(Style::default().bg(theme.palette.panel_bg()));
-    let inner = header_block.inner(area);
-    header_block.render(area, frame);
+    let screens = [
+        Screen::Overview,
+        Screen::Timeline,
+        Screen::Explainability,
+        Screen::Candidates,
+        Screen::Ballast,
+        Screen::LogSearch,
+        Screen::Diagnostics,
+    ];
+    let mut nav_spans = Vec::new();
+    for (idx, screen) in screens.iter().enumerate() {
+        let active = *screen == model.screen;
+        let label = format!(" {}:{} ", screen.number(), screen_tab_label(*screen));
+        let style = if active {
+            Style::default()
+                .fg(PackedRgba::rgb(20, 20, 30))
+                .bg(theme.palette.accent_color())
+                .bold()
+        } else {
+            Style::default().fg(theme.palette.text_secondary())
+        };
+        nav_spans.push(Span::styled(label, style));
+        if idx + 1 < screens.len() {
+            nav_spans.push(Span::raw(" "));
+        }
+    }
+    lines.push(Line::from_spans(nav_spans));
 
-    // Render title line inside the block.
-    let title_line = Line::from_spans(title_spans);
-    let paragraph = Paragraph::new(Text::from(title_line));
-    paragraph.render(inner, frame);
+    let overlay_label = model.active_overlay.map_or("none", overlay_name);
+    let profile_mode = preference_profile_mode_label(model.preference_profile_mode);
+    let history_hint = "Esc overlay->detail->back->quit";
+    lines.push(Line::from(format!(
+        "start={} density={} hints={} overlay={} profile={} history={} ({history_hint})",
+        start_screen_label(model.preferred_start_screen),
+        model.density,
+        model.hint_verbosity,
+        overlay_label,
+        profile_mode,
+        model.screen_history.len(),
+    )));
+
+    if model.screen_history.is_empty() {
+        lines.push(Line::from(format!("nav: {}", screen_label(model.screen))));
+    } else {
+        use std::fmt::Write as _;
+        let max_crumbs = 6;
+        let history = &model.screen_history;
+        let start = history.len().saturating_sub(max_crumbs);
+        let mut crumb = String::from("nav:");
+        for s in &history[start..] {
+            let _ = write!(crumb, " {} >", screen_label(*s));
+        }
+        let _ = write!(crumb, " {}", screen_label(model.screen));
+        lines.push(Line::from(crumb));
+    }
+
+    let visible_lines = usize::from(inner.height);
+    Paragraph::new(Text::from_lines(lines.into_iter().take(visible_lines)))
+        .style(Style::default().fg(theme.palette.text_primary()))
+        .render(inner, frame);
 }
 
-#[cfg(feature = "tui")]
-fn frame_render_screen(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
-    match model.screen {
-        Screen::Overview => frame_render_overview(model, theme, area, frame),
-        Screen::Timeline => frame_render_list_screen(model, theme, area, frame, "S2 Timeline"),
-        Screen::Explainability => frame_render_list_screen(model, theme, area, frame, "S3 Explain"),
-        Screen::Candidates => frame_render_list_screen(model, theme, area, frame, "S4 Candidates"),
-        Screen::Ballast => frame_render_list_screen(model, theme, area, frame, "S5 Ballast"),
-        Screen::Diagnostics => frame_render_diagnostics_frame(model, theme, area, frame),
-        Screen::LogSearch => frame_render_stub(theme, area, frame, "S6 Logs"),
+fn screen_tab_label(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Overview => "Overview",
+        Screen::Timeline => "Timeline",
+        Screen::Explainability => "Explain",
+        Screen::Candidates => "Candidates",
+        Screen::Ballast => "Ballast",
+        Screen::LogSearch => "Logs",
+        Screen::Diagnostics => "Diagnostics",
     }
 }
 
-#[cfg(feature = "tui")]
+fn overlay_name(overlay: super::model::Overlay) -> &'static str {
+    match overlay {
+        super::model::Overlay::CommandPalette => "palette",
+        super::model::Overlay::Help => "help",
+        super::model::Overlay::Voi => "voi",
+        super::model::Overlay::Confirmation(_) => "confirm",
+        super::model::Overlay::IncidentPlaybook => "playbook",
+    }
+}
+
+fn frame_render_screen(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    match model.screen {
+        Screen::Overview => frame_render_overview(model, theme, area, frame),
+        Screen::Timeline => frame_render_timeline(model, theme, area, frame),
+        Screen::Explainability => frame_render_explainability(model, theme, area, frame),
+        Screen::Candidates => frame_render_candidates(model, theme, area, frame),
+        Screen::Ballast => frame_render_ballast(model, theme, area, frame),
+        Screen::LogSearch => frame_render_log_search(model, theme, area, frame),
+        Screen::Diagnostics => frame_render_diagnostics(model, theme, area, frame),
+    }
+}
+
 fn frame_render_overview(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
     let layout = build_overview_layout(area.width, area.height);
     for placement in layout.placements.iter().filter(|p| p.visible) {
@@ -296,7 +388,6 @@ fn frame_render_overview(model: &DashboardModel, theme: &Theme, area: Rect, fram
     }
 }
 
-#[cfg(feature = "tui")]
 fn rect_in_body(body: Rect, pane: crate::tui::layout::PaneRect) -> Rect {
     let x = body.x.saturating_add(pane.col);
     let y = body.y.saturating_add(pane.row);
@@ -310,7 +401,6 @@ fn rect_in_body(body: Rect, pane: crate::tui::layout::PaneRect) -> Rect {
     Rect::new(x, y, pane.width.min(max_w), pane.height.min(max_h))
 }
 
-#[cfg(feature = "tui")]
 fn frame_render_overview_card(
     model: &DashboardModel,
     theme: &Theme,
@@ -337,7 +427,10 @@ fn frame_render_overview_card(
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    let content = overview_pane_text(model, theme, pane, inner.width);
+    let show_target_hint = (model.overview_focus_pane == pane
+        || model.overview_hover_pane == Some(pane))
+        && model.hint_verbosity != HintVerbosity::Off;
+    let content = overview_pane_text(model, theme, pane, inner.width, show_target_hint);
     Paragraph::new(content)
         .style(Style::default().fg(theme.palette.text_secondary()))
         .render(inner, frame);
@@ -362,6 +455,7 @@ fn overview_pane_text(
     theme: &Theme,
     pane: OverviewPane,
     pane_width: u16,
+    show_target_hint: bool,
 ) -> String {
     let base = match pane {
         OverviewPane::PressureSummary => render_pressure_summary(model, theme, pane_width),
@@ -369,15 +463,19 @@ fn overview_pane_text(
         OverviewPane::ActionLane => render_action_lane(model),
         OverviewPane::EwmaTrend => render_ewma_trend(model),
         OverviewPane::DecisionPulse => render_decision_pulse(model, theme),
-        OverviewPane::CandidateHotlist => render_candidate_hotlist(model, theme),
+        OverviewPane::CandidateHotlist => render_candidate_hotlist(model, theme, pane_width),
         OverviewPane::BallastQuick => render_ballast_quick(model, theme),
         OverviewPane::SpecialLocations => render_special_locations(model, theme),
         OverviewPane::ExtendedCounters => render_extended_counters(model),
     };
-    format!(
-        "{base}\n  -> Enter/click opens {}",
-        overview_pane_target_label(pane)
-    )
+    if show_target_hint {
+        format!(
+            "{base}\n  -> Enter/Space/click opens {}",
+            overview_pane_target_label(pane)
+        )
+    } else {
+        base
+    }
 }
 
 fn overview_pane_target_label(pane: OverviewPane) -> &'static str {
@@ -393,130 +491,772 @@ fn overview_pane_target_label(pane: OverviewPane) -> &'static str {
     }
 }
 
-/// Generic list-screen renderer for Timeline, Explainability, Candidates, Ballast.
-///
-/// Renders the screen-specific legacy text content directly inside a bordered Block.
-/// Full per-screen widget breakdowns will follow in subsequent iterations.
-#[cfg(feature = "tui")]
-fn frame_render_list_screen(
-    model: &DashboardModel,
+fn frame_render_text_pane(
     theme: &Theme,
     area: Rect,
-    frame: &mut Frame,
     title: &str,
+    content: String,
+    emphasis: bool,
+    frame: &mut Frame,
 ) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if area.height < 3 || area.width < 6 {
+        Paragraph::new(content)
+            .style(Style::default().fg(theme.palette.text_primary()))
+            .render(area, frame);
+        return;
+    }
+
+    let border_color = if emphasis {
+        theme.palette.accent_color()
+    } else {
+        theme.palette.border_color()
+    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .title(title)
-        .border_style(Style::default().fg(theme.palette.border_color()))
+        .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(theme.palette.panel_bg()));
     let inner = block.inner(area);
     block.render(area, frame);
-
-    // Render only the screen-specific content (not the full dashboard).
-    let accessibility = AccessibilityProfile::from_environment();
-    let legacy_theme = Theme::for_terminal(model.terminal_size.0, accessibility);
-    let mut content = String::new();
-    match model.screen {
-        Screen::Timeline => render_timeline(model, &legacy_theme, &mut content),
-        Screen::Explainability => render_explainability(model, &legacy_theme, &mut content),
-        Screen::Candidates => render_candidates(model, &legacy_theme, &mut content),
-        Screen::Ballast => render_ballast(model, &legacy_theme, &mut content),
-        _ => {}
-    }
     Paragraph::new(content)
-        .style(Style::default().fg(theme.palette.text_primary()))
-        .render(inner, frame);
-}
-
-#[cfg(feature = "tui")]
-fn frame_render_diagnostics_frame(
-    model: &DashboardModel,
-    theme: &Theme,
-    area: Rect,
-    frame: &mut Frame,
-) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title("S7 Diagnostics")
-        .border_style(Style::default().fg(theme.palette.border_color()))
-        .style(Style::default().bg(theme.palette.panel_bg()));
-    let inner = block.inner(area);
-    block.render(area, frame);
-
-    let mut lines = Vec::new();
-
-    // Dashboard health.
-    let mode_badge = if model.degraded { "DEGRADED" } else { "NORMAL" };
-    let mode_color = if model.degraded {
-        theme.palette.warning_color()
-    } else {
-        theme.palette.success_color()
-    };
-    lines.push(Line::from_spans([
-        Span::raw("  Mode: "),
-        Span::styled(mode_badge, Style::default().fg(mode_color).bold()),
-        Span::raw(format!(
-            "  tick={}  refresh={}ms  missed={}",
-            model.tick,
-            model.refresh.as_millis(),
-            model.missed_ticks,
-        )),
-    ]));
-
-    // Frame timing.
-    if let Some((current, avg, min, max)) = model.frame_time_stats() {
-        lines.push(Line::from(format!(
-            "  Frame: {current:.1}ms avg={avg:.1}ms min={min:.1}ms max={max:.1}ms",
-        )));
-    } else {
-        lines.push(Line::from("  Frame: no data yet"));
-    }
-
-    // Terminal.
-    lines.push(Line::from(format!(
-        "  Terminal: {}x{}",
-        model.terminal_size.0, model.terminal_size.1,
-    )));
-
-    // Notifications.
-    lines.push(Line::from(format!(
-        "  Notifications: {} active",
-        model.notifications.len(),
-    )));
-
-    Paragraph::new(Text::from_lines(lines))
         .style(Style::default().fg(theme.palette.text_secondary()))
         .render(inner, frame);
 }
 
-#[cfg(feature = "tui")]
-fn frame_render_stub(theme: &Theme, area: Rect, frame: &mut Frame, title: &str) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(title)
-        .border_style(Style::default().fg(theme.palette.border_color()))
-        .style(Style::default().bg(theme.palette.panel_bg()));
-    let inner = block.inner(area);
-    block.render(area, frame);
-    Paragraph::new("  Implementation pending")
-        .style(Style::default().fg(theme.palette.muted_color()))
-        .render(inner, frame);
+fn frame_render_status_strip(theme: &Theme, area: Rect, content: String, frame: &mut Frame) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    Paragraph::new(content)
+        .style(
+            Style::default()
+                .fg(theme.palette.muted_color())
+                .bg(theme.palette.panel_bg()),
+        )
+        .render(area, frame);
 }
 
-#[cfg(feature = "tui")]
+fn pane_body_rows(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(2).max(1))
+}
+
+fn centered_window(selected: usize, total: usize, rows: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    let rows = rows.max(1).min(total);
+    let start = selected
+        .saturating_sub(rows / 2)
+        .min(total.saturating_sub(rows));
+    let end = (start + rows).min(total);
+    (start, end)
+}
+
+const fn data_source_label(source: DataSource) -> &'static str {
+    match source {
+        DataSource::Sqlite => "SQLite",
+        DataSource::Jsonl => "JSONL",
+        DataSource::None => "none",
+    }
+}
+
+fn frame_render_timeline(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    let layout = build_timeline_layout(area.width, area.height);
+    for placement in layout.placements.iter().filter(|p| p.visible) {
+        let pane_area = rect_in_body(area, placement.rect);
+        if pane_area.width == 0 || pane_area.height == 0 {
+            continue;
+        }
+        match placement.pane {
+            TimelinePane::FilterBar => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S2 Filters",
+                frame_timeline_filter_text(model),
+                false,
+                frame,
+            ),
+            TimelinePane::EventList => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S2 Timeline Events",
+                frame_timeline_list_text(model, theme, pane_body_rows(pane_area)),
+                true,
+                frame,
+            ),
+            TimelinePane::EventDetail => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S2 Event Detail",
+                frame_timeline_detail_text(model, theme),
+                true,
+                frame,
+            ),
+            TimelinePane::StatusFooter => frame_render_status_strip(
+                theme,
+                pane_area,
+                String::from(
+                    "j/k or wheel scroll  f filter  F follow  r refresh  Esc overlay->detail->back->quit",
+                ),
+                frame,
+            ),
+        }
+    }
+}
+
+fn frame_timeline_filter_text(model: &DashboardModel) -> String {
+    let follow = if model.timeline_follow { "on" } else { "off" };
+    format!(
+        "severity={}  follow={}  source={}  partial={}",
+        model.timeline_filter.label(),
+        follow,
+        data_source_label(model.timeline_source),
+        model.timeline_partial,
+    )
+}
+
+fn frame_timeline_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -> String {
+    use std::fmt::Write as _;
+    let filtered = model.timeline_filtered_events();
+    let total = model.timeline_events.len();
+    if filtered.is_empty() {
+        return format!(
+            "No events available for filter={}.\nPress f to cycle severity filters.",
+            model.timeline_filter.label()
+        );
+    }
+
+    let mut out = String::new();
+    let (start, end) = centered_window(model.timeline_selected, filtered.len(), rows);
+    let _ = writeln!(
+        out,
+        "events={} of {} (rows {}..{})",
+        filtered.len(),
+        total,
+        start + 1,
+        end
+    );
+    for (offset, event) in filtered[start..end].iter().enumerate() {
+        let idx = start + offset;
+        let cursor = if idx == model.timeline_selected {
+            ">"
+        } else {
+            " "
+        };
+        render_event_row(cursor, event, theme, &mut out);
+    }
+    out
+}
+
+fn frame_timeline_detail_text(model: &DashboardModel, theme: &Theme) -> String {
+    let mut out = String::new();
+    if let Some(event) = model.timeline_selected_event() {
+        render_event_detail(event, theme, &mut out);
+    } else {
+        out.push_str("No selected event.");
+    }
+    out
+}
+
+fn frame_render_explainability(
+    model: &DashboardModel,
+    theme: &Theme,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    let layout = build_explainability_layout(area.width, area.height);
+    for placement in layout.placements.iter().filter(|p| p.visible) {
+        let pane_area = rect_in_body(area, placement.rect);
+        if pane_area.width == 0 || pane_area.height == 0 {
+            continue;
+        }
+        match placement.pane {
+            ExplainabilityPane::DecisionHeader => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S3 Decision Header",
+                frame_explainability_header_text(model),
+                false,
+                frame,
+            ),
+            ExplainabilityPane::FactorBreakdown => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S3 Decisions",
+                frame_explainability_list_text(model, theme, pane_body_rows(pane_area)),
+                true,
+                frame,
+            ),
+            ExplainabilityPane::VetoDetail => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S3 Detail / Veto",
+                frame_explainability_detail_text(model, theme, pane_area.width),
+                true,
+                frame,
+            ),
+            ExplainabilityPane::StatusFooter => frame_render_status_strip(
+                theme,
+                pane_area,
+                String::from(
+                    "j/k or wheel scroll  click row opens detail  Enter/Space toggle detail  d close  Esc overlay->detail->back->quit",
+                ),
+                frame,
+            ),
+        }
+    }
+}
+
+fn frame_explainability_header_text(model: &DashboardModel) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "source={} partial={} decisions={} selected={}",
+        data_source_label(model.explainability_source),
+        model.explainability_partial,
+        model.explainability_decisions.len(),
+        model.explainability_selected.saturating_add(1),
+    );
+    if let Some(state) = &model.daemon_state {
+        let _ = write!(
+            out,
+            "\npressure={} policy={} scans={} deletions={}",
+            state.pressure.overall,
+            state.policy_mode,
+            state.counters.scans,
+            state.counters.deletions
+        );
+    }
+    if !model.explainability_diagnostics.is_empty() {
+        let _ = write!(out, "\ndiag={}", model.explainability_diagnostics);
+    }
+    out
+}
+
+fn frame_explainability_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -> String {
+    use std::fmt::Write as _;
+    if model.explainability_decisions.is_empty() {
+        return String::from("No decision evidence loaded.");
+    }
+    let mut out = String::new();
+    let total = model.explainability_decisions.len();
+    let (start, end) = centered_window(model.explainability_selected, total, rows);
+    for idx in start..end {
+        let decision = &model.explainability_decisions[idx];
+        let cursor = if idx == model.explainability_selected {
+            ">"
+        } else {
+            " "
+        };
+        let veto_marker = if decision.vetoed { " VETO" } else { "" };
+        let _ = writeln!(
+            out,
+            "{cursor} #{:<4} {} {} score={:.2} P(abn)={:.2}{}",
+            decision.decision_id,
+            extract_time(&decision.timestamp),
+            action_badge(&decision.action, theme),
+            decision.total_score,
+            decision.posterior_abandoned,
+            veto_marker,
+        );
+    }
+    out
+}
+
+fn frame_explainability_detail_text(
+    model: &DashboardModel,
+    theme: &Theme,
+    pane_width: u16,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if let Some(decision) = model.explainability_selected_decision() {
+        if model.explainability_detail {
+            render_decision_detail(decision, theme, usize::from(pane_width).max(40), &mut out);
+        } else {
+            let _ = writeln!(out, "path={}", decision.path);
+            let _ = writeln!(out, "action={}", decision.action);
+            let _ = writeln!(out, "score={:.3}", decision.total_score);
+            let _ = writeln!(out, "posterior={:.3}", decision.posterior_abandoned);
+            let _ = writeln!(out, "calibration={:.3}", decision.calibration_score);
+            if decision.vetoed
+                && let Some(reason) = &decision.veto_reason
+            {
+                let _ = writeln!(out, "veto={reason}");
+            }
+            let _ = writeln!(out, "Enter/Space for full detail");
+        }
+    } else {
+        out.push_str("No selected decision.");
+    }
+    out
+}
+
+fn frame_render_candidates(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    let layout = build_candidates_layout(area.width, area.height);
+    for placement in layout.placements.iter().filter(|p| p.visible) {
+        let pane_area = rect_in_body(area, placement.rect);
+        if pane_area.width == 0 || pane_area.height == 0 {
+            continue;
+        }
+        match placement.pane {
+            CandidatesPane::SummaryBar => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S4 Summary",
+                frame_candidates_summary_text(model),
+                false,
+                frame,
+            ),
+            CandidatesPane::CandidateList => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S4 Candidate Ranking",
+                frame_candidates_list_text(model, theme, pane_body_rows(pane_area)),
+                true,
+                frame,
+            ),
+            CandidatesPane::ScoreDetail => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S4 Score Detail",
+                frame_candidates_detail_text(model, theme, pane_area.width),
+                true,
+                frame,
+            ),
+            CandidatesPane::StatusFooter => frame_render_status_strip(
+                theme,
+                pane_area,
+                String::from(
+                    "j/k or wheel scroll  click row opens detail  Enter/Space toggle detail  s sort  d close  Esc overlay->detail->back->quit",
+                ),
+                frame,
+            ),
+        }
+    }
+}
+
+fn frame_candidates_summary_text(model: &DashboardModel) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "source={} partial={} candidates={} sort={}",
+        data_source_label(model.candidates_source),
+        model.candidates_partial,
+        model.candidates_list.len(),
+        model.candidates_sort.label(),
+    );
+    let reclaimable: u64 = model
+        .candidates_list
+        .iter()
+        .filter(|c| !c.vetoed && c.action == "delete")
+        .map(|c| c.size_bytes)
+        .sum();
+    let _ = write!(out, "\nreclaimable={}", human_bytes(reclaimable));
+    if !model.candidates_diagnostics.is_empty() {
+        let _ = write!(out, "\ndiag={}", model.candidates_diagnostics);
+    }
+    out
+}
+
+fn frame_candidates_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -> String {
+    use std::fmt::Write as _;
+    if model.candidates_list.is_empty() {
+        return String::from("No candidates loaded.");
+    }
+    let mut out = String::new();
+    let total = model.candidates_list.len();
+    let (start, end) = centered_window(model.candidates_selected, total, rows);
+    for idx in start..end {
+        let candidate = &model.candidates_list[idx];
+        let cursor = if idx == model.candidates_selected {
+            ">"
+        } else {
+            " "
+        };
+        let veto = if candidate.vetoed { "VETO" } else { "-" };
+        let _ = writeln!(
+            out,
+            "{cursor} #{:<4} {} score={:.2} size={} age={} {}",
+            candidate.decision_id,
+            action_badge(&candidate.action, theme),
+            candidate.total_score,
+            human_bytes(candidate.size_bytes),
+            human_duration(candidate.age_secs),
+            veto,
+        );
+    }
+    out
+}
+
+fn frame_candidates_detail_text(model: &DashboardModel, theme: &Theme, pane_width: u16) -> String {
+    let mut out = String::new();
+    if let Some(candidate) = model.candidates_selected_item() {
+        if model.candidates_detail {
+            render_candidate_detail(candidate, theme, usize::from(pane_width).max(40), &mut out);
+        } else {
+            out = format!(
+                "path={}\naction={}\nscore={:.3}\nsize={}\nage={}\nEnter/Space for full detail",
+                candidate.path,
+                candidate.action,
+                candidate.total_score,
+                human_bytes(candidate.size_bytes),
+                human_duration(candidate.age_secs),
+            );
+        }
+    } else {
+        out.push_str("No selected candidate.");
+    }
+    out
+}
+
+fn frame_render_ballast(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    let layout = build_ballast_layout(area.width, area.height);
+    for placement in layout.placements.iter().filter(|p| p.visible) {
+        let pane_area = rect_in_body(area, placement.rect);
+        if pane_area.width == 0 || pane_area.height == 0 {
+            continue;
+        }
+        match placement.pane {
+            BallastPane::VolumeList => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S5 Volume Inventory",
+                frame_ballast_list_text(model, theme, pane_body_rows(pane_area)),
+                true,
+                frame,
+            ),
+            BallastPane::VolumeDetail => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S5 Volume Detail",
+                frame_ballast_detail_text(model, theme),
+                true,
+                frame,
+            ),
+            BallastPane::StatusFooter => frame_render_status_strip(
+                theme,
+                pane_area,
+                String::from(
+                    "j/k or wheel scroll  click row opens detail  Enter/Space toggle detail  d close  Esc overlay->detail->back->quit",
+                ),
+                frame,
+            ),
+        }
+    }
+}
+
+fn frame_ballast_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -> String {
+    use std::fmt::Write as _;
+    if model.ballast_volumes.is_empty() {
+        return String::from("No ballast inventory loaded.");
+    }
+    let mut out = String::new();
+    let total = model.ballast_volumes.len();
+    let (start, end) = centered_window(model.ballast_selected, total, rows);
+    for idx in start..end {
+        let vol = &model.ballast_volumes[idx];
+        let cursor = if idx == model.ballast_selected {
+            ">"
+        } else {
+            " "
+        };
+        let status = vol.status_level();
+        let status_color = match status {
+            "OK" => theme.palette.success,
+            "LOW" => theme.palette.warning,
+            "CRITICAL" => theme.palette.critical,
+            _ => theme.palette.muted,
+        };
+        let _ = writeln!(
+            out,
+            "{cursor} {} {:<18} files={}/{} releasable={}",
+            status_badge(status, status_color, theme.accessibility),
+            truncate_path(&vol.mount_point, 18),
+            vol.files_available,
+            vol.files_total,
+            human_bytes(vol.releasable_bytes),
+        );
+    }
+    out
+}
+
+fn frame_ballast_detail_text(model: &DashboardModel, theme: &Theme) -> String {
+    let mut out = String::new();
+    if let Some(vol) = model.ballast_selected_volume() {
+        if model.ballast_detail {
+            render_volume_detail(vol, theme, &mut out);
+        } else {
+            out = format!(
+                "mount={}\nstatus={}\nfiles={}/{}\nreleasable={}\nEnter/Space for full detail",
+                vol.mount_point,
+                vol.status_level(),
+                vol.files_available,
+                vol.files_total,
+                human_bytes(vol.releasable_bytes),
+            );
+        }
+    } else {
+        out.push_str("No selected volume.");
+    }
+    out
+}
+
+fn frame_render_log_search(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    let layout = build_log_search_layout(area.width, area.height);
+    for placement in layout.placements.iter().filter(|p| p.visible) {
+        let pane_area = rect_in_body(area, placement.rect);
+        if pane_area.width == 0 || pane_area.height == 0 {
+            continue;
+        }
+        match placement.pane {
+            LogSearchPane::SearchBar => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S6 Log Search",
+                frame_log_search_header_text(model),
+                false,
+                frame,
+            ),
+            LogSearchPane::LogList => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S6 Entries",
+                frame_log_search_list_text(model, theme, pane_body_rows(pane_area)),
+                true,
+                frame,
+            ),
+            LogSearchPane::EntryDetail => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S6 Entry Detail",
+                frame_log_search_detail_text(model, theme),
+                true,
+                frame,
+            ),
+            LogSearchPane::StatusFooter => frame_render_status_strip(
+                theme,
+                pane_area,
+                String::from(
+                    "mouse wheel scrolls entries  click row focuses entry  Esc overlay->back->quit",
+                ),
+                frame,
+            ),
+        }
+    }
+}
+
+fn frame_log_search_header_text(model: &DashboardModel) -> String {
+    format!(
+        "query=<not-yet-editable>  source={}  timeline-events={}  mode=preview",
+        data_source_label(model.timeline_source),
+        model.timeline_events.len(),
+    )
+}
+
+fn frame_log_entries(model: &DashboardModel) -> Vec<&TimelineEvent> {
+    model.timeline_events.iter().collect()
+}
+
+fn frame_log_search_list_text(model: &DashboardModel, theme: &Theme, rows: usize) -> String {
+    use std::fmt::Write as _;
+    let entries = frame_log_entries(model);
+    if entries.is_empty() {
+        return String::from("No log entries loaded. Timeline telemetry powers this preview.");
+    }
+    let mut out = String::new();
+    let selected = model.timeline_selected.min(entries.len().saturating_sub(1));
+    let (start, end) = centered_window(selected, entries.len(), rows);
+    for (idx, event) in entries.iter().enumerate().take(end).skip(start) {
+        let event = *event;
+        let cursor = if idx == selected { ">" } else { " " };
+        let _ = writeln!(
+            out,
+            "{cursor} {} {} {:<18} {}",
+            extract_time(&event.timestamp),
+            severity_badge(&event.severity, theme),
+            event.event_type,
+            event.path.as_deref().map_or("-", |p| truncate_path(p, 24)),
+        );
+    }
+    out
+}
+
+fn frame_log_search_detail_text(model: &DashboardModel, theme: &Theme) -> String {
+    let entries = frame_log_entries(model);
+    let mut out = String::new();
+    if entries.is_empty() {
+        out.push_str("No selected entry.");
+        return out;
+    }
+    let selected = model.timeline_selected.min(entries.len().saturating_sub(1));
+    render_event_detail(entries[selected], theme, &mut out);
+    out
+}
+
+fn frame_render_diagnostics(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
+    let layout = build_diagnostics_layout(area.width, area.height);
+    for placement in layout.placements.iter().filter(|p| p.visible) {
+        let pane_area = rect_in_body(area, placement.rect);
+        if pane_area.width == 0 || pane_area.height == 0 {
+            continue;
+        }
+        match placement.pane {
+            DiagnosticsPane::HealthHeader => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S7 Health",
+                frame_diagnostics_health_text(model),
+                false,
+                frame,
+            ),
+            DiagnosticsPane::ThreadTable => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S7 Runtime/Adapters",
+                frame_diagnostics_runtime_text(model),
+                true,
+                frame,
+            ),
+            DiagnosticsPane::PerfPanel => frame_render_text_pane(
+                theme,
+                pane_area,
+                "S7 Performance",
+                frame_diagnostics_perf_text(model),
+                true,
+                frame,
+            ),
+            DiagnosticsPane::StatusFooter => frame_render_status_strip(
+                theme,
+                pane_area,
+                format!(
+                    "Shift-V verbose={}  r refresh  Esc overlay->back->quit",
+                    if model.diagnostics_verbose {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ),
+                frame,
+            ),
+        }
+    }
+}
+
+fn frame_diagnostics_health_text(model: &DashboardModel) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "mode={} tick={} refresh={}ms missed={}",
+        if model.degraded { "degraded" } else { "normal" },
+        model.tick,
+        model.refresh.as_millis(),
+        model.missed_ticks,
+    );
+    let fetch_age = model.last_fetch.map_or_else(
+        || String::from("never"),
+        |t| format!("{}ms", t.elapsed().as_millis()),
+    );
+    let _ = write!(
+        out,
+        "\nlast-fetch={} notifications={}",
+        fetch_age,
+        model.notifications.len()
+    );
+    if let Some(state) = &model.daemon_state {
+        let _ = write!(
+            out,
+            "\npolicy={} pressure={} pid={} rss={}",
+            state.policy_mode,
+            state.pressure.overall,
+            state.pid,
+            human_bytes(state.memory_rss_bytes),
+        );
+    }
+    out
+}
+
+fn frame_diagnostics_runtime_text(model: &DashboardModel) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "adapter reads={} errors={}",
+        model.adapter_reads, model.adapter_errors
+    );
+    if let Some(state) = &model.daemon_state {
+        let _ = write!(
+            out,
+            "\nscans={} deletions={} errors={} dropped={}",
+            state.counters.scans,
+            state.counters.deletions,
+            state.counters.errors,
+            state.counters.dropped_log_events,
+        );
+    }
+    let _ = write!(
+        out,
+        "\ntimeline={} explain={} candidates={} ballast={}",
+        data_source_label(model.timeline_source),
+        data_source_label(model.explainability_source),
+        data_source_label(model.candidates_source),
+        data_source_label(model.ballast_source),
+    );
+    if model.diagnostics_verbose {
+        let _ = write!(
+            out,
+            "\nscreen={} history={} events={} decisions={} candidates={}",
+            screen_label(model.screen),
+            model.screen_history.len(),
+            model.timeline_events.len(),
+            model.explainability_decisions.len(),
+            model.candidates_list.len(),
+        );
+    }
+    out
+}
+
+fn frame_diagnostics_perf_text(model: &DashboardModel) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if let Some((current, avg, min, max)) = model.frame_time_stats() {
+        let _ = write!(
+            out,
+            "frame current={current:.1}ms avg={avg:.1}ms min={min:.1}ms max={max:.1}ms",
+        );
+    } else {
+        out.push_str("frame no data yet");
+    }
+    let normalized = model.frame_times.normalized();
+    if !normalized.is_empty() {
+        let _ = write!(out, "\ntrace {}", sparkline(&normalized));
+    }
+    let _ = write!(
+        out,
+        "\nterminal={}x{}",
+        model.terminal_size.0, model.terminal_size.1
+    );
+    out
+}
+
 fn frame_render_footer(model: &DashboardModel, theme: &Theme, area: Rect, frame: &mut Frame) {
     let hints = match model.screen {
         Screen::Overview => {
-            "Tab/Shift-Tab pane focus  Enter open pane  mouse move/click  1-7 screens  [/] prev/next  b ballast  r refresh  ? help  : palette  q quit"
+            "mouse tab click navigates  Tab focus panes  Enter/Space/click open  wheel on hotlist  1-7 [/] b  r  ? help  : palette  Esc overlay->detail->back->quit"
         }
-        Screen::Timeline => "j/k navigate  f filter  F follow  r refresh  ? help  : palette",
+        Screen::Timeline => {
+            "mouse tab click + row click  wheel/j/k navigate  f filter  F follow  r  ? help  : palette  Esc overlay->detail->back->quit"
+        }
         Screen::Explainability | Screen::Ballast => {
-            "j/k navigate  Enter expand  d close  r refresh  ? help  : palette"
+            "mouse tab click + row click-open  wheel/j/k navigate  Enter/Space toggle detail  d close  r  ? help  : palette  Esc overlay->detail->back->quit"
         }
-        Screen::Candidates => "j/k navigate  Enter expand  s sort  r refresh  ? help  : palette",
-        Screen::LogSearch => "1-7 screens  ? help  : palette  q quit",
-        Screen::Diagnostics => "V verbose  r refresh  ? help  : palette  q quit",
+        Screen::Candidates => {
+            "mouse tab click + row click-open  wheel/j/k navigate  Enter/Space detail  s sort  d close  r  ? help  : palette  Esc overlay->detail->back->quit"
+        }
+        Screen::LogSearch => {
+            "mouse tab click + row focus  wheel scroll logs  1-7 [/]  r  ? help  : palette  Esc overlay->back->quit"
+        }
+        Screen::Diagnostics => {
+            "mouse tab click  Shift-V verbose  r refresh  1-7 [/]  ? help  : palette  Esc overlay->back->quit"
+        }
     };
     Paragraph::new(hints)
         .style(
@@ -527,7 +1267,6 @@ fn frame_render_footer(model: &DashboardModel, theme: &Theme, area: Rect, frame:
         .render(area, frame);
 }
 
-#[cfg(feature = "tui")]
 fn frame_render_notifications(
     model: &DashboardModel,
     theme: &Theme,
@@ -559,7 +1298,6 @@ fn frame_render_notifications(
     }
 }
 
-#[cfg(feature = "tui")]
 fn frame_render_overlay(
     model: &DashboardModel,
     overlay: super::model::Overlay,
@@ -567,12 +1305,17 @@ fn frame_render_overlay(
     body_area: Rect,
     frame: &mut Frame,
 ) {
-    // Center a panel in the body area, but never exceed available space.
-    let overlay_w = body_area.width.min(60);
-    let overlay_h = body_area.height.min(20);
-    let x = body_area.x + (body_area.width.saturating_sub(overlay_w)) / 2;
-    let y = body_area.y + (body_area.height.saturating_sub(overlay_h)) / 2;
-    let overlay_area = Rect::new(x, y, overlay_w, overlay_h);
+    // Soft scrim behind overlays so context remains visible but de-emphasized.
+    for y in body_area.y..body_area.y.saturating_add(body_area.height) {
+        for x in body_area.x..body_area.x.saturating_add(body_area.width) {
+            if let Some(cell) = frame.buffer.get_mut(x, y) {
+                cell.bg = theme.palette.surface_bg();
+                cell.fg = theme.palette.muted_color();
+            }
+        }
+    }
+
+    let overlay_area = overlay_panel_rect(body_area, overlay);
 
     let title = match overlay {
         super::model::Overlay::CommandPalette => "Command Palette",
@@ -622,17 +1365,77 @@ fn frame_render_overlay(
             Paragraph::new(Text::from_lines(lines)).render(inner, frame);
         }
         super::model::Overlay::Help => {
-            let help_text = "  ?     toggle help\n  :     command palette\n  1-7   screens\n  [/]   prev/next screen\n  Tab   next overview pane\n  S-Tab prev overview pane\n  Enter open focused pane\n  mouse hover/click overview\n  Esc   close overlay/back/quit\n  r     refresh\n  q     quit";
+            let help_text = "  ?     toggle help\n  :     command palette\n  1-7   screens\n  [/]   prev/next screen\n  Tab   next overview pane\n  S-Tab prev overview pane\n  Enter/Space open focused pane\n  mouse tab click + row click/wheel\n  Esc   close overlay -> detail -> back -> quit\n  click closes overlay\n  r     refresh\n  q     quit";
             Paragraph::new(help_text)
                 .style(Style::default().fg(theme.palette.text_primary()))
                 .render(inner, frame);
         }
+        super::model::Overlay::Voi => {
+            let voi_text = concat!(
+                "  VOI (Value-of-Information) Scan Scheduler\n",
+                "\n",
+                "  Allocates a limited scan budget to paths most\n",
+                "  likely to yield reclaimable space.\n",
+                "\n",
+                "  Budget:  5 paths per cycle (configurable)\n",
+                "  Split:   80% exploitation / 20% exploration\n",
+                "\n",
+                "  Exploitation selects paths with the highest\n",
+                "  expected reclaim weighted by IO cost and\n",
+                "  false-positive risk.\n",
+                "\n",
+                "  Exploration re-scans least-recently-visited\n",
+                "  paths to discover changed workloads.\n",
+                "\n",
+                "  Fallback: if forecast MAPE > 50% for 3\n",
+                "  windows, reverts to round-robin scheduling.\n",
+                "  Recovers after 5 clean windows.\n",
+                "\n",
+                "  Config: [scheduler] section in config.toml\n",
+                "  Esc or click closes overlay (then back/quit).",
+            );
+            Paragraph::new(voi_text)
+                .style(Style::default().fg(theme.palette.text_primary()))
+                .render(inner, frame);
+        }
         _ => {
-            Paragraph::new(format!("  {title} overlay"))
+            Paragraph::new(format!(
+                "  {title} overlay\n\n  Esc or click closes overlay.\n  Next Esc closes detail or goes back.\n  Final Esc quits."
+            ))
                 .style(Style::default().fg(theme.palette.text_secondary()))
                 .render(inner, frame);
         }
     }
+}
+
+fn overlay_panel_rect(body_area: Rect, overlay: super::model::Overlay) -> Rect {
+    // Scale overlays with terminal size while preserving minimum readable bounds.
+    let (width_pct, height_pct, min_w, min_h) = match overlay {
+        super::model::Overlay::CommandPalette => (78u16, 80u16, 52u16, 12u16),
+        super::model::Overlay::Help => (86u16, 84u16, 58u16, 14u16),
+        super::model::Overlay::Voi => (88u16, 88u16, 62u16, 16u16),
+        super::model::Overlay::Confirmation(..) => (56u16, 42u16, 44u16, 10u16),
+        super::model::Overlay::IncidentPlaybook => (78u16, 76u16, 56u16, 14u16),
+    };
+    let desired_w =
+        u16::try_from((u32::from(body_area.width) * u32::from(width_pct)) / 100).unwrap_or(0);
+    let desired_h =
+        u16::try_from((u32::from(body_area.height) * u32::from(height_pct)) / 100).unwrap_or(0);
+    let max_w = body_area.width.saturating_sub(2).max(1);
+    let max_h = body_area.height.saturating_sub(2).max(1);
+    let overlay_w = clamp_overlay_dimension(desired_w, min_w, max_w);
+    let overlay_h = clamp_overlay_dimension(desired_h, min_h, max_h);
+    let x = body_area.x + (body_area.width.saturating_sub(overlay_w)) / 2;
+    let y = body_area.y + (body_area.height.saturating_sub(overlay_h)) / 2;
+    Rect::new(x, y, overlay_w, overlay_h)
+}
+
+fn clamp_overlay_dimension(desired: u16, min: u16, max: u16) -> u16 {
+    if max == 0 {
+        return 0;
+    }
+    let lower = min.min(max);
+    desired.max(lower).min(max)
 }
 
 const PALETTE_DISPLAY_LIMIT: usize = 10;
@@ -746,7 +1549,9 @@ fn render_overview(model: &DashboardModel, theme: &Theme, out: &mut String) {
             OverviewPane::ActionLane => render_action_lane(model),
             OverviewPane::EwmaTrend => render_ewma_trend(model),
             OverviewPane::DecisionPulse => render_decision_pulse(model, theme),
-            OverviewPane::CandidateHotlist => render_candidate_hotlist(model, theme),
+            OverviewPane::CandidateHotlist => {
+                render_candidate_hotlist(model, theme, placement.rect.width)
+            }
             OverviewPane::BallastQuick => render_ballast_quick(model, theme),
             OverviewPane::SpecialLocations => render_special_locations(model, theme),
             OverviewPane::ExtendedCounters => render_extended_counters(model),
@@ -774,8 +1579,8 @@ fn render_overview(model: &DashboardModel, theme: &Theme, out: &mut String) {
     write_navigation_hint(
         model,
         out,
-        "Tab/Shift-Tab pane focus  Enter open pane  mouse move/click drill-in  1-7 screens  [/] prev/next  b ballast  r refresh  ? help  : palette",
-        "Tab focus  Enter open pane  mouse click  1-7 screens  [/] prev/next",
+        "Tab/Shift-Tab pane focus  Enter/Space open pane  mouse move/click drill-in  1-7 screens  [/] prev/next  b ballast  r refresh  ? help  : palette",
+        "Tab focus  Enter/Space open pane  mouse click  1-7 screens  [/] prev/next",
     );
 }
 
@@ -804,25 +1609,58 @@ fn render_pressure_summary(model: &DashboardModel, theme: &Theme, pane_width: u1
             theme.palette.for_pressure_level(&state.pressure.overall),
             theme.accessibility,
         );
-        let gauge_w = gauge_width_for(pane_width);
+        let gauge_w = gauge_width_for(pane_width).max(8);
+        let policy_label = if state.policy_mode.is_empty() {
+            String::new()
+        } else {
+            let policy_badge = status_badge(
+                &state.policy_mode.to_ascii_uppercase(),
+                policy_mode_palette(&state.policy_mode, &theme.palette),
+                theme.accessibility,
+            );
+            format!(" policy={policy_badge}")
+        };
         let mut out = format!(
-            "pressure {badge} worst-free={worst_free_pct:.1}% mounts={}",
+            "pressure {badge} worst-free={worst_free_pct:.1}% mounts={}{policy_label}",
             state.pressure.mounts.len(),
         );
 
-        // Per-mount detail rows matching legacy dashboard parity.
+        let pane_w = usize::from(pane_width);
+        let path_w = pane_w.saturating_sub(40).clamp(8, 26);
+        let _ = write!(
+            out,
+            "\n  {mount:<path_w$} {free:>11} {rate:>11} {level:>10} used",
+            mount = "mount",
+            free = "free",
+            rate = "rate",
+            level = "level",
+            path_w = path_w,
+        );
+
         for mount in &state.pressure.mounts {
             let used_pct = 100.0 - mount.free_pct;
             let g = gauge(used_pct, gauge_w);
-            let level = mount.level.to_ascii_uppercase();
+            let level_core = mount
+                .level
+                .to_ascii_uppercase()
+                .chars()
+                .take(8)
+                .collect::<String>();
+            let level = format!("[{level_core}]");
+            let rate = mount.rate_bps.map_or_else(|| "-".to_string(), human_rate);
             let rate_warn = match mount.rate_bps {
                 Some(r) if r > 0.0 && mount.free_pct > 0.0 => " \u{26a0}",
                 _ => "",
             };
+            let mount_path = truncate_path(&mount.path, path_w);
             let _ = write!(
                 out,
-                "\n  {:<14} {} ({:.1}% free) [{level}]{rate_warn}",
-                mount.path, g, mount.free_pct,
+                "\n  {mount_path:<path_w$} {free:>5.1}% free {rate:>11} {level:>10} {g}{rate_warn}",
+                free = mount.free_pct,
+                rate = rate,
+                level = level,
+                g = g,
+                path_w = path_w,
             );
         }
         out
@@ -950,18 +1788,21 @@ fn render_decision_pulse(model: &DashboardModel, theme: &Theme) -> String {
 }
 
 #[allow(clippy::option_if_let_else)]
-fn render_candidate_hotlist(model: &DashboardModel, theme: &Theme) -> String {
+fn render_candidate_hotlist(model: &DashboardModel, theme: &Theme, pane_width: u16) -> String {
     use std::fmt::Write as _;
 
     if model.candidates_list.is_empty() {
         return String::from("hotlist no candidate ranking loaded yet");
     }
+    let pane_w = usize::from(pane_width);
+    let path_w = pane_w.saturating_sub(36).clamp(12, 46);
     let mut out = format!(
         "hotlist total={} source={:?}",
         model.candidates_list.len(),
         model.candidates_source
     );
-    for candidate in model.candidates_list.iter().take(3) {
+    let _ = write!(out, "\n  rank score   size        age      path");
+    for (idx, candidate) in model.candidates_list.iter().take(5).enumerate() {
         let badge = if candidate.total_score >= 0.8 {
             status_badge("HOT", theme.palette.critical, theme.accessibility)
         } else if candidate.total_score >= 0.6 {
@@ -969,13 +1810,22 @@ fn render_candidate_hotlist(model: &DashboardModel, theme: &Theme) -> String {
         } else {
             status_badge("MILD", theme.palette.accent, theme.accessibility)
         };
+        let cursor = if idx == model.candidates_selected {
+            ">"
+        } else {
+            " "
+        };
+        let veto = if candidate.vetoed { " VETO" } else { "" };
         let _ = write!(
             out,
-            "\n  {} {:<20} score={:.2} size={}",
-            badge,
-            truncate_path(&candidate.path, 20),
+            "\n{cursor} {:>2}. {:>5.2} {:>10} {:>8} {} {:<path_w$}{veto}",
+            idx + 1,
             candidate.total_score,
             human_bytes(candidate.size_bytes),
+            human_duration(candidate.age_secs),
+            badge,
+            truncate_path(&candidate.path, path_w),
+            path_w = path_w,
         );
     }
     out
@@ -1064,17 +1914,44 @@ fn render_ballast_quick(model: &DashboardModel, theme: &Theme) -> String {
 
 #[allow(clippy::option_if_let_else)]
 fn render_extended_counters(model: &DashboardModel) -> String {
+    use std::fmt::Write as _;
+
     if let Some(ref state) = model.daemon_state {
-        format!(
-            "counters errors={} dropped-log-events={} rss={} pid={} uptime={}",
+        let policy = if state.policy_mode.is_empty() {
+            "unknown"
+        } else {
+            &state.policy_mode
+        };
+        let dropped_warn = if state.counters.dropped_log_events > 0 {
+            " \u{26a0}"
+        } else {
+            ""
+        };
+        let mut out = format!(
+            "runtime scans={} deletions={} errors={} dropped={}{dropped_warn}",
+            state.counters.scans,
+            state.counters.deletions,
             state.counters.errors,
             state.counters.dropped_log_events,
+        );
+        let _ = write!(
+            out,
+            "\n  freed={} rss={} uptime={}",
+            human_bytes(state.counters.bytes_freed),
             human_bytes(state.memory_rss_bytes),
-            state.pid,
             human_duration(state.uptime_seconds),
-        )
+        );
+        let _ = write!(
+            out,
+            "\n  pid={} policy={} adapters(r/e)={}/{}",
+            state.pid, policy, model.adapter_reads, model.adapter_errors
+        );
+        out
     } else {
-        String::from("counters unavailable")
+        format!(
+            "counters unavailable\n  adapters(r/e)={}/{}",
+            model.adapter_reads, model.adapter_errors
+        )
     }
 }
 
@@ -1263,6 +2140,75 @@ fn severity_badge(severity: &str, theme: &Theme) -> String {
     status_badge(label, palette, theme.accessibility)
 }
 
+// ──────────────────── S6: Log Search ────────────────────
+
+fn render_log_search(model: &DashboardModel, theme: &Theme, out: &mut String) {
+    use std::fmt::Write as _;
+
+    let layout = build_log_search_layout(model.terminal_size.0, model.terminal_size.1);
+    let source_label = match model.timeline_source {
+        DataSource::Sqlite => "SQLite",
+        DataSource::Jsonl => "JSONL",
+        DataSource::None => "none",
+    };
+    let _ = writeln!(
+        out,
+        "query=<preview> source={source_label} entries={} mode=timeline-mirror",
+        model.timeline_events.len(),
+    );
+    if !model.timeline_diagnostics.is_empty() {
+        let _ = writeln!(out, "  diag: {}", model.timeline_diagnostics);
+    }
+
+    let entries = &model.timeline_events;
+    let _ = writeln!(out);
+    if entries.is_empty() {
+        let _ = writeln!(
+            out,
+            "No log entries loaded. Timeline telemetry powers this preview."
+        );
+    } else {
+        let selected = model.timeline_selected.min(entries.len().saturating_sub(1));
+        let list_visible = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == LogSearchPane::LogList && p.visible);
+        let max_rows = list_visible.map_or(entries.len(), |p| usize::from(p.rect.height));
+        let window_start = selected
+            .saturating_sub(max_rows / 2)
+            .min(entries.len().saturating_sub(max_rows));
+        let window_end = (window_start + max_rows).min(entries.len());
+        for (idx, event) in entries
+            .iter()
+            .enumerate()
+            .take(window_end)
+            .skip(window_start)
+        {
+            let cursor = if idx == selected { ">" } else { " " };
+            render_event_row(cursor, event, theme, out);
+        }
+    }
+
+    let detail_visible = layout
+        .placements
+        .iter()
+        .any(|p| p.pane == LogSearchPane::EntryDetail && p.visible);
+    if detail_visible && !entries.is_empty() {
+        let selected = model.timeline_selected.min(entries.len().saturating_sub(1));
+        let _ = writeln!(out);
+        let width = usize::from(model.terminal_size.0).max(40);
+        let _ = writeln!(out, "{}", section_header("Entry Detail", width));
+        render_event_detail(&entries[selected], theme, out);
+    }
+
+    write_navigation_hint(
+        model,
+        out,
+        "j/k or wheel navigate  click row focus  r refresh  ? help  : palette",
+        "j/k or wheel navigate  click row focus  r refresh",
+    );
+}
+
 // ──────────────────── S3: Explainability ────────────────────
 
 fn render_explainability(model: &DashboardModel, theme: &Theme, out: &mut String) {
@@ -1322,8 +2268,8 @@ fn render_explainability(model: &DashboardModel, theme: &Theme, out: &mut String
         write_navigation_hint(
             model,
             out,
-            "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close detail  r refresh  ? help  : palette",
-            "j/k navigate  Enter detail  d close  r refresh",
+            "j/k or \u{2191}/\u{2193} navigate  Enter/Space expand  d close detail  r refresh  ? help  : palette",
+            "j/k navigate  Enter/Space detail  d close  r refresh",
         );
         return;
     }
@@ -1362,14 +2308,17 @@ fn render_explainability(model: &DashboardModel, theme: &Theme, out: &mut String
         }
     } else {
         let _ = writeln!(out);
-        let _ = writeln!(out, "Press Enter to expand detail for selected decision");
+        let _ = writeln!(
+            out,
+            "Press Enter/Space to expand detail for selected decision"
+        );
     }
 
     write_navigation_hint(
         model,
         out,
-        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close detail  r refresh  ? help  : palette",
-        "j/k navigate  Enter detail  d close  r refresh",
+        "j/k or \u{2191}/\u{2193} navigate  Enter/Space expand  d close detail  r refresh  ? help  : palette",
+        "j/k navigate  Enter/Space detail  d close  r refresh",
     );
 }
 
@@ -1596,8 +2545,8 @@ fn render_candidates(model: &DashboardModel, theme: &Theme, out: &mut String) {
         write_navigation_hint(
             model,
             out,
-            "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  s sort  r refresh  ? help  : palette",
-            "j/k navigate  Enter detail  s sort  r refresh",
+            "j/k or \u{2191}/\u{2193} navigate  Enter/Space expand  d close  s sort  r refresh  ? help  : palette",
+            "j/k navigate  Enter/Space detail  s sort  r refresh",
         );
         return;
     }
@@ -1666,14 +2615,17 @@ fn render_candidates(model: &DashboardModel, theme: &Theme, out: &mut String) {
         }
     } else {
         let _ = writeln!(out);
-        let _ = writeln!(out, "Press Enter to expand detail for selected candidate");
+        let _ = writeln!(
+            out,
+            "Press Enter/Space to expand detail for selected candidate"
+        );
     }
 
     write_navigation_hint(
         model,
         out,
-        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  s sort  r refresh  ? help  : palette",
-        "j/k navigate  Enter detail  s sort  r refresh",
+        "j/k or \u{2191}/\u{2193} navigate  Enter/Space expand  d close  s sort  r refresh  ? help  : palette",
+        "j/k navigate  Enter/Space detail  s sort  r refresh",
     );
 }
 
@@ -1823,6 +2775,18 @@ fn render_diagnostics(model: &DashboardModel, theme: &Theme, out: &mut String) {
     );
     let _ = writeln!(out, "  missed-ticks:  {}", model.missed_ticks);
 
+    // ── Policy mode ──
+    if let Some(ref state) = model.daemon_state
+        && !state.policy_mode.is_empty()
+    {
+        let policy_badge = status_badge(
+            &state.policy_mode.to_ascii_uppercase(),
+            policy_mode_palette(&state.policy_mode, &theme.palette),
+            theme.accessibility,
+        );
+        let _ = writeln!(out, "  policy:        {policy_badge}");
+    }
+
     // ── Last fetch staleness ──
     let fetch_label = model.last_fetch.map_or_else(
         || String::from("never"),
@@ -1830,6 +2794,17 @@ fn render_diagnostics(model: &DashboardModel, theme: &Theme, out: &mut String) {
     );
     let _ = writeln!(out, "  last-fetch:    {fetch_label}");
     let _ = writeln!(out, "  notifications: {} active", model.notifications.len(),);
+
+    // ── Dropped log events ──
+    if let Some(ref state) = model.daemon_state {
+        let dropped = state.counters.dropped_log_events;
+        if dropped > 0 {
+            let warn_badge = status_badge("WARN", theme.palette.warning, theme.accessibility);
+            let _ = writeln!(out, "  dropped-logs:  {dropped} {warn_badge}");
+        } else {
+            let _ = writeln!(out, "  dropped-logs:  0");
+        }
+    }
 
     // ── Frame timing ──
     let _ = writeln!(out);
@@ -2068,8 +3043,8 @@ fn render_ballast(model: &DashboardModel, theme: &Theme, out: &mut String) {
         write_navigation_hint(
             model,
             out,
-            "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  r refresh  ? help  : palette",
-            "j/k navigate  Enter detail  d close  r refresh",
+            "j/k or \u{2191}/\u{2193} navigate  Enter/Space expand  d close  r refresh  ? help  : palette",
+            "j/k navigate  Enter/Space detail  d close  r refresh",
         );
         return;
     }
@@ -2141,14 +3116,17 @@ fn render_ballast(model: &DashboardModel, theme: &Theme, out: &mut String) {
         }
     } else {
         let _ = writeln!(out);
-        let _ = writeln!(out, "Press Enter to expand detail for selected volume");
+        let _ = writeln!(
+            out,
+            "Press Enter/Space to expand detail for selected volume"
+        );
     }
 
     write_navigation_hint(
         model,
         out,
-        "j/k or \u{2191}/\u{2193} navigate  Enter expand  d close  r refresh  ? help  : palette",
-        "j/k navigate  Enter detail  d close  r refresh",
+        "j/k or \u{2191}/\u{2193} navigate  Enter/Space expand  d close  r refresh  ? help  : palette",
+        "j/k navigate  Enter/Space detail  d close  r refresh",
     );
 }
 
@@ -2197,19 +3175,26 @@ fn render_volume_detail(vol: &BallastVolume, theme: &Theme, out: &mut String) {
     }
 }
 
-fn render_screen_stub(model: &DashboardModel, name: &str, theme: &Theme, out: &mut String) {
-    use std::fmt::Write as _;
-    let pending = status_badge("PENDING", theme.palette.muted, theme.accessibility);
-    let _ = writeln!(
-        out,
-        "{name} {pending} — implementation pending (bd-xzt.3.*)"
-    );
-    write_navigation_hint(
-        model,
-        out,
-        "Press 1-7 to navigate, ? for help, : palette, q to quit",
-        "Press 1-7 to navigate, q to quit",
-    );
+/// Map policy mode string to a `PaletteEntry` for `status_badge`.
+fn policy_mode_palette(mode: &str, palette: &ThemePalette) -> PaletteEntry {
+    match mode {
+        "enforce" => palette.success,
+        "canary" => palette.warning,
+        "observe" => palette.accent,
+        "fallback_safe" => palette.critical,
+        _ => palette.muted,
+    }
+}
+
+/// Map policy mode string to a display color for frame-based rendering.
+fn policy_mode_color(mode: &str, palette: &ThemePalette) -> PackedRgba {
+    match mode {
+        "enforce" => palette.success_color(),
+        "canary" => palette.warning_color(),
+        "observe" => palette.accent_color(),
+        "fallback_safe" => palette.critical_color(),
+        _ => palette.muted_color(),
+    }
 }
 
 fn notification_badge(
@@ -2347,7 +3332,7 @@ mod tests {
     }
 
     #[test]
-    fn render_stub_screens_show_label() {
+    fn render_log_search_screen_shows_real_content() {
         let mut model = DashboardModel::new(
             PathBuf::from("/tmp/state.json"),
             vec![],
@@ -2357,7 +3342,8 @@ mod tests {
         model.screen = Screen::LogSearch;
         let frame = render(&model);
         assert!(frame.contains("[S6 Logs]"));
-        assert!(frame.contains("pending"));
+        assert!(frame.contains("query=<preview>"));
+        assert!(!frame.contains("implementation pending"));
     }
 
     #[test]

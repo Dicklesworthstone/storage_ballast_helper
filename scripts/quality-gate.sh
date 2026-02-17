@@ -240,11 +240,11 @@ stage_fmt() {
 }
 
 stage_clippy() {
-  run_cargo "$1" "cargo clippy --all-targets --features tui -- -D warnings"
+  run_cargo "$1" "cargo clippy --all-targets -- -D warnings"
 }
 
 stage_unit() {
-  run_cargo "$1" "cargo test --lib --features tui -- --test-threads=4"
+  run_cargo "$1" "cargo test --lib -- --test-threads=4"
 }
 
 stage_bin() {
@@ -267,43 +267,43 @@ stage_fallback() {
 }
 
 stage_dashboard_integration() {
-  run_cargo "$1" "cargo test --test dashboard_integration_tests --features tui -- --test-threads=4"
+  run_cargo "$1" "cargo test --test dashboard_integration_tests -- --test-threads=4"
 }
 
 stage_tui_unit() {
-  run_cargo "$1" "cargo test --lib --features tui tui:: -- --test-threads=4"
+  run_cargo "$1" "cargo test --lib tui:: -- --test-threads=4"
 }
 
 stage_tui_replay() {
-  run_cargo "$1" "cargo test --lib --features tui tui::test_replay -- --test-threads=4"
+  run_cargo "$1" "cargo test --lib tui::test_replay -- --test-threads=4"
 }
 
 stage_tui_scenarios() {
-  run_cargo "$1" "cargo test --lib --features tui tui::test_scenario_drills -- --test-threads=4"
+  run_cargo "$1" "cargo test --lib tui::test_scenario_drills -- --test-threads=4"
 }
 
 stage_tui_properties() {
-  run_cargo "$1" "cargo test --lib --features tui tui::test_properties -- --test-threads=4"
+  run_cargo "$1" "cargo test --lib tui::test_properties -- --test-threads=4"
 }
 
 stage_tui_fault_injection() {
-  run_cargo "$1" "cargo test --lib --features tui tui::test_fault_injection -- --test-threads=4"
+  run_cargo "$1" "cargo test --lib tui::test_fault_injection -- --test-threads=4"
 }
 
 stage_tui_snapshots() {
-  run_cargo "$1" "cargo test --lib --features tui tui::test_snapshot_golden -- --test-threads=4"
+  run_cargo "$1" "cargo test --lib tui::test_snapshot_golden -- --test-threads=4"
 }
 
 stage_tui_stress() {
-  run_cargo "$1" "cargo test --lib --features tui tui::test_stress -- --test-threads=4"
+  run_cargo "$1" "cargo test --lib tui::test_stress -- --test-threads=4"
 }
 
 stage_tui_parity() {
-  run_cargo "$1" "cargo test --lib --features tui tui::parity_harness -- --test-threads=4"
+  run_cargo "$1" "cargo test --lib tui::parity_harness -- --test-threads=4"
 }
 
 stage_tui_benchmarks() {
-  run_cargo "$1" "cargo test --lib --features tui tui::test_operator_benchmark -- --test-threads=4"
+  run_cargo "$1" "cargo test --lib tui::test_operator_benchmark -- --test-threads=4"
 }
 
 stage_installer() {

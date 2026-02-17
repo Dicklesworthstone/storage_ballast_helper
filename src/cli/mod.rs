@@ -3,7 +3,6 @@
 
 pub mod assets;
 pub mod bootstrap;
-#[cfg(feature = "tui")]
 pub mod dashboard;
 pub mod from_source;
 pub mod install;

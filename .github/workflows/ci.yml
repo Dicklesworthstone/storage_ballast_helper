@@ -25,8 +25,7 @@ jobs:
         run: cargo fmt --check
       - name: Run clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
-      - name: Run clippy (with TUI)
-        run: cargo clippy --all-targets --features tui -- -D warnings
+      # TUI is always compiled — no separate feature-gated clippy needed
 
   unit:
     name: Unit Tests
@@ -38,8 +37,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run unit tests
         run: cargo test --lib -- --nocapture 2>&1 | tee unit-test-output.txt
-      - name: Run unit tests (with TUI)
-        run: cargo test --lib --features tui -- --nocapture 2>&1 | tee unit-test-tui-output.txt
+      # TUI is always compiled — tests run with default features above
       - name: Run binary tests
         run: cargo test --bin sbh -- --nocapture 2>&1 | tee bin-test-output.txt
       - name: Upload test logs
@@ -103,19 +101,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: TUI replay + scenario drills
         run: |
-          cargo test --lib --features tui tui::test_replay -- --nocapture 2>&1 | tee tui-replay-output.txt
-          cargo test --lib --features tui tui::test_scenario_drills -- --nocapture 2>&1 | tee tui-scenarios-output.txt
+          cargo test --lib tui::test_replay -- --nocapture 2>&1 | tee tui-replay-output.txt
+          cargo test --lib tui::test_scenario_drills -- --nocapture 2>&1 | tee tui-scenarios-output.txt
       - name: TUI property + fault injection tests
         run: |
-          cargo test --lib --features tui tui::test_properties -- --nocapture 2>&1 | tee tui-properties-output.txt
-          cargo test --lib --features tui tui::test_fault_injection -- --nocapture 2>&1 | tee tui-fault-injection-output.txt
+          cargo test --lib tui::test_properties -- --nocapture 2>&1 | tee tui-properties-output.txt
+          cargo test --lib tui::test_fault_injection -- --nocapture 2>&1 | tee tui-fault-injection-output.txt
       - name: TUI parity + snapshots + benchmarks
         run: |
-          cargo test --lib --features tui tui::parity_harness -- --nocapture 2>&1 | tee tui-parity-output.txt
-          cargo test --lib --features tui tui::test_snapshot_golden -- --nocapture 2>&1 | tee tui-snapshots-output.txt
-          cargo test --lib --features tui tui::test_operator_benchmark -- --nocapture 2>&1 | tee tui-benchmarks-output.txt
+          cargo test --lib tui::parity_harness -- --nocapture 2>&1 | tee tui-parity-output.txt
+          cargo test --lib tui::test_snapshot_golden -- --nocapture 2>&1 | tee tui-snapshots-output.txt
+          cargo test --lib tui::test_operator_benchmark -- --nocapture 2>&1 | tee tui-benchmarks-output.txt
       - name: Dashboard integration tests
-        run: cargo test --test dashboard_integration_tests --features tui -- --nocapture 2>&1 | tee dashboard-integration-output.txt
+        run: cargo test --test dashboard_integration_tests -- --nocapture 2>&1 | tee dashboard-integration-output.txt
       - name: Fallback verification
         run: cargo test --test fallback_verification -- --nocapture 2>&1 | tee fallback-output.txt
       - name: Upload dashboard test logs

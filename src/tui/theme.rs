@@ -4,7 +4,6 @@
 
 use std::env;
 
-#[cfg(feature = "tui")]
 use ftui::{PackedRgba, Style};
 
 /// Contrast profile used by theme token selection.
@@ -156,75 +155,61 @@ impl ThemePalette {
 
     // ── PackedRgba color accessors (tui feature only) ──
 
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn accent_color(&self) -> PackedRgba {
         PackedRgba::rgb(0, 200, 200)
     }
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn success_color(&self) -> PackedRgba {
         PackedRgba::rgb(80, 200, 80)
     }
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn warning_color(&self) -> PackedRgba {
         PackedRgba::rgb(230, 190, 50)
     }
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn orange_color(&self) -> PackedRgba {
         PackedRgba::rgb(230, 130, 30)
     }
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn danger_color(&self) -> PackedRgba {
         PackedRgba::rgb(220, 60, 60)
     }
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn critical_color(&self) -> PackedRgba {
         PackedRgba::rgb(200, 50, 200)
     }
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn muted_color(&self) -> PackedRgba {
         PackedRgba::rgb(100, 100, 100)
     }
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn text_primary(&self) -> PackedRgba {
         PackedRgba::rgb(220, 220, 220)
     }
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn text_secondary(&self) -> PackedRgba {
         PackedRgba::rgb(160, 160, 160)
     }
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn surface_bg(&self) -> PackedRgba {
         PackedRgba::rgb(20, 20, 30)
     }
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn panel_bg(&self) -> PackedRgba {
         PackedRgba::rgb(30, 30, 45)
     }
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn border_color(&self) -> PackedRgba {
         PackedRgba::rgb(60, 60, 80)
     }
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn highlight_bg(&self) -> PackedRgba {
         PackedRgba::rgb(40, 50, 70)
     }
 
     /// Map a pressure level string to a `PackedRgba` color.
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn pressure_color(&self, level: &str) -> PackedRgba {
         match level {
             "green" => self.success_color(),
@@ -237,8 +222,7 @@ impl ThemePalette {
     }
 
     /// Build a `Style` for a semantic token.
-    #[cfg(feature = "tui")]
-    #[must_use]
+        #[must_use]
     pub fn token_style(&self, token: SemanticToken) -> Style {
         let color = match token {
             SemanticToken::Accent => self.accent_color(),

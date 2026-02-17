@@ -111,6 +111,9 @@ enum Command {
 
     /// Post-install setup: PATH, completions, and verification.
     Setup(SetupArgs),
+
+    /// Detect and manage AI tool integration hooks.
+    Integrations(IntegrationsArgs),
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -168,6 +171,9 @@ struct InstallArgs {
     /// Show what would be done without executing.
     #[arg(long)]
     dry_run: bool,
+    /// Inject pre-execution hooks into detected AI coding tools (Claude Code, Codex, etc.).
+    #[arg(long)]
+    integrations: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -530,6 +536,22 @@ struct SetupArgs {
     dry_run: bool,
 }
 
+#[derive(Debug, Clone, Args, Serialize, Default)]
+struct IntegrationsArgs {
+    /// Only detect tools without injecting hooks.
+    #[arg(long)]
+    detect: bool,
+    /// Print what would be done without making changes.
+    #[arg(long)]
+    dry_run: bool,
+    /// Restrict to specific tools (comma-separated: claude-code, codex, gemini, cursor, aider).
+    #[arg(long, value_delimiter = ',', value_name = "TOOLS")]
+    only: Vec<String>,
+    /// Skip specific tools (comma-separated).
+    #[arg(long, value_delimiter = ',', value_name = "TOOLS")]
+    skip: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputMode {
     Human,
@@ -604,6 +626,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Update(args) => run_update(cli, args),
         Command::Setup(args) => run_setup(cli, args),
+        Command::Integrations(args) => run_integrations(cli, args),
     }
 }
 
@@ -628,6 +651,34 @@ fn run_daemon(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
 
 #[allow(clippy::too_many_lines)]
 fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
+    // -- AI tool integrations (opt-in) ----------------------------------------
+    if args.integrations {
+        use storage_ballast_helper::cli::integrations::{
+            BootstrapOptions, format_summary_human, run_bootstrap,
+        };
+
+        let opts = BootstrapOptions {
+            dry_run: args.dry_run,
+            ..BootstrapOptions::default()
+        };
+        let summary = run_bootstrap(&opts);
+
+        match output_mode(cli) {
+            OutputMode::Human => {
+                print!("{}", format_summary_human(&summary));
+            }
+            OutputMode::Json => {
+                let payload = serde_json::to_value(&summary)?;
+                write_json_line(&payload)?;
+            }
+        }
+
+        // If no other install actions requested, we're done.
+        if !args.wizard && !args.auto && !args.from_source && !args.systemd && !args.launchd {
+            return Ok(());
+        }
+    }
+
     // -- wizard / auto mode ---------------------------------------------------
     if args.wizard || args.auto {
         use storage_ballast_helper::cli::wizard::{
@@ -914,6 +965,84 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             Err(CliError::Runtime(format!("install failed: {e}")))
         }
     }
+}
+
+fn run_integrations(cli: &Cli, args: &IntegrationsArgs) -> Result<(), CliError> {
+    use storage_ballast_helper::cli::integrations::{
+        AiTool, BootstrapOptions, detect_tools, format_summary_human, run_bootstrap,
+    };
+
+    let parse_tool = |name: &str| -> Result<AiTool, CliError> {
+        match name {
+            "claude-code" => Ok(AiTool::ClaudeCode),
+            "codex" => Ok(AiTool::Codex),
+            "gemini" | "gemini-cli" => Ok(AiTool::GeminiCli),
+            "cursor" => Ok(AiTool::Cursor),
+            "aider" => Ok(AiTool::Aider),
+            other => Err(CliError::User(format!(
+                "unknown tool {other:?}; valid: claude-code, codex, gemini-cli, cursor, aider"
+            ))),
+        }
+    };
+
+    // Detect-only mode: list detected tools and exit.
+    if args.detect {
+        let detected = detect_tools();
+        match output_mode(cli) {
+            OutputMode::Human => {
+                if detected.is_empty() {
+                    println!("No AI coding tools detected.");
+                } else {
+                    println!("Detected AI coding tools:");
+                    for d in &detected {
+                        let status = if d.already_configured {
+                            "configured"
+                        } else {
+                            "not configured"
+                        };
+                        println!("  {} ({}): {}", d.tool, status, d.config_path.display());
+                    }
+                }
+            }
+            OutputMode::Json => {
+                let payload = serde_json::to_value(&detected)?;
+                write_json_line(&payload)?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Parse --only / --skip tool filters.
+    let only_tools: Vec<AiTool> = args
+        .only
+        .iter()
+        .map(|s| parse_tool(s))
+        .collect::<Result<_, _>>()?;
+    let skip_tools: Vec<AiTool> = args
+        .skip
+        .iter()
+        .map(|s| parse_tool(s))
+        .collect::<Result<_, _>>()?;
+
+    let opts = BootstrapOptions {
+        dry_run: args.dry_run,
+        backup_dir: None,
+        only_tools,
+        skip_tools,
+    };
+    let summary = run_bootstrap(&opts);
+
+    match output_mode(cli) {
+        OutputMode::Human => {
+            print!("{}", format_summary_human(&summary));
+        }
+        OutputMode::Json => {
+            let payload = serde_json::to_value(&summary)?;
+            write_json_line(&payload)?;
+        }
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2800,7 +2929,6 @@ impl std::fmt::Display for DashboardSelectionReason {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 struct DashboardRuntimeRequest {
     refresh_ms: u64,
     state_file: PathBuf,
@@ -2902,7 +3030,6 @@ fn run_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Result
     }
 }
 
-#[cfg(feature = "tui")]
 fn run_new_dashboard_runtime(request: &DashboardRuntimeRequest) -> Result<(), CliError> {
     use storage_ballast_helper::tui::{
         self, DashboardRuntimeConfig as NewDashboardRuntimeConfig, DashboardRuntimeMode,
@@ -2918,13 +3045,6 @@ fn run_new_dashboard_runtime(request: &DashboardRuntimeRequest) -> Result<(), Cl
     };
     tui::run_dashboard(&config)
         .map_err(|e| CliError::Runtime(format!("dashboard runtime failure: {e}")))
-}
-
-#[cfg(not(feature = "tui"))]
-fn run_new_dashboard_runtime(_request: &DashboardRuntimeRequest) -> Result<(), CliError> {
-    Err(CliError::User(
-        "dashboard: --new-dashboard requires a binary built with `--features tui`".to_string(),
-    ))
 }
 
 fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
@@ -5607,24 +5727,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "tui"))]
-    #[test]
-    fn new_dashboard_requires_tui_feature() {
-        let request = DashboardRuntimeRequest {
-            refresh_ms: 1_000,
-            state_file: PathBuf::from("/tmp/state.json"),
-            monitor_paths: vec![PathBuf::from("/tmp")],
-            selection: DashboardRuntimeSelection::New,
-            _reason: DashboardSelectionReason::CliFlagNew,
-            sqlite_db: None,
-            jsonl_log: None,
-        };
-
-        let err_text = run_new_dashboard_runtime(&request)
-            .err()
-            .map_or_else(String::new, |e| e.to_string());
-        assert!(err_text.contains("--features tui"));
-    }
+    // TUI is always compiled in — no feature-gated fallback test needed.
 
     #[test]
     fn protect_requires_path_or_list() {
