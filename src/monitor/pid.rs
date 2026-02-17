@@ -67,6 +67,7 @@ pub struct PidPressureController {
     /// [critical_seconds, high_seconds, moderate_seconds]
     urgency_thresholds: [f64; 3],
     last_error: f64,
+    last_derivative: f64,
     last_update: Option<Instant>,
     level: PressureLevel,
 }
@@ -103,6 +104,7 @@ impl PidPressureController {
             base_poll_interval,
             urgency_thresholds: [60.0, 300.0, 900.0],
             last_error: 0.0,
+            last_derivative: 0.0,
             last_update: None,
             level: PressureLevel::Green,
         }
@@ -190,7 +192,11 @@ impl PidPressureController {
         self.integral = error
             .mul_add(dt, self.integral)
             .clamp(-self.integral_cap, self.integral_cap);
-        let derivative = (error - self.last_error) / dt;
+        let raw_derivative = (error - self.last_error) / dt;
+        // Low-pass filter on derivative to suppress measurement noise spikes.
+        // Alpha=0.3: responsive enough for real pressure changes, smooths jitter.
+        let derivative = 0.3f64.mul_add(raw_derivative, 0.7 * self.last_derivative);
+        self.last_derivative = derivative;
         self.last_error = error;
         self.last_update = Some(now);
 

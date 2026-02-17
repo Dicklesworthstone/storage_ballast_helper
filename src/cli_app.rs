@@ -2503,8 +2503,23 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
             Ok(())
         }
         Some(BallastCommand::Provision) => {
+            let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+            let collector = FsStatsCollector::new(platform, std::time::Duration::from_millis(500));
+            let ballast_dir = config.paths.ballast_dir.clone();
+            let free_check = move || -> f64 {
+                collector
+                    .collect(&ballast_dir)
+                    .map(|s| {
+                        if s.total_bytes == 0 {
+                            0.0
+                        } else {
+                            s.available_bytes as f64 / s.total_bytes as f64 * 100.0
+                        }
+                    })
+                    .unwrap_or(0.0)
+            };
             let report = manager
-                .provision(None)
+                .provision(Some(&free_check))
                 .map_err(|e| CliError::Runtime(e.to_string()))?;
 
             match output_mode(cli) {
@@ -2600,8 +2615,23 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
             }
         }
         Some(BallastCommand::Replenish) => {
+            let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+            let collector = FsStatsCollector::new(platform, std::time::Duration::from_millis(500));
+            let ballast_dir = config.paths.ballast_dir.clone();
+            let free_check = move || -> f64 {
+                collector
+                    .collect(&ballast_dir)
+                    .map(|s| {
+                        if s.total_bytes == 0 {
+                            0.0
+                        } else {
+                            s.available_bytes as f64 / s.total_bytes as f64 * 100.0
+                        }
+                    })
+                    .unwrap_or(0.0)
+            };
             let report = manager
-                .replenish(None)
+                .replenish(Some(&free_check))
                 .map_err(|e| CliError::Runtime(e.to_string()))?;
 
             match output_mode(cli) {

@@ -12,7 +12,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -217,6 +217,9 @@ pub struct NotificationConfig {
     pub enabled: bool,
     /// Which channel names to activate.
     pub channels: Vec<String>,
+    /// Minimum seconds between notifications (0 = no throttle).
+    /// Red/Critical events bypass this throttle.
+    pub min_notify_interval_secs: u64,
     pub desktop: DesktopConfig,
     pub webhook: WebhookConfig,
     pub file: FileConfig,
@@ -228,6 +231,7 @@ impl Default for NotificationConfig {
         Self {
             enabled: true,
             channels: vec!["journal".to_string(), "file".to_string()],
+            min_notify_interval_secs: 60,
             desktop: DesktopConfig::default(),
             webhook: WebhookConfig::default(),
             file: FileConfig::default(),
@@ -641,6 +645,7 @@ pub struct NotificationManager {
     channels: Vec<Box<dyn Channel>>,
     enabled: bool,
     last_send: Option<Instant>,
+    min_interval: Duration,
 }
 
 impl NotificationManager {
@@ -652,6 +657,7 @@ impl NotificationManager {
                 channels: Vec::new(),
                 enabled: false,
                 last_send: None,
+                min_interval: Duration::ZERO,
             };
         }
 
@@ -681,6 +687,7 @@ impl NotificationManager {
             channels,
             enabled: true,
             last_send: None,
+            min_interval: Duration::from_secs(config.min_notify_interval_secs),
         }
     }
 
@@ -696,15 +703,29 @@ impl NotificationManager {
             channels: Vec::new(),
             enabled: false,
             last_send: None,
+            min_interval: Duration::ZERO,
         }
     }
 
     /// Dispatch a notification event to all enabled channels.
     ///
-    /// Failures in individual channels are logged to stderr but do not propagate.
+    /// Events are throttled by `min_notify_interval_secs` (default 60s).
+    /// Red and Critical events bypass throttling to ensure timely alerts.
     pub fn notify(&mut self, event: &NotificationEvent) {
         if !self.enabled {
             return;
+        }
+
+        // Throttle: skip if we sent recently, unless event is Red/Critical.
+        let level = event.level();
+        let bypass_throttle =
+            level >= NotificationLevel::Red;
+        if !bypass_throttle && !self.min_interval.is_zero() {
+            if let Some(last) = self.last_send {
+                if last.elapsed() < self.min_interval {
+                    return;
+                }
+            }
         }
 
         self.last_send = Some(Instant::now());

@@ -357,7 +357,10 @@ fn write_config(config: &Config, path: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::write(path, toml_str)?;
+    // Atomic write: temp file + rename prevents partial config on crash.
+    let tmp_path = path.with_extension("toml.tmp");
+    std::fs::write(&tmp_path, toml_str)?;
+    std::fs::rename(&tmp_path, path)?;
     Ok(())
 }
 

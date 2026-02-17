@@ -107,9 +107,13 @@ impl DiskRateEstimator {
             self.residual_ewma,
             (inst_rate - self.ewma_rate).abs(),
         );
+        let prev_ewma_rate = self.ewma_rate;
         self.ewma_rate = ewma(alpha, self.ewma_rate, inst_rate);
-        let inst_accel = (inst_rate - previous.inst_rate) / dt;
-        self.ewma_accel = ewma(alpha, self.ewma_accel, inst_accel);
+        // Compute acceleration from EWMA-smoothed rate change, not raw
+        // instantaneous rates. This eliminates noise amplification when the
+        // polling interval varies (e.g., PID changes poll from 4s to 0.5s).
+        let smoothed_accel = (self.ewma_rate - prev_ewma_rate) / dt;
+        self.ewma_accel = ewma(alpha, self.ewma_accel, smoothed_accel);
 
         self.samples = self.samples.saturating_add(1);
         self.last = Some(SampleState {
