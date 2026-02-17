@@ -32,7 +32,6 @@ pub struct RateEstimate {
 struct SampleState {
     free_bytes: u64,
     at: Instant,
-    inst_rate: f64,
 }
 
 /// Online EWMA estimator with adaptive alpha and fallback signaling.
@@ -92,7 +91,6 @@ impl DiskRateEstimator {
             self.last = Some(SampleState {
                 free_bytes,
                 at: observed_at,
-                inst_rate: 0.0,
             });
             return self.fallback_estimate(free_bytes, threshold_free_bytes);
         };
@@ -133,7 +131,6 @@ impl DiskRateEstimator {
         self.last = Some(SampleState {
             free_bytes,
             at: observed_at,
-            inst_rate,
         });
 
         let confidence = self.compute_confidence();

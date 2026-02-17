@@ -44,7 +44,6 @@ use crate::monitor::special_locations::SpecialLocationRegistry;
 use crate::monitor::voi_scheduler::VoiScheduler;
 use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
 use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
-use crate::scanner::merkle::MerkleScanIndex;
 use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry};
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::{CandidacyScore, ScoringEngine};

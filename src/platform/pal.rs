@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -209,6 +211,102 @@ impl Platform for LinuxPlatform {
     }
 }
 
+/// macOS platform implementation using `mount`, `statvfs`, and `sysctl`.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct MacOsPlatform {
+    mounts_cache: RwLock<Option<(Vec<MountPoint>, Instant)>>,
+    cache_ttl: Duration,
+}
+
+#[cfg(target_os = "macos")]
+impl Default for MacOsPlatform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MacOsPlatform {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            mounts_cache: RwLock::new(None),
+            cache_ttl: Duration::from_secs(5),
+        }
+    }
+
+    fn get_cached_mounts(&self) -> Result<Vec<MountPoint>> {
+        {
+            let cache = self.mounts_cache.read();
+            if let Some((mounts, collected_at)) = &*cache
+                && collected_at.elapsed() < self.cache_ttl
+            {
+                return Ok(mounts.clone());
+            }
+        }
+
+        let raw = run_command_capture("mount", &[])?;
+        let mounts = parse_macos_mounts(&raw);
+        *self.mounts_cache.write() = Some((mounts.clone(), Instant::now()));
+        Ok(mounts)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Platform for MacOsPlatform {
+    fn fs_stats(&self, path: &Path) -> Result<FsStats> {
+        let mounts = self.mount_points()?;
+        let mount = find_mount(path, &mounts).ok_or_else(|| SbhError::FsStats {
+            path: path.to_path_buf(),
+            details: "could not map path to mount point".to_string(),
+        })?;
+        let stat = nix::sys::statvfs::statvfs(path).map_err(|error| SbhError::FsStats {
+            path: path.to_path_buf(),
+            details: error.to_string(),
+        })?;
+        let fragment = stat.fragment_size() as u64;
+        Ok(FsStats {
+            total_bytes: (stat.blocks() as u64).saturating_mul(fragment),
+            free_bytes: (stat.blocks_free() as u64).saturating_mul(fragment),
+            available_bytes: (stat.blocks_available() as u64).saturating_mul(fragment),
+            fs_type: mount.fs_type.clone(),
+            mount_point: mount.path.clone(),
+            is_readonly: stat.flags().contains(nix::sys::statvfs::FsFlags::ST_RDONLY),
+        })
+    }
+
+    fn mount_points(&self) -> Result<Vec<MountPoint>> {
+        self.get_cached_mounts()
+    }
+
+    fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+        let mounts = self.mount_points()?;
+        let Some(mount) = find_mount(path, &mounts) else {
+            return Ok(false);
+        };
+        Ok(mount.is_ram_backed)
+    }
+
+    fn default_paths(&self) -> PlatformPaths {
+        PlatformPaths::default()
+    }
+
+    fn memory_info(&self) -> Result<MemoryInfo> {
+        let total_raw = run_command_capture("sysctl", &["-n", "hw.memsize"])?;
+        let vm_stat_raw = run_command_capture("vm_stat", &[])?;
+        let swap_raw = run_command_capture("sysctl", &["-n", "vm.swapusage"])?;
+        parse_macos_memory_info(&total_raw, &vm_stat_raw, &swap_raw)
+    }
+
+    fn service_manager(&self) -> Box<dyn ServiceManager> {
+        match crate::daemon::service::LaunchdServiceManager::from_env(true) {
+            Ok(mgr) => Box::new(mgr),
+            Err(_) => Box::<NoopServiceManager>::default(),
+        }
+    }
+}
+
 /// In-memory mock implementation for deterministic tests.
 #[derive(Debug, Clone)]
 pub struct MockPlatform {
@@ -277,11 +375,240 @@ pub fn detect_platform() -> Result<Arc<dyn Platform>> {
     {
         Ok(Arc::new(LinuxPlatform::new()))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Arc::new(MacOsPlatform::new()))
+    }
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
     {
         Err(SbhError::UnsupportedPlatform {
-            details: "only Linux is currently implemented".to_string(),
+            details: "supported platforms: linux, macos".to_string(),
         })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_command_capture(cmd: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(cmd)
+        .args(args)
+        .output()
+        .map_err(|source| SbhError::Io {
+            path: PathBuf::from(cmd),
+            source,
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(SbhError::Runtime {
+            details: format!(
+                "{cmd} {} failed (exit {}): {}",
+                args.join(" "),
+                output.status.code().unwrap_or(-1),
+                stderr
+            ),
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_mounts(raw: &str) -> Vec<MountPoint> {
+    let mut mounts = Vec::new();
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Some((device, rhs)) = line.split_once(" on ") else {
+            eprintln!("[sbh] warning: skipping malformed mount line: {line}");
+            continue;
+        };
+        let Some((mount_path, details_raw)) = rhs.split_once(" (") else {
+            eprintln!("[sbh] warning: skipping malformed mount line: {line}");
+            continue;
+        };
+        let details = details_raw.strip_suffix(')').unwrap_or(details_raw);
+        let fs_type = details
+            .split(',')
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        mounts.push(MountPoint {
+            path: PathBuf::from(mount_path),
+            device: device.to_string(),
+            is_ram_backed: is_ram_fs(&fs_type),
+            fs_type,
+        });
+    }
+    mounts.sort_by(|left, right| {
+        right
+            .path
+            .as_os_str()
+            .len()
+            .cmp(&left.path.as_os_str().len())
+    });
+    mounts
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_memory_info(
+    memsize_raw: &str,
+    vm_stat_raw: &str,
+    swapusage_raw: &str,
+) -> Result<MemoryInfo> {
+    let total_bytes = memsize_raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| SbhError::MountParse {
+            details: format!("invalid hw.memsize value {memsize_raw:?}: {error}"),
+        })?;
+
+    let page_size = extract_first_u64(vm_stat_raw).ok_or_else(|| SbhError::MountParse {
+        details: "vm_stat output missing page-size header".to_string(),
+    })?;
+
+    let mut free_pages = None;
+    let mut inactive_pages = None;
+    let mut speculative_pages = 0u64;
+    for line in vm_stat_raw.lines() {
+        let Some((key_raw, value_raw)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key_raw.trim();
+        match key {
+            "Pages free" | "Pages inactive" | "Pages speculative" => {
+                let value_token = value_raw
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches('.');
+                let value = parse_macos_u64(value_token, key)?;
+                match key {
+                    "Pages free" => free_pages = Some(value),
+                    "Pages inactive" => inactive_pages = Some(value),
+                    "Pages speculative" => speculative_pages = value,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let free_pages = free_pages.ok_or_else(|| SbhError::MountParse {
+        details: "vm_stat output missing `Pages free`".to_string(),
+    })?;
+    let inactive_pages = inactive_pages.ok_or_else(|| SbhError::MountParse {
+        details: "vm_stat output missing `Pages inactive`".to_string(),
+    })?;
+    let available_pages = free_pages
+        .saturating_add(inactive_pages)
+        .saturating_add(speculative_pages);
+    let available_bytes = available_pages.saturating_mul(page_size).min(total_bytes);
+
+    let swap_total_bytes = parse_swapusage_field(swapusage_raw, "total")?;
+    let swap_free_bytes = parse_swapusage_field(swapusage_raw, "free")?;
+
+    Ok(MemoryInfo {
+        total_bytes,
+        available_bytes,
+        swap_total_bytes,
+        swap_free_bytes,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_u64(raw: &str, field: &str) -> Result<u64> {
+    raw.trim()
+        .replace(',', "")
+        .parse::<u64>()
+        .map_err(|error| SbhError::MountParse {
+            details: format!("invalid numeric value for {field}: {raw:?} ({error})"),
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn parse_swapusage_field(raw: &str, field: &str) -> Result<u64> {
+    let normalized = raw.replace('=', " = ");
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    for idx in 0..tokens.len() {
+        if tokens[idx] == field && idx + 2 < tokens.len() && tokens[idx + 1] == "=" {
+            return parse_size_with_suffix(tokens[idx + 2], field);
+        }
+    }
+    Err(SbhError::MountParse {
+        details: format!("vm.swapusage output missing `{field}` field: {raw}"),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn parse_size_with_suffix(raw: &str, field: &str) -> Result<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(SbhError::MountParse {
+            details: format!("empty size for {field}"),
+        });
+    }
+
+    let last = trimmed.chars().last().ok_or_else(|| SbhError::MountParse {
+        details: format!("empty size for {field}"),
+    })?;
+    let (number_raw, unit) = if last.is_ascii_alphabetic() {
+        (&trimmed[..trimmed.len() - last.len_utf8()], Some(last))
+    } else {
+        (trimmed, None)
+    };
+
+    let number = number_raw
+        .trim()
+        .parse::<f64>()
+        .map_err(|error| SbhError::MountParse {
+            details: format!("invalid size value for {field}: {raw:?} ({error})"),
+        })?;
+    let multiplier = match unit.map(|value| value.to_ascii_uppercase()) {
+        None | Some('B') => 1.0,
+        Some('K') => 1024.0,
+        Some('M') => 1024.0 * 1024.0,
+        Some('G') => 1024.0 * 1024.0 * 1024.0,
+        Some('T') => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        Some(other) => {
+            return Err(SbhError::MountParse {
+                details: format!("unsupported size unit for {field}: {other}"),
+            });
+        }
+    };
+
+    let bytes = number * multiplier;
+    if !bytes.is_finite() || bytes.is_sign_negative() {
+        return Err(SbhError::MountParse {
+            details: format!("invalid computed size for {field}: {raw}"),
+        });
+    }
+    if bytes > u64::MAX as f64 {
+        return Err(SbhError::MountParse {
+            details: format!("size overflow for {field}: {raw}"),
+        });
+    }
+
+    Ok(bytes.round() as u64)
+}
+
+#[cfg(target_os = "macos")]
+fn extract_first_u64(raw: &str) -> Option<u64> {
+    let mut digits = String::new();
+    let mut collecting = false;
+
+    for ch in raw.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            collecting = true;
+        } else if collecting {
+            break;
+        }
+    }
+
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u64>().ok()
     }
 }
 
@@ -324,7 +651,7 @@ fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoin
 fn is_ram_fs(fs_type: &str) -> bool {
     matches!(
         fs_type.to_ascii_lowercase().as_str(),
-        "tmpfs" | "ramfs" | "devtmpfs"
+        "tmpfs" | "ramfs" | "devtmpfs" | "devfs" | "mfs"
     )
 }
 
@@ -442,6 +769,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn parses_macos_mount_output() {
+        let sample = "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n\
+                      devfs on /dev (devfs, local, nobrowse)\n";
+        let mounts = super::parse_macos_mounts(sample);
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts.iter().any(|entry| entry.path == Path::new("/")));
+        assert!(mounts.iter().any(|entry| entry.fs_type == "apfs"));
+        assert!(mounts.iter().any(|entry| entry.is_ram_backed));
+    }
+
+    #[test]
     fn find_mount_prefers_longest_prefix() {
         let mounts = vec![
             MountPoint {
@@ -489,6 +828,25 @@ mod tests {
         assert_eq!(info.available_bytes, 524_288);
         assert_eq!(info.swap_total_bytes, 0);
         assert_eq!(info.swap_free_bytes, 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn parses_macos_memory_outputs() {
+        let info = super::parse_macos_memory_info(
+            "17179869184\n",
+            "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n\
+             Pages free:               1000.\n\
+             Pages inactive:           2000.\n\
+             Pages speculative:         300.\n",
+            "total = 1024.00M  used = 256.00M  free = 768.00M  (encrypted)",
+        )
+        .expect("macos memory output should parse");
+
+        assert_eq!(info.total_bytes, 17_179_869_184);
+        assert_eq!(info.available_bytes, 13_516_800);
+        assert_eq!(info.swap_total_bytes, 1_073_741_824);
+        assert_eq!(info.swap_free_bytes, 805_306_368);
     }
 
     #[test]

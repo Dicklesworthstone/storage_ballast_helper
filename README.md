@@ -33,7 +33,8 @@ Cross-platform disk-pressure defense for AI coding workloads: predictive monitor
 
 ```bash
 # 1) Install and bootstrap service
-sbh install --systemd
+sbh install --systemd --user      # Linux
+sbh install --launchd --user      # macOS
 
 # 2) Provision per-volume ballast pools
 sbh ballast provision
@@ -214,8 +215,8 @@ sbh config validate
 ```
 3. Install service:
 ```bash
-sbh install --systemd        # Linux
-sbh install --launchd        # macOS
+sbh install --systemd --user # Linux (user scope)
+sbh install --launchd --user # macOS (LaunchAgent)
 ```
 4. Start monitoring:
 ```bash
@@ -242,7 +243,26 @@ Running `sbh install` without prior configuration launches the install wizard, w
 | Large | 20 | 1 GiB | 20 GiB |
 | Custom | user-specified | 1 GiB | varies |
 
-For non-interactive environments (CI, automation), `sbh install --auto` applies platform-detected defaults: the platform-native service manager, auto-discovered watched paths, user-scope service, and Medium ballast preset.
+For non-interactive environments (CI, automation), `sbh install --auto` writes a platform-default config and ballast sizing profile. Then run explicit service registration:
+
+```bash
+sbh install --systemd --user # Linux
+sbh install --launchd --user # macOS
+```
+
+### macOS Tested Runbook
+
+```bash
+# Install user launch agent
+sbh install --launchd --user
+
+# Confirm launchd job is loaded
+launchctl list | grep com.sbh.daemon
+
+# Validate daemon health and pressure
+sbh status --json | jq '{daemon_running, pressure: .pressure.overall}'
+sbh check --target-free 15
+```
 
 ## Command Reference
 

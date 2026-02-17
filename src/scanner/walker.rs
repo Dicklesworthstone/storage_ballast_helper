@@ -7,9 +7,12 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_possible_truncation)]
 
-use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -594,10 +597,12 @@ const MAX_ENTRIES_PER_DIR: u32 = 65_536;
 /// Maximum time to spend scanning /proc for open file ancestors.
 /// On agent swarms with many processes, /proc scanning can take minutes.
 /// A 5-second budget captures enough data for reliable veto decisions.
+#[cfg(target_os = "linux")]
 const OPEN_FILES_SCAN_BUDGET: Duration = Duration::from_secs(5);
 
 /// Maximum number of PIDs to scan before bailing out.
 /// Increased to 50,000 to handle busy swarm machines without false-negative open checks.
+#[cfg(target_os = "linux")]
 const OPEN_FILES_MAX_PIDS: usize = 50_000;
 
 /// Collect absolute open-path ancestors for open file descriptors under `root_paths`.
@@ -727,16 +732,30 @@ pub fn is_path_open_by_ancestor<S: std::hash::BuildHasher>(
 
 /// Memoized open-file detector for repeated path checks during one scan pass.
 pub struct OpenPathCache<'a, S = std::collections::hash_map::RandomState> {
+    #[cfg(target_os = "linux")]
     open_inodes: &'a HashSet<(u64, u64), S>,
+    #[cfg(target_os = "linux")]
     dir_cache: HashMap<PathBuf, bool>,
+    #[cfg(not(target_os = "linux"))]
+    marker: PhantomData<&'a HashSet<(u64, u64), S>>,
 }
 
 impl<'a, S: std::hash::BuildHasher> OpenPathCache<'a, S> {
     #[must_use]
     pub fn new(open_inodes: &'a HashSet<(u64, u64), S>) -> Self {
-        Self {
-            open_inodes,
-            dir_cache: HashMap::new(),
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                open_inodes,
+                dir_cache: HashMap::new(),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = open_inodes;
+            Self {
+                marker: PhantomData,
+            }
         }
     }
 
