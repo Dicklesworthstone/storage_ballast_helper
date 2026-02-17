@@ -422,6 +422,13 @@ impl SelfMonitor {
     pub fn record_deletions(&mut self, count: u64, bytes: u64) {
         self.deletions_total += count;
         self.bytes_freed_total += bytes;
+        // Update last_scan_deleted so the state file reflects actual
+        // deletions.  Scan completion and deletion completion arrive via
+        // separate WorkerReport variants, so record_scan always passes 0.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.last_scan_deleted = count as usize;
+        }
     }
 
     /// Record an error.

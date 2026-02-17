@@ -854,13 +854,16 @@ impl MonitoringDaemon {
 
             // 7c. Self-monitoring: write state file + check RSS.
             {
-                let primary_path = self.primary_path();
+                // Use the causing mount from the worst response so the state
+                // file reflects the mount that actually drove the pressure
+                // level, not the primary path which may be healthy.
+                let state_path = &response.causing_mount;
                 let free_pct = self
                     .fs_collector
-                    .collect(primary_path)
+                    .collect(state_path)
                     .map(|s| s.free_pct())
                     .unwrap_or(0.0);
-                let mount_str = primary_path.to_string_lossy().into_owned();
+                let mount_str = state_path.to_string_lossy().into_owned();
                 let ballast_available = self
                     .ballast_coordinator
                     .inventory()
@@ -1101,10 +1104,10 @@ impl MonitoringDaemon {
     }
 
     fn log_pressure_change(&mut self, response: &crate::monitor::pid::PressureResponse) {
-        let primary_path = self.primary_path();
-        // Best-effort: collect fresh stats for the log entry.
+        // Use the causing mount so the log entry reflects the mount that
+        // actually drove the pressure level change, not the primary path.
         let (free_pct, mount, total, free) =
-            if let Ok(stats) = self.fs_collector.collect(primary_path) {
+            if let Ok(stats) = self.fs_collector.collect(&response.causing_mount) {
                 #[allow(clippy::cast_possible_wrap)]
                 (
                     stats.free_pct(),
@@ -1348,8 +1351,20 @@ impl MonitoringDaemon {
 
     fn check_predictive_warning(&mut self, response: &crate::monitor::pid::PressureResponse) {
         let Some(seconds) = response.predicted_seconds else {
+            // Prediction cleared — reset stale state so the next real
+            // warning is not suppressed by an old severity/timestamp.
+            self.last_predictive_level = None;
+            self.last_predictive_warning = None;
             return;
         };
+
+        // Suppress bogus predictions when confidence is below the configured
+        // minimum (default 70%).  Without this gate the daemon spams
+        // "disk full in N minutes" warnings on healthy disks whenever the
+        // EWMA estimator is in fallback mode or has insufficient data.
+        if self.last_ewma_confidence < self.config.pressure.prediction.min_confidence {
+            return;
+        }
 
         let warning_horizon_secs = self.config.pressure.prediction.warning_horizon_minutes * 60.0;
 
@@ -1358,11 +1373,17 @@ impl MonitoringDaemon {
         }
 
         let minutes = seconds / 60.0;
-        // Determine severity level based on config thresholds.
+        // Determine severity level to match NotificationEvent::PredictiveWarning::level():
+        //   Critical  < critical_danger_minutes  (default  2 min)
+        //   Red       < imminent_danger_minutes  (default  5 min)
+        //   Orange    < action_horizon_minutes   (default 30 min)
+        //   Warning   everything else within the warning horizon
         let current_level = if minutes < self.config.pressure.prediction.critical_danger_minutes {
             NotificationLevel::Critical
         } else if minutes < self.config.pressure.prediction.imminent_danger_minutes {
             NotificationLevel::Red
+        } else if minutes < self.config.pressure.prediction.action_horizon_minutes {
+            NotificationLevel::Orange
         } else {
             NotificationLevel::Warning
         };
@@ -1370,7 +1391,7 @@ impl MonitoringDaemon {
         let now = Instant::now();
         let should_notify = match self.last_predictive_level {
             Some(last_level) => {
-                // Escalate if severity increases (e.g. Warning -> Red)
+                // Escalate if severity increases (e.g. Warning -> Orange -> Red)
                 // OR if time cooldown (5 mins) expires.
                 if current_level > last_level {
                     true
@@ -1462,6 +1483,17 @@ impl MonitoringDaemon {
             self.last_special_scan.insert(location.path.clone(), now);
 
             if location.needs_attention(&stats) {
+                // Compute pressure level first so we can use it in the notification.
+                let urgency = f64::from(location.priority) / 255.0;
+                let free_ratio = stats.free_pct() / f64::from(location.buffer_pct);
+                let pressure_level = if free_ratio < 0.25 {
+                    PressureLevel::Red
+                } else if free_ratio < 0.5 {
+                    PressureLevel::Orange
+                } else {
+                    PressureLevel::Yellow
+                };
+
                 self.logger_handle.send(ActivityEvent::Error {
                     code: "SBH-2001".to_string(),
                     message: format!(
@@ -1472,29 +1504,20 @@ impl MonitoringDaemon {
                         location.buffer_pct,
                     ),
                 });
-                self.notification_manager.notify(&NotificationEvent::Error {
-                    code: "SBH-2001".to_string(),
-                    message: format!(
-                        "special location {:?} ({}) at {:.1}% free (buffer={}%)",
-                        location.kind,
-                        location.path.display(),
-                        stats.free_pct(),
-                        location.buffer_pct,
-                    ),
-                });
+                // Use PressureChanged instead of Error so the notification
+                // respects the global throttle (Error is Red, which bypasses
+                // it — leading to a notification every 5 seconds).
+                self.notification_manager
+                    .notify(&NotificationEvent::PressureChanged {
+                        from: "Green".to_string(),
+                        to: format!("{pressure_level:?}"),
+                        mount: location.path.to_string_lossy().into_owned(),
+                        free_pct: stats.free_pct(),
+                    });
 
                 // Trigger root filesystem scan: special location pressure (e.g. /dev/shm
                 // full) indicates agent swarm activity that is likely also generating root
                 // filesystem artifacts. Proactively scan to clean up before root hits capacity.
-                let urgency = f64::from(location.priority) / 255.0;
-                let free_ratio = stats.free_pct() / f64::from(location.buffer_pct);
-                let pressure_level = if free_ratio < 0.25 {
-                    PressureLevel::Red
-                } else if free_ratio < 0.5 {
-                    PressureLevel::Orange
-                } else {
-                    PressureLevel::Yellow
-                };
                 let max_delete_batch = match pressure_level {
                     PressureLevel::Red | PressureLevel::Critical => 100,
                     PressureLevel::Orange => 60,

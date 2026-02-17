@@ -43,5 +43,7 @@ mod test_snapshot_golden;
 mod test_stress;
 #[cfg(test)]
 mod test_unit_coverage;
+#[cfg(test)]
+mod test_operator_benchmark;
 
 pub use runtime::{DashboardRuntimeConfig, DashboardRuntimeMode, run_dashboard};
