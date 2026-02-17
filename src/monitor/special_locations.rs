@@ -215,18 +215,24 @@ mod tests {
         let registry =
             SpecialLocationRegistry::discover(&platform, &[PathBuf::from("/data/tmp/custom")])
                 .expect("discovery should succeed");
-        assert!(registry
-            .all()
-            .iter()
-            .any(|location| location.path == Path::new("/dev/shm")));
-        assert!(registry
-            .all()
-            .iter()
-            .any(|location| matches!(location.kind, SpecialKind::Custom(_))));
-        assert!(registry
-            .all()
-            .iter()
-            .any(|location| location.path == Path::new("/tmp")));
+        assert!(
+            registry
+                .all()
+                .iter()
+                .any(|location| location.path == Path::new("/dev/shm"))
+        );
+        assert!(
+            registry
+                .all()
+                .iter()
+                .any(|location| matches!(location.kind, SpecialKind::Custom(_)))
+        );
+        assert!(
+            registry
+                .all()
+                .iter()
+                .any(|location| location.path == Path::new("/tmp"))
+        );
     }
 
     #[test]

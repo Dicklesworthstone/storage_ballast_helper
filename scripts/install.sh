@@ -434,6 +434,189 @@ install_binary() {
   die "Cannot write to ${DEST_DIR}. Retry with --dest, --user, or elevated privileges."
 }
 
+install_skill() {
+  local claude_dest="$HOME/.claude/skills/sbh"
+  local codex_dest="$HOME/.codex/skills/sbh"
+  local installed_claude=false
+  local installed_codex=false
+
+  start_phase "install_skill" "installing sbh skill for AI coding agents"
+  log_header "Installing sbh skill for AI coding agents"
+
+  mkdir -p "$claude_dest" 2>/dev/null || true
+  mkdir -p "$codex_dest" 2>/dev/null || true
+
+  # ── Try downloading skill tarball from release assets ──────────────────────
+  local skill_url
+  if [[ "$RELEASE_LOCATOR" == "latest" ]]; then
+    skill_url="https://github.com/${REPO}/releases/latest/download/skill.tar.gz"
+  else
+    skill_url="https://github.com/${REPO}/releases/download/${RELEASE_LOCATOR}/skill.tar.gz"
+  fi
+  local skill_temp="${WORKDIR}/skill.tar.gz"
+
+  if curl -fsSL --retry 2 --retry-delay 1 -o "$skill_temp" "$skill_url" 2>/dev/null; then
+    if tar -xzf "$skill_temp" -C "$HOME/.claude/skills" 2>/dev/null; then
+      installed_claude=true
+    fi
+    if tar -xzf "$skill_temp" -C "$HOME/.codex/skills" 2>/dev/null; then
+      installed_codex=true
+    fi
+    rm -f "$skill_temp"
+
+    if $installed_claude || $installed_codex; then
+      $installed_claude && log_info "Skill installed: $claude_dest"
+      $installed_codex  && log_info "Skill installed: $codex_dest"
+      finish_phase "skill installed from release tarball"
+      return 0
+    fi
+  fi
+
+  # ── Fallback: create minimal inline skill ──────────────────────────────────
+  log_info "Skill tarball unavailable — creating inline skill"
+
+  local skill_content
+  skill_content=$(cat << 'SKILL_EOF'
+---
+name: sbh
+description: >-
+  Disk-pressure defense for AI coding workloads. Use when: disk full, low
+  space, ballast, cleanup, scan artifacts, emergency, sbh daemon, sbh status.
+---
+
+# SBH — Storage Ballast Helper
+
+Prevents disk-full disasters via ballast files, artifact scanning, and predictive pressure monitoring. Three-pronged: ballast (instant space), scanner (stale artifacts), special locations (/tmp, /dev/shm, swap).
+
+## Quick Check
+
+```bash
+sbh status                     # Pressure level + free space
+sbh status --json | jq '.pressure'  # Machine-parseable
+sbh check --need 5G            # "Do I have 5 GB free?"
+sbh check --predict 30         # "Will I run out in 30 min?"
+```
+
+Exit codes: 0 = healthy, 1 = pressure, 2 = error.
+
+---
+
+## Daemon
+
+```bash
+sbh daemon                          # Foreground (debugging)
+systemctl --user start sbh          # Systemd user scope
+sbh install --systemd --user --auto # Install + start (Linux)
+sbh install --launchd --auto        # Install + start (macOS)
+sbh install --wizard                # Guided interactive setup
+```
+
+**Signals:** `SIGHUP` = reload config, `SIGUSR1` = force scan now, `SIGTERM` = graceful stop.
+
+---
+
+## Ballast
+
+Pre-allocated sacrificial files — released in milliseconds, no scanning needed.
+
+```bash
+sbh ballast status             # Per-volume inventory
+sbh ballast provision          # Create/rebuild pool
+sbh ballast release 3          # Free 3 files NOW
+sbh ballast replenish          # Rebuild after pressure passes
+```
+
+Defaults: 10 x 1 GiB = 10 GiB. Ensure ballast dir is on **same mount** as pressure source.
+
+---
+
+## Scanning & Cleanup
+
+```bash
+sbh scan /data/projects --top 20       # Rank artifacts by score
+sbh clean /data/projects --dry-run     # Preview what would go
+sbh clean --target-free 50G --yes      # Delete until 50 GB free
+```
+
+Scoring: Location (.25) + Name (.25) + Age (.20) + Size (.15) + Structure (.15) = 1.0.
+
+---
+
+## Protection
+
+```bash
+sbh protect /path              # .sbh-protect marker (subtree)
+sbh unprotect /path            # Remove marker
+```
+
+Config globs: `scanner.protected_paths`. Hard vetoes (always enforced): `.git/` dirs, open files, age < 10 min, non-writable parents.
+
+---
+
+## Emergency Recovery
+
+Zero-write mode for near-100% full disks. No config file needed.
+
+```bash
+sbh emergency /data --yes              # Aggressive cleanup NOW
+sbh emergency --target-free 10G        # Stop at 10 GB recovered
+```
+
+---
+
+## Observability
+
+```bash
+sbh dashboard                  # TUI: 7 screens (1-7 to jump)
+sbh stats --window 24h         # Activity over last 24 hours
+sbh blame --top 10             # Top 10 pressure sources
+sbh explain --id <ID>          # Why was this decision made?
+```
+
+---
+
+## Configuration
+
+Config: `~/.config/sbh/config.toml` | Env: `SBH_` prefix | Fallback: `/etc/sbh/config.toml`
+
+```bash
+sbh config show                # Current values
+sbh config validate            # Check constraints
+sbh config set KEY VALUE       # Change a value
+sbh tune --apply --yes         # Auto-tune for this system
+```
+
+---
+
+## Anti-Patterns
+
+| Don't | Do Instead |
+|-------|------------|
+| Ballast on `/tmp` | `paths.ballast_dir` on same mount as pressure source |
+| Daemon as root, CLI as user | `--user` scope — avoids state file permission mismatch |
+| Skip pre-build check | `sbh check --need 10G` in CI/hook |
+| Delete `.sbh-protect` by hand | `sbh unprotect /path` |
+| Wait for Red to act | Act at Yellow — agent swarms escalate fast |
+| `min_file_age_minutes = 0` | Keep >= 5 to protect in-flight writes |
+
+---
+
+## Docs
+
+Full documentation: https://github.com/Dicklesworthstone/storage_ballast_helper
+SKILL_EOF
+)
+
+  printf '%s\n' "$skill_content" > "$claude_dest/SKILL.md"
+  installed_claude=true
+  printf '%s\n' "$skill_content" > "$codex_dest/SKILL.md"
+  installed_codex=true
+
+  log_info "Skill created: $claude_dest/SKILL.md"
+  log_info "Skill created: $codex_dest/SKILL.md"
+  finish_phase "inline skill created (tarball unavailable)"
+}
+
 print_summary() {
   local message="$1"
   local changed="$2"
@@ -447,6 +630,7 @@ print_summary() {
   log_info "Version:     $VERSION"
   log_info "Target:      $TARGET_TRIPLE"
   log_info "Destination: ${DEST_DIR}/${PROGRAM}"
+  log_info "Skill:       ~/.claude/skills/sbh/"
   log_info "Trace ID:    ${TRACE_ID}"
   log_info "Verify:      $(verify_mode_label)"
   log_info "Asset:       $ASSET_URL"
@@ -485,6 +669,8 @@ main() {
         log_info "Would download checksum: ${CHECKSUM_URL}"
       fi
       log_info "Would install to: ${DEST_DIR}/${PROGRAM}"
+      log_info "Would install skill to: ~/.claude/skills/sbh/"
+      log_info "Would install skill to: ~/.codex/skills/sbh/"
     fi
     finish_phase "dry-run plan generated"
     print_summary "dry-run complete (no changes applied)" false
@@ -537,6 +723,8 @@ main() {
   log_header "Installing binary"
   install_binary "$binary_path" "$target_path"
   finish_phase "binary install phase completed"
+
+  install_skill
 
   if [[ "$INSTALL_CHANGED" == "true" ]]; then
     print_summary "installed ${PROGRAM} to ${target_path}" true

@@ -456,7 +456,7 @@ const GLOBAL_HELP_BINDINGS: [HelpBinding; 15] = [
     },
     HelpBinding {
         keys: "Esc",
-        description: "Back (or quit when history is empty)",
+        description: "Close overlay, then close detail, then back, then quit",
     },
     HelpBinding {
         keys: "q",
@@ -487,7 +487,7 @@ const GLOBAL_HELP_BINDINGS: [HelpBinding; 15] = [
         description: "Cycle overview pane focus",
     },
     HelpBinding {
-        keys: "Enter",
+        keys: "Enter/Space",
         description: "Open focused overview pane target screen",
     },
     HelpBinding {

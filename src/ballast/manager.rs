@@ -126,6 +126,8 @@ impl BallastManager {
             inventory: Vec::new(),
             skip_fallocate: false,
         };
+        // Prune any existing files that exceed the initial configuration count.
+        let _ = mgr.prune_orphans();
         mgr.scan_existing();
         Ok(mgr)
     }
@@ -158,6 +160,8 @@ impl BallastManager {
     /// Update configuration at runtime.
     pub fn update_config(&mut self, config: BallastConfig) {
         self.config = config;
+        // Prune any files that exceed the new configuration count.
+        let _ = self.prune_orphans();
         // Re-scan inventory to reflect new file count limits.
         self.scan_existing();
     }
@@ -214,6 +218,9 @@ impl BallastManager {
             total_bytes: 0,
             errors: Vec::new(),
         };
+
+        // Ensure no orphans exist before provisioning.
+        let _ = self.prune_orphans();
 
         for i in 1..=self.config.file_count {
             let index = i as u32;
@@ -352,6 +359,9 @@ impl BallastManager {
             errors: Vec::new(),
         };
 
+        // Ensure no orphans exist before replenishing.
+        let _ = self.prune_orphans();
+
         for i in 1..=self.config.file_count {
             let index = i as u32;
             let path = self.file_path(index);
@@ -396,6 +406,51 @@ impl BallastManager {
     }
 
     // ──────────────────── internal ────────────────────
+
+    /// Scan directory for ballast files with index > current file_count and remove them.
+    fn prune_orphans(&self) -> Result<()> {
+        let entries = match fs::read_dir(&self.ballast_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(SbhError::io(&self.ballast_dir, e)),
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            // Check pattern: SBH_BALLAST_FILE_{index:05}.dat
+            if !name.starts_with("SBH_BALLAST_FILE_") || !name.ends_with(".dat") {
+                continue;
+            }
+
+            let prefix_len = "SBH_BALLAST_FILE_".len();
+            let suffix_len = ".dat".len();
+            if name.len() <= prefix_len + suffix_len {
+                continue;
+            }
+
+            let num_part = &name[prefix_len..name.len() - suffix_len];
+            if let Ok(index) = num_part.parse::<u32>() {
+                if index > self.config.file_count as u32 || index == 0 {
+                    // Orphan!
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn file_path(&self, index: u32) -> PathBuf {
         self.ballast_dir
@@ -530,10 +585,10 @@ impl BallastManager {
         // Write data portion.
         let data_size = size - HEADER_SIZE as u64;
 
-        // Try fallocate CLI first (instant on ext4/xfs, no unsafe needed).
+        // Try fallocate (instant on ext4/xfs, no unsafe needed).
         // Skipped on CoW filesystems where zero-filled blocks defeat dedup.
         #[cfg(target_os = "linux")]
-        if !self.skip_fallocate && try_fallocate_cli(path, size) {
+        if !self.skip_fallocate && try_fallocate_fd(&file, HEADER_SIZE as u64, data_size) {
             file.sync_all().map_err(|e| SbhError::io(path, e))?;
             return Ok(());
         }
@@ -578,31 +633,25 @@ impl BallastManager {
 
 // ──────────────────── fallocate (Linux) ────────────────────
 
-/// Try to use the `fallocate` CLI tool for instant block allocation on ext4/xfs.
+/// Try to use `fallocate` for instant block allocation on ext4/xfs.
 ///
-/// Falls back to random data writing if the command is not available or fails
+/// Falls back to random data writing if the syscall is not available or fails
 /// (e.g., on CoW filesystems like btrfs/zfs where fallocate doesn't prevent dedup).
-///
-/// Only extends the file from the current position (after header) to total_size,
-/// so we pass `total_size - HEADER_SIZE` as the length.
 #[cfg(target_os = "linux")]
-fn try_fallocate_cli(path: &Path, total_size: u64) -> bool {
-    use std::process::Command;
-    // Guard: total_size must be larger than the header we already wrote.
-    let remaining = match total_size.checked_sub(HEADER_SIZE as u64) {
-        Some(r) if r > 0 => r,
-        _ => return false,
-    };
-    // fallocate -o OFFSET -l LENGTH PATH — extend the file past the header.
-    Command::new("fallocate")
-        .arg("-o")
-        .arg(HEADER_SIZE.to_string())
-        .arg("-l")
-        .arg(remaining.to_string())
-        .arg(path)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+fn try_fallocate_fd(file: &File, offset: u64, len: u64) -> bool {
+    use nix::fcntl::{FallocateFlags, fallocate};
+    use std::os::unix::io::AsRawFd;
+
+    // fallocate(fd, mode, offset, len)
+    match fallocate(
+        file.as_raw_fd(),
+        FallocateFlags::empty(),
+        offset as i64,
+        len as i64,
+    ) {
+        Ok(()) => true,
+        Err(_) => false,
+    }
 }
 
 // ──────────────────── tests ────────────────────
@@ -810,5 +859,41 @@ mod tests {
         let path = dir.path().join("SBH_BALLAST_FILE_00001.dat");
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "ballast file should be owner-only (0o600)");
+    }
+
+    #[test]
+    fn reducing_file_count_removes_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        // Start with 5 files
+        let mut config = small_config();
+        config.file_count = 5;
+        let mut mgr = BallastManager::new(dir.path().to_path_buf(), config.clone()).unwrap();
+        mgr.provision(None).unwrap();
+
+        assert_eq!(mgr.available_count(), 5);
+        for i in 1..=5 {
+            assert!(
+                dir.path()
+                    .join(format!("SBH_BALLAST_FILE_{i:05}.dat"))
+                    .exists()
+            );
+        }
+
+        // Reduce to 3 files
+        config.file_count = 3;
+        mgr.update_config(config);
+
+        // Inventory should show 3
+        assert_eq!(mgr.available_count(), 3);
+
+        // Files 4 and 5 should be gone
+        assert!(
+            !dir.path().join("SBH_BALLAST_FILE_00004.dat").exists(),
+            "Orphaned file 4 should be removed"
+        );
+        assert!(
+            !dir.path().join("SBH_BALLAST_FILE_00005.dat").exists(),
+            "Orphaned file 5 should be removed"
+        );
     }
 }

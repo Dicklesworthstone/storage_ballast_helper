@@ -1179,9 +1179,7 @@ mod tests {
         let err = cfg
             .validate()
             .expect_err("expected min_observations validation error");
-        assert!(err
-            .to_string()
-            .contains("min_observations_for_forecast"));
+        assert!(err.to_string().contains("min_observations_for_forecast"));
     }
 
     #[test]

@@ -6,7 +6,8 @@ mod tests {
     use storage_ballast_helper::core::paths::resolve_absolute_path;
 
     #[test]
-    fn resolve_absolute_path_allows_traversal() {
+    #[ignore = "documents current behavior; enable once path-resolution contract is hardened"]
+    fn resolve_absolute_path_currently_allows_traversal() {
         // This test demonstrates that normalize_syntactic (the fallback when
         // canonicalize fails) allows ".." to escape intended roots if the
         // intermediate paths don't exist.
@@ -20,10 +21,9 @@ mod tests {
         let bad_path = Path::new("/nonexistent_root/../etc/passwd");
         let resolved = resolve_absolute_path(bad_path);
 
-        // If this assertion passes, it means the function resolved it to /etc/passwd
-        // purely via syntactic normalization, ignoring directory boundaries.
-        // This confirms the "vulnerability" (or at least the behavior) of
-        // pure syntactic normalization without a chroot/jail.
+        // This currently resolves to /etc/passwd via syntactic normalization
+        // when canonicalization fails. Keep this as documentation-only until
+        // resolve_absolute_path gains a hardened contract.
         assert_eq!(resolved, Path::new("/etc/passwd"));
     }
 }

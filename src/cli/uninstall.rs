@@ -2,7 +2,6 @@
 //!
 //! Supports conservative (default), keep-data, keep-config, keep-assets, and
 //! explicit purge modes. Every removal is logged and can be dry-run first.
-//! Integration teardown uses backup-first semantics from the bootstrap module.
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -82,7 +81,6 @@ pub enum RemovalCategory {
     LaunchdPlist,
     ShellCompletion,
     ShellProfileEntry,
-    IntegrationHook,
     BallastPool,
     BackupFile,
 }
@@ -101,7 +99,6 @@ impl fmt::Display for RemovalCategory {
             Self::LaunchdPlist => f.write_str("launchd-plist"),
             Self::ShellCompletion => f.write_str("shell-completion"),
             Self::ShellProfileEntry => f.write_str("shell-profile-entry"),
-            Self::IntegrationHook => f.write_str("integration-hook"),
             Self::BallastPool => f.write_str("ballast-pool"),
             Self::BackupFile => f.write_str("backup-file"),
         }
@@ -1064,7 +1061,6 @@ mod tests {
             (RemovalCategory::LaunchdPlist, "launchd-plist"),
             (RemovalCategory::ShellCompletion, "shell-completion"),
             (RemovalCategory::ShellProfileEntry, "shell-profile-entry"),
-            (RemovalCategory::IntegrationHook, "integration-hook"),
             (RemovalCategory::BallastPool, "ballast-pool"),
             (RemovalCategory::BackupFile, "backup-file"),
             (RemovalCategory::DataDirectory, "data-directory"),

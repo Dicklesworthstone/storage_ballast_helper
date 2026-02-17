@@ -4,6 +4,10 @@
   <img src="sbh_illustration.webp" alt="sbh - Storage Ballast Helper illustration">
 </div>
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_helper/main/install.sh | bash
+```
+
 Cross-platform disk-pressure defense for AI coding workloads: predictive monitoring, safe cleanup, ballast release, and explainable policy decisions.
 
 ## TL;DR
@@ -63,6 +67,15 @@ sbh emergency /data --target-free 10 --yes
 3. **Deterministic decisions:** identical inputs produce identical ranking and policy outcomes.
 4. **Explainability is mandatory:** every action has traceable evidence and rationale.
 5. **Fail conservative:** policy/guard failures force fallback-safe behavior.
+
+### Implementation Constraints
+
+`sbh` enforces several hard constraints that shape the codebase:
+
+- **`#![forbid(unsafe_code)]`** in both `lib.rs` and `main.rs`. No unsafe blocks, no raw pointer arithmetic, no manual memory management. All platform-specific behavior goes through safe abstractions (`nix`, `libc` bindings, `signal-hook`).
+- **No async runtime.** Concurrency uses OS threads with `crossbeam-channel` for bounded message passing and `parking_lot` for synchronization. This avoids the complexity and debugging opacity of async runtimes while providing predictable scheduling behavior for a daemon that needs to respond to pressure signals in bounded time.
+- **Pedantic + nursery Clippy lints** are enabled project-wide. The code is held to strict Rust idiom standards beyond the default warning set.
+- **Deterministic builds.** The release profile uses `opt-level = "z"` (size optimization), `lto = true` (link-time optimization), `codegen-units = 1`, `panic = "abort"`, and `strip = true` for a lean, predictable binary.
 
 ## The Problem in Depth
 
@@ -140,6 +153,55 @@ cargo build --release
 gh release download --repo Dicklesworthstone/storage_ballast_helper --pattern "sbh-*.tar.xz"
 ```
 
+## Environment Health and Migration
+
+The bootstrap system detects and repairs common installation problems, from stale PATH entries to misconfigured service files. It runs automatically during `sbh install` and can be invoked manually with `sbh bootstrap`.
+
+### Environment Health States
+
+| State | Meaning |
+| --- | --- |
+| Healthy | All checks pass |
+| Degraded | Minor issues detected, `sbh` remains functional |
+| Broken | Significant issues preventing correct operation |
+| NotInstalled | No installation footprint detected |
+
+### Migration Reasons
+
+The bootstrap scanner checks for 13 migration conditions:
+
+| Reason | Description |
+| --- | --- |
+| `binary-not-on-path` | Binary exists but shell PATH does not include its directory |
+| `stale-path-entry` | Shell profile references a binary location that no longer exists |
+| `duplicate-path-entries` | Multiple `sbh` PATH entries in the same shell profile |
+| `systemd-unit-stale-binary` | systemd `ExecStart` points to a missing binary |
+| `launchd-plist-stale-binary` | launchd `ProgramArguments` references a missing binary |
+| `deprecated-config-key` | Config uses renamed keys (`scan_interval_secs`, `max_ballast_mb`, `log_level`) |
+| `missing-state-file` | Data directory exists but `state.json` is absent |
+| `orphaned-completion` | Shell completion script installed for an unavailable shell |
+| `stale-completion` | Completion script out of date |
+| `empty-ballast-pool` | Ballast directory is undersized or empty |
+| `binary-permissions` | Binary is not executable |
+| `stale-backup-file` | Old backup from a previous install past the cleanup threshold |
+| `interrupted-install` | Marker file indicates an incomplete prior installation |
+
+### Repair Actions
+
+Each detected issue maps to one of 8 action types: `RemoveProfileLine`, `DeduplicateProfile`, `FixPermissions`, `UpdateServicePath`, `RemoveOrphanedFile`, `CleanupBackup`, `CreateDirectory`, `InitStateFile`.
+
+All mutations create timestamped backups before writing. A 7-day default threshold governs automatic cleanup of old backup files.
+
+```bash
+# Run bootstrap scan and repair
+sbh bootstrap
+
+# Dry-run to see what would change
+sbh bootstrap --dry-run
+```
+
+Source: `src/cli/bootstrap.rs`
+
 ## Quick Start
 
 1. Check your config path:
@@ -163,6 +225,24 @@ sbh daemon
 ```bash
 sbh dashboard
 ```
+
+### Install Wizard
+
+Running `sbh install` without prior configuration launches the install wizard, which guides through four steps:
+
+1. **Service manager** -- systemd (Linux default), launchd (macOS default), or none (manual start).
+2. **Service scope** -- user service or system-wide (system scope requires root).
+3. **Watched paths** -- auto-detects `/data/projects`, `/tmp`, and `$HOME` if they exist. Custom paths can be added interactively.
+4. **Ballast sizing** -- choose a preset or enter custom file counts:
+
+| Preset | Files | Per-File Size | Total |
+| --- | --- | --- | --- |
+| Small | 5 | 1 GiB | 5 GiB |
+| Medium (default) | 10 | 1 GiB | 10 GiB |
+| Large | 20 | 1 GiB | 20 GiB |
+| Custom | user-specified | 1 GiB | varies |
+
+For non-interactive environments (CI, automation), `sbh install --auto` applies platform-detected defaults: the platform-native service manager, auto-discovered watched paths, user-scope service, and Medium ballast preset.
 
 ## Command Reference
 
@@ -204,7 +284,7 @@ sbh dashboard
 | Command | Purpose |
 | --- | --- |
 | `sbh config show|set|validate|diff|reset` | Manage effective config |
-| `sbh update [--check] [--refresh-cache] [--offline PATH]` | Check/apply updates with cache control and optional offline manifest |
+| `sbh update [flags]` | Check/apply updates with rollback, cache control, and backup management |
 | `sbh install` / `sbh uninstall` | Install/remove service integration |
 
 ## Dashboard
@@ -305,7 +385,7 @@ Environment overrides: `SBH_DASHBOARD_MODE`, `SBH_DASHBOARD_KILL_SWITCH`.
 Press `:` or `Ctrl-P` to open the command palette. Type to fuzzy-search through 36 available actions including navigation, preference changes, overview pane controls, and incident commands. Press `Enter` to execute, `Esc` to cancel. Palette actions include:
 
 - `nav.overview` through `nav.diagnostics` (screen navigation)
-- `pref.density.compact`, `pref.density.normal`, `pref.density.comfortable` (visual density)
+- `pref.density.compact`, `pref.density.comfortable` (visual density)
 - `pref.hints.off`, `pref.hints.minimal`, `pref.hints.full` (hint verbosity)
 - `pref.start.*` (startup screen)
 - `action.overview.focus-next`, `action.overview.focus-prev`, `action.overview.open-focused` (overview pane navigation)
@@ -388,6 +468,24 @@ Environment overrides are available for operator automation:
 - `SBH_UPDATE_BACKGROUND_REFRESH`
 - `SBH_UPDATE_OPT_OUT`
 
+### Update Command Flags
+
+| Flag | Description |
+| --- | --- |
+| `--check` | Check for updates without applying |
+| `--version V` | Pin to a specific version tag (e.g. `v0.2.1`) |
+| `--force` | Re-download even if already at the target version |
+| `--rollback [ID]` | Roll back to the most recent backup, or a specific backup by ID |
+| `--list-backups` | List available backup snapshots |
+| `--prune N` | Remove old backups, keeping only the N most recent |
+| `--max-backups N` | Maximum backups to retain (default: 5) |
+| `--refresh-cache` | Bypass local metadata cache and fetch fresh release metadata |
+| `--offline PATH` | Use an offline bundle manifest for airgapped updates |
+| `--system` | Install to system-wide location (requires root) |
+| `--user` | Install to user-local location (`~/.local/bin`) |
+| `--dry-run` | Print what would be done without making changes |
+| `--no-verify` | Skip integrity verification (unsafe; debugging only) |
+
 Useful operator checks:
 
 ```bash
@@ -396,6 +494,13 @@ sbh config show --json | jq '.update'
 
 # Force fresh metadata fetch for diagnostics
 sbh update --check --refresh-cache --json
+
+# Roll back to the previous version
+sbh update --rollback
+
+# List and prune old backups
+sbh update --list-backups
+sbh update --prune 3
 ```
 
 ## Configuration Example
@@ -446,7 +551,69 @@ consecutive_clean_windows_for_recovery = 5
 [logging]
 sqlite_path = "/var/lib/sbh/activity.db"
 jsonl_path = "/var/log/sbh/activity.jsonl"
+
+[pressure.prediction]
+enabled = true
+action_horizon_minutes = 30.0
+warning_horizon_minutes = 60.0
+min_confidence = 0.7
+min_samples = 5
+imminent_danger_minutes = 5.0
+critical_danger_minutes = 2.0
+
+[scheduler]
+enabled = true
+scan_budget_per_interval = 5
+exploration_quota_fraction = 0.20
+io_cost_weight = 0.1
+fp_risk_weight = 0.15
+exploration_weight = 0.25
+forecast_error_threshold = 0.5
+fallback_trigger_windows = 3
+recovery_trigger_windows = 5
+
+[notifications]
+enabled = true
+channels = ["journal", "file"]
+
+[notifications.desktop]
+enabled = false
+min_level = "orange"
+
+[notifications.webhook]
+enabled = false
+url = ""
+min_level = "red"
+template = '{"text": "sbh: ${SUMMARY}"}'
+
+[notifications.file]
+path = "~/.local/share/sbh/notifications.jsonl"
+
+[notifications.journal]
+min_level = "warning"
+
+[dashboard]
+mode = "new"       # "legacy" | "new"
+kill_switch = false
 ```
+
+## Environment Variable Overrides
+
+Operator automation can override configuration via environment variables. These take precedence over config file values.
+
+| Variable | Controls |
+| --- | --- |
+| `SBH_UPDATE_ENABLED` | Enable/disable update checks |
+| `SBH_UPDATE_BACKGROUND_REFRESH` | Background metadata refresh |
+| `SBH_UPDATE_OPT_OUT` | Opt out of update system entirely |
+| `SBH_UPDATE_METADATA_CACHE_TTL_SECONDS` | Cache TTL for update metadata |
+| `SBH_UPDATE_METADATA_CACHE_FILE` | On-disk cache path |
+| `SBH_UPDATE_NOTICES_ENABLED` | Human follow-up prompts in update output |
+| `SBH_DASHBOARD_MODE` | Dashboard mode (`legacy` or `new`) |
+| `SBH_DASHBOARD_KILL_SWITCH` | Emergency fallback to legacy dashboard |
+| `SBH_PREDICTION_ENABLED` | Enable/disable predictive forecasting |
+| `SBH_SCANNER_REPEAT_DELETION_BASE_COOLDOWN_SECS` | Base cooldown for repeat-deletion dampening |
+| `SBH_SCANNER_REPEAT_DELETION_MAX_COOLDOWN_SECS` | Max cooldown for repeat-deletion dampening |
 
 ## Architecture
 
@@ -540,10 +707,10 @@ Pressure levels are defined by free-space thresholds:
 | Green | > 20% | base interval | 0 files | 2 |
 | Yellow | 14-20% | base/2 | 0-1 files | 5 |
 | Orange | 10-14% | base/4 | 1-3 files | 10 |
-| Red | 6-10% | base/8 | 3-5 files | 20 |
-| Critical | < 3% | 100ms | 10 files | 40 |
+| Red | 6-10% | base/8 | 3-5 files | 20 + urgency scaling |
+| Critical | < 3% | 100ms | 10 files | 40 + urgency scaling |
 
-Critical is triggered when free space drops below half the Red threshold (`red_min / 2.0`). At Critical, the controller issues maximum-urgency responses regardless of PID output.
+Critical is triggered when free space drops below half the Red threshold (`red_min / 2.0`). At Red and Critical levels, delete batch sizes scale dynamically with PID urgency output, allowing the system to be more aggressive when pressure is rising rapidly versus slowly. At Critical, the controller issues maximum-urgency responses regardless of PID output.
 
 When predictive forecasting is enabled, time-to-exhaustion estimates boost urgency preemptively. If the forecast predicts Red-level pressure within the action horizon (default 30 minutes), urgency is raised to at least 0.70 even if current pressure is only Yellow. This lets the system start scanning and releasing ballast *before* pressure actually reaches dangerous levels.
 
@@ -569,7 +736,9 @@ Every file and directory discovered during a scan receives a composite score fro
 
 **Name** (default weight 0.25) matches against a pattern registry of known artifact types: `.o` files, `node_modules`, `__pycache__`, `.class` files, `.wasm` intermediates, and hundreds of others. Each pattern carries a confidence score.
 
-**Age** (default weight 0.20) uses time since last access/modification, with a non-monotonic curve that peaks at 4-10 hours (the sweet spot for stale build artifacts) and drops for very old files (which might be intentionally archived):
+**Age** (default weight 0.20) uses an effective age timestamp that differs by entry type. For **files**, the modification time (`mtime`) is used because content change is what matters. For **directories**, the creation (birth) time is preferred when available, because directory `mtime` updates whenever any direct child is added or removed — making active build caches like `target/` appear perpetually young when `mtime` is used alone. Birth time reflects when the directory was actually created and is stable across rebuilds. If birth time is unavailable, `mtime` is used as a fallback.
+
+The age-to-score curve is non-monotonic, peaking at 4-10 hours (the sweet spot for stale build artifacts) and dropping for very old files (which might be intentionally archived):
 
 | Age | Score | Rationale |
 | --- | --- | --- |
@@ -674,7 +843,7 @@ When guardrails report a non-Pass status, a penalty (default 50.0) is added to t
 
 ### Safety Layers
 
-`sbh` uses layered safety: five independent mechanisms, any one of which can veto a deletion regardless of what the others decide.
+`sbh` uses layered safety: six independent mechanisms, any one of which can veto a deletion regardless of what the others decide.
 
 #### Layer 1: Protection Registry
 
@@ -706,6 +875,27 @@ As described above, the progressive delivery system (observe/canary/enforce) ens
 #### Layer 5: Guardrails and Drift Detection
 
 The guardrail system continuously validates that the forecasting and scoring pipeline is well-calibrated. If predictions drift from reality, the system automatically falls back to safe mode. See the Guardrails section below for details.
+
+#### Layer 6: Repeat-Deletion Dampening
+
+When an artifact path is deleted and then recreated (common with build directories in active projects), the dampening tracker applies exponential-backoff cooldowns to prevent deletion loops:
+
+```
+cooldown = base_cooldown * 2^(cycle_count - 1), capped at max_cooldown
+```
+
+The first deletion of a given path has no cooldown. After the second deletion, cooldown starts at the base value and doubles with each subsequent cycle.
+
+| Parameter | Config Key | Default |
+| --- | --- | --- |
+| Base cooldown | `scanner.repeat_deletion_base_cooldown_secs` | 300s (5 min) |
+| Maximum cooldown | `scanner.repeat_deletion_max_cooldown_secs` | 3600s (1 hour) |
+
+Red and Critical pressure bypasses all dampening. Disk safety takes priority over anti-churn protection.
+
+The tracker periodically prunes entries whose last deletion is older than `max_cooldown`, preventing unbounded memory growth in long-running daemon sessions.
+
+Source: `src/daemon/loop_main.rs`
 
 ### The Ballast System in Depth
 
@@ -771,6 +961,48 @@ The scan budget is split: 80% exploitation (highest-utility paths) and 20% explo
 #### Fallback Mode
 
 If the VOI scheduler's forecast error (MAPE) exceeds 50% for 3 consecutive windows, it falls back to simple round-robin scheduling. It recovers after 5 consecutive windows with acceptable MAPE. This prevents the scheduler from making poor allocation decisions when its model of the environment is wrong.
+
+### Special Location Monitoring
+
+RAM-backed filesystems (`/dev/shm`, tmpfs, ramfs) require tighter monitoring than disk-backed volumes because they directly compete with application memory. The special location monitor runs independent scan loops with per-location parameters:
+
+| Location Type | Free Buffer Target | Scan Interval | Priority |
+| --- | --- | --- | --- |
+| `/dev/shm` | 20% | 3s | 255 |
+| ramfs | 18% | 4s | 220 |
+| tmpfs | 15% | 5s | 200 |
+| User-defined (`/tmp`, `/data/tmp`) | 15% | 5s | 155-160 |
+| Custom paths | 15% | 5s | 140 |
+
+Priority determines scan order when multiple locations need attention in the same cycle. Higher-priority locations are checked first.
+
+The registry auto-discovers RAM-backed mounts from `/proc/mounts` and adds fallback entries for `/tmp` and `/data/tmp` if they are not already covered. Operator-provided custom paths can override auto-discovered defaults. Duplicate paths are deduplicated, with later entries taking precedence.
+
+#### Swap-Thrash Detection
+
+The daemon monitors swap usage relative to available RAM. When swap utilization exceeds 70% while at least 8 GiB of RAM remains free, the system flags a swap-thrash risk. This condition indicates the host experienced memory pressure and is now paging memory back in slowly, which degrades IO performance for both scanning and deletion.
+
+Swap-thrash warnings are rate-limited to one per 15-minute window to avoid log noise during sustained pressure.
+
+```bash
+# View swap status in the status report
+sbh status --json | jq '.memory'
+```
+
+Source: `src/monitor/special_locations.rs`, `src/daemon/loop_main.rs`
+
+### Temp Artifact Fast-Track
+
+Under Orange or Red pressure, recognized temporary artifacts in `/tmp`, `/var/tmp`, `/data/tmp`, and `/private/tmp` receive an adjusted age that allows them to cross the deletion threshold sooner. This accelerates cleanup of build debris in temp directories during pressure spikes without bypassing the scoring system entirely.
+
+Constraints:
+- A 2-minute minimum observed age safety floor prevents deletion of very recently created files, even under pressure.
+- `NodeModules` and `PythonCache` artifact categories are excluded from fast-tracking because they may contain active dependency trees.
+- Only artifacts with high-confidence pattern matches (>= 0.85 name confidence or specific known patterns like `cargo-target-prefix`, `agent-ft-suffix`, `tmp-codex`) qualify.
+
+Green and Yellow pressure levels do not trigger fast-tracking.
+
+Source: `src/daemon/loop_main.rs`
 
 ### Guardrails and Drift Detection
 
@@ -838,6 +1070,35 @@ If the SQLite backend fails (disk full, corruption, permission error), the logge
 
 The logger thread runs on a bounded channel (capacity 1024). When the channel is full, events are dropped and a counter is incremented. The drop count is reported periodically as a delta (not cumulative) to avoid alarm fatigue.
 
+### Notification Channels
+
+The daemon dispatches alerts through four notification channels, each with independent severity filtering:
+
+| Channel | Transport | Default Min Level |
+| --- | --- | --- |
+| Desktop | `notify-send` (Linux) / `osascript` (macOS) | Orange |
+| Webhook | HTTP POST via `curl` (5-second timeout) | Red |
+| File | JSONL append to `~/.local/share/sbh/notifications.jsonl` | Info |
+| Journal | systemd structured logging via stderr | Warning |
+
+Default active channels are `journal` and `file`. Desktop and webhook channels are opt-in.
+
+**Notification event types:** `PressureChanged`, `PredictiveWarning`, `CleanupCompleted`, `BallastReleased`, `BallastReplenished`, `DaemonStarted`, `DaemonStopped`, `Error`.
+
+**Severity levels (ordered):** Info, Warning, Orange, Red, Critical. Each channel only dispatches events at or above its configured `min_level`.
+
+The webhook channel supports template strings with placeholder substitution:
+
+```toml
+[notifications.webhook]
+enabled = true
+url = "https://hooks.example.com/sbh"
+min_level = "red"
+template = '{"text": "sbh: ${SUMMARY}", "level": "${LEVEL}", "mount": "${MOUNT}", "free_pct": "${FREE_PCT}"}'
+```
+
+Source: `src/daemon/notifications.rs`
+
 ### Zero-Write Emergency Mode
 
 When a disk is at 99%+ utilization, normal operations may fail because they need to write temporary files, state, or logs. `sbh emergency` operates in a zero-write mode that avoids all disk writes:
@@ -852,6 +1113,253 @@ When a disk is at 99%+ utilization, normal operations may fail because they need
 The emergency command scans the specified paths, scores candidates using the standard multi-factor engine, and presents them for immediate deletion. With `--yes`, it executes deletions immediately without interactive confirmation, prioritizing the highest-scoring candidates until the target free space is reached or all candidates are exhausted.
 
 A completely full disk is precisely the situation where most cleanup tools fail, since they need to write temp files or state. By reducing to pure in-memory scoring and direct unlink calls, `sbh emergency` can recover a system that nothing else can touch.
+
+### Incremental Merkle Scan Index
+
+Full directory walks are expensive. A machine with hundreds of thousands of directories pays a significant IO cost every scan cycle, even when most of the filesystem hasn't changed. The Merkle scan index eliminates redundant work by tracking a hash tree over directory metadata, so the daemon can detect unchanged subtrees without walking them.
+
+#### How It Works
+
+Each directory entry produces a metadata hash from its path, size, modification time, inode, device ID, and entry type (file vs. directory). These hashes are combined bottom-up into subtree hashes: a directory's subtree hash is the SHA-256 of its own metadata hash concatenated with the sorted subtree hashes of its children. The result is a Merkle tree where any change to any file in a subtree propagates up to the root.
+
+On subsequent scan cycles, the daemon compares fresh walk entries against the stored index. If a directory's subtree hash matches, the entire subtree is skipped — no scoring, no candidate evaluation, no IO. Only changed, new, or removed paths are passed to the scoring engine.
+
+#### Budget-Aware Degradation
+
+Each incremental diff operates under a `ScanBudget` that limits the number of subtree hash recomputations per cycle. Under heavy filesystem churn (large builds, parallel agent swarms), the budget may be exhausted before all changed paths are processed. When this happens:
+
+- Processed paths are returned as the incremental diff for immediate scoring.
+- Remaining paths are deferred to the next cycle or a full-scan fallback.
+- The index health transitions to `Degraded` rather than `Healthy`.
+
+This prevents a single busy cycle from consuming unbounded CPU time on Merkle recomputation while ensuring forward progress across cycles.
+
+#### Integrity and Recovery
+
+The index checkpoint (persisted to disk between daemon restarts) includes a SHA-256 integrity hash over the serialized node map. On load, this hash is verified. If it fails — due to disk corruption, partial writes, or version skew — the index transitions to `Corrupt` health and the daemon falls back to full-scan mode until a clean rebuild completes.
+
+| Health State | Meaning | Daemon Behavior |
+| --- | --- | --- |
+| Healthy | Index is valid and usable | Incremental scans skip unchanged subtrees |
+| Degraded | Partial corruption or budget exhaustion | Usable for some subtrees; degraded paths get full scans |
+| Corrupt | Integrity check failed | Full scan on every cycle until rebuild |
+| Uninitialized | Index has not been built yet | Initial full scan builds the index from scratch |
+
+The checkpoint format includes a version field for forward compatibility. Schema evolution (new fields in a newer daemon version) does not hard-fail deserialization.
+
+Source: `src/scanner/merkle.rs`
+
+### Parallel Directory Walker
+
+The walker is the scanner's "eyes": it discovers candidate files and directories, collects structural markers for the scoring engine, and integrates with the protection system to skip `.sbh-protect`ed subtrees.
+
+#### Work-Stealing Parallelism
+
+The walker uses a bounded work queue (capacity 4096) shared across `N` worker threads (configurable via `scanner.parallelism`). Root paths are seeded into the queue, and each worker pulls a directory, processes its entries, and enqueues discovered subdirectories back onto the shared queue. Workers that find an empty queue wait briefly (50ms timeout) before checking whether all work is complete. This design provides natural load balancing — workers that finish fast directories steal work from threads processing slower ones — without requiring explicit work-stealing data structures.
+
+An atomic `in_flight` counter tracks work items that have been dequeued but not yet processed. When the last item completes (counter reaches zero), workers exit. Results flow through an unbounded channel for throughput: the walker should never block on result delivery.
+
+#### Per-Directory Iteration Cap
+
+Directories with tens of thousands of entries (e.g., `/data/tmp` with 60K+ children, `node_modules` flats) can monopolize a worker thread for seconds. Each directory is capped at 65,536 child entries. Structural signals (`.git`, `Cargo.lock`, `deps/`, `build/`) are detected early during iteration, so the cap rarely affects scoring accuracy. This prevents any single pathological directory from starving other workers.
+
+#### Open-File Detection
+
+Before any candidate is scored for deletion, the walker collects the set of open file descriptors across all processes. On Linux, this scans `/proc/*/fd` symlinks to build a set of `(device_id, inode)` pairs representing currently open files. Two budget limits prevent this scan from hanging the daemon on busy machines:
+
+| Budget | Limit | Purpose |
+| --- | --- | --- |
+| Time | 5 seconds | Prevents hanging on machines with many processes |
+| PIDs | 50,000 | Caps scan even if individual PIDs are fast |
+
+If either budget is exhausted, the scan returns a partial set. The system fails conservative: a partial open-file set means some open files might be missed, but the pre-flight safety checks provide a second layer of defense.
+
+During scoring, an `OpenPathCache` provides memoized subtree-open checks. For each candidate directory, it walks the directory tree checking inodes against the open set, caching results so that parent directories are not re-scanned for sibling candidates.
+
+#### Cross-Device and Symlink Safety
+
+Two invariants prevent the walker from escaping its intended scope:
+
+- **Cross-device guard**: Unless `scanner.cross_devices` is explicitly enabled, the walker records each root path's device ID at seed time. When processing subdirectories, any entry on a different device (i.e., a mount point) is skipped entirely. This prevents accidentally walking into large foreign filesystems mounted under a watched path.
+
+- **Symlink safety**: By default, the walker uses `symlink_metadata()` (lstat) rather than `metadata()` (stat), so symlinks are examined without following them. Symlinks to directories are not enqueued for traversal, preventing symlink loops and escapes outside watched paths. The pre-flight safety checks independently reject symlinks at deletion time.
+
+Source: `src/scanner/walker.rs`
+
+### Signal Handling and Daemon Lifecycle
+
+The daemon responds to Unix signals for graceful lifecycle management. All signal flags are polled by the main loop each iteration rather than processed in signal handler context, avoiding async-signal-safety concerns.
+
+| Signal | Effect |
+| --- | --- |
+| `SIGTERM` / `SIGINT` | Graceful shutdown: completes the current operation, writes final state, exits cleanly |
+| `SIGHUP` | Configuration reload: re-reads `config.toml` and applies changes without restart |
+| `SIGUSR1` | Immediate scan trigger: bypasses the VOI scheduler and runs a full scan on the next iteration |
+
+Signal registration uses the `signal-hook` crate for safe, portable signal handling. Registration is best-effort: failures are logged to stderr but do not prevent daemon startup. The `SignalHandler` can also be triggered programmatically (e.g., by the watchdog timeout or error escalation logic) for shutdown requests that originate from within the daemon.
+
+#### Systemd Watchdog
+
+When running as a system-scope systemd service (`Type=notify`), the daemon sends `sd_notify` heartbeats at a configurable interval (default: `WatchdogSec=60`). If the main loop stalls (blocked IO, deadlock, infinite loop), systemd detects the missing heartbeat and restarts the service automatically via `Restart=on-failure`. The restart delay (`RestartSec=10`) prevents tight restart loops.
+
+User-scope services use `Type=simple` instead, since user session supervisors typically do not support the `sd_notify` protocol.
+
+#### Shutdown Coordinator
+
+On receiving a shutdown signal, the daemon enters a coordinated shutdown sequence:
+
+1. Sets the shutdown flag (atomic boolean, visible to all threads).
+2. Completes the current scan/deletion cycle if one is in progress.
+3. Writes a final state file so `sbh status` reports a clean exit.
+4. Joins worker threads with a 30-second timeout (`TimeoutStopSec=30`).
+5. Exits with code 0.
+
+If threads do not complete within the timeout, systemd sends `SIGKILL`. The state file write ensures the dashboard does not display stale data after a restart.
+
+Source: `src/daemon/signals.rs`, `src/daemon/loop_main.rs`
+
+### Daemon Self-Monitoring
+
+The self-monitor tracks daemon health from within, providing introspection data for the dashboard's Diagnostics screen and for `sbh status` queries.
+
+#### Thread Heartbeats
+
+Each worker thread (monitor, scanner, executor, logger) periodically calls a heartbeat function that updates a monotonic timestamp. The self-monitor checks these timestamps against a staleness threshold (60 seconds). If a thread misses its window, its status transitions from `Running` to `Stalled`. If a thread panics and is not respawned, its status becomes `Dead` with the captured error message.
+
+The heartbeat uses a process-local monotonic clock (`Instant`) rather than `SystemTime` to avoid false readings when the system clock is adjusted (NTP corrections, daylight saving changes, manual adjustments).
+
+Thread statuses are reported in the state file and displayed on the dashboard Diagnostics screen (`key 7`).
+
+#### RSS Memory Tracking
+
+The daemon reads its own RSS (Resident Set Size) from `/proc/self/statm` on each state file write. If RSS exceeds the configured limit (256 MB by default, matching the systemd `MemoryMax` directive), a warning is logged to stderr. The RSS value is included in the state file for external monitoring tools.
+
+The 256 MB limit ensures `sbh` never competes with build workloads for memory. On machines with constrained RAM, the limit can be adjusted via the systemd unit file or by direct configuration.
+
+#### State File Protocol
+
+The state file (`state.json`) is the primary mechanism for CLI-to-daemon communication. It is written atomically (write to `.tmp`, then `rename()`) to prevent readers from seeing partial writes.
+
+| Parameter | Value | Purpose |
+| --- | --- | --- |
+| Write interval | 30 seconds | Balances freshness with IO overhead |
+| Stale threshold | 90 seconds | `>= 2x` write interval, prevents false "daemon absent" reports |
+| Write method | Atomic rename | Guarantees CLI always reads a complete JSON document |
+
+The schema uses `#[serde(default)]` on all fields, so minor version differences between daemon and CLI (e.g., during a rolling update) degrade gracefully: new fields are ignored by old CLI versions, and missing fields use defaults rather than causing parse failures. The dashboard adapter layer detects schema drift and surfaces warnings rather than crashing.
+
+Source: `src/daemon/self_monitor.rs`
+
+### Service Management
+
+`sbh` generates platform-native service configurations for both Linux (systemd) and macOS (launchd), with security hardening appropriate to each platform.
+
+#### Systemd (Linux)
+
+The generated systemd unit file includes several layers of hardening:
+
+**Scheduling (lowest priority):**
+- `Nice=19` — lowest CPU scheduling priority
+- `IOSchedulingClass=idle` — only uses disk IO when no other process needs it
+- `IOSchedulingPriority=7` — lowest IO priority within the idle class
+
+This ensures `sbh` never competes with build workloads, compiler processes, or test suites for CPU or IO bandwidth.
+
+**Security sandboxing (system scope only):**
+- `ProtectSystem=strict` — mounts the entire filesystem read-only except explicitly allowed paths
+- `ReadWritePaths=` — only the data directory and watched paths are writable
+- `NoNewPrivileges=true` — prevents privilege escalation via setuid/setgid binaries
+- `ProtectKernelTunables=true` — blocks writes to `/proc/sys`, `/sys`
+- `ProtectControlGroups=true` — prevents cgroup manipulation
+- `RestrictSUIDSGID=true` — blocks creation of setuid/setgid files
+- `LimitNOFILE=4096` — caps file descriptor count
+
+**Resource limits:**
+- `MemoryMax=256M` — hard memory ceiling enforced by the cgroup controller
+- `CPUQuota=10%` — limits CPU usage to 10% of one core
+
+**Lifecycle:**
+- `Type=notify` (system scope) with `WatchdogSec=60` for automatic restart on stall
+- `Type=simple` (user scope) for compatibility with user session managers
+- `Restart=on-failure` with `RestartSec=10` and `TimeoutStopSec=30`
+- `ExecReload=/bin/kill -HUP $MAINPID` for live configuration reload
+
+User-scope services skip `ProtectSystem` and kernel/cgroup protections because these directives are not available in user session scope.
+
+#### Launchd (macOS)
+
+The generated launchd plist provides equivalent lifecycle management:
+
+- `RunAtLoad=true` — starts the daemon on login (user agent) or boot (system daemon)
+- `KeepAlive` with `SuccessfulExit=false` — auto-restarts on non-zero exit, stays stopped on clean shutdown
+- `ThrottleInterval=10` — minimum 10 seconds between restart attempts
+- `Nice=19` — lowest scheduling priority
+- `LowPriorityIO=true` — marks all IO as low-priority
+
+User agents install to `~/Library/LaunchAgents/`, system daemons to `/Library/LaunchDaemons/`. Log output goes to `~/Library/Logs/sbh/` (user) or `/var/log/sbh/` (system).
+
+Source: `src/daemon/service.rs`
+
+### Supply Chain Verification
+
+Binary releases and updates pass through a verification pipeline before installation. The pipeline has two layers: mandatory checksum verification and optional cryptographic signature verification.
+
+#### SHA-256 Checksums
+
+Every release artifact ships with a `.sha256` checksum file. During install or update, the pipeline downloads the artifact, computes its SHA-256 hash, and compares it against the expected value from the checksum file. A mismatch halts installation with a structured `IntegrityDecision::Deny` outcome that includes both expected and actual hashes for diagnostics.
+
+The checksum parser handles both bare hex digests and BSD-style `sha256sum` output (hash followed by filename), normalizing to lowercase hex for comparison.
+
+#### Sigstore Signature Verification
+
+When a Sigstore bundle (`.sigstore` file) is present alongside the release artifact, the pipeline upgrades to cryptographic signature verification using `cosign`. The verification policy is determined by the presence of the bundle:
+
+| Bundle Present | Policy | Behavior |
+| --- | --- | --- |
+| No | `Disabled` | Checksum-only verification |
+| Yes | `Required` | Must pass `cosign verify-blob` or install is denied |
+
+If the `cosign` binary is not installed on the system, the pipeline probes for it at verification time. When `cosign` is absent and the policy is `Required`, the outcome is `Deny` with reason code `sigstore_required_unavailable`. When the policy is `Optional`, missing `cosign` degrades to checksum-only with a warning.
+
+#### Bypass and Audit Trail
+
+The `--no-verify` flag explicitly bypasses all verification. This is a loud operation: the outcome includes `bypass_used: true`, a warning message, and reason code `verify_bypass`. The structured `VerificationOutcome` captures the full decision trail (bypass, checksum status, signature status, reason codes, warnings) for audit logging.
+
+For airgapped environments, the `--offline` flag accepts a local bundle manifest, allowing updates without network access while maintaining checksum verification.
+
+Source: `src/cli/mod.rs`, `src/cli/assets.rs`
+
+### Uninstall and Cleanup Modes
+
+`sbh uninstall` supports five cleanup modes that control how aggressively the system is cleaned up, from conservative to full purge:
+
+| Mode | Binary | Service | Config | Data/Logs | Assets | Ballast |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Conservative** (default) | removed | removed | kept | kept | kept | kept |
+| **KeepData** | removed | removed | removed | kept | removed | removed |
+| **KeepConfig** | removed | removed | kept | removed | removed | removed |
+| **KeepAssets** | removed | removed | removed | removed | kept | removed |
+| **Purge** | removed | removed | removed | removed | removed | removed |
+
+Every removal action includes:
+
+- **Category tagging**: Each item is classified (binary, config-file, data-directory, state-file, sqlite-db, jsonl-log, asset-cache, systemd-unit, launchd-plist, shell-completion, shell-profile-entry, ballast-pool, backup-file) for structured reporting.
+- **Backup-first semantics**: Items marked with `backup_first: true` are copied to a timestamped backup before removal.
+- **Dry-run support**: `sbh uninstall --dry-run` generates the full removal plan without executing any deletions, showing exactly what would be removed and backed up.
+- **Structured output**: The plan and execution results are available as JSON (`--json`) for automation.
+
+```bash
+# Preview what would be removed (conservative mode)
+sbh uninstall --dry-run
+
+# Full cleanup with --purge
+sbh uninstall --purge
+
+# Remove everything except logs and database
+sbh uninstall --keep-data
+```
+
+Source: `src/cli/uninstall.rs`
 
 ### Source Layout
 
@@ -903,12 +1411,14 @@ src/
     stats.rs                Stats engine for time-window queries + blame
 
   cli/
-    mod.rs                  Shared installer/update contracts and types
+    mod.rs                  Shared installer/update contracts, supply chain verification
     bootstrap.rs            Bootstrap migration and self-healing
-    integrations.rs         AI tool integration bootstrap (Claude, Codex, etc.)
     assets.rs               Asset manifest download/verify/cache with SHA-256
+    dashboard.rs            Dashboard launcher and mode selection
+    install.rs              Install orchestration with wizard, auto mode, and service setup
     from_source.rs          From-source build fallback mode
     uninstall.rs            Uninstall with 5 cleanup modes
+    update.rs               Self-update with rollback, cache control, and backup management
     wizard.rs               Guided first-run install wizard + --auto mode
 
   tui/
@@ -1012,9 +1522,21 @@ For test harness conventions and structured logging registration, see `docs/test
 - Press `!` to manually open the incident playbook regardless of severity.
 
 ### "Service fails to start"
-- Linux: inspect `systemctl status` and journal logs.
-- macOS: inspect `launchctl` output and plist paths.
+- Linux: inspect `systemctl status sbh` and `journalctl -u sbh -e` for logs.
+- macOS: inspect `launchctl list | grep sbh` and check `~/Library/Logs/sbh/` for log output.
 - Run `sbh daemon` directly to capture startup errors.
+- Verify binary path is correct: `sbh config show --json | jq '.paths'`.
+
+### "Daemon seems stuck or unresponsive"
+- Send `SIGUSR1` to trigger an immediate scan: `kill -USR1 $(pidof sbh)`.
+- Send `SIGHUP` to reload configuration: `kill -HUP $(pidof sbh)`.
+- Check the Diagnostics screen (`key 7`) for thread health — a `Stalled` thread indicates a blocked operation.
+- If using systemd with `Type=notify`, the watchdog will auto-restart after 60 seconds of no heartbeat.
+
+### "Memory usage keeps growing"
+- The daemon enforces a 256 MB RSS limit. Check `sbh status --json | jq '.memory_rss_bytes'`.
+- Systemd's `MemoryMax=256M` provides a hard ceiling.
+- Large Merkle scan indexes on machines with many directories can increase baseline memory. Consider reducing `scanner.root_paths` scope.
 
 ## Limitations
 
@@ -1039,8 +1561,20 @@ Use `sbh dashboard --legacy-dashboard`, set `dashboard.mode = "legacy"` in confi
 ### How do I audit why something was deleted?
 Use `sbh explain --id <decision-id>` and inspect structured logs/evidence records.
 
+### How do I reload configuration without restarting?
+Send `SIGHUP` to the daemon process: `kill -HUP $(pidof sbh)`. On systemd, use `systemctl reload sbh`. The daemon re-reads `config.toml` and applies changes on the next loop iteration.
+
+### How do I trigger an immediate scan?
+Send `SIGUSR1` to the daemon: `kill -USR1 $(pidof sbh)`. This bypasses the VOI scheduler and runs a full scan on the next iteration, useful for verifying cleanup behavior after a configuration change.
+
+### Does the Merkle index persist across daemon restarts?
+Yes. The index is checkpointed to disk with SHA-256 integrity verification. On restart, the daemon loads the checkpoint and resumes incremental scanning. If the checkpoint is corrupt or missing, it falls back to a full scan.
+
+### How much memory does `sbh` use?
+Under normal operation, 20-60 MB of RSS. The hard limit is 256 MB (enforced by both the daemon self-monitor and the systemd `MemoryMax` directive). Machines with hundreds of thousands of directories in watched paths will use more due to the Merkle scan index.
+
 ### Is this Linux-only?
-No. It is cross-platform, with service integration for `systemd` (Linux) and `launchd` (macOS).
+No. It is cross-platform, with service integration for `systemd` (Linux) and `launchd` (macOS). Open-file detection via `/proc/*/fd` is Linux-specific; on other platforms, the open-file veto is skipped but all other safety layers remain active.
 
 ## About Contributions
 

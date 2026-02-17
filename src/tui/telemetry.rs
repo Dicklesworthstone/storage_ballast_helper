@@ -615,6 +615,7 @@ struct TailEntries {
     entries: Vec<crate::logger::jsonl::LogEntry>,
     recovered_lines: usize,
     dropped_lines: usize,
+    truncated_tail_window: bool,
 }
 
 impl JsonlTelemetryAdapter {
@@ -658,6 +659,7 @@ impl JsonlTelemetryAdapter {
         if start_pos > 0 && !raw_lines.is_empty() {
             raw_lines.remove(0);
         }
+        let truncated_tail_window = start_pos > 0 && raw_lines.len() < n;
 
         // Take last n lines.
         let start = raw_lines.len().saturating_sub(n);
@@ -682,6 +684,7 @@ impl JsonlTelemetryAdapter {
             entries,
             recovered_lines,
             dropped_lines,
+            truncated_tail_window,
         }
     }
 }
@@ -695,8 +698,12 @@ impl TelemetryQueryAdapter for JsonlTelemetryAdapter {
         // Read more than limit to account for filtering.
         let read_count = if filter.is_empty() { limit } else { limit * 4 };
         let entries = self.tail_entries(read_count);
-        let diagnostics = schema_shield_diagnostics(entries.recovered_lines, entries.dropped_lines);
-        let partial = entries.dropped_lines > 0;
+        let diagnostics = schema_shield_diagnostics(
+            entries.recovered_lines,
+            entries.dropped_lines,
+            entries.truncated_tail_window,
+        );
+        let partial = entries.dropped_lines > 0 || entries.truncated_tail_window;
 
         let events: Vec<TimelineEvent> = entries
             .entries
@@ -723,8 +730,12 @@ impl TelemetryQueryAdapter for JsonlTelemetryAdapter {
 
     fn recent_decisions(&self, limit: usize) -> TelemetryResult<Vec<DecisionEvidence>> {
         let entries = self.tail_entries(limit * 4);
-        let diagnostics = schema_shield_diagnostics(entries.recovered_lines, entries.dropped_lines);
-        let partial = entries.dropped_lines > 0;
+        let diagnostics = schema_shield_diagnostics(
+            entries.recovered_lines,
+            entries.dropped_lines,
+            entries.truncated_tail_window,
+        );
+        let partial = entries.dropped_lines > 0 || entries.truncated_tail_window;
         let evidence: Vec<DecisionEvidence> = entries
             .entries
             .into_iter()
@@ -752,8 +763,12 @@ impl TelemetryQueryAdapter for JsonlTelemetryAdapter {
         limit: usize,
     ) -> TelemetryResult<Vec<PressurePoint>> {
         let entries = self.tail_entries(limit * 4);
-        let diagnostics = schema_shield_diagnostics(entries.recovered_lines, entries.dropped_lines);
-        let partial = entries.dropped_lines > 0;
+        let diagnostics = schema_shield_diagnostics(
+            entries.recovered_lines,
+            entries.dropped_lines,
+            entries.truncated_tail_window,
+        );
+        let partial = entries.dropped_lines > 0 || entries.truncated_tail_window;
         let points: Vec<PressurePoint> = entries
             .entries
             .into_iter()
@@ -855,10 +870,13 @@ impl TelemetryQueryAdapter for CompositeTelemetryAdapter {
         // Try SQLite first.
         #[cfg(feature = "sqlite")]
         {
-            let sqlite_result = self.sqlite.as_ref()
+            let sqlite_result = self
+                .sqlite
+                .as_ref()
                 .map(|sqlite| sqlite.recent_events(limit, filter))
                 .or_else(|| {
-                    self.sqlite_path.as_deref()
+                    self.sqlite_path
+                        .as_deref()
                         .and_then(SqliteTelemetryAdapter::open)
                         .map(|sqlite| sqlite.recent_events(limit, filter))
                 });
@@ -887,10 +905,13 @@ impl TelemetryQueryAdapter for CompositeTelemetryAdapter {
     fn recent_decisions(&self, limit: usize) -> TelemetryResult<Vec<DecisionEvidence>> {
         #[cfg(feature = "sqlite")]
         {
-            let sqlite_result = self.sqlite.as_ref()
+            let sqlite_result = self
+                .sqlite
+                .as_ref()
                 .map(|sqlite| sqlite.recent_decisions(limit))
                 .or_else(|| {
-                    self.sqlite_path.as_deref()
+                    self.sqlite_path
+                        .as_deref()
                         .and_then(SqliteTelemetryAdapter::open)
                         .map(|sqlite| sqlite.recent_decisions(limit))
                 });
@@ -923,10 +944,13 @@ impl TelemetryQueryAdapter for CompositeTelemetryAdapter {
     ) -> TelemetryResult<Vec<PressurePoint>> {
         #[cfg(feature = "sqlite")]
         {
-            let sqlite_result = self.sqlite.as_ref()
+            let sqlite_result = self
+                .sqlite
+                .as_ref()
                 .map(|sqlite| sqlite.pressure_history(mount, since, limit))
                 .or_else(|| {
-                    self.sqlite_path.as_deref()
+                    self.sqlite_path
+                        .as_deref()
                         .and_then(SqliteTelemetryAdapter::open)
                         .map(|sqlite| sqlite.pressure_history(mount, since, limit))
                 });
@@ -1043,11 +1067,15 @@ fn parse_jsonl_entry_with_schema_shield(line: &str) -> ParseOutcome {
     })
 }
 
-fn schema_shield_diagnostics(recovered: usize, dropped: usize) -> String {
-    if recovered == 0 && dropped == 0 {
+fn schema_shield_diagnostics(recovered: usize, dropped: usize, tail_truncated: bool) -> String {
+    if recovered == 0 && dropped == 0 && !tail_truncated {
         return String::new();
     }
-    format!("jsonl schema-shield recovered={recovered} dropped={dropped}")
+    let mut diagnostics = format!("jsonl schema-shield recovered={recovered} dropped={dropped}");
+    if tail_truncated {
+        diagnostics.push_str(" tail-window-truncated");
+    }
+    diagnostics
 }
 
 fn parse_event_type(input: &str) -> Option<crate::logger::jsonl::EventType> {
@@ -1557,6 +1585,47 @@ mod tests {
         assert!(result.partial);
         assert!(result.diagnostics.contains("recovered=1"));
         assert!(result.diagnostics.contains("dropped=1"));
+    }
+
+    #[test]
+    fn jsonl_tail_window_truncation_marks_partial() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("activity.jsonl");
+
+        let mut content = String::new();
+        for i in 0..120_u64 {
+            let entry = crate::logger::jsonl::LogEntry {
+                ts: format!("2026-02-16T00:00:{i:02}Z"),
+                event: crate::logger::jsonl::EventType::DaemonStart,
+                severity: crate::logger::jsonl::Severity::Info,
+                path: None,
+                size: None,
+                score: None,
+                factors: None,
+                pressure: None,
+                free_pct: None,
+                rate_bps: None,
+                duration_ms: None,
+                ok: None,
+                error_code: None,
+                error_message: None,
+                mount_point: None,
+                details: Some("x".repeat(8192)),
+            };
+            content.push_str(&serde_json::to_string(&entry).expect("serialize"));
+            content.push('\n');
+        }
+        std::fs::write(&path, content).expect("write jsonl");
+        assert!(
+            std::fs::metadata(&path).expect("metadata").len() > 256 * 1024,
+            "fixture must exceed tail chunk size",
+        );
+
+        let adapter = JsonlTelemetryAdapter::open(&path).expect("open");
+        let result = adapter.recent_events(80, &EventFilter::default());
+
+        assert!(result.partial);
+        assert!(result.diagnostics.contains("tail-window-truncated"));
     }
 
     #[test]

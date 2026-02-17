@@ -6,7 +6,6 @@ pub mod bootstrap;
 pub mod dashboard;
 pub mod from_source;
 pub mod install;
-pub mod integrations;
 pub mod uninstall;
 pub mod update;
 pub mod wizard;

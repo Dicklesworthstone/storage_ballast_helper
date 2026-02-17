@@ -296,12 +296,14 @@ src/
     stats.rs          # Stats engine for time-window queries
 
   cli/
-    mod.rs            # Shared installer/update contracts and types
+    mod.rs            # Shared installer/update contracts, supply chain verification
     bootstrap.rs      # Bootstrap migration and self-healing
-    integrations.rs   # AI tool integration bootstrap
     assets.rs         # Asset manifest download/verify/cache pipeline
+    dashboard.rs      # Dashboard launcher and mode selection
+    install.rs        # Install orchestration with wizard and service setup
     from_source.rs    # From-source build fallback mode
     uninstall.rs      # Uninstall with safe cleanup modes
+    update.rs         # Self-update with rollback, cache, and backup management
     wizard.rs         # Guided first-run install wizard
 
   platform/
@@ -322,7 +324,6 @@ src/
 | `src/cli/uninstall.rs` | ~1020 | Uninstall parity with 5 cleanup modes |
 | `src/daemon/notifications.rs` | ~1020 | Multi-channel notification system |
 | `src/cli/mod.rs` | ~910 | Shared installer/update contracts |
-| `src/cli/integrations.rs` | ~910 | AI tool integration with backup-first safety |
 | `src/logger/stats.rs` | ~900 | Stats engine with time-window aggregation |
 | `src/daemon/service.rs` | ~890 | systemd + launchd service management |
 | `src/monitor/voi_scheduler.rs` | ~880 | VOI scan budget allocator |

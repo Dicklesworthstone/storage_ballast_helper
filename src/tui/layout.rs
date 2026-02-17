@@ -23,6 +23,7 @@ pub const fn is_terminal_too_small(cols: u16, rows: u16) -> bool {
 pub enum LayoutClass {
     Narrow,
     Wide,
+    UltraWide,
 }
 
 /// Priority of a pane for narrow-screen collapse behavior.
@@ -129,14 +130,17 @@ pub struct OverviewLayout {
 }
 
 const WIDE_THRESHOLD_COLS: u16 = 100;
+const ULTRA_WIDE_THRESHOLD_COLS: u16 = 180;
 
 /// Classify layout from terminal width.
 #[must_use]
 pub const fn classify_layout(cols: u16) -> LayoutClass {
     if cols < WIDE_THRESHOLD_COLS {
         LayoutClass::Narrow
-    } else {
+    } else if cols < ULTRA_WIDE_THRESHOLD_COLS {
         LayoutClass::Wide
+    } else {
+        LayoutClass::UltraWide
     }
 }
 
@@ -387,75 +391,86 @@ fn build_overview_lg(cols: u16, rows: u16) -> OverviewLayout {
 fn build_overview_xl(term_cols: u16, rows: u16) -> OverviewLayout {
     let full_width = term_cols.max(1);
     let usable = full_width.saturating_sub(3);
-    let c1 = (usable / 4).max(1);
-    let c2 = (usable / 4).max(1);
-    let c3 = (usable / 4).max(1);
+    // Bias extra width toward data-heavy right-side panes.
+    let c1 = (usable.saturating_mul(5) / 24).max(1);
+    let c2 = (usable.saturating_mul(5) / 24).max(1);
+    let c3 = (usable.saturating_mul(6) / 24).max(1);
     let c4 = usable.saturating_sub(c1 + c2 + c3).max(1);
     let col_b = c1.saturating_add(1);
     let col_c = c1.saturating_add(c2).saturating_add(2);
     let col_d = c1.saturating_add(c2 + c3).saturating_add(3);
-    let row3_visible = rows >= 30;
-    let row4_visible = rows >= 36;
+    let min_row1 = 6u16;
+    let min_row2 = 7u16;
+    let top_band_height =
+        ((rows.saturating_mul(3)) / 10).clamp(min_row1, rows.saturating_sub(8).max(6));
+    let remaining = rows.saturating_sub(top_band_height);
+    let middle_band_height = ((remaining.saturating_mul(11)) / 20)
+        .clamp(min_row2, remaining.saturating_sub(4).max(min_row2));
+    let bottom_band_height = remaining.saturating_sub(middle_band_height);
+    let middle_band_top = top_band_height;
+    let bottom_band_top = top_band_height.saturating_add(middle_band_height);
+    let bottom_band_visible = bottom_band_height >= 4;
+    let counters_visible = bottom_band_height >= 6;
 
     let placements = vec![
         PanePlacement::new(
             OverviewPane::PressureSummary,
             PanePriority::P0,
-            PaneRect::new(0, 0, c1, 6),
+            PaneRect::new(0, 0, c1, top_band_height),
             true,
         ),
         PanePlacement::new(
             OverviewPane::ForecastHorizon,
             PanePriority::P0,
-            PaneRect::new(col_b, 0, c2, 6),
+            PaneRect::new(col_b, 0, c2, top_band_height),
             true,
         ),
         PanePlacement::new(
             OverviewPane::ActionLane,
             PanePriority::P0,
-            PaneRect::new(col_c, 0, c3, 6),
+            PaneRect::new(col_c, 0, c3, top_band_height),
             true,
         ),
         PanePlacement::new(
             OverviewPane::DecisionPulse,
             PanePriority::P1,
-            PaneRect::new(col_d, 0, c4, 6),
+            PaneRect::new(col_d, 0, c4, top_band_height),
             true,
         ),
         PanePlacement::new(
             OverviewPane::EwmaTrend,
             PanePriority::P1,
-            PaneRect::new(0, 6, c1 + 1 + c2, 8),
+            PaneRect::new(0, middle_band_top, c1 + 1 + c2, middle_band_height),
             true,
         ),
         PanePlacement::new(
             OverviewPane::CandidateHotlist,
             PanePriority::P1,
-            PaneRect::new(col_c, 6, c3, 8),
+            PaneRect::new(col_c, middle_band_top, c3, middle_band_height),
             true,
         ),
         PanePlacement::new(
             OverviewPane::BallastQuick,
             PanePriority::P1,
-            PaneRect::new(col_d, 6, c4, 8),
+            PaneRect::new(col_d, middle_band_top, c4, middle_band_height),
             true,
         ),
         PanePlacement::new(
             OverviewPane::SpecialLocations,
             PanePriority::P2,
-            PaneRect::new(0, 14, c1 + 1 + c2 + 1 + c3, 6),
-            row3_visible,
+            PaneRect::new(0, bottom_band_top, c1 + 1 + c2 + 1 + c3, bottom_band_height),
+            bottom_band_visible,
         ),
         PanePlacement::new(
             OverviewPane::ExtendedCounters,
             PanePriority::P2,
-            PaneRect::new(col_d, 14, c4, 6),
-            row4_visible,
+            PaneRect::new(col_d, bottom_band_top, c4, bottom_band_height),
+            counters_visible,
         ),
     ];
 
     OverviewLayout {
-        class: LayoutClass::Wide,
+        class: LayoutClass::UltraWide,
         density: OverviewDensity::Xl,
         placements,
     }
@@ -527,6 +542,7 @@ pub fn build_timeline_layout(cols: u16, rows: u16) -> TimelineLayout {
     match classify_layout(cols) {
         LayoutClass::Narrow => build_narrow_timeline(cols, rows),
         LayoutClass::Wide => build_wide_timeline(cols, rows),
+        LayoutClass::UltraWide => build_ultra_timeline(cols, rows),
     }
 }
 
@@ -611,6 +627,47 @@ fn build_wide_timeline(cols: u16, rows: u16) -> TimelineLayout {
     }
 }
 
+fn build_ultra_timeline(cols: u16, rows: u16) -> TimelineLayout {
+    let full_width = cols.max(1);
+    let (list_width, detail_width) = split_columns_ratio(full_width, 2, 11, 20);
+    let detail_col = list_width.saturating_add(2);
+    let footer_row = rows.saturating_sub(1);
+    let body_height = footer_row.saturating_sub(1).max(1);
+    let detail_visible = rows >= 8;
+
+    let placements = vec![
+        TimelinePlacement::new(
+            TimelinePane::FilterBar,
+            PanePriority::P0,
+            PaneRect::new(0, 0, full_width, 1),
+            true,
+        ),
+        TimelinePlacement::new(
+            TimelinePane::EventList,
+            PanePriority::P0,
+            PaneRect::new(0, 1, list_width, body_height),
+            true,
+        ),
+        TimelinePlacement::new(
+            TimelinePane::EventDetail,
+            PanePriority::P1,
+            PaneRect::new(detail_col, 1, detail_width, body_height),
+            detail_visible,
+        ),
+        TimelinePlacement::new(
+            TimelinePane::StatusFooter,
+            PanePriority::P0,
+            PaneRect::new(0, footer_row, full_width, 1),
+            true,
+        ),
+    ];
+
+    TimelineLayout {
+        class: LayoutClass::UltraWide,
+        placements,
+    }
+}
+
 // ──────────────────── ballast layout (S5) ────────────────────
 
 /// Panes for the ballast operations screen.
@@ -674,6 +731,7 @@ pub fn build_ballast_layout(cols: u16, rows: u16) -> BallastLayout {
     match classify_layout(cols) {
         LayoutClass::Narrow => build_narrow_ballast(cols, rows),
         LayoutClass::Wide => build_wide_ballast(cols, rows),
+        LayoutClass::UltraWide => build_ultra_ballast(cols, rows),
     }
 }
 
@@ -745,6 +803,41 @@ fn build_wide_ballast(cols: u16, rows: u16) -> BallastLayout {
     }
 }
 
+fn build_ultra_ballast(cols: u16, rows: u16) -> BallastLayout {
+    let full_width = cols.max(1);
+    let (list_width, detail_width) = split_columns_ratio(full_width, 2, 11, 20);
+    let detail_col = list_width.saturating_add(2);
+    let footer_row = rows.saturating_sub(1);
+    let body_height = footer_row.max(1);
+    let detail_visible = rows >= 8;
+
+    let placements = vec![
+        BallastPlacement::new(
+            BallastPane::VolumeList,
+            PanePriority::P0,
+            PaneRect::new(0, 0, list_width, body_height),
+            true,
+        ),
+        BallastPlacement::new(
+            BallastPane::VolumeDetail,
+            PanePriority::P1,
+            PaneRect::new(detail_col, 0, detail_width, body_height),
+            detail_visible,
+        ),
+        BallastPlacement::new(
+            BallastPane::StatusFooter,
+            PanePriority::P0,
+            PaneRect::new(0, footer_row, full_width, 1),
+            true,
+        ),
+    ];
+
+    BallastLayout {
+        class: LayoutClass::UltraWide,
+        placements,
+    }
+}
+
 // ──────────────────── explainability layout (S3) ────────────────────
 
 /// Panes for the explainability screen.
@@ -811,6 +904,7 @@ pub fn build_explainability_layout(cols: u16, rows: u16) -> ExplainabilityLayout
     match classify_layout(cols) {
         LayoutClass::Narrow => build_narrow_explainability(cols, rows),
         LayoutClass::Wide => build_wide_explainability(cols, rows),
+        LayoutClass::UltraWide => build_ultra_explainability(cols, rows),
     }
 }
 
@@ -894,6 +988,47 @@ fn build_wide_explainability(cols: u16, rows: u16) -> ExplainabilityLayout {
     }
 }
 
+fn build_ultra_explainability(cols: u16, rows: u16) -> ExplainabilityLayout {
+    let full_width = cols.max(1);
+    let (left_width, right_width) = split_columns_ratio(full_width, 2, 11, 20);
+    let right_col = left_width.saturating_add(2);
+    let footer_row = rows.saturating_sub(1);
+    let body_height = footer_row.saturating_sub(3).max(1);
+    let veto_visible = rows >= 10;
+
+    let placements = vec![
+        ExplainabilityPlacement::new(
+            ExplainabilityPane::DecisionHeader,
+            PanePriority::P0,
+            PaneRect::new(0, 0, full_width, 3),
+            true,
+        ),
+        ExplainabilityPlacement::new(
+            ExplainabilityPane::FactorBreakdown,
+            PanePriority::P0,
+            PaneRect::new(0, 3, left_width, body_height),
+            true,
+        ),
+        ExplainabilityPlacement::new(
+            ExplainabilityPane::VetoDetail,
+            PanePriority::P1,
+            PaneRect::new(right_col, 3, right_width, body_height),
+            veto_visible,
+        ),
+        ExplainabilityPlacement::new(
+            ExplainabilityPane::StatusFooter,
+            PanePriority::P0,
+            PaneRect::new(0, footer_row, full_width, 1),
+            true,
+        ),
+    ];
+
+    ExplainabilityLayout {
+        class: LayoutClass::UltraWide,
+        placements,
+    }
+}
+
 // ──────────────────── candidates layout (S4) ────────────────────
 
 /// Panes for the candidates screen.
@@ -960,6 +1095,7 @@ pub fn build_candidates_layout(cols: u16, rows: u16) -> CandidatesLayout {
     match classify_layout(cols) {
         LayoutClass::Narrow => build_narrow_candidates(cols, rows),
         LayoutClass::Wide => build_wide_candidates(cols, rows),
+        LayoutClass::UltraWide => build_ultra_candidates(cols, rows),
     }
 }
 
@@ -1043,6 +1179,47 @@ fn build_wide_candidates(cols: u16, rows: u16) -> CandidatesLayout {
     }
 }
 
+fn build_ultra_candidates(cols: u16, rows: u16) -> CandidatesLayout {
+    let full_width = cols.max(1);
+    let (list_width, detail_width) = split_columns_ratio(full_width, 2, 11, 20);
+    let detail_col = list_width.saturating_add(2);
+    let footer_row = rows.saturating_sub(1);
+    let body_height = footer_row.saturating_sub(1).max(1);
+    let detail_visible = rows >= 8;
+
+    let placements = vec![
+        CandidatesPlacement::new(
+            CandidatesPane::SummaryBar,
+            PanePriority::P0,
+            PaneRect::new(0, 0, full_width, 1),
+            true,
+        ),
+        CandidatesPlacement::new(
+            CandidatesPane::CandidateList,
+            PanePriority::P0,
+            PaneRect::new(0, 1, list_width, body_height),
+            true,
+        ),
+        CandidatesPlacement::new(
+            CandidatesPane::ScoreDetail,
+            PanePriority::P1,
+            PaneRect::new(detail_col, 1, detail_width, body_height),
+            detail_visible,
+        ),
+        CandidatesPlacement::new(
+            CandidatesPane::StatusFooter,
+            PanePriority::P0,
+            PaneRect::new(0, footer_row, full_width, 1),
+            true,
+        ),
+    ];
+
+    CandidatesLayout {
+        class: LayoutClass::UltraWide,
+        placements,
+    }
+}
+
 // ──────────────────── log search layout (S6) ────────────────────
 
 /// Panes for the log search screen.
@@ -1109,6 +1286,7 @@ pub fn build_log_search_layout(cols: u16, rows: u16) -> LogSearchLayout {
     match classify_layout(cols) {
         LayoutClass::Narrow => build_narrow_log_search(cols, rows),
         LayoutClass::Wide => build_wide_log_search(cols, rows),
+        LayoutClass::UltraWide => build_ultra_log_search(cols, rows),
     }
 }
 
@@ -1192,6 +1370,47 @@ fn build_wide_log_search(cols: u16, rows: u16) -> LogSearchLayout {
     }
 }
 
+fn build_ultra_log_search(cols: u16, rows: u16) -> LogSearchLayout {
+    let full_width = cols.max(1);
+    let (list_width, detail_width) = split_columns_ratio(full_width, 2, 11, 20);
+    let detail_col = list_width.saturating_add(2);
+    let footer_row = rows.saturating_sub(1);
+    let body_height = footer_row.saturating_sub(1).max(1);
+    let detail_visible = rows >= 8;
+
+    let placements = vec![
+        LogSearchPlacement::new(
+            LogSearchPane::SearchBar,
+            PanePriority::P0,
+            PaneRect::new(0, 0, full_width, 1),
+            true,
+        ),
+        LogSearchPlacement::new(
+            LogSearchPane::LogList,
+            PanePriority::P0,
+            PaneRect::new(0, 1, list_width, body_height),
+            true,
+        ),
+        LogSearchPlacement::new(
+            LogSearchPane::EntryDetail,
+            PanePriority::P1,
+            PaneRect::new(detail_col, 1, detail_width, body_height),
+            detail_visible,
+        ),
+        LogSearchPlacement::new(
+            LogSearchPane::StatusFooter,
+            PanePriority::P0,
+            PaneRect::new(0, footer_row, full_width, 1),
+            true,
+        ),
+    ];
+
+    LogSearchLayout {
+        class: LayoutClass::UltraWide,
+        placements,
+    }
+}
+
 // ──────────────────── diagnostics layout (S7) ────────────────────
 
 /// Panes for the diagnostics screen.
@@ -1258,6 +1477,7 @@ pub fn build_diagnostics_layout(cols: u16, rows: u16) -> DiagnosticsLayout {
     match classify_layout(cols) {
         LayoutClass::Narrow => build_narrow_diagnostics(cols, rows),
         LayoutClass::Wide => build_wide_diagnostics(cols, rows),
+        LayoutClass::UltraWide => build_ultra_diagnostics(cols, rows),
     }
 }
 
@@ -1348,11 +1568,67 @@ fn build_wide_diagnostics(cols: u16, rows: u16) -> DiagnosticsLayout {
     }
 }
 
+fn build_ultra_diagnostics(cols: u16, rows: u16) -> DiagnosticsLayout {
+    let full_width = cols.max(1);
+    let (left_width, right_width) = split_columns_ratio(full_width, 2, 11, 20);
+    let right_col = left_width.saturating_add(2);
+    let footer_row = rows.saturating_sub(1);
+    let body_height = footer_row.saturating_sub(3).max(1);
+    let perf_visible = rows >= 10;
+
+    let placements = vec![
+        DiagnosticsPlacement::new(
+            DiagnosticsPane::HealthHeader,
+            PanePriority::P0,
+            PaneRect::new(0, 0, full_width, 3),
+            true,
+        ),
+        DiagnosticsPlacement::new(
+            DiagnosticsPane::ThreadTable,
+            PanePriority::P0,
+            PaneRect::new(0, 3, left_width, body_height),
+            true,
+        ),
+        DiagnosticsPlacement::new(
+            DiagnosticsPane::PerfPanel,
+            PanePriority::P1,
+            PaneRect::new(right_col, 3, right_width, body_height),
+            perf_visible,
+        ),
+        DiagnosticsPlacement::new(
+            DiagnosticsPane::StatusFooter,
+            PanePriority::P0,
+            PaneRect::new(0, footer_row, full_width, 1),
+            true,
+        ),
+    ];
+
+    DiagnosticsLayout {
+        class: LayoutClass::UltraWide,
+        placements,
+    }
+}
+
 // ──────────────────── shared helpers ────────────────────
 
 fn split_columns(cols: u16, gutter: u16) -> (u16, u16) {
     let usable = cols.saturating_sub(gutter);
     let left = (usable.saturating_mul(3) / 5).max(1);
+    let right = usable.saturating_sub(left).max(1);
+    (left, right)
+}
+
+fn split_columns_ratio(
+    cols: u16,
+    gutter: u16,
+    left_numerator: u16,
+    denominator: u16,
+) -> (u16, u16) {
+    if denominator == 0 {
+        return split_columns(cols, gutter);
+    }
+    let usable = cols.saturating_sub(gutter);
+    let left = (usable.saturating_mul(left_numerator) / denominator).max(1);
     let right = usable.saturating_sub(left).max(1);
     (left, right)
 }
@@ -1366,6 +1642,8 @@ mod tests {
         assert_eq!(classify_layout(80), LayoutClass::Narrow);
         assert_eq!(classify_layout(99), LayoutClass::Narrow);
         assert_eq!(classify_layout(100), LayoutClass::Wide);
+        assert_eq!(classify_layout(179), LayoutClass::Wide);
+        assert_eq!(classify_layout(180), LayoutClass::UltraWide);
     }
 
     #[test]
@@ -1403,6 +1681,27 @@ mod tests {
         assert_eq!(classify_overview_density(130, 24), OverviewDensity::Md);
         assert_eq!(classify_overview_density(180, 30), OverviewDensity::Lg);
         assert_eq!(classify_overview_density(260, 40), OverviewDensity::Xl);
+    }
+
+    #[test]
+    fn overview_xl_uses_ultra_wide_class() {
+        let layout = build_overview_layout(260, 40);
+        assert_eq!(layout.class, LayoutClass::UltraWide);
+        assert_eq!(layout.density, OverviewDensity::Xl);
+    }
+
+    #[test]
+    fn overview_xl_uses_available_vertical_space() {
+        let rows = 48;
+        let layout = build_overview_layout(260, rows);
+        let max_bottom = layout
+            .placements
+            .iter()
+            .filter(|p| p.visible)
+            .map(|p| p.rect.row.saturating_add(p.rect.height))
+            .max()
+            .unwrap_or(0);
+        assert!(max_bottom >= rows.saturating_sub(1));
     }
 
     // ── Timeline layout ──
@@ -1449,6 +1748,18 @@ mod tests {
             .expect("detail pane");
         assert!(detail.visible);
         assert!(detail.rect.col > 0);
+    }
+
+    #[test]
+    fn ultra_timeline_uses_ultra_wide_class() {
+        let layout = build_timeline_layout(220, 30);
+        assert_eq!(layout.class, LayoutClass::UltraWide);
+        let detail = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == TimelinePane::EventDetail)
+            .expect("detail pane");
+        assert!(detail.visible);
     }
 
     #[test]
@@ -1506,6 +1817,18 @@ mod tests {
             .expect("detail pane");
         assert!(detail.visible);
         assert!(detail.rect.col > 0);
+    }
+
+    #[test]
+    fn ultra_ballast_uses_ultra_wide_class() {
+        let layout = build_ballast_layout(220, 30);
+        assert_eq!(layout.class, LayoutClass::UltraWide);
+        let detail = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == BallastPane::VolumeDetail)
+            .expect("detail pane");
+        assert!(detail.visible);
     }
 
     #[test]
@@ -1596,6 +1919,18 @@ mod tests {
     }
 
     #[test]
+    fn ultra_explainability_uses_ultra_wide_class() {
+        let layout = build_explainability_layout(220, 30);
+        assert_eq!(layout.class, LayoutClass::UltraWide);
+        let veto = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == ExplainabilityPane::VetoDetail)
+            .expect("veto pane");
+        assert!(veto.visible);
+    }
+
+    #[test]
     fn wide_explainability_veto_hidden_on_short_terminal() {
         let layout = build_explainability_layout(140, 10);
         let veto = layout
@@ -1665,6 +2000,18 @@ mod tests {
             .expect("score detail pane");
         assert!(detail.visible);
         assert!(detail.rect.col > 0);
+    }
+
+    #[test]
+    fn ultra_candidates_uses_ultra_wide_class() {
+        let layout = build_candidates_layout(220, 30);
+        assert_eq!(layout.class, LayoutClass::UltraWide);
+        let detail = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == CandidatesPane::ScoreDetail)
+            .expect("score detail pane");
+        assert!(detail.visible);
     }
 
     #[test]
@@ -1740,6 +2087,18 @@ mod tests {
     }
 
     #[test]
+    fn ultra_log_search_uses_ultra_wide_class() {
+        let layout = build_log_search_layout(220, 30);
+        assert_eq!(layout.class, LayoutClass::UltraWide);
+        let detail = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == LogSearchPane::EntryDetail)
+            .expect("entry detail pane");
+        assert!(detail.visible);
+    }
+
+    #[test]
     fn log_search_pane_ids_are_unique() {
         let panes = [
             LogSearchPane::SearchBar,
@@ -1809,6 +2168,18 @@ mod tests {
             .expect("perf panel");
         assert!(perf.visible);
         assert!(perf.rect.col > 0);
+    }
+
+    #[test]
+    fn ultra_diagnostics_uses_ultra_wide_class() {
+        let layout = build_diagnostics_layout(220, 30);
+        assert_eq!(layout.class, LayoutClass::UltraWide);
+        let perf = layout
+            .placements
+            .iter()
+            .find(|p| p.pane == DiagnosticsPane::PerfPanel)
+            .expect("perf panel");
+        assert!(perf.visible);
     }
 
     #[test]

@@ -71,7 +71,7 @@ impl BallastReleaseController {
         // Calculate missing files based on physical inventory, robust to restarts.
         // If files are missing (deleted by us or user), they count as "released".
         let already_released = configured_total.saturating_sub(available);
-        
+
         // Ensure state entry exists for this mount.
         self.states.entry(mount_path.to_path_buf()).or_default();
 
@@ -224,7 +224,6 @@ impl BallastReleaseController {
     pub fn reset(&mut self) {
         self.states.clear();
     }
-
 }
 
 // ──────────────────── tests ────────────────────
@@ -270,7 +269,10 @@ mod tests {
     fn no_release_when_green() {
         let mut ctrl = BallastReleaseController::new(30);
         let response = test_response(PressureLevel::Green, 0.0, 0);
-        assert_eq!(ctrl.files_to_release(Path::new("/test"), &response, 5, 5), 0);
+        assert_eq!(
+            ctrl.files_to_release(Path::new("/test"), &response, 5, 5),
+            0
+        );
     }
 
     #[test]

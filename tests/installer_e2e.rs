@@ -1,4 +1,4 @@
-//! E2E test matrix for installer/update/integration flows (bd-2j5.14).
+//! E2E test matrix for installer/update flows (bd-2j5.14).
 //!
 //! Tests cover:
 //! - Fresh install sequence (data dir, config, ballast provisioning)
@@ -6,7 +6,6 @@
 //! - Uninstall cleanup (data, ballast, config removal)
 //! - Update orchestration (check, apply, pin, dry-run)
 //! - Rollback flow (backup store lifecycle)
-//! - Bootstrap integration (tool detection and injection)
 //! - Failure injection (checksum mismatch, missing manifests, permission errors)
 //! - Golden output format validation for user-visible screens
 
@@ -24,9 +23,6 @@ use storage_ballast_helper::cli::install::{
     InstallOptions, InstallReport, InstallStep, UninstallOptions, UninstallReport,
     format_install_report, format_uninstall_report, run_install_sequence,
     run_install_sequence_with_bundle, run_uninstall_cleanup,
-};
-use storage_ballast_helper::cli::integrations::{
-    ALL_TOOLS, BootstrapOptions, IntegrationStatus, run_bootstrap,
 };
 use storage_ballast_helper::cli::update::{BackupStore, UpdateOptions, run_update_sequence};
 use storage_ballast_helper::cli::wizard::{
@@ -819,44 +815,7 @@ fn e2e_wizard_interactive_custom_paths_roundtrip() {
 }
 
 // ============================================================================
-// H: Integration bootstrap idempotency
-// ============================================================================
-
-#[test]
-fn e2e_bootstrap_skip_all_tools_does_nothing() {
-    let opts = BootstrapOptions {
-        dry_run: true,
-        skip_tools: ALL_TOOLS.to_vec(),
-        ..Default::default()
-    };
-    let summary = run_bootstrap(&opts);
-    assert_eq!(summary.configured_count, 0);
-    assert_eq!(summary.failed_count, 0);
-    for result in &summary.results {
-        assert_eq!(result.status, IntegrationStatus::Skipped);
-    }
-}
-
-#[test]
-fn e2e_bootstrap_idempotent_re_run() {
-    // Running bootstrap twice should not fail and second run should have
-    // the same configured_count as first (no duplicate injections).
-    let opts = BootstrapOptions {
-        dry_run: true,
-        skip_tools: vec![],
-        ..Default::default()
-    };
-    let summary1 = run_bootstrap(&opts);
-    let summary2 = run_bootstrap(&opts);
-    assert_eq!(
-        summary1.configured_count, summary2.configured_count,
-        "re-running bootstrap should be idempotent"
-    );
-    assert_eq!(summary1.failed_count, summary2.failed_count);
-}
-
-// ============================================================================
-// I: Artifact contract resolution
+// H: Artifact contract resolution
 // ============================================================================
 
 #[test]

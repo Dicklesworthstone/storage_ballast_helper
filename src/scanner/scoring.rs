@@ -390,6 +390,11 @@ fn factor_structure(signals: StructuralSignals) -> f64 {
 }
 
 fn pressure_multiplier(urgency: f64) -> f64 {
+    // Piecewise linear function that scales the score based on system urgency.
+    // - Low urgency (0.0 - 0.3): Gentle scaling (1.0x to 1.3x).
+    // - Medium urgency (0.3 - 0.5): Moderate increase (1.3x to 1.5x).
+    // - High urgency (0.5 - 0.8): Aggressive ramp (1.5x to 2.0x).
+    // - Critical urgency (> 0.8): Panic mode (2.0x to 3.0x), pushing marginal candidates over the threshold.
     let u = urgency.clamp(0.0, 1.0);
     if u <= 0.3 {
         1.0 + u
@@ -403,12 +408,22 @@ fn pressure_multiplier(urgency: f64) -> f64 {
 }
 
 fn posterior_from_score(total_score: f64, confidence: f64) -> f64 {
+    // Converts the raw score into a probability (0.0 to 1.0) using a sigmoid function.
+    // - `total_score / 1.5`: Normalizes the score (typically 0-3) to a 0-2 range, clamped to 0-1.
+    // - `3.5`: Steepness of the sigmoid.
+    // - `2.0 * (confidence - 0.5)`: Shifts the curve based on pattern confidence. High confidence
+    //   shifts the curve left (higher probability for lower scores).
     let scaled_score = (total_score / 1.5).clamp(0.0, 1.0);
     let logit = 3.5f64.mul_add(scaled_score - 0.5, 2.0 * (confidence - 0.5));
     1.0 / (1.0 + (-logit).exp())
 }
 
 fn calibration_score(classification_confidence: f64, factors: ScoreFactors) -> f64 {
+    // Heuristic for how "calibrated" the score is.
+    // - Primary driver is classification confidence (0.75 weight).
+    // - Secondary driver is the consistency between location and structure (0.25 weight).
+    //   If location implies safety but structure implies artifact (or vice versa),
+    //   calibration drops, increasing uncertainty.
     let spread = (factors.location - factors.structure).abs();
     0.75f64
         .mul_add(classification_confidence, 0.25 * (1.0 - spread))
@@ -492,6 +507,10 @@ fn min_delete_advantage(calibration: f64, uncertainty: f64) -> f64 {
 }
 
 fn epistemic_uncertainty(posterior_abandoned: f64, calibration: f64) -> f64 {
+    // Calculates uncertainty based on the entropy of the posterior probability and the calibration score.
+    // - `entropy`: Measures how "unsure" the probability is (max at p=0.5).
+    // - `calibration_penalty`: Adds uncertainty if the model is known to be poorly calibrated.
+    // - Mix: 65% entropy, 35% calibration penalty.
     let p = posterior_abandoned.clamp(1e-6, 1.0 - 1e-6);
     let entropy = -(p * p.ln() + (1.0 - p) * (1.0 - p).ln()) / std::f64::consts::LN_2;
     let calibration_penalty = 1.0 - calibration.clamp(0.0, 1.0);
@@ -847,6 +866,25 @@ mod tests {
         let low = engine.score_candidate(&input, 0.0);
         let high = engine.score_candidate(&input, 1.0);
         assert!(high.total_score >= low.total_score);
+    }
+
+    #[test]
+    fn pressure_multiplier_scales_aggressively_at_critical() {
+        // Verify the "panic mode" scaling (2.0x to 3.0x) for urgency > 0.8
+        let critical_low = super::pressure_multiplier(0.8);
+        let critical_high = super::pressure_multiplier(1.0);
+
+        // At 0.8, it should be exactly 1.5 + (0.8 - 0.5) * (0.5/0.3) = 1.5 + 0.3 * 1.666 = 2.0
+        assert!(
+            (critical_low - 2.0).abs() < 1e-6,
+            "multiplier at 0.8 should be 2.0"
+        );
+
+        // At 1.0, it should be 2.0 + (1.0 - 0.8) * 5.0 = 2.0 + 0.2 * 5.0 = 3.0
+        assert!(
+            (critical_high - 3.0).abs() < 1e-6,
+            "multiplier at 1.0 should be 3.0"
+        );
     }
 
     #[test]

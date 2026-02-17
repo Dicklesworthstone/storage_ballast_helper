@@ -65,6 +65,20 @@ impl DiskRateEstimator {
         }
     }
 
+    /// Update estimator parameters at runtime (e.g. after config reload).
+    pub fn update_params(
+        &mut self,
+        base_alpha: f64,
+        min_alpha: f64,
+        max_alpha: f64,
+        min_samples: u64,
+    ) {
+        self.base_alpha = base_alpha;
+        self.min_alpha = min_alpha;
+        self.max_alpha = max_alpha;
+        self.min_samples = min_samples;
+    }
+
     /// Update estimator state with a new free-bytes sample.
     ///
     /// `threshold_free_bytes` should be the configured red threshold in bytes.

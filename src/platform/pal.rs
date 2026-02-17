@@ -166,11 +166,11 @@ impl Platform for LinuxPlatform {
             path: path.to_path_buf(),
             details: error.to_string(),
         })?;
-        let fragment = stat.fragment_size();
+        let fragment = stat.fragment_size() as u64;
         Ok(FsStats {
-            total_bytes: stat.blocks().saturating_mul(fragment),
-            free_bytes: stat.blocks_free().saturating_mul(fragment),
-            available_bytes: stat.blocks_available().saturating_mul(fragment),
+            total_bytes: (stat.blocks() as u64).saturating_mul(fragment),
+            free_bytes: (stat.blocks_free() as u64).saturating_mul(fragment),
+            available_bytes: (stat.blocks_available() as u64).saturating_mul(fragment),
             fs_type: mount.fs_type.clone(),
             mount_point: mount.path.clone(),
             is_readonly: stat.flags().contains(nix::sys::statvfs::FsFlags::ST_RDONLY),

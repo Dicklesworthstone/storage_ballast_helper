@@ -307,3 +307,8 @@ All findings verified against current source by extraction agents.
 - `parse_meminfo` HashMap key bug (Rust HashMap uses value equality)
 - `Option<Option<String>>` for rollback (standard clap v4 pattern)
 - `free_bytes` field "unused" (used extensively across codebase)
+
+## Resolution Update (2026-02-16)
+
+- **I3 (Config reload):** Fixed. Added `DiskRateEstimator::update_params` and `MountMonitor::update_config` to ensure EWMA parameters are propagated during SIGHUP reload.
+- **Verification:** All other Critical (C1-C4) and Priority Fix Cluster issues were verified as already fixed in the current codebase.

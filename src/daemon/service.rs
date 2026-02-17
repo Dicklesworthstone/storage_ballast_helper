@@ -214,7 +214,9 @@ impl SystemdServiceManager {
                     self.config.binary_path.display(),
                     meta.uid()
                 );
-                eprintln!("[SBH-WARN] A non-root user could replace this binary and gain root privileges.");
+                eprintln!(
+                    "[SBH-WARN] A non-root user could replace this binary and gain root privileges."
+                );
                 eprintln!(
                     "[SBH-WARN] Recommendation: 'sudo chown root:root {}'",
                     self.config.binary_path.display()

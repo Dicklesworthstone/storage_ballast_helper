@@ -719,9 +719,8 @@ pub fn is_path_open_by_ancestor<S: std::hash::BuildHasher>(
     if open_ancestors.contains(path) {
         return true;
     }
-    if path.is_absolute() {
-        return false;
-    }
+    // Always normalize to catch symlink aliases (e.g. candidate /var/tmp vs /proc reporting /private/var/tmp).
+    // resolve_absolute_path performs fs::canonicalize if the path exists.
     let normalized = crate::core::paths::resolve_absolute_path(path);
     open_ancestors.contains(&normalized)
 }
@@ -776,7 +775,11 @@ impl<'a, S: std::hash::BuildHasher> OpenPathCache<'a, S> {
                 continue;
             }
 
-            let Ok(meta) = fs::metadata(&p) else {
+            // Use symlink_metadata to avoid following symlinks. Following symlinks
+            // can lead to infinite recursion on loops and escapes the directory tree.
+            // If the symlink points to a directory, is_dir() will be false, so we
+            // won't recurse, which is correct (we don't delete through symlinks).
+            let Ok(meta) = fs::symlink_metadata(&p) else {
                 continue;
             };
 

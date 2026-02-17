@@ -64,6 +64,12 @@ pub struct CalibrationObservation {
 impl CalibrationObservation {
     /// Absolute relative error of the rate prediction.
     fn rate_error_ratio(self) -> f64 {
+        // Ignore errors when rates are trivial (< 1 byte/sec) to prevent
+        // floating-point noise during idle periods from triggering calibration failure.
+        if self.actual_rate.abs() < 1.0 && self.predicted_rate.abs() < 1.0 {
+            return 0.0;
+        }
+
         if self.actual_rate.abs() < 1e-9 {
             if self.predicted_rate.abs() < 1e-9 {
                 return 0.0;
@@ -846,5 +852,26 @@ mod tests {
 
         // After recovery, e-process should be reset to 0.
         assert!((guard.e_process_log - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rate_error_ratio_ignores_idle_noise() {
+        let obs = CalibrationObservation {
+            predicted_rate: 0.5, // Tiny noise
+            actual_rate: 0.0,    // Idle
+            predicted_tte: 300.0,
+            actual_tte: 300.0,
+        };
+        // Before fix, this returned INFINITY. Now should be 0.0.
+        assert_eq!(obs.rate_error_ratio(), 0.0);
+
+        let obs2 = CalibrationObservation {
+            predicted_rate: 0.0,
+            actual_rate: 0.5, // Tiny noise
+            predicted_tte: 300.0,
+            actual_tte: 300.0,
+        };
+        // Should also be 0.0
+        assert_eq!(obs2.rate_error_ratio(), 0.0);
     }
 }

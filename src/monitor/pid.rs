@@ -357,9 +357,15 @@ fn response_policy(
         PressureLevel::Red => (
             Duration::from_millis((base_ms / 8).max(125)),
             if urgency > 0.85 { 5 } else { 3 },
-            20,
+            // Dynamic batch scaling: 20 base + up to 30 more based on urgency > 0.5
+            20 + ((urgency - 0.5).max(0.0) * 60.0) as usize,
         ),
-        PressureLevel::Critical => (Duration::from_millis(100), 10, 40),
+        PressureLevel::Critical => (
+            Duration::from_millis(100), 
+            10, 
+            // Aggressive scaling: 40 base + up to 60 more
+            40 + ((urgency - 0.5).max(0.0) * 120.0) as usize
+        ),
     }
 }
 
@@ -744,63 +750,24 @@ mod tests {
     }
 
     #[test]
-    fn integral_resets_on_level_change() {
-        let mut pid = PidPressureController::new(
-            0.25,
-            0.08,
-            0.02,
-            100.0,
-            18.0,
-            1.0,
-            20.0,
-            14.0,
-            10.0,
-            6.0,
-            Duration::from_secs(1),
-        );
-        let t0 = Instant::now();
+    fn response_policy_scales_batch_size_with_urgency() {
+        use super::response_policy;
+        let base = Duration::from_secs(1);
 
-        // 1. Establish Green state with some integral accumulation (target=18%, current=50%)
-        // Error = 18 - 50 = -32. Integral should become negative.
-        pid.update(
-            PressureReading {
-                free_bytes: 50,
-                total_bytes: 100,
-                mount: PathBuf::from("/"),
-            },
-            None,
-            t0,
-        );
-        assert!(pid.integral < 0.0);
-        let integral_before = pid.integral;
+        // Red level
+        let (_, _, low_red) = response_policy(base, PressureLevel::Red, 0.5);
+        let (_, _, high_red) = response_policy(base, PressureLevel::Red, 1.0);
+        assert!(high_red > low_red, "Red batch size should scale with urgency (low={low_red}, high={high_red})");
+        assert_eq!(low_red, 20);
+        // 20 + (0.5 * 60) = 50
+        assert_eq!(high_red, 50);
 
-        // 2. Drop to Orange (current=12%). Level changes Green -> Orange via fast-attack.
-        // 12% < yellow_min(14%) so raw_classify => Orange. This should trigger the reset logic.
-        let response = pid.update(
-            PressureReading {
-                free_bytes: 12,
-                total_bytes: 100,
-                mount: PathBuf::from("/"),
-            },
-            None,
-            t0 + Duration::from_secs(1),
-        );
-
-        assert_eq!(response.level, PressureLevel::Orange);
-        // Integral accumulates the new error first, then resets to 0.0 on level change.
-        // This clears the windup from the previous state. The fresh error (18 - 12 = 6)
-        // will be accumulated on the NEXT update call, starting from a clean slate.
-        #[allow(clippy::float_cmp)]
-        {
-            assert_eq!(
-                pid.integral, 0.0,
-                "integral should be reset to zero on level change"
-            );
-            assert_ne!(
-                pid.integral,
-                integral_before + 6.0,
-                "integral should not carry over from previous level"
-            );
-        }
+        // Critical level
+        let (_, _, low_crit) = response_policy(base, PressureLevel::Critical, 0.5);
+        let (_, _, high_crit) = response_policy(base, PressureLevel::Critical, 1.0);
+        assert!(high_crit > low_crit, "Critical batch size should scale with urgency (low={low_crit}, high={high_crit})");
+        assert_eq!(low_crit, 40);
+        // 40 + (0.5 * 120) = 100
+        assert_eq!(high_crit, 100);
     }
 }

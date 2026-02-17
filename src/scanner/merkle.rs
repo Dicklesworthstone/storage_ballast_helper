@@ -685,6 +685,11 @@ impl MerkleScanIndex {
         self.nodes.len()
     }
 
+    /// Get all paths currently tracked in the index.
+    pub fn tracked_paths(&self) -> Vec<PathBuf> {
+        self.snapshots.keys().cloned().collect()
+    }
+
     /// Check if a specific path's metadata has changed compared to the index.
     pub fn is_path_changed(&self, path: &Path, current_meta: &WalkEntry) -> bool {
         let Some(old_snap) = self.snapshots.get(path) else {
