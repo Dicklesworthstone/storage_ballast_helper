@@ -416,11 +416,24 @@ pub struct LaunchdConfig {
 
 impl LaunchdConfig {
     /// Build a config from the current environment.
+    ///
+    /// If `user_scope` is false but the current process is not running as root,
+    /// automatically escalates to user-scope to avoid permission errors when
+    /// creating log directories under `/usr/local/var/log/`.
     pub fn from_env(user_scope: bool) -> Result<Self> {
+        let effective_user_scope = if !user_scope && !is_running_as_root() {
+            eprintln!(
+                "[SBH] Not running as root — defaulting to user-scope launchd installation"
+            );
+            true
+        } else {
+            user_scope
+        };
+
         let binary_path = resolve_sbh_binary()?;
-        let (stdout_log, stderr_log) = default_launchd_log_paths(user_scope);
+        let (stdout_log, stderr_log) = default_launchd_log_paths(effective_user_scope);
         Ok(Self {
-            user_scope,
+            user_scope: effective_user_scope,
             binary_path,
             stdout_log,
             stderr_log,
@@ -638,6 +651,22 @@ fn escape_xml(s: &str) -> String {
         }
     }
     out
+}
+
+/// Check whether the current process is running as root.
+///
+/// Uses `nix::unistd::geteuid()` on Unix; always returns `false` on other
+/// platforms (launchd is macOS-only, but this keeps the code compilable
+/// everywhere).
+fn is_running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        nix::unistd::geteuid().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Default log file paths for launchd service.

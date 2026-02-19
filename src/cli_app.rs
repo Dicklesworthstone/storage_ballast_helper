@@ -792,7 +792,7 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
         let mgr = LaunchdServiceManager::from_env(args.user)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
         let plist_path = mgr.config().plist_path();
-        let scope = if args.user { "user" } else { "system" };
+        let scope = if mgr.config().user_scope { "user" } else { "system" };
 
         match mgr.install() {
             Ok(()) => {
