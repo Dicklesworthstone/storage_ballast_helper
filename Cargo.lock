@@ -390,7 +390,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "ftui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-backend"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -410,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-layout"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-render"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "bitflags",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-style"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-text"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-tty"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-widgets"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "bitflags",
@@ -1159,7 +1159,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "storage_ballast_helper"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "clap",
