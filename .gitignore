@@ -47,3 +47,6 @@ target_*/
 ci-artifacts/
 proptest-regressions/
 test_meminfo
+
+# Accidental shell output
+/test
