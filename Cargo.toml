@@ -39,9 +39,9 @@ rusqlite = { version = "0.33", features = ["bundled", "functions"], optional = t
 # Error handling (core)
 thiserror = "2.0"
 # TUI (optional — gated behind "tui" feature)
-ftui = { version = "0.2.1", default-features = false, optional = true }
-ftui-backend = { version = "0.2.1", optional = true }
-ftui-tty = { version = "0.2.1", optional = true }
+ftui = { path = "/dp/frankentui/crates/ftui", default-features = false, optional = true }
+ftui-backend = { path = "/dp/frankentui/crates/ftui-backend", optional = true }
+ftui-tty = { path = "/dp/frankentui/crates/ftui-tty", optional = true }
 # Timestamps (core)
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Concurrency (core — used by scanner walker, not just daemon)
