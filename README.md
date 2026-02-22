@@ -1582,4 +1582,4 @@ No. It is cross-platform, with service integration for `systemd` (Linux) and `la
 
 ## License
 
-MIT.
+MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE).
