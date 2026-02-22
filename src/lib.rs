@@ -34,6 +34,7 @@ pub mod logger;
 pub mod monitor;
 pub mod platform;
 pub mod scanner;
+#[cfg(feature = "tui")]
 pub mod tui;
 
 #[cfg(test)]

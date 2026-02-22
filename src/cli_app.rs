@@ -2910,6 +2910,7 @@ fn run_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Result
     }
 }
 
+#[cfg(feature = "tui")]
 fn run_new_dashboard_runtime(request: &DashboardRuntimeRequest) -> Result<(), CliError> {
     use storage_ballast_helper::tui::{
         self, DashboardRuntimeConfig as NewDashboardRuntimeConfig, DashboardRuntimeMode,
@@ -2925,6 +2926,11 @@ fn run_new_dashboard_runtime(request: &DashboardRuntimeRequest) -> Result<(), Cl
     };
     tui::run_dashboard(&config)
         .map_err(|e| CliError::Runtime(format!("dashboard runtime failure: {e}")))
+}
+
+#[cfg(not(feature = "tui"))]
+fn run_new_dashboard_runtime(_request: &DashboardRuntimeRequest) -> Result<(), CliError> {
+    Err(CliError::Runtime("TUI feature not enabled. Rebuild with --features tui".to_string()))
 }
 
 fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {

@@ -1979,6 +1979,7 @@ fn scanner_thread_main(
             let hb = Arc::clone(heartbeat);
             move || hb.beat()
         });
+        let cancel_token = walker.cancel_token();
 
         // Perform the walk (streaming).
         let rx = match walker.stream() {
@@ -2041,9 +2042,10 @@ fn scanner_thread_main(
                 Err(RecvTimeoutError::Timeout) => {
                     // No entries for 2 seconds — check if budget is exhausted.
                     if Instant::now() >= scan_deadline {
+                        cancel_token.store(true, Ordering::Relaxed);
                         eprintln!(
                             "[SBH-SCANNER] scan timed out ({paths_scanned} entries, \
-                             {candidates_found} candidates, {:.1}s) — walker may be stuck",
+                             {candidates_found} candidates, {:.1}s) — cancelling walker threads",
                             scan_start.elapsed().as_secs_f64()
                         );
                         break;
@@ -2056,9 +2058,10 @@ fn scanner_thread_main(
 
             // Budget check: stop processing if we've exceeded entry count or time limits.
             if paths_scanned >= SCAN_ENTRY_BUDGET || Instant::now() >= scan_deadline {
+                cancel_token.store(true, Ordering::Relaxed);
                 eprintln!(
                     "[SBH-SCANNER] scan budget reached ({paths_scanned} entries, \
-                     {candidates_found} candidates, {:.1}s) — dispatching partial results",
+                     {candidates_found} candidates, {:.1}s) — cancelling walker threads",
                     scan_start.elapsed().as_secs_f64()
                 );
                 break;

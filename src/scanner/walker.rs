@@ -12,7 +12,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -94,6 +94,10 @@ pub struct DirectoryWalker {
     config: WalkerConfig,
     protection: Arc<parking_lot::RwLock<ProtectionRegistry>>,
     heartbeat: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Shared cancellation flag. When set to `true`, walker threads exit promptly
+    /// instead of blocking on full channels. This prevents thread leaks when the
+    /// scanner times out a scan pass.
+    cancel: Arc<AtomicBool>,
 }
 
 impl DirectoryWalker {
@@ -102,7 +106,17 @@ impl DirectoryWalker {
             config,
             protection: Arc::new(parking_lot::RwLock::new(protection)),
             heartbeat: None,
+            cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Return a handle to the cancellation flag.
+    ///
+    /// The caller (scanner) keeps this and sets it to `true` when the scan
+    /// budget expires. Walker threads check the flag periodically and exit
+    /// instead of blocking on full channels.
+    pub fn cancel_token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
     }
 
     /// Set a heartbeat callback to be called periodically by worker threads.
@@ -170,6 +184,7 @@ impl DirectoryWalker {
             let config = self.config.clone();
             let protection = Arc::clone(&self.protection);
             let heartbeat = self.heartbeat.clone();
+            let cancel = Arc::clone(&self.cancel);
 
             thread::spawn(move || {
                 walker_thread(
@@ -180,6 +195,7 @@ impl DirectoryWalker {
                     &config,
                     &protection,
                     heartbeat.as_ref(),
+                    &cancel,
                 );
             });
         }
@@ -203,8 +219,14 @@ fn walker_thread(
     config: &WalkerConfig,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
     heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
+    cancel: &AtomicBool,
 ) {
     loop {
+        // Check cancellation flag before doing any work.
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+
         // Beat the heart if configured.
         if let Some(hb) = heartbeat {
             hb();
@@ -214,6 +236,7 @@ fn walker_thread(
             Ok((dir_path, depth, root_dev)) => {
                 process_directory(
                     &dir_path, depth, root_dev, work_tx, result_tx, in_flight, config, protection,
+                    cancel,
                 );
                 // Mark this work item as completed.
                 let remaining = in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -223,7 +246,8 @@ fn walker_thread(
                 }
             }
             Err(channel::RecvTimeoutError::Timeout) => {
-                if in_flight.load(Ordering::Acquire) == 0 {
+                // Check cancel on timeout too, so threads don't linger waiting for work.
+                if cancel.load(Ordering::Relaxed) || in_flight.load(Ordering::Acquire) == 0 {
                     return;
                 }
             }
@@ -249,6 +273,7 @@ fn process_directory(
     in_flight: &AtomicUsize,
     config: &WalkerConfig,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
+    cancel: &AtomicBool,
 ) {
     // Check exclusion list.
     if config.excluded_paths.contains(dir_path) {
@@ -396,12 +421,30 @@ fn process_directory(
     // ─── Deferred Recursion Dispatch ───
     // Now that we've confirmed no .sbh-protect marker exists (we would have
     // returned above), queue collected child dirs for worker threads.
+    //
+    // Use send_timeout + cancel check instead of blocking send to prevent
+    // thread leaks: when the scanner times out and sets the cancel flag,
+    // threads stuck on a full work channel will notice within 100ms and exit.
     for child_path in pending_children {
-        in_flight.fetch_add(1, Ordering::Release);
-        if work_tx.send((child_path, depth + 1, root_dev)).is_err() {
-            // Channel disconnected (shutdown).
-            in_flight.fetch_sub(1, Ordering::Release);
+        if cancel.load(Ordering::Relaxed) {
             return;
+        }
+        in_flight.fetch_add(1, Ordering::Release);
+        loop {
+            match work_tx.send_timeout((child_path.clone(), depth + 1, root_dev), Duration::from_millis(100)) {
+                Ok(()) => break,
+                Err(channel::SendTimeoutError::Timeout(_)) => {
+                    // Channel full — check cancel before retrying.
+                    if cancel.load(Ordering::Relaxed) {
+                        in_flight.fetch_sub(1, Ordering::Release);
+                        return;
+                    }
+                }
+                Err(channel::SendTimeoutError::Disconnected(_)) => {
+                    in_flight.fetch_sub(1, Ordering::Release);
+                    return;
+                }
+            }
         }
     }
 

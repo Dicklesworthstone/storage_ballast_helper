@@ -18,10 +18,11 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli", "daemon", "sqlite"]
+default = ["cli", "daemon", "sqlite", "tui"]
 cli = ["dep:clap", "dep:clap_complete", "dep:colored", "dep:crossterm", "sqlite", "daemon"]
 daemon = ["dep:signal-hook"]
 sqlite = ["dep:rusqlite"]
+tui = ["dep:ftui", "dep:ftui-backend", "dep:ftui-tty"]
 
 [dependencies]
 # CLI (optional — gated behind "cli" feature)
@@ -37,10 +38,10 @@ toml = "0.8"
 rusqlite = { version = "0.33", features = ["bundled", "functions"], optional = true }
 # Error handling (core)
 thiserror = "2.0"
-# TUI (always included)
-ftui = { version = "0.2.1", default-features = false }
-ftui-backend = "0.2.1"
-ftui-tty = "0.2.1"
+# TUI (optional — gated behind "tui" feature)
+ftui = { version = "0.2.1", default-features = false, optional = true }
+ftui-backend = { version = "0.2.1", optional = true }
+ftui-tty = { version = "0.2.1", optional = true }
 # Timestamps (core)
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Concurrency (core — used by scanner walker, not just daemon)
