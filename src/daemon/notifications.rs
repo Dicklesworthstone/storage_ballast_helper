@@ -122,9 +122,12 @@ impl NotificationEvent {
             },
 
             Self::PredictiveWarning {
-                minutes_remaining, ..
+                minutes_remaining,
+                confidence,
+                ..
             } => {
-                if *minutes_remaining < 5.0 {
+                // Determine severity from time-to-exhaustion.
+                let time_level = if *minutes_remaining < 5.0 {
                     NotificationLevel::Critical
                 } else if *minutes_remaining < 10.0 {
                     NotificationLevel::Red
@@ -132,6 +135,25 @@ impl NotificationEvent {
                     NotificationLevel::Orange
                 } else {
                     NotificationLevel::Warning
+                };
+
+                // Cap severity when confidence is low to avoid CRIT spam from
+                // unreliable predictions (e.g. 1% confidence → Info, suppressed).
+                let confidence_cap = if *confidence < 0.3 {
+                    NotificationLevel::Info
+                } else if *confidence < 0.5 {
+                    NotificationLevel::Warning
+                } else if *confidence < 0.7 {
+                    NotificationLevel::Orange
+                } else {
+                    NotificationLevel::Critical // no cap
+                };
+
+                // Take the lesser of time-based and confidence-capped levels.
+                if time_level <= confidence_cap {
+                    time_level
+                } else {
+                    confidence_cap
                 }
             }
 
