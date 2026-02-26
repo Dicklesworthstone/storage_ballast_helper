@@ -3293,7 +3293,6 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Map free percentage to pressure level string.
 fn run_log(cli: &Cli, args: &LogArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -3315,15 +3314,15 @@ fn run_log(cli: &Cli, args: &LogArgs) -> Result<(), CliError> {
             .map_err(|e| CliError::Runtime(format!("failed to open log: {e}")))?;
         let mut reader = io::BufReader::new(file);
 
+        use io::{BufRead, Seek};
+
         // Seek to end.
-        use io::Seek;
         reader
             .seek(io::SeekFrom::End(0))
             .map_err(|e| CliError::Runtime(format!("seek error: {e}")))?;
 
         loop {
             let mut line = String::new();
-            use io::BufRead;
             match reader.read_line(&mut line) {
                 Ok(0) => {
                     // No new data; sleep briefly and retry.
@@ -3453,6 +3452,7 @@ fn detect_daemon_running_fallback() -> bool {
     false
 }
 
+/// Map free percentage to pressure level string.
 fn pressure_level_str(free_pct: f64, config: &Config) -> &'static str {
     if free_pct >= config.pressure.green_min_free_pct {
         "green"
