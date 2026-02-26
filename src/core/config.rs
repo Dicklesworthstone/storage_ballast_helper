@@ -79,6 +79,8 @@ pub struct ScannerConfig {
     pub max_delete_batch: usize,
     pub repeat_deletion_base_cooldown_secs: u64,
     pub repeat_deletion_max_cooldown_secs: u64,
+    /// Maximum wall-clock seconds for a single scan pass. 0 = use built-in default.
+    pub scan_time_budget_secs: u64,
 }
 
 /// Multi-factor score weights and decision-theoretic losses.
@@ -338,7 +340,12 @@ impl Default for PredictionConfig {
 impl Default for ScannerConfig {
     fn default() -> Self {
         Self {
-            root_paths: vec![PathBuf::from("/data/projects"), PathBuf::from("/tmp")],
+            root_paths: vec![
+                PathBuf::from("/data/projects"),
+                PathBuf::from("/tmp"),
+                PathBuf::from("/data/tmp"),
+                PathBuf::from("/var/tmp"),
+            ],
             excluded_paths: vec![
                 PathBuf::from("/"),
                 PathBuf::from("/boot"),
@@ -361,6 +368,7 @@ impl Default for ScannerConfig {
             max_delete_batch: 20,
             repeat_deletion_base_cooldown_secs: 300,
             repeat_deletion_max_cooldown_secs: 3600,
+            scan_time_budget_secs: 120,
         }
     }
 }

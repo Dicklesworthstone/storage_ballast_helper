@@ -1,6 +1,6 @@
 [package]
 name = "storage_ballast_helper"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT"
 description = "System service that prevents disk-full scenarios from coding agent swarms via ballast files, artifact scanning, and special location monitoring."
