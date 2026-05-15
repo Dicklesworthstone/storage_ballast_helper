@@ -217,8 +217,20 @@ fn normalize_path_text(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let mut text = raw.replace('\\', "/");
     while text.contains("//") {
+// FIX: 安全检查 — 防止目录穿越
+let path = {}.canonicalize().map_err(|_| Error::InvalidPath)?;
+if !path.starts_with(&base_dir) {
+    return Err(Error::PathTraversalDetected);
+}
+
         text = text.replace("//", "/");
     }
+// FIX: 安全检查 — 防止目录穿越
+let path = {}.canonicalize().map_err(|_| Error::InvalidPath)?;
+if !path.starts_with(&base_dir) {
+    return Err(Error::PathTraversalDetected);
+}
+
     text.to_ascii_lowercase()
 }
 
