@@ -1853,4 +1853,62 @@ protected_at = "2026-05-07T03:50:00Z"
         assert_eq!(overlaps[0].kind, SacredOverlapKind::ContainsSacred);
         assert_eq!(overlaps[0].pattern, ".beads/");
     }
+
+    #[test]
+    fn absolute_root_guards_fire_independent_of_home() {
+        let catalog = cross_platform_sacred_paths();
+
+        // Sensitive root dirs (and their descendants) are sacred-vetoed by the
+        // absolute /root guards, so even the loosened /root is_system_path can
+        // never expose them.
+        for path in [
+            "/root/.ssh",
+            "/root/.ssh/id_ed25519",
+            "/root/.gnupg",
+            "/root/.rustup",
+            "/root/.rustup/toolchains/nightly/bin/rustc",
+            "/root/.config",
+            "/root/.local",
+            "/root/.local/bin/rch",
+            "/root/.cargo/config.toml",
+            "/root/.cargo/credentials.toml",
+        ] {
+            let overlaps = find_sacred_overlaps(Path::new(path), catalog).unwrap();
+            assert!(
+                !overlaps.is_empty(),
+                "{path} must be protected by an absolute sacred guard"
+            );
+            assert_eq!(overlaps[0].source, SacredPathSource::Builtin);
+        }
+
+        // The backstop's target: a stranded target dir under /root is NOT
+        // sacred-protected, so the loosened is_system_path can reclaim it.
+        assert!(
+            find_sacred_overlaps(Path::new("/root/cass-ft-target"), catalog)
+                .unwrap()
+                .is_empty(),
+            "the reclaimable /root target must not be sacred-protected"
+        );
+
+        // Surgical .cargo: the regenerable registry/git caches (classified
+        // opaque-cargo-cache) stay reclaimable — only config/credentials are
+        // guarded.
+        for path in ["/root/.cargo/registry", "/root/.cargo/git"] {
+            assert!(
+                find_sacred_overlaps(Path::new(path), catalog)
+                    .unwrap()
+                    .is_empty(),
+                "{path} (opaque-cargo-cache) must stay reclaimable"
+            );
+        }
+
+        // HOME-independence is structural: the guards are ABSOLUTE patterns, so
+        // `expand_home_pattern` returns them verbatim for ANY $HOME (it only
+        // rewrites `~` / `~/`-prefixed patterns). This is why they hold for a
+        // systemd *system* service where $HOME may not be /root.
+        for pat in ["/root/.ssh", "/root/.rustup", "/root/.cargo/config.toml"] {
+            assert!(pat.starts_with('/'));
+            assert_eq!(expand_home_pattern(pat), pat);
+        }
+    }
 }

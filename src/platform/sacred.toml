@@ -135,3 +135,64 @@ pattern = ".config/age/"
 kind = "ContainsAny"
 reason = "Nested age key directories must never be reclaimed."
 source = "Builtin"
+
+# ── Absolute worker-root guards (Step 0 defense-in-depth) ──
+# These protect the root account's credentials, toolchains, and config on
+# rch/sbh worker boxes where the daemon runs as a systemd *system* service.
+# They are ABSOLUTE (no `~`) on purpose: the `~/.ssh` etc. entries above rely
+# on `$HOME` expansion at daemon runtime, which is not guaranteed for a system
+# service. These entries fire regardless of `$HOME`. They are the unconditional
+# backstop that keeps the `is_system_path` `/root` loosening (which only lifts
+# the veto for proven build-artifact basenames) from ever exposing sensitive
+# root-owned data even transitively (e.g. `/root/.ssh/foo-target`).
+
+[[paths]]
+pattern = "/root/.ssh"
+kind = "ExactMatch"
+reason = "Root SSH credentials and config are security-sensitive; absolute guard independent of $HOME."
+source = "Builtin"
+
+[[paths]]
+pattern = "/root/.gnupg"
+kind = "ExactMatch"
+reason = "Root GnuPG keyrings and trust databases are security-sensitive; absolute guard independent of $HOME."
+source = "Builtin"
+
+[[paths]]
+pattern = "/root/.rustup"
+kind = "ExactMatch"
+reason = "Root rustup toolchains are the build toolchain, not disposable artifacts; absolute guard independent of $HOME."
+source = "Builtin"
+
+[[paths]]
+pattern = "/root/.config"
+kind = "ExactMatch"
+reason = "Root application configuration must never be reclaimed; absolute guard independent of $HOME."
+source = "Builtin"
+
+[[paths]]
+pattern = "/root/.local"
+kind = "ExactMatch"
+reason = "Root ~/.local binaries and data (installed rch/rchd/sbh tooling) must never be reclaimed; absolute guard independent of $HOME."
+source = "Builtin"
+
+# .cargo is protected SURGICALLY: the security-sensitive config + credential
+# files are hard-guarded, but the regenerable `.cargo/registry` and
+# `.cargo/git` caches (classified `opaque-cargo-cache`) stay reclaimable.
+[[paths]]
+pattern = "/root/.cargo/config.toml"
+kind = "ExactMatch"
+reason = "Cargo configuration (registry sources / tokens) is security-sensitive; registry/git caches stay reclaimable."
+source = "Builtin"
+
+[[paths]]
+pattern = "/root/.cargo/config"
+kind = "ExactMatch"
+reason = "Legacy cargo configuration file is security-sensitive; registry/git caches stay reclaimable."
+source = "Builtin"
+
+[[paths]]
+pattern = "/root/.cargo/credentials*"
+kind = "GlobMatch"
+reason = "Cargo credentials (crates.io publish tokens) are security-sensitive and must never be reclaimed."
+source = "Builtin"

@@ -13,7 +13,9 @@ use std::time::Duration;
 use crate::core::config::ScoringConfig;
 use crate::platform::cleanup_catalog::{CleanupRule, ReclaimCommand};
 use crate::platform::{linux, macos};
-use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
+use crate::scanner::patterns::{
+    ArtifactCategory, ArtifactClassification, StructuralSignals, is_obvious_build_artifact_basename,
+};
 use crate::scanner::protection::SacredOverlap;
 use crate::scanner::walker::FsIdentity;
 
@@ -1000,6 +1002,30 @@ fn is_system_path(path: &Path) -> bool {
         return false;
     }
 
+    // Backstop carve-out (defense-in-depth): a proven regenerable build
+    // artifact stranded directly under a worker's `/root` (e.g. a 241 GB
+    // `/root/cass-ft-target` cargo target that filled the disk) must be
+    // reclaimable when pressure demands it. We lift the `/root` veto ONLY for a
+    // candidate whose OWN basename is an obvious build artifact (see
+    // `is_obvious_build_artifact_basename`); `/root` itself and every other
+    // path under it — credentials, toolchains, config — stay vetoed here.
+    //
+    // Sensitive root dirs (`.ssh`, `.gnupg`, `.rustup`, `.cargo`, `.config`,
+    // `.local`) are ADDITIONALLY hard-guarded by absolute entries in the sacred
+    // catalog, so even an artifact-named path *inside* one of them (e.g.
+    // `/root/.ssh/foo-target`) is still refused by the sacred-overlap veto that
+    // runs after this check. `/home` is intentionally NOT covered here (see the
+    // omission below) — `/home/*/projects` protection is enforced by the
+    // `is_hardcoded_source_tree` deletion preflight, WITH its own artifact
+    // carve-out, and must not be turned into a blanket veto that would break
+    // legitimate `target/` cleanup under user project trees.
+    if path.starts_with("/root")
+        && path != Path::new("/root")
+        && is_obvious_build_artifact_basename(path)
+    {
+        return false;
+    }
+
     // Check prefixes for protected system directories.
     [
         Path::new("/bin"),
@@ -1027,14 +1053,14 @@ fn is_system_path(path: &Path) -> bool {
 mod tests {
     use super::{
         ActiveReferenceSummary, CandidateInput, DecisionAction, HARD_REFUSE_BUNDLE_EXTENSIONS,
-        ScoringEngine,
+        ScoringEngine, is_system_path,
     };
     use crate::core::config::ScoringConfig;
     use crate::platform::types::SacredPathSource;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
     use crate::scanner::protection::{SacredOverlap, SacredOverlapKind};
     use std::borrow::Cow;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     fn default_engine() -> ScoringEngine {
@@ -1102,6 +1128,54 @@ mod tests {
                 "system path {system_dir} should be hard-vetoed"
             );
         }
+    }
+
+    #[test]
+    fn is_system_path_lifts_only_root_build_artifacts() {
+        // THE fix: a proven regenerable build artifact stranded under /root is
+        // no longer a system path, so it can be scored + reclaimed.
+        assert!(!is_system_path(Path::new("/root/cass-ft-target")));
+        assert!(!is_system_path(Path::new("/root/target")));
+        assert!(!is_system_path(Path::new("/root/foo_target")));
+        // A cargo target nested a level under a non-artifact dir is also
+        // liftable (only its own basename matters); the parent stays vetoed.
+        assert!(!is_system_path(Path::new("/root/build-area/target")));
+        assert!(is_system_path(Path::new("/root/build-area")));
+    }
+
+    #[test]
+    fn is_system_path_still_vetoes_root_and_sensitive_dirs() {
+        // /root itself is never liftable, and every non-artifact path under it
+        // (credentials, toolchains, config) stays a hard system path.
+        for p in [
+            "/root",
+            "/root/.ssh",
+            "/root/.gnupg",
+            "/root/.rustup",
+            "/root/.cargo",
+            "/root/.cargo/registry",
+            "/root/.config",
+            "/root/.local",
+            "/root/.bashrc",
+        ] {
+            assert!(is_system_path(Path::new(p)), "{p} must stay a system path");
+        }
+        // Classic system roots are unaffected.
+        for p in ["/", "/etc", "/usr", "/bin", "/boot", "/lib", "/opt", "/sys"] {
+            assert!(is_system_path(Path::new(p)), "{p} must stay a system path");
+        }
+        // Guard against a `/rootxyz` false lift (component-based starts_with).
+        assert!(!is_system_path(Path::new("/rootxyz/target")));
+    }
+
+    #[test]
+    fn is_system_path_leaves_home_to_the_source_tree_preflight() {
+        // /home is intentionally NOT a system path so user artifacts stay
+        // cleanable; the "projects always vetoed" guarantee for
+        // /home/<user>/projects is enforced by the is_hardcoded_source_tree
+        // deletion preflight (see deletion.rs), NOT by is_system_path.
+        assert!(!is_system_path(Path::new("/home/alice/projects/foo")));
+        assert!(!is_system_path(Path::new("/home/alice/.cache/build")));
     }
 
     #[test]

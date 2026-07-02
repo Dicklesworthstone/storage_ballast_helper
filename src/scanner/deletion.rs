@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 use crate::core::errors::{Result, SbhError};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
 use crate::logger::jsonl::ScoreFactorsRecord;
-use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
+use crate::scanner::patterns::{
+    ArtifactCategory, ArtifactClassification, StructuralSignals, is_obvious_build_artifact_basename,
+};
 use crate::scanner::scoring::{CandidacyScore, DecisionAction, ScoreFactors};
 use crate::scanner::walker;
 
@@ -713,72 +715,6 @@ fn contains_nested_git(path: &Path, max_depth: usize) -> bool {
         }
     }
     false
-}
-
-/// Returns true if the candidate's basename clearly identifies it as a
-/// disposable build/cache artifact that's safe to delete even when located
-/// inside a protected source-tree root.
-///
-/// This is the "carve-out" that keeps sbh useful inside `/data/projects/`,
-/// `/home/<user>/projects/`, and `/Users/<user>/projects/`: the broad
-/// hardcoded-source-tree refusal would otherwise block all cleanup there,
-/// including the wizard's main intended use case (clearing `target/`,
-/// `node_modules/`, etc. under operator-configured source roots).
-///
-/// The list is intentionally narrow — only basenames we are confident
-/// represent disposable build/cache directories. Anything not on this list
-/// stays vetoed under protected roots, preserving the carnage-prevention
-/// guarantee for arbitrary unknown names.
-///
-/// If you ever expand this list, the new entries are additive — they only
-/// ever LOOSEN the refusal for the matched basename. Existing protections
-/// for unmatched basenames are unchanged.
-fn is_obvious_build_artifact_basename(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-
-    // Exact-match basenames (alphabetized for ease of audit). Bare rch
-    // target dir names without a job-suffix are included here so the prefix
-    // matchers below can safely require a separator (`-` or `_`) — this
-    // prevents `.rch-targetfoo` style false positives.
-    let exact_artifacts: &[&str] = &[
-        ".cargo-target",
-        ".next",
-        ".nuxt",
-        ".parcel-cache",
-        ".pytest_cache",
-        ".rch-target",
-        ".rch_target",
-        ".target",
-        ".tox",
-        ".turbo",
-        ".venv",
-        "__pycache__",
-        "build",
-        "dist",
-        "node_modules",
-        "rch-target",
-        "rch_target",
-        "target",
-        "venv",
-    ];
-    if exact_artifacts.contains(&name) {
-        return true;
-    }
-
-    // Prefix-match basenames — match per-job/per-config suffixes produced
-    // by cargo (`target-foo`, `target_bar`) and rch (`.rch-target-job-42`,
-    // `rch-target-…`, `rch_target_…`, `.cargo-target-rusticmill`). Each
-    // prefix REQUIRES the separator (`-` or `_`) so we never match unrelated
-    // names that happen to start with `target` or `.rch-target`.
-    name.starts_with("target-")
-        || name.starts_with("target_")
-        || name.starts_with(".rch-target-")
-        || name.starts_with(".rch_target_")
-        || name.starts_with("rch-target-")
-        || name.starts_with("rch_target_")
-        || name.starts_with(".cargo-target-")
 }
 
 /// Hardcoded refusal: paths inside well-known source-tree locations must
@@ -1827,6 +1763,41 @@ mod tests {
     }
 
     #[test]
+    fn obvious_build_artifact_basename_suffix_matches() {
+        // Descriptive `CARGO_TARGET_DIR` names: `<prefix>-target` /
+        // `<prefix>_target` with a non-empty prefix. This is the rule that lets
+        // the stranded `/root/cass-ft-target` (241 GB) be reclaimed, and it
+        // also newly covers `my-target` (previously start-anchored-only).
+        for name in [
+            "cass-ft-target",
+            "cass_ft_target",
+            "foo_target",
+            "hfdt-release-target",
+            "my-target",
+            "my_target",
+        ] {
+            let p = PathBuf::from(format!("/root/{name}"));
+            assert!(
+                is_obvious_build_artifact_basename(&p),
+                "expected `{name}` to be recognized as a build artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn obvious_build_artifact_basename_suffix_requires_nonempty_prefix() {
+        // A bare separator-then-target has no descriptive prefix and must not
+        // match; `target` itself is covered by the exact list, not the suffix.
+        for name in ["-target", "_target"] {
+            let p = PathBuf::from(format!("/data/projects/foo/{name}"));
+            assert!(
+                !is_obvious_build_artifact_basename(&p),
+                "expected `{name}` (empty prefix) to NOT match the suffix rule"
+            );
+        }
+    }
+
+    #[test]
     fn obvious_build_artifact_basename_negatives() {
         // These should NOT match — operators must never see source-like names
         // exempted from the broad refusal.
@@ -1848,12 +1819,20 @@ mod tests {
             "franken_node",
             // Confusables: similar names that don't match our list
             "targets",      // plural of `target` is not on the list
-            "my-target",    // ends with `-target`, but prefix match is start-anchored
+            "mytarget",     // ends with `target` but has no `-`/`_` separator
             "untargeted",   // contains `target` mid-string
             "nodemodules",  // missing underscore; only `node_modules` exact match
             "deno-modules", // similar shape to `node_modules`, but not in the list
             "project",      // singular form; not a build-artifact name
             "projects",     // singular dir name; not a build-artifact name
+            // Sensitive root-owned dirs that the `/root` is_system_path carve-out
+            // must NEVER treat as artifacts (these keep their hard protection).
+            ".ssh",
+            ".gnupg",
+            ".rustup",
+            ".cargo",
+            ".config",
+            ".local",
             // Top-level dirs that look ambiguous
             "tmp",
             "data",
@@ -1965,6 +1944,15 @@ mod tests {
         // The working tree root itself.
         assert!(is_hardcoded_source_tree(Path::new(
             "/data/projects/franken_node"
+        )));
+        // "projects always vetoed" also holds under /home/<user>/projects: a
+        // non-artifact basename there is refused (this is the guarantee the
+        // is_system_path unit test defers to, since /home is not a system path).
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/home/alice/projects/foo"
+        )));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/Users/alice/projects/foo"
         )));
     }
 

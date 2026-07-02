@@ -193,6 +193,17 @@ pub fn classify_opaque_tree(
         if (name == "target" && context.parent_has_cargo_toml)
             || tmp_like
             || is_agent_build_target_name(&name)
+            // Descriptive `<prefix>-target` / `<prefix>_target` names (e.g.
+            // `cass-ft-target`) are a strong stand-alone signal of a
+            // `CARGO_TARGET_DIR` output, so V2 nominates them as a single
+            // opaque candidate even without tmp/agent/parent-cargo context.
+            // This is what lets a stranded `/root/cass-ft-target` be reclaimed.
+            // The broad `target-`/`target_` PREFIX forms are intentionally NOT
+            // promoted here (see `has_descriptive_target_suffix`): they stay
+            // SignalOnly in a source context, matching the conservative
+            // `opaque_tree_does_not_promote_broad_target_like_names_in_source_context`
+            // guarantee. All downstream deletion vetoes still apply.
+            || has_descriptive_target_suffix(&name)
         {
             return Some(OpaqueTreeClassification::candidate(
                 "cargo/build target with regenerable context",
@@ -278,6 +289,102 @@ fn is_agent_build_target_name(name: &str) -> bool {
             name,
             ".rch-target" | ".rch_target" | "rch-target" | "rch_target"
         )
+}
+
+/// True when `name` is `<prefix>-target` or `<prefix>_target` with a non-empty
+/// `<prefix>` before the separator — the shape cargo produces when
+/// `CARGO_TARGET_DIR` is set to a descriptive name (`cass-ft-target`,
+/// `hfdt-release-target`, `foo_target`).
+///
+/// A bare `target` (handled by the exact list in
+/// [`is_obvious_build_artifact_basename`]) and a leading-separator `-target` /
+/// `_target` (empty prefix) are deliberately excluded so this never widens the
+/// match beyond names that carry a real descriptive prefix.
+pub(crate) fn has_descriptive_target_suffix(name: &str) -> bool {
+    name.strip_suffix("-target")
+        .or_else(|| name.strip_suffix("_target"))
+        .is_some_and(|prefix| !prefix.is_empty())
+}
+
+/// Returns true if the candidate's basename clearly identifies it as a
+/// disposable build/cache artifact that's safe to delete even when located
+/// inside a protected source-tree root (or, via the `is_system_path`
+/// backstop, directly under a worker's `/root`).
+///
+/// This is the "carve-out" that keeps sbh useful inside `/data/projects/`,
+/// `/home/<user>/projects/`, and `/Users/<user>/projects/`: the broad
+/// hardcoded-source-tree refusal would otherwise block all cleanup there,
+/// including the wizard's main intended use case (clearing `target/`,
+/// `node_modules/`, etc. under operator-configured source roots).
+///
+/// The list is intentionally narrow — only basenames we are confident
+/// represent disposable build/cache directories. Anything not on this list
+/// stays vetoed under protected roots, preserving the carnage-prevention
+/// guarantee for arbitrary unknown names.
+///
+/// If you ever expand this list, the new entries are additive — they only
+/// ever LOOSEN the refusal for the matched basename. Existing protections
+/// for unmatched basenames are unchanged.
+///
+/// Matching is case-sensitive (real build-artifact dir names are lowercase).
+pub(crate) fn is_obvious_build_artifact_basename(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+
+    // Exact-match basenames (alphabetized for ease of audit). Bare rch
+    // target dir names without a job-suffix are included here so the prefix
+    // matchers below can safely require a separator (`-` or `_`) — this
+    // prevents `.rch-targetfoo` style false positives.
+    let exact_artifacts: &[&str] = &[
+        ".cargo-target",
+        ".next",
+        ".nuxt",
+        ".parcel-cache",
+        ".pytest_cache",
+        ".rch-target",
+        ".rch_target",
+        ".target",
+        ".tox",
+        ".turbo",
+        ".venv",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "rch-target",
+        "rch_target",
+        "target",
+        "venv",
+    ];
+    if exact_artifacts.contains(&name) {
+        return true;
+    }
+
+    // Prefix-match basenames — match per-job/per-config suffixes produced
+    // by cargo (`target-foo`, `target_bar`) and rch (`.rch-target-job-42`,
+    // `rch-target-…`, `rch_target_…`, `.cargo-target-rusticmill`). Each
+    // prefix REQUIRES the separator (`-` or `_`) so we never match unrelated
+    // names that happen to start with `target` or `.rch-target`.
+    if name.starts_with("target-")
+        || name.starts_with("target_")
+        || name.starts_with(".rch-target-")
+        || name.starts_with(".rch_target_")
+        || name.starts_with("rch-target-")
+        || name.starts_with("rch_target_")
+        || name.starts_with(".cargo-target-")
+    {
+        return true;
+    }
+
+    // Suffix-match basenames — descriptive `CARGO_TARGET_DIR` names such as
+    // `cass-ft-target`, `hfdt-release-target`, `foo_target`. Requires a
+    // non-empty prefix before the `-target` / `_target` separator, so a bare
+    // `target` (already handled above) and a leading-separator `-target`
+    // never match, and `mytarget` (no separator) is excluded. This mirrors the
+    // `target-suffix` (0.88) / `underscore-target-suffix` (0.92) patterns in
+    // the artifact registry.
+    has_descriptive_target_suffix(name)
 }
 
 fn is_tmp_like_path(path: &Path) -> bool {
@@ -1179,6 +1286,7 @@ mod tests {
         ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, CustomPattern,
         OpaqueTreeContext, OpaqueTreeDisposition, StructuralSignals, classify_opaque_tree,
         extract_pattern_label, extract_pattern_label_with_cleanup_rules,
+        has_descriptive_target_suffix, is_obvious_build_artifact_basename,
     };
     use crate::platform::{linux, macos};
     use std::path::Path;
@@ -1293,6 +1401,77 @@ mod tests {
                 opaque.map(|opaque| opaque.disposition),
                 Some(OpaqueTreeDisposition::CandidateOpaque),
                 "{path} must not become an opaque source-tree candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_tree_promotes_descriptive_target_suffix_under_root() {
+        // The backstop: `/root/cass-ft-target` is nominated as a single opaque
+        // RustTarget candidate (was SignalOnly) even with no tmp/agent context.
+        let opaque = classify_opaque_tree(
+            Path::new("/root/cass-ft-target"),
+            OpaqueTreeContext::default(),
+        )
+        .expect("descriptive -target suffix should be classified");
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
+        assert_eq!(opaque.classification.category, ArtifactCategory::RustTarget);
+        assert_eq!(opaque.classification.pattern_name, "opaque-cargo-target");
+
+        // `_target` suffix works the same way.
+        let underscore =
+            classify_opaque_tree(Path::new("/root/foo_target"), OpaqueTreeContext::default())
+                .expect("descriptive _target suffix should be classified");
+        assert_eq!(
+            underscore.disposition,
+            OpaqueTreeDisposition::CandidateOpaque
+        );
+    }
+
+    #[test]
+    fn opaque_tree_does_not_promote_sensitive_root_dirs() {
+        // Sacred/system-protected root dirs must never be nominated as opaque
+        // candidates by the classifier.
+        assert!(
+            classify_opaque_tree(Path::new("/root/.rustup"), OpaqueTreeContext::default())
+                .is_none()
+        );
+        assert!(
+            classify_opaque_tree(Path::new("/root/.ssh"), OpaqueTreeContext::default()).is_none()
+        );
+    }
+
+    #[test]
+    fn descriptive_target_suffix_requires_nonempty_prefix() {
+        assert!(has_descriptive_target_suffix("cass-ft-target"));
+        assert!(has_descriptive_target_suffix("foo_target"));
+        assert!(has_descriptive_target_suffix("hfdt-release-target"));
+        assert!(has_descriptive_target_suffix("my-target"));
+        // Empty prefix / no separator / bare word must not match.
+        assert!(!has_descriptive_target_suffix("-target"));
+        assert!(!has_descriptive_target_suffix("_target"));
+        assert!(!has_descriptive_target_suffix("target"));
+        assert!(!has_descriptive_target_suffix("mytarget"));
+        assert!(!has_descriptive_target_suffix("targets"));
+    }
+
+    #[test]
+    fn is_obvious_build_artifact_basename_covers_suffix_but_not_secrets() {
+        for name in [
+            "cass-ft-target",
+            "foo_target",
+            "hfdt-release-target",
+            "target",
+        ] {
+            assert!(
+                is_obvious_build_artifact_basename(Path::new(name)),
+                "{name}"
+            );
+        }
+        for name in [".ssh", ".rustup", ".cargo", ".config", ".local", "mytarget"] {
+            assert!(
+                !is_obvious_build_artifact_basename(Path::new(name)),
+                "{name}"
             );
         }
     }
