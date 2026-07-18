@@ -12,7 +12,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use storage_ballast_helper::ballast::manager::BallastManager;
+use storage_ballast_helper::ballast::manager::{
+    BallastAvailability, BallastHealth, BallastManager,
+};
 use storage_ballast_helper::cli::RELEASE_REPOSITORY;
 use storage_ballast_helper::cli::update::{UpdateReport, UpdateServiceRestart};
 use storage_ballast_helper::core::config::{
@@ -4234,6 +4236,13 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                         "  Missing: {} files",
                         config.ballast.file_count.saturating_sub(inventory.len())
                     );
+                    println!("  Health: {}", manager.health());
+                    if manager.health() == BallastHealth::Empty {
+                        println!(
+                            "  WARNING: configured reserve is not releasable (0 files present). \
+                             Run: sbh ballast provision"
+                        );
+                    }
 
                     if !inventory.is_empty() {
                         println!(
@@ -4285,6 +4294,7 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                         "releasable_bytes": releasable,
                         "missing_count":
                             config.ballast.file_count.saturating_sub(inventory.len()),
+                        "health": manager.health().as_str(),
                         "files": files,
                     });
                     write_json_line(&payload)?;
@@ -4898,9 +4908,75 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Host-level tuning diagnostics (kernel writeback / dirty-page limits).
+/// Host-level tuning diagnostics (kernel writeback / dirty-page limits) plus
+/// emergency-reserve integrity.
 fn system_doctor_checks(platform: &dyn Platform, config: &Config) -> Vec<DoctorCheck> {
-    vec![writeback_doctor_check(platform, config)]
+    vec![
+        writeback_doctor_check(platform, config),
+        ballast_reserve_doctor_check(config),
+    ]
+}
+
+/// #16: fail loudly when a ballast reserve is configured but not actually
+/// releasable. A dashboard reading configured totals alone can believe a full
+/// reserve exists after every file has been released or lost — exactly when
+/// the reserve is needed most.
+fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
+    let availability = BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
+    match availability.health {
+        BallastHealth::Unconfigured => doctor_check(
+            "ballast.reserve",
+            "Ballast emergency reserve",
+            "PASS",
+            "no ballast reserve configured (ballast.file_count or file_size_bytes is 0)",
+            None,
+        ),
+        BallastHealth::Ok => doctor_check(
+            "ballast.reserve",
+            "Ballast emergency reserve",
+            "PASS",
+            format!(
+                "{} of {} configured files present ({} releasable)",
+                availability.available_count,
+                availability.configured_count,
+                format_bytes(availability.releasable_bytes),
+            ),
+            None,
+        ),
+        BallastHealth::Degraded => doctor_check(
+            "ballast.reserve",
+            "Ballast emergency reserve",
+            "WARN",
+            format!(
+                "only {} of {} configured files present ({} releasable of {} configured)",
+                availability.available_count,
+                availability.configured_count,
+                format_bytes(availability.releasable_bytes),
+                format_bytes(availability.configured_pool_bytes),
+            ),
+            Some(
+                "Run `sbh ballast replenish` (or `sbh ballast provision`) while free space \
+                 is above the 20% provisioning floor to rebuild the reserve."
+                    .to_string(),
+            ),
+        ),
+        BallastHealth::Empty => doctor_check(
+            "ballast.reserve",
+            "Ballast emergency reserve",
+            "FAIL",
+            format!(
+                "a {} reserve is configured but 0 bytes are releasable — the emergency \
+                 reserve does not exist",
+                format_bytes(availability.configured_pool_bytes),
+            ),
+            Some(
+                "Run `sbh ballast provision` while free space is above the 20% provisioning \
+                 floor; until then the daemon has no instant-release reserve for ENOSPC \
+                 recovery."
+                    .to_string(),
+            ),
+        ),
+    }
 }
 
 fn writeback_doctor_check(platform: &dyn Platform, config: &Config) -> DoctorCheck {
@@ -6559,7 +6635,8 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 }
             }
 
-            // Ballast info.
+            // Ballast info: configured pool vs actually releasable reserve (#16).
+            let ballast = BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
             println!("\nBallast:");
             println!(
                 "  Configured: {} files x {}",
@@ -6573,6 +6650,20 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     config.ballast.file_size_bytes,
                 )),
             );
+            println!(
+                "  Releasable: {} files ({}), {} missing",
+                ballast.available_count,
+                format_bytes(ballast.releasable_bytes),
+                ballast.missing_count,
+            );
+            println!("  Health: {}", ballast.health);
+            if ballast.health == BallastHealth::Empty {
+                println!(
+                    "  WARNING: a {} reserve is configured but 0 bytes are releasable — \
+                     the emergency reserve does not exist. Run: sbh ballast provision",
+                    format_bytes(ballast.configured_pool_bytes),
+                );
+            }
 
             // Recent activity from database.
             if let Some(stats) = &db_stats {
@@ -6593,6 +6684,9 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             }
         }
         OutputMode::Json => {
+            // #16: actual ballast availability, not just configured totals.
+            let ballast_availability =
+                BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
             let mut mounts_json: Vec<Value> = Vec::new();
             let mut overall_level = "green";
 
@@ -6638,6 +6732,12 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                         config.ballast.file_count,
                         config.ballast.file_size_bytes,
                     ),
+                    // #16: actual inventory state, so automation can tell a
+                    // configured reserve from a releasable one.
+                    "available_count": ballast_availability.available_count,
+                    "releasable_bytes": ballast_availability.releasable_bytes,
+                    "missing_count": ballast_availability.missing_count,
+                    "health": ballast_availability.health.as_str(),
                 },
                 "memory": memory_info.as_ref().map(|memory| {
                     let swap_used_bytes = memory.swap_total_bytes.saturating_sub(memory.swap_free_bytes);
@@ -8793,6 +8893,16 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         }
     }
 
+    // Check 2.6 (#16): warn when a configured ballast reserve is not actually
+    // releasable — the emergency reserve does not exist when it may be needed.
+    let ballast = BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
+    if ballast.health == BallastHealth::Empty && output_mode(cli) == OutputMode::Human {
+        eprintln!(
+            "sbh: warning: ballast reserve is empty ({} configured, 0 releasable). Run: sbh ballast provision",
+            format_bytes(ballast.configured_pool_bytes),
+        );
+    }
+
     // Check 3: prediction from daemon state.json (if available and --predict requested).
     if let Some(predict_minutes) = args.predict {
         match read_daemon_prediction(&config.paths.state_file, &capacity.mount_point) {
@@ -8870,6 +8980,15 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             "volume_role": capacity.volume_role.as_deref(),
             "free_excludes_purgeable": true,
             "platform": capacity_platform_json(&capacity),
+            // #16: machine-readable reserve state so automation can flag a
+            // configured-but-empty emergency reserve.
+            "ballast": {
+                "configured_pool_bytes": ballast.configured_pool_bytes,
+                "releasable_bytes": ballast.releasable_bytes,
+                "available_count": ballast.available_count,
+                "missing_count": ballast.missing_count,
+                "health": ballast.health.as_str(),
+            },
             "exit_code": 0,
         });
         write_json_line(&payload)?;

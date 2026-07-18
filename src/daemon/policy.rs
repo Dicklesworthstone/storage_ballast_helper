@@ -1657,6 +1657,77 @@ mod tests {
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
     }
 
+    // ──── losing-ground invariant (#16 item 3, partial) ────
+    //
+    // Contract: while pressure stays at Yellow+ the engine must not remain
+    // self-throttled in FallbackSafe (clean=0 / no-delete) forever. After
+    // FALLBACK_EMERGENCY_ESCALATION_SECS of sustained pressure it must
+    // escalate to Enforce so deletion capacity exists again.
+
+    #[test]
+    fn emergency_escalation_breaks_fallback_deadlock_under_sustained_pressure() {
+        let mut engine = PolicyEngine::new(default_config());
+        engine.promote(); // canary
+        engine.set_pressure_level(PressureLevel::Orange);
+        engine.evaluate(&[], Some(&failing_guard()));
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+
+        // FallbackSafe blocks all deletions — the potential deadlock state.
+        let decision = engine.evaluate(
+            &[sample_candidate(DecisionAction::Delete, 2.5)],
+            Some(&passing_guard()),
+        );
+        assert!(decision.approved_for_deletion.is_empty());
+
+        // Freshly entered fallback: below the escalation threshold, no
+        // escalation yet even under sustained pressure.
+        assert!(!engine.check_emergency_escalation(true));
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+
+        // Back-date the fallback entry past the escalation threshold to model
+        // 5+ minutes of sustained Yellow+ pressure deterministically.
+        engine.fallback_entered_at = engine.fallback_entered_at.and_then(|entered| {
+            entered.checked_sub(Duration::from_secs(FALLBACK_EMERGENCY_ESCALATION_SECS + 1))
+        });
+        assert!(
+            engine.fallback_entered_at.is_some(),
+            "test clock could not be back-dated"
+        );
+
+        // Pressure below Yellow never escalates (recovery handles that path).
+        assert!(!engine.check_emergency_escalation(false));
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+
+        // Sustained Yellow+ pressure escalates straight to Enforce: the daemon
+        // regains deletion capacity instead of losing ground at clean=0.
+        assert!(engine.check_emergency_escalation(true));
+        assert_eq!(engine.mode(), ActiveMode::Enforce);
+        let decision = engine.evaluate(
+            &[sample_candidate(DecisionAction::Delete, 2.5)],
+            Some(&passing_guard()),
+        );
+        assert_eq!(
+            decision.approved_for_deletion.len(),
+            1,
+            "post-escalation the engine must approve safe deletions again"
+        );
+    }
+
+    #[test]
+    fn emergency_escalation_never_overrides_kill_switch() {
+        let mut config = default_config();
+        config.kill_switch = true;
+        let mut engine = PolicyEngine::new(config);
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+
+        // Back-date far past the threshold: an operator kill switch must still
+        // never be auto-escalated, no matter how long pressure is sustained.
+        engine.fallback_entered_at = Instant::now()
+            .checked_sub(Duration::from_secs(FALLBACK_EMERGENCY_ESCALATION_SECS * 10));
+        assert!(!engine.check_emergency_escalation(true));
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+    }
+
     // ──── evaluation tests ────
 
     #[test]

@@ -106,6 +106,125 @@ pub struct ReleaseReport {
     pub errors: Vec<String>,
 }
 
+// ──────────────────── health ────────────────────
+
+/// Machine-readable health of a ballast pool: how much of the configured
+/// emergency reserve is actually releasable right now (#16).
+///
+/// The distinction matters operationally: configured totals describe intent,
+/// while releasable bytes describe the reserve that actually exists on disk.
+/// A dashboard that reads only configured totals can believe a full reserve
+/// exists after every file has been released or lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BallastHealth {
+    /// No reserve is configured (`file_count == 0` or `file_size_bytes == 0`).
+    Unconfigured,
+    /// The full configured reserve is present and releasable.
+    Ok,
+    /// Some reserve is releasable, but less than configured
+    /// (released, missing, or truncated files).
+    Degraded,
+    /// A reserve is configured but zero bytes are releasable — the emergency
+    /// reserve does not exist precisely when it may be needed. Surfaces
+    /// loudly in `status`, `check`, and `doctor`.
+    Empty,
+}
+
+impl BallastHealth {
+    /// Evaluate pool health from the configured pool size and the bytes that
+    /// releasing every inventoried file would actually free.
+    ///
+    /// Integrity-corrupt files still count toward `releasable_bytes`:
+    /// deleting a file frees its on-disk bytes regardless of header state.
+    #[must_use]
+    pub fn evaluate(configured_pool_bytes: u64, releasable_bytes: u64) -> Self {
+        if configured_pool_bytes == 0 {
+            Self::Unconfigured
+        } else if releasable_bytes == 0 {
+            Self::Empty
+        } else if releasable_bytes < configured_pool_bytes {
+            Self::Degraded
+        } else {
+            Self::Ok
+        }
+    }
+
+    /// Stable machine-readable label for JSON output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unconfigured => "unconfigured",
+            Self::Ok => "ok",
+            Self::Degraded => "degraded",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+impl std::fmt::Display for BallastHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Read-only snapshot of a ballast pool's actual availability (#16).
+///
+/// Unlike [`BallastManager::new`], observing never creates the pool
+/// directory and never prunes orphans, so it is safe to call from read-only
+/// surfaces (`sbh status`, `sbh check`, `sbh doctor`) even on a full or
+/// read-only filesystem.
+#[derive(Debug, Clone)]
+pub struct BallastAvailability {
+    /// Configured number of ballast files.
+    pub configured_count: usize,
+    /// Configured size of each ballast file in bytes.
+    pub configured_file_size_bytes: u64,
+    /// Configured total pool size (`count × size`, saturating).
+    pub configured_pool_bytes: u64,
+    /// Ballast files currently present on disk.
+    pub available_count: usize,
+    /// Configured files not currently present (released or lost).
+    pub missing_count: usize,
+    /// Bytes that releasing every present file would free.
+    pub releasable_bytes: u64,
+    /// Overall pool health derived from the fields above.
+    pub health: BallastHealth,
+}
+
+impl BallastAvailability {
+    /// Observe the pool at `ballast_dir` without mutating anything.
+    #[must_use]
+    pub fn observe(ballast_dir: &Path, config: &BallastConfig) -> Self {
+        let configured_pool_bytes =
+            (config.file_count as u64).saturating_mul(config.file_size_bytes);
+        let mut available_count = 0usize;
+        let mut releasable_bytes = 0u64;
+        for i in 1..=config.file_count {
+            let path = ballast_dir.join(ballast_file_name(i as u32));
+            if let Ok(meta) = fs::metadata(&path)
+                && meta.is_file()
+            {
+                available_count += 1;
+                releasable_bytes = releasable_bytes.saturating_add(meta.len());
+            }
+        }
+        Self {
+            configured_count: config.file_count,
+            configured_file_size_bytes: config.file_size_bytes,
+            configured_pool_bytes,
+            available_count,
+            missing_count: config.file_count.saturating_sub(available_count),
+            releasable_bytes,
+            health: BallastHealth::evaluate(configured_pool_bytes, releasable_bytes),
+        }
+    }
+}
+
+/// Canonical ballast file name for a 1-based index.
+fn ballast_file_name(index: u32) -> String {
+    format!("SBH_BALLAST_FILE_{index:05}.dat")
+}
+
 // ──────────────────── manager ────────────────────
 
 /// Manages the lifecycle of ballast files: creation, verification, release, replenishment.
@@ -171,6 +290,16 @@ impl BallastManager {
     /// Number of ballast files currently available.
     pub fn available_count(&self) -> usize {
         self.inventory.len()
+    }
+
+    /// Configured total pool size (`file_count × file_size_bytes`, saturating).
+    pub fn configured_pool_bytes(&self) -> u64 {
+        (self.config.file_count as u64).saturating_mul(self.config.file_size_bytes)
+    }
+
+    /// Current pool health: configured reserve vs actually releasable bytes (#16).
+    pub fn health(&self) -> BallastHealth {
+        BallastHealth::evaluate(self.configured_pool_bytes(), self.releasable_bytes())
     }
 
     /// Update configuration at runtime.
@@ -498,8 +627,7 @@ impl BallastManager {
     }
 
     fn file_path(&self, index: u32) -> PathBuf {
-        self.ballast_dir
-            .join(format!("SBH_BALLAST_FILE_{index:05}.dat"))
+        self.ballast_dir.join(ballast_file_name(index))
     }
 
     fn scan_existing(&mut self) {
@@ -1191,5 +1319,97 @@ mod tests {
             !dir.path().join("SBH_BALLAST_FILE_00005.dat").exists(),
             "Orphaned file 5 should be removed"
         );
+    }
+
+    // ──── #16: health / availability ────
+
+    #[test]
+    fn ballast_health_evaluate_covers_all_states() {
+        assert_eq!(BallastHealth::evaluate(0, 0), BallastHealth::Unconfigured);
+        // Unconfigured wins even if stray bytes exist on disk.
+        assert_eq!(BallastHealth::evaluate(0, 100), BallastHealth::Unconfigured);
+        // Configured reserve with zero releasable bytes is the fail-loud state.
+        assert_eq!(BallastHealth::evaluate(1000, 0), BallastHealth::Empty);
+        assert_eq!(BallastHealth::evaluate(1000, 999), BallastHealth::Degraded);
+        assert_eq!(BallastHealth::evaluate(1000, 1000), BallastHealth::Ok);
+        // Over-provisioned (e.g. larger files than configured) still reads Ok.
+        assert_eq!(BallastHealth::evaluate(1000, 1001), BallastHealth::Ok);
+    }
+
+    #[test]
+    fn ballast_health_labels_are_stable() {
+        assert_eq!(BallastHealth::Unconfigured.as_str(), "unconfigured");
+        assert_eq!(BallastHealth::Ok.as_str(), "ok");
+        assert_eq!(BallastHealth::Degraded.as_str(), "degraded");
+        assert_eq!(BallastHealth::Empty.as_str(), "empty");
+        assert_eq!(BallastHealth::Empty.to_string(), "empty");
+    }
+
+    #[test]
+    fn availability_observe_reports_full_pool_and_never_mutates() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = small_config();
+        let mut mgr = BallastManager::new(dir.path().to_path_buf(), config.clone()).unwrap();
+        mgr.provision(None).unwrap();
+
+        let availability = BallastAvailability::observe(dir.path(), &config);
+        assert_eq!(availability.configured_count, 3);
+        assert_eq!(availability.available_count, 3);
+        assert_eq!(availability.missing_count, 0);
+        assert_eq!(
+            availability.releasable_bytes,
+            3 * config.file_size_bytes,
+            "releasable bytes should sum all present files"
+        );
+        assert_eq!(availability.health, BallastHealth::Ok);
+        assert_eq!(mgr.health(), BallastHealth::Ok);
+    }
+
+    #[test]
+    fn availability_observe_flags_empty_reserve_after_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = small_config();
+        let mut mgr = BallastManager::new(dir.path().to_path_buf(), config.clone()).unwrap();
+        mgr.provision(None).unwrap();
+
+        // Release one file → degraded.
+        mgr.release(1).unwrap();
+        let availability = BallastAvailability::observe(dir.path(), &config);
+        assert_eq!(availability.available_count, 2);
+        assert_eq!(availability.missing_count, 1);
+        assert_eq!(availability.health, BallastHealth::Degraded);
+        assert_eq!(mgr.health(), BallastHealth::Degraded);
+
+        // Release the rest → configured-but-empty, the false-green trap (#16).
+        mgr.release(2).unwrap();
+        let availability = BallastAvailability::observe(dir.path(), &config);
+        assert_eq!(availability.available_count, 0);
+        assert_eq!(availability.missing_count, 3);
+        assert_eq!(availability.releasable_bytes, 0);
+        assert_eq!(availability.health, BallastHealth::Empty);
+        assert_eq!(mgr.health(), BallastHealth::Empty);
+    }
+
+    #[test]
+    fn availability_observe_missing_directory_is_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool_dir = dir.path().join("does-not-exist");
+        let config = small_config();
+
+        let availability = BallastAvailability::observe(&pool_dir, &config);
+        assert_eq!(availability.available_count, 0);
+        assert_eq!(availability.health, BallastHealth::Empty);
+        // Observation must not create the pool directory.
+        assert!(!pool_dir.exists(), "observe must never create directories");
+    }
+
+    #[test]
+    fn availability_observe_unconfigured_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = small_config();
+        config.file_count = 0;
+        let availability = BallastAvailability::observe(dir.path(), &config);
+        assert_eq!(availability.configured_pool_bytes, 0);
+        assert_eq!(availability.health, BallastHealth::Unconfigured);
     }
 }
