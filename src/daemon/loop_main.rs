@@ -330,6 +330,25 @@ fn should_skip_for_device_affinity(
     elevated_pressure && no_root_path_on_pressured_device && !cross_devices
 }
 
+/// B6: consecutive no-progress passes after which even Red/Critical pressure
+/// stops bypassing the empty-pass cooldown ("terminal idle"). Re-walking a
+/// tree whose every candidate is protected cannot free bytes no matter how
+/// red the disk is; the observed failure mode (#15) was 1000+ consecutive
+/// no-progress scans pegging a core for days at 97% disk because the Red
+/// bypass made the cooldown unreachable. Special-location triggers (e.g. a
+/// full `/dev/shm`) synthesize Red-level requests even when the root disk is
+/// far below the pressure thresholds, so the same hot-loop could fire at 82%
+/// disk. Three strikes is enough to prove the tree is barren while still
+/// letting genuine emergencies get immediate rescans.
+const TERMINAL_IDLE_EMPTY_PASSES: u32 = 3;
+
+/// B6: cap on the empty-pass cooldown while pressure is Red/Critical and the
+/// scanner is terminally idle. The exponential backoff may reach 32× the base
+/// interval (48 min at the default 90s base) — acceptable when parked below
+/// the thresholds, but under genuine Red pressure the daemon must still
+/// re-check for newly-deletable files on a long-timer wake, not once an hour.
+const TERMINAL_IDLE_PRESSURED_RESCAN_CAP: Duration = Duration::from_mins(5);
+
 /// B6: decide whether to skip a scan pass because a recent pass found nothing
 /// reclaimable and the rescan cooldown has not yet elapsed.
 ///
@@ -338,7 +357,12 @@ fn should_skip_for_device_affinity(
 /// - operator/service forced scans (`force_full_scan`),
 /// - config reloads (`config_update`), which must take effect immediately,
 /// - synthetic requests (`free_pct` is `None`), used by tests/degraded callers,
-/// - rising danger (Red/Critical pressure), where disk safety overrides pacing.
+/// - rising danger (Red/Critical pressure), where disk safety overrides pacing
+///   — but only until [`TERMINAL_IDLE_EMPTY_PASSES`] consecutive no-progress
+///   passes prove that re-scanning cannot help; from then on Red/Critical
+///   waits too, on a cooldown capped at
+///   [`TERMINAL_IDLE_PRESSURED_RESCAN_CAP`] so emergencies still get periodic
+///   long-timer re-checks (#15).
 ///
 /// A `cooldown` of zero (config `min_rescan_interval_secs == 0`) disables it.
 #[must_use]
@@ -347,17 +371,27 @@ fn empty_pass_cooldown_active(
     now: Instant,
     cooldown: Duration,
     request: &ScanRequest,
+    consecutive_empty_passes: u32,
 ) -> bool {
     if cooldown.is_zero() {
         return false;
     }
-    if request.force_full_scan
-        || request.config_update.is_some()
-        || request.free_pct.is_none()
-        || request.pressure_level >= PressureLevel::Red
-    {
+    if request.force_full_scan || request.config_update.is_some() || request.free_pct.is_none() {
         return false;
     }
+    let cooldown = if request.pressure_level >= PressureLevel::Red {
+        if consecutive_empty_passes < TERMINAL_IDLE_EMPTY_PASSES {
+            // Rising danger overrides pacing while a rescan can still
+            // plausibly make progress.
+            return false;
+        }
+        // Terminal idle: nothing was reclaimable for several passes in a row.
+        // Keep pacing even under Red/Critical, but wake on a shorter timer
+        // than the fully backed-off interval.
+        cooldown.min(TERMINAL_IDLE_PRESSURED_RESCAN_CAP)
+    } else {
+        cooldown
+    };
     last_empty_pass_at.is_some_and(|last| now.duration_since(last) < cooldown)
 }
 
@@ -370,8 +404,11 @@ fn empty_pass_cooldown_active(
 /// doubles the pause, capped at 32× the base. A perpetually-pressured-but-
 /// nothing-to-reclaim disk thus decays from one scan per `base`s to one scan per
 /// ~32×base instead of re-walking back-to-back and pinning a core. The counter
-/// resets to the base interval on the first productive pass, and Red/Critical
-/// pressure bypasses the cooldown entirely (handled in `empty_pass_cooldown_active`).
+/// resets to the base interval on the first productive pass. Red/Critical
+/// pressure bypasses the cooldown only until [`TERMINAL_IDLE_EMPTY_PASSES`]
+/// consecutive no-progress passes; after that even Red/Critical waits, on a
+/// cooldown capped at [`TERMINAL_IDLE_PRESSURED_RESCAN_CAP`] (handled in
+/// `empty_pass_cooldown_active`, #15).
 ///
 /// A base of `0` disables the cooldown (legacy behavior).
 #[must_use]
@@ -2669,12 +2706,7 @@ impl MonitoringDaemon {
                 .scanner
                 .root_paths
                 .iter()
-                .filter(|p| {
-                    collector
-                        .collect(p)
-                        .ok()
-                        .is_some_and(|s| s.mount_point == *target)
-                })
+                .filter(|p| collector.collect(p).is_ok_and(|s| s.mount_point == *target))
                 .cloned()
                 .collect()
         } else {
@@ -3893,6 +3925,7 @@ fn scanner_thread_main(
                 consecutive_empty_passes,
             ),
             &request,
+            consecutive_empty_passes,
         ) {
             continue;
         }
@@ -5130,38 +5163,6 @@ fn scanner_thread_main(
             timed_out: scan_timed_out,
         });
 
-        // B6: arm/clear the inter-pass cooldown. A pass that completed (not
-        // timed out) yet *dispatched nothing* to the deletion executor made no
-        // reclaim progress — either it surfaced no candidates, or (the hot-loop
-        // case) it surfaced candidates that were all protected/dampened. Either
-        // way, immediately re-scanning under the same sustained pressure just
-        // re-walks the same tree and pins a core, so arm the cooldown and grow
-        // the backoff. A productive pass (≥1 dispatched) or a timeout (which is
-        // inconclusive) resets it.
-        //
-        // NOTE: keying on dispatched-count, not candidates_found, is the fix for
-        // the perpetual-Yellow hot-loop where every candidate is a sacred-marker
-        // fixture (`*.sqlite-wal`/`.git`/`.beads`): candidates_found stays high
-        // while deleted/freed stays 0, so the old `candidates_found == 0` gate
-        // never armed.
-        if dispatched_this_pass == 0 && !scan_timed_out {
-            consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
-            last_empty_pass_at = Some(Instant::now());
-            let next_secs = effective_empty_pass_cooldown(
-                current_scanner_config.min_rescan_interval_secs,
-                consecutive_empty_passes,
-            )
-            .as_secs();
-            if next_secs > 0 {
-                eprintln!(
-                    "[SBH-SCANNER] no reclaimable progress this pass ({candidates_found} candidates, 0 dispatched); backing off rescans (consecutive={consecutive_empty_passes}, next pressure-driven scan in ≥{next_secs}s)"
-                );
-            }
-        } else {
-            consecutive_empty_passes = 0;
-            last_empty_pass_at = None;
-        }
-
         // Flush remaining candidates in bounded batches.
         // Hard cap: never spend more than 30s flushing after the scan loop ends.
         let flush_deadline = Instant::now() + Duration::from_secs(30);
@@ -5189,6 +5190,53 @@ fn scanner_thread_main(
                 );
                 break;
             }
+        }
+
+        // B6: arm/clear the inter-pass cooldown. A pass that completed (not
+        // timed out) yet *dispatched nothing* to the deletion executor made no
+        // reclaim progress — either it surfaced no candidates, or (the hot-loop
+        // case) it surfaced candidates that were all protected/dampened. Either
+        // way, immediately re-scanning under the same sustained pressure just
+        // re-walks the same tree and pins a core, so arm the cooldown and grow
+        // the backoff. A productive pass (≥1 dispatched) resets it.
+        //
+        // This accounting MUST run after the final flush above: a pass whose
+        // dispatches all happen at flush time (nothing dispatched early during
+        // the walk) is still productive, and judging `dispatched_this_pass`
+        // before the flush would misclassify it as empty and wrongly arm the
+        // backoff (#15).
+        //
+        // A *timed-out* pass with nothing dispatched is inconclusive for the
+        // exponential streak (the budget may simply have expired before the
+        // walker reached reclaimable files), so it does not grow the counter —
+        // but it still arms the base cooldown timestamp. The old behavior of
+        // fully resetting on timeout meant a tree big enough to exhaust the
+        // scan budget on every pass could never back off at all and re-walked
+        // back-to-back forever (~95% CPU at 82% disk, #15 case 1).
+        //
+        // NOTE: keying on dispatched-count, not candidates_found, is the fix for
+        // the perpetual-Yellow hot-loop where every candidate is a sacred-marker
+        // fixture (`*.sqlite-wal`/`.git`/`.beads`): candidates_found stays high
+        // while deleted/freed stays 0, so the old `candidates_found == 0` gate
+        // never armed.
+        if dispatched_this_pass == 0 {
+            if !scan_timed_out {
+                consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
+            }
+            last_empty_pass_at = Some(Instant::now());
+            let next_secs = effective_empty_pass_cooldown(
+                current_scanner_config.min_rescan_interval_secs,
+                consecutive_empty_passes,
+            )
+            .as_secs();
+            if next_secs > 0 {
+                eprintln!(
+                    "[SBH-SCANNER] no reclaimable progress this pass ({candidates_found} candidates, 0 dispatched, timed_out={scan_timed_out}); backing off rescans (consecutive={consecutive_empty_passes}, next pressure-driven scan in ≥{next_secs}s)"
+                );
+            }
+        } else {
+            consecutive_empty_passes = 0;
+            last_empty_pass_at = None;
         }
 
         if scanner_should_exit {
@@ -6923,6 +6971,7 @@ mod tests {
             now,
             Duration::from_secs(90),
             &request,
+            1,
         ));
     }
 
@@ -6937,6 +6986,7 @@ mod tests {
             later,
             Duration::from_secs(90),
             &request,
+            1,
         ));
     }
 
@@ -6949,6 +6999,7 @@ mod tests {
             now,
             Duration::from_secs(90),
             &request,
+            0,
         ));
     }
 
@@ -6961,6 +7012,7 @@ mod tests {
             now,
             Duration::ZERO,
             &request,
+            5,
         ));
     }
 
@@ -6989,16 +7041,17 @@ mod tests {
         );
         assert_eq!(
             effective_empty_pass_cooldown(90, 4),
-            Duration::from_secs(720)
+            Duration::from_mins(12)
         );
-        // The shift caps at 5 → 32× the base, and stays there for longer streaks.
+        // The shift caps at 5 → 32× the base (48 min at a 90s base), and stays
+        // there for longer streaks.
         assert_eq!(
             effective_empty_pass_cooldown(90, 6),
-            Duration::from_secs(90 * 32)
+            Duration::from_mins(48)
         );
         assert_eq!(
             effective_empty_pass_cooldown(90, 100),
-            Duration::from_secs(90 * 32)
+            Duration::from_mins(48)
         );
         // Extreme inputs saturate instead of panicking on overflow.
         let _ = effective_empty_pass_cooldown(u64::MAX, u32::MAX);
@@ -7014,7 +7067,185 @@ mod tests {
             now,
             Duration::from_secs(90),
             &request,
+            1,
         ));
+    }
+
+    #[test]
+    fn empty_pass_cooldown_red_bypass_ends_at_terminal_idle() {
+        let now = Instant::now();
+        let request = cooldown_request(PressureLevel::Red);
+        let cooldown = Duration::from_secs(90);
+
+        // Below the terminal-idle streak, Red still bypasses the cooldown.
+        assert!(!empty_pass_cooldown_active(
+            Some(now),
+            now,
+            cooldown,
+            &request,
+            TERMINAL_IDLE_EMPTY_PASSES - 1,
+        ));
+
+        // At the terminal-idle streak, Red waits like everyone else (#15):
+        // re-walking a tree with zero reclaimable candidates cannot free
+        // bytes no matter how red the disk is.
+        assert!(empty_pass_cooldown_active(
+            Some(now),
+            now,
+            cooldown,
+            &request,
+            TERMINAL_IDLE_EMPTY_PASSES,
+        ));
+
+        // Critical behaves the same as Red.
+        let critical = cooldown_request(PressureLevel::Critical);
+        assert!(empty_pass_cooldown_active(
+            Some(now),
+            now,
+            cooldown,
+            &critical,
+            TERMINAL_IDLE_EMPTY_PASSES,
+        ));
+    }
+
+    #[test]
+    fn empty_pass_cooldown_terminal_idle_red_wake_is_capped() {
+        let start = Instant::now();
+        let request = cooldown_request(PressureLevel::Red);
+        // Fully backed-off interval: 32 × 90s = 48 min.
+        let backed_off = effective_empty_pass_cooldown(90, 10);
+        assert!(backed_off > TERMINAL_IDLE_PRESSURED_RESCAN_CAP);
+
+        // Under Red pressure the terminal-idle wait is capped at the
+        // pressured rescan cap, so the daemon re-checks on a long-timer wake
+        // instead of sleeping the better part of an hour mid-emergency.
+        let just_past_cap = start + TERMINAL_IDLE_PRESSURED_RESCAN_CAP + Duration::from_secs(1);
+        assert!(!empty_pass_cooldown_active(
+            Some(start),
+            just_past_cap,
+            backed_off,
+            &request,
+            10,
+        ));
+
+        // But within the cap the pass is still skipped.
+        let within_cap =
+            start + TERMINAL_IDLE_PRESSURED_RESCAN_CAP.saturating_sub(Duration::from_secs(1));
+        assert!(empty_pass_cooldown_active(
+            Some(start),
+            within_cap,
+            backed_off,
+            &request,
+            10,
+        ));
+
+        // Off-pressure levels keep honoring the full backed-off interval.
+        let orange = cooldown_request(PressureLevel::Orange);
+        assert!(empty_pass_cooldown_active(
+            Some(start),
+            just_past_cap,
+            backed_off,
+            &orange,
+            10,
+        ));
+    }
+
+    #[test]
+    fn empty_pass_cooldown_fresh_state_scans_immediately_at_any_level() {
+        // Restart/trigger path: with no prior empty pass recorded, the first
+        // pressure-driven pass always runs, at every pressure level.
+        let now = Instant::now();
+        for level in [
+            PressureLevel::Green,
+            PressureLevel::Yellow,
+            PressureLevel::Orange,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
+            let request = cooldown_request(level);
+            assert!(
+                !empty_pass_cooldown_active(None, now, Duration::from_secs(90), &request, 0),
+                "fresh state must allow the first pass at {level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_pass_cooldown_boundary_exact_interval_allows_rescan() {
+        // Boundary values: strictly inside the window skips; exactly at the
+        // boundary the comparison is `<`, so the rescan is allowed.
+        let start = Instant::now();
+        let cooldown = Duration::from_secs(90);
+        let request = cooldown_request(PressureLevel::Yellow);
+        assert!(empty_pass_cooldown_active(
+            Some(start),
+            start + cooldown.saturating_sub(Duration::from_nanos(1)),
+            cooldown,
+            &request,
+            1,
+        ));
+        assert!(!empty_pass_cooldown_active(
+            Some(start),
+            start + cooldown,
+            cooldown,
+            &request,
+            1,
+        ));
+    }
+
+    #[test]
+    fn empty_pass_cooldown_restart_below_clear_settles_into_idle() {
+        // Restart with the disk already below the clear threshold (#15 case 2):
+        // fresh scanner state must allow the first pass, then settle into an
+        // exponentially backed-off idle when passes keep making no progress —
+        // never a hot-loop of back-to-back rescans.
+        let base_secs = 90;
+        let request = cooldown_request(PressureLevel::Orange);
+        let mut now = Instant::now();
+        let mut last_empty_pass_at: Option<Instant> = None;
+        let mut consecutive: u32 = 0;
+
+        for pass in 1..=8u32 {
+            // The pass runs only once the backed-off cooldown has elapsed.
+            assert!(
+                !empty_pass_cooldown_active(
+                    last_empty_pass_at,
+                    now,
+                    effective_empty_pass_cooldown(base_secs, consecutive),
+                    &request,
+                    consecutive,
+                ),
+                "pass {pass} should be allowed after its cooldown elapsed"
+            );
+
+            // The pass finds nothing reclaimable: arm the cooldown, grow the
+            // streak (mirrors the accounting in `scanner_thread_main`).
+            consecutive += 1;
+            last_empty_pass_at = Some(now);
+
+            let cooldown = effective_empty_pass_cooldown(base_secs, consecutive);
+            // An immediate retry (the hot-loop) is always skipped.
+            assert!(
+                empty_pass_cooldown_active(
+                    last_empty_pass_at,
+                    now + Duration::from_millis(1),
+                    cooldown,
+                    &request,
+                    consecutive,
+                ),
+                "immediate rescan after empty pass {pass} must be skipped"
+            );
+
+            now += cooldown + Duration::from_secs(1);
+        }
+
+        // After the streak the wait has decayed to the 32× cap (48 min at the
+        // 90s base): the scanner is parked, waking at most once per capped
+        // interval.
+        assert_eq!(
+            effective_empty_pass_cooldown(base_secs, consecutive),
+            Duration::from_mins(48)
+        );
     }
 
     #[test]
@@ -7028,7 +7259,8 @@ mod tests {
             Some(now),
             now,
             cooldown,
-            &forced
+            &forced,
+            5,
         ));
 
         let mut reload = cooldown_request(PressureLevel::Orange);
@@ -7040,7 +7272,8 @@ mod tests {
             Some(now),
             now,
             cooldown,
-            &reload
+            &reload,
+            5,
         ));
 
         let mut synthetic = cooldown_request(PressureLevel::Orange);
@@ -7049,7 +7282,8 @@ mod tests {
             Some(now),
             now,
             cooldown,
-            &synthetic
+            &synthetic,
+            5,
         ));
     }
 
