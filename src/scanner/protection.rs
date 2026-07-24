@@ -23,7 +23,7 @@ use crate::platform::types::{SacredPath, SacredPathKind, SacredPathSource};
 pub const MARKER_FILENAME: &str = ".sbh-protect";
 pub const DEFAULT_STOWAWAY_SCAN_DEPTH: usize = 3;
 
-/// Upper bound on directory entries examined during a single stowaway
+/// Upper bound on directory entries *name-checked* during a single stowaway
 /// (sacred-marker containment) sub-walk.
 ///
 /// The containment scan exists only to answer an *existence* question — "does
@@ -33,11 +33,31 @@ pub const DEFAULT_STOWAWAY_SCAN_DEPTH: usize = 3;
 /// forces a full enumeration of up to `max_depth` levels on *every* scan pass —
 /// the CPU hot-loop observed on trj.
 ///
+/// This budget is deliberately large because name-checking is now nearly free:
+/// entries are matched inline from the `read_dir` iterator using the `d_type`
+/// already carried by `DirEntry`, so a checked entry costs no syscall. The
+/// syscall-bearing unit of work is *opening* a directory, which is bounded
+/// separately by [`DEFAULT_STOWAWAY_SCAN_MAX_DIRS`].
+///
 /// When this cap is reached before a marker is found, the scan is reported as
 /// **truncated**. Truncation is treated as *fail-closed*: the candidate is
 /// considered protected (see `find_sacred_overlaps_with_config`). A bounded
 /// search must never make a protected subtree look reclaimable.
-pub const DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES: usize = 20_000;
+pub const DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES: usize = 2_000_000;
+
+/// Upper bound on directories *opened* (`read_dir` calls) during a single
+/// stowaway sub-walk.
+///
+/// This is the real cost centre: one `read_dir` per directory, versus a free
+/// `d_type` name check per entry. Bounding directories rather than entries is
+/// what makes the walk cheap enough to actually finish on artifact trees.
+///
+/// Sizing: a cargo `target/` at `max_depth` 3 holds a few thousand directories
+/// (`debug/.fingerprint/<crate>`, `debug/incremental/<unit>`, `debug/build/…`)
+/// against millions of *files*. Budgeting directories lets such a tree complete
+/// and be correctly reported marker-free, where an entry budget truncated it
+/// and pinned it as protected forever.
+pub const DEFAULT_STOWAWAY_SCAN_MAX_DIRS: usize = 50_000;
 
 /// Optional metadata stored inside a `.sbh-protect` file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,13 +91,24 @@ pub enum ProtectionSource {
 pub struct StowawayScanConfig {
     pub max_depth: usize,
     pub stop_after_first: bool,
-    /// Maximum directory entries to examine before aborting the sub-walk.
+    /// Maximum directory entries to name-check before aborting the sub-walk.
     ///
     /// `0` means "unbounded" (historical behavior, used by some tests). The
     /// daemon/CLI paths always set a positive bound. When the bound is reached
     /// before a marker is found, the scan is reported as truncated and the
     /// candidate is treated as protected (fail-closed).
+    ///
+    /// Name checks are syscall-free (see [`DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES`]);
+    /// this is a runaway guard for a pathological single directory, not the
+    /// primary throttle. That role belongs to [`Self::max_dirs`].
     pub max_entries: usize,
+    /// Maximum directories to open (`read_dir`) before aborting the sub-walk.
+    ///
+    /// `0` means "unbounded". This is the primary cost throttle: it bounds
+    /// syscalls rather than names, so an artifact tree with millions of files
+    /// but few directories completes instead of truncating into fail-closed
+    /// protection.
+    pub max_dirs: usize,
 }
 
 impl Default for StowawayScanConfig {
@@ -86,6 +117,7 @@ impl Default for StowawayScanConfig {
             max_depth: DEFAULT_STOWAWAY_SCAN_DEPTH,
             stop_after_first: true,
             max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
+            max_dirs: DEFAULT_STOWAWAY_SCAN_MAX_DIRS,
         }
     }
 }
@@ -551,14 +583,32 @@ pub fn scan_stowaways_with_config(
 /// Bounded sacred-marker containment sub-walk.
 ///
 /// Walks `root` up to `config.max_depth` levels looking for sacred markers.
-/// The walk is bounded twice over:
+/// The walk is bounded three ways over:
 ///
 /// 1. **Depth** — never descends past `config.max_depth` (B4: the old call
 ///    sites used an effectively-unbounded depth that descended into million-
 ///    file artifact trees on every pass).
-/// 2. **Entry budget** — never examines more than `config.max_entries` entries
-///    (`0` = unbounded). When the budget is exhausted before the subtree is
-///    fully walked, `truncated` is set.
+/// 2. **Directory budget** — never opens more than `config.max_dirs`
+///    directories (`0` = unbounded). This is the primary throttle.
+/// 3. **Entry budget** — never name-checks more than `config.max_entries`
+///    entries (`0` = unbounded); a runaway guard for a single pathological
+///    directory. When either budget is exhausted before the subtree is fully
+///    walked, `truncated` is set.
+///
+/// COST MODEL: entries are matched *inline* from the `read_dir` iterator using
+/// the file type `DirEntry` already carries (`d_type` on Linux/macOS), so a
+/// name check costs no syscall and only directories are ever queued. The old
+/// implementation pushed every entry onto a stack and re-`lstat`ed it on pop —
+/// one syscall per file — which is why a 20k *entry* cap was needed and why
+/// every large artifact tree truncated into permanent fail-closed protection.
+/// Budgeting directories instead lets those trees finish and be correctly
+/// reported marker-free.
+///
+/// TRAVERSAL ORDER: breadth-first. Sacred markers live shallow (`.git`,
+/// `.beads`, `.sbh-protect` at a project root), so BFS both finds them sooner
+/// and makes the bound meaningful — a LIFO stack could burn the entire budget
+/// descending one `debug/incremental/**` branch without ever examining a
+/// sibling at depth 1.
 ///
 /// EARLY-EXIT: with `stop_after_first` (the default), the walk returns as soon
 /// as the first marker is found — an existence check needs no full enumeration.
@@ -574,74 +624,129 @@ pub fn scan_stowaways_bounded(
     let rules = build_stowaway_rules(catalog)?;
     let mut matches = Vec::new();
     let root = normalize_path_for_protection(root);
-    let mut queue = vec![(root.clone(), 0usize)];
-    let mut entries_examined: usize = 0;
-    let entry_budget = config.max_entries; // 0 == unbounded
 
-    while let Some((path, depth)) = queue.pop() {
-        // Entry-budget guard. If we still have unexplored work queued and the
-        // budget is exhausted, we cannot prove the subtree is marker-free →
-        // report truncation so the caller fails closed.
-        if entry_budget != 0 && entries_examined >= entry_budget {
+    let entry_budget = config.max_entries; // 0 == unbounded
+    let dir_budget = config.max_dirs; // 0 == unbounded
+    let mut entries_examined: usize = 0;
+    let mut dirs_opened: usize = 0;
+
+    // Test one entry against every rule, recording a match. Returns `true` when
+    // the caller should stop the whole walk (definitive positive under
+    // `stop_after_first`).
+    let record_match =
+        |path: &Path, depth: usize, is_dir: bool, matches: &mut Vec<StowawayMatch>| -> bool {
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let relative_path = normalized_relative_path(&root, path);
+            for rule in &rules {
+                if rule.matches(&file_name, &relative_path, is_dir) {
+                    matches.push(StowawayMatch {
+                        path: path.to_path_buf(),
+                        depth,
+                        pattern: rule.pattern.clone(),
+                        kind: rule.kind,
+                        source: rule.source,
+                        reason: rule.reason.clone(),
+                    });
+                    return config.stop_after_first;
+                }
+            }
+            false
+        };
+
+    // The root is the one entry we have no `DirEntry` for, so it costs the
+    // walk's single unavoidable `lstat`.
+    let root_type = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata.file_type(),
+        Err(err)
+            if err.kind() == ErrorKind::NotFound || err.kind() == ErrorKind::PermissionDenied =>
+        {
+            return Ok(StowawayScanResult {
+                matches,
+                truncated: false,
+            });
+        }
+        Err(source) => return Err(SbhError::Io { path: root, source }),
+    };
+    entries_examined = entries_examined.saturating_add(1);
+    if record_match(&root, 0, root_type.is_dir(), &mut matches) {
+        return Ok(StowawayScanResult {
+            matches,
+            truncated: false,
+        });
+    }
+
+    // Only directories are queued; files are matched inline below.
+    let mut queue = std::collections::VecDeque::new();
+    if root_type.is_dir() && !root_type.is_symlink() && config.max_depth > 0 {
+        queue.push_back((root.clone(), 0usize));
+    }
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        // Budget guards. Unexplored work is still queued, so we cannot prove the
+        // subtree is marker-free → report truncation and let the caller fail
+        // closed.
+        if (dir_budget != 0 && dirs_opened >= dir_budget)
+            || (entry_budget != 0 && entries_examined >= entry_budget)
+        {
             return Ok(StowawayScanResult {
                 matches,
                 truncated: true,
             });
         }
-        entries_examined = entries_examined.saturating_add(1);
 
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == ErrorKind::NotFound => continue,
-            Err(err) if err.kind() == ErrorKind::PermissionDenied => continue,
-            Err(source) => return Err(SbhError::Io { path, source }),
-        };
-        let file_type = metadata.file_type();
-        let is_dir = file_type.is_dir();
-        let is_symlink = file_type.is_symlink();
-        let file_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let relative_path = normalized_relative_path(&root, &path);
-
-        for rule in &rules {
-            if rule.matches(&file_name, &relative_path, is_dir) {
-                matches.push(StowawayMatch {
-                    path: path.clone(),
-                    depth,
-                    pattern: rule.pattern.clone(),
-                    kind: rule.kind,
-                    source: rule.source,
-                    reason: rule.reason.clone(),
-                });
-                if config.stop_after_first {
-                    // Definitive positive answer — not a truncation.
-                    return Ok(StowawayScanResult {
-                        matches,
-                        truncated: false,
-                    });
-                }
-                break;
-            }
-        }
-
-        if !is_dir || is_symlink || depth >= config.max_depth {
-            continue;
-        }
-
-        let entries = match fs::read_dir(&path) {
+        let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == ErrorKind::NotFound => continue,
             Err(err) if err.kind() == ErrorKind::PermissionDenied => continue,
-            Err(source) => return Err(SbhError::Io { path, source }),
+            Err(source) => return Err(SbhError::Io { path: dir, source }),
         };
+        dirs_opened = dirs_opened.saturating_add(1);
+        let child_depth = depth + 1;
 
         for entry_result in entries {
             let Ok(entry) = entry_result else {
                 continue;
             };
-            queue.push((entry.path(), depth + 1));
+
+            // Guard inside the loop too: a single directory can hold millions of
+            // entries, and abandoning it mid-iteration is still a truncation.
+            if entry_budget != 0 && entries_examined >= entry_budget {
+                return Ok(StowawayScanResult {
+                    matches,
+                    truncated: true,
+                });
+            }
+            entries_examined = entries_examined.saturating_add(1);
+
+            // `DirEntry::file_type` is `d_type` off the already-read directory
+            // block on Linux/macOS — no syscall. It only falls back to an
+            // `lstat` on filesystems that report DT_UNKNOWN. Like
+            // `symlink_metadata`, it does not follow symlinks.
+            let (is_dir, is_symlink) = match entry.file_type() {
+                Ok(file_type) => (file_type.is_dir(), file_type.is_symlink()),
+                Err(_) => match fs::symlink_metadata(entry.path()) {
+                    Ok(metadata) => (
+                        metadata.file_type().is_dir(),
+                        metadata.file_type().is_symlink(),
+                    ),
+                    Err(_) => continue,
+                },
+            };
+
+            let path = entry.path();
+            if record_match(&path, child_depth, is_dir, &mut matches) {
+                return Ok(StowawayScanResult {
+                    matches,
+                    truncated: false,
+                });
+            }
+
+            if is_dir && !is_symlink && child_depth < config.max_depth {
+                queue.push_back((path, child_depth));
+            }
         }
     }
 
@@ -1539,6 +1644,7 @@ protected_at = "2026-05-07T03:50:00Z"
                 max_depth: 3,
                 stop_after_first: false,
                 max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
+                max_dirs: DEFAULT_STOWAWAY_SCAN_MAX_DIRS,
             },
         )
         .unwrap();
@@ -1582,6 +1688,7 @@ protected_at = "2026-05-07T03:50:00Z"
                 max_depth: 3,
                 stop_after_first: true,
                 max_entries: 5,
+                max_dirs: DEFAULT_STOWAWAY_SCAN_MAX_DIRS,
             },
         )
         .unwrap();
@@ -1593,6 +1700,118 @@ protected_at = "2026-05-07T03:50:00Z"
         assert!(
             result.matches.is_empty(),
             "no markers present, so no definitive matches"
+        );
+    }
+
+    /// REGRESSION (2026-07-24, hz2): a wide artifact tree — millions of files
+    /// but few directories — must complete and be reported *reclaimable*.
+    ///
+    /// The legacy 20_000-*entry* budget truncated exactly the trees most worth
+    /// reclaiming: a 223G cargo `target/` on hz2 blew the cap, failed closed,
+    /// and became permanently un-reclaimable while the host filled to 100%.
+    /// Budgeting directories instead of entries is what fixes it.
+    #[test]
+    fn wide_artifact_tree_past_legacy_entry_cap_stays_reclaimable() {
+        const LEGACY_ENTRY_CAP: usize = 20_000;
+
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("cargo-target");
+        // Shape mirrors a real cargo target: a handful of directories holding a
+        // very large number of marker-free files.
+        let deps = candidate.join("debug").join("deps");
+        fs::create_dir_all(&deps).unwrap();
+        for i in 0..(LEGACY_ENTRY_CAP + 500) {
+            fs::write(deps.join(format!("dep_{i}.o")), b"").unwrap();
+        }
+
+        let result = scan_stowaways_bounded(
+            &candidate,
+            cross_platform_sacred_paths(),
+            StowawayScanConfig::default(),
+        )
+        .unwrap();
+
+        assert!(
+            !result.truncated,
+            "a wide, marker-free artifact tree must not truncate under the default \
+             budget — truncation pins it as protected forever"
+        );
+        assert!(result.matches.is_empty(), "no sacred markers were planted");
+
+        // The whole point: it must read as reclaimable, not fail-closed.
+        let overlaps = find_sacred_overlaps_with_config(
+            &candidate,
+            cross_platform_sacred_paths(),
+            StowawayScanConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            overlaps.is_empty(),
+            "marker-free artifact tree must report no sacred overlap, got: {overlaps:?}"
+        );
+    }
+
+    /// Entries are matched inline from the `read_dir` iterator, so a marker
+    /// sitting directly in the candidate is found without opening a single
+    /// subdirectory — even when the directory budget allows only the root.
+    #[test]
+    fn shallow_marker_is_found_without_descending() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("project");
+        // A bulky sibling subtree that a depth-first walk could dive into first.
+        let bulk = candidate.join("bulk");
+        fs::create_dir_all(&bulk).unwrap();
+        for i in 0..200 {
+            fs::write(bulk.join(format!("obj_{i}.o")), b"").unwrap();
+        }
+        fs::write(candidate.join("beads.db"), b"db").unwrap();
+
+        let result = scan_stowaways_bounded(
+            &candidate,
+            cross_platform_sacred_paths(),
+            StowawayScanConfig {
+                max_depth: 3,
+                stop_after_first: true,
+                max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
+                // Only the candidate itself may be opened.
+                max_dirs: 1,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !result.truncated,
+            "finding a marker is a definitive answer, never a truncation"
+        );
+        assert_eq!(result.matches.len(), 1, "expected the shallow marker");
+    }
+
+    /// The directory budget is the throttle that can still truncate: a tree
+    /// that is *deep and branchy* (rather than merely wide) exhausts it and
+    /// must fail closed, preserving the safety invariant.
+    #[test]
+    fn directory_budget_still_truncates_branchy_trees() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("branchy");
+        for i in 0..40 {
+            fs::create_dir_all(candidate.join(format!("d_{i}")).join("nested")).unwrap();
+        }
+
+        let result = scan_stowaways_bounded(
+            &candidate,
+            cross_platform_sacred_paths(),
+            StowawayScanConfig {
+                max_depth: 3,
+                stop_after_first: true,
+                max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
+                max_dirs: 5,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            result.truncated,
+            "exhausting the directory budget must still fail closed"
         );
     }
 
@@ -1619,6 +1838,7 @@ protected_at = "2026-05-07T03:50:00Z"
                 max_depth: 3,
                 stop_after_first: true,
                 max_entries: 3,
+                max_dirs: DEFAULT_STOWAWAY_SCAN_MAX_DIRS,
             },
         )
         .unwrap();
@@ -1646,6 +1866,7 @@ protected_at = "2026-05-07T03:50:00Z"
                 max_depth: 3,
                 stop_after_first: true,
                 max_entries: 8,
+                max_dirs: DEFAULT_STOWAWAY_SCAN_MAX_DIRS,
             },
         )
         .unwrap();
@@ -1689,6 +1910,7 @@ protected_at = "2026-05-07T03:50:00Z"
                 max_depth: 3,
                 stop_after_first: false,
                 max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
+                max_dirs: DEFAULT_STOWAWAY_SCAN_MAX_DIRS,
             },
         )
         .unwrap();
@@ -1701,6 +1923,7 @@ protected_at = "2026-05-07T03:50:00Z"
                 max_depth: 5,
                 stop_after_first: false,
                 max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
+                max_dirs: DEFAULT_STOWAWAY_SCAN_MAX_DIRS,
             },
         )
         .unwrap();
@@ -1722,6 +1945,7 @@ protected_at = "2026-05-07T03:50:00Z"
                 max_depth: 1,
                 stop_after_first: false,
                 max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
+                max_dirs: DEFAULT_STOWAWAY_SCAN_MAX_DIRS,
             },
         )
         .unwrap();
@@ -1748,6 +1972,7 @@ protected_at = "2026-05-07T03:50:00Z"
                 max_depth: 3,
                 stop_after_first: false,
                 max_entries: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
+                max_dirs: DEFAULT_STOWAWAY_SCAN_MAX_DIRS,
             },
         )
         .unwrap();
