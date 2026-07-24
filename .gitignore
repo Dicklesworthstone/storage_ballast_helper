@@ -57,6 +57,7 @@ test_meminfo
 /test
 test_cast
 agy.mcp.json
+codex.mcp.json
 cursor.mcp.json
 factory.mcp.json
 gemini.mcp.json
