@@ -40,9 +40,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
 plist = "1.9.0"
+# Pinned to 2.x deliberately: bincode 3.0.0 is not a usable release — its
+# lib.rs is a single `compile_error!` pointing at https://xkcd.com/2347/,
+# so any build that resolves it fails outright. It also drops the `serde`
+# feature this crate needs. Do not "upgrade" to 3.x on a version-currency
+# sweep; revisit only if a real 3.x ships.
 bincode = { version = "2.0.1", features = ["serde"] }
 # Database (optional — gated behind "sqlite" feature)
-rusqlite = { version = "0.39", features = ["bundled", "functions"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = true }
 # Error handling (core)
 thiserror = "2.0"
 # TUI (optional — gated behind "tui" feature).
@@ -83,7 +88,7 @@ objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "
 proc_pidinfo = "0.1.4"
 sbh_mach = { path = "crates/sbh_mach" }
 sysctl = "0.7.1"
-whichdisk = "0.4.0"
+whichdisk = "0.5"
 [dev-dependencies]
 tempfile = "3.17"
 proptest = "1.6"
