@@ -990,9 +990,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libsqlite3-sys"
@@ -2239,3 +2239,83 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "fsqlite"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-ast"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-btree"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-core"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-error"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-ext-fts5"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-ext-icu"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-ext-json"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-ext-misc"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-ext-rtree"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-func"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-mvcc"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-observability"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-pager"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-parser"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-planner"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-types"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-vdbe"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-vfs"
+version = "0.1.19"
+
+[[patch.unused]]
+name = "fsqlite-wal"
+version = "0.1.19"
