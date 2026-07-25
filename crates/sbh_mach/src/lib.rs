@@ -36,6 +36,62 @@ use mach2::vm_types::{integer_t, natural_t};
 const THREAD_BASIC_INFO: natural_t = 3;
 const THREAD_BASIC_INFO_COUNT: mach_msg_type_number_t =
     (size_of::<MachThreadBasicInfoRaw>() / size_of::<natural_t>()) as mach_msg_type_number_t;
+/// XNU's original `vm_statistics64` layout — the `HOST_VM_INFO64` rev0 ABI.
+///
+/// Declared locally, and used *only* to derive [`HOST_VM_INFO64_REV0_COUNT`];
+/// the actual read buffer stays `libc::vm_statistics64`, which is a superset
+/// with an identical prefix, so field offsets for everything we read match.
+///
+/// This mirror exists because the count is an **ABI revision selector**, not a
+/// buffer size. `host_statistics64` validates it against the revisions the
+/// kernel implements and rejects anything else with `KERN_INVALID_ARGUMENT` —
+/// it will not simply fill "as much as you asked for". So the count must be a
+/// number XNU recognises, which means we have to own the layout that defines
+/// it rather than inheriting whatever size libc's struct happens to be today.
+#[repr(C)]
+struct VmStatistics64Rev0 {
+    free_count: natural_t,
+    active_count: natural_t,
+    inactive_count: natural_t,
+    wire_count: natural_t,
+    zero_fill_count: u64,
+    reactivations: u64,
+    pageins: u64,
+    pageouts: u64,
+    faults: u64,
+    cow_faults: u64,
+    lookups: u64,
+    hits: u64,
+    purges: u64,
+    purgeable_count: natural_t,
+    speculative_count: natural_t,
+    decompressions: u64,
+    compressions: u64,
+    swapins: u64,
+    swapouts: u64,
+    compressor_page_count: natural_t,
+    throttled_count: natural_t,
+    external_page_count: natural_t,
+    internal_page_count: natural_t,
+    total_uncompressed_pages_in_compressor: u64,
+}
+
+/// `HOST_VM_INFO64` rev0 count (38 `integer_t` slots).
+///
+/// Deliberately **not** `libc::HOST_VM_INFO64_COUNT`. That constant is
+/// `size_of::<vm_statistics64_data_t>() / size_of::<integer_t>()`, so it grows
+/// whenever libc widens the struct to track a newer XNU. libc 0.2.189 widened it
+/// from 24 to 57 fields; the requested count went 38 -> 90, no kernel recognised
+/// that revision, and `host_statistics64` returned `KERN_INVALID_ARGUMENT` —
+/// silently killing *every* macOS memory read while the disk half of sbh kept
+/// working. It reproduced on GitHub's Apple Silicon runners, not just locally.
+///
+/// Anchoring to the rev0 layout keeps the request at a revision every
+/// `HOST_VM_INFO64`-capable kernel implements, and makes us immune to future
+/// upstream struct growth. Every field [`host_vm_stats`] reads lives in rev0.
+const HOST_VM_INFO64_REV0_COUNT: mach_msg_type_number_t =
+    (size_of::<VmStatistics64Rev0>() / size_of::<integer_t>()) as mach_msg_type_number_t;
+
 const PROC_ALL_PIDS: u32 = 1;
 const PROC_PIDREGIONPATHINFO: i32 = 8;
 const RUSAGE_INFO_V4: i32 = 4;
@@ -399,7 +455,7 @@ pub fn current_task_usage() -> Result<CurrentTaskUsage, MachError> {
 /// Read `HOST_VM_INFO64` for the current host.
 pub fn host_vm_stats() -> Result<VmStats, MachError> {
     let mut info = MaybeUninit::<libc::vm_statistics64>::zeroed();
-    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let mut count = HOST_VM_INFO64_REV0_COUNT;
 
     let host = unsafe { mach_host_self() };
     let code = unsafe {
@@ -416,7 +472,7 @@ pub fn host_vm_stats() -> Result<VmStats, MachError> {
     ensure_count(
         "host_statistics64(HOST_VM_INFO64)",
         count,
-        libc::HOST_VM_INFO64_COUNT,
+        HOST_VM_INFO64_REV0_COUNT,
     )?;
 
     let info = unsafe { info.assume_init() };
@@ -708,7 +764,28 @@ mod tests {
     use super::{
         current_task_basic_info, current_task_thread_times, current_task_usage, host_vm_stats,
         current_thread_basic_info, subscribe_memory_pressure_events, MemoryPressureEvent,
+        HOST_VM_INFO64_REV0_COUNT,
     };
+
+    /// REGRESSION: the `HOST_VM_INFO64` count must stay anchored to XNU's rev0
+    /// ABI, never inherited from `libc::HOST_VM_INFO64_COUNT`.
+    ///
+    /// libc 0.2.189 widened `vm_statistics64` from 24 to 57 fields to track a
+    /// newer XNU. Because the libc constant is `size_of::<struct>() /
+    /// size_of::<integer_t>()`, the requested count went 38 -> 90. The count is
+    /// an ABI *revision selector*, not a buffer size, so the kernel rejected the
+    /// unrecognised revision with KERN_INVALID_ARGUMENT — silently killing every
+    /// macOS memory read. Asserting the exact rev0 value means a future libc
+    /// widening (or a typo in the mirror struct) fails loudly here instead of
+    /// disabling memory monitoring in production.
+    #[test]
+    fn host_vm_info64_count_stays_anchored_to_rev0_abi() {
+        assert_eq!(
+            HOST_VM_INFO64_REV0_COUNT, 38,
+            "HOST_VM_INFO64 rev0 is 38 integer_t slots; a different value means \
+             VmStatistics64Rev0 no longer mirrors XNU's original layout"
+        );
+    }
 
     #[test]
     fn current_task_basic_info_reports_plausible_memory() {
