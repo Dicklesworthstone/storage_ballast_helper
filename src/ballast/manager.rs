@@ -128,6 +128,13 @@ pub enum BallastHealth {
     /// reserve does not exist precisely when it may be needed. Surfaces
     /// loudly in `status`, `check`, and `doctor`.
     Empty,
+    /// The pool could not be read, so its true state is unknown. Raised when
+    /// `stat` fails for a reason other than "not found" — most often because
+    /// an unprivileged caller cannot traverse a root-owned ballast directory
+    /// (`/root/...` is mode 700). Reporting `Empty` here would be a lie in the
+    /// most dangerous direction: it tells an operator their emergency reserve
+    /// is gone when the daemon can still see and release every file.
+    Indeterminate,
 }
 
 impl BallastHealth {
@@ -157,6 +164,7 @@ impl BallastHealth {
             Self::Ok => "ok",
             Self::Degraded => "degraded",
             Self::Empty => "empty",
+            Self::Indeterminate => "indeterminate",
         }
     }
 }
@@ -183,8 +191,16 @@ pub struct BallastAvailability {
     pub configured_pool_bytes: u64,
     /// Ballast files currently present on disk.
     pub available_count: usize,
-    /// Configured files not currently present (released or lost).
+    /// Configured files confirmed absent (released or lost).
+    ///
+    /// Only counts files whose `stat` returned `NotFound`. Files that could not
+    /// be inspected at all are counted in `unreadable_count` instead, so a
+    /// permission failure is never reported as a missing reserve.
     pub missing_count: usize,
+    /// Configured files whose presence could not be determined, because `stat`
+    /// failed for a reason other than "not found" (permission denied, I/O
+    /// error). Non-zero means this snapshot is not authoritative.
+    pub unreadable_count: usize,
     /// Bytes that releasing every present file would free.
     pub releasable_bytes: u64,
     /// Overall pool health derived from the fields above.
@@ -198,25 +214,48 @@ impl BallastAvailability {
         let configured_pool_bytes =
             (config.file_count as u64).saturating_mul(config.file_size_bytes);
         let mut available_count = 0usize;
+        let mut missing_count = 0usize;
+        let mut unreadable_count = 0usize;
         let mut releasable_bytes = 0u64;
         for i in 1..=config.file_count {
             let path = ballast_dir.join(ballast_file_name(i as u32));
-            if let Ok(meta) = fs::metadata(&path)
-                && meta.is_file()
-            {
-                available_count += 1;
-                releasable_bytes = releasable_bytes.saturating_add(meta.len());
+            match fs::metadata(&path) {
+                Ok(meta) if meta.is_file() => {
+                    available_count += 1;
+                    releasable_bytes = releasable_bytes.saturating_add(meta.len());
+                }
+                // Path exists but is not a regular file: the reserve slot is
+                // genuinely unusable, which is a real absence.
+                Ok(_) => missing_count += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing_count += 1,
+                // Permission denied, I/O error, and friends: we simply do not
+                // know. Never fold this into `missing`.
+                Err(_) => unreadable_count += 1,
             }
         }
+        let health = if unreadable_count > 0 {
+            BallastHealth::Indeterminate
+        } else {
+            BallastHealth::evaluate(configured_pool_bytes, releasable_bytes)
+        };
         Self {
             configured_count: config.file_count,
             configured_file_size_bytes: config.file_size_bytes,
             configured_pool_bytes,
             available_count,
-            missing_count: config.file_count.saturating_sub(available_count),
+            missing_count,
+            unreadable_count,
             releasable_bytes,
-            health: BallastHealth::evaluate(configured_pool_bytes, releasable_bytes),
+            health,
         }
+    }
+
+    /// Whether this snapshot is authoritative (every configured slot was
+    /// successfully inspected). Callers should avoid asserting that the reserve
+    /// is gone when this is `false`.
+    #[must_use]
+    pub const fn is_authoritative(&self) -> bool {
+        self.unreadable_count == 0
     }
 }
 
@@ -956,6 +995,84 @@ fn shell_quote_for_warning(value: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// Regression: an unreadable ballast directory must NOT be reported as an
+    /// empty reserve.
+    ///
+    /// The original `observe()` used `if let Ok(meta) = fs::metadata(..)`, which
+    /// swallowed `PermissionDenied` exactly like `NotFound`. On a real fleet the
+    /// ballast dir lives under root's home (mode 700), so `sbh status` run as an
+    /// unprivileged user reported `available=0 missing=10 health=empty` for a
+    /// pool that was fully present and releasable by the (root) daemon — the
+    /// alarm fired in the most misleading possible direction.
+    #[cfg(unix)]
+    #[test]
+    fn observe_reports_indeterminate_when_dir_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ballast_dir = dir.path().join("ballast");
+        std::fs::create_dir_all(&ballast_dir).expect("create ballast dir");
+
+        let config = small_config();
+        // Populate the pool so the files genuinely exist.
+        for i in 1..=config.file_count {
+            std::fs::write(ballast_dir.join(ballast_file_name(i as u32)), b"x").expect("write");
+        }
+
+        // Sanity: readable → not indeterminate, and all files are found.
+        let readable = BallastAvailability::observe(&ballast_dir, &config);
+        assert_eq!(readable.available_count, config.file_count);
+        assert_eq!(readable.unreadable_count, 0);
+        assert!(readable.is_authoritative());
+        assert_ne!(readable.health, BallastHealth::Indeterminate);
+
+        // Strip all permissions so stat() inside fails with EACCES.
+        std::fs::set_permissions(&ballast_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        let observed = BallastAvailability::observe(&ballast_dir, &config);
+
+        // Restore before asserting so a failure can't leave an undeletable dir.
+        let _ = std::fs::set_permissions(&ballast_dir, std::fs::Permissions::from_mode(0o755));
+
+        // Running as root defeats the permission check entirely; skip there.
+        if observed.unreadable_count == 0 {
+            println!("TEST SKIP: running as root, permissions not enforced");
+            return;
+        }
+
+        assert_eq!(
+            observed.unreadable_count, config.file_count,
+            "every unstat-able file must count as unreadable"
+        );
+        assert_eq!(
+            observed.missing_count, 0,
+            "permission denied must never be reported as a missing reserve"
+        );
+        assert_eq!(observed.health, BallastHealth::Indeterminate);
+        assert!(!observed.is_authoritative());
+        println!("TEST PASS: observe_reports_indeterminate_when_dir_is_unreadable");
+    }
+
+    /// A genuinely absent pool must still report `Empty`, not `Indeterminate` —
+    /// the fix must not mask the real "reserve is gone" alarm.
+    #[test]
+    fn observe_still_reports_empty_when_files_are_truly_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ballast_dir = dir.path().join("ballast");
+        std::fs::create_dir_all(&ballast_dir).expect("create ballast dir");
+
+        let config = small_config();
+        let observed = BallastAvailability::observe(&ballast_dir, &config);
+
+        assert_eq!(observed.available_count, 0);
+        assert_eq!(observed.missing_count, config.file_count);
+        assert_eq!(observed.unreadable_count, 0);
+        assert!(observed.is_authoritative());
+        assert_eq!(observed.health, BallastHealth::Empty);
+        println!("TEST PASS: observe_still_reports_empty_when_files_are_truly_absent");
+    }
 
     use crate::platform::pal::{MockPlatform, Platform};
     use crate::platform::types::LocalSnapshotInfo;

@@ -4976,6 +4976,29 @@ fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
                     .to_string(),
             ),
         ),
+        // Deliberately WARN, not FAIL: we could not read the pool, so we do not
+        // know whether the reserve exists. Reporting FAIL/"empty" here is what
+        // the old code effectively did, and it scared operators into rebuilding
+        // a reserve that was already present and releasable by the daemon.
+        BallastHealth::Indeterminate => doctor_check(
+            "ballast.reserve",
+            "Ballast emergency reserve",
+            "WARN",
+            format!(
+                "could not inspect {} of {} configured ballast files in {} — reserve state \
+                 is unknown, not necessarily missing",
+                availability.unreadable_count,
+                availability.configured_count,
+                config.paths.ballast_dir.display(),
+            ),
+            Some(format!(
+                "The ballast directory is usually root-owned (mode 700), so an unprivileged \
+                 caller cannot stat it. Re-run as root to get an authoritative answer: \
+                 `sudo sbh ballast status`. The daemon runs as root and is unaffected by \
+                 this — it can still see and release {} files.",
+                availability.configured_count,
+            )),
+        ),
     }
 }
 
@@ -6662,6 +6685,15 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     "  WARNING: a {} reserve is configured but 0 bytes are releasable — \
                      the emergency reserve does not exist. Run: sbh ballast provision",
                     format_bytes(ballast.configured_pool_bytes),
+                );
+            }
+            if !ballast.is_authoritative() {
+                println!(
+                    "  NOTE: {} of {} ballast files could not be inspected (permission \
+                     denied or I/O error), so the counts above are not authoritative. \
+                     The ballast dir is normally root-owned mode 700; re-run as \
+                     `sudo sbh ballast status` for the real state.",
+                    ballast.unreadable_count, ballast.configured_count,
                 );
             }
 
@@ -8987,6 +9019,12 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                 "releasable_bytes": ballast.releasable_bytes,
                 "available_count": ballast.available_count,
                 "missing_count": ballast.missing_count,
+                // Non-zero means this snapshot is NOT authoritative (usually an
+                // unprivileged caller against a root-owned, mode-700 dir).
+                // Automation must not treat `missing_count` as a real absence
+                // while this is > 0.
+                "unreadable_count": ballast.unreadable_count,
+                "authoritative": ballast.is_authoritative(),
                 "health": ballast.health.as_str(),
             },
             "exit_code": 0,
