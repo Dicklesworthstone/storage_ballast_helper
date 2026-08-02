@@ -503,7 +503,14 @@ fn command_output_with_timeout_inner(
                 match child.try_wait() {
                     Ok(Some(_)) => return Ok(None),
                     Ok(None) => thread::sleep(MACOS_COMMAND_POLL_INTERVAL),
-                    Err(_) => break,
+                    // Surface the error as the pre-fix code did, but hand the
+                    // child off first — swallowing it here would silently turn
+                    // a broken wait into "timed out", and dropping it would
+                    // reintroduce the leak on the error path.
+                    Err(error) => {
+                        reap_detached(child);
+                        return Err(error);
+                    }
                 }
             }
 
@@ -1597,14 +1604,16 @@ mod tests {
     }
 
     /// Count zombie processes whose parent is this test process.
+    ///
+    /// Deliberately panics rather than returning 0 if `ps` cannot run: a count
+    /// of zero is the assertion's success value, so a failed measurement would
+    /// otherwise make the test pass without having measured anything.
     fn zombie_children_of_self() -> usize {
         let ppid = std::process::id().to_string();
-        let Ok(output) = Command::new("/bin/ps")
+        let output = Command::new("/bin/ps")
             .args(["-Ao", "ppid=,stat="])
             .output()
-        else {
-            return 0;
-        };
+            .expect("ps must run for this test to mean anything");
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter_map(|line| {
