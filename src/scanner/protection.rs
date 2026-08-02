@@ -616,6 +616,12 @@ pub fn scan_stowaways_with_config(
 /// FAIL-CLOSED INVARIANT: a `truncated` result means "we could not prove the
 /// absence of a marker". Callers MUST treat that as *protected*, never as
 /// reclaimable. Bounding the search must not weaken deletion safety.
+// Six lines over the threshold. This is the sacred-path walk that decides what
+// is protected from deletion; its budget checks are deliberately interleaved
+// with the traversal so no path can be examined without also being counted.
+// Splitting it to satisfy a line count would spread that invariant across
+// functions for no behavioural gain. Same call as `scanner/deletion.rs`.
+#[allow(clippy::too_many_lines)]
 pub fn scan_stowaways_bounded(
     root: &Path,
     catalog: &[SacredPath],

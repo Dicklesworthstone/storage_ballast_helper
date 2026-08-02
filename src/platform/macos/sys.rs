@@ -8,7 +8,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -421,9 +421,40 @@ fn command_timeout_error(command_name: &str, timeout: Duration) -> io::Error {
     )
 }
 
+/// Hand a child we can no longer wait for on this thread to a detached reaper.
+///
+/// `Child::drop` deliberately does **not** wait, so dropping a spawned child
+/// that has not been reaped leaves a zombie for the lifetime of the process.
+/// In a long-running daemon that is a permanent leak: observed in the wild as
+/// ~400 zombies parented to a single `sbh daemon` after two days, which is a
+/// third of the machine's whole process table.
+///
+/// Blocking in `wait()` is precisely what must not happen on the caller's
+/// thread — that is the point of the timeout — and precisely what is harmless
+/// on a throwaway one.
+fn reap_detached(child: Child) {
+    thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+}
+
 fn command_output_with_timeout(
     command: &mut Command,
     timeout: Duration,
+) -> io::Result<Option<Output>> {
+    command_output_with_timeout_inner(command, timeout, MACOS_COMMAND_KILL_REAP_ATTEMPTS)
+}
+
+/// `kill_reap_attempts` is a parameter purely so tests can force the slow path.
+/// Whether the bounded window is missed depends on kernel scheduling and on
+/// whether the child is wedged in an uninterruptible syscall, neither of which
+/// a test can arrange reliably — but setting the budget to zero exercises the
+/// exact same code, which is the part that used to leak.
+fn command_output_with_timeout_inner(
+    command: &mut Command,
+    timeout: Duration,
+    kill_reap_attempts: usize,
 ) -> io::Result<Option<Output>> {
     let mut child = command
         .stdout(Stdio::piped())
@@ -434,31 +465,56 @@ fn command_output_with_timeout(
     let deadline = Instant::now() + timeout;
 
     loop {
-        if let Some(status) = child.try_wait()? {
-            let Some(stdout) =
-                receive_command_stream(stdout.take(), MACOS_COMMAND_OUTPUT_DRAIN_TIMEOUT)?
-            else {
-                return Ok(None);
-            };
-            let Some(stderr) =
-                receive_command_stream(stderr.take(), MACOS_COMMAND_OUTPUT_DRAIN_TIMEOUT)?
-            else {
-                return Ok(None);
-            };
-            return Ok(Some(Output {
-                status,
-                stdout,
-                stderr,
-            }));
+        // Every exit path below must either have reaped the child or handed it
+        // to `reap_detached`. Returning while still owning an unreaped `Child`
+        // is what leaks a zombie.
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Reaped: dropping `child` from here on is safe.
+                let Some(stdout) =
+                    receive_command_stream(stdout.take(), MACOS_COMMAND_OUTPUT_DRAIN_TIMEOUT)?
+                else {
+                    return Ok(None);
+                };
+                let Some(stderr) =
+                    receive_command_stream(stderr.take(), MACOS_COMMAND_OUTPUT_DRAIN_TIMEOUT)?
+                else {
+                    return Ok(None);
+                };
+                return Ok(Some(Output {
+                    status,
+                    stdout,
+                    stderr,
+                }));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                reap_detached(child);
+                return Err(error);
+            }
         }
+
         if Instant::now() >= deadline {
             let _ = child.kill();
-            for _ in 0..MACOS_COMMAND_KILL_REAP_ATTEMPTS {
-                if child.try_wait()?.is_some() {
-                    break;
+
+            // Fast path: a killed child normally dies at once, and reaping it
+            // here avoids spawning a thread on every timeout.
+            for _ in 0..kill_reap_attempts {
+                match child.try_wait() {
+                    Ok(Some(_)) => return Ok(None),
+                    Ok(None) => thread::sleep(MACOS_COMMAND_POLL_INTERVAL),
+                    Err(_) => break,
                 }
-                thread::sleep(MACOS_COMMAND_POLL_INTERVAL);
             }
+
+            // Slow path. This window is only 250ms, and it is missed for two
+            // very ordinary reasons: the child is blocked in an uninterruptible
+            // syscall on a wedged filesystem, so SIGKILL cannot land until the
+            // syscall returns; or the machine is loaded enough that the child's
+            // exit and our next poll simply do not fit inside it. The latter
+            // makes this leak self-reinforcing — a slow box misses the window
+            // more often, and every miss adds a zombie that makes it slower.
+            reap_detached(child);
             return Ok(None);
         }
         thread::sleep(MACOS_COMMAND_POLL_INTERVAL);
@@ -1460,10 +1516,11 @@ mod tests {
     use super::{
         ApfsVolumeRole, FirmlinkSource, LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES,
         LOCAL_SNAPSHOT_THIN_URGENCY, SwapUsage, SwapUsageInfo, command_output_with_timeout,
-        firmlink_map, firmlink_map_from_paths, important_usage_available_bytes,
-        mounted_filesystems, parent_apfs_volume_device, parse_apfs_inventory, parse_firmlink_map,
-        parse_tmutil_local_snapshots, parse_vm_stat, parse_vm_swapusage, read_vm_stats,
-        resolve_firmlinked_path, statfs, sysctl, tmutil_thinlocalsnapshots_args, vm_swapusage,
+        command_output_with_timeout_inner, firmlink_map, firmlink_map_from_paths,
+        important_usage_available_bytes, mounted_filesystems, parent_apfs_volume_device,
+        parse_apfs_inventory, parse_firmlink_map, parse_tmutil_local_snapshots, parse_vm_stat,
+        parse_vm_swapusage, read_vm_stats, resolve_firmlinked_path, statfs, sysctl,
+        tmutil_thinlocalsnapshots_args, vm_swapusage,
     };
 
     const fn mib(value: u64) -> u64 {
@@ -1500,6 +1557,63 @@ mod tests {
             .expect("sleep should spawn and be killed cleanly");
 
         assert!(output.is_none());
+    }
+
+    /// A timed-out child must never be left unreaped.
+    ///
+    /// The daemon calls this helper on a schedule for `mount`/`diskutil`/
+    /// `tmutil`. Before the fix, every timeout whose child outlived the 250ms
+    /// post-kill reap window leaked a zombie permanently, because
+    /// `Child::drop` does not wait. Two days of that produced ~400 zombies
+    /// parented to one `sbh daemon`.
+    ///
+    /// A zero-attempt kill budget forces the slow path every time, which is the
+    /// branch that used to `drop` an unreaped `Child`. Reverting the fix to
+    /// `drop(child)` makes this test fail with a lingering zombie.
+    #[test]
+    fn command_output_with_timeout_reaps_child_that_outlives_kill_window() {
+        let baseline = zombie_children_of_self();
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 5"]);
+
+        let output = command_output_with_timeout_inner(&mut command, Duration::from_millis(50), 0)
+            .expect("child should spawn and time out cleanly");
+        assert!(output.is_none(), "a timed-out command yields no output");
+
+        // The detached reaper runs concurrently, so allow it a moment to land.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if zombie_children_of_self() <= baseline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        panic!(
+            "timed-out child left unreaped: {} zombie(s), baseline {baseline}",
+            zombie_children_of_self()
+        );
+    }
+
+    /// Count zombie processes whose parent is this test process.
+    fn zombie_children_of_self() -> usize {
+        let ppid = std::process::id().to_string();
+        let Ok(output) = Command::new("/bin/ps")
+            .args(["-Ao", "ppid=,stat="])
+            .output()
+        else {
+            return 0;
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let parent = parts.next()?;
+                let stat = parts.next()?;
+                (parent == ppid && stat.starts_with('Z')).then_some(())
+            })
+            .count()
     }
 
     #[test]

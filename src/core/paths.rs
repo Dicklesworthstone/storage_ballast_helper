@@ -262,8 +262,8 @@ mod tests {
             deep.join("missing-child"),
             dir_alias.clone(),
             dir_alias.join("leaf.txt"),
-            file_alias.clone(),
-            dangling.clone(),
+            file_alias,
+            dangling,
             root.join("a").join("b").join("..").join("b").join("c"),
             root.join("a").join(".").join("b"),
             root.join("totally").join("absent").join("chain"),
@@ -321,12 +321,16 @@ mod tests {
 
         // Leaves must not be memoized at all: they are distinct per entry, so
         // caching them is allocation overhead for a hit rate near zero.
-        let cache = resolve_cache().lock();
-        let leaf_entries = cache
-            .entries
-            .keys()
-            .filter(|k| k.to_string_lossy().contains("sibling-"))
-            .count();
+        // Scope the guard so the lock is released before the assertion, which
+        // would otherwise hold it across a potential panic.
+        let leaf_entries = {
+            let cache = resolve_cache().lock();
+            cache
+                .entries
+                .keys()
+                .filter(|k| k.to_string_lossy().contains("sibling-"))
+                .count()
+        };
         assert_eq!(leaf_entries, 0, "leaf paths should not be cached");
     }
 
