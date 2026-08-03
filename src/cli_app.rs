@@ -6673,12 +6673,25 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     config.ballast.file_size_bytes,
                 )),
             );
-            println!(
-                "  Releasable: {} files ({}), {} missing",
-                ballast.available_count,
-                format_bytes(ballast.releasable_bytes),
-                ballast.missing_count,
-            );
+            // Include the unreadable tally when non-zero: without it the line
+            // reads "0 files (0 B), 0 missing" for a 10-file pool, and the
+            // numbers visibly fail to add up to the configured count.
+            if ballast.is_authoritative() {
+                println!(
+                    "  Releasable: {} files ({}), {} missing",
+                    ballast.available_count,
+                    format_bytes(ballast.releasable_bytes),
+                    ballast.missing_count,
+                );
+            } else {
+                println!(
+                    "  Releasable: {} files ({}), {} missing, {} unreadable",
+                    ballast.available_count,
+                    format_bytes(ballast.releasable_bytes),
+                    ballast.missing_count,
+                    ballast.unreadable_count,
+                );
+            }
             println!("  Health: {}", ballast.health);
             if ballast.health == BallastHealth::Empty {
                 println!(
@@ -6769,6 +6782,12 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     "available_count": ballast_availability.available_count,
                     "releasable_bytes": ballast_availability.releasable_bytes,
                     "missing_count": ballast_availability.missing_count,
+                    // Non-zero means this snapshot is NOT authoritative — the
+                    // usual cause is an unprivileged caller against a root-owned
+                    // mode-700 ballast dir. Automation must not read
+                    // `missing_count` as a real absence while this is > 0.
+                    "unreadable_count": ballast_availability.unreadable_count,
+                    "authoritative": ballast_availability.is_authoritative(),
                     "health": ballast_availability.health.as_str(),
                 },
                 "memory": memory_info.as_ref().map(|memory| {
@@ -8928,11 +8947,22 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
     // Check 2.6 (#16): warn when a configured ballast reserve is not actually
     // releasable — the emergency reserve does not exist when it may be needed.
     let ballast = BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
-    if ballast.health == BallastHealth::Empty && output_mode(cli) == OutputMode::Human {
-        eprintln!(
-            "sbh: warning: ballast reserve is empty ({} configured, 0 releasable). Run: sbh ballast provision",
-            format_bytes(ballast.configured_pool_bytes),
-        );
+    if output_mode(cli) == OutputMode::Human {
+        if ballast.health == BallastHealth::Empty {
+            eprintln!(
+                "sbh: warning: ballast reserve is empty ({} configured, 0 releasable). Run: sbh ballast provision",
+                format_bytes(ballast.configured_pool_bytes),
+            );
+        } else if !ballast.is_authoritative() {
+            // Don't go silent here. Before the readability fix this path emitted
+            // a bogus "reserve is empty"; the fix must replace that with an
+            // honest "couldn't tell", not with nothing at all.
+            eprintln!(
+                "sbh: note: could not inspect {} of {} ballast files (permission denied or \
+                 I/O error); reserve state unknown. Re-run as `sudo sbh ballast status`.",
+                ballast.unreadable_count, ballast.configured_count,
+            );
+        }
     }
 
     // Check 3: prediction from daemon state.json (if available and --predict requested).

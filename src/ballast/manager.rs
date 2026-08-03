@@ -233,7 +233,13 @@ impl BallastAvailability {
                 Err(_) => unreadable_count += 1,
             }
         }
-        let health = if unreadable_count > 0 {
+        let health = if configured_pool_bytes == 0 {
+            // No reserve is configured, so readability of the directory is
+            // irrelevant — reporting `Indeterminate` here would send an operator
+            // off to sudo-inspect a pool that is absent by design.
+            // `Unconfigured` outranks `Indeterminate`.
+            BallastHealth::Unconfigured
+        } else if unreadable_count > 0 {
             BallastHealth::Indeterminate
         } else {
             BallastHealth::evaluate(configured_pool_bytes, releasable_bytes)
@@ -1053,6 +1059,35 @@ mod tests {
         assert_eq!(observed.health, BallastHealth::Indeterminate);
         assert!(!observed.is_authoritative());
         println!("TEST PASS: observe_reports_indeterminate_when_dir_is_unreadable");
+    }
+
+    /// `Unconfigured` outranks `Indeterminate`: when no reserve is configured at
+    /// all, an unreadable directory is irrelevant and must not produce a WARN
+    /// telling the operator to sudo-inspect a pool that does not exist by design.
+    #[cfg(unix)]
+    #[test]
+    fn observe_reports_unconfigured_even_when_dir_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ballast_dir = dir.path().join("ballast");
+        std::fs::create_dir_all(&ballast_dir).expect("create ballast dir");
+
+        // file_count > 0 but zero-size files => configured_pool_bytes == 0.
+        let mut config = small_config();
+        config.file_size_bytes = 0;
+
+        std::fs::set_permissions(&ballast_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        let observed = BallastAvailability::observe(&ballast_dir, &config);
+        let _ = std::fs::set_permissions(&ballast_dir, std::fs::Permissions::from_mode(0o755));
+
+        assert_eq!(
+            observed.health,
+            BallastHealth::Unconfigured,
+            "a zero-byte configured pool is Unconfigured regardless of readability"
+        );
+        println!("TEST PASS: observe_reports_unconfigured_even_when_dir_is_unreadable");
     }
 
     /// A genuinely absent pool must still report `Empty`, not `Indeterminate` —
