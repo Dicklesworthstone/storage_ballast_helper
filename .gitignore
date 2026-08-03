@@ -62,3 +62,7 @@ cursor.mcp.json
 factory.mcp.json
 gemini.mcp.json
 windsurf.mcp.json
+
+# === multi-repo ephemeral cleanup 2026-08-03 ===
+# Local Codex CLI project config (machine-specific; never share).
+.codex/
