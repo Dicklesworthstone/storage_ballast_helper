@@ -293,6 +293,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let deep = tmp.path().join("x").join("y").join("z");
         std::fs::create_dir_all(&deep).unwrap();
+        // Canonical form of `deep`, for identifying its ancestor chain in the
+        // cache below (keys are canonicalized, tmp may traverse symlinks).
+        let canonical_deep = resolve_uncached(&deep);
 
         let ancestors_after = |count: usize| -> usize {
             clear_resolve_cache();
@@ -300,10 +303,13 @@ mod tests {
                 let _ = resolve_absolute_path(&deep.join(format!("sibling-{i}")));
             }
             let cache = resolve_cache().lock();
+            // Count only ancestors of OUR path: the cache is process-global and
+            // other tests running in parallel insert their own ancestor chains
+            // between our two measurements, so counting everything is flaky.
             cache
                 .entries
                 .keys()
-                .filter(|k| !k.to_string_lossy().contains("sibling-"))
+                .filter(|k| canonical_deep.starts_with(k))
                 .count()
         };
 

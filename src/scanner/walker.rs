@@ -77,6 +77,8 @@ impl Default for ActiveReferenceScanConfig {
 /// Metadata collected for each filesystem entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryMetadata {
+    /// Allocated on-disk size (`st_blocks * 512` on Unix), not the apparent
+    /// length: sparse files count only the blocks they actually consume.
     pub size_bytes: u64,
     /// Estimated content size for directories: sum of immediate children's file
     /// sizes observed during iteration. For files, equals `size_bytes`.
@@ -547,7 +549,9 @@ fn process_directory(
         // For child dirs: skip (their recursive size will be computed when they
         // are processed as their own WalkEntry).
         if !is_dir && let Ok(child_meta) = entry.metadata() {
-            content_size = content_size.saturating_add(child_meta.len());
+            // Allocated blocks, not apparent length (see `allocated_size`):
+            // sparse files must not inflate the directory's reclaim estimate.
+            content_size = content_size.saturating_add(allocated_size(&child_meta));
         }
 
         // ─── Collect Child Dirs ───
@@ -703,6 +707,26 @@ fn signals_from_children(child_names: &[String]) -> StructuralSignals {
     signals
 }
 
+/// Allocated on-disk size of an entry in bytes.
+///
+/// On Unix this is `st_blocks * 512` (POSIX defines `st_blocks` in 512-byte
+/// units regardless of the filesystem block size), which reflects the space
+/// actually consumed on the volume. This is what a disk-pressure tool must
+/// score and rank on: a sparse file contributes only its allocated blocks
+/// (possibly 0), not its apparent logical length, so "reclaiming this frees
+/// N bytes" holds. On non-Unix platforms falls back to the apparent length.
+fn allocated_size(meta: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
 /// Extract `EntryMetadata` from `fs::Metadata` (Unix-specific fields via MetadataExt).
 fn entry_metadata(meta: &fs::Metadata) -> EntryMetadata {
     let file_type = meta.file_type();
@@ -718,7 +742,11 @@ fn entry_metadata(meta: &fs::Metadata) -> EntryMetadata {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let size = meta.len();
+        // Allocated blocks, not apparent length: a sparse file's `len()` can be
+        // orders of magnitude larger than the space it consumes on disk (and a
+        // hard-linked/cloned tree smaller). Scoring, ranking, and the reclaim
+        // estimate all consume this field as "bytes freed if removed".
+        let size = allocated_size(meta);
         EntryMetadata {
             size_bytes: size,
             content_size_bytes: size, // Overridden for directories in process_directory.
@@ -1637,6 +1665,65 @@ mod tests {
             excluded_paths: HashSet::new(),
             opaque_pruning: false,
         }
+    }
+
+    /// Regression test for GH#17: the scanner must size entries by allocated
+    /// blocks (`st_blocks * 512`), not apparent length (`st_size`). A sparse
+    /// file created via `set_len` has a huge logical size but allocates no
+    /// data blocks, so it must contribute (almost) nothing to `size_bytes`
+    /// or to its parent directory's `content_size_bytes`.
+    #[cfg(unix)]
+    #[test]
+    fn sparse_files_are_sized_by_allocated_blocks_not_apparent_length() {
+        const APPARENT: u64 = 1 << 30; // 1 GiB logical size, zero data written.
+        // Allow generous slack (metadata/indirect blocks), but far below 1 GiB.
+        const ALLOCATED_CEILING: u64 = 16 * 1024 * 1024;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("scratch-build");
+        fs::create_dir_all(&dir).unwrap();
+        let sparse_path = dir.join("disk.img");
+        let file = fs::File::create(&sparse_path).unwrap();
+        file.set_len(APPARENT).unwrap();
+        drop(file);
+
+        // Sanity: the filesystem really reports the full apparent length.
+        let meta = fs::metadata(&sparse_path).unwrap();
+        assert_eq!(meta.len(), APPARENT);
+        // Skip (vacuously pass) only if the filesystem doesn't support sparse
+        // files at all and actually allocated the full gigabyte.
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.blocks().saturating_mul(512) >= APPARENT {
+                eprintln!("filesystem does not support sparse files; skipping");
+                return;
+            }
+        }
+
+        let config = test_config(tmp.path());
+        let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+        let entries = walker.walk().unwrap();
+
+        // `entry_metadata` (the path CandidateOpaque emission also takes) must
+        // report the allocated size, not the 1 GiB apparent length.
+        let emeta = entry_metadata(&meta);
+        assert_eq!(emeta.size_bytes, allocated_size(&meta));
+        assert!(
+            emeta.size_bytes < ALLOCATED_CEILING,
+            "sparse file size_bytes should reflect allocated blocks, got {} (apparent {})",
+            emeta.size_bytes,
+            APPARENT
+        );
+
+        // The walker emits directory entries; the sparse file must not inflate
+        // its parent's accumulated content size.
+        let dir_entry = entries.iter().find(|e| e.path == dir).unwrap();
+        assert!(
+            dir_entry.metadata.content_size_bytes < ALLOCATED_CEILING,
+            "directory content_size_bytes should sum allocated blocks, got {} (apparent {})",
+            dir_entry.metadata.content_size_bytes,
+            APPARENT
+        );
     }
 
     #[test]
