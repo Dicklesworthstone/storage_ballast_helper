@@ -6,6 +6,31 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ---
 
+## v0.4.37 **[release]**
+
+### Fixed — sparse files are sized by allocated blocks (#17)
+
+The walker sized every entry with `meta.len()` (`st_size`, the *apparent*
+logical length) in `entry_metadata`, and accumulated directory content size the
+same way via `child_meta.len()`. A sparse file therefore contributed its full
+logical size rather than the space it actually occupies: a 20 GiB `set_len`
+image with zero allocated blocks was reported as 21474836481 bytes, and a
+real-world store directory holding one sparse disk image reported 927 GiB of
+usage that did not exist on the device.
+
+Entries are now sized by allocated blocks (`st_blocks * 512`) on Unix, which is
+what a ballast/reclaim tool has to reason about — reclaiming a sparse file
+returns only its allocated extents, not its logical length. Apparent length is
+still available where the logical size is the meaningful quantity.
+
+### Also in this release
+
+- Ballast health reporting: `Unconfigured` now outranks `Indeterminate`, an
+  unreadable reserve is never reported as empty, and the unreadable tally is
+  surfaced instead of being silently folded into the healthy count.
+
+---
+
 ## v0.4.31
 
 ### Added — kernel writeback (dirty-page) tuning
