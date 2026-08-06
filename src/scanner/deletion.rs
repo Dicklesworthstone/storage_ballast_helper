@@ -16,7 +16,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -102,6 +102,46 @@ pub struct DeletionReport {
     /// Candidates that failed a safety/preflight/delete check and should be
     /// cooled down before retrying with identical evidence.
     pub backoff_candidates: Vec<CandidacyScore>,
+    /// Histogram of *why* candidates were skipped, keyed by
+    /// [`SkipReason::as_str`]. Sums to `items_skipped`.
+    ///
+    /// Without this, a run that finds N candidates and skips all N reports an
+    /// unexplained `items_skipped: N`, which is indistinguishable from a bug
+    /// even when every skip was a deliberate safety refusal. `BTreeMap` keeps
+    /// JSON key order deterministic for golden-output tests.
+    pub skipped_by_reason: BTreeMap<&'static str, usize>,
+}
+
+impl DeletionReport {
+    /// Record one skip against its reason, keeping `items_skipped` and the
+    /// histogram in lockstep so they can never disagree.
+    fn record_skip(&mut self, reason: SkipReason) {
+        self.items_skipped += 1;
+        *self.skipped_by_reason.entry(reason.as_str()).or_insert(0) += 1;
+    }
+
+    /// True when the executor had work queued but removed nothing at all.
+    ///
+    /// This is the signature of the "sbh looks broken" report: candidates were
+    /// found, nothing was deleted, and no error was raised. It is frequently
+    /// legitimate (everything was protected), but an operator staring at a full
+    /// disk needs it called out either way.
+    #[must_use]
+    pub fn stalled(&self) -> bool {
+        !self.dry_run
+            && self.items_deleted == 0
+            && self.bytes_freed == 0
+            && (self.items_skipped > 0 || self.items_failed > 0)
+    }
+
+    /// The reason responsible for the most skips, if any.
+    #[must_use]
+    pub fn dominant_skip_reason(&self) -> Option<(&'static str, usize)> {
+        self.skipped_by_reason
+            .iter()
+            .max_by_key(|(_, count)| **count)
+            .map(|(reason, count)| (*reason, *count))
+    }
 }
 
 /// A single deletion failure record.
@@ -116,6 +156,9 @@ pub struct DeletionError {
 /// Reason a candidate was skipped during pre-flight checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
+    /// The run stopped touching this candidate because the mount already has
+    /// at least `--target-free` percent free. Not a refusal — a success.
+    TargetFreeReached,
     PathGone,
     FileOpen,
     ContainsGit,
@@ -142,6 +185,55 @@ pub enum SkipReason {
     /// build-output markers. Catches synced source stubs that the cargo-only
     /// veto misses (root cause of the 2026-05-22 frankenterm crate deletions).
     LooksLikeSourceCode,
+}
+
+impl SkipReason {
+    /// Stable machine-readable key, used for `skipped_by_reason` histogram keys
+    /// in JSON output. These are part of the robot-facing contract — renaming
+    /// one is a breaking change for anything parsing `sbh clean --json`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TargetFreeReached => "target_free_reached",
+            Self::PathGone => "path_gone",
+            Self::FileOpen => "file_open",
+            Self::ContainsGit => "contains_git",
+            Self::NotWritable => "not_writable",
+            Self::Vetoed => "vetoed",
+            Self::BelowThreshold => "below_threshold",
+            Self::Symlink => "symlink",
+            Self::IdentityUnavailable => "identity_unavailable",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::ContainsCargoManifest => "contains_cargo_manifest",
+            Self::HardcodedSourceTree => "hardcoded_source_tree",
+            Self::LooksLikeSourceCode => "looks_like_source_code",
+        }
+    }
+
+    /// One-line operator-facing explanation of why nothing was deleted.
+    #[must_use]
+    pub const fn explanation(self) -> &'static str {
+        match self {
+            Self::TargetFreeReached => "target free space already reached — stopped early",
+            Self::PathGone => "path disappeared between scan and delete",
+            Self::FileOpen => "a running process holds the path open",
+            Self::ContainsGit => "contains a .git directory (source tree)",
+            Self::NotWritable => {
+                "parent directory not writable — usually a systemd ReadWritePaths= gap"
+            }
+            Self::Vetoed => "scoring vetoed the candidate",
+            Self::BelowThreshold => "score below the configured min_score",
+            Self::Symlink => "candidate is a symlink",
+            Self::IdentityUnavailable => "filesystem identity could not be re-verified",
+            Self::IdentityMismatch => "path now refers to a different inode than when scanned",
+            Self::ContainsCargoManifest => "contains Cargo.toml without build-artifact markers",
+            Self::HardcodedSourceTree => {
+                "protected source tree (/data/projects, ~/projects) — carnage-prevention floor, \
+                 cannot be disabled by config"
+            }
+            Self::LooksLikeSourceCode => "contains source-code marker files",
+        }
+    }
 }
 
 fn should_backoff_skip(reason: SkipReason) -> bool {
@@ -216,6 +308,7 @@ impl DeletionExecutor {
             deleted_paths: Vec::new(),
             not_writable_paths: Vec::new(),
             backoff_candidates: Vec::new(),
+            skipped_by_reason: BTreeMap::new(),
         };
 
         let mut consecutive_failures: u32 = 0;
@@ -280,7 +373,7 @@ impl DeletionExecutor {
             if let Some(skip) = should_skip
                 && skip(&candidate.path)
             {
-                report.items_skipped += 1;
+                report.record_skip(SkipReason::TargetFreeReached);
                 report.backoff_candidates.push(candidate.clone());
                 continue;
             }
@@ -289,7 +382,7 @@ impl DeletionExecutor {
             match self.preflight_check(candidate, open_paths.as_ref()) {
                 Ok(()) => {}
                 Err(skip) => {
-                    report.items_skipped += 1;
+                    report.record_skip(skip);
                     // Reset consecutive failure counter on skip — a skipped candidate
                     // is not a failure and shouldn't let unrelated failures accumulate
                     // across different path prefixes (e.g. FUSE mount failures shouldn't
@@ -991,6 +1084,150 @@ mod tests {
         assert_eq!(plan.candidates.len(), 1);
         assert_eq!(plan.candidates[0].path, p2);
         assert_eq!(plan.total_reclaimable_bytes, 2000);
+    }
+
+    // --- skip attribution (#18) -------------------------------------------
+    //
+    // Regression cover for: a run that finds N candidates, skips all N, and
+    // reports an unexplained `items_skipped: N`. That shape is
+    // indistinguishable from a malfunction even when every skip was a
+    // deliberate safety refusal, so the reason must always be attributed.
+
+    #[test]
+    fn skip_reason_keys_are_unique_and_stable() {
+        const ALL: [SkipReason; 13] = [
+            SkipReason::TargetFreeReached,
+            SkipReason::PathGone,
+            SkipReason::FileOpen,
+            SkipReason::ContainsGit,
+            SkipReason::NotWritable,
+            SkipReason::Vetoed,
+            SkipReason::BelowThreshold,
+            SkipReason::Symlink,
+            SkipReason::IdentityUnavailable,
+            SkipReason::IdentityMismatch,
+            SkipReason::ContainsCargoManifest,
+            SkipReason::HardcodedSourceTree,
+            SkipReason::LooksLikeSourceCode,
+        ];
+        let keys: std::collections::HashSet<&str> = ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(keys.len(), ALL.len(), "skip reason keys must be unique");
+        for r in ALL {
+            assert!(!r.as_str().is_empty());
+            assert!(!r.explanation().is_empty());
+            // Keys are a machine contract: lowercase snake_case only.
+            assert!(
+                r.as_str()
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{} is not snake_case",
+                r.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn record_skip_keeps_counter_and_histogram_in_lockstep() {
+        let mut report = DeletionReport {
+            items_deleted: 0,
+            items_failed: 0,
+            items_skipped: 0,
+            items_would_delete: 0,
+            bytes_freed: 0,
+            bytes_would_free: 0,
+            duration: Duration::ZERO,
+            errors: Vec::new(),
+            dry_run: false,
+            circuit_breaker_tripped: false,
+            deleted_paths: Vec::new(),
+            not_writable_paths: Vec::new(),
+            backoff_candidates: Vec::new(),
+            skipped_by_reason: BTreeMap::new(),
+        };
+        report.record_skip(SkipReason::HardcodedSourceTree);
+        report.record_skip(SkipReason::HardcodedSourceTree);
+        report.record_skip(SkipReason::FileOpen);
+
+        assert_eq!(report.items_skipped, 3);
+        let summed: usize = report.skipped_by_reason.values().sum();
+        assert_eq!(
+            summed, report.items_skipped,
+            "histogram must sum to counter"
+        );
+        assert_eq!(report.skipped_by_reason["hardcoded_source_tree"], 2);
+        assert_eq!(report.skipped_by_reason["file_open"], 1);
+        assert_eq!(
+            report.dominant_skip_reason(),
+            Some(("hardcoded_source_tree", 2))
+        );
+    }
+
+    #[test]
+    fn execute_attributes_every_skip_and_flags_stall() {
+        // A candidate whose path no longer exists is skipped as PathGone.
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("never-created");
+        let candidate = make_candidate(&gone, 4096, 0.95);
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                require_identity: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![candidate]);
+        assert_eq!(plan.candidates.len(), 1);
+
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_skipped, 1);
+        // The whole point: the skip carries a reason.
+        assert_eq!(
+            report.skipped_by_reason.values().sum::<usize>(),
+            report.items_skipped
+        );
+        assert!(report.dominant_skip_reason().is_some());
+        // Candidates existed, nothing freed -> stalled.
+        assert!(report.stalled(), "report should flag a no-progress run");
+    }
+
+    #[test]
+    fn stalled_is_false_for_productive_and_dry_runs() {
+        let base = DeletionReport {
+            items_deleted: 0,
+            items_failed: 0,
+            items_skipped: 0,
+            items_would_delete: 0,
+            bytes_freed: 0,
+            bytes_would_free: 0,
+            duration: Duration::ZERO,
+            errors: Vec::new(),
+            dry_run: false,
+            circuit_breaker_tripped: false,
+            deleted_paths: Vec::new(),
+            not_writable_paths: Vec::new(),
+            backoff_candidates: Vec::new(),
+            skipped_by_reason: BTreeMap::new(),
+        };
+
+        // Nothing queued at all is not a stall.
+        assert!(!base.stalled());
+
+        // Deleted something despite skips -> not a stall.
+        let mut productive = base.clone();
+        productive.items_deleted = 1;
+        productive.bytes_freed = 10;
+        productive.items_skipped = 5;
+        assert!(!productive.stalled());
+
+        // Dry runs never delete by definition -> never a stall.
+        let mut dry = base.clone();
+        dry.dry_run = true;
+        dry.items_skipped = 5;
+        assert!(!dry.stalled());
     }
 
     #[test]

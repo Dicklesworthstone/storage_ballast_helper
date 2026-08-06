@@ -8246,7 +8246,14 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 );
             }
             OutputMode::Json => {
-                emit_clean_report_json(&plan, &report, dir_count, scan_elapsed, protected_count)?;
+                emit_clean_report_json(
+                    &plan,
+                    &report,
+                    dir_count,
+                    scan_elapsed,
+                    protected_count,
+                    "clean",
+                )?;
             }
         }
     } else if !io::stdout().is_terminal() && !args.yes {
@@ -8287,7 +8294,14 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 print_clean_summary(&report);
             }
             OutputMode::Json => {
-                emit_clean_report_json(&plan, &report, dir_count, scan_elapsed, protected_count)?;
+                emit_clean_report_json(
+                    &plan,
+                    &report,
+                    dir_count,
+                    scan_elapsed,
+                    protected_count,
+                    "clean",
+                )?;
             }
         }
     } else {
@@ -8754,6 +8768,32 @@ fn delete_single_candidate(candidate: &CandidacyScore) -> std::result::Result<()
 }
 
 /// Print a human-readable cleanup summary from a DeletionReport.
+/// Map a `skipped_by_reason` key back to its operator-facing explanation.
+///
+/// Keyed by string rather than the enum so the JSON contract and the human
+/// output can never drift apart — both render from the same key set.
+fn skip_reason_explanation(key: &str) -> &'static str {
+    use storage_ballast_helper::scanner::deletion::SkipReason as R;
+    const ALL: [R; 13] = [
+        R::TargetFreeReached,
+        R::PathGone,
+        R::FileOpen,
+        R::ContainsGit,
+        R::NotWritable,
+        R::Vetoed,
+        R::BelowThreshold,
+        R::Symlink,
+        R::IdentityUnavailable,
+        R::IdentityMismatch,
+        R::ContainsCargoManifest,
+        R::HardcodedSourceTree,
+        R::LooksLikeSourceCode,
+    ];
+    ALL.into_iter()
+        .find(|r| r.as_str() == key)
+        .map_or("unknown skip reason", R::explanation)
+}
+
 fn print_clean_summary(report: &storage_ballast_helper::scanner::deletion::DeletionReport) {
     if report.dry_run {
         println!(
@@ -8771,6 +8811,53 @@ fn print_clean_summary(report: &storage_ballast_helper::scanner::deletion::Delet
         );
         if report.items_skipped > 0 {
             println!("  Skipped: {} items", report.items_skipped);
+            // Always attribute skips. An unexplained skip count on a full disk
+            // is indistinguishable from a malfunction, even when every skip was
+            // a deliberate safety refusal.
+            for (reason, count) in &report.skipped_by_reason {
+                println!(
+                    "    {count:>6}  {reason}  ({})",
+                    skip_reason_explanation(reason)
+                );
+            }
+        }
+        if report.stalled() {
+            println!();
+            println!(
+                "  Nothing was freed. {} candidate(s) were found but every one was skipped.",
+                report.items_skipped + report.items_failed
+            );
+            if let Some((reason, count)) = report.dominant_skip_reason() {
+                println!(
+                    "  Dominant reason: {reason} ({count}) — {}",
+                    skip_reason_explanation(reason)
+                );
+                if reason == "hardcoded_source_tree" {
+                    println!(
+                        "  This is the carnage-prevention floor protecting source trees; it \
+                         cannot be disabled by config. Point --paths at a build/cache directory."
+                    );
+                } else if reason == "not_writable" {
+                    println!(
+                        "  Check the systemd unit's ReadWritePaths= whitelist for these paths."
+                    );
+                } else if reason == "target_free_reached" {
+                    // The trap this message exists for: every candidate sits on a
+                    // mount that is already comfortable (commonly a tmpfs /tmp),
+                    // while the mount actually under pressure has no candidates.
+                    // Deleting would have been pointless, but "221 skipped, 0
+                    // freed" reads as a malfunction rather than as that finding.
+                    println!(
+                        "  Every candidate is on a mount that ALREADY has at least the target \
+                         free space, so removing them would not relieve the mount you care about."
+                    );
+                    println!(
+                        "  Re-run scoped to the mount under pressure, e.g. \
+                         `sbh emergency --target-free <pct> /path/on/the/full/mount`, \
+                         and check `sbh status` for which mount is actually critical."
+                    );
+                }
+            }
         }
         if report.items_failed > 0 {
             println!("  Failed: {} items", report.items_failed);
@@ -8791,6 +8878,7 @@ fn emit_clean_report_json(
     dir_count: usize,
     scan_elapsed: std::time::Duration,
     protected_count: usize,
+    command: &str,
 ) -> Result<(), CliError> {
     let errors: Vec<Value> = report
         .errors
@@ -8805,8 +8893,14 @@ fn emit_clean_report_json(
         })
         .collect();
 
+    let skipped_by_reason: serde_json::Map<String, Value> = report
+        .skipped_by_reason
+        .iter()
+        .map(|(reason, count)| ((*reason).to_string(), json!(count)))
+        .collect();
+
     let payload = json!({
-        "command": "clean",
+        "command": command,
         "scanned_directories": dir_count,
         "elapsed_seconds": scan_elapsed.as_secs_f64(),
         "candidates_count": plan.estimated_items,
@@ -8820,6 +8914,11 @@ fn emit_clean_report_json(
         "dry_run": report.dry_run,
         "circuit_breaker_tripped": report.circuit_breaker_tripped,
         "protected_count": protected_count,
+        // Why nothing (or less than expected) was removed. Sums to items_skipped.
+        "skipped_by_reason": skipped_by_reason,
+        // True when candidates existed but nothing was freed — the shape that
+        // reads as "sbh is broken" and previously carried no explanation.
+        "stalled": report.stalled(),
         "errors": errors,
     });
     write_json_line(&payload)
@@ -9383,7 +9482,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 );
             }
             OutputMode::Json => {
-                emit_clean_report_json(&plan, &report, dir_count, scan_elapsed, 0)?;
+                emit_clean_report_json(&plan, &report, dir_count, scan_elapsed, 0, "emergency")?;
             }
         }
     } else {
