@@ -185,9 +185,41 @@ pub enum SkipReason {
     /// build-output markers. Catches synced source stubs that the cargo-only
     /// veto misses (root cause of the 2026-05-22 frankenterm crate deletions).
     LooksLikeSourceCode,
+    /// Operator answered "no" (or quit) at an interactive prompt. Only ever
+    /// produced by the interactive clean/emergency flows.
+    UserDeclined,
 }
 
 impl SkipReason {
+    /// Every variant, in declaration order.
+    ///
+    /// Single source of truth for callers that must enumerate reasons — notably
+    /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
+    /// list was duplicated at each call site, so adding a variant silently left
+    /// it unexplained. `all_covers_every_variant` guards completeness.
+    pub const ALL: [Self; 14] = [
+        Self::TargetFreeReached,
+        Self::PathGone,
+        Self::FileOpen,
+        Self::ContainsGit,
+        Self::NotWritable,
+        Self::Vetoed,
+        Self::BelowThreshold,
+        Self::Symlink,
+        Self::IdentityUnavailable,
+        Self::IdentityMismatch,
+        Self::ContainsCargoManifest,
+        Self::HardcodedSourceTree,
+        Self::LooksLikeSourceCode,
+        Self::UserDeclined,
+    ];
+
+    /// Resolve a `skipped_by_reason` key back to its variant.
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == key)
+    }
+
     /// Stable machine-readable key, used for `skipped_by_reason` histogram keys
     /// in JSON output. These are part of the robot-facing contract — renaming
     /// one is a breaking change for anything parsing `sbh clean --json`.
@@ -207,6 +239,7 @@ impl SkipReason {
             Self::ContainsCargoManifest => "contains_cargo_manifest",
             Self::HardcodedSourceTree => "hardcoded_source_tree",
             Self::LooksLikeSourceCode => "looks_like_source_code",
+            Self::UserDeclined => "user_declined",
         }
     }
 
@@ -232,12 +265,16 @@ impl SkipReason {
                  cannot be disabled by config"
             }
             Self::LooksLikeSourceCode => "contains source-code marker files",
+            Self::UserDeclined => "operator declined at the interactive prompt",
         }
     }
 }
 
 fn should_backoff_skip(reason: SkipReason) -> bool {
-    !matches!(reason, SkipReason::PathGone | SkipReason::BelowThreshold)
+    !matches!(
+        reason,
+        SkipReason::PathGone | SkipReason::BelowThreshold | SkipReason::UserDeclined
+    )
 }
 
 // ──────────────────── executor ────────────────────
@@ -408,6 +445,7 @@ impl DeletionExecutor {
                             | SkipReason::ContainsCargoManifest
                             | SkipReason::HardcodedSourceTree
                             | SkipReason::LooksLikeSourceCode
+                            | SkipReason::UserDeclined
                     ) {
                         eprintln!(
                             "[SBH-EXECUTOR] skip: {} ({:?})",
@@ -1095,24 +1133,10 @@ mod tests {
 
     #[test]
     fn skip_reason_keys_are_unique_and_stable() {
-        const ALL: [SkipReason; 13] = [
-            SkipReason::TargetFreeReached,
-            SkipReason::PathGone,
-            SkipReason::FileOpen,
-            SkipReason::ContainsGit,
-            SkipReason::NotWritable,
-            SkipReason::Vetoed,
-            SkipReason::BelowThreshold,
-            SkipReason::Symlink,
-            SkipReason::IdentityUnavailable,
-            SkipReason::IdentityMismatch,
-            SkipReason::ContainsCargoManifest,
-            SkipReason::HardcodedSourceTree,
-            SkipReason::LooksLikeSourceCode,
-        ];
-        let keys: std::collections::HashSet<&str> = ALL.iter().map(|r| r.as_str()).collect();
-        assert_eq!(keys.len(), ALL.len(), "skip reason keys must be unique");
-        for r in ALL {
+        let all = SkipReason::ALL;
+        let keys: std::collections::HashSet<&str> = all.iter().map(|r| r.as_str()).collect();
+        assert_eq!(keys.len(), all.len(), "skip reason keys must be unique");
+        for r in all {
             assert!(!r.as_str().is_empty());
             assert!(!r.explanation().is_empty());
             // Keys are a machine contract: lowercase snake_case only.
@@ -1124,6 +1148,53 @@ mod tests {
                 r.as_str()
             );
         }
+    }
+
+    #[test]
+    fn all_covers_every_variant() {
+        // Exhaustive match: adding a variant fails to COMPILE here, which is the
+        // point — the author is then standing next to SkipReason::ALL and must
+        // extend it. If they extend the match but forget ALL, the index lands
+        // outside `seen` and this test panics instead of silently passing.
+        const fn idx(r: SkipReason) -> usize {
+            match r {
+                SkipReason::TargetFreeReached => 0,
+                SkipReason::PathGone => 1,
+                SkipReason::FileOpen => 2,
+                SkipReason::ContainsGit => 3,
+                SkipReason::NotWritable => 4,
+                SkipReason::Vetoed => 5,
+                SkipReason::BelowThreshold => 6,
+                SkipReason::Symlink => 7,
+                SkipReason::IdentityUnavailable => 8,
+                SkipReason::IdentityMismatch => 9,
+                SkipReason::ContainsCargoManifest => 10,
+                SkipReason::HardcodedSourceTree => 11,
+                SkipReason::LooksLikeSourceCode => 12,
+                SkipReason::UserDeclined => 13,
+            }
+        }
+        let mut seen = [false; SkipReason::ALL.len()];
+        for r in SkipReason::ALL {
+            let i = idx(r);
+            assert!(
+                !seen[i],
+                "duplicate variant in SkipReason::ALL at index {i}"
+            );
+            seen[i] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "SkipReason::ALL is missing a variant"
+        );
+    }
+
+    #[test]
+    fn from_key_roundtrips_every_variant() {
+        for r in SkipReason::ALL {
+            assert_eq!(SkipReason::from_key(r.as_str()), Some(r));
+        }
+        assert_eq!(SkipReason::from_key("not_a_real_reason"), None);
     }
 
     #[test]
@@ -1224,7 +1295,7 @@ mod tests {
         assert!(!productive.stalled());
 
         // Dry runs never delete by definition -> never a stall.
-        let mut dry = base.clone();
+        let mut dry = base;
         dry.dry_run = true;
         dry.items_skipped = 5;
         assert!(!dry.stalled());

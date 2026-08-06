@@ -8634,7 +8634,7 @@ fn run_interactive_clean(
     let stdin = io::stdin();
     let mut input = String::new();
     let mut items_deleted: usize = 0;
-    let mut items_skipped: usize = 0;
+    let mut skips = InteractiveSkips::default();
     let mut bytes_freed: u64 = 0;
     let mut delete_all = false;
 
@@ -8661,7 +8661,7 @@ fn run_interactive_clean(
                 "  Target free space ({target:.1}%) achieved on {}. Skipping.",
                 stats.mount_point.display()
             );
-            items_skipped += 1;
+            skips.record(storage_ballast_helper::scanner::deletion::SkipReason::TargetFreeReached);
             continue;
         }
 
@@ -8708,7 +8708,7 @@ fn run_interactive_clean(
                 collect_open_path_ancestors(std::slice::from_ref(&candidate.path));
             if is_path_open_by_ancestor(&candidate.path, &fresh_open_paths) {
                 eprintln!("    Skipped (now in use): {}", candidate.path.display());
-                items_skipped += 1;
+                skips.record(storage_ballast_helper::scanner::deletion::SkipReason::FileOpen);
             } else {
                 match delete_single_candidate(candidate) {
                     Ok(()) => {
@@ -8724,7 +8724,7 @@ fn run_interactive_clean(
                 }
             }
         } else {
-            items_skipped += 1;
+            skips.record(storage_ballast_helper::scanner::deletion::SkipReason::UserDeclined);
         }
     }
 
@@ -8735,8 +8735,8 @@ fn run_interactive_clean(
                 "  Deleted: {items_deleted} items, {} freed",
                 format_bytes(bytes_freed)
             );
-            if items_skipped > 0 {
-                println!("  Skipped: {items_skipped} items");
+            if skips.total > 0 {
+                println!("  Skipped: {} items", skips.total);
             }
         }
         OutputMode::Json => {
@@ -8746,7 +8746,10 @@ fn run_interactive_clean(
                 "elapsed_seconds": scan_elapsed.as_secs_f64(),
                 "candidates_count": plan.estimated_items,
                 "items_deleted": items_deleted,
-                "items_skipped": items_skipped,
+                "items_skipped": skips.total,
+                "skipped_by_reason": skips_json(&skips.by_reason),
+                // Mirrors DeletionReport::stalled(): work was queued, nothing freed.
+                "stalled": items_deleted == 0 && bytes_freed == 0 && skips.total > 0,
                 "bytes_freed": bytes_freed,
                 "dry_run": false,
                 "protected_count": protected_count,
@@ -8767,33 +8770,48 @@ fn delete_single_candidate(candidate: &CandidacyScore) -> std::result::Result<()
     }
 }
 
-/// Print a human-readable cleanup summary from a DeletionReport.
-/// Map a `skipped_by_reason` key back to its operator-facing explanation.
+/// Interactive skip bookkeeping.
 ///
-/// Keyed by string rather than the enum so the JSON contract and the human
-/// output can never drift apart — both render from the same key set.
-fn skip_reason_explanation(key: &str) -> &'static str {
-    use storage_ballast_helper::scanner::deletion::SkipReason as R;
-    const ALL: [R; 13] = [
-        R::TargetFreeReached,
-        R::PathGone,
-        R::FileOpen,
-        R::ContainsGit,
-        R::NotWritable,
-        R::Vetoed,
-        R::BelowThreshold,
-        R::Symlink,
-        R::IdentityUnavailable,
-        R::IdentityMismatch,
-        R::ContainsCargoManifest,
-        R::HardcodedSourceTree,
-        R::LooksLikeSourceCode,
-    ];
-    ALL.into_iter()
-        .find(|r| r.as_str() == key)
-        .map_or("unknown skip reason", R::explanation)
+/// The interactive flows do not go through `DeletionExecutor::execute`, so they
+/// keep their own counters. They still owe the same `skipped_by_reason` /
+/// `stalled` JSON contract as the batch paths, and this keeps the count and the
+/// histogram incremented together at one place.
+#[derive(Default)]
+struct InteractiveSkips {
+    total: usize,
+    by_reason: std::collections::BTreeMap<&'static str, usize>,
 }
 
+impl InteractiveSkips {
+    fn record(&mut self, reason: storage_ballast_helper::scanner::deletion::SkipReason) {
+        self.total += 1;
+        *self.by_reason.entry(reason.as_str()).or_insert(0) += 1;
+    }
+}
+
+/// Map a `skipped_by_reason` key back to its operator-facing explanation.
+///
+/// Delegates to `SkipReason::from_key` so the JSON contract and the human
+/// output render from one list; there is no second copy to drift.
+fn skip_reason_explanation(key: &str) -> &'static str {
+    use storage_ballast_helper::scanner::deletion::SkipReason as R;
+    R::from_key(key).map_or("unknown skip reason", R::explanation)
+}
+
+/// Render a `skipped_by_reason` histogram as a JSON object.
+///
+/// Always emitted — including when empty — so every clean/emergency JSON path
+/// has the same shape and a parser never has to treat the key as optional.
+fn skips_json(skipped_by_reason: &std::collections::BTreeMap<&'static str, usize>) -> Value {
+    Value::Object(
+        skipped_by_reason
+            .iter()
+            .map(|(reason, count)| ((*reason).to_string(), json!(count)))
+            .collect(),
+    )
+}
+
+/// Print a human-readable cleanup summary from a DeletionReport.
 fn print_clean_summary(report: &storage_ballast_helper::scanner::deletion::DeletionReport) {
     if report.dry_run {
         println!(
@@ -8893,12 +8911,6 @@ fn emit_clean_report_json(
         })
         .collect();
 
-    let skipped_by_reason: serde_json::Map<String, Value> = report
-        .skipped_by_reason
-        .iter()
-        .map(|(reason, count)| ((*reason).to_string(), json!(count)))
-        .collect();
-
     let payload = json!({
         "command": command,
         "scanned_directories": dir_count,
@@ -8915,7 +8927,7 @@ fn emit_clean_report_json(
         "circuit_breaker_tripped": report.circuit_breaker_tripped,
         "protected_count": protected_count,
         // Why nothing (or less than expected) was removed. Sums to items_skipped.
-        "skipped_by_reason": skipped_by_reason,
+        "skipped_by_reason": skips_json(&report.skipped_by_reason),
         // True when candidates existed but nothing was freed — the shape that
         // reads as "sbh is broken" and previously carried no explanation.
         "stalled": report.stalled(),
@@ -9417,13 +9429,20 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 );
             }
             OutputMode::Json => {
+                // Same key set as every other clean/emergency payload so a
+                // parser never has to special-case the no-candidate path.
                 let payload = json!({
                     "command": "emergency",
                     "scanned_directories": dir_count,
                     "elapsed_seconds": scan_elapsed.as_secs_f64(),
                     "candidates_count": 0,
                     "items_deleted": 0,
+                    "items_skipped": 0,
+                    "items_failed": 0,
                     "bytes_freed": 0,
+                    "dry_run": false,
+                    "skipped_by_reason": json!({}),
+                    "stalled": false,
                 });
                 write_json_line(&payload)?;
             }
@@ -9510,7 +9529,7 @@ fn run_interactive_emergency(
     let stdin = io::stdin();
     let mut input = String::new();
     let mut items_deleted: usize = 0;
-    let mut items_skipped: usize = 0;
+    let mut skips = InteractiveSkips::default();
     let mut bytes_freed: u64 = 0;
     let mut delete_all = false;
 
@@ -9582,7 +9601,7 @@ fn run_interactive_emergency(
                 }
             }
         } else {
-            items_skipped += 1;
+            skips.record(storage_ballast_helper::scanner::deletion::SkipReason::UserDeclined);
         }
     }
 
@@ -9593,8 +9612,8 @@ fn run_interactive_emergency(
                 "  Deleted: {items_deleted} items, {} freed",
                 format_bytes(bytes_freed),
             );
-            if items_skipped > 0 {
-                eprintln!("  Skipped: {items_skipped} items");
+            if skips.total > 0 {
+                eprintln!("  Skipped: {} items", skips.total);
             }
             eprintln!(
                 "\nConsider installing sbh for ongoing protection: {}",
@@ -9608,7 +9627,10 @@ fn run_interactive_emergency(
                 "elapsed_seconds": scan_elapsed.as_secs_f64(),
                 "candidates_count": plan.estimated_items,
                 "items_deleted": items_deleted,
-                "items_skipped": items_skipped,
+                "items_skipped": skips.total,
+                "skipped_by_reason": skips_json(&skips.by_reason),
+                // Mirrors DeletionReport::stalled(): work was queued, nothing freed.
+                "stalled": items_deleted == 0 && bytes_freed == 0 && skips.total > 0,
                 "bytes_freed": bytes_freed,
             });
             write_json_line(&payload)?;
