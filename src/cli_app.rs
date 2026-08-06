@@ -8198,6 +8198,8 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 }
             }
             OutputMode::Json => {
+                // Same key set as every other clean/emergency completion report
+                // so a parser never has to treat these as optional.
                 let payload = json!({
                     "command": "clean",
                     "scanned_directories": dir_count,
@@ -8205,10 +8207,14 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                     "candidates_count": 0,
                     "items_deleted": 0,
                     "items_would_delete": 0,
+                    "items_skipped": 0,
+                    "items_failed": 0,
                     "bytes_freed": 0,
                     "bytes_would_free": 0,
                     "dry_run": args.dry_run,
                     "protected_count": protected_count,
+                    "skipped_by_reason": json!({}),
+                    "stalled": false,
                 });
                 write_json_line(&payload)?;
             }
