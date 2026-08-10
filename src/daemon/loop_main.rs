@@ -3682,10 +3682,25 @@ fn daemon_protection_reason(
         return Ok(Some(reason));
     }
 
+    // B7: a protected verdict proved on a recent pass is reused instead of
+    // re-walking the subtree. This is the hot loop fix (#N): the containment
+    // scan below is a bounded but *recursive* sub-walk, and re-proving the same
+    // few hundred protected `/data/tmp` candidates on every pass pegged a core
+    // indefinitely on hosts whose candidates are nearly all protected. Only
+    // protected verdicts are cached; "clean" is always re-proved, so a subtree
+    // that gains a sacred marker can never be deleted on a stale verdict.
+    if let Some(reason) = protection.cached_protected_verdict(path) {
+        return Ok(Some(reason));
+    }
+
     let overlaps = protection::find_sacred_overlaps(path, sacred_paths)?;
-    Ok(overlaps
+    let reason = overlaps
         .first()
-        .map(|overlap| format!("sacred path overlap: {}", overlap.summary())))
+        .map(|overlap| format!("sacred path overlap: {}", overlap.summary()));
+    if let Some(reason) = reason.as_ref() {
+        protection.cache_protected_verdict(path, reason.clone());
+    }
+    Ok(reason)
 }
 
 fn should_skip_protected_daemon_candidate(
