@@ -8,10 +8,12 @@
 
 #![allow(missing_docs)]
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -181,15 +183,46 @@ struct GlobPattern {
     compiled: Regex,
 }
 
+/// B7: how long a *protected* verdict stays memoized before it is re-proved.
+///
+/// Bounded so a tree that genuinely becomes reclaimable (the sacred marker is
+/// deleted) re-enters the candidate pool within one TTL instead of being
+/// protected forever by a stale cache entry.
+pub const SACRED_VERDICT_CACHE_TTL: Duration = Duration::from_secs(600);
+
+/// B7: cap on memoized protected verdicts. `/data/tmp` on a busy agent host
+/// holds a few hundred protected candidates; 4096 covers that with headroom
+/// while bounding the daemon's steady-state memory.
+pub const SACRED_VERDICT_CACHE_CAPACITY: usize = 4096;
+
+/// B7: a memoized "this candidate is protected" verdict.
+///
+/// Only *protected* verdicts are ever cached — see
+/// [`ProtectionRegistry::cache_protected_verdict`] for why the asymmetry is
+/// load-bearing for deletion safety.
+#[derive(Debug, Clone)]
+struct CachedSacredVerdict {
+    reason: String,
+    cached_at: Instant,
+    /// Root mtime observed when the verdict was proved. A change means the
+    /// directory was touched, so the verdict is re-proved rather than reused.
+    root_mtime: Option<SystemTime>,
+}
+
 /// Registry of protected paths from marker files and config-level glob patterns.
 ///
 /// The registry supports two modes:
 /// - **Full**: config patterns + marker files (normal operation)
 /// - **Marker-only**: just marker files (emergency mode, no config available)
+///
+/// It also memoizes protected verdicts across scan passes (B7) so the daemon
+/// does not re-walk known-protected subtrees on every pass.
 #[derive(Debug)]
 pub struct ProtectionRegistry {
     marker_paths: HashSet<PathBuf>,
     config_patterns: Vec<GlobPattern>,
+    /// B7: path → memoized *protected* verdict. Never holds "clean" verdicts.
+    sacred_verdict_cache: HashMap<PathBuf, CachedSacredVerdict>,
 }
 
 impl ProtectionRegistry {
@@ -217,6 +250,7 @@ impl ProtectionRegistry {
         Ok(Self {
             marker_paths: HashSet::new(),
             config_patterns: compiled,
+            sacred_verdict_cache: HashMap::new(),
         })
     }
 
@@ -225,7 +259,76 @@ impl ProtectionRegistry {
         Self {
             marker_paths: HashSet::new(),
             config_patterns: Vec::new(),
+            sacred_verdict_cache: HashMap::new(),
         }
+    }
+
+    /// B7: look up a memoized *protected* verdict for `path`.
+    ///
+    /// Returns `Some(reason)` only when the verdict is still fresh (within
+    /// [`SACRED_VERDICT_CACHE_TTL`]) **and** the candidate root's mtime is
+    /// unchanged since the verdict was proved. Any doubt → `None`, which makes
+    /// the caller re-run the full containment scan.
+    #[must_use]
+    pub fn cached_protected_verdict(&mut self, path: &Path) -> Option<String> {
+        let entry = self.sacred_verdict_cache.get(path)?;
+        if entry.cached_at.elapsed() >= SACRED_VERDICT_CACHE_TTL {
+            self.sacred_verdict_cache.remove(path);
+            return None;
+        }
+        if entry.root_mtime != root_mtime(path) {
+            // Directory was touched: the subtree may have changed. Re-prove.
+            self.sacred_verdict_cache.remove(path);
+            return None;
+        }
+        Some(entry.reason.clone())
+    }
+
+    /// B7: memoize a *protected* verdict for `path`.
+    ///
+    /// # Why only protected verdicts are cached
+    ///
+    /// The asymmetry is a deletion-safety invariant, not an optimization
+    /// detail. Caching "protected" is fail-safe: the worst case is that a tree
+    /// which became reclaimable stays protected until the TTL expires, which
+    /// costs disk but never data. Caching "clean" would be fail-open: a tree
+    /// that gained a sacred marker after the verdict was cached could be
+    /// deleted on a later pass without the marker ever being observed. That is
+    /// the same class of regression the fail-closed truncation branch in
+    /// [`find_sacred_overlaps_with_config`] exists to prevent, so the clean
+    /// verdict is deliberately re-proved on every pass.
+    pub fn cache_protected_verdict(&mut self, path: &Path, reason: String) {
+        if self.sacred_verdict_cache.len() >= SACRED_VERDICT_CACHE_CAPACITY
+            && !self.sacred_verdict_cache.contains_key(path)
+        {
+            self.evict_oldest_verdict();
+        }
+        self.sacred_verdict_cache.insert(
+            path.to_path_buf(),
+            CachedSacredVerdict {
+                reason,
+                cached_at: Instant::now(),
+                root_mtime: root_mtime(path),
+            },
+        );
+    }
+
+    /// B7: drop the least-recently-proved verdict to stay within capacity.
+    fn evict_oldest_verdict(&mut self) {
+        if let Some(oldest) = self
+            .sacred_verdict_cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.cached_at)
+            .map(|(path, _)| path.clone())
+        {
+            self.sacred_verdict_cache.remove(&oldest);
+        }
+    }
+
+    /// B7: number of memoized protected verdicts (diagnostics and tests).
+    #[must_use]
+    pub fn cached_verdict_count(&self) -> usize {
+        self.sacred_verdict_cache.len()
     }
 
     /// Check whether a path is protected by any mechanism (marker or config pattern).
@@ -506,6 +609,15 @@ pub fn sacred_paths_from_protected_patterns(patterns: &[String]) -> Vec<SacredPa
             })
         })
         .collect()
+}
+
+/// B7: mtime of a candidate root, used to invalidate memoized verdicts.
+///
+/// `None` on any error (missing path, permission denied). Since `None` is also
+/// what an unreadable path yields, a verdict cached against `None` only matches
+/// another `None`, which keeps the comparison conservative.
+fn root_mtime(path: &Path) -> Option<SystemTime> {
+    fs::symlink_metadata(path).ok()?.modified().ok()
 }
 
 pub fn find_sacred_overlaps_with_config(
@@ -2141,5 +2253,102 @@ protected_at = "2026-05-07T03:50:00Z"
             assert!(pat.starts_with('/'));
             assert_eq!(expand_home_pattern(pat), pat);
         }
+    }
+
+    // ---- B7: memoized protected verdicts (hot-loop fix) ----
+
+    #[test]
+    fn protected_verdict_is_memoized_and_returned_on_second_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("tmp-tree");
+        fs::create_dir_all(&candidate).unwrap();
+
+        let mut reg = ProtectionRegistry::marker_only();
+        assert_eq!(reg.cached_verdict_count(), 0);
+        assert!(reg.cached_protected_verdict(&candidate).is_none());
+
+        reg.cache_protected_verdict(&candidate, "contains sacred marker".to_string());
+
+        assert_eq!(reg.cached_verdict_count(), 1);
+        assert_eq!(
+            reg.cached_protected_verdict(&candidate).as_deref(),
+            Some("contains sacred marker")
+        );
+    }
+
+    #[test]
+    fn clean_verdicts_are_never_cached() {
+        // The fail-closed invariant: only protected verdicts are memoized, so a
+        // subtree that later gains a sacred marker is always re-proved. Nothing
+        // in the public API can insert a "clean" verdict.
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("clean-tree");
+        fs::create_dir_all(&candidate).unwrap();
+
+        let mut reg = ProtectionRegistry::marker_only();
+        // Simulate many passes over a clean tree.
+        for _ in 0..5 {
+            assert!(reg.cached_protected_verdict(&candidate).is_none());
+        }
+        assert_eq!(
+            reg.cached_verdict_count(),
+            0,
+            "clean verdicts must never populate the cache"
+        );
+    }
+
+    #[test]
+    fn memoized_verdict_is_invalidated_when_root_mtime_changes() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("mutating-tree");
+        fs::create_dir_all(&candidate).unwrap();
+
+        let mut reg = ProtectionRegistry::marker_only();
+        reg.cache_protected_verdict(&candidate, "contains sacred marker".to_string());
+        assert!(reg.cached_protected_verdict(&candidate).is_some());
+
+        // Touch the root so its mtime moves, then confirm the verdict is dropped.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(candidate.join("new-file"), b"x").unwrap();
+        let bumped = SystemTime::now() + Duration::from_secs(5);
+        filetime::set_file_mtime(&candidate, filetime::FileTime::from_system_time(bumped)).unwrap();
+
+        assert!(
+            reg.cached_protected_verdict(&candidate).is_none(),
+            "a touched root must force the containment scan to re-run"
+        );
+        assert_eq!(reg.cached_verdict_count(), 0);
+    }
+
+    #[test]
+    fn memoized_verdict_is_invalidated_when_candidate_disappears() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("vanishing-tree");
+        fs::create_dir_all(&candidate).unwrap();
+
+        let mut reg = ProtectionRegistry::marker_only();
+        reg.cache_protected_verdict(&candidate, "contains sacred marker".to_string());
+        assert!(reg.cached_protected_verdict(&candidate).is_some());
+
+        fs::remove_dir_all(&candidate).unwrap();
+        assert!(reg.cached_protected_verdict(&candidate).is_none());
+    }
+
+    #[test]
+    fn verdict_cache_is_bounded_by_capacity() {
+        let tmp = TempDir::new().unwrap();
+        let mut reg = ProtectionRegistry::marker_only();
+
+        for idx in 0..(SACRED_VERDICT_CACHE_CAPACITY + 64) {
+            let candidate = tmp.path().join(format!("tree-{idx}"));
+            fs::create_dir_all(&candidate).unwrap();
+            reg.cache_protected_verdict(&candidate, "contains sacred marker".to_string());
+        }
+
+        assert!(
+            reg.cached_verdict_count() <= SACRED_VERDICT_CACHE_CAPACITY,
+            "cache grew past capacity: {}",
+            reg.cached_verdict_count()
+        );
     }
 }
