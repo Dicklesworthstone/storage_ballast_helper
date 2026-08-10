@@ -206,12 +206,13 @@ printf 'leased payload\n' > "$1/sentinel.txt"
     )
     .expect("parse active lease renewal");
     assert_eq!(renewal["action"].as_str(), Some("renew"));
-    assert!(
-        renewal["expires_at_unix_seconds"].as_u64()
-            > active["metadata"]["expires_at_unix_seconds"]
-                .as_u64()
-                .unwrap()
-    );
+    let renewed_expiry = renewal["expires_at_unix_seconds"]
+        .as_u64()
+        .expect("renewal response must contain a numeric expiry");
+    let original_expiry = active["metadata"]["expires_at_unix_seconds"]
+        .as_u64()
+        .expect("active lease metadata must contain a numeric expiry");
+    assert!(renewed_expiry > original_expiry);
 
     let raw_token = fs::read_to_string(&token_path).expect("read inherited token witness");
     assert_eq!(raw_token.len(), 64, "renewal token should be 256 bits");
@@ -251,6 +252,80 @@ printf 'leased payload\n' > "$1/sentinel.txt"
     assert_cli_success(&after, "active target lease post-exit status");
     let after_payload = parse_json_stdout(&after);
     assert_eq!(after_payload["active"].as_bool(), Some(false));
+}
+
+#[cfg(unix)]
+#[test]
+fn active_target_lease_watchdog_cancels_an_over_quota_process_group() {
+    let fixture = tempfile::tempdir().expect("create watchdog fixture");
+    let scan_root = fixture.path().join("scan-root");
+    fs::create_dir(&scan_root).expect("create watchdog scan root");
+    let target = scan_root.join("bounded-build");
+    let config_path = fixture.path().join("sbh.toml");
+    fs::write(
+        &config_path,
+        format!("[scanner]\nroot_paths = [\"{}\"]\n", toml_path(&scan_root)),
+    )
+    .expect("write watchdog config");
+    let args = [
+        "--config",
+        config_path.to_str().unwrap(),
+        "lease",
+        "run",
+        "--target",
+        target.to_str().unwrap(),
+        "--max-bytes",
+        "8K",
+        "--ttl",
+        "5m",
+        "--",
+        "sh",
+        "-c",
+        "dd if=/dev/zero of=\"$1/payload.bin\" bs=1048576 count=1 2>/dev/null; sleep 30",
+        "active-lease-over-quota",
+        target.to_str().unwrap(),
+    ];
+
+    let started = Instant::now();
+    let run = common::run_cli_case("active_target_lease_over_quota", &args);
+    let elapsed = started.elapsed();
+    assert!(
+        !run.status.success(),
+        "watchdog must terminate the over-quota command; log: {}",
+        run.log_path.display()
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "watchdog did not terminate before the planted 30-second sleep; elapsed={elapsed:?}; log: {}",
+        run.log_path.display()
+    );
+    assert!(
+        run.stderr
+            .contains("[SBH-ACTIVE-LEASE] cancelling process group")
+            && run.stderr.contains("over quota"),
+        "watchdog diagnostics must identify the exact fired bound; stderr={:?}; log: {}",
+        run.stderr,
+        run.log_path.display()
+    );
+    assert!(
+        target.join("payload.bin").exists(),
+        "watchdog may cancel the process but must not delete its target"
+    );
+
+    let after = common::run_cli_case(
+        "active_target_lease_over_quota_after_exit",
+        &[
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "lease",
+            "status",
+            "--target",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert_cli_success(&after, "over-quota lease post-exit status");
+    assert_eq!(parse_json_stdout(&after)["active"].as_bool(), Some(false));
 }
 
 #[test]

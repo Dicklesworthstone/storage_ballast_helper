@@ -364,6 +364,35 @@ For non-interactive environments (CI, automation), `sbh install --auto` applies 
 | `sbh protect <path>` | Add `.sbh-protect` marker |
 | `sbh protect --list` | List all protected paths |
 | `sbh unprotect <path>` | Remove protection marker |
+| `sbh lease run --target PATH --max-bytes SIZE -- COMMAND...` | Run a command with a process-bound active-target lease |
+| `sbh lease status [--target PATH]` | Inspect active lease state and machine-readable bounds |
+| `sbh lease renew [--target PATH] [--extend DURATION]` | Authenticated soft-deadline renewal from inside the leased process tree |
+
+`sbh protect` is permanent operator policy; `sbh lease` is ephemeral process
+lifetime protection for fresh build/test output. On Linux and macOS, `lease run`
+locks a stable sidecar before creating the target, places the command in its own
+process group, injects `CARGO_TARGET_DIR`, and replaces `sbh` with the command.
+The kernel releases protection when that process tree exits or crashes. A
+separate watchdog terminates that process group if its renewable deadline,
+declared byte budget, hard eight-hour lifetime, or the 10 GiB emergency reserve
+is crossed. It never deletes the target.
+
+The target must be absent, absolute, and an immediate child of one configured
+`scanner.root_paths` entry. A root admits at most four concurrent leases, 64 GiB
+per lease, and 128 GiB in aggregate. Renewal uses a 256-bit token inherited in
+`SBH_ACTIVE_LEASE_TOKEN`; durable metadata stores only its SHA-256 digest. Use
+`--json` with `status` or `renew` for automation. The command's stdout remains
+its own; lease lifecycle diagnostics go to stderr.
+
+```bash
+lease_target=/data/tmp/mtdt-check-$$
+sbh lease run --target "$lease_target" --max-bytes 32G --ttl 2h -- \
+  cargo check --workspace --all-targets
+
+# From the leased command or one of its descendants:
+sbh --json lease status
+sbh --json lease renew --extend 30m
+```
 
 ### Observability and Explainability
 
@@ -1043,7 +1072,7 @@ Two protection mechanisms prevent cleanup of important directories:
 
 #### Layer 2: Pre-Flight Safety Checks
 
-Before any deletion is executed, a six-point pre-flight check must pass:
+Before any deletion is executed, an eight-point pre-flight check must pass:
 
 1. **Path still exists**: Uses `symlink_metadata()` (doesn't follow symlinks) to verify the target hasn't been removed by another process since scoring.
 2. **Not a symlink**: Symlinks are rejected because `remove_dir_all` follows symlinks into the target, which could destroy data outside watched directories.
@@ -1052,6 +1081,7 @@ Before any deletion is executed, a six-point pre-flight check must pass:
 5. **Not a Cargo source root**: A direct `Cargo.toml` without Cargo build-output markers vetoes deletion, even when a directory name matches `target`, `target_*`, `*_target`, or `*-target`. Broad target-like names outside temporary storage also require Cargo build-output markers before they can become deletion candidates; `/private/tmp` target caches still require open-file checks.
 6. **No stowaway sacred state**: Depth-limited scans reject cleanup candidates that contain protected marker directories or database state such as `.git/`, `.beads/`, `*.db`, `*.sqlite`, or `*.sqlite3`.
 7. **Not open by any process**: The deletion executor checks platform open-file evidence before reclaiming a target tree. Linux scans `/proc/*/fd` symlinks; macOS uses the PAL/libproc open-file collector. If that pre-flight evidence is incomplete, the batch fails conservative instead of deleting an in-use directory.
+8. **No active-target lease**: The executor probes the stable kernel lock derived from the candidate and its ancestors, both during pre-flight and immediately before mutation. A locked target is skipped even when its metadata is expired, over quota, unreadable, or tampered; the watchdog cancels the owner and deletion waits for the kernel to release the lock. This closes the gap where open-file evidence can miss build outputs between compiler phases.
 
 Any single check failure causes the candidate to be skipped (not failed), so it doesn't trip the circuit breaker.
 
