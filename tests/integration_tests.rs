@@ -185,9 +185,41 @@ printf 'leased payload\n' > "$1/sentinel.txt"
     ];
     let run = common::run_cli_case("active_target_lease_run", &args);
     assert_cli_success(&run, "active target lease run");
+    assert_active_lease_lifecycle_evidence(
+        &scan_root,
+        &target,
+        &active_status_path,
+        &renewal_path,
+        &token_path,
+    );
 
+    let after = common::run_cli_case(
+        "active_target_lease_after_exit",
+        &[
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "lease",
+            "status",
+            "--target",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert_cli_success(&after, "active target lease post-exit status");
+    let after_payload = parse_json_stdout(&after);
+    assert_eq!(after_payload["active"].as_bool(), Some(false));
+}
+
+#[cfg(unix)]
+fn assert_active_lease_lifecycle_evidence(
+    scan_root: &Path,
+    target: &Path,
+    active_status_path: &Path,
+    renewal_path: &Path,
+    token_path: &Path,
+) {
     let active: Value = serde_json::from_slice(
-        &fs::read(&active_status_path).expect("read active lease status"),
+        &fs::read(active_status_path).expect("read active lease status"),
     )
     .expect("parse active lease status");
     assert_eq!(active["active"].as_bool(), Some(true));
@@ -196,15 +228,11 @@ printf 'leased payload\n' > "$1/sentinel.txt"
         active["metadata"]["contract_id"].as_str(),
         Some("sbh.active_target_lease.v1")
     );
-    assert_eq!(
-        active["metadata"]["target"].as_str(),
-        target.to_str()
-    );
+    assert_eq!(active["metadata"]["target"].as_str(), target.to_str());
 
-    let renewal: Value = serde_json::from_slice(
-        &fs::read(&renewal_path).expect("read active lease renewal"),
-    )
-    .expect("parse active lease renewal");
+    let renewal: Value =
+        serde_json::from_slice(&fs::read(renewal_path).expect("read active lease renewal"))
+            .expect("parse active lease renewal");
     assert_eq!(renewal["action"].as_str(), Some("renew"));
     let renewed_expiry = renewal["expires_at_unix_seconds"]
         .as_u64()
@@ -214,9 +242,9 @@ printf 'leased payload\n' > "$1/sentinel.txt"
         .expect("active lease metadata must contain a numeric expiry");
     assert!(renewed_expiry > original_expiry);
 
-    let raw_token = fs::read_to_string(&token_path).expect("read inherited token witness");
+    let raw_token = fs::read_to_string(token_path).expect("read inherited token witness");
     assert_eq!(raw_token.len(), 64, "renewal token should be 256 bits");
-    let metadata_path = fs::read_dir(&scan_root)
+    let metadata_path = fs::read_dir(scan_root)
         .expect("read lease sidecars")
         .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
@@ -236,22 +264,6 @@ printf 'leased payload\n' > "$1/sentinel.txt"
         fs::read_to_string(target.join("sentinel.txt")).unwrap(),
         "leased payload\n"
     );
-
-    let after = common::run_cli_case(
-        "active_target_lease_after_exit",
-        &[
-            "--config",
-            config_path.to_str().unwrap(),
-            "--json",
-            "lease",
-            "status",
-            "--target",
-            target.to_str().unwrap(),
-        ],
-    );
-    assert_cli_success(&after, "active target lease post-exit status");
-    let after_payload = parse_json_stdout(&after);
-    assert_eq!(after_payload["active"].as_bool(), Some(false));
 }
 
 #[cfg(unix)]

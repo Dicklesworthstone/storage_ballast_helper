@@ -46,7 +46,7 @@ pub const DEFAULT_MAX_BYTES_PER_LEASE: u64 = 64 * 1024 * 1024 * 1024;
 /// Maximum aggregate reservation beneath one configured root (128 GiB).
 pub const DEFAULT_MAX_RESERVED_BYTES_PER_ROOT: u64 = 128 * 1024 * 1024 * 1024;
 /// Hard lifetime ceiling for a lease, including renewals (8 hours).
-pub const DEFAULT_MAX_LIFETIME: Duration = Duration::from_secs(8 * 60 * 60);
+pub const DEFAULT_MAX_LIFETIME: Duration = Duration::from_hours(8);
 /// Free-space floor below which a lease is not admitted or is cancelled (10 GiB).
 pub const DEFAULT_EMERGENCY_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// Watchdog polling cadence.
@@ -468,7 +468,7 @@ fn terminate_process_group(
     }
     let deadline = SystemTime::now()
         .checked_add(policy.termination_grace)
-        .unwrap_or(SystemTime::now());
+        .unwrap_or_else(SystemTime::now);
     while SystemTime::now() < deadline {
         if inspect_exact_target(target).is_none() {
             return Ok(());
@@ -879,8 +879,14 @@ fn hash_path(path: &Path) -> String {
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn absolute_lexical(path: &Path) -> Result<PathBuf> {
