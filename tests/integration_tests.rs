@@ -108,6 +108,7 @@ fn subcommand_help_flags_work() {
         "emergency",
         "protect",
         "unprotect",
+        "lease",
         "tune",
         "check",
         "blame",
@@ -128,6 +129,128 @@ fn subcommand_help_flags_work() {
             result.log_path.display()
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn active_target_lease_cli_binds_lifetime_renewal_and_machine_status() {
+    let fixture = tempfile::tempdir().expect("create active lease fixture");
+    let scan_root = fixture.path().join("scan-root");
+    fs::create_dir(&scan_root).expect("create scan root");
+    let target = scan_root.join("leased-build");
+    let config_path = fixture.path().join("sbh.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[scanner]\nroot_paths = [\"{}\"]\n",
+            toml_path(&scan_root)
+        ),
+    )
+    .expect("write active lease config");
+    let active_status_path = fixture.path().join("active-status.json");
+    let renewal_path = fixture.path().join("renewal.json");
+    let token_path = fixture.path().join("raw-token.test-only");
+    let binary = common::sbh_bin_path();
+    let script = r#"
+set -eu
+test "$CARGO_TARGET_DIR" = "$1"
+test "$SBH_ACTIVE_LEASE_TARGET" = "$1"
+printf '%s' "$SBH_ACTIVE_LEASE_TOKEN" > "$6"
+"$2" --config "$3" --json lease status --target "$1" > "$4"
+"$2" --config "$3" --json lease renew --extend 5m > "$5"
+printf 'leased payload\n' > "$1/sentinel.txt"
+"#;
+    let args = [
+        "--config",
+        config_path.to_str().unwrap(),
+        "lease",
+        "run",
+        "--target",
+        target.to_str().unwrap(),
+        "--max-bytes",
+        "1M",
+        "--ttl",
+        "5m",
+        "--",
+        "sh",
+        "-c",
+        script,
+        "active-lease-script",
+        target.to_str().unwrap(),
+        binary.to_str().unwrap(),
+        config_path.to_str().unwrap(),
+        active_status_path.to_str().unwrap(),
+        renewal_path.to_str().unwrap(),
+        token_path.to_str().unwrap(),
+    ];
+    let run = common::run_cli_case("active_target_lease_run", &args);
+    assert_cli_success(&run, "active target lease run");
+
+    let active: Value = serde_json::from_slice(
+        &fs::read(&active_status_path).expect("read active lease status"),
+    )
+    .expect("parse active lease status");
+    assert_eq!(active["active"].as_bool(), Some(true));
+    assert_eq!(active["state"].as_str(), Some("active"));
+    assert_eq!(
+        active["metadata"]["contract_id"].as_str(),
+        Some("sbh.active_target_lease.v1")
+    );
+    assert_eq!(
+        active["metadata"]["target"].as_str(),
+        target.to_str()
+    );
+
+    let renewal: Value = serde_json::from_slice(
+        &fs::read(&renewal_path).expect("read active lease renewal"),
+    )
+    .expect("parse active lease renewal");
+    assert_eq!(renewal["action"].as_str(), Some("renew"));
+    assert!(
+        renewal["expires_at_unix_seconds"].as_u64()
+            > active["metadata"]["expires_at_unix_seconds"]
+                .as_u64()
+                .unwrap()
+    );
+
+    let raw_token = fs::read_to_string(&token_path).expect("read inherited token witness");
+    assert_eq!(raw_token.len(), 64, "renewal token should be 256 bits");
+    let metadata_path = fs::read_dir(&scan_root)
+        .expect("read lease sidecars")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(".sbh-active-lease-") && name.ends_with(".json")
+            })
+        })
+        .expect("active lease metadata sidecar");
+    let metadata_bytes = fs::read_to_string(metadata_path).expect("read lease metadata sidecar");
+    assert!(
+        !metadata_bytes.contains(&raw_token),
+        "durable metadata must store only the renewal token hash"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("sentinel.txt")).unwrap(),
+        "leased payload\n"
+    );
+
+    let after = common::run_cli_case(
+        "active_target_lease_after_exit",
+        &[
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "lease",
+            "status",
+            "--target",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert_cli_success(&after, "active target lease post-exit status");
+    let after_payload = parse_json_stdout(&after);
+    assert_eq!(after_payload["active"].as_bool(), Some(false));
 }
 
 #[test]

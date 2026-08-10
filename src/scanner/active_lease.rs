@@ -410,26 +410,30 @@ pub const fn path_is_actively_leased(_path: &Path) -> bool {
 /// invalid identity, or emergency pressure the process group is terminated and
 /// a typed runtime error describes the bound that fired.
 #[cfg(unix)]
-pub fn watch(target: &Path, policy: LeasePolicy) -> Result<()> {
+pub fn watch(target: &Path, expected_process_group_id: i32, policy: LeasePolicy) -> Result<()> {
     validate_policy(policy)?;
+    if expected_process_group_id <= 0 {
+        return Err(invalid_config(
+            "active lease watchdog process group must be positive".to_string(),
+        ));
+    }
     loop {
         let Some(inspection) = inspect_exact_target(target) else {
             return Ok(());
         };
-        match inspection.state {
+        let state = if inspection
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.process_group_id != expected_process_group_id)
+        {
+            ActiveLeaseState::Invalid
+        } else {
+            inspection.state
+        };
+        match state {
             ActiveLeaseState::Active => thread::sleep(policy.watch_interval),
             state => {
-                let process_group_id = inspection
-                    .metadata
-                    .as_ref()
-                    .map(|metadata| metadata.process_group_id)
-                    .ok_or_else(|| SbhError::Runtime {
-                        details: format!(
-                            "active lease became invalid while locked: {}",
-                            inspection.detail
-                        ),
-                    })?;
-                terminate_process_group(process_group_id, target, state, policy)?;
+                terminate_process_group(expected_process_group_id, target, state, policy)?;
                 return Err(SbhError::Runtime {
                     details: format!(
                         "active lease cancelled for {}: {}",
@@ -794,9 +798,14 @@ fn write_metadata(path: &Path, metadata: &ActiveLeaseMetadata) -> Result<()> {
         .and_then(|()| file.sync_all())
         .map_err(|error| SbhError::io(&temporary, error))?;
     fs::rename(&temporary, path).map_err(|error| SbhError::io(path, error))?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| SbhError::io(parent, error))
+    match File::open(parent).and_then(|directory| directory.sync_all()) {
+        Ok(()) => Ok(()),
+        // Some otherwise supported filesystems reject directory fsync. The
+        // renamed file itself is already synced; do not turn that portability
+        // limitation into a false claim that the lease was never written.
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        Err(error) => Err(SbhError::io(parent, error)),
+    }
 }
 
 #[cfg(unix)]
@@ -1001,6 +1010,28 @@ mod tests {
     }
 
     #[test]
+    fn expired_lock_is_still_protected_for_watchdog_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("leased");
+        let lease = ActiveLease::acquire_with_policy(
+            &[root.path().to_path_buf()],
+            &target,
+            Duration::from_secs(30),
+            4096,
+            test_policy(),
+        )
+        .unwrap();
+        let mut expired = lease.metadata().clone();
+        expired.started_at_unix_seconds = 1;
+        expired.expires_at_unix_seconds = 2;
+        write_metadata(lease.metadata_path(), &expired).unwrap();
+
+        let inspection = inspect_path(&target).expect("expired lock must remain protected");
+        assert_eq!(inspection.state, ActiveLeaseState::Expired);
+        assert!(path_is_actively_leased(&target));
+    }
+
+    #[test]
     fn acquisition_refuses_existing_nested_and_over_reserved_targets() {
         let root = tempfile::tempdir().unwrap();
         let existing = root.path().join("existing");
@@ -1042,5 +1073,84 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn stale_corrupt_metadata_with_an_unlocked_sidecar_does_not_block_new_work() {
+        let root = tempfile::tempdir().unwrap();
+        let stale_target = root.path().join("stale-target");
+        let stale = sidecar_paths(&stale_target).unwrap();
+        fs::write(&stale.metadata, b"{not valid json").unwrap();
+        File::create(&stale.lock).unwrap();
+
+        let fresh_target = root.path().join("fresh-target");
+        let lease = ActiveLease::acquire_with_policy(
+            &[root.path().to_path_buf()],
+            &fresh_target,
+            Duration::from_secs(30),
+            4096,
+            test_policy(),
+        )
+        .expect("unlocked stale metadata must not deny the root forever");
+        assert_eq!(lease.metadata().target, fresh_target);
+    }
+
+    #[test]
+    fn locked_tampered_metadata_fails_safe_until_the_kernel_lock_releases() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("leased");
+        let lease = ActiveLease::acquire_with_policy(
+            &[root.path().to_path_buf()],
+            &target,
+            Duration::from_secs(30),
+            4096,
+            test_policy(),
+        )
+        .unwrap();
+        fs::write(lease.metadata_path(), b"{tampered").unwrap();
+
+        let inspection = inspect_path(&target).expect("locked invalid record must protect");
+        assert_eq!(inspection.state, ActiveLeaseState::Invalid);
+        assert!(inspection.metadata.is_none());
+
+        drop(lease);
+        assert!(inspect_path(&target).is_none());
+    }
+
+    #[test]
+    fn root_count_and_aggregate_caps_are_enforced_against_live_locks_only() {
+        let root = tempfile::tempdir().unwrap();
+        let mut policy = test_policy();
+        policy.max_active_leases_per_root = 2;
+        policy.max_bytes_per_lease = 1024;
+        policy.max_reserved_bytes_per_root = 1536;
+        let first = ActiveLease::acquire_with_policy(
+            &[root.path().to_path_buf()],
+            &root.path().join("first"),
+            Duration::from_secs(30),
+            1024,
+            policy,
+        )
+        .unwrap();
+        let aggregate = ActiveLease::acquire_with_policy(
+            &[root.path().to_path_buf()],
+            &root.path().join("aggregate-refused"),
+            Duration::from_secs(30),
+            1024,
+            policy,
+        )
+        .unwrap_err();
+        assert_eq!(aggregate.code(), "SBH-2003");
+
+        drop(first);
+        let second = ActiveLease::acquire_with_policy(
+            &[root.path().to_path_buf()],
+            &root.path().join("second"),
+            Duration::from_secs(30),
+            1024,
+            policy,
+        )
+        .expect("released locks must stop counting against aggregate capacity");
+        assert_eq!(second.metadata().max_bytes, 1024);
     }
 }
