@@ -613,6 +613,9 @@ struct LeaseWatchArgs {
     /// Exact target watched by the internal cancellation process.
     #[arg(long, value_name = "PATH")]
     target: PathBuf,
+    /// Exact process group created by `lease run`.
+    #[arg(long, value_name = "PGID")]
+    process_group_id: i32,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -7530,6 +7533,8 @@ fn run_lease_command(cli: &Cli, args: &LeaseRunArgs) -> Result<(), CliError> {
         .arg("__lease-watch")
         .arg("--target")
         .arg(&lease.metadata().target)
+        .arg("--process-group-id")
+        .arg(lease.metadata().process_group_id.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -7657,7 +7662,7 @@ fn run_lease_status(cli: &Cli, args: &LeaseStatusArgs) -> Result<(), CliError> {
 
 #[cfg(unix)]
 fn run_lease_watch(args: &LeaseWatchArgs) -> Result<(), CliError> {
-    active_lease::watch(&args.target, LeasePolicy::default())
+    active_lease::watch(&args.target, args.process_group_id, LeasePolicy::default())
         .map_err(|error| CliError::Runtime(error.to_string()))
 }
 
