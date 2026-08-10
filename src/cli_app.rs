@@ -5,6 +5,11 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::process::{Command as ProcessCommand, Stdio};
+
 use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell as CompletionShell, generate};
 use colored::control;
@@ -40,6 +45,10 @@ use storage_ballast_helper::platform::pal::{
 use storage_ballast_helper::platform::types::{
     Capacity, FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
     ProcessInfo, ProcessIo, ServiceKind,
+};
+#[cfg(unix)]
+use storage_ballast_helper::scanner::active_lease::{
+    self, ACTIVE_LEASE_TARGET_ENV, ACTIVE_LEASE_TOKEN_ENV, ActiveLease, LeasePolicy,
 };
 use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
 use storage_ballast_helper::scanner::engine::{ScannerEngine, SelectedScannerEngine};
@@ -125,6 +134,11 @@ enum Command {
     Protect(ProtectArgs),
     /// Remove protection marker from a path.
     Unprotect(UnprotectArgs),
+    /// Run and renew bounded, process-scoped active-target leases.
+    Lease(LeaseArgs),
+    /// Internal watchdog for a process-scoped active-target lease.
+    #[command(name = "__lease-watch", hide = true)]
+    LeaseWatch(LeaseWatchArgs),
     /// Show/apply tuning recommendations.
     Tune(TuneArgs),
     /// Pre-build disk pressure check.
@@ -545,6 +559,62 @@ struct UnprotectArgs {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Args)]
+struct LeaseArgs {
+    #[command(subcommand)]
+    action: LeaseAction,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum LeaseAction {
+    /// Create a fresh target and replace sbh with the leased command.
+    Run(LeaseRunArgs),
+    /// Extend the soft deadline of the current inherited lease.
+    Renew(LeaseRenewArgs),
+    /// Inspect whether a target or descendant is protected by a live lease.
+    Status(LeaseStatusArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct LeaseRunArgs {
+    /// Fresh absent target directory, immediately beneath a configured scan root.
+    #[arg(long, value_name = "PATH")]
+    target: PathBuf,
+    /// Maximum allocated target bytes (for example 32G).
+    #[arg(long, value_name = "SIZE", value_parser = parse_byte_count)]
+    max_bytes: u64,
+    /// Renewable soft lifetime (for example 45m or 2h; hard cap is 8h).
+    #[arg(long = "ttl", default_value = "2h", value_name = "DURATION", value_parser = parse_lease_duration_seconds)]
+    ttl_seconds: u64,
+    /// Command and arguments. `CARGO_TARGET_DIR` and renewal variables are injected.
+    #[arg(last = true, required = true, num_args = 1..)]
+    command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct LeaseRenewArgs {
+    /// Leased target. Defaults to `SBH_ACTIVE_LEASE_TARGET` inherited from `lease run`.
+    #[arg(long, value_name = "PATH")]
+    target: Option<PathBuf>,
+    /// Amount to extend the current soft deadline (bounded by the original hard deadline).
+    #[arg(long = "extend", default_value = "1h", value_name = "DURATION", value_parser = parse_lease_duration_seconds)]
+    extend_seconds: u64,
+}
+
+#[derive(Debug, Clone, Args)]
+struct LeaseStatusArgs {
+    /// Target or descendant to inspect. Defaults to the inherited lease target.
+    #[arg(long, value_name = "PATH")]
+    target: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct LeaseWatchArgs {
+    /// Exact target watched by the internal cancellation process.
+    #[arg(long, value_name = "PATH")]
+    target: PathBuf,
+}
+
 #[derive(Debug, Clone, Args, Serialize, Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct TuneArgs {
@@ -802,6 +872,8 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Emergency(args) => run_emergency(cli, args),
         Command::Protect(args) => run_protect(cli, args),
         Command::Unprotect(args) => run_unprotect(cli, args),
+        Command::Lease(args) => run_lease(cli, args),
+        Command::LeaseWatch(args) => run_lease_watch(args),
         Command::Tune(args) => run_tune(cli, args),
         Command::Check(args) => run_check(cli, args),
         Command::Blame(args) => run_blame(cli, args),
@@ -7415,6 +7487,187 @@ fn run_unprotect(cli: &Cli, args: &UnprotectArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn run_lease(cli: &Cli, args: &LeaseArgs) -> Result<(), CliError> {
+    match &args.action {
+        LeaseAction::Run(run) => run_lease_command(cli, run),
+        LeaseAction::Renew(renew) => run_lease_renew(cli, renew),
+        LeaseAction::Status(status) => run_lease_status(cli, status),
+    }
+}
+
+#[cfg(not(unix))]
+fn run_lease(_cli: &Cli, _args: &LeaseArgs) -> Result<(), CliError> {
+    Err(CliError::User(
+        "active target leases currently require Linux or macOS".to_string(),
+    ))
+}
+
+#[cfg(unix)]
+fn run_lease_command(cli: &Cli, args: &LeaseRunArgs) -> Result<(), CliError> {
+    let config = Config::load(cli.config.as_deref())
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+
+    // Give the leased command and all descendants their own process group so
+    // the watchdog can cancel the whole build without touching the caller's
+    // shell or unrelated jobs.
+    nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0)).map_err(
+        |error| CliError::Runtime(format!("create active lease process group: {error}")),
+    )?;
+
+    let lease = ActiveLease::acquire(
+        &config.scanner.root_paths,
+        &args.target,
+        Duration::from_secs(args.ttl_seconds),
+        args.max_bytes,
+    )
+    .map_err(|error| CliError::User(error.to_string()))?;
+
+    let current_exe = std::env::current_exe()
+        .map_err(|error| CliError::Runtime(format!("resolve sbh executable: {error}")))?;
+    let mut watchdog = ProcessCommand::new(&current_exe);
+    watchdog
+        .arg("__lease-watch")
+        .arg("--target")
+        .arg(&lease.metadata().target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .process_group(0);
+    watchdog
+        .spawn()
+        .map_err(|error| CliError::Runtime(format!("start active lease watchdog: {error}")))?;
+
+    lease
+        .retain_lock_across_exec()
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    if !cli.quiet {
+        eprintln!(
+            "[SBH-ACTIVE-LEASE] active target={} max_bytes={} expires_at={} hard_expires_at={}",
+            lease.metadata().target.display(),
+            lease.metadata().max_bytes,
+            lease.metadata().expires_at_unix_seconds,
+            lease.metadata().hard_expires_at_unix_seconds,
+        );
+    }
+
+    let (program, command_args) = args
+        .command
+        .split_first()
+        .ok_or_else(|| CliError::User("lease run requires a command after --".to_string()))?;
+    let mut command = ProcessCommand::new(program);
+    command
+        .args(command_args)
+        .env("CARGO_TARGET_DIR", &lease.metadata().target)
+        .env(ACTIVE_LEASE_TARGET_ENV, &lease.metadata().target)
+        .env(ACTIVE_LEASE_TOKEN_ENV, lease.renewal_token());
+    let error = command.exec();
+    Err(CliError::Runtime(format!(
+        "exec leased command {program:?}: {error}"
+    )))
+}
+
+#[cfg(unix)]
+fn run_lease_renew(cli: &Cli, args: &LeaseRenewArgs) -> Result<(), CliError> {
+    let target = args
+        .target
+        .clone()
+        .or_else(|| std::env::var_os(ACTIVE_LEASE_TARGET_ENV).map(PathBuf::from))
+        .ok_or_else(|| {
+            CliError::User(format!(
+                "lease renew needs --target or inherited {ACTIVE_LEASE_TARGET_ENV}"
+            ))
+        })?;
+    let token = std::env::var(ACTIVE_LEASE_TOKEN_ENV).map_err(|_| {
+        CliError::User(format!(
+            "lease renew must run beneath lease run with inherited {ACTIVE_LEASE_TOKEN_ENV}"
+        ))
+    })?;
+    let expires_at = active_lease::renew(&target, &token, Duration::from_secs(args.extend_seconds))
+        .map_err(|error| CliError::User(error.to_string()))?;
+
+    match output_mode(cli) {
+        OutputMode::Human => println!(
+            "Renewed active target lease: {} (expires_at_unix_seconds={expires_at})",
+            target.display()
+        ),
+        OutputMode::Json => write_json_line(&json!({
+            "command": "lease",
+            "action": "renew",
+            "target": target.to_string_lossy(),
+            "expires_at_unix_seconds": expires_at,
+        }))?,
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_lease_status(cli: &Cli, args: &LeaseStatusArgs) -> Result<(), CliError> {
+    let target = args
+        .target
+        .clone()
+        .or_else(|| std::env::var_os(ACTIVE_LEASE_TARGET_ENV).map(PathBuf::from))
+        .ok_or_else(|| {
+            CliError::User(format!(
+                "lease status needs --target or inherited {ACTIVE_LEASE_TARGET_ENV}"
+            ))
+        })?;
+    let inspection = active_lease::inspect_path(&target);
+    match output_mode(cli) {
+        OutputMode::Human => {
+            if let Some(inspection) = inspection {
+                println!(
+                    "Active target lease: {} ({:?}; {})",
+                    inspection.leased_target.display(),
+                    inspection.state,
+                    inspection.detail
+                );
+            } else {
+                println!("No active target lease: {}", target.display());
+            }
+        }
+        OutputMode::Json => {
+            let payload = inspection.map_or_else(
+                || {
+                    json!({
+                        "command": "lease",
+                        "action": "status",
+                        "target": target.to_string_lossy(),
+                        "active": false,
+                    })
+                },
+                |inspection| {
+                    json!({
+                        "command": "lease",
+                        "action": "status",
+                        "target": target.to_string_lossy(),
+                        "active": true,
+                        "leased_target": inspection.leased_target.to_string_lossy(),
+                        "state": inspection.state,
+                        "detail": inspection.detail,
+                        "metadata": inspection.metadata,
+                    })
+                },
+            );
+            write_json_line(&payload)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_lease_watch(args: &LeaseWatchArgs) -> Result<(), CliError> {
+    active_lease::watch(&args.target, LeasePolicy::default())
+        .map_err(|error| CliError::Runtime(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn run_lease_watch(_args: &LeaseWatchArgs) -> Result<(), CliError> {
+    Err(CliError::User(
+        "active target lease watchdog requires Linux or macOS".to_string(),
+    ))
+}
+
 #[derive(Debug, Clone)]
 struct ScoredScanEntry {
     score: CandidacyScore,
@@ -9203,6 +9456,32 @@ fn read_daemon_prediction(state_path: &Path, mount_point: &Path) -> Option<f64> 
     rate_obj.get("bytes_per_sec")?.as_f64()
 }
 
+fn parse_lease_duration_seconds(raw: &str) -> std::result::Result<u64, String> {
+    let input = raw.trim();
+    if input.is_empty() {
+        return Err("lease duration must not be empty".to_string());
+    }
+    let split = input
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(input.len());
+    let (number, suffix) = input.split_at(split);
+    let value = number
+        .parse::<u64>()
+        .map_err(|_| "lease duration must begin with a positive integer".to_string())?;
+    if value == 0 {
+        return Err("lease duration must be positive".to_string());
+    }
+    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
+        _ => return Err("lease duration suffix must be seconds, minutes, or hours".to_string()),
+    };
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| "lease duration is too large".to_string())
+}
+
 fn parse_byte_count(raw: &str) -> std::result::Result<u64, String> {
     let input = raw.trim();
     if input.is_empty() {
@@ -10650,6 +10929,28 @@ mod tests {
             vec!["sbh", "protect", "--list"],
             vec!["sbh", "protect", "/data/projects/critical"],
             vec!["sbh", "unprotect", "/data/projects/critical"],
+            vec![
+                "sbh",
+                "lease",
+                "run",
+                "--target",
+                "/data/tmp/leased-build",
+                "--max-bytes",
+                "32G",
+                "--ttl",
+                "45m",
+                "--",
+                "cargo",
+                "test",
+            ],
+            vec!["sbh", "lease", "renew", "--extend", "30m"],
+            vec![
+                "sbh",
+                "lease",
+                "status",
+                "--target",
+                "/data/tmp/leased-build",
+            ],
             vec!["sbh", "tune", "--apply"],
             vec!["sbh", "check", "/data", "--target-free", "20"],
             vec!["sbh", "scan", "/tmp", "--explain", "--top", "5"],
@@ -10730,6 +11031,51 @@ mod tests {
                 "input should be rejected: {input:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_lease_duration_is_exact_and_bounded_arithmetically() {
+        assert_eq!(parse_lease_duration_seconds("45m").unwrap(), 2700);
+        assert_eq!(parse_lease_duration_seconds("2 hours").unwrap(), 7200);
+        assert_eq!(parse_lease_duration_seconds("30s").unwrap(), 30);
+        for invalid in ["", "0m", "1", "1d", "1.5h", "18446744073709551615h"] {
+            assert!(
+                parse_lease_duration_seconds(invalid).is_err(),
+                "invalid duration accepted: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn lease_run_requires_a_fresh_target_budget_and_command_boundary() {
+        assert!(
+            Cli::try_parse_from([
+                "sbh",
+                "lease",
+                "run",
+                "--target",
+                "/data/tmp/leased-build",
+                "--max-bytes",
+                "4G",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sbh",
+                "lease",
+                "run",
+                "--target",
+                "/data/tmp/leased-build",
+                "--max-bytes",
+                "0",
+                "--",
+                "cargo",
+                "check",
+            ])
+            .is_ok(),
+            "clap accepts the shape; the product policy rejects a zero reservation"
+        );
     }
 
     #[test]

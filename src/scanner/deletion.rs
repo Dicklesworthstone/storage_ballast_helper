@@ -10,6 +10,7 @@
 //! 4. Directory does not contain .git/ (final safety net)
 //! 5. Directory is not a Cargo source root misclassified as a target artifact
 //! 6. Candidate identity still matches the object observed by the scanner
+//! 7. Candidate is not covered by a kernel-held active-target lease
 //!
 //! Circuit breaker: 3 consecutive failures -> halt batch (daemon retries next cycle).
 
@@ -24,6 +25,7 @@ use std::time::{Duration, Instant};
 use crate::core::errors::{Result, SbhError};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
 use crate::logger::jsonl::ScoreFactorsRecord;
+use crate::scanner::active_lease;
 use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, StructuralSignals, is_obvious_build_artifact_basename,
 };
@@ -188,6 +190,10 @@ pub enum SkipReason {
     /// Operator answered "no" (or quit) at an interactive prompt. Only ever
     /// produced by the interactive clean/emergency flows.
     UserDeclined,
+    /// A build/test process holds an ephemeral kernel-backed lease on this
+    /// candidate or one of its ancestors. The lease disappears with the
+    /// process; unlike `.sbh-protect`, it is not permanent policy.
+    ActiveLease,
 }
 
 impl SkipReason {
@@ -197,7 +203,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -212,6 +218,7 @@ impl SkipReason {
         Self::HardcodedSourceTree,
         Self::LooksLikeSourceCode,
         Self::UserDeclined,
+        Self::ActiveLease,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -240,6 +247,7 @@ impl SkipReason {
             Self::HardcodedSourceTree => "hardcoded_source_tree",
             Self::LooksLikeSourceCode => "looks_like_source_code",
             Self::UserDeclined => "user_declined",
+            Self::ActiveLease => "active_lease",
         }
     }
 
@@ -266,6 +274,7 @@ impl SkipReason {
             }
             Self::LooksLikeSourceCode => "contains source-code marker files",
             Self::UserDeclined => "operator declined at the interactive prompt",
+            Self::ActiveLease => "an active build/test process holds an ephemeral target lease",
         }
     }
 }
@@ -531,6 +540,15 @@ impl DeletionExecutor {
             return Err(SkipReason::HardcodedSourceTree);
         }
 
+        // 0b. A lease is acquired before the target directory is created, so
+        // this check closes the register/scan race as well as the later
+        // scan/delete race. Locked-but-expired or over-quota targets remain
+        // protected until their watchdog terminates the owner and the kernel
+        // releases the lock; they are never deleted in the same cycle.
+        if active_lease::path_is_actively_leased(path) {
+            return Err(SkipReason::ActiveLease);
+        }
+
         // 1. Path still exists (use symlink_metadata to not follow symlinks).
         let Ok(meta) = fs::symlink_metadata(path) else {
             return Err(SkipReason::PathGone);
@@ -626,6 +644,15 @@ impl DeletionExecutor {
     #[allow(clippy::unused_self)]
     fn delete_path(&self, candidate: &CandidacyScore) -> Result<()> {
         let path = &candidate.path;
+        // Recheck immediately before mutation. A lease can begin after the
+        // earlier preflight, and deleting despite the newly held lock would
+        // recreate the exact scan/reap race this protection exists to close.
+        if active_lease::path_is_actively_leased(path) {
+            return Err(SbhError::SafetyVeto {
+                path: path.clone(),
+                reason: "active target lease acquired after deletion preflight".to_string(),
+            });
+        }
         // Re-check with symlink_metadata (not metadata/is_dir which follow symlinks)
         // to close the TOCTOU window between preflight_check and actual deletion.
         let meta = fs::symlink_metadata(path).map_err(|e| SbhError::io(path, e))?;
@@ -1046,6 +1073,7 @@ fn factors_to_record(f: &ScoreFactors) -> ScoreFactorsRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::active_lease::{ActiveLease, LeasePolicy};
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::scoring::{DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::borrow::Cow;
@@ -1172,6 +1200,7 @@ mod tests {
                 SkipReason::HardcodedSourceTree => 11,
                 SkipReason::LooksLikeSourceCode => 12,
                 SkipReason::UserDeclined => 13,
+                SkipReason::ActiveLease => 14,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];
@@ -1563,6 +1592,51 @@ mod tests {
 
         assert_eq!(report.items_deleted, 0);
         assert_eq!(report.items_skipped, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_lease_skips_then_releases_the_exact_deletion_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("leased-target");
+        let policy = LeasePolicy {
+            max_active_leases_per_root: 1,
+            max_bytes_per_lease: 1024 * 1024,
+            max_reserved_bytes_per_root: 1024 * 1024,
+            max_lifetime: Duration::from_secs(60),
+            emergency_reserve_bytes: 0,
+            watch_interval: Duration::from_millis(10),
+            termination_grace: Duration::from_millis(20),
+        };
+        let lease = ActiveLease::acquire_with_policy(
+            &[root.path().to_path_buf()],
+            &target,
+            Duration::from_secs(30),
+            4096,
+            policy,
+        )
+        .unwrap();
+        let candidate = make_candidate(&target, 4096, 0.99);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                ..DeletionConfig::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![candidate.clone()]);
+
+        let protected = executor.execute(&plan, None);
+        assert_eq!(protected.items_deleted, 0);
+        assert_eq!(protected.items_skipped, 1);
+        assert_eq!(protected.skipped_by_reason["active_lease"], 1);
+        assert!(target.exists());
+
+        drop(lease);
+        let released = executor.execute(&executor.plan(vec![candidate]), None);
+        assert_eq!(released.items_deleted, 1);
+        assert_eq!(released.items_skipped, 0);
+        assert!(!target.exists());
     }
 
     #[test]
