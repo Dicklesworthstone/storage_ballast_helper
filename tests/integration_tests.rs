@@ -141,10 +141,7 @@ fn active_target_lease_cli_binds_lifetime_renewal_and_machine_status() {
     let config_path = fixture.path().join("sbh.toml");
     fs::write(
         &config_path,
-        format!(
-            "[scanner]\nroot_paths = [\"{}\"]\n",
-            toml_path(&scan_root)
-        ),
+        format!("[scanner]\nroot_paths = [\"{}\"]\n", toml_path(&scan_root)),
     )
     .expect("write active lease config");
     let active_status_path = fixture.path().join("active-status.json");
@@ -218,10 +215,9 @@ fn assert_active_lease_lifecycle_evidence(
     renewal_path: &Path,
     token_path: &Path,
 ) {
-    let active: Value = serde_json::from_slice(
-        &fs::read(active_status_path).expect("read active lease status"),
-    )
-    .expect("parse active lease status");
+    let active: Value =
+        serde_json::from_slice(&fs::read(active_status_path).expect("read active lease status"))
+            .expect("parse active lease status");
     assert_eq!(active["active"].as_bool(), Some(true));
     assert_eq!(active["state"].as_str(), Some("active"));
     assert_eq!(
@@ -338,6 +334,73 @@ fn active_target_lease_watchdog_cancels_an_over_quota_process_group() {
     );
     assert_cli_success(&after, "over-quota lease post-exit status");
     assert_eq!(parse_json_stdout(&after)["active"].as_bool(), Some(false));
+}
+
+#[cfg(unix)]
+#[test]
+fn active_target_lease_owner_crash_releases_lock_without_deleting_target() {
+    let fixture = tempfile::tempdir().expect("create crash fixture");
+    let scan_root = fixture.path().join("scan-root");
+    fs::create_dir(&scan_root).expect("create crash scan root");
+    let target = scan_root.join("crashed-build");
+    let config_path = fixture.path().join("sbh.toml");
+    fs::write(
+        &config_path,
+        format!("[scanner]\nroot_paths = [\"{}\"]\n", toml_path(&scan_root)),
+    )
+    .expect("write crash config");
+    let args = [
+        "--config",
+        config_path.to_str().unwrap(),
+        "lease",
+        "run",
+        "--target",
+        target.to_str().unwrap(),
+        "--max-bytes",
+        "1M",
+        "--ttl",
+        "5m",
+        "--",
+        "sh",
+        "-c",
+        "printf 'crash witness\\n' > \"$1/crash-witness\"; kill -KILL $$",
+        "active-lease-owner-crash",
+        target.to_str().unwrap(),
+    ];
+
+    let run = common::run_cli_case("active_target_lease_owner_crash", &args);
+    assert!(
+        !run.status.success(),
+        "the planted owner crash must be observable; log: {}",
+        run.log_path.display()
+    );
+    assert!(
+        run.stderr.contains("[SBH-ACTIVE-LEASE] active target="),
+        "the command must acquire the lease before crashing; stderr={:?}; log: {}",
+        run.stderr,
+        run.log_path.display()
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("crash-witness")).unwrap(),
+        "crash witness\n",
+        "the crash must happen after the leased process writes its target"
+    );
+
+    let after = common::run_cli_case(
+        "active_target_lease_owner_crash_after_exit",
+        &[
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "lease",
+            "status",
+            "--target",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert_cli_success(&after, "crashed lease post-exit status");
+    assert_eq!(parse_json_stdout(&after)["active"].as_bool(), Some(false));
+    assert!(target.exists(), "owner death must never delete the target");
 }
 
 #[test]

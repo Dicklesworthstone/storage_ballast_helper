@@ -348,8 +348,7 @@ pub fn renew(target: &Path, token: &str, extension: Duration) -> Result<u64> {
         false,
     )?;
     let mut metadata: ActiveLeaseMetadata = serde_json::from_slice(
-        &fs::read(&sidecars.metadata)
-            .map_err(|error| SbhError::io(&sidecars.metadata, error))?,
+        &fs::read(&sidecars.metadata).map_err(|error| SbhError::io(&sidecars.metadata, error))?,
     )?;
     validate_metadata(&metadata, &sidecars.metadata)?;
     if hash_text(token) != metadata.renewal_token_sha256 {
@@ -634,10 +633,7 @@ fn active_reservations(root: &Path) -> Result<(usize, u64)> {
             LOCK_SUFFIX
         );
         let lock_path = root.join(lock_name);
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lock_path);
+        let lock_file = OpenOptions::new().read(true).write(true).open(&lock_path);
         let lock_file = match lock_file {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1158,5 +1154,103 @@ mod tests {
         )
         .expect("released locks must stop counting against aggregate capacity");
         assert_eq!(second.metadata().max_bytes, 1024);
+    }
+
+    #[test]
+    fn concurrent_admission_preserves_root_caps_without_leaking_loser_target() {
+        let root = tempfile::tempdir().unwrap();
+        let mut policy = test_policy();
+        policy.max_active_leases_per_root = 1;
+        policy.max_bytes_per_lease = 1024;
+        policy.max_reserved_bytes_per_root = 1024;
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let finish = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut workers = Vec::new();
+        for name in ["first", "second"] {
+            let worker_root = root.path().to_path_buf();
+            let worker_start = std::sync::Arc::clone(&start);
+            let worker_finish = std::sync::Arc::clone(&finish);
+            let worker_sender = sender.clone();
+            workers.push(std::thread::spawn(move || {
+                let target = worker_root.join(name);
+                worker_start.wait();
+                let lease = ActiveLease::acquire_with_policy(
+                    std::slice::from_ref(&worker_root),
+                    &target,
+                    Duration::from_secs(30),
+                    1024,
+                    policy,
+                );
+                let report = lease
+                    .as_ref()
+                    .map(|lease| lease.metadata().target.clone())
+                    .map_err(|error| error.code().to_string());
+                worker_sender.send((target, report)).unwrap();
+                worker_finish.wait();
+                drop(lease);
+            }));
+        }
+        drop(sender);
+
+        start.wait();
+        let reports = [receiver.recv().unwrap(), receiver.recv().unwrap()];
+        let during = active_reservations(root.path()).unwrap();
+        let target_existence = reports
+            .iter()
+            .map(|(target, _)| (target.clone(), target.exists()))
+            .collect::<Vec<_>>();
+        finish.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let admitted = reports
+            .iter()
+            .filter_map(|(_, report)| report.as_ref().ok())
+            .collect::<Vec<_>>();
+        let refused = reports
+            .iter()
+            .filter_map(|(_, report)| report.as_ref().err())
+            .collect::<Vec<_>>();
+        assert_eq!(admitted.len(), 1, "exactly one concurrent lease may win");
+        assert_eq!(refused.len(), 1, "exactly one concurrent lease must lose");
+        assert_eq!(refused[0].as_str(), "SBH-2003");
+        assert_eq!(during, (1, 1024));
+        for (target, exists) in target_existence {
+            assert_eq!(
+                exists,
+                admitted
+                    .iter()
+                    .any(|admitted_target| admitted_target.as_path() == target.as_path()),
+                "only the admitted lease may create its target: {}",
+                target.display()
+            );
+        }
+        assert_eq!(active_reservations(root.path()).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn emergency_reserve_refuses_before_target_or_target_sidecars_exist() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("reserve-refused");
+        let sidecars = sidecar_paths(&target).unwrap();
+        let mut policy = test_policy();
+        policy.emergency_reserve_bytes = u64::MAX;
+
+        let error = ActiveLease::acquire_with_policy(
+            &[root.path().to_path_buf()],
+            &target,
+            Duration::from_secs(30),
+            4096,
+            policy,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "SBH-2003");
+        assert!(!target.exists());
+        assert!(!sidecars.lock.exists());
+        assert!(!sidecars.metadata.exists());
     }
 }
