@@ -36,6 +36,8 @@ use crate::scanner::walker;
 
 /// Configuration for the deletion executor.
 #[derive(Debug, Clone)]
+// Independent operator toggles on a config struct, not an encoded state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct DeletionConfig {
     /// Maximum candidates to delete in one batch before re-checking pressure.
     pub max_batch_size: usize,
@@ -51,6 +53,18 @@ pub struct DeletionConfig {
     pub check_open_files: bool,
     /// Whether deletion candidates must carry a scanner-observed filesystem identity.
     pub require_identity: bool,
+    /// Emergency escalation: also plan candidates whose decision-theoretic
+    /// outcome is `Review` (score cleared `min_score`, no veto, but the
+    /// keep-vs-delete loss margin was too ambiguous for automatic deletion).
+    ///
+    /// Normal `clean`/daemon runs keep this `false`: `Review` means "a human
+    /// should look". `sbh emergency` sets it `true` — on a critically full disk
+    /// the operator IS looking (interactive confirm or explicit `--yes`), and a
+    /// corpus that is 100% `Review` must not make the last line of defence a
+    /// no-op (#18). Every hard safety rail still applies: vetoes, sacred paths,
+    /// `.sbh-protect` markers, and all pre-flight checks (`.git`, Cargo
+    /// manifests, source-tree heuristics, open files, active leases).
+    pub include_review: bool,
 }
 
 impl Default for DeletionConfig {
@@ -63,6 +77,7 @@ impl Default for DeletionConfig {
             circuit_breaker_cooldown: Duration::from_secs(30),
             check_open_files: true,
             require_identity: false,
+            include_review: false,
         }
     }
 }
@@ -302,21 +317,33 @@ impl DeletionExecutor {
 
     /// Build a deletion plan from scored candidates.
     ///
-    /// Filters to only actionable candidates (decision=Delete, not vetoed,
-    /// above score threshold), then sorts by score descending.
+    /// Filters to only actionable candidates (decision=Delete — plus Review
+    /// when `include_review` is set for emergency escalation — not vetoed,
+    /// above score threshold), then sorts unambiguous Delete decisions before
+    /// Review escalations, by score descending within each group.
     pub fn plan(&self, mut candidates: Vec<CandidacyScore>) -> DeletionPlan {
-        // Filter: only Delete decisions, not vetoed, above threshold.
+        // Filter: only actionable decisions, not vetoed, above threshold.
+        // `Keep` and vetoed candidates are never plannable, in any mode.
         candidates.retain(|c| {
-            c.decision.action == DecisionAction::Delete
-                && !c.vetoed
-                && c.total_score >= self.config.min_score
+            let actionable = match c.decision.action {
+                DecisionAction::Delete => true,
+                DecisionAction::Review => self.config.include_review,
+                DecisionAction::Keep => false,
+            };
+            actionable && !c.vetoed && c.total_score >= self.config.min_score
         });
 
-        // Sort by score descending (most obvious artifacts first).
+        // Sort: unambiguous Delete decisions first, then Review escalations,
+        // score descending within each group (most obvious artifacts first) —
+        // so a batch/target limit spends its budget on the safest candidates.
         candidates.sort_by(|a, b| {
-            b.total_score
-                .partial_cmp(&a.total_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let rank =
+                |c: &CandidacyScore| usize::from(c.decision.action != DecisionAction::Delete);
+            rank(a).cmp(&rank(b)).then_with(|| {
+                b.total_score
+                    .partial_cmp(&a.total_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
 
         let total_reclaimable_bytes: u64 = candidates.iter().map(|c| c.size_bytes).sum();
@@ -1152,6 +1179,122 @@ mod tests {
         assert_eq!(plan.total_reclaimable_bytes, 2000);
     }
 
+    // --- emergency escalation of Review decisions (#18) --------------------
+    //
+    // Regression cover for: `sbh emergency` finding candidates and freeing 0
+    // bytes because every candidate's decision-theoretic outcome was `Review`
+    // and the planner only admitted `Delete`. Emergency mode sets
+    // `include_review` so a 100%-Review corpus cannot no-op the last line of
+    // defence; clean keeps the conservative default.
+
+    fn make_review_candidate(path: &Path, size: u64, score: f64) -> CandidacyScore {
+        let mut candidate = make_candidate(path, size, score);
+        candidate.decision.action = DecisionAction::Review;
+        candidate
+    }
+
+    #[test]
+    fn plan_excludes_review_decisions_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = make_review_candidate(&dir.path().join("ambiguous"), 4096, 0.85);
+
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let plan = executor.plan(vec![candidate]);
+
+        assert!(
+            plan.candidates.is_empty(),
+            "clean/daemon planning must keep holding Review candidates for a human"
+        );
+        assert_eq!(plan.total_reclaimable_bytes, 0);
+    }
+
+    #[test]
+    fn emergency_plan_includes_review_and_orders_delete_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let review_path = dir.path().join("ambiguous");
+        let delete_path = dir.path().join("obvious");
+
+        // Review outscores Delete — ordering must still put the unambiguous
+        // Delete decision first so a batch/target limit spends its budget on
+        // the safest candidate.
+        let review = make_review_candidate(&review_path, 4096, 0.95);
+        let delete = make_candidate(&delete_path, 1024, 0.80);
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                include_review: true,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![review, delete]);
+
+        assert_eq!(plan.candidates.len(), 2);
+        assert_eq!(plan.candidates[0].path, delete_path);
+        assert_eq!(plan.candidates[0].decision.action, DecisionAction::Delete);
+        assert_eq!(plan.candidates[1].path, review_path);
+        assert_eq!(plan.candidates[1].decision.action, DecisionAction::Review);
+        assert_eq!(plan.total_reclaimable_bytes, 4096 + 1024);
+    }
+
+    #[test]
+    fn emergency_escalation_never_plans_vetoed_keep_or_subthreshold() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut vetoed = make_review_candidate(&dir.path().join("vetoed"), 4096, 0.9);
+        vetoed.vetoed = true;
+
+        let mut keep = make_candidate(&dir.path().join("keep"), 4096, 0.9);
+        keep.decision.action = DecisionAction::Keep;
+
+        let subthreshold = make_review_candidate(&dir.path().join("weak"), 4096, 0.2);
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                include_review: true,
+                min_score: 0.5,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![vetoed, keep, subthreshold]);
+
+        assert!(
+            plan.candidates.is_empty(),
+            "escalation must widen only the Review gate, never vetoes, Keep, or min_score"
+        );
+    }
+
+    #[test]
+    fn emergency_execute_frees_bytes_from_review_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A real artifact tree whose only classification is Review.
+        let target_dir = dir.path().join("stale_target");
+        fs::create_dir_all(target_dir.join("debug")).unwrap();
+        fs::write(target_dir.join("debug/build.o"), "object file").unwrap();
+        let candidate = make_review_candidate(&target_dir, 11, 0.85);
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                include_review: true,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![candidate]);
+        assert_eq!(plan.estimated_items, 1);
+
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.items_skipped, 0);
+        assert_eq!(report.bytes_freed, 11);
+        assert!(!target_dir.exists());
+        assert!(report.skipped_by_reason.is_empty());
+        assert!(!report.stalled());
+    }
+
     // --- skip attribution (#18) -------------------------------------------
     //
     // Regression cover for: a run that finds N candidates, skips all N, and
@@ -1165,8 +1308,8 @@ mod tests {
         let keys: std::collections::HashSet<&str> = all.iter().map(|r| r.as_str()).collect();
         assert_eq!(keys.len(), all.len(), "skip reason keys must be unique");
         for r in all {
-            assert!(!r.as_str().is_empty());
-            assert!(!r.explanation().is_empty());
+            assert_ne!(r.as_str(), "");
+            assert_ne!(r.explanation(), "");
             // Keys are a machine contract: lowercase snake_case only.
             assert!(
                 r.as_str()

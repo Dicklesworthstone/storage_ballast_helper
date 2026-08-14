@@ -1347,6 +1347,8 @@ When a disk is at 99%+ utilization, normal operations may fail because they need
 
 The emergency command scans the specified paths, scores candidates using the standard multi-factor engine, and presents them for immediate deletion. With `--yes`, it executes deletions immediately without interactive confirmation, prioritizing the highest-scoring candidates until the target free space is reached or all candidates are exhausted.
 
+**Emergency escalation:** unlike `sbh clean`, emergency mode also acts on candidates whose decision-theoretic outcome is `Review` (score cleared the threshold and nothing vetoed them, but the keep-vs-delete loss margin was too ambiguous for unattended deletion). `Review` means "a human should look" — in emergency mode the human *is* looking, via the interactive confirmation or an explicit `--yes`. Without this escalation, a candidate corpus that is 100% `Review` would make the last line of defence a silent no-op on a critically full disk. Unambiguous `Delete` decisions are still executed first; every hard safety rail (vetoes, sacred paths, `.sbh-protect` markers, and the `.git`/Cargo-manifest/source-tree/open-file/active-lease pre-flight checks) applies unchanged.
+
 A completely full disk is precisely the situation where most cleanup tools fail, since they need to write temp files or state. By reducing to pure in-memory scoring and direct unlink calls, `sbh emergency` can recover a system that nothing else can touch.
 
 ### Scanner Indexes

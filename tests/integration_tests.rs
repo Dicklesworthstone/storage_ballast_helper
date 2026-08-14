@@ -135,18 +135,25 @@ fn subcommand_help_flags_work() {
 #[test]
 fn active_target_lease_cli_binds_lifetime_renewal_and_machine_status() {
     let fixture = tempfile::tempdir().expect("create active lease fixture");
-    let scan_root = fixture.path().join("scan-root");
+    // Canonicalize: the lease exports the CANONICAL target path to the child
+    // environment, and macOS tempdirs sit behind the /var -> /private/var
+    // symlink, so lexical fixture paths would never compare equal.
+    let fixture_path = fixture
+        .path()
+        .canonicalize()
+        .expect("canonicalize active lease fixture");
+    let scan_root = fixture_path.join("scan-root");
     fs::create_dir(&scan_root).expect("create scan root");
     let target = scan_root.join("leased-build");
-    let config_path = fixture.path().join("sbh.toml");
+    let config_path = fixture_path.join("sbh.toml");
     fs::write(
         &config_path,
         format!("[scanner]\nroot_paths = [\"{}\"]\n", toml_path(&scan_root)),
     )
     .expect("write active lease config");
-    let active_status_path = fixture.path().join("active-status.json");
-    let renewal_path = fixture.path().join("renewal.json");
-    let token_path = fixture.path().join("raw-token.test-only");
+    let active_status_path = fixture_path.join("active-status.json");
+    let renewal_path = fixture_path.join("renewal.json");
+    let token_path = fixture_path.join("raw-token.test-only");
     let binary = common::sbh_bin_path();
     let script = r#"
 set -eu
@@ -3764,6 +3771,7 @@ fn dry_run_deletes_nothing() {
             circuit_breaker_cooldown: Duration::from_secs(1),
             check_open_files: false,
             require_identity: false,
+            include_review: false,
         },
         None,
     );

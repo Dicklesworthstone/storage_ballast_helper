@@ -9701,6 +9701,13 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         check_open_files: true,
         require_identity: matches!(config.scanner.engine, ScannerEngineMode::V2),
         circuit_breaker_threshold: u32::MAX, // Effectively disabled.
+        // Emergency escalation (#18): also act on `Review`-classified
+        // candidates. On a critically full disk a corpus that is 100% Review
+        // must not turn the last line of defence into a no-op; the operator
+        // still confirms (interactively or via --yes) and every hard safety
+        // rail (vetoes, markers, .git/manifest/source/open-file pre-flight)
+        // still applies.
+        include_review: true,
         ..Default::default()
     };
     let executor = DeletionExecutor::new(deletion_config, None);
@@ -9749,7 +9756,10 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             scan_elapsed.as_secs_f64(),
         );
         eprintln!(
-            "Config-level protections are not active in emergency mode. Only .sbh-protect marker files are honored.\n"
+            "Config-level protections are not active in emergency mode. Only .sbh-protect marker files are honored."
+        );
+        eprintln!(
+            "Emergency escalation: Review-classified candidates are eligible for deletion (clean would hold them for manual review).\n"
         );
         eprintln!("Candidates for deletion:\n");
         print_deletion_plan(&plan);
