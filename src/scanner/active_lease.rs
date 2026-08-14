@@ -387,6 +387,20 @@ pub fn inspect_path(path: &Path) -> Option<ActiveLeaseInspection> {
             return Some(inspection);
         }
     }
+    // Leases are recorded under the acquire-time CANONICAL target (sidecar
+    // digests key on it), so a lexical-only probe misses a lease whenever the
+    // query path reaches the target through a symlinked ancestor (e.g. macOS
+    // `/var` -> `/private/var`, or `/tmp` -> tmpfs redirects). That would make
+    // a safety check fail open. Probe the canonical form too when it differs.
+    if let Ok(canonical) = absolute.canonicalize()
+        && canonical != absolute
+    {
+        for cursor in canonical.ancestors() {
+            if let Some(inspection) = inspect_exact_target(cursor) {
+                return Some(inspection);
+            }
+        }
+    }
     None
 }
 
@@ -810,9 +824,10 @@ fn available_bytes(path: &Path) -> Result<u64> {
         path: path.to_path_buf(),
         details: error.to_string(),
     })?;
-    Ok(stats
-        .blocks_available()
-        .saturating_mul(stats.fragment_size()))
+    // statvfs field widths differ per platform (u32 on macOS, u64 on Linux);
+    // widen losslessly through u128 so this compiles warning-free on both.
+    let bytes = u128::from(stats.blocks_available()) * u128::from(stats.fragment_size());
+    Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
 }
 
 #[cfg(unix)]
@@ -935,9 +950,13 @@ mod tests {
     #[test]
     fn live_lock_protects_target_and_descendants_then_releases() {
         let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("build-output");
+        // Match production callers: leases key sidecars on the CANONICAL
+        // target, and macOS tempdirs live behind the /var -> /private/var
+        // symlink, so a lexical fixture path would never round-trip.
+        let root_path = root.path().canonicalize().unwrap();
+        let target = root_path.join("build-output");
         let lease = ActiveLease::acquire_with_policy(
-            &[root.path().to_path_buf()],
+            std::slice::from_ref(&root_path),
             &target,
             Duration::from_secs(30),
             4096,
@@ -1080,14 +1099,17 @@ mod tests {
     #[test]
     fn stale_corrupt_metadata_with_an_unlocked_sidecar_does_not_block_new_work() {
         let root = tempfile::tempdir().unwrap();
-        let stale_target = root.path().join("stale-target");
+        // Canonicalize so the fixture matches acquire-time canonical targets
+        // (macOS tempdirs sit behind the /var -> /private/var symlink).
+        let root_path = root.path().canonicalize().unwrap();
+        let stale_target = root_path.join("stale-target");
         let stale = sidecar_paths(&stale_target).unwrap();
         fs::write(&stale.metadata, b"{not valid json").unwrap();
         File::create(&stale.lock).unwrap();
 
-        let fresh_target = root.path().join("fresh-target");
+        let fresh_target = root_path.join("fresh-target");
         let lease = ActiveLease::acquire_with_policy(
-            &[root.path().to_path_buf()],
+            &[root_path],
             &fresh_target,
             Duration::from_secs(30),
             4096,
@@ -1159,6 +1181,9 @@ mod tests {
     #[test]
     fn concurrent_admission_preserves_root_caps_without_leaking_loser_target() {
         let root = tempfile::tempdir().unwrap();
+        // Canonicalize so registry scans and sidecar digests agree on macOS,
+        // where tempdirs sit behind the /var -> /private/var symlink.
+        let root_dir = root.path().canonicalize().unwrap();
         let mut policy = test_policy();
         policy.max_active_leases_per_root = 1;
         policy.max_bytes_per_lease = 1024;
@@ -1169,7 +1194,7 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut workers = Vec::new();
         for name in ["first", "second"] {
-            let worker_root = root.path().to_path_buf();
+            let worker_root = root_dir.clone();
             let worker_start = std::sync::Arc::clone(&start);
             let worker_finish = std::sync::Arc::clone(&finish);
             let worker_sender = sender.clone();
@@ -1196,7 +1221,7 @@ mod tests {
 
         start.wait();
         let reports = [receiver.recv().unwrap(), receiver.recv().unwrap()];
-        let during = active_reservations(root.path()).unwrap();
+        let during = active_reservations(&root_dir).unwrap();
         let target_existence = reports
             .iter()
             .map(|(target, _)| (target.clone(), target.exists()))
@@ -1228,7 +1253,7 @@ mod tests {
                 target.display()
             );
         }
-        assert_eq!(active_reservations(root.path()).unwrap(), (0, 0));
+        assert_eq!(active_reservations(&root_dir).unwrap(), (0, 0));
     }
 
     #[test]
