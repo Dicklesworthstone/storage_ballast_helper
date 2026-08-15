@@ -13,3 +13,11 @@ last-touched
 # Local history and repair backups
 .br_history/
 .br_recovery/
+
+# br fsqlite-ns VFS sidecars + vacuum copies
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+
+# WAL certification sidecars (`*.db-wal` does not match these)
+*.db-wal-cert
+*.db-wal-cert-head
