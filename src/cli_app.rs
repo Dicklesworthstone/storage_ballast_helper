@@ -8572,6 +8572,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
         // Interactive mode.
         run_interactive_clean(
             cli,
+            &executor,
             &plan,
             args,
             &root_paths,
@@ -8888,6 +8889,7 @@ fn open_status_for_candidate(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_interactive_clean(
     cli: &Cli,
+    executor: &DeletionExecutor,
     plan: &DeletionPlan,
     args: &CleanArgs,
     _root_paths: &[PathBuf],
@@ -8967,20 +8969,38 @@ fn run_interactive_clean(
         };
 
         if action == 'y' {
-            // Re-check if path is still in use before deleting.
-            let (fresh_open_paths, _) =
+            // Collect a fresh open-file index for this candidate, then route
+            // through the executor's full pre-flight veto stack. A "y" (or
+            // "a") answer is consent, not a bypass: every safety rail that
+            // protects the --yes batch path applies here too.
+            let (fresh_open_paths, complete) =
                 collect_open_path_ancestors(std::slice::from_ref(&candidate.path));
-            if is_path_open_by_ancestor(&candidate.path, &fresh_open_paths) {
-                eprintln!("    Skipped (now in use): {}", candidate.path.display());
+            if !complete {
+                // Fail safe, mirroring the batch executor: if we cannot see
+                // which paths are open we cannot prove this one is closed.
+                eprintln!(
+                    "    Skipped (open-file scan incomplete): {}",
+                    candidate.path.display()
+                );
                 skips.record(storage_ballast_helper::scanner::deletion::SkipReason::FileOpen);
             } else {
-                match delete_single_candidate(candidate) {
-                    Ok(()) => {
+                match executor.delete_candidate_checked(candidate, Some(&fresh_open_paths)) {
+                    Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Deleted) => {
                         items_deleted += 1;
                         bytes_freed += candidate.size_bytes;
                         if !delete_all {
                             println!("    Deleted.");
                         }
+                    }
+                    Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Skipped(
+                        skip,
+                    )) => {
+                        eprintln!(
+                            "    Skipped ({}): {}",
+                            skip.explanation(),
+                            candidate.path.display()
+                        );
+                        skips.record(skip);
                     }
                     Err(e) => {
                         eprintln!("    Failed to delete {}: {e}", candidate.path.display());
@@ -9023,15 +9043,6 @@ fn run_interactive_clean(
     }
 
     Ok(())
-}
-
-/// Delete a single candidate path (file or directory).
-fn delete_single_candidate(candidate: &CandidacyScore) -> std::result::Result<(), String> {
-    if candidate.path.is_dir() {
-        std::fs::remove_dir_all(&candidate.path).map_err(|e| e.to_string())
-    } else {
-        std::fs::remove_file(&candidate.path).map_err(|e| e.to_string())
-    }
 }
 
 /// Interactive skip bookkeeping.
@@ -9806,7 +9817,15 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         }
     } else {
         // Interactive emergency cleanup.
-        run_interactive_emergency(cli, &plan, args, &root_paths, dir_count, scan_elapsed)?;
+        run_interactive_emergency(
+            cli,
+            &executor,
+            &plan,
+            args,
+            &root_paths,
+            dir_count,
+            scan_elapsed,
+        )?;
     }
 
     Ok(())
@@ -9820,6 +9839,7 @@ fn ongoing_protection_install_hint() -> &'static str {
 #[allow(clippy::too_many_lines)]
 fn run_interactive_emergency(
     cli: &Cli,
+    executor: &DeletionExecutor,
     plan: &DeletionPlan,
     args: &EmergencyArgs,
     _root_paths: &[PathBuf],
@@ -9888,16 +9908,44 @@ fn run_interactive_emergency(
         };
 
         if action == 'y' {
-            match delete_single_candidate(candidate) {
-                Ok(()) => {
-                    items_deleted += 1;
-                    bytes_freed += candidate.size_bytes;
-                    if !delete_all {
-                        eprintln!("    Deleted.");
+            // Route through the executor's full pre-flight veto stack, exactly
+            // like the --yes batch path. Emergency escalation (#18) makes
+            // Review-classified candidates *eligible*; it promises that every
+            // hard safety rail still applies, and this is where the interactive
+            // path keeps that promise (source-tree floor, active leases,
+            // .git/manifest/source markers, identity, open files).
+            let (fresh_open_paths, complete) =
+                collect_open_path_ancestors(std::slice::from_ref(&candidate.path));
+            if !complete {
+                // Fail safe, mirroring the batch executor: if we cannot see
+                // which paths are open we cannot prove this one is closed.
+                eprintln!(
+                    "    Skipped (open-file scan incomplete): {}",
+                    candidate.path.display()
+                );
+                skips.record(storage_ballast_helper::scanner::deletion::SkipReason::FileOpen);
+            } else {
+                match executor.delete_candidate_checked(candidate, Some(&fresh_open_paths)) {
+                    Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Deleted) => {
+                        items_deleted += 1;
+                        bytes_freed += candidate.size_bytes;
+                        if !delete_all {
+                            eprintln!("    Deleted.");
+                        }
                     }
-                }
-                Err(e) => {
-                    eprintln!("    Failed: {e}");
+                    Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Skipped(
+                        skip,
+                    )) => {
+                        eprintln!(
+                            "    Skipped ({}): {}",
+                            skip.explanation(),
+                            candidate.path.display()
+                        );
+                        skips.record(skip);
+                    }
+                    Err(e) => {
+                        eprintln!("    Failed: {e}");
+                    }
                 }
             }
         } else {

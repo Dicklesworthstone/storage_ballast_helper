@@ -301,6 +301,17 @@ fn should_backoff_skip(reason: SkipReason) -> bool {
     )
 }
 
+/// Outcome of a single checked deletion (`delete_candidate_checked`):
+/// either the candidate passed every pre-flight veto and was deleted, or a
+/// veto fired and nothing was touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedDeletion {
+    /// All pre-flight vetoes passed and the path was removed.
+    Deleted,
+    /// A pre-flight veto fired; the path was left untouched.
+    Skipped(SkipReason),
+}
+
 // ──────────────────── executor ────────────────────
 
 /// The deletion executor: takes scored candidates and deletes them safely.
@@ -543,6 +554,39 @@ impl DeletionExecutor {
 
         report.duration = start.elapsed();
         report
+    }
+
+    /// Delete one candidate through the full batch-mode safety stack: the
+    /// complete `preflight_check` veto suite (hardcoded source-tree floor,
+    /// active lease, symlink, identity, .git/manifest/source markers,
+    /// open-file index) followed by `delete_path`'s lease/symlink/identity
+    /// rechecks at the mutation point.
+    ///
+    /// Interactive flows MUST route accepted candidates through this instead
+    /// of deleting directly: operator confirmation widens *consent*, never the
+    /// safety rails. Emergency escalation (#18) explicitly promises that every
+    /// hard veto still applies to Review-classified candidates, and this is
+    /// the method that keeps that promise on the per-item paths.
+    ///
+    /// `open_paths` carries a fresh open-file ancestor index for the open-file
+    /// veto; pass `None` only when `check_open_files` is disabled.
+    pub fn delete_candidate_checked(
+        &self,
+        candidate: &CandidacyScore,
+        open_paths: Option<&HashSet<PathBuf>>,
+    ) -> Result<CheckedDeletion> {
+        // Fail closed if a dry-run executor ever reaches a mutating entry
+        // point: refuse rather than guess which mode the caller meant.
+        if self.config.dry_run {
+            return Err(SbhError::Runtime {
+                details: "delete_candidate_checked called on a dry-run executor".to_string(),
+            });
+        }
+        if let Err(skip) = self.preflight_check(candidate, open_paths) {
+            return Ok(CheckedDeletion::Skipped(skip));
+        }
+        self.delete_path(candidate)?;
+        Ok(CheckedDeletion::Deleted)
     }
 
     // ──────────────────── pre-flight checks ────────────────────
