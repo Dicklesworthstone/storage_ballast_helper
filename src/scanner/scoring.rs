@@ -719,6 +719,11 @@ fn factor_structure(signals: StructuralSignals) -> f64 {
     if signals.has_git {
         return 0.0;
     }
+    // A validated CACHEDIR.TAG root marker is a definitive regenerable-cache
+    // signal, independent of the directory's name or nested cargo markers.
+    if signals.has_cachedir_tag {
+        return 0.95;
+    }
     if signals.has_fingerprint || signals.has_incremental {
         return 0.95;
     }
@@ -1356,6 +1361,7 @@ mod tests {
                     has_git: false,
                     has_cargo_toml: false,
                     mostly_object_files: true,
+                    has_cachedir_tag: false,
                 },
                 active_references: ActiveReferenceSummary::default(),
                 is_open: false,
@@ -1372,6 +1378,80 @@ mod tests {
             DecisionAction::Keep,
             "high-confidence target should not be kept"
         );
+    }
+
+    fn cachedir_tagged_candidate(path: &str, is_open: bool, age: Duration) -> CandidateInput {
+        CandidateInput {
+            path: PathBuf::from(path),
+            size_bytes: 34 * 1_073_741_824,
+            age,
+            classification: ArtifactClassification {
+                pattern_name: Cow::Borrowed("cachedir-tagged-cache"),
+                category: ArtifactCategory::CacheDir,
+                name_confidence: 0.75,
+                structural_confidence: 0.95,
+                combined_confidence: 0.75,
+            },
+            signals: StructuralSignals {
+                has_cachedir_tag: true,
+                ..StructuralSignals::default()
+            },
+            active_references: ActiveReferenceSummary::default(),
+            is_open,
+            excluded: false,
+        }
+    }
+
+    #[test]
+    fn cachedir_tagged_cache_without_name_match_is_actionable() {
+        // bd-k0t3r: a 34 GB build cache under an arbitrary name ("srw") that
+        // matched no `rch_target_*`/target pattern, but carries a validated root
+        // CACHEDIR.TAG. Stale and unopened, it must be reclaimable.
+        let engine = default_engine();
+        let score = engine.score_candidate(
+            &cachedir_tagged_candidate("/data/tmp/srw", false, Duration::from_hours(48)),
+            0.7,
+        );
+        assert!(
+            !score.vetoed,
+            "a stale, unopened, cachedir-tagged cache must not be vetoed: {:?}",
+            score.veto_reason
+        );
+        assert!(score.total_score > 1.0);
+        assert_ne!(
+            score.decision.action,
+            DecisionAction::Keep,
+            "an arbitrarily-named tagged cache should be actionable"
+        );
+    }
+
+    #[test]
+    fn cachedir_tagged_cache_held_open_is_spared() {
+        // A live build holds an fd into its target — the open-file veto must
+        // still protect it even though the CACHEDIR.TAG makes it look reclaimable.
+        let engine = default_engine();
+        let score = engine.score_candidate(
+            &cachedir_tagged_candidate("/data/tmp/srw", true, Duration::from_hours(48)),
+            0.9,
+        );
+        assert!(score.vetoed, "an open cachedir-tagged cache must be spared");
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+    }
+
+    #[test]
+    fn fresh_cachedir_tagged_cache_is_spared_by_min_age() {
+        // A build that just wrote its CACHEDIR.TAG must not be reaped mid-flight;
+        // the minimum-age veto is the brake.
+        let engine = default_engine();
+        let score = engine.score_candidate(
+            &cachedir_tagged_candidate("/data/tmp/srw", false, Duration::from_secs(30)),
+            0.9,
+        );
+        assert!(
+            score.vetoed,
+            "a freshly-written tagged cache must be spared"
+        );
+        assert_eq!(score.decision.action, DecisionAction::Keep);
     }
 
     #[test]
@@ -1568,6 +1648,7 @@ mod tests {
                 has_git: false,
                 has_cargo_toml: false,
                 mostly_object_files: true,
+                has_cachedir_tag: false,
             },
             active_references: ActiveReferenceSummary::default(),
             is_open: false,
@@ -1596,6 +1677,7 @@ mod tests {
                 has_git: false,
                 has_cargo_toml: false,
                 mostly_object_files: false,
+                has_cachedir_tag: false,
             },
             active_references: ActiveReferenceSummary::default(),
             is_open: false,
@@ -1741,6 +1823,7 @@ mod tests {
                 has_git: false,
                 has_cargo_toml: false,
                 mostly_object_files: false,
+                has_cachedir_tag: false,
             },
             active_references: ActiveReferenceSummary::default(),
             is_open: false,
@@ -1824,6 +1907,7 @@ mod tests {
                     has_git: false,
                     has_cargo_toml: false,
                     mostly_object_files: false,
+                    has_cachedir_tag: false,
                 },
                 active_references: ActiveReferenceSummary::default(),
                 is_open: false,

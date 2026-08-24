@@ -496,6 +496,18 @@ fn process_directory(
                 "build" => signals.has_build = true,
                 ".fingerprint" => signals.has_fingerprint = true,
                 ".git" => signals.has_git = true,
+                // Root-level cache-directory tag (Cache Directory Tagging
+                // Standard, case-sensitive uppercase per the spec). This is the
+                // one signal that identifies an arbitrarily-named build cache —
+                // whose deps/incremental/.fingerprint markers live one level
+                // deeper under debug/ and release/ — without a name match.
+                // Validate the signature line so an unrelated file that merely
+                // shares the name cannot mark a directory reclaimable.
+                "CACHEDIR.TAG" => {
+                    if is_valid_cachedir_tag(&child_path) {
+                        signals.has_cachedir_tag = true;
+                    }
+                }
                 "cargo.toml" | "Cargo.toml" => signals.has_cargo_toml = true,
                 "package.json"
                 | "package-lock.json"
@@ -689,6 +701,10 @@ fn signals_from_children(child_names: &[String]) -> StructuralSignals {
             ".fingerprint" => signals.has_fingerprint = true,
             ".git" => signals.has_git = true,
             "cargo.toml" => signals.has_cargo_toml = true,
+            // Presence-only in this name-list helper (the live walker validates
+            // the tag's signature). The spec name is uppercase CACHEDIR.TAG;
+            // this helper receives already-lowercased names.
+            "cachedir.tag" => signals.has_cachedir_tag = true,
             _ => {}
         }
         // Names are already lowercased, so case-insensitive matching is not needed.
@@ -705,6 +721,31 @@ fn signals_from_children(child_names: &[String]) -> StructuralSignals {
     }
 
     signals
+}
+
+/// The mandatory signature line that opens a `CACHEDIR.TAG` file, per the Cache
+/// Directory Tagging Standard (<https://bford.info/cachedir/>). A conforming
+/// file's contents begin with exactly these 43 bytes.
+const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Returns true when `path` is a valid `CACHEDIR.TAG` file — i.e. its contents
+/// begin with the standard signature line. The read is bounded to the signature
+/// length so a large or adversarial file that merely shares the name cannot cost
+/// more than a couple of hundred bytes of I/O, and cannot falsely mark a
+/// directory as a reclaimable cache.
+fn is_valid_cachedir_tag(path: &Path) -> bool {
+    use std::io::Read;
+
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; CACHEDIR_TAG_SIGNATURE.len()];
+    // `read_exact` fills the whole buffer or fails; a file shorter than the
+    // signature cannot be a valid tag, so a short read is a clean rejection.
+    if file.read_exact(&mut buf).is_err() {
+        return false;
+    }
+    buf == CACHEDIR_TAG_SIGNATURE
 }
 
 /// Allocated on-disk size of an entry in bytes.
@@ -1986,6 +2027,73 @@ mod tests {
         assert!(target_entry.structural_signals.has_incremental);
         assert!(target_entry.structural_signals.has_deps);
         assert!(target_entry.structural_signals.has_fingerprint);
+    }
+
+    const VALID_CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n# For information about cache directory tags see https://bford.info/cachedir/\n";
+
+    #[test]
+    fn collects_cachedir_tag_signal_on_arbitrarily_named_dir() {
+        // The whole point of bd-k0t3r: a build cache under an arbitrary name
+        // (here "srw", which matches no `rch_target_*`/target pattern) whose
+        // real cargo markers live one level down under debug/ and release/ must
+        // still be detected — via the root CACHEDIR.TAG cargo writes.
+        let tmp = TempDir::new().unwrap();
+        let cache_dir = tmp.path().join("srw");
+        fs::create_dir_all(cache_dir.join("debug").join("deps")).unwrap();
+        fs::create_dir_all(cache_dir.join("release")).unwrap();
+        fs::write(cache_dir.join("CACHEDIR.TAG"), VALID_CACHEDIR_TAG).unwrap();
+
+        let config = test_config(tmp.path());
+        let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+        let entries = walker.walk().unwrap();
+
+        let cache_entry = entries.iter().find(|e| e.path == cache_dir).unwrap();
+        assert!(
+            cache_entry.structural_signals.has_cachedir_tag,
+            "root CACHEDIR.TAG should set has_cachedir_tag regardless of dir name"
+        );
+        assert!(
+            cache_entry.structural_signals.has_strong_signal(),
+            "a validated CACHEDIR.TAG is a strong build/cache signal on its own"
+        );
+    }
+
+    #[test]
+    fn cachedir_tag_with_wrong_signature_is_ignored() {
+        // A file that merely shares the name CACHEDIR.TAG but lacks the standard
+        // signature must NOT mark the directory reclaimable.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("looks-tagged");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("CACHEDIR.TAG"), "not the real signature\n").unwrap();
+
+        let config = test_config(tmp.path());
+        let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+        let entries = walker.walk().unwrap();
+
+        let entry = entries.iter().find(|e| e.path == dir).unwrap();
+        assert!(
+            !entry.structural_signals.has_cachedir_tag,
+            "a CACHEDIR.TAG without the standard signature must be ignored"
+        );
+    }
+
+    #[test]
+    fn is_valid_cachedir_tag_checks_signature() {
+        let tmp = TempDir::new().unwrap();
+        let good = tmp.path().join("good.tag");
+        fs::write(&good, VALID_CACHEDIR_TAG).unwrap();
+        assert!(is_valid_cachedir_tag(&good));
+
+        let bad = tmp.path().join("bad.tag");
+        fs::write(&bad, "Signature: deadbeef\n").unwrap();
+        assert!(!is_valid_cachedir_tag(&bad));
+
+        let short = tmp.path().join("short.tag");
+        fs::write(&short, "Signature:").unwrap();
+        assert!(!is_valid_cachedir_tag(&short));
+
+        assert!(!is_valid_cachedir_tag(&tmp.path().join("absent.tag")));
     }
 
     #[test]

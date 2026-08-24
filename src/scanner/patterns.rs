@@ -38,6 +38,15 @@ pub struct StructuralSignals {
     pub has_git: bool,
     pub has_cargo_toml: bool,
     pub mostly_object_files: bool,
+    /// A validated `CACHEDIR.TAG` file (per the Cache Directory Tagging
+    /// Standard, <https://bford.info/cachedir/>) sits at this directory's root.
+    /// Cargo, restic, borg, and many other tools write it precisely so that
+    /// cache reclaimers can find regenerable build/cache trees regardless of
+    /// the directory's *name*. This is the definitive, name-independent,
+    /// root-level signal the daemon uses to reclaim arbitrarily-named build
+    /// caches (e.g. `srw`, `p4-verify`, the shared `cargo-target`) that never
+    /// matched the old `rch_target_*` name predicate.
+    pub has_cachedir_tag: bool,
 }
 
 impl StructuralSignals {
@@ -46,6 +55,11 @@ impl StructuralSignals {
     /// object files).
     #[must_use]
     pub fn has_strong_signal(&self) -> bool {
+        // A validated CACHEDIR.TAG is a definitive, name-independent marker of a
+        // regenerable cache directory — on its own it is a strong signal.
+        if self.has_cachedir_tag {
+            return true;
+        }
         // Two or more Rust-specific markers = strong signal.
         let rust_markers = u8::from(self.has_incremental)
             + u8::from(self.has_deps)
@@ -650,6 +664,25 @@ impl ArtifactPatternRegistry {
                 structural_confidence: 0.0,
                 combined_confidence: rescue_confidence,
             };
+        } else if best.category == ArtifactCategory::Unknown && signals.has_cachedir_tag {
+            // Name-agnostic rescue: the directory carries a validated
+            // CACHEDIR.TAG at its root (per the Cache Directory Tagging
+            // Standard) but its *name* matched no artifact pattern — exactly
+            // the arbitrarily-named build caches (`srw`, `p4-verify`, a shared
+            // `cargo-target` whose deps/incremental/.fingerprint markers live
+            // one level down under debug/ and release/) that the old
+            // `rch_target_*` name predicate could never see. The tag is the
+            // canonical "regenerable cache, safe to reclaim" marker, so treat
+            // it as a definitive CacheDir. The remaining safety gates (`.git`,
+            // held fds, minimum age, and the multi-factor decision layer) still
+            // apply on top of this classification.
+            best = ArtifactClassification {
+                pattern_name: Cow::Borrowed("cachedir-tagged-cache"),
+                category: ArtifactCategory::CacheDir,
+                name_confidence: 0.75,
+                structural_confidence: 0.0,
+                combined_confidence: 0.75,
+            };
         }
 
         let structural = structural_score(best.category, signals);
@@ -747,6 +780,12 @@ fn cleanup_rule_category(rule: &CleanupRule) -> ArtifactCategory {
 fn structural_score(category: ArtifactCategory, signals: StructuralSignals) -> f64 {
     if signals.has_git {
         return 0.0;
+    }
+    // A validated CACHEDIR.TAG at the root is a definitive, name-independent
+    // marker that the directory is a regenerable cache — score it strongly
+    // regardless of category so arbitrarily-named build caches are reclaimable.
+    if signals.has_cachedir_tag {
+        return 0.95;
     }
     match category {
         ArtifactCategory::RustTarget => {
@@ -1286,7 +1325,7 @@ mod tests {
         ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, CustomPattern,
         OpaqueTreeContext, OpaqueTreeDisposition, StructuralSignals, classify_opaque_tree,
         extract_pattern_label, extract_pattern_label_with_cleanup_rules,
-        has_descriptive_target_suffix, is_obvious_build_artifact_basename,
+        has_descriptive_target_suffix, is_obvious_build_artifact_basename, structural_score,
     };
     use crate::platform::{linux, macos};
     use std::path::Path;
@@ -1333,6 +1372,80 @@ mod tests {
         let classification = registry.classify(Path::new("target"), StructuralSignals::default());
         assert_eq!(classification.category, ArtifactCategory::RustTarget);
         assert!(classification.combined_confidence < 0.80);
+    }
+
+    #[test]
+    fn cachedir_tag_alone_is_a_strong_signal() {
+        let signals = StructuralSignals {
+            has_cachedir_tag: true,
+            ..StructuralSignals::default()
+        };
+        assert!(signals.has_strong_signal());
+        // Even next to a Cargo.toml (contrived), the tag keeps it strong so the
+        // "Cargo.toml without build markers" veto does not fire on a tagged cache.
+        let with_manifest = StructuralSignals {
+            has_cachedir_tag: true,
+            has_cargo_toml: true,
+            ..StructuralSignals::default()
+        };
+        assert!(with_manifest.has_strong_signal());
+    }
+
+    #[test]
+    fn cachedir_tag_rescues_arbitrarily_named_dir_as_cachedir() {
+        let registry = ArtifactPatternRegistry::default();
+        // A name that matches no artifact pattern, but the dir carries a
+        // validated root CACHEDIR.TAG (marker set by the walker).
+        let classification = registry.classify(
+            Path::new("/data/tmp/srw"),
+            StructuralSignals {
+                has_cachedir_tag: true,
+                ..StructuralSignals::default()
+            },
+        );
+        assert_eq!(classification.pattern_name, "cachedir-tagged-cache");
+        assert_eq!(classification.category, ArtifactCategory::CacheDir);
+        assert!(classification.structural_confidence > 0.90);
+        assert!(classification.combined_confidence > 0.70);
+    }
+
+    #[test]
+    fn cachedir_tag_does_not_override_a_matched_name() {
+        let registry = ArtifactPatternRegistry::default();
+        // node_modules matches by name; the tag must not downgrade it to CacheDir.
+        let classification = registry.classify(
+            Path::new("node_modules"),
+            StructuralSignals {
+                has_cachedir_tag: true,
+                ..StructuralSignals::default()
+            },
+        );
+        assert_eq!(classification.category, ArtifactCategory::NodeModules);
+    }
+
+    #[test]
+    fn cachedir_tag_gives_high_structural_score() {
+        assert!(
+            structural_score(
+                ArtifactCategory::CacheDir,
+                StructuralSignals {
+                    has_cachedir_tag: true,
+                    ..StructuralSignals::default()
+                }
+            ) > 0.90
+        );
+        // But .git still wins — never score a checkout as reclaimable.
+        assert_eq!(
+            structural_score(
+                ArtifactCategory::CacheDir,
+                StructuralSignals {
+                    has_cachedir_tag: true,
+                    has_git: true,
+                    ..StructuralSignals::default()
+                }
+            ),
+            0.0
+        );
     }
 
     #[test]
