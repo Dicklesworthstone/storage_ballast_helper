@@ -106,6 +106,7 @@ fn make_candidate(idx: usize, age_hours: u64, size_gib: u64) -> CandidateInput {
             has_git: false,
             has_cargo_toml: false,
             mostly_object_files: true,
+            has_cachedir_tag: false,
         },
         active_references: ActiveReferenceSummary::default(),
         is_open: false,

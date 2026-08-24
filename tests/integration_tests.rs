@@ -2841,6 +2841,7 @@ proptest! {
             has_git: false,
             has_cargo_toml: false,
             mostly_object_files,
+            has_cachedir_tag: false,
         };
         let registry = ArtifactPatternRegistry::default();
         let engine = ScoringEngine::from_config(&ScoringConfig::default(), 30);
@@ -4055,6 +4056,7 @@ fn e2e_candidate(path: &str, size_gb: u64, age_hours: u64, confidence: f64) -> C
             has_git: false,
             has_cargo_toml: false,
             mostly_object_files: true,
+            has_cachedir_tag: false,
         },
         active_references: ActiveReferenceSummary::default(),
         is_open: false,
