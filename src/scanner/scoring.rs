@@ -426,10 +426,8 @@ impl ScoringEngine {
         if is_system_path(&input.path) {
             return Some(Cow::Borrowed("system path is never deletable"));
         }
-        if is_rch_pooled_target(&input.path) {
-            return Some(Cow::Borrowed(
-                "rch pooled target dir is a shared warm build cache (rch never reaps these)",
-            ));
+        if let Some(reason) = rch_target_veto_reason(&input.path) {
+            return Some(reason);
         }
         if input.signals.has_cargo_toml
             && !input.signals.has_strong_signal()
@@ -505,6 +503,158 @@ impl ScoringEngine {
                 summary: "hard veto applied".to_string(),
             },
         }
+    }
+}
+
+/// Which kind of rch-managed remote `CARGO_TARGET_DIR` a path is, if any.
+///
+/// rch names every forwarded target dir `.rch-target-<worker>-<marker>-<key>`,
+/// where the marker is one of `job` / `pid` (one build) or `pool` (the default:
+/// a dir REUSED across every future job with the same build dimensions).
+/// See `rch-common/src/stale_target_reap.rs` — `REAP_GLOBS` is exactly
+/// `.rch-target-*-job-*`, `.rch-target-*-pid-*`, `.rch-target-*-pool-*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RchTargetKind {
+    /// `-job-` / `-pid-`: scoped to a single dispatch.
+    PerJob,
+    /// `-pool-`: a long-lived warm cache shared by concurrent and future jobs.
+    Pooled,
+}
+
+impl RchTargetKind {
+    /// Idle time rch itself requires before reclaiming this kind of dir.
+    ///
+    /// Mirrors `rch-common::remediation_config`:
+    /// `DEFAULT_POOLED_REAPER_IDLE_HOURS = 12` for per-job dirs and
+    /// `DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS = 168` (7 days) for pooled ones.
+    /// rch validates that the pooled floor is never set below 24h, because
+    /// "pooled dirs are warm caches, not short-TTL targets".
+    const fn required_idle(self) -> Duration {
+        match self {
+            Self::PerJob => Duration::from_secs(12 * 3600),
+            Self::Pooled => Duration::from_secs(168 * 3600),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PerJob => "per-job",
+            Self::Pooled => "pooled",
+        }
+    }
+}
+
+/// Classify a path as an rch-managed target dir by its basename.
+#[must_use]
+pub fn classify_rch_target(path: &Path) -> Option<RchTargetKind> {
+    let name = path.file_name()?.to_str()?;
+    // Accept the dotted form rch actually emits plus the undotted variant, and
+    // the legacy underscore spelling, so a naming change upstream degrades to
+    // "protected" rather than "silently reclaimable".
+    let stem = name.strip_prefix('.').unwrap_or(name);
+    if !(stem.starts_with("rch-target-") || stem.starts_with("rch_target_")) {
+        return None;
+    }
+    if stem.contains("-pool-") || stem.contains("_pool_") {
+        return Some(RchTargetKind::Pooled);
+    }
+    if stem.contains("-job-")
+        || stem.contains("_job_")
+        || stem.contains("-pid-")
+        || stem.contains("_pid_")
+    {
+        return Some(RchTargetKind::PerJob);
+    }
+    // An rch target dir whose marker we don't recognise: treat it as the most
+    // conservative kind rather than falling through to name/size scoring.
+    Some(RchTargetKind::Pooled)
+}
+
+/// Bound on the idle probe below. An active build touches files constantly, so
+/// the early exit fires almost immediately in the dangerous case; this cap only
+/// governs how long we're willing to look before giving up (and refusing to
+/// delete).
+const RCH_IDLE_PROBE_MAX_ENTRIES: usize = 20_000;
+
+/// Outcome of asking "has anything in this tree been written recently?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeActivity {
+    /// Found a file modified within the window — the tree is in use.
+    Active,
+    /// Walked the whole tree; nothing was modified within the window.
+    IdleThroughout,
+    /// Could not decide (IO error, or the tree exceeded the probe budget).
+    Unknown,
+}
+
+/// Whether anything under `root` was modified within `window`.
+///
+/// This is deliberately *recursive*. `EntryMetadata::effective_age_timestamp`
+/// ages directories by birth time, which is right for ordinary build caches but
+/// catastrophic for rch pool dirs: a pool dir created days ago and rebuilt into
+/// continuously ever since still reports an age of days, so it scores as
+/// maximally abandoned while a build is actively writing to it. rch's own
+/// reaper instead asks whether the *tree* has seen file activity, and that is
+/// the question we have to answer too.
+fn rch_tree_activity(root: &Path, window: Duration) -> TreeActivity {
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(window) else {
+        return TreeActivity::Unknown;
+    };
+    let mut stack = vec![root.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            // Unreadable subtree: we cannot prove the dir is idle.
+            return TreeActivity::Unknown;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return TreeActivity::Unknown;
+            };
+            seen += 1;
+            if seen > RCH_IDLE_PROBE_MAX_ENTRIES {
+                return TreeActivity::Unknown;
+            }
+            // Symlinks are not followed: only real files in this tree count as
+            // activity, and following them could escape the tree entirely.
+            let Ok(meta) = entry.metadata() else {
+                return TreeActivity::Unknown;
+            };
+            if meta.is_symlink() {
+                continue;
+            }
+            if let Ok(modified) = meta.modified() {
+                if modified > cutoff {
+                    return TreeActivity::Active;
+                }
+            }
+            if meta.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    TreeActivity::IdleThroughout
+}
+
+/// Hard-veto rch target dirs unless they are idle past rch's own floor.
+///
+/// Deleting a live pool dir does not reclaim reusable space — it forces every
+/// subsequent dispatch sharing those build dimensions to rebuild the whole
+/// crate graph from cold, and can clip a build already in flight.
+fn rch_target_veto_reason(path: &Path) -> Option<Cow<'static, str>> {
+    let kind = classify_rch_target(path)?;
+    let required = kind.required_idle();
+    match rch_tree_activity(path, required) {
+        TreeActivity::IdleThroughout => None,
+        TreeActivity::Active => Some(Cow::Owned(format!(
+            "rch {} target dir has file activity within rch's {}h idle floor",
+            kind.label(),
+            required.as_secs() / 3600
+        ))),
+        TreeActivity::Unknown => Some(Cow::Owned(format!(
+            "rch {} target dir idleness could not be established",
+            kind.label()
+        ))),
     }
 }
 
