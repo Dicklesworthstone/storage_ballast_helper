@@ -426,6 +426,11 @@ impl ScoringEngine {
         if is_system_path(&input.path) {
             return Some(Cow::Borrowed("system path is never deletable"));
         }
+        if is_rch_pooled_target(&input.path) {
+            return Some(Cow::Borrowed(
+                "rch pooled target dir is a shared warm build cache (rch never reaps these)",
+            ));
+        }
         if input.signals.has_cargo_toml
             && !input.signals.has_strong_signal()
             && !cleanup_rule_allows_embedded_manifest(&input.classification)
