@@ -186,9 +186,11 @@ const OPAQUE_SIZE_PROBE_BUDGET: usize = 200_000;
 /// apparent length, so "reclaiming this frees N bytes" holds for sparse files.
 /// Iterative (no recursion depth risk), never follows symlinks, stays on the
 /// starting device unless `cross_devices`, honours `cancel`, and stops after
-/// `budget` entries. Returns the bytes counted and whether the walk completed;
-/// an incomplete or failed walk falls back to the floor at the call site so a
-/// truncated probe can never under-report a tree into looking trivial.
+/// `budget` entries. Returns the bytes counted and whether the walk completed.
+/// A partial result is still the best available LOWER BOUND, so the call site
+/// floors it at [`OPAQUE_CANDIDATE_SIZE_FLOOR`] rather than discarding it: a
+/// budget-truncated walk of a huge tree keeps its large partial total, while a
+/// walk that saw almost nothing cannot make that tree look trivial.
 fn opaque_tree_allocated_size(
     root: &Path,
     cross_devices: bool,
