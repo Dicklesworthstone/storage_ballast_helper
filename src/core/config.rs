@@ -172,6 +172,19 @@ pub struct ScannerConfig {
     /// cooldown forces a pause. Forced/operator scans and rising pressure (Red/
     /// Critical) bypass it. `0` disables the cooldown (legacy behavior).
     pub min_rescan_interval_secs: u64,
+    /// Ceiling on the share of wall-clock time the scanner may spend scanning,
+    /// as a percentage (1-100). `0` disables the limiter (legacy behavior).
+    ///
+    /// `min_rescan_interval_secs` only paces *unproductive* passes. On a
+    /// chronically-full host every pass reclaims a trickle, so the empty-pass
+    /// counter resets forever, the Red/Critical bypass never expires, and the
+    /// daemon re-walks back-to-back and pins a core (#15). This is the missing
+    /// floor: after a pass lasting `T`, the next pressure-driven pass waits at
+    /// least `T * (100 - pct) / pct`, which bounds scanner CPU at roughly `pct`
+    /// of one core no matter how large the tree or how red the disk.
+    ///
+    /// Forced/operator scans and config reloads always bypass it.
+    pub max_scan_duty_cycle_pct: u8,
     /// Maximum wall-clock seconds for a single scan pass. 0 = use built-in default.
     pub scan_time_budget_secs: u64,
     /// Seconds to reuse active file/process/mmap evidence before refreshing.
@@ -690,6 +703,10 @@ impl Default for ScannerConfig {
             repeat_deletion_base_cooldown_secs: 300,
             repeat_deletion_max_cooldown_secs: 3600,
             min_rescan_interval_secs: 90,
+            // 25% => after a pass of T seconds, wait 3T before the next
+            // pressure-driven pass. Keeps reclaim continuous on a full
+            // disk while capping the scanner near a quarter of one core.
+            max_scan_duty_cycle_pct: 25,
             // 300s is too short for /data/tmp on agent-swarm machines where
             // a single directory can hold tens of thousands of test artifact
             // entries. Scans timing out before identifying candidates was the
@@ -1176,6 +1193,10 @@ impl Config {
         set_env_u64(
             "SBH_SCANNER_MIN_RESCAN_INTERVAL_SECS",
             &mut self.scanner.min_rescan_interval_secs,
+        )?;
+        set_env_u8(
+            "SBH_SCANNER_MAX_SCAN_DUTY_CYCLE_PCT",
+            &mut self.scanner.max_scan_duty_cycle_pct,
         )?;
         set_env_u64(
             "SBH_SCANNER_ACTIVE_REFERENCE_CACHE_TTL_SECS",
@@ -1851,6 +1872,16 @@ fn set_env_f64(name: &str, slot: &mut f64) -> Result<()> {
 fn set_env_u64(name: &str, slot: &mut u64) -> Result<()> {
     if let Some(raw) = env_var(name) {
         *slot = raw.parse::<u64>().map_err(|error| SbhError::ConfigParse {
+            context: "env",
+            details: format!("{name}={raw:?}: {error}"),
+        })?;
+    }
+    Ok(())
+}
+
+fn set_env_u8(name: &str, slot: &mut u8) -> Result<()> {
+    if let Some(raw) = env_var(name) {
+        *slot = raw.parse::<u8>().map_err(|error| SbhError::ConfigParse {
             context: "env",
             details: format!("{name}={raw:?}: {error}"),
         })?;
