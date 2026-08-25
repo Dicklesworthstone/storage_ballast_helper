@@ -395,6 +395,70 @@ fn empty_pass_cooldown_active(
     last_empty_pass_at.is_some_and(|last| now.duration_since(last) < cooldown)
 }
 
+/// Absolute floor between pressure-driven scan passes when the duty-cycle
+/// limiter is enabled.
+///
+/// The proportional rule alone (`T * (100-pct)/pct`) collapses to ~0 for a very
+/// cheap pass, which would still let a fast-but-fruitless tree spin. A small
+/// fixed floor keeps the loop from busy-waiting without hurting responsiveness.
+const DUTY_CYCLE_MIN_PASS_GAP: Duration = Duration::from_secs(5);
+
+/// #15: minimum idle time owed after a scan pass, to bound scanner CPU.
+///
+/// `empty_pass_cooldown_active` only paces passes that reclaimed **nothing**.
+/// The hot-loop that kept sbh disabled on most of the fleet is the *productive*
+/// case: on a chronically-full host every pass frees a trickle (css measured 72
+/// deletions / 1.55 GB per hour), so `consecutive_empty_passes` resets to 0 on
+/// every pass, the Red/Critical bypass never expires, and the daemon re-walks
+/// back-to-back forever at ~100% CPU.
+///
+/// Bounding the *duty cycle* fixes that without giving up reclaim: after a pass
+/// lasting `T`, owe `T * (100 - pct) / pct` of idle. Scanning therefore occupies
+/// at most `pct` of wall-clock — about a quarter of one core at the default —
+/// regardless of tree size, disk fullness or pressure level. Because the debt is
+/// proportional, a cheap pass under genuine Red pressure still comes back almost
+/// immediately; only expensive passes are throttled, which is exactly the case
+/// that pins a core.
+///
+/// `pct == 0` (or `>= 100`) disables the limiter.
+#[must_use]
+fn duty_cycle_idle_debt(last_pass_duration: Duration, pct: u8) -> Duration {
+    if pct == 0 || pct >= 100 {
+        return Duration::ZERO;
+    }
+    let owed = last_pass_duration
+        .saturating_mul(u32::from(100 - pct))
+        .checked_div(u32::from(pct))
+        .unwrap_or(Duration::ZERO);
+    owed.max(DUTY_CYCLE_MIN_PASS_GAP)
+}
+
+/// #15: decide whether to defer a pass because the scanner still owes idle time
+/// from the previous pass.
+///
+/// Deliberately bypassed for the same requests as the empty-pass cooldown —
+/// operator/forced scans, config reloads and synthetic requests — so an operator
+/// can always force an immediate scan. Unlike that cooldown this is **not**
+/// bypassed by Red/Critical pressure: pressure is precisely when the hot-loop
+/// fires, and the proportional debt already keeps cheap passes responsive.
+#[must_use]
+fn duty_cycle_defer_active(
+    last_pass_finished_at: Option<Instant>,
+    last_pass_duration: Duration,
+    now: Instant,
+    request: &ScanRequest,
+    pct: u8,
+) -> bool {
+    if request.force_full_scan || request.config_update.is_some() || request.free_pct.is_none() {
+        return false;
+    }
+    let debt = duty_cycle_idle_debt(last_pass_duration, pct);
+    if debt.is_zero() {
+        return false;
+    }
+    last_pass_finished_at.is_some_and(|last| now.duration_since(last) < debt)
+}
+
 /// B6: exponential backoff for the empty-pass cooldown.
 ///
 /// `min_rescan_interval_secs` is the *base* pause after a single no-progress
@@ -3910,6 +3974,14 @@ fn scanner_thread_main(
     let mut last_empty_pass_at: Option<Instant> = None;
     let mut consecutive_empty_passes: u32 = 0;
 
+    // #15: duty-cycle limiter. The empty-pass cooldown above only paces passes
+    // that reclaimed nothing; a chronically-full host reclaims a trickle every
+    // pass, resetting that counter forever and re-walking back-to-back at ~100%
+    // CPU. Tracking how long the last pass took lets us owe proportional idle
+    // afterwards, capping scanner CPU regardless of pressure level.
+    let mut last_pass_finished_at: Option<Instant> = None;
+    let mut last_pass_duration = Duration::ZERO;
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -3944,6 +4016,20 @@ fn scanner_thread_main(
         ) {
             continue;
         }
+
+        // #15: defer while the scanner still owes idle time from the previous
+        // pass. Applies under Red/Critical too — that is the case that pins a
+        // core — but the debt is proportional, so cheap passes stay responsive.
+        if duty_cycle_defer_active(
+            last_pass_finished_at,
+            last_pass_duration,
+            Instant::now(),
+            &request,
+            current_scanner_config.max_scan_duty_cycle_pct,
+        ) {
+            continue;
+        }
+        let pass_started_at = Instant::now();
         let selected_scanner_engine =
             SelectedScannerEngine::for_mode(current_scanner_config.engine);
         let scanner_engine_mode = selected_scanner_engine.mode();
@@ -5253,6 +5339,12 @@ fn scanner_thread_main(
             consecutive_empty_passes = 0;
             last_empty_pass_at = None;
         }
+
+        // #15: record this pass's cost so the next pressure-driven pass owes
+        // proportional idle. Recorded for productive AND unproductive passes —
+        // the productive case is the one that used to pin a core.
+        last_pass_duration = pass_started_at.elapsed();
+        last_pass_finished_at = Some(Instant::now());
 
         if scanner_should_exit {
             break;
@@ -7261,6 +7353,136 @@ mod tests {
             effective_empty_pass_cooldown(base_secs, consecutive),
             Duration::from_mins(48)
         );
+    }
+
+    #[test]
+    /// The regression this limiter exists for: a PRODUCTIVE pass under Red.
+    ///
+    /// `empty_pass_cooldown_active` returns false here (the empty-pass counter
+    /// is 0 because the pass reclaimed something), which is precisely how the
+    /// daemon used to re-walk back-to-back at ~100% CPU on a chronically-full
+    /// host. The duty-cycle limiter must still defer.
+    #[test]
+    fn duty_cycle_defers_productive_red_passes_that_cooldown_ignores() {
+        let now = Instant::now();
+        let request = cooldown_request(PressureLevel::Red);
+
+        // Baseline: the empty-pass cooldown does NOT gate this.
+        assert!(!empty_pass_cooldown_active(
+            Some(now),
+            now,
+            Duration::from_secs(90),
+            &request,
+            0,
+        ));
+
+        // A 20s pass at 25% owes 60s of idle; 10s in we must still defer.
+        let finished = now - Duration::from_secs(10);
+        assert!(duty_cycle_defer_active(
+            Some(finished),
+            Duration::from_secs(20),
+            now,
+            &request,
+            25,
+        ));
+        // Once the debt is paid, the pass runs.
+        let finished = now - Duration::from_secs(61);
+        assert!(!duty_cycle_defer_active(
+            Some(finished),
+            Duration::from_secs(20),
+            now,
+            &request,
+            25,
+        ));
+    }
+
+    #[test]
+    fn duty_cycle_idle_debt_bounds_cpu_share() {
+        // 25% duty => 3x the pass duration of idle.
+        assert_eq!(
+            duty_cycle_idle_debt(Duration::from_secs(20), 25),
+            Duration::from_secs(60)
+        );
+        // 50% duty => 1x.
+        assert_eq!(
+            duty_cycle_idle_debt(Duration::from_secs(20), 50),
+            Duration::from_secs(20)
+        );
+        // Cheap passes fall back to the absolute floor rather than ~0.
+        assert_eq!(
+            duty_cycle_idle_debt(Duration::from_millis(10), 25),
+            DUTY_CYCLE_MIN_PASS_GAP
+        );
+        // Disabled / nonsensical settings opt out entirely.
+        assert!(duty_cycle_idle_debt(Duration::from_secs(60), 0).is_zero());
+        assert!(duty_cycle_idle_debt(Duration::from_secs(60), 100).is_zero());
+    }
+
+    #[test]
+    fn duty_cycle_never_blocks_operator_or_config_scans() {
+        let now = Instant::now();
+        let just_finished = Some(now);
+        let expensive = Duration::from_secs(600);
+
+        let mut forced = cooldown_request(PressureLevel::Green);
+        forced.force_full_scan = true;
+        assert!(!duty_cycle_defer_active(
+            just_finished,
+            expensive,
+            now,
+            &forced,
+            25
+        ));
+
+        let mut reload = cooldown_request(PressureLevel::Green);
+        reload.config_update = Some((
+            crate::core::config::ScoringConfig::default(),
+            crate::core::config::ScannerConfig::default(),
+        ));
+        assert!(!duty_cycle_defer_active(
+            just_finished,
+            expensive,
+            now,
+            &reload,
+            25
+        ));
+
+        let mut synthetic = cooldown_request(PressureLevel::Green);
+        synthetic.free_pct = None;
+        assert!(!duty_cycle_defer_active(
+            just_finished,
+            expensive,
+            now,
+            &synthetic,
+            25
+        ));
+    }
+
+    #[test]
+    fn duty_cycle_first_pass_is_never_deferred() {
+        let now = Instant::now();
+        let request = cooldown_request(PressureLevel::Critical);
+        // No previous pass recorded → nothing owed.
+        assert!(!duty_cycle_defer_active(
+            None,
+            Duration::ZERO,
+            now,
+            &request,
+            25
+        ));
+    }
+
+    #[test]
+    fn duty_cycle_disabled_setting_matches_legacy_behavior() {
+        let now = Instant::now();
+        let request = cooldown_request(PressureLevel::Red);
+        assert!(!duty_cycle_defer_active(
+            Some(now),
+            Duration::from_secs(600),
+            now,
+            &request,
+            0,
+        ));
     }
 
     #[test]
