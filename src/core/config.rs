@@ -173,15 +173,21 @@ pub struct ScannerConfig {
     /// Critical) bypass it. `0` disables the cooldown (legacy behavior).
     pub min_rescan_interval_secs: u64,
     /// Ceiling on the share of wall-clock time the scanner may spend scanning,
-    /// as a percentage (1-100). `0` disables the limiter (legacy behavior).
+    /// as a percentage. `0` — or any value `>= 100` — disables the limiter
+    /// (legacy behavior).
     ///
     /// `min_rescan_interval_secs` only paces *unproductive* passes. On a
     /// chronically-full host every pass reclaims a trickle, so the empty-pass
     /// counter resets forever, the Red/Critical bypass never expires, and the
     /// daemon re-walks back-to-back and pins a core (#15). This is the missing
     /// floor: after a pass lasting `T`, the next pressure-driven pass waits at
-    /// least `T * (100 - pct) / pct`, which bounds scanner CPU at roughly `pct`
-    /// of one core no matter how large the tree or how red the disk.
+    /// least `T * (100 - pct) / pct`.
+    ///
+    /// Bounds *scanning time*, not core count — the scan is parallel (see
+    /// `parallelism`), so the process-wide CPU share lands near
+    /// `pct * parallelism`, not `pct` of one core. The wait is clamped to a 5s
+    /// floor and a 5min ceiling so a fast pass cannot busy-wait and a
+    /// budget-exhausting pass cannot stall reclaim on a filling disk.
     ///
     /// Forced/operator scans and config reloads always bypass it.
     pub max_scan_duty_cycle_pct: u8,

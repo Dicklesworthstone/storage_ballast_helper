@@ -403,6 +403,23 @@ fn empty_pass_cooldown_active(
 /// fixed floor keeps the loop from busy-waiting without hurting responsiveness.
 const DUTY_CYCLE_MIN_PASS_GAP: Duration = Duration::from_secs(5);
 
+/// Ceiling on the idle debt a single pass can accrue.
+///
+/// Without this, a pass that exhausts `scan_time_budget_secs` (default **900**)
+/// would owe 45 minutes at the default 25% — long enough for a filling disk to
+/// blow through Red before the scanner looks again. That would trade the
+/// hot-loop for a worse failure, and it contradicts the principle already
+/// encoded in [`TERMINAL_IDLE_PRESSURED_RESCAN_CAP`]: even while pacing, a
+/// pressured host must still get a periodic re-check.
+///
+/// Trade-off, stated plainly: for a pass longer than
+/// `cap * pct / (100 - pct)` the realised duty cycle exceeds `pct` (a 900s pass
+/// capped at 300s runs at ~75%, not 25%). That is deliberate. A pass that long
+/// means the scan budget is being exhausted every time, and there bounded
+/// latency matters more than a strict CPU bound — 75% of a scan window still
+/// beats the unbounded back-to-back re-walk this replaces.
+const DUTY_CYCLE_MAX_DEBT: Duration = Duration::from_mins(5);
+
 /// #15: minimum idle time owed after a scan pass, to bound scanner CPU.
 ///
 /// `empty_pass_cooldown_active` only paces passes that reclaimed **nothing**.
@@ -413,12 +430,22 @@ const DUTY_CYCLE_MIN_PASS_GAP: Duration = Duration::from_secs(5);
 /// back-to-back forever at ~100% CPU.
 ///
 /// Bounding the *duty cycle* fixes that without giving up reclaim: after a pass
-/// lasting `T`, owe `T * (100 - pct) / pct` of idle. Scanning therefore occupies
-/// at most `pct` of wall-clock — about a quarter of one core at the default —
-/// regardless of tree size, disk fullness or pressure level. Because the debt is
-/// proportional, a cheap pass under genuine Red pressure still comes back almost
-/// immediately; only expensive passes are throttled, which is exactly the case
-/// that pins a core.
+/// lasting `T`, owe `T * (100 - pct) / pct` of idle, so at most `pct` of
+/// wall-clock is spent scanning regardless of tree size, disk fullness or
+/// pressure level. Because the debt is proportional, a cheap pass under genuine
+/// Red pressure still comes back almost immediately; only expensive passes are
+/// throttled, which is exactly the case that pins a core.
+///
+/// This bounds *scanning time*, not core count. The scan itself is parallel
+/// (`scanner.parallelism`, default `cores/2`), so CPU during a scan window can
+/// reach several cores and the process-wide share lands near
+/// `pct * parallelism`, not `pct` of one core. Measured on a Red host: 156% →
+/// 32% at the default, which is what that model predicts — the point is that
+/// the share is now *bounded and tunable* instead of unbounded.
+///
+/// The result is clamped to [`DUTY_CYCLE_MIN_PASS_GAP`] (so a trivially fast
+/// pass cannot busy-wait) and [`DUTY_CYCLE_MAX_DEBT`] (so a budget-exhausting
+/// pass cannot stall reclaim on a filling disk).
 ///
 /// `pct == 0` (or `>= 100`) disables the limiter.
 #[must_use]
@@ -430,7 +457,7 @@ fn duty_cycle_idle_debt(last_pass_duration: Duration, pct: u8) -> Duration {
         .saturating_mul(u32::from(100 - pct))
         .checked_div(u32::from(pct))
         .unwrap_or(Duration::ZERO);
-    owed.max(DUTY_CYCLE_MIN_PASS_GAP)
+    owed.clamp(DUTY_CYCLE_MIN_PASS_GAP, DUTY_CYCLE_MAX_DEBT)
 }
 
 /// #15: decide whether to defer a pass because the scanner still owes idle time
@@ -7416,6 +7443,29 @@ mod tests {
         // Disabled / nonsensical settings opt out entirely.
         assert!(duty_cycle_idle_debt(Duration::from_secs(60), 0).is_zero());
         assert!(duty_cycle_idle_debt(Duration::from_secs(60), 100).is_zero());
+        assert!(duty_cycle_idle_debt(Duration::from_secs(60), 200).is_zero());
+    }
+
+    /// A pass that exhausts `scan_time_budget_secs` (default 900) would owe 45
+    /// minutes unclamped — long enough for a filling disk to blow through Red
+    /// before the scanner looks again. Trading the hot-loop for that would be a
+    /// worse bug, so the debt is capped.
+    #[test]
+    fn duty_cycle_debt_is_capped_so_reclaim_cannot_stall() {
+        let budget_exhausting = Duration::from_secs(900);
+        let unclamped = budget_exhausting * 3; // 45 min at pct=25
+        assert!(unclamped > DUTY_CYCLE_MAX_DEBT, "premise of this test");
+        assert_eq!(
+            duty_cycle_idle_debt(budget_exhausting, 25),
+            DUTY_CYCLE_MAX_DEBT
+        );
+        // Even a pathological pass length cannot exceed the ceiling.
+        assert_eq!(
+            duty_cycle_idle_debt(Duration::from_secs(86_400), 1),
+            DUTY_CYCLE_MAX_DEBT
+        );
+        // The floor and ceiling are ordered, so `clamp` cannot panic.
+        assert!(DUTY_CYCLE_MIN_PASS_GAP <= DUTY_CYCLE_MAX_DEBT);
     }
 
     #[test]
