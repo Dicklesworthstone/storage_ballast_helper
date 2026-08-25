@@ -2321,6 +2321,60 @@ mod tests {
         );
     }
 
+    /// The probe's number is consumed as "bytes freed if removed", and every
+    /// other size in the pipeline (deletion report, rch's reaper) comes from
+    /// `du -sk`. Validate the two agree on a tree with subdirectories, nested
+    /// files, and hardlinks rather than asserting the property in the abstract.
+    #[test]
+    fn opaque_size_probe_agrees_with_du() {
+        use std::process::Command;
+
+        let tmp = TempDir::new().unwrap();
+        let tree = tmp.path().join("du-parity");
+        let nested = tree.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(tree.join("c")).unwrap();
+        let payload = vec![b'x'; 128 * 1024];
+        for index in 0..12 {
+            fs::write(nested.join(format!("f{index}")), &payload).unwrap();
+        }
+        fs::write(tree.join("c").join("solo"), &payload).unwrap();
+        let _ = fs::hard_link(nested.join("f0"), tree.join("c").join("hardlink"));
+
+        let Ok(out) = Command::new("du").arg("-sk").arg(&tree).output() else {
+            return; // no du on this platform: nothing to compare against
+        };
+        if !out.status.success() {
+            return;
+        }
+        let du_kb: u64 = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if du_kb == 0 {
+            return;
+        }
+
+        let root_meta = fs::metadata(&tree).unwrap();
+        let root_dev = device_id(&root_meta);
+        let cancel = AtomicBool::new(false);
+        let (measured, complete) =
+            opaque_tree_allocated_size(&tree, false, root_dev, OPAQUE_SIZE_PROBE_BUDGET, &cancel);
+        assert!(complete);
+
+        // The probe excludes the root's own blocks (the call site adds them
+        // from the dir's own metadata), so add them back for the comparison.
+        let probe_kb = measured.saturating_add(allocated_size(&root_meta)) / 1024;
+
+        // Allow one block of slack for filesystem accounting differences.
+        let diff = probe_kb.abs_diff(du_kb);
+        assert!(
+            diff <= 8,
+            "probe and du must agree: probe={probe_kb}KB du={du_kb}KB diff={diff}KB"
+        );
+    }
+
     /// A hardlinked file frees nothing when its second link is removed, so it
     /// must be counted once — the same rule `du` follows, and the rule the
     /// deletion report's `du -sk` numbers already assume.
