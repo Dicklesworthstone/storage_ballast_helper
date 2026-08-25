@@ -1,5 +1,13 @@
 //! SBH-prefixed error types with structured error codes.
 
+// clippy::redundant_field_names fires on the `#[from] source: PalError` field
+// of the Pal variant below. thiserror expands #[from] into a From impl containing
+// `Pal { source: source }`, and the lint is attributed back to the field span, so
+// neither a variant-level nor a field-level #[allow] reaches it. The suggested
+// rewrite (`#[from] source,`) is not valid Rust for a field declaration.
+// Pre-existing: this file is unchanged since v0.4.40 and fires on both the
+// floating nightly and pinned nightly-2026-08-20.
+#![allow(clippy::redundant_field_names)]
 #![allow(missing_docs)]
 
 use std::path::{Path, PathBuf};

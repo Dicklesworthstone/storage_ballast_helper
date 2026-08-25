@@ -333,8 +333,10 @@ impl PredictiveActionPolicy {
             }
             if implied_rate_pct_per_min > 5.0 {
                 let severity = ((implied_rate_pct_per_min - 5.0) / 10.0).clamp(0.0, 1.0);
-                let required =
-                    self.config.min_confidence + severity * (0.95 - self.config.min_confidence);
+                let required = severity.mul_add(
+                    0.95 - self.config.min_confidence,
+                    self.config.min_confidence,
+                );
                 if estimate.confidence < required {
                     return PredictiveAction::Clear;
                 }
@@ -360,8 +362,10 @@ impl PredictiveActionPolicy {
             // 50% of a 1TB disk in 10 minutes, which is almost always a burst.
             if implied_rate_pct_per_min > 5.0 {
                 let severity = ((implied_rate_pct_per_min - 5.0) / 10.0).clamp(0.0, 1.0);
-                let required =
-                    self.config.min_confidence + severity * (0.95 - self.config.min_confidence);
+                let required = severity.mul_add(
+                    0.95 - self.config.min_confidence,
+                    self.config.min_confidence,
+                );
                 if estimate.confidence < required {
                     return PredictiveAction::Clear;
                 }
