@@ -6,6 +6,45 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ---
 
+## v0.5.0 **[release]**
+
+### Changed — build-cache reclaim is now keyed on `CACHEDIR.TAG`, not directory name (bd-k0t3r)
+
+**This widens what the reclaim daemon will delete. Read before rolling out.**
+
+Previously a regenerable build cache was recognised only by directory *name*
+(`rch_target_*` plus a fixed set of `target`-like patterns) together with
+structural markers (`deps/`, `incremental/`, `.fingerprint`) that live one level
+down under `debug/` and `release/`. Cargo target dirs under arbitrary names —
+`srw`, `p4-verify`, `*bld`, the shared `cargo-target` — matched no name pattern
+and exposed no markers at their own root, so they were never reclaimed. They
+were also the largest consumers, and drove `/` to ~98%, at which point the host
+starts killing in-flight builds.
+
+Reclaim now detects cargo's canonical `CACHEDIR.TAG` marker, **with signature
+validation**, so a file merely *named* `CACHEDIR.TAG` cannot mark a directory
+reclaimable.
+
+Operationally: directories that were previously invisible to the sweeper are now
+eligible. That includes isolated `RCH_TARGET_BASE` target dirs. Verify on a
+canary host before fleet rollout.
+
+### Fixed
+
+- Scanner duty cycle is bounded so a productive pass cannot pin a core.
+- Scanner/walker error mapping, symlink handling, and diagnostics refined.
+- Five exhaustive struct literals that `cargo test --lib` never compiled.
+- `clippy -D warnings` clean, including the two deletion fail-safes, which keep
+  their deliberate negative-first form (`if !complete { skip } else { delete }`)
+  under an annotated `#[allow(clippy::if_not_else)]` rather than being inverted.
+
+### Notes
+
+- Lib tests: 1404 passed, 0 failed. Run them as a **non-root** user — as root,
+  `fallback_when_primary_dir_unwritable` cannot exercise its fallback because
+  root can create the "unwritable" path, producing ~20 environmental failures
+  that are not defects (see #19).
+
 ## v0.4.37 **[release]**
 
 ### Fixed — sparse files are sized by allocated blocks (#17)
