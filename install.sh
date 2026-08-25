@@ -5,22 +5,26 @@ REPO="Dicklesworthstone/storage_ballast_helper"
 INSTALL_DIR="${SBH_INSTALL_DIR:-/usr/local/bin}"
 BINARY="sbh"
 
-# Detect platform
+# Detect platform.
+#
+# Asset names must match what the release workflow actually uploads:
+# raw (un-archived) binaries named sbh_{os}_{arch}, alongside a single
+# SHA256SUMS manifest covering all four. See the v0.5.0 release assets.
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
 case "${OS}" in
   Linux)
     case "${ARCH}" in
-      x86_64)  TARGET="x86_64-unknown-linux-gnu" ;;
-      aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+      x86_64)  ASSET="${BINARY}_linux_amd64" ;;
+      aarch64) ASSET="${BINARY}_linux_arm64" ;;
       *)       echo "Unsupported Linux architecture: ${ARCH}" >&2; exit 1 ;;
     esac
     ;;
   Darwin)
     case "${ARCH}" in
-      arm64|aarch64) TARGET="aarch64-apple-darwin" ;;
-      x86_64)        TARGET="x86_64-apple-darwin" ;;
+      arm64|aarch64) ASSET="${BINARY}_darwin_arm64" ;;
+      x86_64)        ASSET="${BINARY}_darwin_amd64" ;;
       *)             echo "Unsupported macOS architecture: ${ARCH}" >&2; exit 1 ;;
     esac
     ;;
@@ -28,8 +32,6 @@ case "${OS}" in
     echo "Unsupported OS: ${OS}" >&2; exit 1
     ;;
 esac
-
-ARCHIVE="${BINARY}-${TARGET}.tar.xz"
 
 # Get latest release tag
 if command -v gh &>/dev/null; then
@@ -43,37 +45,44 @@ if [ -z "${TAG}" ]; then
   exit 1
 fi
 
-URL="https://github.com/${REPO}/releases/download/${TAG}/${ARCHIVE}"
-SHA_URL="${URL}.sha256"
+BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
+URL="${BASE_URL}/${ASSET}"
+SUMS_URL="${BASE_URL}/SHA256SUMS"
 
-echo "Installing ${BINARY} ${TAG} for ${TARGET}..."
+echo "Installing ${BINARY} ${TAG} (${ASSET})..."
 
-TMPDIR="$(mktemp -d)"
-trap 'rm -rf "${TMPDIR}"' EXIT
+WORKDIR="$(mktemp -d)"
+trap 'rm -rf "${WORKDIR}"' EXIT
 
-# Download archive and checksum
-curl -fsSL -o "${TMPDIR}/${ARCHIVE}" "${URL}"
-curl -fsSL -o "${TMPDIR}/${ARCHIVE}.sha256" "${SHA_URL}"
+# Download binary and the shared checksum manifest
+curl -fsSL -o "${WORKDIR}/${ASSET}" "${URL}"
+curl -fsSL -o "${WORKDIR}/SHA256SUMS" "${SUMS_URL}"
 
-# Verify checksum
-cd "${TMPDIR}"
+cd "${WORKDIR}"
+
+# Verify checksum: SHA256SUMS covers every asset, so select our line first.
+# Failing to find the entry is an error, not a reason to skip verification.
+if ! grep -E "[[:space:]]\*?${ASSET}\$" SHA256SUMS > "${ASSET}.sha256"; then
+  echo "No checksum entry for ${ASSET} in SHA256SUMS" >&2
+  exit 1
+fi
+
 if command -v sha256sum &>/dev/null; then
-  sha256sum -c "${ARCHIVE}.sha256"
+  sha256sum -c "${ASSET}.sha256"
 elif command -v shasum &>/dev/null; then
-  shasum -a 256 -c "${ARCHIVE}.sha256"
+  shasum -a 256 -c "${ASSET}.sha256"
 else
   echo "Warning: no sha256sum or shasum found, skipping checksum verification" >&2
 fi
 
-# Extract
-tar xJf "${ARCHIVE}"
+chmod +x "${ASSET}"
 
 # Install
 if [ -w "${INSTALL_DIR}" ]; then
-  mv "${BINARY}" "${INSTALL_DIR}/${BINARY}"
+  mv "${ASSET}" "${INSTALL_DIR}/${BINARY}"
 else
   echo "Installing to ${INSTALL_DIR} (requires sudo)..."
-  sudo mv "${BINARY}" "${INSTALL_DIR}/${BINARY}"
+  sudo mv "${ASSET}" "${INSTALL_DIR}/${BINARY}"
 fi
 
 chmod +x "${INSTALL_DIR}/${BINARY}"
