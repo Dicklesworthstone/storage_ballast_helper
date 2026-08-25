@@ -545,29 +545,31 @@ impl RchTargetKind {
 }
 
 /// Classify a path as an rch-managed target dir by its basename.
+///
+/// Scope is deliberately exactly rch's `REAP_GLOBS` — the marker-bearing
+/// `.rch-target-*-{job,pid,pool}-*` shapes. Bare `rch_target_*` / `target`
+/// trees keep their existing scoring: rch reaps those too, but they have always
+/// been safe, high-yield reclaims here and widening the contract to cover them
+/// would freeze a lot of genuinely dead space.
 #[must_use]
 pub fn classify_rch_target(path: &Path) -> Option<RchTargetKind> {
     let name = path.file_name()?.to_str()?;
-    // Accept the dotted form rch actually emits plus the undotted variant, and
-    // the legacy underscore spelling, so a naming change upstream degrades to
-    // "protected" rather than "silently reclaimable".
-    let stem = name.strip_prefix('.').unwrap_or(name);
-    if !(stem.starts_with("rch-target-") || stem.starts_with("rch_target_")) {
+    // Only the dotted spelling is rch's own; `rch-target-` without the dot is
+    // matched too because rch's globs tolerate it.
+    let stem = name.strip_prefix('.')?;
+    if !stem.starts_with("rch-target-") {
         return None;
     }
-    if stem.contains("-pool-") || stem.contains("_pool_") {
+    if stem.contains("-pool-") {
         return Some(RchTargetKind::Pooled);
     }
-    if stem.contains("-job-")
-        || stem.contains("_job_")
-        || stem.contains("-pid-")
-        || stem.contains("_pid_")
-    {
+    if stem.contains("-job-") || stem.contains("-pid-") {
         return Some(RchTargetKind::PerJob);
     }
-    // An rch target dir whose marker we don't recognise: treat it as the most
-    // conservative kind rather than falling through to name/size scoring.
-    Some(RchTargetKind::Pooled)
+    // A dotted rch target dir carrying a marker we don't know yet. Treat it as
+    // rch-managed at the per-job floor rather than letting it fall through to
+    // name/size scoring, which is exactly how a live pool dir got deleted.
+    Some(RchTargetKind::PerJob)
 }
 
 /// Bound on the idle probe below. An active build touches files constantly, so
@@ -1225,6 +1227,155 @@ mod tests {
 
     fn default_engine() -> ScoringEngine {
         ScoringEngine::from_config(&ScoringConfig::default(), 30)
+    }
+
+    mod rch_contract {
+        use super::super::{RchTargetKind, classify_rch_target, rch_target_veto_reason};
+        use super::{
+            ActiveReferenceSummary, ArtifactCategory, CandidateInput, DecisionAction, Duration,
+            StructuralSignals, classification, default_engine,
+        };
+        use std::path::{Path, PathBuf};
+
+        #[test]
+        fn pooled_and_per_job_markers_are_classified() {
+            for (name, want) in [
+                (
+                    ".rch-target-hz1-pool-e8298f7544a4b8493a8270f7ccf03bb3",
+                    RchTargetKind::Pooled,
+                ),
+                (
+                    ".rch-target-ovh-b-pool-75509f",
+                    RchTargetKind::Pooled,
+                ),
+                (
+                    ".rch-target-vmi1264463-job-17-1787-3",
+                    RchTargetKind::PerJob,
+                ),
+                (".rch-target-hz2-pid-2589722-0", RchTargetKind::PerJob),
+            ] {
+                let got = classify_rch_target(&PathBuf::from("/data/projects/p").join(name));
+                assert_eq!(got, Some(want), "{name}");
+            }
+        }
+
+        #[test]
+        fn unrecognised_rch_marker_still_counts_as_rch_managed() {
+            // A future rch naming we don't know must not fall through to
+            // name/size scoring — that is exactly how the incident happened.
+            let got = classify_rch_target(Path::new("/data/projects/p/.rch-target-hz1-future-x"));
+            assert_eq!(got, Some(RchTargetKind::PerJob));
+        }
+
+        #[test]
+        fn non_rch_paths_keep_their_existing_scoring() {
+            // Notably `rch_target_*`: rch reaps those too, but they have always
+            // been safe high-yield reclaims here, so the strict contract must
+            // not swallow them and freeze dead space.
+            for name in [
+                "target",
+                "rch_target_oxrc",
+                "rch-target-hz1-pool-abc", // undotted: not rch's own spelling
+                ".rch-tmp",
+                "cargo-target",
+                ".venv",
+            ] {
+                assert_eq!(
+                    classify_rch_target(&PathBuf::from("/data/tmp").join(name)),
+                    None,
+                    "{name}"
+                );
+            }
+        }
+
+        #[test]
+        fn pooled_floor_is_seven_days_and_per_job_is_twelve_hours() {
+            // These mirror rch-common::remediation_config. If rch changes them,
+            // this test should fail loudly rather than sbh silently drifting.
+            assert_eq!(
+                RchTargetKind::Pooled.required_idle(),
+                Duration::from_secs(168 * 3600)
+            );
+            assert_eq!(
+                RchTargetKind::PerJob.required_idle(),
+                Duration::from_secs(12 * 3600)
+            );
+        }
+
+        /// The hz1 incident: an 18.9 GB pool dir with a build actively writing
+        /// into it was scored `age=0.2 name=1.0 size=0.9` and deleted, because
+        /// directory age came from birth time rather than tree activity.
+        #[test]
+        fn active_pool_dir_is_vetoed_even_though_it_scores_high() {
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = tmp
+                .path()
+                .join(".rch-target-hz1-pool-e8298f7544a4b8493a8270f7ccf03bb3");
+            std::fs::create_dir_all(pool.join("debug/deps")).unwrap();
+            // A fresh artifact deep in the tree — exactly what cargo leaves
+            // behind mid-build, and what a top-level mtime/birth-time check misses.
+            std::fs::write(pool.join("debug/deps/libfoo.rlib"), b"x").unwrap();
+
+            assert!(
+                rch_target_veto_reason(&pool).is_some(),
+                "active pool dir must be vetoed"
+            );
+
+            let engine = default_engine();
+            let score = engine.score_candidate(
+                &CandidateInput {
+                    path: pool.clone(),
+                    size_bytes: 18_876_190_720,
+                    // Birth-time age, as the walker would have reported it.
+                    age: Duration::from_secs(3 * 24 * 3600),
+                    classification: classification(0.92, ArtifactCategory::RustTarget),
+                    signals: StructuralSignals::default(),
+                    active_references: ActiveReferenceSummary::default(),
+                    is_open: false,
+                    excluded: false,
+                },
+                // Red-pressure urgency, which is when the incident happened.
+                1.0,
+            );
+            assert!(score.vetoed, "expected veto, got score {}", score.total_score);
+            assert_eq!(score.decision.action, DecisionAction::Keep);
+            assert!(
+                score
+                    .veto_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("rch pooled")),
+                "unexpected reason: {:?}",
+                score.veto_reason
+            );
+        }
+
+        #[test]
+        fn genuinely_idle_pool_dir_is_still_reclaimable() {
+            // The fix must not make pool dirs immortal: rch reaps them after
+            // 168h idle and so must sbh, or disk pressure never resolves.
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = tmp.path().join(".rch-target-hz1-pool-deadbeef");
+            std::fs::create_dir_all(pool.join("debug")).unwrap();
+            let stale = pool.join("debug/old.rlib");
+            std::fs::write(&stale, b"x").unwrap();
+
+            let long_ago = std::time::SystemTime::now() - Duration::from_secs(200 * 3600);
+            let ft = filetime::FileTime::from_system_time(long_ago);
+            filetime::set_file_mtime(&stale, ft).unwrap();
+            filetime::set_file_mtime(pool.join("debug"), ft).unwrap();
+
+            assert!(
+                rch_target_veto_reason(&pool).is_none(),
+                "a pool dir idle beyond rch's floor must remain reclaimable"
+            );
+        }
+
+        #[test]
+        fn unreadable_tree_fails_safe() {
+            // If we cannot establish idleness we must refuse to delete.
+            let missing = Path::new("/nonexistent-rch-root/.rch-target-hz1-pool-abc");
+            assert!(rch_target_veto_reason(missing).is_some());
+        }
     }
 
     fn classification(confidence: f64, category: ArtifactCategory) -> ArtifactClassification {
