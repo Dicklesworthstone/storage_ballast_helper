@@ -363,6 +363,38 @@ map_target_to_raw_name() {
   esac
 }
 
+map_target_to_raw_name_candidates() {
+  # Raw-binary asset naming has changed across releases, so emit every
+  # convention we know about, newest first, one per line. The caller picks
+  # whichever actually exists in the release.
+  #
+  #   sbh_linux_amd64   -- current (v0.5.0+): underscores, Go-style arch
+  #   sbh-linux-x86_64  -- legacy  (v0.2.8):  hyphens, Rust-style arch
+  local triple="$1"
+  case "$triple" in
+    x86_64-unknown-linux-gnu)   printf '%s\n' "${PROGRAM}_linux_amd64" ;;
+    aarch64-unknown-linux-gnu)  printf '%s\n' "${PROGRAM}_linux_arm64" ;;
+    x86_64-apple-darwin)        printf '%s\n' "${PROGRAM}_darwin_amd64" ;;
+    aarch64-apple-darwin)       printf '%s\n' "${PROGRAM}_darwin_arm64" ;;
+  esac
+  map_target_to_raw_name "$triple"
+  printf '\n'
+}
+
+pick_checksum_manifest_name() {
+  # Releases have shipped the raw-binary manifest under both names. Prefer
+  # whichever the release actually lists; default to SHA256SUMS.
+  local asset_list="$1"
+  local candidate
+  for candidate in "SHA256SUMS" "SHA256SUMS.txt"; do
+    if printf '%s\n' "$asset_list" | grep -qxF "$candidate" 2>/dev/null; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  printf '%s' "SHA256SUMS"
+}
+
 probe_release_assets() {
   # Queries the GitHub API to discover what assets actually exist in the
   # target release, then sets ASSET_FORMAT to one of:
@@ -450,18 +482,23 @@ probe_release_assets() {
     return 0
   fi
 
-  # Probe strategy 3: raw binary (newer naming, e.g. sbh-linux-x86_64)
-  local raw_name
+  # Probe strategy 3: raw binary. Naming has changed between releases
+  # (sbh_linux_amd64 today, sbh-linux-x86_64 historically), so try each
+  # known convention against the asset list the API gave us.
+  local raw_name raw_candidate
   raw_name="$(map_target_to_raw_name "$TARGET_TRIPLE")"
 
-  if printf '%s\n' "$asset_json" | grep -qxF "$raw_name" 2>/dev/null; then
-    ASSET_FORMAT="raw"
-    ASSET_NAME="$raw_name"
-    CHECKSUM_NAME="SHA256SUMS.txt"
-    ASSET_URL="${base_url}/${ASSET_NAME}"
-    CHECKSUM_URL="${base_url}/${CHECKSUM_NAME}"
-    return 0
-  fi
+  while IFS= read -r raw_candidate; do
+    [[ -n "$raw_candidate" ]] || continue
+    if printf '%s\n' "$asset_json" | grep -qxF "$raw_candidate" 2>/dev/null; then
+      ASSET_FORMAT="raw"
+      ASSET_NAME="$raw_candidate"
+      CHECKSUM_NAME="$(pick_checksum_manifest_name "$asset_json")"
+      ASSET_URL="${base_url}/${ASSET_NAME}"
+      CHECKSUM_URL="${base_url}/${CHECKSUM_NAME}"
+      return 0
+    fi
+  done < <(map_target_to_raw_name_candidates "$TARGET_TRIPLE")
 
   # If the API call failed (no gh, no curl, rate-limited) fall back to
   # guessing with HEAD requests.
@@ -486,15 +523,23 @@ probe_release_assets() {
       CHECKSUM_URL="${base_url}/${CHECKSUM_NAME}"
       return 0
     fi
-    # Try raw binary
-    if curl -fsSL --head "${base_url}/${raw_name}" >/dev/null 2>&1; then
-      ASSET_FORMAT="raw"
-      ASSET_NAME="$raw_name"
-      CHECKSUM_NAME="SHA256SUMS.txt"
-      ASSET_URL="${base_url}/${ASSET_NAME}"
-      CHECKSUM_URL="${base_url}/${CHECKSUM_NAME}"
-      return 0
-    fi
+    # Try raw binary, across every known naming convention.
+    while IFS= read -r raw_candidate; do
+      [[ -n "$raw_candidate" ]] || continue
+      if curl -fsSL --head "${base_url}/${raw_candidate}" >/dev/null 2>&1; then
+        ASSET_FORMAT="raw"
+        ASSET_NAME="$raw_candidate"
+        # No asset list here, so probe the manifest names directly.
+        CHECKSUM_NAME="SHA256SUMS"
+        if ! curl -fsSL --head "${base_url}/SHA256SUMS" >/dev/null 2>&1 \
+            && curl -fsSL --head "${base_url}/SHA256SUMS.txt" >/dev/null 2>&1; then
+          CHECKSUM_NAME="SHA256SUMS.txt"
+        fi
+        ASSET_URL="${base_url}/${ASSET_NAME}"
+        CHECKSUM_URL="${base_url}/${CHECKSUM_NAME}"
+        return 0
+      fi
+    done < <(map_target_to_raw_name_candidates "$TARGET_TRIPLE")
   fi
 
   # No matching asset found
