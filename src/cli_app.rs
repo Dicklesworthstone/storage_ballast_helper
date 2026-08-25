@@ -8975,6 +8975,12 @@ fn run_interactive_clean(
             // protects the --yes batch path applies here too.
             let (fresh_open_paths, complete) =
                 collect_open_path_ancestors(std::slice::from_ref(&candidate.path));
+            // clippy::if_not_else is deliberately allowed here. The negative-first
+            // form is load-bearing: it puts the fail-safe (skip) branch ahead of the
+            // destructive branch (delete), so the guard is visible before the action
+            // when auditing this path. Inverting it to satisfy the lint would bury
+            // the safety rail below the deletion it protects.
+            #[allow(clippy::if_not_else)]
             if !complete {
                 // Fail safe, mirroring the batch executor: if we cannot see
                 // which paths are open we cannot prove this one is closed.
@@ -9916,6 +9922,12 @@ fn run_interactive_emergency(
             // .git/manifest/source markers, identity, open files).
             let (fresh_open_paths, complete) =
                 collect_open_path_ancestors(std::slice::from_ref(&candidate.path));
+            // clippy::if_not_else is deliberately allowed here. The negative-first
+            // form is load-bearing: it puts the fail-safe (skip) branch ahead of the
+            // destructive branch (delete), so the guard is visible before the action
+            // when auditing this path. Inverting it to satisfy the lint would bury
+            // the safety rail below the deletion it protects.
+            #[allow(clippy::if_not_else)]
             if !complete {
                 // Fail safe, mirroring the batch executor: if we cannot see
                 // which paths are open we cannot prove this one is closed.
