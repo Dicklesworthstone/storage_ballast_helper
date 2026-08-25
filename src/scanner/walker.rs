@@ -162,6 +162,79 @@ struct WorkItem {
 
 const OPAQUE_CANDIDATE_SIZE_FLOOR: u64 = 100 * 1_048_576;
 
+/// Entry budget for [`opaque_tree_allocated_size`].
+///
+/// Opaque trees are cargo targets and build caches: tens of thousands of small
+/// files. This bounds a pathological tree from stalling a scan while still
+/// completing for essentially every real candidate.
+const OPAQUE_SIZE_PROBE_BUDGET: usize = 200_000;
+
+/// Measure the allocated size of an opaque (pruned) candidate tree.
+///
+/// Opaque trees are deliberately not walked by the main scanner — pruning them
+/// is the whole point of the classification. But a disk-pressure tool still has
+/// to know how big they are. Without a real measurement every opaque candidate
+/// reported exactly [`OPAQUE_CANDIDATE_SIZE_FLOOR`], because a pruned directory
+/// contributes only its own inode to `content_size_bytes` and the floor then
+/// dominates. The floor was intended as "assume at least this much"; in
+/// practice it acted as a CEILING, so a 130 GB rch pool and a 100 MB scratch
+/// dir were indistinguishable: [`factor_size`] never left its 0.70 bucket,
+/// size-ranked eviction had nothing to rank on, and `--target-free` planned
+/// against fictional bytes.
+///
+/// Counts allocated blocks (like `du`, via [`allocated_size`]) rather than
+/// apparent length, so "reclaiming this frees N bytes" holds for sparse files.
+/// Iterative (no recursion depth risk), never follows symlinks, stays on the
+/// starting device unless `cross_devices`, honours `cancel`, and stops after
+/// `budget` entries. Returns the bytes counted and whether the walk completed;
+/// an incomplete or failed walk falls back to the floor at the call site so a
+/// truncated probe can never under-report a tree into looking trivial.
+fn opaque_tree_allocated_size(
+    root: &Path,
+    cross_devices: bool,
+    root_dev: u64,
+    budget: usize,
+    cancel: &AtomicBool,
+) -> (u64, bool) {
+    let mut total: u64 = 0;
+    let mut seen: usize = 0;
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return (total, false);
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            // An unreadable subtree means the total is a floor, not a truth.
+            return (total, false);
+        };
+        for entry in entries.flatten() {
+            if cancel.load(Ordering::Relaxed) {
+                return (total, false);
+            }
+            seen += 1;
+            if seen > budget {
+                return (total, false);
+            }
+            // `DirEntry::metadata` does not traverse symlinks, so a link is
+            // sized as the link itself: no double-counting, no escaping the
+            // tree via a symlink to somewhere large.
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !cross_devices && device_id(&meta) != root_dev {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total = total.saturating_add(allocated_size(&meta));
+            }
+        }
+    }
+    (total, true)
+}
+
 /// Parallel directory walker with safety guards.
 ///
 /// Safety invariants:
@@ -608,8 +681,25 @@ fn process_directory(
                     }
                     let mut emeta = entry_metadata(&meta);
                     if emeta.is_dir {
-                        emeta.content_size_bytes =
-                            emeta.content_size_bytes.max(OPAQUE_CANDIDATE_SIZE_FLOOR);
+                        // The tree is pruned from the main walk, so measure it
+                        // here: without this every opaque candidate reported
+                        // exactly the floor and nothing could be ranked by size.
+                        // A truncated/failed probe keeps the floor semantics.
+                        let (measured, complete) = opaque_tree_allocated_size(
+                            &child_path,
+                            config.cross_devices,
+                            root_dev,
+                            OPAQUE_SIZE_PROBE_BUDGET,
+                            cancel,
+                        );
+                        emeta.content_size_bytes = if complete {
+                            emeta.content_size_bytes.saturating_add(measured)
+                        } else {
+                            emeta
+                                .content_size_bytes
+                                .saturating_add(measured)
+                                .max(OPAQUE_CANDIDATE_SIZE_FLOOR)
+                        };
                     }
                     let walk_entry = WalkEntry {
                         path: child_path,
@@ -2145,6 +2235,86 @@ mod tests {
         }
 
         target_dir
+    }
+
+    /// Opaque trees are pruned from the main walk, so their size has to come
+    /// from the dedicated probe. Before it, every opaque candidate reported
+    /// exactly `OPAQUE_CANDIDATE_SIZE_FLOOR`, which made a 130 GB rch pool and
+    /// a 100 MB scratch dir score and rank identically.
+    #[test]
+    fn opaque_candidate_reports_measured_size_not_just_the_floor() {
+        let tmp = TempDir::new().unwrap();
+        let tree = tmp.path().join("opaque-target");
+        fs::create_dir_all(tree.join("debug").join("deps")).unwrap();
+        // Enough real bytes to be unambiguously distinguishable from an empty
+        // tree, while staying small enough for a unit test.
+        let payload = vec![b'x'; 64 * 1024];
+        for index in 0..40 {
+            fs::write(
+                tree.join("debug")
+                    .join("deps")
+                    .join(format!("a{index}.rlib")),
+                &payload,
+            )
+            .unwrap();
+        }
+        let root_dev = device_id(&fs::metadata(&tree).unwrap());
+        let cancel = AtomicBool::new(false);
+
+        let (measured, complete) =
+            opaque_tree_allocated_size(&tree, false, root_dev, OPAQUE_SIZE_PROBE_BUDGET, &cancel);
+
+        assert!(complete, "probe should complete on a small tree");
+        // ~2.5 MiB of payload; assert it tracks real bytes, not a constant.
+        assert!(
+            measured >= 2 * 1024 * 1024,
+            "expected the probe to sum real file bytes, got {measured}"
+        );
+        // An empty tree must NOT report the same as a populated one.
+        let empty = tmp.path().join("empty-target");
+        fs::create_dir_all(&empty).unwrap();
+        let (empty_measured, _) =
+            opaque_tree_allocated_size(&empty, false, root_dev, OPAQUE_SIZE_PROBE_BUDGET, &cancel);
+        assert!(
+            empty_measured < measured,
+            "sizes must discriminate: empty={empty_measured} populated={measured}"
+        );
+    }
+
+    /// A truncated probe must not under-report a big tree into looking
+    /// trivial — the floor is the fallback exactly when measurement is partial.
+    #[test]
+    fn opaque_size_probe_reports_incomplete_when_budget_exhausted() {
+        let tmp = TempDir::new().unwrap();
+        let tree = tmp.path().join("wide");
+        fs::create_dir_all(&tree).unwrap();
+        for index in 0..16 {
+            fs::write(tree.join(format!("f{index}")), b"x").unwrap();
+        }
+        let root_dev = device_id(&fs::metadata(&tree).unwrap());
+        let cancel = AtomicBool::new(false);
+
+        let (_, complete) = opaque_tree_allocated_size(&tree, false, root_dev, 4, &cancel);
+        assert!(
+            !complete,
+            "exceeding the entry budget must report incomplete"
+        );
+    }
+
+    /// Cancellation during a probe must stop promptly and report incomplete.
+    #[test]
+    fn opaque_size_probe_honours_cancellation() {
+        let tmp = TempDir::new().unwrap();
+        let tree = tmp.path().join("cancelled");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("f"), b"x").unwrap();
+        let root_dev = device_id(&fs::metadata(&tree).unwrap());
+        let cancel = AtomicBool::new(true);
+
+        let (bytes, complete) =
+            opaque_tree_allocated_size(&tree, false, root_dev, OPAQUE_SIZE_PROBE_BUDGET, &cancel);
+        assert!(!complete);
+        assert_eq!(bytes, 0);
     }
 
     fn walk_fixture(root: &Path, opaque_pruning: bool) -> Vec<WalkEntry> {
