@@ -2432,20 +2432,40 @@ fn run_stats(cli: &Cli, args: &StatsArgs) -> Result<(), CliError> {
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
 
     if !config.paths.sqlite_db.exists() {
+        // The activity DB lives under the *invoking user's* data dir. When the
+        // daemon runs as root (the usual install), its history is under root's
+        // home and an unprivileged `sbh stats` legitimately finds nothing here.
+        // Say so explicitly — otherwise this reads as "stats is broken".
+        let root_db = Path::new("/root/.local/share/sbh/activity.sqlite3");
+        let daemon_db_elsewhere = !running_as_root() && root_db.exists();
         match output_mode(cli) {
             OutputMode::Human => {
                 println!(
                     "No activity database found at {}.",
                     config.paths.sqlite_db.display()
                 );
-                println!("  Run the daemon to start collecting statistics.");
+                if daemon_db_elsewhere {
+                    println!(
+                        "  A root-owned database exists at {}.",
+                        root_db.display()
+                    );
+                    println!(
+                        "  The daemon appears to run as root — try: sudo sbh stats"
+                    );
+                } else {
+                    println!("  Run the daemon to start collecting statistics.");
+                }
             }
             OutputMode::Json => {
-                let payload = json!({
+                let mut payload = json!({
                     "command": "stats",
                     "error": "no_database",
                     "db_path": config.paths.sqlite_db.to_string_lossy(),
                 });
+                if daemon_db_elsewhere {
+                    payload["hint"] = json!("daemon database is root-owned; retry with sudo");
+                    payload["root_db_path"] = json!(root_db.to_string_lossy());
+                }
                 write_json_line(&payload)?;
             }
         }
