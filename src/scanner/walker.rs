@@ -198,15 +198,25 @@ fn opaque_tree_allocated_size(
 ) -> (u64, bool) {
     let mut total: u64 = 0;
     let mut seen: usize = 0;
+    let mut complete = true;
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    // Multiply-linked inodes are counted once, matching `du`: the second link
+    // frees nothing, so counting it would break the "reclaiming this frees N
+    // bytes" property that `allocated_size` exists to preserve. Only entries
+    // with nlink > 1 are tracked, so the set stays empty for ordinary trees.
+    let mut linked: HashSet<(u64, u64)> = HashSet::new();
 
     while let Some(dir) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
             return (total, false);
         }
         let Ok(entries) = fs::read_dir(&dir) else {
-            // An unreadable subtree means the total is a floor, not a truth.
-            return (total, false);
+            // One unreadable subtree must not abandon the whole measurement —
+            // that would discard everything already counted and everything
+            // still queued. Record it as incomplete and keep going, so the
+            // total stays the best available lower bound.
+            complete = false;
+            continue;
         };
         for entry in entries.flatten() {
             if cancel.load(Ordering::Relaxed) {
@@ -226,13 +236,43 @@ fn opaque_tree_allocated_size(
                 continue;
             }
             if meta.is_dir() {
+                // Directory blocks count toward `du -sk`, which is what the
+                // deletion report and rch's reaper use to state "freed N KB".
+                // The caller contributes the root dir's own blocks.
+                total = total.saturating_add(allocated_size(&meta));
                 stack.push(entry.path());
             } else {
+                if let Some(key) = hardlink_key(&meta) {
+                    if !linked.insert(key) {
+                        continue;
+                    }
+                }
                 total = total.saturating_add(allocated_size(&meta));
             }
         }
     }
-    (total, true)
+    (total, complete)
+}
+
+/// Identity of a multiply-linked file, for counting its blocks exactly once.
+///
+/// Returns `None` for single-link files (the common case) so callers do not pay
+/// set insertions for a tree with no hardlinks, and on non-Unix where the link
+/// count is unavailable.
+fn hardlink_key(meta: &fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return Some((meta.dev(), meta.ino()));
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
 }
 
 /// Parallel directory walker with safety guards.
@@ -2278,6 +2318,78 @@ mod tests {
         assert!(
             empty_measured < measured,
             "sizes must discriminate: empty={empty_measured} populated={measured}"
+        );
+    }
+
+    /// A hardlinked file frees nothing when its second link is removed, so it
+    /// must be counted once — the same rule `du` follows, and the rule the
+    /// deletion report's `du -sk` numbers already assume.
+    #[test]
+    fn opaque_size_probe_counts_hardlinks_once() {
+        let tmp = TempDir::new().unwrap();
+        let tree = tmp.path().join("linked");
+        fs::create_dir_all(&tree).unwrap();
+        let payload = vec![b'x'; 256 * 1024];
+        let original = tree.join("original.bin");
+        fs::write(&original, &payload).unwrap();
+        let root_dev = device_id(&fs::metadata(&tree).unwrap());
+        let cancel = AtomicBool::new(false);
+
+        let (before, _) =
+            opaque_tree_allocated_size(&tree, false, root_dev, OPAQUE_SIZE_PROBE_BUDGET, &cancel);
+
+        // Ten extra links to the SAME inode consume no additional blocks.
+        for index in 0..10 {
+            if fs::hard_link(&original, tree.join(format!("link{index}.bin"))).is_err() {
+                return; // filesystem without hardlink support: nothing to assert
+            }
+        }
+        let (after, complete) =
+            opaque_tree_allocated_size(&tree, false, root_dev, OPAQUE_SIZE_PROBE_BUDGET, &cancel);
+
+        assert!(complete);
+        assert_eq!(
+            before, after,
+            "hardlinks must not inflate the total: {before} -> {after}"
+        );
+    }
+
+    /// One unreadable subdirectory must not discard the whole measurement:
+    /// everything readable still counts, and the result is flagged incomplete
+    /// so the call site keeps the floor semantics.
+    #[test]
+    fn opaque_size_probe_survives_an_unreadable_subdir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let tree = tmp.path().join("partly-readable");
+        let good = tree.join("good");
+        let blocked = tree.join("blocked");
+        fs::create_dir_all(&good).unwrap();
+        fs::create_dir_all(&blocked).unwrap();
+        let payload = vec![b'x'; 256 * 1024];
+        for index in 0..8 {
+            fs::write(good.join(format!("f{index}")), &payload).unwrap();
+        }
+        fs::write(blocked.join("hidden"), &payload).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let root_dev = device_id(&fs::metadata(&tree).unwrap());
+        let cancel = AtomicBool::new(false);
+        let (measured, complete) =
+            opaque_tree_allocated_size(&tree, false, root_dev, OPAQUE_SIZE_PROBE_BUDGET, &cancel);
+
+        // Restore permissions so TempDir cleanup can remove the tree.
+        let _ = fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755));
+
+        // Running as root ignores the permission bits; then nothing is
+        // unreadable and the walk legitimately completes.
+        if complete {
+            return;
+        }
+        assert!(
+            measured >= 2 * 1024 * 1024,
+            "readable siblings must still be counted, got {measured}"
         );
     }
 
