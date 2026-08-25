@@ -244,10 +244,11 @@ fn opaque_tree_allocated_size(
                 total = total.saturating_add(allocated_size(&meta));
                 stack.push(entry.path());
             } else {
-                if let Some(key) = hardlink_key(&meta) {
-                    if !linked.insert(key) {
-                        continue;
-                    }
+                // A second link to an inode already counted frees nothing.
+                if let Some(key) = hardlink_key(&meta)
+                    && !linked.insert(key)
+                {
+                    continue;
                 }
                 total = total.saturating_add(allocated_size(&meta));
             }
