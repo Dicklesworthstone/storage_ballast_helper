@@ -572,11 +572,19 @@ pub fn classify_rch_target(path: &Path) -> Option<RchTargetKind> {
     Some(RchTargetKind::PerJob)
 }
 
-/// Bound on the idle probe below. An active build touches files constantly, so
-/// the early exit fires almost immediately in the dangerous case; this cap only
-/// governs how long we're willing to look before giving up (and refusing to
-/// delete).
-const RCH_IDLE_PROBE_MAX_ENTRIES: usize = 20_000;
+/// Runaway guard for the idle probe below — *not* a correctness knob.
+///
+/// rch's own test is `find <dir> -mmin -N -print -quit`: early-exit on the first
+/// fresh entry, and a full traversal when the dir really is idle. We mirror that,
+/// because proving "nothing here is fresh" genuinely requires visiting
+/// everything. The cap only stops a pathological tree from stalling a scan; a
+/// real cargo target dir is comfortably inside it.
+///
+/// Exceeding it yields [`TreeActivity::Unknown`], which vetoes. That is the
+/// right division of labour rather than a lost reclaim: rch runs its own reaper
+/// over these dirs with the same idle floors, so deferring costs nothing but a
+/// later sweep, whereas guessing costs a cold rebuild of the whole crate graph.
+const RCH_IDLE_PROBE_MAX_ENTRIES: usize = 400_000;
 
 /// Outcome of asking "has anything in this tree been written recently?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1375,6 +1383,37 @@ mod tests {
             // If we cannot establish idleness we must refuse to delete.
             let missing = Path::new("/nonexistent-rch-root/.rch-target-hz1-pool-abc");
             assert!(rch_target_veto_reason(missing).is_some());
+        }
+
+        #[test]
+        fn idle_probe_walks_a_realistically_sized_tree() {
+            // Regression guard: an earlier cap of 20k entries meant any real
+            // cargo target dir (easily 100k+ files) hit the runaway guard,
+            // reported Unknown, and was vetoed forever — quietly making every
+            // rch pool dir immortal. A tree well past the old cap must still
+            // resolve to a definite verdict.
+            use super::super::{RCH_IDLE_PROBE_MAX_ENTRIES, TreeActivity, rch_tree_activity};
+            assert!(
+                RCH_IDLE_PROBE_MAX_ENTRIES >= 400_000,
+                "cap must stay above realistic cargo target sizes"
+            );
+
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = tmp.path().join(".rch-target-hz1-pool-sized");
+            // 25k entries: >the old cap, small enough to stay a fast unit test.
+            for bucket in 0..50 {
+                let dir = pool.join(format!("debug/deps/b{bucket}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                for i in 0..500 {
+                    std::fs::write(dir.join(format!("f{i}.o")), b"x").unwrap();
+                }
+            }
+            // Everything is fresh, so this must be a definite Active, reached
+            // via early exit rather than by exhausting the guard.
+            assert_eq!(
+                rch_tree_activity(&pool, Duration::from_secs(168 * 3600)),
+                TreeActivity::Active
+            );
         }
     }
 
