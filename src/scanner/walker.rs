@@ -220,10 +220,16 @@ fn opaque_tree_allocated_size(
             complete = false;
             continue;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
             if cancel.load(Ordering::Relaxed) {
                 return (total, false);
             }
+            // An iteration error means entries we never saw at all, so the
+            // total is a lower bound rather than the tree's true size.
+            let Ok(entry) = entry else {
+                complete = false;
+                continue;
+            };
             seen += 1;
             if seen > budget {
                 return (total, false);
@@ -231,8 +237,18 @@ fn opaque_tree_allocated_size(
             // `DirEntry::metadata` does not traverse symlinks, so a link is
             // sized as the link itself: no double-counting, no escaping the
             // tree via a symlink to somewhere large.
-            let Ok(meta) = entry.metadata() else {
-                continue;
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(err) => {
+                    // A file disappearing mid-walk is routine while a build is
+                    // writing and does NOT make the total untrustworthy — its
+                    // blocks are genuinely gone. Anything else (permissions,
+                    // EIO) is a real gap we failed to measure.
+                    if err.kind() != ErrorKind::NotFound {
+                        complete = false;
+                    }
+                    continue;
+                }
             };
             if !cross_devices && device_id(&meta) != root_dev {
                 continue;
