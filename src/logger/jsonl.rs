@@ -553,6 +553,20 @@ fn format_utc_now() -> String {
 mod tests {
     use super::*;
 
+    /// A path no process can create — root included: its parent is a regular
+    /// FILE inside the tempdir, so `create_dir_all` fails with `ENOTDIR`
+    /// instead of succeeding for a privileged uid. This keeps the
+    /// "primary path unavailable" fixtures hermetic (nothing is ever created
+    /// outside the tempdir, so a root-run suite leaves no litter at `/`) and
+    /// valid regardless of who runs the tests.
+    fn uncreatable_path(dir: &Path, leaf: &str) -> PathBuf {
+        let blocker = dir.join("not-a-directory");
+        if !blocker.exists() {
+            fs::write(&blocker, b"regular file standing in for an unwritable dir").unwrap();
+        }
+        blocker.join(leaf)
+    }
+
     #[test]
     fn write_entry_produces_valid_json_lines() {
         let dir = tempfile::tempdir().unwrap();
@@ -632,7 +646,7 @@ mod tests {
     #[test]
     fn fallback_when_primary_dir_unwritable() {
         let dir = tempfile::tempdir().unwrap();
-        let bad_primary = PathBuf::from("/nonexistent_sbh_test_dir_12345/primary.jsonl");
+        let bad_primary = uncreatable_path(dir.path(), "primary.jsonl");
         let fallback = dir.path().join("fallback.jsonl");
         let config = JsonlConfig {
             path: bad_primary,
@@ -694,7 +708,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let recovery_path = dir.path().join("recovered.jsonl");
         let config = JsonlConfig {
-            path: PathBuf::from("/nonexistent_sbh_test_dir_12345/primary.jsonl"),
+            path: uncreatable_path(dir.path(), "primary.jsonl"),
             fallback_path: None,
             max_size_bytes: 1024 * 1024,
             max_rotated_files: 3,
@@ -720,8 +734,9 @@ mod tests {
     fn full_degradation_chain_primary_to_discard() {
         // Inject: primary bad, no fallback.
         // Expect: degrades through stderr to discard without panic.
+        let dir = tempfile::tempdir().unwrap();
         let config = JsonlConfig {
-            path: PathBuf::from("/nonexistent_primary_sbh/bad.jsonl"),
+            path: uncreatable_path(dir.path(), "bad.jsonl"),
             fallback_path: None,
             max_size_bytes: 1024 * 1024,
             max_rotated_files: 3,
@@ -744,9 +759,10 @@ mod tests {
     fn fallback_to_stderr_when_both_paths_fail() {
         // Inject: both primary and fallback paths are non-creatable.
         // Expect: degrades to stderr.
+        let dir = tempfile::tempdir().unwrap();
         let config = JsonlConfig {
-            path: PathBuf::from("/nonexistent_primary_aaa/log.jsonl"),
-            fallback_path: Some(PathBuf::from("/nonexistent_fallback_bbb/log.jsonl")),
+            path: uncreatable_path(dir.path(), "primary/log.jsonl"),
+            fallback_path: Some(uncreatable_path(dir.path(), "fallback/log.jsonl")),
             max_size_bytes: 1024 * 1024,
             max_rotated_files: 3,
             fsync_interval_secs: 60,
@@ -768,7 +784,7 @@ mod tests {
 
         // Intentionally make primary directory non-creatable at first.
         let config = JsonlConfig {
-            path: PathBuf::from("/nonexistent_sbh_recovery_test/primary.jsonl"),
+            path: uncreatable_path(dir.path(), "primary.jsonl"),
             fallback_path: Some(fallback_path.clone()),
             max_size_bytes: 1024 * 1024,
             max_rotated_files: 3,
@@ -800,7 +816,7 @@ mod tests {
         let primary_path = dir.path().join("recovered_from_stderr.jsonl");
 
         let config = JsonlConfig {
-            path: PathBuf::from("/nonexistent_sbh_stderr_test/bad.jsonl"),
+            path: uncreatable_path(dir.path(), "bad.jsonl"),
             fallback_path: None,
             max_size_bytes: 1024 * 1024,
             max_rotated_files: 3,
@@ -827,10 +843,8 @@ mod tests {
         let fallback_path = dir.path().join("recovered_fallback.jsonl");
 
         let config = JsonlConfig {
-            path: PathBuf::from("/nonexistent_sbh_stderr_to_fallback/primary.jsonl"),
-            fallback_path: Some(PathBuf::from(
-                "/nonexistent_sbh_stderr_to_fallback/fallback.jsonl",
-            )),
+            path: uncreatable_path(dir.path(), "primary.jsonl"),
+            fallback_path: Some(uncreatable_path(dir.path(), "fallback.jsonl")),
             max_size_bytes: 1024 * 1024,
             max_rotated_files: 3,
             fsync_interval_secs: 60,

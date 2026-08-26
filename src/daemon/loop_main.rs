@@ -7382,7 +7382,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// The regression this limiter exists for: a PRODUCTIVE pass under Red.
     ///
     /// `empty_pass_cooldown_active` returns false here (the empty-pass counter

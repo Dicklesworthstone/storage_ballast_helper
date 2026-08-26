@@ -778,6 +778,19 @@ mod tests {
         }
     }
 
+    /// A path no process can create — root included — because its parent is a
+    /// regular file inside the tempdir (`create_dir_all` fails with
+    /// `ENOTDIR`). Hermetic and privilege-independent, unlike an absolute
+    /// `/nonexistent_…` path, which root CAN create and then leaves behind at
+    /// the filesystem root.
+    fn uncreatable_path(dir: &std::path::Path, leaf: &str) -> std::path::PathBuf {
+        let blocker = dir.join("not-a-directory");
+        if !blocker.exists() {
+            std::fs::write(&blocker, b"regular file standing in for an unwritable dir").unwrap();
+        }
+        blocker.join(leaf)
+    }
+
     #[test]
     fn spawn_and_shutdown() {
         let dir = tempfile::tempdir().unwrap();
@@ -942,9 +955,7 @@ mod tests {
         // Expect: all events still reach the JSONL backend.
         let dir = tempfile::tempdir().unwrap();
         let config = DualLoggerConfig {
-            sqlite_path: Some(std::path::PathBuf::from(
-                "/nonexistent_sbh_test_readonly_dir/impossible.db",
-            )),
+            sqlite_path: Some(uncreatable_path(dir.path(), "impossible.db")),
             jsonl_config: JsonlConfig {
                 path: dir.path().join("fallback_only.jsonl"),
                 fallback_path: None,
@@ -989,10 +1000,11 @@ mod tests {
     fn both_backends_unavailable_no_panic() {
         // Inject: SQLite path bad, JSONL primary bad, no fallback.
         // Expect: logger thread does not panic; shutdown completes cleanly.
+        let dir = tempfile::tempdir().unwrap();
         let config = DualLoggerConfig {
-            sqlite_path: Some(std::path::PathBuf::from("/nonexistent_dir_1/bad.db")),
+            sqlite_path: Some(uncreatable_path(dir.path(), "bad.db")),
             jsonl_config: JsonlConfig {
-                path: std::path::PathBuf::from("/nonexistent_dir_2/bad.jsonl"),
+                path: uncreatable_path(dir.path(), "bad.jsonl"),
                 fallback_path: None,
                 max_size_bytes: 10 * 1024 * 1024,
                 max_rotated_files: 3,
@@ -1023,7 +1035,7 @@ mod tests {
         let config = DualLoggerConfig {
             sqlite_path: None,
             jsonl_config: JsonlConfig {
-                path: std::path::PathBuf::from("/nonexistent_primary_dir/bad.jsonl"),
+                path: uncreatable_path(dir.path(), "bad.jsonl"),
                 fallback_path: Some(fallback_path.clone()),
                 max_size_bytes: 10 * 1024 * 1024,
                 max_rotated_files: 3,
