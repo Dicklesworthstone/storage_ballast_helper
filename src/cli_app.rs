@@ -2445,13 +2445,8 @@ fn run_stats(cli: &Cli, args: &StatsArgs) -> Result<(), CliError> {
                     config.paths.sqlite_db.display()
                 );
                 if daemon_db_elsewhere {
-                    println!(
-                        "  A root-owned database exists at {}.",
-                        root_db.display()
-                    );
-                    println!(
-                        "  The daemon appears to run as root — try: sudo sbh stats"
-                    );
+                    println!("  A root-owned database exists at {}.", root_db.display());
+                    println!("  The daemon appears to run as root — try: sudo sbh stats");
                 } else {
                     println!("  Run the daemon to start collecting statistics.");
                 }
@@ -4419,6 +4414,8 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
             match output_mode(cli) {
                 OutputMode::Human => {
                     println!("Ballast provision complete:");
+                    println!("  Ballast dir: {}", config.paths.ballast_dir.display());
+                    println!("  Config: {}", config.paths.config_file.display());
                     println!("  Files created: {}", report.files_created);
                     println!("  Files skipped (existing): {}", report.files_skipped);
                     println!(
@@ -4435,6 +4432,8 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                 OutputMode::Json => {
                     let payload = json!({
                         "command": "ballast provision",
+                        "ballast_dir": config.paths.ballast_dir.to_string_lossy(),
+                        "config_path": config.paths.config_file.to_string_lossy(),
                         "files_created": report.files_created,
                         "files_skipped": report.files_skipped,
                         "total_bytes": report.total_bytes,

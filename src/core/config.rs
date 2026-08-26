@@ -936,6 +936,55 @@ fn system_config_file() -> PathBuf {
     }
 }
 
+/// Which file an invocation with no explicit `--config` / `SBH_CONFIG` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplicitConfigChoice {
+    /// The per-user config (or, when it is absent, built-in defaults).
+    User,
+    /// No per-user config exists but the system one does: read it so an
+    /// unprivileged `sbh status` sees what the system service sees.
+    SystemFallback,
+    /// The process is root and a system config exists. Root is the identity
+    /// the system service and `sudo sbh …` share, so both must resolve the
+    /// same file; `shadowed_user_config` records that root's own per-user
+    /// file also exists and is being ignored.
+    SystemForRoot { shadowed_user_config: bool },
+}
+
+/// Decide the implicit config file. Privilege must not silently change which
+/// config is in force: before this rule `sudo sbh ballast provision` read
+/// `~root/.config/sbh/config.toml`, so the pool declared by
+/// `/etc/sbh/config.toml` (root-owned, hence only writable via sudo) could
+/// never be provisioned, and `sbh status` and `sudo sbh status` reported two
+/// different pools. An explicit `--config` / `SBH_CONFIG` still wins and is
+/// handled by the caller.
+fn choose_implicit_config(
+    is_root: bool,
+    user_config_exists: bool,
+    system_config_exists: bool,
+) -> ImplicitConfigChoice {
+    if is_root && system_config_exists {
+        ImplicitConfigChoice::SystemForRoot {
+            shadowed_user_config: user_config_exists,
+        }
+    } else if !user_config_exists && system_config_exists {
+        ImplicitConfigChoice::SystemFallback
+    } else {
+        ImplicitConfigChoice::User
+    }
+}
+
+fn effective_uid_is_root() -> bool {
+    #[cfg(unix)]
+    {
+        nix::unistd::Uid::effective().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 fn system_data_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -1045,19 +1094,37 @@ impl Config {
         );
         let is_explicit_path = path.is_some() || env_config.is_some();
 
-        // System-wide fallback: when no explicit path is given and user-level
-        // config doesn't exist, try the platform system config before using
-        // defaults. This allows `sbh status` (run as a regular user) to find
-        // the same config that the system service uses.
+        // System-wide resolution when no explicit path is given: a regular
+        // user without a per-user config reads the system config (so
+        // `sbh status` sees what the service sees), and root always prefers
+        // the system config when one exists (so `sudo sbh …` and the system
+        // service agree on which ballast pool is real).
         let system_config = system_config_file();
-        let (effective_path, is_system_fallback) = if allow_system_fallback
-            && !is_explicit_path
-            && !path_buf.exists()
-            && system_config.exists()
-        {
-            (system_config, true)
+        let choice = if allow_system_fallback && !is_explicit_path {
+            choose_implicit_config(
+                effective_uid_is_root(),
+                path_buf.exists(),
+                system_config.exists(),
+            )
         } else {
-            (path_buf, false)
+            ImplicitConfigChoice::User
+        };
+        let (effective_path, is_system_fallback) = match choice {
+            ImplicitConfigChoice::User => (path_buf, false),
+            ImplicitConfigChoice::SystemFallback => (system_config, true),
+            ImplicitConfigChoice::SystemForRoot {
+                shadowed_user_config,
+            } => {
+                if shadowed_user_config {
+                    eprintln!(
+                        "[SBH-CONFIG] Running as root: using system config at {} \
+                         (ignoring {}; pass --config to read that file instead)",
+                        system_config.display(),
+                        path_buf.display()
+                    );
+                }
+                (system_config, true)
+            }
         };
 
         let mut cfg = if effective_path.exists() {
@@ -1075,7 +1142,7 @@ impl Config {
                 &default_paths
             };
             apply_missing_path_defaults(&mut parsed.paths, &raw_value, path_defaults);
-            if is_system_fallback {
+            if choice == ImplicitConfigChoice::SystemFallback {
                 eprintln!(
                     "[SBH-CONFIG] Using system config at {}",
                     effective_path.display()
@@ -2031,6 +2098,51 @@ mod tests {
             assert_eq!(paths.state_file, PathBuf::from("/var/lib/sbh/state.json"));
             assert_eq!(paths.ballast_dir, PathBuf::from("/var/lib/sbh/ballast"));
         }
+    }
+
+    #[test]
+    fn root_prefers_system_config_whenever_it_exists() {
+        use super::{ImplicitConfigChoice, choose_implicit_config};
+        // The sudo/system-service identity must resolve the same file the
+        // unprivileged CLI falls back to, even when root has a per-user config.
+        assert_eq!(
+            choose_implicit_config(true, true, true),
+            ImplicitConfigChoice::SystemForRoot {
+                shadowed_user_config: true
+            }
+        );
+        assert_eq!(
+            choose_implicit_config(true, false, true),
+            ImplicitConfigChoice::SystemForRoot {
+                shadowed_user_config: false
+            }
+        );
+        // Without a system config root behaves like any user.
+        assert_eq!(
+            choose_implicit_config(true, true, false),
+            ImplicitConfigChoice::User
+        );
+        assert_eq!(
+            choose_implicit_config(true, false, false),
+            ImplicitConfigChoice::User
+        );
+    }
+
+    #[test]
+    fn unprivileged_user_config_still_wins_over_system_config() {
+        use super::{ImplicitConfigChoice, choose_implicit_config};
+        assert_eq!(
+            choose_implicit_config(false, true, true),
+            ImplicitConfigChoice::User
+        );
+        assert_eq!(
+            choose_implicit_config(false, false, true),
+            ImplicitConfigChoice::SystemFallback
+        );
+        assert_eq!(
+            choose_implicit_config(false, false, false),
+            ImplicitConfigChoice::User
+        );
     }
 
     #[test]
