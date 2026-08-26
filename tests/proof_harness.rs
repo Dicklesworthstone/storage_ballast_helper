@@ -804,7 +804,10 @@ fn fault_eprocess_drift_forces_fallback() {
         ActiveMode::FallbackSafe,
         "e-process alarm must force fallback"
     );
-    assert_eq!(decision.approved_for_deletion, [] as [storage_ballast_helper::prelude::CandidacyScore; 0]);
+    assert_eq!(
+        decision.approved_for_deletion,
+        [] as [storage_ballast_helper::prelude::CandidacyScore; 0]
+    );
 }
 
 // Fault family 4: Canary budget exhaustion → graceful degradation
@@ -1582,7 +1585,10 @@ fn invariant_fallback_always_dominates() {
 
             let decision = engine.evaluate(&candidates, Some(&good_guard()));
 
-            assert_eq!(decision.approved_for_deletion, [] as [storage_ballast_helper::prelude::CandidacyScore; 0]);
+            assert_eq!(
+                decision.approved_for_deletion,
+                [] as [storage_ballast_helper::prelude::CandidacyScore; 0]
+            );
             assert_eq!(decision.mode, ActiveMode::FallbackSafe);
             assert!(!decision.records.is_empty());
             for record in &decision.records {

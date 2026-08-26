@@ -242,7 +242,10 @@ fn state_file_empty_json_object_uses_defaults() {
     assert_eq!(loaded.pid, 0);
     assert_eq!(loaded.uptime_seconds, 0);
     assert_eq!(loaded.pressure.overall, "");
-    assert_eq!(loaded.pressure.mounts, [] as [storage_ballast_helper::daemon::self_monitor::MountPressure; 0]);
+    assert_eq!(
+        loaded.pressure.mounts,
+        [] as [storage_ballast_helper::daemon::self_monitor::MountPressure; 0]
+    );
     assert_eq!(loaded.ballast.available, 0);
     assert_eq!(loaded.counters.scans, 0);
 }
@@ -314,7 +317,10 @@ fn state_file_with_partial_fields_fills_defaults() {
     assert_eq!(loaded.pid, 555);
     // Missing fields default to zero/empty.
     assert_eq!(loaded.uptime_seconds, 0);
-    assert_eq!(loaded.pressure.mounts, [] as [storage_ballast_helper::daemon::self_monitor::MountPressure; 0]);
+    assert_eq!(
+        loaded.pressure.mounts,
+        [] as [storage_ballast_helper::daemon::self_monitor::MountPressure; 0]
+    );
     assert_eq!(loaded.ballast.available, 0);
     assert_eq!(loaded.counters.scans, 0);
 }
@@ -557,7 +563,10 @@ fn daemon_state_default_has_safe_values() {
     assert_eq!(state.version, "");
     assert_eq!(state.pid, 0);
     assert_eq!(state.uptime_seconds, 0);
-    assert_eq!(state.pressure.mounts, [] as [storage_ballast_helper::daemon::self_monitor::MountPressure; 0]);
+    assert_eq!(
+        state.pressure.mounts,
+        [] as [storage_ballast_helper::daemon::self_monitor::MountPressure; 0]
+    );
     assert_eq!(state.ballast.available, 0);
     assert_eq!(state.ballast.total, 0);
     assert_eq!(state.counters.scans, 0);
