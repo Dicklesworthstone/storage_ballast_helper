@@ -1322,5 +1322,5 @@ fn variance(values: &[f64]) -> f64 {
 fn u64_to_f64(value: u64) -> f64 {
     let upper = u32::try_from(value >> 32).expect("upper half fits in u32");
     let lower = u32::try_from(value & u64::from(u32::MAX)).expect("lower half fits in u32");
-    f64::from(upper) * 4_294_967_296.0 + f64::from(lower)
+    f64::mul_add(f64::from(upper), 4_294_967_296.0, f64::from(lower))
 }

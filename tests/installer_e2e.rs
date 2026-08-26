@@ -825,7 +825,7 @@ fn e2e_host_detection_resolves_valid_contract() {
     let contract = resolve_installer_artifact_contract(host, ReleaseChannel::Stable, None).unwrap();
 
     assert_eq!(contract.repository, RELEASE_REPOSITORY);
-    assert!(!contract.asset_name().is_empty());
+    assert_ne!(contract.asset_name(), "");
     assert!(contract.asset_name().contains("sbh"));
     assert!(contract.checksum_name().ends_with(".sha256"));
     assert!(contract.sigstore_bundle_name().ends_with(".sigstore.json"));

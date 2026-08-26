@@ -6,6 +6,55 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ---
 
+## v0.5.1
+
+### Fixed — rch target dirs are reclaimed on idle time, not birth time (regression from v0.5.0)
+
+v0.5.0 widened reclaim to key on `CACHEDIR.TAG` rather than directory name.
+Cargo writes `CACHEDIR.TAG` into every target dir, so rch's remote
+`CARGO_TARGET_DIR` trees — previously invisible to the name matcher — became
+first-class candidates. Being the largest directories on a build host, they
+scored highest.
+
+They were also removed **while builds were writing to them**, because
+`EntryMetadata::effective_age_timestamp` ages directories by *birth* time. That
+is deliberate and correct for ordinary caches (a directory's `mtime` bumps on
+every child add/remove, so an active `target/` looks perpetually young), but it
+inverts for an rch pool dir: a warm cache created days ago and rebuilt into ever
+since still reports an age of days, so it scores as maximally abandoned exactly
+when it is busiest. On one host this removed an 18.9 GB and a 12.3 GB pool dir
+in a single sweep.
+
+Removing a pool dir does not reclaim reusable space. It forces every subsequent
+dispatch sharing those build dimensions to rebuild the whole crate graph from
+cold.
+
+Reclaim of rch-managed dirs now mirrors rch's own contract
+(`rch-common/src/stale_target_reap.rs`):
+
+- scope is exactly rch's `REAP_GLOBS` — the `-job-`, `-pid-` and `-pool-`
+  marker shapes under `.rch-target-`. Bare `rch_target_*` and `target` trees
+  keep their existing scoring.
+- eligibility is **recursive tree idleness**, tested with an early exit on the
+  first fresh file, not the directory's own timestamp.
+- idle floors match rch: 12 h for per-job and per-pid dirs, 168 h (7 days) for
+  pooled ones, which rch treats as warm caches rather than short-TTL targets.
+- an indeterminate result (unreadable subtree, or a tree past the traversal
+  guard) vetoes rather than removes, deferring to rch's own reaper.
+
+Vetoed candidates are never plannable in any mode, including emergency
+escalation.
+
+### Fixed — `sbh stats` no longer looks broken when the daemon runs as root
+
+The activity database lives under the invoking user's data dir. With the usual
+root-owned daemon, an unprivileged `sbh stats` correctly found nothing and
+reported a bare `no_database`, which reads as a malfunction. It now detects the
+root-owned database and points at `sudo sbh stats` (JSON output gains `hint` and
+`root_db_path`).
+
+---
+
 ## v0.5.0 **[release]**
 
 ### Changed — build-cache reclaim is now keyed on `CACHEDIR.TAG`, not directory name (bd-k0t3r)

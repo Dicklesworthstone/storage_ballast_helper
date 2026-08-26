@@ -804,7 +804,7 @@ fn fault_eprocess_drift_forces_fallback() {
         ActiveMode::FallbackSafe,
         "e-process alarm must force fallback"
     );
-    assert!(decision.approved_for_deletion.is_empty());
+    assert_eq!(decision.approved_for_deletion, [] as [storage_ballast_helper::prelude::CandidacyScore; 0]);
 }
 
 // Fault family 4: Canary budget exhaustion → graceful degradation
@@ -1192,7 +1192,7 @@ fn repro_pack_generates_valid_json() {
 
     // Must serialize without panic.
     let json = serde_json::to_string_pretty(&pack).expect("repro pack must serialize");
-    assert!(!json.is_empty());
+    assert_ne!(json, "");
 
     // Must contain key sections.
     assert!(json.contains("\"os\""));
@@ -1322,7 +1322,7 @@ fn repro_pack_writes_to_tempdir() {
     // Verify files are non-empty and parseable.
     for path in &[&env_path, &manifest_path, &trace_path] {
         let content = std::fs::read_to_string(path).unwrap();
-        assert!(!content.is_empty());
+        assert_ne!(content, "");
         let _: serde_json::Value = serde_json::from_str(&content).expect("must be valid JSON");
     }
 }
@@ -1582,7 +1582,7 @@ fn invariant_fallback_always_dominates() {
 
             let decision = engine.evaluate(&candidates, Some(&good_guard()));
 
-            assert!(decision.approved_for_deletion.is_empty());
+            assert_eq!(decision.approved_for_deletion, [] as [storage_ballast_helper::prelude::CandidacyScore; 0]);
             assert_eq!(decision.mode, ActiveMode::FallbackSafe);
             assert!(!decision.records.is_empty());
             for record in &decision.records {

@@ -316,7 +316,7 @@ fn e2e_burst_growth_shadow_mode() {
         let l1 = format_explain(record, ExplainLevel::L1);
         let l2 = format_explain(record, ExplainLevel::L2);
         let l3 = format_explain(record, ExplainLevel::L3);
-        assert!(!l0.is_empty());
+        assert_ne!(l0, "");
         assert!(l1.len() >= l0.len());
         assert!(l2.len() >= l1.len());
         assert!(l3.len() >= l2.len());
@@ -461,7 +461,7 @@ fn e2e_canary_bounded_impact() {
     // Step 4: Verify JSON serialization roundtrips for all records.
     for record in decision.records.iter().chain(decision2.records.iter()) {
         let json = record.to_json_compact();
-        assert!(!json.is_empty());
+        assert_ne!(json, "");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.get("decision_id").is_some());
         assert!(parsed.get("trace_id").is_some());
