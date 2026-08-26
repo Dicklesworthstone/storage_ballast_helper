@@ -882,7 +882,7 @@ const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806b
 /// length so a large or adversarial file that merely shares the name cannot cost
 /// more than a couple of hundred bytes of I/O, and cannot falsely mark a
 /// directory as a reclaimable cache.
-fn is_valid_cachedir_tag(path: &Path) -> bool {
+pub(crate) fn is_valid_cachedir_tag(path: &Path) -> bool {
     use std::io::Read;
 
     let Ok(mut file) = fs::File::open(path) else {

@@ -14,7 +14,8 @@ use crate::core::config::ScoringConfig;
 use crate::platform::cleanup_catalog::{CleanupRule, ReclaimCommand};
 use crate::platform::{linux, macos};
 use crate::scanner::patterns::{
-    ArtifactCategory, ArtifactClassification, StructuralSignals, is_obvious_build_artifact_basename,
+    ArtifactCategory, ArtifactClassification, StructuralSignals, is_cargo_registry_internal_path,
+    is_obvious_build_artifact_basename,
 };
 use crate::scanner::protection::SacredOverlap;
 use crate::scanner::walker::FsIdentity;
@@ -426,6 +427,11 @@ impl ScoringEngine {
         if is_system_path(&input.path) {
             return Some(Cow::Borrowed("system path is never deletable"));
         }
+        if is_cargo_registry_internal_path(&input.path) {
+            return Some(Cow::Borrowed(
+                "inside a cargo registry/git store: crate source, not build output",
+            ));
+        }
         if let Some(reason) = rch_target_veto_reason(&input.path) {
             return Some(reason);
         }
@@ -531,8 +537,8 @@ impl RchTargetKind {
     /// "pooled dirs are warm caches, not short-TTL targets".
     const fn required_idle(self) -> Duration {
         match self {
-            Self::PerJob => Duration::from_secs(12 * 3600),
-            Self::Pooled => Duration::from_secs(168 * 3600),
+            Self::PerJob => Duration::from_hours(12),
+            Self::Pooled => Duration::from_hours(168),
         }
     }
 
@@ -633,10 +639,10 @@ fn rch_tree_activity(root: &Path, window: Duration) -> TreeActivity {
             if meta.is_symlink() {
                 continue;
             }
-            if let Ok(modified) = meta.modified() {
-                if modified > cutoff {
-                    return TreeActivity::Active;
-                }
+            if let Ok(modified) = meta.modified()
+                && modified > cutoff
+            {
+                return TreeActivity::Active;
             }
             if meta.is_dir() {
                 stack.push(entry.path());
@@ -1252,10 +1258,7 @@ mod tests {
                     ".rch-target-hz1-pool-e8298f7544a4b8493a8270f7ccf03bb3",
                     RchTargetKind::Pooled,
                 ),
-                (
-                    ".rch-target-ovh-b-pool-75509f",
-                    RchTargetKind::Pooled,
-                ),
+                (".rch-target-ovh-b-pool-75509f", RchTargetKind::Pooled),
                 (
                     ".rch-target-vmi1264463-job-17-1787-3",
                     RchTargetKind::PerJob,
@@ -1302,11 +1305,11 @@ mod tests {
             // this test should fail loudly rather than sbh silently drifting.
             assert_eq!(
                 RchTargetKind::Pooled.required_idle(),
-                Duration::from_secs(168 * 3600)
+                Duration::from_hours(168)
             );
             assert_eq!(
                 RchTargetKind::PerJob.required_idle(),
-                Duration::from_secs(12 * 3600)
+                Duration::from_hours(12)
             );
         }
 
@@ -1345,7 +1348,11 @@ mod tests {
                 // Red-pressure urgency, which is when the incident happened.
                 1.0,
             );
-            assert!(score.vetoed, "expected veto, got score {}", score.total_score);
+            assert!(
+                score.vetoed,
+                "expected veto, got score {}",
+                score.total_score
+            );
             assert_eq!(score.decision.action, DecisionAction::Keep);
             assert!(
                 score
@@ -1424,6 +1431,39 @@ mod tests {
             name_confidence: confidence,
             structural_confidence: confidence,
             combined_confidence: confidence,
+        }
+    }
+
+    #[test]
+    fn crate_source_inside_cargo_stores_is_hard_vetoed_whatever_the_classifier_says() {
+        // Regression: an unpacked `target-triple-1.0.0` crate reached the
+        // Review queue as a 0.93 RustTarget. Even if an upstream classifier
+        // (or a custom pattern) nominates it, the scorer must veto it.
+        let engine = default_engine();
+        for p in [
+            "/data/tmp/rch-cargo-home-abc/registry/src/index.crates.io-1949cf8c6b5b557f/target-triple-1.0.0",
+            "/home/u/.cargo/git/checkouts/foo-1234abcd/deadbeef/target",
+        ] {
+            let score = engine.score_candidate(
+                &CandidateInput {
+                    path: PathBuf::from(p),
+                    size_bytes: 50 * 1024 * 1024,
+                    age: Duration::from_hours(24 * 30),
+                    classification: classification(0.93, ArtifactCategory::RustTarget),
+                    signals: StructuralSignals::default(),
+                    active_references: ActiveReferenceSummary::default(),
+                    is_open: false,
+                    excluded: false,
+                },
+                0.8,
+            );
+            assert!(score.vetoed, "{p}");
+            assert_eq!(
+                score.veto_reason.as_deref(),
+                Some("inside a cargo registry/git store: crate source, not build output"),
+                "{p}"
+            );
+            assert_eq!(score.decision.action, DecisionAction::Keep, "{p}");
         }
     }
 

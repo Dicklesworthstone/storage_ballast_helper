@@ -1149,6 +1149,35 @@ mod tests {
     use crate::scanner::scoring::{DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::borrow::Cow;
 
+    /// Fixture root for deletion tests, guaranteed to sit OUTSIDE the
+    /// hardcoded source-tree roots (`/data/projects`, `/home/<u>/projects`,
+    /// `/Users/<u>/projects`). The preflight refuses to delete anything under
+    /// those by design, so a fixture created under a `TMPDIR` that build
+    /// tooling has redirected into a checkout is vetoed as
+    /// `HardcodedSourceTree` and every deletion test fails for an
+    /// environmental reason. Falls through the usual temp roots and fails
+    /// loudly rather than asserting something the preflight forbids.
+    fn scratch_dir() -> tempfile::TempDir {
+        let bases = [
+            std::env::temp_dir(),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/var/tmp"),
+            PathBuf::from("/data/tmp"),
+        ];
+        for base in &bases {
+            if base.is_dir()
+                && !is_hardcoded_source_tree(base)
+                && let Ok(dir) = tempfile::tempdir_in(base)
+            {
+                return dir;
+            }
+        }
+        panic!(
+            "no scratch base outside the protected source roots (tried {bases:?}); \
+             point TMPDIR at a neutral directory"
+        );
+    }
+
     fn make_candidate(path: &Path, size: u64, score: f64) -> CandidacyScore {
         CandidacyScore {
             path: path.to_path_buf(),
@@ -1196,7 +1225,7 @@ mod tests {
 
     #[test]
     fn plan_filters_and_sorts_candidates() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let p1 = dir.path().join("a");
         let p2 = dir.path().join("b");
         let p3 = dir.path().join("c");
@@ -1239,7 +1268,7 @@ mod tests {
 
     #[test]
     fn plan_excludes_review_decisions_by_default() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let candidate = make_review_candidate(&dir.path().join("ambiguous"), 4096, 0.85);
 
         let executor = DeletionExecutor::new(DeletionConfig::default(), None);
@@ -1254,7 +1283,7 @@ mod tests {
 
     #[test]
     fn emergency_plan_includes_review_and_orders_delete_first() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let review_path = dir.path().join("ambiguous");
         let delete_path = dir.path().join("obvious");
 
@@ -1283,7 +1312,7 @@ mod tests {
 
     #[test]
     fn emergency_escalation_never_plans_vetoed_keep_or_subthreshold() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
 
         let mut vetoed = make_review_candidate(&dir.path().join("vetoed"), 4096, 0.9);
         vetoed.vetoed = true;
@@ -1311,7 +1340,7 @@ mod tests {
 
     #[test]
     fn emergency_execute_frees_bytes_from_review_candidates() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
 
         // A real artifact tree whose only classification is Review.
         let target_dir = dir.path().join("stale_target");
@@ -1452,7 +1481,7 @@ mod tests {
     #[test]
     fn execute_attributes_every_skip_and_flags_stall() {
         // A candidate whose path no longer exists is skipped as PathGone.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let gone = dir.path().join("never-created");
         let candidate = make_candidate(&gone, 4096, 0.95);
 
@@ -1519,7 +1548,7 @@ mod tests {
 
     #[test]
     fn plan_sorts_by_score_descending() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let p1 = dir.path().join("a");
         let p2 = dir.path().join("b");
         let p3 = dir.path().join("c");
@@ -1539,7 +1568,7 @@ mod tests {
 
     #[test]
     fn execute_deletes_files_and_dirs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
 
         // Create a file.
         let file_path = dir.path().join("deleteme.txt");
@@ -1566,7 +1595,7 @@ mod tests {
 
     #[test]
     fn require_identity_allows_matching_candidate() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let file_path = dir.path().join("target-cache");
         fs::write(&file_path, "artifact data").unwrap();
 
@@ -1588,7 +1617,7 @@ mod tests {
 
     #[test]
     fn require_identity_skips_candidate_without_identity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let file_path = dir.path().join("target-cache");
         fs::write(&file_path, "artifact data").unwrap();
 
@@ -1611,7 +1640,7 @@ mod tests {
 
     #[test]
     fn preflight_rejects_replaced_candidate_identity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let file_path = dir.path().join("target-cache");
         let moved_path = dir.path().join("moved-cache");
         fs::write(&file_path, "old artifact").unwrap();
@@ -1638,7 +1667,7 @@ mod tests {
 
     #[test]
     fn delete_path_rechecks_identity_before_removal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let file_path = dir.path().join("target-cache");
         let moved_path = dir.path().join("moved-cache");
         fs::write(&file_path, "old artifact").unwrap();
@@ -1665,7 +1694,7 @@ mod tests {
     fn preflight_rejects_symlink_substitution() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let candidate_path = dir.path().join("target");
         let moved_path = dir.path().join("real-target");
         fs::create_dir(&candidate_path).unwrap();
@@ -1692,7 +1721,7 @@ mod tests {
 
     #[test]
     fn dry_run_does_not_delete() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let file_path = dir.path().join("keep_me.txt");
         fs::write(&file_path, "important").unwrap();
 
@@ -1717,7 +1746,7 @@ mod tests {
 
     #[test]
     fn skips_path_with_dot_git() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let git_dir = dir.path().join("my_project");
         fs::create_dir_all(git_dir.join(".git")).unwrap();
         fs::write(git_dir.join("Cargo.toml"), "[package]").unwrap();
@@ -1734,7 +1763,7 @@ mod tests {
 
     #[test]
     fn skips_scored_delete_for_cargo_manifest_source_root() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let crate_dir = dir
             .path()
             .join("asupersync_ansi_c")
@@ -1769,7 +1798,7 @@ mod tests {
 
     #[test]
     fn skips_nonexistent_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let gone = dir.path().join("already_gone");
 
         let c = make_candidate(&gone, 1000, 0.85);
@@ -1784,7 +1813,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn active_lease_skips_then_releases_the_exact_deletion_candidate() {
-        let root = tempfile::tempdir().unwrap();
+        let root = scratch_dir();
         let target = root.path().join("leased-target");
         let policy = LeasePolicy {
             max_active_leases_per_root: 1,
@@ -1828,7 +1857,7 @@ mod tests {
 
     #[test]
     fn respects_batch_size_limit() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let mut candidates = Vec::new();
         for i in 0..10 {
             let p = dir.path().join(format!("file_{i}.txt"));
@@ -1854,7 +1883,7 @@ mod tests {
 
     #[test]
     fn pressure_check_stops_early() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let mut candidates = Vec::new();
         for i in 0..5 {
             let p = dir.path().join(format!("file_{i}.txt"));
@@ -1881,7 +1910,7 @@ mod tests {
 
     #[test]
     fn successful_batch_does_not_trip_breaker() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let mut candidates = Vec::new();
         // Create paths that don't exist (will fail deletion) but pass preflight
         // by creating them first, then making parent read-only... actually that
@@ -1910,7 +1939,7 @@ mod tests {
 
     #[test]
     fn deletion_error_records_details() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         // File that will succeed.
         let good = dir.path().join("good.txt");
         fs::write(&good, "ok").unwrap();
@@ -1937,7 +1966,7 @@ mod tests {
     fn circuit_breaker_halts_batch_on_consecutive_failures() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let mut candidates = Vec::new();
 
         // Create directories with unremovable subdirs (chmod 000 prevents remove_dir_all).
@@ -1984,7 +2013,14 @@ mod tests {
     fn is_writable_detects_read_only_directory() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        // Root bypasses mode bits, so `access(W_OK)` correctly reports a
+        // 0o555 directory as writable and the precondition cannot hold.
+        if nix::unistd::Uid::effective().is_root() {
+            eprintln!("skipping is_writable_detects_read_only_directory: running as root");
+            return;
+        }
+
+        let dir = scratch_dir();
         let readonly_dir = dir.path().join("readonly");
         fs::create_dir(&readonly_dir).unwrap();
 
@@ -2005,7 +2041,7 @@ mod tests {
     fn nested_open_file_is_detected_for_parent_directory() {
         use crate::scanner::walker;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let nested = dir.path().join("a").join("b").join("c");
         fs::create_dir_all(&nested).unwrap();
         let file_path = nested.join("in_use.bin");
@@ -2031,7 +2067,7 @@ mod tests {
 
     #[test]
     fn deletion_report_tracks_deleted_paths() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
 
         let file1 = dir.path().join("a.txt");
         let file2 = dir.path().join("b.txt");
@@ -2074,7 +2110,7 @@ mod tests {
             return;
         }
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let readonly_parent = dir.path().join("readonly");
         fs::create_dir(&readonly_parent).unwrap();
         let target = readonly_parent.join("artifact");
@@ -2168,35 +2204,35 @@ mod tests {
 
     #[test]
     fn looks_like_source_code_detects_cargo_toml() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
         assert!(looks_like_source_code(dir.path()));
     }
 
     #[test]
     fn looks_like_source_code_detects_rust_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         fs::write(dir.path().join("lib.rs"), "pub fn x() {}").unwrap();
         assert!(looks_like_source_code(dir.path()));
     }
 
     #[test]
     fn looks_like_source_code_detects_package_json() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
         assert!(looks_like_source_code(dir.path()));
     }
 
     #[test]
     fn looks_like_source_code_detects_python_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         fs::write(dir.path().join("main.py"), "x = 1").unwrap();
         assert!(looks_like_source_code(dir.path()));
     }
 
     #[test]
     fn looks_like_source_code_ignores_build_artifacts() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         // A pure cargo target/ would contain these but no source manifests.
         fs::create_dir_all(dir.path().join("debug/deps")).unwrap();
         fs::create_dir_all(dir.path().join(".fingerprint")).unwrap();
@@ -2224,7 +2260,7 @@ mod tests {
         // the existing ContainsCargoManifest check (step 5) doesn't fire
         // first — this test specifically validates step 5b (LooksLikeSourceCode)
         // catches non-cargo source projects that the older veto missed.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         fs::write(dir.path().join("package.json"), "{\"name\":\"x\"}").unwrap();
         fs::write(dir.path().join("index.ts"), "export const x = 1;").unwrap();
 
@@ -2240,7 +2276,7 @@ mod tests {
         // ContainsCargoManifest veto fires first (step 5 before 5b). Either
         // skip is a successful veto — we just lock down which one fires so a
         // future refactor that swaps the order is visible in test diffs.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
 
         let executor = DeletionExecutor::new(DeletionConfig::default(), None);
@@ -2251,7 +2287,7 @@ mod tests {
 
     #[test]
     fn looks_like_source_code_detects_go_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         fs::write(dir.path().join("main.go"), "package main").unwrap();
         assert!(looks_like_source_code(dir.path()));
     }
@@ -2581,7 +2617,7 @@ mod tests {
     fn remove_dir_all_force_defeats_readonly_module_cache_tree() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let root = dir.path().join("gomodcache");
         // Mimic GOMODCACHE: a module dir (0555) holding a 0444 go.mod + .go.
         let module = root.join("github.com").join("foo").join("bar@v1.2.3");
@@ -2615,7 +2651,7 @@ mod tests {
         // The candidate IS a module dir whose direct child is go.mod — exactly
         // what `looks_like_source_code` vetoes. With the GoCache carve-out it
         // must delete; with any other category it must be source-vetoed.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
 
         // Positive case: GoCache classification deletes through the veto.
         let go_dir = dir.path().join("m@v1.0.0");

@@ -168,6 +168,22 @@ pub fn classify_opaque_tree(
         ));
     }
 
+    // Anything strictly inside cargo's own stores (`registry/src`,
+    // `registry/cache`, `registry/index`, `git/checkouts`, `git/db`) is
+    // cargo-managed content — unpacked crate SOURCE, `.crate` archives, index
+    // clones — never a build output. It must be checked before any name rule:
+    // crates such as `target-triple-1.0.0` / `target-lexicon-0.13.5` unpack to
+    // directories whose names satisfy the broad `target-` prefix, and a store
+    // that lives under a temp-like `CARGO_HOME` would otherwise be promoted to
+    // a 0.93 `opaque-cargo-target` candidate purely on that name. The store
+    // roots themselves are excluded here so `.cargo/registry` / `.cargo/git`
+    // remain the opaque reclaim unit handled below.
+    if is_cargo_registry_internal_path(path) {
+        return Some(OpaqueTreeClassification::protected(
+            "cargo registry/git store content is crate source, never a build target",
+        ));
+    }
+
     // Go toolchain caches (GOCACHE build cache / GOMODCACHE module cache).
     // Detected structurally because on the fleet they sit under arbitrarily
     // named roots in /data/tmp that no name pattern matches. The cheap
@@ -204,8 +220,16 @@ pub fn classify_opaque_tree(
     }
 
     if is_cargo_target_name(&name) {
+        // The broad `target-<x>` / `target_<x>` PREFIX forms are the only
+        // target-like shapes that ordinary crate and project names also
+        // satisfy (`target-triple`, `target_spec`), so temp-like placement
+        // alone is not enough to promote them: the tree must additionally
+        // carry a cargo build marker at its root. Every other shape keeps the
+        // plain temp-context promotion.
+        let tmp_promotes =
+            tmp_like && (!has_broad_target_prefix(&name) || has_cargo_target_root_markers(path));
         if (name == "target" && context.parent_has_cargo_toml)
-            || tmp_like
+            || tmp_promotes
             || is_agent_build_target_name(&name)
             // Descriptive `<prefix>-target` / `<prefix>_target` names (e.g.
             // `cass-ft-target`) are a strong stand-alone signal of a
@@ -226,9 +250,11 @@ pub fn classify_opaque_tree(
                 0.93,
             ));
         }
-        return Some(OpaqueTreeClassification::signal_only(
-            "target-like directory lacks cargo/temp context",
-        ));
+        return Some(OpaqueTreeClassification::signal_only(if tmp_like {
+            "target-prefixed name under temp storage lacks cargo build markers"
+        } else {
+            "target-like directory lacks cargo/temp context"
+        }));
     }
 
     if name == "node_modules" {
@@ -399,6 +425,72 @@ pub(crate) fn is_obvious_build_artifact_basename(path: &Path) -> bool {
     // `target-suffix` (0.88) / `underscore-target-suffix` (0.92) patterns in
     // the artifact registry.
     has_descriptive_target_suffix(name)
+}
+
+/// The broad `target-<x>` / `target_<x>` prefix shapes: the one target-like
+/// family that legitimate crate and project names routinely share.
+fn has_broad_target_prefix(name: &str) -> bool {
+    name.starts_with("target-") || name.starts_with("target_")
+}
+
+/// Cheap root-level structural corroboration that a directory is a cargo
+/// build output: a validated `CACHEDIR.TAG` (cargo writes one at every target
+/// root), cargo's `.rustc_info.json`, or one of the profile / fingerprint
+/// subdirectories only cargo produces. One `read_dir`, no descent.
+fn has_cargo_target_root_markers(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        let is_dir = || entry.file_type().is_ok_and(|ft| ft.is_dir());
+        let marker = match name {
+            "CACHEDIR.TAG" => crate::scanner::walker::is_valid_cachedir_tag(&entry.path()),
+            ".rustc_info.json" => entry.file_type().is_ok_and(|ft| ft.is_file()),
+            "debug" | "release" | ".fingerprint" | "deps" | "incremental" => is_dir(),
+            _ => false,
+        };
+        if marker {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `path` lies strictly inside one of cargo's home stores.
+///
+/// The stores are `registry/src`, `registry/cache`, `registry/index`,
+/// `git/checkouts` and `git/db` (any `CARGO_HOME`, not only `~/.cargo`).
+/// Everything below those directories is cargo-managed content: unpacked
+/// crate source, `.crate` archives, index clones, git checkouts. None of it
+/// is a build output, so no name pattern may nominate it and the deletion
+/// scorer vetoes it outright. The store directories themselves (and the
+/// `registry` / `git` roots above them) are deliberately NOT matched: those
+/// remain the opaque, whole-store reclaim unit (`opaque-cargo-cache` / the
+/// cleanup catalog).
+#[must_use]
+pub fn is_cargo_registry_internal_path(path: &Path) -> bool {
+    // `ancestors()` yields `path` first; the store dir must be a STRICT
+    // ancestor, so start from the parent.
+    path.ancestors().skip(1).any(|dir| {
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let Some(parent) = dir
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+        else {
+            return false;
+        };
+        matches!(
+            (parent, name),
+            ("registry", "src" | "cache" | "index") | ("git", "checkouts" | "db")
+        )
+    })
 }
 
 fn is_tmp_like_path(path: &Path) -> bool {
@@ -606,6 +698,11 @@ impl ArtifactPatternRegistry {
         let Some(name_os) = path.file_name() else {
             return ArtifactClassification::unknown();
         };
+        // Crate source unpacked under a cargo store is never an artifact,
+        // whatever its basename looks like (`target-triple-1.0.0`).
+        if is_cargo_registry_internal_path(path) {
+            return ArtifactClassification::unknown();
+        }
         let normalized = name_os.to_string_lossy().to_lowercase();
 
         let catalog_classification = cleanup_catalog_path_classification(path, cleanup_rules, home);
@@ -1325,7 +1422,8 @@ mod tests {
         ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, CustomPattern,
         OpaqueTreeContext, OpaqueTreeDisposition, StructuralSignals, classify_opaque_tree,
         extract_pattern_label, extract_pattern_label_with_cleanup_rules,
-        has_descriptive_target_suffix, is_obvious_build_artifact_basename, structural_score,
+        has_descriptive_target_suffix, is_cargo_registry_internal_path,
+        is_obvious_build_artifact_basename, structural_score,
     };
     use crate::platform::{linux, macos};
     use std::path::Path;
@@ -1516,6 +1614,142 @@ mod tests {
                 "{path} must not become an opaque source-tree candidate"
             );
         }
+    }
+
+    #[test]
+    fn cargo_registry_internal_paths_are_detected_strictly_inside_stores() {
+        for p in [
+            "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/target-triple-1.0.0",
+            "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/target-lexicon-0.13.5/src",
+            "/data/tmp/rch-cargo-home-abc/registry/cache/index.crates.io-1949cf8c6b5b557f/x.crate",
+            "/root/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache",
+            "/root/.cargo/git/checkouts/foo-1234abcd/deadbeef/target-thing",
+            "/root/.cargo/git/db/foo-1234abcd/objects",
+        ] {
+            assert!(is_cargo_registry_internal_path(Path::new(p)), "{p}");
+        }
+        // The stores and their roots stay outside: they are the reclaim unit.
+        for p in [
+            "/root/.cargo",
+            "/root/.cargo/registry",
+            "/root/.cargo/registry/src",
+            "/root/.cargo/registry/cache",
+            "/root/.cargo/git",
+            "/root/.cargo/git/checkouts",
+            "/data/projects/app/target",
+            "/data/projects/registry/target-x",
+            "/repo/.git/objects",
+        ] {
+            assert!(!is_cargo_registry_internal_path(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn opaque_tree_protects_crate_source_under_cargo_stores() {
+        // Regression: `target-triple-1.0.0` unpacked under a temp-like
+        // CARGO_HOME used to be promoted to a 0.93 RustTarget candidate on its
+        // name alone. Store content is protected opaque regardless of name.
+        for p in [
+            "/data/tmp/rch-cargo-home-abc/registry/src/index.crates.io-1949cf8c6b5b557f/target-triple-1.0.0",
+            "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/target-lexicon-0.13.5",
+            "/tmp/ch/git/checkouts/foo-1234abcd/deadbeef/cass-ft-target",
+            "/tmp/ch/registry/src/index.crates.io-1949cf8c6b5b557f/node_modules",
+        ] {
+            let opaque = classify_opaque_tree(
+                Path::new(p),
+                OpaqueTreeContext {
+                    parent_has_cargo_toml: true,
+                    parent_has_node_manifest: true,
+                },
+            )
+            .unwrap_or_else(|| panic!("{p} should be classified"));
+            assert_eq!(
+                opaque.disposition,
+                OpaqueTreeDisposition::ProtectedOpaque,
+                "{p}"
+            );
+            assert_eq!(opaque.classification.category, ArtifactCategory::Unknown);
+        }
+
+        // The store root is still the whole-store cache candidate.
+        let root = classify_opaque_tree(
+            Path::new("/root/.cargo/registry"),
+            OpaqueTreeContext::default(),
+        )
+        .expect("registry root should be classified");
+        assert_eq!(root.disposition, OpaqueTreeDisposition::CandidateOpaque);
+        assert_eq!(root.classification.pattern_name, "opaque-cargo-cache");
+    }
+
+    #[test]
+    fn name_registry_never_classifies_crate_source_under_cargo_stores() {
+        let registry = ArtifactPatternRegistry::default();
+        let classification = registry.classify(
+            Path::new(
+                "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/target-triple-1.0.0",
+            ),
+            StructuralSignals::default(),
+        );
+        assert_eq!(classification.category, ArtifactCategory::Unknown);
+        assert_eq!(classification.combined_confidence, 0.0);
+
+        // Same basename outside a store still hits the name rule.
+        let outside = registry.classify(
+            Path::new("/data/tmp/target-triple-1.0.0"),
+            StructuralSignals::default(),
+        );
+        assert_eq!(outside.pattern_name, "target-prefix");
+    }
+
+    #[test]
+    fn opaque_tree_broad_target_prefix_under_tmp_requires_cargo_root_markers() {
+        // `/tmp` is temp-like on every platform sbh supports (it stays a
+        // `/tmp`-prefixed string even where it is a symlink).
+        let base = tempfile::tempdir_in("/tmp").expect("tempdir under /tmp");
+
+        // A crate-like tree that merely starts with `target-`: SignalOnly.
+        let source = base.path().join("target-triple-1.0.0");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::write(source.join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
+        std::fs::write(source.join("src/lib.rs"), "").unwrap();
+        let opaque = classify_opaque_tree(&source, OpaqueTreeContext::default())
+            .expect("target-prefixed name is still target-like");
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::SignalOnly);
+        assert!(opaque.reason.contains("lacks cargo build markers"));
+
+        // The same prefix with a validated CACHEDIR.TAG at the root: candidate.
+        let tagged = base.path().join("target-ci-1");
+        std::fs::create_dir_all(&tagged).unwrap();
+        std::fs::write(
+            tagged.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n",
+        )
+        .unwrap();
+        let opaque = classify_opaque_tree(&tagged, OpaqueTreeContext::default())
+            .expect("tagged target should be classified");
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
+        assert_eq!(opaque.classification.pattern_name, "opaque-cargo-target");
+
+        // A forged tag (wrong signature) does not count; a `debug/` profile
+        // directory does.
+        let forged = base.path().join("target_forged");
+        std::fs::create_dir_all(&forged).unwrap();
+        std::fs::write(forged.join("CACHEDIR.TAG"), "nope\n").unwrap();
+        let opaque = classify_opaque_tree(&forged, OpaqueTreeContext::default()).unwrap();
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::SignalOnly);
+        std::fs::create_dir_all(forged.join("debug")).unwrap();
+        let opaque = classify_opaque_tree(&forged, OpaqueTreeContext::default()).unwrap();
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
+
+        // Non-broad shapes keep the plain temp promotion (no markers needed).
+        let descriptive = base.path().join("cass-ft-target");
+        std::fs::create_dir_all(&descriptive).unwrap();
+        let opaque = classify_opaque_tree(&descriptive, OpaqueTreeContext::default()).unwrap();
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
+        let plain = base.path().join("target");
+        std::fs::create_dir_all(&plain).unwrap();
+        let opaque = classify_opaque_tree(&plain, OpaqueTreeContext::default()).unwrap();
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
     }
 
     #[test]
