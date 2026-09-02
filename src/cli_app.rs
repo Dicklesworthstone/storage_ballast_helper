@@ -29,6 +29,7 @@ use storage_ballast_helper::core::config::{
 use storage_ballast_helper::daemon::loop_main::{
     DaemonArgs as RuntimeDaemonArgs, MonitoringDaemon,
 };
+use storage_ballast_helper::daemon::mount_controller::{MountStateRecord, unprotected_pressure};
 use storage_ballast_helper::daemon::process_io_history::ProcessIoHistory;
 use storage_ballast_helper::daemon::self_monitor::{
     DAEMON_STATE_STALE_THRESHOLD_SECS, detect_daemon_liveness,
@@ -770,6 +771,11 @@ struct CheckArgs {
     /// Predict if space will last for this many minutes (requires running daemon).
     #[arg(long, value_name = "MINUTES")]
     predict: Option<u64>,
+    /// Do not fail when the target mount is at Orange or worse and the
+    /// daemon has nothing to reclaim there (exit 0 with a warning instead of
+    /// exit 1 `unprotected_pressure`).
+    #[arg(long)]
+    allow_unprotected: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize)]
@@ -6711,10 +6717,12 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
 /// Host-level tuning diagnostics (kernel writeback / dirty-page limits) plus
 /// emergency-reserve integrity.
 fn system_doctor_checks(platform: &dyn Platform, config: &Config) -> Vec<DoctorCheck> {
-    vec![
+    let mut checks = vec![
         writeback_doctor_check(platform, config),
         ballast_reserve_doctor_check(config),
-    ]
+    ];
+    checks.extend(reclaim_capability_doctor_checks(config));
+    checks
 }
 
 /// #16: fail loudly when a ballast reserve is configured but not actually
@@ -8546,9 +8554,11 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     }
                 }
                 println!("\nMount Control:");
-                let (h_mount, h_state, h_level, h_surface) =
-                    ("Mount Point", "State", "Level", "Surface");
-                println!("  {h_mount:<20}  {h_state:<12}  {h_level:<8}  {h_surface:<12}  Note");
+                let (h_mount, h_state, h_level, h_reclaim, h_reserve) =
+                    ("Mount Point", "State", "Level", "Reclaim", "Reserve");
+                println!(
+                    "  {h_mount:<20}  {h_state:<12}  {h_level:<8}  {h_reclaim:<12}  {h_reserve:<22}  Note"
+                );
                 for controller in controllers {
                     let field = |key: &str| {
                         controller
@@ -8564,12 +8574,45 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     if note == "-" {
                         note.clear();
                     }
+                    let reserve = controller.get("reserve_state").map_or_else(
+                        || "-".to_string(),
+                        |reserve| {
+                            let present = reserve
+                                .get("present_bytes")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            let target = reserve
+                                .get("target_bytes")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            let mut text =
+                                format!("{}/{}", format_bytes(present), format_bytes(target));
+                            if let Some(minutes) =
+                                reserve.get("horizon_minutes").and_then(Value::as_f64)
+                            {
+                                text = format!("{text} ({minutes:.0} min)");
+                            }
+                            if reserve.get("floor_limited") == Some(&Value::Bool(true)) {
+                                text.push_str(" floor");
+                            }
+                            text
+                        },
+                    );
+                    let record: Option<MountStateRecord> =
+                        serde_json::from_value(controller.clone()).ok();
+                    if record.as_ref().is_some_and(unprotected_pressure) {
+                        note = if note.is_empty() {
+                            "UNPROTECTED".to_string()
+                        } else {
+                            format!("UNPROTECTED, {note}")
+                        };
+                    }
                     println!(
-                        "  {:<20}  {:<12}  {:<8}  {:<12}  {note}",
+                        "  {:<20}  {:<12}  {:<8}  {:<12}  {reserve:<22}  {note}",
                         field("mount"),
                         field("state"),
                         field("level"),
-                        field("surface"),
+                        field("reclaim_capability"),
                     );
                 }
             }
@@ -11414,16 +11457,33 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         return Err(CliError::User("insufficient disk space".to_string()));
     }
 
+    // What the daemon could reclaim on this mount, when it is pressured and
+    // the answer is nothing: reported with every outcome below, and a
+    // failure of its own once the plain threshold passes (Check 2.7).
+    let unprotected = unprotected_pressure_at(&config.paths.state_file, &capacity.mount_point);
+    let unprotected_json = unprotected.as_ref().map_or(Value::Null, |u| {
+        json!({
+            "reason": UNPROTECTED_PRESSURE,
+            "level": u.level,
+            "reclaim_capability": u.capability,
+            "allowed": args.allow_unprotected,
+        })
+    });
+
     // Check 2: percentage threshold.
     if free_pct < threshold_pct {
         match output_mode(cli) {
             OutputMode::Human => {
                 println!(
-                    "sbh: {} has {} free ({:.1}%). Run: sbh emergency {}",
+                    "sbh: {} has {} free ({:.1}%). Run: sbh emergency {}{}",
                     capacity.mount_point.display(),
                     format_bytes(capacity.available_bytes),
                     free_pct,
                     check_path.display(),
+                    unprotected.as_ref().map_or_else(String::new, |u| format!(
+                        " (the daemon has nothing to reclaim there: reclaim_capability={})",
+                        u.capability
+                    )),
                 );
             }
             OutputMode::Json => {
@@ -11436,6 +11496,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     "total_bytes": capacity.total_bytes,
                     "free_pct": free_pct,
                     "threshold_pct": threshold_pct,
+                    "unprotected": unprotected_json,
                     "container_id": capacity.container_id.as_deref(),
                     "container_total_bytes": capacity.container_total_bytes,
                     "container_available_bytes": capacity.container_available_bytes,
@@ -11451,6 +11512,49 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         }
         // C-EXIT: a pressure condition is exit 1, distinct from an I/O failure.
         return Err(CliError::User("disk space below threshold".to_string()));
+    }
+
+    // Check 2.7: unprotected pressure. The daemon reports, per mount, what
+    // it could reclaim; a mount at Orange or worse where that is nothing is
+    // a pressure condition `check` must not wave through (C-EXIT 1,
+    // reason `unprotected_pressure`) unless the caller says so.
+    if let Some(unprotected) = &unprotected {
+        let line = format!(
+            "{} is at {} and the daemon has nothing to reclaim there (reclaim_capability={}). \
+             Next: add a scanner.root_path on this device, set \
+             scanner.catalog_roots_on_pressured_device = true, or run `sbh ballast provision`",
+            capacity.mount_point.display(),
+            unprotected.level,
+            unprotected.capability,
+        );
+        if args.allow_unprotected {
+            if output_mode(cli) == OutputMode::Human {
+                eprintln!("sbh: warning: {line}");
+            }
+        } else {
+            match output_mode(cli) {
+                OutputMode::Human => println!("sbh: {line}"),
+                OutputMode::Json => {
+                    let payload = json!({
+                        "command": "check",
+                        "status": "unprotected",
+                        "reason": UNPROTECTED_PRESSURE,
+                        "path": check_path.to_string_lossy(),
+                        "mount_point": capacity.mount_point.to_string_lossy(),
+                        "free_bytes": capacity.available_bytes,
+                        "total_bytes": capacity.total_bytes,
+                        "free_pct": free_pct,
+                        "level": unprotected.level,
+                        "reclaim_capability": unprotected.capability,
+                        "unprotected": unprotected_json,
+                        "platform": capacity_platform_json(&capacity),
+                        "exit_code": 1,
+                    });
+                    write_json_line(&payload)?;
+                }
+            }
+            return Err(CliError::User(UNPROTECTED_PRESSURE.to_string()));
+        }
     }
 
     // Check 2.5: warn if state.json is stale (daemon may not be running).
@@ -11596,6 +11700,9 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             // The daemon's forecast when `--predict` asked for one: the rate
             // object, or a string saying why none was usable.
             "forecast": forecast_json,
+            // Set when the mount is under pressure with nothing to reclaim
+            // and `--allow-unprotected` let the check pass.
+            "unprotected": unprotected_json,
             // #16: machine-readable reserve state so automation can flag a
             // configured-but-empty emergency reserve.
             "ballast": {
@@ -11617,6 +11724,159 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// Reason slug `check` exits 1 with when the target mount is pressured and
+/// the daemon can reclaim nothing there.
+const UNPROTECTED_PRESSURE: &str = "unprotected_pressure";
+
+/// A pressured mount the daemon reports no reclaim capability for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnprotectedMount {
+    level: String,
+    capability: String,
+}
+
+/// `state.json` parsed, but only while it is fresh: a stale file describes
+/// a daemon that is gone, and nothing in it should gate anything.
+fn read_fresh_daemon_state(state_path: &Path) -> Option<Value> {
+    let age_secs = std::fs::metadata(state_path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .map_or(u64::MAX, |age| age.as_secs());
+    if age_secs > DAEMON_STATE_STALE_THRESHOLD_SECS {
+        return None;
+    }
+    serde_json::from_str(&std::fs::read_to_string(state_path).ok()?).ok()
+}
+
+/// The daemon's per-mount control records from a fresh `state.json`.
+fn fresh_mount_records(state_path: &Path) -> Vec<MountStateRecord> {
+    read_fresh_daemon_state(state_path)
+        .and_then(|state| state.get("mount_controllers").cloned())
+        .and_then(|records| serde_json::from_value(records).ok())
+        .unwrap_or_default()
+}
+
+/// Whether the daemon reports `mount` as pressured (Orange or worse) with
+/// nothing to reclaim. A missing, stale or silent state file gates nothing.
+fn unprotected_pressure_at(state_path: &Path, mount: &Path) -> Option<UnprotectedMount> {
+    let wanted = mount.to_string_lossy();
+    fresh_mount_records(state_path)
+        .into_iter()
+        .find(|record| record.mount == wanted.as_ref())
+        .filter(|record| {
+            matches!(record.level.as_str(), "orange" | "red" | "critical")
+                && unprotected_pressure(record)
+        })
+        .map(|record| UnprotectedMount {
+            level: record.level,
+            capability: record.reclaim_capability.as_str().to_string(),
+        })
+}
+
+/// `doctor --system`: every mount the daemon reports at Yellow or worse
+/// must have a reclaim surface and a reserve; each failing mount is its own
+/// FAIL with the exact remediation. Without a fresh state file the check
+/// is a WARN, since nothing is known.
+fn reclaim_capability_doctor_checks(config: &Config) -> Vec<DoctorCheck> {
+    let Some(state) = read_fresh_daemon_state(&config.paths.state_file) else {
+        return vec![doctor_check(
+            "reclaim.capability",
+            "Reclaim capability under pressure",
+            "WARN",
+            format!(
+                "no fresh daemon state at {} (daemon not running, or state older than {}s): \
+                 per-mount reclaim capability is unknown",
+                config.paths.state_file.display(),
+                DAEMON_STATE_STALE_THRESHOLD_SECS
+            ),
+            Some(
+                "Start the daemon (`sbh install` / `systemctl start sbh`) and re-run.".to_string(),
+            ),
+        )];
+    };
+    let records: Vec<MountStateRecord> = state
+        .get("mount_controllers")
+        .cloned()
+        .and_then(|records| serde_json::from_value(records).ok())
+        .unwrap_or_default();
+    let mut checks = Vec::new();
+    let mut pressured = 0usize;
+    for record in &records {
+        if record.level == "green" {
+            continue;
+        }
+        pressured += 1;
+        if unprotected_pressure(record) {
+            checks.push(doctor_check(
+                "reclaim.capability",
+                "Reclaim capability under pressure",
+                "FAIL",
+                format!(
+                    "{} is at {} and sbh can reclaim nothing there (reclaim_capability={})",
+                    record.mount,
+                    record.level,
+                    record.reclaim_capability.as_str()
+                ),
+                Some(format!(
+                    "Give the daemon a surface on {}: add a `scanner.root_paths` entry on that \
+                     device, set `scanner.catalog_roots_on_pressured_device = true` to clean \
+                     known-safe caches there, or run `sbh ballast provision` for an \
+                     instant-release reserve.",
+                    record.mount
+                )),
+            ));
+            continue;
+        }
+        if let Some(reserve) = record.reserve_state
+            && reserve.target_bytes > 0
+            && reserve.present_bytes == 0
+        {
+            checks.push(doctor_check(
+                "reclaim.reserve",
+                "Ballast reserve under pressure",
+                "FAIL",
+                format!(
+                    "{} is at {} with an empty ballast reserve ({} configured{})",
+                    record.mount,
+                    record.level,
+                    format_bytes(reserve.target_bytes),
+                    if reserve.floor_limited {
+                        ", provisioning stopped at the headroom floor"
+                    } else {
+                        ""
+                    }
+                ),
+                Some(
+                    "Run `sbh ballast provision`; files are created one at a time while the \
+                     volume stays above the headroom floor."
+                        .to_string(),
+                ),
+            ));
+        }
+    }
+    if checks.is_empty() {
+        checks.push(doctor_check(
+            "reclaim.capability",
+            "Reclaim capability under pressure",
+            "PASS",
+            if pressured == 0 {
+                format!(
+                    "no mount under pressure ({} mount(s) reported by the daemon)",
+                    records.len()
+                )
+            } else {
+                format!(
+                    "{pressured} mount(s) under pressure, each with a reclaim surface and a \
+                     reserve"
+                )
+            },
+            None,
+        ));
+    }
+    checks
 }
 
 /// The daemon's forecast for one mount, as `state.json` v2 `rates` carries it.
@@ -14518,6 +14778,89 @@ mod tests {
 
     /// C-EXIT: the single mapping every command's error goes through.
     #[test]
+    fn unprotected_pressure_gate_reads_fresh_state_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let write = |controllers: &str| {
+            std::fs::write(
+                &state_path,
+                format!(r#"{{"schema_version":2,"mount_controllers":{controllers}}}"#),
+            )
+            .unwrap();
+        };
+        // No state: nothing gates.
+        assert_eq!(unprotected_pressure_at(&state_path, Path::new("/")), None);
+
+        write(
+            r#"[{"mount":"/","state":"observe_only","idle_reason":"no_root_path_on_device","surface":"none","level":"orange","urgency":0.9,"reclaim_capability":"none"},
+                {"mount":"/data","state":"reclaim","surface":"configured","level":"orange","urgency":0.9,"reclaim_capability":"configured"},
+                {"mount":"/srv","state":"observe_only","surface":"none","level":"yellow","urgency":0.3,"reclaim_capability":"none"},
+                {"mount":"/pool","state":"reclaim","surface":"ballast_only","level":"red","urgency":0.95,"reclaim_capability":"ballast_only","reserve_state":{"present_bytes":0,"target_bytes":1048576,"floor_limited":true}}]"#,
+        );
+        let table = [
+            ("/", Some(("orange", "none"))),
+            ("/data", None),
+            ("/srv", None), // Yellow is not a check failure.
+            ("/pool", Some(("red", "ballast_only"))),
+            ("/nope", None),
+        ];
+        for (mount, want) in table {
+            let got = unprotected_pressure_at(&state_path, Path::new(mount));
+            assert_eq!(
+                got,
+                want.map(|(level, capability)| UnprotectedMount {
+                    level: level.to_string(),
+                    capability: capability.to_string(),
+                }),
+                "{mount}"
+            );
+        }
+
+        // doctor --system: one FAIL per unprotected pressured mount, an
+        // empty-reserve FAIL for the ballast-only mount, Yellow counts too.
+        let mut config = Config::default();
+        config.paths.state_file.clone_from(&state_path);
+        let checks = reclaim_capability_doctor_checks(&config);
+        let fails: Vec<(&str, &str)> = checks
+            .iter()
+            .filter(|c| c.status == "FAIL")
+            .map(|c| (c.id, c.message.as_str()))
+            .collect();
+        assert_eq!(fails.len(), 3, "{checks:?}");
+        assert!(
+            fails
+                .iter()
+                .any(|(id, m)| *id == "reclaim.capability" && m.starts_with("/ is at orange"))
+        );
+        assert!(
+            fails
+                .iter()
+                .any(|(id, m)| *id == "reclaim.capability" && m.starts_with("/srv is at yellow"))
+        );
+        assert!(
+            fails
+                .iter()
+                .any(|(id, m)| *id == "reclaim.capability" && m.starts_with("/pool is at red"))
+        );
+        assert!(
+            checks
+                .iter()
+                .all(|c| c.status != "FAIL" || c.remediation.is_some())
+        );
+        let json = serde_json::to_value(&checks).unwrap();
+        assert_eq!(json[0]["id"], "reclaim.capability");
+
+        // Stale state gates nothing and doctor says it cannot tell.
+        let old = SystemTime::now()
+            - std::time::Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS + 100);
+        filetime::set_file_mtime(&state_path, filetime::FileTime::from_system_time(old)).unwrap();
+        assert_eq!(unprotected_pressure_at(&state_path, Path::new("/")), None);
+        let stale = reclaim_capability_doctor_checks(&config);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].status, "WARN");
+    }
+
+    #[test]
     fn forecast_read_distinguishes_fresh_stale_and_missing_state() {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
@@ -15795,6 +16138,11 @@ mod tests {
     /// Every counterfactual the explainer suggests must actually flip the
     /// engine's verdict when applied, and a vetoed candidate gets none.
     #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
     fn counterfactual_suggestions_flip_the_decision_when_applied() {
         use storage_ballast_helper::scanner::patterns::{
             ArtifactPatternRegistry, StructuralSignals,

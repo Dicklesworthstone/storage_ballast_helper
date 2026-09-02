@@ -118,6 +118,14 @@ pub enum NotificationEvent {
         used_pct_1m: f64,
         minutes: u32,
     },
+    /// A mount is under pressure and sbh has nothing to reclaim on it: no
+    /// configured root, no catalog root, no cross-device fallback and no
+    /// releasable ballast. Sent once per pressure epoch.
+    ReclaimUnavailable {
+        mount: String,
+        level: String,
+        reason: String,
+    },
 }
 
 impl NotificationEvent {
@@ -197,6 +205,15 @@ impl NotificationEvent {
             Self::Error { .. } => NotificationLevel::Red,
 
             Self::CpuBudgetExceeded { .. } => NotificationLevel::Warning,
+
+            // The pressure level itself: Orange on an unprotected mount is
+            // as loud as Orange anywhere.
+            Self::ReclaimUnavailable { level, .. } => match level.as_str() {
+                "critical" => NotificationLevel::Critical,
+                "red" => NotificationLevel::Red,
+                "orange" => NotificationLevel::Orange,
+                _ => NotificationLevel::Warning,
+            },
         }
     }
 
@@ -214,6 +231,7 @@ impl NotificationEvent {
             Self::DaemonStopped { .. } => "daemon_stopped",
             Self::Error { .. } => "error",
             Self::CpuBudgetExceeded { .. } => "cpu_budget_exceeded",
+            Self::ReclaimUnavailable { .. } => "reclaim_unavailable",
         }
     }
 
@@ -287,6 +305,13 @@ impl NotificationEvent {
             } => format!(
                 "sbh daemon over its CPU budget for {minutes} min ({used_pct_1m:.1}% of a core used, budget {pct}%)"
             ),
+            Self::ReclaimUnavailable {
+                mount,
+                level,
+                reason,
+            } => {
+                format!("Pressure {level} on {mount} and nothing sbh can reclaim there ({reason})")
+            }
         }
     }
 }

@@ -314,13 +314,24 @@ impl<'a> StatsEngine<'a> {
                         }),
                         "most_common_category": w.deletions.most_common_category,
                         "avg_score": w.deletions.avg_score,
+                        "avg_age_hours": w.deletions.avg_age_hours,
                         "failures": w.deletions.failures,
+                        "failures_by_reason": w
+                            .deletions
+                            .failures_by_reason
+                            .iter()
+                            .map(|f| serde_json::json!({ "code": f.code, "count": f.count }))
+                            .collect::<Vec<_>>(),
                     },
                     "ballast": {
                         "files_released": w.ballast.files_released,
                         "files_replenished": w.ballast.files_replenished,
                         "current_inventory": w.ballast.current_inventory,
                         "bytes_available": w.ballast.bytes_available,
+                    },
+                    "policy": {
+                        "transitions": w.policy.transitions,
+                        "last_transition": w.policy.last_transition,
                     },
                     "pressure": {
                         "green_pct": w.pressure.time_in_green_pct,

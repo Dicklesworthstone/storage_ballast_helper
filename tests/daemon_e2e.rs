@@ -754,12 +754,14 @@ fn injected_orange_mount_reclaims_only_the_stale_target() {
         (&fixture_mount, 1_000_000_000_000, 550_000_000_000, false),
         (&rootless, 1_000_000_000_000, 110_000_000_000, true),
     ]);
+    let notify = dir.path().join("notify.jsonl");
     let scenario = ScenarioConfig {
         root_paths: vec![fixtures.root.clone()],
         // The stale fixture's mtimes are five hours old but its directory
         // was just created; one minute is the shortest honest gate.
         min_file_age_minutes: 1,
         maintenance_interval_secs: 5,
+        notify_file: Some(notify.clone()),
         ..ScenarioConfig::default()
     };
     let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
@@ -799,6 +801,99 @@ fn injected_orange_mount_reclaims_only_the_stale_target() {
     assert_eq!(fixture_state["level"], "green", "{fixture_state}");
     assert_eq!(fixture_state["surface"], "configured", "{fixture_state}");
     assert_ne!(fixture_state["state"], "observe_only", "{fixture_state}");
+
+    // Loud degradation: the pressured mount with nothing to reclaim is
+    // reported as such everywhere an operator or a script would look.
+    assert_eq!(
+        rootless_state["reclaim_capability"], "none",
+        "{rootless_state}"
+    );
+    assert_eq!(
+        fixture_state["reclaim_capability"], "configured",
+        "{fixture_state}"
+    );
+    assert!(
+        fixture_state["reserve_state"]["target_bytes"]
+            .as_u64()
+            .is_some_and(|b| b > 0),
+        "{fixture_state}"
+    );
+    let cli = |args: &[&str]| {
+        Command::new(common::sbh_bin_path())
+            .arg("--config")
+            .arg(&run.config_path)
+            .args(args)
+            .env("SBH_TEST_MODE", "1")
+            .env("SBH_TEST_FS_STATS", &table)
+            .env("SBH_OUTPUT_FORMAT", "human")
+            .output()
+            .expect("run sbh")
+    };
+    // With the plain threshold below the mount's 11% the gate is the only
+    // thing that can fail the check; at the default threshold the
+    // threshold failure carries the same information.
+    let gated = cli(&["--json", "check", "--target-free", "5", "/"]);
+    let payload: Value = serde_json::from_str(String::from_utf8_lossy(&gated.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&gated.stdout)));
+    assert_eq!(gated.status.code(), Some(1), "{payload}");
+    assert_eq!(payload["reason"], "unprotected_pressure", "{payload}");
+    assert_eq!(payload["reclaim_capability"], "none", "{payload}");
+    let human = cli(&["check", "--target-free", "5", "/"]);
+    assert_eq!(human.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("nothing to reclaim there"),
+        "{}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+    let below = cli(&["--json", "check", "/"]);
+    let payload: Value = serde_json::from_str(String::from_utf8_lossy(&below.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&below.stdout)));
+    assert_eq!(below.status.code(), Some(1), "{payload}");
+    assert_eq!(payload["status"], "critical", "{payload}");
+    assert_eq!(
+        payload["unprotected"]["reason"], "unprotected_pressure",
+        "{payload}"
+    );
+    let allowed = cli(&[
+        "--json",
+        "check",
+        "--target-free",
+        "5",
+        "--allow-unprotected",
+        "/",
+    ]);
+    let payload: Value = serde_json::from_str(String::from_utf8_lossy(&allowed.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&allowed.stdout)));
+    assert_eq!(allowed.status.code(), Some(0), "{payload}");
+    assert_eq!(payload["unprotected"]["allowed"], true, "{payload}");
+    let doctor = cli(&["--json", "doctor", "--system"]);
+    let report: Value = serde_json::from_str(String::from_utf8_lossy(&doctor.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&doctor.stdout)));
+    let checks = report["system"]["checks"].as_array().unwrap();
+    assert!(
+        checks.iter().any(|c| c["id"] == "reclaim.capability"
+            && c["status"] == "FAIL"
+            && c["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("/ is at orange"))),
+        "{report}"
+    );
+    run.wait_until(
+        "the reclaim_unavailable notification",
+        Duration::from_secs(10),
+        |_| {
+            fs::read_to_string(&notify)
+                .unwrap_or_default()
+                .contains("\"reclaim_unavailable\"")
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        run.stderr_count("reclaim unavailable: pressure orange on /"),
+        1,
+        "once per epoch: {}",
+        run.stderr()
+    );
 
     // Keep the fresh target fresh while the stale one crosses the age gate.
     let stale_path = fixtures.stale_target.clone();
@@ -1034,6 +1129,7 @@ impl Drop for LoopMount {
 /// sibling survives, and each deletion cites a recorded decision. Returns
 /// the deleted paths relative to the root so the two engines can be
 /// compared.
+#[allow(clippy::too_many_lines)]
 fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
     let dir = scratch();
     let stale_age = Duration::from_hours(5);
@@ -1291,10 +1387,16 @@ fn red_pressure_releases_the_whole_pool_before_scanning() {
         .expect("run sbh stats");
     let payload: Value = serde_json::from_str(String::from_utf8_lossy(&stats_output.stdout).trim())
         .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&stats_output.stdout)));
-    assert_eq!(payload["ballast"]["files_released"], 2, "{payload}");
-    assert_eq!(payload["ballast"]["current_inventory"], 0, "{payload}");
+    // `stats --json --window` reports the window inside `windows`.
+    let window = payload["windows"]
+        .as_array()
+        .and_then(|w| w.first())
+        .cloned()
+        .unwrap_or_else(|| payload.clone());
+    assert_eq!(window["ballast"]["files_released"], 2, "{payload}");
+    assert_eq!(window["ballast"]["current_inventory"], 0, "{payload}");
     assert!(
-        payload["policy"]["transitions"].as_u64().is_some(),
+        window["policy"]["transitions"].as_u64().is_some(),
         "{payload}"
     );
 

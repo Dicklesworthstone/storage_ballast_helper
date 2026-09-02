@@ -25,6 +25,8 @@ use super::widgets::{
     mini_bar_chart, progress_indicator, section_header, segmented_gauge, separator_line, sparkline,
     status_badge, styled_badge, styled_status_strip, trend_label,
 };
+use crate::daemon::mount_controller::unprotected_pressure;
+use crate::daemon::self_monitor::DaemonState;
 use crate::tui::telemetry::{DataSource, DecisionEvidence, TimelineEvent};
 
 use ftui::core::geometry::Rect;
@@ -599,6 +601,12 @@ fn styled_pressure_summary<'a>(
                 };
                 row.push(Span::styled(rate_str, Style::default().fg(rate_color)));
             }
+            // Pressure the daemon can do nothing about is the loudest thing
+            // on the screen.
+            if mount_is_unprotected(state, &mount.path) {
+                row.push(Span::raw(" "));
+                row.push(styled_badge("UNPROTECTED", theme.palette.danger_color()));
+            }
             lines.push(Line::from_spans(row));
         }
         lines
@@ -606,6 +614,14 @@ fn styled_pressure_summary<'a>(
         let plain = render_pressure_summary(model, theme, pane_width);
         plain.lines().map(|l| Line::from(l.to_string())).collect()
     }
+}
+
+/// Whether the daemon reports `mount` as pressured with nothing to reclaim.
+fn mount_is_unprotected(state: &DaemonState, mount: &str) -> bool {
+    state
+        .mount_controllers
+        .iter()
+        .any(|record| record.mount == mount && unprotected_pressure(record))
 }
 
 fn styled_forecast_horizon<'a>(model: &'a DashboardModel, theme: &'a Theme) -> Vec<Line<'a>> {
@@ -3947,9 +3963,14 @@ fn render_pressure_summary(model: &DashboardModel, theme: &Theme, pane_width: u1
                 _ => "",
             };
             let mount_path = truncate_path(&mount.path, path_w);
+            let unprotected = if mount_is_unprotected(state, &mount.path) {
+                " UNPROTECTED"
+            } else {
+                ""
+            };
             let _ = write!(
                 out,
-                "\n  {mount_path:<path_w$} {free:>5.1}% free {rate:>11} {level:>10} {g}{rate_warn}",
+                "\n  {mount_path:<path_w$} {free:>5.1}% free {rate:>11} {level:>10} {g}{rate_warn}{unprotected}",
                 free = mount.free_pct,
                 rate = rate,
                 level = level,

@@ -32,7 +32,7 @@ use crate::core::errors::{Result, SbhError};
 use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD};
 use crate::daemon::mount_controller::{
     IdleReason, MountController, MountControllerConfig, MountState, MountStateRecord, MountSurface,
-    MountTickInput, WakeSignals, global_tick,
+    MountTickInput, ReserveState, WakeSignals, global_tick,
 };
 use crate::daemon::notifications::{NotificationEvent, NotificationLevel, NotificationManager};
 use crate::daemon::policy::{
@@ -1249,6 +1249,11 @@ pub struct MonitoringDaemon {
     /// Policy transitions already logged as `policy_transition` events
     /// (a cursor into `PolicyEngine::transitions_total`).
     policy_transitions_seen: u64,
+    /// Mounts whose last provision or replenish pass stopped at the headroom
+    /// floor: their reserve is short by plan, not by release.
+    floor_limited: HashSet<PathBuf>,
+    /// Once-per-epoch throttle for the "nothing to reclaim here" alert.
+    reclaim_alerts: AlertThrottle,
     /// Derived catalog roots per mount (W1 catalog roots), refreshed every
     /// `scanner.catalog_rescan_interval_secs`.
     catalog_root_cache: HashMap<PathBuf, (Instant, Vec<ExpandedCatalogRoot>)>,
@@ -2154,6 +2159,8 @@ impl MonitoringDaemon {
             wake_next_tick: WakeSignals::default(),
             pending_recovery: HashSet::new(),
             policy_transitions_seen: 0,
+            floor_limited: HashSet::new(),
+            reclaim_alerts: AlertThrottle::default(),
             catalog_root_cache: HashMap::new(),
             catalog_epochs: HashMap::new(),
             emergency_mounts: HashSet::new(),
@@ -2611,6 +2618,28 @@ impl MonitoringDaemon {
             .map(|controller| controller.record(now))
             .collect();
         controllers.sort_by(|a, b| a.mount.cmp(&b.mount));
+        // The reserve on each mount: what is releasable now against what
+        // the configuration asks for, how long it would last at the mount's
+        // fill rate, and whether the headroom floor is what keeps it short.
+        let inventory = self.ballast_coordinator.inventory();
+        for record in &mut controllers {
+            let mount = PathBuf::from(&record.mount);
+            let Some(pool) = inventory
+                .iter()
+                .find(|item| item.mount_point == mount && !item.skipped)
+            else {
+                continue;
+            };
+            let rate = self.mount_rates.get(&mount).copied().unwrap_or(0.0);
+            #[allow(clippy::cast_precision_loss)]
+            let horizon_minutes = (rate > 0.0).then(|| pool.releasable_bytes as f64 / rate / 60.0);
+            record.reserve_state = Some(ReserveState {
+                present_bytes: pool.releasable_bytes,
+                target_bytes: pool.configured_bytes,
+                horizon_minutes,
+                floor_limited: self.floor_limited.contains(&mount),
+            });
+        }
         let idle_reason = daemon_idle_reason(&controllers);
         self.self_monitor.set_mount_snapshot(mounts, controllers);
         self.self_monitor
@@ -3425,6 +3454,9 @@ impl MonitoringDaemon {
         let mut cadence = Vec::with_capacity(responses.len());
         let mut replenished_this_tick = false;
         let mut pressured_without_surface: Option<(PathBuf, PressureLevel)> = None;
+        // Every pressured mount sbh can do nothing about, for the
+        // once-per-epoch ReclaimUnavailable alert.
+        let mut unprotected_mounts: HashMap<PathBuf, PressureLevel> = HashMap::new();
 
         for tick in &responses {
             let mount = tick.response.causing_mount.clone();
@@ -3553,12 +3585,14 @@ impl MonitoringDaemon {
                     }
                 }
                 MountState::ObserveOnly => {
-                    if tick.response.level != PressureLevel::Green
-                        && pressured_without_surface
+                    if tick.response.level != PressureLevel::Green {
+                        unprotected_mounts.insert(mount.clone(), tick.response.level);
+                        if pressured_without_surface
                             .as_ref()
                             .is_none_or(|(_, level)| tick.response.level > *level)
-                    {
-                        pressured_without_surface = Some((mount.clone(), tick.response.level));
+                        {
+                            pressured_without_surface = Some((mount.clone(), tick.response.level));
+                        }
                     }
                 }
                 MountState::Recovery | MountState::Idle => {}
@@ -3717,8 +3751,74 @@ impl MonitoringDaemon {
                     .send(ActivityEvent::Info { message: msg });
             }
         }
+        self.emit_reclaim_unavailable(&unprotected_mounts, now);
 
         global_tick(cadence, base_poll)
+    }
+
+    /// The loud version of "observing only": a notification and a warning
+    /// event once per pressure epoch for every pressured mount with no
+    /// reclaim surface, repeated at the special-location alert interval,
+    /// escalated at once when the level rises, and cleared (logged once)
+    /// when the mount recovers or gains a surface.
+    fn emit_reclaim_unavailable(
+        &mut self,
+        unprotected: &HashMap<PathBuf, PressureLevel>,
+        now: Instant,
+    ) {
+        let interval = Duration::from_secs(
+            self.config
+                .special_locations
+                .alert_interval_minutes
+                .saturating_mul(60),
+        );
+        let mounts: Vec<PathBuf> = self.mount_controllers.keys().cloned().collect();
+        for mount in mounts {
+            let level = unprotected.get(&mount).copied();
+            let severity = match level {
+                None | Some(PressureLevel::Green) => SpecialAlert::None,
+                Some(PressureLevel::Yellow | PressureLevel::Orange) => SpecialAlert::Warning,
+                Some(PressureLevel::Red | PressureLevel::Critical) => SpecialAlert::Critical,
+            };
+            if !self
+                .reclaim_alerts
+                .should_emit(&mount, severity, now, interval)
+            {
+                continue;
+            }
+            let Some(level) = level else {
+                let message = format!(
+                    "pressure on {} cleared, or sbh gained a reclaim surface there",
+                    mount.display()
+                );
+                eprintln!("[SBH-DAEMON] {message}");
+                self.logger_handle.send(ActivityEvent::Info { message });
+                continue;
+            };
+            let level_name = format!("{level:?}").to_lowercase();
+            let reason = format!(
+                "no root_path, catalog root, cross_devices fallback or releasable ballast on \
+                 this device (idle_reason={})",
+                IdleReason::NoSurface.as_str()
+            );
+            let message = format!(
+                "reclaim unavailable: pressure {level_name} on {} and nothing sbh can reclaim \
+                 there ({reason}). Next: add a scanner.root_path on this device, set \
+                 scanner.catalog_roots_on_pressured_device = true, or run `sbh ballast provision`",
+                mount.display()
+            );
+            eprintln!("[SBH-DAEMON] {message}");
+            self.logger_handle.send(ActivityEvent::Warning {
+                code: "SBH-2006".to_string(),
+                message,
+            });
+            self.notification_manager
+                .notify(&NotificationEvent::ReclaimUnavailable {
+                    mount: mount.to_string_lossy().into_owned(),
+                    level: level_name,
+                    reason,
+                });
+        }
     }
 
     /// A mount just entered `Recovery` (EROFS or ENOSPC on deletion): free
@@ -3865,6 +3965,11 @@ impl MonitoringDaemon {
         else {
             return false;
         };
+        if report.skipped_for_floor > 0 {
+            self.floor_limited.insert(mount.to_path_buf());
+        } else if report.files_created > 0 {
+            self.floor_limited.remove(mount);
+        }
         if report.files_created == 0 {
             return false;
         }
@@ -4436,6 +4541,11 @@ impl MonitoringDaemon {
         }
 
         for (path, provision_report) in &report.per_volume {
+            if provision_report.skipped_for_floor > 0 {
+                self.floor_limited.insert(path.clone());
+            } else {
+                self.floor_limited.remove(path);
+            }
             for (file, size_bytes) in &provision_report.created {
                 self.logger_handle.send(ActivityEvent::BallastProvisioned {
                     path: file.display().to_string(),
@@ -7846,6 +7956,8 @@ mod tests {
                 level: "green".to_string(),
                 urgency: 0.0,
                 rescan_in_secs: None,
+                reclaim_capability: crate::daemon::mount_controller::ReclaimCapability::Configured,
+                reserve_state: None,
             }
         }
         assert_eq!(daemon_idle_reason(&[]), None);

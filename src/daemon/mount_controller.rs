@@ -567,6 +567,83 @@ where
         .min(base_poll)
 }
 
+/// How sbh could reclaim space on a mount, for `state.json`, `sbh status`,
+/// `sbh check` and `sbh doctor`: the surface kind read as a capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReclaimCapability {
+    /// Configured roots on the mount can be scanned and cleaned.
+    Configured,
+    /// Only catalog roots (known-safe caches) can be cleaned.
+    Catalog,
+    /// No root here; `scanner.cross_devices` lets other roots' cleanup help.
+    CrossDevice,
+    /// Only a ballast pool: release is possible, nothing can be cleaned.
+    BallastOnly,
+    /// Nothing at all: pressure here can only be observed.
+    #[default]
+    None,
+}
+
+impl ReclaimCapability {
+    /// The capability a surface kind amounts to.
+    #[must_use]
+    pub const fn from_surface(kind: SurfaceKind) -> Self {
+        match kind {
+            SurfaceKind::Configured => Self::Configured,
+            SurfaceKind::Catalog => Self::Catalog,
+            SurfaceKind::CrossDevice => Self::CrossDevice,
+            SurfaceKind::BallastOnly => Self::BallastOnly,
+            SurfaceKind::None => Self::None,
+        }
+    }
+
+    /// The `state.json` spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Catalog => "catalog",
+            Self::CrossDevice => "cross_device",
+            Self::BallastOnly => "ballast_only",
+            Self::None => "none",
+        }
+    }
+}
+
+/// The ballast reserve on a mount as the daemon sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ReserveState {
+    /// Bytes releasable right now.
+    pub present_bytes: u64,
+    /// Bytes the configuration asks for on this mount.
+    pub target_bytes: u64,
+    /// Minutes the present reserve would buy at the mount's current fill
+    /// rate; absent when the mount is not filling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizon_minutes: Option<f64>,
+    /// The reserve is short of its target because the headroom floor refused
+    /// further files (not because files were released).
+    pub floor_limited: bool,
+}
+
+/// Whether pressure on a mount finds sbh unable to do anything about it:
+/// no reclaim surface, or a ballast pool that is the only surface and is
+/// empty. `Green` is never unprotected.
+#[must_use]
+pub fn unprotected_pressure(record: &MountStateRecord) -> bool {
+    if record.level == "green" {
+        return false;
+    }
+    match record.reclaim_capability {
+        ReclaimCapability::None => true,
+        ReclaimCapability::BallastOnly => record
+            .reserve_state
+            .is_none_or(|reserve| reserve.present_bytes == 0),
+        _ => false,
+    }
+}
+
 /// Snapshot of a controller for `state.json` and `sbh status`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MountStateRecord {
@@ -586,10 +663,17 @@ pub struct MountStateRecord {
     /// Seconds until an idle mount rescans on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rescan_in_secs: Option<u64>,
+    /// How sbh could reclaim here (the surface kind as a capability).
+    #[serde(default)]
+    pub reclaim_capability: ReclaimCapability,
+    /// The ballast reserve on this mount, when the daemon knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_state: Option<ReserveState>,
 }
 
 impl MountController {
-    /// Snapshot for `state.json` and `sbh status`.
+    /// Snapshot for `state.json` and `sbh status`. The reserve is filled in
+    /// by the daemon, which owns the ballast pools.
     #[must_use]
     pub fn record(&self, now: Instant) -> MountStateRecord {
         MountStateRecord {
@@ -602,6 +686,8 @@ impl MountController {
             rescan_in_secs: self
                 .idle_until
                 .map(|until| until.saturating_duration_since(now).as_secs()),
+            reclaim_capability: ReclaimCapability::from_surface(self.surface.kind()),
+            reserve_state: None,
         }
     }
 }
@@ -1111,5 +1197,101 @@ mod tests {
         let back: MountStateRecord =
             serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
         assert_eq!(back, record);
+    }
+
+    /// Capability follows the surface kind; a pressured mount is
+    /// unprotected only with no capability, or a ballast-only surface whose
+    /// reserve is empty; Green is never unprotected; records written before
+    /// the field existed read back as `none`.
+    #[test]
+    fn reclaim_capability_and_unprotected_pressure() {
+        let cases = [
+            (
+                MountSurface {
+                    configured_roots: 1,
+                    ..MountSurface::default()
+                },
+                ReclaimCapability::Configured,
+            ),
+            (
+                MountSurface {
+                    catalog_roots: 2,
+                    ..MountSurface::default()
+                },
+                ReclaimCapability::Catalog,
+            ),
+            (
+                MountSurface {
+                    cross_device_fallback: true,
+                    ..MountSurface::default()
+                },
+                ReclaimCapability::CrossDevice,
+            ),
+            (
+                MountSurface {
+                    ballast_pool: true,
+                    ..MountSurface::default()
+                },
+                ReclaimCapability::BallastOnly,
+            ),
+            (MountSurface::default(), ReclaimCapability::None),
+        ];
+        for (surface, want) in cases {
+            assert_eq!(ReclaimCapability::from_surface(surface.kind()), want);
+            assert_eq!(
+                serde_json::to_value(want).unwrap(),
+                serde_json::Value::String(want.as_str().to_string())
+            );
+        }
+
+        let record =
+            |level: &str, capability: ReclaimCapability, reserve: Option<u64>| MountStateRecord {
+                mount: "/".to_string(),
+                state: MountState::ObserveOnly,
+                idle_reason: None,
+                surface: SurfaceKind::None,
+                level: level.to_string(),
+                urgency: 0.5,
+                rescan_in_secs: None,
+                reclaim_capability: capability,
+                reserve_state: reserve.map(|present_bytes| ReserveState {
+                    present_bytes,
+                    target_bytes: 1 << 30,
+                    horizon_minutes: None,
+                    floor_limited: false,
+                }),
+            };
+        assert!(unprotected_pressure(&record(
+            "orange",
+            ReclaimCapability::None,
+            None
+        )));
+        assert!(!unprotected_pressure(&record(
+            "green",
+            ReclaimCapability::None,
+            None
+        )));
+        assert!(!unprotected_pressure(&record(
+            "orange",
+            ReclaimCapability::Configured,
+            None
+        )));
+        assert!(unprotected_pressure(&record(
+            "red",
+            ReclaimCapability::BallastOnly,
+            Some(0)
+        )));
+        assert!(!unprotected_pressure(&record(
+            "red",
+            ReclaimCapability::BallastOnly,
+            Some(4096)
+        )));
+
+        let old: MountStateRecord = serde_json::from_str(
+            r#"{"mount":"/","state":"observe_only","surface":"none","level":"orange","urgency":0.9}"#,
+        )
+        .unwrap();
+        assert_eq!(old.reclaim_capability, ReclaimCapability::None);
+        assert!(old.reserve_state.is_none());
     }
 }

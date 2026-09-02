@@ -90,6 +90,8 @@ pub struct PoolInventory {
     pub files_available: usize,
     pub files_total: usize,
     pub releasable_bytes: u64,
+    /// Bytes the configuration asks for on this mount (`files_total` files).
+    pub configured_bytes: u64,
     /// Health of this pool (`Unconfigured` for skipped volumes).
     pub health: BallastHealth,
     /// Ballast files in the pool dir outside the configured index range;
@@ -283,6 +285,7 @@ impl BallastPoolCoordinator {
                     files_available: observed.available_count,
                     files_total: observed.configured_count,
                     releasable_bytes: observed.releasable_bytes,
+                    configured_bytes: observed.configured_pool_bytes,
                     health: observed.health,
                     skipped: false,
                     skip_reason: None,
@@ -300,6 +303,7 @@ impl BallastPoolCoordinator {
                     files_available: 0,
                     files_total: 0,
                     releasable_bytes: 0,
+                    configured_bytes: 0,
                     health: BallastHealth::Unconfigured,
                     orphans: Vec::new(),
                     skipped: true,
@@ -529,6 +533,11 @@ impl BallastPoolCoordinator {
                 files_available: pool.available_count(),
                 files_total: pool.expected_count(),
                 releasable_bytes: pool.releasable_bytes(),
+                configured_bytes: pool
+                    .manager
+                    .config()
+                    .file_size_bytes
+                    .saturating_mul(u64::try_from(pool.expected_count()).unwrap_or(u64::MAX)),
                 health: pool.manager.health(),
                 orphans: pool.manager.orphans(),
                 skipped: false,
@@ -547,6 +556,7 @@ impl BallastPoolCoordinator {
                     files_available: 0,
                     files_total: 0,
                     releasable_bytes: 0,
+                    configured_bytes: 0,
                     health: BallastHealth::Unconfigured,
                     orphans: Vec::new(),
                     skipped: true,
