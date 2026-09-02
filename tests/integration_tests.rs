@@ -30,7 +30,9 @@ use storage_ballast_helper::monitor::ewma::DiskRateEstimator;
 use storage_ballast_helper::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus,
 };
-use storage_ballast_helper::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
+use storage_ballast_helper::monitor::pid::{
+    PidConfig, PidPressureController, PressureLevel, PressureReading,
+};
 use storage_ballast_helper::monitor::predictive::{PredictiveActionPolicy, PredictiveConfig};
 #[cfg(target_os = "macos")]
 use storage_ballast_helper::platform::pal::Platform;
@@ -2251,6 +2253,225 @@ fn uninstall_dry_run_json_plans_the_user_footprint_and_changes_nothing() {
 /// reads them back by `--last`, `--id` (every level) and `--path`; an unknown
 /// id fails with a hint listing recent ids.
 #[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn clean_quarantines_at_green_and_undo_restores_the_target() {
+    // Outside the hardcoded source-tree roots (a remote worker's temp dir
+    // can sit under the project) and canonical, as `clean` reports paths.
+    let base = if Path::new("/private/tmp").is_dir() {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sbh-quarantine-")
+        .tempdir_in(base)
+        .expect("temp dir");
+    let scan_root = dir.path().join("scan-root");
+    let state_dir = dir.path().join("state");
+    let ballast_dir = dir.path().join("ballast");
+    fs::create_dir_all(&scan_root).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(&ballast_dir).unwrap();
+    let scan_root = scan_root.canonicalize().unwrap();
+    common::create_fake_rust_target(&scan_root, Duration::from_hours(72));
+    let config_path = dir.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"[paths]
+state_file = "{}"
+sqlite_db = "{}"
+jsonl_log = "{}"
+ballast_dir = "{}"
+
+[scanner]
+root_paths = ["{}"]
+min_file_age_minutes = 0
+max_depth = 8
+parallelism = 1
+
+[ballast]
+file_count = 1
+file_size_bytes = 4096
+
+[notifications]
+enabled = false
+"#,
+            toml_path(&state_dir.join("state.json")),
+            toml_path(&state_dir.join("activity.sqlite3")),
+            toml_path(&state_dir.join("activity.jsonl")),
+            toml_path(&ballast_dir),
+            toml_path(&scan_root),
+        ),
+    )
+    .expect("write config");
+    let config_arg = config_path.to_string_lossy().to_string();
+    let root_arg = scan_root.to_string_lossy().to_string();
+    let report_line = |stdout: &str, key: &str| -> Value {
+        stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|v| v.get(key).is_some())
+            .unwrap_or_else(|| panic!("no JSON line with {key:?} in {stdout:?}"))
+    };
+
+    // Layer 7: a manual clean at Green quarantines instead of removing.
+    let clean = common::run_cli_case(
+        "clean_quarantines_the_target",
+        &[
+            "--config",
+            &config_arg,
+            "clean",
+            &root_arg,
+            "--yes",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    );
+    assert_cli_success(&clean, "clean --yes --json");
+    let report = report_line(&clean.stdout, "items_quarantined");
+    assert_eq!(report["items_deleted"], 1, "{report}");
+    assert_eq!(report["items_quarantined"], 1, "{report}");
+    assert_eq!(
+        report["bytes_freed"], 0,
+        "quarantine frees nothing: {report}"
+    );
+    assert_eq!(report["quarantine_unavailable"], 0, "{report}");
+    // The engine names the artifact it acted on (the fake target's `debug`
+    // tree); everything below follows that path.
+    let target = PathBuf::from(
+        report["candidates"][0]["path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("candidate path in {report}")),
+    );
+    assert!(target.starts_with(&scan_root), "{}", target.display());
+    let entry_name = target.file_name().unwrap().to_os_string();
+    assert!(!target.exists(), "the target left its original path");
+    assert!(
+        clean.stderr.contains("[SBH-QUARANTINE] held"),
+        "stderr={}",
+        clean.stderr
+    );
+    let store = scan_root.join(".sbh").join("quarantine");
+    assert!(store.join(".sbh-protect").exists());
+
+    let list = common::run_cli_case(
+        "undo_list_shows_the_held_entry",
+        &["--config", &config_arg, "undo", "--list", "--json"],
+    );
+    assert_cli_success(&list, "undo --list --json");
+    let listing = report_line(&list.stdout, "held");
+    let held = listing["held"].as_array().expect("held array");
+    assert_eq!(held.len(), 1, "{listing}");
+    assert_eq!(held[0]["original_path"], target.to_string_lossy().as_ref());
+    let decision_id = held[0]["decision_id"].as_str().unwrap().to_string();
+    let held_entry = store.join(&decision_id).join(&entry_name);
+    assert!(held_entry.is_dir(), "held entry keeps its content");
+    let held_files = fs::read_dir(&held_entry).unwrap().count();
+    assert!(held_files > 0, "{}", held_entry.display());
+
+    // A second clean finds nothing: the quarantine is never re-scored.
+    let again = common::run_cli_case(
+        "clean_ignores_the_quarantine",
+        &[
+            "--config",
+            &config_arg,
+            "clean",
+            &root_arg,
+            "--yes",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    );
+    assert_cli_success(&again, "second clean");
+    assert!(
+        held_entry.is_dir(),
+        "the held entry survives a rescan; stdout={}",
+        again.stdout
+    );
+    let rescan = report_line(&again.stdout, "candidates_count");
+    for candidate in rescan["candidates"].as_array().into_iter().flatten() {
+        let path = candidate["path"].as_str().unwrap();
+        assert!(
+            !path.starts_with(store.to_string_lossy().as_ref()),
+            "the quarantine is never scored: {candidate}"
+        );
+    }
+
+    let undo = common::run_cli_case(
+        "undo_restores_the_target",
+        &["--config", &config_arg, "undo", &decision_id, "--json"],
+    );
+    assert_cli_success(&undo, "undo <decision-id>");
+    let restored = report_line(&undo.stdout, "restored");
+    assert_eq!(
+        restored["restored"][0]["restored_to"],
+        target.to_string_lossy().as_ref(),
+        "{restored}"
+    );
+    assert_eq!(
+        fs::read_dir(&target).unwrap().count(),
+        held_files,
+        "the target is back with its content"
+    );
+    assert!(!store.join(format!("{decision_id}.json")).exists());
+    assert!(
+        undo.stderr.contains("[SBH-UNDO] restored"),
+        "{}",
+        undo.stderr
+    );
+    let twice = common::run_cli_case(
+        "undo_refuses_a_restored_id",
+        &["--config", &config_arg, "undo", &decision_id, "--json"],
+    );
+    assert!(
+        !twice.status.success(),
+        "a restored id cannot be restored again"
+    );
+
+    // --no-quarantine removes for good.
+    let unlink = common::run_cli_case(
+        "clean_no_quarantine_removes",
+        &[
+            "--config",
+            &config_arg,
+            "clean",
+            &root_arg,
+            "--yes",
+            "--no-quarantine",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    );
+    assert_cli_success(&unlink, "clean --no-quarantine");
+    let report = report_line(&unlink.stdout, "items_quarantined");
+    assert_eq!(report["items_deleted"], 1, "{report}");
+    assert_eq!(report["items_quarantined"], 0, "{report}");
+    assert!(
+        report["bytes_freed"].as_u64().is_some_and(|b| b > 0),
+        "{report}"
+    );
+    assert!(!target.exists());
+    let empty = common::run_cli_case(
+        "undo_list_is_empty_after_unlink",
+        &["--config", &config_arg, "undo", "--list", "--json"],
+    );
+    assert_cli_success(&empty, "undo --list after --no-quarantine");
+    let still_held = report_line(&empty.stdout, "held");
+    assert!(
+        still_held["held"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["original_path"] != target.to_string_lossy().as_ref()),
+        "nothing held for a path removed for good: {still_held}"
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn explain_reads_back_decisions_recorded_by_clean_dry_run() {
@@ -4997,16 +5218,16 @@ fn green_pressure_no_deletions() {
 #[test]
 fn pressure_escalation_through_levels() {
     let mut pid = PidPressureController::new(
-        0.25,
-        0.08,
-        0.02,
-        100.0,
-        18.0,
-        1.0,
-        20.0,
-        14.0,
-        10.0,
-        6.0,
+        &PidConfig {
+            kp: 0.25,
+            ki: 0.08,
+            kd: 0.02,
+            integral_cap: 100.0,
+            target_free_pct: 18.0,
+            hysteresis_pct: 1.0,
+            thresholds: [20.0, 14.0, 10.0, 6.0],
+            ..PidConfig::default()
+        },
         Duration::from_secs(2),
     );
     let t0 = Instant::now();

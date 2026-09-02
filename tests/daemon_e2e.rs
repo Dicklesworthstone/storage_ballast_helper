@@ -1453,6 +1453,197 @@ fn sigusr1_forces_a_green_scan_within_two_seconds() {
     assert!(status.success(), "{status}");
 }
 
+/// Scenario `quarantine` (Layer 7): the Green maintenance passes move the
+/// two stale targets (the git project's included) into
+/// `<root>/.sbh/quarantine/<decision-id>/` instead of removing them, the
+/// held bytes reach `state.json`, and when the mount steps to Orange the
+/// quarantine is drained on the tick, ahead of the scan it dispatches.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn green_quarantine_holds_the_stale_target_and_orange_drains_it_first() {
+    let dir = scratch();
+    let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
+    let fixture_mount = dir.path().to_path_buf();
+    // 1 TB volume at 50% free (Green) until t=200 s, then 11% (Orange).
+    let (root, root_total, root_free, root_ro) = quiet_root_mount();
+    let table = table_of(&[
+        mount_entry(
+            &fixture_mount,
+            1_000_000_000_000,
+            500_000_000_000,
+            false,
+            &[(200, 110_000_000_000)],
+        ),
+        mount_entry(root, root_total, root_free, root_ro, &[]),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![fixtures.root.clone()],
+        min_file_age_minutes: 1,
+        maintenance_interval_secs: 5,
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    let stale_path = fixtures.stale_target.to_string_lossy().to_string();
+    let quarantined_event = |run: &DaemonRun| {
+        run.events_of("artifact_delete")
+            .into_iter()
+            .find(|e| e["path"] == stale_path.as_str() && e["quarantined"] == Value::Bool(true))
+    };
+    run.wait_until(
+        "the stale target quarantined at Green",
+        Duration::from_secs(150),
+        |run| {
+            fixtures.touch_fresh();
+            quarantined_event(run).is_some()
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let event = quarantined_event(&run).unwrap();
+    assert_eq!(event["ok"], Value::Bool(true), "{event}");
+    let decision_id = event["decision_id"]
+        .as_str()
+        .expect("decision id on the event")
+        .to_string();
+    let store = fixtures.root.join(".sbh").join("quarantine");
+    assert!(
+        store.join(".sbh-protect").exists(),
+        "the quarantine root carries a protection marker"
+    );
+    let held_entry = store.join(&decision_id).join("target");
+    assert!(
+        held_entry.join("CACHEDIR.TAG").exists(),
+        "held entry {} keeps its content",
+        held_entry.display()
+    );
+    assert!(!fixtures.stale_target.exists(), "the original path is gone");
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(store.join(format!("{decision_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["original_path"], stale_path.as_str(), "{record}");
+    // The git project's own stale target is an artifact like any other; the
+    // project root survives.
+    let project_path = fixtures.project_target.to_string_lossy().to_string();
+    run.wait_until(
+        "the git project's stale target quarantined too",
+        Duration::from_secs(60),
+        |run| {
+            fixtures.touch_fresh();
+            run.events_of("artifact_delete").iter().any(|e| {
+                e["path"] == project_path.as_str() && e["quarantined"] == Value::Bool(true)
+            })
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        fixtures
+            .project_target
+            .parent()
+            .unwrap()
+            .join(".git")
+            .exists(),
+        "the git project root survives"
+    );
+    assert!(
+        fixtures.fresh_target.exists(),
+        "the fresh target is untouched"
+    );
+    assert_eq!(run.stderr_count("[SBH-QUARANTINE] held"), 2);
+
+    // The minute sweep counts the held bytes and the next state write
+    // reports them under the mount's reserve.
+    let state = run
+        .wait_for_state(
+            "quarantined bytes in reserve_state",
+            Duration::from_secs(120),
+            |state| {
+                fixtures.touch_fresh();
+                state["mount_controllers"].as_array().is_some_and(|cs| {
+                    cs.iter().any(|c| {
+                        c["mount"] == fixture_mount.to_string_lossy().as_ref()
+                            && c["reserve_state"]["quarantined_bytes"]
+                                .as_u64()
+                                .is_some_and(|b| b > 0)
+                    })
+                })
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        state["mount_controllers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["level"] == "green"),
+        "still Green while the reserve is reported: {state}"
+    );
+
+    // Orange: the tick drains the quarantine before its scan runs.
+    run.wait_until(
+        "the quarantine drained at Orange",
+        Duration::from_secs(150),
+        |run| {
+            fixtures.touch_fresh();
+            run.stderr_count("[SBH-QUARANTINE] quarantine under") >= 1
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(!held_entry.exists(), "the drained entry is gone for good");
+    assert!(
+        !store.join(format!("{decision_id}.json")).exists(),
+        "its record is gone with it"
+    );
+    let drain = run
+        .events_of("info")
+        .into_iter()
+        .find(|e| {
+            e["details"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("quarantine under") && d.contains("for pressure"))
+        })
+        .expect("the drain is logged as an info event");
+    assert!(
+        drain["details"]
+            .as_str()
+            .unwrap()
+            .contains("drained 2 entries"),
+        "{drain}"
+    );
+    run.wait_until(
+        "the Orange scan to complete",
+        Duration::from_secs(60),
+        |run| {
+            run.events_of("scan_complete")
+                .iter()
+                .any(|e| scan_reason(e) == Some("orange_pressure"))
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let drain_ts = drain["ts"].as_str().unwrap().to_string();
+    for scan in run
+        .events_of("scan_complete")
+        .iter()
+        .filter(|e| scan_reason(e) == Some("orange_pressure"))
+    {
+        assert!(
+            scan["ts"].as_str().unwrap() >= drain_ts.as_str(),
+            "drain {drain_ts} must precede the Orange scan {scan}"
+        );
+    }
+    for delete in run.events_of("artifact_delete") {
+        if delete["quarantined"] == Value::Bool(true) {
+            continue;
+        }
+        assert!(
+            delete["ts"].as_str().unwrap() >= drain_ts.as_str(),
+            "no removal before the drain: {delete}"
+        );
+    }
+    assert_log_conforms(&run.data_dir);
+    let status = run.stop();
+    assert!(status.success(), "{status}");
+}
+
 /// Scenario `reload`: SIGHUP with a new root in the config file logs the
 /// reload and the matrix, and the new root's stale target is reclaimed by
 /// the next maintenance pass.

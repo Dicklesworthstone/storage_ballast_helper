@@ -56,7 +56,7 @@ use crate::monitor::guardrails::{
     PredictionScorecard,
 };
 use crate::monitor::pid::{
-    PidPressureController, PressureLevel, PressureReading, PressureResponse,
+    PidConfig, PidPressureController, PressureLevel, PressureReading, PressureResponse,
 };
 use crate::monitor::predictive::{PredictiveAction, PredictiveActionPolicy};
 use crate::monitor::special_locations::{
@@ -438,6 +438,16 @@ fn empty_pass_cooldown_active(
         cooldown
     };
     last_empty_pass_at.is_some_and(|last| now.duration_since(last) < cooldown)
+}
+
+/// A pressure-driven request at a higher level than the last completed pass:
+/// the disk is filling in a way the earlier, empty passes did not see, so the
+/// pacing they built no longer applies. Maintenance passes carry no such
+/// signal, and the first pass of a run has nothing to compare against.
+#[must_use]
+fn pressure_escalated(last_pass_level: Option<PressureLevel>, request: &ScanRequest) -> bool {
+    !request.maintenance
+        && last_pass_level.is_some_and(|previous| request.pressure_level > previous)
 }
 
 /// Absolute floor between pressure-driven scan passes when the duty-cycle
@@ -1100,16 +1110,7 @@ impl MountMonitor {
         );
 
         let mut pressure_controller = PidPressureController::new(
-            0.25,  // kp
-            0.08,  // ki
-            0.02,  // kd
-            100.0, // integral_cap
-            config.pressure.green_min_free_pct,
-            1.0, // hysteresis_pct
-            config.pressure.green_min_free_pct,
-            config.pressure.yellow_min_free_pct,
-            config.pressure.orange_min_free_pct,
-            config.pressure.red_min_free_pct,
+            &PidConfig::from(&config.pressure),
             Duration::from_millis(config.pressure.poll_interval_ms),
         );
         if config.pressure.prediction.enabled {
@@ -1140,13 +1141,7 @@ impl MountMonitor {
         );
 
         self.pressure_controller
-            .set_target_free_pct(config.pressure.green_min_free_pct);
-        self.pressure_controller.set_pressure_thresholds(
-            config.pressure.green_min_free_pct,
-            config.pressure.yellow_min_free_pct,
-            config.pressure.orange_min_free_pct,
-            config.pressure.red_min_free_pct,
-        );
+            .apply_config(&PidConfig::from(&config.pressure));
         self.pressure_controller
             .set_base_poll_interval(Duration::from_millis(config.pressure.poll_interval_ms));
 
@@ -3300,12 +3295,24 @@ impl MonitoringDaemon {
                 None
             };
 
-            // Run PID controller.
+            // Run PID controller. Anti-windup on actionability: a mount
+            // that had no actuator last tick (observe-only, idle after an
+            // empty pass, recovering from EROFS/ENOSPC) does not integrate.
             let reading = PressureReading {
                 free_bytes: stats.available_bytes,
                 total_bytes: stats.total_bytes,
                 mount: stats.mount_point.clone(),
             };
+            let frozen = self
+                .mount_controllers
+                .get(&mount_path)
+                .is_some_and(|controller| {
+                    matches!(
+                        controller.state(),
+                        MountState::ObserveOnly | MountState::Idle | MountState::Recovery
+                    )
+                });
+            monitor.pressure_controller.freeze_integral(frozen);
             let response = monitor
                 .pressure_controller
                 .update(reading, predicted_seconds, now);
@@ -5556,6 +5563,9 @@ fn scanner_thread_main(
     // stays pressured with nothing to reclaim, and resets on a productive pass.
     let mut last_empty_pass_at: Option<Instant> = None;
     let mut consecutive_empty_passes: u32 = 0;
+    // The level of the last completed pass: a rise since then is new
+    // information and clears the pacing (`pressure_escalated`).
+    let mut last_pass_level: Option<PressureLevel> = None;
 
     // #15: duty-cycle limiter. The empty-pass cooldown above only paces passes
     // that reclaimed nothing; a chronically-full host reclaims a trickle every
@@ -5587,6 +5597,20 @@ fn scanner_thread_main(
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
+
+        // A rise in pressure since the last pass is new information: the
+        // pacing built up by routine empty passes on a calm mount (routine
+        // maintenance on a healthy host saturates the backoff within hours)
+        // must not hold the first Orange scan for the backed-off interval.
+        if pressure_escalated(last_pass_level, &request) && last_empty_pass_at.is_some() {
+            eprintln!(
+                "[SBH-SCANNER] pressure rose to {:?} since the last pass; empty-pass backoff reset (was consecutive={consecutive_empty_passes})",
+                request.pressure_level
+            );
+            last_empty_pass_at = None;
+            consecutive_empty_passes = 0;
+        }
+        let request_level = request.pressure_level;
 
         // B6: skip this pressure-driven pass if recent passes dispatched
         // nothing reclaimable and the (backed-off) cooldown has not elapsed.
@@ -7091,6 +7115,7 @@ fn scanner_thread_main(
         // the productive case is the one that used to pin a core.
         last_pass_duration = pass_started_at.elapsed();
         last_pass_finished_at = Some(Instant::now());
+        last_pass_level = Some(request_level);
 
         if scanner_should_exit {
             break;
@@ -9557,6 +9582,25 @@ mod tests {
             &request,
             1,
         ));
+    }
+
+    #[test]
+    fn pressure_escalation_is_a_rise_over_the_last_completed_pass() {
+        let orange = cooldown_request(PressureLevel::Orange);
+        assert!(pressure_escalated(Some(PressureLevel::Green), &orange));
+        assert!(pressure_escalated(Some(PressureLevel::Yellow), &orange));
+        assert!(!pressure_escalated(Some(PressureLevel::Orange), &orange));
+        assert!(!pressure_escalated(Some(PressureLevel::Red), &orange));
+        assert!(
+            !pressure_escalated(None, &orange),
+            "nothing to compare against"
+        );
+        let mut maintenance = cooldown_request(PressureLevel::Orange);
+        maintenance.maintenance = true;
+        assert!(
+            !pressure_escalated(Some(PressureLevel::Green), &maintenance),
+            "maintenance passes carry no pressure signal"
+        );
     }
 
     #[test]
