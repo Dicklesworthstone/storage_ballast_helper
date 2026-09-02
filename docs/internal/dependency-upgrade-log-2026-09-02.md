@@ -88,3 +88,65 @@ Requirement floors (e.g. `clap = "4.5"`, `tempfile = "3.17"`) were deliberately 
 
 ## Upgrade Entries
 
+### `mach2` 0.6.0 -> 0.7.0 (`crates/sbh_mach/Cargo.toml`)
+
+- Research (`gh api repos/JohnTitor/mach2/releases`, `gh api repos/JohnTitor/mach2/compare/0.6.0...0.7.0`): 0.7.0 was published 2026-08-30. The 0.x "major" bump is driven by a `BOOTSTRAP_*` constant correction (`src/bootstrap.rs`), signature/const changes in `vm.rs`, `semaphore.rs`, `port.rs`, `thread_act.rs`, `vm_statistics.rs`, and three new modules (`host_info`, `mach_host`, `machine`). None of those are used by `sbh_mach`.
+- Modules `sbh_mach` imports and how they changed: `kern_return` (six new `KERN_*` consts, additive), `mach_port` (three new extern fns, additive), `mach_types` (new aliases `thread_suspension_token_t`, `ledger_entry_id_t`, additive), `message` (new `MACH_MSG_TYPE_PORT_*` consts, additive), `traps` (new `task_name_for_pid`, `mach_vm_reclaim_update_kernel_accounting_trap`, `thread_set_x86_64_compat`, additive), `vm_types` (new `err_vm_reclaim`, additive). `task`, `task_info`, `mach_init`, `time_value` are unchanged. Edition stays 2024. No breaking change for the items `sbh_mach` uses (`kern_return_t`, `KERN_SUCCESS`, `KERN_INVALID_ARGUMENT`, `mach_host_self`, `mach_thread_self`, `mach_port_deallocate`, `thread_act_t`, `mach_msg_type_number_t`, `task_info`, `MACH_TASK_BASIC_INFO*`, `TASK_THREAD_TIMES_INFO*`, `mach_task_basic_info`, `task_thread_times_info`, `time_value_t`, `mach_task_self`, `integer_t`, `natural_t`).
+- Reverse dependencies: `cargo tree -i mach2 --target aarch64-apple-darwin` shows only `sbh_mach` -> `storage_ballast_helper`, so no second `mach2` copy enters the graph.
+- Action: edited `crates/sbh_mach/Cargo.toml` from `mach2 = "0.6.0"` to `mach2 = "0.7.0"`, then `cargo update -p mach2` ("Locking 1 package": `mach2` 0.6.0 -> 0.7.0; no other lock entries touched by this command).
+- No source changes were required.
+- Verification:
+  - `rch exec -- cargo check --all-targets` (Linux): passed, exit 0, remote worker `hz3` (172s). Note: `sbh_mach` is `cfg(target_os = "macos")`, so the Linux gate validates the lockfile but does not compile the crate.
+  - `rch exec -- cargo check --target aarch64-apple-darwin -p sbh_mach --all-targets`: passed, exit 0, 0 warnings; `Checking mach2 v0.7.0` and `Checking sbh_mach v0.1.0` both compiled. rch fell back to local (`[RCH] local`, no worker declares `os = "darwin"`), which is acceptable.
+  - `rch exec -- cargo check --target aarch64-apple-darwin --all-targets` (whole crate): could not be completed on this host — exit 101 in the `libsqlite3-sys` 0.38.2 bundled C build because the host `cc` rejects `-arch arm64` / `-mmacosx-version-min`; a single retry with `CC_aarch64_apple_darwin="zig cc -target aarch64-macos"` also failed (zig rejects cc-rs's added `--target=arm64-apple-macosx` alongside `-target`). This is a cross-toolchain limitation, not a code failure; the root crate does not reference `mach2` directly and `sbh_mach`'s public API was not changed, so the `-p sbh_mach` cross-check is the load-bearing verification. A native macOS `cargo check`/`cargo test` of `sbh_mach` remains unverified from this Linux host.
+  - `rch exec -- cargo test --workspace --no-fail-fast` (Linux): passed, exit 0, remote worker `hz3` (98.9s); 23 suites, 1756 passed, 0 failed, 1 ignored (1419 lib + 122 bin + 212 integration + 3 doc-tests) — identical to baseline.
+  - `cargo fmt --check`: clean.
+- Result: updated.
+
+### Lockfile moves observed during the sweep (not made by this workflow)
+
+- While this sweep was in progress, another agent committed the working tree as `944e3ce` ("chore(deps,docs): bump whichdisk to 0.6, mach2 to 0.7, and add 2026-09-02 bridge plan"). That commit captured this sweep's `mach2` bump, the pre-existing `whichdisk` bump, and the first 90 lines of this log, plus 26 transitive patch/minor moves that this sweep did not perform (`cargo update -p mach2` locked exactly one package): `aho-corasick` 1.1.4→1.1.5, `android_system_properties` 0.1.5→0.1.6, `cc` 1.4.0→1.4.4, `cpufeatures` 0.3.0→0.3.1, `either` 1.17.0→1.18.0, `find-msvc-tools` 0.1.9→0.1.11, `futures-core`/`futures-task`/`futures-util` 0.3.33→0.3.34, `hybrid-array` 0.4.13→0.4.14, `indexmap` 2.14.0→2.14.1, `js-sys`/`web-sys` 0.3.103→0.3.104, `log` 0.4.33→0.4.34, `lru` 0.18.1→0.18.3, `pkg-config` 0.3.33→0.3.34, `regex-automata` 0.4.16→0.4.18, `smallvec` 1.15.2→1.16.0, `syn` 3.0.3→3.0.4, `time` 0.3.54→0.3.55, `wasm-bindgen`(+`-macro`, `-macro-support`, `-shared`) 0.2.126→0.2.127, `zerocopy`/`zerocopy-derive` 0.8.55→0.8.56. No packages were added or removed.
+- This workflow made no commits. The final gate below ran against the lockfile as committed in `944e3ce` (the `cargo test`, final `cargo check`, and `cargo clippy` runs all started after 00:18:28 local, the commit time), so those transitive moves are covered by it.
+- After that commit, `cargo update --dry-run` reports "Locking 0 packages" (only `bincode` remains behind latest, by policy), and `git diff HEAD -- Cargo.toml Cargo.lock crates/sbh_mach/Cargo.toml` is empty.
+
+## Final Quality Gates
+
+All compilation went through `rch`; every run below used the lockfile as committed in `944e3ce` (which is byte-identical to the working tree for `Cargo.toml`, `Cargo.lock`, and `crates/sbh_mach/Cargo.toml`).
+
+- `rch exec -- cargo check --all-targets`: passed, exit 0 (remote `hz3`).
+- `cargo fmt --check`: clean.
+- `cargo metadata --locked --format-version 1`: exit 0 (lockfile consistent).
+- `cargo update --dry-run`: "Locking 0 packages" — only `bincode` remains behind latest, by policy.
+- `cargo audit` (cargo-audit 0.22.1): exit 0, 0 vulnerabilities; 1 allowed warning, RUSTSEC-2025-0141 "bincode is unmaintained" (`bincode` 2.0.1, known and accepted — 3.0.0 is poisoned).
+- `rch exec -- cargo clippy --all-targets -- -D warnings`: exit 101 with exactly the 62 pre-existing lint errors from baseline (61 lib-test + 1 bin-test): 37 `used assert! to check that a value is empty`, 16 `... is not empty`, 5 `Duration` unit readability, 2 `unchecked subtraction of a Duration`, 1 `constant assertion`, 1 `redundant clone`. No new error kinds and no count change versus baseline; these are not addressed by this sweep (another agent's task).
+- `rch exec -- cargo test --workspace --no-fail-fast`, run three times on remote `hz3`:
+  - Run 1 (98.9s): 23 suites, 1756 passed, 0 failed, 1 ignored — exit 0.
+  - Run 2 (final-gate re-run): 1755 passed, 1 failed — `tests/integration_tests.rs::daemon_exits_nonzero_when_rss_hard_cap_exceeded` panicked at line 2489 with "timed out waiting for child exit" (the test gives the daemon a hard 10 s `wait_for_child_exit` budget at line 1643). The identical tree had just passed in run 1; re-running the single test in isolation on the same worker passed 3/3 (7.46 s, 2.21 s, 0.45 s wall). Classified as a timing flake under worker load, not a dependency regression.
+  - Run 3 (58.9s): 23 suites, 1756 passed, 0 failed, 1 ignored — exit 0.
+  - Split for the passing runs: 1419 lib + 122 bin + 212 integration + 3 doc-tests, matching baseline exactly.
+- macOS coverage caveat: `sbh_mach` and the root crate's macOS platform code are `cfg(target_os = "macos")` and are not compiled or tested by the Linux gate. The `mach2` bump was cross-checked with `cargo check --target aarch64-apple-darwin -p sbh_mach --all-targets` (clean). A native macOS build/test was not possible from this host.
+
+## Summary
+
+- Updated: 1 — `mach2` 0.6.0 → 0.7.0 (`crates/sbh_mach`).
+- Already latest (no action): 32 direct dependencies across both manifests (see inventory tables); the lockfile was already at the highest semver-compatible version for every requirement, and `cargo update --dry-run` locks 0 packages.
+- Skipped / preserved by policy: 3 — `bincode` 2.0.1 (3.0.0 poisoned), `ftui`/`ftui-backend`/`ftui-tty` git tag `v0.4.1` (upstream `v0.5.0`, `v0.6.0` exist), `sbh_mach` path dependency (its own deps were swept).
+- Failed / rolled back: 0.
+- Code changes: none. Manifest changes by this sweep: `crates/sbh_mach/Cargo.toml` (one line) and the corresponding single `Cargo.lock` entry.
+- Commits: none by this workflow. Commit `944e3ce` was made by another agent mid-sweep and includes this sweep's manifest/lock change and the first 90 lines of this log.
+- Final test totals: 1756 passed / 0 failed / 1 ignored across 23 suites (runs 1 and 3); one timing flake in run 2 documented above.
+
+## Needs Attention (human decisions)
+
+- `tests/integration_tests.rs::daemon_exits_nonzero_when_rss_hard_cap_exceeded`: the 10 s child-exit budget is tight on loaded workers (7.46 s in an isolated pass; one timeout in a full parallel run). Consider raising the budget or marking the test serial. Not touched by this sweep.
+- `rustix = "=1.1.4"`: no recorded reason for the exact pin (introduced as `=1.1.3` in `1c0f8f5` with no explanation). Latest 1.x is 1.1.4 already, so nothing changed; decide whether to relax to `"1.1"` so future sweeps can move it without a manifest edit.
+- `ftui*` git tag: upstream frankentui has `v0.5.0` and `v0.6.0`; a TUI migration would be a separate, deliberate task.
+- `bincode` 2.0.1 is flagged unmaintained (RUSTSEC-2025-0141) and 3.0.0 is poisoned; a long-term replacement (e.g. `postcard`, `bitcode`, or plain `serde_json`) is a design decision outside this sweep.
+- `libc` 1.0.0-alpha.4 exists as a pre-release; ignored per policy until a stable 1.0 ships (note `nix`, `rustix`, and others must move first).
+
+## Addendum: post-sweep working-tree change by another agent (not part of this sweep)
+
+- At 2026-09-02 00:29:42 local, after this sweep's final gates had run, another agent edited `Cargo.toml` to move the three `ftui` git dependencies (`ftui`, `ftui-backend`, `ftui-tty`) from tag `v0.4.1` to `v0.6.0`. This sweep did not make that change and, per its instructions, left the `v0.4.1` pin untouched; the edit is uncommitted and belongs to that other agent.
+- `Cargo.lock` was not updated alongside it (still resolves the `v0.4.1` commit `436e917`), so the working tree is currently manifest/lock-inconsistent: `cargo metadata --locked --format-version 1` now exits 101 with: `error: cannot update the lock file /data/projects/storage_ballast_helper/Cargo.lock because --locked was passed to prevent this
+help: to generate the lock file without accessing the network, remove the --locked flag and use --offline instead.`
+- Every gate result recorded above was produced against the `v0.4.1` manifest and matching lockfile (as committed in `944e3ce`). The `v0.6.0` move is NOT covered by this sweep's verification; it needs its own lock update (`cargo update -p ftui -p ftui-backend -p ftui-tty`) and a `--features tui` build/test pass by whoever owns it.

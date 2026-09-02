@@ -290,268 +290,551 @@ to remove.
 - `docs/internal/macos-parity-completion-audit.md` says "Complete as of
   v0.4.22" while the epic is open and reality regressed after it.
 
-## 6. Bridge plan
+## 6. Bridge plan (revision 4 — ambition rounds 1-3 applied)
 
-Principle for every workstream: change the code to match the promise where
-the promise is the right product, and change the promise where the code's
-behavior is the right product. Never leave a documented capability that a
-user cannot exercise. Every workstream ends with a proof that runs in CI.
+### 6.0 Contracts that every workstream consumes
 
-### W0 — Restore the proof machinery (prerequisite)
+Each contract is a Rust module with a serde schema, a version field, and a
+round-trip test. Docs are generated from the module (a doc-test renders the
+table), never hand-typed.
 
-Problem: gates are red, disabled, or vacuous; nothing that follows can be
-trusted without them.
+**C-STATE — `state.json` v2** (`src/daemon/state_schema.rs`)
 
-Changes:
-1. Fix the 62 clippy errors by hand (assert-empty idioms, `Duration`
-   constructors, checked subtraction, constant assertion, redundant clone).
-   Add a CI step that pins the nightly date in `rust-toolchain.toml` so lint
-   drift is a deliberate bump, not a surprise.
-2. Re-enable CI, Release, and cert-expiration workflows; confirm a green run
-   on HEAD; make `paths-ignore` minimal.
-3. Make `scripts/quality-gate.sh` honest: every TUI stage passes
-   `--features tui` and fails if zero tests were selected; add a
-   `--features tui` build+test lane in CI (ftui is a git dependency now, so
-   the "strip local path deps" step is obsolete).
-4. Run `crates/sbh_mach` tests in the macOS lanes.
-5. Replace hardcoded numbers in `docs/testing-and-logging.md` and the gate
-   runbook with a generated table (script that parses `cargo test` output).
+```
+version, schema_version: 2, run_id, pid, started_at, last_updated,
+stopped_at?, exit_reason?,
+mounts[]: { path, fs_type, total, free, free_pct, level, urgency,
+            controller: observe_only|maintain|reclaim|recovery|idle,
+            idle_reason?, rates: { bytes_per_sec, accel, confidence,
+            seconds_to_red?, seconds_to_full? },
+            ballast: { dir, configured, available, health, releasable_bytes },
+            last_scan: { at, engine, candidates, deleted, freed_bytes,
+                         decision_ids_range },
+            behavior_cell: { scan, cleanup, ballast, notify } }
+memory: { level, available, swap_used_pct, thrash_risk },
+policy: { mode, since, fallback_reason?, guard: {status, e_value, obs} },
+threads: { monitor, scanner, executor, logger: running|stalled|dead, last_beat_secs },
+counters: { scans, deletions, deletion_failures, bytes_freed, errors,
+            dropped_log_events },
+memory_rss_bytes, cpu_secs_total
+```
 
-Proof: green CI on main with Linux + macOS + TUI lanes; `quality-gate.sh`
-exit 0 with non-zero test counts per stage.
+`#[serde(default)]` is kept; readers tolerate v1 and set `state_stale` from
+`last_updated`.
+
+**C-EVENT — activity event schema** (`src/logger/schema.rs`): every event has
+`ts, event, severity, run_id`; `artifact_delete` adds `decision_id, path,
+size, ok, skip_reason?, errno?`; `decision` is the full `DecisionRecord`;
+`ballast_provisioned|released|replenished` add `mount, files, bytes`;
+`policy_transition` adds `from, to, reason`; `special_location` adds
+`location, free_pct, free_bytes, floor_bytes`; `emergency` adds `mount,
+free_pct, files_released`; `error` is reserved for failures and carries
+`error_code`. Severity is one of `debug|info|warning|critical`; nothing
+informational is ever `error`.
+
+**C-ASSET — release asset contract** (`src/cli/mod.rs::ReleaseAssetContract`):
+canonical `sbh-<tag>-<triple>.tar.xz` + `.sha256` + `.sigstore.json`; mirror
+`sbh_<os>_<arch>` + `SHA256SUMS`; `release-provenance.json`. Installer and
+updater probe in the same order; a test asserts `scripts/install.sh`'s
+strategy block equals the contract's rendering.
+
+**C-CONFIG — configuration schema**: `config_version = 2` at the top of the
+file; `deny_unknown_fields` everywhere; v1 files (no version) are migrated by
+`sbh bootstrap` (`deprecated-config-key` covers renamed keys, with backup);
+the README example is a test fixture parsed in CI.
+
+**C-EXIT — CLI exit codes**: 0 ok · 1 user error or pressure condition · 2
+runtime/IO failure · 3 internal · 4 partial success. `check` uses 1 for
+pressure; `clean`/`emergency` use 4 when any item failed. Human reports on
+stdout, diagnostics on stderr, always.
+
+### W0 — Restore the proof machinery
+
+Design (unchanged from revision 2, with additions):
+- Lint fixes by hand; nightly pinned by date; weekly "lint drift" job files a
+  bead instead of breaking main.
+- CI matrix: `{linux-x86_64, linux-aarch64, macos-arm64, macos-x86_64} ×
+  {default, tui}`; release builds are `tui`.
+- `quality-gate.sh` stages record executed-test counts and fail on zero;
+  `--print-stages --markdown` is the source for both docs.
+- `sbh_mach` in the workspace and tested on macOS lanes.
+- `scripts/test-census.sh` generates the test table; CI diffs it.
+
+Test matrix: gate self-test (vacuous stage detection), census diff test,
+workflow lint (`actionlint`) in CI.
+
+Acceptance: two consecutive green pushes on main across the full matrix;
+TUI lane ≥ 950 tests; zero vacuous stages.
 
 ### W1 — Make the daemon reclaim before the cliff
 
-Problem: A3, A4, A5, A6, A8, A13, A17 combine so that the daemon watches a
-disk fill and does nothing until Red, then cannot act.
+**1.1 MountController state machine** (`src/daemon/mount_controller.rs`)
 
-Changes:
-1. Behavior matrix: at normal memory, Yellow → `HighConfidenceCandidates`
-   + ballast `None`; Orange → `DefiniteCandidates` + ballast `Release`; keep
-   Red/Critical as is. Expose the matrix under `[behavior]` in config with
-   validation and log the effective matrix at startup and on reload.
-2. Definite-artifact fast lane in scoring: a candidate whose category is a
-   validated regenerable build output (CACHEDIR.TAG signature, Rust
-   fingerprint/incremental, Go cache, node_modules under temp) with age ≥
-   floor and no active references gets a posterior floor that yields
-   `Delete` under Orange+ pressure. Golden tests: the sandbox fixtures
-   (stale → Delete at Orange, fresh → Keep, `.git` sibling → Keep).
-3. Device affinity: the gate must only suppress the *aggressive* scan of the
-   pressured device; routine/other-device work continues. Track pressure per
-   mount that has a root_path or ballast pool and drive per-mount responses,
-   so a foreign Orange mount cannot starve cleanup elsewhere.
-4. Green maintenance: a configurable routine scan cadence (default 30 min)
-   at Green that runs the normal safety pipeline in `HighConfidenceCandidates`
-   mode; either wire `VoiScheduler::schedule()` to pick which roots to visit
-   or delete the scheduler and its README section (decision: wire it).
-5. Ballast provisioning floor: replace the flat 20 % refusal with "provision
-   as many files as fit while keeping free ≥ orange threshold + one file";
-   provision incrementally after each successful reclaim; `doctor --system`
-   and `status` must show per-mount pools including `<mount>/.sbh/ballast`.
-6. Idle spin: when no action is possible (no scannable root on the
-   pressured device and no releasable ballast), back the tick off to ≥ 30 s
-   and drop the Critical 100 ms cadence; add a test that measures daemon CPU
-   time over a fixed window in that state.
-7. Special locations: thresholds become `min(percent, absolute_bytes)` with a
-   default absolute floor of 32 GiB for disk-backed user temp roots; alerts
-   rate-limited to one per 15 min per location; severity `warning` unless
-   RAM-backed.
-8. Fix the bogus `free_pct` in `emergency` events; make "release all
-   ballast" idempotent (one event when the pool is already empty).
-9. Read-only filesystem awareness: classify `NotWritable` as root into
-   EROFS / ENOSPC / permission with the real errno; on EROFS or btrfs
-   metadata exhaustion, prefer ballast release and raise a Critical
-   notification with the recovery command rather than retrying deletions.
+States: `ObserveOnly` (no root_path, no pool on this mount), `Maintain`
+(Green, has work surface), `Reclaim` (Yellow+), `Recovery` (EROFS/ENOSPC
+detected), `Idle` (has surface, nothing actionable, backoff armed).
 
-Proof: a sandboxed daemon e2e (see W10) that reproduces the host layout
-(pressured `/` without root_paths, healthy `/data` root) and asserts: routine
-scan of `/data` root happens, stale target is deleted at Orange, ballast is
-released at Orange, CPU time under a bound.
+Transitions, evaluated per tick from the mount's own PID/EWMA:
+- `Maintain → Reclaim` when level ≥ Yellow, or predictive `seconds_to_red ≤
+  action_horizon` with confidence ≥ min.
+- `Reclaim → Maintain` after `recovery_clean_windows` consecutive Green ticks.
+- `Reclaim|Maintain → Recovery` on `FilesystemReadOnly` or
+  `NoSpaceForMetadata` from the executor; `Recovery → Reclaim` when a probe
+  write of 4 KiB to `<mount>/.sbh/probe` succeeds and free ≥ red_min.
+- `* → Idle` when a full pass yields zero dispatchable candidates and no
+  ballast is releasable; `Idle → Maintain|Reclaim` on event-dirty roots,
+  SIGUSR1, config reload, or after `min_rescan_interval × 2^n` (capped 1 h).
+- `ObserveOnly` is entered at startup/reload and only leaves on config
+  change.
+
+Each state defines the tick cadence it contributes (`ObserveOnly`/`Idle`:
+base poll; `Maintain`: base poll; `Reclaim`: PID interval with the existing
+floors; `Recovery`: 30 s). The daemon's tick interval is the minimum over
+mounts not in `ObserveOnly`/`Idle`. This removes R3 and R7 by construction.
+
+**1.2 Behavior matrix** as `[behavior]` config with a `preset` selector
+(`"v0.6"` default, `"v0.5"` for the old cells, `"custom"` with explicit
+cells). Default v0.6 cells at normal memory: Green → maintenance pass
+(`HighConfidenceCandidates`, ballast `None`), Yellow →
+`HighConfidenceCandidates`/`None`, Orange → `DefiniteCandidates`/`Release`,
+Red → `AnyDefiniteCandidate`/`ReleaseFirst`, Critical → same + Review
+escalation. Memory rows may lower scan aggressiveness but never lower the
+cleanup/ballast cell below the disk row (`memory_never_reduces_cleanup =
+true`). The effective matrix is logged at startup and shown by `sbh config
+show --effective`; `state.json` carries the active cell per mount.
+
+**1.3 Definite-artifact certainty** (`src/scanner/certainty.rs`; calibration from Q4, idleness from Q5)
+
+| Evidence (all structural, no name matching) | Certainty |
+|---|---|
+| Validated `CACHEDIR.TAG` at root, or Rust `.fingerprint/` + `incremental/`, or Go build-cache layout, or `node_modules/` under a temp root, or Xcode DerivedData child, or Electron cache dir, or rch marker dir with idle tree | Definite |
+| Name pattern ≥ 0.85 confidence with one structural marker | Likely |
+| Anything else | Unclear |
+
+Decision layer: `Definite` uses prior `posterior_floor_definite` (0.85) after
+all vetoes; `Likely` uses the existing posterior; `Unclear` can only reach
+`Review`. The fast lane never runs before min-age, active-reference, sacred,
+lease, or source-tree checks. Golden tests pin: sandbox stale target →
+Delete at Yellow+ (with maintenance cell) and Orange+; fresh → Keep;
+`.git` sibling → Keep; leased → Keep; open file → Keep.
+
+**1.4 Green maintenance** (root selection from Q6): `maintenance_interval_secs` (1800) schedules a
+`HighConfidenceCandidates` pass over roots picked by
+`VoiScheduler::schedule()` (budget `[scheduler].scan_budget_per_interval`);
+obeys duty cycle and empty-pass backoff; suppressed when memory is Critical.
+
+**1.5 Ballast plan** (reserve target from Q1): per mount `n = clamp(floor((free_bytes -
+reserve_floor_bytes) / file_size), 0, configured)` with `reserve_floor_bytes
+= max(orange_min_free_pct × total, file_size)`; provision `n` now; re-plan
+after each reclaim/replenish and every `maintenance_interval`; health
+`full|partial|empty|unconfigured-for-space|unreadable`. CLI and daemon share
+`BallastCoordinator::discover(config)`; `sbh ballast status` lists every pool
+with its mount and health.
+
+**1.6 Special locations** (horizon rule from Q2): `free_buffer = min(pct, absolute)`; defaults
+RAM-backed 20 % (no absolute), disk-backed temp roots 15 % or 32 GiB,
+custom 15 % or 32 GiB; alert severity `warning` (disk) / `critical` (RAM);
+one event per location per 15 min; state changes log immediately.
+
+**1.7 Failure classification** (alarm from Q8): `SkipReason::{ParentNotWritable(errno),
+FilesystemReadOnly, NoSpaceForMetadata}`; the executor stops the batch on the
+latter two and returns `BatchOutcome::RecoveryNeeded(mount)`; the daemon
+switches that mount to `Recovery` (ballast release, Critical notification
+with the exact commands, retries paused).
+
+**1.8 Observability**: `rates`/`forecast` in `state.json`; `idle_reason` per
+mount; `emergency` events truthful and deduplicated; `sbh status` prints the
+controller state and idle reason per mount.
+
+Test matrix:
+
+| Level | Tests |
+|---|---|
+| Unit | state-machine transitions (table-driven); matrix resolution incl. presets and the never-reduce rule; certainty classifier per evidence row; ballast plan arithmetic incl. zero and negative headroom; special-location floor math; skip-reason errno mapping |
+| Integration (MockPlatform, multi-mount stats) | two mounts, one pressured without root: other mount still maintained; tick cadence stays at base poll; Recovery entry/exit |
+| Daemon e2e (W10) | host layout; Orange reclaim; Red with ballast; read-only bind mount; partial provisioning at 12 % free |
+
+Rollout: ship with `preset = "v0.6"` default and `SBH_BEHAVIOR_PRESET=v0.5`
+env override; canary on the operator workstation for 7 days with daily
+review of `sbh stats --window 24h` (deletion success rate, bytes freed,
+false-positive reports), `journalctl` CPU, and `sbh status` idle reasons;
+fleet rollout via `sbh update` after W4; rollback is the env override.
 
 ### W2 — Explainability that exists
 
-Changes: persist `DecisionRecord`s to SQLite (`decision_log` table) and JSONL
-with a stable id (`<daemon_run_id>-<seq>` or UUID); print the id on every
-`artifact_delete`, `scan_complete` candidate line, and in `sbh scan --explain`
-/ `sbh clean` output; implement `sbh explain --id <id> [--level 0..3]` over
-the store with the four explain levels already in `decision_record.rs`; feed
-the dashboard Explainability screen from the same store; retention alongside
-`activity_log`.
+Design as revision 2, plus: `decision_log` indexed by `(run_id, seq)` and
+`path`; `sbh explain --last N`, `--path`, `--since`; dashboard reads the
+same table; retention 30 days shared with `activity_log`; JSONL `decision`
+events are optional (`[telemetry] log_decisions_jsonl`, default true) to
+bound log growth.
 
-Proof: e2e that deletes in the sandbox, captures the id from JSONL, and
-`sbh explain --id` returns the full record in JSON and human modes.
+Test matrix: unit (id minting, record round-trip), integration (SQLite
+insert/query, retention), e2e (delete → id → explain at four levels, CLI-only
+run without daemon).
 
 ### W3 — Truthful CLI on real installs
 
-Changes:
-1. `daemon_running`: state-file freshness + pidfile (`--pidfile` already
-   exists; write it by default under the data dir) + `systemctl is-active`
-   / `launchctl print`; remove the `/proc` cmdline substring scan; expose
-   `state_age_secs` and `state_stale: bool` in JSON.
-2. Read-only commands (`stats`, `tune`, `status` recent activity, `log`)
-   open SQLite with `?mode=ro` and fall back to JSONL; non-root against a
-   system install prints the `sudo` hint with the real system path; `config
-   path` uses the same resolution as `Config::load`.
-3. Export the EWMA rate and forecast into `state.json` (`rates` per mount)
-   so `check --predict` and the status rate block work; delete the dead
-   branches if the decision is not to export.
-4. Exit codes: `clean`/`emergency` return `Partial` (4) when any deletion
-   failed; `check` pressure failure is exit 1 not 2; human output stream
-   consistent (stdout for reports, stderr for diagnostics); make
-   `--no-color`, `-q`, `-v` real or remove them from clap.
-5. Wire the uninstall planner: `--dry-run`, `--keep-data`, `--keep-config`,
-   `--keep-assets`, `--purge`, backup-first, category-tagged JSON; `--purge`
-   without backup is not allowed.
-6. Wire bootstrap: `sbh bootstrap [--dry-run]` and an automatic dry-run
-   report at the end of `sbh install` with a prompt to apply; all mutating
-   actions back up first; drop AGENTS.md's "13 reasons".
-7. Dashboard decision: make `tui` a default feature (ftui is already a git
-   dependency; CI builds it), ship it in releases and Homebrew, keep
-   `--legacy-dashboard` as the text loop, fix quick-release `x` (execute
-   the confirmation through the ballast manager), add `--start-screen`,
-   honor `REDUCE_MOTION`, correct the preferences filename in docs, delete
-   the unreachable `src/cli/dashboard.rs` after confirming no behavior
-   depends on it.
-8. Config: `#[serde(deny_unknown_fields)]` on every config struct, with
-   `sbh config validate` and daemon startup reporting unknown keys with the
-   closest real key; tilde expansion for all path fields; add
-   `[behavior]`; fix the README example to real keys (`[pressure]`,
-   `[paths]`, `[policy] initial_mode`, `file_size_bytes`).
+Design as revision 2 with these precisions:
+- `DaemonProbe` order: pidfile (default `<data_dir>/sbh.pid`, written by the
+  daemon, checked with `kill(pid, 0)` and `/proc/<pid>/comm == "sbh"`),
+  service manager (`systemctl is-active sbh.service` / `launchctl print`),
+  state freshness. `daemon_running` is true only if pidfile or service
+  manager says so; state freshness alone yields `daemon_running: false,
+  state_stale: false` with a hint.
+- Read-only SQLite opens; JSONL fallback; the sudo hint names the real
+  system paths.
+- `clean`/`emergency` partial → 4; `check` pressure → 1; `-q`/`-v`/
+  `--no-color` implemented through one `Ui` helper.
+- Uninstall planner wired with backups; `--purge` requires `--yes` in
+  non-TTY and always backs up config + last 1 MiB of each log.
+- Bootstrap wired; `sbh install` runs a dry-run and applies in `--auto`.
+- TUI default feature; quick-release executes; `--start-screen`;
+  `REDUCE_MOTION`; docs fixed; dead crossterm dashboard feature-gated pending
+  deletion approval.
+- `deny_unknown_fields` + `config_version` + tilde expansion + unknown-key
+  diagnostics with did-you-mean; `auto_provision` honored.
 
-Proof: CLI e2e cases for each item running against a root-owned fixture
-install (CI job with sudo) and a user install.
+Test matrix: CLI e2e in CI on user install and root-owned system install
+fixtures (sudo job); config fixture round-trips; probe unit tests with fake
+pidfiles.
 
 ### W4 — One release contract, working updater, live pipeline
 
-Changes:
-1. Canonical asset contract, published in `docs/installer-dx-parity-matrix.md`
-   and enforced by both `scripts/install.sh` and `src/cli/update.rs`:
-   `sbh-<tag>-<triple>.tar.xz` + `.sha256` + `.sigstore.json`, plus raw
-   `sbh_<os>_<arch>` mirrors and `SHA256SUMS`. The updater probes the release
-   asset list via the GitHub API (with an offline manifest fallback) and
-   accepts either form; checksum required for both.
-2. Fix the Release workflow clippy gate (W0), re-enable it, and cut v0.5.2
-   through the workflow: signed + notarized macOS tarballs (stapling the
-   tarball is not possible; document `xattr` quarantine handling), sigstore
-   bundles, tap update. Verify `sbh update` from 0.5.1 → 0.5.2 on one Linux
-   host and one Mac before fleet rollout.
-3. Manual release fallback (`docs/macos.md` "Manual Release Fallback") must
-   produce the same asset set and run the tarball-arch guard locally; add a
-   `sbh doctor --release --assets <dir>` check.
-4. `sbh version --verbose` build metadata populated in every build path
-   (build script reading git, or release env).
-5. Keep `master` mirrored (documented in AGENTS.md) via a step in the
-   Release workflow.
-
-Proof: updater e2e against a local fake release server serving both asset
-layouts; `install.sh` e2e on Linux and macOS lanes; the fleet self-updates
-to 0.5.2.
+Design as revision 2, plus the post-publish audit (`sbh doctor --release
+--assets <dir|tag>`): downloads every asset, verifies checksums, Mach-O/ELF
+arch per target, codesign identity and notarization ticket for macOS,
+sigstore bundle verification, and tarball-vs-raw byte equality; the Release
+workflow runs it and the manual script runs it before upload. Both installer
+and updater share `probe_release_assets()` semantics; a fake-release-server
+e2e covers tarball-only, raw-only, and mixed releases plus a checksum
+mismatch and a missing sigstore with `Required` policy.
 
 ### W5 — systemd correctness
 
-Changes: send `READY=1` after init and `STOPPING=1` on shutdown; read
-`WATCHDOG_USEC` and heartbeat at half the interval; derive `ReadWritePaths`
-from `scanner.root_paths`, special locations, ballast dirs, data/config dirs
-and re-render on `sbh install`/`config set`; write the final state file on
-shutdown (and a `stopped_at`); join workers with the documented 30 s budget
-or document 5 s; include thread health in `state.json`; remove
-`ShutdownCoordinator` dead code. Add an integration test that runs the
-daemon under `systemd-run --user --property=Type=notify` (or a container
-with systemd) and asserts `active`.
+Design as revision 2. Test: `systemd-run --user` integration on Linux CI
+(`Type=notify`, `WatchdogSec=5`) asserting `active` within 10 s, heartbeat
+observed via `systemctl show -p WatchdogTimestamp`, clean stop writes
+`stopped_at`.
 
 ### W6 — Logging and stats integrity
 
-Changes: emit `BallastProvisioned/Released/Replenished` and
-`PolicyTransition` events from the daemon and store them (`ballast_inventory`
-upserts on every change); make degradation constants match docs (or docs
-match code) and enable the RAM fallback in the daemon config; test the
-SQLite trip/reopen path; only `VACUUM` when `auto_vacuum` changes; `stats`
-`avg_age_hours` real or removed.
+Design as revision 2, with the C-EVENT schema as the contract; `stats`
+reads ballast/policy sections from real rows; degradation constants unified
+and tested; VACUUM conditional.
 
-### W7 — Scanner v2 hardening and honesty
+### W7 — Scanner v2 hardening
 
-Changes: index replay under Orange+ re-scores each persisted candidate with
-fresh min-age, active-reference, and sacred-overlap checks before dispatch
-(or routes through the same `should_skip` closure plus a fresh
-`ScoringInput`); move the stowaway sacred check into
-`DeletionExecutor::preflight_check`; README and `engine.rs` state that v2 is
-the default and what v1 is for; capture a live A/B artifact on one fleet
-host and close `bd-xtpv.8` on evidence; either implement fanotify behind a
-safe crate or remove the capability probe wording; macOS FSEvents via a safe
-crate or explicit "reconciliation-only" in docs.
+Design as revision 2, plus: replayed candidates carry `index_generation` and
+are dropped if the root's generation advanced; the A/B artifact format
+(`scan-v1.json`/`scan-v2.json` + `scan_complete` events) is the closing
+evidence for `bd-xtpv.8`.
 
 ### W8 — Ballast integrity
 
-Changes: `verify()` and `prune_orphans()` under the flock; `sbh ballast
-status` is read-only (no pruning); CLI enumerates the daemon's per-mount pools;
-APFS added to the preallocate-friendly set so daemon and CLI provision the
-same way; release-controller cooldown reset runs on every tick, not only at
-Green; document `<mount>/.sbh/ballast`.
+Design as revision 2 (flock coverage, read-only `ballast status`, per-mount
+enumeration, APFS preallocation parity, cooldown reset every tick).
 
 ### W9 — macOS closeout
 
-Changes: rewrite epic acceptance criterion 6 (macos-13 → macos-15-intel);
-measure and budget cold-start `sbh status` latency (replace `/sbin/mount`
-with `getfsstat` via a safe crate or cache across processes); add a deadline
-to `open_files_under`/`executables_under`; separate purgeable from
-snapshot-retained bytes or label them as one estimate; add a
-`~/Library/Caches` rule or drop the claim; fix `ThrottleInterval` in docs;
-refresh the parity audit to reflect August reality and close `bd-r7m7.17`
-with either CI proof or an explicit operator decision.
+Design as revision 2, plus: `getfsstat` via `sbh_mach` with a unit test
+against `/sbin/mount` output on the macOS lane; cold-start `sbh status`
+budget 250 ms in the perf lane; `open_files_under` deadline 5 s / 50k pids
+fail-closed; single `estimated_reclaimable_by_snapshot_thinning` field.
 
-### W10 — Proof: a real daemon end-to-end suite
+### W10 — Real daemon end-to-end suite
 
-Changes: turn the sandbox scripts from this audit into
-`tests/daemon_e2e.rs`: a temp root with stale/fresh/git/open-file/lease
-fixtures, a pressure injection hook (`[telemetry] fs_stats_override_file`
-read only when `SBH_TEST_MODE=1`, or a loop-mounted small filesystem in CI),
-and assertions on deletions, ballast release, JSONL/SQLite rows, explain ids,
-state.json fields, and CPU time. Convert the placeholder test files into real
-tests instead of deleting them. Make chmod-based tests skip under root. Run
-the suite in CI on Linux and macOS.
+Scenario table (each asserts events, state, filesystem, CPU):
+
+| Scenario | Setup | Must hold |
+|---|---|---|
+| host-layout | mount A pressured (injected stats), root on mount B healthy | B maintained within interval; A observe-only; CPU < 2 % |
+| orange-reclaim | root mount Orange | stale Definite deleted; fresh/git/open/leased kept; ballast released; decision ids present |
+| red-ballast | Red, pool of 2 | ReleaseFirst before scan; both released; events logged |
+| read-only | root on `ro` bind mount | batch stops; Recovery; Critical notification; no retries 5 min |
+| partial-provision | mount at 12 % free, orange 10 % | pool `partial` with n files |
+| reload | SIGHUP with new root | new root scanned; matrix re-logged |
+| forced-scan | SIGUSR1 at Green | scan_complete within 2 s |
+| shutdown | SIGTERM | `stopped_at`, `exit_reason` written; exit 0 |
+| engines | v1 and v2 | parity on the reclaim scenario |
+
+Pressure injection: `SBH_TEST_FS_STATS` JSON consumed by `FsStatsCollector`
+only under `SBH_TEST_MODE=1`; CI additionally uses a 512 MiB loop-mounted
+ext4 for one real-pressure run. Placeholder tests become real; chmod tests
+skip as root; suite runs on Linux and macOS.
 
 ### W11 — Documentation reconciliation
 
-Changes: README sections for thresholds, formulas, config example, command
-reference (add `service`, `log`, `setup`, `truncate-logs`, `doctor
---release`, `lease`), dashboard availability, release assets, troubleshooting
-unit names; AGENTS.md key-files table and config table; CHANGELOG release
-markers; delete nothing, correct everything; add a CI check that every
-`sbh <command>` mentioned in README exists in `sbh --help`.
+As revision 2, plus an explicit README change list:
+- Delete: "1s polls", the non-monotonic age curve, "hundreds of patterns",
+  `[monitor]`/`[logging]`/`[guardrails]`/`[scoring.weights]`/`[policy]
+  mode` keys, `sbh explain` until W2 ships, the dashboard section until W3.7
+  ships, `gh release download --pattern "sbh-*.tar.xz"` until W4 ships,
+  `systemctl status sbh-daemon`, "runs automatically during install" until
+  W3.6 ships, uninstall matrix until W3.5 ships.
+- Rewrite: thresholds (20/14/10/6, Critical < 6), PID setpoint, EWMA alpha
+  direction and confidence weights, guardrail constants, circuit breaker 5,
+  degradation constants, JSONL daemon settings, ballast pools per mount,
+  behavior matrix table, special-location floors, exit codes, release assets.
+- Add: `service`, `log`, `setup`, `truncate-logs`, `doctor --release`,
+  `lease`, `status --sacred`, env-var table completion.
+- CI checks: README command existence; README config example validates;
+  numbers in docs come from generated tables.
 
 ### W12 — Tracker hygiene
 
-Changes: reopen or annotate the false-closed beads; create beads for every
-row above (done as the output of this document); add the missing
-`.beads/.gitignore` patterns; decide whether `beads.db` stays tracked in git
-(recommendation: untrack, keep `issues.jsonl` canonical — requires operator
-approval since it removes a tracked file).
+As revision 2.
 
-## 7. Sequencing
+### 6.14 Quantitative design (revision 4 — ambition round 3)
 
-1. W0 (gates) and W12 (tracker) immediately; nothing else is trustworthy
-   without W0.
-2. W1 (reclaim before the cliff) and W3 (truthful CLI) in parallel; W10's
-   daemon e2e is built alongside W1 as its acceptance test.
-3. W4 (release contract + pipeline) and W5 (systemd) next; they unblock
-   shipping W1/W3 to the fleet and the Mac.
-4. W2, W6, W7, W8, W9 after the core is delivering; each has its own proof.
-5. W11 continuously, finishing after everything else lands.
+The daemon already contains the right skeletons: an adaptive EWMA with a
+quadratic time-to-exhaustion solver, a PID with anti-windup, an e-process
+guardrail, a Bayesian expected-loss decision, a VOI utility, a duty-cycle
+limiter, and a process-level write-rate history. What follows makes each of
+them load-bearing, with the math chosen so that every quantity is estimable
+from data the daemon already collects and every guarantee is checkable by a
+property test.
 
-Critical path: W0 → W1 (+W10) → W4 → fleet rollout of v0.5.2.
+#### Q1. Reaction-window reserve sizing (ballast as a quantile, not a constant)
 
-## 8. Decisions needed from the operator
+Definition. For mount `m`, the *reaction window* `W_m` is the time from a
+pressure transition to the first byte actually freed: `W_m = poll + scan +
+preflight + delete`, measured by the daemon (EWMA of observed cycle latencies,
+default prior 300 s). The reserve the daemon must be able to release
+instantly is the amount the host can write on `m` during `W_m`.
 
-1. Should Orange delete definite artifacts and release ballast by default
-   (this plan says yes; it is what the README promised)?
-2. Ship the TUI in default builds (this plan says yes) or delete the README
-   dashboard section?
-3. Release asset contract: return to `.tar.xz` + sidecars as canonical with
-   raw mirrors (this plan), or make raw binaries canonical and change the
-   updater?
-4. Untrack `.beads/beads.db` from git (needs explicit permission to remove a
-   tracked file)?
-5. On this workstation: once W1 ships, remove `/etc/sbh/HOTLOOP_DISABLED`,
-   regenerate the unit with `sbh install --systemd`, add a `/`-resident root
-   path (e.g. `/home/ubuntu/.cache`, `/var/tmp`) or enable `cross_devices`,
-   and provision a partial ballast pool on `/`.
+Estimator. `ProcessIoHistory` already samples per-process `write_bytes`
+every 15 s. Aggregate per mount (attribute a process's writes to the mount of
+its cwd / open files, fallback: the busiest mount) into window sums
+`X_k = bytes written on m during window k of length W_m`. Keep a streaming
+quantile sketch (t-digest, 100 centroids, persisted with `io_history.bin`).
+`reserve_m = q_{0.99}(X)`; with fewer than 50 windows, use a
+peaks-over-threshold fit (generalized Pareto on exceedances over `q_{0.90}`)
+to extrapolate the 0.99 quantile, and floor the estimate at the configured
+`file_size × 2`.
+
+Use. `sbh tune` recommends `file_count_m = ceil(reserve_m / file_size)` per
+mount; the daemon's provisioning plan (W1.5) targets that count subject to
+the headroom rule; `doctor --system` reports reserve coverage as a ratio
+(`releasable_bytes / reserve_m`) and FAILs below 1.0.
+
+Property tests: monotonicity in the input stream; the GPD extrapolation never
+returns less than the empirical `q_{0.90}`; a synthetic bursty writer (1 GiB
+in 30 s every 10 min) yields a reserve ≥ 1 GiB.
+
+#### Q2. Time-to-harm horizons for special locations and floors
+
+Replace fixed percentage buffers by a hazard horizon. For location `L` with
+free bytes `F_L` and estimated write rate `r_L` (EWMA of the location's own
+`X_k / W`, with the mount's rate as a prior), define `h_L = F_L / max(r_L,
+r_min)`. Alert when `h_L < H_alert` (default 30 min) or `F_L < absolute_floor`
+(RAM-backed: 20 % of size; disk-backed: 4 GiB), whichever is stricter for
+RAM-backed and whichever is *looser* for disk-backed roots on multi-TB
+volumes. The 35,692-event storm of August becomes zero events: 760 GiB free at
+any plausible rate is days of horizon.
+
+Property tests: `h_L` is decreasing in `r_L`, increasing in `F_L`; the alert
+predicate is invariant to volume size when expressed in horizon.
+
+#### Q3. Per-mount control with feedforward and gain scheduling
+
+Keep the PID but make it per mount (W1.1) and add:
+- **Feedforward from the forecaster.** `raw = Kp·e + Ki·∫e + Kd·ė +
+  Kf · clamp(1 − t_red / H_action, 0, 1)` where `t_red` is the quadratic
+  TTE to the red line and `H_action` is the action horizon. The existing
+  "boost to ≥ 0.70" becomes the `Kf` term (default 0.8) so urgency rises
+  smoothly rather than jumping at 15 min.
+- **Gain scheduling by capacity.** Errors are in percent; a 1 % error on a
+  5.5 TiB volume is 55 GiB, on a 100 GiB root it is 1 GiB. Schedule
+  `Kp_m = Kp · sqrt(total_m / 1 TiB)` clamped to [0.5, 2]·Kp so large volumes
+  respond to the same *byte* rate of change.
+- **Anti-windup on actionability.** Freeze the integral term while the mount
+  is `ObserveOnly`, `Idle`, or `Recovery` (no actuator authority), which is
+  the textbook cause of the "sits at urgency 0.99 forever" state in the
+  kill-switch note.
+
+Property tests: with the actuator frozen the integral does not grow; urgency
+is monotone in `−t_red`; a step in free space converges without overshoot
+beyond one level within N ticks (numeric stability test with the sandbox
+trace).
+
+#### Q4. Calibrated deletion with conformal risk control
+
+Labels the daemon can observe. A deletion at time `t` of opaque root `p` is
+a *regret event* if the same identity `(parent_dev, parent_ino, name)` is
+recreated within `τ = 30 min` while a process with cwd or open files under
+`p`'s parent is alive — i.e. somebody was still using it. Regret is a proxy
+for false positive; it is exactly the "rebuild from cold" cost the v0.5.1
+changelog describes for rch pools. Record it as `decision_outcome` rows
+(`decision_id, outcome: regret|clean|unknown, observed_at`).
+
+Estimator. Per category `c` (RustTarget, GoCache, NodeModules, Electron,
+DerivedData, TempDir, …), maintain Beta posteriors `Beta(a_c, b_c)` for the
+regret rate with an empirical-Bayes prior fit across categories (method of
+moments on the per-category means), so rare categories borrow strength.
+
+Control. Choose the delete threshold `θ_c` on the posterior-abandoned scale so
+that the Clopper–Pearson upper bound of the regret rate at level `δ = 0.05`
+stays ≤ `α_c` (default 0.02 for Definite, 0.005 for Likely). This is
+learn-then-test risk control applied to one threshold per category: sort past
+decisions by posterior, find the largest threshold whose empirical regret
+upper bound ≤ α. The `posterior_floor_definite` of W1.3 is the *initial*
+threshold; Q4 tightens or loosens it from evidence and the `calibration`
+score already in the decision layer becomes `1 − UB(regret)`.
+
+Guardrail. The existing e-process machinery gets a second stream: H0
+"regret rate ≤ α"; observations are deletions; alarm demotes the policy to
+Canary for that category (not globally), which is the missing category-level
+fallback.
+
+Property tests: with zero regrets the threshold never rises above the initial
+floor; with regret rate 10 % in one category only that category's threshold
+tightens; the Clopper–Pearson bound is monotone in the count.
+
+#### Q5. Opaque-root idleness instead of birth time
+
+Age of a directory should mean "time since anything inside it changed".
+Compute `tree_idle_since(p)` cheaply: sample up to `k = 64` entries via a
+bounded reservoir over the first 4,096 readdir results at depth ≤ 3, take the
+max mtime, and combine with the root's own mtime and birth time:
+`effective_age = now − max(sampled_max_mtime, root_mtime)`; birth time is
+only a lower bound on age. This is the generalization of the rch idle probe
+(`rch_tree_activity`) to every opaque candidate, with a hard cap on
+syscalls. Property test: a tree with one fresh leaf never reports idle longer
+than that leaf's age (sampling is deterministic under a seed so the test is
+exact for k ≥ tree size).
+
+#### Q6. Scan scheduling as a hazard-driven index policy
+
+With v2's inotify dirty roots, the only question VOI must answer at Green is
+"which non-dirty roots deserve a bounded look?". Model each root `i` as a
+restless arm with change hazard `λ_i` (EWMA of dirty transitions per hour),
+expected reclaim per visit `R_i` (already tracked), and visit cost `C_i`
+(entries walked, already tracked). The index is
+`I_i = R_i · (1 − e^{−λ_i · Δt_i}) − w_c · C_i`, where `Δt_i` is time since
+the last visit: the probability that something changed times the payoff,
+minus cost. Pick the top-`k` by index within the budget; roots with dirty
+flags are always visited first. This is the Whittle-index heuristic for
+restless bandits with Poisson change and it reduces to the existing
+exploration bonus when `λ` is unknown (prior `λ_0 = 1/24 h`).
+
+Property tests: a root with `λ = 0` and no dirty flag is visited at most
+once per day; a root with high `λ` and high `R` dominates; the budget is
+never exceeded.
+
+#### Q7. CPU budget with a stated bound
+
+Model scanner work as a token bucket with rate `ρ = max_scan_duty_cycle_pct /
+100` cores and burst `B = 5 s`, fed by all scanner, prescan, and
+maintenance work (not just walker passes), and charge the monitor thread's
+own tick time to the same bucket. Long-run CPU fraction ≤ `ρ` plus the
+bucket burst amortized over the window; with `ρ = 0.25` and `B = 5 s`, over
+any 60 s window CPU ≤ 25 % + 8 %. The existing idle-debt formula gives the
+same long-run bound for walker passes only; extending the charge to every
+thread and adding per-mount `Idle`/`ObserveOnly` cadence is what turns the
+bound into an invariant. Test: run the daemon 60 s in the host layout and
+in Orange-with-work; assert `cpu_secs_total / wall ≤ 0.02` and `≤ 0.33`
+respectively from `state.json.cpu_secs_total`.
+
+#### Q8. Anytime-valid deletion-failure monitor
+
+Failures are a stream; a 10,362-count `NotWritable` run should have tripped
+something within minutes. Apply the guardrail e-process to the executor:
+H0 "failure rate ≤ 10 %"; e-value factor 1.5 on failure, 2/3 on success,
+clamp [−5, 3.5], alarm at 20 (same constants as the forecaster guard so the
+math is shared). Alarm → mount enters `Recovery` (W1.7) and a Critical
+notification names the dominant `SkipReason`. Property test: 20 consecutive
+failures alarm; 9 failures per 100 do not.
+
+#### Q9. Event-watch budget allocation
+
+With `event_watch_budget = 8192` recursive watches and roots with far more
+directories, allocate watches to directories in decreasing order of observed
+event rate (EWMA per directory, Zipf-like in practice), keeping the root and
+depth-1 always; everything unwatched is covered by the reconciliation pass
+whose cadence is the maintenance interval. Overflow (`Q_OVERFLOW`) already
+marks all roots dirty; add a counter and back off the reconciliation cadence
+exponentially when overflows repeat. Property test: allocation never exceeds
+the budget and always includes the root and depth-1 directories.
+
+#### Q10. Snapshot-aware release accounting (macOS)
+
+Ballast release under APFS with local snapshots frees blocks only when no
+snapshot references them. Measure effectiveness `η_m = Δfree_observed /
+bytes_released` after each release (statfs before/after, 5 s settle) and keep
+an EWMA; the release controller targets `bytes_needed / η_m` files and the
+status line reports `η_m` with the thin command when `η_m < 0.5`. Property
+test: with `η = 0.25` the controller requests four times the files, capped
+at the pool.
+
+#### Proof obligations summary
+
+Each Q-item ships with: (1) a pure function or small struct in the crate,
+(2) proptest properties as listed, (3) a line in the daemon e2e that
+exercises it end to end where feasible (Q1 via a synthetic writer, Q2 via
+injected stats, Q3/Q7 via the sandbox trace, Q4 via a scripted regret, Q5
+via fixtures, Q8 via a read-only mount), and (4) the numbers surfaced in
+`state.json` and `sbh status --json` so operators and the dashboard can see
+them.
+
+## 7. Cross-cutting invariants
+
+As revision 2, plus:
+8. Every `SkipReason` is one of a closed enum with an errno where
+   applicable; `stats` reports failures by reason.
+9. `state.json` v2 is written at least every 30 s and on shutdown; readers
+   compute staleness from `last_updated`.
+10. The tick interval is never below the base poll interval unless at least
+    one mount is in `Reclaim` with dispatchable work or releasable ballast.
+
+## 8. Failure-mode analysis
+
+As revision 2, plus:
+
+| Failure | Detection | Response |
+|---|---|---|
+| Config from README v1 example | unknown-key diagnostics | `config validate` fails; daemon refuses to start in strict mode with did-you-mean |
+| Fleet update to a release with only raw assets | asset probe | updater installs from raw + SHA256SUMS; audit flags missing sidecars |
+| TUI build fails off-VPS | ftui git dep resolution | CI `tui` lane on a clean runner |
+| Two daemons (user + system) on one host | pidfile + service probe | `sbh status` lists both; `sbh install` refuses a second scope without `--force` |
+
+## 9. Security scope for a root daemon
+
+- Deletion scope is the union of `scanner.root_paths` minus protected,
+  sacred, source-tree, `.git`, lease, and open-file vetoes; the hardcoded
+  source-tree refusal for `/data/projects`, `/home/*/projects`,
+  `/Users/*/projects` stays and is documented.
+- `ReadWritePaths` is derived from config so the systemd sandbox matches the
+  deletion scope exactly; `ProtectSystem=strict` stays.
+- Lease tokens remain 256-bit with digest-only storage; the sidecar lock path
+  is canonicalized (fix `37111db` retained).
+- `sbh uninstall --purge` never deletes outside the sbh config/data/ballast
+  dirs and always backs up.
+- The updater refuses unsigned macOS binaries unless `--no-verify`, and the
+  Release workflow produces signed ones again.
+
+## 10. Host remediation runbook (operator workstation)
+
+As revision 2, with the addition that step 5 is preceded by a 60-minute
+dry run: `SBH_SCANNER_DRY_RUN=1 sbh daemon --config /etc/sbh/config.toml`
+in the foreground, reviewing `decision` events before enabling the service.
+
+## 11. Fleet rollout plan
+
+1. v0.5.2 (W0 + W4 + minimal W3 truthfulness): restores updater and CI;
+   no behavior change; fleet self-updates; verify `sbh status` on every host.
+2. v0.6.0 (W1 + W10 + W2 + W5 + W6): behavior change; canary on the
+   operator workstation and one rch VPS for 7 days; rollout gated on
+   deletion success rate ≥ 90 %, zero source-tree or protected deletions,
+   CPU ≤ 2 % at Green, zero `Recovery` false entries; rollback via
+   `SBH_BEHAVIOR_PRESET=v0.5`.
+3. v0.6.x (W7, W8, W9, W11): incremental.
+
+## 12. Sequencing and critical path
+
+W0 + W12 → W1 (+W10) + W3 in parallel → W4 + W5 → W2, W6, W7, W8, W9 →
+W11 throughout. Critical path: W0 → W4 (v0.5.2, fleet updater restored) →
+W1/W10 → v0.6.0 canary → fleet.
+
+## 13. Decisions needed from the operator
+
+As revision 2.
