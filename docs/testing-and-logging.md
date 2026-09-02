@@ -15,6 +15,33 @@ cargo test --lib --features tui
 cargo test --bin sbh
 ```
 
+## Status and Check JSON (schema_version 2)
+
+`sbh status --json` and `sbh check --json` carry a top-level
+`"schema_version": 2`. Version 2 keys each mount's `platform` block by
+filesystem family and drops the APFS-only mount keys on every other family
+instead of emitting them as null. Assert on the family you expect:
+
+```json
+{"path": "/data", "fs_type": "ext4", "free": 250, "free_pct": 25.0,
+ "platform": {"linux": {"fs_type": "ext4", "is_ram_backed": false,
+                        "is_readonly": false, "device_id": 66306}}}
+```
+
+```json
+{"path": "/System/Volumes/Data", "fs_type": "apfs", "free": 250,
+ "free_excludes_purgeable": true, "purgeable_bytes": 32,
+ "platform": {"darwin": {"apfs": {"container_id": "/dev/disk3",
+                                  "free_excludes_purgeable": true}}}}
+```
+
+Nothing in the repository parses these payloads except the tests and
+`scripts/e2e_test.sh`; the dashboard reads `state.json`, whose own
+`schema_version` is checked by `tui/adapters.rs`. Unit coverage:
+`status_mount_json_keys_the_platform_block_by_filesystem_family` and
+`status_mount_json_exposes_apfs_container_metadata` in `src/cli_app.rs`; the
+macOS integration tests compare the APFS block against `diskutil`.
+
 ## Dashboard and Status Contract Baseline (bd-xzt.1.1)
 
 Source of truth: `docs/dashboard-status-contract-baseline.md`

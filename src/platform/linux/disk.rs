@@ -52,7 +52,9 @@ pub(super) fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'
         .max_by_key(|mount| mount.path.as_os_str().len())
 }
 
-fn is_ram_fs(fs_type: &str) -> bool {
+/// Whether a filesystem type name is RAM-backed (`tmpfs`, `ramfs`,
+/// `devtmpfs`): space reclaimed there frees memory, not disk.
+pub fn is_ram_fs(fs_type: &str) -> bool {
     matches!(
         fs_type.to_ascii_lowercase().as_str(),
         "tmpfs" | "ramfs" | "devtmpfs"

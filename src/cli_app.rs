@@ -9619,14 +9619,32 @@ fn capacity_platform_json(capacity: &Capacity) -> Value {
             }
         });
     }
-    if cfg!(target_os = "linux") {
-        return json!({
-            "linux": {
-                "fs_type": capacity.fs_type,
-                "is_readonly": capacity.is_readonly,
-            }
-        });
-    }
+    linux_platform_json(capacity)
+}
+
+/// The `linux` family block: the filesystem type, whether it is RAM-backed
+/// (reclaiming there frees memory, not disk), the read-only flag, and the
+/// device id of the mount point (null when the path cannot be stat'ed).
+#[cfg(target_os = "linux")]
+fn linux_platform_json(capacity: &Capacity) -> Value {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let device_id = std::fs::metadata(&capacity.mount_point)
+        .ok()
+        .map(|metadata| metadata.dev());
+    json!({
+        "linux": {
+            "fs_type": capacity.fs_type,
+            "is_ram_backed": storage_ballast_helper::platform::linux::disk::is_ram_fs(&capacity.fs_type),
+            "is_readonly": capacity.is_readonly,
+            "device_id": device_id,
+        }
+    })
+}
+
+/// Families sbh has no extra facts for get an empty `platform` block.
+#[cfg(not(target_os = "linux"))]
+fn linux_platform_json(_capacity: &Capacity) -> Value {
     json!({})
 }
 
@@ -12338,21 +12356,21 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                 OutputMode::Human => println!("sbh: {line}"),
                 OutputMode::Json => {
                     let payload = json!({
-                            "command": "check",
-                            "schema_version": 2,
-                            "status": "unprotected",
-                            "reason": UNPROTECTED_PRESSURE,
-                            "path": check_path.to_string_lossy(),
-                            "mount_point": capacity.mount_point.to_string_lossy(),
-                            "free_bytes": capacity.available_bytes,
-                            "total_bytes": capacity.total_bytes,
-                            "free_pct": free_pct,
-                            "level": unprotected.level,
-                            "reclaim_capability": unprotected.capability,
-                            "unprotected": unprotected_json,
-                            "platform": capacity_platform_json(&capacity),
-                            "exit_code": 1,
-                        });
+                        "command": "check",
+                        "schema_version": 2,
+                        "status": "unprotected",
+                        "reason": UNPROTECTED_PRESSURE,
+                        "path": check_path.to_string_lossy(),
+                        "mount_point": capacity.mount_point.to_string_lossy(),
+                        "free_bytes": capacity.available_bytes,
+                        "total_bytes": capacity.total_bytes,
+                        "free_pct": free_pct,
+                        "level": unprotected.level,
+                        "reclaim_capability": unprotected.capability,
+                        "unprotected": unprotected_json,
+                        "platform": capacity_platform_json(&capacity),
+                        "exit_code": 1,
+                    });
                     write_json_line(&payload)?;
                 }
             }
@@ -12440,29 +12458,29 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                         }
                         OutputMode::Json => {
                             let payload = json!({
-                                            "command": "check",
-                                            "schema_version": 2,
-                                            "status": "warning",
-                                            "path": check_path.to_string_lossy(),
-                                            "mount_point": capacity.mount_point.to_string_lossy(),
-                                            "free_bytes": capacity.available_bytes,
-                                            "total_bytes": capacity.total_bytes,
-                                            "free_pct": free_pct,
-                                            "rate_bytes_per_sec": forecast.bytes_per_sec,
-                                            "seconds_to_red": seconds_left,
-                                            "minutes_until_red": minutes_left,
-                                            "predict_minutes": predict_minutes,
-                                            "forecast": forecast_json,
-                                            "container_id": capacity.container_id.as_deref(),
-                                            "container_total_bytes": capacity.container_total_bytes,
-                                            "container_available_bytes": capacity.container_available_bytes,
-                                            "volume_total_bytes": capacity.volume_total_bytes,
-                                            "volume_available_bytes": capacity.volume_available_bytes,
-                                            "volume_role": capacity.volume_role.as_deref(),
-                                            "free_excludes_purgeable": true,
-                                            "platform": capacity_platform_json(&capacity),
-                                            "exit_code": 1,
-                                        });
+                                "command": "check",
+                                "schema_version": 2,
+                                "status": "warning",
+                                "path": check_path.to_string_lossy(),
+                                "mount_point": capacity.mount_point.to_string_lossy(),
+                                "free_bytes": capacity.available_bytes,
+                                "total_bytes": capacity.total_bytes,
+                                "free_pct": free_pct,
+                                "rate_bytes_per_sec": forecast.bytes_per_sec,
+                                "seconds_to_red": seconds_left,
+                                "minutes_until_red": minutes_left,
+                                "predict_minutes": predict_minutes,
+                                "forecast": forecast_json,
+                                "container_id": capacity.container_id.as_deref(),
+                                "container_total_bytes": capacity.container_total_bytes,
+                                "container_available_bytes": capacity.container_available_bytes,
+                                "volume_total_bytes": capacity.volume_total_bytes,
+                                "volume_available_bytes": capacity.volume_available_bytes,
+                                "volume_role": capacity.volume_role.as_deref(),
+                                "free_excludes_purgeable": true,
+                                "platform": capacity_platform_json(&capacity),
+                                "exit_code": 1,
+                            });
                             write_json_line(&payload)?;
                         }
                     }
@@ -12487,6 +12505,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
     if output_mode(cli) == OutputMode::Json {
         let payload = json!({
             "command": "check",
+            "schema_version": 2,
             "status": "ok",
             "path": check_path.to_string_lossy(),
             "mount_point": capacity.mount_point.to_string_lossy(),
@@ -17808,7 +17827,7 @@ mod tests {
     #[test]
     fn status_mount_json_keys_the_platform_block_by_filesystem_family() {
         let capacity = Capacity {
-            mount_point: PathBuf::from("/data"),
+            mount_point: PathBuf::from("/"),
             fs_type: "ext4".to_string(),
             total_bytes: 1_000,
             free_bytes: 250,
@@ -17850,7 +17869,20 @@ mod tests {
         let platform = capacity_platform_json(&capacity);
         if cfg!(target_os = "linux") {
             assert_eq!(platform["linux"]["fs_type"], "ext4");
+            assert_eq!(platform["linux"]["is_ram_backed"], false);
             assert_eq!(platform["linux"]["is_readonly"], false);
+            assert!(
+                platform["linux"]["device_id"].is_u64(),
+                "the root mount can always be stat'ed: {platform}"
+            );
+            let shm = Capacity {
+                mount_point: PathBuf::from("/nonexistent-sbh-mount"),
+                fs_type: "tmpfs".to_string(),
+                ..capacity
+            };
+            let platform = capacity_platform_json(&shm);
+            assert_eq!(platform["linux"]["is_ram_backed"], true);
+            assert!(platform["linux"]["device_id"].is_null());
         } else {
             assert_eq!(platform, json!({}));
         }
