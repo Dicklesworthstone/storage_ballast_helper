@@ -118,6 +118,14 @@ impl MultiProvisionReport {
     pub fn has_errors(&self) -> bool {
         self.per_volume.iter().any(|(_, r)| !r.errors.is_empty())
     }
+
+    /// Files across all volumes that the headroom floor kept from being created.
+    pub fn total_skipped_for_floor(&self) -> usize {
+        self.per_volume
+            .iter()
+            .map(|(_, r)| r.skipped_for_floor)
+            .sum()
+    }
 }
 
 // ──────────────────── coordinator ────────────────────
@@ -307,22 +315,29 @@ impl BallastPoolCoordinator {
         })
     }
 
+    /// Apply one headroom floor to every pool (percent free that must remain
+    /// after each ballast file is created).
+    pub fn set_provision_floor(&mut self, floor_pct: f64) {
+        for pool in self.pools.values_mut() {
+            pool.manager.set_provision_floor(floor_pct);
+        }
+    }
+
     /// Provision all pools (idempotent: skips existing valid files).
     pub fn provision_all(&mut self, platform: &dyn Platform) -> Result<MultiProvisionReport> {
         let mut per_volume = Vec::new();
         let mut skipped_volumes = Vec::new();
 
         for (mount_path, pool) in &mut self.pools {
-            // Pre-flight: check free space on this specific volume.
-            let free_pct = match platform.fs_stats(mount_path) {
-                Ok(stats) => stats.free_pct(),
-                Err(e) => {
-                    skipped_volumes
-                        .push((mount_path.clone(), format!("failed to get fs stats: {e}")));
-                    continue;
-                }
-            };
+            // A volume whose stats cannot be read cannot be planned against.
+            if let Err(e) = platform.fs_stats(mount_path) {
+                skipped_volumes.push((mount_path.clone(), format!("failed to get fs stats: {e}")));
+                continue;
+            }
 
+            // Live probe for the manager's per-file headroom admission. There
+            // is no wholesale refusal here: a low-but-not-critical volume gets
+            // a partial reserve instead of none.
             let mount_path_clone = mount_path.clone();
             let platform_ref = platform;
             let free_check = move || -> f64 {
@@ -330,14 +345,6 @@ impl BallastPoolCoordinator {
                     .fs_stats(&mount_path_clone)
                     .map_or(0.0, |s| s.free_pct())
             };
-
-            if free_pct < 20.0 {
-                skipped_volumes.push((
-                    mount_path.clone(),
-                    format!("free space too low ({free_pct:.1}% < 20%)"),
-                ));
-                continue;
-            }
 
             match pool.manager.provision(Some(&free_check)) {
                 Ok(report) => per_volume.push((mount_path.clone(), report)),
@@ -795,6 +802,99 @@ mod tests {
         assert!(
             report.skipped_volumes.is_empty(),
             "expected no skipped volumes, got {:?}",
+            report.skipped_volumes
+        );
+        assert!(!report.has_errors());
+    }
+
+    /// A volume at 12% free is no longer refused wholesale: with the floor
+    /// derived from config (10%) it gets its reserve, and with the legacy
+    /// 20% floor the refusal is a per-volume plan outcome, not a skip.
+    #[test]
+    fn provision_all_plans_a_low_volume_against_the_floor_instead_of_skipping_it() {
+        /// Two ext4 volumes: `dir_low` at 12% free, `dir_roomy` at 50%.
+        fn low_and_roomy(dir_low: &Path, dir_roomy: &Path) -> MockPlatform {
+            let volume = |dir: &Path, device: &str, available: u64| {
+                (
+                    MountPoint {
+                        path: dir.to_path_buf(),
+                        device: device.to_string(),
+                        fs_type: "ext4".to_string(),
+                        is_ram_backed: false,
+                    },
+                    FsStats {
+                        total_bytes: 100_000_000_000,
+                        free_bytes: available,
+                        available_bytes: available,
+                        fs_type: "ext4".to_string(),
+                        mount_point: dir.to_path_buf(),
+                        is_readonly: false,
+                    },
+                )
+            };
+            let (low_mount, low_stats) = volume(dir_low, "/dev/sda1", 12_000_000_000);
+            let (roomy_mount, roomy_stats) = volume(dir_roomy, "/dev/sdb1", 50_000_000_000);
+            MockPlatform::new(
+                vec![low_mount, roomy_mount],
+                HashMap::from([
+                    (dir_low.to_path_buf(), low_stats),
+                    (dir_roomy.to_path_buf(), roomy_stats),
+                ]),
+                MemoryInfo {
+                    total_bytes: 32_000_000_000,
+                    available_bytes: 16_000_000_000,
+                    swap_total_bytes: 0,
+                    swap_free_bytes: 0,
+                },
+                PlatformPaths::default(),
+            )
+        }
+
+        let dir_low = tempfile::tempdir().unwrap();
+        let dir_roomy = tempfile::tempdir().unwrap();
+        let platform = low_and_roomy(dir_low.path(), dir_roomy.path());
+        let watched = vec![dir_low.path().to_path_buf(), dir_roomy.path().to_path_buf()];
+        let config = tiny_ballast_config();
+        let manager_platform: Arc<dyn Platform> = Arc::new(platform.clone());
+
+        let mut with_config_floor = BallastPoolCoordinator::discover_with_manager_platform(
+            &config,
+            &watched,
+            &platform,
+            &manager_platform,
+        )
+        .unwrap();
+        with_config_floor.set_provision_floor(10.0);
+        let report = with_config_floor.provision_all(&platform).unwrap();
+        assert_eq!(report.total_files_created(), 6);
+        assert_eq!(report.total_skipped_for_floor(), 0);
+        assert!(report.skipped_volumes.is_empty());
+        assert!(!report.has_errors());
+
+        // Fresh directories so the second coordinator starts from an empty pool.
+        let dir_low = tempfile::tempdir().unwrap();
+        let dir_roomy = tempfile::tempdir().unwrap();
+        let platform = low_and_roomy(dir_low.path(), dir_roomy.path());
+        let watched = vec![dir_low.path().to_path_buf(), dir_roomy.path().to_path_buf()];
+        let manager_platform: Arc<dyn Platform> = Arc::new(platform.clone());
+        let mut with_legacy_floor = BallastPoolCoordinator::discover_with_manager_platform(
+            &config,
+            &watched,
+            &platform,
+            &manager_platform,
+        )
+        .unwrap();
+        with_legacy_floor.set_provision_floor(20.0);
+        let report = with_legacy_floor.provision_all(&platform).unwrap();
+        assert_eq!(
+            report.total_files_created(),
+            3,
+            "only the roomy volume gets files"
+        );
+        assert_eq!(report.total_skipped_for_floor(), 3);
+        assert!(
+            report.skipped_volumes.is_empty(),
+            "a floor refusal is a plan outcome, not a skipped volume: {:?}",
             report.skipped_volumes
         );
         assert!(!report.has_errors());

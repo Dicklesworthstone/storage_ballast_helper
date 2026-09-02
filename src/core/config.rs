@@ -1519,6 +1519,19 @@ impl Config {
         }
     }
 
+    /// Percent of a volume that must remain free after each ballast file is
+    /// created: the Orange threshold, but never closer than two points to
+    /// Red. A reserve is worth building only while the volume is still above
+    /// the level at which the daemon starts reclaiming; below Red it is
+    /// releasing, not reserving.
+    #[must_use]
+    pub fn ballast_provision_floor_pct(&self) -> f64 {
+        self.pressure
+            .orange_min_free_pct
+            .max(self.pressure.red_min_free_pct + 2.0)
+            .clamp(0.0, 100.0)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<()> {
         // Behavior matrix: custom cell keys must name a real cell.
@@ -2070,6 +2083,23 @@ mod tests {
     fn default_config_is_valid() {
         let cfg = Config::default();
         assert!(cfg.validate().is_ok());
+    }
+
+    /// The ballast headroom floor follows the pressure thresholds instead of
+    /// a fixed 20%: provisioning may take a volume down to Orange but never
+    /// into Red (kept two points above it).
+    #[test]
+    fn ballast_provision_floor_tracks_pressure_thresholds() {
+        let mut cfg = Config::default();
+        assert!((cfg.ballast_provision_floor_pct() - 10.0).abs() < f64::EPSILON);
+
+        cfg.pressure.orange_min_free_pct = 7.0;
+        cfg.pressure.red_min_free_pct = 6.0;
+        assert!((cfg.ballast_provision_floor_pct() - 8.0).abs() < f64::EPSILON);
+
+        cfg.pressure.orange_min_free_pct = 30.0;
+        cfg.pressure.red_min_free_pct = 5.0;
+        assert!((cfg.ballast_provision_floor_pct() - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]

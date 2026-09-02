@@ -33,7 +33,12 @@ const HEADER_SIZE: usize = 4096;
 const MAGIC: &str = "SBH_BALLAST_v1";
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB write chunks
 const FSYNC_EVERY_BYTES: u64 = 64 * 1024 * 1024; // fsync every 64 MB
-const MIN_FREE_PCT: f64 = 20.0; // abort provisioning below this
+/// Provisioning floor used until a caller derives one from config.
+///
+/// A ballast file is created only if the volume stays at or above this much
+/// free space after it. The daemon and CLI replace this with
+/// `Config::ballast_provision_floor_pct`, which follows the pressure thresholds.
+pub const DEFAULT_PROVISION_FLOOR_PCT: f64 = 20.0;
 
 // ──────────────────── header ────────────────────
 
@@ -85,6 +90,15 @@ pub struct ProvisionReport {
     pub files_skipped: usize,
     pub total_bytes: u64,
     pub errors: Vec<String>,
+    /// Files not created because creating them would have taken the volume
+    /// below the provisioning floor. Not an error: the reserve is partial by
+    /// plan and grows on later replenish passes as space frees.
+    pub skipped_for_floor: usize,
+    /// The floor (percent free) the admission decision used.
+    pub floor_pct: f64,
+    /// Free percent observed at the last admission decision (after the last
+    /// created file, or at the refusal).
+    pub free_pct_after: Option<f64>,
 }
 
 /// Result of a verify operation.
@@ -282,6 +296,19 @@ pub struct BallastManager {
     /// Set for CoW filesystems (btrfs, zfs) where zero-allocated extents can
     /// be trivially deduplicated, defeating the purpose of ballast.
     skip_fallocate: bool,
+    /// Percent of the volume that must remain free after each ballast file
+    /// is created. See [`DEFAULT_PROVISION_FLOOR_PCT`].
+    provision_floor_pct: f64,
+}
+
+/// Outcome of the per-file headroom check.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Admission {
+    /// The next file fits: free space after creating it stays above the floor
+    /// (`None` when the caller opted out of headroom planning).
+    Admit { free_pct_after: Option<f64> },
+    /// Creating the next file would take the volume below the floor.
+    Refuse { free_pct_after: f64 },
 }
 
 impl BallastManager {
@@ -305,6 +332,7 @@ impl BallastManager {
             inventory: Vec::new(),
             platform,
             skip_fallocate: false,
+            provision_floor_pct: DEFAULT_PROVISION_FLOOR_PCT,
         };
         // Prune any existing files that exceed the initial configuration count.
         let _ = mgr.prune_orphans();
@@ -360,6 +388,54 @@ impl BallastManager {
     ///
     /// Required on CoW filesystems (btrfs, zfs, bcachefs) where fallocate
     /// allocates zero-filled blocks that are trivially deduplicated.
+    /// Set the headroom floor (percent free that must remain after each
+    /// file). Callers derive it from the pressure thresholds so the reserve is
+    /// built incrementally on a low-but-not-critical volume instead of being
+    /// refused wholesale.
+    pub fn set_provision_floor(&mut self, floor_pct: f64) {
+        self.provision_floor_pct = floor_pct.clamp(0.0, 100.0);
+    }
+
+    /// The headroom floor in effect.
+    #[must_use]
+    pub fn provision_floor_pct(&self) -> f64 {
+        self.provision_floor_pct
+    }
+
+    /// Decide whether the next ballast file fits above the floor.
+    ///
+    /// `free_pct_check` is the caller's live free-space probe for the volume
+    /// (the CLI and the coordinator both pass one that re-reads fs stats, so
+    /// it shrinks as files land). `None` means the caller opted out of
+    /// headroom planning entirely; every file is admitted and only the create
+    /// itself fails closed on ENOSPC. The file's share of the volume comes
+    /// from the platform's total bytes.
+    fn admit_next_file(&self, free_pct_check: Option<&dyn Fn() -> f64>) -> Admission {
+        let Some(check) = free_pct_check else {
+            return Admission::Admit {
+                free_pct_after: None,
+            };
+        };
+        let free_pct = check();
+        #[allow(clippy::cast_precision_loss)]
+        let file_share_pct = self
+            .platform
+            .fs_stats(&self.ballast_dir)
+            .ok()
+            .filter(|s| s.total_bytes > 0)
+            .map_or(0.0, |s| {
+                self.config.file_size_bytes as f64 / s.total_bytes as f64 * 100.0
+            });
+        let free_pct_after = free_pct - file_share_pct;
+        if free_pct_after >= self.provision_floor_pct {
+            Admission::Admit {
+                free_pct_after: Some(free_pct_after),
+            }
+        } else {
+            Admission::Refuse { free_pct_after }
+        }
+    }
+
     pub fn set_skip_fallocate(&mut self, skip: bool) {
         self.skip_fallocate = skip;
     }
@@ -407,6 +483,9 @@ impl BallastManager {
             files_skipped: 0,
             total_bytes: 0,
             errors: Vec::new(),
+            skipped_for_floor: 0,
+            floor_pct: self.provision_floor_pct,
+            free_pct_after: None,
         };
 
         // Ensure no orphans exist before provisioning.
@@ -426,13 +505,21 @@ impl BallastManager {
                 let _ = fs::remove_file(&path);
             }
 
-            // Free-space check.
-            if let Some(check) = free_pct_check {
-                let free = check();
-                if free < MIN_FREE_PCT {
-                    report.errors.push(format!(
-                        "aborted at file {index}: free space {free:.1}% < {MIN_FREE_PCT}%"
-                    ));
+            // Headroom admission: create this file only if the volume stays at
+            // or above the floor afterwards. A refusal ends the pass (later
+            // files would be refused too) and is reported as a plan outcome,
+            // not an error; the pool grows on later passes as space frees.
+            match self.admit_next_file(free_pct_check) {
+                Admission::Admit { free_pct_after } => {
+                    report.free_pct_after = free_pct_after;
+                }
+                Admission::Refuse { free_pct_after } => {
+                    report.free_pct_after = Some(free_pct_after);
+                    report.skipped_for_floor = self
+                        .config
+                        .file_count
+                        .saturating_sub(index as usize)
+                        .saturating_add(1);
                     break;
                 }
             }
@@ -575,6 +662,9 @@ impl BallastManager {
             files_skipped: 0,
             total_bytes: 0,
             errors: Vec::new(),
+            skipped_for_floor: 0,
+            floor_pct: self.provision_floor_pct,
+            free_pct_after: None,
         };
 
         // Ensure no orphans exist before replenishing.
@@ -592,13 +682,21 @@ impl BallastManager {
                 let _ = fs::remove_file(&path);
             }
 
-            // Free-space check.
-            if let Some(check) = free_pct_check {
-                let free = check();
-                if free < MIN_FREE_PCT {
-                    report.errors.push(format!(
-                        "aborted at file {index}: free space {free:.1}% < {MIN_FREE_PCT}%"
-                    ));
+            // Headroom admission: create this file only if the volume stays at
+            // or above the floor afterwards. A refusal ends the pass (later
+            // files would be refused too) and is reported as a plan outcome,
+            // not an error; the pool grows on later passes as space frees.
+            match self.admit_next_file(free_pct_check) {
+                Admission::Admit { free_pct_after } => {
+                    report.free_pct_after = free_pct_after;
+                }
+                Admission::Refuse { free_pct_after } => {
+                    report.free_pct_after = Some(free_pct_after);
+                    report.skipped_for_floor = self
+                        .config
+                        .file_count
+                        .saturating_sub(index as usize)
+                        .saturating_add(1);
                     break;
                 }
             }
@@ -1337,18 +1435,114 @@ mod tests {
         );
     }
 
+    /// A volume below the floor gets no files, and that is a plan outcome
+    /// (`skipped_for_floor`), not an error: the pool grows on a later pass.
     #[test]
-    fn provision_aborts_when_free_space_low() {
+    fn provision_refuses_files_that_would_breach_the_floor() {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        mgr.set_provision_floor(10.0);
 
-        // Simulate always-low free space.
-        let report = mgr.provision(Some(&|| 5.0)).unwrap();
+        let report = mgr.provision(Some(&|| 9.0)).unwrap();
+
         assert_eq!(report.files_created, 0);
+        assert_eq!(report.skipped_for_floor, 3);
+        assert!((report.floor_pct - 10.0).abs() < f64::EPSILON);
         assert!(
-            !report.errors.is_empty(),
-            "expected at least one provisioning error when free space stays below the abort floor"
+            report.errors.is_empty(),
+            "a headroom refusal is not an error, got {:?}",
+            report.errors
         );
+        let after = report
+            .free_pct_after
+            .expect("refusal reports the projected free pct");
+        assert!(
+            after < 10.0,
+            "projected free {after} should sit below the floor"
+        );
+        assert_eq!(mgr.available_count(), 0);
+    }
+
+    /// The production bug this guards: a volume at 12% free with a 10% floor
+    /// must get its whole reserve. The old fixed 20% abort left such hosts
+    /// with zero ballast, so the daemon had nothing to release under pressure.
+    #[test]
+    fn provision_admits_a_full_reserve_when_the_volume_stays_above_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        mgr.set_provision_floor(10.0);
+
+        let report = mgr.provision(Some(&|| 12.0)).unwrap();
+
+        assert_eq!(report.files_created, 3);
+        assert_eq!(report.skipped_for_floor, 0);
+        assert!(report.errors.is_empty());
+        let after = report
+            .free_pct_after
+            .expect("admission reports the projected free pct");
+        assert!(after >= 10.0 && after <= 12.0, "projected free {after}");
+        assert_eq!(mgr.available_count(), 3);
+    }
+
+    /// Admission is per file against a live probe, so a volume that crosses
+    /// the floor mid-pass ends up with a partial reserve rather than none.
+    #[test]
+    fn provision_stops_at_the_file_that_would_cross_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        mgr.set_provision_floor(10.0);
+
+        // Free space as the caller's probe would see it before each file:
+        // 12% -> 11% -> 9.5% (third file would breach the floor).
+        let probes = std::cell::RefCell::new(vec![12.0, 11.0, 9.5].into_iter());
+        let free_check = || probes.borrow_mut().next().unwrap_or(0.0);
+
+        let report = mgr.provision(Some(&free_check)).unwrap();
+
+        assert_eq!(report.files_created, 2);
+        assert_eq!(report.skipped_for_floor, 1);
+        assert!(report.errors.is_empty());
+        assert_eq!(mgr.available_count(), 2);
+    }
+
+    /// Why the daemon and CLI must set the floor from config: the built-in
+    /// default keeps the legacy 20% and would refuse a 12%-free volume.
+    #[test]
+    fn default_floor_refuses_a_volume_that_config_would_admit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        assert!((mgr.provision_floor_pct() - DEFAULT_PROVISION_FLOOR_PCT).abs() < f64::EPSILON);
+
+        let report = mgr.provision(Some(&|| 12.0)).unwrap();
+        assert_eq!(report.files_created, 0);
+        assert_eq!(report.skipped_for_floor, 3);
+
+        mgr.set_provision_floor(10.0);
+        let report = mgr.provision(Some(&|| 12.0)).unwrap();
+        assert_eq!(report.files_created, 3);
+        assert_eq!(report.skipped_for_floor, 0);
+    }
+
+    /// Replenish uses the same admission: a released file is not rebuilt
+    /// while the volume is below the floor, and the refusal is reported.
+    #[test]
+    fn replenish_one_honors_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        mgr.set_provision_floor(10.0);
+        assert_eq!(mgr.provision(None).unwrap().files_created, 3);
+        assert_eq!(mgr.release(1).unwrap().files_released, 1);
+
+        let held = mgr.replenish_one(Some(&|| 9.0)).unwrap();
+        assert_eq!(held.files_created, 0);
+        assert_eq!(held.skipped_for_floor, 1);
+        assert!(held.errors.is_empty());
+        assert_eq!(mgr.available_count(), 2);
+
+        let rebuilt = mgr.replenish_one(Some(&|| 12.0)).unwrap();
+        assert_eq!(rebuilt.files_created, 1);
+        assert_eq!(rebuilt.skipped_for_floor, 0);
+        assert_eq!(mgr.available_count(), 3);
     }
 
     #[test]

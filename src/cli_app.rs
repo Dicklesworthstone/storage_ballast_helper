@@ -4547,6 +4547,7 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
 
     let mut manager = BallastManager::new(config.paths.ballast_dir.clone(), config.ballast.clone())
         .map_err(|e| CliError::Runtime(e.to_string()))?;
+    manager.set_provision_floor(config.ballast_provision_floor_pct());
 
     match &args.command {
         None | Some(BallastCommand::Status) => {
@@ -4670,6 +4671,16 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                     println!("  Config: {}", config.paths.config_file.display());
                     println!("  Files created: {}", report.files_created);
                     println!("  Files skipped (existing): {}", report.files_skipped);
+                    if report.skipped_for_floor > 0 {
+                        println!(
+                            "  Files skipped (headroom floor {:.1}% free; volume now {}): {}",
+                            report.floor_pct,
+                            report
+                                .free_pct_after
+                                .map_or_else(|| "unknown".to_string(), |pct| format!("{pct:.1}%")),
+                            report.skipped_for_floor
+                        );
+                    }
                     println!(
                         "  Total bytes allocated: {}",
                         format_bytes(report.total_bytes)
@@ -4688,6 +4699,9 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                         "config_path": config.paths.config_file.to_string_lossy(),
                         "files_created": report.files_created,
                         "files_skipped": report.files_skipped,
+                        "skipped_for_floor": report.skipped_for_floor,
+                        "floor_pct": report.floor_pct,
+                        "free_pct_after": report.free_pct_after,
                         "total_bytes": report.total_bytes,
                         "errors": report.errors,
                     });
@@ -4790,6 +4804,16 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                     println!("Ballast replenish complete:");
                     println!("  Files recreated: {}", report.files_created);
                     println!("  Files skipped (existing): {}", report.files_skipped);
+                    if report.skipped_for_floor > 0 {
+                        println!(
+                            "  Files skipped (headroom floor {:.1}% free; volume now {}): {}",
+                            report.floor_pct,
+                            report
+                                .free_pct_after
+                                .map_or_else(|| "unknown".to_string(), |pct| format!("{pct:.1}%")),
+                            report.skipped_for_floor
+                        );
+                    }
                     println!(
                         "  Total bytes allocated: {}",
                         format_bytes(report.total_bytes)
@@ -4806,6 +4830,9 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                         "command": "ballast replenish",
                         "files_created": report.files_created,
                         "files_skipped": report.files_skipped,
+                        "skipped_for_floor": report.skipped_for_floor,
+                        "floor_pct": report.floor_pct,
+                        "free_pct_after": report.free_pct_after,
                         "total_bytes": report.total_bytes,
                         "errors": report.errors,
                     });
@@ -5339,11 +5366,11 @@ fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
                 format_bytes(availability.releasable_bytes),
                 format_bytes(availability.configured_pool_bytes),
             ),
-            Some(
-                "Run `sbh ballast replenish` (or `sbh ballast provision`) while free space \
-                 is above the 20% provisioning floor to rebuild the reserve."
-                    .to_string(),
-            ),
+            Some(format!(
+                "Run `sbh ballast replenish` (or `sbh ballast provision`); files are created \
+                 one at a time while the volume stays above the {:.1}% headroom floor.",
+                config.ballast_provision_floor_pct()
+            )),
         ),
         BallastHealth::Empty => doctor_check(
             "ballast.reserve",
@@ -5354,12 +5381,13 @@ fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
                  reserve does not exist",
                 format_bytes(availability.configured_pool_bytes),
             ),
-            Some(
-                "Run `sbh ballast provision` while free space is above the 20% provisioning \
-                 floor; until then the daemon has no instant-release reserve for ENOSPC \
-                 recovery."
-                    .to_string(),
-            ),
+            Some(format!(
+                "Run `sbh ballast provision`; files are created one at a time while the \
+                 volume stays above the {:.1}% headroom floor, so even a low volume gets a \
+                 partial reserve. Until then the daemon has no instant-release reserve for \
+                 ENOSPC recovery.",
+                config.ballast_provision_floor_pct()
+            )),
         ),
         // Deliberately WARN, not FAIL: we could not read the pool, so we do not
         // know whether the reserve exists. Reporting FAIL/"empty" here is what

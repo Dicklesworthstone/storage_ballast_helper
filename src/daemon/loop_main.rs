@@ -1812,13 +1812,14 @@ impl MonitoringDaemon {
 
         // 6. Initialize ballast coordinator (multi-volume).
         let discovery_paths = ballast_discovery_paths(&config, &special_locations);
-        let ballast_coordinator = BallastPoolCoordinator::discover_inner(
+        let mut ballast_coordinator = BallastPoolCoordinator::discover_inner(
             &config.ballast,
             &discovery_paths,
             platform.as_ref(),
             &platform,
             Some(config.paths.ballast_dir.as_path()),
         )?;
+        ballast_coordinator.set_provision_floor(config.ballast_provision_floor_pct());
         // Surface the resolved ballast directories so the configured
         // `[paths] ballast_dir` is observable at startup (issue #14).
         eprintln!(
@@ -3519,6 +3520,20 @@ impl MonitoringDaemon {
         }
 
         for (path, provision_report) in &report.per_volume {
+            if provision_report.skipped_for_floor > 0 {
+                let message = format!(
+                    "ballast provision volume={} created={} skipped_for_floor={} floor_pct={:.1} free_after_pct={}",
+                    path.display(),
+                    provision_report.files_created,
+                    provision_report.skipped_for_floor,
+                    provision_report.floor_pct,
+                    provision_report
+                        .free_pct_after
+                        .map_or_else(|| "unknown".to_string(), |pct| format!("{pct:.1}"))
+                );
+                eprintln!("[SBH-BALLAST] {message}");
+                self.logger_handle.send(ActivityEvent::Info { message });
+            }
             for err in &provision_report.errors {
                 eprintln!(
                     "[SBH-DAEMON] ballast provision incomplete for {}: {}",
@@ -3573,6 +3588,8 @@ impl MonitoringDaemon {
                     ) {
                         Ok(coordinator) => {
                             self.ballast_coordinator = coordinator;
+                            self.ballast_coordinator
+                                .set_provision_floor(new_config.ballast_provision_floor_pct());
                         }
                         Err(err) => {
                             eprintln!(
