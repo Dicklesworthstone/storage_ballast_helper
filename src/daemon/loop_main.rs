@@ -341,6 +341,9 @@ pub struct ScanRequest {
     /// scanner treats every root as an opaque candidate unit (bounded probe,
     /// no descent) instead of walking `paths`. Empty for ordinary scans.
     pub catalog_roots: Vec<ExpandedCatalogRoot>,
+    /// A Green maintenance pass (Q6): the scheduler chose `paths`, so the v2
+    /// engine walks them even without dirty event roots.
+    pub maintenance: bool,
 }
 
 /// B6: consecutive no-progress passes after which even Red/Critical pressure
@@ -531,6 +534,9 @@ fn scan_reason_for_request(request: &ScanRequest) -> &'static str {
     if !request.catalog_roots.is_empty() {
         return "catalog";
     }
+    if request.maintenance {
+        return "maintenance";
+    }
     if request.force_full_scan {
         return "forced";
     }
@@ -572,6 +578,9 @@ struct RootScanResult {
     potential_bytes: u64,
     false_positives: usize,
     duration: Duration,
+    /// The v2 event source reported changes under this root before the
+    /// pass (feeds the scheduler's hazard rate).
+    dirty: bool,
 }
 
 #[derive(Debug)]
@@ -909,11 +918,14 @@ fn mount_controller_config(config: &Config) -> MountControllerConfig {
     }
 }
 
-/// Entry budget for sizing one catalog root: enough to measure a large
-/// package cache, bounded so a pathological tree cannot stall the scanner.
-const CATALOG_PROBE_MAX_ENTRIES: usize = 200_000;
+/// Entry budget for sizing one catalog root. A catalog scan probes every
+/// derived root (a hundred or more under one home), so the per-root budget
+/// is what bounds the whole pass: a truncated probe reports a size lower
+/// bound and the tree's newest sampled mtime, which is enough to rank and
+/// gate the root.
+const CATALOG_PROBE_MAX_ENTRIES: usize = 50_000;
 /// Depth budget for the catalog root probe.
-const CATALOG_PROBE_MAX_DEPTH: usize = 6;
+const CATALOG_PROBE_MAX_DEPTH: usize = 5;
 
 /// Turn derived catalog roots into opaque candidate units for the scanner
 /// loop. Each root is probed once (allocated size, newest mtime, structural
@@ -1173,6 +1185,8 @@ pub struct MonitoringDaemon {
     mount_rates: HashMap<PathBuf, f64>,
     /// Per-location alert throttle for the special-location horizon rule.
     special_alerts: AlertThrottle,
+    /// When the last Green maintenance pass was dispatched.
+    last_maintenance_scan: Option<Instant>,
     special_locations: SpecialLocationRegistry,
     ballast_coordinator: BallastPoolCoordinator,
     release_controller: BallastReleaseController,
@@ -1484,7 +1498,7 @@ fn v2_active_scan_paths(
     request: &ScanRequest,
     dirty_roots: &BTreeSet<PathBuf>,
 ) -> Option<Vec<PathBuf>> {
-    if request.force_full_scan {
+    if request.force_full_scan || request.maintenance {
         return None;
     }
     match request.pressure_level {
@@ -2045,6 +2059,7 @@ impl MonitoringDaemon {
             emergency_mounts: HashSet::new(),
             mount_rates: HashMap::new(),
             special_alerts: AlertThrottle::default(),
+            last_maintenance_scan: None,
             special_locations,
             ballast_coordinator,
             release_controller,
@@ -2681,6 +2696,7 @@ impl MonitoringDaemon {
                                 stat.duration.as_millis() as f64,
                                 now,
                             );
+                            self.voi_scheduler.record_dirty(&stat.path, stat.dirty, now);
                         }
                         self.voi_scheduler.end_window();
                         // A completed (not timed-out) pass with nothing found
@@ -3321,6 +3337,10 @@ impl MonitoringDaemon {
                             } else {
                                 roots_here
                             };
+                            // Under pressure the budget is the pressure
+                            // level's; the scheduler only orders the roots
+                            // (dirty first, then by hazard index).
+                            let paths = self.voi_scheduler.rank_paths(&paths, now);
                             self.send_scan_request(scan_tx, scan_rx, &tick.response, paths);
                             self.last_tick_cleanup_ran = true;
                         }
@@ -3367,6 +3387,71 @@ impl MonitoringDaemon {
                 }
             } else {
                 self.emergency_mounts.remove(&mount);
+            }
+        }
+
+        // Green maintenance (Q6): once per maintenance interval, a routine
+        // pass over the roots the hazard-driven scheduler picks within its
+        // budget. The Green behavior cell keeps it to high-confidence
+        // candidates; the scanner's duty-cycle limiter and empty-pass
+        // backoff still apply; memory Critical suppresses it.
+        let maintenance_interval =
+            Duration::from_secs(self.config.pressure.maintenance_interval_secs);
+        // Maintenance is per mount state, not per worst level: a mount in
+        // Maintain keeps its routine passes even while an unrelated,
+        // observe-only mount is pressured (the operator-host layout).
+        let maintain_tick = responses.iter().find(|tick| {
+            self.mount_controllers
+                .get(&tick.response.causing_mount)
+                .is_some_and(|controller| controller.state() == MountState::Maintain)
+        });
+        if let Some(maintain_tick) = maintain_tick
+            && scan_allowed
+            && maintenance_interval > Duration::ZERO
+            && self.behavior_state.memory_level != MemoryPressureLevel::Critical
+            && self
+                .last_maintenance_scan
+                .is_none_or(|last| now.saturating_duration_since(last) >= maintenance_interval)
+        {
+            let plan = self.voi_scheduler.schedule(now);
+            let paths: Vec<PathBuf> = plan.paths.iter().map(|entry| entry.path.clone()).collect();
+            if !paths.is_empty() {
+                self.last_maintenance_scan = Some(now);
+                let response = &maintain_tick.response;
+                let message = format!(
+                    "maintenance scan: {} of {} root(s) by hazard index (budget {}, fallback={}): {}",
+                    plan.budget_used,
+                    self.config.scanner.root_paths.len(),
+                    plan.budget_total,
+                    plan.fallback_active,
+                    plan.paths
+                        .iter()
+                        .map(|entry| format!(
+                            "{} (index {:.0})",
+                            entry.path.display(),
+                            entry.utility
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                eprintln!("[SBH-DAEMON] {message}");
+                self.logger_handle.send(ActivityEvent::Info { message });
+                let request = ScanRequest {
+                    paths,
+                    urgency: response.urgency.max(0.05),
+                    pressure_level: response.level,
+                    free_pct: Some(response.free_pct),
+                    max_delete_batch: behavior_delete_batch_limit(
+                        self.behavior_state.mode,
+                        response.max_delete_batch,
+                    ),
+                    force_full_scan: false,
+                    config_update: None,
+                    catalog_roots: Vec::new(),
+                    maintenance: true,
+                };
+                let response = response.clone();
+                self.enqueue_scan_logged(scan_tx, scan_rx, &response, request);
             }
         }
 
@@ -3638,6 +3723,7 @@ impl MonitoringDaemon {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
         self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
     }
@@ -3696,6 +3782,7 @@ impl MonitoringDaemon {
             force_full_scan: false,
             config_update: None,
             catalog_roots,
+            maintenance: false,
         };
         self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
     }
@@ -3757,6 +3844,7 @@ impl MonitoringDaemon {
             force_full_scan: true,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
         // For forced scans, block briefly to ensure delivery.
         let _ = scan_tx.send_timeout(request, Duration::from_millis(100));
@@ -4061,6 +4149,7 @@ impl MonitoringDaemon {
                     force_full_scan: false,
                     config_update: None,
                     catalog_roots: Vec::new(),
+                    maintenance: false,
                 };
 
                 match enqueue_scan_request(scan_tx, scan_rx, request, true) {
@@ -5176,6 +5265,7 @@ fn scanner_thread_main(
                     potential_bytes: 0,
                     false_positives: 0,
                     duration: Duration::ZERO,
+                    dirty: scanner_event_dirty_roots.contains(path),
                 })
                 .collect();
             let _ = report_tx.try_send(WorkerReport::ScanCompleted {
@@ -5391,6 +5481,7 @@ fn scanner_thread_main(
                             potential_bytes: if index == 0 { indexed_bytes } else { 0 },
                             false_positives: 0,
                             duration: Duration::ZERO,
+                            dirty: scanner_event_dirty_roots.contains(path),
                         })
                         .collect();
                     let _ = report_tx.try_send(WorkerReport::ScanCompleted {
@@ -5837,6 +5928,7 @@ fn scanner_thread_main(
                     potential_bytes: 0,
                     false_positives: 0,
                     duration,
+                    dirty: scanner_event_dirty_roots.contains(path),
                 })
                 .collect();
             let _ = report_tx.send(WorkerReport::ScanCompleted {
@@ -5906,6 +5998,7 @@ fn scanner_thread_main(
                     },
                     false_positives: 0,
                     duration,
+                    dirty: scanner_event_dirty_roots.contains(path),
                 })
                 .collect();
             let _ = report_tx.try_send(WorkerReport::ScanCompleted {
@@ -6021,6 +6114,7 @@ fn scanner_thread_main(
                     potential_bytes: 0,
                     false_positives: 0,
                     duration: Duration::ZERO,
+                    dirty: scanner_event_dirty_roots.contains(root),
                 },
             );
         }
@@ -6153,6 +6247,25 @@ fn scanner_thread_main(
             };
 
             let mut score = engine.score_candidate(&input, request.urgency);
+            // A maintenance pass is rare and its point is to reclaim what is
+            // definitely stale, so say why a classified entry was not.
+            if request.maintenance
+                && score.decision.action != crate::scanner::scoring::DecisionAction::Delete
+            {
+                eprintln!(
+                    "[SBH-SCANNER] maintenance keep: {} action={:?} total={:.2} posterior={:.2} \
+                     certainty={} floor_applied={} age={}s vetoed={} reason={}",
+                    entry.path.display(),
+                    score.decision.action,
+                    score.total_score,
+                    score.decision.posterior_abandoned,
+                    score.decision.certainty.label(),
+                    score.decision.posterior_floor_applied,
+                    input.age.as_secs(),
+                    score.vetoed,
+                    score.veto_reason.as_deref().unwrap_or("-"),
+                );
+            }
             if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
                 && !score.vetoed
                 && active_reference_scan.should_probe(entry.metadata.content_size_bytes)
@@ -7058,6 +7171,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
         let identity = identity_for_path(&target, false).unwrap();
         let record = |generation: u64| CandidateIndexRecord {
@@ -7386,6 +7500,7 @@ mod tests {
                 force_full_scan: false,
                 config_update: None,
                 catalog_roots: Vec::new(),
+                maintenance: false,
             })
             .unwrap();
         drop(scan_tx);
@@ -7485,6 +7600,7 @@ mod tests {
                 force_full_scan: true,
                 config_update: None,
                 catalog_roots: Vec::new(),
+                maintenance: false,
             })
             .unwrap();
         drop(scan_tx);
@@ -8012,6 +8128,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
         let mut scored = vec![test_candidate("/tmp/a", 0.4), test_candidate("/tmp/b", 0.6)];
 
@@ -8152,6 +8269,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
         assert_eq!(request.paths.len(), 2);
         assert_eq!(request.urgency.to_bits(), 0.7_f64.to_bits());
@@ -8189,6 +8307,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
         assert_eq!(
             log_truncation_free_pct_for_request(&request).to_bits(),
@@ -8303,6 +8422,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
         // With capacity 0, send blocks until recv is called.
         // We use thread to unblock.
@@ -8425,6 +8545,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
 
         assert_eq!(v2_pressure_candidate_byte_target(&request), None);
@@ -8450,6 +8571,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
         let mut dirty = BTreeSet::new();
 
@@ -8477,6 +8599,7 @@ mod tests {
             force_full_scan: true,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
         let dirty = BTreeSet::new();
 
@@ -8592,6 +8715,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         }
     }
 
@@ -9131,6 +9255,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
 
         // Fill the channel to capacity.
@@ -9158,6 +9283,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
 
         // Fill queue with stale requests.
@@ -9227,6 +9353,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
         for _ in 0..SCANNER_CHANNEL_CAP {
             tx.try_send(make_request())
@@ -9248,6 +9375,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
         let (del_tx, del_rx) = bounded::<DeletionBatch>(4);
         let mut scored = vec![
@@ -9281,6 +9409,7 @@ mod tests {
             force_full_scan: false,
             config_update: None,
             catalog_roots: Vec::new(),
+            maintenance: false,
         };
         let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
         del_tx

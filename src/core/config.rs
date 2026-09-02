@@ -280,6 +280,11 @@ pub struct PressureConfig {
     pub orange_min_free_pct: f64,
     pub red_min_free_pct: f64,
     pub poll_interval_ms: u64,
+    /// Seconds between routine maintenance passes at Green (Q6): the
+    /// hazard-driven scheduler picks the roots within `[scheduler]
+    /// scan_budget_per_interval`; only high-confidence candidates are
+    /// reclaimed. 0 disables maintenance passes.
+    pub maintenance_interval_secs: u64,
     /// Minimum seconds between repeated behavior transitions in the same direction.
     pub behavior_hysteresis_secs: u64,
     /// Predictive pre-emption settings.
@@ -611,13 +616,16 @@ pub struct VoiConfig {
     pub enabled: bool,
     /// Maximum number of paths to scan per scheduling interval.
     pub scan_budget_per_interval: usize,
-    /// Minimum fraction of budget reserved for exploration (round-robin of least-scanned paths).
+    /// Retained for config compatibility; the hazard-driven index (Q6)
+    /// replaced the exploration quota, so this key has no effect.
     pub exploration_quota_fraction: f64,
-    /// Weight for IO cost penalty (bytes estimated per scan).
+    /// Weight for the visit-cost penalty (`w_c` in the Q6 index).
     pub io_cost_weight: f64,
-    /// Weight for false-positive risk penalty.
+    /// Retained for config compatibility; the Q6 index does not penalize
+    /// false positives (scoring vetoes handle them), so this key has no effect.
     pub fp_risk_weight: f64,
-    /// Weight for exploration bonus.
+    /// Retained for config compatibility; the hazard term of the Q6 index
+    /// replaced the exploration bonus, so this key has no effect.
     pub exploration_weight: f64,
     /// Forecast-error threshold: if MAPE exceeds this, switch to fallback.
     pub forecast_error_threshold: f64,
@@ -910,6 +918,7 @@ impl Default for PressureConfig {
             orange_min_free_pct: 10.0,
             red_min_free_pct: 6.0,
             poll_interval_ms: 5_000,
+            maintenance_interval_secs: 1_800,
             behavior_hysteresis_secs: 5,
             prediction: PredictionConfig::default(),
         }

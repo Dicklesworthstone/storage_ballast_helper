@@ -8,14 +8,21 @@
 //! nothing to reclaim. VOI scheduling directs limited scan budget toward the most
 //! promising paths.
 //!
-//! # Utility Model
+//! # Index (Q6)
+//!
+//! Each root is ranked by a hazard-driven index:
 //!
 //! ```text
-//! utility(path) = expected_reclaim_bytes × uncertainty_discount
-//!               − io_cost_penalty
-//!               − false_positive_risk_penalty
-//!               + exploration_bonus (for under-sampled paths)
+//! I_i = R_i * (1 - exp(-lambda_i * dt_i)) - w_c * C_i
 //! ```
+//!
+//! where `R_i` is the expected reclaim (EWMA of bytes reclaimed per scan),
+//! `C_i` the visit cost (EWMA of IO per scan), `lambda_i` the EWMA of dirty
+//! transitions per hour reported by the v2 event source (prior: once a day,
+//! also the floor), and `dt_i` the hours since the last visit. Roots with a
+//! pending dirty transition always go first; then the top of the index within
+//! the budget. The hazard term is what keeps an idle root from being starved:
+//! it climbs on its own as time passes, so no exploration quota is needed.
 //!
 //! # Fallback Guarantee
 //!
@@ -59,7 +66,19 @@ pub struct PathStats {
     last_pre_scan_forecast: f64,
     /// Last actual reclaim (for forecast error tracking).
     pub last_actual_reclaim: u64,
+    /// EWMA of dirty transitions per hour seen for this root (Q6 hazard
+    /// rate `lambda_i`), from the v2 event source. Prior: once a day.
+    pub dirty_rate_per_hour: f64,
+    /// When the dirty rate was last observed.
+    last_dirty_observation: Option<Instant>,
+    /// A dirty transition was reported since the last scan: the root goes
+    /// first in the next plan regardless of its index.
+    pub dirty_pending: bool,
 }
+
+/// Prior hazard rate for a root nothing is known about: one dirty
+/// transition per day.
+pub const PRIOR_DIRTY_RATE_PER_HOUR: f64 = 1.0 / 24.0;
 
 impl PathStats {
     fn new() -> Self {
@@ -74,7 +93,42 @@ impl PathStats {
             forecast_reclaim: 0.0,
             last_pre_scan_forecast: 0.0,
             last_actual_reclaim: 0,
+            dirty_rate_per_hour: PRIOR_DIRTY_RATE_PER_HOUR,
+            last_dirty_observation: None,
+            dirty_pending: false,
         }
+    }
+
+    /// Fold one pass's dirty observation into the hazard rate: a dirty pass
+    /// counts as one transition over the time since the previous
+    /// observation, a clean pass as zero.
+    fn record_dirty(&mut self, dirty: bool, now: Instant, alpha: f64) {
+        let hours = self.last_dirty_observation.map_or(1.0 / 60.0, |last| {
+            (now.saturating_duration_since(last).as_secs_f64() / 3600.0).max(1.0 / 60.0)
+        });
+        let observed = if dirty { 1.0 / hours } else { 0.0 };
+        self.dirty_rate_per_hour = ewma(alpha, self.dirty_rate_per_hour, observed);
+        self.last_dirty_observation = Some(now);
+        if dirty {
+            self.dirty_pending = true;
+        }
+    }
+
+    /// Q6 index: expected reclaim discounted by the chance the root changed
+    /// since its last visit, minus the weighted visit cost.
+    ///
+    /// `I = R * (1 - exp(-lambda * dt)) - w_c * C`, with `lambda` floored at
+    /// the daily prior so a quiet root is still revisited about once a day,
+    /// and `dt` the hours since the last visit. A never-visited root's state
+    /// is unknown, which is the maximal hazard: it ranks on its full prior
+    /// reclaim until its first scan, so nothing is starved.
+    fn hazard_index(&self, expected_reclaim: f64, io_cost_weight: f64, now: Instant) -> f64 {
+        let hazard = self.last_scanned.map_or(1.0, |t| {
+            let dt_hours = now.saturating_duration_since(t).as_secs_f64() / 3600.0;
+            let lambda = self.dirty_rate_per_hour.max(PRIOR_DIRTY_RATE_PER_HOUR);
+            1.0 - (-lambda * dt_hours).exp()
+        });
+        expected_reclaim.mul_add(hazard, -(io_cost_weight * self.ewma_io_cost_per_scan))
     }
 
     /// Update stats after a completed scan.
@@ -93,6 +147,7 @@ impl PathStats {
         self.scan_count = self.scan_count.saturating_add(1);
         self.last_scanned = Some(now);
         self.last_actual_reclaim = reclaimed_bytes;
+        self.dirty_pending = false;
 
         // Snapshot the pre-update forecast so forecast_error() compares the actual
         // result against the prediction that was made *before* seeing this observation.
@@ -121,21 +176,6 @@ impl PathStats {
         }
         let denominator = actual.abs().max(forecast.abs()).max(1.0);
         Some((actual - forecast).abs() / denominator)
-    }
-
-    /// Time since last scan (or infinity if never scanned).
-    fn staleness(&self, now: Instant) -> f64 {
-        self.last_scanned.map_or(f64::INFINITY, |t| {
-            now.saturating_duration_since(t).as_secs_f64()
-        })
-    }
-
-    /// False-positive rate.
-    fn fp_rate(&self) -> f64 {
-        if self.scan_count == 0 {
-            return 0.0;
-        }
-        f64::from(self.false_positive_count) / f64::from(self.scan_count)
     }
 }
 
@@ -286,6 +326,73 @@ impl VoiScheduler {
         }
     }
 
+    /// Record whether a completed pass found `path` dirty (v2 event source),
+    /// feeding the hazard rate and marking the root for the next plan.
+    pub fn record_dirty(&mut self, path: &PathBuf, dirty: bool, now: Instant) {
+        if let Some(stats) = self.path_stats.get_mut(path) {
+            stats.record_dirty(dirty, now, self.config.ewma_alpha);
+        }
+    }
+
+    /// Order `paths` by the hazard index (dirty roots first), for callers
+    /// that already know which roots to scan but not in which order. Paths
+    /// the scheduler has never seen keep their input order at the end.
+    #[must_use]
+    pub fn rank_paths(&self, paths: &[PathBuf], now: Instant) -> Vec<PathBuf> {
+        let prior = self.unscanned_reclaim_prior();
+        let mut ranked: Vec<(bool, f64, usize, &PathBuf)> = paths
+            .iter()
+            .enumerate()
+            .map(|(position, path)| {
+                let stats = self.path_stats.get(path);
+                let dirty = stats.is_some_and(|s| s.dirty_pending);
+                let index = stats.map_or(f64::NEG_INFINITY, |s| {
+                    s.hazard_index(
+                        Self::expected_reclaim(s, prior),
+                        self.config.io_cost_weight,
+                        now,
+                    )
+                });
+                (dirty, index, position, path)
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        ranked
+            .into_iter()
+            .map(|(_, _, _, path)| path.clone())
+            .collect()
+    }
+
+    /// Reclaim to assume for a root that was never scanned: the mean
+    /// forecast of the scanned roots, at least one byte so the hazard term
+    /// can matter.
+    fn unscanned_reclaim_prior(&self) -> f64 {
+        let scanned: Vec<f64> = self
+            .path_stats
+            .values()
+            .filter(|s| s.scan_count > 0)
+            .map(|s| s.forecast_reclaim)
+            .collect();
+        if scanned.is_empty() {
+            return 1.0;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let mean = scanned.iter().sum::<f64>() / scanned.len() as f64;
+        mean.max(1.0)
+    }
+
+    fn expected_reclaim(stats: &PathStats, prior: f64) -> f64 {
+        if stats.scan_count == 0 {
+            prior
+        } else {
+            stats.forecast_reclaim
+        }
+    }
+
     /// End the current scheduling window: compute forecast accuracy and update calibration.
     pub fn end_window(&mut self) {
         if self.pending_errors.is_empty() {
@@ -360,127 +467,56 @@ impl VoiScheduler {
     }
 
     /// VOI-prioritized scheduler with exploration quota.
+    /// Q6: rank every root by its hazard index (dirty roots first) and take
+    /// the top of the list within the budget. The exploit/explore split is
+    /// gone: the hazard term already grows with time since the last visit,
+    /// so an unvisited or long-idle root climbs the list on its own.
     fn schedule_voi(&self, paths: &[&PathBuf], budget: usize, now: Instant) -> ScanPlan {
-        // Split budget: exploration vs exploitation.
-        // Guarantee at least 1 exploitation slot when budget >= 1: under pressure,
-        // the scheduler must scan the highest-yield path, not waste the single
-        // slot on exploration.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let exploration_budget = ((budget as f64 * self.config.exploration_quota_fraction).ceil()
-            as usize)
-            .min(budget.saturating_sub(1));
-        let exploitation_budget = budget.saturating_sub(exploration_budget);
-
-        // 1. Score all paths by utility.
-        let mut scored: Vec<(&PathBuf, f64)> = paths
+        let prior = self.unscanned_reclaim_prior();
+        let mut scored: Vec<(bool, f64, &PathBuf)> = paths
             .iter()
-            .map(|p| {
-                let utility = self.compute_utility(p, now);
-                (*p, utility)
-            })
-            .collect();
-
-        // Sort descending by utility, using path as tie-breaker for determinism.
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(b.0))
-        });
-
-        // 2. Pick exploitation targets (top utility, up to exploitation_budget).
-        let mut selected: Vec<ScanPlanEntry> = Vec::with_capacity(budget);
-        let mut selected_set: std::collections::HashSet<&PathBuf> =
-            std::collections::HashSet::new();
-
-        for (path, utility) in scored.iter().take(exploitation_budget) {
-            let forecast = self
-                .path_stats
-                .get(*path)
-                .map_or(0.0, |s| s.forecast_reclaim);
-            selected.push(ScanPlanEntry {
-                path: (*path).clone(),
-                utility: *utility,
-                is_exploration: false,
-                forecast_reclaim_bytes: forecast,
-            });
-            selected_set.insert(path);
-        }
-
-        // 3. Pick exploration targets: least-scanned paths not already selected.
-        let mut exploration_candidates: Vec<(&PathBuf, u32, f64)> = paths
-            .iter()
-            .filter(|p| !selected_set.contains(*p))
             .map(|p| {
                 let stats = self.path_stats.get(*p);
-                let count = stats.map_or(0, |s| s.scan_count);
-                let staleness = stats.map_or(f64::INFINITY, |s| s.staleness(now));
-                (*p, count, staleness)
+                let dirty = stats.is_some_and(|s| s.dirty_pending);
+                let index = stats.map_or(0.0, |s| {
+                    s.hazard_index(
+                        Self::expected_reclaim(s, prior),
+                        self.config.io_cost_weight,
+                        now,
+                    )
+                });
+                (dirty, index, *p)
             })
             .collect();
 
-        // Prefer least-scanned, then most stale.
-        exploration_candidates.sort_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        // Dirty first, then by index, then by path for determinism.
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.2.cmp(b.2))
         });
 
-        for (path, _, _) in exploration_candidates.iter().take(exploration_budget) {
-            let forecast = self
-                .path_stats
-                .get(*path)
-                .map_or(0.0, |s| s.forecast_reclaim);
-            let utility = self.compute_utility(path, now);
-            selected.push(ScanPlanEntry {
-                path: (*path).clone(),
-                utility,
-                is_exploration: true,
-                forecast_reclaim_bytes: forecast,
-            });
-        }
+        let selected: Vec<ScanPlanEntry> = scored
+            .iter()
+            .take(budget)
+            .map(|(_, index, path)| {
+                let stats = self.path_stats.get(*path);
+                ScanPlanEntry {
+                    path: (*path).clone(),
+                    utility: *index,
+                    is_exploration: stats.is_none_or(|s| s.scan_count == 0),
+                    forecast_reclaim_bytes: stats.map_or(0.0, |s| s.forecast_reclaim),
+                }
+            })
+            .collect();
 
         let used = selected.len();
-
         ScanPlan {
             paths: selected,
             fallback_active: false,
             budget_used: used,
             budget_total: budget,
         }
-    }
-
-    /// Compute the VOI utility score for a path.
-    fn compute_utility(&self, path: &PathBuf, now: Instant) -> f64 {
-        let Some(stats) = self.path_stats.get(path) else {
-            return 0.0;
-        };
-
-        // Expected reclaim.
-        let expected_reclaim = stats.ewma_reclaim_per_scan;
-
-        // Uncertainty discount: reduce utility if we have few observations.
-        let observation_ratio = (f64::from(stats.scan_count)
-            / f64::from(self.config.min_observations_for_forecast))
-        .min(1.0);
-        let uncertainty_discount = 0.5f64.mul_add(observation_ratio, 0.5); // range [0.5, 1.0]
-
-        // IO cost penalty.
-        let io_penalty = stats.ewma_io_cost_per_scan * self.config.io_cost_weight;
-
-        // False-positive risk penalty.
-        let fp_penalty = stats.fp_rate() * expected_reclaim * self.config.fp_risk_weight;
-
-        // Exploration bonus: grows with staleness and inversely with scan count.
-        let staleness_hours = stats.staleness(now) / 3600.0;
-        let exploration_bonus = self.config.exploration_weight
-            * staleness_hours.min(24.0)
-            * (1.0 / (f64::from(stats.scan_count) + 1.0));
-
-        // Combine.
-        let utility = expected_reclaim.mul_add(uncertainty_discount, -io_penalty) - fp_penalty
-            + exploration_bonus;
-
-        // Clamp to non-negative (a path can't have negative priority — just low).
-        utility.max(0.0)
     }
 
     /// Get current statistics for a path (read-only).
@@ -524,6 +560,7 @@ fn ewma(alpha: f64, prev: f64, current: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     fn default_scheduler() -> VoiScheduler {
@@ -590,20 +627,21 @@ mod tests {
         }
     }
 
+    /// Q6: unvisited roots are not starved by a quota; the hazard term does
+    /// the work. A root scanned a minute ago has almost no chance of having
+    /// changed, so the never-visited roots (a day of prior hazard) outrank it.
     #[test]
-    fn exploration_quota_prevents_starvation() {
+    fn unvisited_roots_outrank_a_just_scanned_root_by_hazard() {
         let mut s = VoiScheduler::new(VoiConfig {
             scan_budget_per_interval: 4,
-            exploration_quota_fraction: 0.50, // 50% exploration
             ..Default::default()
         });
-        s.register_path(PathBuf::from("/a"));
-        s.register_path(PathBuf::from("/b"));
-        s.register_path(PathBuf::from("/c"));
-        s.register_path(PathBuf::from("/d"));
+        for path in ["/a", "/b", "/c", "/d"] {
+            s.register_path(PathBuf::from(path));
+        }
 
         let now = Instant::now();
-        // Only /a has any scan history.
+        // Only /a has any scan history, and it was just scanned.
         for i in 0..5 {
             s.record_scan_result(
                 &PathBuf::from("/a"),
@@ -616,21 +654,72 @@ mod tests {
         }
 
         let plan = s.schedule(now + Duration::from_mins(1));
-        let exploration: Vec<_> = plan.paths.iter().filter(|e| e.is_exploration).collect();
-        // With 50% exploration and budget=4, at least 2 should be exploration picks.
-        assert!(
-            exploration.len() >= 2,
-            "expected at least 2 exploration picks, got {}",
-            exploration.len()
+        assert_eq!(plan.budget_used, 4);
+        assert_ne!(
+            plan.paths[0].path,
+            Path::new("/a"),
+            "a root scanned a minute ago must not lead the plan"
         );
-        // Exploration picks should NOT include /a (which has the most scans).
-        for e in &exploration {
-            assert_ne!(
-                e.path,
-                PathBuf::from("/a"),
-                "exploration should prefer least-scanned"
-            );
+        let unvisited: Vec<_> = plan.paths.iter().filter(|e| e.is_exploration).collect();
+        assert_eq!(
+            unvisited.len(),
+            3,
+            "the three never-scanned roots are exploration picks"
+        );
+        assert!(unvisited.iter().all(|e| e.path != Path::new("/a")));
+
+        // A day later the just-scanned root has regained most of its hazard:
+        // its index is orders of magnitude above the just-scanned value.
+        let minute_index = plan
+            .paths
+            .iter()
+            .find(|e| e.path == Path::new("/a"))
+            .map(|e| e.utility)
+            .expect("/a is in the plan");
+        let later = s.schedule(now + Duration::from_hours(24));
+        let day_index = later
+            .paths
+            .iter()
+            .find(|e| e.path == Path::new("/a"))
+            .map(|e| e.utility)
+            .expect("/a is in the plan");
+        assert!(
+            day_index > minute_index * 100.0,
+            "index after a day {day_index} vs after a minute {minute_index}"
+        );
+    }
+
+    /// Dirty roots (v2 events) go first regardless of index, and the flag
+    /// clears once the root is scanned.
+    #[test]
+    fn dirty_roots_go_first_until_scanned() {
+        let mut s = scheduler_with_paths(&["/big", "/small"]);
+        let now = Instant::now();
+        for i in 0..5 {
+            s.record_scan_result(&PathBuf::from("/big"), 50_000_000, 10, 0, 500.0, now);
+            s.record_scan_result(&PathBuf::from("/small"), 1_000, 1, 0, 500.0, now);
+            let _ = i;
         }
+        let later = now + Duration::from_hours(2);
+        assert_eq!(s.schedule(later).paths[0].path, PathBuf::from("/big"));
+
+        s.record_dirty(&PathBuf::from("/small"), true, later);
+        assert_eq!(s.schedule(later).paths[0].path, PathBuf::from("/small"));
+        assert_eq!(
+            s.rank_paths(&[PathBuf::from("/big"), PathBuf::from("/small")], later)[0],
+            PathBuf::from("/small")
+        );
+
+        s.record_scan_result(&PathBuf::from("/small"), 1_000, 1, 0, 500.0, later);
+        assert!(
+            !s.path_stats(&PathBuf::from("/small"))
+                .unwrap()
+                .dirty_pending
+        );
+        assert_eq!(
+            s.schedule(later + Duration::from_secs(1)).paths[0].path,
+            PathBuf::from("/big")
+        );
     }
 
     #[test]
@@ -770,51 +859,72 @@ mod tests {
         );
     }
 
+    /// Q6 index properties: monotone in time since the last visit, the
+    /// hazard rate floored at the daily prior (a quiet root is still worth a
+    /// visit after a day), and a hot, rich root dominates a quiet, poor one.
     #[test]
-    fn false_positive_rate_reduces_utility() {
-        let mut s = scheduler_with_paths(&["/fp_heavy", "/clean"]);
+    fn hazard_index_is_monotone_in_idle_time_and_dominated_by_hot_rich_roots() {
         let now = Instant::now();
+        let mut quiet = PathStats::new();
+        quiet.last_scanned = Some(now);
+        quiet.forecast_reclaim = 1_000_000.0;
+        quiet.scan_count = 3;
+        quiet.dirty_rate_per_hour = 0.0; // never seen dirty: floored to the prior
+        let cost_weight = 0.1;
 
-        // Both paths have similar reclaim, but /fp_heavy has many false positives.
-        for i in 0..5 {
-            s.record_scan_result(
-                &PathBuf::from("/fp_heavy"),
-                1_000_000,
-                10,
-                8, // 8 false positives per scan
-                500.0,
-                now + Duration::from_secs(i),
-            );
-            s.record_scan_result(
-                &PathBuf::from("/clean"),
-                1_000_000,
-                10,
-                0, // no false positives
-                500.0,
-                now + Duration::from_secs(i),
-            );
+        let at = |hours: f64| {
+            quiet.hazard_index(
+                quiet.forecast_reclaim,
+                cost_weight,
+                now + Duration::from_secs_f64(hours * 3600.0),
+            )
+        };
+        assert!(at(0.0) < at(1.0));
+        assert!(at(1.0) < at(6.0));
+        assert!(at(6.0) < at(24.0));
+        assert!(at(24.0) < at(48.0));
+        // With the daily prior, a day of idleness recovers ~63% of the reclaim.
+        let day = at(24.0);
+        let expected = 1_000_000.0f64.mul_add(1.0 - (-1.0f64).exp(), -(cost_weight * 1000.0));
+        assert!((day - expected).abs() < 1.0, "{day} vs {expected}");
+        // Right after a visit the index is at most the (negative) cost term.
+        assert!(at(0.0) <= 0.0);
+
+        // A hot (dirty ten times an hour), rich root beats a quiet, poor one
+        // at the same idle time.
+        let mut hot = PathStats::new();
+        hot.last_scanned = Some(now);
+        hot.forecast_reclaim = 10_000_000.0;
+        hot.scan_count = 3;
+        hot.dirty_rate_per_hour = 10.0;
+        let later = now + Duration::from_mins(30);
+        assert!(
+            hot.hazard_index(hot.forecast_reclaim, cost_weight, later)
+                > quiet.hazard_index(quiet.forecast_reclaim, cost_weight, later)
+        );
+
+        // The dirty rate follows observations: a dirty pass every ten
+        // minutes pushes the rate well above the prior, clean passes decay it.
+        let mut observed = PathStats::new();
+        let mut t = now;
+        for _ in 0..12 {
+            t += Duration::from_mins(10);
+            observed.record_dirty(true, t, 0.3);
         }
-
-        let plan = s.schedule(now + Duration::from_mins(1));
-        let exploitation: Vec<_> = plan.paths.iter().filter(|e| !e.is_exploration).collect();
-        if exploitation.len() >= 2 {
-            // /clean should rank higher than /fp_heavy.
-            assert!(
-                exploitation[0].utility >= exploitation[1].utility,
-                "clean path should have higher utility than FP-heavy path"
-            );
+        assert!(
+            observed.dirty_rate_per_hour > 3.0,
+            "{}",
+            observed.dirty_rate_per_hour
+        );
+        for _ in 0..12 {
+            t += Duration::from_mins(10);
+            observed.record_dirty(false, t, 0.3);
         }
-    }
-
-    #[test]
-    fn uncertainty_discount_reduces_utility_for_new_paths() {
-        let s = scheduler_with_paths(&["/new"]);
-        let now = Instant::now();
-        // New path with no observations has uncertainty discount.
-        let utility = s.compute_utility(&PathBuf::from("/new"), now);
-        // With no observations, expected reclaim is 0, so utility should be just exploration bonus.
-        // The exploration bonus depends on staleness (infinite for never-scanned).
-        assert!(utility >= 0.0, "utility should be non-negative");
+        assert!(
+            observed.dirty_rate_per_hour < 0.2,
+            "{}",
+            observed.dirty_rate_per_hour
+        );
     }
 
     #[test]

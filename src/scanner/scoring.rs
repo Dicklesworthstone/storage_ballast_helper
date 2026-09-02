@@ -467,11 +467,20 @@ impl ScoringEngine {
             uncertainty,
         );
 
+        // A Definite artifact is decided by its posterior, not by the
+        // pressure-scaled score: the min_score gate is what kept stale
+        // targets alive at Green (score 0.67 at urgency 0.05 vs 0.70), which
+        // is exactly the maintenance case the floor exists for.
+        let min_score_gate = if posterior_floor_applied {
+            0.0
+        } else {
+            self.min_score
+        };
         let action = manual_review_override(
             &input.classification,
             decide_action(
                 total,
-                self.min_score,
+                min_score_gate,
                 expected_loss_keep,
                 expected_loss_delete,
                 posterior_abandoned,
@@ -1947,7 +1956,7 @@ mod tests {
         // past the floor; the floor is what makes the Green/Yellow maintenance
         // and predictive paths (urgency well below 0.6) reach `Delete` too.
         let engine = default_engine();
-        for urgency in [0.1, 0.2, 0.55, 0.93] {
+        for urgency in [0.0, 0.05, 0.1, 0.2, 0.55, 0.93] {
             let score =
                 engine.score_candidate(&stale_definite_target("/data/tmp/stale/target"), urgency);
             assert!(!score.vetoed, "urgency={urgency}: {:?}", score.veto_reason);
