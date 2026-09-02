@@ -212,7 +212,9 @@ impl NotificationEvent {
 
             Self::Error { .. } => NotificationLevel::Red,
 
-            Self::CpuBudgetExceeded { .. } => NotificationLevel::Warning,
+            Self::CpuBudgetExceeded { .. } | Self::PolicyTransition { .. } => {
+                NotificationLevel::Warning
+            }
 
             // The pressure level itself: Orange on an unprotected mount is
             // as loud as Orange anywhere.
@@ -222,8 +224,6 @@ impl NotificationEvent {
                 "orange" => NotificationLevel::Orange,
                 _ => NotificationLevel::Warning,
             },
-
-            Self::PolicyTransition { .. } => NotificationLevel::Warning,
         }
     }
 

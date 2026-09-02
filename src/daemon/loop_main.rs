@@ -7730,6 +7730,7 @@ mod tests {
             rss_warning_bytes,
             rss_hard_limit_bytes: u64::MAX,
             rss_hard_limit_exceeded: false,
+            state_write_failed: false,
         }
     }
 

@@ -321,19 +321,26 @@ enum StateReadOutcome {
 }
 
 /// Expected top-level keys in `DaemonState`. Used for drift detection.
-const EXPECTED_STATE_KEYS: &[&str] = &[
-    "version",
-    "pid",
-    "started_at",
-    "uptime_seconds",
-    "last_updated",
-    "pressure",
-    "ballast",
-    "last_scan",
-    "counters",
-    "memory_rss_bytes",
-    "policy_mode",
-];
+/// `DaemonState` fields that serialize only when set, so a default value
+/// does not show them and they must be listed by hand.
+const OPTIONAL_STATE_KEYS: &[&str] = &["idle_reason"];
+
+/// The keys a current `DaemonState` writes: derived from the type itself,
+/// so a new state-file field is never reported as schema drift. A
+/// hardcoded list here rotted unnoticed for ten fields while nothing
+/// compiled the TUI.
+fn expected_state_keys() -> std::collections::BTreeSet<String> {
+    let mut keys: std::collections::BTreeSet<String> = serde_json::to_value(DaemonState::default())
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .map(|object| object.keys().cloned().collect())
+        })
+        .unwrap_or_default();
+    keys.extend(OPTIONAL_STATE_KEYS.iter().map(ToString::to_string));
+    keys
+}
 
 /// Compare JSON keys against expected `DaemonState` fields.
 fn detect_schema_drift(raw: &str) -> SchemaWarnings {
@@ -344,17 +351,14 @@ fn detect_schema_drift(raw: &str) -> SchemaWarnings {
         return SchemaWarnings::default();
     };
 
-    let actual_keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
-    let expected_keys: std::collections::BTreeSet<&str> =
-        EXPECTED_STATE_KEYS.iter().copied().collect();
+    let actual_keys: std::collections::BTreeSet<String> = obj.keys().cloned().collect();
+    let expected_keys = expected_state_keys();
 
-    let unknown_fields: Vec<String> = actual_keys
-        .difference(&expected_keys)
-        .map(|k| (*k).to_string())
-        .collect();
+    let unknown_fields: Vec<String> = actual_keys.difference(&expected_keys).cloned().collect();
     let missing_fields: Vec<String> = expected_keys
         .difference(&actual_keys)
-        .map(|k| (*k).to_string())
+        .filter(|key| !OPTIONAL_STATE_KEYS.contains(&key.as_str()))
+        .cloned()
         .collect();
 
     SchemaWarnings {
@@ -826,11 +830,11 @@ mod tests {
         assert_eq!(state.pressure.mounts.len(), 0);
         assert_eq!(state.counters.scans, 0);
 
-        // All known fields are missing.
+        // Every required field is missing (optional ones are never reported).
         assert!(snapshot.warnings.has_drift());
         assert_eq!(
             snapshot.warnings.missing_fields.len(),
-            EXPECTED_STATE_KEYS.len()
+            expected_state_keys().len() - OPTIONAL_STATE_KEYS.len()
         );
     }
 

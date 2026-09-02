@@ -212,10 +212,12 @@ DOCS_UPDATE_BASE=origin/main DOCS_UPDATE_HEAD=HEAD bash scripts/ci_docs_update_c
 
 **Superseded CI cancellation:** Branch and pull-request CI runs use workflow
 concurrency group `github.workflow` plus the PR number or ref, with
-`cancel-in-progress` enabled for pushes to `refs/heads/main` and for
-`pull_request` events. Tag-triggered release workflow calls are not cancelable
-through this CI policy. This keeps newer main commits from waiting behind
-obsolete hosted-runner jobs while preserving `workflow_call` behavior for
+`cancel-in-progress` enabled only for `pull_request` events;
+pushes to `refs/heads/main` queue behind each other and every one completes. Several
+agents push to main every few minutes, and cancelling in progress meant no
+main run ever finished (four in a row were cancelled on 2026-09-02).
+Tag-triggered release workflow calls are not cancelable through this CI
+policy either, which preserves `workflow_call` behavior for the
 release quality gates.
 
 **macOS validation independence:** The `macos-platform`, `macos-coverage`, and

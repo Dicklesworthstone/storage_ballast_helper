@@ -8556,18 +8556,27 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 if let Some(policy) = daemon_state
                     .as_ref()
                     .and_then(|state| state.get("policy"))
-                    .filter(|p| p.get("mode").and_then(Value::as_str).is_some_and(|m| !m.is_empty()))
+                    .filter(|p| {
+                        p.get("mode")
+                            .and_then(Value::as_str)
+                            .is_some_and(|m| !m.is_empty())
+                    })
                 {
                     let field = |key: &str| policy.get(key).and_then(Value::as_str).unwrap_or("-");
-                    let since = policy.get("since_secs").and_then(Value::as_u64).unwrap_or(0);
+                    let since = policy
+                        .get("since_secs")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                     let mut line = format!(
                         "  Policy: {} (since {}, auto_recover_to {})",
                         field("mode"),
-                        format_eta(since as f64),
+                        format_eta(f64::from(u32::try_from(since).unwrap_or(u32::MAX))),
                         field("auto_recover_to")
                     );
-                    if let Some(reason) = policy.get("last_fallback_reason").and_then(Value::as_str) {
-                        line.push_str(&format!(", last fallback: {reason}"));
+                    if let Some(reason) = policy.get("last_fallback_reason").and_then(Value::as_str)
+                    {
+                        line.push_str(", last fallback: ");
+                        line.push_str(reason);
                     }
                     println!("{line}");
                 }
@@ -15511,6 +15520,7 @@ mod tests {
         storage_ballast_helper::cli::wizard::WizardAnswers {
             service,
             user_scope,
+            initial_mode: storage_ballast_helper::daemon::policy::ActiveMode::Enforce,
             watched_paths: vec![PathBuf::from("/tmp")],
             ballast_preset: storage_ballast_helper::cli::wizard::BallastPreset::Medium,
             ballast_file_count: 10,

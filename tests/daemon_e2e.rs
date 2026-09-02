@@ -741,6 +741,7 @@ fn test_mode_daemon_refuses_to_start_under_a_service_manager() {
 /// maintenance cadence: a maintenance pass reclaims the stale Definite
 /// target while the fresh target and the git project survive.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn injected_orange_mount_reclaims_only_the_stale_target() {
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
@@ -1291,6 +1292,7 @@ fn engine_v1_reclaims_the_same_set_as_v2_at_orange() {
 /// startup; both files are released, each logged once, before the scan
 /// the same tick dispatches.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn red_pressure_releases_the_whole_pool_before_scanning() {
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 4096);

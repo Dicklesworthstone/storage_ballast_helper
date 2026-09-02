@@ -1164,14 +1164,14 @@ impl PolicyEngine {
         engine
     }
 
-    /// Current active mode.
-    #[must_use]
     /// The active configuration.
     #[must_use]
     pub const fn config(&self) -> &PolicyConfig {
         &self.config
     }
 
+    /// Current active mode.
+    #[must_use]
     pub fn mode(&self) -> ActiveMode {
         self.mode
     }
@@ -2562,10 +2562,26 @@ mod tests {
     #[test]
     fn auto_recover_to_decides_where_recovery_lands() {
         let cases = [
-            (AutoRecoverTo::None, ActiveMode::Enforce, ActiveMode::FallbackSafe),
-            (AutoRecoverTo::Canary, ActiveMode::Enforce, ActiveMode::Canary),
-            (AutoRecoverTo::Canary, ActiveMode::Observe, ActiveMode::Observe),
-            (AutoRecoverTo::Previous, ActiveMode::Enforce, ActiveMode::Enforce),
+            (
+                AutoRecoverTo::None,
+                ActiveMode::Enforce,
+                ActiveMode::FallbackSafe,
+            ),
+            (
+                AutoRecoverTo::Canary,
+                ActiveMode::Enforce,
+                ActiveMode::Canary,
+            ),
+            (
+                AutoRecoverTo::Canary,
+                ActiveMode::Observe,
+                ActiveMode::Observe,
+            ),
+            (
+                AutoRecoverTo::Previous,
+                ActiveMode::Enforce,
+                ActiveMode::Enforce,
+            ),
         ];
         for (recover, initial, expected) in cases {
             let config = PolicyConfig {

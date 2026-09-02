@@ -2440,21 +2440,26 @@ mod tests {
         for required in [
             "concurrency:",
             "group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
-            "cancel-in-progress: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'pull_request' }}",
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
             "workflow_call:",
-            "docs/internal/macos-parity-completion-audit.md",
         ] {
             assert!(
                 ci_workflow.contains(required),
-                "CI workflow must cancel superseded branch/PR runs without disabling workflow_call or churning internal audit-only pushes: {required}"
+                "CI workflow must cancel superseded PR runs, let main runs queue and complete, and keep workflow_call: {required}"
             );
         }
+        assert!(
+            !ci_workflow.contains(
+                "github.ref == 'refs/heads/main') || github.event_name == 'pull_request'"
+            ),
+            "pushes to main must not cancel each other: agents push every few minutes and no run ever finished"
+        );
 
         for required in [
             "Superseded CI cancellation",
-            "`cancel-in-progress` enabled for pushes to `refs/heads/main` and for",
+            "`cancel-in-progress` enabled only for `pull_request` events",
+            "pushes to `refs/heads/main` queue behind each other",
             "Tag-triggered release workflow calls are not cancelable",
-            "This keeps newer main commits from waiting behind",
             "release quality gates",
         ] {
             assert!(
