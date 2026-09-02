@@ -230,6 +230,48 @@ pub struct OpaqueTreeProbe {
     pub complete: bool,
     /// Newest `mtime` among the entries visited (symlinks excluded).
     pub newest_mtime: Option<SystemTime>,
+    /// Structural markers seen at the root (validated `CACHEDIR.TAG`,
+    /// `Cargo.toml`, `.git`) and within two levels (`incremental/`, `deps/`,
+    /// `build/`, `.fingerprint/`, `.git/`), so a pruned tree scores with the
+    /// same evidence a walked tree would.
+    pub signals: StructuralSignals,
+}
+
+/// Record structural markers seen while probing an opaque tree, so a pruned
+/// tree carries the same evidence a walked one would: root-level tag /
+/// manifest markers, and the Rust build layout one or two levels down
+/// (`debug/deps`, `debug/incremental`, ...).
+fn note_opaque_signal(
+    signals: &mut StructuralSignals,
+    depth: usize,
+    entry: &fs::DirEntry,
+    is_dir: bool,
+) {
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
+        return;
+    };
+    if depth == 0 {
+        match name {
+            "CACHEDIR.TAG" => {
+                if is_valid_cachedir_tag(&entry.path()) {
+                    signals.has_cachedir_tag = true;
+                }
+            }
+            "Cargo.toml" => signals.has_cargo_toml = true,
+            _ => {}
+        }
+    }
+    if depth <= 2 && is_dir {
+        match name {
+            "incremental" => signals.has_incremental = true,
+            "deps" => signals.has_deps = true,
+            "build" => signals.has_build = true,
+            ".fingerprint" => signals.has_fingerprint = true,
+            ".git" => signals.has_git = true,
+            _ => {}
+        }
+    }
 }
 
 /// Walk an opaque candidate tree once, measuring size and the newest `mtime`
@@ -243,21 +285,23 @@ fn opaque_tree_probe(
 ) -> OpaqueTreeProbe {
     let mut total: u64 = 0;
     let mut newest: Option<SystemTime> = None;
+    let mut signals = StructuralSignals::default();
     let mut seen: usize = 0;
     let mut complete = true;
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
     // Multiply-linked inodes are counted once, matching `du`: the second link
     // frees nothing, so counting it would break the "reclaiming this frees N
     // bytes" property that `allocated_size` exists to preserve. Only entries
     // with nlink > 1 are tracked, so the set stays empty for ordinary trees.
     let mut linked: HashSet<(u64, u64)> = HashSet::new();
 
-    while let Some(dir) = stack.pop() {
+    while let Some((dir, depth)) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
             return OpaqueTreeProbe {
                 allocated_bytes: total,
                 complete: false,
                 newest_mtime: newest,
+                signals,
             };
         }
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -274,6 +318,7 @@ fn opaque_tree_probe(
                     allocated_bytes: total,
                     complete: false,
                     newest_mtime: newest,
+                    signals,
                 };
             }
             // An iteration error means entries we never saw at all, so the
@@ -288,6 +333,7 @@ fn opaque_tree_probe(
                     allocated_bytes: total,
                     complete: false,
                     newest_mtime: newest,
+                    signals,
                 };
             }
             // `DirEntry::metadata` does not traverse symlinks, so a link is
@@ -314,12 +360,13 @@ fn opaque_tree_probe(
             {
                 newest = Some(newest.map_or(modified, |seen_newest| seen_newest.max(modified)));
             }
+            note_opaque_signal(&mut signals, depth, &entry, meta.is_dir());
             if meta.is_dir() {
                 // Directory blocks count toward `du -sk`, which is what the
                 // deletion report and rch's reaper use to state "freed N KB".
                 // The caller contributes the root dir's own blocks.
                 total = total.saturating_add(allocated_size(&meta));
-                stack.push(entry.path());
+                stack.push((entry.path(), depth + 1));
             } else {
                 // A second link to an inode already counted frees nothing.
                 if let Some(key) = hardlink_key(&meta)
@@ -335,6 +382,7 @@ fn opaque_tree_probe(
         allocated_bytes: total,
         complete,
         newest_mtime: newest,
+        signals,
     }
 }
 
@@ -376,6 +424,7 @@ pub fn tree_newest_mtime(root: &Path, max_entries: usize, max_depth: usize) -> O
                     allocated_bytes: 0,
                     complete: false,
                     newest_mtime: newest,
+                    signals: StructuralSignals::default(),
                 };
             }
             let Ok(meta) = entry.metadata() else {
@@ -397,6 +446,7 @@ pub fn tree_newest_mtime(root: &Path, max_entries: usize, max_depth: usize) -> O
         allocated_bytes: 0,
         complete,
         newest_mtime: newest,
+        signals: StructuralSignals::default(),
     }
 }
 
@@ -890,6 +940,7 @@ fn process_directory(
                         continue;
                     }
                     let mut emeta = entry_metadata(&meta);
+                    let mut probe_signals = StructuralSignals::default();
                     if emeta.is_dir {
                         // The tree is pruned from the main walk, so measure it
                         // here: without this every opaque candidate reported
@@ -906,6 +957,7 @@ fn process_directory(
                         // Same pass, no extra syscalls: the newest mtime inside
                         // the tree is what "age" means for a build cache.
                         emeta.tree_last_modified = probe.newest_mtime;
+                        probe_signals = probe.signals;
                         emeta.content_size_bytes = if complete {
                             emeta.content_size_bytes.saturating_add(measured)
                         } else {
@@ -919,7 +971,7 @@ fn process_directory(
                         path: child_path,
                         metadata: emeta,
                         depth: depth + 1,
-                        structural_signals: StructuralSignals::default(),
+                        structural_signals: probe_signals,
                         is_open: false,
                         opaque_tree: Some(opaque),
                     };
@@ -2509,6 +2561,15 @@ mod tests {
             "newest={newest:?} fresh={fresh:?}"
         );
         assert!(newest > old + Duration::from_hours(1));
+        // The pruned tree carries the same structural evidence a walked one
+        // would, so the definite-artifact fast lane sees it.
+        assert!(
+            probe.signals.has_cachedir_tag,
+            "validated root CACHEDIR.TAG"
+        );
+        assert!(probe.signals.has_deps, "debug/deps two levels down");
+        assert!(!probe.signals.has_git);
+        assert!(!probe.signals.has_cargo_toml);
     }
 
     #[test]
