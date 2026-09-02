@@ -8271,7 +8271,9 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 registry.classify(&entry.path, entry.structural_signals)
             };
             let age = now
-                .duration_since(entry.metadata.effective_age_timestamp())
+                .duration_since(
+                    entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
+                )
                 .unwrap_or_default();
             let mut candidate = CandidateInput {
                 path: entry.path.clone(),
@@ -8643,7 +8645,9 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
         .map(|entry| {
             let classification = registry.classify(&entry.path, entry.structural_signals);
             let age = now
-                .duration_since(entry.metadata.effective_age_timestamp())
+                .duration_since(
+                    entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
+                )
                 .unwrap_or_default();
             let mut candidate = CandidateInput {
                 path: entry.path.clone(),
@@ -9922,7 +9926,9 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         .map(|entry| {
             let classification = registry.classify(&entry.path, entry.structural_signals);
             let age = now
-                .duration_since(entry.metadata.effective_age_timestamp())
+                .duration_since(
+                    entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
+                )
                 .unwrap_or_default();
             let mut candidate = CandidateInput {
                 path: entry.path.clone(),

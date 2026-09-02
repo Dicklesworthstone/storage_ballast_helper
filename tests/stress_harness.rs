@@ -290,6 +290,7 @@ fn make_walk_entry(path: &str, size: u64, depth: usize) -> WalkEntry {
             content_size_bytes: size,
             modified: SystemTime::now() - Duration::from_hours(1),
             created: None,
+            tree_last_modified: None,
             is_dir: true,
             inode: 1000 + u64_from_usize(depth),
             device_id: 1,
@@ -1183,6 +1184,7 @@ fn run_scenario_g(seed: u64, iterations: usize) -> ScenarioResult {
                         modified: SystemTime::now()
                             - Duration::from_secs(3600 * (u64_from_usize(i) + 1)),
                         created: None,
+                        tree_last_modified: None,
                         is_dir: true,
                         inode: 2000 + u64_from_usize(i),
                         device_id: 1,

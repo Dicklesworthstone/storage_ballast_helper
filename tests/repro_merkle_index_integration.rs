@@ -17,6 +17,7 @@ mod tests {
                 content_size_bytes: 100,
                 modified: SystemTime::UNIX_EPOCH + Duration::from_secs(mtime_secs),
                 created: None,
+                tree_last_modified: None,
                 is_dir: false,
                 inode: 0,
                 device_id: 0,

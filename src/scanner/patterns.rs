@@ -27,6 +27,18 @@ pub enum ArtifactCategory {
     Unknown,
 }
 
+impl ArtifactCategory {
+    /// Categories whose members are directory trees that tools regenerate,
+    /// where "age" must mean idleness of the whole tree (a compiler writes to
+    /// `target/debug/deps/`, not to `target/`). The scanner takes a bounded
+    /// idle probe for these before scoring; `Unknown` directories keep the
+    /// cheap directory-level timestamps.
+    #[must_use]
+    pub const fn is_regenerable_tree(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+}
+
 /// Structural features collected from a directory tree.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -5187,12 +5187,6 @@ fn scanner_thread_main(
                 visited_dirs.insert(entry.path.clone());
             }
 
-            let age = entry
-                .metadata
-                .effective_age_timestamp()
-                .elapsed()
-                .unwrap_or(Duration::ZERO);
-
             // Skip directories already known to contain .git (project roots).
             if entry.metadata.is_dir && known_git_dirs.contains(&entry.path) {
                 continue;
@@ -5219,6 +5213,13 @@ fn scanner_thread_main(
             } else {
                 pattern_registry.classify(&entry.path, entry.structural_signals)
             };
+            // Age means idleness of the whole tree for regenerable categories:
+            // the opaque probe recorded the newest mtime for pruned trees, and
+            // a bounded sample covers v1-walked build/cache directories.
+            let age = entry
+                .effective_age_timestamp(classification.category.is_regenerable_tree())
+                .elapsed()
+                .unwrap_or(Duration::ZERO);
 
             // Skip unknown artifacts to save scoring cycles.
             if classification.category == crate::scanner::patterns::ArtifactCategory::Unknown {

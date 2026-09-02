@@ -7,7 +7,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_possible_truncation)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -88,6 +88,11 @@ pub struct EntryMetadata {
     pub content_size_bytes: u64,
     pub modified: SystemTime,
     pub created: Option<SystemTime>,
+    /// Newest modification time observed anywhere inside a directory tree by
+    /// the opaque-tree probe (bounded by its entry budget). `None` when the
+    /// tree was not probed; then [`WalkEntry::effective_age_timestamp`] runs
+    /// the bounded idle probe on demand for regenerable-tree categories.
+    pub tree_last_modified: Option<SystemTime>,
     pub is_dir: bool,
     pub inode: u64,
     pub device_id: u64,
@@ -115,16 +120,22 @@ pub struct FsIdentity {
 impl EntryMetadata {
     /// Return the timestamp to use for age-based scoring.
     ///
-    /// For **directories**, returns the creation (birth) time when available,
-    /// because directory `mtime` updates whenever any direct child is added or
-    /// removed — making active build caches like `target/` appear perpetually
-    /// young. Birth time reflects when the directory was actually created and is
-    /// stable across builds.
+    /// For **directories**, returns the newest of the directory's own `mtime`,
+    /// its birth time, and the newest modification time observed inside the
+    /// tree (`tree_last_modified`, when a probe ran). Age therefore means
+    /// "time since anything in this tree changed". Birth time alone is *not*
+    /// used: a warm build cache created days ago and rebuilt into ever since
+    /// reported an age of days and was reclaimed while it was busiest (v0.5.1
+    /// regression on rch pool dirs); a directory's own `mtime` misses writes
+    /// deeper than its direct children.
     ///
     /// For **files**, always returns `modified` (content change is what matters).
     pub fn effective_age_timestamp(&self) -> SystemTime {
         if self.is_dir {
-            self.created.unwrap_or(self.modified)
+            [self.created, self.tree_last_modified]
+                .into_iter()
+                .flatten()
+                .fold(self.modified, SystemTime::max)
         } else {
             self.modified
         }
@@ -191,6 +202,10 @@ const OPAQUE_SIZE_PROBE_BUDGET: usize = 200_000;
 /// floors it at [`OPAQUE_CANDIDATE_SIZE_FLOOR`] rather than discarding it: a
 /// budget-truncated walk of a huge tree keeps its large partial total, while a
 /// walk that saw almost nothing cannot make that tree look trivial.
+///
+/// Production code uses [`opaque_tree_probe`] (same walk, plus the newest
+/// mtime); this size-only view is kept for the size-accounting tests.
+#[cfg(test)]
 fn opaque_tree_allocated_size(
     root: &Path,
     cross_devices: bool,
@@ -198,7 +213,36 @@ fn opaque_tree_allocated_size(
     budget: usize,
     cancel: &AtomicBool,
 ) -> (u64, bool) {
+    let probe = opaque_tree_probe(root, cross_devices, root_dev, budget, cancel);
+    (probe.allocated_bytes, probe.complete)
+}
+
+/// Result of walking an opaque candidate tree once: its allocated size and
+/// the newest modification time seen, both bounded by the entry budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpaqueTreeProbe {
+    /// Allocated bytes of everything below the root (the root's own blocks
+    /// are the caller's).
+    pub allocated_bytes: u64,
+    /// False when the budget, a cancel, or an unreadable subtree cut the walk
+    /// short: `allocated_bytes` is then a lower bound and `newest_mtime` may
+    /// miss fresher files.
+    pub complete: bool,
+    /// Newest `mtime` among the entries visited (symlinks excluded).
+    pub newest_mtime: Option<SystemTime>,
+}
+
+/// Walk an opaque candidate tree once, measuring size and the newest `mtime`
+/// in the same pass so idleness costs no extra syscalls.
+fn opaque_tree_probe(
+    root: &Path,
+    cross_devices: bool,
+    root_dev: u64,
+    budget: usize,
+    cancel: &AtomicBool,
+) -> OpaqueTreeProbe {
     let mut total: u64 = 0;
+    let mut newest: Option<SystemTime> = None;
     let mut seen: usize = 0;
     let mut complete = true;
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -210,7 +254,11 @@ fn opaque_tree_allocated_size(
 
     while let Some(dir) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
-            return (total, false);
+            return OpaqueTreeProbe {
+                allocated_bytes: total,
+                complete: false,
+                newest_mtime: newest,
+            };
         }
         let Ok(entries) = fs::read_dir(&dir) else {
             // One unreadable subtree must not abandon the whole measurement —
@@ -222,7 +270,11 @@ fn opaque_tree_allocated_size(
         };
         for entry in entries {
             if cancel.load(Ordering::Relaxed) {
-                return (total, false);
+                return OpaqueTreeProbe {
+                    allocated_bytes: total,
+                    complete: false,
+                    newest_mtime: newest,
+                };
             }
             // An iteration error means entries we never saw at all, so the
             // total is a lower bound rather than the tree's true size.
@@ -232,7 +284,11 @@ fn opaque_tree_allocated_size(
             };
             seen += 1;
             if seen > budget {
-                return (total, false);
+                return OpaqueTreeProbe {
+                    allocated_bytes: total,
+                    complete: false,
+                    newest_mtime: newest,
+                };
             }
             // `DirEntry::metadata` does not traverse symlinks, so a link is
             // sized as the link itself: no double-counting, no escaping the
@@ -253,6 +309,11 @@ fn opaque_tree_allocated_size(
             if !cross_devices && device_id(&meta) != root_dev {
                 continue;
             }
+            if !meta.file_type().is_symlink()
+                && let Ok(modified) = meta.modified()
+            {
+                newest = Some(newest.map_or(modified, |seen_newest| seen_newest.max(modified)));
+            }
             if meta.is_dir() {
                 // Directory blocks count toward `du -sk`, which is what the
                 // deletion report and rch's reaper use to state "freed N KB".
@@ -270,7 +331,97 @@ fn opaque_tree_allocated_size(
             }
         }
     }
-    (total, complete)
+    OpaqueTreeProbe {
+        allocated_bytes: total,
+        complete,
+        newest_mtime: newest,
+    }
+}
+
+/// Entry budget for [`tree_newest_mtime`]: enough to see the freshest files of
+/// a real build tree without turning every scored directory into a full walk.
+pub const TREE_IDLE_PROBE_MAX_ENTRIES: usize = 4096;
+/// Depth budget for [`tree_newest_mtime`] (`target/debug/deps/x.rlib` is 3).
+pub const TREE_IDLE_PROBE_MAX_DEPTH: usize = 3;
+
+/// Bounded breadth-first sample of a directory tree's newest `mtime`.
+///
+/// Visits at most `max_entries` entries down to `max_depth` levels below the
+/// root and reports the newest modification time seen (symlinks are not
+/// followed and not counted). This is what makes "age" mean *idleness* for a
+/// build cache: `target/` keeps an old `mtime` while a compiler writes to
+/// `target/debug/deps/`, and its birth time is older still. A truncated probe
+/// still returns the newest time it saw, which is a lower bound on activity:
+/// a fresh file among the sampled entries proves the tree is live; an idle
+/// verdict on a truncated sample is only as strong as the sample.
+#[must_use]
+pub fn tree_newest_mtime(root: &Path, max_entries: usize, max_depth: usize) -> OpaqueTreeProbe {
+    let mut newest: Option<SystemTime> = None;
+    let mut seen: usize = 0;
+    let mut complete = true;
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::from([(root.to_path_buf(), 0)]);
+    while let Some((dir, depth)) = queue.pop_front() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            complete = false;
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                complete = false;
+                continue;
+            };
+            seen += 1;
+            if seen > max_entries {
+                return OpaqueTreeProbe {
+                    allocated_bytes: 0,
+                    complete: false,
+                    newest_mtime: newest,
+                };
+            }
+            let Ok(meta) = entry.metadata() else {
+                complete = false;
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if let Ok(modified) = meta.modified() {
+                newest = Some(newest.map_or(modified, |seen_newest| seen_newest.max(modified)));
+            }
+            if meta.is_dir() && depth + 1 < max_depth {
+                queue.push_back((entry.path(), depth + 1));
+            }
+        }
+    }
+    OpaqueTreeProbe {
+        allocated_bytes: 0,
+        complete,
+        newest_mtime: newest,
+    }
+}
+
+impl WalkEntry {
+    /// The timestamp this entry's age is measured from.
+    ///
+    /// Files use their `mtime`. Directories use the newest of their own
+    /// `mtime`, birth time, and any tree modification time the opaque probe
+    /// already recorded; when nothing recorded the tree and `probe_tree` is
+    /// set (regenerable-tree categories such as cargo targets and caches), a
+    /// bounded [`tree_newest_mtime`] sample is taken so files written deep
+    /// inside the tree count as activity.
+    #[must_use]
+    pub fn effective_age_timestamp(&self, probe_tree: bool) -> SystemTime {
+        let base = self.metadata.effective_age_timestamp();
+        if !self.metadata.is_dir || self.metadata.tree_last_modified.is_some() || !probe_tree {
+            return base;
+        }
+        let probe = tree_newest_mtime(
+            &self.path,
+            TREE_IDLE_PROBE_MAX_ENTRIES,
+            TREE_IDLE_PROBE_MAX_DEPTH,
+        );
+        probe.newest_mtime.map_or(base, |newest| newest.max(base))
+    }
 }
 
 /// Identity of a multiply-linked file, for counting its blocks exactly once.
@@ -744,13 +895,17 @@ fn process_directory(
                         // here: without this every opaque candidate reported
                         // exactly the floor and nothing could be ranked by size.
                         // A truncated/failed probe keeps the floor semantics.
-                        let (measured, complete) = opaque_tree_allocated_size(
+                        let probe = opaque_tree_probe(
                             &child_path,
                             config.cross_devices,
                             root_dev,
                             OPAQUE_SIZE_PROBE_BUDGET,
                             cancel,
                         );
+                        let (measured, complete) = (probe.allocated_bytes, probe.complete);
+                        // Same pass, no extra syscalls: the newest mtime inside
+                        // the tree is what "age" means for a build cache.
+                        emeta.tree_last_modified = probe.newest_mtime;
                         emeta.content_size_bytes = if complete {
                             emeta.content_size_bytes.saturating_add(measured)
                         } else {
@@ -942,6 +1097,7 @@ fn entry_metadata(meta: &fs::Metadata) -> EntryMetadata {
             content_size_bytes: size, // Overridden for directories in process_directory.
             modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             created: meta.created().ok(),
+            tree_last_modified: None,
             is_dir: meta.is_dir(),
             inode: meta.ino(),
             device_id: meta.dev(),
@@ -957,6 +1113,7 @@ fn entry_metadata(meta: &fs::Metadata) -> EntryMetadata {
             content_size_bytes: size,
             modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             created: meta.created().ok(),
+            tree_last_modified: None,
             is_dir: meta.is_dir(),
             inode: 0,
             device_id: 0,
@@ -2300,6 +2457,147 @@ mod tests {
     /// from the dedicated probe. Before it, every opaque candidate reported
     /// exactly `OPAQUE_CANDIDATE_SIZE_FLOOR`, which made a 130 GB rch pool and
     /// a 100 MB scratch dir score and rank identically.
+    /// Build a `target/`-shaped tree whose directories and most files carry an
+    /// old mtime while one file deep inside is fresh: the shape of a warm cache
+    /// between two build phases.
+    fn idle_tree_with_one_fresh_deep_file(tmp: &TempDir) -> (PathBuf, SystemTime, SystemTime) {
+        let tree = tmp.path().join("target");
+        let deps = tree.join("debug").join("deps");
+        fs::create_dir_all(&deps).unwrap();
+        for index in 0..5 {
+            fs::write(deps.join(format!("old{index}.rlib")), b"old").unwrap();
+        }
+        fs::write(
+            tree.join("CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        let fresh = SystemTime::now();
+        let old = fresh - Duration::from_hours(6);
+        let old_ft = filetime::FileTime::from_system_time(old);
+        for path in [
+            deps.join("old0.rlib"),
+            deps.join("old1.rlib"),
+            deps.join("old2.rlib"),
+            deps.join("old3.rlib"),
+            deps.join("old4.rlib"),
+            tree.join("CACHEDIR.TAG"),
+        ] {
+            filetime::set_file_mtime(&path, old_ft).unwrap();
+        }
+        // The fresh write happens after the old stamps so parent mtimes are
+        // then stamped old too (directory mtime bumps on child creation).
+        fs::write(deps.join("fresh.rlib"), b"fresh").unwrap();
+        for dir in [&deps, &tree.join("debug"), &tree] {
+            filetime::set_file_mtime(dir, old_ft).unwrap();
+        }
+        (tree, old, fresh)
+    }
+
+    #[test]
+    fn opaque_probe_reports_the_newest_mtime_inside_the_tree() {
+        let tmp = TempDir::new().unwrap();
+        let (tree, old, fresh) = idle_tree_with_one_fresh_deep_file(&tmp);
+        let root_dev = device_id(&fs::metadata(&tree).unwrap());
+        let cancel = AtomicBool::new(false);
+
+        let probe = opaque_tree_probe(&tree, false, root_dev, OPAQUE_SIZE_PROBE_BUDGET, &cancel);
+        assert!(probe.complete);
+        let newest = probe.newest_mtime.expect("a populated tree has an mtime");
+        assert!(
+            newest >= fresh - Duration::from_secs(2),
+            "newest={newest:?} fresh={fresh:?}"
+        );
+        assert!(newest > old + Duration::from_hours(1));
+    }
+
+    #[test]
+    fn tree_newest_mtime_sees_deep_fresh_files_and_respects_its_budget() {
+        let tmp = TempDir::new().unwrap();
+        let (tree, old, fresh) = idle_tree_with_one_fresh_deep_file(&tmp);
+
+        let probe = tree_newest_mtime(
+            &tree,
+            TREE_IDLE_PROBE_MAX_ENTRIES,
+            TREE_IDLE_PROBE_MAX_DEPTH,
+        );
+        assert!(probe.complete);
+        let newest = probe.newest_mtime.expect("populated tree");
+        assert!(newest >= fresh - Duration::from_secs(2));
+
+        // Depth 1 only sees `CACHEDIR.TAG` and `debug/` (both stamped old).
+        let shallow = tree_newest_mtime(&tree, TREE_IDLE_PROBE_MAX_ENTRIES, 1);
+        let shallow_newest = shallow.newest_mtime.expect("root children have mtimes");
+        assert!(
+            shallow_newest < old + Duration::from_hours(1),
+            "{shallow_newest:?}"
+        );
+
+        // A budget of one entry truncates and says so.
+        let truncated = tree_newest_mtime(&tree, 1, TREE_IDLE_PROBE_MAX_DEPTH);
+        assert!(!truncated.complete);
+    }
+
+    #[test]
+    fn walk_entry_age_means_tree_idleness_for_regenerable_categories() {
+        let tmp = TempDir::new().unwrap();
+        let (tree, old, fresh) = idle_tree_with_one_fresh_deep_file(&tmp);
+        // Synthetic metadata: an old birth time and old mtime, no probe recorded.
+        let stale_looking = EntryMetadata {
+            size_bytes: 4096,
+            content_size_bytes: 4096,
+            modified: old,
+            created: Some(old - Duration::from_hours(48)),
+            tree_last_modified: None,
+            is_dir: true,
+            inode: 1,
+            device_id: 1,
+            kind: FsEntryKind::Directory,
+            permissions: 0o755,
+        };
+        let entry = WalkEntry {
+            path: tree.clone(),
+            metadata: stale_looking.clone(),
+            depth: 1,
+            structural_signals: StructuralSignals::default(),
+            is_open: false,
+            opaque_tree: None,
+        };
+
+        // Without the probe the directory looks six hours idle (the v0.5.1
+        // regression); with it, the fresh deep file makes it young.
+        assert_eq!(entry.effective_age_timestamp(false), old);
+        let probed = entry.effective_age_timestamp(true);
+        assert!(probed >= fresh - Duration::from_secs(2), "{probed:?}");
+
+        // A recorded opaque-probe result wins without re-walking.
+        let recorded = EntryMetadata {
+            tree_last_modified: Some(fresh),
+            ..stale_looking.clone()
+        };
+        assert_eq!(recorded.effective_age_timestamp(), fresh);
+        let recorded_entry = WalkEntry {
+            metadata: recorded,
+            ..entry.clone()
+        };
+        assert_eq!(recorded_entry.effective_age_timestamp(false), fresh);
+
+        // Birth time is only a lower bound: newest of the three wins.
+        let young_birth = EntryMetadata {
+            created: Some(fresh),
+            ..stale_looking
+        };
+        assert_eq!(young_birth.effective_age_timestamp(), fresh);
+        // Files always use their own mtime.
+        let file = EntryMetadata {
+            is_dir: false,
+            kind: FsEntryKind::File,
+            tree_last_modified: Some(fresh),
+            ..young_birth
+        };
+        assert_eq!(file.effective_age_timestamp(), old);
+    }
+
     #[test]
     fn opaque_candidate_reports_measured_size_not_just_the_floor() {
         let tmp = TempDir::new().unwrap();
@@ -3122,6 +3420,7 @@ mod tests {
                     content_size_bytes: 0,
                     modified: SystemTime::UNIX_EPOCH,
                     created: None,
+                    tree_last_modified: None,
                     is_dir: true,
                     inode: 0,
                     device_id: 0,

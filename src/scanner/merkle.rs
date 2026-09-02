@@ -791,6 +791,7 @@ mod tests {
                 content_size_bytes: size,
                 modified: UNIX_EPOCH + Duration::from_secs(modified_secs),
                 created: None,
+                tree_last_modified: None,
                 is_dir: true,
                 inode: 0,
                 device_id: 0,
