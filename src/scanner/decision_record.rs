@@ -14,11 +14,53 @@
 
 use std::fmt;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::scanner::scoring::{CandidacyScore, DecisionAction, EvidenceLedger, ScoreFactors};
+use crate::scanner::walker::FsIdentity;
+
+// ──────────────────── stable decision id ────────────────────
+
+/// Length of a stable decision id in hex characters (48 bits).
+pub const DECISION_ID_LEN: usize = 12;
+
+/// Stable identifier for a decision about one artifact version.
+///
+/// Derived from what the decision is *about* (path, filesystem identity,
+/// size), not from when or by whom it was made, so `sbh scan --explain`, the
+/// daemon's ledger entry, the `artifact_delete` event and `sbh explain --id`
+/// all name the same thing. Re-deciding an unchanged artifact reuses the id;
+/// the ledger keeps every record and `explain` shows the most recent one.
+#[must_use]
+pub fn stable_decision_id(path: &Path, identity: Option<FsIdentity>, size_bytes: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_os_str().as_encoded_bytes());
+    hasher.update([0u8]);
+    if let Some(identity) = identity {
+        hasher.update(identity.device_id.to_le_bytes());
+        hasher.update(identity.inode.to_le_bytes());
+    }
+    hasher.update([0u8]);
+    hasher.update(size_bytes.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut id = String::with_capacity(DECISION_ID_LEN);
+    for byte in digest.iter().take(DECISION_ID_LEN / 2) {
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
+}
+
+/// Whether `candidate` looks like a stable decision id (12 lowercase hex chars).
+#[must_use]
+pub fn is_decision_id(candidate: &str) -> bool {
+    candidate.len() == DECISION_ID_LEN
+        && candidate
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 
 // ──────────────────── explain level ────────────────────
 
@@ -64,6 +106,10 @@ impl fmt::Display for ExplainLevel {
 pub struct DecisionRecord {
     /// Monotonic decision identifier within this daemon run.
     pub decision_id: u64,
+    /// Stable id of the artifact version this decision is about; see
+    /// [`stable_decision_id`]. Empty only for records written before ids.
+    #[serde(default)]
+    pub id: String,
     /// Trace identifier for correlating with scan/deletion events.
     pub trace_id: String,
     /// ISO 8601 timestamp when the decision was made.
@@ -291,6 +337,7 @@ impl DecisionRecordBuilder {
 
         DecisionRecord {
             decision_id: id,
+            id: stable_decision_id(&score.path, score.identity, score.size_bytes),
             trace_id,
             timestamp,
             policy_mode,
@@ -484,7 +531,9 @@ impl DecisionRecord {
     pub fn to_json_at_level(&self, level: ExplainLevel) -> serde_json::Value {
         match level {
             ExplainLevel::L0 => serde_json::json!({
+                "id": self.id,
                 "decision_id": self.decision_id,
+                "timestamp": self.timestamp,
                 "path": self.path,
                 "action": self.action,
                 "total_score": self.total_score,
@@ -493,7 +542,9 @@ impl DecisionRecord {
                 "veto_reason": self.veto_reason,
             }),
             ExplainLevel::L1 => serde_json::json!({
+                "id": self.id,
                 "decision_id": self.decision_id,
+                "timestamp": self.timestamp,
                 "path": self.path,
                 "action": self.action,
                 "total_score": self.total_score,
@@ -506,7 +557,9 @@ impl DecisionRecord {
                 "veto_reason": self.veto_reason,
             }),
             ExplainLevel::L2 => serde_json::json!({
+                "id": self.id,
                 "decision_id": self.decision_id,
+                "timestamp": self.timestamp,
                 "path": self.path,
                 "action": self.action,
                 "total_score": self.total_score,
@@ -602,7 +655,11 @@ pub fn parse_decision_from_details(json: &str) -> Option<DecisionRecord> {
 pub fn decision_summary_line(record: &DecisionRecord) -> String {
     format!(
         "[{id}] {action} {path} score={score:.3} ({cat})",
-        id = record.trace_id,
+        id = if record.id.is_empty() {
+            record.trace_id.as_str()
+        } else {
+            record.id.as_str()
+        },
         action = record.action,
         path = record.path.display(),
         score = record.total_score,
@@ -1012,7 +1069,10 @@ mod tests {
         let mut builder = DecisionRecordBuilder::new();
         let record = builder.build(&sample_score(), PolicyMode::Live, None, None, None);
         let line = decision_summary_line(&record);
-        assert!(line.contains("sbh-00000001"));
+        assert!(
+            line.starts_with(&format!("[{}]", record.id)),
+            "summary leads with the stable id: {line}"
+        );
         assert!(line.contains("DELETE"));
         assert!(line.contains(".target_opus"));
         assert!(line.contains("RustTarget"));
@@ -1047,6 +1107,156 @@ mod tests {
     fn builder_default_trait() {
         let builder = DecisionRecordBuilder::default();
         assert_eq!(builder.next_id, 1);
+    }
+
+    #[test]
+    fn stable_id_depends_on_path_identity_and_size_only() {
+        use crate::scanner::walker::{FsEntryKind, FsIdentity};
+        let path = Path::new("/data/projects/foo/target");
+        let identity = FsIdentity {
+            device_id: 0x1234,
+            inode: 987_654,
+            kind: FsEntryKind::Directory,
+        };
+        let id = stable_decision_id(path, Some(identity), 3_500_000_000);
+        assert!(is_decision_id(&id), "12 lowercase hex chars: {id}");
+        assert_eq!(id, stable_decision_id(path, Some(identity), 3_500_000_000));
+        assert_ne!(
+            id,
+            stable_decision_id(
+                Path::new("/data/projects/bar/target"),
+                Some(identity),
+                3_500_000_000
+            ),
+            "path is part of the id"
+        );
+        assert_ne!(
+            id,
+            stable_decision_id(
+                path,
+                Some(FsIdentity {
+                    inode: 1,
+                    ..identity
+                }),
+                3_500_000_000
+            ),
+            "inode is part of the id (a recreated target is a new decision)"
+        );
+        assert_ne!(
+            id,
+            stable_decision_id(path, Some(identity), 3_500_000_001),
+            "size is part of the id"
+        );
+        assert_ne!(
+            id,
+            stable_decision_id(path, None, 3_500_000_000),
+            "identity presence changes the id"
+        );
+        assert!(
+            !is_decision_id("sbh-00000001"),
+            "trace ids are not decision ids"
+        );
+        assert!(!is_decision_id("ABCDEF012345"), "uppercase is rejected");
+    }
+
+    #[test]
+    fn builder_sets_stable_id_and_records_without_one_still_deserialize() {
+        let mut builder = DecisionRecordBuilder::new();
+        let score = sample_score();
+        let record = builder.build(&score, PolicyMode::Live, None, None, None);
+        assert_eq!(
+            record.id,
+            stable_decision_id(&score.path, score.identity, score.size_bytes)
+        );
+        let again = builder.build(&score, PolicyMode::Shadow, None, None, None);
+        assert_eq!(record.id, again.id, "same artifact, same id across builds");
+        assert_ne!(
+            record.decision_id, again.decision_id,
+            "sequence still advances"
+        );
+
+        // A record written before ids existed deserializes with an empty id.
+        let mut json: serde_json::Value = serde_json::from_str(&record.to_json_compact()).unwrap();
+        json.as_object_mut().unwrap().remove("id");
+        let legacy: DecisionRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.id, "");
+        assert!(
+            decision_summary_line(&legacy).starts_with(&format!("[{}]", legacy.trace_id)),
+            "summary falls back to the trace id"
+        );
+        assert!(decision_summary_line(&record).starts_with(&format!("[{}]", record.id)));
+        for level in [
+            ExplainLevel::L0,
+            ExplainLevel::L1,
+            ExplainLevel::L2,
+            ExplainLevel::L3,
+        ] {
+            assert_eq!(
+                record.to_json_at_level(level)["id"],
+                serde_json::json!(record.id),
+                "every explain level carries the id ({level})"
+            );
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn decision_log_roundtrips_queries_and_prunes() {
+        use crate::logger::sqlite::SqliteLogger;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteLogger::open(&dir.path().join("ledger.sqlite3")).unwrap();
+        let mut builder = DecisionRecordBuilder::new();
+        let score = sample_score();
+        let first = builder.build(&score, PolicyMode::Shadow, None, None, None);
+        let second = builder.build(&score, PolicyMode::Live, None, None, None);
+        let mut other_score = sample_score();
+        other_score.path = PathBuf::from("/data/projects/other/target");
+        other_score.size_bytes = 42;
+        let other = builder.build(&other_score, PolicyMode::Live, None, None, None);
+        for record in [&first, &second, &other] {
+            db.log_decision(record).unwrap();
+        }
+
+        // --id: the newest record for that artifact, and how many share it.
+        let (found, count) = db.decision_by_id(&first.id).unwrap().expect("id is known");
+        assert_eq!(count, 2);
+        assert_eq!(found.decision_id, second.decision_id, "newest record wins");
+        assert_eq!(found.policy_mode, PolicyMode::Live);
+        assert!(db.decision_by_id("000000000000").unwrap().is_none());
+
+        // --last / --path / --since.
+        let recent = db.recent_decisions(2).unwrap();
+        assert_eq!(
+            recent.iter().map(|r| r.decision_id).collect::<Vec<_>>(),
+            vec![other.decision_id, second.decision_id]
+        );
+        let by_path = db
+            .decisions_for_path(&other_score.path.to_string_lossy(), 10)
+            .unwrap();
+        assert_eq!(by_path.len(), 1);
+        assert_eq!(by_path[0].id, other.id);
+        assert_eq!(
+            db.decisions_since("2000-01-01T00:00:00Z", 10)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(
+            db.decisions_since("2999-01-01T00:00:00Z", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Retention: rows younger than the cutoff survive, older ones go.
+        assert_eq!(db.prune_decision_log(30).unwrap(), 0);
+        assert_eq!(db.recent_decisions(10).unwrap().len(), 3);
+        assert_eq!(
+            db.prune_decision_log(0).unwrap(),
+            3,
+            "a zero-day cutoff is 'now', so everything written before it is pruned"
+        );
+        assert!(db.recent_decisions(10).unwrap().is_empty());
     }
 
     #[test]

@@ -11,6 +11,7 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags, params};
 
 use crate::core::errors::{Result, SbhError};
+use crate::scanner::decision_record::DecisionRecord;
 
 /// SQLite activity logger with WAL mode and prepared-statement patterns.
 pub struct SqliteLogger {
@@ -237,6 +238,114 @@ impl SqliteLogger {
         Ok(deleted)
     }
 
+    // ──────────────────── decision_log (evidence ledger) ────────────────────
+
+    /// Append a decision record to the evidence ledger.
+    ///
+    /// Indexed columns are denormalized for querying; `record` holds the
+    /// full JSON so `sbh explain` can render every level from one row.
+    pub fn log_decision(&self, record: &DecisionRecord) -> Result<()> {
+        let payload = serde_json::to_string(record).map_err(|e| SbhError::Serialization {
+            context: "decision record",
+            details: e.to_string(),
+        })?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO decision_log (
+                    decision_id, timestamp, path, action, effective_action, policy_mode,
+                    total_score, posterior_abandoned, expected_loss_keep,
+                    expected_loss_delete, vetoed, veto_reason, record
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            )?
+            .execute(params![
+                record.id,
+                record.timestamp,
+                record.path.to_string_lossy().to_string(),
+                record.action.to_string(),
+                record.effective_action.as_ref().map(ToString::to_string),
+                record.policy_mode.to_string(),
+                record.total_score,
+                record.posterior_abandoned,
+                record.expected_loss_keep,
+                record.expected_loss_delete,
+                i32::from(record.vetoed),
+                record.veto_reason,
+                payload,
+            ])?;
+        Ok(())
+    }
+
+    /// The most recent decision with this stable id, plus how many records
+    /// share it (an unchanged artifact re-decided over time).
+    pub fn decision_by_id(&self, decision_id: &str) -> Result<Option<(DecisionRecord, usize)>> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM decision_log WHERE decision_id = ?1",
+            params![decision_id],
+            |row| {
+                row.get::<_, i64>(0)
+                    .map(|n| usize::try_from(n).unwrap_or(0))
+            },
+        )?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT record FROM decision_log WHERE decision_id = ?1 ORDER BY id DESC LIMIT 1",
+        )?;
+        let record = stmt
+            .query_row(params![decision_id], |row| row.get::<_, String>(0))
+            .ok()
+            .and_then(|json| serde_json::from_str::<DecisionRecord>(&json).ok());
+        Ok(record.map(|record| (record, count)))
+    }
+
+    /// The `limit` most recent decisions, newest first.
+    pub fn recent_decisions(&self, limit: u32) -> Result<Vec<DecisionRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT record FROM decision_log ORDER BY id DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit], |row| row.get::<_, String>(0))?;
+        Ok(rows
+            .filter_map(std::result::Result::ok)
+            .filter_map(|json| serde_json::from_str(&json).ok())
+            .collect())
+    }
+
+    /// Decisions recorded for exactly this path, newest first.
+    pub fn decisions_for_path(&self, path: &str, limit: u32) -> Result<Vec<DecisionRecord>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT record FROM decision_log WHERE path = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![path, limit], |row| row.get::<_, String>(0))?;
+        Ok(rows
+            .filter_map(std::result::Result::ok)
+            .filter_map(|json| serde_json::from_str(&json).ok())
+            .collect())
+    }
+
+    /// Decisions with a timestamp at or after `since` (RFC 3339), newest first.
+    pub fn decisions_since(&self, since: &str, limit: u32) -> Result<Vec<DecisionRecord>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT record FROM decision_log WHERE timestamp >= ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since, limit], |row| row.get::<_, String>(0))?;
+        Ok(rows
+            .filter_map(std::result::Result::ok)
+            .filter_map(|json| serde_json::from_str(&json).ok())
+            .collect())
+    }
+
+    /// Delete decision_log rows older than `retention_days`.
+    pub fn prune_decision_log(&self, retention_days: u32) -> Result<usize> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(retention_days));
+        let cutoff_str = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let deleted = self.conn.execute(
+            "DELETE FROM decision_log WHERE timestamp < ?1",
+            params![cutoff_str],
+        )?;
+        Ok(deleted)
+    }
+
     // ──────────────────── ballast_inventory ────────────────────
 
     /// Upsert a ballast file record.
@@ -445,6 +554,26 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             integrity_hash TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS decision_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            path TEXT NOT NULL,
+            action TEXT NOT NULL,
+            effective_action TEXT,
+            policy_mode TEXT NOT NULL,
+            total_score REAL NOT NULL,
+            posterior_abandoned REAL NOT NULL,
+            expected_loss_keep REAL NOT NULL,
+            expected_loss_delete REAL NOT NULL,
+            vetoed INTEGER NOT NULL DEFAULT 0,
+            veto_reason TEXT,
+            record TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_decision_id ON decision_log(decision_id);
+        CREATE INDEX IF NOT EXISTS idx_decision_path ON decision_log(path);
+        CREATE INDEX IF NOT EXISTS idx_decision_timestamp ON decision_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_activity_event_type ON activity_log(event_type);
         CREATE INDEX IF NOT EXISTS idx_activity_type_time ON activity_log(event_type, timestamp);

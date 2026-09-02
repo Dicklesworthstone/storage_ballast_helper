@@ -19,6 +19,7 @@ use crate::logger::jsonl::{
 };
 #[cfg(feature = "sqlite")]
 use crate::logger::sqlite::{ActivityRow, PressureRow, SqliteLogger};
+use crate::scanner::decision_record::DecisionRecord;
 
 // ──────────────────── channel capacity ────────────────────
 
@@ -86,6 +87,9 @@ pub enum ActivityEvent {
         pressure: String,
         free_pct: f64,
         duration_ms: u64,
+        /// Stable decision id of the ledger record that approved this
+        /// deletion (see `decision_record::stable_decision_id`).
+        decision_id: Option<String>,
     },
     ArtifactDeletionFailed {
         path: String,
@@ -112,6 +116,9 @@ pub enum ActivityEvent {
         details: String,
         free_pct: f64,
     },
+    /// A cleanup decision (keep, delete, review, veto) for the evidence
+    /// ledger: SQLite `decision_log` plus a JSONL `decision` line.
+    DecisionRecorded(Box<DecisionRecord>),
     /// Sentinel to request graceful shutdown of the logger thread.
     Shutdown,
 }
@@ -218,6 +225,7 @@ pub fn spawn_logger(
 // ──────────────────── logger thread ────────────────────
 
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)]
 fn logger_thread_main(
     rx: Receiver<ActivityEvent>,
     sqlite_path: Option<PathBuf>,
@@ -292,12 +300,21 @@ fn logger_thread_main(
                 let pressure_ok = pressure_row
                     .as_ref()
                     .map(|row| db.log_pressure(row).is_ok());
+                let decision_ok = match &event {
+                    ActivityEvent::DecisionRecorded(record) => {
+                        Some(db.log_decision(record).is_ok())
+                    }
+                    _ => None,
+                };
                 // Only update the failure counter when at least one write was
                 // attempted.  Events that produce no SQLite rows (e.g.
                 // ConfigReloaded) must not reset the consecutive-failure
                 // counter, otherwise the circuit breaker can never trip.
-                let any_attempted = activity_ok.is_some() || pressure_ok.is_some();
-                let all_ok = activity_ok.unwrap_or(true) && pressure_ok.unwrap_or(true);
+                let any_attempted =
+                    activity_ok.is_some() || pressure_ok.is_some() || decision_ok.is_some();
+                let all_ok = activity_ok.unwrap_or(true)
+                    && pressure_ok.unwrap_or(true)
+                    && decision_ok.unwrap_or(true);
                 if any_attempted {
                     if all_ok {
                         sqlite_failures = 0;
@@ -318,6 +335,7 @@ fn logger_thread_main(
                     if let Some(db) = &sqlite {
                         let _ = db.prune_pressure_history(RETENTION_DAYS);
                         let _ = db.prune_activity_log(RETENTION_DAYS);
+                        let _ = db.prune_decision_log(RETENTION_DAYS);
                     }
                 }
             } else {
@@ -440,6 +458,7 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
             pressure,
             free_pct,
             duration_ms,
+            decision_id,
         } => {
             let mut e = LogEntry::new(EventType::ArtifactDelete, Severity::Info);
             e.path = Some(path.clone());
@@ -450,6 +469,18 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
             e.free_pct = Some(*free_pct);
             e.duration_ms = Some(*duration_ms);
             e.ok = Some(true);
+            e.decision_id.clone_from(decision_id);
+            e
+        }
+        ActivityEvent::DecisionRecorded(record) => {
+            let mut e = LogEntry::new(EventType::Decision, Severity::Info);
+            e.path = Some(record.path.to_string_lossy().to_string());
+            e.size = Some(record.size_bytes);
+            e.score = Some(record.total_score);
+            e.decision_id = Some(record.id.clone());
+            // The full record: `sbh explain` reads it back when SQLite is
+            // unavailable, and it is the replayable evidence trail.
+            e.details = Some(record.to_json_compact());
             e
         }
         ActivityEvent::ArtifactDeletionFailed {
@@ -545,6 +576,7 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             pressure,
             free_pct,
             duration_ms,
+            decision_id,
         } => Some(ActivityRow {
             timestamp: ts,
             event_type: "artifact_delete".to_string(),
@@ -559,7 +591,7 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             success: 1,
             error_code: None,
             error_message: None,
-            details: None,
+            details: decision_id.as_ref().map(|id| format!("decision_id={id}")),
         }),
         ActivityEvent::ArtifactDeletionFailed {
             path,
@@ -840,6 +872,7 @@ mod tests {
             pressure: "orange".to_string(),
             free_pct: 8.3,
             duration_ms: 145,
+            decision_id: None,
         });
         handle.shutdown();
         join.join().unwrap();
@@ -1128,6 +1161,7 @@ mod tests {
             pressure: "red".to_string(),
             free_pct: 3.2,
             duration_ms: 200,
+            decision_id: None,
         });
         handle.send(ActivityEvent::ArtifactDeletionFailed {
             path: "/data/protected/.target".to_string(),

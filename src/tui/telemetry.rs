@@ -1063,6 +1063,7 @@ fn parse_jsonl_entry_with_schema_shield(line: &str) -> ParseOutcome {
         error_code: read_string_field(object, &["error_code"]),
         error_message: read_string_field(object, &["error_message", "error"]),
         mount_point: read_string_field(object, &["mount_point", "mount"]),
+        decision_id: read_string_field(object, &["decision_id"]),
         details,
     })
 }
@@ -1378,6 +1379,7 @@ mod tests {
             error_code: None,
             error_message: None,
             mount_point: None,
+            decision_id: None,
             details: Some("test deletion".to_string()),
         };
 
@@ -1472,6 +1474,7 @@ mod tests {
                 error_code: None,
                 error_message: None,
                 mount_point: None,
+                decision_id: None,
                 details: Some("started".to_string()),
             },
             crate::logger::jsonl::LogEntry {
@@ -1490,6 +1493,7 @@ mod tests {
                 error_code: None,
                 error_message: None,
                 mount_point: None,
+                decision_id: None,
                 details: None,
             },
             crate::logger::jsonl::LogEntry {
@@ -1508,6 +1512,7 @@ mod tests {
                 error_code: Some("SBH-3002".to_string()),
                 error_message: Some("IO failure".to_string()),
                 mount_point: None,
+                decision_id: None,
                 details: None,
             },
         ];
@@ -1612,6 +1617,7 @@ mod tests {
                 error_code: None,
                 error_message: None,
                 mount_point: None,
+                decision_id: None,
                 details: Some("x".repeat(8192)),
             };
             content.push_str(&serde_json::to_string(&entry).expect("serialize"));
@@ -1652,6 +1658,7 @@ mod tests {
                 error_code: None,
                 error_message: None,
                 mount_point: None,
+                decision_id: None,
                 details: None,
             },
             crate::logger::jsonl::LogEntry {
@@ -1670,6 +1677,7 @@ mod tests {
                 error_code: None,
                 error_message: None,
                 mount_point: None,
+                decision_id: None,
                 details: None,
             },
         ];
@@ -1710,6 +1718,7 @@ mod tests {
                 error_code: None,
                 error_message: None,
                 mount_point: Some("/".to_string()),
+                decision_id: None,
                 details: None,
             },
             crate::logger::jsonl::LogEntry {
@@ -1728,6 +1737,7 @@ mod tests {
                 error_code: None,
                 error_message: None,
                 mount_point: Some("/data".to_string()),
+                decision_id: None,
                 details: None,
             },
         ];
@@ -1796,6 +1806,7 @@ mod tests {
             error_code: None,
             error_message: None,
             mount_point: None,
+            decision_id: None,
             details: Some("started".to_string()),
         };
 
@@ -1838,6 +1849,7 @@ mod tests {
             error_code: None,
             error_message: None,
             mount_point: None,
+            decision_id: None,
             details: Some("late file".to_string()),
         };
         std::fs::write(
@@ -2091,6 +2103,7 @@ mod tests {
             error_code: None,
             error_message: None,
             mount_point: None,
+            decision_id: None,
             details: Some("jsonl source".to_string()),
         };
         std::fs::write(

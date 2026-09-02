@@ -147,6 +147,8 @@ enum Command {
     Check(CheckArgs),
     /// Attribute disk pressure by process/agent.
     Blame(BlameArgs),
+    /// Explain recorded cleanup decisions from the evidence ledger.
+    Explain(ExplainArgs),
     /// Live TUI-style dashboard.
     Dashboard(DashboardArgs),
     /// Run diagnostics.
@@ -296,7 +298,6 @@ impl ResolvedServiceControl {
     after_long_help = "Platform notes:\n  Omit --systemd/--launchd for auto-detection.\n  On macOS, launchd plist discovery checks both user and system scopes before removal."
 )]
 #[allow(clippy::struct_excessive_bools)]
-#[allow(clippy::struct_excessive_bools)]
 struct UninstallArgs {
     /// Remove systemd service units (Linux).
     #[arg(long, conflicts_with = "launchd")]
@@ -401,6 +402,32 @@ struct ServiceLogsArgs {
     /// Number of recent log lines to print.
     #[arg(long, short = 'n', default_value_t = 80, value_name = "N")]
     tail: usize,
+}
+
+#[derive(Debug, Clone, Args, Serialize, Default)]
+#[command(
+    group = clap::ArgGroup::new("selector").required(true).multiple(false),
+    after_long_help = "Levels:\n  0  one-line verdict\n  1  weighted factor table\n  2  posterior, expected loss, calibration, guards (default)\n  3  full serialized trace\n\nSources: the daemon's SQLite decision_log (read-only), falling back to `decision` lines in the JSONL activity log.\nIds are stable per artifact version (path + inode + size) and appear in `scan --json`, `clean --json`, and artifact_delete events."
+)]
+struct ExplainArgs {
+    /// Decision id (12 hex chars) as printed by scan/clean and activity events.
+    #[arg(long, value_name = "ID", group = "selector")]
+    id: Option<String>,
+    /// Show the N most recent decisions.
+    #[arg(long, value_name = "N", group = "selector")]
+    last: Option<usize>,
+    /// Decisions recorded for exactly this path, newest first.
+    #[arg(long, value_name = "PATH", group = "selector")]
+    path: Option<PathBuf>,
+    /// Decisions newer than a window (e.g. 30m, 2h, 1d), newest first.
+    #[arg(long, value_name = "WINDOW", group = "selector")]
+    since: Option<String>,
+    /// Detail level 0-3.
+    #[arg(long, default_value_t = 2, value_name = "LEVEL")]
+    level: u8,
+    /// Maximum records for --path and --since.
+    #[arg(long, default_value_t = 20, value_name = "N")]
+    limit: usize,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -951,9 +978,285 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Update(args) => run_update(cli, args),
         Command::Setup(args) => run_setup(cli, args),
         Command::Bootstrap(args) => run_bootstrap(cli, args),
+        Command::Explain(args) => run_explain(cli, args),
         Command::Log(args) => run_log(cli, args),
         Command::TruncateLogs(args) => run_truncate_logs(cli, args),
     }
+}
+
+/// Which decisions `sbh explain` should render.
+enum ExplainSelector {
+    Id(String),
+    Last(usize),
+    Path(PathBuf),
+    Since(std::time::Duration),
+}
+
+/// Where `sbh explain` reads decisions from: the daemon's SQLite ledger
+/// (read-only) or, when that is absent or unreadable, the `decision` lines of
+/// the JSONL activity log.
+enum ExplainSource {
+    Sqlite(SqliteLogger),
+    Jsonl(Vec<storage_ballast_helper::scanner::decision_record::DecisionRecord>),
+}
+
+impl ExplainSource {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Sqlite(_) => "sqlite",
+            Self::Jsonl(_) => "jsonl",
+        }
+    }
+
+    /// Records matching the selector, newest first, plus (for `--id`) how
+    /// many ledger rows share that id.
+    fn select(
+        &self,
+        selector: &ExplainSelector,
+        limit: u32,
+    ) -> Result<
+        (
+            Vec<storage_ballast_helper::scanner::decision_record::DecisionRecord>,
+            Option<usize>,
+        ),
+        CliError,
+    > {
+        let runtime = |e: storage_ballast_helper::core::errors::SbhError| {
+            CliError::Runtime(format!("decision ledger query failed: {e}"))
+        };
+        match self {
+            Self::Sqlite(db) => Ok(match selector {
+                ExplainSelector::Id(id) => db
+                    .decision_by_id(id)
+                    .map_err(runtime)?
+                    .map_or((Vec::new(), Some(0)), |(record, count)| {
+                        (vec![record], Some(count))
+                    }),
+                ExplainSelector::Last(n) => (
+                    db.recent_decisions(u32::try_from(*n).unwrap_or(u32::MAX).max(1))
+                        .map_err(runtime)?,
+                    None,
+                ),
+                ExplainSelector::Path(path) => (
+                    db.decisions_for_path(&path.to_string_lossy(), limit)
+                        .map_err(runtime)?,
+                    None,
+                ),
+                ExplainSelector::Since(window) => {
+                    let since = (chrono::Utc::now()
+                        - chrono::Duration::from_std(*window).unwrap_or(chrono::Duration::MAX))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    (db.decisions_since(&since, limit).map_err(runtime)?, None)
+                }
+            }),
+            Self::Jsonl(records) => {
+                // `records` are oldest-first as written; render newest first.
+                let newest_first = records.iter().rev();
+                Ok(match selector {
+                    ExplainSelector::Id(id) => {
+                        let matching: Vec<_> = newest_first
+                            .filter(|record| &record.id == id)
+                            .cloned()
+                            .collect();
+                        let count = matching.len();
+                        (matching.into_iter().take(1).collect(), Some(count))
+                    }
+                    ExplainSelector::Last(n) => {
+                        (newest_first.take((*n).max(1)).cloned().collect(), None)
+                    }
+                    ExplainSelector::Path(path) => (
+                        newest_first
+                            .filter(|record| &record.path == path)
+                            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                            .cloned()
+                            .collect(),
+                        None,
+                    ),
+                    ExplainSelector::Since(window) => {
+                        let since = (chrono::Utc::now()
+                            - chrono::Duration::from_std(*window).unwrap_or(chrono::Duration::MAX))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                        (
+                            newest_first
+                                .filter(|record| record.timestamp >= since)
+                                .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                                .cloned()
+                                .collect(),
+                            None,
+                        )
+                    }
+                })
+            }
+        }
+    }
+
+    /// The most recent ids, for the "no match" hint.
+    fn recent_ids(&self, n: u32) -> Vec<String> {
+        match self {
+            Self::Sqlite(db) => db
+                .recent_decisions(n)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|record| record.id)
+                .collect(),
+            Self::Jsonl(records) => records
+                .iter()
+                .rev()
+                .take(usize::try_from(n).unwrap_or(usize::MAX))
+                .map(|record| record.id.clone())
+                .collect(),
+        }
+    }
+}
+
+/// Parse the `decision` lines of a JSONL activity log into records
+/// (oldest first). Lines that are not decisions, or fail to parse, are
+/// skipped: the JSONL log is append-only and may hold older schemas.
+fn decisions_from_jsonl(
+    path: &Path,
+) -> Option<Vec<storage_ballast_helper::scanner::decision_record::DecisionRecord>> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    Some(
+        contents
+            .lines()
+            .filter(|line| line.contains("\"event\":\"decision\""))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry["event"] == "decision")
+            .filter_map(|entry| {
+                entry["details"].as_str().and_then(
+                    storage_ballast_helper::scanner::decision_record::parse_decision_from_details,
+                )
+            })
+            .collect(),
+    )
+}
+
+fn open_explain_source(cli: &Cli, config: &Config) -> Result<ExplainSource, CliError> {
+    let db_path = &config.paths.sqlite_db;
+    if db_path.exists()
+        && let Ok(db) = SqliteLogger::open_read_only(db_path)
+    {
+        return Ok(ExplainSource::Sqlite(db));
+    }
+    if let Some(records) = decisions_from_jsonl(&config.paths.jsonl_log) {
+        if cli.verbose {
+            eprintln!(
+                "[SBH-EXPLAIN] decision ledger {} unavailable; reading {} decision line(s) from {}",
+                db_path.display(),
+                records.len(),
+                config.paths.jsonl_log.display()
+            );
+        }
+        return Ok(ExplainSource::Jsonl(records));
+    }
+    // Neither source is readable: emit the standard permission-aware hint.
+    open_activity_db_for_reading(cli, "explain", config)?.map_or_else(
+        || {
+            Err(CliError::User(format!(
+                "no decision ledger is readable: {} and {} are missing or unreadable",
+                db_path.display(),
+                config.paths.jsonl_log.display()
+            )))
+        },
+        |db| Ok(ExplainSource::Sqlite(db)),
+    )
+}
+
+fn run_explain(cli: &Cli, args: &ExplainArgs) -> Result<(), CliError> {
+    use storage_ballast_helper::scanner::decision_record::{
+        ExplainLevel, format_explain, is_decision_id,
+    };
+
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let level = ExplainLevel::from_int(args.level.min(3));
+    let limit = u32::try_from(args.limit.max(1)).unwrap_or(u32::MAX);
+    let selector = if let Some(id) = &args.id {
+        let id = id.trim().to_ascii_lowercase();
+        if !is_decision_id(&id) {
+            return Err(CliError::User(format!(
+                "{id:?} is not a decision id (12 hex characters); find ids with `sbh explain --last 20`"
+            )));
+        }
+        ExplainSelector::Id(id)
+    } else if let Some(n) = args.last {
+        ExplainSelector::Last(n)
+    } else if let Some(path) = &args.path {
+        ExplainSelector::Path(path.canonicalize().unwrap_or_else(|_| path.clone()))
+    } else if let Some(window) = &args.since {
+        ExplainSelector::Since(parse_window_duration(window)?)
+    } else {
+        return Err(CliError::User(
+            "specify one of --id, --last, --path, or --since".to_string(),
+        ));
+    };
+
+    let source = open_explain_source(cli, &config)?;
+    let (records, shared_count) = source.select(&selector, limit)?;
+    if records.is_empty() {
+        let recent = source.recent_ids(3);
+        let hint = if recent.is_empty() {
+            "the ledger has no decisions yet (the daemon records one per evaluated candidate; `sbh clean` records its plan)".to_string()
+        } else {
+            format!("recent ids: {}", recent.join(", "))
+        };
+        let what = match &selector {
+            ExplainSelector::Id(id) => format!("no decision with id {id}"),
+            ExplainSelector::Last(_) => "no decisions recorded".to_string(),
+            ExplainSelector::Path(path) => format!("no decision for path {}", path.display()),
+            ExplainSelector::Since(_) => "no decisions in that window".to_string(),
+        };
+        if output_mode(cli) == OutputMode::Json {
+            write_json_line(&json!({
+                "command": "explain",
+                "error": "no_matching_decision",
+                "source": source.label(),
+                "recent_ids": recent,
+            }))?;
+        }
+        return Err(CliError::User(format!("{what} ({hint})")));
+    }
+
+    match output_mode(cli) {
+        OutputMode::Json => {
+            let mut payload = json!({
+                "command": "explain",
+                "source": source.label(),
+                "level": args.level.min(3),
+                "count": records.len(),
+                "decisions": records
+                    .iter()
+                    .map(|record| record.to_json_at_level(level))
+                    .collect::<Vec<_>>(),
+            });
+            if let Some(count) = shared_count {
+                payload["records_with_id"] = json!(count);
+            }
+            write_json_line(&payload)?;
+        }
+        OutputMode::Human => {
+            for (index, record) in records.iter().enumerate() {
+                if index > 0 {
+                    println!();
+                }
+                let shared = match shared_count {
+                    Some(count) if count > 1 => {
+                        format!(" ({count} records share this id; newest shown)")
+                    }
+                    _ => String::new(),
+                };
+                println!(
+                    "Decision {}  {}  mode={}  source={}{shared}",
+                    record.id,
+                    record.timestamp,
+                    record.policy_mode,
+                    source.label()
+                );
+                print!("{}", format_explain(record, level));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_bootstrap(cli: &Cli, args: &BootstrapArgs) -> Result<(), CliError> {
@@ -8247,6 +8550,11 @@ fn scan_entry_json(entry: &ScoredScanEntry, explain: bool) -> Value {
         "pattern_name": candidate.classification.pattern_name.as_ref(),
         "confidence": candidate.classification.combined_confidence,
         "decision": format!("{:?}", candidate.decision.action),
+        "decision_id": storage_ballast_helper::scanner::decision_record::stable_decision_id(
+            &candidate.path,
+            candidate.identity,
+            candidate.size_bytes,
+        ),
         "certainty": candidate.decision.certainty.label(),
         "posterior_floor_applied": candidate.decision.posterior_floor_applied,
         "veto_reason": candidate.veto_reason.as_deref(),
@@ -8656,6 +8964,47 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Record the CLI's cleanup decisions in the evidence ledger (SQLite
+/// `decision_log`) so `sbh explain` can answer for `sbh clean` runs, not only
+/// for the daemon. Best effort: a ledger that cannot be opened (typically a
+/// root-owned daemon database) is mentioned in verbose mode and skipped.
+/// Returns the number of records written.
+fn record_cli_decisions(
+    cli: &Cli,
+    config: &Config,
+    candidates: &[CandidacyScore],
+    dry_run: bool,
+) -> usize {
+    use storage_ballast_helper::scanner::decision_record::{DecisionRecordBuilder, PolicyMode};
+
+    if candidates.is_empty() {
+        return 0;
+    }
+    let db = match SqliteLogger::open(&config.paths.sqlite_db) {
+        Ok(db) => db,
+        Err(e) => {
+            if cli.verbose {
+                eprintln!(
+                    "[SBH-CLEAN] decision ledger {} not writable, decisions not recorded: {e}",
+                    config.paths.sqlite_db.display()
+                );
+            }
+            return 0;
+        }
+    };
+    let mode = if dry_run {
+        PolicyMode::DryRun
+    } else {
+        PolicyMode::Live
+    };
+    let mut builder = DecisionRecordBuilder::new();
+    candidates
+        .iter()
+        .map(|candidate| builder.build(candidate, mode, None, None, None))
+        .filter(|record| db.log_decision(record).is_ok())
+        .count()
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let config =
@@ -8807,7 +9156,17 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
         ..Default::default()
     };
     let executor = DeletionExecutor::new(deletion_config, None);
+    // Record every scored, non-vetoed candidate (keep, review and delete
+    // verdicts alike) before planning, so `sbh explain` can also answer
+    // "why was this kept?" for CLI runs.
+    let recorded_decisions = record_cli_decisions(cli, &config, &scored, args.dry_run);
     let plan = executor.plan(scored);
+    if cli.verbose && recorded_decisions > 0 {
+        eprintln!(
+            "[SBH-CLEAN] recorded {recorded_decisions} decision(s) in {} (see `sbh explain --last {recorded_decisions}`)",
+            config.paths.sqlite_db.display()
+        );
+    }
 
     if plan.candidates.is_empty() {
         match output_mode(cli) {
@@ -12575,6 +12934,37 @@ mod tests {
 
         assert!(Cli::try_parse_from(["sbh", "install", "--scope", "user", "--user"]).is_err());
         assert!(Cli::try_parse_from(["sbh", "install", "--systemd", "--launchd"]).is_err());
+    }
+
+    #[test]
+    fn explain_command_requires_exactly_one_selector() {
+        for case in [
+            vec!["sbh", "explain", "--id", "0123456789ab"],
+            vec!["sbh", "explain", "--last", "5"],
+            vec!["sbh", "explain", "--path", "/data/projects/foo/target"],
+            vec!["sbh", "explain", "--since", "2h", "--limit", "5"],
+            vec!["sbh", "explain", "--id", "0123456789ab", "--level", "3"],
+        ] {
+            let parsed = Cli::try_parse_from(case.iter().copied());
+            assert!(parsed.is_ok(), "failed to parse explain case: {case:?}");
+        }
+        let parsed = Cli::try_parse_from(["sbh", "explain", "--last", "3"]).expect("parse");
+        match parsed.command {
+            Command::Explain(args) => {
+                assert_eq!(args.last, Some(3));
+                assert_eq!(args.level, 2, "level 2 is the documented default");
+                assert_eq!(args.limit, 20);
+            }
+            other => panic!("expected explain, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["sbh", "explain"]).is_err(),
+            "a selector is required"
+        );
+        assert!(
+            Cli::try_parse_from(["sbh", "explain", "--id", "0123456789ab", "--last", "2"]).is_err(),
+            "selectors are mutually exclusive"
+        );
     }
 
     #[test]

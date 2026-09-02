@@ -784,6 +784,11 @@ impl DeletionExecutor {
             pressure: String::new(), // Caller doesn't pass pressure level here
             free_pct: 0.0,
             duration_ms,
+            decision_id: Some(crate::scanner::decision_record::stable_decision_id(
+                &candidate.path,
+                candidate.identity,
+                candidate.size_bytes,
+            )),
         });
     }
 

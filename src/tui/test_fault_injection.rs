@@ -145,6 +145,7 @@ fn make_log_entry(
         error_code: None,
         error_message: None,
         mount_point: None,
+        decision_id: None,
         details: None,
     }
 }

@@ -2085,6 +2085,7 @@ fn bootstrap_repairs_an_isolated_home_footprint_with_backups() {
 /// anything is touched.
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn uninstall_dry_run_json_plans_the_user_footprint_and_changes_nothing() {
     let home = tempfile::tempdir().expect("temp home");
     let home_path = home.path();
@@ -2243,6 +2244,202 @@ fn uninstall_dry_run_json_plans_the_user_footprint_and_changes_nothing() {
     assert!(
         ballast_dir.join("ballast-0.bin").exists(),
         "refused purge must not remove ballast"
+    );
+}
+
+/// `sbh clean --dry-run` records its decisions in the ledger and `sbh explain`
+/// reads them back by `--last`, `--id` (every level) and `--path`; an unknown
+/// id fails with a hint listing recent ids.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn explain_reads_back_decisions_recorded_by_clean_dry_run() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let scan_root = dir.path().join("scan-root");
+    let state_dir = dir.path().join("state");
+    let ballast_dir = dir.path().join("ballast");
+    fs::create_dir_all(&scan_root).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(&ballast_dir).unwrap();
+    // A directory's age includes its birth time, so a fixture created now can
+    // never look old; the config below disables the age floor and the clean
+    // runs with --min-score 0 so the target is scored (and recorded) either way.
+    let target = common::create_fake_rust_target(&scan_root, Duration::from_hours(72));
+    let config_path = dir.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"[paths]
+state_file = "{}"
+sqlite_db = "{}"
+jsonl_log = "{}"
+ballast_dir = "{}"
+
+[scanner]
+root_paths = ["{}"]
+min_file_age_minutes = 0
+max_depth = 8
+parallelism = 1
+
+[ballast]
+file_count = 1
+file_size_bytes = 4096
+
+[notifications]
+enabled = false
+"#,
+            toml_path(&state_dir.join("state.json")),
+            toml_path(&state_dir.join("activity.sqlite3")),
+            toml_path(&state_dir.join("activity.jsonl")),
+            toml_path(&ballast_dir),
+            toml_path(&scan_root),
+        ),
+    )
+    .expect("write config");
+    let config_arg = config_path.to_string_lossy().to_string();
+    let root_arg = scan_root.to_string_lossy().to_string();
+
+    // Nothing recorded yet: explain fails with the empty-ledger hint.
+    let empty = common::run_cli_case(
+        "explain_before_any_decision",
+        &["--config", &config_arg, "explain", "--last", "1", "--json"],
+    );
+    assert!(!empty.status.success(), "no ledger yet must fail");
+
+    let clean = common::run_cli_case(
+        "clean_dry_run_records_decisions",
+        &[
+            "--config",
+            &config_arg,
+            "clean",
+            &root_arg,
+            "--dry-run",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    );
+    assert_cli_success(&clean, "clean --dry-run --json");
+    assert!(
+        state_dir.join("activity.sqlite3").exists(),
+        "clean records its plan in the ledger; stdout={}",
+        clean.stdout
+    );
+
+    let last = common::run_cli_case(
+        "explain_last_json",
+        &["--config", &config_arg, "explain", "--last", "50", "--json"],
+    );
+    assert_cli_success(&last, "explain --last 50 --json");
+    let payload = parse_json_stdout(&last);
+    assert_eq!(payload["command"], "explain");
+    assert_eq!(payload["source"], "sqlite");
+    let decisions = payload["decisions"].as_array().expect("decisions array");
+    assert!(
+        !decisions.is_empty(),
+        "clean recorded at least one decision"
+    );
+    let decision = decisions
+        .iter()
+        .find(|d| d["path"].as_str().is_some_and(|p| Path::new(p) == target))
+        .unwrap_or_else(|| panic!("no decision for {}: {decisions:?}", target.display()));
+    let id = decision["id"].as_str().expect("decision id").to_string();
+    assert_eq!(id.len(), 12, "stable ids are 12 hex chars: {id}");
+    assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(decision["policy_mode"], "dry_run");
+
+    // Every level renders for that id, human and JSON.
+    for level in ["0", "1", "2", "3"] {
+        let by_id = common::run_cli_case(
+            "explain_by_id_json",
+            &[
+                "--config",
+                &config_arg,
+                "explain",
+                "--id",
+                &id,
+                "--level",
+                level,
+                "--json",
+            ],
+        );
+        assert_cli_success(&by_id, "explain --id --json");
+        let by_id_json = parse_json_stdout(&by_id);
+        assert_eq!(by_id_json["count"], 1);
+        assert_eq!(by_id_json["decisions"][0]["id"], serde_json::json!(id));
+        assert!(
+            by_id_json["records_with_id"]
+                .as_u64()
+                .is_some_and(|n| n >= 1)
+        );
+        let human = common::run_cli_case(
+            "explain_by_id_human",
+            &[
+                "--config",
+                &config_arg,
+                "explain",
+                "--id",
+                &id,
+                "--level",
+                level,
+            ],
+        );
+        assert_cli_success(&human, "explain --id (human)");
+        assert!(
+            human.stdout.contains(&format!("Decision {id}")),
+            "human output names the id at level {level}: {}",
+            human.stdout
+        );
+        assert!(human.stdout.contains(&target.to_string_lossy().to_string()));
+    }
+
+    let by_path = common::run_cli_case(
+        "explain_by_path_json",
+        &[
+            "--config",
+            &config_arg,
+            "explain",
+            "--path",
+            &target.to_string_lossy(),
+            "--json",
+        ],
+    );
+    assert_cli_success(&by_path, "explain --path --json");
+    assert_eq!(
+        parse_json_stdout(&by_path)["decisions"][0]["id"],
+        serde_json::json!(id)
+    );
+
+    // Unknown id: exit 1 with a hint that lists recent ids.
+    let unknown = common::run_cli_case(
+        "explain_unknown_id",
+        &[
+            "--config",
+            &config_arg,
+            "explain",
+            "--id",
+            "000000000000",
+            "--json",
+        ],
+    );
+    assert!(!unknown.status.success(), "unknown id must fail");
+    assert_eq!(unknown.status.code(), Some(1), "user error exit code");
+    let refusal = parse_json_stdout(&unknown);
+    assert_eq!(refusal["error"], "no_matching_decision");
+    let recent: Vec<String> = refusal["recent_ids"]
+        .as_array()
+        .expect("recent_ids")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !recent.is_empty() && recent.iter().all(|r| r.len() == 12),
+        "hint lists recent ids: {refusal}"
+    );
+    assert!(
+        unknown.stderr.contains("recent ids:") && recent.iter().all(|r| unknown.stderr.contains(r)),
+        "human error carries the hint: {}",
+        unknown.stderr
     );
 }
 

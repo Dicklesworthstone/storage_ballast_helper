@@ -376,7 +376,7 @@ src/
 | `sbh stats [--window WINDOW] [--top-patterns N] [--top-deletions N]` | Time-window activity statistics |
 | `sbh blame [--top N]` | Attribute disk pressure by process/agent |
 | `sbh dashboard` | Live TUI dashboard with pressure visualization |
-| `sbh explain --id <decision-id>` | Explain policy decision evidence |
+| `sbh explain (--id ID \| --last N \| --path P \| --since W) [--level 0-3]` | Explain recorded cleanup decisions from the evidence ledger (SQLite `decision_log`, JSONL fallback) |
 
 ### Configuration and Lifecycle
 

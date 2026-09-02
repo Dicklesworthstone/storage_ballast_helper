@@ -46,6 +46,8 @@ pub enum EventType {
     Info,
     Error,
     Emergency,
+    /// A cleanup decision (the full `DecisionRecord` is in `details`).
+    Decision,
 }
 
 /// A single JSONL log entry — all fields optional except `ts`, `event`, `severity`.
@@ -93,6 +95,9 @@ pub struct LogEntry {
     /// Mount point involved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mount_point: Option<String>,
+    /// Stable decision id linking this event to a ledger decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
     /// Freeform details.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
@@ -127,6 +132,7 @@ impl LogEntry {
             error_code: None,
             error_message: None,
             mount_point: None,
+            decision_id: None,
             details: None,
         }
     }
@@ -987,6 +993,7 @@ mod tests {
             EventType::Info,
             EventType::Error,
             EventType::Emergency,
+            EventType::Decision,
         ];
 
         for et in &event_types {

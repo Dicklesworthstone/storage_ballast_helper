@@ -5760,16 +5760,22 @@ fn executor_thread_main(
 
         // Gate candidates through the policy engine. The lock is held only for
         // the duration of evaluate() (pure computation, no I/O).
-        let (approved_candidates, policy_mode) = {
+        let decision = {
             let guard_snapshot = shared_guard_diagnostics.read().clone();
             let guard_for_policy = guard_snapshot
                 .as_ref()
                 .filter(|diag| diag.status != GuardStatus::Unknown);
-            let decision = policy_engine
+            policy_engine
                 .lock()
-                .evaluate(&batch.candidates, guard_for_policy);
-            (decision.approved_for_deletion, decision.mode)
+                .evaluate(&batch.candidates, guard_for_policy)
         };
+        // Every decision goes to the evidence ledger (SQLite decision_log +
+        // JSONL `decision` lines) whether or not it is executed, so
+        // `sbh explain --id` can answer for keeps and vetoes too.
+        for record in &decision.records {
+            logger.send(ActivityEvent::DecisionRecorded(Box::new(record.clone())));
+        }
+        let (approved_candidates, policy_mode) = (decision.approved_for_deletion, decision.mode);
 
         if !approved_candidates.is_empty() {
             eprintln!(

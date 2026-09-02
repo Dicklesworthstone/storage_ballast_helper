@@ -381,13 +381,23 @@ pub fn create_fake_rust_target(root: &Path, age: Duration) -> PathBuf {
         fs::write(&path, "dummy artifact data").expect("write artifact");
     }
 
-    // Set age on the top-level target directory.
+    // Age the whole tree: a directory's age is its tree idleness (newest
+    // mtime inside), so a fresh inner file would make the target look active.
     if age > Duration::ZERO {
-        let mtime = SystemTime::now() - age;
-        let _ = filetime::set_file_mtime(&target, filetime::FileTime::from_system_time(mtime));
+        let mtime = filetime::FileTime::from_system_time(SystemTime::now() - age);
+        set_mtime_recursive(&target, mtime);
     }
 
     target
+}
+
+fn set_mtime_recursive(path: &Path, mtime: filetime::FileTime) {
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            set_mtime_recursive(&entry.path(), mtime);
+        }
+    }
+    let _ = filetime::set_file_mtime(path, mtime);
 }
 
 // ──────────────────── SyntheticMacTree ────────────────────

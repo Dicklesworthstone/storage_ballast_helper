@@ -414,7 +414,7 @@ sbh --json lease renew --extend 30m
 | `sbh dashboard` | Real-time TUI dashboard |
 | `sbh doctor --pal` | Validate platform integration and macOS runtime prerequisites |
 | `sbh doctor --system` | Check host kernel tuning (writeback / dirty-page limits) |
-| `sbh explain --id <decision-id>` | Explain policy decision evidence |
+| `sbh explain (--id ID \| --last N \| --path P \| --since W) [--level 0-3]` | Explain recorded cleanup decisions: the daemon records one per evaluated candidate, `sbh clean` records its plan; ids are stable per artifact version and appear in `scan --json` and `artifact_delete` events |
 
 On macOS, `sbh doctor --pal` adds PASS/WARN/FAIL checks for the binary signature,
 Gatekeeper assessment, launchd service state, Full Disk Access, APFS inventory,
