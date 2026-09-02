@@ -881,3 +881,38 @@ W1/W10 → v0.6.0 canary → fleet.
 ## 13. Decisions needed from the operator
 
 As revision 2.
+
+## 14. Refinement record (2026-09-02)
+
+Five plan-space passes were run on the bead tree after generation:
+
+1. **Consolidation** with the parallel session's tree (section 5b): 62 G beads
+   merged in, 48 descriptions ported, 16 review comments folded, one missing
+   bead added (`7.4`, the never-implemented monitored-filesystem check),
+   `bd-t951` closed as absorbed, epic-level gating relaxed so 33 beads are
+   ready in parallel.
+2. **Contradiction and dependency review, W6–W13**: 32 beads received
+   decision sections; five splits created (`14.3` cut v0.6.0, `14.4` v0.6.0
+   canary, `12.5` README v0.6.0 additions, `12.6` CHANGELOG backfill, `8.7`
+   scanner-v2 closeout evidence); stale blockers on closed bridge beads
+   removed; W13 raised to P0 and wired to W1/W2/W4/W5/W6/W10 and `8.1`.
+3. **Contradiction and dependency review, W0–W5**: 44 beads received decision
+   sections; six splits created (`1.7` operator-only release checklist,
+   `2.18` Q1 reserve sizing, `2.19` loud degradation surfaces, `3.6` explain
+   verification suite, `4.15` dashboard ballast actions, `5.6` release drift
+   checks + manual release parity). Key decisions recorded: decision id =
+   content hash + sequence, table `decision_log`; `2.8` is the single
+   state.json owner (P0); catalog-derivable roots are a work surface in the
+   mount state machine; quarantine applies at Green and manual `clean` only;
+   the code default and `--auto` stay Enforce; config strictness is opt-in
+   (`--strict`), no refuse-to-start; the daemon lock is the liveness
+   primitive; v0.5.2 ships the lean feature set and includes `READY=1`; one
+   daemon test runner and one injection mechanism (`SBH_TEST_FS_STATS`).
+4. **Interplay pass**: quarantine vs. behavior matrix vs. maintenance
+   recorded on `2.2`, `2.4`, `2.13`, `11.2`.
+5. **Validation**: `bv` reports no cycles, no duplicate suggestions, no
+   priority inversions on the critical path; `br doctor` healthy; tracker in
+   sync.
+
+Entry point for implementers: `br ready` (starts at `1.1`, the clippy fix
+and nightly pin, which gates every workstream root task).

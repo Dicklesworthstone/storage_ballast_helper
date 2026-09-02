@@ -21,3 +21,8 @@ last-touched
 # WAL certification sidecars (`*.db-wal` does not match these)
 *.db-wal-cert
 *.db-wal-cert-head
+
+# br migration and vacuum sidecars
+*.db-journal
+*.vacuum-wal-cert*
+*.fsqlite-migration-state
