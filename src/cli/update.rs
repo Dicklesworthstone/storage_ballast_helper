@@ -18,10 +18,10 @@ use crate::core::hex_lower;
 use crate::core::update_cache::{CachedUpdateMetadata, UpdateMetadataCache};
 
 use super::{
-    HostSpecifier, IntegrityDecision, ReleaseArtifactContract, ReleaseChannel, ReleaseLocator,
-    SigstorePolicy, VerificationMode, resolve_bundle_artifact_contract,
-    resolve_updater_artifact_contract, sigstore_policy_and_probe_for_bundle,
-    verify_artifact_supply_chain,
+    HostSpecifier, IntegrityDecision, ReleaseArtifactContract, ReleaseAssetLayout, ReleaseChannel,
+    ReleaseLocator, ResolvedReleaseAsset, SigstorePolicy, VerificationMode,
+    resolve_bundle_artifact_contract, resolve_updater_artifact_contract,
+    sigstore_policy_and_probe_for_bundle, verify_artifact_supply_chain,
 };
 
 // ---------------------------------------------------------------------------
@@ -663,6 +663,45 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
     report.artifact_url = Some(target.artifact_url.clone());
     report.step_ok(format!("Target version: {}", target.target_tag));
 
+    // Step 3b: Resolve which published asset layout this release actually
+    // uses (versioned tarball, legacy tarball, or raw binary + SHA256SUMS).
+    // Guessing one name is how every v0.5.x updater 404'd.
+    let resolved_asset = if matches!(target.source, TargetMetadataSource::OfflineBundle) {
+        None
+    } else {
+        match fetch_release_asset_names(&contract, &target.target_tag) {
+            Ok(names) => {
+                let Some(asset) = contract.resolve_release_asset(&target.target_tag, &names) else {
+                    report.step_fail(
+                        "Resolve release asset",
+                        format!(
+                            "release {} publishes none of the asset layouts this updater understands ({} assets: {})",
+                            target.target_tag,
+                            names.len(),
+                            names.join(", ")
+                        ),
+                    );
+                    return report;
+                };
+                report.artifact_url = Some(
+                    contract.asset_url_for_tag_and_name(&target.target_tag, &asset.asset_name),
+                );
+                report.step_ok(format!(
+                    "Resolved release asset {} ({:?} layout, checksum from {})",
+                    asset.asset_name, asset.layout, asset.checksum_name
+                ));
+                Some(asset)
+            }
+            Err(e) => {
+                report.step_ok(format!(
+                    "Release asset list unavailable ({e}); assuming {}",
+                    contract.asset_name_for_tag(&target.target_tag)
+                ));
+                None
+            }
+        }
+    };
+
     // Step 4: Compare versions.
     let current_tag = format!("v{current}");
     match compare_release_tags(&current_tag, &target.target_tag) {
@@ -713,7 +752,13 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
                 target.artifact_url
             ));
         } else {
-            report.step_plan(format!("Would download {}", target.artifact_url));
+            report.step_plan(format!(
+                "Would download {}",
+                report
+                    .artifact_url
+                    .clone()
+                    .unwrap_or_else(|| target.artifact_url.clone())
+            ));
         }
         report.step_plan(format!("Would install to {}", install_path.display()));
         report.step_plan(format!(
@@ -733,8 +778,22 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
         }
     };
 
-    let archive_name = contract.asset_name_for_tag(&target.target_tag);
-    let checksum_name = contract.checksum_name_for_tag(&target.target_tag);
+    // Without a resolved layout (offline bundle, or the API was unreachable)
+    // fall back to the workflow's versioned tarball naming.
+    let asset = resolved_asset.unwrap_or_else(|| ResolvedReleaseAsset {
+        layout: ReleaseAssetLayout::VersionedArchive,
+        asset_name: contract.asset_name_for_tag(&target.target_tag),
+        checksum_name: contract.checksum_name_for_tag(&target.target_tag),
+        checksum_is_manifest: false,
+        is_archive: true,
+    });
+    let archive_name = asset.asset_name.clone();
+    // The verifier reads a per-asset sidecar; a manifest is reduced to one below.
+    let checksum_name = if asset.checksum_is_manifest {
+        format!("{archive_name}.sha256")
+    } else {
+        asset.checksum_name.clone()
+    };
     let archive_path = tmp_dir.join(&archive_name);
     let checksum_path = tmp_dir.join(&checksum_name);
     if let (Some(source_archive), Some(source_checksum)) = (
@@ -761,8 +820,9 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
             source_checksum.display()
         ));
     } else {
-        let archive_url = target.artifact_url;
-        let checksum_url = format!("{archive_url}.sha256");
+        let archive_url = contract.asset_url_for_tag_and_name(&target.target_tag, &archive_name);
+        let checksum_url =
+            contract.asset_url_for_tag_and_name(&target.target_tag, &asset.checksum_name);
 
         if let Err(e) = curl_download(&archive_url, &archive_path) {
             report.step_fail("Download artifact", e);
@@ -771,12 +831,46 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
         }
         report.step_ok(format!("Downloaded {archive_name}"));
 
-        if let Err(e) = curl_download(&checksum_url, &checksum_path) {
-            report.step_fail("Download checksum", e);
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return report;
+        if asset.checksum_is_manifest {
+            let manifest_path = tmp_dir.join(&asset.checksum_name);
+            if let Err(e) = curl_download(&checksum_url, &manifest_path) {
+                report.step_fail("Download checksum manifest", e);
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return report;
+            }
+            let manifest = match std::fs::read_to_string(&manifest_path) {
+                Ok(text) => text,
+                Err(e) => {
+                    report.step_fail("Read checksum manifest", e.to_string());
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    return report;
+                }
+            };
+            let Some(digest) = super::sha256_from_manifest(&manifest, &archive_name) else {
+                report.step_fail(
+                    "Locate checksum",
+                    format!("{} has no entry for {archive_name}", asset.checksum_name),
+                );
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return report;
+            };
+            if let Err(e) = std::fs::write(&checksum_path, format!("{digest}  {archive_name}\n")) {
+                report.step_fail("Write checksum sidecar", e.to_string());
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return report;
+            }
+            report.step_ok(format!(
+                "Downloaded {} and selected the {archive_name} entry",
+                asset.checksum_name
+            ));
+        } else {
+            if let Err(e) = curl_download(&checksum_url, &checksum_path) {
+                report.step_fail("Download checksum", e);
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return report;
+            }
+            report.step_ok(format!("Downloaded {checksum_name}"));
         }
-        report.step_ok(format!("Downloaded {checksum_name}"));
     }
 
     // Step 7: Verify integrity (shared code path with installer).
@@ -847,7 +941,12 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
     } else {
         BinaryTrustPolicy::Enforce
     };
-    match extract_and_install(&archive_path, &install_path, binary_trust_policy) {
+    match extract_and_install(
+        &archive_path,
+        &install_path,
+        binary_trust_policy,
+        asset.is_archive,
+    ) {
         Ok(()) => {
             report.step_ok(format!("Installed to {}", install_path.display()));
             report.applied = true;
@@ -1179,8 +1278,48 @@ fn resolve_latest_release_tag(
         contract.repository
     );
 
+    let json = github_api_json(&api_url)?;
+
+    json.get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(normalize_tag)
+        .ok_or_else(|| "no tag_name in GitHub API response".to_string())
+}
+
+/// Names of the assets published for `tag`, from the GitHub releases API.
+///
+/// Public so an opt-in network test can prove the contract resolves against
+/// the live release layout.
+pub fn fetch_release_asset_names(
+    contract: &ReleaseArtifactContract,
+    tag: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let api_url = format!(
+        "https://api.github.com/repos/{}/releases/tags/{tag}",
+        contract.repository
+    );
+    let json = github_api_json(&api_url)?;
+    let assets = json
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "no assets array in GitHub API response".to_string())?;
+    Ok(assets
+        .iter()
+        .filter_map(|asset| asset.get("name").and_then(|n| n.as_str()))
+        .map(str::to_string)
+        .collect())
+}
+
+fn github_api_json(api_url: &str) -> std::result::Result<serde_json::Value, String> {
     let output = Command::new("curl")
-        .args(["-sL", "-H", "Accept: application/json", &api_url])
+        .args([
+            "-sL",
+            "-A",
+            super::HTTP_USER_AGENT,
+            "-H",
+            "Accept: application/json",
+            api_url,
+        ])
         .output()
         .map_err(|e| format!("curl not found or failed: {e}"))?;
 
@@ -1192,18 +1331,12 @@ fn resolve_latest_release_tag(
     }
 
     let body = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("failed to parse API response: {e}"))?;
-
-    json.get("tag_name")
-        .and_then(|v| v.as_str())
-        .map(normalize_tag)
-        .ok_or_else(|| "no tag_name in GitHub API response".to_string())
+    serde_json::from_str(&body).map_err(|e| format!("failed to parse API response: {e}"))
 }
 
 fn curl_download(url: &str, dest: &Path) -> std::result::Result<(), String> {
     let status = Command::new("curl")
-        .args(["-fsSL", "-o"])
+        .args(["-fsSL", "-A", super::HTTP_USER_AGENT, "-o"])
         .arg(dest)
         .arg(url)
         .status()
@@ -1220,30 +1353,37 @@ fn extract_and_install(
     archive_path: &Path,
     install_path: &Path,
     binary_trust_policy: BinaryTrustPolicy,
+    is_archive: bool,
 ) -> std::result::Result<(), String> {
     let extract_dir = archive_path.with_extension("extract");
     std::fs::create_dir_all(&extract_dir)
         .map_err(|e| format!("failed to create extract dir: {e}"))?;
 
-    // Use 'xf' for auto-detection of compression format (xz, gz, etc).
-    let tar_status = Command::new("tar")
-        .args(["xf"])
-        .arg(archive_path)
-        .arg("-C")
-        .arg(&extract_dir)
-        .status()
-        .map_err(|e| format!("failed to run tar: {e}"))?;
+    let new_binary = if is_archive {
+        // Use 'xf' for auto-detection of compression format (xz, gz, etc).
+        let tar_status = Command::new("tar")
+            .args(["xf"])
+            .arg(archive_path)
+            .arg("-C")
+            .arg(&extract_dir)
+            .status()
+            .map_err(|e| format!("failed to run tar: {e}"))?;
 
-    if !tar_status.success() {
-        let _ = std::fs::remove_dir_all(&extract_dir);
-        return Err("tar extraction failed".to_string());
-    }
+        if !tar_status.success() {
+            let _ = std::fs::remove_dir_all(&extract_dir);
+            return Err("tar extraction failed".to_string());
+        }
 
-    let new_binary = extract_dir.join("sbh");
-    if !new_binary.exists() {
-        let _ = std::fs::remove_dir_all(&extract_dir);
-        return Err("extracted archive does not contain sbh binary".to_string());
-    }
+        let new_binary = extract_dir.join("sbh");
+        if !new_binary.exists() {
+            let _ = std::fs::remove_dir_all(&extract_dir);
+            return Err("extracted archive does not contain sbh binary".to_string());
+        }
+        new_binary
+    } else {
+        // Raw-binary layout: the downloaded asset is the executable itself.
+        archive_path.to_path_buf()
+    };
 
     if let Some(parent) = install_path.parent() {
         std::fs::create_dir_all(parent)

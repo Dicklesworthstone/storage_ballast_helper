@@ -698,6 +698,8 @@ impl Channel for WebhookChannel {
             .arg("--silent")
             .arg("--max-time")
             .arg("5")
+            .arg("--user-agent")
+            .arg(crate::cli::HTTP_USER_AGENT)
             .arg("--header")
             .arg("Content-Type: application/json")
             .arg("--data-raw")

@@ -4767,7 +4767,7 @@ struct DashboardRuntimeRequest {
     state_file: PathBuf,
     monitor_paths: Vec<PathBuf>,
     selection: DashboardRuntimeSelection,
-    _reason: DashboardSelectionReason,
+    reason: DashboardSelectionReason,
     sqlite_db: Option<PathBuf>,
     jsonl_log: Option<PathBuf>,
 }
@@ -4864,13 +4864,14 @@ fn run_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Result
 }
 
 #[cfg(feature = "tui")]
-fn run_new_dashboard_runtime(
-    _cli: &Cli,
-    request: &DashboardRuntimeRequest,
-) -> Result<(), CliError> {
+fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Result<(), CliError> {
     use storage_ballast_helper::tui::{
         self, DashboardRuntimeConfig as NewDashboardRuntimeConfig, DashboardRuntimeMode,
     };
+
+    if cli.verbose {
+        eprintln!("[dashboard] starting cockpit runtime ({})", request.reason);
+    }
 
     let config = NewDashboardRuntimeConfig {
         state_file: request.state_file.clone(),
@@ -4890,7 +4891,7 @@ fn run_new_dashboard_runtime(
 /// `sbh dashboard` on a lean build still shows something useful.
 #[cfg(not(feature = "tui"))]
 fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Result<(), CliError> {
-    if let Some(error) = lean_build_dashboard_refusal(&request._reason) {
+    if let Some(error) = lean_build_dashboard_refusal(&request.reason) {
         return Err(error);
     }
     eprintln!(
@@ -4928,7 +4929,7 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
         state_file: config.paths.state_file.clone(),
         monitor_paths: config.scanner.root_paths,
         selection,
-        _reason: reason,
+        reason,
         sqlite_db: Some(config.paths.sqlite_db.clone()),
         jsonl_log: Some(config.paths.jsonl_log),
     };

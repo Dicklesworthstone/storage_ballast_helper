@@ -854,7 +854,7 @@ fn download_and_verify(entry: &AssetEntry, cache: &AssetCache) -> io::Result<u64
     // Write asset data to partial file.
     // Use curl for robust downloading.
     let status = Command::new("curl")
-        .args(["-fsSL", "-o"])
+        .args(["-fsSL", "-A", super::HTTP_USER_AGENT, "-o"])
         .arg(&partial)
         .arg(&entry.url)
         .status()

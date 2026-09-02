@@ -250,7 +250,150 @@ pub struct VerificationOutcome {
     pub warnings: Vec<String>,
 }
 
+/// User-Agent every outbound HTTP request from sbh must carry (AGENTS.md rule).
+pub const HTTP_USER_AGENT: &str = "OpenAI File Downloader, XaiImageApiFetch/1.0";
+
+/// Aggregate checksum manifest published next to raw `sbh_<os>_<arch>` binaries.
+pub const RAW_CHECKSUM_MANIFEST: &str = "SHA256SUMS";
+
+/// Asset layouts a release may use, most preferred first.
+///
+/// The release workflow publishes `sbh-<tag>-<triple>.tar.xz` with a
+/// `.sha256` sidecar; older releases used `sbh-<triple>.tar.xz`; the
+/// hand-published v0.5.x releases carry raw `sbh_<os>_<arch>` binaries with a
+/// single aggregate `SHA256SUMS`. The updater cannot choose which layout an
+/// operator published, so it must resolve against the release's actual asset
+/// list instead of guessing one name (which 404'd for every v0.5.x user).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ReleaseAssetLayout {
+    VersionedArchive,
+    LegacyArchive,
+    RawBinary,
+}
+
+/// One release asset selected for this host, with where its checksum lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedReleaseAsset {
+    pub layout: ReleaseAssetLayout,
+    pub asset_name: String,
+    pub checksum_name: String,
+    /// `true` when `checksum_name` is an aggregate manifest listing many files.
+    pub checksum_is_manifest: bool,
+    /// `true` when the asset is an archive that must be extracted.
+    pub is_archive: bool,
+}
+
+/// Find `asset_name`'s SHA-256 in an aggregate manifest.
+///
+/// Accepts GNU `hash  name`, GNU binary-mode `hash *name`, and BSD
+/// `SHA256 (name) = hash` lines; returns the lowercase 64-hex digest.
+#[must_use]
+pub fn sha256_from_manifest(manifest: &str, asset_name: &str) -> Option<String> {
+    for line in manifest.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(rest) = line.strip_prefix("SHA256 (") {
+            if let Some((name, hash)) = rest.split_once(") = ")
+                && name == asset_name
+            {
+                return normalize_hex64(hash);
+            }
+            continue;
+        }
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let (Some(hash), Some(name)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if name.trim().trim_start_matches('*') == asset_name {
+            return normalize_hex64(hash);
+        }
+    }
+    None
+}
+
+fn normalize_hex64(raw: &str) -> Option<String> {
+    let token = raw.trim().to_ascii_lowercase();
+    (token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit())).then_some(token)
+}
+
 impl ReleaseArtifactContract {
+    /// `sbh_<os>_<arch>` spelling of this target's raw binary, when the
+    /// target has one (`x86_64`/`aarch64` on Linux or macOS).
+    #[must_use]
+    pub fn raw_binary_name(&self) -> Option<String> {
+        let mut parts = self.target.triple.split('-');
+        let arch = match parts.next()? {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            _ => return None,
+        };
+        let rest: Vec<&str> = parts.collect();
+        let os = if rest.contains(&"darwin") {
+            "darwin"
+        } else if rest.contains(&"linux") {
+            "linux"
+        } else {
+            return None;
+        };
+        Some(format!("{}_{os}_{arch}", self.binary_name))
+    }
+
+    /// Candidate assets for `release_tag`, most preferred first.
+    #[must_use]
+    pub fn release_asset_candidates(&self, release_tag: &str) -> Vec<ResolvedReleaseAsset> {
+        let versioned = self.asset_name_for_tag(release_tag);
+        let legacy = self.unversioned_asset_name();
+        let mut candidates = vec![
+            ResolvedReleaseAsset {
+                layout: ReleaseAssetLayout::VersionedArchive,
+                checksum_name: format!("{versioned}.sha256"),
+                asset_name: versioned,
+                checksum_is_manifest: false,
+                is_archive: true,
+            },
+            ResolvedReleaseAsset {
+                layout: ReleaseAssetLayout::LegacyArchive,
+                checksum_name: format!("{legacy}.sha256"),
+                asset_name: legacy,
+                checksum_is_manifest: false,
+                is_archive: true,
+            },
+        ];
+        if let Some(raw) = self.raw_binary_name() {
+            candidates.push(ResolvedReleaseAsset {
+                layout: ReleaseAssetLayout::RawBinary,
+                asset_name: raw,
+                checksum_name: RAW_CHECKSUM_MANIFEST.to_string(),
+                checksum_is_manifest: true,
+                is_archive: false,
+            });
+        }
+        candidates
+    }
+
+    /// Pick the first candidate whose asset and checksum both appear in the
+    /// release's published asset list.
+    #[must_use]
+    pub fn resolve_release_asset(
+        &self,
+        release_tag: &str,
+        published: &[String],
+    ) -> Option<ResolvedReleaseAsset> {
+        self.release_asset_candidates(release_tag)
+            .into_iter()
+            .find(|candidate| {
+                published.contains(&candidate.asset_name)
+                    && published.contains(&candidate.checksum_name)
+            })
+    }
+
+    /// Download URL of a named asset within `release_tag`.
+    #[must_use]
+    pub fn asset_url_for_tag_and_name(&self, release_tag: &str, asset_name: &str) -> String {
+        format!(
+            "https://github.com/{}/releases/download/{release_tag}/{asset_name}",
+            self.repository
+        )
+    }
+
     #[must_use]
     pub fn asset_name(&self) -> String {
         match &self.locator {
@@ -1940,6 +2083,161 @@ mod tests {
                 "macOS guide must document manual release fallback safety fragment: {required}"
             );
         }
+    }
+
+    fn linux_amd64_contract(tag: &str) -> ReleaseArtifactContract {
+        ReleaseArtifactContract {
+            repository: "Dicklesworthstone/storage_ballast_helper",
+            binary_name: "sbh",
+            locator: ReleaseLocator::Tag(tag.to_string()),
+            target: ArtifactTarget {
+                triple: "x86_64-unknown-linux-gnu",
+                archive: ArchiveFormat::TarXz,
+            },
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn raw_binary_names_follow_the_hand_published_scheme() {
+        let mut contract = linux_amd64_contract("v0.5.1");
+        assert_eq!(
+            contract.raw_binary_name().as_deref(),
+            Some("sbh_linux_amd64")
+        );
+        contract.target.triple = "aarch64-unknown-linux-gnu";
+        assert_eq!(
+            contract.raw_binary_name().as_deref(),
+            Some("sbh_linux_arm64")
+        );
+        contract.target.triple = "x86_64-apple-darwin";
+        assert_eq!(
+            contract.raw_binary_name().as_deref(),
+            Some("sbh_darwin_amd64")
+        );
+        contract.target.triple = "aarch64-apple-darwin";
+        assert_eq!(
+            contract.raw_binary_name().as_deref(),
+            Some("sbh_darwin_arm64")
+        );
+        contract.target.triple = "riscv64gc-unknown-linux-gnu";
+        assert_eq!(
+            contract.raw_binary_name(),
+            None,
+            "unknown arch has no raw spelling"
+        );
+    }
+
+    /// The exact asset lists of three real releases (`gh release view --json
+    /// assets`): the workflow layout, the hand-published raw layout, and a
+    /// mixed one. The updater must resolve all of them instead of guessing.
+    #[test]
+    fn release_asset_resolution_matches_the_published_layouts() {
+        // v0.4.28: workflow layout (tarballs + sidecars + provenance).
+        let contract = linux_amd64_contract("v0.4.28");
+        let v0_4_28 = names(&[
+            "sbh-v0.4.28-aarch64-apple-darwin.tar.xz",
+            "sbh-v0.4.28-aarch64-apple-darwin.tar.xz.sha256",
+            "sbh-v0.4.28-x86_64-unknown-linux-gnu.tar.xz",
+            "sbh-v0.4.28-x86_64-unknown-linux-gnu.tar.xz.sha256",
+            "SHA256SUMS.txt",
+            "release-provenance.json",
+        ]);
+        let resolved = contract
+            .resolve_release_asset("v0.4.28", &v0_4_28)
+            .expect("workflow layout resolves");
+        assert_eq!(resolved.layout, ReleaseAssetLayout::VersionedArchive);
+        assert_eq!(
+            resolved.asset_name,
+            "sbh-v0.4.28-x86_64-unknown-linux-gnu.tar.xz"
+        );
+        assert_eq!(
+            resolved.checksum_name,
+            "sbh-v0.4.28-x86_64-unknown-linux-gnu.tar.xz.sha256"
+        );
+        assert!(resolved.is_archive && !resolved.checksum_is_manifest);
+
+        // v0.5.1: hand-published raw binaries + one aggregate SHA256SUMS.
+        let contract = linux_amd64_contract("v0.5.1");
+        let v0_5_1 = names(&[
+            "sbh_darwin_amd64",
+            "sbh_darwin_arm64",
+            "sbh_linux_amd64",
+            "sbh_linux_arm64",
+            "SHA256SUMS",
+        ]);
+        let resolved = contract
+            .resolve_release_asset("v0.5.1", &v0_5_1)
+            .expect("raw layout resolves");
+        assert_eq!(resolved.layout, ReleaseAssetLayout::RawBinary);
+        assert_eq!(resolved.asset_name, "sbh_linux_amd64");
+        assert_eq!(resolved.checksum_name, RAW_CHECKSUM_MANIFEST);
+        assert!(!resolved.is_archive && resolved.checksum_is_manifest);
+        assert_eq!(
+            contract.asset_url_for_tag_and_name("v0.5.1", &resolved.asset_name),
+            "https://github.com/Dicklesworthstone/storage_ballast_helper/releases/download/v0.5.1/sbh_linux_amd64"
+        );
+
+        // v0.4.40: legacy unversioned tarball alongside a typo'd mirror.
+        let contract = linux_amd64_contract("v0.4.40");
+        let v0_4_40 = names(&[
+            "sbh",
+            "sbh.sha256",
+            "sbh-aarch64-apple-darwin.tar.xz",
+            "sbh-aarch64-apple-darwin.tar.xz.sha256",
+            "sbh-x86_64-unknown-linux-gnu.tar.xz",
+            "sbh-x86_64-unknown-linux-gnu.tar.xz.sha256",
+            "sbh-vx86_64-unknown-linux-gnu.tar.xz",
+            "SHA256SUMS",
+        ]);
+        let resolved = contract
+            .resolve_release_asset("v0.4.40", &v0_4_40)
+            .expect("legacy layout resolves");
+        assert_eq!(resolved.layout, ReleaseAssetLayout::LegacyArchive);
+        assert_eq!(resolved.asset_name, "sbh-x86_64-unknown-linux-gnu.tar.xz");
+
+        // A tarball without its sidecar is not resolvable (checksum mandatory).
+        let missing_sidecar = names(&["sbh-v0.4.28-x86_64-unknown-linux-gnu.tar.xz"]);
+        assert_eq!(
+            linux_amd64_contract("v0.4.28").resolve_release_asset("v0.4.28", &missing_sidecar),
+            None
+        );
+        assert_eq!(
+            linux_amd64_contract("v9").resolve_release_asset("v9", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn sha256_from_manifest_accepts_gnu_binary_and_bsd_forms() {
+        let digest_a = "a".repeat(64);
+        let digest_b = "B".repeat(64);
+        let digest_c = "c".repeat(64);
+        let manifest = format!(
+            "{digest_a}  sbh_darwin_amd64\n{digest_b} *sbh_linux_amd64\nSHA256 (sbh_linux_arm64) = {digest_c}\n\nnot a checksum line\n"
+        );
+        assert_eq!(
+            sha256_from_manifest(&manifest, "sbh_darwin_amd64").as_deref(),
+            Some(digest_a.as_str())
+        );
+        assert_eq!(
+            sha256_from_manifest(&manifest, "sbh_linux_amd64").as_deref(),
+            Some(digest_b.to_ascii_lowercase().as_str()),
+            "binary-mode marker and uppercase hex are normalized"
+        );
+        assert_eq!(
+            sha256_from_manifest(&manifest, "sbh_linux_arm64").as_deref(),
+            Some(digest_c.as_str())
+        );
+        assert_eq!(sha256_from_manifest(&manifest, "sbh_windows_amd64"), None);
+        assert_eq!(
+            sha256_from_manifest("deadbeef  sbh_linux_amd64\n", "sbh_linux_amd64"),
+            None,
+            "a short digest is rejected"
+        );
     }
 
     #[test]

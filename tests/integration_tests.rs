@@ -1721,6 +1721,54 @@ fn status_liveness(config_path: &Path) -> serde_json::Value {
     serde_json::from_str(line).expect("parse status JSON")
 }
 
+/// Opt-in live check (`SBH_NET_TESTS=1`): the updater's asset contract must
+/// resolve the *published* layout of a real release. v0.5.1 was hand-published
+/// with raw `sbh_<os>_<arch>` binaries and one `SHA256SUMS`; the previous
+/// updater guessed a tarball name for it and got HTTP 404.
+#[test]
+fn updater_resolves_the_live_release_asset_layout() {
+    use storage_ballast_helper::cli::update::fetch_release_asset_names;
+    use storage_ballast_helper::cli::{HostSpecifier, ReleaseAssetLayout, ReleaseChannel};
+
+    if std::env::var_os("SBH_NET_TESTS").is_none() {
+        eprintln!("skipping: set SBH_NET_TESTS=1 to run the live release-asset check");
+        return;
+    }
+
+    let host = HostSpecifier::detect().expect("detect host");
+    let contract = storage_ballast_helper::cli::resolve_updater_artifact_contract(
+        host,
+        ReleaseChannel::Stable,
+        Some("v0.5.1"),
+    )
+    .expect("resolve contract");
+    let names = fetch_release_asset_names(&contract, "v0.5.1").expect("list release assets");
+    let resolved = contract
+        .resolve_release_asset("v0.5.1", &names)
+        .unwrap_or_else(|| panic!("no resolvable asset for this host in {names:?}"));
+    assert_eq!(resolved.layout, ReleaseAssetLayout::RawBinary);
+
+    let url = contract.asset_url_for_tag_and_name("v0.5.1", &resolved.asset_name);
+    let status = Command::new("curl")
+        .args([
+            "-sIL",
+            "-A",
+            storage_ballast_helper::cli::HTTP_USER_AGENT,
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &url,
+        ])
+        .output()
+        .expect("curl HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout).trim(),
+        "200",
+        "resolved asset must exist: {url}"
+    );
+}
+
 /// `sbh status` must decide daemon liveness from the daemon's lock, not from
 /// process command lines: before this test existed, any shell whose argv
 /// mentioned "sbh" and "daemon" made `daemon_running` true for days after the
