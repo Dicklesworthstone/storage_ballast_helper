@@ -1439,6 +1439,10 @@ fn run_daemon(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
             config.paths.config_file.display()
         )));
     }
+    // Injected filesystem statistics are for the e2e runner only: a unit
+    // that inherited SBH_TEST_MODE must not act on fiction.
+    storage_ballast_helper::platform::test_overlay::refuse_under_service_manager()
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
     let runtime_args = to_runtime_daemon_args(args);
     let mut daemon = MonitoringDaemon::init(config, &runtime_args)
         .map_err(|e| CliError::Runtime(format!("failed to initialize daemon: {e}")))?;

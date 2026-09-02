@@ -5,6 +5,7 @@ pub mod linux;
 pub mod macos;
 pub mod pal;
 pub mod sacred_catalog;
+pub mod test_overlay;
 pub mod types;
 
 use pal::Platform;

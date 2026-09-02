@@ -802,7 +802,9 @@ fn default_mock_self_stats() -> SelfStats {
 pub fn detect_platform() -> Result<Arc<dyn Platform>> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        Ok(Arc::new(crate::platform::current()))
+        // W10: under SBH_TEST_MODE=1 with SBH_TEST_FS_STATS, every mount
+        // query answers from the injected table first.
+        crate::platform::test_overlay::wrap_if_requested(Arc::new(crate::platform::current()))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
