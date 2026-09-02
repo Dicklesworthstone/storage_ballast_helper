@@ -538,18 +538,18 @@ fn table_of(entries: &[String]) -> String {
 
 /// C-EVENT conformance: every line of the run's activity log validates at
 /// the current schema version and names this run.
-fn assert_log_conforms(run: &DaemonRun) {
-    let text = fs::read_to_string(run.data_dir.join("activity.jsonl")).unwrap();
+fn assert_log_conforms(data_dir: &Path) {
+    let text = fs::read_to_string(data_dir.join("activity.jsonl")).unwrap();
     let report = storage_ballast_helper::logger::schema::validate_jsonl(&text)
         .unwrap_or_else(|errors| panic!("activity.jsonl does not conform: {errors:?}"));
     assert!(report.lines > 0, "an empty log proves nothing");
     assert_eq!(report.v1_lines, 0, "{report:?}");
     assert_eq!(report.v2_lines, report.lines, "{report:?}");
-    let run_id = run
-        .state()
-        .and_then(|s| s["run_id"].as_str().map(str::to_string));
-    let run_id = run_id.expect("state.json carries run_id");
-    for event in run.events() {
+    let state: Value =
+        serde_json::from_str(&fs::read_to_string(data_dir.join("state.json")).unwrap()).unwrap();
+    let run_id = state["run_id"].as_str().expect("state.json carries run_id");
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let event: Value = serde_json::from_str(line).unwrap();
         assert_eq!(event["run_id"], run_id, "{event}");
     }
 }

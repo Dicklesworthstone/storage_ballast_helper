@@ -1564,7 +1564,7 @@ fn why_not_report(
     );
     let preflight = executor
         .explain_preflight(&score, Some(&open_set))
-        .map_err(|reason| reason.as_str());
+        .map_err(storage_ballast_helper::scanner::deletion::SkipReason::as_str);
     report.preflight = Some(preflight);
 
     if with_counterfactuals {

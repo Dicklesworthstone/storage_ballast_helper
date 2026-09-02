@@ -280,7 +280,7 @@ const DECISION_LOG_SCHEMA: &[&str] = &[
     "record TEXT 1 0",
 ];
 
-/// Top-level keys of a JSONL `decision` line.
+/// Top-level keys every JSONL `decision` line must carry.
 const DECISION_LINE_KEYS: &[&str] = &[
     "decision_id",
     "details",
@@ -291,6 +291,10 @@ const DECISION_LINE_KEYS: &[&str] = &[
     "size",
     "ts",
 ];
+
+/// Keys the writer may additionally stamp on a line (run provenance); any
+/// other extra key is a schema change and fails the pin.
+const DECISION_LINE_OPTIONAL_KEYS: &[&str] = &["run_id", "schema_version"];
 
 /// Keys every serialized `DecisionRecord` (the `details` payload, and what
 /// level 3 returns) must carry.
@@ -508,13 +512,23 @@ fn daemon_deletions_resolve_through_explain_and_the_ledger_is_pinned() {
         "decision_log schema changed"
     );
     let line = &decisions[0];
-    assert_eq!(
-        keys(line),
-        DECISION_LINE_KEYS
-            .iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>(),
-        "JSONL decision line keys changed: {line}"
+    let line_keys = keys(line);
+    for key in DECISION_LINE_KEYS {
+        assert!(
+            line_keys.contains(*key),
+            "JSONL decision line lost {key}: {line}"
+        );
+    }
+    let unexpected: Vec<&String> = line_keys
+        .iter()
+        .filter(|key| {
+            !DECISION_LINE_KEYS.contains(&key.as_str())
+                && !DECISION_LINE_OPTIONAL_KEYS.contains(&key.as_str())
+        })
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "JSONL decision line grew unknown keys {unexpected:?}: {line}"
     );
     let details: Value = serde_json::from_str(line["details"].as_str().unwrap()).unwrap();
     assert_eq!(
