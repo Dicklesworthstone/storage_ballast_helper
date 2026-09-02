@@ -381,7 +381,7 @@ fn prompt_service<R: BufRead, W: Write>(
     writer: &mut W,
     defaults: &WizardPlatformDefaults,
 ) -> io::Result<ServiceChoice> {
-    let _ = writeln!(writer, "  [1/4] Service manager");
+    let _ = writeln!(writer, "  [1/5] Service manager");
 
     let default = defaults.service_name();
 
@@ -429,7 +429,7 @@ fn prompt_watched_paths<R: BufRead, W: Write>(
         .collect();
 
     let _ = writeln!(writer);
-    let _ = writeln!(writer, "  [2/4] Watched paths for artifact scanning");
+    let _ = writeln!(writer, "  [2/5] Watched paths for artifact scanning");
     let _ = writeln!(writer, "    Defaults: {}", default_display.join(", "));
     let _ = write!(
         writer,
@@ -460,7 +460,7 @@ fn prompt_ballast<R: BufRead, W: Write>(
     writer: &mut W,
 ) -> io::Result<(BallastPreset, usize, u64)> {
     let _ = writeln!(writer);
-    let _ = writeln!(writer, "  [3/4] Ballast pool sizing");
+    let _ = writeln!(writer, "  [3/5] Ballast pool sizing");
     let _ = writeln!(writer, "    Presets:");
     let _ = writeln!(writer, "      s) Small  —  5 GB (5 x 1 GB files)");
     let _ = writeln!(
@@ -546,7 +546,7 @@ fn prompt_confirm<R: BufRead, W: Write>(
 }
 
 fn display_summary<W: Write>(writer: &mut W, answers: &WizardAnswers) {
-    let _ = writeln!(writer, "  [4/4] Configuration summary");
+    let _ = writeln!(writer, "  [5/5] Configuration summary");
     let _ = writeln!(writer, "    Service: {}", answers.service);
     if answers.service != ServiceChoice::None {
         let scope = if answers.user_scope { "user" } else { "system" };
@@ -632,6 +632,7 @@ pub fn format_summary(summary: &WizardSummary) -> String {
         summary.answers.ballast_file_count,
         summary.answers.ballast_file_size_bytes / 1_073_741_824,
     );
+    let _ = writeln!(out, "  Policy mode: {}", summary.answers.initial_mode);
 
     let _ = writeln!(out, "  Config: {}", summary.config_path.display());
     if summary.config_written {
@@ -724,6 +725,7 @@ mod tests {
             ballast_preset: BallastPreset::Small,
             ballast_file_count: 5,
             ballast_file_size_bytes: 1_073_741_824,
+            initial_mode: ActiveMode::Enforce,
             auto_mode: false,
         };
 
@@ -745,6 +747,7 @@ mod tests {
             ballast_preset: BallastPreset::Medium,
             ballast_file_count: 10,
             ballast_file_size_bytes: 1_073_741_824,
+            initial_mode: ActiveMode::Enforce,
             auto_mode: false,
         };
 
@@ -904,6 +907,7 @@ mod tests {
                 ballast_preset: BallastPreset::Large,
                 ballast_file_count: 20,
                 ballast_file_size_bytes: 1_073_741_824,
+                initial_mode: ActiveMode::Enforce,
                 auto_mode: false,
             },
             config_path: PathBuf::from("/etc/sbh/config.toml"),
@@ -1106,6 +1110,7 @@ mod tests {
             ballast_preset: BallastPreset::Large,
             ballast_file_count: 20,
             ballast_file_size_bytes: 1_073_741_824,
+            initial_mode: ActiveMode::Enforce,
             auto_mode: false,
         };
         let config = answers.to_config();
