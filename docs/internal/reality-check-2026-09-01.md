@@ -816,18 +816,177 @@ provision` (graduated); enable catalog roots; `sbh status` must show
 catalog` for `/`. Recorded as a bead with a checklist so the outcome is
 verified, not assumed.
 
+### Ambition additions (rounds 1-3, folded into the plan)
+
+The first draft above closes the gaps as literally stated. Three further passes
+asked "what would make each fix *optimal* for the operator, and what
+established technique gives real leverage here?" The answers below are not
+optional garnish: several of them turn a test-only guarantee into a runtime
+invariant, or turn an irreversible action into a reversible one.
+
+#### G1.7 — Horizon-sized reserve and a self-enforced CPU budget
+
+- **Reserve as time, not bytes.** The graduated floor (G1.1) says *when* a
+  file may be created; it does not say *how much reserve is worth having*. The
+  EWMA forecaster already yields a fill rate and acceleration per mount. Size
+  the target reserve per volume as the predicted fill over the action horizon
+  at an upper quantile: `reserve_target = Q_0.9(fill over action_horizon)`,
+  clamped to `[1 file, configured pool]`, recomputed each Green tick and
+  reported in `status` as `reserve_state.horizon_minutes` (how long the current
+  reserve buys at the current burst rate). Release (G1.1 ladder) then keeps
+  `time_to_exhaustion ≥ action_horizon` rather than releasing a fixed count.
+  A 10 GiB pool on a volume filling at 100 MiB/s buys 100 s; the operator
+  should see that number, and the daemon should size for it. Ruin-theory
+  intuition: ballast is capital, bursts are claims; hold enough capital that
+  the probability of ruin (hitting 100 %) within the horizon stays below a
+  configurable bound (`ballast.ruin_probability`, default 0.05).
+- **Runtime CPU budget.** G1.5 proves "< 1 % of a core" in a test. Make it an
+  invariant: a daemon-wide token bucket fed from `getrusage(RUSAGE_SELF)`
+  deltas (already sampled by the self-monitor) with `daemon.cpu_budget_pct`
+  (default 2 % steady, 25 % under Orange+, unlimited at Critical); when the
+  bucket is empty every non-critical worker (scanner, catalog scan,
+  special-location probes) yields for the deficit, and the fact is logged
+  once per minute and surfaced in `status.daemon.cpu_budget = { pct, deficit_secs }`.
+  The kill switch on this host becomes unnecessary by construction.
+
+#### G13 — Daemon control socket
+
+A Unix-domain socket `<state_dir>/control.sock` (0o600, owner-only; std
+`UnixListener` on a dedicated thread, JSON-lines request/response, no async
+runtime) replaces signal-only control: `ping` (liveness with pid/uptime/version,
+the authoritative answer for `status`), `status` (live, not the 30-s state
+file), `scan-now [paths]`, `reload`, `policy promote|demote|status`,
+`explain <id>` from live memory before the ledger write, `ballast release N`,
+`shutdown`. Signals stay as fallbacks. The dashboard uses it when present for
+sub-second refresh and executes G5.2 actions through it when the daemon is
+running (so the daemon, not the CLI, owns the flock). `sbh daemon ping` and
+`sbh daemon scan-now` are thin wrappers. Security: socket permissions plus a
+per-boot token in the lock file; root daemon + user CLI falls back to the state
+file with `daemon_state_reason = socket_unreadable`.
+
+#### G14 — Quarantine-first deletion with `sbh undo`
+
+The May incidents were unrecoverable because deletion was immediate. Under
+Green and Yellow (where time exists) the executor *moves* a candidate to a
+same-filesystem quarantine directory (`<mount>/.sbh/quarantine/<decision-id>/`)
+instead of unlinking; quarantine entries expire after
+`scanner.quarantine_ttl_hours` (default 24) or immediately when pressure
+reaches Orange (quarantine is drained oldest-first before any new deletion).
+`sbh undo <decision-id>` (or `--path`) restores; `sbh explain` shows
+`quarantined_until`. Rename is O(1) and frees nothing, which is exactly right
+at Green: nothing needed freeing yet. At Orange+ behavior is unchanged
+(direct deletion, space now). Ballast release is never quarantined. Sacred and
+protected paths are never candidates, so quarantine is a second net for the
+scorer, not a substitute for vetoes. The quarantine directory is itself
+`.sbh-protect`ed and excluded from scoring; `du`-style accounting reports it as
+"reclaimable on demand".
+
+#### G15 — Adaptive conformal time-to-exhaustion intervals
+
+The forecaster emits a point TTE and the guardrail scores "conservatism" by
+comparing point predictions to outcomes. Replace the point trigger with an
+interval that carries a coverage guarantee: adaptive conformal inference (ACI)
+over the EWMA residuals gives a lower bound `TTE_lo` such that
+`P(actual TTE ≥ TTE_lo) ≥ 1 − α` with α tracked online (α adapts when coverage
+drifts, which is precisely the distribution-shift case a build burst causes).
+Urgency boosts (currently 1.0 / 0.90 / 0.70 at horizon/30, /6, /2 of the
+*point* TTE) key off `TTE_lo` instead, so early action has a stated error
+rate; the guardrail's "conservative fraction" becomes *empirical coverage*
+versus target coverage, which is a calibration statistic with a known
+distribution rather than a heuristic threshold; the e-process keeps its role as
+the anytime-valid alarm on coverage failure. Reported in `status` as
+`forecast: { tte_point, tte_lo, coverage_target, coverage_empirical }` and in
+`explain` records. No new dependencies: a few hundred lines in
+`monitor/predictive.rs` plus tests with synthetic bursty traces and a
+coverage assertion.
+
+#### G16 — Risk-budgeted batch planner
+
+Today the executor takes the top-N candidates by score up to the level's batch
+size. When a target (`--target-free`, or the Orange threshold) is known, the
+right question is "which set of candidates reaches the target with the least
+expected loss?" — a knapsack with expected reclaim as value and
+`(1 − posterior) × false_positive_loss` as cost, under a per-batch risk budget
+that scales with pressure (Green: tiny; Critical: large). Greedy by
+`bytes / expected_loss` with the risk cap is within a constant factor of
+optimal for this shape and is trivially explainable ("chosen: 3 candidates,
+12.4 GiB, expected loss 4.1 of budget 10"). The planner's choice and budget go
+into every decision record (G2) so `explain` can say why a lower-scored but
+larger candidate went first.
+
+#### Smaller additions
+
+- **G2.4 — `explain --why-not <path>` and counterfactuals.** The commonest
+  operator question is "the disk is full, why didn't it delete X?". Score the
+  path now, run pre-flight, and print the first veto or the factor gap;
+  `--counterfactual` prints the smallest factor change that would flip the
+  action. `--replay <id>` re-scores a stored record with current code and
+  reports drift (reusing the decision-plane replay harness).
+- **G5.7 — Incident replay.** `sbh dashboard --replay <activity.jsonl>` drives
+  the cockpit from a captured log with a time scrubber, using the existing
+  `tui/test_replay.rs` machinery, for postmortems and for reviewing a fleet
+  host's night without SSH.
+- **G7.5 — README-driven command smoke.** A test extracts every `sbh …`
+  invocation from fenced `bash` blocks in README.md and AGENTS.md and verifies
+  the subcommand and every `--flag` exist in clap (`--help` parse), and runs
+  the read-only ones (`--help`, `--dry-run`, `--json` on fixtures). This alone
+  would have caught `explain`, `bootstrap`, `--start-screen`, and the uninstall
+  flags.
+- **G7.6 — Fuzz targets** for the config loader, JSONL reader, `SHA256SUMS`
+  parser, provenance manifest, and the control-socket protocol (`cargo fuzz`,
+  nightly is already required), run for a bounded time in the weekly canary.
+- **G10.7 — Prometheus textfile export.** Each state write also renders
+  `<data_dir>/metrics.prom` (pressure per mount, reserve bytes, TTE_lo,
+  decisions by action, scanner CPU seconds, policy mode) for node_exporter's
+  textfile collector; fleets get graphs with zero new network surface.
+- **G4.5 — Keyless signing and provenance attestation.** `release.yml` signs
+  every asset with `cosign sign-blob` under GitHub OIDC and attaches an
+  `actions/attest-build-provenance` attestation; the provenance manifest
+  records both; the updater sets `SigstorePolicy::Required` whenever the
+  manifest says an asset is signed, so the currently unreachable `Optional`
+  branch becomes a real downgrade path only for pre-signing releases.
+- **G8.7 — Claims registry.** Every numeric claim in README prose (not just
+  tables) carries an HTML comment `<!-- claim:pid.kp -->` resolved by
+  `sbh docs --check`, so prose sentences such as "Kp=0.25" are verified too.
+
+#### Tranches (fastest field impact first)
+
+| Tranche | Beads | Outcome |
+|---|---|---|
+| A — hotfix release v0.5.2 | G7.1, G7.2, G1.3, G3.1, G4.1, G10.1, G11.1 | CI green; `status` truthful; system-scope units start; updater resolves live releases; stats works for operators; docs stop lying about v1 |
+| B — host protection | G1.1, G1.2, G1.4, G1.5, G1.6, G1.7, G3.2, G3.3, G3.4, G0 | This host and the fleet protected; CPU invariant; drift visible |
+| C — explain + contract | G2.1–G2.4, G8.1–G8.7, G4.2–G4.5, G6.1–G6.3, G10.2–G10.7 | Ledger and `explain`; docs generated and tested; release pipeline restored; dead modules live |
+| D — cockpit + policy | G5.1–G5.7, G9.1–G9.3, G13, G14, G15, G16, G11.2, G11.3, G12 | Dashboard ships; policy semantics coherent; control socket, quarantine/undo, conformal TTE, risk-budgeted batches |
+
+Every bead carries a `tranche:<a-d>` label; `bv --robot-plan --label tranche:a`
+yields the hotfix track.
+
 ### Dependency graph (bead ordering)
 
 ```
-G7  toolchain pin + clippy fixes      (unblocks green CI for everything)
-G8  config strictness + doc contract  ─┐
-G3  READY=1 + shutdown + drift        ─┼─> G1 host protection ─> G0 runbook
-G2  decision persistence + explain    ─┼─> G5 dashboard            │
-G10 observability fixes               ─┘                           │
-G4  release contract                  ──> G12 bead hygiene         │
-G6  bootstrap/uninstall wiring                                     │
-G9  policy semantics                  ──> (docs via G8)            │
-G11 scanner v2 closeout               <── G1 CPU proof ────────────┘
+G7.1 pin nightly ─> G7.2 clippy ─> G7.3 CI everything ─> G4.4 re-enable workflows
+                                        │
+G4.1 contract ─> G4.2 installers/wf ────┴──> G4.5 keyless signing ─> G12 hygiene
+             └─> G4.3 doctor --release
+
+G1.1 reserve ┐
+G1.2 catalog ├─> G1.4 loud ─> G1.6 tests ─┐
+G1.3 lock    ┘   G1.5 CPU harness ─────────┼─> G1.7 horizon reserve + CPU budget ─> G0 runbook
+G3.1 READY=1 ─> G3.3 drift ───────────────┘            ▲
+G3.2 shutdown/self-monitor ─> G3.4 lifecycle tests     │
+                                                        │
+G2.1 ledger ─> G2.2 explain ─> G2.3 tests ─> G2.4 why-not/replay
+   │                └───────────────────────────────────┼─> G16 risk-budgeted planner
+   └─> G14 quarantine + undo ───────────────────────────┘
+G13 control socket ─> G9.3 policy subcommand; ─> G5.2 dashboard actions (when daemon runs)
+G15 conformal TTE ─> G9.2 guardrail semantics ─> G9.3 docs/wizard
+G8.1 strict config ─┐
+G8.2 generated docs ┼─> G8.3 ledger fixes ─> G8.6 contract tests ─> G8.7 claims registry
+G7.5 README smoke ──┘
+G5.1 tui default ─> G5.2/G5.3/G5.4 ─> G5.5 honest gate ─> G5.6 e2e ─> G5.7 replay
+G6.1 bootstrap, G6.2 uninstall ─> G6.3 tests
+G10.1..G10.5 ─> G10.6 tests; G10.7 metrics (after G2.1, G15)
+G11.1 docs ─> G11.2 scan --ab ─> G11.3 fleet capture (after G0)
 ```
 
 ### Verification plan (after all bridge work)
@@ -843,3 +1002,18 @@ G11 scanner v2 closeout               <── G1 CPU proof ───────
 - [ ] V23: README example parses strictly; generated tables match code.
 - [ ] Every remaining V-row re-audited with the same seven-area method and the
   table in §1 updated in place.
+- [ ] Tranche A shipped as v0.5.2 through `release.yml` with provenance;
+  `sbh update` from v0.5.1 resolves it.
+- [ ] G14: a deliberate mis-scored fixture deleted at Green is restored by
+  `sbh undo` byte-for-byte.
+- [ ] G15: empirical coverage of `tte_lo` on the synthetic burst suite within
+  ±5 % of target over 10,000 observations.
+- [ ] G13: `sbh daemon ping` answers in < 50 ms while the daemon runs and
+  fails fast with `socket_absent` when it does not.
+
+### Revision history
+
+- 2026-09-01 r1: reality check, vision checklist, discrepancy ledger, bridge plan G0–G13.
+- 2026-09-02 r2 (ambition round 1): horizon-sized reserve and runtime CPU budget (G1.7); quarantine + undo (G14); control socket (G13); README-driven command smoke (G7.5); metrics export (G10.7); why-not/replay explain (G2.4); incident replay (G5.7).
+- 2026-09-02 r3 (ambition round 2): tranche sequencing for fastest field impact; keyless signing + attestation (G4.5); fuzz targets (G7.6); claims registry (G8.7); dashboard actions via the control socket.
+- 2026-09-02 r4 (ambition round 3, technique depth): adaptive conformal TTE intervals replacing point triggers and heuristic conservatism (G15); risk-budgeted knapsack batch planner (G16); ruin-probability framing for reserve sizing (G1.7).
