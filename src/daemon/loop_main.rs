@@ -999,6 +999,29 @@ fn catalog_epoch_due(
     })
 }
 
+/// A pre-scan candidate's age by the walker's rule: files by mtime;
+/// directories by the newest of their mtime, birth time and a bounded probe
+/// of the tree, so a tree created a moment ago with old mtimes (a copy, an
+/// extracted archive) is as young as the walker would find it.
+fn prescan_age(path: &Path) -> Duration {
+    let Ok(meta) = path.metadata() else {
+        return Duration::ZERO;
+    };
+    let entry = crate::scanner::walker::entry_metadata(&meta);
+    let mut newest = entry.effective_age_timestamp();
+    if entry.is_dir {
+        let probe = crate::scanner::walker::tree_newest_mtime(
+            path,
+            crate::scanner::walker::TREE_IDLE_PROBE_MAX_ENTRIES,
+            crate::scanner::walker::TREE_IDLE_PROBE_MAX_DEPTH,
+        );
+        if let Some(tree_newest) = probe.newest_mtime {
+            newest = newest.max(tree_newest);
+        }
+    }
+    newest.elapsed().unwrap_or(Duration::ZERO)
+}
+
 /// Probe write used to leave `MountState::Recovery`: 4 KiB into the mount's
 /// ballast directory (or `<mount>/.sbh`), removed again on success.
 fn probe_mount_writable(mount: &Path, ballast_dir: Option<&Path>) -> bool {
@@ -5767,12 +5790,7 @@ fn scanner_thread_main(
                             {
                                 continue;
                             }
-                            let age = candidate_path
-                                .metadata()
-                                .and_then(|m| m.modified())
-                                .ok()
-                                .and_then(|t| t.elapsed().ok())
-                                .unwrap_or(Duration::ZERO);
+                            let age = prescan_age(&candidate_path);
                             // For directories, metadata().len() only returns the
                             // dir entry size (~4KB), not the recursive contents.
                             // Use a heuristic floor: known artifact dirs (target/,
@@ -7609,6 +7627,119 @@ mod tests {
             WorkerReport::DeletionCompleted { .. } => panic!("expected scanner completion report"),
         }
 
+        logger.shutdown();
+        logger_join.join().unwrap();
+    }
+
+    /// A cargo target created just now whose mtimes were set five hours back
+    /// is young by the walker's rule (birth time). The priority pre-scan must
+    /// measure it the same way and hold it behind `min_file_age_minutes`.
+    #[test]
+    fn scanner_prescan_holds_a_young_tree_with_old_mtimes() {
+        fn set_mtime_recursive(path: &Path, mtime: filetime::FileTime) {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    set_mtime_recursive(&entry.path(), mtime);
+                }
+            }
+            let _ = filetime::set_file_mtime(path, mtime);
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("scan-root");
+        let target = root.join("proj").join("target");
+        let debug = target.join("debug");
+        for sub in ["deps", "incremental", "build", ".fingerprint"] {
+            std::fs::create_dir_all(debug.join(sub)).unwrap();
+        }
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n",
+        )
+        .unwrap();
+        std::fs::write(debug.join("deps").join("libx.rlib"), vec![0xA5u8; 4096]).unwrap();
+        let old = filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_hours(5));
+        set_mtime_recursive(&target, old);
+        if std::fs::metadata(&target)
+            .and_then(|m| m.created())
+            .is_err()
+        {
+            eprintln!("filesystem reports no birth time; the rule has nothing to hold on to here");
+            return;
+        }
+        assert!(
+            prescan_age(&target) < Duration::from_secs(60),
+            "a just-created tree is young whatever its mtimes say"
+        );
+        assert!(
+            prescan_age(&debug.join("deps").join("libx.rlib")) >= Duration::from_hours(4),
+            "files still age by mtime"
+        );
+
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+        config.scanner.min_file_age_minutes = 1;
+        config.scanner.active_reference_min_size_bytes = u64::MAX;
+
+        let log_path = temp.path().join("activity.jsonl");
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: log_path,
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+        })
+        .unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
+        let (report_tx, report_rx) = bounded::<WorkerReport>(1);
+        let (_index_feedback_tx, index_feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        let heartbeat = Arc::new(ThreadHeartbeat::new("test-scanner"));
+        let shared_scoring_config = Arc::new(RwLock::new(config.scoring));
+        let shared_scanner_config = Arc::new(RwLock::new(config.scanner));
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let scanner_index_path = temp.path().join("scanner-index-v2.json");
+
+        scan_tx
+            .send(ScanRequest {
+                paths: vec![root],
+                urgency: 0.9,
+                pressure_level: PressureLevel::Orange,
+                free_pct: Some(9.0),
+                max_delete_batch: 10,
+                force_full_scan: false,
+                config_update: None,
+                catalog_roots: Vec::new(),
+                maintenance: false,
+            })
+            .unwrap();
+        drop(scan_tx);
+
+        scanner_thread_main(
+            &scan_rx,
+            &del_tx,
+            &logger,
+            &shared_scoring_config,
+            &shared_scanner_config,
+            &platform,
+            &heartbeat,
+            &report_tx,
+            &shutdown,
+            &scanner_index_path,
+            &index_feedback_rx,
+        );
+
+        assert!(
+            del_rx.try_recv().is_err(),
+            "a target younger than min_file_age_minutes must not be dispatched by the pre-scan"
+        );
+        assert!(target.exists());
+        let _ = report_rx.try_recv();
         logger.shutdown();
         logger_join.join().unwrap();
     }
