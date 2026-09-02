@@ -422,6 +422,7 @@ src/
 
 | Section | Key Settings |
 |---------|-------------|
+| `[core]` | `strict_config` (unknown keys are always reported; `true` makes the daemon refuse to start and `config validate` fail on them) |
 | `[pressure]` | `green_min_free_pct`, `yellow_min_free_pct`, `orange_min_free_pct`, `red_min_free_pct`, `poll_interval_ms` |
 | `[pressure.prediction]` | `enabled`, `action_horizon_minutes`, `warning_horizon_minutes`, `min_confidence`, `min_samples` |
 | `[scanner]` | `engine` (`"v2"` default, `"v1"` rollback), `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run`, `cross_devices` |

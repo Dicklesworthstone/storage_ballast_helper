@@ -577,7 +577,7 @@ enum ConfigCommand {
     /// Print effective merged configuration.
     Show,
     /// Validate configuration and exit.
-    Validate,
+    Validate(ConfigValidateArgs),
     /// Show effective-vs-default config diff.
     Diff,
     /// Reset to generated defaults.
@@ -592,6 +592,14 @@ struct ConfigSetArgs {
     key: String,
     /// New value to apply.
     value: String,
+}
+
+#[derive(Debug, Clone, Args, Serialize, Default)]
+struct ConfigValidateArgs {
+    /// Fail when the file contains keys no section declares
+    /// (also implied by `[core] strict_config = true`).
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -1413,6 +1421,18 @@ fn to_runtime_daemon_args(args: &DaemonArgs) -> RuntimeDaemonArgs {
 fn run_daemon(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    // A key nobody reads is a setting the operator believes is in force.
+    // Say so at startup; refuse under strict mode.
+    for key in &config.unknown_keys {
+        eprintln!("[SBH-CONFIG] {key}");
+    }
+    if config.core.strict_config && !config.unknown_keys.is_empty() {
+        return Err(CliError::User(format!(
+            "refusing to start: {} unknown config key(s) in {} and [core] strict_config = true (see `sbh config validate`)",
+            config.unknown_keys.len(),
+            config.paths.config_file.display()
+        )));
+    }
     let runtime_args = to_runtime_daemon_args(args);
     let mut daemon = MonitoringDaemon::init(config, &runtime_args)
         .map_err(|e| CliError::Runtime(format!("failed to initialize daemon: {e}")))?;
@@ -4600,29 +4620,65 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Some(ConfigCommand::Validate) => match Config::load(cli.config.as_deref()) {
+        Some(ConfigCommand::Validate(validate)) => match Config::load(cli.config.as_deref()) {
             Ok(config) => {
                 let hash = config
                     .stable_hash()
                     .map_err(|e| CliError::Runtime(e.to_string()))?;
+                // Unknown keys never stop a load (the rest of the file still
+                // applies) but they are the most common way a config is
+                // silently wrong, so validate always lists them and fails on
+                // them under --strict / [core] strict_config.
+                let strict = validate.strict || config.core.strict_config;
+                let unknown = &config.unknown_keys;
+                let valid = unknown.is_empty() || !strict;
 
                 match output_mode(cli) {
                     OutputMode::Human => {
-                        println!("Configuration is valid.");
+                        if unknown.is_empty() {
+                            println!("Configuration is valid.");
+                        } else if strict {
+                            println!(
+                                "Configuration is INVALID under strict mode: {} unknown key(s).",
+                                unknown.len()
+                            );
+                        } else {
+                            println!(
+                                "Configuration is valid, with {} unknown key(s) that are ignored:",
+                                unknown.len()
+                            );
+                        }
+                        for key in unknown {
+                            println!("  - {key}");
+                        }
+                        if !unknown.is_empty() && !strict {
+                            println!(
+                                "  (pass --strict or set [core] strict_config = true to fail on these)"
+                            );
+                        }
                         println!("  Source: {}", config.paths.config_file.display());
                         println!("  Hash: {hash}");
                     }
                     OutputMode::Json => {
                         let payload = json!({
                             "command": "config validate",
-                            "valid": true,
+                            "valid": valid,
+                            "strict": strict,
                             "path": config.paths.config_file.to_string_lossy(),
                             "hash": hash,
+                            "unknown_keys": unknown,
                         });
                         write_json_line(&payload)?;
                     }
                 }
-                Ok(())
+                if valid {
+                    Ok(())
+                } else {
+                    Err(CliError::User(format!(
+                        "invalid config: {} unknown key(s) under strict mode",
+                        unknown.len()
+                    )))
+                }
             }
             Err(e) => {
                 match output_mode(cli) {

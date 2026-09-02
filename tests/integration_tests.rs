@@ -2553,6 +2553,125 @@ fn config_path_and_validate_agree_and_log_explains_missing_file() {
     );
 }
 
+/// Unknown config keys are reported with a did-you-mean, ignored by default,
+/// fatal under `--strict` or `[core] strict_config`, and stop the daemon.
+#[test]
+fn config_validate_reports_unknown_keys_and_strict_mode_refuses_them() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let lenient = dir.path().join("lenient.toml");
+    fs::write(
+        &lenient,
+        "[scanner]\nparalellism = 2\nmax_depth = 4\n\n[scoring.weights]\nlocation = 0.25\n",
+    )
+    .unwrap();
+    let lenient_arg = lenient.to_string_lossy().to_string();
+
+    let validate = common::run_cli_case(
+        "config_validate_unknown_keys_json",
+        &["--config", &lenient_arg, "config", "validate", "--json"],
+    );
+    assert_cli_success(&validate, "config validate --json (lenient)");
+    let payload = parse_json_stdout(&validate);
+    assert_eq!(payload["valid"], serde_json::Value::Bool(true));
+    assert_eq!(payload["strict"], serde_json::Value::Bool(false));
+    let unknown = payload["unknown_keys"].as_array().expect("unknown_keys");
+    let paths: Vec<&str> = unknown.iter().filter_map(|k| k["path"].as_str()).collect();
+    assert!(paths.contains(&"scanner.paralellism"), "{paths:?}");
+    assert!(paths.contains(&"scoring.weights"), "{paths:?}");
+    let typo = unknown
+        .iter()
+        .find(|k| k["path"] == "scanner.paralellism")
+        .expect("typo entry");
+    assert_eq!(typo["suggestion"], "did you mean `parallelism`?");
+
+    let human = common::run_cli_case(
+        "config_validate_unknown_keys_human",
+        &["--config", &lenient_arg, "config", "validate"],
+    );
+    assert_cli_success(&human, "config validate (lenient)");
+    assert!(
+        human
+            .stdout
+            .contains("unknown config key `scanner.paralellism`")
+            && human.stdout.contains("did you mean `parallelism`?")
+            && human.stdout.contains("[scoring] location_weight"),
+        "human output lists keys with hints: {}",
+        human.stdout
+    );
+
+    let strict = common::run_cli_case(
+        "config_validate_strict_json",
+        &[
+            "--config",
+            &lenient_arg,
+            "config",
+            "validate",
+            "--strict",
+            "--json",
+        ],
+    );
+    assert!(
+        !strict.status.success(),
+        "--strict must fail on unknown keys"
+    );
+    assert_eq!(strict.status.code(), Some(1));
+    assert_eq!(
+        parse_json_stdout(&strict)["valid"],
+        serde_json::Value::Bool(false)
+    );
+
+    // A clean file passes --strict.
+    let clean = dir.path().join("clean.toml");
+    fs::write(&clean, "[scanner]\nparallelism = 2\n").unwrap();
+    let clean_arg = clean.to_string_lossy().to_string();
+    let strict_ok = common::run_cli_case(
+        "config_validate_strict_clean",
+        &[
+            "--config", &clean_arg, "config", "validate", "--strict", "--json",
+        ],
+    );
+    assert_cli_success(&strict_ok, "config validate --strict (clean)");
+    assert!(
+        parse_json_stdout(&strict_ok)["unknown_keys"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+
+    // [core] strict_config = true: validate fails and the daemon refuses to start.
+    let strict_cfg = dir.path().join("strict.toml");
+    fs::write(
+        &strict_cfg,
+        "[core]\nstrict_config = true\n\n[scanner]\nparalellism = 2\n",
+    )
+    .unwrap();
+    let strict_arg = strict_cfg.to_string_lossy().to_string();
+    let by_config = common::run_cli_case(
+        "config_validate_strict_config_key",
+        &["--config", &strict_arg, "config", "validate", "--json"],
+    );
+    assert!(!by_config.status.success());
+    assert_eq!(
+        parse_json_stdout(&by_config)["strict"],
+        serde_json::Value::Bool(true)
+    );
+    let daemon = common::run_cli_case(
+        "daemon_refuses_unknown_keys",
+        &["--config", &strict_arg, "daemon"],
+    );
+    assert!(
+        !daemon.status.success(),
+        "daemon must refuse under strict_config; stdout={} stderr={}",
+        daemon.stdout,
+        daemon.stderr
+    );
+    assert!(
+        daemon.stderr.contains("refusing to start")
+            && daemon.stderr.contains("scanner.paralellism"),
+        "daemon names the offending key: {}",
+        daemon.stderr
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_foreground_daemon_idle_energy_budget() {

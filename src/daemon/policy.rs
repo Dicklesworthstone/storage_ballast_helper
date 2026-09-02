@@ -112,7 +112,7 @@ impl fmt::Display for FallbackReason {
 
 /// Configuration for the policy engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Initial mode on daemon start.
     pub initial_mode: ActiveMode,
@@ -754,7 +754,7 @@ impl From<BehaviorCellConfig> for BehaviorMode {
 
 /// `[behavior]` configuration: which matrix the daemon runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BehaviorConfig {
     /// Matrix preset (`"v0.6"` default, `"v0.5"` rollback, `"custom"`).
     /// Overridable with `SBH_BEHAVIOR_PRESET`.

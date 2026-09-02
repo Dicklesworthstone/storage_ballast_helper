@@ -876,6 +876,40 @@ struct MountMonitor {
     last_guard_sample: Option<GuardSample>,
 }
 
+/// One mount's reading from `check_pressure`, kept so `handle_pressure` can
+/// drive every mount from its own response instead of only the worst one.
+#[derive(Debug, Clone)]
+struct MountTickResponse {
+    response: crate::monitor::pid::PressureResponse,
+    seconds_to_red: Option<f64>,
+    prediction_confident: bool,
+}
+
+/// Controller tunables derived from config.
+fn mount_controller_config(config: &Config) -> MountControllerConfig {
+    MountControllerConfig {
+        action_horizon: Duration::from_secs_f64(
+            (config.pressure.prediction.action_horizon_minutes * 60.0).max(0.0),
+        ),
+        recovery_clean_windows: crate::daemon::mount_controller::DEFAULT_RECOVERY_CLEAN_WINDOWS,
+        min_rescan_interval: Duration::from_secs(config.scanner.min_rescan_interval_secs.max(1)),
+        red_min_free_pct: config.pressure.red_min_free_pct,
+    }
+}
+
+/// Probe write used to leave `MountState::Recovery`: 4 KiB into the mount's
+/// ballast directory (or `<mount>/.sbh`), removed again on success.
+fn probe_mount_writable(mount: &Path, ballast_dir: Option<&Path>) -> bool {
+    let dir = ballast_dir.map_or_else(|| mount.join(".sbh"), Path::to_path_buf);
+    if fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let probe = dir.join("probe");
+    let written = fs::write(&probe, [0u8; 4096]).is_ok();
+    let _ = fs::remove_file(&probe);
+    written
+}
+
 struct GuardSample {
     at: Instant,
     available_bytes: u64,
@@ -1027,6 +1061,16 @@ pub struct MonitoringDaemon {
     pidfile: Option<PathBuf>,
     fs_collector: FsStatsCollector,
     mount_monitors: HashMap<PathBuf, MountMonitor>,
+    /// One control state machine per mount (W1.1): decides per mount whether
+    /// sbh reclaims, maintains, only observes, recovers or idles, and what
+    /// each mount contributes to the tick cadence.
+    mount_controllers: HashMap<PathBuf, MountController>,
+    /// Every mount's response from the last `check_pressure`, consumed by
+    /// `handle_pressure` so each mount is driven by its own reading.
+    mount_responses: Vec<MountTickResponse>,
+    /// Wake signals (SIGUSR1, reload) collected for the next tick's
+    /// controllers.
+    wake_next_tick: WakeSignals,
     special_locations: SpecialLocationRegistry,
     ballast_coordinator: BallastPoolCoordinator,
     release_controller: BallastReleaseController,
@@ -1902,6 +1946,9 @@ impl MonitoringDaemon {
             pidfile: args.pidfile.clone(),
             fs_collector,
             mount_monitors: HashMap::new(),
+            mount_controllers: HashMap::new(),
+            mount_responses: Vec::new(),
+            wake_next_tick: WakeSignals::default(),
             special_locations,
             ballast_coordinator,
             release_controller,
@@ -2794,6 +2841,13 @@ impl MonitoringDaemon {
                 self.last_predictive_action = pred_action;
             }
 
+            // Keep this mount's own reading for the per-mount controllers.
+            self.mount_responses.push(MountTickResponse {
+                response: response.clone(),
+                seconds_to_red: predicted_seconds,
+                prediction_confident: rate_estimate.confidence >= effective_min_conf,
+            });
+
             // Track worst response (highest urgency/severity).
             match worst_response {
                 None => {
@@ -3506,6 +3560,13 @@ impl MonitoringDaemon {
     // ──────────────────── ballast ────────────────────
 
     fn provision_ballast(&mut self) -> Result<()> {
+        if !self.config.ballast.auto_provision {
+            eprintln!(
+                "[SBH-DAEMON] ballast auto_provision = false; not provisioning \
+                 (run `sbh ballast provision` to build the pool)"
+            );
+            return Ok(());
+        }
         let report = self
             .ballast_coordinator
             .provision_all(self.platform.as_ref())?;

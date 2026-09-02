@@ -667,44 +667,44 @@ root_paths = ["/data/projects", "/tmp", "/dev/shm"]
 cross_devices = false
 protected_paths = ["/data/projects/production-*", "/home/*/critical-builds"]
 
-[monitor]
-sample_interval_seconds = 2
-pressure_green_pct = 35
-pressure_yellow_pct = 20
-pressure_orange_pct = 10
-pressure_red_pct = 5
+[core]
+strict_config = false  # true: refuse to start when the file has keys no section declares
+
+[pressure]
+green_min_free_pct = 35.0
+yellow_min_free_pct = 20.0
+orange_min_free_pct = 10.0
+red_min_free_pct = 5.0
+poll_interval_ms = 2000
 
 [ballast]
-auto_provision = true
-per_volume_file_count = 5
-per_volume_file_size_mb = 1024
+auto_provision = true          # false: the daemon never builds the pool; use `sbh ballast provision`
+file_count = 5
+file_size_bytes = 1073741824   # 1 GiB per file
 
 [ballast.overrides."/data"]
 file_count = 10
-file_size_mb = 2048
+file_size_bytes = 2147483648
 
 [ballast.overrides."/tmp"]
 enabled = false
 
-[scoring.weights]
-location = 0.25
-name = 0.25
-age = 0.20
-size = 0.15
-structure = 0.15
+[scoring]
+location_weight = 0.25
+name_weight = 0.25
+age_weight = 0.20
+size_weight = 0.15
+structure_weight = 0.15
+calibration_floor = 0.75
 
 [policy]
-mode = "observe" # observe | canary | enforce
-canary_delete_cap_per_hour = 5
-fallback_safe = true
+initial_mode = "observe"       # observe | canary | enforce
+max_canary_deletes_per_hour = 5
+kill_switch = false            # true holds the daemon in fallback-safe (no deletions)
 
-[guardrails]
-calibration_floor = 0.75
-consecutive_clean_windows_for_recovery = 5
-
-[logging]
-sqlite_path = "/var/lib/sbh/activity.db"
-jsonl_path = "/var/log/sbh/activity.jsonl"
+[paths]
+sqlite_db = "/var/lib/sbh/activity.sqlite3"
+jsonl_log = "/var/lib/sbh/activity.jsonl"
 
 [pressure.prediction]
 enabled = true
@@ -765,6 +765,8 @@ writeback_benchmark_bytes = 100663296     # 96 MiB micro-benchmark budget
 writeback_pool_warn_bytes = 4294967296    # doctor WARN above ~4 GiB effective dirty pool
 writeback_sysctl_path = "/etc/sysctl.d/99-sbh-writeback.conf"
 ```
+
+Every section rejects keys it does not declare. `sbh config validate` lists unknown keys with a did-you-mean (legacy names such as `[monitor]`, `[scoring.weights]`, `per_volume_file_size_mb` or `policy.mode` get their replacement spelled out), the daemon warns about them at startup, and `sbh config validate --strict` or `[core] strict_config = true` turns them into errors. Path-typed values expand a leading `~` or `$HOME`. This example is parsed by the test suite, so it cannot drift from the code.
 
 ## Environment Variable Overrides
 

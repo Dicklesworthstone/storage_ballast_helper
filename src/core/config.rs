@@ -16,10 +16,42 @@ use crate::daemon::policy::{BehaviorConfig, BehaviorDispatchTable, BehaviorPrese
 /// Supplemental protection file written by `sbh protect`.
 pub const SACRED_CONFIG_FILENAME: &str = "sacred.toml";
 
+/// A key in the config file that no section declares.
+///
+/// Collected (not fatal) by [`Config::load`]; `sbh config validate` lists
+/// them and fails under `--strict` or `[core] strict_config = true`, and the
+/// daemon warns per key at startup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnknownConfigKey {
+    /// Dotted key path as written, e.g. `scoring.weights` or `monitor`.
+    pub path: String,
+    /// "did you mean `x`?" or the replacement for a legacy README key.
+    pub suggestion: Option<String>,
+}
+
+impl std::fmt::Display for UnknownConfigKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.suggestion {
+            Some(suggestion) => write!(f, "unknown config key `{}` ({suggestion})", self.path),
+            None => write!(f, "unknown config key `{}`", self.path),
+        }
+    }
+}
+
+/// `[core]`: behaviour of the config loader itself.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CoreConfig {
+    /// Refuse to start the daemon (and fail `config validate`) when the file
+    /// contains keys no section declares, instead of warning about them.
+    pub strict_config: bool,
+}
+
 /// Full SBH configuration model.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub core: CoreConfig,
     pub pressure: PressureConfig,
     pub scanner: ScannerConfig,
     pub scoring: ScoringConfig,
@@ -35,11 +67,212 @@ pub struct Config {
     /// `cells`). See [`BehaviorConfig`].
     pub behavior: BehaviorConfig,
     pub system_tuning: SystemTuningConfig,
+    /// Keys the loaded file contained that no section declares. Not part
+    /// of the file format (never serialized; excluded from `stable_hash`).
+    #[serde(skip)]
+    pub unknown_keys: Vec<UnknownConfigKey>,
+}
+
+/// Parse a config file leniently: every struct rejects unknown keys, so the
+/// parser is run repeatedly, removing each reported unknown key from the raw
+/// table until it succeeds. The removed keys come back with did-you-mean
+/// suggestions; the returned config is what a lenient parse would have
+/// produced. Any other parse error is returned as-is.
+fn parse_config_lenient(raw: &str) -> Result<(Config, Vec<UnknownConfigKey>)> {
+    const MAX_UNKNOWN_KEYS: usize = 256;
+    let mut table: toml::Table = toml::from_str(raw)?;
+    let mut unknown = Vec::new();
+    loop {
+        match table.clone().try_into::<Config>() {
+            Ok(config) => return Ok((config, unknown)),
+            Err(err) => {
+                let message = err.to_string();
+                let Some((field, expected)) = parse_unknown_field_error(&message) else {
+                    return Err(err.into());
+                };
+                let Some(path) = remove_unknown_key(&mut table, &field, &expected) else {
+                    return Err(err.into());
+                };
+                let suggestion = suggest_config_key(&field, &expected, &path);
+                unknown.push(UnknownConfigKey { path, suggestion });
+                if unknown.len() > MAX_UNKNOWN_KEYS {
+                    return Err(SbhError::InvalidConfig {
+                        details: format!(
+                            "more than {MAX_UNKNOWN_KEYS} unknown keys; this is not an sbh config file"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Extract (`field`, expected keys) from serde's `unknown field` message,
+/// which reads "unknown field `x`, expected one of `a`, `b`" or
+/// "unknown field `x`, expected `a`".
+fn parse_unknown_field_error(message: &str) -> Option<(String, Vec<String>)> {
+    let rest = message.split("unknown field `").nth(1)?;
+    let (field, after) = rest.split_once('`')?;
+    let expected_part = after.split("expected").nth(1).unwrap_or("");
+    let expected_line = expected_part.lines().next().unwrap_or("");
+    let expected = expected_line
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect();
+    Some((field.to_string(), expected))
+}
+
+/// Remove `field` from the table the parser complained about and return its
+/// dotted path. Prefers a table whose other keys are all in `expected` (the
+/// keys the complaining struct declares); falls back to the first table that
+/// holds the key at all (a section with several unknown keys).
+fn remove_unknown_key(table: &mut toml::Table, field: &str, expected: &[String]) -> Option<String> {
+    let mut prefix = Vec::new();
+    remove_unknown_key_in(table, field, expected, true, &mut prefix)
+        .or_else(|| remove_unknown_key_in(table, field, expected, false, &mut prefix))
+}
+
+fn remove_unknown_key_in(
+    table: &mut toml::Table,
+    field: &str,
+    expected: &[String],
+    siblings_must_be_known: bool,
+    prefix: &mut Vec<String>,
+) -> Option<String> {
+    if table.contains_key(field) {
+        let siblings_known = table
+            .keys()
+            .filter(|key| key.as_str() != field)
+            .all(|key| expected.iter().any(|known| known == key));
+        if !siblings_must_be_known || siblings_known {
+            table.remove(field);
+            let mut path = prefix.clone();
+            path.push(field.to_string());
+            return Some(path.join("."));
+        }
+    }
+    for (key, value) in table.iter_mut() {
+        prefix.push(key.clone());
+        let found = match value {
+            toml::Value::Table(inner) => {
+                remove_unknown_key_in(inner, field, expected, siblings_must_be_known, prefix)
+            }
+            toml::Value::Array(items) => items.iter_mut().enumerate().find_map(|(index, item)| {
+                let toml::Value::Table(inner) = item else {
+                    return None;
+                };
+                prefix.push(format!("[{index}]"));
+                let found =
+                    remove_unknown_key_in(inner, field, expected, siblings_must_be_known, prefix);
+                prefix.pop();
+                found
+            }),
+            _ => None,
+        };
+        prefix.pop();
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// Replacements for keys that older READMEs and configs used.
+fn legacy_config_key_hint(path: &str) -> Option<&'static str> {
+    let leaf = path.rsplit('.').next().unwrap_or(path);
+    let hint = match path {
+        "monitor" => {
+            "the [monitor] section became [pressure]: green_min_free_pct, yellow_min_free_pct, orange_min_free_pct, red_min_free_pct, poll_interval_ms"
+        }
+        "logging" => "the [logging] section became [paths]: sqlite_db, jsonl_log",
+        "guardrails" => {
+            "guardrail settings live in [scoring] calibration_floor and [telemetry] guardrail_window_size / guardrail_min_observations"
+        }
+        "scoring.weights" => {
+            "weights are flat keys: [scoring] location_weight, name_weight, age_weight, size_weight, structure_weight"
+        }
+        "ballast.per_volume_file_count" => "use [ballast] file_count",
+        "ballast.per_volume_file_size_mb" => "use [ballast] file_size_bytes",
+        "policy.mode" => "use [policy] initial_mode = \"observe\" | \"canary\" | \"enforce\"",
+        "policy.canary_delete_cap_per_hour" => "use [policy] max_canary_deletes_per_hour",
+        "policy.fallback_safe" => {
+            "use [policy] kill_switch = true to hold the daemon in fallback-safe"
+        }
+        _ => match leaf {
+            "file_size_mb" => "use file_size_bytes",
+            "scan_interval_secs" | "sample_interval_seconds" => "use [pressure] poll_interval_ms",
+            "max_ballast_mb" => "use [ballast] file_count and file_size_bytes",
+            "log_level" => "removed; there is no log level setting",
+            _ => return None,
+        },
+    };
+    Some(hint)
+}
+
+/// A did-you-mean for an unknown key: a legacy-key hint when the key is a
+/// known relic, else the closest declared key by edit distance.
+fn suggest_config_key(field: &str, expected: &[String], path: &str) -> Option<String> {
+    if let Some(hint) = legacy_config_key_hint(path) {
+        return Some(hint.to_string());
+    }
+    let threshold = (field.len() / 3).max(2);
+    expected
+        .iter()
+        .map(|candidate| (levenshtein(field, candidate), candidate))
+        .filter(|(distance, _)| *distance <= threshold)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| format!("did you mean `{candidate}`?"))
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(ca != cb);
+            current[j + 1] = (previous[j + 1] + 1).min(current[j] + 1).min(substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
+}
+
+/// Expand a leading `~`, `~/`, `$HOME` or `${HOME}` in a path. Anything
+/// else is returned unchanged; without a `HOME` the path is left alone.
+#[must_use]
+pub fn expand_home_path(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    PathBuf::from(expand_home_str(text))
+}
+
+/// [`expand_home_path`] for string-typed paths and globs.
+#[must_use]
+pub fn expand_home_str(text: &str) -> String {
+    let Some(home) = env::var_os("HOME") else {
+        return text.to_string();
+    };
+    let home = home.to_string_lossy();
+    for prefix in ["~/", "$HOME/", "${HOME}/"] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            return format!("{}/{rest}", home.trim_end_matches('/'));
+        }
+    }
+    if text == "~" || text == "$HOME" || text == "${HOME}" {
+        return home.to_string();
+    }
+    text.to_string()
 }
 
 /// Pressure thresholds and control knobs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PressureConfig {
     pub green_min_free_pct: f64,
     pub yellow_min_free_pct: f64,
@@ -54,7 +287,7 @@ pub struct PressureConfig {
 
 /// Knobs for predictive pre-emptive action (EWMA → graduated response).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PredictionConfig {
     /// Master switch — when false, predictive pipeline is disabled.
     pub enabled: bool,
@@ -150,7 +383,7 @@ impl std::str::FromStr for ScannerEventSourceMode {
 
 /// Scanner behavior and safety constraints.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ScannerConfig {
     pub engine: ScannerEngineMode,
     pub event_source: ScannerEventSourceMode,
@@ -220,7 +453,7 @@ pub struct ScannerConfig {
 /// per home). Other wildcard characters such as `?` are treated literally.
 /// `~` and `$HOME` are NOT expanded; configure absolute paths explicitly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LogTruncationConfig {
     /// Master switch. Disabled by default for backward compatibility with
     /// existing deployments; enable explicitly per-host once paths are vetted.
@@ -243,7 +476,7 @@ pub struct LogTruncationConfig {
 
 /// Multi-factor score weights and decision-theoretic losses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ScoringConfig {
     pub min_score: f64,
     pub location_weight: f64,
@@ -264,7 +497,7 @@ pub struct ScoringConfig {
 
 /// Ballast allocation settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BallastConfig {
     pub file_count: usize,
     pub file_size_bytes: u64,
@@ -279,7 +512,7 @@ pub struct BallastConfig {
 
 /// Per-volume override for ballast pool settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BallastVolumeOverride {
     /// Whether to provision a ballast pool on this volume (default: true).
     pub enabled: bool,
@@ -330,7 +563,7 @@ impl BallastConfig {
 
 /// Tuning knobs for the VOI scan scheduler.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct VoiConfig {
     /// Master switch.
     pub enabled: bool,
@@ -376,7 +609,7 @@ impl Default for VoiConfig {
 
 /// Logging and stats-collector tuning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TelemetryConfig {
     pub fs_cache_ttl_ms: u64,
     pub ewma_base_alpha: f64,
@@ -397,7 +630,7 @@ pub struct TelemetryConfig {
 
 /// Update-check behavior, cache policy, and opt-out controls.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
     pub enabled: bool,
     pub metadata_cache_ttl_seconds: u64,
@@ -417,7 +650,7 @@ pub struct UpdateConfig {
 /// surfaced by `sbh doctor --system` and applied by `sbh tune --apply` or `sbh
 /// install` (both root-gated, backup-first, reversible).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SystemTuningConfig {
     /// Master switch for writeback tuning detection/recommendation.
     pub writeback_enabled: bool,
@@ -508,7 +741,7 @@ impl std::str::FromStr for DashboardMode {
 /// 5. `dashboard.mode` config field → configured mode
 /// 6. Hardcoded default → New
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DashboardConfig {
     /// Default runtime mode when no CLI flag or env var overrides.
     pub mode: DashboardMode,
@@ -527,7 +760,7 @@ impl Default for DashboardConfig {
 
 /// Filesystem paths used by sbh.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PathsConfig {
     pub config_file: PathBuf,
     pub ballast_dir: PathBuf,
@@ -1277,7 +1510,8 @@ impl Config {
                 source,
             })?;
             let raw_value: toml::Value = toml::from_str(&raw)?;
-            let mut parsed: Self = toml::from_str(&raw)?;
+            let (mut parsed, unknown_keys) = parse_config_lenient(&raw)?;
+            parsed.unknown_keys = unknown_keys;
             let system_path_defaults;
             let path_defaults = if is_system_fallback || effective_path == system_config_file() {
                 system_path_defaults = PathsConfig::system_default();
@@ -1619,6 +1853,37 @@ impl Config {
 
     /// Normalize paths for consistent comparison (M27).
     fn normalize_paths(&mut self) {
+        // `~` and `$HOME` in path-typed fields: a literal `~` directory is
+        // never what an operator meant.
+        for path in [
+            &mut self.paths.config_file,
+            &mut self.paths.ballast_dir,
+            &mut self.paths.state_file,
+            &mut self.paths.sqlite_db,
+            &mut self.paths.jsonl_log,
+            &mut self.update.metadata_cache_file,
+            &mut self.system_tuning.writeback_sysctl_path,
+            &mut self.notifications.file.path,
+        ] {
+            *path = expand_home_path(path);
+        }
+        for path in self
+            .scanner
+            .root_paths
+            .iter_mut()
+            .chain(self.scanner.excluded_paths.iter_mut())
+        {
+            *path = expand_home_path(path);
+        }
+        for pattern in self
+            .scanner
+            .protected_paths
+            .iter_mut()
+            .chain(self.scanner.log_truncation.paths.iter_mut())
+        {
+            *pattern = expand_home_str(pattern);
+        }
+
         // Strip trailing slashes from ballast override keys.
         // Uses BTreeMap for stable iteration order.
         let old_overrides = std::mem::take(&mut self.ballast.overrides);
@@ -2398,6 +2663,146 @@ mod tests {
             choose_implicit_config(false, false, false),
             ImplicitConfigChoice::User
         );
+    }
+
+    #[test]
+    fn unknown_keys_are_collected_with_suggestions_and_the_rest_still_loads() {
+        use super::parse_config_lenient;
+        let raw = "[monitor]\nsample_interval_seconds = 2\n\n\
+                   [scanner]\nmax_dpeth = 3\nparallelism = 2\n\n\
+                   [scoring.weights]\nlocation = 0.25\n\n\
+                   [ballast]\nper_volume_file_count = 5\nper_volume_file_size_mb = 1024\nfile_count = 3\n\n\
+                   [policy]\nmode = \"observe\"\n";
+        let (config, unknown) = parse_config_lenient(raw).expect("lenient parse succeeds");
+        assert_eq!(
+            config.scanner.parallelism, 2,
+            "known keys next to unknown ones still apply"
+        );
+        assert_eq!(config.ballast.file_count, 3);
+
+        let paths: Vec<&str> = unknown.iter().map(|k| k.path.as_str()).collect();
+        for expected in [
+            "monitor",
+            "scanner.max_dpeth",
+            "scoring.weights",
+            "ballast.per_volume_file_count",
+            "ballast.per_volume_file_size_mb",
+            "policy.mode",
+        ] {
+            assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
+        }
+        let suggestion = |path: &str| {
+            unknown
+                .iter()
+                .find(|k| k.path == path)
+                .and_then(|k| k.suggestion.clone())
+                .unwrap_or_default()
+        };
+        assert!(
+            suggestion("scanner.max_dpeth").contains("max_depth"),
+            "{}",
+            suggestion("scanner.max_dpeth")
+        );
+        assert!(suggestion("monitor").contains("[pressure]"));
+        assert!(suggestion("ballast.per_volume_file_size_mb").contains("file_size_bytes"));
+        assert!(suggestion("policy.mode").contains("initial_mode"));
+        assert!(suggestion("scoring.weights").contains("location_weight"));
+
+        // The same text refuses a strict parse: unknown keys are never silent.
+        assert!(toml::from_str::<Config>(raw).is_err());
+        // A genuinely malformed file is still an error, not an "unknown key".
+        assert!(parse_config_lenient("[scanner]\nparallelism = \"two\"\n").is_err());
+    }
+
+    #[test]
+    fn config_load_reports_unknown_keys_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[scanner]\nparalellism = 2\nmax_depth = 4\n").unwrap();
+        let config = Config::load(Some(&path)).expect("load stays lenient");
+        assert_eq!(config.scanner.max_depth, 4);
+        assert_eq!(config.unknown_keys.len(), 1);
+        assert_eq!(config.unknown_keys[0].path, "scanner.paralellism");
+        assert_eq!(
+            config.unknown_keys[0].suggestion.as_deref(),
+            Some("did you mean `parallelism`?")
+        );
+        assert!(!config.core.strict_config, "strict mode is opt-in");
+        // The hash and serialized form ignore the diagnostics.
+        assert!(!toml::to_string(&config).unwrap().contains("unknown_keys"));
+    }
+
+    #[test]
+    fn parse_unknown_field_error_handles_both_serde_forms() {
+        use super::{levenshtein, parse_unknown_field_error};
+        let (field, expected) = parse_unknown_field_error(
+            "TOML parse error at line 1, column 1\n  |\n1 | [x]\n  | ^^^\nunknown field `x`, expected one of `a`, `b_c`, `d`\n",
+        )
+        .unwrap();
+        assert_eq!(field, "x");
+        assert_eq!(expected, vec!["a", "b_c", "d"]);
+        let (field, expected) =
+            parse_unknown_field_error("unknown field `only`, expected `single`").unwrap();
+        assert_eq!(
+            (field.as_str(), expected),
+            ("only", vec!["single".to_string()])
+        );
+        assert!(parse_unknown_field_error("invalid type: string, expected integer").is_none());
+        assert_eq!(levenshtein("max_dpeth", "max_depth"), 2);
+        assert_eq!(levenshtein("", "abc"), 3);
+    }
+
+    #[test]
+    fn home_expansion_applies_to_path_fields() {
+        use super::expand_home_str;
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let home = home.trim_end_matches('/').to_string();
+        assert_eq!(expand_home_str("~/x"), format!("{home}/x"));
+        assert_eq!(expand_home_str("$HOME/y"), format!("{home}/y"));
+        assert_eq!(expand_home_str("${HOME}"), home);
+        assert_eq!(expand_home_str("/abs/~/not"), "/abs/~/not");
+        let mut config = Config::default();
+        config.notifications.file.path = PathBuf::from("~/n.jsonl");
+        config.scanner.root_paths = vec![PathBuf::from("$HOME/projects/")];
+        config.scanner.protected_paths = vec!["~/keep-*".to_string()];
+        config.normalize_paths();
+        assert_eq!(
+            config.notifications.file.path,
+            PathBuf::from(format!("{home}/n.jsonl"))
+        );
+        assert_eq!(
+            config.scanner.root_paths,
+            vec![PathBuf::from(format!("{home}/projects"))]
+        );
+        assert_eq!(
+            config.scanner.protected_paths,
+            vec![format!("{home}/keep-*")]
+        );
+    }
+
+    /// The README's configuration example is parsed here, so it cannot drift
+    /// from the declared keys again (it once had six sections nobody read).
+    #[test]
+    fn readme_configuration_example_has_no_unknown_keys() {
+        use super::parse_config_lenient;
+        let readme = include_str!("../../README.md");
+        let section = readme
+            .find("## Configuration Example")
+            .map(|start| &readme[start..])
+            .expect("README has a Configuration Example section");
+        let open = section.find("```toml").expect("toml block") + "```toml".len();
+        let close = section[open..].find("```").expect("block end");
+        let example = &section[open..open + close];
+        let (config, unknown) = parse_config_lenient(example).expect("README example parses");
+        assert!(
+            unknown.is_empty(),
+            "README example uses keys the config does not declare: {unknown:?}"
+        );
+        config.validate().expect("README example passes validation");
+        assert_eq!(config.ballast.file_count, 5);
+        assert!(!config.policy.kill_switch);
     }
 
     #[test]

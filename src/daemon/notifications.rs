@@ -278,7 +278,7 @@ impl NotificationEvent {
 
 /// Top-level notification configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NotificationConfig {
     /// Master switch for all notifications.
     pub enabled: bool,
@@ -313,7 +313,7 @@ impl Default for NotificationConfig {
 
 /// Desktop notification settings (notify-send on Linux, osascript on macOS).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DesktopConfig {
     pub enabled: bool,
     pub min_level: NotificationLevel,
@@ -330,7 +330,7 @@ impl Default for DesktopConfig {
 
 /// Webhook notification settings (HTTP POST via curl).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WebhookConfig {
     pub enabled: bool,
     pub url: String,
@@ -352,7 +352,7 @@ impl Default for WebhookConfig {
 
 /// File notification settings (append-only JSONL).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
     pub path: PathBuf,
 }
@@ -375,7 +375,7 @@ impl Default for FileConfig {
 /// The channel writes structured stderr lines so systemd journals and launchd
 /// stdout/stderr capture both receive the same operator-visible events.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct JournalConfig {
     pub min_level: NotificationLevel,
 }
