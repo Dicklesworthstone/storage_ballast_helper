@@ -1,5 +1,14 @@
 # macOS/Linux Parity Prompt-To-Artifact Completion Audit
 
+> **Superseded (2026-09-02).** This audit certified prompt-to-artifact parity
+> against the bead tree as it stood in May 2026. The reality check of
+> 2026-09-02 (`docs/internal/reality-check-and-bridge-plan-2026-09-02.md`,
+> bead tree `bd-rc-master-ajg1`) found that several of the beads this audit
+> counts as complete were closed without their deliverable shipping (see the
+> notes on `bd-izu.2`, `bd-2j5.21`, `bd-2s9`, `bd-xzt.5.3`, `bd-xzt.5.6`).
+> Treat the status tables below as historical; the bridge plan and its beads
+> are the current record.
+
 Bead: `bd-r7m7.11`
 Refresh beads: `bd-r7m7.12`, `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`
 Parent: `bd-r7m7`
