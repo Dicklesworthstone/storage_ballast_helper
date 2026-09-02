@@ -411,6 +411,92 @@ pub struct DaemonState {
     /// Per-mount control state: what the daemon is doing on each mount and
     /// why it is idle on the ones it is not working on.
     pub mount_controllers: Vec<MountStateRecord>,
+    /// State file schema version (C-STATE). Readers accept older files:
+    /// every field defaults, and v1 files simply lack the v2 sections.
+    pub schema_version: u32,
+    /// Identifies one daemon run (pid + start time), so events and state
+    /// written by different runs can be told apart.
+    pub run_id: String,
+    /// Per-mount EWMA rate estimates keyed by mount point, what
+    /// `sbh check --predict` and the status rate block read.
+    pub rates: std::collections::BTreeMap<String, MountRateState>,
+    /// Worker thread health as of the last write.
+    pub threads: ThreadsState,
+    /// CPU time (user + system) the daemon has consumed, seconds.
+    pub cpu_secs_total: f64,
+    /// Set by the final write on shutdown.
+    pub stopped_at: Option<String>,
+    /// Why the daemon stopped (final write only).
+    pub exit_reason: Option<String>,
+}
+
+/// Current state file schema version.
+pub const STATE_SCHEMA_VERSION: u32 = 2;
+
+/// EWMA rate estimate for one mount.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MountRateState {
+    /// Net fill rate; negative means the mount is recovering.
+    pub bytes_per_sec: f64,
+    /// Change in the fill rate.
+    pub accel: f64,
+    /// Estimator confidence (0.0–1.0).
+    pub confidence: f64,
+    /// Predicted seconds until the red threshold, if the mount is filling.
+    pub seconds_to_red: Option<f64>,
+    /// Predicted seconds until the mount is full, if it is filling.
+    pub seconds_to_full: Option<f64>,
+}
+
+/// Health of one daemon thread.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThreadState {
+    /// `running`, `stalled`, `dead`, or `unknown`.
+    pub status: String,
+    /// Seconds since the thread's last heartbeat, when known.
+    pub seconds_since_heartbeat: Option<u64>,
+}
+
+/// Health of the daemon's threads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThreadsState {
+    pub monitor: ThreadState,
+    pub scanner: ThreadState,
+    pub executor: ThreadState,
+    pub logger: ThreadState,
+}
+
+impl ThreadState {
+    /// Snapshot of a heartbeat-driven thread status.
+    #[must_use]
+    pub fn from_status(status: &ThreadStatus) -> Self {
+        match status {
+            ThreadStatus::Running { last_heartbeat, .. } => Self {
+                status: "running".to_string(),
+                seconds_since_heartbeat: Some(last_heartbeat.elapsed().as_secs()),
+            },
+            ThreadStatus::Stalled { stalled_since, .. } => Self {
+                status: "stalled".to_string(),
+                seconds_since_heartbeat: Some(stalled_since.elapsed().as_secs()),
+            },
+            ThreadStatus::Dead { .. } => Self {
+                status: "dead".to_string(),
+                seconds_since_heartbeat: None,
+            },
+        }
+    }
+
+    /// The thread doing the writing is alive by construction.
+    #[must_use]
+    pub fn running_now() -> Self {
+        Self {
+            status: "running".to_string(),
+            seconds_since_heartbeat: Some(0),
+        }
+    }
 }
 
 /// Current pressure across monitored mounts.
@@ -622,6 +708,15 @@ pub struct SelfMonitor {
     mount_snapshot: Vec<MountPressure>,
     /// Latest per-mount controller records, set by the main loop each tick.
     controller_snapshot: Vec<MountStateRecord>,
+    /// Latest per-mount rate estimates, set by the main loop each tick.
+    rate_snapshot: std::collections::BTreeMap<String, MountRateState>,
+    /// Latest thread health, set by the main loop each tick.
+    threads_snapshot: ThreadsState,
+    /// Identifies this daemon run.
+    run_id: String,
+    /// The last state written, so the final write on shutdown can stamp
+    /// `stopped_at` and `exit_reason` onto an otherwise complete record.
+    last_state: Option<DaemonState>,
 }
 
 impl SelfMonitor {
@@ -645,6 +740,41 @@ impl SelfMonitor {
     ) {
         self.mount_snapshot = mounts;
         self.controller_snapshot = controllers;
+    }
+
+    /// Record the per-mount rate estimates and thread health the next state
+    /// file write should carry.
+    pub fn set_runtime_snapshot(
+        &mut self,
+        rates: std::collections::BTreeMap<String, MountRateState>,
+        threads: ThreadsState,
+    ) {
+        self.rate_snapshot = rates;
+        self.threads_snapshot = threads;
+    }
+
+    /// This run's identifier, as written to the state file.
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// Final write on shutdown: the last state with `stopped_at`,
+    /// `exit_reason` and the final uptime, written regardless of the write
+    /// interval so readers can tell a stopped daemon from a stalled one.
+    pub fn write_final_state(&mut self, exit_reason: &str) {
+        let Some(mut state) = self.last_state.clone() else {
+            return;
+        };
+        state.uptime_seconds = self.start_time.elapsed().as_secs();
+        state.last_updated =
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        state.stopped_at = Some(state.last_updated.clone());
+        state.exit_reason = Some(exit_reason.to_string());
+        if let Err(e) = write_state_atomic(&self.state_file_path, &state) {
+            eprintln!("[SBH-SELFMON] failed to write final state file: {e}");
+        }
+        self.last_state = Some(state);
     }
 
     /// Create a new self-monitor using daemon RSS limits from config.
@@ -679,6 +809,10 @@ impl SelfMonitor {
             rss_hard_limit_bytes,
             mount_snapshot: Vec::new(),
             controller_snapshot: Vec::new(),
+            rate_snapshot: std::collections::BTreeMap::new(),
+            threads_snapshot: ThreadsState::default(),
+            run_id: format!("{:x}-{:x}", std::process::id(), now.timestamp_millis()),
+            last_state: None,
 
             scan_count: 0,
             last_scan_at: None,
@@ -775,9 +909,17 @@ impl SelfMonitor {
             memory_rss_bytes: rss,
             policy_mode: policy_mode.to_string(),
             mount_controllers: self.controller_snapshot.clone(),
+            schema_version: STATE_SCHEMA_VERSION,
+            run_id: self.run_id.clone(),
+            rates: self.rate_snapshot.clone(),
+            threads: self.threads_snapshot.clone(),
+            cpu_secs_total: self.current_cpu_secs(),
+            stopped_at: None,
+            exit_reason: None,
         };
 
         let result = write_state_atomic(&self.state_file_path, &state);
+        self.last_state = Some(state);
         if let Err(e) = &result {
             eprintln!("[SBH-SELFMON] failed to write state file: {e}");
         }
@@ -880,6 +1022,15 @@ impl SelfMonitor {
         self.current_self_stats().rss_bytes
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    fn current_cpu_secs(&self) -> f64 {
+        let stats = self.current_self_stats();
+        (stats
+            .cpu_user_micros
+            .saturating_add(stats.cpu_system_micros)) as f64
+            / 1_000_000.0
+    }
+
     fn current_self_stats(&self) -> SelfStats {
         self.platform
             .self_stats()
@@ -980,6 +1131,76 @@ fn empty_self_stats() -> SelfStats {
 // ──────────────────── tests ────────────────────
 
 #[cfg(test)]
+mod state_schema_tests {
+    use super::{DaemonState, MountRateState, STATE_SCHEMA_VERSION, ThreadState, ThreadsState};
+
+    /// C-STATE: a v1 file (no v2 sections) still parses, with every v2 field
+    /// at its default, and a v2 record round-trips unchanged.
+    #[test]
+    fn v1_state_files_parse_and_v2_round_trips() {
+        let v1 = r#"{
+            "version": "0.5.1",
+            "pid": 42,
+            "started_at": "2026-09-02T00:00:00Z",
+            "uptime_seconds": 10,
+            "last_updated": "2026-09-02T00:00:10Z",
+            "pressure": {"overall": "orange", "mounts": [
+                {"path": "/", "free_pct": 11.5, "level": "orange", "rate_bps": null}
+            ]},
+            "ballast": {"available": 2, "total": 4, "released": 2},
+            "last_scan": {"at": null, "candidates": 0, "deleted": 0},
+            "counters": {"scans": 1, "deletions": 0, "bytes_freed": 0, "errors": 0},
+            "memory_rss_bytes": 1024,
+            "policy_mode": "enforce"
+        }"#;
+        let parsed: DaemonState = serde_json::from_str(v1).expect("v1 parses");
+        assert_eq!(parsed.schema_version, 0, "v1 files carry no schema version");
+        assert!(parsed.run_id.is_empty(), "v1 files carry no run id");
+        assert!(parsed.rates.is_empty());
+        assert_eq!(parsed.threads, ThreadsState::default());
+        assert_eq!(parsed.stopped_at, None);
+        assert_eq!(parsed.exit_reason, None);
+        assert_eq!(parsed.pressure.mounts.len(), 1);
+        assert_eq!(parsed.pressure.overall, "orange");
+
+        let mut v2 = parsed;
+        v2.schema_version = STATE_SCHEMA_VERSION;
+        v2.run_id = "abc-123".to_string();
+        v2.rates.insert(
+            "/".to_string(),
+            MountRateState {
+                bytes_per_sec: 1_048_576.0,
+                accel: -12.5,
+                confidence: 0.8,
+                seconds_to_red: Some(900.0),
+                seconds_to_full: Some(3600.0),
+            },
+        );
+        v2.threads = ThreadsState {
+            monitor: ThreadState::running_now(),
+            scanner: ThreadState {
+                status: "stalled".to_string(),
+                seconds_since_heartbeat: Some(45),
+            },
+            executor: ThreadState::running_now(),
+            logger: ThreadState::running_now(),
+        };
+        v2.cpu_secs_total = 12.5;
+        v2.stopped_at = Some("2026-09-02T00:01:00Z".to_string());
+        v2.exit_reason = Some("clean shutdown".to_string());
+
+        let json = serde_json::to_value(&v2).expect("serializes");
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["rates"]["/"]["bytes_per_sec"], 1_048_576.0);
+        assert_eq!(json["rates"]["/"]["seconds_to_red"], 900.0);
+        assert_eq!(json["threads"]["scanner"]["status"], "stalled");
+        assert_eq!(json["exit_reason"], "clean shutdown");
+        let back: DaemonState = serde_json::from_value(json).expect("round-trips");
+        assert_eq!(back, v2);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1041,6 +1262,13 @@ mod tests {
             memory_rss_bytes: 44_040_192,
             policy_mode: "enforce".into(),
             mount_controllers: Vec::new(),
+            schema_version: STATE_SCHEMA_VERSION,
+            run_id: String::new(),
+            rates: std::collections::BTreeMap::new(),
+            threads: ThreadsState::default(),
+            cpu_secs_total: 0.0,
+            stopped_at: None,
+            exit_reason: None,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -1091,6 +1319,13 @@ mod tests {
             memory_rss_bytes: 0,
             policy_mode: String::new(),
             mount_controllers: Vec::new(),
+            schema_version: STATE_SCHEMA_VERSION,
+            run_id: String::new(),
+            rates: std::collections::BTreeMap::new(),
+            threads: ThreadsState::default(),
+            cpu_secs_total: 0.0,
+            stopped_at: None,
+            exit_reason: None,
         };
 
         write_state_atomic(&path, &state).unwrap();
@@ -1143,6 +1378,13 @@ mod tests {
             memory_rss_bytes: 0,
             policy_mode: String::new(),
             mount_controllers: Vec::new(),
+            schema_version: STATE_SCHEMA_VERSION,
+            run_id: String::new(),
+            rates: std::collections::BTreeMap::new(),
+            threads: ThreadsState::default(),
+            cpu_secs_total: 0.0,
+            stopped_at: None,
+            exit_reason: None,
         };
 
         write_state_atomic(&path, &state).unwrap();

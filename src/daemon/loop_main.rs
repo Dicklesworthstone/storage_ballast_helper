@@ -40,7 +40,8 @@ use crate::daemon::policy::{
 };
 use crate::daemon::process_io_history::ProcessIoHistory;
 use crate::daemon::self_monitor::{
-    DaemonLock, MountPressure, SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadStatus,
+    DaemonLock, MountPressure, MountRateState, SelfMonitor, SelfMonitorTick, ThreadHeartbeat,
+    ThreadState, ThreadStatus, ThreadsState,
 };
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat, resolve_watchdog_sec};
 use crate::logger::dual::{
@@ -885,6 +886,13 @@ struct MountTickResponse {
     response: crate::monitor::pid::PressureResponse,
     seconds_to_red: Option<f64>,
     prediction_confident: bool,
+    /// The mount's EWMA estimate, for `state.json` (`rates`, `rate_bps`).
+    rate: MountRateState,
+}
+
+/// A finite, positive prediction or nothing.
+fn finite_positive(seconds: f64) -> Option<f64> {
+    (seconds.is_finite() && seconds > 0.0).then_some(seconds)
 }
 
 /// Controller tunables derived from config.
@@ -1155,6 +1163,9 @@ pub struct MonitoringDaemon {
     /// Last catalog scan per mount: the level it was dispatched at and when.
     /// One catalog scan per pressure epoch; a rising level re-arms it.
     catalog_epochs: HashMap<PathBuf, (PressureLevel, Instant)>,
+    /// Mounts currently at Critical: the `emergency` event is emitted once
+    /// when a mount enters Critical, not on every tick it stays there.
+    emergency_mounts: HashSet<PathBuf>,
     special_locations: SpecialLocationRegistry,
     ballast_coordinator: BallastPoolCoordinator,
     release_controller: BallastReleaseController,
@@ -1164,7 +1175,6 @@ pub struct MonitoringDaemon {
     shared_executor_config: Arc<SharedExecutorConfig>,
     shared_scoring_config: Arc<RwLock<crate::core::config::ScoringConfig>>,
     shared_scanner_config: Arc<RwLock<crate::core::config::ScannerConfig>>,
-    cached_primary_path: PathBuf,
     start_time: Instant,
     last_pressure_level: PressureLevel,
     /// Highest pressure level that was notified within the cooldown window.
@@ -1210,15 +1220,6 @@ pub struct MonitoringDaemon {
     scanner_heartbeat: Arc<ThreadHeartbeat>,
     executor_heartbeat: Arc<ThreadHeartbeat>,
     prediction_scorecard: PredictionScorecard,
-}
-
-fn compute_primary_path(config: &Config) -> PathBuf {
-    config
-        .scanner
-        .root_paths
-        .first()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 fn bytes_to_pct(value: u64, total: u64) -> f64 {
@@ -2015,12 +2016,10 @@ impl MonitoringDaemon {
             PressureLevel::Green,
         );
 
-        let cached_primary_path = compute_primary_path(&config);
         let prediction_config = config.pressure.prediction.clone();
 
         Ok(Self {
             config,
-            cached_primary_path,
             platform,
             logger_handle,
             logger_join: Some(logger_join),
@@ -2036,6 +2035,7 @@ impl MonitoringDaemon {
             pending_recovery: HashSet::new(),
             catalog_root_cache: HashMap::new(),
             catalog_epochs: HashMap::new(),
+            emergency_mounts: HashSet::new(),
             special_locations,
             ballast_coordinator,
             release_controller,
@@ -2394,7 +2394,17 @@ impl MonitoringDaemon {
                 path: tick.response.causing_mount.to_string_lossy().into_owned(),
                 free_pct: tick.response.free_pct,
                 level: format!("{:?}", tick.response.level).to_lowercase(),
-                rate_bps: None,
+                rate_bps: Some(tick.rate.bytes_per_sec),
+            })
+            .collect();
+        let rates = self
+            .mount_responses
+            .iter()
+            .map(|tick| {
+                (
+                    tick.response.causing_mount.to_string_lossy().into_owned(),
+                    tick.rate.clone(),
+                )
             })
             .collect();
         let now = Instant::now();
@@ -2405,6 +2415,44 @@ impl MonitoringDaemon {
             .collect();
         controllers.sort_by(|a, b| a.mount.cmp(&b.mount));
         self.self_monitor.set_mount_snapshot(mounts, controllers);
+
+        // Thread health: the monitor thread is writing this, the workers are
+        // judged by their heartbeats, the logger by whether its thread lives.
+        let health = self.self_monitor.health_snapshot(
+            &[
+                Arc::clone(&self.scanner_heartbeat),
+                Arc::clone(&self.executor_heartbeat),
+            ],
+            THREAD_HEALTH_CHECK_INTERVAL,
+            response.level,
+        );
+        let worker = |index: usize| {
+            health
+                .thread_status
+                .get(index)
+                .map_or_else(ThreadState::default, ThreadState::from_status)
+        };
+        let logger = if self
+            .logger_join
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            ThreadState::running_now()
+        } else {
+            ThreadState {
+                status: "dead".to_string(),
+                seconds_since_heartbeat: None,
+            }
+        };
+        self.self_monitor.set_runtime_snapshot(
+            rates,
+            ThreadsState {
+                monitor: ThreadState::running_now(),
+                scanner: worker(0),
+                executor: worker(1),
+                logger,
+            },
+        );
 
         self.self_monitor.maybe_write_state(
             response.level,
@@ -2850,16 +2898,16 @@ impl MonitoringDaemon {
         }
 
         // ──────── shutdown sequence ────────
-        self.shutdown(scan_tx, del_tx, scanner_join, executor_join);
+        let exit_reason = if shutdown_result.is_err() {
+            "rss hard limit exceeded"
+        } else {
+            "clean shutdown"
+        };
+        self.shutdown(scan_tx, del_tx, scanner_join, executor_join, exit_reason);
         shutdown_result
     }
 
     // ──────────────────── helpers ────────────────────
-
-    /// Return the first configured root path, or `/` as fallback.
-    fn primary_path(&self) -> &Path {
-        &self.cached_primary_path
-    }
 
     fn rss_hard_limit_error(&self, tick: SelfMonitorTick) -> SbhError {
         let details = format!(
@@ -2985,6 +3033,13 @@ impl MonitoringDaemon {
                 response: response.clone(),
                 seconds_to_red: predicted_seconds,
                 prediction_confident: rate_estimate.confidence >= effective_min_conf,
+                rate: MountRateState {
+                    bytes_per_sec: rate_estimate.bytes_per_second,
+                    accel: rate_estimate.acceleration,
+                    confidence: rate_estimate.confidence,
+                    seconds_to_red: predicted_seconds,
+                    seconds_to_full: finite_positive(rate_estimate.seconds_to_exhaustion),
+                },
             });
 
             // Track worst response (highest urgency/severity).
@@ -3220,10 +3275,11 @@ impl MonitoringDaemon {
                 self.enter_mount_recovery(&mount, &tick.response);
             }
 
+            let mut files_released = 0;
             match decision.state {
                 MountState::Reclaim => {
                     if decision.release_ballast && release_ballast {
-                        let _ = self.release_ballast(&mount, &tick.response);
+                        files_released = self.release_ballast(&mount, &tick.response).unwrap_or(0);
                         self.last_tick_cleanup_ran = true;
                     }
                     if decision.scan && scan_allowed {
@@ -3274,10 +3330,32 @@ impl MonitoringDaemon {
                             .as_ref()
                             .is_none_or(|(_, level)| tick.response.level > *level)
                     {
-                        pressured_without_surface = Some((mount, tick.response.level));
+                        pressured_without_surface = Some((mount.clone(), tick.response.level));
                     }
                 }
                 MountState::Recovery | MountState::Idle => {}
+            }
+
+            // Truthful emergency events: this mount's real free percent, the
+            // files actually released, and only on entering Critical. A tick
+            // that stays Critical (or an already-empty pool) is not news.
+            if tick.response.level == PressureLevel::Critical {
+                if self.emergency_mounts.insert(mount.clone()) {
+                    self.logger_handle.send(ActivityEvent::Emergency {
+                        details: format!(
+                            "critical pressure on {} ({:.1}% free, urgency={:.2}): released {} \
+                             ballast file(s), controller={}",
+                            mount.display(),
+                            tick.response.free_pct,
+                            tick.response.urgency,
+                            files_released,
+                            decision.state,
+                        ),
+                        free_pct: tick.response.free_pct,
+                    });
+                }
+            } else {
+                self.emergency_mounts.remove(&mount);
             }
         }
 
@@ -3316,21 +3394,6 @@ impl MonitoringDaemon {
                     self.last_tick_cleanup_ran = true;
                 }
             }
-        }
-
-        if response.level == PressureLevel::Critical {
-            let primary = self.primary_path();
-            let actual_free_pct = self
-                .fs_collector
-                .collect(primary)
-                .map_or(0.0, |s| s.free_pct());
-            self.logger_handle.send(ActivityEvent::Emergency {
-                details: format!(
-                    "critical pressure: urgency={:.2}, releasing all ballast",
-                    response.urgency
-                ),
-                free_pct: actual_free_pct,
-            });
         }
 
         // A pressured mount sbh cannot act on is reported (rate-limited), not
@@ -3506,9 +3569,9 @@ impl MonitoringDaemon {
         &mut self,
         mount: &std::path::Path,
         response: &crate::monitor::pid::PressureResponse,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let Some(pool) = self.ballast_coordinator.pool_for_mount(mount) else {
-            return Ok(());
+            return Ok(0);
         };
         let available = pool.available_count();
         let expected = pool.expected_count();
@@ -3516,6 +3579,7 @@ impl MonitoringDaemon {
             .release_controller
             .files_to_release(mount, response, available, expected);
 
+        let mut released = 0;
         if count > 0
             && let Some(report) = self.ballast_coordinator.release_for_mount(mount, count)?
         {
@@ -3523,6 +3587,7 @@ impl MonitoringDaemon {
                 eprintln!("[sbh] warning: {warning}");
             }
 
+            released = report.files_released;
             self.release_controller
                 .on_released(mount, report.files_released);
 
@@ -3533,7 +3598,7 @@ impl MonitoringDaemon {
                     bytes_freed: report.bytes_freed,
                 });
         }
-        Ok(())
+        Ok(released)
     }
 
     fn send_scan_request(
@@ -4142,7 +4207,6 @@ impl MonitoringDaemon {
                         details: format!("config hash: {old_hash} -> {new_hash}"),
                     });
                     self.config = new_config;
-                    self.cached_primary_path = compute_primary_path(&self.config);
                     // Reload may change what sbh can act on: retune the
                     // per-mount controllers and wake idle mounts next tick.
                     let controller_config = mount_controller_config(&self.config);
@@ -4246,6 +4310,7 @@ impl MonitoringDaemon {
         del_tx: Sender<DeletionBatch>,
         scanner_join: Option<thread::JoinHandle<()>>,
         executor_join: Option<thread::JoinHandle<()>>,
+        exit_reason: &str,
     ) {
         let uptime_secs = self.start_time.elapsed().as_secs();
 
@@ -4270,14 +4335,16 @@ impl MonitoringDaemon {
             join_worker_with_timeout("executor", h, WORKER_SHUTDOWN_JOIN_TIMEOUT);
         }
 
-        // 3. Log shutdown.
+        // 3. Log shutdown and stamp the state file so readers can tell a
+        //    stopped daemon from a stalled one.
+        self.self_monitor.write_final_state(exit_reason);
         self.logger_handle.send(ActivityEvent::DaemonStopped {
-            reason: "clean shutdown".to_string(),
+            reason: exit_reason.to_string(),
             uptime_secs,
         });
         self.notification_manager
             .notify(&NotificationEvent::DaemonStopped {
-                reason: "clean shutdown".to_string(),
+                reason: exit_reason.to_string(),
                 uptime_secs,
             });
 
@@ -4838,7 +4905,12 @@ fn scanner_thread_main(
 
         let request = match scan_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
             Ok(request) => request,
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                // Idle is alive: "stalled" must mean stuck inside a pass,
+                // not waiting for one.
+                heartbeat.beat();
+                continue;
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         };
         if shutdown.load(Ordering::Relaxed) {
@@ -6478,7 +6550,12 @@ fn executor_thread_main(
 
         let batch = match del_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
             Ok(batch) => batch,
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                // Idle is alive: "stalled" must mean stuck inside a batch,
+                // not waiting for one.
+                heartbeat.beat();
+                continue;
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         };
         if shutdown.load(Ordering::Relaxed) {

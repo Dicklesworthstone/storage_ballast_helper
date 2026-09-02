@@ -260,6 +260,13 @@ fn multi_mount_state() -> DaemonState {
         },
         policy_mode: "enforce".into(),
         mount_controllers: Vec::new(),
+        schema_version: 2,
+        run_id: String::new(),
+        rates: Default::default(),
+        threads: Default::default(),
+        cpu_secs_total: 0.0,
+        stopped_at: None,
+        exit_reason: None,
         memory_rss_bytes: 104_857_600,
     }
 }
@@ -294,6 +301,13 @@ fn state_without_rates() -> DaemonState {
         counters: Counters::default(),
         policy_mode: "enforce".into(),
         mount_controllers: Vec::new(),
+        schema_version: 2,
+        run_id: String::new(),
+        rates: Default::default(),
+        threads: Default::default(),
+        cpu_secs_total: 0.0,
+        stopped_at: None,
+        exit_reason: None,
         memory_rss_bytes: 16_000_000,
     }
 }
@@ -328,6 +342,13 @@ fn state_no_scan_history() -> DaemonState {
         counters: Counters::default(),
         policy_mode: "enforce".into(),
         mount_controllers: Vec::new(),
+        schema_version: 2,
+        run_id: String::new(),
+        rates: Default::default(),
+        threads: Default::default(),
+        cpu_secs_total: 0.0,
+        stopped_at: None,
+        exit_reason: None,
         memory_rss_bytes: 8_000_000,
     }
 }

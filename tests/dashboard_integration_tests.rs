@@ -175,6 +175,13 @@ fn sample_daemon_state() -> DaemonState {
         },
         policy_mode: "enforce".into(),
         mount_controllers: Vec::new(),
+        schema_version: 2,
+        run_id: String::new(),
+        rates: Default::default(),
+        threads: Default::default(),
+        cpu_secs_total: 0.0,
+        stopped_at: None,
+        exit_reason: None,
         memory_rss_bytes: 52_428_800, // 50 MB
     }
 }
