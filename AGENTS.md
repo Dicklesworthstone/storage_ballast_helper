@@ -317,7 +317,7 @@ src/
 | File | Lines | Purpose |
 |------|-------|---------|
 | `src/cli_app.rs` | ~4800 | CLI definition (clap derive) and all command handlers |
-| `src/cli/bootstrap.rs` | ~1660 | Bootstrap migration with 13 migration reason types |
+| `src/cli/bootstrap.rs` | ~2700 | Bootstrap migration with 15 migration reason types |
 | `src/cli/assets.rs` | ~1240 | Asset manifest pipeline with SHA-256 verification |
 | `src/daemon/loop_main.rs` | ~1170 | Main daemon monitoring loop |
 | `src/scanner/merkle.rs` | ~1080 | Incremental Merkle scan index with full-scan fallback |
@@ -383,7 +383,9 @@ src/
 | Command | Purpose |
 |---------|---------|
 | `sbh config path\|show\|validate\|diff\|reset\|set` | Manage configuration |
-| `sbh install [--systemd\|--launchd] [--user] [--from-source] [--wizard\|--auto]` | Install as system service |
+| `sbh install [--systemd\|--launchd] [--user] [--from-source] [--wizard\|--auto] [--no-bootstrap]` | Install as system service (runs the safe bootstrap repairs first) |
+| `sbh bootstrap [--dry-run]` | Scan the install footprint and repair it with backups (PATH lines, unit paths, permissions, legacy paths, state) |
+| `sbh doctor --pal\|--system\|--env\|--release` | Diagnostics; `--env` is the read-only bootstrap scan |
 | `sbh uninstall [--systemd\|--launchd] [--purge]` | Remove service integration |
 | `sbh setup [--all] [--path] [--verify] [--completions SHELLS]` | Post-install PATH/completions setup |
 | `sbh tune [--apply] [--yes]` | Show/apply tuning recommendations |

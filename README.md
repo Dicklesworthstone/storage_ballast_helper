@@ -262,7 +262,18 @@ sbh bootstrap
 
 # Dry-run to see what would change
 sbh bootstrap --dry-run
+
+# Machine-readable report (reasons use the kebab-case codes above)
+sbh bootstrap --dry-run --json
+
+# Read-only scan as part of doctor
+sbh doctor --env
+
+# Skip the automatic install-time repairs
+sbh install --no-bootstrap
 ```
+
+During `sbh install` only the actions that fix the install being produced run automatically: `RemoveProfileLine`, `DeduplicateProfile`, `FixPermissions`, `UpdateServicePath`, `CreateDirectory`, `InitStateFile`. Legacy config/state copies, orphaned-file removal, and backup cleanup are planned and reported but left for an explicit `sbh bootstrap`. A non-dry-run `sbh bootstrap` exits non-zero when the environment is still `Broken` afterwards or any action failed.
 
 Source: `src/cli/bootstrap.rs`
 

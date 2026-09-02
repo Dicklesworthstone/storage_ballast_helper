@@ -1596,7 +1596,7 @@ sleep 30;
         .expect("spawn synthetic blame writer")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn wait_for_file(path: &Path, timeout: Duration, mut poll: impl FnMut()) {
     let deadline = Instant::now() + timeout;
     while !path.exists() {
@@ -1845,6 +1845,17 @@ fn status_reports_daemon_liveness_from_lock_not_from_lookalike_processes() {
         state_dir.join("daemon.lock").exists(),
         "daemon must create the lock next to state.json"
     );
+    // The lock is taken before the first state.json write; wait for the
+    // state file so the post-kill check below exercises "fresh state, no
+    // lock holder" rather than "no state at all".
+    let state_file = state_dir.join("state.json");
+    wait_for_file(&state_file, Duration::from_secs(15), || {
+        assert!(
+            daemon.child.try_wait().expect("poll daemon").is_none(),
+            "daemon exited before writing state.json; stderr:\n{}",
+            fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+    });
 
     // 3. Kill it (SIGKILL: no orderly shutdown, state.json stays fresh).
     daemon.child.kill().expect("kill daemon");
@@ -1857,6 +1868,215 @@ fn status_reports_daemon_liveness_from_lock_not_from_lookalike_processes() {
     );
     assert_eq!(after["daemon_state_reason"], "lock_released");
     assert_eq!(after["state_stale"], serde_json::Value::Bool(false));
+}
+
+/// Migration actions from a `bootstrap --json` report whose target lives
+/// under `root`. Host-level footprints (`/etc/sbh`, `/usr/local/bin/sbh`)
+/// are outside the fixture and deliberately ignored.
+fn bootstrap_actions_under(report: &serde_json::Value, root: &Path) -> Vec<serde_json::Value> {
+    report["actions"]
+        .as_array()
+        .expect("report.actions is an array")
+        .iter()
+        .filter(|action| {
+            action["target"]
+                .as_str()
+                .is_some_and(|target| Path::new(target).starts_with(root))
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn bootstrap_repairs_an_isolated_home_footprint_with_backups() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().expect("temp home");
+    let home_path = home.path();
+    let local_bin = home_path.join(".local").join("bin");
+    let data_dir = home_path.join(".local").join("share").join("sbh");
+    let config_home = home_path.join(".config");
+    fs::create_dir_all(&local_bin).expect("create .local/bin");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    fs::create_dir_all(&config_home).expect("create .config");
+
+    // Planted defects: a stale PATH line, duplicate PATH lines, a
+    // non-executable binary, and a data dir without state.json.
+    let stale_dir = home_path.join("old-install").join("bin");
+    let bashrc = home_path.join(".bashrc");
+    let stale_line = format!("export PATH=\"{}:$PATH\"  # sbh", stale_dir.display());
+    fs::write(
+        &bashrc,
+        format!("# shell rc\n{stale_line}\nalias ll='ls -l'\n"),
+    )
+    .expect("write .bashrc");
+    let zshrc = home_path.join(".zshrc");
+    let good_line = format!("export PATH=\"{}:$PATH\"  # sbh", local_bin.display());
+    fs::write(&zshrc, format!("{good_line}\n{good_line}\n")).expect("write .zshrc");
+    let binary = local_bin.join("sbh");
+    fs::write(&binary, "#!/bin/sh\nexit 0\n").expect("write fake binary");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    let state_file = data_dir.join("state.json");
+    assert!(!state_file.exists());
+
+    let home_env = home_path.to_string_lossy().to_string();
+    let config_env = config_home.to_string_lossy().to_string();
+    let data_env = home_path
+        .join(".local")
+        .join("share")
+        .to_string_lossy()
+        .to_string();
+    let env = [
+        ("HOME", home_env.as_str()),
+        ("XDG_CONFIG_HOME", config_env.as_str()),
+        ("XDG_DATA_HOME", data_env.as_str()),
+    ];
+    let planted = [
+        "stale-path-entry",
+        "duplicate-path-entries",
+        "binary-permissions",
+        "missing-state-file",
+    ];
+
+    // 1) Dry run: every planted defect is planned, nothing is touched.
+    let dry = common::run_cli_case_with_env(
+        "bootstrap_dry_run_json",
+        &["bootstrap", "--dry-run", "--json"],
+        &env,
+    );
+    assert_cli_success(&dry, "bootstrap --dry-run --json");
+    let dry_json = parse_json_stdout(&dry);
+    assert_eq!(dry_json["command"], "bootstrap");
+    assert_eq!(dry_json["dry_run"], serde_json::Value::Bool(true));
+    let planned_actions = bootstrap_actions_under(&dry_json["report"], home_path);
+    let planned_reasons: Vec<&str> = planned_actions
+        .iter()
+        .filter_map(|action| action["reason"].as_str())
+        .collect();
+    for reason in planted {
+        assert!(
+            planned_reasons.contains(&reason),
+            "dry run must plan {reason}; planned: {planned_reasons:?}\n{}",
+            dry.stdout
+        );
+    }
+    assert!(
+        planned_actions
+            .iter()
+            .all(|action| action["applied"] == serde_json::Value::Bool(false)),
+        "dry run never applies"
+    );
+    assert_eq!(
+        fs::metadata(&binary).unwrap().permissions().mode() & 0o111,
+        0,
+        "dry run must not chmod"
+    );
+    assert!(fs::read_to_string(&bashrc).unwrap().contains(&stale_line));
+    assert!(!state_file.exists(), "dry run must not create state.json");
+
+    // 2) Apply: every fixture action succeeds, mutated files get backups.
+    let apply =
+        common::run_cli_case_with_env("bootstrap_apply_json", &["bootstrap", "--json"], &env);
+    assert_cli_success(&apply, "bootstrap --json");
+    let apply_json = parse_json_stdout(&apply);
+    let applied_actions = bootstrap_actions_under(&apply_json["report"], home_path);
+    assert!(
+        applied_actions.len() >= planted.len(),
+        "expected at least {} fixture actions, got {applied_actions:?}",
+        planted.len()
+    );
+    for action in &applied_actions {
+        assert_eq!(
+            action["applied"],
+            serde_json::Value::Bool(true),
+            "fixture action not applied: {action}"
+        );
+        assert!(action["error"].is_null(), "fixture action failed: {action}");
+    }
+    for kind in ["RemoveProfileLine", "DeduplicateProfile", "FixPermissions"] {
+        let action = applied_actions
+            .iter()
+            .find(|action| action["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} action in {applied_actions:?}"));
+        let backup = action["backup_path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{kind} must record a backup: {action}"));
+        assert!(
+            Path::new(backup).is_file(),
+            "{kind} backup must exist on disk: {backup}"
+        );
+    }
+    let bashrc_backup = applied_actions
+        .iter()
+        .find(|action| action["kind"] == "RemoveProfileLine")
+        .and_then(|action| action["backup_path"].as_str())
+        .map(PathBuf::from)
+        .expect("bashrc backup path");
+    assert!(
+        fs::read_to_string(&bashrc_backup)
+            .unwrap()
+            .contains(&stale_line),
+        "backup preserves the pre-repair .bashrc"
+    );
+
+    let repaired_bashrc = fs::read_to_string(&bashrc).unwrap();
+    assert!(
+        !repaired_bashrc.contains(&stale_line),
+        "stale PATH line removed: {repaired_bashrc}"
+    );
+    assert!(
+        repaired_bashrc.contains("alias ll='ls -l'"),
+        "unrelated lines survive: {repaired_bashrc}"
+    );
+    let repaired_zshrc = fs::read_to_string(&zshrc).unwrap();
+    assert_eq!(
+        repaired_zshrc
+            .lines()
+            .filter(|line| line.contains("# sbh"))
+            .count(),
+        1,
+        "duplicate PATH lines collapsed to one: {repaired_zshrc}"
+    );
+    assert_ne!(
+        fs::metadata(&binary).unwrap().permissions().mode() & 0o111,
+        0,
+        "binary is executable after repair"
+    );
+    assert!(state_file.is_file(), "state.json initialized");
+
+    // 3) Second pass: nothing under the fixture home is left to repair.
+    let again = common::run_cli_case_with_env(
+        "bootstrap_second_pass_json",
+        &["bootstrap", "--dry-run", "--json"],
+        &env,
+    );
+    assert_cli_success(&again, "bootstrap --dry-run --json (second pass)");
+    let again_json = parse_json_stdout(&again);
+    let remaining = bootstrap_actions_under(&again_json["report"], home_path);
+    assert!(
+        remaining.is_empty(),
+        "second pass must plan nothing under the fixture: {remaining:?}"
+    );
+    assert_ne!(
+        again_json["report"]["health"], "Broken",
+        "repaired fixture must not read as Broken: {}",
+        again.stdout
+    );
+
+    // 4) doctor --env reports the same scan read-only.
+    let doctor =
+        common::run_cli_case_with_env("doctor_env_json", &["doctor", "--env", "--json"], &env);
+    assert_cli_success(&doctor, "doctor --env --json");
+    let doctor_json = parse_json_stdout(&doctor);
+    let checks = doctor_json["env"]["checks"]
+        .as_array()
+        .expect("doctor --env emits env.checks");
+    assert!(
+        checks.iter().any(|check| check["id"] == "env.health"),
+        "doctor --env includes the summary check: {checks:?}"
+    );
 }
 
 #[cfg(target_os = "macos")]

@@ -19,7 +19,11 @@ use serde::Serialize;
 // ---------------------------------------------------------------------------
 
 /// Machine-readable reason codes for migration decisions.
+///
+/// Serialized in the same kebab-case form as [`fmt::Display`], so `--json`
+/// output and the README reason table agree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum MigrationReason {
     /// Binary exists but is not on PATH.
     BinaryNotOnPath,
@@ -1106,7 +1110,14 @@ pub fn run_migration(opts: &MigrateOptions) -> MigrationReport {
         .iter()
         .filter(|a| a.applied && a.error.is_none())
         .count();
-    let health = assess_health(&footprints, &actions);
+    // Health describes the environment as it is *now*: after a repair pass the
+    // pre-apply footprints are stale, so rescan before judging. Deferred or
+    // failed actions still count as unresolved.
+    let health = if issues_repaired > 0 {
+        assess_health(&scan_footprints(), &actions)
+    } else {
+        assess_health(&footprints, &actions)
+    };
 
     let scanned_at = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

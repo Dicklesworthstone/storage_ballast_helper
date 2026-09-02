@@ -366,8 +366,9 @@ struct ServiceLogsArgs {
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
 #[command(
-    after_long_help = "Platform notes:\n  Use --pal for platform diagnostics.\n  Use --system for host tuning checks (kernel writeback / dirty-page limits on Linux).\n  Use --release for macOS release signing/notarization/Homebrew readiness.\n  On macOS --pal includes launchd, APFS, codesign/notarization, and Full Disk Access checks."
+    after_long_help = "Platform notes:\n  Use --pal for platform diagnostics.\n  Use --system for host tuning checks (kernel writeback / dirty-page limits on Linux).\n  Use --env for a read-only install-footprint scan (PATH lines, unit paths, permissions, state).\n  Use --release for macOS release signing/notarization/Homebrew readiness.\n  On macOS --pal includes launchd, APFS, codesign/notarization, and Full Disk Access checks."
 )]
+#[allow(clippy::struct_excessive_bools)]
 struct DoctorArgs {
     /// Probe the Platform Abstraction Layer implementation.
     #[arg(long)]
@@ -12464,6 +12465,70 @@ mod tests {
 
         assert!(Cli::try_parse_from(["sbh", "install", "--scope", "user", "--user"]).is_err());
         assert!(Cli::try_parse_from(["sbh", "install", "--systemd", "--launchd"]).is_err());
+    }
+
+    #[test]
+    fn bootstrap_command_and_install_time_repair_flags_parse() {
+        use storage_ballast_helper::cli::bootstrap::{ActionKind, install_time_safe_actions};
+
+        let parsed = Cli::try_parse_from(["sbh", "bootstrap"]).expect("bare bootstrap parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Bootstrap(BootstrapArgs { dry_run: false })
+        ));
+        let parsed =
+            Cli::try_parse_from(["sbh", "bootstrap", "--dry-run"]).expect("dry-run parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Bootstrap(BootstrapArgs { dry_run: true })
+        ));
+        assert!(
+            Cli::try_parse_from(["sbh", "bootstrap", "--apply"]).is_err(),
+            "bootstrap has no --apply flag; applying is the default"
+        );
+
+        let parsed = Cli::try_parse_from(["sbh", "install", "--no-bootstrap"])
+            .expect("install --no-bootstrap parses");
+        match parsed.command {
+            Command::Install(args) => assert!(args.no_bootstrap),
+            other => panic!("expected install, got {other:?}"),
+        }
+        let parsed = Cli::try_parse_from(["sbh", "install"]).expect("install parses");
+        match parsed.command {
+            Command::Install(args) => assert!(!args.no_bootstrap, "bootstrap runs by default"),
+            other => panic!("expected install, got {other:?}"),
+        }
+
+        let parsed = Cli::try_parse_from(["sbh", "doctor", "--env"]).expect("doctor --env parses");
+        match parsed.command {
+            Command::Doctor(args) => assert!(args.env && !args.pal && !args.system),
+            other => panic!("expected doctor, got {other:?}"),
+        }
+
+        // Install may only self-apply repairs that fix the install it is
+        // producing. Anything that copies or removes operator data is deferred.
+        let safe = install_time_safe_actions();
+        for kind in [
+            ActionKind::RemoveProfileLine,
+            ActionKind::DeduplicateProfile,
+            ActionKind::FixPermissions,
+            ActionKind::UpdateServicePath,
+            ActionKind::CreateDirectory,
+            ActionKind::InitStateFile,
+        ] {
+            assert!(safe.contains(&kind), "{kind} is safe at install time");
+        }
+        for kind in [
+            ActionKind::CopyLegacyConfig,
+            ActionKind::CopyLegacyState,
+            ActionKind::RemoveOrphanedFile,
+            ActionKind::CleanupBackup,
+        ] {
+            assert!(
+                !safe.contains(&kind),
+                "{kind} moves or removes operator data and must stay behind `sbh bootstrap`"
+            );
+        }
     }
 
     #[test]

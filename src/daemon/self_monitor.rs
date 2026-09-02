@@ -238,9 +238,14 @@ pub struct DaemonLiveness {
 /// the service manager's view of the unit.
 ///
 /// Precedence: a held lock is authoritative. Without a lock, a fresh
-/// `state.json` or an active unit still counts as running (a daemon older
-/// than lock support); a stale or missing state file with no lock does not.
-/// An unreadable lock defers to the unit state, then to state freshness.
+/// `state.json` still counts as running (a daemon older than lock support);
+/// a released lock, or a stale or missing state file with no lock, does not.
+///
+/// The service manager's view is consulted only when the lock exists but
+/// cannot be read (a root-owned system daemon queried by an unprivileged
+/// user). It must not decide the other cases: the unit may run a daemon for
+/// a *different* config, and an active unit whose daemon stopped writing
+/// state is not doing its job.
 #[must_use]
 pub fn detect_daemon_liveness(state_file: &Path, service_active: Option<bool>) -> DaemonLiveness {
     let state_age_secs = fs::metadata(state_file)
@@ -263,18 +268,10 @@ pub fn detect_daemon_liveness(state_file: &Path, service_active: Option<bool>) -
         DaemonLockProbe::Held(info) => verdict(true, "lock_held", Some(info)),
         // A lock file that nobody holds was left by a lock-aware daemon that
         // has since exited; a fresh state.json (< 90 s) must not resurrect it.
-        DaemonLockProbe::Free => {
-            if service_active == Some(true) {
-                verdict(true, "unit_active_lock_released", None)
-            } else {
-                verdict(false, "lock_released", None)
-            }
-        }
+        DaemonLockProbe::Free => verdict(false, "lock_released", None),
         DaemonLockProbe::Absent => {
             if !state_stale {
                 verdict(true, "state_fresh_no_lock", None)
-            } else if service_active == Some(true) {
-                verdict(true, "unit_active_no_lock", None)
             } else if state_age_secs.is_some() {
                 verdict(false, "no_lock_state_stale", None)
             } else {
@@ -351,10 +348,18 @@ mod daemon_lock_tests {
         assert_eq!(v.reason, "no_lock_state_stale");
         assert!(v.state_stale);
 
-        // Stale state, no lock, but the unit says active (old binary under systemd).
+        // Stale state, no lock, unit active: the unit may belong to another
+        // config (a fleet host's system service while querying an isolated
+        // config), and a daemon that stopped writing state is not working.
         let v = detect_daemon_liveness(&state_file, Some(true));
-        assert!(v.running);
-        assert_eq!(v.reason, "unit_active_no_lock");
+        assert!(
+            !v.running,
+            "an active unit must not vouch for this state file"
+        );
+        assert_eq!(v.reason, "no_lock_state_stale");
+        let v = detect_daemon_liveness(&dir.path().join("never-written.json"), Some(true));
+        assert!(!v.running);
+        assert_eq!(v.reason, "no_lock_no_state");
 
         // The lock wins over a stale state file.
         let lock = DaemonLock::acquire(&state_file).unwrap();
@@ -371,10 +376,11 @@ mod daemon_lock_tests {
         assert!(!v.running, "released lock must beat a fresh state file");
         assert_eq!(v.reason, "lock_released");
         assert!(!v.state_stale);
-        // ...unless the service manager says the unit is active (restarting).
+        // ...even when the service manager says the unit is active: a
+        // restarting unit re-acquires the lock, and until then it is not up.
         let v = detect_daemon_liveness(&state_file, Some(true));
-        assert!(v.running);
-        assert_eq!(v.reason, "unit_active_lock_released");
+        assert!(!v.running);
+        assert_eq!(v.reason, "lock_released");
     }
 }
 
