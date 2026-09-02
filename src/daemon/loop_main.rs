@@ -3421,17 +3421,25 @@ impl MonitoringDaemon {
                 .is_none_or(|last| now.saturating_duration_since(last) >= maintenance_interval)
         {
             let plan = self.voi_scheduler.schedule(now);
-            let paths: Vec<PathBuf> = plan.paths.iter().map(|entry| entry.path.clone()).collect();
+            // Only roots whose own mount is in Maintain: a root on a mount
+            // parked in Recovery (or reclaiming, or idle after an empty
+            // pass) is that mount's business, not the routine pass's.
+            let entries: Vec<_> = plan
+                .paths
+                .iter()
+                .filter(|entry| self.root_mount_in_maintain(&entry.path))
+                .collect();
+            let paths: Vec<PathBuf> = entries.iter().map(|entry| entry.path.clone()).collect();
             if !paths.is_empty() {
                 self.last_maintenance_scan = Some(now);
                 let response = &maintain_tick.response;
                 let message = format!(
                     "maintenance scan: {} of {} root(s) by hazard index (budget {}, fallback={}): {}",
-                    plan.budget_used,
+                    paths.len(),
                     self.config.scanner.root_paths.len(),
                     plan.budget_total,
                     plan.fallback_active,
-                    plan.paths
+                    entries
                         .iter()
                         .map(|entry| format!(
                             "{} (index {:.0})",
@@ -3526,6 +3534,17 @@ impl MonitoringDaemon {
     /// what can be freed without a metadata write of our own (release every
     /// ballast file on it), tell the operator exactly what to run, and let
     /// the controller hold deletions until a probe write succeeds.
+    /// Whether `root` sits on a mount whose controller is in `Maintain`
+    /// (true for a mount that has no controller yet).
+    fn root_mount_in_maintain(&self, root: &Path) -> bool {
+        let Ok(stats) = self.fs_collector.collect(root) else {
+            return true;
+        };
+        self.mount_controllers
+            .get(&stats.mount_point)
+            .is_none_or(|controller| controller.state() == MountState::Maintain)
+    }
+
     fn enter_mount_recovery(
         &mut self,
         mount: &Path,
