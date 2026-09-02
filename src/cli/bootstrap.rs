@@ -37,6 +37,10 @@ pub enum MigrationReason {
     /// Systemd unit's `ReadWritePaths=` sandbox does not cover the scan
     /// roots, ballast or data directories the current config needs.
     SystemdUnitStalePaths,
+    /// Systemd unit is not the one sbh generates: hardening directives are
+    /// missing or changed, the process type differs, or a condition gate
+    /// keeps it from starting (see `daemon::service::UnitDrift`).
+    SystemdUnitDrift,
     /// Launchd plist references a binary path that does not exist.
     LaunchdPlistStaleBinary,
     /// Config file uses a deprecated key or schema version.
@@ -69,6 +73,7 @@ impl fmt::Display for MigrationReason {
             Self::DuplicatePathEntries => "duplicate-path-entries",
             Self::SystemdUnitStaleBinary => "systemd-unit-stale-binary",
             Self::SystemdUnitStalePaths => "systemd-unit-stale-paths",
+            Self::SystemdUnitDrift => "systemd-unit-drift",
             Self::LaunchdPlistStaleBinary => "launchd-plist-stale-binary",
             Self::DeprecatedConfigKey => "deprecated-config-key",
             Self::LegacyConfigPath => "legacy-config-path",
@@ -176,6 +181,9 @@ pub enum ActionKind {
     FixPermissions,
     /// Update a service unit file to point to current binary.
     UpdateServicePath,
+    /// Replace a drifted service unit with the generated one (backup
+    /// beside it, drop-ins kept).
+    ReinstallServiceUnit,
     /// Copy a legacy config file into the canonical config location.
     CopyLegacyConfig,
     /// Copy legacy state/log files into the canonical data location.
@@ -197,6 +205,7 @@ impl fmt::Display for ActionKind {
             Self::DeduplicateProfile => "deduplicate-profile",
             Self::FixPermissions => "fix-permissions",
             Self::UpdateServicePath => "update-service-path",
+            Self::ReinstallServiceUnit => "reinstall-service-unit",
             Self::CopyLegacyConfig => "copy-legacy-config",
             Self::CopyLegacyState => "copy-legacy-state",
             Self::RemoveOrphanedFile => "remove-orphaned-file",
@@ -999,6 +1008,15 @@ fn check_systemd_health(path: &Path) -> (bool, Option<MigrationReason>, Option<S
                     );
                 }
             }
+            // The unit must be the one sbh ships: `Type=`, priority, sandbox
+            // and resource caps, with no condition gate holding it down.
+            if let Some(summary) = systemd_unit_drift_summary(path, &contents) {
+                return (
+                    false,
+                    Some(MigrationReason::SystemdUnitDrift),
+                    Some(summary),
+                );
+            }
             (true, None, None)
         }
         Err(e) => (
@@ -1007,6 +1025,57 @@ fn check_systemd_health(path: &Path) -> (bool, Option<MigrationReason>, Option<S
             Some(format!("cannot read unit file: {e}")),
         ),
     }
+}
+
+/// Whether the unit at `path` is a system or user unit, by location.
+fn systemd_unit_is_user_scope(path: &Path) -> bool {
+    !path.starts_with("/etc/systemd") && !path.starts_with("/usr/lib/systemd")
+}
+
+/// A one-line description of FAIL-grade drift for the unit at `path`, or
+/// `None` when the unit matches what sbh generates (or when sbh cannot
+/// generate one here, e.g. no binary on PATH).
+fn systemd_unit_drift_summary(path: &Path, contents: &str) -> Option<String> {
+    use crate::daemon::service::{DriftSeverity, SystemdServiceManager, UnitDrift};
+
+    let manager = SystemdServiceManager::from_env(systemd_unit_is_user_scope(path)).ok()?;
+    let dropins = if manager.config().unit_path() == path {
+        manager.config().read_dropins()
+    } else {
+        Vec::new()
+    };
+    let drift = UnitDrift::compute(path, contents, &manager.generate_unit_file(), &dropins);
+    if drift.severity() != DriftSeverity::Fail {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let gaps = drift.hardening_gaps();
+    if !gaps.is_empty() {
+        parts.push(format!("missing or changed hardening: {}", gaps.join(", ")));
+    }
+    if !drift.exec_start_matches {
+        parts.push("ExecStart runs a different binary".to_string());
+    }
+    for gate in drift.blocking_gates() {
+        parts.push(format!(
+            "{} in {} keeps the unit from starting",
+            gate.directive,
+            gate.source.display()
+        ));
+    }
+    Some(parts.join("; "))
+}
+
+fn apply_reinstall_service_unit(action: &mut MigrationAction) -> std::io::Result<()> {
+    use crate::daemon::service::SystemdServiceManager;
+
+    let manager = SystemdServiceManager::from_env(systemd_unit_is_user_scope(&action.target))
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let report = manager
+        .reinstall_unit(false)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    action.backup_path = report.backup_path;
+    Ok(())
 }
 
 /// Whether a unit file path belongs to the system scope (`/etc/systemd`).
@@ -1267,6 +1336,21 @@ fn plan_actions(footprints: &[Footprint], opts: &MigrateOptions) -> Vec<Migratio
                     });
                 }
             }
+            (FootprintKind::SystemdUnit, Some(MigrationReason::SystemdUnitDrift)) => {
+                actions.push(MigrationAction {
+                    kind: ActionKind::ReinstallServiceUnit,
+                    reason: MigrationReason::SystemdUnitDrift,
+                    target: fp.path.clone(),
+                    description: format!(
+                        "replace {} with the unit sbh generates (backup beside it, drop-ins kept): {}",
+                        fp.path.display(),
+                        fp.detail.clone().unwrap_or_default()
+                    ),
+                    applied: false,
+                    backup_path: None,
+                    error: None,
+                });
+            }
             (FootprintKind::SystemdUnit, Some(MigrationReason::SystemdUnitStalePaths)) => {
                 actions.push(MigrationAction {
                     kind: ActionKind::UpdateServicePath,
@@ -1421,6 +1505,7 @@ fn apply_actions(actions: &mut [MigrationAction], backup_dir: Option<&Path>) {
             ActionKind::DeduplicateProfile => apply_deduplicate_profile(action, backup_dir),
             ActionKind::FixPermissions => apply_fix_permissions(action, backup_dir),
             ActionKind::UpdateServicePath => apply_update_service_path(action, backup_dir),
+            ActionKind::ReinstallServiceUnit => apply_reinstall_service_unit(action),
             ActionKind::CopyLegacyConfig => apply_copy_legacy_config(action),
             ActionKind::CopyLegacyState => apply_copy_legacy_state(action),
             ActionKind::RemoveOrphanedFile => apply_remove_orphaned_file(action, backup_dir),
@@ -2016,9 +2101,15 @@ mod tests {
             format!("[Service]\nExecStart={}\n", existing.display()),
         )
         .unwrap();
-        let (healthy, issue, _) = check_systemd_health(&unit);
-        assert!(healthy);
-        assert!(issue.is_none());
+        // A unit that only names the binary is not the hardened unit sbh
+        // ships: the binary check passes, the drift check does not.
+        let (healthy, issue, detail) = check_systemd_health(&unit);
+        assert!(!healthy);
+        assert_eq!(issue, Some(MigrationReason::SystemdUnitDrift));
+        assert!(
+            detail.as_deref().is_some_and(|d| d.contains("hardening")),
+            "{detail:?}"
+        );
     }
 
     #[test]
@@ -2484,12 +2575,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let unit = tmp.path().join("sbh.service");
         fs::write(&unit, "[Unit]\nDescription=Test\n").unwrap();
+        // No stale binary reference, but nothing sbh generates either: the
+        // drift check reports it instead of the binary check.
         let (healthy, issue, _) = check_systemd_health(&unit);
-        assert!(
-            healthy,
-            "unit without ExecStart should be OK (no stale ref)"
-        );
-        assert!(issue.is_none());
+        assert!(!healthy);
+        assert_eq!(issue, Some(MigrationReason::SystemdUnitDrift));
     }
 
     #[test]
@@ -2505,9 +2595,11 @@ mod tests {
             ),
         )
         .unwrap();
+        // The binary check accepts the first ExecStart; what remains is the
+        // drift of a unit that has none of the generated hardening.
         let (healthy, issue, _) = check_systemd_health(&unit);
-        assert!(healthy, "valid ExecStart should make unit healthy");
-        assert!(issue.is_none());
+        assert!(!healthy);
+        assert_eq!(issue, Some(MigrationReason::SystemdUnitDrift));
     }
 
     #[test]

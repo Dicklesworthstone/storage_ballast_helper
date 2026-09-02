@@ -2806,6 +2806,174 @@ impl Drop for SystemdUserUnitGuard {
 /// unit's MainPID is the pid holding the daemon lock, and `systemctl stop`
 /// ends with `Result=success` and exit status 0 (`STOPPING=1` + orderly
 /// shutdown). Skips where no user service manager is reachable.
+/// `doctor --service` against a fixture unit directory shaped like this
+/// host's hand-written unit (Type=simple, no hardening, a kill-switch
+/// drop-in), then `service reinstall-unit` repairs it in place: backup
+/// beside the unit, drop-ins kept, and with `--purge-dropins` moved aside.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn doctor_service_reports_unit_drift_and_reinstall_unit_repairs_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let unit_dir = dir.path().join("units");
+    let dropin_dir = unit_dir.join("sbh.service.d");
+    fs::create_dir_all(&dropin_dir).unwrap();
+    let kill_switch = dir.path().join("HOTLOOP_DISABLED");
+    fs::write(&kill_switch, b"").unwrap();
+    let hand_written = format!(
+        "[Unit]\nDescription=Storage Ballast Helper daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon --config /etc/sbh/config.toml\nRestart=always\nRestartSec=10\nTimeoutStopSec=30\nUMask=0022\n\n[Install]\nWantedBy=default.target\n",
+        common::sbh_bin_path().display()
+    );
+    let unit_path = unit_dir.join("sbh.service");
+    fs::write(&unit_path, &hand_written).unwrap();
+    fs::write(
+        dropin_dir.join("10-scanner-v2.conf"),
+        "[Service]\nEnvironment=SBH_SCANNER_ENGINE=v2\n",
+    )
+    .unwrap();
+    fs::write(
+        dropin_dir.join("zz-hotloop-disabled.conf"),
+        format!("[Unit]\nConditionPathExists=!{}\n", kill_switch.display()),
+    )
+    .unwrap();
+    let unit_dir_arg = unit_dir.to_string_lossy().to_string();
+    let env: [(&str, &str); 2] = [
+        ("SBH_TEST_MODE", "1"),
+        ("SBH_SYSTEMD_UNIT_DIR", &unit_dir_arg),
+    ];
+    let check = |payload: &serde_json::Value, id: &str| -> (String, String) {
+        let checks = payload["service"]["checks"]
+            .as_array()
+            .expect("service.checks");
+        let check = checks
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap_or_else(|| panic!("no check {id}: {payload}"));
+        (
+            check["status"].as_str().unwrap().to_string(),
+            check["message"].as_str().unwrap().to_string(),
+        )
+    };
+
+    // The hand-written unit fails on hardening and on the active gate.
+    let before = common::run_cli_case_with_env(
+        "doctor_service_drift",
+        &["--json", "doctor", "--service", "--user"],
+        &env,
+    );
+    assert_eq!(
+        before.status.code(),
+        Some(1),
+        "drift is a FAIL: {}",
+        before.stderr
+    );
+    let payload = parse_json_stdout(&before);
+    assert_eq!(check(&payload, "service-unit-present").0, "PASS");
+    let (status, message) = check(&payload, "service-unit-hardening");
+    assert_eq!(status, "FAIL", "{payload}");
+    // User-scope units are Type=simple on both sides; the priority and
+    // hardening directives are what the hand-written unit lacks.
+    assert!(message.contains("Service/Nice"), "{message}");
+    assert!(message.contains("Service/NoNewPrivileges"), "{message}");
+    assert!(message.contains("Service/Restart"), "{message}");
+    assert_eq!(
+        check(&payload, "service-unit-execstart").0,
+        "PASS",
+        "{payload}"
+    );
+    let (status, message) = check(&payload, "service-unit-gates");
+    assert_eq!(status, "FAIL", "{payload}");
+    assert!(message.contains("HOTLOOP_DISABLED"), "{message}");
+    assert!(message.contains("zz-hotloop-disabled.conf"), "{message}");
+    assert_eq!(
+        check(&payload, "service-unit-dropins").0,
+        "WARN",
+        "{payload}"
+    );
+
+    // Reinstall keeps the drop-ins and the gate, so the gate still fails.
+    let reinstall = common::run_cli_case_with_env(
+        "service_reinstall_unit",
+        &["--json", "service", "--systemd", "--user", "reinstall-unit"],
+        &env,
+    );
+    assert_cli_success(&reinstall, "service reinstall-unit");
+    let payload = parse_json_stdout(&reinstall);
+    assert_eq!(payload["changed"], true);
+    assert_eq!(
+        payload["daemon_reloaded"], false,
+        "skipped under the test override"
+    );
+    let backup = PathBuf::from(payload["backup_path"].as_str().expect("backup path"));
+    assert_eq!(fs::read_to_string(&backup).unwrap(), hand_written);
+    let rewritten = fs::read_to_string(&unit_path).unwrap();
+    assert!(rewritten.contains("NoNewPrivileges=true"), "{rewritten}");
+    assert!(rewritten.contains("Nice=19"), "{rewritten}");
+    assert_eq!(
+        payload["dropins_kept"].as_array().unwrap().len(),
+        2,
+        "{payload}"
+    );
+    assert_eq!(
+        payload["drift_after"], "FAIL",
+        "the gate remains: {payload}"
+    );
+
+    let after = common::run_cli_case_with_env(
+        "doctor_service_after_reinstall",
+        &["--json", "doctor", "--service", "--user"],
+        &env,
+    );
+    let payload = parse_json_stdout(&after);
+    assert_eq!(
+        check(&payload, "service-unit-hardening").0,
+        "PASS",
+        "{payload}"
+    );
+    assert_eq!(check(&payload, "service-unit-gates").0, "FAIL", "{payload}");
+
+    // Purging moves the drop-ins aside (never deletes them); the unit is clean.
+    let purge = common::run_cli_case_with_env(
+        "service_reinstall_unit_purge",
+        &[
+            "--json",
+            "service",
+            "--systemd",
+            "--user",
+            "reinstall-unit",
+            "--purge-dropins",
+        ],
+        &env,
+    );
+    assert_cli_success(&purge, "service reinstall-unit --purge-dropins");
+    let payload = parse_json_stdout(&purge);
+    let moved = payload["dropins_moved"].as_array().unwrap();
+    assert_eq!(moved.len(), 2, "{payload}");
+    for entry in moved {
+        assert!(!Path::new(entry["from"].as_str().unwrap()).exists());
+        assert!(Path::new(entry["to"].as_str().unwrap()).exists(), "{entry}");
+    }
+    assert_eq!(payload["drift_after"], "PASS", "{payload}");
+
+    let clean = common::run_cli_case_with_env(
+        "doctor_service_clean",
+        &["--json", "doctor", "--service", "--user"],
+        &env,
+    );
+    assert_cli_success(&clean, "doctor --service after purge");
+    let payload = parse_json_stdout(&clean);
+    for id in [
+        "service-unit-present",
+        "service-unit-hardening",
+        "service-unit-execstart",
+        "service-unit-gates",
+        "service-unit-dropins",
+        "service-unit-other",
+    ] {
+        assert_eq!(check(&payload, id).0, "PASS", "{id}: {payload}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[allow(clippy::too_many_lines)]

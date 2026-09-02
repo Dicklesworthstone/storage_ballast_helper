@@ -16,7 +16,10 @@ use crate::platform::types::ServiceKind;
 
 pub use launchctl::{LaunchctlDomain, LaunchctlServiceTarget};
 pub use launchd::{LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport};
-pub use systemd::{SystemdConfig, SystemdServiceManager};
+pub use systemd::{
+    ConditionGate, DirectiveChange, DriftSeverity, ForeignDropIn, ReinstallReport, SystemdConfig,
+    SystemdServiceManager, UnitDrift, parse_unit_directives,
+};
 
 /// Unit name for the systemd service.
 pub const SYSTEMD_UNIT_NAME: &str = "sbh.service";

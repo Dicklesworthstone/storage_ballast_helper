@@ -396,6 +396,17 @@ enum ServiceCommand {
     Restart,
     /// Print recent service log lines.
     Logs(ServiceLogsArgs),
+    /// Replace the installed systemd unit with the one sbh generates
+    /// (timestamped backup beside it; drop-ins are kept unless purged).
+    ReinstallUnit(ReinstallUnitArgs),
+}
+
+#[derive(Debug, Clone, Args, Serialize, Default)]
+struct ReinstallUnitArgs {
+    /// Move every drop-in (`sbh.service.d/*.conf`, `system.control`) aside
+    /// into the backup directory instead of leaving it in effect.
+    #[arg(long)]
+    purge_dropins: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize)]
@@ -462,6 +473,14 @@ struct DoctorArgs {
     /// legacy paths, state) without changing anything.
     #[arg(long)]
     env: bool,
+    /// Compare the installed service unit (systemd) or plist (launchd)
+    /// with what sbh generates: hardening directives, process type,
+    /// foreign drop-ins, and condition gates that keep it from starting.
+    #[arg(long)]
+    service: bool,
+    /// With --service: check the user-scope unit instead of the system one.
+    #[arg(long, requires = "service")]
+    user: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -3523,7 +3542,409 @@ fn run_service(cli: &Cli, args: &ServiceArgs) -> Result<(), CliError> {
         ServiceCommand::Status => run_service_status(cli, service),
         ServiceCommand::Restart => run_service_restart(cli, service),
         ServiceCommand::Logs(logs_args) => run_service_logs(cli, service, logs_args),
+        ServiceCommand::ReinstallUnit(reinstall) => {
+            run_service_reinstall_unit(cli, service, reinstall)
+        }
     }
+}
+
+/// `doctor --service`: the installed unit against what sbh generates.
+fn service_doctor_checks(user_scope_requested: bool) -> Result<Vec<DoctorCheck>, CliError> {
+    use storage_ballast_helper::daemon::service::SystemdServiceManager;
+
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    match platform.service_kind() {
+        ServiceKind::Systemd => {}
+        ServiceKind::Launchd => return Ok(launchd_doctor_checks(user_scope_requested)),
+        ServiceKind::None => {
+            return Ok(vec![doctor_check(
+                "service-unit-present",
+                "Service unit",
+                "WARN",
+                "no service manager on this platform; nothing to compare",
+                None,
+            )]);
+        }
+    }
+
+    // The system unit is what runs on an installed host; fall back to the
+    // user unit when only that exists, or when asked for it.
+    let user_scope = if user_scope_requested {
+        true
+    } else {
+        let system =
+            SystemdServiceManager::from_env(false).map_err(|e| CliError::Runtime(e.to_string()))?;
+        !system.config().unit_path().exists()
+            && SystemdServiceManager::from_env(true)
+                .is_ok_and(|user| user.config().unit_path().exists())
+    };
+    let manager = SystemdServiceManager::from_env(user_scope)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let unit_path = manager.config().unit_path();
+    let reinstall = if user_scope {
+        "sbh service --systemd --user reinstall-unit".to_string()
+    } else {
+        "sudo sbh service --systemd reinstall-unit".to_string()
+    };
+    let install = if user_scope {
+        "sbh install --user"
+    } else {
+        "sudo sbh install --scope system"
+    };
+
+    let drift = match manager.drift_report() {
+        Ok(drift) => drift,
+        Err(error) => {
+            return Ok(vec![doctor_check(
+                "service-unit-present",
+                "Service unit",
+                "FAIL",
+                format!("no unit at {}: {error}", unit_path.display()),
+                Some(install.to_string()),
+            )]);
+        }
+    };
+
+    Ok(unit_drift_checks(
+        &drift,
+        &unit_path,
+        user_scope,
+        &manager.config().binary_path,
+        &reinstall,
+    ))
+}
+
+/// The `doctor --service` checks for a computed drift: unit present,
+/// hardening, binary, gates, then drop-ins and everything else.
+fn unit_drift_checks(
+    drift: &storage_ballast_helper::daemon::service::UnitDrift,
+    unit_path: &Path,
+    user_scope: bool,
+    binary_path: &Path,
+    reinstall: &str,
+) -> Vec<DoctorCheck> {
+    let mut checks = vec![doctor_check(
+        "service-unit-present",
+        "Service unit",
+        "PASS",
+        format!(
+            "{} ({} scope)",
+            unit_path.display(),
+            if user_scope { "user" } else { "system" }
+        ),
+        None,
+    )];
+
+    let gaps = drift.hardening_gaps();
+    checks.push(if gaps.is_empty() {
+        doctor_check(
+            "service-unit-hardening",
+            "Hardening directives",
+            "PASS",
+            "process type, priority, sandbox and resource caps match the generated unit",
+            None,
+        )
+    } else {
+        doctor_check(
+            "service-unit-hardening",
+            "Hardening directives",
+            "FAIL",
+            format!("missing or changed: {}", gaps.join(", ")),
+            Some(reinstall.to_string()),
+        )
+    });
+
+    checks.push(if drift.exec_start_matches {
+        doctor_check(
+            "service-unit-execstart",
+            "ExecStart binary",
+            "PASS",
+            "runs this sbh binary",
+            None,
+        )
+    } else {
+        doctor_check(
+            "service-unit-execstart",
+            "ExecStart binary",
+            "FAIL",
+            format!("runs a different binary than {}", binary_path.display()),
+            Some(reinstall.to_string()),
+        )
+    });
+
+    let blocking = drift.blocking_gates();
+    checks.push(if !blocking.is_empty() {
+        let gates: Vec<String> = blocking
+            .iter()
+            .map(|gate| format!("{} ({})", gate.directive, gate.source.display()))
+            .collect();
+        doctor_check(
+            "service-unit-gates",
+            "Condition gates",
+            "FAIL",
+            format!("the unit cannot start: {}", gates.join("; ")),
+            Some(format!(
+                "remove the gating path or the drop-in that sets it, or `{reinstall} --purge-dropins` to move every drop-in aside"
+            )),
+        )
+    } else if drift.condition_gates.is_empty() {
+        doctor_check("service-unit-gates", "Condition gates", "PASS", "none", None)
+    } else {
+        let gates: Vec<String> = drift
+            .condition_gates
+            .iter()
+            .map(|gate| format!("{} ({})", gate.directive, gate.source.display()))
+            .collect();
+        doctor_check(
+            "service-unit-gates",
+            "Condition gates",
+            "WARN",
+            format!("present but currently passing: {}", gates.join("; ")),
+            None,
+        )
+    });
+
+    checks.extend(unit_drift_extra_checks(drift, reinstall));
+    checks
+}
+
+/// Drop-ins and non-hardening differences: warnings, unless a drop-in
+/// overrides a hardening directive.
+fn unit_drift_extra_checks(
+    drift: &storage_ballast_helper::daemon::service::UnitDrift,
+    reinstall: &str,
+) -> Vec<DoctorCheck> {
+    let gaps = drift.hardening_gaps();
+    let mut checks = Vec::new();
+    checks.push(if drift.foreign_dropins.is_empty() {
+        doctor_check("service-unit-dropins", "Drop-ins", "PASS", "none", None)
+    } else {
+        let listed: Vec<String> = drift
+            .foreign_dropins
+            .iter()
+            .map(|d| format!("{} sets {}", d.path.display(), d.directives.join(", ")))
+            .collect();
+        let overrides = drift.foreign_dropins.iter().any(|d| d.overrides_hardening);
+        doctor_check(
+            "service-unit-dropins",
+            "Drop-ins",
+            if overrides { "FAIL" } else { "WARN" },
+            format!(
+                "{}{}",
+                if overrides {
+                    "a drop-in overrides a hardening directive: "
+                } else {
+                    "sbh did not write these: "
+                },
+                listed.join("; ")
+            ),
+            Some(format!("{reinstall} --purge-dropins")),
+        )
+    });
+
+    let other: Vec<String> = drift
+        .changed_directives
+        .iter()
+        .filter(|change| !change.hardening)
+        .map(|change| {
+            format!(
+                "{} is {} (generated {})",
+                change.directive,
+                change.installed.join(" "),
+                change.generated.join(" ")
+            )
+        })
+        .chain(
+            drift
+                .missing_directives
+                .iter()
+                .filter(|d| !gaps.contains(d))
+                .map(|d| format!("{d} missing")),
+        )
+        .chain(
+            drift
+                .extra_directives
+                .iter()
+                .map(|d| format!("{d} not generated by sbh")),
+        )
+        .collect();
+    checks.push(if other.is_empty() {
+        doctor_check(
+            "service-unit-other",
+            "Other directives",
+            "PASS",
+            "identical",
+            None,
+        )
+    } else {
+        doctor_check(
+            "service-unit-other",
+            "Other directives",
+            "WARN",
+            other.join("; "),
+            Some(reinstall.to_string()),
+        )
+    });
+    checks
+}
+
+/// `doctor --service` on macOS: the installed plist against the generated one.
+fn launchd_doctor_checks(user_scope: bool) -> Vec<DoctorCheck> {
+    let manager = match LaunchdServiceManager::from_env_for_control(user_scope) {
+        Ok(manager) => manager,
+        Err(error) => {
+            return vec![doctor_check(
+                "service-unit-present",
+                "Launchd plist",
+                "FAIL",
+                format!("cannot resolve the launchd service: {error}"),
+                None,
+            )];
+        }
+    };
+    let plist_path = manager.config().plist_path();
+    let Ok(installed) = std::fs::read_to_string(&plist_path) else {
+        return vec![doctor_check(
+            "service-unit-present",
+            "Launchd plist",
+            "FAIL",
+            format!("no plist at {}", plist_path.display()),
+            Some(if user_scope {
+                "sbh install --user".to_string()
+            } else {
+                "sudo sbh install --scope system".to_string()
+            }),
+        )];
+    };
+    let normalize = |text: &str| -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    };
+    let installed_lines = normalize(&installed);
+    let generated_lines = normalize(&manager.generate_plist());
+    let mut checks = vec![doctor_check(
+        "service-unit-present",
+        "Launchd plist",
+        "PASS",
+        plist_path.display().to_string(),
+        None,
+    )];
+    checks.push(if installed_lines == generated_lines {
+        doctor_check(
+            "service-unit-hardening",
+            "Plist contents",
+            "PASS",
+            "matches the generated plist",
+            None,
+        )
+    } else {
+        let differing = installed_lines
+            .iter()
+            .filter(|line| !generated_lines.contains(line))
+            .count()
+            + generated_lines
+                .iter()
+                .filter(|line| !installed_lines.contains(line))
+                .count();
+        doctor_check(
+            "service-unit-hardening",
+            "Plist contents",
+            "WARN",
+            format!("{differing} line(s) differ from the generated plist"),
+            Some("sbh install (rewrites the plist)".to_string()),
+        )
+    });
+    checks
+}
+
+fn run_service_reinstall_unit(
+    cli: &Cli,
+    service: ResolvedServiceControl,
+    args: &ReinstallUnitArgs,
+) -> Result<(), CliError> {
+    if service.kind != ServiceKind::Systemd {
+        return Err(CliError::User(
+            "reinstall-unit rewrites a systemd unit; on launchd run `sbh install` to rewrite the plist"
+                .to_string(),
+        ));
+    }
+    ensure_privileged_service_action(cli, service, "reinstall-unit")?;
+    let manager = SystemdServiceManager::from_env(service.user_scope)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let before = manager.drift_report().ok().map(|drift| drift.severity());
+    let report = manager
+        .reinstall_unit(args.purge_dropins)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let after = manager
+        .drift_report()
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+
+    match output_mode(cli) {
+        OutputMode::Json => write_json_line(&json!({
+            "command": "service reinstall-unit",
+            "scope": service.scope_name(),
+            "unit_path": report.unit_path.to_string_lossy(),
+            "backup_path": report.backup_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            "changed": report.changed,
+            "daemon_reloaded": report.daemon_reloaded,
+            "dropins_kept": report.dropins_kept.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+            "dropins_moved": report.dropins_moved.iter().map(|(from, to)| json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() })).collect::<Vec<_>>(),
+            "drift_before": before,
+            "drift_after": after.severity(),
+            "remaining_gates": after.blocking_gates().iter().map(|g| format!("{} ({})", g.directive, g.source.display())).collect::<Vec<_>>(),
+        }))?,
+        OutputMode::Human => {
+            println!(
+                "{} {} ({} scope)",
+                if report.changed {
+                    "Rewrote"
+                } else {
+                    "Refreshed (unchanged)"
+                },
+                report.unit_path.display(),
+                service.scope_name()
+            );
+            if let Some(backup) = &report.backup_path {
+                println!("  backup: {}", backup.display());
+            }
+            for path in &report.dropins_kept {
+                println!("  kept drop-in: {}", path.display());
+            }
+            for (from, to) in &report.dropins_moved {
+                println!("  moved drop-in: {} -> {}", from.display(), to.display());
+            }
+            println!(
+                "  daemon-reload: {}",
+                if report.daemon_reloaded {
+                    "done"
+                } else {
+                    "skipped"
+                }
+            );
+            println!(
+                "  drift: {} -> {}",
+                before.map_or_else(
+                    || "no unit".to_string(),
+                    |s| format!("{s:?}").to_uppercase()
+                ),
+                format!("{:?}", after.severity()).to_uppercase()
+            );
+            for gate in after.blocking_gates() {
+                println!(
+                    "  still gated: {} ({})",
+                    gate.directive,
+                    gate.source.display()
+                );
+            }
+            if !report.daemon_reloaded {
+                println!("  run `systemctl daemon-reload` before restarting the service");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_service_status(cli: &Cli, service: ResolvedServiceControl) -> Result<(), CliError> {
@@ -6613,14 +7034,56 @@ struct PalDoctorFollowUp {
     steps: Vec<String>,
 }
 
+/// Human `doctor` output: each requested report in order, blank-line
+/// separated.
+fn print_doctor_reports(
+    pal_report: Option<&PalDoctorReport>,
+    release_report: Option<&ReleaseDoctorReport>,
+    system_checks: Option<&[DoctorCheck]>,
+    env_checks: Option<&[DoctorCheck]>,
+    service_checks: Option<&[DoctorCheck]>,
+) {
+    let mut printed = false;
+    let separate = |printed: &mut bool| {
+        if *printed {
+            println!();
+        }
+        *printed = true;
+    };
+    if let Some(report) = pal_report {
+        separate(&mut printed);
+        print_pal_doctor_report(report);
+    }
+    if let Some(report) = release_report {
+        separate(&mut printed);
+        print_release_doctor_report(report);
+    }
+    for (title, checks) in [
+        ("System tuning checks:", system_checks),
+        ("Install footprint checks:", env_checks),
+        ("Service unit checks:", service_checks),
+    ] {
+        if let Some(checks) = checks {
+            separate(&mut printed);
+            println!("{title}");
+            print_doctor_checks(checks);
+        }
+    }
+}
+
 fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
-    if !args.pal && !args.release && !args.system && !args.env {
+    if !args.pal && !args.release && !args.system && !args.env && !args.service {
         return Err(CliError::User(
-            "specify a diagnostic target, for example: sbh doctor --pal, --system, --env, or --release"
+            "specify a diagnostic target, for example: sbh doctor --pal, --system, --env, --service, or --release"
                 .to_string(),
         ));
     }
     let env_checks = args.env.then(env_doctor_checks);
+    let service_checks = if args.service {
+        Some(service_doctor_checks(args.user)?)
+    } else {
+        None
+    };
 
     let pal_report = if args.pal {
         let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -6642,11 +7105,16 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
         OutputMode::Json => {
             // Preserve the single-target top-level shapes; nest only when targets
             // are combined.
-            let payload = match (args.pal, args.release, args.system, args.env) {
-                (true, false, false, false) => serde_json::to_value(&pal_report)?,
-                (false, true, false, false) => serde_json::to_value(&release_report)?,
-                (false, false, true, false) => json!({ "system": { "checks": system_checks } }),
-                (false, false, false, true) => json!({ "env": { "checks": env_checks } }),
+            let payload = match (args.pal, args.release, args.system, args.env, args.service) {
+                (true, false, false, false, false) => serde_json::to_value(&pal_report)?,
+                (false, true, false, false, false) => serde_json::to_value(&release_report)?,
+                (false, false, true, false, false) => {
+                    json!({ "system": { "checks": system_checks } })
+                }
+                (false, false, false, true, false) => json!({ "env": { "checks": env_checks } }),
+                (false, false, false, false, true) => {
+                    json!({ "service": { "checks": service_checks } })
+                }
                 _ => {
                     let mut obj = serde_json::Map::new();
                     if let Some(report) = &pal_report {
@@ -6661,36 +7129,21 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
                     if let Some(checks) = &env_checks {
                         obj.insert("env".to_string(), json!({ "checks": checks }));
                     }
+                    if let Some(checks) = &service_checks {
+                        obj.insert("service".to_string(), json!({ "checks": checks }));
+                    }
                     Value::Object(obj)
                 }
             };
             write_json_line(&payload)?;
         }
-        OutputMode::Human => {
-            if let Some(report) = &pal_report {
-                print_pal_doctor_report(report);
-            }
-            if let Some(report) = &release_report {
-                if pal_report.is_some() {
-                    println!();
-                }
-                print_release_doctor_report(report);
-            }
-            if let Some(checks) = &system_checks {
-                if pal_report.is_some() || release_report.is_some() {
-                    println!();
-                }
-                println!("System tuning checks:");
-                print_doctor_checks(checks);
-            }
-            if let Some(checks) = &env_checks {
-                if pal_report.is_some() || release_report.is_some() || system_checks.is_some() {
-                    println!();
-                }
-                println!("Install footprint checks:");
-                print_doctor_checks(checks);
-            }
-        }
+        OutputMode::Human => print_doctor_reports(
+            pal_report.as_ref(),
+            release_report.as_ref(),
+            system_checks.as_deref(),
+            env_checks.as_deref(),
+            service_checks.as_deref(),
+        ),
     }
 
     let failed = pal_report
@@ -6703,6 +7156,9 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
             .as_ref()
             .is_some_and(|checks| doctor_checks_have_failures(checks))
         || env_checks
+            .as_ref()
+            .is_some_and(|checks| doctor_checks_have_failures(checks))
+        || service_checks
             .as_ref()
             .is_some_and(|checks| doctor_checks_have_failures(checks));
     if failed {

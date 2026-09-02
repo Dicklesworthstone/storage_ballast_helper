@@ -385,7 +385,8 @@ src/
 | `sbh config path\|show\|validate\|diff\|reset\|set` | Manage configuration |
 | `sbh install [--systemd\|--launchd] [--user] [--from-source] [--wizard\|--auto] [--no-bootstrap]` | Install as system service (runs the safe bootstrap repairs first) |
 | `sbh bootstrap [--dry-run]` | Scan the install footprint and repair it with backups (PATH lines, unit paths, permissions, legacy paths, state) |
-| `sbh doctor --pal\|--system\|--env\|--release` | Diagnostics; `--env` is the read-only bootstrap scan |
+| `sbh doctor --pal\|--system\|--env\|--service [--user]\|--release` | Diagnostics; `--env` is the read-only bootstrap scan; `--service` diffs the installed unit/plist against the generator (hardening, `Type=`, binary, drop-ins, condition gates) |
+| `sbh service --systemd reinstall-unit [--purge-dropins]` | Rewrite the systemd unit from the generator (backup beside it); drop-ins kept unless purged (moved, never deleted) |
 | `sbh uninstall [--systemd\|--launchd] [--user] [--purge\|--keep-data\|--keep-config\|--keep-assets] [--dry-run] [--backup-dir DIR] [--yes]` | Remove binary + service (default) or clean up per the README matrix, backup-first; `--dry-run` plans only |
 | `sbh setup [--all] [--path] [--verify] [--completions SHELLS]` | Post-install PATH/completions setup |
 | `sbh tune [--apply] [--yes]` | Show/apply tuning recommendations |
