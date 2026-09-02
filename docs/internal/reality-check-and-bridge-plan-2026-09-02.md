@@ -292,43 +292,46 @@ to remove.
 - `docs/internal/macos-parity-completion-audit.md` says "Complete as of
   v0.4.22" while the epic is open and reality regressed after it.
 
-## 5b. Consolidation with the parallel bridge plan (2026-09-02)
+## 5b. Consolidation with the parallel bridge plan (2026-09-02, final)
 
-A second agent ran an independent reality check in the same hours and
-produced `docs/internal/reality-check-2026-09-01.md` plus the bead tree
-`bd-rc-bridge-2026-09-btcx` (G0–G12, 62 beads). The two analyses agree on
-every major finding they both cover (explain/bootstrap/uninstall/dashboard
-absent, `READY=1` never sent, updater asset contract 404s, config example
-silently ignored, CI/clippy red, host unprotected, `daemon_running` false
-positive). Each found things the other did not:
+A second session (agent "OliveIbis") ran an independent reality check in the
+same hours and produced `docs/internal/reality-check-2026-09-01.md` plus the
+bead tree `bd-rc-bridge-2026-09-btcx` (G0–G12, 62 beads). The two analyses
+agree on every major finding they both cover (explain/bootstrap/uninstall/
+dashboard absent, `READY=1` never sent, updater asset contract 404s, config
+example silently ignored, CI/clippy red, host unprotected, `daemon_running`
+false positive). Each found things the other did not:
 
-- G-tree only: catalog roots for a pressured device with no configured root
-  (G1.2), systemd unit-drift detection (G3.3), policy-engine fallback
-  semantics and the guardrail near-alarm at e = 14.9 (G9), the LogSearch
-  stub (G5.3), the `curl` calls without the required user agent (G4.1), no
-  branch protection on `main` (G4.4), the 2026-05 source-tree deletion
-  history behind the FAQ answer (G8.3), repository clutter decisions (G8.5).
-- This tree only: the behavior matrix making Yellow/Orange identify-only
-  (W1.2), Green never scanning (W1.4), the Review verdict for definite
-  artifacts (W1.3), per-mount control ending affinity starvation (W1.1),
-  the special-location horizon rule (W1.6), EROFS/ENOSPC recovery and the
-  failure e-process (W1.7), state.json v2 (W1.8), the quantitative designs
-  Q1–Q10, ballast integrity (W8), macOS technical closeout (W9), the
-  daemon e2e suite (W10), regret-calibrated thresholds (W2.4), and the
-  fleet rollout record (W13.2).
+- G-tree only: catalog roots for a pressured device with no configured root,
+  systemd unit-drift detection, policy-engine fallback semantics and the
+  guardrail near-alarm at e = 14.9, the LogSearch stub, `curl` calls without
+  the required user agent, no branch protection on `main`, the 2026-05
+  source-tree deletion history behind the FAQ answer, repository clutter.
+- This tree only: the behavior matrix making Yellow/Orange identify-only,
+  Green never scanning, the Review verdict for definite artifacts, per-mount
+  control ending affinity starvation, the special-location horizon rule,
+  EROFS/ENOSPC recovery and the failure e-process, state.json v2, the
+  quantitative designs Q1–Q10, ballast integrity, macOS technical closeout,
+  the daemon e2e suite, regret-calibrated thresholds, the fleet record.
 
-Resolution applied with `br`: every bead in this tree that duplicated a
-G bead was closed with a pointer to the canonical G bead, its unique
-details were appended to that G bead as notes, and cross-tree blocking or
-related edges were added. Closed as duplicates: W0 (all children), W2.1–2.3,
-W3.1, W3.2, W3.5–3.8, W4.1–4.4, W5.1, W5.3, W7.3, W9.4, W10.4, W11 (all),
-W12 (all), W13.1. Remaining under `bd-rc-master-ajg1`: W1 (all eleven),
-W2.4, W3.3, W3.4, W4.5, W5.2, W6, W7.1, W7.2, W7.4, W7.5, W8, W9.1–9.3,
-W10.1–10.3, W13.2. The two master epics are linked as related. Implementers
-should treat the union as one plan: G-tree for lifecycle, distribution,
-explain, dashboard, docs, and policy; this tree for daemon behavior,
-quantitative control, e2e proof, ballast integrity, macOS technical items,
-and rollout.
+**Final rule: `bd-rc-master-ajg1` is the single canonical tree.** The two
+sessions first reconciled in opposite directions within the same minutes
+(this one closed 30 beads in favor of the G-tree; the other closed all 62 G
+beads in favor of this tree and folded 19 of its unique items in as
+`folded`-labeled children). The closures on this side were reversed and
+every merged G bead's description (Files, Tests, Success criteria) was
+appended to its canonical bead here, so no specification was lost. Where a
+G bead's close reason named no specific home, the mapping used was: G1 epic
+→ W1; G1.4 → W1.8; G1.5 → W1.11; G1.6 → W10.2; G0 → W13.1; G4 epic → W4;
+G4.4 → W0.2 (and noted on W4.5); G6 epic → W3; G6.3 → W3.5; G9 epic → W1;
+G9.3 → the folded policy bead; G10 epic → W3; G10.6 → W3.4; G11 epic → W7;
+G11.3 → W7.3. The folded children (catalog roots, control socket,
+quarantine-first deletion with `sbh undo`, adaptive conformal
+time-to-exhaustion, risk-budgeted batch planner, `explain --why-not/
+--replay`, incident replay, Prometheus textfile export, claims registry,
+fuzz targets, unit-drift doctor, dashboard e2e, LogSearch, platform JSON
+honesty, policy fallback semantics, guardrail near-alarm, path-traversal
+regression, clutter decisions) are first-class beads in this tree.
 
 ## 6. Bridge plan (revision 4 — ambition rounds 1-3 applied)
 
