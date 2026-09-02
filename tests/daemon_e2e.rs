@@ -11,6 +11,7 @@
 //! Two scenarios need a real filesystem whose free space and write mode the
 //! test controls (a loop-mounted ext4 image): they are `#[ignore]`d and run
 //! with `--ignored` where passwordless sudo is available.
+#![allow(missing_docs)]
 
 mod common;
 
@@ -126,6 +127,8 @@ pub struct ScenarioConfig {
     /// When set, notifications go to this file (JSON lines) instead of
     /// being disabled.
     pub notify_file: Option<PathBuf>,
+    /// Raw TOML appended after the generated sections.
+    pub extra_toml: String,
 }
 
 impl Default for ScenarioConfig {
@@ -145,6 +148,7 @@ impl Default for ScenarioConfig {
             ballast_file_bytes: 1_048_576,
             engine: "v2",
             notify_file: None,
+            extra_toml: String::new(),
         }
     }
 }
@@ -169,7 +173,7 @@ fn write_config(dir: &Path, scenario: &ScenarioConfig) -> PathBuf {
         },
     );
     let config = format!(
-        r#"[paths]
+        r"[paths]
 ballast_dir = {ballast:?}
 jsonl_log = {jsonl:?}
 sqlite_db = {sqlite:?}
@@ -193,7 +197,7 @@ min_file_age_minutes = {min_age}
 min_rescan_interval_secs = {rescan}
 max_depth = 6
 parallelism = 2
-{notifications}"#,
+{notifications}{extra}",
         ballast = data.join("ballast").display().to_string(),
         jsonl = data.join("activity.jsonl").display().to_string(),
         sqlite = data.join("activity.sqlite3").display().to_string(),
@@ -208,6 +212,7 @@ parallelism = 2
         roots = roots,
         min_age = scenario.min_file_age_minutes,
         rescan = scenario.min_rescan_interval_secs,
+        extra = scenario.extra_toml,
     );
     let path = dir.join("config.toml");
     fs::write(&path, config).unwrap();
@@ -359,6 +364,38 @@ impl DaemonRun {
             .cloned()
     }
 
+    /// Copy the daemon's stderr, activity log and state file somewhere that
+    /// survives the scratch directory, for post-mortems; returns that dir.
+    fn preserve_outputs(&self) -> PathBuf {
+        let name = self
+            .data_dir
+            .parent()
+            .and_then(Path::file_name)
+            .map_or_else(|| "run".to_string(), |n| n.to_string_lossy().into_owned());
+        let dir = scratch_base()
+            .join("sbh-e2e-failures")
+            .join(format!("{name}-{}", self.child.id()));
+        let _ = fs::create_dir_all(&dir);
+        for (from, to) in [
+            (self.stderr_path.clone(), "daemon.stderr"),
+            (self.data_dir.join("activity.jsonl"), "activity.jsonl"),
+            (self.state_path(), "state.json"),
+        ] {
+            let _ = fs::copy(from, dir.join(to));
+        }
+        dir
+    }
+
+    fn timeout(&self, what: &str) -> RunnerError {
+        RunnerError::Timeout(format!(
+            "{what} after {:?}; deleted so far: {:?}; outputs kept in {}; stderr tail:\n{}",
+            self.started.elapsed(),
+            self.deleted_paths(),
+            self.preserve_outputs().display(),
+            self.stderr_tail()
+        ))
+    }
+
     /// Poll until `predicate` holds for the state file, the daemon exits, or
     /// the deadline passes. Never passes vacuously: no state means failure.
     pub fn wait_for_state(
@@ -378,11 +415,7 @@ impl DaemonRun {
                 return Ok(state);
             }
             if Instant::now() >= deadline {
-                return Err(RunnerError::Timeout(format!(
-                    "{what} after {:?}; stderr tail:\n{}",
-                    self.started.elapsed(),
-                    self.stderr_tail()
-                )));
+                return Err(self.timeout(what));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -404,11 +437,7 @@ impl DaemonRun {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err(RunnerError::Timeout(format!(
-                    "{what} after {:?}; stderr tail:\n{}",
-                    self.started.elapsed(),
-                    self.stderr_tail()
-                )));
+                return Err(self.timeout(what));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -492,10 +521,18 @@ fn quiet_root_mount() -> (&'static Path, u64, u64, bool) {
     (Path::new("/"), 1_000_000_000_000, 500_000_000_000, true)
 }
 
+/// Where scratch trees and preserved failure outputs live.
+fn scratch_base() -> PathBuf {
+    let preferred = PathBuf::from("/data/tmp");
+    if preferred.is_dir() {
+        preferred
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 fn scratch() -> tempfile::TempDir {
-    tempfile::tempdir_in("/data/tmp")
-        .or_else(|_| tempfile::tempdir())
-        .unwrap()
+    tempfile::tempdir_in(scratch_base()).unwrap()
 }
 
 // ──────────────────── scenarios ────────────────────
@@ -508,7 +545,7 @@ fn runner_starts_and_stops_a_daemon() {
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 4096);
     let scenario = ScenarioConfig {
-        root_paths: vec![fixtures.root.clone()],
+        root_paths: vec![fixtures.root],
         ..ScenarioConfig::default()
     };
     let mut run = DaemonRun::spawn(dir.path(), &scenario, None);
@@ -523,7 +560,7 @@ fn runner_starts_and_stops_a_daemon() {
             .and_then(Value::as_str)
             .is_some_and(|id| !id.is_empty())
     );
-    assert!(state["threads"]["monitor"]["status"] == "running");
+    assert_eq!(state["threads"]["monitor"]["status"], "running");
 
     let status = run.stop();
     assert!(status.success(), "clean SIGTERM exit, got {status}");
@@ -678,13 +715,13 @@ fn injected_orange_mount_reclaims_only_the_stale_target() {
     assert_ne!(fixture_state["state"], "observe_only", "{fixture_state}");
 
     // Keep the fresh target fresh while the stale one crosses the age gate.
-    let stale = fixtures.stale_target.clone();
+    let stale_path = fixtures.stale_target.clone();
     run.wait_until(
         "deletion of the stale target",
         Duration::from_secs(150),
         |run| {
             fixtures.touch_fresh();
-            run.deleted_paths().iter().any(|p| p == &stale)
+            run.deleted_paths().iter().any(|p| p == &stale_path)
         },
     )
     .unwrap_or_else(|e| panic!("{e}"));
@@ -718,6 +755,8 @@ fn injected_orange_mount_reclaims_only_the_stale_target() {
             .exists(),
         "the git project root survives"
     );
+    let cpu = run.cpu_ratio().unwrap_or(f64::NAN);
+    let _ = writeln!(std::io::stderr(), "host-layout daemon cpu share: {cpu:.4}");
     let status = run.stop();
     assert!(status.success(), "{status}");
     let _ = fs::read_to_string(dir.path().join("daemon.stderr"))
@@ -731,7 +770,9 @@ fn injected_orange_mount_reclaims_only_the_stale_target() {
 
 // ──────────────────── guarded candidates ────────────────────
 
-/// Candidates that must survive a reclaim: a Definite target with a file
+/// Candidates that must survive a reclaim.
+///
+/// A Definite target with a file
 /// held open by this process, a target under an active build lease held by
 /// this process, and a symlink to a Definite target outside the root.
 pub struct KeepFixtures {
@@ -754,17 +795,17 @@ impl KeepFixtures {
         )
         .unwrap();
 
-        // The lease is taken before the target exists and creates it.
-        let leased_project = root.join("leased-proj");
-        fs::create_dir_all(&leased_project).unwrap();
+        // A lease covers an immediate child of a configured root and is
+        // taken before the target exists (it creates the directory), so the
+        // leased target is `root/target` itself.
         let lease = ActiveLease::acquire(
             &[root.to_path_buf()],
-            &leased_project.join("target"),
+            &root.join("target"),
             Duration::from_secs(600),
             1 << 30,
         )
         .expect("acquire an active lease");
-        let leased_target = definite_target(&leased_project, stale_age, 4096);
+        let leased_target = definite_target(root, stale_age, 4096);
 
         let link_dest = definite_target(&dir.join("outside-proj"), stale_age, 4096);
         let link_project = root.join("link-proj");
@@ -937,31 +978,33 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
     // gate has passed, a forced scan (SIGUSR1) wakes it instead of waiting
     // out the backoff; the reclaim itself is the daemon's own decision.
     let gate = created + Duration::from_secs(66);
-    run.wait_until("the age gate", Duration::from_secs(70), |_| {
+    let stale_path = fixtures.stale_target.clone();
+    run.wait_until("the age gate", Duration::from_secs(70), |run| {
         fixtures.touch_fresh();
-        Instant::now() >= gate
+        Instant::now() >= gate || run.deleted_paths().iter().any(|p| p == &stale_path)
     })
     .unwrap_or_else(|e| panic!("[{engine}] {e}"));
-    run.signal("-USR1");
-    let stale = fixtures.stale_target.clone();
+    if !run.deleted_paths().iter().any(|p| p == &stale_path) {
+        run.signal("-USR1");
+    }
     run.wait_until(
         "deletion of the stale target",
         Duration::from_secs(60),
         |run| {
             fixtures.touch_fresh();
-            run.deleted_paths().iter().any(|p| p == &stale)
+            run.deleted_paths().iter().any(|p| p == &stale_path)
         },
     )
     .unwrap_or_else(|e| panic!("[{engine}] {e}"));
 
     // Every successful deletion cites a decision recorded for the same path.
     let decisions = run.events_of("decision");
-    let deletes: Vec<Value> = run
+    let delete_events: Vec<Value> = run
         .events_of("artifact_delete")
         .into_iter()
         .filter(|e| e.get("ok") != Some(&Value::Bool(false)))
         .collect();
-    for delete in &deletes {
+    for delete in &delete_events {
         let id = delete["decision_id"]
             .as_str()
             .unwrap_or_else(|| panic!("[{engine}] artifact_delete without decision_id: {delete}"));
@@ -996,23 +1039,23 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
     for path in &deleted {
         assert!(
             path.starts_with(&fixtures.root),
-            "[{engine}] deleted outside the root: {path:?}"
+            "[{engine}] deleted outside the root: {}",
+            path.display()
         );
     }
 
-    let record = run
-        .wait_for_state(
-            "the fixture mount record",
-            Duration::from_secs(60),
-            |state| {
-                state["mount_controllers"].as_array().is_some_and(|c| {
-                    c.iter()
-                        .any(|c| c["mount"] == fixture_mount.to_string_lossy().as_ref())
-                })
-            },
-        )
-        .map(|_| run.mount_record(&fixture_mount).unwrap())
-        .unwrap_or_else(|e| panic!("[{engine}] {e}"));
+    run.wait_for_state(
+        "the fixture mount record",
+        Duration::from_secs(60),
+        |state| {
+            state["mount_controllers"].as_array().is_some_and(|c| {
+                c.iter()
+                    .any(|c| c["mount"] == fixture_mount.to_string_lossy().as_ref())
+            })
+        },
+    )
+    .unwrap_or_else(|e| panic!("[{engine}] {e}"));
+    let record = run.mount_record(&fixture_mount).unwrap();
     assert_eq!(record["surface"], "configured", "{record}");
     assert_eq!(record["level"], "orange", "{record}");
     assert!(
@@ -1071,19 +1114,20 @@ fn red_pressure_releases_the_whole_pool_before_scanning() {
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 4096);
     let fixture_mount = dir.path().to_path_buf();
     let (root, root_total, root_free, root_ro) = quiet_root_mount();
-    // Green for the first 12 s (the pool provisions at startup), then 4%.
+    // Green for the first 12 s (the pool provisions at startup), then 8%:
+    // Red, between the 6% red floor and the 10% orange line.
     let table = table_of(&[
         mount_entry(
             &fixture_mount,
             1_000_000_000_000,
             500_000_000_000,
             false,
-            &[(12, 40_000_000_000)],
+            &[(12, 80_000_000_000)],
         ),
         mount_entry(root, root_total, root_free, root_ro, &[]),
     ]);
     let scenario = ScenarioConfig {
-        root_paths: vec![fixtures.root.clone()],
+        root_paths: vec![fixtures.root],
         ballast_files: 2,
         ..ScenarioConfig::default()
     };
@@ -1166,7 +1210,7 @@ fn sigusr1_forces_a_green_scan_within_two_seconds() {
         quiet_root_mount(),
     ]);
     let scenario = ScenarioConfig {
-        root_paths: vec![fixtures.root.clone()],
+        root_paths: vec![fixtures.root],
         ..ScenarioConfig::default()
     };
     let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
@@ -1228,6 +1272,8 @@ fn sighup_reload_scans_the_new_root_and_relogs_the_matrix() {
     let root_b = dir.path().join("root-b");
     let late_target = definite_target(&root_b.join("late-proj"), Duration::from_hours(5), 4096);
     scenario.root_paths.push(root_b);
+    // A `[behavior]` change is what makes the daemon re-log its matrix.
+    scenario.extra_toml = "[behavior]\nmemory_never_reduces_cleanup = false\n".to_string();
     write_config(dir.path(), &scenario);
     run.signal("-HUP");
     run.wait_until("the config_reload event", Duration::from_secs(15), |run| {
@@ -1267,7 +1313,7 @@ fn special_locations_stay_quiet_at_fourteen_percent_of_a_large_volume() {
         (Path::new("/"), 6_047_313_952_768, 840_576_639_434, true),
     ]);
     let scenario = ScenarioConfig {
-        root_paths: vec![fixtures.root.clone()],
+        root_paths: vec![fixtures.root],
         ..ScenarioConfig::default()
     };
     let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
@@ -1433,7 +1479,7 @@ fn read_only_volume_parks_deletions_in_recovery_until_remount() {
     .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(run.stderr_count("[SBH-RECOVERY]"), 1, "{}", run.stderr());
     assert_eq!(run.events_of("artifact_delete").len(), attempts_at_entry);
-    assert!(run.deleted_paths().is_empty());
+    assert!(run.deleted_paths().is_empty(), "{:?}", run.deleted_paths());
 
     vol.remount("rw");
     run.wait_until(

@@ -423,10 +423,16 @@ pub fn error_recovery_cause(error: &SbhError) -> Option<RecoveryCause> {
     }
 }
 
+/// Whether a skipped candidate earns a per-path repeat-deletion backoff. A
+/// read-only filesystem is a mount incident handled by mount recovery, not a
+/// fault of the path, so it gets none.
 fn should_backoff_skip(reason: SkipReason) -> bool {
     !matches!(
         reason,
-        SkipReason::PathGone | SkipReason::BelowThreshold | SkipReason::UserDeclined
+        SkipReason::PathGone
+            | SkipReason::BelowThreshold
+            | SkipReason::UserDeclined
+            | SkipReason::FilesystemReadOnly
     )
 }
 
@@ -694,7 +700,10 @@ impl DeletionExecutor {
                     });
 
                     report.errors.push(error);
-                    report.backoff_candidates.push(candidate.clone());
+                    // A mount incident (EROFS/ENOSPC) is not the path's fault.
+                    if error_recovery_cause(&e).is_none() {
+                        report.backoff_candidates.push(candidate.clone());
+                    }
                 }
             }
         }
@@ -1613,6 +1622,13 @@ mod tests {
                 r.as_str()
             );
         }
+    }
+
+    #[test]
+    fn mount_incidents_get_no_per_path_backoff() {
+        assert!(!should_backoff_skip(SkipReason::FilesystemReadOnly));
+        assert!(should_backoff_skip(SkipReason::Symlink));
+        assert!(!should_backoff_skip(SkipReason::PathGone));
     }
 
     #[test]

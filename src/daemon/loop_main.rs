@@ -372,6 +372,7 @@ const TERMINAL_IDLE_PRESSURED_RESCAN_CAP: Duration = Duration::from_mins(5);
 /// driven re-scans. It is bypassed for
 /// - operator/service forced scans (`force_full_scan`),
 /// - config reloads (`config_update`), which must take effect immediately,
+/// - maintenance passes (`maintenance`), paced by `maintenance_interval_secs`,
 /// - synthetic requests (`free_pct` is `None`), used by tests/degraded callers,
 /// - rising danger (Red/Critical pressure), where disk safety overrides pacing
 ///   — but only until [`TERMINAL_IDLE_EMPTY_PASSES`] consecutive no-progress
@@ -392,7 +393,11 @@ fn empty_pass_cooldown_active(
     if cooldown.is_zero() {
         return false;
     }
-    if request.force_full_scan || request.config_update.is_some() || request.free_pct.is_none() {
+    if request.force_full_scan
+        || request.config_update.is_some()
+        || request.free_pct.is_none()
+        || request.maintenance
+    {
         return false;
     }
     let cooldown = if request.pressure_level >= PressureLevel::Red {
@@ -3406,8 +3411,9 @@ impl MonitoringDaemon {
         // Green maintenance (Q6): once per maintenance interval, a routine
         // pass over the roots the hazard-driven scheduler picks within its
         // budget. The Green behavior cell keeps it to high-confidence
-        // candidates; the scanner's duty-cycle limiter and empty-pass
-        // backoff still apply; memory Critical suppresses it.
+        // candidates; the scanner's duty-cycle limiter still applies, the
+        // empty-pass cooldown does not (the interval is its pacing); memory
+        // Critical suppresses it.
         let maintenance_interval =
             Duration::from_secs(self.config.pressure.maintenance_interval_secs);
         // Maintenance is per mount state, not per worst level: a mount in
@@ -3587,6 +3593,7 @@ impl MonitoringDaemon {
             released = report.files_released;
             self.release_controller
                 .on_released(mount, report.files_released);
+            self.log_ballast_releases(&report.released, response);
         }
 
         let mut commands = vec![format!("sudo sbh emergency {root_hint} --yes")];
@@ -3682,6 +3689,12 @@ impl MonitoringDaemon {
         if report.files_created == 0 {
             return false;
         }
+        for (path, size_bytes) in &report.created {
+            self.logger_handle.send(ActivityEvent::BallastReplenished {
+                path: path.display().to_string(),
+                size_bytes: *size_bytes,
+            });
+        }
         self.release_controller
             .on_replenished(mount, report.files_created);
         self.notification_manager
@@ -3718,6 +3731,7 @@ impl MonitoringDaemon {
             released = report.files_released;
             self.release_controller
                 .on_released(mount, report.files_released);
+            self.log_ballast_releases(&report.released, response);
 
             self.notification_manager
                 .notify(&NotificationEvent::BallastReleased {
@@ -3727,6 +3741,24 @@ impl MonitoringDaemon {
                 });
         }
         Ok(released)
+    }
+
+    /// One `ballast_release` activity event per removed file, tagged with
+    /// the pressure that caused it.
+    fn log_ballast_releases(
+        &self,
+        released: &[(PathBuf, u64)],
+        response: &crate::monitor::pid::PressureResponse,
+    ) {
+        let pressure = format!("{:?}", response.level).to_lowercase();
+        for (path, size_bytes) in released {
+            self.logger_handle.send(ActivityEvent::BallastReleased {
+                path: path.display().to_string(),
+                size_bytes: *size_bytes,
+                pressure: pressure.clone(),
+                free_pct: response.free_pct,
+            });
+        }
     }
 
     fn send_scan_request(
@@ -4225,6 +4257,12 @@ impl MonitoringDaemon {
         }
 
         for (path, provision_report) in &report.per_volume {
+            for (file, size_bytes) in &provision_report.created {
+                self.logger_handle.send(ActivityEvent::BallastProvisioned {
+                    path: file.display().to_string(),
+                    size_bytes: *size_bytes,
+                });
+            }
             if provision_report.skipped_for_floor > 0 {
                 let message = format!(
                     "ballast provision volume={} created={} skipped_for_floor={} floor_pct={:.1} free_after_pct={}",
@@ -8860,6 +8898,29 @@ mod tests {
             Duration::from_secs(90),
             &request,
             1,
+        ));
+    }
+
+    #[test]
+    fn empty_pass_cooldown_bypassed_for_maintenance_passes() {
+        let now = Instant::now();
+        let mut request = cooldown_request(PressureLevel::Green);
+        request.maintenance = true;
+        // Maintenance is paced by its own interval, not by the rescan cooldown.
+        assert!(!empty_pass_cooldown_active(
+            Some(now),
+            now,
+            Duration::from_secs(90),
+            &request,
+            TERMINAL_IDLE_EMPTY_PASSES,
+        ));
+        request.maintenance = false;
+        assert!(empty_pass_cooldown_active(
+            Some(now),
+            now,
+            Duration::from_secs(90),
+            &request,
+            TERMINAL_IDLE_EMPTY_PASSES,
         ));
     }
 

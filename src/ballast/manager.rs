@@ -99,6 +99,9 @@ pub struct ProvisionReport {
     /// Free percent observed at the last admission decision (after the last
     /// created file, or at the refusal).
     pub free_pct_after: Option<f64>,
+    /// Files created this pass with their on-disk sizes, for the activity
+    /// log.
+    pub created: Vec<(PathBuf, u64)>,
 }
 
 /// Result of a verify operation.
@@ -118,6 +121,8 @@ pub struct ReleaseReport {
     pub bytes_freed: u64,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
+    /// Files removed with the sizes they had, for the activity log.
+    pub released: Vec<(PathBuf, u64)>,
 }
 
 // ──────────────────── health ────────────────────
@@ -535,6 +540,7 @@ impl BallastManager {
             skipped_for_floor: 0,
             floor_pct: self.provision_floor_pct,
             free_pct_after: None,
+            created: Vec::new(),
         };
 
         // Ensure no orphans exist before provisioning.
@@ -579,6 +585,7 @@ impl BallastManager {
                     let actual_size =
                         fs::metadata(&path).map_or(self.config.file_size_bytes, |m| m.len());
                     report.total_bytes += actual_size;
+                    report.created.push((path.clone(), actual_size));
                 }
                 Err(e) => {
                     if record_create_error(&mut report, index, &path, &e) {
@@ -602,6 +609,7 @@ impl BallastManager {
             bytes_freed: 0,
             warnings: Vec::new(),
             errors: Vec::new(),
+            released: Vec::new(),
         };
 
         // Collect indices of available files in descending order.
@@ -615,6 +623,7 @@ impl BallastManager {
                 Ok(()) => {
                     report.files_released += 1;
                     report.bytes_freed += actual_size;
+                    report.released.push((path.clone(), actual_size));
                 }
                 Err(e) => {
                     report
@@ -722,6 +731,7 @@ impl BallastManager {
             skipped_for_floor: 0,
             floor_pct: self.provision_floor_pct,
             free_pct_after: None,
+            created: Vec::new(),
         };
 
         // Ensure no orphans exist before replenishing.
@@ -764,6 +774,7 @@ impl BallastManager {
                     let actual_size =
                         fs::metadata(&path).map_or(self.config.file_size_bytes, |m| m.len());
                     report.total_bytes += actual_size;
+                    report.created.push((path.clone(), actual_size));
                     // Only create one file per call.
                     break;
                 }

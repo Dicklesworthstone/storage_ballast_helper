@@ -366,6 +366,11 @@ fn logger_thread_main(
                 }
             }
         }
+        // Make the line visible to readers (tails, `sbh explain`, the e2e
+        // runner) as soon as the queue drains; fsync keeps its own cadence.
+        if rx.is_empty() {
+            jsonl.flush();
+        }
     }
 
     // Final flush.
