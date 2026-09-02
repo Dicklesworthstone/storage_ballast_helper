@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::core::config::{Config, PathsConfig};
+use crate::daemon::policy::{ActiveMode, PolicyConfig};
 use crate::platform::pal::{Platform, detect_platform};
 use crate::platform::types::ServiceKind;
 
