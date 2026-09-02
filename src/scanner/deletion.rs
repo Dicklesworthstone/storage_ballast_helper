@@ -149,6 +149,21 @@ pub struct DeletionReport {
     /// total wall time, so the cost of that rail is visible per batch.
     pub sacred_scans: usize,
     pub sacred_scan_ms: u64,
+    /// Candidates whose filesystem answered EROFS: the mount needs recovery,
+    /// not a retry. Disjoint from `not_writable_paths` (permission/sandbox).
+    pub read_only_paths: Vec<PathBuf>,
+    /// Candidates whose *deletion* failed with ENOSPC (no room for the
+    /// metadata the removal needs): the mount needs recovery.
+    pub no_space_paths: Vec<PathBuf>,
+}
+
+impl DeletionReport {
+    /// Paths whose mount should enter recovery: read-only or metadata-exhausted.
+    pub fn recovery_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.read_only_paths
+            .iter()
+            .chain(self.no_space_paths.iter())
+    }
 }
 
 /// Per-batch bookkeeping for the pre-flight sacred containment check.
@@ -276,6 +291,12 @@ pub enum SkipReason {
     /// executor so the daemon, `clean` and `emergency` share one rail
     /// regardless of what their scoring stage did.
     SacredStowaway,
+    /// The filesystem holding the candidate is mounted read-only (EROFS from
+    /// `access(2)` or `ST_RDONLY` from `statvfs`). Unlike [`Self::NotWritable`]
+    /// this is not a permission or sandbox problem: nothing sbh does on that
+    /// mount can succeed until it is remounted, so the daemon parks the mount
+    /// in recovery instead of retrying.
+    FilesystemReadOnly,
 }
 
 impl SkipReason {
@@ -285,7 +306,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -302,6 +323,7 @@ impl SkipReason {
         Self::UserDeclined,
         Self::ActiveLease,
         Self::SacredStowaway,
+        Self::FilesystemReadOnly,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -332,6 +354,7 @@ impl SkipReason {
             Self::UserDeclined => "user_declined",
             Self::ActiveLease => "active_lease",
             Self::SacredStowaway => "sacred_stowaway",
+            Self::FilesystemReadOnly => "filesystem_read_only",
         }
     }
 
@@ -363,7 +386,40 @@ impl SkipReason {
                 "is or contains a sacred path (.beads/, *.db, .sbh-protect, protected_paths), \
                  or the containment walk ran out of budget (fail-closed)"
             }
+            Self::FilesystemReadOnly => {
+                "filesystem is mounted read-only (EROFS) — remount or repair the volume; \
+                 the daemon pauses deletions on it until a probe write succeeds"
+            }
         }
+    }
+}
+
+/// Why a mount needs recovery rather than another deletion attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryCause {
+    /// EROFS: the filesystem is mounted read-only.
+    ReadOnly,
+    /// ENOSPC on a *deletion*: the filesystem has no room for the metadata
+    /// the operation needs (the btrfs metadata-exhaustion profile).
+    NoSpace,
+}
+
+/// Recovery cause carried by an I/O error, if any.
+#[must_use]
+pub fn io_error_recovery_cause(error: &std::io::Error) -> Option<RecoveryCause> {
+    match error.raw_os_error() {
+        Some(code) if code == libc::EROFS => Some(RecoveryCause::ReadOnly),
+        Some(code) if code == libc::ENOSPC => Some(RecoveryCause::NoSpace),
+        _ => None,
+    }
+}
+
+/// Recovery cause carried by an `SbhError`, if it wraps such an I/O error.
+#[must_use]
+pub fn error_recovery_cause(error: &SbhError) -> Option<RecoveryCause> {
+    match error {
+        SbhError::Io { source, .. } => io_error_recovery_cause(source),
+        _ => None,
     }
 }
 
@@ -468,6 +524,8 @@ impl DeletionExecutor {
             skipped_by_reason: BTreeMap::new(),
             sacred_scans: 0,
             sacred_scan_ms: 0,
+            read_only_paths: Vec::new(),
+            no_space_paths: Vec::new(),
         };
 
         let mut consecutive_failures: u32 = 0;
@@ -554,6 +612,9 @@ impl DeletionExecutor {
                     if matches!(skip, SkipReason::NotWritable) {
                         report.not_writable_paths.push(candidate.path.clone());
                     }
+                    if matches!(skip, SkipReason::FilesystemReadOnly) {
+                        report.read_only_paths.push(candidate.path.clone());
+                    }
                     if should_backoff_skip(skip) {
                         report.backoff_candidates.push(candidate.clone());
                     }
@@ -609,6 +670,15 @@ impl DeletionExecutor {
                 Err(e) => {
                     report.items_failed += 1;
                     consecutive_failures += 1;
+                    match error_recovery_cause(&e) {
+                        Some(RecoveryCause::ReadOnly) => {
+                            report.read_only_paths.push(candidate.path.clone());
+                        }
+                        Some(RecoveryCause::NoSpace) => {
+                            report.no_space_paths.push(candidate.path.clone());
+                        }
+                        None => {}
+                    }
                     eprintln!("[SBH-EXECUTOR] fail: {} ({})", candidate.path.display(), e);
                     let error = DeletionError {
                         path: candidate.path.clone(),
@@ -717,11 +787,16 @@ impl DeletionExecutor {
         // 3. Scanner-observed identity must still refer to this same entry.
         self.verify_candidate_identity(candidate)?;
 
-        // 4. Parent directory is writable (effective permission for this process).
-        if let Some(parent) = path.parent()
-            && !is_writable(parent)
-        {
-            return Err(SkipReason::NotWritable);
+        // 4. Parent directory is writable (effective permission for this
+        //    process). A read-only filesystem is classified apart from a
+        //    permission or sandbox refusal: the former needs recovery, the
+        //    latter a config fix.
+        if let Some(parent) = path.parent() {
+            match writability(parent) {
+                Writability::Writable => {}
+                Writability::ReadOnlyFilesystem => return Err(SkipReason::FilesystemReadOnly),
+                Writability::NotWritable => return Err(SkipReason::NotWritable),
+            }
         }
 
         // 5. Does not contain .git (safety net — checks 3 levels deep).
@@ -913,18 +988,64 @@ fn identity_is_supported(identity: walker::FsIdentity) -> bool {
 /// Uses `access(W_OK)` on Unix which checks effective permissions (owner, group,
 /// ACLs, and mount flags) — more reliable than `permissions().readonly()` which
 /// only checks if any write bit is set.
-fn is_writable(path: &Path) -> bool {
+/// Whether this process can write into a directory, and if not, why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Writability {
+    Writable,
+    /// The filesystem is mounted read-only: recovery, not a retry.
+    ReadOnlyFilesystem,
+    /// Permission, sandbox, or any other refusal.
+    NotWritable,
+}
+
+#[cfg(unix)]
+fn classify_access_error(errno: nix::errno::Errno) -> Writability {
+    if errno == nix::errno::Errno::EROFS {
+        Writability::ReadOnlyFilesystem
+    } else {
+        Writability::NotWritable
+    }
+}
+
+fn writability(path: &Path) -> Writability {
     #[cfg(unix)]
     {
-        nix::unistd::access(path, nix::unistd::AccessFlags::W_OK).is_ok()
+        match nix::unistd::access(path, nix::unistd::AccessFlags::W_OK) {
+            Ok(()) => {
+                // Root passes access(W_OK) on a read-only mount on some
+                // kernels; the mount flag is the authoritative answer.
+                let read_only_mount = nix::sys::statvfs::statvfs(path).is_ok_and(|stats| {
+                    stats
+                        .flags()
+                        .contains(nix::sys::statvfs::FsFlags::ST_RDONLY)
+                });
+                if read_only_mount {
+                    Writability::ReadOnlyFilesystem
+                } else {
+                    Writability::Writable
+                }
+            }
+            Err(errno) => classify_access_error(errno),
+        }
     }
     #[cfg(not(unix))]
     {
         // Fallback: check write bit (same as old behavior).
-        path.metadata()
+        if path
+            .metadata()
             .map(|m| !m.permissions().readonly())
             .unwrap_or(false)
+        {
+            Writability::Writable
+        } else {
+            Writability::NotWritable
+        }
     }
+}
+
+#[cfg(test)]
+fn is_writable(path: &Path) -> bool {
+    writability(path) == Writability::Writable
 }
 
 // ──────────────────── read-only-cache removal ────────────────────
@@ -1518,6 +1639,7 @@ mod tests {
                 SkipReason::UserDeclined => 13,
                 SkipReason::ActiveLease => 14,
                 SkipReason::SacredStowaway => 15,
+                SkipReason::FilesystemReadOnly => 16,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];
@@ -1562,6 +1684,8 @@ mod tests {
             skipped_by_reason: BTreeMap::new(),
             sacred_scans: 0,
             sacred_scan_ms: 0,
+            read_only_paths: Vec::new(),
+            no_space_paths: Vec::new(),
         };
         report.record_skip(SkipReason::HardcodedSourceTree);
         report.record_skip(SkipReason::HardcodedSourceTree);
@@ -1632,6 +1756,8 @@ mod tests {
             skipped_by_reason: BTreeMap::new(),
             sacred_scans: 0,
             sacred_scan_ms: 0,
+            read_only_paths: Vec::new(),
+            no_space_paths: Vec::new(),
         };
 
         // Nothing queued at all is not a stall.
@@ -1864,6 +1990,51 @@ mod tests {
         assert_eq!(report.items_deleted, 0);
         assert_eq!(report.items_skipped, 1);
         assert!(git_dir.exists());
+    }
+
+    /// EROFS is a mount incident, everything else a refusal: the two must
+    /// never be confused, because one pauses the mount and the other asks
+    /// the operator to fix the unit.
+    #[cfg(unix)]
+    #[test]
+    fn access_errors_classify_read_only_apart_from_permission() {
+        use nix::errno::Errno;
+        assert_eq!(
+            classify_access_error(Errno::EROFS),
+            Writability::ReadOnlyFilesystem
+        );
+        for errno in [Errno::EACCES, Errno::EPERM, Errno::ENOENT, Errno::EIO] {
+            assert_eq!(
+                classify_access_error(errno),
+                Writability::NotWritable,
+                "{errno}"
+            );
+        }
+        let dir = scratch_dir();
+        assert_eq!(writability(dir.path()), Writability::Writable);
+    }
+
+    /// Deletion errors carrying EROFS or ENOSPC name a recovery cause; the
+    /// rest (ENOTEMPTY, EIO, ...) stay ordinary failures.
+    #[test]
+    fn io_errors_map_to_recovery_causes() {
+        let cases = [
+            (libc::EROFS, Some(RecoveryCause::ReadOnly)),
+            (libc::ENOSPC, Some(RecoveryCause::NoSpace)),
+            (libc::ENOTEMPTY, None),
+            (libc::EIO, None),
+            (libc::EACCES, None),
+        ];
+        for (code, expected) in cases {
+            let io = std::io::Error::from_raw_os_error(code);
+            assert_eq!(io_error_recovery_cause(&io), expected, "errno {code}");
+            let wrapped = SbhError::io(Path::new("/x"), std::io::Error::from_raw_os_error(code));
+            assert_eq!(error_recovery_cause(&wrapped), expected, "errno {code}");
+        }
+        let other = SbhError::Runtime {
+            details: "not io".to_string(),
+        };
+        assert_eq!(error_recovery_cause(&other), None);
     }
 
     /// Every route to the executor gets the sacred containment rail: a

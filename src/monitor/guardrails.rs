@@ -115,6 +115,98 @@ impl CalibrationObservation {
 
 // ──────────────────── guard configuration ────────────────────
 
+/// Anytime-valid monitor over the executor's success/failure stream (Q8).
+///
+/// H0: the deletion failure rate is at most 10%. Each failure multiplies
+/// the evidence by `e_process_penalty` (1.5) and each success by
+/// `e_process_reward` (2/3), on the same log scale, clamp and alarm
+/// threshold (20) as the forecaster guard, so both alarms mean the same
+/// thing to an operator: "the evidence against the healthy hypothesis is
+/// 20:1 and still valid at any stopping time". Twenty consecutive failures
+/// alarm; nine failures in a hundred attempts never do.
+#[derive(Debug, Clone)]
+pub struct DeletionFailureMonitor {
+    penalty_log: f64,
+    reward_log: f64,
+    threshold: f64,
+    e_process_log: f64,
+    successes: u64,
+    failures: u64,
+    failures_by_reason: std::collections::BTreeMap<&'static str, u64>,
+}
+
+impl Default for DeletionFailureMonitor {
+    fn default() -> Self {
+        Self::with_defaults()
+    }
+}
+
+impl DeletionFailureMonitor {
+    /// Monitor sharing the forecaster guard's e-process constants.
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        let config = GuardrailConfig::default();
+        Self {
+            penalty_log: config.e_process_penalty.ln(),
+            reward_log: config.e_process_reward.ln(),
+            threshold: config.e_process_threshold,
+            e_process_log: 0.0,
+            successes: 0,
+            failures: 0,
+            failures_by_reason: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A deletion succeeded.
+    pub fn observe_success(&mut self) {
+        self.successes += 1;
+        self.e_process_log = (self.e_process_log + self.reward_log).clamp(-5.0, 3.5);
+    }
+
+    /// A deletion attempt failed for `reason` (a `SkipReason` key or
+    /// `"delete_error"`).
+    pub fn observe_failure(&mut self, reason: &'static str) {
+        self.failures += 1;
+        *self.failures_by_reason.entry(reason).or_insert(0) += 1;
+        self.e_process_log = (self.e_process_log + self.penalty_log).clamp(-5.0, 3.5);
+    }
+
+    /// Current evidence against H0 (the e-process value).
+    #[must_use]
+    pub fn evidence(&self) -> f64 {
+        self.e_process_log.exp()
+    }
+
+    /// Whether the evidence has crossed the alarm threshold.
+    #[must_use]
+    pub fn alarm(&self) -> bool {
+        self.evidence() >= self.threshold
+    }
+
+    /// The failure reason seen most often, if any failure was seen.
+    #[must_use]
+    pub fn dominant_reason(&self) -> Option<(&'static str, u64)> {
+        self.failures_by_reason
+            .iter()
+            .max_by_key(|(_, count)| **count)
+            .map(|(reason, count)| (*reason, *count))
+    }
+
+    /// Successes and failures seen so far.
+    #[must_use]
+    pub const fn counts(&self) -> (u64, u64) {
+        (self.successes, self.failures)
+    }
+
+    /// Start over (after the operator resolved the incident).
+    pub fn reset(&mut self) {
+        self.e_process_log = 0.0;
+        self.successes = 0;
+        self.failures = 0;
+        self.failures_by_reason.clear();
+    }
+}
+
 /// Configuration for the statistical guardrails.
 #[derive(Debug, Clone)]
 pub struct GuardrailConfig {
@@ -610,6 +702,48 @@ impl PredictionScorecard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Q8 acceptance: twenty consecutive failures alarm; nine failures in a
+    /// hundred attempts do not, and successes drain the evidence again.
+    #[test]
+    fn deletion_failure_monitor_alarms_on_a_failure_streak_but_not_at_nine_percent() {
+        let mut streak = DeletionFailureMonitor::with_defaults();
+        for _ in 0..20 {
+            streak.observe_failure("filesystem_read_only");
+        }
+        assert!(streak.alarm(), "evidence {}", streak.evidence());
+        assert_eq!(streak.dominant_reason(), Some(("filesystem_read_only", 20)));
+        assert_eq!(streak.counts(), (0, 20));
+
+        let mut healthy = DeletionFailureMonitor::with_defaults();
+        for i in 0..100 {
+            if i % 11 == 0 {
+                healthy.observe_failure("delete_error");
+            } else {
+                healthy.observe_success();
+            }
+        }
+        assert_eq!(healthy.counts().1, 10);
+        assert!(!healthy.alarm(), "evidence {}", healthy.evidence());
+        assert!(
+            healthy.evidence() < 1.0,
+            "successes must drive evidence below 1"
+        );
+
+        // Mixed reasons: the dominant one is named.
+        let mut mixed = DeletionFailureMonitor::with_defaults();
+        for _ in 0..3 {
+            mixed.observe_failure("not_writable");
+        }
+        for _ in 0..5 {
+            mixed.observe_failure("filesystem_read_only");
+        }
+        assert_eq!(mixed.dominant_reason(), Some(("filesystem_read_only", 5)));
+        mixed.reset();
+        assert_eq!(mixed.counts(), (0, 0));
+        assert!(!mixed.alarm());
+        assert_eq!(mixed.dominant_reason(), None);
+    }
 
     fn good_obs() -> CalibrationObservation {
         CalibrationObservation {

@@ -50,7 +50,8 @@ use crate::logger::jsonl::JsonlConfig;
 use crate::monitor::ewma::{DiskRateEstimator, RateEstimate};
 use crate::monitor::fs_stats::FsStatsCollector;
 use crate::monitor::guardrails::{
-    AdaptiveGuard, CalibrationObservation, GuardDiagnostics, GuardStatus, PredictionScorecard,
+    AdaptiveGuard, CalibrationObservation, DeletionFailureMonitor, GuardDiagnostics, GuardStatus,
+    PredictionScorecard,
 };
 use crate::monitor::pid::{
     PidPressureController, PressureLevel, PressureReading, PressureResponse,
@@ -575,6 +576,12 @@ enum WorkerReport {
         deleted: u64,
         bytes_freed: u64,
         failed: u64,
+        /// Candidates whose filesystem answered EROFS or ENOSPC: their
+        /// mounts need recovery, not another attempt.
+        recovery_paths: Vec<PathBuf>,
+        /// Set when the deletion-failure e-process crossed its alarm
+        /// threshold on this batch: the dominant failure reason and count.
+        failure_alarm: Option<(&'static str, u64)>,
     },
 }
 
@@ -1057,6 +1064,9 @@ pub struct MonitoringDaemon {
     /// Wake signals (SIGUSR1, reload) collected for the next tick's
     /// controllers.
     wake_next_tick: WakeSignals,
+    /// Mounts the executor reported as read-only or out of metadata space
+    /// since the last tick; each enters `MountState::Recovery`.
+    pending_recovery: HashSet<PathBuf>,
     special_locations: SpecialLocationRegistry,
     ballast_coordinator: BallastPoolCoordinator,
     release_controller: BallastReleaseController,
@@ -1935,6 +1945,7 @@ impl MonitoringDaemon {
             mount_controllers: HashMap::new(),
             mount_responses: Vec::new(),
             wake_next_tick: WakeSignals::default(),
+            pending_recovery: HashSet::new(),
             special_locations,
             ballast_coordinator,
             release_controller,
@@ -2535,11 +2546,35 @@ impl MonitoringDaemon {
                         deleted,
                         bytes_freed,
                         failed,
+                        recovery_paths,
+                        failure_alarm,
                     } => {
                         self.summary_deleted += deleted;
                         self.summary_failed += failed;
                         self.summary_bytes_freed += bytes_freed;
                         self.self_monitor.record_deletions(deleted, bytes_freed);
+                        // Mount incidents: park the owning mounts in recovery
+                        // on the next tick instead of retrying.
+                        for path in &recovery_paths {
+                            if let Ok(stats) = self.fs_collector.collect(path) {
+                                self.pending_recovery.insert(stats.mount_point);
+                            }
+                        }
+                        if let Some((reason, count)) = failure_alarm {
+                            let message = format!(
+                                "deletion failure rate alarm (e-process >= 20:1 against a <=10% \
+                                 failure rate): dominant reason {reason} x{count}; see \
+                                 `sbh stats` and the [SBH-EXECUTOR] skip lines"
+                            );
+                            self.logger_handle.send(ActivityEvent::Error {
+                                code: "SBH-2005".to_string(),
+                                message: message.clone(),
+                            });
+                            self.notification_manager.notify(&NotificationEvent::Error {
+                                code: "SBH-2005".to_string(),
+                                message,
+                            });
+                        }
                         if deleted > 0 {
                             // Best effort: we don't have the mount point here easily without tracking
                             // it through the batch. Use "primary" or "various".
@@ -3045,6 +3080,7 @@ impl MonitoringDaemon {
                 ballast_pool: has_pool,
                 cross_device_fallback,
             };
+            let recovery_needed = self.pending_recovery.remove(&mount);
             let controller = self
                 .mount_controllers
                 .entry(mount.clone())
@@ -3059,7 +3095,7 @@ impl MonitoringDaemon {
                 prediction_confident: tick.prediction_confident,
                 surface,
                 releasable_ballast,
-                recovery_needed: false,
+                recovery_needed,
                 recovery_probe_ok,
                 wake,
                 now,
@@ -3076,6 +3112,12 @@ impl MonitoringDaemon {
                 );
                 eprintln!("[SBH-MOUNT] {message}");
                 self.logger_handle.send(ActivityEvent::Info { message });
+            }
+            if decision
+                .transition
+                .is_some_and(|(_, to)| to == MountState::Recovery)
+            {
+                self.enter_mount_recovery(&mount, &tick.response);
             }
 
             match decision.state {
@@ -3191,6 +3233,75 @@ impl MonitoringDaemon {
         }
 
         global_tick(cadence, base_poll)
+    }
+
+    /// A mount just entered `Recovery` (EROFS or ENOSPC on deletion): free
+    /// what can be freed without a metadata write of our own (release every
+    /// ballast file on it), tell the operator exactly what to run, and let
+    /// the controller hold deletions until a probe write succeeds.
+    fn enter_mount_recovery(
+        &mut self,
+        mount: &Path,
+        response: &crate::monitor::pid::PressureResponse,
+    ) {
+        let fs_type = self
+            .fs_collector
+            .collect(mount)
+            .map(|stats| stats.fs_type)
+            .unwrap_or_default();
+        let root_hint = self
+            .config
+            .scanner
+            .root_paths
+            .iter()
+            .find(|root| {
+                self.fs_collector
+                    .collect(root)
+                    .is_ok_and(|stats| stats.mount_point == mount)
+            })
+            .map_or_else(
+                || mount.display().to_string(),
+                |root| root.display().to_string(),
+            );
+
+        let available = self.ballast_coordinator.pool_for_mount(mount).map_or(
+            0,
+            super::super::ballast::coordinator::BallastPool::available_count,
+        );
+        let mut released = 0;
+        if available > 0
+            && let Ok(Some(report)) = self.ballast_coordinator.release_for_mount(mount, available)
+        {
+            released = report.files_released;
+            self.release_controller
+                .on_released(mount, report.files_released);
+        }
+
+        let mut commands = vec![format!("sudo sbh emergency {root_hint} --yes")];
+        if fs_type == "btrfs" {
+            commands.push(format!("sudo btrfs filesystem usage {}", mount.display()));
+            commands.push(format!(
+                "sudo btrfs balance start -dusage=50 {}",
+                mount.display()
+            ));
+        }
+        let message = format!(
+            "mount {} ({fs_type}) refused writes (read-only or out of metadata space) at {:.1}% \
+             free: released {released} ballast file(s); deletions on it are paused until a probe \
+             write succeeds above red_min. Next: {}",
+            mount.display(),
+            response.free_pct,
+            commands.join(" ; ")
+        );
+        eprintln!("[SBH-RECOVERY] {message}");
+        self.logger_handle.send(ActivityEvent::Error {
+            code: "SBH-2004".to_string(),
+            message: message.clone(),
+        });
+        self.notification_manager.notify(&NotificationEvent::Error {
+            code: "SBH-2004".to_string(),
+            message,
+        });
     }
 
     /// Feed a completed scan pass to the per-mount controllers: a mount whose
@@ -5887,6 +5998,9 @@ fn executor_thread_main(
     // per executor thread. The condition is persistent until the operator
     // fixes the unit file, so logging on every batch would flood journals.
     let mut last_not_writable_warning: Option<Instant> = None;
+    // Q8: anytime-valid monitor over this thread's success/failure stream.
+    let mut failure_monitor = DeletionFailureMonitor::with_defaults();
+    let mut failure_alarm_raised = false;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -6179,11 +6293,73 @@ fn executor_thread_main(
             );
         }
 
+        // A read-only mount is an incident for the mount controller, not a
+        // sandbox misconfiguration: say so once per batch and hand the paths
+        // to the main loop, which parks the mount in recovery.
+        if !report.read_only_paths.is_empty() || !report.no_space_paths.is_empty() {
+            eprintln!(
+                "[SBH-EXECUTOR] mount needs recovery: read_only={} no_space={} (first: {})",
+                report.read_only_paths.len(),
+                report.no_space_paths.len(),
+                report
+                    .recovery_paths()
+                    .next()
+                    .map_or_else(String::new, |p| p.display().to_string()),
+            );
+        }
+
+        // Q8: feed the failure monitor. Safety refusals are not failures;
+        // delete errors and mount incidents are.
+        if !report.dry_run {
+            for _ in 0..report.items_deleted {
+                failure_monitor.observe_success();
+            }
+            for _ in 0..report.read_only_paths.len() {
+                failure_monitor.observe_failure(
+                    crate::scanner::deletion::SkipReason::FilesystemReadOnly.as_str(),
+                );
+            }
+            for _ in 0..report.no_space_paths.len() {
+                failure_monitor.observe_failure("no_space");
+            }
+            let plain_errors = report
+                .items_failed
+                .saturating_sub(report.no_space_paths.len())
+                .saturating_sub(
+                    report
+                        .errors
+                        .iter()
+                        .filter(|e| report.read_only_paths.contains(&e.path))
+                        .count(),
+                );
+            for _ in 0..plain_errors {
+                failure_monitor.observe_failure("delete_error");
+            }
+        }
+        let failure_alarm = if failure_monitor.alarm() && !failure_alarm_raised {
+            failure_alarm_raised = true;
+            let dominant = failure_monitor.dominant_reason();
+            let (successes, failures) = failure_monitor.counts();
+            eprintln!(
+                "[SBH-EXECUTOR] deletion failure alarm: evidence={:.1} successes={successes} failures={failures} dominant={:?}",
+                failure_monitor.evidence(),
+                dominant,
+            );
+            dominant
+        } else {
+            if !failure_monitor.alarm() {
+                failure_alarm_raised = false;
+            }
+            None
+        };
+
         // Report deletion stats back to main loop for SelfMonitor counters.
         let _ = report_tx.try_send(WorkerReport::DeletionCompleted {
             deleted: report.items_deleted as u64,
             bytes_freed: report.bytes_freed,
             failed: report.items_failed as u64,
+            recovery_paths: report.recovery_paths().cloned().collect(),
+            failure_alarm,
         });
 
         if report.circuit_breaker_tripped {
