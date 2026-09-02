@@ -1320,7 +1320,7 @@ mod tests {
         assert!(marker.exists());
         let content = fs::read_to_string(&marker).unwrap();
         assert!(
-            !content.is_empty(),
+            content.is_empty(),
             "expected an empty marker file, got {content:?}"
         );
     }
