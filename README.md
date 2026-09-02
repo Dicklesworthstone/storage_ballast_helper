@@ -730,6 +730,18 @@ min_samples = 5
 imminent_danger_minutes = 5.0
 critical_danger_minutes = 2.0
 
+[pressure.controller]
+# Per-mount PID gains (see "PID Pressure Controller"); the setpoint is green_min_free_pct.
+kp = 0.25
+ki = 0.08
+kd = 0.02
+kf = 0.8                        # forecast feedforward gain
+integral_cap = 100.0
+hysteresis_pct = 1.0
+reference_total_bytes = 1099511627776   # 1 TiB: kp applies unscaled here
+kp_scale_min = 0.5
+kp_scale_max = 2.0
+
 [scheduler]
 enabled = true
 scan_budget_per_interval = 5
@@ -883,17 +895,25 @@ Trend classification uses fixed thresholds: recovering (rate < -1.0 bytes/sec), 
 
 The PID controller converts the gap between target free space and actual free space into an urgency signal (0.0 to 1.0) that drives scan frequency, deletion batch sizes, and ballast release counts.
 
-Default gains: **Kp=0.25**, **Ki=0.08**, **Kd=0.02**, with an integral cap of 100.0 to prevent windup. The target setpoint defaults to 18.0% free space.
+There is one controller per mount. Default gains (`[pressure.controller]`): **Kp=0.25**, **Ki=0.08**, **Kd=0.02**, **Kf=0.8**, integral cap 100.0, hysteresis 1.0 point. The setpoint is `green_min_free_pct` (20% by default). The block below is `monitor::pid::FORMULAS`, and a test keeps this copy identical to the code:
 
 ```
 error = target_free_pct - current_free_pct
-integral = clamp(integral + error * dt, -100.0, 100.0)
-derivative = (error - last_error) / dt
-raw = Kp * error + Ki * integral + Kd * derivative
+kp_m = Kp * clamp(sqrt(total_bytes / reference_total_bytes), kp_scale_min, kp_scale_max)
+integral = clamp(integral + error * dt, -integral_cap, integral_cap)   # frozen while the mount cannot act
+derivative = 0.3 * (error - last_error) / dt + 0.7 * last_derivative
+feedforward = Kf * clamp(1 - seconds_to_red / action_horizon_secs, 0, 1)   # 0 without a forecast
+raw = kp_m * error + Ki * integral + Kd * derivative + feedforward
 urgency = 1 - exp(-max(0, raw))
 ```
 
-The `1 - exp(-x)` transform maps the raw PID output to a 0-1 range with a natural saturation curve: small errors produce proportionally small urgency, while large errors quickly approach 1.0 without overshooting.
+Three things make this a controller that cannot wind up while it has no actuator:
+
+- **Capacity gain scheduling.** Errors are in percent, and one point is 55 GiB on a 5.5 TB pool but 1 GiB on a small root. `Kp` is scaled by `sqrt(total / reference_total_bytes)` (reference 1 TiB), clamped to `[0.5, 2] x Kp`, so large volumes answer a one-point error harder and tiny ones softer.
+- **Forecast feedforward.** The EWMA forecast enters as a smooth term that grows from 0 at the action horizon (`pressure.prediction.action_horizon_minutes`, 30 by default) to `Kf` at zero seconds-to-red, instead of stepped urgency boosts. Urgency is monotone in the forecast: a nearer red never lowers it.
+- **Anti-windup on actionability.** The integral is frozen while the mount's controller is observe-only (no root path on the device), idle after an empty pass, or recovering from a read-only or full filesystem. A mount sbh cannot act on no longer accumulates a Red urgency it could do nothing with; the integral also resets on every level change.
+
+The `1 - exp(-x)` transform maps the raw output to a 0-1 range with a natural saturation curve: small errors produce proportionally small urgency, while large errors quickly approach 1.0 without overshooting.
 
 Pressure levels are defined by free-space thresholds:
 
@@ -907,7 +927,7 @@ Pressure levels are defined by free-space thresholds:
 
 Critical is triggered when free space drops below half the Red threshold (`red_min / 2.0`). At Red and Critical levels, delete batch sizes scale dynamically with PID urgency output, allowing the system to be more aggressive when pressure is rising rapidly versus slowly. At Critical, the controller issues maximum-urgency responses regardless of PID output.
 
-When predictive forecasting is enabled, time-to-exhaustion estimates boost urgency preemptively. If the forecast predicts Red-level pressure within the action horizon (default 30 minutes), urgency is raised to at least 0.70 even if current pressure is only Yellow. This lets the system start scanning and releasing ballast *before* pressure actually reaches dangerous levels.
+When predictive forecasting is enabled, the time-to-red estimate feeds the controller's feedforward term: a forecast inside the action horizon (default 30 minutes) raises urgency smoothly, up to `Kf` at zero seconds, even while current pressure is only Yellow. This lets the system start scanning and releasing ballast *before* pressure actually reaches dangerous levels.
 
 ### Artifact Scoring: Decision-Theoretic Ranking
 

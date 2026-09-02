@@ -427,6 +427,7 @@ src/
 | `[core]` | `strict_config` (unknown keys are always reported; `true` makes the daemon refuse to start and `config validate` fail on them) |
 | `[pressure]` | `green_min_free_pct`, `yellow_min_free_pct`, `orange_min_free_pct`, `red_min_free_pct`, `poll_interval_ms` |
 | `[pressure.prediction]` | `enabled`, `action_horizon_minutes`, `warning_horizon_minutes`, `min_confidence`, `min_samples` |
+| `[pressure.controller]` | per-mount PID: `kp`, `ki`, `kd`, `kf` (forecast feedforward), `integral_cap`, `hysteresis_pct`, `reference_total_bytes`, `kp_scale_min`, `kp_scale_max` |
 | `[scanner]` | `engine` (`"v2"` default, `"v1"` rollback), `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run`, `cross_devices`, `quarantine_enabled`, `quarantine_ttl_hours`, `quarantine_max_bytes_pct` |
 | `[scoring]` | `min_score`, `location_weight`, `name_weight`, `age_weight`, `size_weight`, `structure_weight` |
 | `[scoring]` (decision-theoretic) | `false_positive_loss`, `false_negative_loss`, `calibration_floor` |
@@ -490,7 +491,7 @@ The artifact scoring system uses five weighted factors to rank deletion candidat
 | Orange | 10-20% free | Begin ballast release + cleanup |
 | Red | < 5% free | Emergency mode: aggressive cleanup |
 
-The PID controller smooths transitions between levels. EWMA rate estimation predicts when the next level will be reached.
+One PID controller per mount smooths transitions between levels: `Kp` is scaled by volume size, the EWMA time-to-red enters as a feedforward term, and the integral is frozen while the mount has no actuator (observe-only, idle, recovering). See `src/monitor/pid.rs` `FORMULAS`.
 
 ---
 
