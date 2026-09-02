@@ -150,3 +150,22 @@ All compilation went through `rch`; every run below used the lockfile as committ
 - `Cargo.lock` was not updated alongside it (still resolves the `v0.4.1` commit `436e917`), so the working tree is currently manifest/lock-inconsistent: `cargo metadata --locked --format-version 1` now exits 101 with: `error: cannot update the lock file /data/projects/storage_ballast_helper/Cargo.lock because --locked was passed to prevent this
 help: to generate the lock file without accessing the network, remove the --locked flag and use --offline instead.`
 - Every gate result recorded above was produced against the `v0.4.1` manifest and matching lockfile (as committed in `944e3ce`). The `v0.6.0` move is NOT covered by this sweep's verification; it needs its own lock update (`cargo update -p ftui -p ftui-backend -p ftui-tty`) and a `--features tui` build/test pass by whoever owns it.
+
+## Addendum 2: verification of the moves made by the parallel session (agent OliveIbis, 2026-09-02)
+
+The `Cargo.lock` moves noted under "Lockfile moves observed during the sweep", the `whichdisk` 0.5 → 0.6 manifest change, and the `ftui*` `v0.4.1` → `v0.6.0` move were made by a second library-updater run in a parallel session. That run followed the one-dependency-at-a-time protocol; its evidence:
+
+| Step | Action | Verification | Result |
+| --- | --- | --- | --- |
+| thiserror 2.0.19 → 2.0.20 | `cargo update -p thiserror --precise 2.0.20` | `cargo test --lib` | 1419 passed, 0 failed |
+| toml 1.1.3 → 1.1.4 | `cargo update -p toml --precise 1.1.4` | `cargo test --lib` | 1419 passed |
+| rusqlite 0.40.1 → 0.40.2 (+ libsqlite3-sys 0.38.2) | `cargo update -p rusqlite --precise 0.40.2` | `cargo test --lib` | 1419 passed |
+| inotify 0.11.4 → 0.11.5 | `cargo update -p inotify --precise 0.11.5` | `cargo test --lib` | 1419 passed |
+| clap 4.6.4 → 4.6.6 (+ clap_builder) | `cargo update -p clap --precise 4.6.6` | `cargo test --lib` | 1419 passed |
+| clap_complete 4.6.7 → 4.6.9 | `cargo update -p clap_complete --precise 4.6.9` | `cargo test --lib` | 1419 passed |
+| chacha20 0.10.1 (yanked) → 0.10.2 | `cargo update -p chacha20 --precise 0.10.2` | `cargo test --lib` | 1419 passed; clears the `cargo audit` yanked warning |
+| whichdisk 0.5.0 → 0.6.0 (macOS-only) | manifest `"0.5"` → `"0.6"`, `cargo update -p whichdisk` | Linux `cargo test --lib` (1419 passed); native darwin check impossible from this host (`rch` has no darwin worker); crate source inspected: `resolve()`, `list()`, `MountPoint::mount_point()`, `device()` unchanged in 0.6.0; changelog lists only additive `VolumeIdentity` and a BSD `getmntinfo` race fix | accepted; needs the macOS CI lane for a native pass |
+| transitive `cargo update` | aho-corasick 1.1.5, cc 1.4.4, lru 0.18.1 → 0.18.3 (clears RUSTSEC-2026-0253 in the `tui` graph), regex-automata 0.4.18, smallvec 1.16.0, syn 3.0.4, time 0.3.55, zerocopy 0.8.56, wasm-bindgen 0.2.127, others | `cargo test --lib` (1419 passed); `cargo check --all-targets` (default features) clean; `cargo audit` exit 0 with only the allowed `bincode` RUSTSEC-2025-0141 unmaintained warning | accepted |
+| ftui / ftui-backend / ftui-tty git tag `v0.4.1` → `v0.6.0` | manifest edit; lock resolved to `cdc28842` | `cargo check --features tui --all-targets` clean (remote worker hz3, 4 m 29 s); `cargo test --features tui --lib -- tui::` **955 passed, 0 failed** (remote hz3, 31 s) | accepted; upstream release notes for `v0.5.0`/`v0.6.0` carry no body, so compatibility was established by compiling and running the full TUI suite |
+
+Toolchain for these runs: `rustc 1.100.0-nightly (0dfb098f3 2026-08-31)`. The bumps landed on `main` through commits `7c1b388`, `944e3ce`, and `6128cc7`.

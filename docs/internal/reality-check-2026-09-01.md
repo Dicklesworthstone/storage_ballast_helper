@@ -1,5 +1,23 @@
 # Reality Check: storage_ballast_helper (`sbh`) — 2026-09-01
 
+> **Reconciliation (2026-09-02).** A second reality-check session ran in
+> parallel and produced `docs/internal/reality-check-and-bridge-plan-2026-09-02.md`
+> with the bead tree `bd-rc-master-ajg1` (14 workstreams W0–W13 plus a
+> quantitative design Q1–Q10). The two analyses agree on every finding. To
+> keep one tracker, **`bd-rc-master-ajg1` is the canonical tree**: the beads
+> created from this document (`bd-rc-bridge-2026-09-btcx`) were closed with a
+> `related` link to their counterparts, and the items unique to this document
+> were added as children of the matching W-epics, labeled `folded`: catalog
+> roots on a pressured device, quarantine-first deletion with `sbh undo`,
+> adaptive conformal TTE intervals, the risk-budgeted batch planner,
+> configurable policy fallbacks and the guardrail idle-noise fix, `explain
+> --why-not/--counterfactual/--replay`, the daemon control socket, LogSearch /
+> Diagnostics / VOI / incident-replay dashboard work, status-JSON platform
+> honesty, unit drift detection, Prometheus textfile metrics, fuzz targets,
+> and the README claims registry. This document remains the evidence record
+> (vision checklist, discrepancy ledger, live-host evidence) and the design
+> text for those folded items; the other document is the workstream plan.
+
 **Method:** README.md, AGENTS.md, every `docs/*.md` plan/signoff document, and the
 seven open/in-progress beads were read in full. Seven parallel code audits then
 walked every README "How It Works" claim to its implementing code, classified it
