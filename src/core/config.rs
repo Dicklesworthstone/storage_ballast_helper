@@ -984,6 +984,158 @@ fn choose_implicit_config(
     }
 }
 
+/// Why `sbh` reads a particular config file. Printed by `sbh config path`
+/// and used by [`Config::load`], so the two can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigPathSource {
+    /// `--config PATH`.
+    Explicit,
+    /// The `SBH_CONFIG` environment variable.
+    Env,
+    /// The platform's per-user (or service-scope) default path.
+    Default,
+    /// No per-user config exists but the system one does.
+    SystemFallback,
+    /// Running as root with a system config present.
+    SystemForRoot,
+}
+
+impl ConfigPathSource {
+    /// Whether the operator named this file (so its absence is an error).
+    #[must_use]
+    pub const fn is_explicit(self) -> bool {
+        matches!(self, Self::Explicit | Self::Env)
+    }
+
+    /// Whether the system config (and system data paths) are in force.
+    #[must_use]
+    pub const fn is_system(self) -> bool {
+        matches!(self, Self::SystemFallback | Self::SystemForRoot)
+    }
+}
+
+impl std::fmt::Display for ConfigPathSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Explicit => "--config",
+            Self::Env => "SBH_CONFIG",
+            Self::Default => "default",
+            Self::SystemFallback => "system fallback",
+            Self::SystemForRoot => "system (root)",
+        })
+    }
+}
+
+/// The config file an invocation reads, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResolvedConfigPath {
+    pub path: PathBuf,
+    pub source: ConfigPathSource,
+    pub exists: bool,
+    /// Root's own per-user config, ignored in favour of the system one.
+    pub shadowed_user_config: Option<PathBuf>,
+    /// One sentence for humans.
+    pub reason: String,
+}
+
+/// Pure resolution over already-observed inputs (testable without touching
+/// the environment or the real filesystem layout).
+fn resolve_config_path_from(
+    explicit: Option<&Path>,
+    env_config: Option<&Path>,
+    default_path: &Path,
+    system_config: &Path,
+    is_root: bool,
+    allow_system_fallback: bool,
+) -> ResolvedConfigPath {
+    if let Some(path) = explicit {
+        return ResolvedConfigPath {
+            path: path.to_path_buf(),
+            source: ConfigPathSource::Explicit,
+            exists: path.exists(),
+            shadowed_user_config: None,
+            reason: "--config names this file".to_string(),
+        };
+    }
+    if let Some(path) = env_config {
+        return ResolvedConfigPath {
+            path: path.to_path_buf(),
+            source: ConfigPathSource::Env,
+            exists: path.exists(),
+            shadowed_user_config: None,
+            reason: "SBH_CONFIG names this file".to_string(),
+        };
+    }
+    let choice = if allow_system_fallback {
+        choose_implicit_config(is_root, default_path.exists(), system_config.exists())
+    } else {
+        ImplicitConfigChoice::User
+    };
+    match choice {
+        ImplicitConfigChoice::User => {
+            let exists = default_path.exists();
+            let reason = if exists {
+                "the default config for this user".to_string()
+            } else if allow_system_fallback {
+                format!(
+                    "no config file for this user and none at {}; built-in defaults apply",
+                    system_config.display()
+                )
+            } else {
+                "no config file at the service-scope default; built-in defaults apply".to_string()
+            };
+            ResolvedConfigPath {
+                path: default_path.to_path_buf(),
+                source: ConfigPathSource::Default,
+                exists,
+                shadowed_user_config: None,
+                reason,
+            }
+        }
+        ImplicitConfigChoice::SystemFallback => ResolvedConfigPath {
+            path: system_config.to_path_buf(),
+            source: ConfigPathSource::SystemFallback,
+            exists: true,
+            shadowed_user_config: None,
+            reason: format!(
+                "no per-user config at {}; reading the system config the service uses",
+                default_path.display()
+            ),
+        },
+        ImplicitConfigChoice::SystemForRoot {
+            shadowed_user_config,
+        } => ResolvedConfigPath {
+            path: system_config.to_path_buf(),
+            source: ConfigPathSource::SystemForRoot,
+            exists: true,
+            shadowed_user_config: shadowed_user_config.then(|| default_path.to_path_buf()),
+            reason: "running as root: the system config is the one the service and sudo share"
+                .to_string(),
+        },
+    }
+}
+
+fn resolve_config_path_with(
+    explicit: Option<&Path>,
+    default_paths: &PathsConfig,
+    allow_system_fallback: bool,
+) -> ResolvedConfigPath {
+    let env_config = if explicit.is_none() {
+        env::var_os("SBH_CONFIG").map(PathBuf::from)
+    } else {
+        None
+    };
+    resolve_config_path_from(
+        explicit,
+        env_config.as_deref(),
+        &default_paths.config_file,
+        &system_config_file(),
+        effective_uid_is_root(),
+        allow_system_fallback,
+    )
+}
+
 fn effective_uid_is_root() -> bool {
     #[cfg(unix)]
     {
@@ -1070,6 +1222,13 @@ impl Config {
         Self::load_with_default_paths(path, PathsConfig::for_service_scope(user_scope), false)
     }
 
+    /// The config file [`Config::load`] would read for this invocation, and
+    /// why. `sbh config path` prints it; the two share one resolver.
+    #[must_use]
+    pub fn resolve_config_path(explicit: Option<&Path>) -> ResolvedConfigPath {
+        resolve_config_path_with(explicit, &PathsConfig::default(), true)
+    }
+
     /// Load config from default or explicit path, then apply env overrides.
     ///
     /// Resolution order for config file path:
@@ -1093,55 +1252,24 @@ impl Config {
         default_paths: PathsConfig,
         allow_system_fallback: bool,
     ) -> Result<Self> {
-        // Check SBH_CONFIG env var if no explicit path was given.
-        let env_config = if path.is_none() {
-            env::var_os("SBH_CONFIG").map(PathBuf::from)
-        } else {
-            None
-        };
-
-        let path_buf = path.map_or_else(
-            || {
-                env_config
-                    .clone()
-                    .unwrap_or_else(|| default_paths.config_file.clone())
-            },
-            Path::to_path_buf,
-        );
-        let is_explicit_path = path.is_some() || env_config.is_some();
-
-        // System-wide resolution when no explicit path is given: a regular
-        // user without a per-user config reads the system config (so
-        // `sbh status` sees what the service sees), and root always prefers
-        // the system config when one exists (so `sudo sbh …` and the system
-        // service agree on which ballast pool is real).
-        let system_config = system_config_file();
-        let choice = if allow_system_fallback && !is_explicit_path {
-            choose_implicit_config(
-                effective_uid_is_root(),
-                path_buf.exists(),
-                system_config.exists(),
-            )
-        } else {
-            ImplicitConfigChoice::User
-        };
-        let (effective_path, is_system_fallback) = match choice {
-            ImplicitConfigChoice::User => (path_buf, false),
-            ImplicitConfigChoice::SystemFallback => (system_config, true),
-            ImplicitConfigChoice::SystemForRoot {
-                shadowed_user_config,
-            } => {
-                if shadowed_user_config {
-                    eprintln!(
-                        "[SBH-CONFIG] Running as root: using system config at {} \
-                         (ignoring {}; pass --config to read that file instead)",
-                        system_config.display(),
-                        path_buf.display()
-                    );
-                }
-                (system_config, true)
-            }
-        };
+        // Which file: `--config`, then `SBH_CONFIG`, then the implicit choice
+        // (a regular user without a per-user config reads the system config so
+        // `sbh status` sees what the service sees; root always prefers the
+        // system config so `sudo sbh …` and the service agree on which ballast
+        // pool is real). `sbh config path` prints this same resolution.
+        let resolved = resolve_config_path_with(path, &default_paths, allow_system_fallback);
+        let is_explicit_path = resolved.source.is_explicit();
+        let is_system_fallback = resolved.source.is_system();
+        if let Some(shadowed) = &resolved.shadowed_user_config {
+            eprintln!(
+                "[SBH-CONFIG] Running as root: using system config at {} \
+                 (ignoring {}; pass --config to read that file instead)",
+                resolved.path.display(),
+                shadowed.display()
+            );
+        }
+        let announce_system_fallback = resolved.source == ConfigPathSource::SystemFallback;
+        let effective_path = resolved.path;
 
         let mut cfg = if effective_path.exists() {
             let raw = fs::read_to_string(&effective_path).map_err(|source| SbhError::Io {
@@ -1158,7 +1286,7 @@ impl Config {
                 &default_paths
             };
             apply_missing_path_defaults(&mut parsed.paths, &raw_value, path_defaults);
-            if choice == ImplicitConfigChoice::SystemFallback {
+            if announce_system_fallback {
                 eprintln!(
                     "[SBH-CONFIG] Using system config at {}",
                     effective_path.display()
@@ -2270,6 +2398,66 @@ mod tests {
             choose_implicit_config(false, false, false),
             ImplicitConfigChoice::User
         );
+    }
+
+    #[test]
+    fn resolve_config_path_reports_source_and_reason() {
+        use super::{ConfigPathSource, resolve_config_path_from};
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        let system = dir.path().join("system.toml");
+        let explicit = dir.path().join("explicit.toml");
+
+        // --config wins even when the file is absent (its absence is an error later).
+        let r = resolve_config_path_from(Some(&explicit), Some(&user), &user, &system, true, true);
+        assert_eq!(
+            (r.source, r.exists, &r.path),
+            (ConfigPathSource::Explicit, false, &explicit)
+        );
+        assert!(r.source.is_explicit() && !r.source.is_system());
+
+        // SBH_CONFIG next.
+        let r = resolve_config_path_from(None, Some(&explicit), &user, &system, false, true);
+        assert_eq!((r.source, &r.path), (ConfigPathSource::Env, &explicit));
+
+        // Nothing on disk: the default path, built-in defaults.
+        let r = resolve_config_path_from(None, None, &user, &system, false, true);
+        assert_eq!(
+            (r.source, r.exists, &r.path),
+            (ConfigPathSource::Default, false, &user)
+        );
+        assert!(r.reason.contains("built-in defaults"), "{}", r.reason);
+
+        // Only a system config: an unprivileged user falls back to it.
+        std::fs::write(&system, "").unwrap();
+        let r = resolve_config_path_from(None, None, &user, &system, false, true);
+        assert_eq!(
+            (r.source, r.exists, &r.path),
+            (ConfigPathSource::SystemFallback, true, &system)
+        );
+        assert!(r.source.is_system());
+        assert!(
+            r.reason.contains(&user.display().to_string()),
+            "{}",
+            r.reason
+        );
+
+        // A per-user config wins for an unprivileged user...
+        std::fs::write(&user, "").unwrap();
+        let r = resolve_config_path_from(None, None, &user, &system, false, true);
+        assert_eq!((r.source, &r.path), (ConfigPathSource::Default, &user));
+        // ...but root reads the system config and reports the shadowed file.
+        let r = resolve_config_path_from(None, None, &user, &system, true, true);
+        assert_eq!(
+            (r.source, &r.path),
+            (ConfigPathSource::SystemForRoot, &system)
+        );
+        assert_eq!(r.shadowed_user_config.as_deref(), Some(user.as_path()));
+
+        // Service-scope loads never fall back.
+        let r = resolve_config_path_from(None, None, &user, &system, true, false);
+        assert_eq!(r.source, ConfigPathSource::Default);
+        assert!(r.shadowed_user_config.is_none());
     }
 
     #[test]

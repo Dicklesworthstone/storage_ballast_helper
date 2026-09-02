@@ -4553,22 +4553,27 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
 fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
     match &args.command {
         None | Some(ConfigCommand::Path) => {
-            let path = cli.config.clone().unwrap_or_else(Config::default_path);
-            let exists = path.exists();
+            // The same resolver `Config::load` uses, so `config path` and
+            // `config validate`/`show` can never name different files.
+            let resolved = Config::resolve_config_path(cli.config.as_deref());
 
             match output_mode(cli) {
                 OutputMode::Human => {
-                    println!("{}", path.display());
-                    if !exists {
+                    println!("{}", resolved.path.display());
+                    println!("  Source: {} ({})", resolved.source, resolved.reason);
+                    if let Some(shadowed) = &resolved.shadowed_user_config {
+                        println!(
+                            "  Ignored: {} (root reads the system config; pass --config to read this one)",
+                            shadowed.display()
+                        );
+                    }
+                    if !resolved.exists {
                         println!("  (file does not exist; defaults will be used)");
                     }
                 }
                 OutputMode::Json => {
-                    let payload = json!({
-                        "command": "config path",
-                        "path": path.to_string_lossy(),
-                        "exists": exists,
-                    });
+                    let mut payload = serde_json::to_value(&resolved)?;
+                    payload["command"] = json!("config path");
                     write_json_line(&payload)?;
                 }
             }
@@ -7604,9 +7609,62 @@ fn run_log(cli: &Cli, args: &LogArgs) -> Result<(), CliError> {
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
     let log_path = &config.paths.jsonl_log;
 
-    if !log_path.exists() {
+    // Read-side command on a system install: the daemon's log usually lives
+    // in the system data dir and belongs to another user. Say so instead of
+    // failing with a bare "not found"/EACCES.
+    let permission_denied = log_path.exists()
+        && matches!(
+            std::fs::File::open(log_path),
+            Err(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied
+        );
+    if !log_path.exists() || permission_denied {
+        let hint = daemon_activity_db_hint(log_path);
+        let error = if permission_denied {
+            "permission_denied"
+        } else {
+            "no_log_file"
+        };
+        match output_mode(cli) {
+            OutputMode::Human => {
+                if permission_denied {
+                    eprintln!(
+                        "Activity log {} is not readable by this user (it belongs to the daemon's user).",
+                        log_path.display()
+                    );
+                } else {
+                    eprintln!("No activity log found at {}.", log_path.display());
+                }
+                if let Some(path) = &hint {
+                    eprintln!("  The daemon's log is at {}.", path.display());
+                }
+                if permission_denied || hint.is_some() {
+                    eprintln!("  The daemon runs as another user — try: sudo sbh log");
+                } else {
+                    eprintln!("  Run the daemon to start collecting activity.");
+                }
+            }
+            OutputMode::Json => {
+                let mut payload = json!({
+                    "command": "log",
+                    "error": error,
+                    "log_path": log_path.to_string_lossy(),
+                });
+                if permission_denied || hint.is_some() {
+                    payload["hint"] = json!("daemon log belongs to another user; retry with sudo");
+                }
+                if let Some(path) = &hint {
+                    payload["root_log_path"] = json!(path.to_string_lossy());
+                }
+                write_json_line(&payload)?;
+            }
+        }
         return Err(CliError::Runtime(format!(
-            "log file not found: {}",
+            "{}: {}",
+            if permission_denied {
+                "log file is not readable by this user"
+            } else {
+                "log file not found"
+            },
             log_path.display()
         )));
     }

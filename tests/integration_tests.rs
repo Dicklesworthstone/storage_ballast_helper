@@ -2443,6 +2443,116 @@ enabled = false
     );
 }
 
+/// `config path` and `config validate` resolve through one function, `config
+/// path` says why, and `log` explains a missing/unreadable log instead of
+/// failing bare.
+#[test]
+fn config_path_and_validate_agree_and_log_explains_missing_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_path = dir.path().join("config.toml");
+    let missing_log = dir.path().join("nolog").join("activity.jsonl");
+    fs::write(
+        &config_path,
+        format!(
+            "[paths]\njsonl_log = \"{}\"\n\n[notifications]\nenabled = false\n",
+            toml_path(&missing_log)
+        ),
+    )
+    .expect("write config");
+    let config_arg = config_path.to_string_lossy().to_string();
+
+    // --config: explicit source, and validate names the same file.
+    let path = common::run_cli_case(
+        "config_path_explicit_json",
+        &["--config", &config_arg, "config", "path", "--json"],
+    );
+    assert_cli_success(&path, "config path --json");
+    let path_json = parse_json_stdout(&path);
+    assert_eq!(path_json["command"], "config path");
+    assert_eq!(path_json["source"], "explicit");
+    assert_eq!(path_json["exists"], serde_json::Value::Bool(true));
+    assert_eq!(path_json["path"], serde_json::json!(config_arg));
+    assert!(
+        path_json["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("--config"))
+    );
+    let validate = common::run_cli_case(
+        "config_validate_explicit_json",
+        &["--config", &config_arg, "config", "validate", "--json"],
+    );
+    assert_cli_success(&validate, "config validate --json");
+    let validate_json = parse_json_stdout(&validate);
+    assert_eq!(validate_json["valid"], serde_json::Value::Bool(true));
+    assert_eq!(
+        validate_json["path"], path_json["path"],
+        "validate and path must name the same file"
+    );
+    let human = common::run_cli_case(
+        "config_path_explicit_human",
+        &["--config", &config_arg, "config", "path"],
+    );
+    assert_cli_success(&human, "config path");
+    assert!(
+        human.stdout.contains("Source: --config"),
+        "human output explains the source: {}",
+        human.stdout
+    );
+
+    // SBH_CONFIG: env source.
+    let env_path = common::run_cli_case_with_env(
+        "config_path_env_json",
+        &["config", "path", "--json"],
+        &[("SBH_CONFIG", config_arg.as_str())],
+    );
+    assert_cli_success(&env_path, "config path --json (SBH_CONFIG)");
+    let env_json = parse_json_stdout(&env_path);
+    assert_eq!(env_json["source"], "env");
+    assert_eq!(env_json["path"], serde_json::json!(config_arg));
+
+    // A named file that does not exist: path reports it, validate refuses.
+    let missing_cfg = dir.path().join("missing.toml");
+    let missing_arg = missing_cfg.to_string_lossy().to_string();
+    let missing = common::run_cli_case(
+        "config_path_missing_json",
+        &["--config", &missing_arg, "config", "path", "--json"],
+    );
+    assert_cli_success(&missing, "config path --json (missing)");
+    let missing_json = parse_json_stdout(&missing);
+    assert_eq!(missing_json["exists"], serde_json::Value::Bool(false));
+    assert_eq!(missing_json["source"], "explicit");
+    let invalid = common::run_cli_case(
+        "config_validate_missing",
+        &["--config", &missing_arg, "config", "validate", "--json"],
+    );
+    assert!(
+        !invalid.status.success(),
+        "validate must fail for a missing --config"
+    );
+
+    // log: the configured log does not exist -> structured refusal naming it.
+    let log = common::run_cli_case(
+        "log_missing_json",
+        &["--config", &config_arg, "log", "--json"],
+    );
+    assert!(
+        !log.status.success(),
+        "log must fail when the file is missing"
+    );
+    let log_json = parse_json_stdout(&log);
+    assert_eq!(log_json["command"], "log");
+    assert_eq!(log_json["error"], "no_log_file");
+    assert_eq!(
+        log_json["log_path"],
+        serde_json::json!(missing_log.to_string_lossy())
+    );
+    assert!(
+        log.stderr.contains("log file not found"),
+        "human error names the problem: {}",
+        log.stderr
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_foreground_daemon_idle_energy_budget() {
