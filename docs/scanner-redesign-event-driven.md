@@ -1,8 +1,9 @@
 # Design: Event-Driven, Pressure-Gated Scanner (v2)
 
 **Status:** Implemented and the default engine since v0.4.32 (`scanner.engine`
-defaults to `"v2"`; `"v1"` is the opt-out rollback). The fleet-level A/B
-evidence in section 7 is still being collected · **Author:**
+defaults to `"v2"`; `"v1"` is the opt-out rollback). The A/B evidence
+measured on 2026-09-02 (section 7) does not yet meet the promotion
+criteria · **Author:**
 fleet-maintenance investigation, 2026-05-25
 **Supersedes the steady-state behavior of:** `src/scanner/walker.rs`, the open-file
 path in `OpenPathCache`, and the periodic full-walk model.
@@ -285,9 +286,36 @@ metrics. Focused JSON validation artifacts are produced by
 `event_overflow_validation_artifact_records_reconciliation_fallback`, and
 `pressure_latency_validation_artifact_is_machine_readable`. Since v0.4.32 the
 default is `scanner.engine = "v2"` (see the `ScannerConfig` default in
-`src/core/config.rs`); the live A/B artifacts that demonstrate the
-CPU-seconds/pass target and safety parity outside the synthetic harness are
-still to be recorded here, and `"v1"` remains the rollback.
+`src/core/config.rs`); the live A/B artifacts are recorded below, and
+`"v1"` remains the rollback.
+
+### Measured (2026-09-02)
+
+Full evidence: `docs/internal/scanner-ab-2026-09-02.md` (release build of
+965c0a6 on the operator workstation; self-measured, not independently
+re-run).
+
+- One-shot `sbh scan /data/projects --top 200` (2.1 TB project tree): v1
+  13.1 CPU-s, 15,019 entries, 64 candidates; v2 44.4 CPU-s, 11,977 entries,
+  53 opaque roots pruned, 49 candidates. v2 costs 3.4x v1 because it
+  measures every pruned opaque root with the allocated-size probe (449 GB
+  measured vs v1's 4 GB shallow estimate). On the small `/data/tmp` tree
+  the engines are equivalent (same 7 candidates, CPU within noise).
+- Safety: v1 hard-vetoed nothing on either tree, so the "never approves
+  what v1 vetoes" check is vacuous outside the synthetic harness; v2 was
+  strictly more conservative (19 `Review` roots whose children v1 rates
+  `Delete`).
+- Daemon steady state at injected Orange, 300 s, identify-only: v1 601.7
+  CPU-s (two cores, 2 full passes of 231,053 paths); v2 92.8 CPU-s but as a
+  hot loop: 1 walk of 44 entries (the pressure byte-target early stop) then
+  574 zero-duration index-replay passes, about two per second, each
+  re-dispatching the same two `unclear` candidates that the certainty gate
+  holds back. The empty-pass cooldown never armed because a replay pass
+  counts as a dispatch. Filed as a P0 bug from this capture.
+- Verdict: the >= 50x CPU-seconds-per-pass criterion is **not
+  demonstrated** and the retry-backoff criterion is violated in spirit;
+  bd-xtpv.8 stays open until the replay loop is fixed and a forced full
+  pass is compared engine to engine.
 
 Live A/B capture procedure:
 

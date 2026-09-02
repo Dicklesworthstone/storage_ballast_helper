@@ -1,0 +1,160 @@
+# Scanner v1/v2 A/B evidence (2026-09-02)
+
+Measured for bd-rc-master-ajg1.8.3 against the promotion criteria in
+`docs/scanner-redesign-event-driven.md` section 7 (bd-xtpv.8). Binary:
+release build of `origin/main` at 965c0a6 (v0.5.1), built and run on the
+operator workstation (csd, Linux 7.0, `/data` = 5.5 TiB ext4, 46% used).
+Everything below was produced and read by one agent session; nothing has
+been independently re-run.
+
+## 1. One-shot `sbh scan` (the design doc's capture procedure)
+
+Commands, only the engine override changed:
+
+```bash
+SBH_SCANNER_ENGINE=v1 sbh --json scan <root> --top 200
+SBH_SCANNER_ENGINE=v2 sbh --json scan <root> --top 200
+```
+
+Timed with `/usr/bin/time -f "wall=%es user=%Us sys=%Ss maxrss=%MKB"`; the
+CPU column is the JSON's own `process_cpu_micros`.
+
+| Root | Engine | CPU (s) | wall (s) | user / sys (s) | scanned_entries | opaque_pruned_dirs | candidates | total_reclaimable_bytes |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| /data/tmp | v1 | 0.87 | 0.75 | 0.12 / 0.77 | 893 | 0 | 7 | 12,288 |
+| /data/tmp | v2 | 0.85 | 0.83 | 0.12 / 0.77 | 760 | 0 | 7 | 12,288 |
+| /data/projects | v1 | 13.09 | 8.38 | 1.23 / 11.95 | 15,019 | 0 | 64 | 4,054,454,272 |
+| /data/projects | v2 | 44.39 | 9.34 | 2.88 / 41.60 | 11,977 | 53 | 49 | 448,793,174,016 |
+
+Two more pairs were captured through the `rch` hook (`cargo run
+--release` directly, then `rch exec -- sh -c '... cargo run ...'`). The
+compiles ran on a worker, but the binary executed on this workstation both
+times (`hostname` printed from inside the wrapper was this host, the run
+line names the local target directory, and the entry counts match the
+local runs exactly), so neither is the "one rch VPS" sample the bead asks
+for and they are not counted here (v1 0.77 s / v2 0.46 s and v1 0.69 s /
+v2 0.78 s CPU on /data/tmp).
+
+What the numbers say:
+
+- On the small tree the engines are equivalent (same 7 candidates, same
+  bytes, same decisions, CPU within noise).
+- On the 2.1 TB project tree v2 spends **3.4x the CPU of v1** and almost all
+  of it is system time: every one of the 53 opaque roots (`target/`,
+  `node_modules/`, `.cargo/registry`, `.gocache`) is measured with the
+  budgeted allocated-size probe (`opaque_tree_allocated_size`), which stats
+  the pruned subtree v2 just declined to walk. v1 reports a shallow estimate
+  instead (4 GB vs 449 GB for the same roots), so v2's number is the honest
+  one, but the section 7 promise of "no full descent" does not hold for a
+  one-shot scan.
+- v2 prunes at the opaque root, v1 lists the profile directories beneath it:
+  34 of v1's 64 candidates are `target/debug`, `target/release`,
+  `target-gate/debug` style children of roots that v2 reports once. 28 of
+  v2's 49 candidates are roots v1 never surfaced (`node_modules`,
+  `.cargo/registry`, `.gocache`, `.codex-target`).
+
+### Safety parity
+
+- v1 hard-vetoed nothing on either tree (`veto_reason` null on all 64 + 7
+  candidates), so the "v2 never approves what v1 hard-vetoes" check is
+  vacuous here; it is only covered by the synthetic harness
+  (`engine_v1_reclaims_the_same_set_as_v2_at_orange`, the deep-open-file
+  opaque-root tests).
+- v2 is the more conservative engine on this tree: 19 of its 49 candidates
+  are `Review` (certainty `likely`/`unclear`), including
+  `/data/projects/frankengit/target` (47.6 GB) and
+  `/data/projects/mcp_agent_mail_rust/.codex-target` (343 GB), whose
+  children v1 rates `Delete` at `definite`.
+- No v2 `Delete` root contains a path that v1 rated anything other than
+  `Delete`.
+
+## 2. Daemon steady state (what the criteria are actually about)
+
+Foreground daemon per engine for 300 s, same release binary, identify-only
+and `dry_run = true`; pressure injected through the test overlay so that
+only the configured root is pressured:
+
+```bash
+SBH_TEST_MODE=1 \
+SBH_TEST_FS_STATS='{"mounts":[{"path":"/","fs_type":"ext4","total":1000000000000,"free":400000000000},{"path":"/data","fs_type":"ext4","total":6000000000000,"free":720000000000}]}' \
+sbh --config <run>/config.toml daemon --pidfile <run>/pid
+```
+
+Config: `root_paths = ["/data/projects"]`, `poll_interval_ms = 2000`,
+`min_rescan_interval_secs = 20`, `max_scan_duty_cycle_pct = 100`,
+`telemetry.cpu_budget_pct = 0` (no throttling, so the loop's own pacing is
+what is measured), `max_depth = 6`, `parallelism = 2`, `ballast.file_count =
+1` (the 4 KiB minimum). CPU is `utime + stime` from `/proc/<pid>/stat` read
+at 300 s; passes are the run's own `scan_complete` events.
+
+| Engine | CPU-s / 300 s | `cpu_budget.used_pct_1m` at end | scan_complete events | walk passes | paths per walk | candidates per walk | `decision` rows written |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| v1 | 601.7 (270 user + 331 sys) | 200% (two cores) | 3 | 2 full + 1 cut short by shutdown | 231,053 | 5,561 | 5,875 |
+| v2 | 92.8 (34 user + 59 sys) | 25% of a core | 575 | 1 (2.6 s, 44 entries, 6 opaque roots, 4 candidates) | 44 | 4 | 1,152 |
+
+v2's other 574 `scan_complete` events are zero-duration passes, about two
+per second for the whole run, each of which replays the same two index
+records and dispatches them again:
+
+```
+[SBH-SCANNER] index replay path=/data/projects/flywheel_gateway/node_modules generation=1 verdict=dispatch score=2.084 certainty=unclear
+[SBH-SCANNER] index replay path=/data/projects/beads_rust/target generation=1 verdict=dispatch score=2.400 certainty=unclear
+[SBH-EXECUTOR] policy engine approved 2/2 candidates (mode=enforce)
+[SBH-EXECUTOR] certainty gate held back 2 candidate(s) below likely (pressure=Orange)
+```
+
+(575 occurrences of each line; 0 occurrences of the `no reclaimable
+progress ... backing off rescans` message in either run.)
+
+Mechanism, from `src/daemon/loop_main.rs` at 965c0a6:
+
+1. At Orange the v2 walk stops early once it has seen
+   `V2_PRESSURE_RECLAIM_BYTES_PER_CANDIDATE x max_delete_batch` of candidate
+   bytes (`v2_pressure_candidate_byte_target`). Here that was 5.7 GB after
+   44 entries, so the walk never reached the 30 `Delete`-grade roots the
+   one-shot v2 scan finds in the same tree.
+2. Both candidates it did find are `unclear`, so the executor's certainty
+   gate holds them back at Orange. The scanner thread does not learn that.
+3. The empty-pass cooldown keys on `dispatched_this_pass == 0`. A replay
+   pass dispatches the two records again, so it counts as productive,
+   `consecutive_empty_passes` resets, and the next pressure tick rescans
+   immediately. The index cooldown (`candidate_in_cooldown`) only arms on
+   replay *drops*, not on held-back dispatches.
+
+This is the production failure shape recorded in the reality check (daemon
+at its CPU quota, thousands of attempts, nothing reclaimed): with the unit's
+`CPUQuota=10%` and `cpu_budget_pct = 25` the loop is throttled rather than
+fixed. Filed as a P0 bug from this capture (see the bead created alongside
+this document).
+
+v1 has no such loop because a pass costs 25 s of wall time and the executor
+does reach `would_delete` batches (263 dry-run batches of 4-10 candidates),
+but it spends two cores for the whole five minutes doing it.
+
+## 3. Verdict against section 7
+
+| Criterion | Result |
+|---|---|
+| Steady state < 1% of one core (Green, no FS activity) | Not measured (both runs were at Orange by construction). |
+| No full descent; >= 50x CPU-s per pass vs v1 on a large tree | **Not demonstrated.** A full v2 walk of the same tree costs 3.4x v1 (section 1). The daemon's v2 pass was 2.6 s against v1's 25 s only because it walked 44 entries instead of 231,053 (early stop), which is different work, not a cheaper pass. |
+| Zero `canonicalize` per entry | Not measured here (covered by unit counters). |
+| Active-reference check O(open refs + indexed candidates) | Not measured here. |
+| Deletion-failure retry bounded by backoff | **Violated in spirit:** the same two held-back candidates were re-dispatched 575 times in five minutes. |
+| v2 never approves what v1 hard-vetoes | Vacuous on this tree (v1 vetoed nothing); v2 was strictly more conservative. |
+| Docs match code | README and design doc updated with this document on 2026-09-02. |
+
+bd-xtpv.8 therefore stays open. The blocking item is the replay hot loop;
+after it is fixed the daemon capture above should be re-run (same commands)
+and the CPU-per-pass comparison should be made on a forced full pass
+(`force_full_scan`) so both engines walk the whole tree.
+
+## 4. Follow-ups noticed
+
+- `stats` cannot report scanner CPU-seconds per day: `scan_complete` carries
+  `duration_ms` (wall) only; `process_cpu_micros` exists only in the
+  one-shot `scan --json` path.
+- The 343 GB `/data/projects/mcp_agent_mail_rust/.codex-target` root is
+  worth an operator look regardless of engine.
+- Raw captures (JSON, stderr, `/proc` samples) are in the session
+  scratchpad under `ab-local/`, `ab-remote/` and `ab-daemon/`; they were not
+  committed.
