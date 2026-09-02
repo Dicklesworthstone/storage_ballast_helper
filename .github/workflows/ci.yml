@@ -13,9 +13,12 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  # Pull requests supersede their own earlier runs. Pushes to main queue
-  # behind each other instead: several agents push every few minutes, and
-  # cancelling in progress meant main never completed a run at all.
+  # Pull requests supersede their own earlier runs. A main run that is in
+  # progress is never cancelled: several agents push every few minutes, and
+  # cancelling in progress meant main never completed a run at all. GitHub
+  # still keeps at most one main run waiting behind the active one, and a
+  # newer push replaces the waiting run; a run that never leaves "queued"
+  # therefore blocks every later push until it is cancelled by hand.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:

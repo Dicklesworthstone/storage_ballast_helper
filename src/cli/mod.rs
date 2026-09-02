@@ -2458,7 +2458,8 @@ mod tests {
         for required in [
             "Superseded CI cancellation",
             "`cancel-in-progress` enabled only for `pull_request` events",
-            "pushes to `refs/heads/main` queue behind each other",
+            "a main run that is in progress is never cancelled",
+            "a newer push replaces the waiting run",
             "Tag-triggered release workflow calls are not cancelable",
             "release quality gates",
         ] {
