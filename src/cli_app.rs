@@ -484,6 +484,12 @@ struct ScanArgs {
     /// Include per-candidate confidence and safety-check traces.
     #[arg(long)]
     explain: bool,
+    /// Preview the catalog roots the daemon would scan on MOUNT (default /)
+    /// when that device is under pressure and has no configured root_path:
+    /// known-safe caches (~/.cache/pip, cargo registry caches, npm _cacache,
+    /// Trash, /var/tmp/*, ...) with their size and idle time. No scoring.
+    #[arg(long, value_name = "MOUNT", num_args = 0..=1, default_missing_value = "/")]
+    catalog: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args, Serialize)]
@@ -8800,9 +8806,142 @@ fn current_process_cpu_micros() -> Option<u64> {
 }
 
 #[allow(clippy::too_many_lines)]
+/// `sbh scan --catalog [MOUNT]`: the same derivation the daemon runs for a
+/// pressured device with no configured root, so an operator can see which
+/// known-safe caches would be considered, how large they are and how long
+/// they have been idle. Nothing is scored or deleted.
+fn render_catalog_preview(cli: &Cli, config: &Config, mount: &Path) -> Result<(), CliError> {
+    use storage_ballast_helper::platform::cleanup_catalog;
+    use storage_ballast_helper::scanner::walker::tree_newest_mtime;
+
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let mount = mount
+        .canonicalize()
+        .map_err(|e| CliError::User(format!("invalid mount {}: {e}", mount.display())))?;
+    let Some(device) = cleanup_catalog::device_of(&mount) else {
+        return Err(CliError::Runtime(format!(
+            "cannot stat {} to determine its device",
+            mount.display()
+        )));
+    };
+    let homes = cleanup_catalog::user_homes(&platform.user_home());
+    let roots =
+        cleanup_catalog::catalog_roots_for_mount(cleanup_catalog::CATALOG_ROOTS, &homes, device);
+    let now = std::time::SystemTime::now();
+
+    struct Row {
+        path: PathBuf,
+        rule: &'static str,
+        confidence: &'static str,
+        min_age_hours: u64,
+        allocated_bytes: u64,
+        size_complete: bool,
+        idle_secs: u64,
+        eligible: bool,
+    }
+    let rows: Vec<Row> = roots
+        .iter()
+        .map(|root| {
+            let probe = tree_newest_mtime(&root.path, 200_000, 6);
+            let newest = probe
+                .newest_mtime
+                .or_else(|| {
+                    std::fs::metadata(&root.path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                })
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let idle = now.duration_since(newest).unwrap_or_default();
+            Row {
+                path: root.path.clone(),
+                rule: root.rule,
+                confidence: root.confidence.label(),
+                min_age_hours: root.min_age.as_secs() / 3600,
+                allocated_bytes: probe.allocated_bytes,
+                size_complete: probe.complete,
+                idle_secs: idle.as_secs(),
+                eligible: idle >= root.min_age,
+            }
+        })
+        .collect();
+
+    match output_mode(cli) {
+        OutputMode::Human => {
+            println!(
+                "Catalog roots on {} (device {device}), {} user home(s), catalog scans {}:",
+                mount.display(),
+                homes.len(),
+                if config.scanner.catalog_roots_on_pressured_device {
+                    "enabled"
+                } else {
+                    "disabled by scanner.catalog_roots_on_pressured_device"
+                }
+            );
+            if rows.is_empty() {
+                println!("  (none: no known-safe cache location exists on this device)");
+            } else {
+                println!(
+                    "  {:<44}  {:<32}  {:<8}  {:>10}  {:>9}  {}",
+                    "Path", "Rule", "Conf", "Size", "Idle", "Eligible"
+                );
+                for row in &rows {
+                    println!(
+                        "  {:<44}  {:<32}  {:<8}  {:>10}{}  {:>8}h  {}",
+                        row.path.display(),
+                        row.rule,
+                        row.confidence,
+                        format_bytes(row.allocated_bytes),
+                        if row.size_complete { " " } else { "+" },
+                        row.idle_secs / 3600,
+                        if row.eligible {
+                            "yes"
+                        } else {
+                            "no (min idle not reached)"
+                        },
+                    );
+                }
+                println!(
+                    "  A '+' after a size means the probe hit its budget and the tree is larger. \
+                     Eligible roots still pass scoring and every pre-flight veto before deletion."
+                );
+            }
+        }
+        OutputMode::Json => {
+            let payload = json!({
+                "command": "scan",
+                "mode": "catalog",
+                "mount": mount.to_string_lossy(),
+                "device": device,
+                "enabled": config.scanner.catalog_roots_on_pressured_device,
+                "rescan_interval_secs": config.scanner.catalog_rescan_interval_secs,
+                "homes": homes.iter().map(|h| h.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+                "roots": rows.iter().map(|row| json!({
+                    "path": row.path.to_string_lossy(),
+                    "rule": row.rule,
+                    "confidence": row.confidence,
+                    "min_age_hours": row.min_age_hours,
+                    "allocated_bytes": row.allocated_bytes,
+                    "size_complete": row.size_complete,
+                    "idle_secs": row.idle_secs,
+                    "eligible": row.eligible,
+                })).collect::<Vec<_>>(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .map_err(|e| CliError::Runtime(e.to_string()))?
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    if let Some(mount) = &args.catalog {
+        return render_catalog_preview(cli, &config, mount);
+    }
     let cpu_start_micros = current_process_cpu_micros();
     let start = std::time::Instant::now();
 

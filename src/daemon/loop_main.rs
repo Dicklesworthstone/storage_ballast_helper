@@ -59,6 +59,7 @@ use crate::monitor::pid::{
 use crate::monitor::predictive::{PredictiveAction, PredictiveActionPolicy};
 use crate::monitor::special_locations::SpecialLocationRegistry;
 use crate::monitor::voi_scheduler::VoiScheduler;
+use crate::platform::cleanup_catalog::{self, ExpandedCatalogRoot};
 use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
 use crate::platform::types::{
     FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
@@ -79,7 +80,7 @@ use crate::scanner::scoring::{
     ActiveReferenceSummary, ArtifactCertainty, CandidacyScore, ScoringEngine,
 };
 use crate::scanner::walker::{
-    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkerConfig,
+    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkEntry, WalkerConfig,
     collect_active_reference_index_cached, collect_open_path_ancestors_cached,
 };
 
@@ -332,6 +333,11 @@ pub struct ScanRequest {
         crate::core::config::ScoringConfig,
         crate::core::config::ScannerConfig,
     )>,
+    /// Catalog-only scan (W1 catalog roots): each entry is one known-safe
+    /// cache location on a pressured device without a configured root. The
+    /// scanner treats every root as an opaque candidate unit (bounded probe,
+    /// no descent) instead of walking `paths`. Empty for ordinary scans.
+    pub catalog_roots: Vec<ExpandedCatalogRoot>,
 }
 
 /// B6: consecutive no-progress passes after which even Red/Critical pressure
@@ -519,6 +525,9 @@ fn effective_empty_pass_cooldown(base_secs: u64, consecutive_empty_passes: u32) 
 
 #[must_use]
 fn scan_reason_for_request(request: &ScanRequest) -> &'static str {
+    if !request.catalog_roots.is_empty() {
+        return "catalog";
+    }
     if request.force_full_scan {
         return "forced";
     }
@@ -890,6 +899,79 @@ fn mount_controller_config(config: &Config) -> MountControllerConfig {
     }
 }
 
+/// Entry budget for sizing one catalog root: enough to measure a large
+/// package cache, bounded so a pathological tree cannot stall the scanner.
+const CATALOG_PROBE_MAX_ENTRIES: usize = 200_000;
+/// Depth budget for the catalog root probe.
+const CATALOG_PROBE_MAX_DEPTH: usize = 6;
+
+/// Turn derived catalog roots into opaque candidate units for the scanner
+/// loop. Each root is probed once (allocated size, newest mtime, structural
+/// markers); roots used more recently than their rule's minimum idle age are
+/// left alone. Returns the entries and how many roots were skipped as young.
+fn catalog_walk_entries(roots: &[ExpandedCatalogRoot]) -> (Vec<WalkEntry>, usize) {
+    let now = SystemTime::now();
+    let mut entries = Vec::with_capacity(roots.len());
+    let mut skipped_young = 0usize;
+    for root in roots {
+        let Ok(std_meta) = std::fs::symlink_metadata(&root.path) else {
+            continue;
+        };
+        if !std_meta.is_dir() {
+            continue;
+        }
+        let probe = crate::scanner::walker::tree_newest_mtime(
+            &root.path,
+            CATALOG_PROBE_MAX_ENTRIES,
+            CATALOG_PROBE_MAX_DEPTH,
+        );
+        let mut metadata = crate::scanner::walker::entry_metadata(&std_meta);
+        metadata.content_size_bytes = probe.allocated_bytes.max(metadata.size_bytes);
+        metadata.tree_last_modified = probe.newest_mtime;
+        let idle = now
+            .duration_since(metadata.effective_age_timestamp())
+            .unwrap_or(Duration::ZERO);
+        if idle < root.min_age {
+            skipped_young += 1;
+            continue;
+        }
+        let confidence = root.confidence.as_name_confidence();
+        let classification = ArtifactClassification {
+            pattern_name: Cow::Borrowed(root.rule),
+            category: crate::scanner::patterns::ArtifactCategory::CacheDir,
+            name_confidence: confidence,
+            structural_confidence: confidence,
+            combined_confidence: confidence,
+        };
+        entries.push(WalkEntry {
+            path: root.path.clone(),
+            metadata,
+            depth: 0,
+            structural_signals: probe.signals,
+            is_open: false,
+            opaque_tree: Some(crate::scanner::patterns::OpaqueTreeClassification {
+                disposition: OpaqueTreeDisposition::CandidateOpaque,
+                reason: Cow::Owned(format!("catalog root ({})", root.rule)),
+                classification,
+            }),
+        });
+    }
+    (entries, skipped_young)
+}
+
+/// Whether a catalog scan is due for a mount: never dispatched yet, the
+/// pressure level rose since the last one, or the rescan interval elapsed.
+fn catalog_epoch_due(
+    previous: Option<(PressureLevel, Instant)>,
+    level: PressureLevel,
+    now: Instant,
+    rescan_interval: Duration,
+) -> bool {
+    previous.is_none_or(|(prev_level, at)| {
+        level > prev_level || now.saturating_duration_since(at) >= rescan_interval
+    })
+}
+
 /// Probe write used to leave `MountState::Recovery`: 4 KiB into the mount's
 /// ballast directory (or `<mount>/.sbh`), removed again on success.
 fn probe_mount_writable(mount: &Path, ballast_dir: Option<&Path>) -> bool {
@@ -1067,6 +1149,12 @@ pub struct MonitoringDaemon {
     /// Mounts the executor reported as read-only or out of metadata space
     /// since the last tick; each enters `MountState::Recovery`.
     pending_recovery: HashSet<PathBuf>,
+    /// Derived catalog roots per mount (W1 catalog roots), refreshed every
+    /// `scanner.catalog_rescan_interval_secs`.
+    catalog_root_cache: HashMap<PathBuf, (Instant, Vec<ExpandedCatalogRoot>)>,
+    /// Last catalog scan per mount: the level it was dispatched at and when.
+    /// One catalog scan per pressure epoch; a rising level re-arms it.
+    catalog_epochs: HashMap<PathBuf, (PressureLevel, Instant)>,
     special_locations: SpecialLocationRegistry,
     ballast_coordinator: BallastPoolCoordinator,
     release_controller: BallastReleaseController,
@@ -1946,6 +2034,8 @@ impl MonitoringDaemon {
             mount_responses: Vec::new(),
             wake_next_tick: WakeSignals::default(),
             pending_recovery: HashSet::new(),
+            catalog_root_cache: HashMap::new(),
+            catalog_epochs: HashMap::new(),
             special_locations,
             ballast_coordinator,
             release_controller,
@@ -3074,9 +3164,19 @@ impl MonitoringDaemon {
                         Some(pool.ballast_dir.clone()),
                     )
                 });
+            // A mount with no configured root and no cross-device fallback
+            // still has a bounded surface: the known-safe caches on it.
+            let catalog = if roots_here.is_empty()
+                && !cross_device_fallback
+                && self.config.scanner.catalog_roots_on_pressured_device
+            {
+                self.catalog_roots_for(&mount, now)
+            } else {
+                Vec::new()
+            };
             let surface = MountSurface {
                 configured_roots: roots_here.len(),
-                catalog_roots: 0,
+                catalog_roots: catalog.len(),
                 ballast_pool: has_pool,
                 cross_device_fallback,
             };
@@ -3127,15 +3227,36 @@ impl MonitoringDaemon {
                         self.last_tick_cleanup_ran = true;
                     }
                     if decision.scan && scan_allowed {
-                        // A mount with no root of its own only reclaims via
-                        // cross_devices, where any configured root may help.
-                        let paths = if roots_here.is_empty() {
-                            root_paths.clone()
+                        if roots_here.is_empty() && !catalog.is_empty() {
+                            // Catalog surface: one bounded catalog scan per
+                            // pressure epoch, re-armed by a rising level.
+                            let rescan = Duration::from_secs(
+                                self.config.scanner.catalog_rescan_interval_secs.max(1),
+                            );
+                            let previous = self.catalog_epochs.get(&mount).copied();
+                            if catalog_epoch_due(previous, tick.response.level, now, rescan) {
+                                self.catalog_epochs
+                                    .insert(mount.clone(), (tick.response.level, now));
+                                self.send_catalog_scan_request(
+                                    scan_tx,
+                                    scan_rx,
+                                    &tick.response,
+                                    catalog,
+                                );
+                                self.last_tick_cleanup_ran = true;
+                            }
                         } else {
-                            roots_here
-                        };
-                        self.send_scan_request(scan_tx, scan_rx, &tick.response, paths);
-                        self.last_tick_cleanup_ran = true;
+                            // A mount with no root of its own only gets here
+                            // via cross_devices, where any configured root may
+                            // help.
+                            let paths = if roots_here.is_empty() {
+                                root_paths.clone()
+                            } else {
+                                roots_here
+                            };
+                            self.send_scan_request(scan_tx, scan_rx, &tick.response, paths);
+                            self.last_tick_cleanup_ran = true;
+                        }
                     }
                 }
                 MountState::Maintain => {
@@ -3440,8 +3561,76 @@ impl MonitoringDaemon {
             ),
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
+        self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
+    }
 
+    /// Catalog roots for `mount` (W1 catalog roots), derived from the
+    /// cross-platform templates for every real user home on that device and
+    /// cached for `scanner.catalog_rescan_interval_secs`. Logs the derived
+    /// set once per refresh.
+    fn catalog_roots_for(&mut self, mount: &Path, now: Instant) -> Vec<ExpandedCatalogRoot> {
+        let ttl = Duration::from_secs(self.config.scanner.catalog_rescan_interval_secs.max(1));
+        if let Some((derived_at, roots)) = self.catalog_root_cache.get(mount)
+            && now.saturating_duration_since(*derived_at) < ttl
+        {
+            return roots.clone();
+        }
+        let roots = cleanup_catalog::device_of(mount).map_or_else(Vec::new, |device| {
+            let homes = cleanup_catalog::user_homes(&self.platform.user_home());
+            cleanup_catalog::catalog_roots_for_mount(cleanup_catalog::CATALOG_ROOTS, &homes, device)
+        });
+        let message = format!(
+            "catalog roots for {}: {} derived ({})",
+            mount.display(),
+            roots.len(),
+            roots
+                .iter()
+                .map(|root| format!("{} [{}]", root.path.display(), root.rule))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        eprintln!("[SBH-DAEMON] {message}");
+        self.logger_handle.send(ActivityEvent::Info { message });
+        self.catalog_root_cache
+            .insert(mount.to_path_buf(), (now, roots.clone()));
+        roots
+    }
+
+    /// Dispatch a catalog-only scan: the derived roots are the request's
+    /// paths and its `catalog_roots`, so the scanner probes each as one
+    /// opaque candidate unit instead of walking.
+    fn send_catalog_scan_request(
+        &mut self,
+        scan_tx: &Sender<ScanRequest>,
+        scan_rx: &Receiver<ScanRequest>,
+        response: &crate::monitor::pid::PressureResponse,
+        catalog_roots: Vec<ExpandedCatalogRoot>,
+    ) {
+        let request = ScanRequest {
+            paths: catalog_roots.iter().map(|root| root.path.clone()).collect(),
+            urgency: response.urgency,
+            pressure_level: response.level,
+            free_pct: Some(response.free_pct),
+            max_delete_batch: behavior_delete_batch_limit(
+                self.behavior_state.mode,
+                response.max_delete_batch,
+            ),
+            force_full_scan: false,
+            config_update: None,
+            catalog_roots,
+        };
+        self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
+    }
+
+    fn enqueue_scan_logged(
+        &mut self,
+        scan_tx: &Sender<ScanRequest>,
+        scan_rx: &Receiver<ScanRequest>,
+        response: &crate::monitor::pid::PressureResponse,
+        request: ScanRequest,
+    ) {
         let replace_on_full = response.level >= PressureLevel::Red || response.urgency >= 0.90;
         match enqueue_scan_request(scan_tx, scan_rx, request, replace_on_full) {
             ScanEnqueueStatus::Queued => {}
@@ -3491,6 +3680,7 @@ impl MonitoringDaemon {
             max_delete_batch: response.max_delete_batch,
             force_full_scan: true,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
         // For forced scans, block briefly to ensure delivery.
         let _ = scan_tx.send_timeout(request, Duration::from_millis(100));
@@ -3752,6 +3942,7 @@ impl MonitoringDaemon {
                     max_delete_batch,
                     force_full_scan: false,
                     config_update: None,
+                    catalog_roots: Vec::new(),
                 };
 
                 match enqueue_scan_request(scan_tx, scan_rx, request, true) {
@@ -5635,22 +5826,50 @@ fn scanner_thread_main(
             },
         };
 
-        let walker = DirectoryWalker::new(walker_config, protection).with_heartbeat({
-            let hb = Arc::clone(heartbeat);
-            move || hb.beat()
-        });
-        let cancel_token = walker.cancel_token();
+        // Catalog-only requests do not walk: each derived root is one opaque
+        // candidate unit, sized and dated by a bounded probe, and flows
+        // through the same classification, scoring, vetoes and dispatch below.
+        let (rx, cancel_token) = if request.catalog_roots.is_empty() {
+            let walker = DirectoryWalker::new(walker_config, protection).with_heartbeat({
+                let hb = Arc::clone(heartbeat);
+                move || hb.beat()
+            });
+            let cancel_token = walker.cancel_token();
 
-        // Perform the walk (streaming).
-        let rx = match walker.stream() {
-            Ok(r) => r,
-            Err(e) => {
-                logger.send(ActivityEvent::Error {
-                    code: e.code().to_string(),
-                    message: format!("walker failed: {e}"),
-                });
-                continue;
+            // Perform the walk (streaming).
+            match walker.stream() {
+                Ok(r) => (r, cancel_token),
+                Err(e) => {
+                    logger.send(ActivityEvent::Error {
+                        code: e.code().to_string(),
+                        message: format!("walker failed: {e}"),
+                    });
+                    continue;
+                }
             }
+        } else {
+            drop(walker_config);
+            drop(protection);
+            let (entries, skipped_young) = catalog_walk_entries(&request.catalog_roots);
+            let message = format!(
+                "catalog scan: {} root(s) probed, {} skipped as recently used, {} candidate unit(s): {}",
+                request.catalog_roots.len(),
+                skipped_young,
+                entries.len(),
+                entries
+                    .iter()
+                    .map(|entry| entry.path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            eprintln!("[SBH-SCANNER] {message}");
+            logger.send(ActivityEvent::Info { message });
+            let (tx, rx) = crossbeam_channel::unbounded::<WalkEntry>();
+            for entry in entries {
+                let _ = tx.send(entry);
+            }
+            drop(tx);
+            (rx, Arc::new(AtomicBool::new(false)))
         };
 
         let mut paths_scanned = 0;
@@ -6708,6 +6927,7 @@ mod tests {
             max_delete_batch: 4,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
         let identity = identity_for_path(&target, false).unwrap();
         let record = |generation: u64| CandidateIndexRecord {
@@ -7035,6 +7255,7 @@ mod tests {
                 max_delete_batch: 10,
                 force_full_scan: false,
                 config_update: None,
+                catalog_roots: Vec::new(),
             })
             .unwrap();
         drop(scan_tx);
@@ -7133,6 +7354,7 @@ mod tests {
                 max_delete_batch: 10,
                 force_full_scan: true,
                 config_update: None,
+                catalog_roots: Vec::new(),
             })
             .unwrap();
         drop(scan_tx);
@@ -7659,6 +7881,7 @@ mod tests {
             max_delete_batch: 0,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
         let mut scored = vec![test_candidate("/tmp/a", 0.4), test_candidate("/tmp/b", 0.6)];
 
@@ -7798,6 +8021,7 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
         assert_eq!(request.paths.len(), 2);
         assert_eq!(request.urgency.to_bits(), 0.7_f64.to_bits());
@@ -7834,6 +8058,7 @@ mod tests {
             max_delete_batch: 0,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
         assert_eq!(
             log_truncation_free_pct_for_request(&request).to_bits(),
@@ -7947,6 +8172,7 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
         // With capacity 0, send blocks until recv is called.
         // We use thread to unblock.
@@ -8068,6 +8294,7 @@ mod tests {
             max_delete_batch: 4,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
 
         assert_eq!(v2_pressure_candidate_byte_target(&request), None);
@@ -8092,6 +8319,7 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
         let mut dirty = BTreeSet::new();
 
@@ -8118,11 +8346,51 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: true,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
         let dirty = BTreeSet::new();
 
         assert_eq!(scan_reason_for_request(&request), "forced");
         assert_eq!(v2_active_scan_paths(&request, &dirty), None);
+    }
+
+    /// Catalog scans run once per pressure epoch: a rising level or the
+    /// rescan interval re-arms them, repeated ticks at the same level do not.
+    #[test]
+    fn catalog_epoch_is_due_once_per_level_and_after_the_interval() {
+        let now = Instant::now();
+        let interval = Duration::from_mins(15);
+        assert!(catalog_epoch_due(
+            None,
+            PressureLevel::Orange,
+            now,
+            interval
+        ));
+        let dispatched = Some((PressureLevel::Orange, now));
+        assert!(!catalog_epoch_due(
+            dispatched,
+            PressureLevel::Orange,
+            now + Duration::from_secs(10),
+            interval
+        ));
+        assert!(!catalog_epoch_due(
+            dispatched,
+            PressureLevel::Yellow,
+            now + Duration::from_secs(10),
+            interval
+        ));
+        assert!(catalog_epoch_due(
+            dispatched,
+            PressureLevel::Red,
+            now + Duration::from_secs(10),
+            interval
+        ));
+        assert!(catalog_epoch_due(
+            dispatched,
+            PressureLevel::Orange,
+            now + interval,
+            interval
+        ));
     }
 
     /// The B5 device-affinity gate became per-mount state (W1.1): a pressured
@@ -8193,6 +8461,7 @@ mod tests {
             max_delete_batch: 10,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         }
     }
 
@@ -8731,6 +9000,7 @@ mod tests {
             max_delete_batch: 40,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
 
         // Fill the channel to capacity.
@@ -8757,6 +9027,7 @@ mod tests {
             max_delete_batch: 40,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
 
         // Fill queue with stale requests.
@@ -8825,6 +9096,7 @@ mod tests {
             max_delete_batch: 40,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
         for _ in 0..SCANNER_CHANNEL_CAP {
             tx.try_send(make_request())
@@ -8845,6 +9117,7 @@ mod tests {
             max_delete_batch: 1,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
         let (del_tx, del_rx) = bounded::<DeletionBatch>(4);
         let mut scored = vec![
@@ -8877,6 +9150,7 @@ mod tests {
             max_delete_batch: 1,
             force_full_scan: false,
             config_update: None,
+            catalog_roots: Vec::new(),
         };
         let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
         del_tx

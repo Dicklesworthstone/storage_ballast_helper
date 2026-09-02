@@ -384,6 +384,8 @@ impl std::str::FromStr for ScannerEventSourceMode {
 /// Scanner behavior and safety constraints.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+// Independent operator toggles on a config struct, not an encoded state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ScannerConfig {
     pub engine: ScannerEngineMode,
     pub event_source: ScannerEventSourceMode,
@@ -435,6 +437,16 @@ pub struct ScannerConfig {
     /// Minimum candidate size before running expensive active-reference probes.
     /// 0 checks every candidate.
     pub active_reference_min_size_bytes: u64,
+    /// When a pressured device has no configured `root_paths` (and
+    /// `cross_devices` is off), scan the known-safe cache locations on that
+    /// device (`~/.cache/pip`, cargo registry caches, npm `_cacache`, Trash,
+    /// `/var/tmp/*`, ...) as opaque candidates instead of doing nothing.
+    /// Every veto and the executor pre-flight still apply. Turn off on shared
+    /// multi-user hosts where other users' caches must stay untouched.
+    pub catalog_roots_on_pressured_device: bool,
+    /// How often (seconds) a catalog scan may repeat on the same mount at the
+    /// same pressure level; a rising level re-arms it immediately.
+    pub catalog_rescan_interval_secs: u64,
     /// Active append-only log truncation policy.
     ///
     /// Standard delete is blocked by the FileOpen veto when a process holds a
@@ -951,6 +963,8 @@ impl Default for ScannerConfig {
             repeat_deletion_base_cooldown_secs: 300,
             repeat_deletion_max_cooldown_secs: 3600,
             min_rescan_interval_secs: 90,
+            catalog_roots_on_pressured_device: true,
+            catalog_rescan_interval_secs: 900,
             // 25% => after a pass of T seconds, wait 3T before the next
             // pressure-driven pass. Keeps reclaim continuous on a full
             // disk while capping the scanner near a quarter of one core.
