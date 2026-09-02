@@ -88,7 +88,7 @@ objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "
 proc_pidinfo = "0.1.4"
 sbh_mach = { path = "crates/sbh_mach" }
 sysctl = "0.7.1"
-whichdisk = "0.5"
+whichdisk = "0.6"
 [dev-dependencies]
 tempfile = "3.17"
 proptest = "1.6"
