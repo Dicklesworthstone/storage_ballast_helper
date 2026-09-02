@@ -129,6 +129,10 @@ pub struct ScenarioConfig {
     pub notify_file: Option<PathBuf>,
     /// Raw TOML appended after the generated sections.
     pub extra_toml: String,
+    /// `scanner.max_scan_duty_cycle_pct` (100 disables the per-pass limiter).
+    pub duty_cycle_pct: u8,
+    /// `telemetry.cpu_budget_pct` (0 disables the daemon-wide budget).
+    pub cpu_budget_pct: u8,
 }
 
 impl Default for ScenarioConfig {
@@ -149,6 +153,8 @@ impl Default for ScenarioConfig {
             engine: "v2",
             notify_file: None,
             extra_toml: String::new(),
+            duty_cycle_pct: 25,
+            cpu_budget_pct: 25,
         }
     }
 }
@@ -195,8 +201,11 @@ catalog_roots_on_pressured_device = {catalog}
 root_paths = [{roots}]
 min_file_age_minutes = {min_age}
 min_rescan_interval_secs = {rescan}
+max_scan_duty_cycle_pct = {duty}
 max_depth = 6
 parallelism = 2
+[telemetry]
+cpu_budget_pct = {budget}
 {notifications}{extra}",
         ballast = data.join("ballast").display().to_string(),
         jsonl = data.join("activity.jsonl").display().to_string(),
@@ -212,6 +221,8 @@ parallelism = 2
         roots = roots,
         min_age = scenario.min_file_age_minutes,
         rescan = scenario.min_rescan_interval_secs,
+        duty = scenario.duty_cycle_pct,
+        budget = scenario.cpu_budget_pct,
         extra = scenario.extra_toml,
     );
     let path = dir.join("config.toml");
@@ -343,6 +354,25 @@ impl DaemonRun {
     pub fn cpu_ratio(&self) -> Option<f64> {
         let cpu = self.state()?.get("cpu_secs_total")?.as_f64()?;
         Some(cpu / self.started.elapsed().as_secs_f64())
+    }
+
+    /// The daemon's CPU time right now from the kernel (user + system), so
+    /// a budget assertion does not depend on the 30 s state-write cadence.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn proc_cpu_secs(&self) -> f64 {
+        let stat = fs::read_to_string(format!("/proc/{}/stat", self.child.id())).unwrap();
+        let tail = &stat[stat.rfind(')').unwrap() + 1..];
+        let fields: Vec<&str> = tail.split_whitespace().collect();
+        let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+        let hz = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+            .ok()
+            .flatten()
+            .unwrap_or(100);
+        ticks as f64 / hz as f64
+    }
+
+    pub fn wall_secs(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
     }
 
     /// Number of stderr lines containing `needle`.
@@ -1505,4 +1535,163 @@ fn read_only_volume_parks_deletions_in_recovery_until_remount() {
     .unwrap_or_else(|e| panic!("{e}"));
     let status = run.stop();
     assert!(status.success(), "{status}");
+}
+
+// ──────────────────── CPU budget (Q7) ────────────────────
+
+/// A root with `projects` Definite cargo targets of `files` fresh files
+/// each: expensive to walk, nothing to delete.
+fn wide_fixture(dir: &Path, projects: usize, files: usize) -> PathBuf {
+    let root = dir.join("root");
+    for p in 0..projects {
+        let target = definite_target(&root.join(format!("proj-{p:04}")), Duration::ZERO, 256);
+        let deps = target.join("debug").join("deps");
+        for f in 0..files {
+            fs::write(deps.join(format!("lib{f:03}.rlib")), b"x").unwrap();
+        }
+    }
+    root
+}
+
+/// One daemon over the wide fixture at Green with a one-second maintenance
+/// interval on the full-walk v1 engine: `(cpu_secs, wall_secs, exceeded
+/// lines, run)`.
+fn run_expensive_scanner(cpu_budget_pct: u8, wall: Duration) -> (f64, f64, usize, DaemonRun) {
+    let dir = scratch();
+    let root = wide_fixture(dir.path(), 300, 40);
+    let fixture_mount = dir.path().to_path_buf();
+    let table = injected_table(&[
+        (&fixture_mount, 1_000_000_000_000, 500_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![root],
+        engine: "v1",
+        maintenance_interval_secs: 1,
+        duty_cycle_pct: 100,
+        cpu_budget_pct,
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    run.wait_until("the daemon start event", Duration::from_secs(30), |run| {
+        !run.events_of("daemon_start").is_empty()
+    })
+    .unwrap_or_else(|e| panic!("[budget {cpu_budget_pct}] {e}"));
+    run.wait_until(
+        "the measurement window",
+        wall + Duration::from_secs(5),
+        |run| run.wall_secs() >= wall.as_secs_f64(),
+    )
+    .unwrap_or_else(|e| panic!("[budget {cpu_budget_pct}] {e}"));
+    let cpu = run.proc_cpu_secs();
+    let elapsed = run.wall_secs();
+    let exceeded = run.stderr_count("cpu budget exceeded");
+    // Keep the scratch dir alive with the run; the caller stops it.
+    std::mem::forget(dir);
+    (cpu, elapsed, exceeded, run)
+}
+
+/// Scenario `cpu-budget`: with the per-pass duty cycle disabled and a
+/// deliberately expensive scanner, the daemon-wide budget holds the
+/// documented bound `pct/100 * wall + burst`; the same daemon without a
+/// budget burns more; the deficit line appears at most once a minute; and
+/// `sbh status --json` reports `daemon.cpu_budget`.
+#[test]
+fn cpu_budget_bounds_an_expensive_scanner_at_green() {
+    let window = Duration::from_secs(75);
+    let unbudgeted = std::thread::spawn(move || run_expensive_scanner(0, window));
+    let (cpu, wall, exceeded, run) = run_expensive_scanner(5, window);
+    let (free_cpu, free_wall, free_exceeded, free_run) = unbudgeted.join().expect("unbudgeted run");
+    let _ = writeln!(
+        std::io::stderr(),
+        "cpu budget 5%: {cpu:.2} s over {wall:.1} s ({:.1}%), exceeded lines {exceeded}; \
+         unbudgeted: {free_cpu:.2} s over {free_wall:.1} s ({:.1}%)",
+        cpu / wall * 100.0,
+        free_cpu / free_wall * 100.0
+    );
+
+    // The documented bound plus one second for startup and the protected
+    // operations (state writes, ballast checks) that share the process.
+    let bound = 0.05f64.mul_add(wall, 5.0 + 1.0);
+    assert!(
+        cpu <= bound,
+        "{cpu:.2} s of CPU exceeds the bound {bound:.2} s"
+    );
+    assert!(
+        free_cpu > cpu,
+        "the unbudgeted daemon ({free_cpu:.2} s) must burn more than the budgeted one ({cpu:.2} s), \
+         or the scanner was not expensive enough to prove anything"
+    );
+    // The budget acted: passes were cut short as the bucket emptied (they
+    // report as timed out), or the daemon went into deficit and said so.
+    let cut_short = |run: &DaemonRun| {
+        run.events_of("scan_complete")
+            .iter()
+            .filter(|e| {
+                e["details"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("timed_out=true"))
+            })
+            .count()
+    };
+    let deficit_warnings = run
+        .events()
+        .iter()
+        .filter(|e| e["error_code"] == "SBH-3004" && e["severity"] == "warning")
+        .count();
+    let shortened = cut_short(&run);
+    let _ = writeln!(
+        std::io::stderr(),
+        "cpu budget 5%: {shortened} passes cut short, {deficit_warnings} deficit warnings"
+    );
+    assert!(
+        shortened >= 1 || deficit_warnings >= 1,
+        "the budget never acted: no pass cut short and no deficit reported"
+    );
+    // A deficit is reported at most once a minute, on stderr and as an
+    // activity warning; a daemon that never runs dry reports nothing.
+    assert!(
+        exceeded <= 3,
+        "deficit line once per minute at most: {exceeded} in {wall:.0} s"
+    );
+    if exceeded >= 1 {
+        assert!(
+            deficit_warnings >= 1,
+            "the deficit is also an activity warning"
+        );
+    }
+    assert_eq!(
+        free_exceeded, 0,
+        "a disabled budget never reports a deficit"
+    );
+    assert_eq!(
+        cut_short(&free_run),
+        0,
+        "without a budget no pass is cut short inside the 900 s scan budget"
+    );
+
+    let status = Command::new(common::sbh_bin_path())
+        .arg("--config")
+        .arg(&run.config_path)
+        .args(["--json", "status"])
+        .env_remove("SBH_TEST_MODE")
+        .output()
+        .expect("run sbh status");
+    let payload: Value = serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&status.stdout)));
+    assert_eq!(
+        payload["daemon"]["cpu_budget"]["pct"], 5,
+        "{}",
+        payload["daemon"]
+    );
+    assert!(
+        payload["daemon"]["cpu_budget"]["used_pct_1m"]
+            .as_f64()
+            .is_some(),
+        "{}",
+        payload["daemon"]
+    );
+
+    assert!(run.stop().success());
+    assert!(free_run.stop().success());
 }

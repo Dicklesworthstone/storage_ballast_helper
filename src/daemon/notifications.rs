@@ -111,6 +111,13 @@ pub enum NotificationEvent {
         code: String,
         message: String,
     },
+    /// The daemon has been over its CPU budget (`telemetry.cpu_budget_pct`)
+    /// for `minutes` consecutive minutes.
+    CpuBudgetExceeded {
+        pct: u8,
+        used_pct_1m: f64,
+        minutes: u32,
+    },
 }
 
 impl NotificationEvent {
@@ -188,6 +195,8 @@ impl NotificationEvent {
             Self::BehaviorEmergency { .. } => NotificationLevel::Critical,
 
             Self::Error { .. } => NotificationLevel::Red,
+
+            Self::CpuBudgetExceeded { .. } => NotificationLevel::Warning,
         }
     }
 
@@ -204,6 +213,7 @@ impl NotificationEvent {
             Self::DaemonStarted { .. } => "daemon_started",
             Self::DaemonStopped { .. } => "daemon_stopped",
             Self::Error { .. } => "error",
+            Self::CpuBudgetExceeded { .. } => "cpu_budget_exceeded",
         }
     }
 
@@ -270,6 +280,13 @@ impl NotificationEvent {
                 format!("sbh stopped ({reason}) after {hours}h {minutes}m")
             }
             Self::Error { code, message } => format!("[{code}] {message}"),
+            Self::CpuBudgetExceeded {
+                pct,
+                used_pct_1m,
+                minutes,
+            } => format!(
+                "sbh daemon over its CPU budget for {minutes} min ({used_pct_1m:.1}% of a core used, budget {pct}%)"
+            ),
         }
     }
 }

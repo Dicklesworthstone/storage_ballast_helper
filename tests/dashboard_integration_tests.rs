@@ -177,9 +177,11 @@ fn sample_daemon_state() -> DaemonState {
         mount_controllers: Vec::new(),
         schema_version: 2,
         run_id: String::new(),
-        rates: Default::default(),
-        threads: Default::default(),
+        rates: std::collections::BTreeMap::default(),
+        threads: storage_ballast_helper::daemon::self_monitor::ThreadsState::default(),
         cpu_secs_total: 0.0,
+        cpu_budget: storage_ballast_helper::daemon::cpu_budget::CpuBudgetState::default(),
+        idle_reason: None,
         stopped_at: None,
         exit_reason: None,
         memory_rss_bytes: 52_428_800, // 50 MB

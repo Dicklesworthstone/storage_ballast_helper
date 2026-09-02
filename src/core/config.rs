@@ -676,6 +676,12 @@ pub struct TelemetryConfig {
     pub daemon_rss_warning_bytes: u64,
     /// RSS hard cap that makes the daemon exit nonzero for service restart.
     pub daemon_rss_hard_limit_bytes: u64,
+    /// CPU budget for the whole daemon as percent of one core (Q7): a token
+    /// bucket with a 5 s burst that scanner passes, pre-scans, maintenance,
+    /// index work and the monitor tick all draw from; in deficit the daemon
+    /// yields (never at Critical, never for ballast release, state writes or
+    /// heartbeats). 0 disables pacing; accounting still shows in `sbh status`.
+    pub cpu_budget_pct: u8,
 }
 
 /// Update-check behavior, cache policy, and opt-out controls.
@@ -1083,6 +1089,7 @@ impl Default for TelemetryConfig {
             guardrail_min_observations: 60,
             daemon_rss_warning_bytes: 256 * 1024 * 1024,
             daemon_rss_hard_limit_bytes: 500 * 1024 * 1024,
+            cpu_budget_pct: 25,
         }
     }
 }
@@ -1770,6 +1777,10 @@ impl Config {
             "SBH_TELEMETRY_DAEMON_RSS_HARD_LIMIT_BYTES",
             &mut self.telemetry.daemon_rss_hard_limit_bytes,
         )?;
+        set_env_u8(
+            "SBH_TELEMETRY_CPU_BUDGET_PCT",
+            &mut self.telemetry.cpu_budget_pct,
+        )?;
 
         // update
         self.apply_update_env_overrides_from(env_var)?;
@@ -2204,6 +2215,12 @@ impl Config {
         if self.telemetry.daemon_rss_warning_bytes > self.telemetry.daemon_rss_hard_limit_bytes {
             return Err(SbhError::InvalidConfig {
                 details: "telemetry.daemon_rss_warning_bytes must be <= telemetry.daemon_rss_hard_limit_bytes"
+                    .to_string(),
+            });
+        }
+        if self.telemetry.cpu_budget_pct > 100 {
+            return Err(SbhError::InvalidConfig {
+                details: "telemetry.cpu_budget_pct must be 0..=100 (percent of one core)"
                     .to_string(),
             });
         }

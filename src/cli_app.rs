@@ -7727,11 +7727,44 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 && let Some(controllers) = state.get("mount_controllers").and_then(Value::as_array)
                 && !controllers.is_empty()
             {
+                if let Some(budget) = daemon_state
+                    .as_ref()
+                    .and_then(|state| state.get("cpu_budget"))
+                {
+                    let pct = budget.get("pct").and_then(Value::as_u64).unwrap_or(0);
+                    let used = budget
+                        .get("used_pct_1m")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let deficit = budget
+                        .get("deficit_secs")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let minutes = budget
+                        .get("over_budget_minutes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let idle = daemon_state
+                        .as_ref()
+                        .and_then(|state| state.get("idle_reason"))
+                        .and_then(Value::as_str)
+                        .map_or_else(String::new, |reason| format!(", idle: {reason}"));
+                    if pct == 0 {
+                        println!("  CPU budget: off (used {used:.1}% of a core last minute{idle})");
+                    } else if deficit > 0.0 {
+                        println!(
+                            "  CPU budget: {pct}% of a core, OVER by {deficit:.1} s (used {used:.1}% last minute, {minutes} min over{idle})"
+                        );
+                    } else {
+                        println!(
+                            "  CPU budget: {pct}% of a core (used {used:.1}% last minute{idle})"
+                        );
+                    }
+                }
                 println!("\nMount Control:");
-                println!(
-                    "  {:<20}  {:<12}  {:<8}  {:<12}  {}",
-                    "Mount Point", "State", "Level", "Surface", "Note"
-                );
+                let (h_mount, h_state, h_level, h_surface) =
+                    ("Mount Point", "State", "Level", "Surface");
+                println!("  {h_mount:<20}  {h_state:<12}  {h_level:<8}  {h_surface:<12}  Note");
                 for controller in controllers {
                     let field = |key: &str| {
                         controller
@@ -7868,6 +7901,15 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 "daemon_pid": liveness.lock.as_ref().map(|l| l.pid),
                 "state_age_secs": liveness.state_age_secs,
                 "state_stale": liveness.state_stale,
+                // Q7: the daemon's own accounting from state.json (absent
+                // when no state file is readable).
+                "daemon": daemon_state.as_ref().map(|state| json!({
+                    "run_id": state.get("run_id").cloned().unwrap_or(Value::Null),
+                    "cpu_secs_total": state.get("cpu_secs_total").cloned().unwrap_or(Value::Null),
+                    "cpu_budget": state.get("cpu_budget").cloned().unwrap_or(Value::Null),
+                    "idle_reason": state.get("idle_reason").cloned().unwrap_or(Value::Null),
+                    "threads": state.get("threads").cloned().unwrap_or(Value::Null),
+                })),
             "config_path": config.paths.config_file.to_string_lossy(),
             "pressure": {
                 "mounts": mounts_json,
@@ -8971,6 +9013,17 @@ fn render_catalog_preview(cli: &Cli, config: &Config, mount: &Path) -> Result<()
     use storage_ballast_helper::platform::cleanup_catalog;
     use storage_ballast_helper::scanner::walker::tree_newest_mtime;
 
+    struct Row {
+        path: PathBuf,
+        rule: &'static str,
+        confidence: &'static str,
+        min_age_hours: u64,
+        allocated_bytes: u64,
+        size_complete: bool,
+        idle_secs: u64,
+        eligible: bool,
+    }
+
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
     let mount = mount
         .canonicalize()
@@ -8986,16 +9039,6 @@ fn render_catalog_preview(cli: &Cli, config: &Config, mount: &Path) -> Result<()
         cleanup_catalog::catalog_roots_for_mount(cleanup_catalog::CATALOG_ROOTS, &homes, device);
     let now = std::time::SystemTime::now();
 
-    struct Row {
-        path: PathBuf,
-        rule: &'static str,
-        confidence: &'static str,
-        min_age_hours: u64,
-        allocated_bytes: u64,
-        size_complete: bool,
-        idle_secs: u64,
-        eligible: bool,
-    }
     let rows: Vec<Row> = roots
         .iter()
         .map(|root| {
@@ -9037,9 +9080,10 @@ fn render_catalog_preview(cli: &Cli, config: &Config, mount: &Path) -> Result<()
             if rows.is_empty() {
                 println!("  (none: no known-safe cache location exists on this device)");
             } else {
+                let (h_path, h_rule, h_conf, h_size, h_idle) =
+                    ("Path", "Rule", "Conf", "Size", "Idle");
                 println!(
-                    "  {:<44}  {:<32}  {:<8}  {:>10}  {:>9}  {}",
-                    "Path", "Rule", "Conf", "Size", "Idle", "Eligible"
+                    "  {h_path:<44}  {h_rule:<32}  {h_conf:<8}  {h_size:>10}  {h_idle:>9}  Eligible"
                 );
                 for row in &rows {
                     println!(

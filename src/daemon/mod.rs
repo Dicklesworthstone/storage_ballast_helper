@@ -1,6 +1,7 @@
 //! Daemon subsystem: main monitoring loop, service integration, signal handling,
 //! self-monitoring, and multi-channel notifications.
 
+pub mod cpu_budget;
 #[cfg(feature = "daemon")]
 pub mod loop_main;
 pub mod mount_controller;

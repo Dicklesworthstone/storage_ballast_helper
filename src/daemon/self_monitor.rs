@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::config::TelemetryConfig;
 use crate::core::errors::{Result, SbhError};
+use crate::daemon::cpu_budget::CpuBudgetState;
 use crate::daemon::mount_controller::MountStateRecord;
 use crate::monitor::pid::PressureLevel;
 use crate::platform::pal::Platform;
@@ -424,6 +425,14 @@ pub struct DaemonState {
     pub threads: ThreadsState,
     /// CPU time (user + system) the daemon has consumed, seconds.
     pub cpu_secs_total: f64,
+    /// The CPU budget (Q7): configured percent, last-minute use, deficit.
+    #[serde(default)]
+    pub cpu_budget: CpuBudgetState,
+    /// Why the whole daemon is idle, when every mount is observe-only or
+    /// idle: the dominant per-mount idle reason (`no_root_path_on_device`,
+    /// `nothing_to_reclaim`, `write_failure`). Absent while any mount works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_reason: Option<String>,
     /// Set by the final write on shutdown.
     pub stopped_at: Option<String>,
     /// Why the daemon stopped (final write only).
@@ -710,6 +719,9 @@ pub struct SelfMonitor {
     controller_snapshot: Vec<MountStateRecord>,
     /// Latest per-mount rate estimates, set by the main loop each tick.
     rate_snapshot: std::collections::BTreeMap<String, MountRateState>,
+    /// Latest CPU budget reading and daemon-wide idle reason (Q7).
+    budget_snapshot: CpuBudgetState,
+    idle_reason: Option<String>,
     /// Latest thread health, set by the main loop each tick.
     threads_snapshot: ThreadsState,
     /// Identifies this daemon run.
@@ -751,6 +763,13 @@ impl SelfMonitor {
     ) {
         self.rate_snapshot = rates;
         self.threads_snapshot = threads;
+    }
+
+    /// Record the CPU budget and the daemon-wide idle reason the next state
+    /// file write should carry.
+    pub fn set_budget_snapshot(&mut self, budget: CpuBudgetState, idle_reason: Option<String>) {
+        self.budget_snapshot = budget;
+        self.idle_reason = idle_reason;
     }
 
     /// This run's identifier, as written to the state file.
@@ -811,6 +830,8 @@ impl SelfMonitor {
             controller_snapshot: Vec::new(),
             rate_snapshot: std::collections::BTreeMap::new(),
             threads_snapshot: ThreadsState::default(),
+            budget_snapshot: CpuBudgetState::default(),
+            idle_reason: None,
             run_id: format!("{:x}-{:x}", std::process::id(), now.timestamp_millis()),
             last_state: None,
 
@@ -914,6 +935,8 @@ impl SelfMonitor {
             rates: self.rate_snapshot.clone(),
             threads: self.threads_snapshot.clone(),
             cpu_secs_total: self.current_cpu_secs(),
+            cpu_budget: self.budget_snapshot.clone(),
+            idle_reason: self.idle_reason.clone(),
             stopped_at: None,
             exit_reason: None,
         };
@@ -1023,7 +1046,9 @@ impl SelfMonitor {
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn current_cpu_secs(&self) -> f64 {
+    /// The process's cumulative CPU time (user + system), seconds.
+    #[must_use]
+    pub fn current_cpu_secs(&self) -> f64 {
         let stats = self.current_self_stats();
         (stats
             .cpu_user_micros
@@ -1267,6 +1292,8 @@ mod tests {
             rates: std::collections::BTreeMap::new(),
             threads: ThreadsState::default(),
             cpu_secs_total: 0.0,
+            cpu_budget: CpuBudgetState::default(),
+            idle_reason: None,
             stopped_at: None,
             exit_reason: None,
         };
@@ -1324,6 +1351,8 @@ mod tests {
             rates: std::collections::BTreeMap::new(),
             threads: ThreadsState::default(),
             cpu_secs_total: 0.0,
+            cpu_budget: CpuBudgetState::default(),
+            idle_reason: None,
             stopped_at: None,
             exit_reason: None,
         };
@@ -1383,6 +1412,8 @@ mod tests {
             rates: std::collections::BTreeMap::new(),
             threads: ThreadsState::default(),
             cpu_secs_total: 0.0,
+            cpu_budget: CpuBudgetState::default(),
+            idle_reason: None,
             stopped_at: None,
             exit_reason: None,
         };

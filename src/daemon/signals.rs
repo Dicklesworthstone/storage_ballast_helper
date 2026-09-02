@@ -273,6 +273,12 @@ impl WatchdogHeartbeat {
         }
     }
 
+    /// The heartbeat cadence (half the service manager's timeout).
+    #[must_use]
+    pub const fn interval(&self) -> Duration {
+        self.interval
+    }
+
     /// If enough time has elapsed, send a watchdog notification.
     ///
     /// Returns `true` if a notification was sent.

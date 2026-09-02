@@ -29,9 +29,10 @@ use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::{Config, ScannerConfig, ScannerEngineMode};
 use crate::core::errors::{Result, SbhError};
+use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD};
 use crate::daemon::mount_controller::{
-    IdleReason, MountController, MountControllerConfig, MountState, MountSurface, MountTickInput,
-    WakeSignals, global_tick,
+    IdleReason, MountController, MountControllerConfig, MountState, MountStateRecord, MountSurface,
+    MountTickInput, WakeSignals, global_tick,
 };
 use crate::daemon::notifications::{NotificationEvent, NotificationLevel, NotificationManager};
 use crate::daemon::policy::{
@@ -999,6 +1000,29 @@ fn catalog_epoch_due(
     })
 }
 
+/// The daemon-wide idle reason for `state.json`: when every mount is
+/// observe-only or idle, the idle reason shared by the most mounts; `None`
+/// while any mount maintains, reclaims or recovers (or nothing is known).
+fn daemon_idle_reason(controllers: &[MountStateRecord]) -> Option<String> {
+    if controllers.is_empty()
+        || controllers
+            .iter()
+            .any(|c| !matches!(c.state, MountState::ObserveOnly | MountState::Idle))
+    {
+        return None;
+    }
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    for record in controllers {
+        if let Some(reason) = record.idle_reason {
+            *counts.entry(reason.as_str()).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        .map(|(reason, _)| reason.to_string())
+}
+
 /// A pre-scan candidate's age by the walker's rule: files by mtime;
 /// directories by the newest of their mtime, birth time and a bounded probe
 /// of the tree, so a tree created a moment ago with old mtimes (a copy, an
@@ -1187,6 +1211,9 @@ pub struct MonitoringDaemon {
     logger_join: Option<thread::JoinHandle<()>>,
     signal_handler: SignalHandler,
     watchdog: WatchdogHeartbeat,
+    /// Q7: the daemon-wide CPU token bucket, observed once per tick here and
+    /// consulted by the scanner before each discretionary pass.
+    cpu_budget: Arc<Mutex<CpuBudget>>,
     /// Exclusive liveness lock next to `state.json`; held until the daemon exits.
     _daemon_lock: DaemonLock,
     /// Optional `--pidfile`, removed again on orderly shutdown.
@@ -2079,6 +2106,13 @@ impl MonitoringDaemon {
         );
 
         let prediction_config = config.pressure.prediction.clone();
+        // Q7: calibrated to the CPU already spent on startup so that work
+        // (config load, ballast discovery) is not charged to the first tick.
+        let cpu_budget = Arc::new(Mutex::new(CpuBudget::new(
+            config.telemetry.cpu_budget_pct,
+            Instant::now(),
+            self_monitor.current_cpu_secs(),
+        )));
 
         Ok(Self {
             config,
@@ -2087,6 +2121,7 @@ impl MonitoringDaemon {
             logger_join: Some(logger_join),
             signal_handler,
             watchdog,
+            cpu_budget,
             _daemon_lock: daemon_lock,
             pidfile: args.pidfile.clone(),
             fs_collector,
@@ -2324,6 +2359,44 @@ impl MonitoringDaemon {
         }
     }
 
+    /// Feed the process's CPU time to the budget, log the once-a-minute
+    /// deficit line, raise the Warning after five over-budget minutes, and
+    /// return how much longer this tick should sleep.
+    fn observe_cpu_budget(&mut self, level: PressureLevel) -> Duration {
+        let now = Instant::now();
+        let cpu_secs = self.self_monitor.current_cpu_secs();
+        let (tick, budget_yield, snapshot) = {
+            let mut budget = self.cpu_budget.lock();
+            let tick = budget.observe(now, cpu_secs);
+            let cap = MAX_TICK_YIELD.min(self.watchdog.interval() / 2);
+            (tick, budget.yield_for(level, cap), budget.snapshot(now))
+        };
+        if tick.log_exceeded {
+            let message = format!(
+                "cpu budget exceeded pct={} used_pct_1m={:.1} deficit_secs={:.1} level={:?} yield_ms={}",
+                snapshot.pct,
+                snapshot.used_pct_1m,
+                snapshot.deficit_secs,
+                level,
+                duration_millis(budget_yield)
+            );
+            eprintln!("[SBH-DAEMON] {message}");
+            self.logger_handle.send(ActivityEvent::Warning {
+                code: "SBH-3004".to_string(),
+                message,
+            });
+        }
+        if let Some(minutes) = tick.warn_after_minutes {
+            self.notification_manager
+                .notify(&NotificationEvent::CpuBudgetExceeded {
+                    pct: snapshot.pct,
+                    used_pct_1m: snapshot.used_pct_1m,
+                    minutes,
+                });
+        }
+        budget_yield
+    }
+
     fn sleep_with_memory_pressure_events(
         &mut self,
         rx: &Receiver<MemoryPressureEvent>,
@@ -2479,7 +2552,10 @@ impl MonitoringDaemon {
             .map(|controller| controller.record(now))
             .collect();
         controllers.sort_by(|a, b| a.mount.cmp(&b.mount));
+        let idle_reason = daemon_idle_reason(&controllers);
         self.self_monitor.set_mount_snapshot(mounts, controllers);
+        self.self_monitor
+            .set_budget_snapshot(self.cpu_budget.lock().snapshot(now), idle_reason);
 
         // Thread health: the monitor thread is writing this, the workers are
         // judged by their heartbeats, the logger by whether its thread lives.
@@ -2953,13 +3029,19 @@ impl MonitoringDaemon {
                 self.logger_handle.send(ActivityEvent::Info { message });
             }
 
+            // 11b. Q7: charge this tick's CPU to the daemon-wide budget and
+            // stretch the sleep while in deficit. The yield is capped below
+            // the state-write interval and the watchdog cadence, so those and
+            // ballast release keep running; Critical pressure never yields.
+            let budget_yield = self.observe_cpu_budget(response.level);
+
             // 12. Sleep for the PID/self-throttle adjusted interval, but wake
             // immediately for memory-pressure transitions so behavior changes
             // are not delayed until the next disk-pressure poll.
             self.sleep_with_memory_pressure_events(
                 &memory_pressure_rx,
                 response.level,
-                throttle_decision.interval,
+                throttle_decision.interval + budget_yield,
             );
         }
 
@@ -4437,6 +4519,9 @@ impl MonitoringDaemon {
                     // Propagate notification config (channels, webhook URLs, cooldowns).
                     self.notification_manager
                         .update_config(&new_config.notifications);
+                    self.cpu_budget
+                        .lock()
+                        .set_pct(new_config.telemetry.cpu_budget_pct);
 
                     self.logger_handle.send(ActivityEvent::ConfigReloaded {
                         details: format!("config hash: {old_hash} -> {new_hash}"),
@@ -4478,6 +4563,7 @@ impl MonitoringDaemon {
         let platform = Arc::clone(&self.platform);
         let shutdown = self.signal_handler.shutdown_token();
         let scanner_index_path = self.config.paths.scanner_index_file();
+        let cpu_budget = Arc::clone(&self.cpu_budget);
         thread::Builder::new()
             .name("sbh-scanner".to_string())
             .spawn(move || {
@@ -4493,6 +4579,7 @@ impl MonitoringDaemon {
                     &shutdown,
                     &scanner_index_path,
                     &index_feedback_rx,
+                    &cpu_budget,
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -5097,6 +5184,7 @@ fn scanner_thread_main(
     shutdown: &Arc<AtomicBool>,
     scanner_index_path: &Path,
     index_feedback_rx: &Receiver<ScannerIndexFeedback>,
+    cpu_budget: &Arc<Mutex<CpuBudget>>,
 ) {
     const DIR_SIZE_FLOOR: u64 = 100 * 1_048_576; // 100 MiB
 
@@ -5183,6 +5271,22 @@ fn scanner_thread_main(
             &request,
             current_scanner_config.max_scan_duty_cycle_pct,
         ) {
+            continue;
+        }
+
+        // Q7: the daemon-wide CPU budget. A discretionary pass waits until
+        // the bucket holds a CPU-second (the next tick re-requests it) and
+        // then walks only as long as the bucket lasts; operator and
+        // config-reload scans run regardless, and Critical is never limited.
+        let budget_allowance = if request.force_full_scan || request.config_update.is_some() {
+            None
+        } else {
+            cpu_budget
+                .lock()
+                .pass_allowance(request.pressure_level, current_scanner_config.parallelism)
+        };
+        if budget_allowance == Some(Duration::ZERO) {
+            heartbeat.beat();
             continue;
         }
         let pass_started_at = Instant::now();
@@ -5425,8 +5529,14 @@ fn scanner_thread_main(
         }
 
         let scan_start = Instant::now();
-        let scan_deadline =
+        let mut scan_deadline =
             scan_start + effective_scan_budget(&current_scanner_config, request.pressure_level);
+        // Q7: the walker's deadline checks end the pass when the CPU budget
+        // runs out (it then reports as timed out; partial results still
+        // dispatch).
+        if let Some(allowance) = budget_allowance {
+            scan_deadline = scan_deadline.min(scan_start + allowance);
+        }
 
         // Track total candidates found (priority pre-scan + general walker).
         let mut candidates_found = 0;
@@ -7572,6 +7682,7 @@ mod tests {
         let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
         let (report_tx, report_rx) = bounded::<WorkerReport>(1);
         let (_index_feedback_tx, index_feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        let cpu_budget = Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0)));
         let heartbeat = Arc::new(ThreadHeartbeat::new("test-scanner"));
         let shared_scoring_config = Arc::new(RwLock::new(config.scoring));
         let shared_scanner_config = Arc::new(RwLock::new(config.scanner));
@@ -7606,6 +7717,7 @@ mod tests {
             &shutdown,
             &scanner_index_path,
             &index_feedback_rx,
+            &cpu_budget,
         );
 
         assert!(
@@ -7629,6 +7741,46 @@ mod tests {
 
         logger.shutdown();
         logger_join.join().unwrap();
+    }
+
+    #[test]
+    fn daemon_idle_reason_is_the_dominant_reason_only_when_every_mount_is_idle() {
+        fn record(mount: &str, state: MountState, reason: Option<IdleReason>) -> MountStateRecord {
+            MountStateRecord {
+                mount: mount.to_string(),
+                state,
+                idle_reason: reason,
+                surface: crate::daemon::mount_controller::SurfaceKind::Configured,
+                level: "green".to_string(),
+                urgency: 0.0,
+                rescan_in_secs: None,
+            }
+        }
+        assert_eq!(daemon_idle_reason(&[]), None);
+        let all_idle = [
+            record("/", MountState::ObserveOnly, Some(IdleReason::NoSurface)),
+            record(
+                "/data",
+                MountState::Idle,
+                Some(IdleReason::NothingToReclaim),
+            ),
+            record("/srv", MountState::ObserveOnly, Some(IdleReason::NoSurface)),
+        ];
+        assert_eq!(
+            daemon_idle_reason(&all_idle).as_deref(),
+            Some("no_root_path_on_device")
+        );
+        let one_working = [
+            record("/", MountState::ObserveOnly, Some(IdleReason::NoSurface)),
+            record("/data", MountState::Maintain, None),
+        ];
+        assert_eq!(daemon_idle_reason(&one_working), None);
+        let recovering = [record(
+            "/data",
+            MountState::Recovery,
+            Some(IdleReason::WriteFailure),
+        )];
+        assert_eq!(daemon_idle_reason(&recovering), None);
     }
 
     /// A cargo target created just now whose mtimes were set five hours back
@@ -7698,6 +7850,7 @@ mod tests {
         let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
         let (report_tx, report_rx) = bounded::<WorkerReport>(1);
         let (_index_feedback_tx, index_feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        let cpu_budget = Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0)));
         let heartbeat = Arc::new(ThreadHeartbeat::new("test-scanner"));
         let shared_scoring_config = Arc::new(RwLock::new(config.scoring));
         let shared_scanner_config = Arc::new(RwLock::new(config.scanner));
@@ -7732,6 +7885,7 @@ mod tests {
             &shutdown,
             &scanner_index_path,
             &index_feedback_rx,
+            &cpu_budget,
         );
 
         assert!(
@@ -7785,6 +7939,7 @@ mod tests {
         let (del_tx, _del_rx) = bounded::<DeletionBatch>(1);
         let (report_tx, report_rx) = bounded::<WorkerReport>(1);
         let (_index_feedback_tx, index_feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        let cpu_budget = Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0)));
         let heartbeat = Arc::new(ThreadHeartbeat::new("test-scanner"));
         let shared_scoring_config = Arc::new(RwLock::new(config.scoring));
         let shared_scanner_config = Arc::new(RwLock::new(config.scanner));
@@ -7819,6 +7974,7 @@ mod tests {
             &shutdown,
             &scanner_index_path,
             &index_feedback_rx,
+            &cpu_budget,
         );
 
         let report = report_rx

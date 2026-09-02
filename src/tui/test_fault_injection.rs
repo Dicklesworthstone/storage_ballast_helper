@@ -117,6 +117,8 @@ fn sample_state() -> DaemonState {
         rates: Default::default(),
         threads: Default::default(),
         cpu_secs_total: 0.0,
+        cpu_budget: crate::daemon::cpu_budget::CpuBudgetState::default(),
+        idle_reason: None,
         stopped_at: None,
         exit_reason: None,
         memory_rss_bytes: 1_048_576,
