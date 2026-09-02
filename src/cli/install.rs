@@ -15,7 +15,7 @@ use super::{
     sigstore_policy_and_probe_for_bundle, verify_artifact_supply_chain,
 };
 use crate::ballast::manager::BallastManager;
-use crate::core::config::{BallastConfig, Config, PathsConfig};
+use crate::core::config::{BallastConfig, Config};
 #[cfg(test)]
 use crate::core::hex_lower;
 // errors module available but not directly used in this module.
@@ -367,181 +367,6 @@ fn write_config(config: &Config, path: &Path) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Uninstall options and report
-// ---------------------------------------------------------------------------
-
-/// Options for uninstall.
-#[derive(Debug, Clone, Default)]
-pub struct UninstallOptions {
-    /// Keep the data directory and logs.
-    pub keep_data: bool,
-    /// Keep ballast files (don't reclaim space).
-    pub keep_ballast: bool,
-    /// Show plan without executing.
-    pub dry_run: bool,
-    /// Paths config for locating artifacts.
-    pub paths: PathsConfig,
-}
-
-/// Structured report from an uninstall run.
-#[derive(Debug, Clone, Serialize)]
-pub struct UninstallReport {
-    /// Steps attempted.
-    pub steps: Vec<InstallStep>,
-    /// Overall success.
-    pub success: bool,
-    /// Bytes reclaimed from ballast removal.
-    pub bytes_reclaimed: u64,
-    /// Whether this was a dry run.
-    pub dry_run: bool,
-}
-
-/// Run the uninstall data/ballast cleanup sequence.
-///
-/// Service unregistration (systemd/launchd) is handled separately in `cli_app.rs`.
-pub fn run_uninstall_cleanup(opts: &UninstallOptions) -> UninstallReport {
-    let mut report = UninstallReport {
-        steps: Vec::new(),
-        success: true,
-        bytes_reclaimed: 0,
-        dry_run: opts.dry_run,
-    };
-
-    if !opts.keep_ballast {
-        cleanup_ballast(&opts.paths.ballast_dir, opts.dry_run, &mut report);
-    }
-
-    if !opts.keep_data {
-        let data_dir = opts
-            .paths
-            .state_file
-            .parent()
-            .unwrap_or_else(|| Path::new("/tmp"));
-        cleanup_directory(data_dir, "data directory", opts.dry_run, &mut report);
-        cleanup_file(&opts.paths.config_file, "config", opts.dry_run, &mut report);
-    }
-
-    report
-}
-
-fn cleanup_ballast(ballast_dir: &Path, dry_run: bool, report: &mut UninstallReport) {
-    if dry_run {
-        report.steps.push(InstallStep {
-            description: format!("Remove ballast directory: {}", ballast_dir.display()),
-            done: false,
-            error: None,
-        });
-    } else if ballast_dir.is_dir() {
-        match remove_directory_contents(ballast_dir) {
-            Ok(bytes) => {
-                report.steps.push(InstallStep {
-                    description: format!(
-                        "Removed ballast files in {} ({bytes} bytes reclaimed)",
-                        ballast_dir.display()
-                    ),
-                    done: true,
-                    error: None,
-                });
-                report.bytes_reclaimed = bytes;
-            }
-            Err(e) => {
-                report.steps.push(InstallStep {
-                    description: format!("Remove ballast directory: {}", ballast_dir.display()),
-                    done: false,
-                    error: Some(e.to_string()),
-                });
-                report.success = false;
-            }
-        }
-    } else {
-        report.steps.push(InstallStep {
-            description: format!("Ballast directory not found: {}", ballast_dir.display()),
-            done: true,
-            error: None,
-        });
-    }
-}
-
-fn cleanup_directory(dir: &Path, label: &str, dry_run: bool, report: &mut UninstallReport) {
-    if dry_run {
-        report.steps.push(InstallStep {
-            description: format!("Remove {label}: {}", dir.display()),
-            done: false,
-            error: None,
-        });
-    } else if dir.is_dir() {
-        match std::fs::remove_dir_all(dir) {
-            Ok(()) => {
-                report.steps.push(InstallStep {
-                    description: format!("Removed {label}: {}", dir.display()),
-                    done: true,
-                    error: None,
-                });
-            }
-            Err(e) => {
-                report.steps.push(InstallStep {
-                    description: format!("Remove {label}: {}", dir.display()),
-                    done: false,
-                    error: Some(e.to_string()),
-                });
-                report.success = false;
-            }
-        }
-    } else {
-        report.steps.push(InstallStep {
-            description: format!("{label} not found: {}", dir.display()),
-            done: true,
-            error: None,
-        });
-    }
-}
-
-fn cleanup_file(path: &Path, label: &str, dry_run: bool, report: &mut UninstallReport) {
-    if dry_run {
-        report.steps.push(InstallStep {
-            description: format!("Remove {label}: {}", path.display()),
-            done: false,
-            error: None,
-        });
-    } else if path.is_file() {
-        match std::fs::remove_file(path) {
-            Ok(()) => {
-                report.steps.push(InstallStep {
-                    description: format!("Removed {label}: {}", path.display()),
-                    done: true,
-                    error: None,
-                });
-            }
-            Err(e) => {
-                report.steps.push(InstallStep {
-                    description: format!("Remove {label}: {}", path.display()),
-                    done: false,
-                    error: Some(e.to_string()),
-                });
-                report.success = false;
-            }
-        }
-    }
-}
-
-fn remove_directory_contents(dir: &Path) -> std::io::Result<u64> {
-    let mut bytes = 0u64;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let meta = entry.metadata()?;
-        if meta.is_file() {
-            bytes += meta.len();
-            std::fs::remove_file(entry.path())?;
-        } else if meta.is_dir() {
-            bytes += remove_directory_contents(&entry.path())?;
-        }
-    }
-    // Remove the directory itself after contents are cleared.
-    std::fs::remove_dir(dir)?;
-    Ok(bytes)
-}
-
-// ---------------------------------------------------------------------------
 // Human formatting
 // ---------------------------------------------------------------------------
 
@@ -583,41 +408,6 @@ pub fn format_install_report(report: &InstallReport) -> String {
                 report.ballast_files_created, gb
             );
         }
-    }
-
-    out
-}
-
-/// Format an uninstall report for terminal output.
-#[must_use]
-pub fn format_uninstall_report(report: &UninstallReport) -> String {
-    let mut out = String::new();
-
-    let mode = if report.dry_run {
-        "dry-run"
-    } else {
-        "uninstall"
-    };
-    let _ = writeln!(out, "sbh {mode} cleanup report:\n");
-
-    for step in &report.steps {
-        let icon = if step.error.is_some() {
-            "FAIL"
-        } else if step.done {
-            "DONE"
-        } else {
-            "PLAN"
-        };
-        let _ = writeln!(out, "  [{icon}] {}", step.description);
-        if let Some(err) = &step.error {
-            let _ = writeln!(out, "         error: {err}");
-        }
-    }
-
-    if report.bytes_reclaimed > 0 {
-        let gb = report.bytes_reclaimed / 1_073_741_824;
-        let mb = (report.bytes_reclaimed % 1_073_741_824) / (1024 * 1024);
-        let _ = writeln!(out, "\n  Space reclaimed: {gb} GB {mb} MB");
     }
 
     out
@@ -754,117 +544,6 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_dry_run() {
-        let tmp = TempDir::new().unwrap();
-        let opts = UninstallOptions {
-            dry_run: true,
-            paths: PathsConfig {
-                config_file: tmp.path().join("config.toml"),
-                ballast_dir: tmp.path().join("ballast"),
-                state_file: tmp.path().join("data").join("state.json"),
-                sqlite_db: tmp.path().join("data").join("db.sqlite3"),
-                jsonl_log: tmp.path().join("data").join("log.jsonl"),
-            },
-            ..Default::default()
-        };
-        let report = run_uninstall_cleanup(&opts);
-        assert!(report.dry_run);
-        // Steps should all be planned.
-        for step in &report.steps {
-            assert!(!step.done);
-        }
-    }
-
-    #[test]
-    fn uninstall_removes_ballast_and_data() {
-        let tmp = TempDir::new().unwrap();
-        let ballast_dir = tmp.path().join("ballast");
-        let data_dir = tmp.path().join("data");
-        let config_path = tmp.path().join("config.toml");
-
-        // Create test artifacts.
-        std::fs::create_dir_all(&ballast_dir).unwrap();
-        std::fs::write(ballast_dir.join("file.dat"), vec![0u8; 1024]).unwrap();
-        std::fs::create_dir_all(&data_dir).unwrap();
-        std::fs::write(data_dir.join("state.json"), "{}").unwrap();
-        std::fs::write(&config_path, "[pressure]\n").unwrap();
-
-        let opts = UninstallOptions {
-            dry_run: false,
-            keep_data: false,
-            keep_ballast: false,
-            paths: PathsConfig {
-                config_file: config_path.clone(),
-                ballast_dir: ballast_dir.clone(),
-                state_file: data_dir.join("state.json"),
-                sqlite_db: data_dir.join("db.sqlite3"),
-                jsonl_log: data_dir.join("log.jsonl"),
-            },
-        };
-
-        let report = run_uninstall_cleanup(&opts);
-        assert!(report.success, "uninstall should succeed: {report:?}");
-        assert!(!ballast_dir.exists(), "ballast dir should be removed");
-        assert!(!data_dir.exists(), "data dir should be removed");
-        assert!(!config_path.exists(), "config should be removed");
-        assert!(report.bytes_reclaimed > 0);
-    }
-
-    #[test]
-    fn uninstall_keeps_data_when_requested() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        let config_path = tmp.path().join("config.toml");
-
-        std::fs::create_dir_all(&data_dir).unwrap();
-        std::fs::write(data_dir.join("state.json"), "{}").unwrap();
-        std::fs::write(&config_path, "[pressure]\n").unwrap();
-
-        let opts = UninstallOptions {
-            dry_run: false,
-            keep_data: true,
-            keep_ballast: true,
-            paths: PathsConfig {
-                config_file: config_path.clone(),
-                ballast_dir: tmp.path().join("ballast"),
-                state_file: data_dir.join("state.json"),
-                sqlite_db: data_dir.join("db.sqlite3"),
-                jsonl_log: data_dir.join("log.jsonl"),
-            },
-        };
-
-        let report = run_uninstall_cleanup(&opts);
-        assert!(report.success);
-        assert!(data_dir.exists(), "data dir should be kept");
-        assert!(config_path.exists(), "config should be kept");
-    }
-
-    #[test]
-    fn uninstall_report_format() {
-        let report = UninstallReport {
-            steps: vec![
-                InstallStep {
-                    description: "Removed ballast".into(),
-                    done: true,
-                    error: None,
-                },
-                InstallStep {
-                    description: "Removed data dir".into(),
-                    done: true,
-                    error: None,
-                },
-            ],
-            success: true,
-            bytes_reclaimed: 10_737_418_240,
-            dry_run: false,
-        };
-        let output = format_uninstall_report(&report);
-        assert!(output.contains("uninstall"));
-        assert!(output.contains("[DONE]"));
-        assert!(output.contains("10 GB"));
-    }
-
-    #[test]
     fn report_serializes_to_json() {
         let report = InstallReport::new(false);
         let json = serde_json::to_string(&report).unwrap();
@@ -873,42 +552,11 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_report_serializes_to_json() {
-        let report = UninstallReport {
-            steps: vec![],
-            success: true,
-            bytes_reclaimed: 0,
-            dry_run: true,
-        };
-        let json = serde_json::to_string(&report).unwrap();
-        assert!(json.contains("\"dry_run\":true"));
-    }
-
-    #[test]
     fn install_options_default_matches_config() {
         let opts = InstallOptions::default();
         let config = Config::default();
         assert_eq!(opts.ballast_count, config.ballast.file_count);
         assert_eq!(opts.ballast_size_bytes, config.ballast.file_size_bytes);
-    }
-
-    #[test]
-    fn uninstall_handles_missing_dirs_gracefully() {
-        let tmp = TempDir::new().unwrap();
-        let opts = UninstallOptions {
-            dry_run: false,
-            keep_data: false,
-            keep_ballast: false,
-            paths: PathsConfig {
-                config_file: tmp.path().join("nonexistent_config.toml"),
-                ballast_dir: tmp.path().join("nonexistent_ballast"),
-                state_file: tmp.path().join("nonexistent_data").join("state.json"),
-                sqlite_db: tmp.path().join("nonexistent_data").join("db.sqlite3"),
-                jsonl_log: tmp.path().join("nonexistent_data").join("log.jsonl"),
-            },
-        };
-        let report = run_uninstall_cleanup(&opts);
-        assert!(report.success, "should handle missing dirs gracefully");
     }
 
     #[test]

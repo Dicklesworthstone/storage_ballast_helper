@@ -156,6 +156,17 @@ pub struct UninstallOptions {
     pub backup_dir: Option<PathBuf>,
     /// Explicit binary path (auto-detect if None).
     pub binary_path: Option<PathBuf>,
+    /// Canonical config/data/ballast paths of the install being removed:
+    /// the loaded config's `[paths]`, or the scope defaults.
+    pub paths: PathsConfig,
+    /// User-scope install. User scope only touches locations under `home`;
+    /// system scope only touches system locations (`/usr/local/bin`,
+    /// `/etc/systemd/system`, `/Library/LaunchDaemons`, ...).
+    pub user_scope: bool,
+    /// Home directory for user-scope discovery. `None` disables home-based
+    /// discovery entirely. Deliberately not read from the environment here,
+    /// so a test can never plan against the real home by accident.
+    pub home: Option<PathBuf>,
 }
 
 impl Default for UninstallOptions {
@@ -165,6 +176,9 @@ impl Default for UninstallOptions {
             dry_run: false,
             backup_dir: None,
             binary_path: None,
+            paths: PathsConfig::default(),
+            user_scope: true,
+            home: None,
         }
     }
 }
@@ -173,30 +187,31 @@ impl Default for UninstallOptions {
 // Path discovery
 // ---------------------------------------------------------------------------
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
-/// Discover all sbh-related paths on the system.
-fn discover_paths() -> DiscoveredPaths {
-    let defaults = PathsConfig::default();
-    let data_dir = defaults.state_file.parent().map(PathBuf::from);
+/// Discover the sbh footprint for the scope being uninstalled.
+fn discover_paths(opts: &UninstallOptions) -> DiscoveredPaths {
+    let paths = &opts.paths;
+    let data_dir = paths.state_file.parent().map(PathBuf::from);
     let asset_cache = data_dir.as_ref().map(|dir| dir.join("assets"));
-    let home = home_dir();
-    let h = home.as_deref();
+    let home = if opts.user_scope {
+        opts.home.as_deref()
+    } else {
+        None
+    };
+    let system = !opts.user_scope;
 
     DiscoveredPaths {
-        binaries: discover_binaries(),
-        config_file: Some(defaults.config_file),
+        binaries: discover_binaries(home, system),
+        config_file: Some(paths.config_file.clone()),
         data_dir,
-        state_file: Some(defaults.state_file),
-        sqlite_db: Some(defaults.sqlite_db),
-        jsonl_log: Some(defaults.jsonl_log),
+        state_file: Some(paths.state_file.clone()),
+        sqlite_db: Some(paths.sqlite_db.clone()),
+        jsonl_log: Some(paths.jsonl_log.clone()),
         asset_cache,
-        systemd_units: discover_systemd_units(h),
-        launchd_plists: discover_launchd_plists(h),
-        completions: discover_completions(h),
-        profile_entries: discover_profile_entries(),
+        ballast_dir: Some(paths.ballast_dir.clone()),
+        systemd_units: discover_systemd_units(home, system),
+        launchd_plists: discover_launchd_plists(home, system),
+        completions: discover_completions(home, system),
+        profile_entries: discover_profile_entries(home),
     }
 }
 
@@ -208,15 +223,16 @@ struct DiscoveredPaths {
     sqlite_db: Option<PathBuf>,
     jsonl_log: Option<PathBuf>,
     asset_cache: Option<PathBuf>,
+    ballast_dir: Option<PathBuf>,
     systemd_units: Vec<PathBuf>,
     launchd_plists: Vec<PathBuf>,
     completions: Vec<PathBuf>,
     profile_entries: Vec<PathBuf>,
 }
 
-fn discover_binaries() -> Vec<PathBuf> {
+fn discover_binaries(home: Option<&Path>, system: bool) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = home_dir() {
+    if let Some(home) = home {
         let local_bin = home.join(".local").join("bin").join("sbh");
         if local_bin.exists() {
             paths.push(local_bin);
@@ -226,17 +242,19 @@ fn discover_binaries() -> Vec<PathBuf> {
             paths.push(cargo_bin);
         }
     }
-    let system = PathBuf::from("/usr/local/bin/sbh");
-    if system.exists() {
-        paths.push(system);
+    if system {
+        let system_bin = PathBuf::from("/usr/local/bin/sbh");
+        if system_bin.exists() {
+            paths.push(system_bin);
+        }
     }
     paths
 }
 
-fn discover_systemd_units(home: Option<&Path>) -> Vec<PathBuf> {
+fn discover_systemd_units(home: Option<&Path>, system: bool) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let system_unit = PathBuf::from("/etc/systemd/system/sbh.service");
-    if system_unit.exists() {
+    if system && system_unit.exists() {
         paths.push(system_unit);
     }
     if let Some(h) = home {
@@ -252,12 +270,12 @@ fn discover_systemd_units(home: Option<&Path>) -> Vec<PathBuf> {
     paths
 }
 
-fn discover_launchd_plists(home: Option<&Path>) -> Vec<PathBuf> {
+fn discover_launchd_plists(home: Option<&Path>, system: bool) -> Vec<PathBuf> {
     let label = configured_launchd_label();
     let labels = launchd_labels_for_discovery(label.as_deref());
     let user_dir = home.map(|h| h.join("Library").join("LaunchAgents"));
     discover_launchd_plists_in_dirs(
-        Path::new("/Library/LaunchDaemons"),
+        system.then_some(Path::new("/Library/LaunchDaemons")),
         user_dir.as_deref(),
         &labels,
     )
@@ -268,15 +286,17 @@ fn configured_launchd_label() -> Option<String> {
 }
 
 fn discover_launchd_plists_in_dirs(
-    system_dir: &Path,
+    system_dir: Option<&Path>,
     user_dir: Option<&Path>,
     labels: &[String],
 ) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    for label in labels {
-        let system_plist = system_dir.join(format!("{label}.plist"));
-        if system_plist.exists() {
-            paths.push(system_plist);
+    if let Some(dir) = system_dir {
+        for label in labels {
+            let system_plist = dir.join(format!("{label}.plist"));
+            if system_plist.exists() {
+                paths.push(system_plist);
+            }
         }
     }
     if let Some(dir) = user_dir {
@@ -290,10 +310,10 @@ fn discover_launchd_plists_in_dirs(
     paths
 }
 
-fn discover_completions(home: Option<&Path>) -> Vec<PathBuf> {
+fn discover_completions(home: Option<&Path>, system: bool) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let bash_system = PathBuf::from("/etc/bash_completion.d/sbh");
-    if bash_system.exists() {
+    if system && bash_system.exists() {
         paths.push(bash_system);
     }
     if let Some(h) = home {
@@ -322,8 +342,8 @@ fn discover_completions(home: Option<&Path>) -> Vec<PathBuf> {
     paths
 }
 
-fn discover_profile_entries() -> Vec<PathBuf> {
-    let Some(home) = home_dir() else {
+fn discover_profile_entries(home: Option<&Path>) -> Vec<PathBuf> {
+    let Some(home) = home else {
         return Vec::new();
     };
     let profiles = [
@@ -351,7 +371,7 @@ fn discover_profile_entries() -> Vec<PathBuf> {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn plan_uninstall(opts: &UninstallOptions) -> UninstallReport {
-    let paths = discover_paths();
+    let paths = discover_paths(opts);
     let mut actions = Vec::new();
     let mut kept = Vec::new();
 
@@ -516,6 +536,30 @@ pub fn plan_uninstall(opts: &UninstallOptions) -> UninstallReport {
         }
     }
 
+    // -- Ballast pool: sacrificial space, kept only in conservative mode.
+    if let Some(ref ballast) = paths.ballast_dir
+        && ballast.exists()
+    {
+        if opts.mode == CleanupMode::Conservative {
+            kept.push(KeptItem {
+                category: RemovalCategory::BallastPool,
+                path: ballast.clone(),
+                reason: format!("kept by {} mode", opts.mode),
+            });
+        } else {
+            actions.push(RemovalAction {
+                category: RemovalCategory::BallastPool,
+                path: ballast.clone(),
+                is_directory: true,
+                backup_first: false,
+                executed: false,
+                backup_path: None,
+                error: None,
+                reason: "remove ballast pool directory".to_string(),
+            });
+        }
+    }
+
     // -- Data directory cleanup (only if all data files removed).
     if let Some(ref data_dir) = paths.data_dir
         && data_dir.exists()
@@ -568,10 +612,38 @@ pub fn execute_uninstall(opts: &UninstallOptions) -> UninstallReport {
     let mut failed_count = 0usize;
     let mut bytes_freed = 0u64;
 
+    // Directories this plan removes whole (purge removes the data dir). A
+    // backup written *inside* one of them would vanish with it, so those
+    // backups go to a sibling directory unless the caller chose a location.
+    let removed_dirs: Vec<PathBuf> = report
+        .actions
+        .iter()
+        .filter(|action| action.is_directory)
+        .map(|action| action.path.clone())
+        .collect();
+    let timestamp = report.timestamp.clone();
+    let sibling_backup_dir = |path: &Path| -> Option<PathBuf> {
+        removed_dirs
+            .iter()
+            .find(|dir| path.starts_with(dir))
+            .map(|dir| {
+                let name = dir
+                    .file_name()
+                    .map_or_else(|| "sbh".to_string(), |n| n.to_string_lossy().to_string());
+                dir.with_file_name(format!("{name}.sbh-uninstall-backups-{timestamp}"))
+            })
+    };
+
     for action in &mut report.actions {
         // Create backup if requested.
         if action.backup_first && action.path.exists() {
-            match create_backup(&action.path, opts.backup_dir.as_deref()) {
+            let fallback_dir = if opts.backup_dir.is_none() {
+                sibling_backup_dir(&action.path)
+            } else {
+                None
+            };
+            let backup_dir = opts.backup_dir.as_deref().or(fallback_dir.as_deref());
+            match create_backup(&action.path, backup_dir) {
                 Ok(backup) => {
                     action.backup_path = Some(backup);
                 }
@@ -825,9 +897,14 @@ mod tests {
         fs::write(&custom_user, "custom").unwrap();
 
         let labels = launchd_labels_for_discovery(Some("com.example.sbh.test"));
-        let paths = discover_launchd_plists_in_dirs(&system_dir, Some(&user_dir), &labels);
+        let paths = discover_launchd_plists_in_dirs(Some(&system_dir), Some(&user_dir), &labels);
+        assert_eq!(paths, vec![default_system.clone(), custom_user.clone()]);
 
-        assert_eq!(paths, vec![default_system, custom_user]);
+        // User scope never reaches into the system directory, and vice versa.
+        let user_only = discover_launchd_plists_in_dirs(None, Some(&user_dir), &labels);
+        assert_eq!(user_only, vec![custom_user]);
+        let system_only = discover_launchd_plists_in_dirs(Some(&system_dir), None, &labels);
+        assert_eq!(system_only, vec![default_system]);
     }
 
     #[test]
@@ -1134,6 +1211,112 @@ mod tests {
         assert!(!config_kept);
     }
 
+    fn scoped_opts(tmp: &Path, mode: CleanupMode, dry_run: bool) -> UninstallOptions {
+        let data_dir = tmp.join("data");
+        UninstallOptions {
+            mode,
+            dry_run,
+            backup_dir: None,
+            binary_path: None,
+            paths: PathsConfig {
+                config_file: tmp.join("config.toml"),
+                ballast_dir: tmp.join("ballast"),
+                state_file: data_dir.join("state.json"),
+                sqlite_db: data_dir.join("db.sqlite3"),
+                jsonl_log: data_dir.join("log.jsonl"),
+            },
+            user_scope: true,
+            home: None,
+        }
+    }
+
+    #[test]
+    fn execute_purge_removes_ballast_data_and_config_and_counts_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let opts = scoped_opts(tmp.path(), CleanupMode::Purge, false);
+        let ballast_dir = opts.paths.ballast_dir.clone();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&ballast_dir).unwrap();
+        fs::write(ballast_dir.join("file.dat"), vec![0u8; 1024]).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(&opts.paths.state_file, "{}").unwrap();
+        fs::write(&opts.paths.sqlite_db, b"sqlite").unwrap();
+        fs::write(&opts.paths.config_file, "[pressure]\n").unwrap();
+
+        let report = execute_uninstall(&opts);
+        assert_eq!(report.failed_count, 0, "purge should succeed: {report:?}");
+        assert!(!ballast_dir.exists(), "ballast dir should be removed");
+        assert!(!data_dir.exists(), "data dir should be removed");
+        assert!(!opts.paths.config_file.exists(), "config should be removed");
+        assert!(report.bytes_freed >= 1024, "ballast bytes are counted");
+        let config_backup = report
+            .actions
+            .iter()
+            .find(|a| a.category == RemovalCategory::ConfigFile)
+            .and_then(|a| a.backup_path.clone())
+            .expect("config is backed up first");
+        assert_eq!(fs::read_to_string(config_backup).unwrap(), "[pressure]\n");
+        // The database lives inside the data dir that purge removes: its
+        // backup must survive, so it is written to a sibling directory.
+        let db_backup = report
+            .actions
+            .iter()
+            .find(|a| a.category == RemovalCategory::SqliteDb)
+            .and_then(|a| a.backup_path.clone())
+            .expect("database is backed up first");
+        assert!(
+            db_backup.is_file(),
+            "backup survives the data-dir removal: {}",
+            db_backup.display()
+        );
+        assert!(
+            !db_backup.starts_with(&data_dir),
+            "backup lives outside the removed data dir: {}",
+            db_backup.display()
+        );
+        assert_eq!(fs::read(db_backup).unwrap(), b"sqlite");
+    }
+
+    #[test]
+    fn execute_conservative_keeps_config_data_and_ballast() {
+        let tmp = TempDir::new().unwrap();
+        let opts = scoped_opts(tmp.path(), CleanupMode::Conservative, false);
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&opts.paths.ballast_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(&opts.paths.state_file, "{}").unwrap();
+        fs::write(&opts.paths.config_file, "[pressure]\n").unwrap();
+
+        let report = execute_uninstall(&opts);
+        assert_eq!(report.failed_count, 0);
+        assert_eq!(
+            report.removed_count, 0,
+            "nothing to remove without a home footprint"
+        );
+        assert!(data_dir.exists(), "data dir should be kept");
+        assert!(opts.paths.config_file.exists(), "config should be kept");
+        assert!(opts.paths.ballast_dir.exists(), "ballast should be kept");
+        assert!(
+            report
+                .kept
+                .iter()
+                .any(|k| k.category == RemovalCategory::BallastPool),
+            "ballast pool is reported as kept: {report:?}"
+        );
+    }
+
+    #[test]
+    fn execute_handles_missing_paths_gracefully() {
+        let tmp = TempDir::new().unwrap();
+        let opts = scoped_opts(&tmp.path().join("nonexistent"), CleanupMode::Purge, false);
+        let report = execute_uninstall(&opts);
+        assert_eq!(report.failed_count, 0, "missing paths are not failures");
+        assert!(
+            report.actions.is_empty(),
+            "nothing exists, nothing is planned"
+        );
+    }
+
     // bd-2j5.19 — UninstallOptions default values
     #[test]
     fn uninstall_options_default() {
@@ -1142,6 +1325,11 @@ mod tests {
         assert!(!opts.dry_run);
         assert!(opts.backup_dir.is_none());
         assert!(opts.binary_path.is_none());
+        assert!(opts.user_scope);
+        assert!(
+            opts.home.is_none(),
+            "home-based discovery is opt-in; the CLI passes HOME explicitly"
+        );
     }
 
     // bd-2j5.19 — explicit binary path filtering

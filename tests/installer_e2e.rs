@@ -20,9 +20,12 @@ use storage_ballast_helper::cli::from_source::{
     format_prerequisite_failures,
 };
 use storage_ballast_helper::cli::install::{
-    InstallOptions, InstallReport, InstallStep, UninstallOptions, UninstallReport,
-    format_install_report, format_uninstall_report, run_install_sequence,
-    run_install_sequence_with_bundle, run_uninstall_cleanup,
+    InstallOptions, InstallReport, InstallStep, format_install_report, run_install_sequence,
+    run_install_sequence_with_bundle,
+};
+use storage_ballast_helper::cli::uninstall::{
+    CleanupMode, KeptItem, RemovalAction, RemovalCategory, UninstallOptions, UninstallReport,
+    execute_uninstall, format_report_human as format_uninstall_report, plan_uninstall,
 };
 use storage_ballast_helper::cli::update::{BackupStore, UpdateOptions, run_update_sequence};
 use storage_ballast_helper::cli::wizard::{
@@ -267,6 +270,44 @@ fn e2e_reinstall_is_idempotent() {
 // C: Uninstall cleanup
 // ============================================================================
 
+/// Uninstall options scoped to a test config: user scope, no home-based
+/// discovery (so nothing outside the temp dir can ever be planned).
+fn test_uninstall_opts(config: &Config, mode: CleanupMode, dry_run: bool) -> UninstallOptions {
+    UninstallOptions {
+        mode,
+        dry_run,
+        backup_dir: None,
+        binary_path: None,
+        paths: config.paths.clone(),
+        user_scope: true,
+        home: None,
+    }
+}
+
+/// A full user-data footprint: config, state, database, log, asset cache,
+/// ballast pool. Returns the data dir.
+fn write_data_footprint(config: &Config) -> PathBuf {
+    let data_dir = config.paths.state_file.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(config.paths.config_file.parent().unwrap()).unwrap();
+    std::fs::write(&config.paths.config_file, "[scanner]\n").unwrap();
+    std::fs::write(&config.paths.state_file, "{}").unwrap();
+    std::fs::write(&config.paths.sqlite_db, b"sqlite").unwrap();
+    std::fs::write(&config.paths.jsonl_log, "{}\n").unwrap();
+    std::fs::create_dir_all(data_dir.join("assets")).unwrap();
+    std::fs::write(data_dir.join("assets").join("manifest.json"), "{}").unwrap();
+    std::fs::create_dir_all(&config.paths.ballast_dir).unwrap();
+    std::fs::write(config.paths.ballast_dir.join("ballast-0.bin"), [0u8; 4096]).unwrap();
+    data_dir
+}
+
+fn categories(items: impl Iterator<Item = RemovalCategory>) -> Vec<RemovalCategory> {
+    let mut out: Vec<RemovalCategory> = items.collect();
+    out.sort_by_key(std::string::ToString::to_string);
+    out.dedup();
+    out
+}
+
 #[test]
 fn e2e_install_then_uninstall_removes_everything() {
     let tmp = tempfile::tempdir().unwrap();
@@ -282,57 +323,251 @@ fn e2e_install_then_uninstall_removes_everything() {
     };
     let install_report = run_install_sequence(&install_opts);
     assert!(install_report.success);
+    let data_dir = write_data_footprint(&config);
 
-    // Now uninstall.
-    let uninstall_opts = UninstallOptions {
-        dry_run: false,
-        keep_data: false,
-        keep_ballast: false,
-        paths: config.paths.clone(),
-    };
-    let uninstall_report = run_uninstall_cleanup(&uninstall_opts);
-    assert!(
-        uninstall_report.success,
-        "uninstall should succeed: {uninstall_report:?}"
-    );
-
-    // Config and data should be removed.
+    // Purge: everything goes, config and database are backed up first.
+    let report = execute_uninstall(&test_uninstall_opts(&config, CleanupMode::Purge, false));
+    assert_eq!(report.failed_count, 0, "purge should succeed: {report:?}");
     assert!(
         !config.paths.config_file.exists(),
         "config should be removed after uninstall"
     );
+    assert!(!data_dir.exists(), "data dir should be removed by purge");
+    assert!(
+        !config.paths.ballast_dir.exists(),
+        "ballast pool should be removed by purge"
+    );
+    for category in [RemovalCategory::ConfigFile, RemovalCategory::SqliteDb] {
+        let backup = report
+            .actions
+            .iter()
+            .find(|action| action.category == category)
+            .and_then(|action| action.backup_path.clone())
+            .unwrap_or_else(|| panic!("{category} is removed backup-first: {report:?}"));
+        assert!(
+            backup.is_file(),
+            "{category} backup exists: {}",
+            backup.display()
+        );
+    }
 }
 
 #[test]
 fn e2e_uninstall_keep_data_preserves_state() {
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(tmp.path());
+    let data_dir = write_data_footprint(&config);
 
-    // Install.
-    let install_opts = InstallOptions {
-        config: config.clone(),
-        ballast_count: 0,
-        ballast_size_bytes: 0,
-        ballast_path: Some(tmp.path().join("ballast")),
-        dry_run: false,
-    };
-    let install_report = run_install_sequence(&install_opts);
-    assert!(install_report.success);
+    let report = execute_uninstall(&test_uninstall_opts(&config, CleanupMode::KeepData, false));
+    assert_eq!(report.failed_count, 0, "{report:?}");
 
-    // Uninstall with keep_data.
-    let uninstall_opts = UninstallOptions {
-        dry_run: false,
-        keep_data: true,
-        keep_ballast: true,
-        paths: config.paths.clone(),
-    };
-    let uninstall_report = run_uninstall_cleanup(&uninstall_opts);
-    assert!(uninstall_report.success);
-
-    // Data dir should still exist.
-    let data_dir = config.paths.state_file.parent().unwrap();
+    // README matrix, KeepData row: data/logs kept; config, assets, ballast removed.
     assert!(data_dir.is_dir(), "data dir should be kept");
-    assert!(config.paths.config_file.exists(), "config should be kept");
+    assert!(config.paths.state_file.exists(), "state kept");
+    assert!(config.paths.sqlite_db.exists(), "database kept");
+    assert!(config.paths.jsonl_log.exists(), "log kept");
+    assert!(!config.paths.config_file.exists(), "config removed");
+    assert!(!data_dir.join("assets").exists(), "asset cache removed");
+    assert!(!config.paths.ballast_dir.exists(), "ballast removed");
+}
+
+#[test]
+fn e2e_uninstall_conservative_keeps_user_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path());
+    let data_dir = write_data_footprint(&config);
+
+    let report = execute_uninstall(&test_uninstall_opts(
+        &config,
+        CleanupMode::Conservative,
+        false,
+    ));
+    assert_eq!(report.failed_count, 0, "{report:?}");
+    assert!(
+        report.actions.is_empty(),
+        "with no home-based footprint, conservative mode removes nothing: {report:?}"
+    );
+    assert!(config.paths.config_file.exists());
+    assert!(data_dir.join("assets").exists());
+    assert!(config.paths.ballast_dir.exists());
+    assert_eq!(
+        categories(report.kept.iter().map(|kept| kept.category)),
+        categories(
+            [
+                RemovalCategory::ConfigFile,
+                RemovalCategory::StateFile,
+                RemovalCategory::SqliteDb,
+                RemovalCategory::JsonlLog,
+                RemovalCategory::AssetCache,
+                RemovalCategory::BallastPool,
+            ]
+            .into_iter()
+        )
+    );
+}
+
+/// The README "Uninstall and Cleanup Modes" matrix, row by row, against a
+/// full footprint. Planning only; nothing is removed.
+#[test]
+fn e2e_uninstall_plan_matches_readme_matrix() {
+    use RemovalCategory as C;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path());
+    write_data_footprint(&config);
+
+    let data = [C::StateFile, C::SqliteDb, C::JsonlLog];
+    let all = [
+        C::ConfigFile,
+        C::StateFile,
+        C::SqliteDb,
+        C::JsonlLog,
+        C::AssetCache,
+        C::BallastPool,
+    ];
+    let expect = |removed: &[C], kept: &[C]| {
+        (
+            categories(removed.iter().copied()),
+            categories(kept.iter().copied()),
+        )
+    };
+    let rows = [
+        (CleanupMode::Conservative, expect(&[], &all)),
+        (
+            CleanupMode::KeepData,
+            expect(&[C::ConfigFile, C::AssetCache, C::BallastPool], &data),
+        ),
+        (
+            CleanupMode::KeepConfig,
+            expect(
+                &[
+                    C::StateFile,
+                    C::SqliteDb,
+                    C::JsonlLog,
+                    C::AssetCache,
+                    C::BallastPool,
+                ],
+                &[C::ConfigFile],
+            ),
+        ),
+        (
+            CleanupMode::KeepAssets,
+            expect(
+                &[
+                    C::ConfigFile,
+                    C::StateFile,
+                    C::SqliteDb,
+                    C::JsonlLog,
+                    C::BallastPool,
+                ],
+                &[C::AssetCache],
+            ),
+        ),
+        (
+            CleanupMode::Purge,
+            expect(
+                &[
+                    C::ConfigFile,
+                    C::StateFile,
+                    C::SqliteDb,
+                    C::JsonlLog,
+                    C::AssetCache,
+                    C::BallastPool,
+                    C::DataDirectory,
+                ],
+                &[],
+            ),
+        ),
+    ];
+    for (mode, (removed, kept)) in rows {
+        let report = plan_uninstall(&test_uninstall_opts(&config, mode, true));
+        assert!(report.dry_run);
+        assert_eq!(
+            categories(report.actions.iter().map(|action| action.category)),
+            removed,
+            "{mode}: removed categories"
+        );
+        assert_eq!(
+            categories(report.kept.iter().map(|kept| kept.category)),
+            kept,
+            "{mode}: kept categories"
+        );
+        assert!(
+            report.actions.iter().all(|action| !action.executed),
+            "{mode}: a plan executes nothing"
+        );
+    }
+    assert!(
+        config.paths.config_file.exists(),
+        "planning changed nothing"
+    );
+}
+
+/// User scope plans the home footprint (binary, unit, completions, PATH
+/// line) and nothing outside the fixture home: on a host with a system
+/// install (`/usr/local/bin/sbh`, `/etc/systemd/system/sbh.service`) a
+/// scoping bug would show up here as an out-of-tree target.
+#[cfg(unix)]
+#[test]
+fn e2e_uninstall_user_scope_never_plans_outside_its_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path());
+    write_data_footprint(&config);
+    let home = tmp.path().join("home");
+    let local_bin = home.join(".local").join("bin");
+    std::fs::create_dir_all(&local_bin).unwrap();
+    std::fs::write(local_bin.join("sbh"), "#!/bin/sh\n").unwrap();
+    let unit_dir = home.join(".config").join("systemd").join("user");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    std::fs::write(unit_dir.join("sbh.service"), "[Unit]\n").unwrap();
+    std::fs::create_dir_all(home.join(".zfunc")).unwrap();
+    std::fs::write(home.join(".zfunc").join("_sbh"), "#compdef sbh\n").unwrap();
+    std::fs::write(
+        home.join(".zshrc"),
+        "export PATH=\"$HOME/.local/bin:$PATH\"  # sbh\n",
+    )
+    .unwrap();
+
+    let opts = UninstallOptions {
+        home: Some(home.clone()),
+        ..test_uninstall_opts(&config, CleanupMode::Conservative, true)
+    };
+    let report = plan_uninstall(&opts);
+    let planned = categories(report.actions.iter().map(|action| action.category));
+    assert_eq!(
+        planned,
+        categories(
+            [
+                RemovalCategory::Binary,
+                RemovalCategory::SystemdUnit,
+                RemovalCategory::ShellCompletion,
+                RemovalCategory::ShellProfileEntry,
+            ]
+            .into_iter()
+        ),
+        "conservative user-scope plan: {report:?}"
+    );
+    for action in &report.actions {
+        assert!(
+            action.path.starts_with(tmp.path()),
+            "user scope planned a target outside the fixture: {}",
+            action.path.display()
+        );
+    }
+
+    // System scope with no home: never the user's files.
+    let system_opts = UninstallOptions {
+        user_scope: false,
+        home: Some(home),
+        ..test_uninstall_opts(&config, CleanupMode::Conservative, true)
+    };
+    let system_report = plan_uninstall(&system_opts);
+    assert!(
+        system_report
+            .actions
+            .iter()
+            .all(|action| !action.path.starts_with(tmp.path().join("home"))),
+        "system scope must not plan the user's home footprint: {system_report:?}"
+    );
 }
 
 #[test]
@@ -349,19 +584,25 @@ fn e2e_uninstall_dry_run_no_changes() {
         dry_run: false,
     };
     assert!(run_install_sequence(&install_opts).success);
+    let data_dir = write_data_footprint(&config);
 
-    // Dry-run uninstall.
-    let uninstall_opts = UninstallOptions {
-        dry_run: true,
-        keep_data: false,
-        keep_ballast: false,
-        paths: config.paths.clone(),
-    };
-    let report = run_uninstall_cleanup(&uninstall_opts);
+    // Dry-run purge plans everything and touches nothing.
+    let report = execute_uninstall(&test_uninstall_opts(&config, CleanupMode::Purge, true));
     assert!(report.dry_run);
+    assert!(!report.actions.is_empty());
+    assert_eq!(report.removed_count, 0);
+    assert!(
+        report
+            .actions
+            .iter()
+            .all(|action| action.backup_path.is_none())
+    );
 
     // Everything should still exist.
     assert!(config.paths.config_file.exists());
+    assert!(config.paths.state_file.exists());
+    assert!(data_dir.join("assets").exists());
+    assert!(config.paths.ballast_dir.exists());
 }
 
 // ============================================================================
@@ -1004,27 +1245,50 @@ fn e2e_install_report_golden_failure() {
 #[test]
 fn e2e_uninstall_report_golden_with_reclaimed_space() {
     let report = UninstallReport {
-        steps: vec![
-            InstallStep {
-                description: "Removed ballast".into(),
-                done: true,
+        mode: CleanupMode::Purge,
+        dry_run: false,
+        timestamp: "0".into(),
+        actions: vec![
+            RemovalAction {
+                category: RemovalCategory::BallastPool,
+                path: PathBuf::from("/tmp/sbh/ballast"),
+                is_directory: true,
+                backup_first: false,
+                executed: true,
+                backup_path: None,
                 error: None,
+                reason: "remove ballast pool directory".into(),
             },
-            InstallStep {
-                description: "Removed data dir".into(),
-                done: true,
+            RemovalAction {
+                category: RemovalCategory::ConfigFile,
+                path: PathBuf::from("/tmp/sbh/config.toml"),
+                is_directory: false,
+                backup_first: true,
+                executed: true,
+                backup_path: Some(PathBuf::from("/tmp/sbh/config.toml.sbh-uninstall-backup-0")),
                 error: None,
+                reason: "remove config file".into(),
             },
         ],
-        success: true,
-        bytes_reclaimed: 10_737_418_240,
-        dry_run: false,
+        kept: vec![KeptItem {
+            category: RemovalCategory::StateFile,
+            path: PathBuf::from("/tmp/sbh/state.json"),
+            reason: "kept by purge mode".into(),
+        }],
+        removed_count: 2,
+        failed_count: 0,
+        bytes_freed: 10_737_418_240,
     };
 
     let output = format_uninstall_report(&report);
-    assert!(output.contains("uninstall"));
-    assert!(output.contains("[DONE]"));
-    assert!(output.contains("10 GB"), "should show reclaimed space");
+    assert!(output.contains("Uninstall report (mode: purge)"));
+    assert!(output.contains("[DONE] ballast-pool: /tmp/sbh/ballast"));
+    assert!(output.contains("backup: /tmp/sbh/config.toml.sbh-uninstall-backup-0"));
+    assert!(output.contains("[KEEP] state-file"));
+    assert!(
+        output.contains("2 removed, 0 failed, 10737418240 bytes freed"),
+        "should show reclaimed space: {output}"
+    );
 }
 
 // ============================================================================
@@ -1150,18 +1414,33 @@ fn e2e_install_report_json_contract() {
 #[test]
 fn e2e_uninstall_report_json_contract() {
     let report = UninstallReport {
-        steps: vec![],
-        success: true,
-        bytes_reclaimed: 1024,
+        mode: CleanupMode::KeepData,
         dry_run: false,
+        timestamp: "0".into(),
+        actions: vec![],
+        kept: vec![],
+        removed_count: 0,
+        failed_count: 0,
+        bytes_freed: 1024,
     };
 
     let json = serde_json::to_string(&report).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-    assert!(parsed.get("success").is_some());
-    assert!(parsed.get("bytes_reclaimed").is_some());
-    assert_eq!(parsed["bytes_reclaimed"], 1024);
+    for key in [
+        "mode",
+        "dry_run",
+        "timestamp",
+        "actions",
+        "kept",
+        "removed_count",
+        "failed_count",
+        "bytes_freed",
+    ] {
+        assert!(parsed.get(key).is_some(), "uninstall report exposes {key}");
+    }
+    assert_eq!(parsed["mode"], "KeepData");
+    assert_eq!(parsed["bytes_freed"], 1024);
 }
 
 // ============================================================================

@@ -2079,6 +2079,173 @@ fn bootstrap_repairs_an_isolated_home_footprint_with_backups() {
     );
 }
 
+/// `sbh uninstall --user --dry-run --json` plans the isolated home's
+/// user-scope footprint plus the loaded config's paths, unloads nothing and
+/// removes nothing; a data-removing mode without `--yes` is refused before
+/// anything is touched.
+#[cfg(target_os = "linux")]
+#[test]
+fn uninstall_dry_run_json_plans_the_user_footprint_and_changes_nothing() {
+    let home = tempfile::tempdir().expect("temp home");
+    let home_path = home.path();
+    let local_bin = home_path.join(".local").join("bin");
+    fs::create_dir_all(&local_bin).expect("create .local/bin");
+    let binary = local_bin.join("sbh");
+    fs::write(&binary, "#!/bin/sh\nexit 0\n").expect("write fake binary");
+    let unit_dir = home_path.join(".config").join("systemd").join("user");
+    fs::create_dir_all(&unit_dir).expect("create user unit dir");
+    let unit = unit_dir.join("sbh.service");
+    fs::write(&unit, "[Unit]\nDescription=sbh\n").expect("write unit");
+
+    let scan_root = home_path.join("scan-root");
+    let state_dir = home_path.join("state");
+    let ballast_dir = home_path.join("ballast");
+    fs::create_dir_all(&scan_root).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(&ballast_dir).unwrap();
+    fs::write(state_dir.join("state.json"), "{}").unwrap();
+    fs::write(ballast_dir.join("ballast-0.bin"), [0u8; 512]).unwrap();
+    let config_path = home_path.join("config.toml");
+    write_liveness_daemon_config(&config_path, &scan_root, &state_dir, &ballast_dir);
+    let config_arg = config_path.to_string_lossy().to_string();
+    let home_env = home_path.to_string_lossy().to_string();
+    let env = [("HOME", home_env.as_str())];
+
+    // Conservative dry run: binary + unit planned, data kept, nothing touched.
+    let dry = common::run_cli_case_with_env(
+        "uninstall_user_dry_run_json",
+        &[
+            "--config",
+            &config_arg,
+            "uninstall",
+            "--user",
+            "--dry-run",
+            "--json",
+        ],
+        &env,
+    );
+    assert_cli_success(&dry, "uninstall --user --dry-run --json");
+    let payload = parse_json_stdout(&dry);
+    assert_eq!(payload["action"], "uninstall");
+    assert_eq!(payload["service_type"], "systemd");
+    assert_eq!(payload["scope"], "user");
+    assert_eq!(payload["dry_run"], serde_json::Value::Bool(true));
+    assert_eq!(payload["success"], serde_json::Value::Bool(true));
+    assert_eq!(
+        payload["unit_path"],
+        serde_json::json!(unit.to_string_lossy())
+    );
+    let cleanup = &payload["cleanup"];
+    assert_eq!(cleanup["mode"], "Conservative");
+    assert_eq!(cleanup["dry_run"], serde_json::Value::Bool(true));
+    let actions = cleanup["actions"].as_array().expect("cleanup.actions");
+    let planned: Vec<(&str, &str)> = actions
+        .iter()
+        .map(|action| {
+            (
+                action["category"].as_str().unwrap_or(""),
+                action["path"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert!(
+        planned.contains(&("Binary", binary.to_str().unwrap())),
+        "plan removes the user binary: {planned:?}"
+    );
+    assert!(
+        planned.contains(&("SystemdUnit", unit.to_str().unwrap())),
+        "plan removes the user unit: {planned:?}"
+    );
+    for (_, path) in &planned {
+        assert!(
+            Path::new(path).starts_with(home_path),
+            "user scope planned outside the fixture home: {path}"
+        );
+    }
+    let kept: Vec<&str> = cleanup["kept"]
+        .as_array()
+        .expect("cleanup.kept")
+        .iter()
+        .filter_map(|item| item["category"].as_str())
+        .collect();
+    assert!(
+        kept.contains(&"StateFile"),
+        "conservative keeps state: {kept:?}"
+    );
+    assert!(
+        kept.contains(&"BallastPool"),
+        "conservative keeps ballast: {kept:?}"
+    );
+    assert!(binary.exists() && unit.exists(), "dry run removes nothing");
+
+    // Purge dry run: state and ballast move from kept to actions.
+    let purge = common::run_cli_case_with_env(
+        "uninstall_user_purge_dry_run_json",
+        &[
+            "--config",
+            &config_arg,
+            "uninstall",
+            "--user",
+            "--purge",
+            "--dry-run",
+            "--json",
+        ],
+        &env,
+    );
+    assert_cli_success(&purge, "uninstall --user --purge --dry-run --json");
+    let purge_payload = parse_json_stdout(&purge);
+    assert_eq!(purge_payload["cleanup"]["mode"], "Purge");
+    let purge_categories: Vec<&str> = purge_payload["cleanup"]["actions"]
+        .as_array()
+        .expect("actions")
+        .iter()
+        .filter_map(|action| action["category"].as_str())
+        .collect();
+    for category in ["StateFile", "BallastPool", "Binary", "SystemdUnit"] {
+        assert!(
+            purge_categories.contains(&category),
+            "purge plans {category}: {purge_categories:?}"
+        );
+    }
+    assert!(
+        purge_payload["cleanup"]["kept"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+
+    // A data-removing mode without --yes is refused up front (stdout is not
+    // a terminal here); the fixture is untouched.
+    let refused = common::run_cli_case_with_env(
+        "uninstall_user_purge_without_yes",
+        &[
+            "--config",
+            &config_arg,
+            "uninstall",
+            "--user",
+            "--purge",
+            "--json",
+        ],
+        &env,
+    );
+    assert!(
+        !refused.status.success(),
+        "purge without --yes must fail in non-interactive mode; stdout={:?}",
+        refused.stdout
+    );
+    let refusal = parse_json_stdout(&refused);
+    assert_eq!(refusal["error"], "non_interactive_without_yes");
+    assert!(binary.exists(), "refused purge must not remove the binary");
+    assert!(unit.exists(), "refused purge must not remove the unit");
+    assert!(
+        state_dir.join("state.json").exists(),
+        "refused purge must not remove state"
+    );
+    assert!(
+        ballast_dir.join("ballast-0.bin").exists(),
+        "refused purge must not remove ballast"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_foreground_daemon_idle_energy_budget() {

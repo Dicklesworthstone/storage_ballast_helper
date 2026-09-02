@@ -1629,18 +1629,26 @@ Every removal action includes:
 - **macOS service teardown**: `sbh uninstall --launchd` calls `launchctl bootout`, removes the matching LaunchAgent or LaunchDaemon plist, and exits successfully when the service is already unloaded or the plist is already absent.
 - **Custom launchd labels**: Uninstall discovery checks both `com.sbh.daemon` and a valid `SBH_LAUNCHD_LABEL`, so isolated CI/test installs clean up the same plist label they installed.
 - **Backup-first semantics**: Items marked with `backup_first: true` are copied to a timestamped backup before removal.
-- **Dry-run support**: `sbh uninstall --dry-run` generates the full removal plan without executing any deletions, showing exactly what would be removed and backed up.
-- **Structured output**: The plan and execution results are available as JSON (`--json`) for automation.
+- **Dry-run support**: `sbh uninstall --dry-run` generates the full removal plan without unloading the service or executing any deletions, showing exactly what would be removed and backed up. A dry run of a system-scope install does not need root.
+- **Structured output**: The plan and execution results are available as JSON (`--json`) as one payload: the service teardown result (`service_type`, `scope`, `unit_path`, `success`, `error`) plus `cleanup` (the plan or results, with `actions`, `kept`, `removed_count`, `failed_count`, `bytes_freed`).
+- **Scope-safe discovery**: a user-scope uninstall only touches the home footprint (`~/.local/bin/sbh`, `~/.cargo/bin/sbh`, the user unit or LaunchAgent, user completions, shell-profile PATH lines) and the paths in the loaded config; a system-scope uninstall only touches `/usr/local/bin/sbh`, the system unit or LaunchDaemon, and system completions.
+- **Confirmation**: data-removing modes (`--purge`, `--keep-*`) prompt on a terminal and require `--yes` when stdin is not a terminal. The conservative default needs no confirmation.
 
 ```bash
 # Preview what would be removed (conservative mode)
 sbh uninstall --dry-run
 
-# Full cleanup with --purge
-sbh uninstall --purge
+# Full cleanup with --purge (prompts; --yes for scripts)
+sbh uninstall --purge --yes
 
 # Remove everything except logs and database
 sbh uninstall --keep-data
+
+# Keep backups of config/database in one place
+sbh uninstall --purge --backup-dir ~/sbh-backups --yes
+
+# Machine-readable plan
+sbh uninstall --dry-run --json
 ```
 
 Source: `src/cli/uninstall.rs`

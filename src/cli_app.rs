@@ -296,6 +296,7 @@ impl ResolvedServiceControl {
     after_long_help = "Platform notes:\n  Omit --systemd/--launchd for auto-detection.\n  On macOS, launchd plist discovery checks both user and system scopes before removal."
 )]
 #[allow(clippy::struct_excessive_bools)]
+#[allow(clippy::struct_excessive_bools)]
 struct UninstallArgs {
     /// Remove systemd service units (Linux).
     #[arg(long, conflicts_with = "launchd")]
@@ -309,9 +310,47 @@ struct UninstallArgs {
     /// Service scope for systemd or launchd removal.
     #[arg(long, value_enum, value_name = "SCOPE", conflicts_with = "user")]
     scope: Option<InstallScopeArg>,
-    /// Remove all generated state and logs.
+    /// Remove everything: binary, service, config, data/logs, cached assets,
+    /// ballast pool (config and database are backed up first).
     #[arg(long)]
     purge: bool,
+    /// Remove everything except the config file.
+    #[arg(long, conflicts_with_all = ["purge", "keep_data", "keep_assets"])]
+    keep_config: bool,
+    /// Remove everything except state, logs, and the activity database.
+    #[arg(long, conflicts_with_all = ["purge", "keep_config", "keep_assets"])]
+    keep_data: bool,
+    /// Remove everything except the cached release assets.
+    #[arg(long, conflicts_with_all = ["purge", "keep_config", "keep_data"])]
+    keep_assets: bool,
+    /// Print the removal plan without unloading the service or deleting anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Directory for backups of files removed backup-first (default: next to each file).
+    #[arg(long, value_name = "DIR")]
+    backup_dir: Option<PathBuf>,
+    /// Confirm a data-removing mode (--purge, --keep-*) without a prompt.
+    #[arg(long, short = 'y')]
+    yes: bool,
+}
+
+impl UninstallArgs {
+    /// Cleanup mode selected by the flags; none of them means the
+    /// conservative default (binary + service only).
+    fn cleanup_mode(&self) -> storage_ballast_helper::cli::uninstall::CleanupMode {
+        use storage_ballast_helper::cli::uninstall::CleanupMode;
+        if self.purge {
+            CleanupMode::Purge
+        } else if self.keep_config {
+            CleanupMode::KeepConfig
+        } else if self.keep_data {
+            CleanupMode::KeepData
+        } else if self.keep_assets {
+            CleanupMode::KeepAssets
+        } else {
+            CleanupMode::Conservative
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -2098,14 +2137,59 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
-    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
-    let service_kind = resolve_uninstall_kind(args, platform.service_kind())?;
+/// The service registration `sbh uninstall` is about to remove, resolved to
+/// a scope before anything is touched so the cleanup plan can be shown (and
+/// confirmed) first.
+enum UninstallServiceTarget {
+    Launchd(LaunchdServiceManager),
+    Systemd(SystemdServiceManager),
+}
 
+impl UninstallServiceTarget {
+    fn service_type(&self) -> &'static str {
+        match self {
+            Self::Launchd(_) => "launchd",
+            Self::Systemd(_) => "systemd",
+        }
+    }
+
+    fn user_scope(&self) -> bool {
+        match self {
+            Self::Launchd(mgr) => mgr.config().user_scope,
+            Self::Systemd(mgr) => mgr.config().user_scope,
+        }
+    }
+
+    fn scope(&self) -> &'static str {
+        if self.user_scope() { "user" } else { "system" }
+    }
+
+    fn unit_path(&self) -> PathBuf {
+        match self {
+            Self::Launchd(mgr) => mgr.config().plist_path(),
+            Self::Systemd(mgr) => mgr.config().unit_path(),
+        }
+    }
+
+    fn uninstall(&self) -> storage_ballast_helper::core::errors::Result<()> {
+        match self {
+            Self::Launchd(mgr) => mgr.uninstall(),
+            Self::Systemd(mgr) => mgr.uninstall(),
+        }
+    }
+}
+
+/// Resolve which service registration (kind + scope) to remove. System scope
+/// needs root unless this is a dry run, which only prints a plan.
+fn resolve_uninstall_target(
+    cli: &Cli,
+    args: &UninstallArgs,
+    service_kind: ServiceKind,
+) -> Result<UninstallServiceTarget, CliError> {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     if service_kind == ServiceKind::Launchd {
-        // Determine scope: check system plists first, then user agents. Include
-        // both the production label and a configured CI/test label.
-        let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        // Check system plists first, then user agents. Include both the
+        // production label and a configured CI/test label.
         let (system_plists, user_plists) =
             launchd_uninstall_plist_paths(&home, env_value(LAUNCHD_LABEL_ENV).as_deref());
         let launchd_user = resolve_uninstall_user_scope(
@@ -2114,153 +2198,177 @@ fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
             paths_exist(&user_plists),
             true,
         );
-        if !launchd_user && !running_as_root() {
+        if !launchd_user && !running_as_root() && !args.dry_run {
             return Err(CliError::User(service_system_scope_root_message(
                 "uninstall",
                 ServiceKind::Launchd,
                 &format_sudo_rerun_command(cli, ServiceKind::Launchd),
             )));
         }
-
         let mgr = LaunchdServiceManager::from_env(launchd_user)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
-        let plist_path = mgr.config().plist_path();
-        let plist_existed = plist_path.exists();
-        let scope = if mgr.config().user_scope {
-            "user"
-        } else {
-            "system"
-        };
-
-        match mgr.uninstall() {
-            Ok(()) => {
-                let result = ServiceActionResult {
-                    action: "uninstall",
-                    service_type: "launchd",
-                    scope,
-                    unit_path: plist_path.clone(),
-                    success: true,
-                    error: None,
-                };
-
-                match output_mode(cli) {
-                    OutputMode::Human => {
-                        println!("Uninstalled launchd service ({scope} scope).");
-                        if plist_existed {
-                            println!("  Removed: {}", plist_path.display());
-                        } else {
-                            println!("  Already absent: {}", plist_path.display());
-                        }
-                    }
-                    OutputMode::Json => {
-                        let payload = serde_json::to_value(&result)?;
-                        write_json_line(&payload)?;
-                    }
-                }
-
-                if args.purge {
-                    run_uninstall_purge(cli)?;
-                }
-
-                return Ok(());
-            }
-            Err(e) => {
-                let result = ServiceActionResult {
-                    action: "uninstall",
-                    service_type: "launchd",
-                    scope,
-                    unit_path: plist_path,
-                    success: false,
-                    error: Some(e.to_string()),
-                };
-
-                match output_mode(cli) {
-                    OutputMode::Human => {
-                        eprintln!("Failed to uninstall launchd service: {e}");
-                    }
-                    OutputMode::Json => {
-                        let payload = serde_json::to_value(&result)?;
-                        write_json_line(&payload)?;
-                    }
-                }
-                return Err(CliError::Runtime(format!("uninstall failed: {e}")));
-            }
-        }
+        return Ok(UninstallServiceTarget::Launchd(mgr));
     }
 
-    // -- systemd uninstall ------------------------------------------------
-    // Determine scope from whether the unit file exists.
-    // System scope is the default unless the system unit doesn't exist and
-    // a user-scope one does.
-    let system_path = std::path::PathBuf::from("/etc/systemd/system/sbh.service");
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+    // systemd: system scope is the default unless only a user unit exists.
+    let system_path = PathBuf::from("/etc/systemd/system/sbh.service");
     let user_path = home.join(".config/systemd/user/sbh.service");
     let user_scope =
         resolve_uninstall_user_scope(args, system_path.exists(), user_path.exists(), false);
-    if !user_scope && !running_as_root() {
+    if !user_scope && !running_as_root() && !args.dry_run {
         return Err(CliError::User(service_system_scope_root_message(
             "uninstall",
             ServiceKind::Systemd,
             &format_sudo_rerun_command(cli, ServiceKind::Systemd),
         )));
     }
-
     let mgr = SystemdServiceManager::from_env(user_scope)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
-    let unit_path = mgr.config().unit_path();
-    let scope = if user_scope { "user" } else { "system" };
+    Ok(UninstallServiceTarget::Systemd(mgr))
+}
 
-    match mgr.uninstall() {
-        Ok(()) => {
-            let result = ServiceActionResult {
-                action: "uninstall",
-                service_type: "systemd",
-                scope,
-                unit_path: unit_path.clone(),
-                success: true,
-                error: None,
-            };
+/// Paths of the install being removed: the loaded config's `[paths]`, or the
+/// scope defaults when no config can be read (already removed, or unreadable).
+fn uninstall_paths_for(cli: &Cli, user_scope: bool) -> PathsConfig {
+    Config::load(cli.config.as_deref()).map_or_else(
+        |_| PathsConfig::for_service_scope(user_scope),
+        |config| config.paths,
+    )
+}
 
-            match output_mode(cli) {
-                OutputMode::Human => {
-                    println!("Uninstalled systemd service ({scope} scope).");
-                    println!("  Removed: {}", unit_path.display());
-                }
-                OutputMode::Json => {
-                    let payload = serde_json::to_value(&result)?;
-                    write_json_line(&payload)?;
-                }
+/// Ask on the terminal before a data-removing uninstall. Anything but an
+/// explicit `y`/`yes` aborts.
+fn confirm_uninstall_on_tty(planned: usize, mode: impl std::fmt::Display) -> bool {
+    print!("Proceed with `sbh uninstall --{mode}` ({planned} removal(s))? [y/N] ");
+    let _ = io::stdout().flush();
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_uninstall(cli: &Cli, args: &UninstallArgs) -> Result<(), CliError> {
+    use storage_ballast_helper::cli::uninstall::{
+        CleanupMode, UninstallOptions, execute_uninstall, format_report_human, plan_uninstall,
+    };
+
+    let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
+    let service_kind = resolve_uninstall_kind(args, platform.service_kind())?;
+    let target = resolve_uninstall_target(cli, args, service_kind)?;
+    let mode = args.cleanup_mode();
+
+    // 1. Plan the file cleanup for this scope before touching anything.
+    let opts = UninstallOptions {
+        mode,
+        dry_run: args.dry_run,
+        backup_dir: args.backup_dir.clone(),
+        binary_path: None,
+        paths: uninstall_paths_for(cli, target.user_scope()),
+        user_scope: target.user_scope(),
+        home: std::env::var_os("HOME").map(PathBuf::from),
+    };
+    let plan = plan_uninstall(&opts);
+
+    // 2. Data-removing modes are confirmed before the service goes away:
+    //    a prompt on a terminal, `--yes` otherwise.
+    if !args.dry_run && mode != CleanupMode::Conservative && !args.yes {
+        if !io::stdout().is_terminal() {
+            if output_mode(cli) == OutputMode::Json {
+                write_json_line(&json!({
+                    "action": "uninstall",
+                    "error": "non_interactive_without_yes",
+                    "mode": mode.to_string(),
+                    "planned_actions": plan.actions.len(),
+                }))?;
             }
-
-            // Run data/ballast cleanup if --purge was requested.
-            if args.purge {
-                run_uninstall_purge(cli)?;
-            }
-
-            Ok(())
+            return Err(CliError::User(format!(
+                "`sbh uninstall --{mode}` removes data; pass --yes to confirm in non-interactive mode, or --dry-run to preview"
+            )));
         }
-        Err(e) => {
-            let result = ServiceActionResult {
-                action: "uninstall",
-                service_type: "systemd",
-                scope,
-                unit_path,
-                success: false,
-                error: Some(e.to_string()),
-            };
-
-            match output_mode(cli) {
-                OutputMode::Human => {
-                    eprintln!("Failed to uninstall systemd service: {e}");
-                }
-                OutputMode::Json => {
-                    let payload = serde_json::to_value(&result)?;
-                    write_json_line(&payload)?;
-                }
-            }
-            Err(CliError::Runtime(format!("uninstall failed: {e}")))
+        println!(
+            "{} service ({} scope): {}",
+            target.service_type(),
+            target.scope(),
+            target.unit_path().display()
+        );
+        for action in &plan.actions {
+            println!("  [PLAN] {}: {}", action.category, action.path.display());
+        }
+        if !confirm_uninstall_on_tty(plan.actions.len(), mode) {
+            return Err(CliError::User("uninstall aborted".to_string()));
         }
     }
+
+    // 3. Service teardown (skipped on dry run), then file cleanup.
+    let unit_path = target.unit_path();
+    let unit_existed = unit_path.exists();
+    let service_error = if args.dry_run {
+        None
+    } else {
+        target.uninstall().err().map(|e| e.to_string())
+    };
+    let service_result = ServiceActionResult {
+        action: "uninstall",
+        service_type: target.service_type(),
+        scope: target.scope(),
+        unit_path: unit_path.clone(),
+        success: service_error.is_none(),
+        error: service_error.clone(),
+    };
+    let report = if args.dry_run || service_error.is_some() {
+        plan
+    } else {
+        execute_uninstall(&opts)
+    };
+
+    // 4. One report: service result plus the cleanup plan/results.
+    match output_mode(cli) {
+        OutputMode::Human => {
+            let scope = target.scope();
+            let service_type = target.service_type();
+            match (&service_error, args.dry_run) {
+                (Some(e), _) => eprintln!("Failed to uninstall {service_type} service: {e}"),
+                (None, true) => println!(
+                    "Would uninstall {service_type} service ({scope} scope): {}",
+                    unit_path.display()
+                ),
+                (None, false) => {
+                    println!("Uninstalled {service_type} service ({scope} scope).");
+                    if unit_existed {
+                        println!("  Removed: {}", unit_path.display());
+                    } else {
+                        println!("  Already absent: {}", unit_path.display());
+                    }
+                }
+            }
+            println!();
+            print!("{}", format_report_human(&report));
+        }
+        OutputMode::Json => {
+            let mut payload = serde_json::to_value(&service_result)?;
+            payload["dry_run"] = json!(args.dry_run);
+            payload["cleanup"] = if service_error.is_some() {
+                Value::Null
+            } else {
+                serde_json::to_value(&report)?
+            };
+            write_json_line(&payload)?;
+        }
+    }
+
+    if let Some(e) = service_error {
+        return Err(CliError::Runtime(format!("uninstall failed: {e}")));
+    }
+    if report.failed_count > 0 {
+        return Err(CliError::Partial(format!(
+            "{} of {} removal(s) failed; see the report above",
+            report.failed_count,
+            report.actions.len()
+        )));
+    }
+    Ok(())
 }
 
 fn run_service(cli: &Cli, args: &ServiceArgs) -> Result<(), CliError> {
@@ -2489,38 +2597,6 @@ fn read_plain_tail_lines(path: &Path, count: usize) -> Result<Vec<String>, CliEr
     let lines: Vec<String> = content.lines().map(ToOwned::to_owned).collect();
     let start = lines.len().saturating_sub(count);
     Ok(lines[start..].to_vec())
-}
-
-fn run_uninstall_purge(cli: &Cli) -> Result<(), CliError> {
-    use storage_ballast_helper::cli::install::{
-        UninstallOptions, format_uninstall_report, run_uninstall_cleanup,
-    };
-    use storage_ballast_helper::core::config::PathsConfig;
-
-    let opts = UninstallOptions {
-        keep_data: false,
-        keep_ballast: false,
-        dry_run: false,
-        paths: PathsConfig::default(),
-    };
-
-    let report = run_uninstall_cleanup(&opts);
-
-    match output_mode(cli) {
-        OutputMode::Human => {
-            print!("{}", format_uninstall_report(&report));
-        }
-        OutputMode::Json => {
-            let payload = serde_json::to_value(&report)?;
-            write_json_line(&payload)?;
-        }
-    }
-
-    if !report.success {
-        return Err(CliError::Runtime("purge cleanup failed".to_string()));
-    }
-
-    Ok(())
 }
 
 fn parse_window_duration(s: &str) -> Result<std::time::Duration, CliError> {
@@ -13110,6 +13186,17 @@ mod tests {
             vec!["sbh", "uninstall", "--launchd", "--scope", "system"],
             vec!["sbh", "uninstall", "--systemd", "--user"],
             vec!["sbh", "uninstall", "--systemd", "--purge"],
+            vec!["sbh", "uninstall", "--dry-run"],
+            vec!["sbh", "uninstall", "--keep-data", "--yes"],
+            vec!["sbh", "uninstall", "--keep-config", "-y"],
+            vec!["sbh", "uninstall", "--keep-assets", "--dry-run"],
+            vec![
+                "sbh",
+                "uninstall",
+                "--purge",
+                "--backup-dir",
+                "/tmp/sbh-backups",
+            ],
         ] {
             let parsed = Cli::try_parse_from(case.iter().copied());
             assert!(parsed.is_ok(), "failed to parse uninstall case: {case:?}");
@@ -13120,6 +13207,48 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["sbh", "uninstall", "--systemd", "--launchd"]).is_err());
+        // Cleanup modes are mutually exclusive.
+        for case in [
+            ["sbh", "uninstall", "--purge", "--keep-data"],
+            ["sbh", "uninstall", "--keep-data", "--keep-config"],
+            ["sbh", "uninstall", "--keep-config", "--keep-assets"],
+            ["sbh", "uninstall", "--keep-assets", "--purge"],
+        ] {
+            assert!(
+                Cli::try_parse_from(case).is_err(),
+                "cleanup modes must conflict: {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_flags_map_to_cleanup_modes() {
+        use storage_ballast_helper::cli::uninstall::CleanupMode;
+        let mode_of = |argv: &[&str]| match Cli::try_parse_from(argv).expect("parse").command {
+            Command::Uninstall(args) => args.cleanup_mode(),
+            other => panic!("expected uninstall, got {other:?}"),
+        };
+        assert_eq!(
+            mode_of(&["sbh", "uninstall"]),
+            CleanupMode::Conservative,
+            "no flag means the documented conservative default"
+        );
+        assert_eq!(
+            mode_of(&["sbh", "uninstall", "--purge"]),
+            CleanupMode::Purge
+        );
+        assert_eq!(
+            mode_of(&["sbh", "uninstall", "--keep-data"]),
+            CleanupMode::KeepData
+        );
+        assert_eq!(
+            mode_of(&["sbh", "uninstall", "--keep-config"]),
+            CleanupMode::KeepConfig
+        );
+        assert_eq!(
+            mode_of(&["sbh", "uninstall", "--keep-assets"]),
+            CleanupMode::KeepAssets
+        );
     }
 
     #[test]
