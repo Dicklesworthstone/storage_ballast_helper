@@ -1978,8 +1978,10 @@ mod tests {
     fn definite_floor_is_disabled_by_config_and_never_overrides_a_veto() {
         // Without the floor, the same definite target at maintenance urgency is
         // the 2026-09-02 sandbox result: a verdict the daemon never dispatches.
-        let mut config = ScoringConfig::default();
-        config.posterior_floor_definite = 0.0;
+        let config = ScoringConfig {
+            posterior_floor_definite: 0.0,
+            ..ScoringConfig::default()
+        };
         let engine = ScoringEngine::from_config(&config, 30);
         let score = engine.score_candidate(&stale_definite_target("/data/tmp/stale/target"), 0.2);
         assert_eq!(score.decision.certainty, ArtifactCertainty::Definite);

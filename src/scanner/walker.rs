@@ -2617,7 +2617,7 @@ mod tests {
             permissions: 0o755,
         };
         let entry = WalkEntry {
-            path: tree.clone(),
+            path: tree,
             metadata: stale_looking.clone(),
             depth: 1,
             structural_signals: StructuralSignals::default(),
@@ -2634,12 +2634,12 @@ mod tests {
         // A recorded opaque-probe result wins without re-walking.
         let recorded = EntryMetadata {
             tree_last_modified: Some(fresh),
-            ..stale_looking.clone()
+            ..stale_looking
         };
         assert_eq!(recorded.effective_age_timestamp(), fresh);
         let recorded_entry = WalkEntry {
             metadata: recorded,
-            ..entry.clone()
+            ..entry
         };
         assert_eq!(recorded_entry.effective_age_timestamp(false), fresh);
 

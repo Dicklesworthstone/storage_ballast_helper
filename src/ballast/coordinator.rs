@@ -868,7 +868,11 @@ mod tests {
         let report = with_config_floor.provision_all(&platform).unwrap();
         assert_eq!(report.total_files_created(), 6);
         assert_eq!(report.total_skipped_for_floor(), 0);
-        assert!(report.skipped_volumes.is_empty());
+        assert!(
+            report.skipped_volumes.is_empty(),
+            "expected no skipped volumes, got {:?}",
+            report.skipped_volumes
+        );
         assert!(!report.has_errors());
 
         // Fresh directories so the second coordinator starts from an empty pool.

@@ -1476,11 +1476,11 @@ mod tests {
 
         assert_eq!(report.files_created, 3);
         assert_eq!(report.skipped_for_floor, 0);
-        assert!(report.errors.is_empty());
+        assert!(report.errors.is_empty(), "got {:?}", report.errors);
         let after = report
             .free_pct_after
             .expect("admission reports the projected free pct");
-        assert!(after >= 10.0 && after <= 12.0, "projected free {after}");
+        assert!((10.0..=12.0).contains(&after), "projected free {after}");
         assert_eq!(mgr.available_count(), 3);
     }
 
@@ -1501,7 +1501,7 @@ mod tests {
 
         assert_eq!(report.files_created, 2);
         assert_eq!(report.skipped_for_floor, 1);
-        assert!(report.errors.is_empty());
+        assert!(report.errors.is_empty(), "got {:?}", report.errors);
         assert_eq!(mgr.available_count(), 2);
     }
 
@@ -1536,7 +1536,7 @@ mod tests {
         let held = mgr.replenish_one(Some(&|| 9.0)).unwrap();
         assert_eq!(held.files_created, 0);
         assert_eq!(held.skipped_for_floor, 1);
-        assert!(held.errors.is_empty());
+        assert!(held.errors.is_empty(), "got {:?}", held.errors);
         assert_eq!(mgr.available_count(), 2);
 
         let rebuilt = mgr.replenish_one(Some(&|| 12.0)).unwrap();
