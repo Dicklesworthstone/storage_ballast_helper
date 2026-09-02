@@ -7692,32 +7692,18 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 println!("  Visibility: {}", visibility.detail);
             }
 
-            // Rate estimates from daemon state.
+            // Rate estimates from daemon state (v2 `rates`): fill rate,
+            // acceleration, confidence and the red horizon per mount.
             if let Some(state) = &daemon_state
                 && let Some(rates) = state.get("rates").and_then(Value::as_object)
                 && !rates.is_empty()
             {
                 println!("\nRate Estimates:");
+                let min_confidence = config.pressure.prediction.min_confidence;
                 for (mount, rate_obj) in rates {
-                    let bps = rate_obj
-                        .get("bytes_per_sec")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    let trend = if bps > 0.0 {
-                        "filling"
-                    } else if bps < 0.0 {
-                        "recovering"
-                    } else {
-                        "stable"
-                    };
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                    let rate_str = if bps.abs() > 0.0 {
-                        format!("{}/s", format_bytes(bps.abs() as u64))
-                    } else {
-                        "0 B/s".to_string()
-                    };
-                    let sign = if bps > 0.0 { "+" } else { "" };
-                    println!("  {mount:<20}  {sign}{rate_str:<15} ({trend})");
+                    if let Some(forecast) = MountForecast::from_rate(rate_obj) {
+                        println!("{}", rate_line(mount, &forecast, min_confidence));
+                    }
                 }
             }
 
@@ -7901,6 +7887,24 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 "daemon_pid": liveness.lock.as_ref().map(|l| l.pid),
                 "state_age_secs": liveness.state_age_secs,
                 "state_stale": liveness.state_stale,
+                // The daemon's per-mount forecast (state.json v2 `rates`)
+                // with the warming flag resolved against this config.
+                "rates": daemon_state
+                    .as_ref()
+                    .and_then(|state| state.get("rates"))
+                    .and_then(Value::as_object)
+                    .map(|rates| {
+                        let min_confidence = config.pressure.prediction.min_confidence;
+                        Value::Object(
+                            rates
+                                .iter()
+                                .filter_map(|(mount, rate)| {
+                                    MountForecast::from_rate(rate)
+                                        .map(|f| (mount.clone(), f.to_json(min_confidence)))
+                                })
+                                .collect(),
+                        )
+                    }),
                 // Q7: the daemon's own accounting from state.json (absent
                 // when no state file is readable).
                 "daemon": daemon_state.as_ref().map(|state| json!({
@@ -10680,26 +10684,45 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         }
     }
 
-    // Check 3: prediction from daemon state.json (if available and --predict requested).
+    // Check 3: the daemon's forecast (`--predict N`): the mount's
+    // `seconds_to_red` from state.json v2, or the rate against the check's
+    // own threshold when the daemon has no red horizon yet. A missing or
+    // stale state file is reported as unknown, never as a number.
+    let mut forecast_json = Value::Null;
     if let Some(predict_minutes) = args.predict {
-        match read_daemon_prediction(&config.paths.state_file, &capacity.mount_point) {
-            Some(rate_bps) if rate_bps > 0.0 => {
-                // Positive rate means filling; estimate time to threshold.
-                let bytes_until_threshold = capacity
-                    .available_bytes
-                    .saturating_sub((threshold_pct / 100.0 * capacity.total_bytes as f64) as u64);
-                let seconds_left = bytes_until_threshold as f64 / rate_bps;
-                let minutes_left = seconds_left / 60.0;
-
-                if minutes_left < predict_minutes as f64 {
+        let window_secs = predict_minutes as f64 * 60.0;
+        let min_confidence = config.pressure.prediction.min_confidence;
+        let read = read_daemon_forecast(&config.paths.state_file, &capacity.mount_point);
+        match &read {
+            ForecastRead::Fresh(Some(forecast)) => {
+                forecast_json = forecast.to_json(min_confidence);
+                let seconds_left = forecast.seconds_to_red.or_else(|| {
+                    (forecast.bytes_per_sec > 0.0).then(|| {
+                        let bytes_until_threshold = capacity.available_bytes.saturating_sub(
+                            (threshold_pct / 100.0 * capacity.total_bytes as f64) as u64,
+                        );
+                        bytes_until_threshold as f64 / forecast.bytes_per_sec
+                    })
+                });
+                if let Some(seconds_left) = seconds_left
+                    && seconds_left < window_secs
+                {
+                    let minutes_left = seconds_left / 60.0;
                     match output_mode(cli) {
                         OutputMode::Human => {
                             println!(
-                                "sbh: {} has {} free but predicted full in {:.0} min (need {} min)",
+                                "sbh: {} has {} free but predicted red in {} (need {} min; rate {}/s, confidence {:.2}{})",
                                 capacity.mount_point.display(),
                                 format_bytes(capacity.available_bytes),
-                                minutes_left,
+                                format_eta(seconds_left),
                                 predict_minutes,
+                                format_bytes(forecast.bytes_per_sec.max(0.0) as u64),
+                                forecast.confidence,
+                                if forecast.warming(min_confidence) {
+                                    ", warming"
+                                } else {
+                                    ""
+                                },
                             );
                         }
                         OutputMode::Json => {
@@ -10711,9 +10734,11 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                                 "free_bytes": capacity.available_bytes,
                                 "total_bytes": capacity.total_bytes,
                                 "free_pct": free_pct,
-                                "rate_bytes_per_sec": rate_bps,
-                                "minutes_until_full": minutes_left,
+                                "rate_bytes_per_sec": forecast.bytes_per_sec,
+                                "seconds_to_red": seconds_left,
+                                "minutes_until_red": minutes_left,
                                 "predict_minutes": predict_minutes,
+                                "forecast": forecast_json,
                                 "container_id": capacity.container_id.as_deref(),
                                 "container_total_bytes": capacity.container_total_bytes,
                                 "container_available_bytes": capacity.container_available_bytes,
@@ -10732,9 +10757,14 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     ));
                 }
             }
-            _ => {
-                // No prediction available — daemon not running or not filling.
-                // This is not an error, just degraded mode.
+            other => {
+                // No usable forecast: say so instead of pretending. Not an
+                // error; `check` still answers from the live statistics.
+                let reason = other.unknown_reason().unwrap_or_default();
+                forecast_json = Value::String(reason.clone());
+                if output_mode(cli) == OutputMode::Human {
+                    eprintln!("sbh: warning: no forecast for --predict: {reason}");
+                }
             }
         }
     }
@@ -10757,6 +10787,9 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             "volume_role": capacity.volume_role.as_deref(),
             "free_excludes_purgeable": true,
             "platform": capacity_platform_json(&capacity),
+            // The daemon's forecast when `--predict` asked for one: the rate
+            // object, or a string saying why none was usable.
+            "forecast": forecast_json,
             // #16: machine-readable reserve state so automation can flag a
             // configured-but-empty emergency reserve.
             "ballast": {
@@ -10780,25 +10813,158 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Read EWMA rate prediction from daemon state.json if available and fresh.
-fn read_daemon_prediction(state_path: &Path, mount_point: &Path) -> Option<f64> {
-    let content = std::fs::read_to_string(state_path).ok()?;
+/// The daemon's forecast for one mount, as `state.json` v2 `rates` carries it.
+#[derive(Debug, Clone, PartialEq)]
+struct MountForecast {
+    bytes_per_sec: f64,
+    accel: f64,
+    confidence: f64,
+    seconds_to_red: Option<f64>,
+    seconds_to_full: Option<f64>,
+}
 
-    // Check freshness: file modified within the staleness threshold.
-    let meta = std::fs::metadata(state_path).ok()?;
-    let modified = meta.modified().ok()?;
-    let age = SystemTime::now().duration_since(modified).ok()?;
-    if age.as_secs() > DAEMON_STATE_STALE_THRESHOLD_SECS {
-        return None; // Stale state, daemon likely not running.
+impl MountForecast {
+    fn from_rate(rate: &Value) -> Option<Self> {
+        Some(Self {
+            bytes_per_sec: rate.get("bytes_per_sec")?.as_f64()?,
+            accel: rate.get("accel").and_then(Value::as_f64).unwrap_or(0.0),
+            confidence: rate
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0),
+            seconds_to_red: rate.get("seconds_to_red").and_then(Value::as_f64),
+            seconds_to_full: rate.get("seconds_to_full").and_then(Value::as_f64),
+        })
     }
 
-    let state: serde_json::Value = serde_json::from_str(&content).ok()?;
+    /// Below the configured confidence the estimator is still warming up:
+    /// the numbers are shown but not acted on.
+    fn warming(&self, min_confidence: f64) -> bool {
+        self.confidence < min_confidence
+    }
 
-    // Look for rate prediction matching the mount point.
-    let rates = state.get("rates")?.as_object()?;
+    fn to_json(&self, min_confidence: f64) -> Value {
+        json!({
+            "bytes_per_sec": self.bytes_per_sec,
+            "accel": self.accel,
+            "confidence": self.confidence,
+            "seconds_to_red": self.seconds_to_red,
+            "seconds_to_full": self.seconds_to_full,
+            "warming": self.warming(min_confidence),
+        })
+    }
+}
+
+/// What the CLI found when it looked for the daemon's forecast.
+#[derive(Debug, Clone, PartialEq)]
+enum ForecastRead {
+    /// No state file, or one that does not parse.
+    Missing,
+    /// A state file older than the staleness threshold: its numbers are
+    /// history, not a forecast.
+    Stale { age_secs: u64 },
+    /// Fresh state; `None` when the daemon has no rate entry for the mount.
+    Fresh(Option<MountForecast>),
+}
+
+impl ForecastRead {
+    /// Why there is no usable forecast, for reports.
+    fn unknown_reason(&self) -> Option<String> {
+        match self {
+            Self::Missing => Some("unknown (daemon state missing)".to_string()),
+            Self::Stale { age_secs } => Some(format!(
+                "unknown (daemon state stale: {age_secs}s old, threshold {DAEMON_STATE_STALE_THRESHOLD_SECS}s)"
+            )),
+            Self::Fresh(None) => Some("unknown (daemon has no rate for this mount)".to_string()),
+            Self::Fresh(Some(_)) => None,
+        }
+    }
+}
+
+/// Read the daemon's forecast for `mount_point` from `state.json` v2.
+fn read_daemon_forecast(state_path: &Path, mount_point: &Path) -> ForecastRead {
+    let Ok(content) = std::fs::read_to_string(state_path) else {
+        return ForecastRead::Missing;
+    };
+    let age_secs = std::fs::metadata(state_path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .map_or(u64::MAX, |age| age.as_secs());
+    if age_secs > DAEMON_STATE_STALE_THRESHOLD_SECS {
+        return ForecastRead::Stale { age_secs };
+    }
+    let Ok(state) = serde_json::from_str::<Value>(&content) else {
+        return ForecastRead::Missing;
+    };
     let mount_key = mount_point.to_string_lossy();
-    let rate_obj = rates.get(mount_key.as_ref())?;
-    rate_obj.get("bytes_per_sec")?.as_f64()
+    ForecastRead::Fresh(
+        state
+            .get("rates")
+            .and_then(Value::as_object)
+            .and_then(|rates| rates.get(mount_key.as_ref()))
+            .and_then(MountForecast::from_rate),
+    )
+}
+
+/// One human status line for a mount's forecast.
+fn rate_line(mount: &str, forecast: &MountForecast, min_confidence: f64) -> String {
+    let bps = forecast.bytes_per_sec;
+    let trend = if bps > 0.0 {
+        "filling"
+    } else if bps < 0.0 {
+        "recovering"
+    } else {
+        "stable"
+    };
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let rate_str = if bps.abs() > 0.0 {
+        format!(
+            "{}{}/s",
+            if bps > 0.0 { "+" } else { "-" },
+            format_bytes(bps.abs() as u64)
+        )
+    } else {
+        "0 B/s".to_string()
+    };
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let accel_str = if forecast.accel.abs() > 0.0 {
+        format!(
+            "{}{}/s\u{b2}",
+            if forecast.accel > 0.0 { "+" } else { "-" },
+            format_bytes(forecast.accel.abs() as u64)
+        )
+    } else {
+        "0 B/s\u{b2}".to_string()
+    };
+    let horizon = match forecast.seconds_to_red {
+        Some(secs) if secs.is_finite() => format!("red in {}", format_eta(secs)),
+        _ => "no red horizon".to_string(),
+    };
+    let status = if forecast.warming(min_confidence) {
+        format!(
+            "warming (confidence {:.2} < {min_confidence:.2})",
+            forecast.confidence
+        )
+    } else {
+        format!("confidence {:.2}", forecast.confidence)
+    };
+    format!("  {mount:<20}  {rate_str:<12} {trend:<10} accel {accel_str:<12} {horizon}, {status}")
+}
+
+/// `42s`, `7m`, `3h 10m`, `2d 4h`.
+fn format_eta(secs: f64) -> String {
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let total = secs.max(0.0).round() as u64;
+    if total < 60 {
+        format!("{total}s")
+    } else if total < 3600 {
+        format!("{}m", total / 60)
+    } else if total < 86_400 {
+        format!("{}h {}m", total / 3600, (total % 3600) / 60)
+    } else {
+        format!("{}d {}h", total / 86_400, (total % 86_400) / 3600)
+    }
 }
 
 fn parse_lease_duration_seconds(raw: &str) -> std::result::Result<u64, String> {
@@ -13545,6 +13711,88 @@ mod tests {
     }
 
     /// C-EXIT: the single mapping every command's error goes through.
+    #[test]
+    fn forecast_read_distinguishes_fresh_stale_and_missing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mount = Path::new("/data");
+        assert_eq!(
+            read_daemon_forecast(&state_path, mount),
+            ForecastRead::Missing
+        );
+
+        std::fs::write(
+            &state_path,
+            r#"{"schema_version":2,"rates":{"/data":{"bytes_per_sec":2048.5,"accel":1.5,"confidence":0.8,"seconds_to_red":1200.0,"seconds_to_full":4000.0}}}"#,
+        )
+        .unwrap();
+        let fresh = read_daemon_forecast(&state_path, mount);
+        assert_eq!(
+            fresh,
+            ForecastRead::Fresh(Some(MountForecast {
+                bytes_per_sec: 2048.5,
+                accel: 1.5,
+                confidence: 0.8,
+                seconds_to_red: Some(1200.0),
+                seconds_to_full: Some(4000.0),
+            }))
+        );
+        assert_eq!(fresh.unknown_reason(), None);
+        // A mount the daemon has no rate for is "fresh, nothing".
+        let none = read_daemon_forecast(&state_path, Path::new("/srv"));
+        assert_eq!(none, ForecastRead::Fresh(None));
+        assert!(none.unknown_reason().unwrap().contains("no rate"));
+
+        // Older than the staleness threshold: the numbers are history.
+        let old = SystemTime::now()
+            - std::time::Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS + 100);
+        filetime::set_file_mtime(&state_path, filetime::FileTime::from_system_time(old)).unwrap();
+        match read_daemon_forecast(&state_path, mount) {
+            ForecastRead::Stale { age_secs } => {
+                assert!(age_secs > DAEMON_STATE_STALE_THRESHOLD_SECS);
+            }
+            other => panic!("expected stale, got {other:?}"),
+        }
+        assert!(
+            ForecastRead::Stale { age_secs: 500 }
+                .unknown_reason()
+                .unwrap()
+                .contains("stale: 500s old")
+        );
+    }
+
+    #[test]
+    fn rate_line_shows_the_horizon_and_marks_warming_below_min_confidence() {
+        let confident = MountForecast {
+            bytes_per_sec: 1_048_576.0,
+            accel: 2048.0,
+            confidence: 0.9,
+            seconds_to_red: Some(2520.0),
+            seconds_to_full: None,
+        };
+        let line = rate_line("/data", &confident, 0.6);
+        assert!(line.contains("/data"), "{line}");
+        assert!(line.contains("filling"), "{line}");
+        assert!(line.contains("red in 42m"), "{line}");
+        assert!(line.contains("confidence 0.90"), "{line}");
+        assert!(!line.contains("warming"), "{line}");
+
+        let warming = MountForecast {
+            confidence: 0.2,
+            seconds_to_red: None,
+            ..confident
+        };
+        let line = rate_line("/data", &warming, 0.6);
+        assert!(line.contains("warming (confidence 0.20 < 0.60)"), "{line}");
+        assert!(line.contains("no red horizon"), "{line}");
+        assert!(warming.to_json(0.6)["warming"].as_bool().unwrap());
+        assert!(!confident.to_json(0.6)["warming"].as_bool().unwrap());
+
+        assert_eq!(format_eta(42.0), "42s");
+        assert_eq!(format_eta(3_900.0), "1h 5m");
+        assert_eq!(format_eta(200_000.0), "2d 7h");
+    }
+
     #[test]
     fn exit_code_contract_maps_every_error_class() {
         assert_eq!(CliError::User("x".into()).exit_code(), 1);

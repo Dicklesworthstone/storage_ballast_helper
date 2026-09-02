@@ -1695,3 +1695,121 @@ fn cpu_budget_bounds_an_expensive_scanner_at_green() {
     assert!(run.stop().success());
     assert!(free_run.stop().success());
 }
+
+// ──────────────────── forecast (check --predict) ────────────────────
+
+/// Scenario `check-predict`: an injected mount that loses 25 GB every four
+/// seconds gives the daemon a red horizon of a minute or two; `check
+/// --predict 30` against the live daemon exits 1 with that forecast, and
+/// `sbh status --json` carries the per-mount rates. Once the daemon is
+/// gone and its state file has aged past the staleness threshold, the same
+/// check exits 0 and reports the forecast as unknown instead of reusing
+/// the stale number.
+#[test]
+fn check_predict_reads_the_daemon_forecast_and_refuses_stale_state() {
+    let dir = scratch();
+    let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 4096);
+    let fixture_mount = dir.path().to_path_buf();
+    // 1 TB volume: 50% free, falling 2.5% every 4 s (6.25 GB/s) from t=4 s
+    // down to 5% (below red) at t=72 s, then holding there.
+    let series: Vec<(u64, u64)> = (1..=18)
+        .map(|i| (i * 4, 500_000_000_000u64.saturating_sub(i * 25_000_000_000)))
+        .collect();
+    let (root, root_total, root_free, root_ro) = quiet_root_mount();
+    let table = table_of(&[
+        mount_entry(
+            &fixture_mount,
+            1_000_000_000_000,
+            500_000_000_000,
+            false,
+            &series,
+        ),
+        mount_entry(root, root_total, root_free, root_ro, &[]),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![fixtures.root],
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    let mount_key = fixture_mount.to_string_lossy().into_owned();
+    let state = run
+        .wait_for_state(
+            "a red horizon in the rates",
+            Duration::from_secs(150),
+            |state| {
+                state["rates"][&mount_key]["seconds_to_red"]
+                    .as_f64()
+                    .is_some()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    let horizon = state["rates"][&mount_key]["seconds_to_red"]
+        .as_f64()
+        .unwrap();
+    let _ = writeln!(std::io::stderr(), "daemon forecast: red in {horizon:.0} s");
+    assert!(horizon < 30.0 * 60.0, "{horizon}");
+
+    let check = |args: &[&str]| {
+        Command::new(common::sbh_bin_path())
+            .arg("--config")
+            .arg(&run.config_path)
+            .args(args)
+            .env("SBH_TEST_MODE", "1")
+            .env("SBH_TEST_FS_STATS", &table)
+            .env("SBH_OUTPUT_FORMAT", "human")
+            .output()
+            .expect("run sbh check")
+    };
+    let path = fixture_mount.to_string_lossy().into_owned();
+    let json = check(&["--json", "check", "--predict", "30", &path]);
+    let payload: Value = serde_json::from_str(String::from_utf8_lossy(&json.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&json.stdout)));
+    assert_eq!(json.status.code(), Some(1), "{payload}");
+    assert_eq!(payload["status"], "warning", "{payload}");
+    assert!(payload["seconds_to_red"].as_f64().is_some(), "{payload}");
+    assert!(
+        payload["forecast"]["confidence"].as_f64().is_some(),
+        "{payload}"
+    );
+    assert_eq!(payload["exit_code"], 1);
+    let human = check(&["check", "--predict", "30", &path]);
+    assert_eq!(human.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("predicted red in"),
+        "{}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+
+    let status = check(&["--json", "status"]);
+    let status_payload: Value =
+        serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
+    let rates = &status_payload["rates"][&mount_key];
+    assert!(
+        rates["bytes_per_sec"].as_f64().is_some(),
+        "{status_payload}"
+    );
+    assert!(rates["warming"].as_bool().is_some(), "{status_payload}");
+
+    // Dead daemon, aged state: no forecast, no number, exit 0.
+    assert!(run.stop().success());
+    let state_path = dir.path().join("data/state.json");
+    let old = SystemTime::now() - Duration::from_secs(600);
+    filetime::set_file_mtime(&state_path, filetime::FileTime::from_system_time(old)).unwrap();
+    let stale_check = Command::new(common::sbh_bin_path())
+        .arg("--config")
+        .arg(dir.path().join("config.toml"))
+        .args(["--json", "check", "--predict", "30", &path])
+        .env("SBH_TEST_MODE", "1")
+        .env("SBH_TEST_FS_STATS", &table)
+        .output()
+        .expect("run sbh check");
+    let stale_payload: Value =
+        serde_json::from_str(String::from_utf8_lossy(&stale_check.stdout).trim()).unwrap();
+    assert_eq!(stale_check.status.code(), Some(0), "{stale_payload}");
+    assert!(
+        stale_payload["forecast"]
+            .as_str()
+            .is_some_and(|s| s.contains("stale")),
+        "{stale_payload}"
+    );
+}
