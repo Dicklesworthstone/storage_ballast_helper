@@ -405,6 +405,7 @@ pub const TREE_IDLE_PROBE_MAX_DEPTH: usize = 3;
 #[must_use]
 pub fn tree_newest_mtime(root: &Path, max_entries: usize, max_depth: usize) -> OpaqueTreeProbe {
     let mut newest: Option<SystemTime> = None;
+    let mut allocated: u64 = 0;
     let mut seen: usize = 0;
     let mut complete = true;
     let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::from([(root.to_path_buf(), 0)]);
@@ -420,8 +421,9 @@ pub fn tree_newest_mtime(root: &Path, max_entries: usize, max_depth: usize) -> O
             };
             seen += 1;
             if seen > max_entries {
+                // Truncated: the size is a lower bound on the sampled tree.
                 return OpaqueTreeProbe {
-                    allocated_bytes: 0,
+                    allocated_bytes: allocated,
                     complete: false,
                     newest_mtime: newest,
                     signals: StructuralSignals::default(),
@@ -434,6 +436,7 @@ pub fn tree_newest_mtime(root: &Path, max_entries: usize, max_depth: usize) -> O
             if meta.file_type().is_symlink() {
                 continue;
             }
+            allocated = allocated.saturating_add(allocated_size(&meta));
             if let Ok(modified) = meta.modified() {
                 newest = Some(newest.map_or(modified, |seen_newest| seen_newest.max(modified)));
             }
@@ -443,7 +446,7 @@ pub fn tree_newest_mtime(root: &Path, max_entries: usize, max_depth: usize) -> O
         }
     }
     OpaqueTreeProbe {
-        allocated_bytes: 0,
+        allocated_bytes: allocated,
         complete,
         newest_mtime: newest,
         signals: StructuralSignals::default(),
@@ -2600,6 +2603,10 @@ mod tests {
         assert!(probe.complete);
         let newest = probe.newest_mtime.expect("populated tree");
         assert!(newest >= fresh - Duration::from_secs(2));
+        assert!(
+            probe.allocated_bytes > 0,
+            "the probe sizes the sampled tree (catalog roots rely on it)"
+        );
 
         // Depth 1 only sees `CACHEDIR.TAG` and `debug/` (both stamped old).
         let shallow = tree_newest_mtime(&tree, TREE_IDLE_PROBE_MAX_ENTRIES, 1);
@@ -2609,9 +2616,10 @@ mod tests {
             "{shallow_newest:?}"
         );
 
-        // A budget of one entry truncates and says so.
+        // A budget of one entry truncates and says so; its size is a lower bound.
         let truncated = tree_newest_mtime(&tree, 1, TREE_IDLE_PROBE_MAX_DEPTH);
         assert!(!truncated.complete);
+        assert!(truncated.allocated_bytes <= probe.allocated_bytes);
     }
 
     #[test]
