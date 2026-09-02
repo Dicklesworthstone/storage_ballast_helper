@@ -3741,6 +3741,7 @@ impl MonitoringDaemon {
         let policy_engine = Arc::clone(&self.policy_engine);
         let shared_guard_diagnostics = Arc::clone(&self.shared_guard_diagnostics);
         let shutdown = self.signal_handler.shutdown_token();
+        let platform_sacred_paths = self.platform.sacred_paths();
 
         thread::Builder::new()
             .name("sbh-executor".to_string())
@@ -3756,6 +3757,7 @@ impl MonitoringDaemon {
                     &shared_guard_diagnostics,
                     &shutdown,
                     &index_feedback_tx,
+                    &platform_sacred_paths,
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -5697,6 +5699,7 @@ fn executor_thread_main(
     shared_guard_diagnostics: &Arc<RwLock<Option<GuardDiagnostics>>>,
     shutdown: &Arc<AtomicBool>,
     index_feedback_tx: &Sender<ScannerIndexFeedback>,
+    platform_sacred_paths: &[crate::platform::types::SacredPath],
 ) {
     let mut tracker = RepeatDeletionTracker::new(
         Duration::from_secs(shared_config.repeat_base_cooldown_secs()),
@@ -5858,6 +5861,15 @@ fn executor_thread_main(
         }
 
         let pre_plan_count = approved_candidates.len();
+        // The executor's pre-flight sacred rail sees the same catalog the
+        // scoring stage does: platform builtins plus operator patterns.
+        let executor_sacred_paths = {
+            let mut catalog = platform_sacred_paths.to_vec();
+            catalog.extend(protection::sacred_paths_from_protected_patterns(
+                &shared_scanner_config.read().protected_paths,
+            ));
+            catalog
+        };
         let executor = DeletionExecutor::new(
             DeletionConfig {
                 max_batch_size,
@@ -5868,6 +5880,7 @@ fn executor_thread_main(
                     shared_scanner_config.read().engine,
                     ScannerEngineMode::V2
                 ),
+                sacred_paths: executor_sacred_paths,
                 ..Default::default()
             },
             Some(logger.clone()),
@@ -5984,11 +5997,13 @@ fn executor_thread_main(
             }
         } else if report.items_deleted > 0 || report.items_failed > 0 {
             eprintln!(
-                "[SBH-EXECUTOR] deleted={} failed={} skipped={} freed={}B ({:?})",
+                "[SBH-EXECUTOR] deleted={} failed={} skipped={} freed={}B sacred_scans={} sacred_ms={} ({:?})",
                 report.items_deleted,
                 report.items_failed,
                 report.items_skipped,
                 report.bytes_freed,
+                report.sacred_scans,
+                report.sacred_scan_ms,
                 report.duration,
             );
         }
@@ -6874,7 +6889,7 @@ mod tests {
         likely.decision.certainty = ArtifactCertainty::Likely;
         let mut unclear = test_candidate("/tmp/unclear", 1.2);
         unclear.decision.certainty = ArtifactCertainty::Unclear;
-        let batch = vec![definite.clone(), likely.clone(), unclear.clone()];
+        let batch = vec![definite.clone(), likely.clone(), unclear];
 
         let (kept, held) =
             retain_dispatchable_by_certainty(batch.clone(), ArtifactCertainty::Definite);
@@ -6887,7 +6902,7 @@ mod tests {
         assert_eq!(held, 1);
         assert_eq!(
             kept.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
-            vec![definite.path.clone(), likely.path.clone()]
+            vec![definite.path, likely.path]
         );
 
         let (kept, held) = retain_dispatchable_by_certainty(batch, ArtifactCertainty::Unclear);

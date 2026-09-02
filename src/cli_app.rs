@@ -9153,6 +9153,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
         min_score: args.min_score,
         check_open_files: true,
         require_identity: matches!(config.scanner.engine, ScannerEngineMode::V2),
+        sacred_paths,
         ..Default::default()
     };
     let executor = DeletionExecutor::new(deletion_config, None);
@@ -10454,6 +10455,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         // rail (vetoes, markers, .git/manifest/source/open-file pre-flight)
         // still applies.
         include_review: true,
+        sacred_paths,
         ..Default::default()
     };
     let executor = DeletionExecutor::new(deletion_config, None);

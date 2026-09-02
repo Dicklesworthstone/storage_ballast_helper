@@ -25,10 +25,13 @@ use std::time::{Duration, Instant};
 use crate::core::errors::{Result, SbhError};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
 use crate::logger::jsonl::ScoreFactorsRecord;
+use crate::platform::sacred_catalog::cross_platform_sacred_paths;
+use crate::platform::types::SacredPath;
 use crate::scanner::active_lease;
 use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, StructuralSignals, is_obvious_build_artifact_basename,
 };
+use crate::scanner::protection::{self, StowawayScanConfig};
 use crate::scanner::scoring::{CandidacyScore, DecisionAction, ScoreFactors};
 use crate::scanner::walker;
 
@@ -65,6 +68,19 @@ pub struct DeletionConfig {
     /// `.sbh-protect` markers, and all pre-flight checks (`.git`, Cargo
     /// manifests, source-tree heuristics, open files, active leases).
     pub include_review: bool,
+    /// Sacred-path catalog for the pre-flight containment check: a candidate
+    /// that matches one of these, or that contains a sacred marker within
+    /// `stowaway_scan.max_depth` levels (`.beads/`, `*.db`, `.sbh-protect`,
+    /// operator `protected_paths` globs), is skipped with
+    /// [`SkipReason::SacredStowaway`].
+    ///
+    /// Defaults to the cross-platform catalog so an executor built from
+    /// `Default` still refuses the markers every route must honor; the daemon
+    /// and CLI extend it with the platform catalog and operator patterns.
+    pub sacred_paths: Vec<SacredPath>,
+    /// Bounds for the pre-flight containment sub-walk. A walk that exhausts
+    /// its budget before proving the subtree marker-free fails closed.
+    pub stowaway_scan: StowawayScanConfig,
 }
 
 impl Default for DeletionConfig {
@@ -78,6 +94,8 @@ impl Default for DeletionConfig {
             check_open_files: true,
             require_identity: false,
             include_review: false,
+            sacred_paths: cross_platform_sacred_paths().to_vec(),
+            stowaway_scan: StowawayScanConfig::default(),
         }
     }
 }
@@ -127,6 +145,48 @@ pub struct DeletionReport {
     /// even when every skip was a deliberate safety refusal. `BTreeMap` keeps
     /// JSON key order deterministic for golden-output tests.
     pub skipped_by_reason: BTreeMap<&'static str, usize>,
+    /// Pre-flight sacred containment walks performed in this batch and their
+    /// total wall time, so the cost of that rail is visible per batch.
+    pub sacred_scans: usize,
+    pub sacred_scan_ms: u64,
+}
+
+/// Per-batch bookkeeping for the pre-flight sacred containment check.
+#[derive(Debug, Default)]
+struct SacredScanStats {
+    walks: usize,
+    elapsed: Duration,
+    /// Sacred paths matched earlier in this batch. A later candidate that
+    /// contains one of them is refused without another walk.
+    matched: Vec<PathBuf>,
+}
+
+impl SacredScanStats {
+    /// Whether `path` is, or contains, a sacred path under `config`'s catalog
+    /// and walk budget. Unreadable or budget-exhausted subtrees count as
+    /// sacred (fail-closed).
+    fn contains_sacred(&mut self, path: &Path, config: &DeletionConfig) -> bool {
+        if self.matched.iter().any(|matched| matched.starts_with(path)) {
+            return true;
+        }
+        let started = Instant::now();
+        self.walks += 1;
+        let verdict = match protection::find_sacred_overlaps_with_config(
+            path,
+            &config.sacred_paths,
+            config.stowaway_scan,
+        ) {
+            Ok(overlaps) => {
+                let found = !overlaps.is_empty();
+                self.matched
+                    .extend(overlaps.into_iter().map(|overlap| overlap.matched_path));
+                found
+            }
+            Err(_) => true,
+        };
+        self.elapsed += started.elapsed();
+        verdict
+    }
 }
 
 impl DeletionReport {
@@ -209,6 +269,13 @@ pub enum SkipReason {
     /// candidate or one of its ancestors. The lease disappears with the
     /// process; unlike `.sbh-protect`, it is not permanent policy.
     ActiveLease,
+    /// The candidate is, or contains within the bounded containment walk, a
+    /// sacred path (`.beads/`, `*.db`, `.sbh-protect`, an operator
+    /// `protected_paths` glob, ...), or the walk ran out of budget before it
+    /// could prove the subtree marker-free (fail-closed). Checked at the
+    /// executor so the daemon, `clean` and `emergency` share one rail
+    /// regardless of what their scoring stage did.
+    SacredStowaway,
 }
 
 impl SkipReason {
@@ -218,7 +285,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -234,6 +301,7 @@ impl SkipReason {
         Self::LooksLikeSourceCode,
         Self::UserDeclined,
         Self::ActiveLease,
+        Self::SacredStowaway,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -263,6 +331,7 @@ impl SkipReason {
             Self::LooksLikeSourceCode => "looks_like_source_code",
             Self::UserDeclined => "user_declined",
             Self::ActiveLease => "active_lease",
+            Self::SacredStowaway => "sacred_stowaway",
         }
     }
 
@@ -290,6 +359,10 @@ impl SkipReason {
             Self::LooksLikeSourceCode => "contains source-code marker files",
             Self::UserDeclined => "operator declined at the interactive prompt",
             Self::ActiveLease => "an active build/test process holds an ephemeral target lease",
+            Self::SacredStowaway => {
+                "is or contains a sacred path (.beads/, *.db, .sbh-protect, protected_paths), \
+                 or the containment walk ran out of budget (fail-closed)"
+            }
         }
     }
 }
@@ -393,9 +466,12 @@ impl DeletionExecutor {
             not_writable_paths: Vec::new(),
             backoff_candidates: Vec::new(),
             skipped_by_reason: BTreeMap::new(),
+            sacred_scans: 0,
+            sacred_scan_ms: 0,
         };
 
         let mut consecutive_failures: u32 = 0;
+        let mut sacred = SacredScanStats::default();
         let limit = plan.candidates.len().min(self.config.max_batch_size);
         // Build an open-path ancestor index once per mutating batch to avoid
         // deep per-candidate inode-tree scans on large artifact directories.
@@ -463,7 +539,7 @@ impl DeletionExecutor {
             }
 
             // Pre-flight safety checks.
-            match self.preflight_check(candidate, open_paths.as_ref()) {
+            match self.preflight_check(candidate, open_paths.as_ref(), &mut sacred) {
                 Ok(()) => {}
                 Err(skip) => {
                     report.record_skip(skip);
@@ -493,6 +569,7 @@ impl DeletionExecutor {
                             | SkipReason::HardcodedSourceTree
                             | SkipReason::LooksLikeSourceCode
                             | SkipReason::UserDeclined
+                            | SkipReason::SacredStowaway
                     ) {
                         eprintln!(
                             "[SBH-EXECUTOR] skip: {} ({:?})",
@@ -553,6 +630,11 @@ impl DeletionExecutor {
         }
 
         report.duration = start.elapsed();
+        report.sacred_scans = sacred.walks;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            report.sacred_scan_ms = sacred.elapsed.as_millis() as u64;
+        }
         report
     }
 
@@ -582,7 +664,8 @@ impl DeletionExecutor {
                 details: "delete_candidate_checked called on a dry-run executor".to_string(),
             });
         }
-        if let Err(skip) = self.preflight_check(candidate, open_paths) {
+        let mut sacred = SacredScanStats::default();
+        if let Err(skip) = self.preflight_check(candidate, open_paths, &mut sacred) {
             return Ok(CheckedDeletion::Skipped(skip));
         }
         self.delete_path(candidate)?;
@@ -591,11 +674,11 @@ impl DeletionExecutor {
 
     // ──────────────────── pre-flight checks ────────────────────
 
-    #[allow(clippy::unused_self)]
     fn preflight_check(
         &self,
         candidate: &CandidacyScore,
         open_paths: Option<&HashSet<PathBuf>>,
+        sacred: &mut SacredScanStats,
     ) -> std::result::Result<(), SkipReason> {
         let path = &candidate.path;
         // 0. Hardcoded source-tree refusal — runs BEFORE the existence check
@@ -671,6 +754,16 @@ impl DeletionExecutor {
             && looks_like_source_code(path)
         {
             return Err(SkipReason::LooksLikeSourceCode);
+        }
+
+        // 6c. Sacred containment: the candidate must not be, or hold within
+        //     the bounded walk, a sacred path (.beads/, *.db, .sbh-protect,
+        //     operator protected_paths). The daemon's and CLI's scoring
+        //     stages check this too, but the executor is the one route shared
+        //     by the daemon, `clean` and `emergency`, so the rail lives here
+        //     and does not depend on what any scoring stage did.
+        if meta.is_dir() && sacred.contains_sacred(path, &self.config) {
+            return Err(SkipReason::SacredStowaway);
         }
 
         // 7. Not currently open by any process (Linux /proc check).
@@ -1424,6 +1517,7 @@ mod tests {
                 SkipReason::LooksLikeSourceCode => 12,
                 SkipReason::UserDeclined => 13,
                 SkipReason::ActiveLease => 14,
+                SkipReason::SacredStowaway => 15,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];
@@ -1466,6 +1560,8 @@ mod tests {
             not_writable_paths: Vec::new(),
             backoff_candidates: Vec::new(),
             skipped_by_reason: BTreeMap::new(),
+            sacred_scans: 0,
+            sacred_scan_ms: 0,
         };
         report.record_skip(SkipReason::HardcodedSourceTree);
         report.record_skip(SkipReason::HardcodedSourceTree);
@@ -1534,6 +1630,8 @@ mod tests {
             not_writable_paths: Vec::new(),
             backoff_candidates: Vec::new(),
             skipped_by_reason: BTreeMap::new(),
+            sacred_scans: 0,
+            sacred_scan_ms: 0,
         };
 
         // Nothing queued at all is not a stall.
@@ -1766,6 +1864,149 @@ mod tests {
         assert_eq!(report.items_deleted, 0);
         assert_eq!(report.items_skipped, 1);
         assert!(git_dir.exists());
+    }
+
+    /// Every route to the executor gets the sacred containment rail: a
+    /// `.beads/` three levels down refuses the candidate even though the
+    /// candidate arrives scored Delete (scoring may have run elsewhere, on
+    /// stale evidence, or not at all).
+    #[test]
+    fn preflight_refuses_candidate_with_sacred_marker_three_levels_down() {
+        let dir = scratch_dir();
+        let candidate = dir.path().join("build-cache");
+        let marker = candidate.join("a").join("b").join(".beads");
+        fs::create_dir_all(&marker).unwrap();
+        fs::write(candidate.join("a").join("junk.o"), b"x").unwrap();
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![make_candidate(&candidate, 4096, 0.95)]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert_eq!(report.sacred_scans, 1);
+        assert!(marker.exists(), "the protected subtree must be untouched");
+    }
+
+    /// Nested candidates share the batch's sacred matches: once the outer
+    /// candidate's walk found the marker, an inner candidate that contains
+    /// it is refused without another walk.
+    #[test]
+    fn nested_candidates_reuse_a_sacred_match_without_rescanning() {
+        let dir = scratch_dir();
+        let outer = dir.path().join("cache");
+        let inner = outer.join("a");
+        let marker = inner.join("b").join(".beads");
+        fs::create_dir_all(&marker).unwrap();
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        // The outer candidate scores higher, so its walk runs first.
+        let plan = executor.plan(vec![
+            make_candidate(&outer, 4096, 0.95),
+            make_candidate(&inner, 2048, 0.90),
+        ]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_skipped, 2);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&2));
+        assert_eq!(
+            report.sacred_scans, 1,
+            "the inner candidate must reuse the outer match instead of walking again"
+        );
+        assert!(marker.exists());
+    }
+
+    /// A containment walk that exhausts its budget cannot prove the subtree
+    /// marker-free, so the candidate is refused, never deleted.
+    #[test]
+    fn exhausted_sacred_walk_fails_closed() {
+        let dir = scratch_dir();
+        let candidate = dir.path().join("cache");
+        for i in 0..8 {
+            fs::create_dir_all(candidate.join(format!("d{i}")).join("x")).unwrap();
+        }
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                stowaway_scan: StowawayScanConfig {
+                    max_dirs: 2,
+                    ..StowawayScanConfig::default()
+                },
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![make_candidate(&candidate, 4096, 0.95)]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert!(candidate.exists());
+    }
+
+    /// Operator `protected_paths` globs reach the executor through the same
+    /// catalog, so a direct match refuses even a clean artifact tree.
+    #[test]
+    fn operator_protected_pattern_refuses_at_the_executor() {
+        let dir = scratch_dir();
+        let candidate = dir.path().join("keep-me-target");
+        fs::create_dir_all(candidate.join("debug")).unwrap();
+        let pattern = dir.path().join("keep-*").to_string_lossy().to_string();
+        let mut sacred_paths = cross_platform_sacred_paths().to_vec();
+        sacred_paths.extend(protection::sacred_paths_from_protected_patterns(&[pattern]));
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                sacred_paths,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![make_candidate(&candidate, 4096, 0.95)]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert!(candidate.exists());
+    }
+
+    /// A clean artifact tree passes the rail and is deleted as before; the
+    /// report shows the one walk it cost.
+    #[test]
+    fn clean_artifact_tree_passes_the_sacred_rail() {
+        let dir = scratch_dir();
+        let candidate = dir.path().join("target");
+        fs::create_dir_all(candidate.join("debug").join("deps")).unwrap();
+        fs::write(candidate.join("debug").join("deps").join("libx.rlib"), b"x").unwrap();
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![make_candidate(&candidate, 4096, 0.95)]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.sacred_scans, 1);
+        assert!(!candidate.exists());
     }
 
     #[test]
@@ -2256,7 +2497,7 @@ mod tests {
             1,
             1.0,
         );
-        let result = executor.preflight_check(&candidate, None);
+        let result = executor.preflight_check(&candidate, None, &mut SacredScanStats::default());
         assert_eq!(result, Err(SkipReason::HardcodedSourceTree));
     }
 
@@ -2273,7 +2514,7 @@ mod tests {
 
         let executor = DeletionExecutor::new(DeletionConfig::default(), None);
         let candidate = make_candidate(dir.path(), 1, 1.0);
-        let result = executor.preflight_check(&candidate, None);
+        let result = executor.preflight_check(&candidate, None, &mut SacredScanStats::default());
         assert_eq!(result, Err(SkipReason::LooksLikeSourceCode));
     }
 
@@ -2288,7 +2529,7 @@ mod tests {
 
         let executor = DeletionExecutor::new(DeletionConfig::default(), None);
         let candidate = make_candidate(dir.path(), 1, 1.0);
-        let result = executor.preflight_check(&candidate, None);
+        let result = executor.preflight_check(&candidate, None, &mut SacredScanStats::default());
         assert_eq!(result, Err(SkipReason::ContainsCargoManifest));
     }
 

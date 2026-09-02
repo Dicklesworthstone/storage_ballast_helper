@@ -4557,6 +4557,7 @@ fn dry_run_deletes_nothing() {
             check_open_files: false,
             require_identity: false,
             include_review: false,
+            ..DeletionConfig::default()
         },
         None,
     );
