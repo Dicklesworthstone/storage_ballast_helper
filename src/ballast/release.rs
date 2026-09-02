@@ -37,7 +37,18 @@ struct MountReleaseState {
     /// pressure spikes (e.g. compilation bursts) without resetting the
     /// entire replenishment cooldown.
     non_green_interruptions: u32,
+    /// Files the daemon released on this mount since it was last Green for
+    /// a full cooldown; reported so an operator can see what the reserve
+    /// is rebuilding, not a cap on replenishment (a reserve short for any
+    /// other reason is rebuilt too).
+    released_since_green: usize,
 }
+
+/// Non-Green ticks tolerated inside a replenish cooldown before it restarts.
+///
+/// Covers a compilation burst that spikes one mount to Yellow for a tick or
+/// two without holding the reserve rebuild back for the whole cooldown again.
+pub const TOLERATED_INTERRUPTIONS: u32 = 3;
 
 /// Tracks release/replenishment state across monitoring loop iterations.
 pub struct BallastReleaseController {
@@ -142,11 +153,43 @@ impl BallastReleaseController {
     }
 
     /// Record a successful release event.
-    pub fn on_released(&mut self, mount_path: &Path, _count: usize) {
+    pub fn on_released(&mut self, mount_path: &Path, count: usize) {
         let state = self.states.entry(mount_path.to_path_buf()).or_default();
         state.last_release_time = Some(Instant::now());
         // Reset green timer since we just released (we're under pressure).
         state.green_since = None;
+        state.non_green_interruptions = 0;
+        state.released_since_green = state.released_since_green.saturating_add(count);
+    }
+
+    /// Feed one tick's pressure level for `mount_path`. Runs every tick from
+    /// the daemon, whatever the mount's control state, so a Yellow or
+    /// Orange excursion restarts the replenish cooldown even while the mount
+    /// is reclaiming and no replenish is being considered. Up to
+    /// [`TOLERATED_INTERRUPTIONS`] non-Green ticks inside a cooldown are
+    /// forgiven; beyond that the cooldown starts over at the next Green.
+    pub fn observe_level(&mut self, mount_path: &Path, current_level: PressureLevel) {
+        let state = self.states.entry(mount_path.to_path_buf()).or_default();
+        if current_level == PressureLevel::Green {
+            state.green_since.get_or_insert_with(Instant::now);
+            return;
+        }
+        if state.green_since.is_some() {
+            state.non_green_interruptions += 1;
+            if state.non_green_interruptions > TOLERATED_INTERRUPTIONS {
+                state.green_since = None;
+                state.non_green_interruptions = 0;
+            }
+        }
+    }
+
+    /// Files released on `mount_path` since it last completed a Green
+    /// cooldown (what the reserve is rebuilding).
+    #[must_use]
+    pub fn released_since_green(&self, mount_path: &Path) -> usize {
+        self.states
+            .get(mount_path)
+            .map_or(0, |state| state.released_since_green)
     }
 
     /// Check if conditions are met for replenishment and replenish one file.
@@ -159,6 +202,7 @@ impl BallastReleaseController {
         current_level: PressureLevel,
         free_pct_check: &dyn Fn() -> f64,
     ) -> Result<bool> {
+        self.observe_level(mount_path, current_level);
         if !self.is_ready_for_replenish(
             mount_path,
             current_level,
@@ -178,7 +222,10 @@ impl BallastReleaseController {
         Ok(false)
     }
 
-    /// Check if a specific mount is ready for replenishment.
+    /// Whether a mount may replenish one file now: Green, Green for the full
+    /// cooldown (as fed by [`Self::observe_level`] every tick), short of its
+    /// configured files, and past the per-file rate limit. Pure with
+    /// respect to the cooldown: the observation happens in `observe_level`.
     pub fn is_ready_for_replenish(
         &mut self,
         mount_path: &Path,
@@ -186,27 +233,17 @@ impl BallastReleaseController {
         current_files: usize,
         target_files: usize,
     ) -> bool {
-        let state = self.states.entry(mount_path.to_path_buf()).or_default();
-
         if current_level != PressureLevel::Green {
-            // Allow up to 3 brief non-green interruptions during the cooldown
-            // window (e.g. compilation bursts that spike to Yellow for one tick).
-            // Beyond that, reset the cooldown entirely.
-            if state.green_since.is_some() {
-                state.non_green_interruptions += 1;
-                if state.non_green_interruptions > 3 {
-                    state.green_since = None;
-                    state.non_green_interruptions = 0;
-                }
-            }
             return false;
         }
+        let state = self.states.entry(mount_path.to_path_buf()).or_default();
 
-        // Track when we first reached green.
+        // Cooldown: must be green for the full cooldown period. An observer
+        // that never saw Green (no observe_level call yet) is not ready.
         let now = Instant::now();
-        let green_since = *state.green_since.get_or_insert(now);
-
-        // Cooldown: must be green for the full cooldown period.
+        let Some(green_since) = state.green_since else {
+            return false;
+        };
         if now.duration_since(green_since) < self.replenish_cooldown {
             return false;
         }
@@ -227,9 +264,10 @@ impl BallastReleaseController {
     }
 
     /// Record a successful replenishment event.
-    pub fn on_replenished(&mut self, mount_path: &Path, _count: usize) {
+    pub fn on_replenished(&mut self, mount_path: &Path, count: usize) {
         let state = self.states.entry(mount_path.to_path_buf()).or_default();
         state.last_replenish_time = Some(Instant::now());
+        state.released_since_green = state.released_since_green.saturating_sub(count);
     }
 
     /// Reset all state (e.g., after config reload).
@@ -276,6 +314,57 @@ mod tests {
         Instant::now()
             .checked_sub(Duration::from_hours(1))
             .expect("current instant must support one-hour subtraction in tests")
+    }
+
+    /// The cooldown is fed by `observe_level` every tick, so an excursion
+    /// while the mount is reclaiming (when the daemon never asks about
+    /// replenishment) still restarts it; brief spikes are forgiven; a mount
+    /// that was never seen Green is not ready; the released-since-Green
+    /// count follows releases and replenishments.
+    #[test]
+    fn interruptions_observed_on_every_tick_restart_the_cooldown() {
+        let mount = Path::new("/test");
+        let mut ctrl = BallastReleaseController::new(0);
+        ctrl.replenish_cooldown = Duration::from_millis(40);
+        ctrl.replenish_interval = Duration::ZERO;
+
+        // Never observed: not ready even at Green with files missing.
+        assert!(!ctrl.is_ready_for_replenish(mount, PressureLevel::Green, 3, 5));
+
+        // Green long enough: ready.
+        ctrl.observe_level(mount, PressureLevel::Green);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(ctrl.is_ready_for_replenish(mount, PressureLevel::Green, 3, 5));
+        assert!(!ctrl.is_ready_for_replenish(mount, PressureLevel::Green, 5, 5));
+
+        // Three Yellow ticks are forgiven: the cooldown keeps its start.
+        for _ in 0..TOLERATED_INTERRUPTIONS {
+            ctrl.observe_level(mount, PressureLevel::Yellow);
+        }
+        ctrl.observe_level(mount, PressureLevel::Green);
+        assert!(ctrl.is_ready_for_replenish(mount, PressureLevel::Green, 3, 5));
+
+        // A fourth non-Green tick (an Orange episode the mount reclaims
+        // through) restarts it: not ready until a full cooldown of Green.
+        ctrl.observe_level(mount, PressureLevel::Orange);
+        ctrl.observe_level(mount, PressureLevel::Green);
+        assert!(!ctrl.is_ready_for_replenish(mount, PressureLevel::Green, 3, 5));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(ctrl.is_ready_for_replenish(mount, PressureLevel::Green, 3, 5));
+
+        // Not Green right now: never ready, whatever the history.
+        assert!(!ctrl.is_ready_for_replenish(mount, PressureLevel::Yellow, 3, 5));
+
+        // Releases count towards what the reserve is rebuilding; a release
+        // also restarts the cooldown.
+        ctrl.on_released(mount, 2);
+        assert_eq!(ctrl.released_since_green(mount), 2);
+        assert!(!ctrl.is_ready_for_replenish(mount, PressureLevel::Green, 3, 5));
+        ctrl.on_replenished(mount, 1);
+        assert_eq!(ctrl.released_since_green(mount), 1);
+        ctrl.on_replenished(mount, 5);
+        assert_eq!(ctrl.released_since_green(mount), 0);
+        assert_eq!(ctrl.released_since_green(Path::new("/other")), 0);
     }
 
     #[test]

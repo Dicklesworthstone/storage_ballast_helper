@@ -1171,7 +1171,7 @@ When local snapshots are present, `sbh ballast release` emits a warning for the 
 
 #### Replenishment
 
-When pressure returns to Green, the replenishment controller begins rebuilding released ballast files. Replenishment is deliberately slow (one file per cycle, with a configurable cooldown) to avoid re-creating pressure immediately after recovery. The controller tracks how many files were released since the last Green period and only replenishes that many, preventing unnecessary churn.
+When a mount has been Green for the full `ballast.replenish_cooldown_minutes`, the replenishment controller rebuilds its missing ballast files one per cycle, at most one every five minutes, while the volume stays above the headroom floor. The cooldown is observed on every daemon tick, whatever the mount is doing: a Yellow or Orange excursion of more than three ticks (a compilation burst is forgiven, a real pressure episode is not) restarts it, and any release resets it. The controller also counts the files it released on each mount since the last completed Green cooldown, so the reserve being rebuilt is visible; a reserve that is short for any other reason (an operator deleted files, a floor-limited provision) is rebuilt the same way, up to the configured count.
 
 All ballast operations (provision, release, replenish, verify) are serialized per-volume via `flock()` on a lockfile, preventing races between the daemon and CLI commands. Read paths never mutate a pool: `sbh ballast status` opens the configured directory without creating it and reports files outside the configured index range as **orphans** instead of deleting them; only `provision` and `replenish` prune orphans, under the lock.
 

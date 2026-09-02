@@ -3531,6 +3531,11 @@ impl MonitoringDaemon {
                 self.enter_mount_recovery(&mount, &tick.response);
             }
 
+            // The replenish cooldown watches every tick, whatever the mount
+            // is doing: an Orange excursion while reclaiming restarts it.
+            self.release_controller
+                .observe_level(&mount, tick.response.level);
+
             let mut files_released = 0;
             match decision.state {
                 MountState::Reclaim => {
