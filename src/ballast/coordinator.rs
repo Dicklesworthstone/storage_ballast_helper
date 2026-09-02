@@ -11,7 +11,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::ballast::manager::{BallastManager, ProvisionReport, ReleaseReport, VerifyReport};
+use crate::ballast::manager::{
+    BallastAvailability, BallastHealth, BallastManager, ProvisionReport, ReleaseReport,
+    VerifyReport, orphan_ballast_files,
+};
 use crate::core::config::BallastConfig;
 use crate::core::errors::Result;
 use crate::platform::pal::{MountPoint, Platform};
@@ -87,8 +90,23 @@ pub struct PoolInventory {
     pub files_available: usize,
     pub files_total: usize,
     pub releasable_bytes: u64,
+    /// Health of this pool (`Unconfigured` for skipped volumes).
+    pub health: BallastHealth,
+    /// Ballast files in the pool dir outside the configured index range;
+    /// reported here, removed only by provision/replenish under the lock.
+    pub orphans: Vec<PathBuf>,
     pub skipped: bool,
     pub skip_reason: Option<String>,
+}
+
+/// A pool the coordinator would manage, before any manager is opened.
+#[derive(Debug, Clone)]
+struct PlannedPool {
+    mount_point: PathBuf,
+    ballast_dir: PathBuf,
+    fs_type: String,
+    strategy: ProvisionStrategy,
+    config: BallastConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -191,8 +209,117 @@ impl BallastPoolCoordinator {
         manager_platform: &Arc<dyn Platform>,
         configured_ballast_dir: Option<&Path>,
     ) -> Result<Self> {
-        let mounts = platform.mount_points()?;
+        let (planned, skipped_pools) =
+            Self::plan_pools(config, watched_paths, platform, configured_ballast_dir)?;
         let mut pools = HashMap::new();
+        let mut skipped_pools = skipped_pools;
+        for plan in planned {
+            let mut manager = match BallastManager::with_platform(
+                plan.ballast_dir.clone(),
+                plan.config,
+                Arc::clone(manager_platform),
+            ) {
+                Ok(manager) => manager,
+                Err(err) => {
+                    skipped_pools.insert(
+                        plan.mount_point.clone(),
+                        SkippedPoolInfo {
+                            ballast_dir: plan.ballast_dir.clone(),
+                            fs_type: plan.fs_type.clone(),
+                            strategy: plan.strategy,
+                            reason: format!("failed to initialize ballast manager: {err}"),
+                        },
+                    );
+                    continue;
+                }
+            };
+
+            // On CoW filesystems, force random-data writes (fallocate zeros are
+            // trivially deduplicated, defeating the purpose of ballast).
+            if plan.strategy == ProvisionStrategy::RandomData {
+                manager.set_skip_fallocate(true);
+            }
+
+            pools.insert(
+                plan.mount_point.clone(),
+                BallastPool {
+                    mount_point: plan.mount_point,
+                    ballast_dir: plan.ballast_dir,
+                    fs_type: plan.fs_type,
+                    strategy: plan.strategy,
+                    manager,
+                },
+            );
+        }
+
+        Ok(Self {
+            pools,
+            skipped_pools,
+        })
+    }
+
+    /// Read-only view of every pool the coordinator would manage for this
+    /// config: the same mount selection and skip reasons the daemon uses,
+    /// observed without opening managers, creating directories, or pruning.
+    /// This is what `sbh ballast status` and `sbh status` show.
+    pub fn inventory_for_config(
+        config: &BallastConfig,
+        watched_paths: &[PathBuf],
+        platform: &dyn Platform,
+        configured_ballast_dir: Option<&Path>,
+    ) -> Result<Vec<PoolInventory>> {
+        let (planned, skipped) =
+            Self::plan_pools(config, watched_paths, platform, configured_ballast_dir)?;
+        let mut inventory: Vec<PoolInventory> = planned
+            .into_iter()
+            .map(|plan| {
+                let observed = BallastAvailability::observe(&plan.ballast_dir, &plan.config);
+                PoolInventory {
+                    orphans: orphan_ballast_files(&plan.ballast_dir, plan.config.file_count),
+                    mount_point: plan.mount_point,
+                    ballast_dir: plan.ballast_dir,
+                    fs_type: plan.fs_type,
+                    strategy: plan.strategy,
+                    files_available: observed.available_count,
+                    files_total: observed.configured_count,
+                    releasable_bytes: observed.releasable_bytes,
+                    health: observed.health,
+                    skipped: false,
+                    skip_reason: None,
+                }
+            })
+            .collect();
+        inventory.extend(
+            skipped
+                .into_iter()
+                .map(|(mount_point, info)| PoolInventory {
+                    mount_point,
+                    ballast_dir: info.ballast_dir,
+                    fs_type: info.fs_type,
+                    strategy: info.strategy,
+                    files_available: 0,
+                    files_total: 0,
+                    releasable_bytes: 0,
+                    health: BallastHealth::Unconfigured,
+                    orphans: Vec::new(),
+                    skipped: true,
+                    skip_reason: Some(info.reason),
+                }),
+        );
+        inventory.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
+        Ok(inventory)
+    }
+
+    /// Decide which mounts get a pool (and why the others do not) without
+    /// touching the filesystem beyond `fs_stats`.
+    fn plan_pools(
+        config: &BallastConfig,
+        watched_paths: &[PathBuf],
+        platform: &dyn Platform,
+        configured_ballast_dir: Option<&Path>,
+    ) -> Result<(Vec<PlannedPool>, HashMap<PathBuf, SkippedPoolInfo>)> {
+        let mounts = platform.mount_points()?;
+        let mut planned = Vec::new();
         let mut skipped_pools = HashMap::new();
 
         // Deduplicate watched paths by mount point.
@@ -276,43 +403,16 @@ impl BallastPoolCoordinator {
 
             // Configured ballast_dir on this mount is honored verbatim;
             // otherwise fall back to the per-volume subdirectory.
-            let ballast_dir = resolved_dir;
-            let pool_config = per_volume_config(config, &mount_str);
-
-            let mut manager = match BallastManager::with_platform(
-                ballast_dir.clone(),
-                pool_config,
-                Arc::clone(manager_platform),
-            ) {
-                Ok(manager) => manager,
-                Err(err) => {
-                    skip_with(format!("failed to initialize ballast manager: {err}"));
-                    continue;
-                }
-            };
-
-            // On CoW filesystems, force random-data writes (fallocate zeros are
-            // trivially deduplicated, defeating the purpose of ballast).
-            if strategy == ProvisionStrategy::RandomData {
-                manager.set_skip_fallocate(true);
-            }
-
-            pools.insert(
-                mount_path.clone(),
-                BallastPool {
-                    mount_point: mount_path.clone(),
-                    ballast_dir,
-                    fs_type: mount.fs_type.clone(),
-                    strategy,
-                    manager,
-                },
-            );
+            planned.push(PlannedPool {
+                mount_point: mount_path.clone(),
+                ballast_dir: resolved_dir,
+                fs_type: mount.fs_type.clone(),
+                strategy,
+                config: per_volume_config(config, &mount_str),
+            });
         }
 
-        Ok(Self {
-            pools,
-            skipped_pools,
-        })
+        Ok((planned, skipped_pools))
     }
 
     /// Apply one headroom floor to every pool (percent free that must remain
@@ -429,6 +529,8 @@ impl BallastPoolCoordinator {
                 files_available: pool.available_count(),
                 files_total: pool.expected_count(),
                 releasable_bytes: pool.releasable_bytes(),
+                health: pool.manager.health(),
+                orphans: pool.manager.orphans(),
                 skipped: false,
                 skip_reason: None,
             })
@@ -445,6 +547,8 @@ impl BallastPoolCoordinator {
                     files_available: 0,
                     files_total: 0,
                     releasable_bytes: 0,
+                    health: BallastHealth::Unconfigured,
+                    orphans: Vec::new(),
                     skipped: true,
                     skip_reason: Some(skipped.reason.clone()),
                 }),
@@ -774,6 +878,74 @@ mod tests {
                     .as_deref()
                     .is_some_and(|reason| reason.contains("disabled"))
         }));
+    }
+
+    /// The read-only enumeration shows the same volumes and skip reasons as
+    /// discovery, without creating a single pool directory.
+    #[test]
+    fn inventory_for_config_observes_every_volume_without_creating_pools() {
+        let dir_data = tempfile::tempdir().unwrap();
+        let dir_scratch = tempfile::tempdir().unwrap();
+        let platform = mock_platform_two_volumes(dir_data.path(), dir_scratch.path());
+        let watched = vec![
+            dir_data.path().to_path_buf(),
+            dir_scratch.path().to_path_buf(),
+        ];
+        let mut config = tiny_ballast_config();
+        config.overrides.insert(
+            dir_scratch.path().to_string_lossy().to_string(),
+            crate::core::config::BallastVolumeOverride {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        // A pre-existing pool on the data volume with one orphan.
+        let pool_dir = dir_data.path().join(".sbh").join("ballast");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+        let orphan = pool_dir.join("SBH_BALLAST_FILE_00099.dat");
+        std::fs::write(&orphan, b"stale").unwrap();
+
+        let inventory =
+            BallastPoolCoordinator::inventory_for_config(&config, &watched, &platform, None)
+                .unwrap();
+        assert_eq!(inventory.len(), 2, "{inventory:?}");
+        let data = inventory
+            .iter()
+            .find(|item| item.mount_point == dir_data.path())
+            .expect("data volume listed");
+        assert!(!data.skipped);
+        assert_eq!(data.ballast_dir, pool_dir);
+        assert_eq!(data.files_total, config.file_count);
+        assert_eq!(data.files_available, 0);
+        assert_eq!(data.health, BallastHealth::Empty);
+        assert_eq!(data.orphans, vec![orphan.clone()]);
+        assert!(orphan.exists(), "enumeration never prunes");
+        let scratch = inventory
+            .iter()
+            .find(|item| item.mount_point == dir_scratch.path())
+            .expect("scratch volume listed");
+        assert!(scratch.skipped);
+        assert!(
+            scratch
+                .skip_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("disabled"))
+        );
+        assert!(
+            !dir_scratch.path().join(".sbh").exists(),
+            "a skipped volume gets no directory"
+        );
+
+        // Discovery (manager-backed) agrees and still creates nothing until provision.
+        let coordinator = BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        assert_eq!(coordinator.pool_count(), 1);
+        let discovered = coordinator.inventory();
+        let discovered_data = discovered
+            .iter()
+            .find(|item| item.mount_point == dir_data.path())
+            .unwrap();
+        assert_eq!(discovered_data.orphans, vec![orphan.clone()]);
+        assert!(orphan.exists(), "opening managers never prunes");
     }
 
     #[test]

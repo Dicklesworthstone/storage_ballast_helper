@@ -1555,7 +1555,13 @@ fn scan_deadline_reached(scan_start: Instant, scan_deadline: Instant, phase: &st
     true
 }
 
-fn ballast_discovery_paths(
+/// Paths whose mounts get a ballast pool.
+///
+/// Scan roots, special locations, the state dir and the configured ballast
+/// dir's parent. Shared by the daemon and the CLI so `sbh ballast status`
+/// enumerates exactly the daemon's pools.
+#[must_use]
+pub fn ballast_discovery_paths(
     config: &Config,
     special_locations: &SpecialLocationRegistry,
 ) -> Vec<PathBuf> {
@@ -4724,7 +4730,7 @@ impl ReplayDrop {
 /// the walker's age rule (newest of mtime, birth time and tree idleness),
 /// open-file detection and the sacred-overlap pass. Only a fresh, unvetoed
 /// `Delete` verdict is returned.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn replay_indexed_record(
     record: &CandidateIndexRecord,
     index_generation: u64,
@@ -7148,6 +7154,7 @@ mod tests {
     /// path and refuse anything fresh evidence rejects, whatever score the
     /// checkpoint carried.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn index_replay_rescores_records_with_fresh_vetoes() {
         use crate::scanner::index::{
             CandidateIndexRecord, CandidateSafetyState, IndexedPruneDecision,

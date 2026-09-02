@@ -1173,7 +1173,9 @@ When local snapshots are present, `sbh ballast release` emits a warning for the 
 
 When pressure returns to Green, the replenishment controller begins rebuilding released ballast files. Replenishment is deliberately slow (one file per cycle, with a configurable cooldown) to avoid re-creating pressure immediately after recovery. The controller tracks how many files were released since the last Green period and only replenishes that many, preventing unnecessary churn.
 
-All ballast operations (provision, release, replenish, verify) are serialized per-volume via `flock()` on a lockfile, preventing races between the daemon and CLI commands.
+All ballast operations (provision, release, replenish, verify) are serialized per-volume via `flock()` on a lockfile, preventing races between the daemon and CLI commands. Read paths never mutate a pool: `sbh ballast status` opens the configured directory without creating it and reports files outside the configured index range as **orphans** instead of deleting them; only `provision` and `replenish` prune orphans, under the lock.
+
+The daemon manages one pool per eligible mount, not just the configured `ballast_dir`: every mount that hosts a scan root, a special location, the state dir or the ballast dir gets `<mount>/.sbh/ballast` (RAM-backed, network, read-only and override-disabled mounts are skipped with a reason). `sbh ballast status` lists every such volume with its health, file counts, releasable bytes and skip reason, and `--json` carries them under `volumes`, so a pool the daemon built on another volume is never invisible to the operator.
 
 ### VOI Scan Scheduling
 

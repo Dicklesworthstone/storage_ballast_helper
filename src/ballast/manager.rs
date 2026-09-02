@@ -284,6 +284,41 @@ fn ballast_file_name(index: u32) -> String {
     format!("SBH_BALLAST_FILE_{index:05}.dat")
 }
 
+/// Ballast files in `dir` whose index is outside `1..=file_count`: leftovers
+/// of a larger pool, or files sbh did not create. Read-only.
+#[must_use]
+pub fn orphan_ballast_files(dir: &Path, file_count: usize) -> Vec<PathBuf> {
+    const PREFIX: &str = "SBH_BALLAST_FILE_";
+    const SUFFIX: &str = ".dat";
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut orphans: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                return false;
+            };
+            if !name.starts_with(PREFIX)
+                || !Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("dat"))
+                || name.len() <= PREFIX.len() + SUFFIX.len()
+            {
+                return false;
+            }
+            let index = &name[PREFIX.len()..name.len() - SUFFIX.len()];
+            index
+                .parse::<u32>()
+                .is_ok_and(|index| index == 0 || index as usize > file_count)
+        })
+        .collect();
+    orphans.sort();
+    orphans
+}
+
 // ──────────────────── manager ────────────────────
 
 /// Manages the lifecycle of ballast files: creation, verification, release, replenishment.
@@ -319,13 +354,16 @@ impl BallastManager {
     }
 
     /// Create a new manager with an explicit platform implementation.
+    ///
+    /// Opening a pool never mutates it: the directory is not created and
+    /// orphaned files are not removed, so `sbh ballast status` and the daemon's
+    /// startup inventory are read-only. `provision`/`replenish` create the
+    /// directory and prune orphans under the flock.
     pub fn with_platform(
         ballast_dir: PathBuf,
         config: BallastConfig,
         platform: Arc<dyn Platform>,
     ) -> Result<Self> {
-        fs::create_dir_all(&ballast_dir).map_err(|e| SbhError::io(&ballast_dir, e))?;
-
         let mut mgr = Self {
             ballast_dir,
             config,
@@ -334,10 +372,17 @@ impl BallastManager {
             skip_fallocate: false,
             provision_floor_pct: DEFAULT_PROVISION_FLOOR_PCT,
         };
-        // Prune any existing files that exceed the initial configuration count.
-        let _ = mgr.prune_orphans();
         mgr.scan_existing();
         Ok(mgr)
+    }
+
+    /// Ballast files in the pool directory whose index is outside
+    /// `1..=file_count` (left behind by a smaller `file_count`, or foreign).
+    /// Reported by `status`; removed only by `provision`/`replenish` under
+    /// the lock.
+    #[must_use]
+    pub fn orphans(&self) -> Vec<PathBuf> {
+        orphan_ballast_files(&self.ballast_dir, self.config.file_count)
     }
 
     /// Directory containing ballast files.
@@ -376,10 +421,12 @@ impl BallastManager {
     }
 
     /// Update configuration at runtime.
+    ///
+    /// Files above a lowered `file_count` become orphans; they are reported
+    /// by `orphans()` and removed by the next provision/replenish under the
+    /// lock, never here (this runs unlocked on config reload).
     pub fn update_config(&mut self, config: BallastConfig) {
         self.config = config;
-        // Prune any files that exceed the new configuration count.
-        let _ = self.prune_orphans();
         // Re-scan inventory to reflect new file count limits.
         self.scan_existing();
     }
@@ -444,6 +491,8 @@ impl BallastManager {
 
     #[cfg(unix)]
     fn acquire_lock(&self) -> Result<nix::fcntl::Flock<File>> {
+        // Mutating paths own directory creation; opening a manager does not.
+        fs::create_dir_all(&self.ballast_dir).map_err(|e| SbhError::io(&self.ballast_dir, e))?;
         let lock_path = self.ballast_dir.join(".lock");
         let file = OpenOptions::new()
             .read(true)
@@ -489,7 +538,7 @@ impl BallastManager {
         };
 
         // Ensure no orphans exist before provisioning.
-        let _ = self.prune_orphans();
+        self.prune_orphans();
 
         for i in 1..=self.config.file_count {
             let index = i as u32;
@@ -609,6 +658,14 @@ impl BallastManager {
 
     /// Verify integrity of all expected ballast files.
     pub fn verify(&mut self) -> Result<VerifyReport> {
+        // Hold the pool lock while reading so a concurrent provision or
+        // release cannot be observed half-written. A pool that does not
+        // exist yet is reported as all-missing without creating anything.
+        let _lock = if self.ballast_dir.is_dir() {
+            Some(self.acquire_lock()?)
+        } else {
+            None
+        };
         let mut report = VerifyReport {
             files_checked: 0,
             files_ok: 0,
@@ -668,7 +725,7 @@ impl BallastManager {
         };
 
         // Ensure no orphans exist before replenishing.
-        let _ = self.prune_orphans();
+        self.prune_orphans();
 
         for i in 1..=self.config.file_count {
             let index = i as u32;
@@ -725,48 +782,11 @@ impl BallastManager {
     // ──────────────────── internal ────────────────────
 
     /// Scan directory for ballast files with index > current file_count and remove them.
-    fn prune_orphans(&self) -> Result<()> {
-        let entries = match fs::read_dir(&self.ballast_dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(SbhError::io(&self.ballast_dir, e)),
-        };
-
-        for entry in entries {
-            let Ok(entry) = entry else { continue };
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-
-            // Check pattern: SBH_BALLAST_FILE_{index:05}.dat
-            if !name.starts_with("SBH_BALLAST_FILE_")
-                || !std::path::Path::new(name)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("dat"))
-            {
-                continue;
-            }
-
-            let prefix_len = "SBH_BALLAST_FILE_".len();
-            let suffix_len = ".dat".len();
-            if name.len() <= prefix_len + suffix_len {
-                continue;
-            }
-
-            let num_part = &name[prefix_len..name.len() - suffix_len];
-            if let Ok(index) = num_part.parse::<u32>()
-                && (index > self.config.file_count as u32 || index == 0)
-            {
-                // Orphan!
-                let _ = fs::remove_file(&path);
-            }
+    /// Remove orphaned ballast files. Callers hold the pool lock.
+    fn prune_orphans(&self) {
+        for path in orphan_ballast_files(&self.ballast_dir, self.config.file_count) {
+            let _ = fs::remove_file(&path);
         }
-        Ok(())
     }
 
     fn file_path(&self, index: u32) -> PathBuf {
@@ -1221,6 +1241,60 @@ mod tests {
         }
     }
 
+    /// Opening a pool is read-only: no directory is created and orphans are
+    /// reported, not removed. Only provision prunes them, under the lock.
+    #[test]
+    fn opening_a_pool_neither_creates_nor_prunes() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("pool-that-does-not-exist");
+        let mgr = BallastManager::new(missing.clone(), small_config()).unwrap();
+        assert!(!missing.exists(), "opening must not create the pool dir");
+        assert!(mgr.inventory().is_empty());
+        assert_eq!(mgr.orphans(), Vec::<PathBuf>::new());
+
+        // A pool with one valid slot and two orphans (index 0 and index 9 > file_count 3).
+        let pool = dir.path().join("pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        let orphan_hi = pool.join(ballast_file_name(9));
+        let orphan_zero = pool.join(ballast_file_name(0));
+        std::fs::write(&orphan_hi, b"stale").unwrap();
+        std::fs::write(&orphan_zero, b"stale").unwrap();
+        std::fs::write(pool.join("unrelated.dat"), b"keep").unwrap();
+        let mut mgr = BallastManager::new(pool.clone(), small_config()).unwrap();
+        mgr.set_skip_fallocate(true);
+        assert_eq!(mgr.orphans(), vec![orphan_zero.clone(), orphan_hi.clone()]);
+        assert!(
+            orphan_hi.exists() && orphan_zero.exists(),
+            "status-style open leaves orphans"
+        );
+        assert_eq!(
+            orphan_ballast_files(&pool, 3),
+            mgr.orphans(),
+            "the free function is what the manager reports"
+        );
+
+        // verify() on the existing pool takes the lock and creates nothing new.
+        let report = mgr.verify().unwrap();
+        assert_eq!(report.files_missing, 3);
+        assert!(orphan_hi.exists(), "verify never prunes");
+
+        // provision() prunes under the lock and leaves unrelated files alone.
+        let report = mgr.provision(None).unwrap();
+        assert_eq!(report.files_created, 3, "{report:?}");
+        assert!(
+            !orphan_hi.exists() && !orphan_zero.exists(),
+            "provision prunes orphans"
+        );
+        assert!(pool.join("unrelated.dat").exists());
+        assert_eq!(mgr.orphans(), Vec::<PathBuf>::new());
+
+        // verify() on a missing pool reports all-missing and still creates nothing.
+        let mut absent = BallastManager::new(missing.clone(), small_config()).unwrap();
+        let report = absent.verify().unwrap();
+        assert_eq!(report.files_missing, 3);
+        assert!(!missing.exists());
+    }
+
     #[test]
     fn provision_creates_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -1663,15 +1737,27 @@ mod tests {
         // Inventory should show 3
         assert_eq!(mgr.available_count(), 3);
 
-        // Files 4 and 5 should be gone
+        // Files 4 and 5 are orphans now: reported, not removed (config
+        // reload runs unlocked; only provision/replenish prune).
+        let file4 = dir.path().join("SBH_BALLAST_FILE_00004.dat");
+        let file5 = dir.path().join("SBH_BALLAST_FILE_00005.dat");
         assert!(
-            !dir.path().join("SBH_BALLAST_FILE_00004.dat").exists(),
-            "Orphaned file 4 should be removed"
+            file4.exists() && file5.exists(),
+            "orphans survive a config update"
+        );
+        assert_eq!(mgr.orphans(), vec![file4.clone(), file5.clone()]);
+
+        // The next provision prunes them under the lock.
+        mgr.provision(None).unwrap();
+        assert!(
+            !file4.exists(),
+            "Orphaned file 4 should be removed by provision"
         );
         assert!(
-            !dir.path().join("SBH_BALLAST_FILE_00005.dat").exists(),
-            "Orphaned file 5 should be removed"
+            !file5.exists(),
+            "Orphaned file 5 should be removed by provision"
         );
+        assert_eq!(mgr.orphans(), Vec::<PathBuf>::new());
     }
 
     // ──── #16: health / availability ────

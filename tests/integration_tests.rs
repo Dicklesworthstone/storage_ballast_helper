@@ -2556,6 +2556,7 @@ fn config_path_and_validate_agree_and_log_explains_missing_file() {
 /// Unknown config keys are reported with a did-you-mean, ignored by default,
 /// fatal under `--strict` or `[core] strict_config`, and stop the daemon.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn config_validate_reports_unknown_keys_and_strict_mode_refuses_them() {
     let dir = tempfile::tempdir().expect("temp dir");
     let lenient = dir.path().join("lenient.toml");
@@ -2669,6 +2670,80 @@ fn config_validate_reports_unknown_keys_and_strict_mode_refuses_them() {
             && daemon.stderr.contains("scanner.paralellism"),
         "daemon names the offending key: {}",
         daemon.stderr
+    );
+}
+
+/// `ballast status` is read-only: it does not create the pool directory,
+/// reports orphaned ballast files instead of deleting them, and lists every
+/// volume the daemon would manage.
+#[test]
+fn ballast_status_is_read_only_and_reports_orphans_and_volumes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let scan_root = dir.path().join("scan-root");
+    let state_dir = dir.path().join("state");
+    let ballast_dir = dir.path().join("ballast");
+    fs::create_dir_all(&scan_root).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let config_path = dir.path().join("config.toml");
+    write_liveness_daemon_config(&config_path, &scan_root, &state_dir, &ballast_dir);
+    let config_arg = config_path.to_string_lossy().to_string();
+
+    // Pool dir absent: status must not create it.
+    let absent = common::run_cli_case(
+        "ballast_status_absent_pool",
+        &["--config", &config_arg, "ballast", "status", "--json"],
+    );
+    assert_cli_success(&absent, "ballast status --json (absent pool)");
+    assert!(
+        !ballast_dir.exists(),
+        "status must not create the pool directory"
+    );
+    let payload = parse_json_stdout(&absent);
+    assert_eq!(payload["health"], "empty");
+    assert_eq!(payload["available_count"], 0);
+
+    // An orphan (index 9 with file_count 1) survives status and is reported.
+    fs::create_dir_all(&ballast_dir).unwrap();
+    let orphan = ballast_dir.join("SBH_BALLAST_FILE_00009.dat");
+    fs::write(&orphan, b"stale").unwrap();
+    let status = common::run_cli_case(
+        "ballast_status_orphan",
+        &["--config", &config_arg, "ballast", "status", "--json"],
+    );
+    assert_cli_success(&status, "ballast status --json (orphan)");
+    assert!(orphan.exists(), "status must not prune orphans");
+    let payload = parse_json_stdout(&status);
+    assert_eq!(
+        payload["orphans"],
+        serde_json::json!([orphan.to_string_lossy()]),
+        "orphan is reported: {payload}"
+    );
+    let volumes = payload["volumes"].as_array().expect("volumes array");
+    assert!(
+        volumes
+            .iter()
+            .any(|v| v["ballast_dir"] == serde_json::json!(ballast_dir.to_string_lossy())),
+        "the configured pool's volume is listed: {volumes:?}"
+    );
+    for volume in volumes {
+        if volume["skipped"] == serde_json::Value::Bool(false) {
+            let pool_dir = PathBuf::from(volume["ballast_dir"].as_str().unwrap());
+            assert!(
+                pool_dir == ballast_dir || !pool_dir.starts_with(dir.path()),
+                "enumeration created nothing under the fixture: {}",
+                pool_dir.display()
+            );
+        }
+    }
+    let human = common::run_cli_case(
+        "ballast_status_orphan_human",
+        &["--config", &config_arg, "ballast", "status"],
+    );
+    assert_cli_success(&human, "ballast status (orphan)");
+    assert!(
+        human.stdout.contains("Orphans (1 file(s)") && human.stdout.contains("Volumes ("),
+        "human output lists orphans and volumes: {}",
+        human.stdout
     );
 }
 

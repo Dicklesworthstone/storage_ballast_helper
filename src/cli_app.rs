@@ -4990,6 +4990,75 @@ fn print_json_diff(prefix: &str, default: &Value, effective: &Value) {
     }
 }
 
+/// Every pool the daemon would manage for this config, observed read-only:
+/// the same mount selection and skip reasons as the daemon (scan roots,
+/// special locations, state and ballast dirs), including the per-mount
+/// `<mount>/.sbh/ballast` pools the configured directory alone never shows.
+/// Empty when the platform cannot be probed (mentioned in verbose mode).
+fn ballast_volume_inventory(
+    cli: &Cli,
+    config: &Config,
+) -> Vec<storage_ballast_helper::ballast::coordinator::PoolInventory> {
+    use storage_ballast_helper::ballast::coordinator::BallastPoolCoordinator;
+    use storage_ballast_helper::daemon::loop_main::ballast_discovery_paths;
+    use storage_ballast_helper::monitor::special_locations::SpecialLocationRegistry;
+
+    let note = |what: &str, err: &dyn std::fmt::Display| {
+        if cli.verbose {
+            eprintln!("[SBH-BALLAST] volume enumeration skipped: {what}: {err}");
+        }
+    };
+    let platform = match detect_platform() {
+        Ok(platform) => platform,
+        Err(e) => {
+            note("platform", &e);
+            return Vec::new();
+        }
+    };
+    let special = match SpecialLocationRegistry::discover(platform.as_ref(), &[]) {
+        Ok(registry) => registry,
+        Err(e) => {
+            note("special locations", &e);
+            return Vec::new();
+        }
+    };
+    let paths = ballast_discovery_paths(config, &special);
+    match BallastPoolCoordinator::inventory_for_config(
+        &config.ballast,
+        &paths,
+        platform.as_ref(),
+        Some(config.paths.ballast_dir.as_path()),
+    ) {
+        Ok(volumes) => volumes,
+        Err(e) => {
+            note("mount discovery", &e);
+            Vec::new()
+        }
+    }
+}
+
+fn ballast_volume_json(
+    volume: &storage_ballast_helper::ballast::coordinator::PoolInventory,
+) -> Value {
+    json!({
+        "mount_point": volume.mount_point.to_string_lossy(),
+        "ballast_dir": volume.ballast_dir.to_string_lossy(),
+        "fs_type": volume.fs_type,
+        "strategy": format!("{:?}", volume.strategy).to_lowercase(),
+        "files_available": volume.files_available,
+        "files_total": volume.files_total,
+        "releasable_bytes": volume.releasable_bytes,
+        "health": volume.health.as_str(),
+        "orphans": volume
+            .orphans
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
+        "skipped": volume.skipped,
+        "skip_reason": volume.skip_reason,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
     let config =
@@ -5001,9 +5070,13 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
 
     match &args.command {
         None | Some(BallastCommand::Status) => {
+            // Read-only: opening the manager neither creates the pool dir
+            // nor prunes orphans; volumes are observed without managers.
             let inventory = manager.inventory().to_vec();
             let available = manager.available_count();
             let releasable = manager.releasable_bytes();
+            let orphans = manager.orphans();
+            let volumes = ballast_volume_inventory(cli, &config);
 
             match output_mode(cli) {
                 OutputMode::Human => {
@@ -5059,6 +5132,43 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                             );
                         }
                     }
+                    if !orphans.is_empty() {
+                        println!(
+                            "\n  Orphans ({} file(s) outside the configured index range; removed by the next provision/replenish):",
+                            orphans.len()
+                        );
+                        for orphan in &orphans {
+                            println!("    {}", orphan.display());
+                        }
+                    }
+                    if !volumes.is_empty() {
+                        println!(
+                            "\nVolumes ({} the daemon considers for ballast):",
+                            volumes.len()
+                        );
+                        for volume in &volumes {
+                            if volume.skipped {
+                                println!(
+                                    "  {:<24} skipped: {}",
+                                    volume.mount_point.display(),
+                                    volume.skip_reason.as_deref().unwrap_or("unknown")
+                                );
+                            } else {
+                                println!(
+                                    "  {:<24} {:<10} {}/{} files, {} releasable, {}",
+                                    volume.mount_point.display(),
+                                    volume.health,
+                                    volume.files_available,
+                                    volume.files_total,
+                                    format_bytes(volume.releasable_bytes),
+                                    volume.ballast_dir.display()
+                                );
+                                for orphan in &volume.orphans {
+                                    println!("      orphan: {}", orphan.display());
+                                }
+                            }
+                        }
+                    }
                 }
                 OutputMode::Json => {
                     let files: Vec<Value> = inventory
@@ -5089,6 +5199,11 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                             config.ballast.file_count.saturating_sub(inventory.len()),
                         "health": manager.health().as_str(),
                         "files": files,
+                        "orphans": orphans
+                            .iter()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect::<Vec<_>>(),
+                        "volumes": volumes.iter().map(ballast_volume_json).collect::<Vec<_>>(),
                     });
                     write_json_line(&payload)?;
                 }
