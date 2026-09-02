@@ -13,7 +13,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use serde::Serialize;
 use storage_ballast_helper::monitor::ewma::DiskRateEstimator;
 use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
-use storage_ballast_helper::monitor::pid::{PidPressureController, PressureReading};
+use storage_ballast_helper::monitor::pid::{PidConfig, PidPressureController, PressureReading};
 use storage_ballast_helper::platform::pal::{
     FsStats, MemoryInfo, MockPlatform, MountPoint, Platform, PlatformPaths, detect_platform,
 };
@@ -66,16 +66,15 @@ impl PollTickFixture {
             root_path,
             estimator: DiskRateEstimator::new(0.30, 0.10, 0.80, 3),
             controller: PidPressureController::new(
-                0.25,
-                0.08,
-                0.02,
-                100.0,
-                35.0,
-                1.0,
-                35.0,
-                20.0,
-                10.0,
-                5.0,
+                &PidConfig {
+                    kp: 0.25,
+                    ki: 0.08,
+                    kd: 0.02,
+                    integral_cap: 100.0,
+                    target_free_pct: 35.0,
+                    hysteresis_pct: 1.0,
+                    ..PidConfig::with_thresholds(35.0, 20.0, 10.0, 5.0)
+                },
                 Duration::from_secs(1),
             ),
             started_at: Instant::now(),

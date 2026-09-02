@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use storage_ballast_helper::core::config::Config;
 use storage_ballast_helper::monitor::ewma::DiskRateEstimator;
 use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
-use storage_ballast_helper::monitor::pid::{PidPressureController, PressureReading};
+use storage_ballast_helper::monitor::pid::{PidConfig, PidPressureController, PressureReading};
 use storage_ballast_helper::platform::pal::detect_platform;
 
 fn main() {
@@ -27,18 +27,23 @@ fn main() {
 
     let mut estimator = DiskRateEstimator::new(0.3, 0.05, 0.8, 3);
 
-    // Use sensible defaults for PID gains since Config doesn't expose them directly.
+    // Sensible PID gains for a demo; the daemon derives its own from config.
+    let pid = PidConfig {
+        kp: 1.0,
+        ki: 0.1,
+        kd: 0.05,
+        integral_cap: 50.0,
+        target_free_pct: 20.0,
+        hysteresis_pct: 1.0,
+        ..PidConfig::with_thresholds(
+            config.pressure.green_min_free_pct,
+            config.pressure.yellow_min_free_pct,
+            config.pressure.orange_min_free_pct,
+            config.pressure.red_min_free_pct,
+        )
+    };
     let mut controller = PidPressureController::new(
-        1.0,  // kp
-        0.1,  // ki
-        0.05, // kd
-        50.0, // integral_cap
-        20.0, // target_free_pct
-        1.0,  // hysteresis_pct
-        config.pressure.green_min_free_pct,
-        config.pressure.yellow_min_free_pct,
-        config.pressure.orange_min_free_pct,
-        config.pressure.red_min_free_pct,
+        &pid,
         Duration::from_millis(config.pressure.poll_interval_ms),
     );
 

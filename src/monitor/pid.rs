@@ -903,12 +903,17 @@ mod tests {
         with.set_action_horizon_minutes(30.0);
         let response = with.update(reading(), Some(200.0), Instant::now());
         // Kf * (1 - 200 / 1800) on top of Kp * 2 points.
-        assert!((with.last_feedforward() - 0.8 * (1.0 - 200.0 / 1800.0)).abs() < 1e-9);
+        assert!(
+            0.8f64
+                .mul_add(-(1.0 - 200.0 / 1800.0), with.last_feedforward())
+                .abs()
+                < 1e-9
+        );
         assert!(
             response.urgency > baseline.urgency,
             "{response:?} vs {baseline:?}"
         );
-        let expected = 1.0 - (-(0.1f64 * 2.0 + with.last_feedforward())).exp();
+        let expected = 1.0 - (-(0.1f64.mul_add(2.0, with.last_feedforward()))).exp();
         assert!(
             (response.urgency - expected).abs() < 1e-6,
             "{}",
@@ -1145,6 +1150,9 @@ mod tests {
         use std::path::PathBuf;
         use std::time::{Duration, Instant};
 
+        // `free_pct` is generated in 0..40, so the cast neither truncates
+        // anything that matters nor sees a negative value.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         fn reading(free_pct: f64) -> PressureReading {
             PressureReading {
                 free_bytes: (free_pct * 10_000.0) as u64,
@@ -1166,7 +1174,7 @@ mod tests {
                 pid.freeze_integral(true);
                 for (i, free) in frees.iter().enumerate() {
                     let _ = pid.update(reading(*free), None, t0 + Duration::from_millis(dt_ms * i as u64));
-                    prop_assert_eq!(pid.integral(), 0.0);
+                    prop_assert!(pid.integral().abs() < f64::EPSILON, "{}", pid.integral());
                 }
             }
 
