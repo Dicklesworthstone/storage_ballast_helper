@@ -1167,6 +1167,7 @@ mod tests {
             },
             policy_mode: "enforce".into(),
             memory_rss_bytes: 52_428_800,
+            ..crate::daemon::self_monitor::DaemonState::default()
         }
     }
 

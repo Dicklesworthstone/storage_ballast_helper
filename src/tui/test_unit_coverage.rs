@@ -883,6 +883,7 @@ fn rapid_data_updates_track_counters_correctly() {
         },
         policy_mode: "enforce".into(),
         memory_rss_bytes: 0,
+        ..DaemonState::default()
     };
 
     let mut model = test_model();

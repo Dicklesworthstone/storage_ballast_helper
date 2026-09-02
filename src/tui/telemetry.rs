@@ -1065,6 +1065,9 @@ fn parse_jsonl_entry_with_schema_shield(line: &str) -> ParseOutcome {
         mount_point: read_string_field(object, &["mount_point", "mount"]),
         decision_id: read_string_field(object, &["decision_id"]),
         details,
+        schema_version: read_u64_field(object, &["schema_version"])
+            .and_then(|v| u32::try_from(v).ok()),
+        run_id: read_string_field(object, &["run_id"]),
     })
 }
 
@@ -1381,6 +1384,8 @@ mod tests {
             mount_point: None,
             decision_id: None,
             details: Some("test deletion".to_string()),
+            schema_version: None,
+            run_id: None,
         };
 
         let timeline = logentry_to_timeline(&entry);
@@ -1476,6 +1481,8 @@ mod tests {
                 mount_point: None,
                 decision_id: None,
                 details: Some("started".to_string()),
+                schema_version: None,
+                run_id: None,
             },
             crate::logger::jsonl::LogEntry {
                 ts: "2026-02-16T00:00:02Z".to_string(),
@@ -1495,6 +1502,8 @@ mod tests {
                 mount_point: None,
                 decision_id: None,
                 details: None,
+                schema_version: None,
+                run_id: None,
             },
             crate::logger::jsonl::LogEntry {
                 ts: "2026-02-16T00:00:03Z".to_string(),
@@ -1514,6 +1523,8 @@ mod tests {
                 mount_point: None,
                 decision_id: None,
                 details: None,
+                schema_version: None,
+                run_id: None,
             },
         ];
 
@@ -1619,6 +1630,8 @@ mod tests {
                 mount_point: None,
                 decision_id: None,
                 details: Some("x".repeat(8192)),
+                schema_version: None,
+                run_id: None,
             };
             content.push_str(&serde_json::to_string(&entry).expect("serialize"));
             content.push('\n');
@@ -1660,6 +1673,8 @@ mod tests {
                 mount_point: None,
                 decision_id: None,
                 details: None,
+                schema_version: None,
+                run_id: None,
             },
             crate::logger::jsonl::LogEntry {
                 ts: "2026-02-16T00:00:02Z".to_string(),
@@ -1679,6 +1694,8 @@ mod tests {
                 mount_point: None,
                 decision_id: None,
                 details: None,
+                schema_version: None,
+                run_id: None,
             },
         ];
 
@@ -1720,6 +1737,8 @@ mod tests {
                 mount_point: Some("/".to_string()),
                 decision_id: None,
                 details: None,
+                schema_version: None,
+                run_id: None,
             },
             crate::logger::jsonl::LogEntry {
                 ts: "2026-02-16T00:00:02Z".to_string(),
@@ -1739,6 +1758,8 @@ mod tests {
                 mount_point: Some("/data".to_string()),
                 decision_id: None,
                 details: None,
+                schema_version: None,
+                run_id: None,
             },
         ];
 
@@ -1808,6 +1829,8 @@ mod tests {
             mount_point: None,
             decision_id: None,
             details: Some("started".to_string()),
+            schema_version: None,
+            run_id: None,
         };
 
         std::fs::write(
@@ -1851,6 +1874,8 @@ mod tests {
             mount_point: None,
             decision_id: None,
             details: Some("late file".to_string()),
+            schema_version: None,
+            run_id: None,
         };
         std::fs::write(
             &jsonl_path,
@@ -2105,6 +2130,8 @@ mod tests {
             mount_point: None,
             decision_id: None,
             details: Some("jsonl source".to_string()),
+            schema_version: None,
+            run_id: None,
         };
         std::fs::write(
             &jsonl_path,

@@ -695,6 +695,7 @@ mod tests {
             },
             policy_mode: "enforce".into(),
             memory_rss_bytes: 1024 * 1024,
+            ..DaemonState::default()
         }
     }
 

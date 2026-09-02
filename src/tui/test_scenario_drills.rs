@@ -64,6 +64,7 @@ fn yellow_state() -> DaemonState {
         },
         policy_mode: "enforce".into(),
         memory_rss_bytes: 48_000_000,
+        ..DaemonState::default()
     }
 }
 
@@ -103,6 +104,7 @@ fn red_state() -> DaemonState {
         },
         policy_mode: "enforce".into(),
         memory_rss_bytes: 72_000_000,
+        ..DaemonState::default()
     }
 }
 
@@ -142,6 +144,7 @@ fn recovery_state() -> DaemonState {
         },
         policy_mode: "enforce".into(),
         memory_rss_bytes: 40_000_000,
+        ..DaemonState::default()
     }
 }
 
@@ -181,6 +184,7 @@ fn depleted_state() -> DaemonState {
         },
         policy_mode: "enforce".into(),
         memory_rss_bytes: 80_000_000,
+        ..DaemonState::default()
     }
 }
 
@@ -228,6 +232,7 @@ fn multi_mount_state() -> DaemonState {
         },
         policy_mode: "enforce".into(),
         memory_rss_bytes: 52_000_000,
+        ..DaemonState::default()
     }
 }
 

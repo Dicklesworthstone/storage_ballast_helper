@@ -102,6 +102,7 @@ fn arb_daemon_state() -> impl Strategy<Value = DaemonState> {
         },
         policy_mode: "enforce".into(),
         memory_rss_bytes: 32_000_000,
+        ..DaemonState::default()
     })
 }
 
@@ -446,6 +447,7 @@ proptest! {
                     },
                     policy_mode: "enforce".into(),
         memory_rss_bytes: 0,
+                    ..DaemonState::default()
                 };
                 update::update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state))));
             } else {
@@ -1060,6 +1062,7 @@ fn degraded_state_toggles_with_data_updates() {
             },
             policy_mode: "enforce".into(),
             memory_rss_bytes: 0,
+            ..DaemonState::default()
         }))),
     );
     assert!(!model.degraded);
