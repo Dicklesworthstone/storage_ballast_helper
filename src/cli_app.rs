@@ -79,7 +79,7 @@ const LOCAL_SNAPSHOT_THIN_URGENCY: u8 = 4;
     author,
     version,
     about = "Storage Ballast Helper - Linux/macOS disk space guardian",
-    after_long_help = "Platform behavior:\n  sbh auto-detects Linux/systemd and macOS/launchd when service flags are omitted.\n  macOS runs use launchd, APFS-aware ballast checks, Time Machine snapshot warnings,\n  and Full Disk Access diagnostics where relevant.",
+    after_long_help = "Platform behavior:\n  sbh auto-detects Linux/systemd and macOS/launchd when service flags are omitted.\n  macOS runs use launchd, APFS-aware ballast checks, Time Machine snapshot warnings,\n  and Full Disk Access diagnostics where relevant.\n\nExit codes (C-EXIT):\n  0  ok (including `clean`/`emergency` with nothing to reclaim)\n  1  user error, or a pressure condition (`check` below threshold or --need unmet)\n  2  runtime or I/O failure\n  3  internal error\n  4  partial success (some deletions or setup steps failed)\nHuman reports go to stdout, diagnostics and warnings to stderr; --json reports carry exit_code.",
     long_about = None,
     arg_required_else_help = true,
     max_term_width = 100
@@ -945,6 +945,19 @@ pub enum CliError {
 
 impl CliError {
     /// Process exit code contract for the CLI.
+    /// The exit-code contract (C-EXIT), the single mapping every command
+    /// goes through:
+    ///
+    /// | code | meaning | examples |
+    /// |------|---------|----------|
+    /// | 0 | ok | `clean`/`emergency` with nothing to reclaim, `check` above threshold |
+    /// | 1 | user error or pressure condition | bad arguments, `check` below threshold or `--need` unmet, predicted full |
+    /// | 2 | runtime or I/O failure | cannot stat a path, config unreadable |
+    /// | 3 | internal error | invariant violation, JSON encoding failure |
+    /// | 4 | partial success | `clean`/`emergency` with failed deletions, `ballast`/`setup` with failed steps |
+    ///
+    /// Vetoes and skips are never an exit-code class; they appear in the
+    /// report. Human reports go to stdout, diagnostics to stderr.
     pub const fn exit_code(&self) -> i32 {
         match self {
             Self::User(_) => 1,
@@ -9656,6 +9669,15 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                 )?;
             }
         }
+        // C-EXIT: failed deletions are a partial success (4), reported after
+        // the summary so the operator sees what did and did not happen.
+        if report.items_failed > 0 {
+            return Err(CliError::Partial(format!(
+                "{} of {} deletion(s) failed",
+                report.items_failed,
+                report.items_failed + report.items_deleted
+            )));
+        }
     } else {
         // Interactive mode.
         run_interactive_clean(
@@ -10336,7 +10358,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
     {
         match output_mode(cli) {
             OutputMode::Human => {
-                eprintln!(
+                println!(
                     "sbh: {} has {} free but {} required. Run: sbh emergency {}",
                     capacity.mount_point.display(),
                     format_bytes(capacity.available_bytes),
@@ -10362,19 +10384,20 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     "volume_role": capacity.volume_role.as_deref(),
                     "free_excludes_purgeable": true,
                     "platform": capacity_platform_json(&capacity),
-                    "exit_code": 2,
+                    "exit_code": 1,
                 });
                 write_json_line(&payload)?;
             }
         }
-        return Err(CliError::Runtime("insufficient disk space".to_string()));
+        // C-EXIT: a pressure condition is exit 1, distinct from an I/O failure.
+        return Err(CliError::User("insufficient disk space".to_string()));
     }
 
     // Check 2: percentage threshold.
     if free_pct < threshold_pct {
         match output_mode(cli) {
             OutputMode::Human => {
-                eprintln!(
+                println!(
                     "sbh: {} has {} free ({:.1}%). Run: sbh emergency {}",
                     capacity.mount_point.display(),
                     format_bytes(capacity.available_bytes),
@@ -10400,12 +10423,13 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                     "volume_role": capacity.volume_role.as_deref(),
                     "free_excludes_purgeable": true,
                     "platform": capacity_platform_json(&capacity),
-                    "exit_code": 2,
+                    "exit_code": 1,
                 });
                 write_json_line(&payload)?;
             }
         }
-        return Err(CliError::Runtime("disk space below threshold".to_string()));
+        // C-EXIT: a pressure condition is exit 1, distinct from an I/O failure.
+        return Err(CliError::User("disk space below threshold".to_string()));
     }
 
     // Check 2.5: warn if state.json is stale (daemon may not be running).
@@ -10459,7 +10483,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                 if minutes_left < predict_minutes as f64 {
                     match output_mode(cli) {
                         OutputMode::Human => {
-                            eprintln!(
+                            println!(
                                 "sbh: {} has {} free but predicted full in {:.0} min (need {} min)",
                                 capacity.mount_point.display(),
                                 format_bytes(capacity.available_bytes),
@@ -10824,7 +10848,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     if plan.candidates.is_empty() {
         match output_mode(cli) {
             OutputMode::Human => {
-                eprintln!(
+                println!(
                     "Emergency scan: scanned {} directories in {:.1}s — no cleanup candidates found.",
                     dir_count,
                     scan_elapsed.as_secs_f64(),
@@ -10852,13 +10876,15 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 write_json_line(&payload)?;
             }
         }
-        return Err(CliError::User("no cleanup candidates found".to_string()));
+        // C-EXIT: nothing to reclaim is a successful outcome, as for `clean`.
+        return Ok(());
     }
 
-    // Display candidates.
+    // Display candidates: the report goes to stdout, the mode banner and
+    // its caveats to stderr.
     if output_mode(cli) == OutputMode::Human {
         eprintln!("EMERGENCY MODE — zero-write recovery");
-        eprintln!(
+        println!(
             "Scanned {} directories in {:.1}s\n",
             dir_count,
             scan_elapsed.as_secs_f64(),
@@ -10869,14 +10895,14 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         eprintln!(
             "Emergency escalation: Review-classified candidates are eligible for deletion (clean would hold them for manual review).\n"
         );
-        eprintln!("Candidates for deletion:\n");
+        println!("Candidates for deletion:\n");
         print_deletion_plan(&plan);
-        eprintln!(
+        println!(
             "\nTotal: {} items, {}",
             plan.estimated_items,
             format_bytes(plan.total_reclaimable_bytes),
         );
-        eprintln!();
+        println!();
     }
 
     // Execute based on flags.
@@ -10911,6 +10937,14 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             OutputMode::Json => {
                 emit_clean_report_json(&plan, &report, dir_count, scan_elapsed, 0, "emergency")?;
             }
+        }
+        // C-EXIT: failed deletions are a partial success (4).
+        if report.items_failed > 0 {
+            return Err(CliError::Partial(format!(
+                "{} of {} deletion(s) failed",
+                report.items_failed,
+                report.items_failed + report.items_deleted
+            )));
         }
     } else {
         // Interactive emergency cleanup.
@@ -13296,6 +13330,31 @@ mod tests {
 
         assert!(Cli::try_parse_from(["sbh", "install", "--scope", "user", "--user"]).is_err());
         assert!(Cli::try_parse_from(["sbh", "install", "--systemd", "--launchd"]).is_err());
+    }
+
+    /// C-EXIT: the single mapping every command's error goes through.
+    #[test]
+    fn exit_code_contract_maps_every_error_class() {
+        assert_eq!(CliError::User("x".into()).exit_code(), 1);
+        assert_eq!(CliError::Runtime("x".into()).exit_code(), 2);
+        assert_eq!(
+            CliError::Io(std::io::Error::other("x")).exit_code(),
+            2,
+            "I/O failures share the runtime class"
+        );
+        assert_eq!(CliError::Internal("x".into()).exit_code(), 3);
+        assert_eq!(CliError::Partial("x".into()).exit_code(), 4);
+        let help = Cli::command().render_long_help().to_string();
+        for line in [
+            "Exit codes (C-EXIT):",
+            "0  ok",
+            "1  user error, or a pressure condition",
+            "2  runtime or I/O failure",
+            "3  internal error",
+            "4  partial success",
+        ] {
+            assert!(help.contains(line), "help epilog lacks {line:?}");
+        }
     }
 
     #[test]
