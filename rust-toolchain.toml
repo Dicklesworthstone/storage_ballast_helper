@@ -1,3 +1,6 @@
 [toolchain]
-channel = "nightly"
+# Pinned by date so lint drift is a deliberate bump, not a surprise red gate.
+# Bump procedure: change the date, run `rch exec "cargo clippy --all-targets -- -D warnings"`,
+# fix new lints in the same commit (never blanket-allow), then update ci.yml's toolchain input.
+channel = "nightly-2026-08-31"
 components = ["rustfmt", "clippy"]
