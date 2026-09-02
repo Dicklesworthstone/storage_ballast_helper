@@ -2,11 +2,11 @@
 
 All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
-Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
+Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and the Release workflow refuses to publish a tag that has no marked heading here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
 ---
 
-## v0.5.1
+## v0.5.1 **[release]**
 
 ### Fixed — rch target dirs are reclaimed on idle time, not birth time (regression from v0.5.0)
 
@@ -94,6 +94,39 @@ canary host before fleet rollout.
   root can create the "unwritable" path, producing ~20 environmental failures
   that are not defects (see #19).
 
+## v0.4.40 **[release]**
+
+Tag: [`v0.4.40`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.40) | Compare: [`v0.4.39...v0.4.40`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.39...v0.4.40) | 2026-08-16
+
+### Fixed — interactive clean/emergency deletions use the full preflight veto stack
+
+- Adversarial review of the v0.4.39 emergency escalation found that the interactive `clean` and `emergency` paths (no `--yes`) removed accepted candidates through a bare `remove_dir_all`, bypassing the source-tree floor, active-lease, open-file, and marker vetoes the `--yes` batch path enforces. Both now go through the same preflight stack ([`0dde89a`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/0dde89ae3356570d5e08bd08057c362f784a7373)).
+
+## v0.4.39 **[release]**
+
+Tag: [`v0.4.39`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.39) | Compare: [`v0.4.38...v0.4.39`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.38...v0.4.39) | 2026-08-15
+
+### Added — process-scoped active-target leases
+
+- A live cargo/build target is neither marker-protected nor an open file, so it could be reclaimed mid-build. A build can now hold a process-scoped lease on its target that survives `exec`; leases are probed on canonical paths so symlink ancestors cannot fail open, and a watchdog keyed on the process group releases them when the process dies ([`8ed845b`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/8ed845b4daa24e8d75b8ee682cfb0e9151ff28f0), [`37111db`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/37111dba9bd2c38d1286f33b2fbfaf27d8d88e85), [`430b7dd`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/430b7dd4ef6552d7407a4f591d8ff30855324368), [`fd9298f`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/fd9298f2cac6d92888ddc430db6e54dbb129f6f1)).
+
+### Changed — emergency mode acts on `Review` candidates
+
+- `sbh emergency` only admitted `Delete` decisions, so a corpus that scored entirely as `Review` made the last line of defence a no-op on a full disk. Review candidates are now eligible in emergency mode, with every hard safety rail unchanged ([`1923bc8`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/1923bc898da3b9b0afe000dc7fac2f372b097f8b)).
+
+### Fixed — every skip is attributed
+
+- A run reporting 221 candidates, 221 skipped, and 0 bytes freed with no reason was indistinguishable from a malfunction. `clean` and `emergency` reports now attribute each skip (`skipped_by_reason`) and flag a stalled run, on the no-candidates path too ([`8e10858`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/8e10858b5ca794a489e255b22a95103fcb0539f5), [`b00ca43`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/b00ca43bac83b6f6779f5fc128ae1a878b83df6b), [`c47ce06`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/c47ce06289281da1957b22ec6b5882accf7a1789)).
+- Local builds use the parallel rustc front-end (`-Z threads=4`) ([`94fa77a`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/94fa77a85355b50f0092c899be6e02a91966a994)).
+
+## v0.4.38 **[release]**
+
+Tag: [`v0.4.38`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.38) | Compare: [`v0.4.37...v0.4.38`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.37...v0.4.38) | 2026-08-11
+
+### Performance — protected sacred verdicts are memoized across daemon passes
+
+- Re-proving sacred overlaps every pass recursively walked known-protected `/data/tmp` candidates and pegged a core. Only *protected* verdicts are cached (never "clean", which would fail open if a marker appeared later): TTL 600 s, capacity 4096, invalidated when the root's mtime changes ([`12fd99e`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/12fd99e355cb6aea3f874a399ca4a3a15843a870)).
+
 ## v0.4.37 **[release]**
 
 ### Fixed — sparse files are sized by allocated blocks (#17)
@@ -119,7 +152,43 @@ still available where the logical size is the meaningful quantity.
 
 ---
 
+## v0.4.36 **[release]**
+
+Tag: [`v0.4.36`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.36) | Compare: [`v0.4.35...v0.4.36`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.35...v0.4.36) | 2026-08-02
+
+### Performance — ancestor canonicalization is memoized
+
+- `resolve_absolute_path` called `canonicalize` once per path, one `readlink` per component, re-resolving the same ancestor chain for every descendant. Ancestors are now memoized, which ends the scanner's readlink storm on wide trees ([`74e52a9`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/74e52a95b32c2daae49ba4ab4b8bd3b9f4c4a991)).
+
+### Fixed — macOS zombie processes
+
+- `command_output_with_timeout` dropped a timed-out child before reaping it, leaking one zombie per timed-out command for the life of the process ([`3508685`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/35086853bc69b87250d2fcdf25c2b37abd7068be)).
+
+## v0.4.33 **[release]**
+
+Tag: [`v0.4.33`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.33) | Compare: [`v0.4.32...v0.4.33`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.32...v0.4.33) | 2026-07-02
+
+### Added — safe `/root` build-artifact backstop
+
+- A stale 241 GB `/root/cass-ft-target` filled a worker because `/root` is a hard system-path veto and the artifact-basename rule had no `*-target`/`*_target` suffix. A narrow, safety-gated backstop now reclaims regenerable build targets under `/root` ([`1389645`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/13896455a4c3c8ef7a29e6cd6240f32234325da0)).
+- `Cargo.lock` completed with ftui's transitive `fsqlite-*` dependencies so `--locked` source builds resolve ([`7298046`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/7298046e627d1cc4f07f23b0a663a173782df1c2)).
+
+## v0.4.32 **[release]**
+
+Tag: [`v0.4.32`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.32) | Compare: [`v0.4.30...v0.4.32`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.30...v0.4.32) | 2026-06-30. The v0.4.31 version bump below was never tagged; this release carries it.
+
+### Added — Go caches are reclaimable; scanner v2 is the default engine
+
+- `GOCACHE`/`GOMODCACHE` trees (tens of GB under arbitrary names; module dirs ship a `go.mod` and are mode `0555`) are now recognized, pass the source-code veto, and can be removed. The v2 scanner engine is the default ([`7e50e27`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/7e50e2787b077d1a2447a27b3818d8ee2559105c)).
+
+### Fixed
+
+- The daemon's multi-volume ballast coordinator ignored `[paths] ballast_dir` and always used `<mount>/.sbh/ballast` ([`0e8f703`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/0e8f703b42deb6b50ec6ed70091296f5dba6a08c)).
+- `ftui` is sourced from git instead of a local `/dp` path so `cargo install --git` works off the build host (#12) ([`0f534d8`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/0f534d8c9c4a20e90eb626b946e74a9bda0248b9)); the empty-pass no-progress fix landed via #13 ([`8591776`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/8591776757b425f24dcd03dfbb71f62c505527cd)).
+
 ## v0.4.31
+
+Never tagged; shipped in v0.4.32 above.
 
 ### Added — kernel writeback (dirty-page) tuning
 
@@ -171,7 +240,7 @@ assessment, `sysctl.d` rendering, conflict detection, and bandwidth estimation, 
 
 ---
 
-## v0.4.30
+## v0.4.30 **[release]**
 
 Compare: [`v0.4.29...v0.4.30`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.29...v0.4.30)
 
@@ -203,7 +272,7 @@ backing off rescans (consecutive=2, … ≥180s)`).
 
 ---
 
-## v0.4.29
+## v0.4.29 **[release]**
 
 Compare: [`v0.4.28...v0.4.29`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.28...v0.4.29)
 
@@ -241,7 +310,7 @@ tests pass.
 
 ---
 
-## v0.4.28
+## v0.4.28 **[release]**
 
 ### Added — `rch-cargo-home-*` cleanup matcher
 
@@ -261,7 +330,13 @@ change to deletion-scope floors.
 
 ---
 
-## v0.4.25
+## v0.4.27 **[release]**
+
+Tag: [`v0.4.27`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.27) | Compare: [`v0.4.26...v0.4.27`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.26...v0.4.27) | 2026-05-27
+
+- One commit over the unpublished v0.4.26 tag: the macOS active-reference mock paths are normalized so the platform test lane passes; no runtime change ([`53a7475`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/53a747501846319c24de314f97882fdc8a48d235)). For what v0.4.26 itself changed over v0.4.25, see the compare link.
+
+## v0.4.25 **[release]**
 
 Compare: [`v0.4.24...v0.4.25`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.24...v0.4.25)
 
@@ -347,6 +422,48 @@ Preflight wiring:
 
 This crate version is not yet built or deployed. The je fleet currently runs v0.4.24 with operator-patched `/etc/sbh/config.toml` (`root_paths = ["/tmp", "/data/tmp"]`). The config patch alone is sufficient to prevent the recurring scenario (walker never descends into `/data/projects`); v0.4.25 lets operators safely add `/data/projects` back to `root_paths` because the in-code defenses fire at deletion time — refusing source-shaped paths while permitting `target/` and friends.
 
+## v0.4.24 **[release]**
+
+Tag: [`v0.4.24`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.24) | Compare: [`v0.4.23...v0.4.24`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.23...v0.4.24) | 2026-05-17
+
+### Fixed — release artifacts are verified against their matrix target
+
+- v0.4.23 shipped the macOS aarch64 binary inside the Linux x86_64 tarball, so every Linux self-update failed with `Exec format error`. The release workflow now verifies each tarball's binary matches its matrix target before upload ([`b15e1e0`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/b15e1e0da3ac4cc8362f3e2af1a955bcd28a30ac)).
+
+### Changed — log truncation sees the measured free space
+
+- The v0.4.23 truncation hook mapped pressure levels to synthetic free percentages; it now receives the measured `free_pct` and opens files defensively ([`19d8814`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/19d88147ff7dc9e197c687718a74f01a6127fafb)); the non-UTF-8 filename test is gated to Linux ([`5854496`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/58544962980f0a6b9a8806c40f8c21399c8c2a32)).
+
+## v0.4.23
+
+Tag: [`v0.4.23`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.23) | Compare: [`v0.4.22...v0.4.23`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.22...v0.4.23) | 2026-05-14. A GitHub Release exists but carries no assets: the artifacts were mispackaged (see v0.4.24).
+
+### Added — truncate-in-place for active append-only logs
+
+- The 2026-05-13 fleet incident drove three hosts to 99% because the open-file veto refused to touch `~/.codex/log/codex-tui.log` while codex held it open (318 GB, 132 GB, and 81 GB). Active append-only logs are now truncated in place under pressure ([`508fe4c`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/508fe4ca36c5f2d1b84994cba886142d8b733fe5)); the macOS docs record the v0.4.22 release ([`13abf49`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/13abf49953f98863c3e64a738c09dcc7d89583f1)).
+
+## v0.4.22 **[release]**
+
+Tag: [`v0.4.22`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.22) | Compare: [`v0.4.21...v0.4.22`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.21...v0.4.22) | 2026-05-12
+
+- The release publisher and Homebrew tap updater download only `sbh-*` build artifacts, keeping the archive contract to the four build artifacts plus checksum sidecars. v0.4.21 had proven the gates and the signed, notarized builds but failed at publish ([`d8bfa92`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/d8bfa924a511ac02ad0644639ce8cf529d589144)).
+
+## v0.4.14 **[release]**
+
+Tag: [`v0.4.14`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.14) | Compare: [`v0.4.13...v0.4.14`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.13...v0.4.14) | 2026-05-12
+
+### Fixed — macOS cross builds
+
+- `libproc` generated its Darwin bindings with host-side cfg checks, so Linux cross builds for `aarch64-apple-darwin` failed before linking. Its process-list, pidpath, rusage, and region-path calls moved behind the existing `sbh_mach` platform crate ([`079553d`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/079553d2cf14b99877f046ec1cd0836469978983)).
+
+## v0.4.8 **[release]**
+
+Tag: [`v0.4.8`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.8) | Compare: [`v0.4.7...v0.4.8`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.7...v0.4.8) | 2026-05-11
+
+### Changed — macOS release trust verification
+
+- The release workflow's raw `spctl` gate is replaced by validation of Apple's accepted notary log; the Unix installer and the self-update verifier require `codesign` structural validity plus the expected Developer ID Application authority and TeamIdentifier ([`081d3e7`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/081d3e7024f046ca6e67a62f614f637cae13608e), [`52b4c3d`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/52b4c3d31399a08d8f671444e746e2f98a99ed4a)).
+
 ## Unreleased
 
 Compare: [`v0.4.6...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.6...HEAD)
@@ -371,7 +488,7 @@ Compare: [`v0.4.6...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_
 
 ---
 
-## [v0.4.6] -- 2026-05-02
+## [v0.4.6] -- 2026-05-02 **[release]**
 
 Tag: [`v0.4.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.6) | Compare: [`v0.4.5...v0.4.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.5...v0.4.6)
 
@@ -387,7 +504,7 @@ Fresh-eyes review of the v0.4.5 incident-fix commit caught two bugs:
 
 ---
 
-## [v0.4.5] -- 2026-04-30
+## [v0.4.5] -- 2026-04-30 **[release]**
 
 Tag: [`v0.4.5`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.5) | Compare: [`v0.4.4...v0.4.5`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.4...v0.4.5)
 
@@ -412,6 +529,50 @@ Three independent bugs combined to let `ts1` (a 1.9 TB build host) silently hit 
 
 - Two new dampener tests: `repeat_dampening_high_urgency_bypasses_at_yellow` (regression) and `repeat_dampening_low_urgency_at_yellow_still_dampens` (sanity).
 - New `deletion_report_tracks_not_writable_paths` test verifies the new bucket on Unix hosts (uses `chmod 555` on a tempdir parent).
+
+---
+
+## [v0.4.4] -- 2026-04-18 **[release]**
+
+Tag: [`v0.4.4`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.4) | Compare: [`v0.4.3...v0.4.4`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.3...v0.4.4)
+
+### Installer
+
+- systemd's ignore-error prefix (`ExecStart=-/usr/local/bin/sbh`) is parsed to the binary path, and the user-scope error path reports correctly ([`7225f38`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/7225f38e3fdcdc70cd3ecb3b695f72c7df1073a8)).
+- After a `--user` install, a system unit whose `ExecStart` points at a different binary is detected and synced, since most fleet machines run the system unit at `/usr/local/bin/sbh`; adds a rustfmt pre-commit hook ([`9a446b9`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/9a446b90e512c002b69b98184ce82a7e0837326b)).
+
+---
+
+## [v0.4.3] -- 2026-04-16 **[release]**
+
+Tag: [`v0.4.3`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.3) | Compare: [`v0.4.2...v0.4.3`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.2...v0.4.3)
+
+### Scanner
+
+- Structural rescue uses graduated confidence: 0.75 with three or more cargo markers (`.fingerprint`, `deps`, `incremental`, `build`) versus 0.55 for fewer, and `.rch-target-` is a recognized pattern ([`6323bd8`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/6323bd8deb709bf719b2c1909a1832d861c636ae)).
+- `cmd_result_to_artifact` is gated behind the `tui` feature ([`0e3506b`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/0e3506b0ce0743173bd431501398ab0496d4027f)); the alternate `target-local/` cargo target directory is ignored ([`a99cfd6`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/a99cfd61720fc0ad5d8b6db7e29b3fc8c08f5ddb)).
+
+---
+
+## [v0.4.2] -- 2026-04-07 **[release]**
+
+Tag: [`v0.4.2`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.4.2) | Compare: [`v0.4.1...v0.4.2`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.4.1...v0.4.2)
+
+First published release after the v0.3.x series; v0.4.0 and v0.4.1 were tagged only.
+
+- `x86_64-apple-darwin` builds on `macos-13` (Intel), since `macos-latest` became ARM64; `fail-fast: false` so one target's failure no longer cancels the others ([`e50bac0`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/e50bac0324840e9bf38d49cfc6ea46a563617d23)).
+
+---
+
+## [v0.3.17] -- 2026-04-01 **[release]**
+
+Tag: [`v0.3.17`](https://github.com/Dicklesworthstone/storage_ballast_helper/releases/tag/v0.3.17) | Compare: [`v0.3.16...v0.3.17`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.3.16...v0.3.17)
+
+### Installer
+
+- The installer hardcoded `.tar.xz`, but v0.2.8+ shipped raw binaries. It now probes the GitHub API for the actual asset format, handles both, and falls back to `cargo install` when no artifacts exist (closes #8) ([`9a5782a`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/9a5782adeb50cbe268863e6076e92dd753f6db07)).
+- The `SHA256SUMS.txt` lookup matches the asset name as an exact field so `sbh-linux-x86_64` cannot match `sbh-linux-x86_64-musl` ([`0367ca3`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/0367ca3a89d20b75e9995ecd8afa755aee8135fc)).
+- The nightly toolchain is unpinned to rolling latest for this verification release ([`2e7d05c`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/2e7d05c10da781baccc8b088862abcdff4683743)).
 
 ---
 
@@ -590,7 +751,7 @@ Massive release adding the interactive TUI dashboard, extensive hardening from d
 ### TUI Dashboard
 
 - **Full interactive TUI** with 7 screens: Overview cockpit, Timeline, Explainability, Scan Candidates, Ballast Operations, LogSearch, and Diagnostics ([`429c1a3`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/429c1a3de91a45015602ee997c18f2ee90c1ceee), [`dd8a8c1`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/dd8a8c1d57a3529723b89c5cb7f8e8628a5257e1), [`40a219d`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/40a219d6876e41d2e6885772a2193caaa1cc7dca), [`f1b7dfc`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/f1b7dfc3b38bc3aec561476d7df0c29456ad914d), [`054ed6a`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/054ed6ad5fd33faae94f7cb833c759f7b0198a7a))
-- TUI always compiled -- no feature flag needed ([`25388e8`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/25388e80cc4de24ec24ca43629695ff5bf123aaf))
+- TUI compiled unconditionally at the time; it has since become the optional `tui` cargo feature, off by default ([`25388e8`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/25388e80cc4de24ec24ca43629695ff5bf123aaf))
 - Migrated from crossterm to ftui with layout engine, theme system, and rich overview rendering ([`4cc1010`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/4cc1010e1fb7513c71f20bcfc295270bc4665c14))
 - Panic-safe terminal guard prevents TUI crashes from corrupting the terminal ([`c0d305a`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/c0d305adf6a52358f08418ae38dcd1a2b7c142dd))
 - Frame-based rendering pipeline ([`0d0b5d2`](https://github.com/Dicklesworthstone/storage_ballast_helper/commit/0d0b5d2c3ee2f147c6ab9f8068d42e9733c4b3f8))
@@ -774,12 +935,13 @@ Initial release of Storage Ballast Helper -- a cross-platform disk-pressure defe
 
 | Metric | Value |
 |--------|-------|
-| Total commits | 310 |
-| Tags | 6 (v0.1.0, v0.2.0, v0.2.1, v0.2.8, v0.3.15, v0.3.16) |
-| GitHub Releases (with assets) | 4 (v0.1.0, v0.2.0, v0.2.1, v0.2.8) |
-| Tags without GitHub Releases | 2 (v0.3.15, v0.3.16) |
+| Total commits | 904 (as of 2026-09-02) |
+| Tags | 51 (v0.1.0 through v0.5.1) |
+| GitHub Releases with assets | 28, each marked **[release]** above (`scripts/changelog_check.sh --all` audits this) |
+| GitHub Releases without assets | 1 (v0.4.23) |
+| Tags without GitHub Releases | 22 (v0.3.15, v0.3.16, v0.3.18, v0.3.19, v0.4.0, v0.4.1, v0.4.7, v0.4.9--v0.4.13, v0.4.15--v0.4.21, v0.4.26, v0.4.34, v0.4.35) |
 | Development period | 2026-02-14 to present |
-| Intermediate point releases (in-tree only) | v0.3.0 through v0.3.14 |
+| Intermediate point releases (in-tree only) | v0.3.0 through v0.3.14; v0.4.31 |
 | Skipped version numbers | v0.2.2--v0.2.7, v0.3.6, v0.3.9 |
 
 [v0.3.16]: https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.3.15...v0.3.16

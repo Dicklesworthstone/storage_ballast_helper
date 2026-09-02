@@ -2113,3 +2113,82 @@ fn e2e_install_script_probes_the_same_asset_names_as_the_rust_contract() {
         );
     }
 }
+
+/// `scripts/changelog_check.sh` gates a release on its CHANGELOG entry: a
+/// tag needs exactly one heading, carrying `**[release]**` iff the tag has
+/// release assets. The release workflow runs it with `--expect-release`.
+#[test]
+fn e2e_changelog_check_script_enforces_headings_and_release_markers() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = repo.join("scripts").join("changelog_check.sh");
+    let tmp = tempfile::tempdir().unwrap();
+    let changelog = tmp.path().join("CHANGELOG.md");
+    std::fs::write(
+        &changelog,
+        "# Changelog\n\n## v1.2.3 **[release]**\n\nreleased\n\n## [v1.2.2] -- 2026-01-01\n\ntagged only\n\n## v1.2.30 **[release]**\n\nprefix trap\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new("bash")
+            .arg(&script)
+            .arg("--changelog")
+            .arg(&changelog)
+            .args(args)
+            .output()
+            .expect("run changelog_check.sh");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+
+    // Positive paths: marker state matches the asset count, and the tag
+    // being published has its marked heading (v1.2.3 must not also match
+    // v1.2.30).
+    assert_eq!(run(&["--tag", "v1.2.3", "--assets", "5"]).0, Some(0));
+    assert_eq!(run(&["--tag", "v1.2.3", "--expect-release"]).0, Some(0));
+    assert_eq!(run(&["--tag", "v1.2.2", "--assets", "0"]).0, Some(0));
+
+    // Heading without the marker while the tag has assets.
+    let (code, stderr) = run(&["--tag", "v1.2.2", "--assets", "2"]);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("lacks the **[release]** marker"),
+        "{stderr}"
+    );
+    let (code, stderr) = run(&["--tag", "v1.2.2", "--expect-release"]);
+    assert_eq!(code, Some(1), "{stderr}");
+
+    // Marker without assets.
+    let (code, stderr) = run(&["--tag", "v1.2.3", "--assets", "0"]);
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("no release assets"), "{stderr}");
+
+    // No heading at all.
+    let (code, stderr) = run(&["--tag", "v9.9.9", "--expect-release"]);
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("has no heading"), "{stderr}");
+
+    // Usage errors are distinguishable from mismatches.
+    assert_eq!(run(&["--tag", "v1.2.3", "--assets", "many"]).0, Some(2));
+    assert_eq!(run(&[]).0, Some(2));
+
+    // The real changelog carries a marked heading for the crate version,
+    // which is what the release workflow will demand when it is tagged.
+    let output = std::process::Command::new("bash")
+        .arg(&script)
+        .args([
+            "--tag",
+            concat!("v", env!("CARGO_PKG_VERSION")),
+            "--expect-release",
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("run changelog_check.sh");
+    assert!(
+        output.status.success(),
+        "CHANGELOG.md lacks a marked heading for v{}: {}",
+        env!("CARGO_PKG_VERSION"),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

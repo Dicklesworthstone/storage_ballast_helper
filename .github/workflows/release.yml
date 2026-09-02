@@ -468,6 +468,9 @@ jobs:
           echo "  \"rustc_version\": \"$(rustc --version)\"" >> release-provenance.json
           echo "}" >> release-provenance.json
 
+      - name: Check CHANGELOG entry for this tag
+        run: scripts/changelog_check.sh --tag "${GITHUB_REF_NAME}" --expect-release
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3.0.0
         with:
