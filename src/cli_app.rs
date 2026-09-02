@@ -2383,23 +2383,16 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
     }
 
     // -- systemd install --------------------------------------------------
-    let mut systemd_config =
-        storage_ballast_helper::daemon::service::SystemdConfig::from_env(service.user_scope)
-            .map_err(|e| CliError::Runtime(e.to_string()))?;
+    // The sandbox (`ProtectSystem=strict` + `ReadWritePaths=`) is derived from
+    // the config the service will run with: scan roots, special locations,
+    // every ballast dir, and the daemon's own data/config/log directories.
+    let mut systemd_config = storage_ballast_helper::daemon::service::SystemdConfig::from_config(
+        &config,
+        service.user_scope,
+    )
+    .map_err(|e| CliError::Runtime(e.to_string()))?;
     if let Some(binary_path) = installed_binary_path {
         systemd_config.binary_path = binary_path;
-    }
-
-    // Add configured paths to ReadWritePaths to satisfy ProtectSystem=strict
-    for path in &config.scanner.root_paths {
-        systemd_config.read_write_paths.push(path.clone());
-    }
-    systemd_config
-        .read_write_paths
-        .push(config.paths.ballast_dir.clone());
-    // Also allow writing to the log/state directory if it's custom
-    if let Some(parent) = config.paths.sqlite_db.parent() {
-        systemd_config.read_write_paths.push(parent.to_path_buf());
     }
 
     let mgr = SystemdServiceManager::new(systemd_config);
@@ -4799,6 +4792,11 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
             std::fs::rename(&tmp_path, &config_path)
                 .map_err(|e| CliError::Runtime(format!("rename config: {e}")))?;
 
+            // A changed root/ballast/data path must also be writable inside
+            // the systemd sandbox, or the daemon will report every deletion
+            // as "parent directory not writable".
+            let unit_update = sync_systemd_sandbox_after_config_change(cli, &config_path);
+
             match output_mode(cli) {
                 OutputMode::Human => {
                     println!(
@@ -4807,6 +4805,9 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
                         set_args.value,
                         config_path.display()
                     );
+                    if let Some(note) = &unit_update {
+                        println!("  {note}");
+                    }
                 }
                 OutputMode::Json => {
                     let payload = json!({
@@ -4815,6 +4816,7 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
                         "value": set_args.value,
                         "path": config_path.to_string_lossy(),
                         "valid": true,
+                        "systemd_unit": unit_update,
                     });
                     write_json_line(&payload)?;
                 }
@@ -4822,6 +4824,67 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
             Ok(())
         }
     }
+}
+
+/// After a config write, keep the systemd unit's `ReadWritePaths=` in step
+/// with the paths the daemon now needs. Rewrites the unit (and
+/// `daemon-reload`s) when this process may write it; otherwise returns the
+/// hint to run bootstrap. `None` when there is no unit or nothing is missing.
+fn sync_systemd_sandbox_after_config_change(cli: &Cli, config_path: &Path) -> Option<String> {
+    use storage_ballast_helper::daemon::service::SystemdConfig;
+
+    let config = Config::load(Some(config_path)).ok()?;
+    let mut notes = Vec::new();
+    for user_scope in [false, true] {
+        let Ok(systemd) = SystemdConfig::from_env(user_scope) else {
+            continue;
+        };
+        let unit_path = systemd.unit_path();
+        let Ok(contents) = std::fs::read_to_string(&unit_path) else {
+            continue;
+        };
+        let required = SystemdConfig::read_write_paths_for(&config, user_scope);
+        let missing = SystemdConfig::missing_read_write_paths(&contents, &required);
+        if missing.is_empty() {
+            continue;
+        }
+        let listed = missing
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let can_write = user_scope || running_as_root();
+        let patched = can_write
+            .then(|| SystemdConfig::patch_read_write_paths(&contents, &required))
+            .flatten()
+            .and_then(|updated| std::fs::write(&unit_path, updated).ok());
+        if patched.is_some() {
+            let scope_flag: &[&str] = if user_scope { &["--user"] } else { &[] };
+            let reloaded = std::process::Command::new("systemctl")
+                .args(scope_flag)
+                .arg("daemon-reload")
+                .status()
+                .is_ok_and(|status| status.success());
+            notes.push(format!(
+                "systemd unit {} now grants ReadWritePaths for {listed}{}",
+                unit_path.display(),
+                if reloaded {
+                    " (daemon-reload done; restart the service to apply)"
+                } else {
+                    " (run `systemctl daemon-reload` and restart the service)"
+                }
+            ));
+        } else {
+            notes.push(format!(
+                "systemd unit {} does not grant ReadWritePaths for {listed}; run `sudo sbh bootstrap` to update it",
+                unit_path.display()
+            ));
+        }
+        if cli.verbose {
+            eprintln!("[SBH-CONFIG] {}", notes.last().map_or("", String::as_str));
+        }
+    }
+    (!notes.is_empty()).then(|| notes.join("; "))
 }
 
 /// Set a value in a TOML table using a dot-separated path.

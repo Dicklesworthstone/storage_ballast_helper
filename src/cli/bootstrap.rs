@@ -34,6 +34,9 @@ pub enum MigrationReason {
     DuplicatePathEntries,
     /// Systemd unit file references a binary path that does not exist.
     SystemdUnitStaleBinary,
+    /// Systemd unit's `ReadWritePaths=` sandbox does not cover the scan
+    /// roots, ballast or data directories the current config needs.
+    SystemdUnitStalePaths,
     /// Launchd plist references a binary path that does not exist.
     LaunchdPlistStaleBinary,
     /// Config file uses a deprecated key or schema version.
@@ -65,6 +68,7 @@ impl fmt::Display for MigrationReason {
             Self::StalePathEntry => "stale-path-entry",
             Self::DuplicatePathEntries => "duplicate-path-entries",
             Self::SystemdUnitStaleBinary => "systemd-unit-stale-binary",
+            Self::SystemdUnitStalePaths => "systemd-unit-stale-paths",
             Self::LaunchdPlistStaleBinary => "launchd-plist-stale-binary",
             Self::DeprecatedConfigKey => "deprecated-config-key",
             Self::LegacyConfigPath => "legacy-config-path",
@@ -975,6 +979,26 @@ fn check_systemd_health(path: &Path) -> (bool, Option<MigrationReason>, Option<S
                     }
                 }
             }
+            // The sandbox must cover what the daemon deletes and writes.
+            if let Some(required) = required_read_write_paths_for_unit(path) {
+                let missing = crate::daemon::service::SystemdConfig::missing_read_write_paths(
+                    &contents, &required,
+                );
+                if !missing.is_empty() {
+                    return (
+                        false,
+                        Some(MigrationReason::SystemdUnitStalePaths),
+                        Some(format!(
+                            "ReadWritePaths= does not grant {} (the daemon cannot delete or write there under ProtectSystem=strict)",
+                            missing
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )),
+                    );
+                }
+            }
             (true, None, None)
         }
         Err(e) => (
@@ -983,6 +1007,22 @@ fn check_systemd_health(path: &Path) -> (bool, Option<MigrationReason>, Option<S
             Some(format!("cannot read unit file: {e}")),
         ),
     }
+}
+
+/// Whether a unit file path belongs to the system scope (`/etc/systemd`).
+fn unit_is_system_scope(unit_path: &Path) -> bool {
+    unit_path.starts_with("/etc/systemd")
+}
+
+/// The `ReadWritePaths=` set the unit at `unit_path` needs, derived from the
+/// config its scope loads. `None` when that config cannot be loaded (the
+/// unit is then judged on its binary only).
+fn required_read_write_paths_for_unit(unit_path: &Path) -> Option<Vec<PathBuf>> {
+    let user_scope = !unit_is_system_scope(unit_path);
+    let config = crate::core::config::Config::load_for_service_scope(None, user_scope).ok()?;
+    Some(crate::daemon::service::SystemdConfig::read_write_paths_for(
+        &config, user_scope,
+    ))
 }
 
 fn check_launchd_health(path: &Path) -> (bool, Option<MigrationReason>, Option<String>) {
@@ -1227,6 +1267,20 @@ fn plan_actions(footprints: &[Footprint], opts: &MigrateOptions) -> Vec<Migratio
                     });
                 }
             }
+            (FootprintKind::SystemdUnit, Some(MigrationReason::SystemdUnitStalePaths)) => {
+                actions.push(MigrationAction {
+                    kind: ActionKind::UpdateServicePath,
+                    reason: MigrationReason::SystemdUnitStalePaths,
+                    target: fp.path.clone(),
+                    description: format!(
+                        "update ReadWritePaths in {} to the configured scan roots, ballast and data directories",
+                        fp.path.display()
+                    ),
+                    applied: false,
+                    backup_path: None,
+                    error: None,
+                });
+            }
             (FootprintKind::LaunchdPlist, Some(MigrationReason::LaunchdPlistStaleBinary)) => {
                 if let Some(current_exe) = current_binary_path() {
                     actions.push(MigrationAction {
@@ -1452,10 +1506,51 @@ fn apply_fix_permissions(
     Ok(())
 }
 
+/// Rewrite a systemd unit's `ReadWritePaths=` line to the derived set and
+/// ask systemd to reload (best effort: the reload needs the right privileges).
+fn apply_update_read_write_paths(
+    action: &mut MigrationAction,
+    backup_dir: Option<&Path>,
+) -> std::io::Result<()> {
+    let Some(required) = required_read_write_paths_for_unit(&action.target) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cannot load the config this unit runs with",
+        ));
+    };
+    let contents = fs::read_to_string(&action.target)?;
+    let Some(updated) =
+        crate::daemon::service::SystemdConfig::patch_read_write_paths(&contents, &required)
+    else {
+        return Ok(());
+    };
+    let backup = create_backup(&action.target, backup_dir)?;
+    action.backup_path = Some(backup);
+    fs::write(&action.target, updated)?;
+
+    let mut reload = std::process::Command::new("systemctl");
+    if !unit_is_system_scope(&action.target) {
+        reload.arg("--user");
+    }
+    let reloaded = reload
+        .arg("daemon-reload")
+        .status()
+        .is_ok_and(|status| status.success());
+    if !reloaded {
+        action
+            .description
+            .push_str(" (run `systemctl daemon-reload` and restart sbh)");
+    }
+    Ok(())
+}
+
 fn apply_update_service_path(
     action: &mut MigrationAction,
     backup_dir: Option<&Path>,
 ) -> std::io::Result<()> {
+    if action.reason == MigrationReason::SystemdUnitStalePaths {
+        return apply_update_read_write_paths(action, backup_dir);
+    }
     let backup = create_backup(&action.target, backup_dir)?;
     action.backup_path = Some(backup);
 
@@ -2741,6 +2836,7 @@ mod tests {
             MigrationReason::StalePathEntry,
             MigrationReason::DuplicatePathEntries,
             MigrationReason::SystemdUnitStaleBinary,
+            MigrationReason::SystemdUnitStalePaths,
             MigrationReason::LaunchdPlistStaleBinary,
             MigrationReason::DeprecatedConfigKey,
             MigrationReason::LegacyConfigPath,
@@ -2759,7 +2855,7 @@ mod tests {
             assert!(!s.is_empty(), "display should not be empty");
             assert!(seen.insert(s.clone()), "duplicate display: {s}");
         }
-        assert_eq!(seen.len(), 15, "should cover all 15 reason codes");
+        assert_eq!(seen.len(), 16, "should cover all 16 reason codes");
     }
 
     #[test]

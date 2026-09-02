@@ -317,7 +317,7 @@ src/
 | File | Lines | Purpose |
 |------|-------|---------|
 | `src/cli_app.rs` | ~4800 | CLI definition (clap derive) and all command handlers |
-| `src/cli/bootstrap.rs` | ~2700 | Bootstrap migration with 15 migration reason types |
+| `src/cli/bootstrap.rs` | ~2800 | Bootstrap migration with 16 migration reason types |
 | `src/cli/assets.rs` | ~1240 | Asset manifest pipeline with SHA-256 verification |
 | `src/daemon/loop_main.rs` | ~1170 | Main daemon monitoring loop |
 | `src/scanner/merkle.rs` | ~1080 | Incremental Merkle scan index with full-scan fallback |

@@ -3,7 +3,7 @@
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::core::errors::{Result, SbhError};
@@ -52,6 +52,158 @@ impl SystemdConfig {
     pub fn unit_path(&self) -> PathBuf {
         self.unit_dir().join(SYSTEMD_UNIT_NAME)
     }
+
+    /// Build a config whose `ReadWritePaths=` sandbox is derived from the
+    /// sbh config the service will run with (see [`Self::read_write_paths_for`]).
+    pub fn from_config(config: &crate::core::config::Config, user_scope: bool) -> Result<Self> {
+        let mut systemd = Self::from_env(user_scope)?;
+        systemd.read_write_paths = Self::read_write_paths_for(config, user_scope);
+        Ok(systemd)
+    }
+
+    /// Every path the daemon must be able to write under `ProtectSystem=strict`:
+    /// the scan roots it deletes under, the special locations it cleans,
+    /// every ballast directory (configured, per-volume overrides'
+    /// `<mount>/.sbh`), its own data/config/log/cache directories, plus the
+    /// scope defaults. `/proc` and `/sys` are never included (kernel tuning
+    /// is applied by `sbh tune`, never by the daemon). Deduplicated and
+    /// sorted so a re-render is byte-stable.
+    #[must_use]
+    pub fn read_write_paths_for(
+        config: &crate::core::config::Config,
+        user_scope: bool,
+    ) -> Vec<PathBuf> {
+        let mut paths = default_read_write_paths(user_scope);
+        // Special locations the daemon reclaims from.
+        paths.push(PathBuf::from("/dev/shm"));
+        paths.extend(config.scanner.root_paths.iter().cloned());
+        paths.push(config.paths.ballast_dir.clone());
+        for (mount, volume) in &config.ballast.overrides {
+            if volume.enabled {
+                paths.push(Path::new(mount).join(".sbh"));
+            }
+        }
+        for file in [
+            &config.paths.config_file,
+            &config.paths.state_file,
+            &config.paths.sqlite_db,
+            &config.paths.jsonl_log,
+            &config.update.metadata_cache_file,
+            &config.notifications.file.path,
+        ] {
+            if let Some(parent) = file.parent() {
+                paths.push(parent.to_path_buf());
+            }
+        }
+        let mut paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| path.is_absolute())
+            .filter(|path| !path.starts_with("/proc") && !path.starts_with("/sys"))
+            .filter(|path| path != Path::new("/"))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// `ReadWritePaths=` value for `paths`, with systemd quoting for paths
+    /// that contain spaces or quotes.
+    #[must_use]
+    pub fn render_read_write_paths(paths: &[PathBuf]) -> String {
+        paths
+            .iter()
+            .map(|p| {
+                let s = p.display().to_string();
+                if s.contains(' ') || s.contains('"') {
+                    // Systemd quote escaping: escape internal quotes and wrap in quotes.
+                    format!("\"{}\"", s.replace('"', "\\\""))
+                } else {
+                    s
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Parse the value of a `ReadWritePaths=` line (the inverse of
+    /// [`Self::render_read_write_paths`]).
+    #[must_use]
+    pub fn parse_read_write_paths(value: &str) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let mut chars = value.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if in_quotes => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                '"' => in_quotes = !in_quotes,
+                ' ' if !in_quotes => {
+                    if !current.is_empty() {
+                        paths.push(PathBuf::from(std::mem::take(&mut current)));
+                    }
+                }
+                _ => current.push(c),
+            }
+        }
+        if !current.is_empty() {
+            paths.push(PathBuf::from(current));
+        }
+        paths
+    }
+
+    /// Paths in `required` that a unit file's `ReadWritePaths=` line does not
+    /// grant (a unit without `ProtectSystem=strict` needs none).
+    #[must_use]
+    pub fn missing_read_write_paths(unit_contents: &str, required: &[PathBuf]) -> Vec<PathBuf> {
+        let strict = unit_contents
+            .lines()
+            .any(|line| line.trim() == "ProtectSystem=strict");
+        if !strict {
+            return Vec::new();
+        }
+        let granted: Vec<PathBuf> = unit_contents
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("ReadWritePaths="))
+            .flat_map(Self::parse_read_write_paths)
+            .collect();
+        required
+            .iter()
+            .filter(|path| !granted.iter().any(|g| path.starts_with(g)))
+            .cloned()
+            .collect()
+    }
+
+    /// Rewrite the `ReadWritePaths=` line of an existing unit file to
+    /// `paths` (added after `ProtectSystem=strict` when absent). Returns the
+    /// new contents, or `None` when nothing changed.
+    #[must_use]
+    pub fn patch_read_write_paths(unit_contents: &str, paths: &[PathBuf]) -> Option<String> {
+        let rendered = format!("ReadWritePaths={}", Self::render_read_write_paths(paths));
+        let mut replaced = false;
+        let mut lines: Vec<String> = unit_contents
+            .lines()
+            .map(|line| {
+                if line.trim().starts_with("ReadWritePaths=") {
+                    replaced = true;
+                    rendered.clone()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect();
+        if !replaced {
+            let index = lines
+                .iter()
+                .position(|line| line.trim() == "ProtectSystem=strict")?;
+            lines.insert(index + 1, rendered);
+        }
+        let updated = lines.join("\n") + "\n";
+        (updated != unit_contents).then_some(updated)
+    }
 }
 
 /// [`ServiceManager`] implementation that drives `systemctl` and generates
@@ -83,21 +235,7 @@ impl SystemdServiceManager {
     #[must_use]
     pub fn generate_unit_file(&self) -> String {
         let binary = self.config.binary_path.display();
-        let rw_paths = self
-            .config
-            .read_write_paths
-            .iter()
-            .map(|p| {
-                let s = p.display().to_string();
-                if s.contains(' ') || s.contains('"') {
-                    // Systemd quote escaping: escape internal quotes and wrap in quotes.
-                    format!("\"{}\"", s.replace('"', "\\\""))
-                } else {
-                    s
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+        let rw_paths = SystemdConfig::render_read_write_paths(&self.config.read_write_paths);
 
         let mut unit = String::with_capacity(2048);
 
@@ -481,6 +619,138 @@ fn default_read_write_paths(user_scope: bool) -> Vec<PathBuf> {
         paths.push(home.join(".config/sbh"));
     }
     paths
+}
+
+#[cfg(test)]
+mod read_write_paths_tests {
+    use super::*;
+    use crate::core::config::{BallastVolumeOverride, Config};
+
+    fn sample_config() -> Config {
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![
+            PathBuf::from("/data/projects"),
+            PathBuf::from("/srv/builds with space"),
+        ];
+        config.paths.ballast_dir = PathBuf::from("/var/lib/sbh/ballast");
+        config.paths.state_file = PathBuf::from("/var/lib/sbh/state.json");
+        config.paths.sqlite_db = PathBuf::from("/var/lib/sbh/activity.sqlite3");
+        config.paths.jsonl_log = PathBuf::from("/var/lib/sbh/activity.jsonl");
+        config.paths.config_file = PathBuf::from("/etc/sbh/config.toml");
+        config.notifications.file.path = PathBuf::from("/var/log/sbh/notifications.jsonl");
+        config.system_tuning.writeback_sysctl_path = PathBuf::from("/proc/sys/vm/dirty_bytes");
+        config.ballast.overrides.insert(
+            "/data".to_string(),
+            BallastVolumeOverride {
+                enabled: true,
+                ..BallastVolumeOverride::default()
+            },
+        );
+        config.ballast.overrides.insert(
+            "/mnt/disabled".to_string(),
+            BallastVolumeOverride {
+                enabled: false,
+                ..BallastVolumeOverride::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn derived_sandbox_covers_roots_ballast_data_and_never_proc() {
+        let paths = SystemdConfig::read_write_paths_for(&sample_config(), false);
+        for expected in [
+            "/data/projects",
+            "/srv/builds with space",
+            "/var/lib/sbh/ballast",
+            "/var/lib/sbh",
+            "/etc/sbh",
+            "/var/log/sbh",
+            "/data/.sbh",
+            "/dev/shm",
+            "/tmp",
+        ] {
+            assert!(
+                paths.contains(&PathBuf::from(expected)),
+                "{expected} missing from {paths:?}"
+            );
+        }
+        assert!(
+            !paths.contains(&PathBuf::from("/mnt/disabled/.sbh")),
+            "disabled override volumes get no ballast dir"
+        );
+        assert!(
+            paths
+                .iter()
+                .all(|p| !p.starts_with("/proc") && !p.starts_with("/sys")),
+            "kernel tunables are never writable for the daemon: {paths:?}"
+        );
+        let mut sorted = paths.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(paths, sorted, "stable, deduplicated order");
+    }
+
+    #[test]
+    fn read_write_paths_render_parse_and_patch_roundtrip() {
+        let paths = vec![
+            PathBuf::from("/data/projects"),
+            PathBuf::from("/srv/builds with space"),
+            PathBuf::from("/tmp"),
+        ];
+        let rendered = SystemdConfig::render_read_write_paths(&paths);
+        assert_eq!(rendered, "/data/projects \"/srv/builds with space\" /tmp");
+        assert_eq!(SystemdConfig::parse_read_write_paths(&rendered), paths);
+
+        let unit = "[Service]\nNoNewPrivileges=true\nProtectSystem=strict\nReadWritePaths=/tmp /var/lib/sbh\nProtectHome=false\n";
+        let required = vec![
+            PathBuf::from("/data/projects"),
+            PathBuf::from("/var/lib/sbh/ballast"),
+            PathBuf::from("/tmp"),
+        ];
+        assert_eq!(
+            SystemdConfig::missing_read_write_paths(unit, &required),
+            vec![PathBuf::from("/data/projects")],
+            "a granted parent covers its children; a new root is missing"
+        );
+        let patched = SystemdConfig::patch_read_write_paths(unit, &required).expect("changed");
+        assert!(patched.contains("ReadWritePaths=/data/projects /var/lib/sbh/ballast /tmp\n"));
+        assert!(
+            SystemdConfig::missing_read_write_paths(&patched, &required).is_empty(),
+            "after the patch nothing is missing"
+        );
+        assert!(
+            SystemdConfig::patch_read_write_paths(&patched, &required).is_none(),
+            "patching again is a no-op"
+        );
+
+        // A user-scope unit without ProtectSystem=strict needs no grants.
+        let lenient = "[Service]\nNoNewPrivileges=true\n";
+        assert_eq!(
+            SystemdConfig::missing_read_write_paths(lenient, &required),
+            Vec::<PathBuf>::new()
+        );
+        assert!(SystemdConfig::patch_read_write_paths(lenient, &required).is_none());
+    }
+
+    #[test]
+    fn generated_unit_uses_the_derived_sandbox() {
+        let config = sample_config();
+        let systemd = SystemdConfig {
+            user_scope: false,
+            binary_path: PathBuf::from("/usr/local/bin/sbh"),
+            read_write_paths: SystemdConfig::read_write_paths_for(&config, false),
+        };
+        let unit = SystemdServiceManager::new(systemd).generate_unit_file();
+        let line = unit
+            .lines()
+            .find(|line| line.starts_with("ReadWritePaths="))
+            .expect("unit has ReadWritePaths");
+        assert!(line.contains("/data/projects"));
+        assert!(line.contains("\"/srv/builds with space\""));
+        assert!(!line.contains("/proc/sys"));
+        assert!(unit.contains("ProtectSystem=strict\n"));
+    }
 }
 
 #[cfg(test)]

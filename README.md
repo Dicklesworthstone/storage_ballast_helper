@@ -230,7 +230,7 @@ The bootstrap system detects and repairs common installation problems, from stal
 
 ### Migration Reasons
 
-The bootstrap scanner checks for 15 migration conditions:
+The bootstrap scanner checks for 16 migration conditions:
 
 | Reason | Description |
 | --- | --- |
@@ -238,6 +238,7 @@ The bootstrap scanner checks for 15 migration conditions:
 | `stale-path-entry` | Shell profile references a binary location that no longer exists |
 | `duplicate-path-entries` | Multiple `sbh` PATH entries in the same shell profile |
 | `systemd-unit-stale-binary` | systemd `ExecStart` points to a missing binary |
+| `systemd-unit-stale-paths` | systemd `ReadWritePaths=` does not cover the configured scan roots, ballast or data directories (the daemon could not delete or write there under `ProtectSystem=strict`); repaired by rewriting the line and `daemon-reload` |
 | `launchd-plist-stale-binary` | launchd `ProgramArguments` references a missing binary |
 | `deprecated-config-key` | Config uses renamed keys (`scan_interval_secs`, `max_ballast_mb`, `log_level`) |
 | `legacy-config-path` | Config exists in an older Linux/XDG, manual, or Homebrew path and should be copied to the canonical platform path |
