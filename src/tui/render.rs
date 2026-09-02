@@ -4762,18 +4762,10 @@ fn action_badge(action: &str, theme: &Theme) -> String {
     status_badge(label, palette, theme.accessibility)
 }
 
-/// Truncate a path string for display, keeping the tail end.
+/// Truncate a path string for display, keeping the tail end (shared,
+/// char-boundary-safe implementation in `core::paths`).
 fn truncate_path(path: &str, max_len: usize) -> &str {
-    if path.len() <= max_len {
-        path
-    } else {
-        // Clamp to a valid UTF-8 char boundary before slicing.
-        let start = path.ceil_char_boundary(path.len() - max_len);
-        // Find the next '/' boundary to avoid cutting mid-component.
-        path[start..]
-            .find('/')
-            .map_or(&path[start..], |idx| &path[start + idx..])
-    }
+    crate::core::paths::truncate_display_tail(path, max_len)
 }
 
 // ──────────────────── S4: Candidates ────────────────────

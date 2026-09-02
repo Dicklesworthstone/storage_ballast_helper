@@ -142,10 +142,18 @@ fn resolve_uncached(absolute: &Path) -> PathBuf {
     normalize_syntactic(absolute)
 }
 
+/// Resolve the longest existing ancestor with `canonicalize` and append the
+/// missing suffix verbatim (minus `.` components).
+///
+/// `..` is only ever applied by `canonicalize`, i.e. against directories
+/// that exist. A `..` inside the missing suffix is kept literally: collapsing
+/// it syntactically would let `/nonexistent_root/../etc/passwd` resolve to
+/// `/etc/passwd`, a path the operator never named. A literal `..` in the
+/// result is also visibly unnormalized, so containment checks
+/// (`starts_with(root)`) treat such paths as outside every root.
 fn resolve_existing_ancestor(path: &Path) -> Option<PathBuf> {
-    let normalized = normalize_syntactic(path);
     let mut missing_components = Vec::new();
-    let mut probe = normalized.as_path();
+    let mut probe = path;
 
     loop {
         if let Ok(canonical) = std::fs::canonicalize(probe) {
@@ -153,12 +161,153 @@ fn resolve_existing_ancestor(path: &Path) -> Option<PathBuf> {
             for component in missing_components.iter().rev() {
                 resolved.push(component);
             }
-            return Some(normalize_syntactic(&resolved));
+            return Some(resolved);
         }
 
-        missing_components.push(probe.file_name()?.to_os_string());
+        // `Path::file_name` is `None` for a trailing `..`; look at the last
+        // component directly so `..` is carried along literally.
+        match probe.components().next_back()? {
+            Component::Normal(name) => missing_components.push(name.to_os_string()),
+            Component::ParentDir => missing_components.push("..".into()),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
         probe = probe.parent()?;
     }
+}
+
+/// Why a strict resolution or a base-bounded normalization was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathResolveError {
+    /// A component that has to be traversed does not exist.
+    MissingComponent(PathBuf),
+    /// A `..` would be applied to a component that does not exist.
+    ParentOfMissing(PathBuf),
+    /// The path leaves `base` after lexical normalization.
+    EscapesBase {
+        /// The directory the path had to stay inside.
+        base: PathBuf,
+        /// The path as given.
+        path: PathBuf,
+    },
+    /// The filesystem refused to resolve the path (symlink loop, EACCES, ...).
+    Io(String),
+}
+
+impl std::fmt::Display for PathResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingComponent(path) => {
+                write!(f, "path component does not exist: {}", path.display())
+            }
+            Self::ParentOfMissing(path) => write!(
+                f,
+                "`..` cannot be resolved through a component that does not exist: {}",
+                path.display()
+            ),
+            Self::EscapesBase { base, path } => write!(
+                f,
+                "{} escapes its base directory {}",
+                path.display(),
+                base.display()
+            ),
+            Self::Io(details) => write!(f, "path resolution failed: {details}"),
+        }
+    }
+}
+
+impl std::error::Error for PathResolveError {}
+
+/// Strict resolution: a wrong answer is worse than no answer.
+///
+/// Every component that must be traversed exists, `..` is only applied by
+/// the filesystem, and only the final component may be absent. Use it for
+/// protection comparisons and targets that must be inside a known tree.
+pub fn resolve_absolute_path_strict(path: &Path) -> Result<PathBuf, PathResolveError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|e| PathResolveError::Io(e.to_string()))?
+            .join(path)
+    };
+    match std::fs::canonicalize(&absolute) {
+        Ok(canonical) => Ok(canonical),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // The leaf may be absent, its parent chain may not.
+            let parent = absolute
+                .parent()
+                .ok_or_else(|| PathResolveError::MissingComponent(absolute.clone()))?;
+            match absolute.components().next_back() {
+                Some(Component::Normal(name)) => match std::fs::canonicalize(parent) {
+                    Ok(canonical_parent) => Ok(canonical_parent.join(name)),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        Err(PathResolveError::MissingComponent(parent.to_path_buf()))
+                    }
+                    Err(err) => Err(PathResolveError::Io(err.to_string())),
+                },
+                Some(Component::ParentDir | Component::CurDir) => {
+                    Err(PathResolveError::ParentOfMissing(absolute.clone()))
+                }
+                _ => Err(PathResolveError::MissingComponent(absolute.clone())),
+            }
+        }
+        Err(err) => Err(PathResolveError::Io(err.to_string())),
+    }
+}
+
+/// Normalize `path` lexically and require that it stays inside `base`.
+///
+/// No filesystem access: `.` is dropped, `..` pops the previous component
+/// but never past `base`. For targets that may not exist yet (a ballast
+/// dir, a lease target) where the only invariant is "under this tree".
+pub fn normalize_lexically_within(base: &Path, path: &Path) -> Result<PathBuf, PathResolveError> {
+    let base_components: Vec<Component<'_>> = base.components().collect();
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let mut components: Vec<Component<'_>> = Vec::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if components.len() <= base_components.len()
+                    || !matches!(components.last(), Some(Component::Normal(_)))
+                {
+                    return Err(PathResolveError::EscapesBase {
+                        base: base.to_path_buf(),
+                        path: path.to_path_buf(),
+                    });
+                }
+                components.pop();
+            }
+            other => components.push(other),
+        }
+    }
+    let normalized: PathBuf = components.iter().collect();
+    if normalized.starts_with(base) {
+        Ok(normalized)
+    } else {
+        Err(PathResolveError::EscapesBase {
+            base: base.to_path_buf(),
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// Keep the tail of a display string within `max_len` bytes without ever
+/// slicing inside a UTF-8 scalar, then align to the next `/` so a path is not
+/// cut mid-component. Shared by the TUI and the CLI tables.
+#[must_use]
+pub fn truncate_display_tail(text: &str, max_len: usize) -> &str {
+    if text.len() <= max_len {
+        return text;
+    }
+    let start = text.ceil_char_boundary(text.len() - max_len);
+    let tail = &text[start..];
+    tail.find('/').map_or(tail, |idx| &tail[idx..])
 }
 
 fn normalize_syntactic(path: &Path) -> PathBuf {
@@ -195,22 +344,117 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_nonexistent_path_syntactically() {
-        // /nonexistent/foo/../bar -> /nonexistent/bar
-        // Note: we assume /nonexistent doesn't exist.
+    fn never_collapses_parent_dir_across_a_missing_component() {
+        // /nonexistent/foo/../bar: `foo` does not exist, so `..` has nothing
+        // real to climb out of. The syntactic answer (/nonexistent/bar) is a
+        // path the caller never named; keep the `..` literal instead.
         #[cfg(unix)]
         let root = Path::new("/");
         #[cfg(windows)]
         let root = Path::new("C:");
 
         let input = root.join("nonexistent").join("foo").join("..").join("bar");
-        let expected = root.join("nonexistent").join("bar");
-
-        // Ensure input doesn't exist so we trigger fallback
         assert!(std::fs::canonicalize(&input).is_err());
 
         let resolved = resolve_absolute_path(&input);
-        assert_eq!(resolved, expected);
+        assert_eq!(resolved, input, "the missing suffix is appended verbatim");
+        assert!(!resolved.starts_with(root.join("nonexistent").join("bar")));
+
+        // `.` in the missing suffix is dropped; a missing leaf under an existing
+        // parent is fine.
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(
+            resolve_absolute_path(&tmp.path().join(".").join("missing").join(".").join("leaf")),
+            canonical_tmp.join("missing").join("leaf")
+        );
+        // `..` against an existing directory is resolved by the filesystem.
+        std::fs::create_dir(tmp.path().join("real")).unwrap();
+        assert_eq!(
+            resolve_absolute_path(&tmp.path().join("real").join("..").join("gone")),
+            canonical_tmp.join("gone")
+        );
+    }
+
+    #[test]
+    fn strict_resolution_refuses_missing_traversal_and_parent_of_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(tmp.path().join("real")).unwrap();
+
+        // Existing path, and a missing leaf under an existing parent, are fine.
+        assert_eq!(
+            resolve_absolute_path_strict(&tmp.path().join("real")).unwrap(),
+            canonical_tmp.join("real")
+        );
+        assert_eq!(
+            resolve_absolute_path_strict(&tmp.path().join("real").join("new-file")).unwrap(),
+            canonical_tmp.join("real").join("new-file")
+        );
+        // `..` through an existing dir is resolved by the filesystem.
+        assert_eq!(
+            resolve_absolute_path_strict(&tmp.path().join("real").join("..").join("new")).unwrap(),
+            canonical_tmp.join("new")
+        );
+        // A missing directory that must be traversed is an error...
+        let err =
+            resolve_absolute_path_strict(&tmp.path().join("missing").join("leaf")).unwrap_err();
+        assert_eq!(
+            err,
+            PathResolveError::MissingComponent(tmp.path().join("missing"))
+        );
+        // ...and `..` right after a missing component is never collapsed.
+        let err = resolve_absolute_path_strict(&tmp.path().join("missing").join("..")).unwrap_err();
+        assert!(matches!(err, PathResolveError::ParentOfMissing(_)), "{err}");
+        assert!(matches!(
+            resolve_absolute_path_strict(Path::new("/nonexistent_root/../etc/passwd")),
+            Err(PathResolveError::MissingComponent(_))
+        ));
+    }
+
+    #[test]
+    fn lexical_normalization_stays_within_base() {
+        let base = Path::new("/data/.sbh");
+        assert_eq!(
+            normalize_lexically_within(base, Path::new("ballast/./pool")).unwrap(),
+            PathBuf::from("/data/.sbh/ballast/pool")
+        );
+        assert_eq!(
+            normalize_lexically_within(base, Path::new("ballast/../lease")).unwrap(),
+            PathBuf::from("/data/.sbh/lease")
+        );
+        assert_eq!(
+            normalize_lexically_within(base, Path::new("/data/.sbh/x")).unwrap(),
+            PathBuf::from("/data/.sbh/x")
+        );
+        for escape in [
+            "../../etc",
+            "ballast/../../etc/passwd",
+            "/etc/passwd",
+            "../.sbh/x",
+        ] {
+            assert!(
+                matches!(
+                    normalize_lexically_within(base, Path::new(escape)),
+                    Err(PathResolveError::EscapesBase { .. })
+                ),
+                "{escape} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn display_tail_never_splits_a_scalar() {
+        // 'é' is two bytes; a byte-based cut at len-1 would land inside it.
+        // One byte cannot hold it, two can.
+        assert_eq!(truncate_display_tail("aé", 1), "");
+        assert_eq!(truncate_display_tail("aé", 2), "é");
+        assert_eq!(truncate_display_tail("/short", 40), "/short");
+        let long = "/very/long/déep/nested/project/target/debug/build/artifact";
+        let tail = truncate_display_tail(long, 20);
+        assert!(tail.starts_with('/'), "{tail}");
+        assert!(long.ends_with(tail));
+        assert!(tail.len() <= 20 + "/nested".len());
     }
 
     #[cfg(unix)]
