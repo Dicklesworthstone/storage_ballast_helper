@@ -41,8 +41,8 @@ use crate::daemon::policy::{
 };
 use crate::daemon::process_io_history::ProcessIoHistory;
 use crate::daemon::self_monitor::{
-    DaemonLock, MountPressure, MountRateState, SelfMonitor, SelfMonitorTick, ThreadHeartbeat,
-    ThreadState, ThreadStatus, ThreadsState,
+    DaemonLock, MountPressure, MountRateState, PolicyStateRecord, SelfMonitor, SelfMonitorTick,
+    ThreadHeartbeat, ThreadState, ThreadStatus, ThreadsState,
 };
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat, resolve_watchdog_sec};
 use crate::logger::dual::{
@@ -2412,10 +2412,17 @@ impl MonitoringDaemon {
                 transition,
                 from,
                 to,
-                ..
+                reason,
             } = &event
             {
                 eprintln!("[SBH-POLICY] {transition}: {from} -> {to}");
+                self.notification_manager
+                    .notify(&NotificationEvent::PolicyTransition {
+                        transition: transition.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                        reason: reason.clone(),
+                    });
             }
             self.logger_handle.send(event);
         }
@@ -2586,7 +2593,17 @@ impl MonitoringDaemon {
             .map(|i| i.files_total)
             .sum();
         let dropped_log_events = self.logger_handle.dropped_events();
-        let policy_mode = self.policy_engine.lock().mode().to_string();
+        let policy_mode = {
+            let policy = self.policy_engine.lock();
+            self.self_monitor.set_policy_snapshot(PolicyStateRecord {
+                mode: policy.mode().to_string(),
+                since_secs: policy.mode_since_secs(),
+                last_fallback_reason: policy.last_fallback_reason().map(str::to_string),
+                auto_recover_to: policy.config().auto_recover_to.to_string(),
+                serialization_failures: policy.serialization_failures(),
+            });
+            policy.mode().to_string()
+        };
 
         // Every mount's reading and control state, not only the worst mount,
         // so `sbh status` and the dashboard can show what the daemon is doing
@@ -2865,6 +2882,12 @@ impl MonitoringDaemon {
             // RSS breach should exit promptly for the service manager restart
             // path instead of spending another tick on scans or deletions.
             let self_monitor_tick = self.maybe_write_self_monitor_state(&response);
+            // Evidence that cannot be persisted must not keep driving
+            // deletions: the policy engine decides what a failed state
+            // write means (`policy.serialization_failure_action`).
+            if self_monitor_tick.state_write_failed {
+                self.policy_engine.lock().note_serialization_failure();
+            }
             if self_monitor_tick.should_exit_for_rss_hard_limit() {
                 shutdown_result = Err(self.rss_hard_limit_error(self_monitor_tick));
                 break;

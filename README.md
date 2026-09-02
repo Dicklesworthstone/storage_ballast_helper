@@ -702,6 +702,14 @@ calibration_floor = 0.75
 initial_mode = "observe"       # observe | canary | enforce
 max_canary_deletes_per_hour = 5
 kill_switch = false            # true holds the daemon in fallback-safe (no deletions)
+# What each fallback trigger does. Unset calibration_breach_action means
+# "demote" unless initial_mode is "enforce" (then "advisory"); unset
+# emergency_escalation means on for enforce fleets, off otherwise.
+# calibration_breach_action = "demote"      # demote | advisory
+# canary_budget_action = "demote"           # demote | keep
+# serialization_failure_action = "demote"   # demote | advisory
+# auto_recover_to = "canary"                # none | canary | previous
+# emergency_escalation = false
 
 [paths]
 sqlite_db = "/var/lib/sbh/activity.sqlite3"

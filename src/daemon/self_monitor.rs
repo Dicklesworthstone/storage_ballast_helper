@@ -37,6 +37,22 @@ pub const DAEMON_STATE_WRITE_INTERVAL_SECS: u64 = 30;
 /// daemon as absent simply because a write cycle hasn't completed yet.
 pub const DAEMON_STATE_STALE_THRESHOLD_SECS: u64 = 90;
 
+/// The policy engine as `state.json` and `sbh status` show it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyStateRecord {
+    /// `observe`, `canary`, `enforce` or `fallback_safe`.
+    pub mode: String,
+    /// Seconds the mode has been active.
+    pub since_secs: u64,
+    /// The most recent fallback reason, kept after recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fallback_reason: Option<String>,
+    /// `none`, `canary` or `previous`.
+    pub auto_recover_to: String,
+    /// State-file write failures the policy engine was told about.
+    pub serialization_failures: u64,
+}
+
 /// A fresh run identifier (`<pid hex>-<epoch millis hex>`), shared by the
 /// state file and every activity log line of one daemon run.
 #[must_use]
@@ -444,6 +460,10 @@ pub struct DaemonState {
     /// `nothing_to_reclaim`, `write_failure`). Absent while any mount works.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_reason: Option<String>,
+    /// The policy engine: mode, how long it has held it, the last fallback
+    /// reason and where automatic recovery lands.
+    #[serde(default)]
+    pub policy: PolicyStateRecord,
     /// Set by the final write on shutdown.
     pub stopped_at: Option<String>,
     /// Why the daemon stopped (final write only).
@@ -692,6 +712,8 @@ pub struct SelfMonitorTick {
     pub rss_warning_bytes: u64,
     pub rss_hard_limit_bytes: u64,
     pub rss_hard_limit_exceeded: bool,
+    /// This tick attempted a state-file write and it failed.
+    pub state_write_failed: bool,
 }
 
 impl SelfMonitorTick {
@@ -733,6 +755,8 @@ pub struct SelfMonitor {
     /// Latest CPU budget reading and daemon-wide idle reason (Q7).
     budget_snapshot: CpuBudgetState,
     idle_reason: Option<String>,
+    /// Latest policy engine snapshot.
+    policy_snapshot: PolicyStateRecord,
     /// Latest thread health, set by the main loop each tick.
     threads_snapshot: ThreadsState,
     /// Identifies this daemon run.
@@ -781,6 +805,11 @@ impl SelfMonitor {
     pub fn set_budget_snapshot(&mut self, budget: CpuBudgetState, idle_reason: Option<String>) {
         self.budget_snapshot = budget;
         self.idle_reason = idle_reason;
+    }
+
+    /// Record the policy engine snapshot the next state file write carries.
+    pub fn set_policy_snapshot(&mut self, policy: PolicyStateRecord) {
+        self.policy_snapshot = policy;
     }
 
     /// This run's identifier, as written to the state file.
@@ -849,6 +878,7 @@ impl SelfMonitor {
             threads_snapshot: ThreadsState::default(),
             budget_snapshot: CpuBudgetState::default(),
             idle_reason: None,
+            policy_snapshot: PolicyStateRecord::default(),
             run_id: generate_run_id(),
             last_state: None,
 
@@ -879,11 +909,12 @@ impl SelfMonitor {
     ) -> SelfMonitorTick {
         let now = Instant::now();
         let rss = self.current_rss_bytes();
-        let tick = SelfMonitorTick {
+        let mut tick = SelfMonitorTick {
             rss_bytes: rss,
             rss_warning_bytes: self.rss_warning_bytes,
             rss_hard_limit_bytes: self.rss_hard_limit_bytes,
             rss_hard_limit_exceeded: rss > self.rss_hard_limit_bytes,
+            state_write_failed: false,
         };
 
         let write_due = self
@@ -954,6 +985,7 @@ impl SelfMonitor {
             cpu_secs_total: self.current_cpu_secs(),
             cpu_budget: self.budget_snapshot.clone(),
             idle_reason: self.idle_reason.clone(),
+            policy: self.policy_snapshot.clone(),
             stopped_at: None,
             exit_reason: None,
         };
@@ -962,14 +994,11 @@ impl SelfMonitor {
         self.last_state = Some(state);
         if let Err(e) = &result {
             eprintln!("[SBH-SELFMON] failed to write state file: {e}");
+            tick.state_write_failed = true;
         }
         // Update last_write regardless of success to respect the interval
         // and prevent log spam on persistent errors (e.g. permission denied).
         self.last_write = Some(now);
-
-        if result.is_err() {
-            return tick;
-        }
 
         tick
     }
@@ -1311,6 +1340,7 @@ mod tests {
             cpu_secs_total: 0.0,
             cpu_budget: CpuBudgetState::default(),
             idle_reason: None,
+            policy: PolicyStateRecord::default(),
             stopped_at: None,
             exit_reason: None,
         };
@@ -1370,6 +1400,7 @@ mod tests {
             cpu_secs_total: 0.0,
             cpu_budget: CpuBudgetState::default(),
             idle_reason: None,
+            policy: PolicyStateRecord::default(),
             stopped_at: None,
             exit_reason: None,
         };
@@ -1431,6 +1462,7 @@ mod tests {
             cpu_secs_total: 0.0,
             cpu_budget: CpuBudgetState::default(),
             idle_reason: None,
+            policy: PolicyStateRecord::default(),
             stopped_at: None,
             exit_reason: None,
         };

@@ -143,6 +143,92 @@ pub struct PolicyConfig {
     /// main loop ticks at 100-250ms, which would flood the guard's statistical
     /// machinery. Set to 0 in tests to allow back-to-back calls.
     pub observe_min_interval_secs: u64,
+    /// What a calibration breach (`calibration_breach_windows` consecutive
+    /// guard-FAIL windows under pressure) does: `demote` enters FallbackSafe,
+    /// `advisory` logs and carries on. Unset: `demote` unless `initial_mode`
+    /// is `enforce`, where a fleet that has already earned Enforce keeps it.
+    pub calibration_breach_action: Option<FallbackAction>,
+    /// What exhausting `max_canary_deletes_per_hour` does: `demote` enters
+    /// FallbackSafe (the canary paused until clean windows prove it), `keep`
+    /// only refuses further deletions this hour. Either way the decision
+    /// that hit the cap is Keep.
+    pub canary_budget_action: CanaryBudgetAction,
+    /// What a failed `state.json` write does: `demote` enters FallbackSafe
+    /// (evidence that cannot be persisted must not drive deletions),
+    /// `advisory` logs and carries on.
+    pub serialization_failure_action: FallbackAction,
+    /// Where automatic recovery from FallbackSafe lands after
+    /// `recovery_clean_windows`: `canary` (never higher than Canary, the
+    /// mandatory re-proving gate; Observe stays Observe), `previous` (the
+    /// mode before the fallback), `none` (only `promote()` leaves
+    /// FallbackSafe).
+    pub auto_recover_to: AutoRecoverTo,
+    /// Whether sustained Yellow+ pressure inside FallbackSafe may break the
+    /// deadlock by promoting out of it (see `check_emergency_escalation`).
+    /// Unset: on for `initial_mode = enforce` fleets, off otherwise.
+    pub emergency_escalation: Option<bool>,
+}
+
+/// What a fallback trigger does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackAction {
+    /// Enter FallbackSafe.
+    Demote,
+    /// Log the condition; keep the current mode.
+    Advisory,
+}
+
+/// What exhausting the canary budget does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanaryBudgetAction {
+    /// Enter FallbackSafe until clean windows recover it.
+    Demote,
+    /// Refuse further deletions this hour and stay in Canary.
+    Keep,
+}
+
+/// Where automatic recovery from FallbackSafe lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoRecoverTo {
+    /// Never automatically; only `promote()` leaves FallbackSafe.
+    None,
+    /// The pre-fallback mode capped at Canary.
+    Canary,
+    /// The pre-fallback mode, Enforce included.
+    Previous,
+}
+
+impl fmt::Display for AutoRecoverTo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Canary => "canary",
+            Self::Previous => "previous",
+        })
+    }
+}
+
+impl PolicyConfig {
+    /// `calibration_breach_action` with the unset default resolved.
+    #[must_use]
+    pub fn resolved_calibration_breach_action(&self) -> FallbackAction {
+        self.calibration_breach_action
+            .unwrap_or(if self.initial_mode == ActiveMode::Enforce {
+                FallbackAction::Advisory
+            } else {
+                FallbackAction::Demote
+            })
+    }
+
+    /// `emergency_escalation` with the unset default resolved.
+    #[must_use]
+    pub fn resolved_emergency_escalation(&self) -> bool {
+        self.emergency_escalation
+            .unwrap_or(self.initial_mode == ActiveMode::Enforce)
+    }
 }
 
 impl Default for PolicyConfig {
@@ -161,6 +247,11 @@ impl Default for PolicyConfig {
             loss_review: 5.0,
             kill_switch: false,
             observe_min_interval_secs: MIN_OBSERVE_INTERVAL_SECS,
+            calibration_breach_action: None,
+            canary_budget_action: CanaryBudgetAction::Demote,
+            serialization_failure_action: FallbackAction::Demote,
+            auto_recover_to: AutoRecoverTo::Canary,
+            emergency_escalation: None,
         }
     }
 }
@@ -998,6 +1089,12 @@ pub struct PolicyEngine {
     /// within `MIN_OBSERVE_INTERVAL_SECS` are silently skipped to prevent
     /// the high-frequency pressure tick loop from flooding the guard.
     last_observe_time: Option<Instant>,
+    /// When the current mode was entered.
+    mode_since: Instant,
+    /// The most recent fallback reason, kept after recovery for `sbh status`.
+    last_fallback_reason: Option<String>,
+    /// State-file write failures reported by the daemon.
+    serialization_failures: u64,
 }
 
 /// Record of a mode transition.
@@ -1041,6 +1138,9 @@ impl PolicyEngine {
             pressure_level: PressureLevel::Green,
             last_suppression_log: None,
             last_observe_time: None,
+            mode_since: Instant::now(),
+            last_fallback_reason: None,
+            serialization_failures: 0,
         };
 
         if engine.config.kill_switch {
@@ -1066,6 +1166,12 @@ impl PolicyEngine {
 
     /// Current active mode.
     #[must_use]
+    /// The active configuration.
+    #[must_use]
+    pub const fn config(&self) -> &PolicyConfig {
+        &self.config
+    }
+
     pub fn mode(&self) -> ActiveMode {
         self.mode
     }
@@ -1259,11 +1365,19 @@ impl PolicyEngine {
                 } else if self.consecutive_breach_windows == self.config.calibration_breach_windows
                     && self.recalibration_count < 3
                 {
-                    eprintln!(
-                        "[SBH-POLICY] calibration breach ({} consecutive windows) — \
-                         continuing in current mode (advisory only)",
-                        self.consecutive_breach_windows,
-                    );
+                    match self.config.resolved_calibration_breach_action() {
+                        FallbackAction::Demote => {
+                            let consecutive_windows = self.consecutive_breach_windows;
+                            self.enter_fallback(FallbackReason::CalibrationBreach {
+                                consecutive_windows,
+                            });
+                        }
+                        FallbackAction::Advisory => eprintln!(
+                            "[SBH-POLICY] calibration breach ({} consecutive windows) — \
+                             continuing in current mode (calibration_breach_action = advisory)",
+                            self.consecutive_breach_windows,
+                        ),
+                    }
                 }
             } else {
                 // Not a Fail breach — decay by 1 instead of accumulating.
@@ -1303,9 +1417,19 @@ impl PolicyEngine {
             return false;
         }
 
-        // Emergency escalation directly to Enforce (not Canary) — the disk is
-        // in crisis and the 10-deletes/hour canary budget is far too small to
-        // make a dent. Reset breach counters so calibration checks start fresh.
+        // Escalation is a configured choice, not a given: off by default for
+        // fleets that never earned Enforce.
+        if !self.config.resolved_emergency_escalation() {
+            return false;
+        }
+        // The disk is in crisis: land where the configuration lets automatic
+        // recovery land, and where `previous` was Enforce, back in Enforce
+        // (the 10-deletes/hour canary budget makes no dent). `none` leaves
+        // this to `promote()` too.
+        let Some(target) = self.auto_recovery_target() else {
+            return false;
+        };
+        // Reset breach counters so calibration checks start fresh.
         self.fallback_reason = None;
         self.fallback_entered_at = None;
         self.emergency_escalated_at = Some(Instant::now());
@@ -1314,10 +1438,10 @@ impl PolicyEngine {
         self.log_transition(
             "emergency_escalate",
             self.mode,
-            ActiveMode::Enforce,
+            target,
             Some("fallback_safe deadlock: pressure sustained at Yellow+".to_string()),
         );
-        self.mode = ActiveMode::Enforce;
+        self.mode = target;
         true
     }
 
@@ -1419,6 +1543,7 @@ impl PolicyEngine {
             let from = self.mode;
             self.pre_fallback_mode = self.mode;
             let reason_str = reason.to_string();
+            self.last_fallback_reason = Some(reason_str.clone());
             self.fallback_reason = Some(reason);
             self.fallback_entered_at = Some(Instant::now());
             self.total_fallback_entries += 1;
@@ -1537,13 +1662,18 @@ impl PolicyEngine {
             }
         }
 
-        // Canary mode: check hourly budget.
-        // Budget exhaustion caps further deletions this hour but does NOT
-        // enter FallbackSafe — that would block ALL actions and require a
-        // long recovery cycle for what is just normal rate limiting.
+        // Canary mode: check hourly budget. The decision that hits the cap is
+        // Keep either way; `canary_budget_action` decides whether the canary
+        // also pauses in FallbackSafe until clean windows recover it.
         if self.mode == ActiveMode::Canary {
             self.rotate_canary_hour();
             if self.canary_deletes_this_hour >= self.config.max_canary_deletes_per_hour {
+                match self.config.canary_budget_action {
+                    CanaryBudgetAction::Demote => {
+                        self.enter_fallback(FallbackReason::CanaryBudgetExhausted);
+                    }
+                    CanaryBudgetAction::Keep => {}
+                }
                 return DecisionAction::Keep;
             }
             self.canary_deletes_this_hour += 1;
@@ -1594,13 +1724,34 @@ impl PolicyEngine {
             .unwrap();
     }
 
+    /// Where automatic recovery lands for this configuration, or `None`
+    /// when only `promote()` may leave FallbackSafe.
+    fn auto_recovery_target(&self) -> Option<ActiveMode> {
+        match self.config.auto_recover_to {
+            AutoRecoverTo::None => None,
+            // The mandatory canary gate: Enforce must re-prove itself in
+            // Canary; Observe stays Observe.
+            AutoRecoverTo::Canary => Some(match self.pre_fallback_mode {
+                ActiveMode::Enforce => ActiveMode::Canary,
+                other => other,
+            }),
+            AutoRecoverTo::Previous => Some(self.pre_fallback_mode),
+        }
+    }
+
     fn recover_from_fallback(&mut self) {
-        // Cap recovery at Canary to enforce the mandatory canary gate.
-        // If the system was in Enforce when fallback triggered, it must
-        // re-prove itself in Canary before returning to Enforce.
-        let target = match self.pre_fallback_mode {
-            ActiveMode::Enforce => ActiveMode::Canary,
-            other => other,
+        let Some(target) = self.auto_recovery_target() else {
+            if self
+                .last_suppression_log
+                .is_none_or(|t| t.elapsed() >= Duration::from_mins(5))
+            {
+                eprintln!(
+                    "[SBH-POLICY] clean windows would recover from FallbackSafe, but \
+                     auto_recover_to = none: waiting for `sbh policy promote`"
+                );
+                self.last_suppression_log = Some(Instant::now());
+            }
+            return;
         };
         let from = self.mode;
         self.fallback_reason = None;
@@ -1608,6 +1759,44 @@ impl PolicyEngine {
         self.log_transition("recover", from, target, None);
         self.mode = target;
         eprintln!("[SBH-POLICY] {from} → {target} (recovered)");
+    }
+
+    /// The daemon could not persist `state.json`. Evidence that cannot be
+    /// written must not keep driving deletions: with
+    /// `serialization_failure_action = demote` the engine enters
+    /// FallbackSafe; `advisory` only counts and logs.
+    pub fn note_serialization_failure(&mut self) {
+        self.serialization_failures = self.serialization_failures.saturating_add(1);
+        match self.config.serialization_failure_action {
+            FallbackAction::Demote => {
+                if self.mode != ActiveMode::FallbackSafe {
+                    self.enter_fallback(FallbackReason::SerializationFailure);
+                }
+            }
+            FallbackAction::Advisory => eprintln!(
+                "[SBH-POLICY] state file write failed ({} so far) — continuing in {} \
+                 (serialization_failure_action = advisory)",
+                self.serialization_failures, self.mode
+            ),
+        }
+    }
+
+    /// State-file write failures reported so far.
+    #[must_use]
+    pub const fn serialization_failures(&self) -> u64 {
+        self.serialization_failures
+    }
+
+    /// Seconds the current mode has been active.
+    #[must_use]
+    pub fn mode_since_secs(&self) -> u64 {
+        self.mode_since.elapsed().as_secs()
+    }
+
+    /// The most recent fallback reason, kept after recovery.
+    #[must_use]
+    pub fn last_fallback_reason(&self) -> Option<&str> {
+        self.last_fallback_reason.as_deref()
     }
 
     fn apply_transition(&mut self, to: ActiveMode, kind: &str) {
@@ -1633,6 +1822,7 @@ impl PolicyEngine {
             reason,
         });
         self.transitions_total = self.transitions_total.saturating_add(1);
+        self.mode_since = Instant::now();
     }
 
     /// Transitions recorded over the engine's lifetime (the log itself is

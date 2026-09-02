@@ -126,6 +126,14 @@ pub enum NotificationEvent {
         level: String,
         reason: String,
     },
+    /// The policy engine changed mode (promotion, demotion, fallback,
+    /// recovery, emergency escalation).
+    PolicyTransition {
+        transition: String,
+        from: String,
+        to: String,
+        reason: Option<String>,
+    },
 }
 
 impl NotificationEvent {
@@ -214,6 +222,8 @@ impl NotificationEvent {
                 "orange" => NotificationLevel::Orange,
                 _ => NotificationLevel::Warning,
             },
+
+            Self::PolicyTransition { .. } => NotificationLevel::Warning,
         }
     }
 
@@ -232,6 +242,7 @@ impl NotificationEvent {
             Self::Error { .. } => "error",
             Self::CpuBudgetExceeded { .. } => "cpu_budget_exceeded",
             Self::ReclaimUnavailable { .. } => "reclaim_unavailable",
+            Self::PolicyTransition { .. } => "policy_transition",
         }
     }
 
@@ -312,6 +323,15 @@ impl NotificationEvent {
             } => {
                 format!("Pressure {level} on {mount} and nothing sbh can reclaim there ({reason})")
             }
+            Self::PolicyTransition {
+                transition,
+                from,
+                to,
+                reason,
+            } => reason.as_ref().map_or_else(
+                || format!("Policy {transition}: {from} -> {to}"),
+                |reason| format!("Policy {transition}: {from} -> {to} ({reason})"),
+            ),
         }
     }
 }

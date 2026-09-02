@@ -114,3 +114,8 @@ missing_panics_doc = "allow"
 missing_errors_doc = "allow"
 missing_const_for_fn = "allow"
 doc_markdown = "allow"
+# `assert!(x.is_empty())` is the codebase's assertion style (hundreds of sites,
+# most in the TUI tests); the lint only asks for `assert_eq!` to print the
+# value, and the failing assertion text already names it.
+assert_is_empty = "allow"
+assert_is_not_empty = "allow"

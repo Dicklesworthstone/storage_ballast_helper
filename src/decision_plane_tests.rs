@@ -460,6 +460,78 @@ fn policy_fallback_recovery_restores_mode() {
     );
 }
 
+/// Invariant: nothing is approved for deletion in FallbackSafe, whatever the
+/// fallback/recovery configuration, however the fallback was entered, and
+/// however good the guard looks.
+#[test]
+fn policy_no_deletion_in_fallback_safe_under_any_config() {
+    use crate::daemon::policy::{AutoRecoverTo, CanaryBudgetAction, FallbackAction};
+    let mut rng = SeededRng::new(0xF4_11_BA_C4);
+    let good = crate::monitor::guardrails::GuardDiagnostics {
+        status: GuardStatus::Pass,
+        observation_count: 60,
+        median_rate_error: 0.05,
+        conservative_fraction: 0.9,
+        e_process_value: 1.0,
+        e_process_alarm: false,
+        consecutive_clean: 10,
+        reason: "ok".to_string(),
+    };
+    for initial in [ActiveMode::Observe, ActiveMode::Canary, ActiveMode::Enforce] {
+        for breach in [
+            None,
+            Some(FallbackAction::Demote),
+            Some(FallbackAction::Advisory),
+        ] {
+            for budget in [CanaryBudgetAction::Demote, CanaryBudgetAction::Keep] {
+                for recover in [
+                    AutoRecoverTo::None,
+                    AutoRecoverTo::Canary,
+                    AutoRecoverTo::Previous,
+                ] {
+                    for reason in [
+                        FallbackReason::GuardrailDrift,
+                        FallbackReason::KillSwitch,
+                        FallbackReason::CanaryBudgetExhausted,
+                        FallbackReason::SerializationFailure,
+                        FallbackReason::CalibrationBreach {
+                            consecutive_windows: 25,
+                        },
+                    ] {
+                        let config = PolicyConfig {
+                            initial_mode: initial,
+                            calibration_breach_action: breach,
+                            canary_budget_action: budget,
+                            auto_recover_to: recover,
+                            // Recovery must not fire inside this test.
+                            recovery_clean_windows: 1_000,
+                            min_fallback_secs: 3_600,
+                            observe_min_interval_secs: 0,
+                            ..PolicyConfig::default()
+                        };
+                        let mut engine = PolicyEngine::new(config);
+                        engine.set_pressure_level(crate::monitor::pid::PressureLevel::Red);
+                        engine.enter_fallback(reason);
+                        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+                        let candidates = random_candidates(&mut rng, 12)
+                            .into_iter()
+                            .map(|c| default_engine().score_candidate(&c, 0.95))
+                            .collect::<Vec<_>>();
+                        let decision = engine.evaluate(&candidates, Some(&good));
+                        assert!(
+                            decision.approved_for_deletion.is_empty(),
+                            "initial={initial:?} breach={breach:?} budget={budget:?} recover={recover:?}: \
+                             {} approved in FallbackSafe",
+                            decision.approved_for_deletion.len()
+                        );
+                        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn policy_fallback_from_any_active_mode() {
     for initial in [ActiveMode::Observe, ActiveMode::Canary, ActiveMode::Enforce] {
