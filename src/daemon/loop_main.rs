@@ -1108,6 +1108,13 @@ impl MountMonitor {
                 // these as calibration failures permanently poisons the guard on
                 // machines with bursty workloads (rustc, cargo build, etc.).
                 let burst_outlier = rate_estimate.burst_state.is_burst_outlier(actual_rate);
+                // A fill rate that could not reach the red threshold within a
+                // day is calibration noise on this mount, not evidence.
+                self.guard.set_material_rate(
+                    crate::monitor::guardrails::material_rate_for_headroom(
+                        available_bytes.saturating_sub(threshold_bytes),
+                    ),
+                );
                 self.guard.observe(CalibrationObservation {
                     predicted_rate: previous.predicted_rate,
                     actual_rate,

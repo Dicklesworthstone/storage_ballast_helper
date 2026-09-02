@@ -48,6 +48,26 @@ impl fmt::Display for GuardStatus {
 
 // ──────────────────── calibration observation ────────────────────
 
+/// Rates below this (on both sides) are floating-point and EWMA-lag noise,
+/// never calibration evidence. Production: trj had predicted≈-2, actual≈0
+/// producing infinite error from noise-level disagreement.
+pub const NOISE_FLOOR_RATE_BYTES_PER_SEC: f64 = 10.0;
+
+/// Seconds of headroom below which a fill rate is material for calibration:
+/// a rate that would not reach the red threshold within a day cannot make an
+/// underestimation dangerous.
+pub const MATERIAL_RATE_HORIZON_SECS: f64 = 86_400.0;
+
+/// The fill rate (bytes per second) that matters for calibration on a mount
+/// with `headroom_bytes` above its red threshold.
+///
+/// Anything slower would take longer than [`MATERIAL_RATE_HORIZON_SECS`] to
+/// reach the threshold.
+#[must_use]
+pub fn material_rate_for_headroom(headroom_bytes: u64) -> f64 {
+    (headroom_bytes as f64 / MATERIAL_RATE_HORIZON_SECS).max(NOISE_FLOOR_RATE_BYTES_PER_SEC)
+}
+
 /// A single forecast-vs-actual observation for calibration tracking.
 #[derive(Debug, Clone, Copy)]
 pub struct CalibrationObservation {
@@ -77,12 +97,25 @@ impl CalibrationObservation {
     /// This prevents post-burst EWMA decay (predicted >> actual, EWMA still elevated
     /// while reality returns to baseline) from poisoning the guard. During this phase,
     /// the EWMA is correctly recovering — its overestimation is safe, not miscalibration.
+    #[cfg(test)]
     fn rate_danger_ratio(self) -> f64 {
-        // Ignore errors when rates are trivial (< 10 bytes/sec) to prevent
-        // floating-point noise and minor EWMA lag during idle periods from
-        // triggering calibration failure. Production: trj had predicted≈-2,
-        // actual≈0 producing infinite error from noise-level disagreement.
-        if self.actual_rate.abs() < 10.0 && self.predicted_rate.abs() < 10.0 {
+        self.rate_danger_ratio_with_floor(NOISE_FLOOR_RATE_BYTES_PER_SEC)
+    }
+
+    /// Directional rate error with an explicit noise floor: rates below
+    /// `floor` on both sides are not evidence of anything.
+    ///
+    /// The floor is what makes calibration honest on a big idle volume: the
+    /// daemon's own state and log writes are a few hundred bytes per second,
+    /// which against an EWMA of ~0 is a 100% "underestimation" and, with the
+    /// fixed 10 B/s floor, drove the e-process to 14.9 (alarm at 20) on a
+    /// fresh daemon at steady Orange with a perfect median error. A fill
+    /// rate that cannot reach the red threshold within a day is noise for
+    /// calibration purposes; the daemon sets the floor per mount from its
+    /// headroom.
+    fn rate_danger_ratio_with_floor(self, floor: f64) -> f64 {
+        let floor = floor.max(NOISE_FLOOR_RATE_BYTES_PER_SEC);
+        if self.actual_rate.abs() < floor && self.predicted_rate.abs() < floor {
             return 0.0;
         }
 
@@ -286,6 +319,9 @@ pub struct AdaptiveGuard {
     status: GuardStatus,
     /// Consecutive clean calibration windows for recovery.
     consecutive_clean: usize,
+    /// Rate floor below which observations are neutral; set per mount from
+    /// its headroom (see [`material_rate_for_headroom`]).
+    material_rate: f64,
 }
 
 impl AdaptiveGuard {
@@ -298,7 +334,19 @@ impl AdaptiveGuard {
             e_process_log: 0.0,
             status: GuardStatus::Unknown,
             consecutive_clean: 0,
+            material_rate: NOISE_FLOOR_RATE_BYTES_PER_SEC,
         }
+    }
+
+    /// Set the rate below which observations are neutral for calibration.
+    pub fn set_material_rate(&mut self, bytes_per_sec: f64) {
+        self.material_rate = bytes_per_sec.max(NOISE_FLOOR_RATE_BYTES_PER_SEC);
+    }
+
+    /// The current material-rate floor.
+    #[must_use]
+    pub const fn material_rate(&self) -> f64 {
+        self.material_rate
     }
 
     /// Create a guard with default configuration.
@@ -315,8 +363,9 @@ impl AdaptiveGuard {
         // miscalibration. Counting burst observations as failures causes the guard
         // to permanently fail on machines with bursty workloads (production: 600+
         // consecutive breach windows on machines running rustc compilations).
-        let obs_good = obs.burst_outlier
-            || (obs.rate_danger_ratio() <= self.config.max_rate_error && obs.tte_conservative());
+        let ratio = obs.rate_danger_ratio_with_floor(self.material_rate);
+        let obs_good =
+            obs.burst_outlier || (ratio <= self.config.max_rate_error && obs.tte_conservative());
 
         // Maintain rolling window.
         self.observations.push_back(obs);
@@ -332,7 +381,6 @@ impl AdaptiveGuard {
         let lr = if obs_good {
             self.config.e_process_reward.ln()
         } else {
-            let ratio = obs.rate_danger_ratio();
             let severity = ((ratio - self.config.max_rate_error)
                 / (1.0 - self.config.max_rate_error))
                 .clamp(0.0, 1.0);
@@ -483,7 +531,10 @@ impl AdaptiveGuard {
         }
 
         // Compute median rate danger (underestimation only).
-        let mut errors: Vec<f64> = non_burst.iter().map(|o| o.rate_danger_ratio()).collect();
+        let mut errors: Vec<f64> = non_burst
+            .iter()
+            .map(|o| o.rate_danger_ratio_with_floor(self.material_rate))
+            .collect();
         errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_error = if errors.len().is_multiple_of(2) {
             let mid = errors.len() / 2;
@@ -743,6 +794,64 @@ mod tests {
         assert_eq!(mixed.counts(), (0, 0));
         assert!(!mixed.alarm());
         assert_eq!(mixed.dominant_reason(), None);
+    }
+
+    /// Reproduction of the field near-alarm (2026-08-30, e=14.9 at steady
+    /// Orange with median error 0.00): the daemon's own few-hundred-B/s
+    /// writes against an EWMA of ~0 are 100% "underestimations" under the
+    /// fixed 10 B/s floor. With the material-rate floor derived from the
+    /// mount's headroom they are neutral, while a real underestimation is
+    /// still penalized.
+    #[test]
+    fn idle_noise_is_neutral_under_the_material_rate_floor() {
+        let noise = |i: usize| CalibrationObservation {
+            predicted_rate: -2.0,
+            actual_rate: if i.is_multiple_of(3) { 0.0 } else { 500.0 },
+            predicted_tte: f64::INFINITY,
+            actual_tte: f64::INFINITY,
+            burst_outlier: false,
+        };
+
+        // Legacy floor: the evidence climbs toward the alarm.
+        let mut legacy = AdaptiveGuard::with_defaults();
+        for i in 0..300 {
+            legacy.observe(noise(i));
+        }
+        let legacy_e = legacy.diagnostics().e_process_value;
+        assert!(
+            legacy_e > 5.0,
+            "legacy floor lets idle noise accumulate: e={legacy_e}"
+        );
+
+        // Material floor for 100 GiB of headroom: ~1.2 MiB/s; the noise is
+        // neutral and the evidence drains to the lower clamp.
+        let mut guarded = AdaptiveGuard::with_defaults();
+        guarded.set_material_rate(material_rate_for_headroom(100 * 1024 * 1024 * 1024));
+        assert!(guarded.material_rate() > 1_000_000.0);
+        for i in 0..300 {
+            guarded.observe(noise(i));
+        }
+        let diag = guarded.diagnostics();
+        assert!(diag.e_process_value < 1.0, "e={}", diag.e_process_value);
+        assert!(!diag.e_process_alarm);
+        assert_eq!(diag.status, GuardStatus::Pass, "{}", diag.reason);
+
+        // A material underestimation still counts: 50 MiB/s actual against
+        // a 1 MiB/s forecast pushes the evidence up.
+        let before = guarded.diagnostics().e_process_value;
+        for _ in 0..20 {
+            guarded.observe(CalibrationObservation {
+                predicted_rate: 1_048_576.0,
+                actual_rate: 50.0 * 1_048_576.0,
+                predicted_tte: 3600.0,
+                actual_tte: 60.0,
+                burst_outlier: false,
+            });
+        }
+        assert!(guarded.diagnostics().e_process_value > before);
+        assert!(
+            (material_rate_for_headroom(0) - NOISE_FLOOR_RATE_BYTES_PER_SEC).abs() < f64::EPSILON
+        );
     }
 
     fn good_obs() -> CalibrationObservation {
