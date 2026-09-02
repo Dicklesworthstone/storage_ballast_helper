@@ -29,7 +29,9 @@ use storage_ballast_helper::monitor::ewma::DiskRateEstimator;
 use storage_ballast_helper::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, GuardrailConfig,
 };
-use storage_ballast_helper::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
+use storage_ballast_helper::monitor::pid::{
+    PidConfig, PidPressureController, PressureLevel, PressureReading,
+};
 use storage_ballast_helper::monitor::predictive::{PredictiveAction, PredictiveConfig};
 use storage_ballast_helper::monitor::voi_scheduler::{VoiConfig, VoiScheduler};
 use storage_ballast_helper::scanner::merkle::{IndexHealth, MerkleScanIndex, ScanBudget};
@@ -204,16 +206,16 @@ fn free_pct(free_bytes: u64, total_bytes: u64) -> f64 {
 
 fn make_pid() -> PidPressureController {
     PidPressureController::new(
-        0.25,  // kp
-        0.08,  // ki
-        0.02,  // kd
-        100.0, // integral_cap
-        18.0,  // target_free_pct
-        1.0,   // hysteresis_pct
-        20.0,  // green_min_free_pct
-        14.0,  // yellow_min_free_pct
-        10.0,  // orange_min_free_pct
-        6.0,   // red_min_free_pct
+        &PidConfig {
+            kp: 0.25,
+            ki: 0.08,
+            kd: 0.02,
+            integral_cap: 100.0,
+            target_free_pct: 18.0,
+            hysteresis_pct: 1.0,
+            thresholds: [20.0, 14.0, 10.0, 6.0],
+            ..PidConfig::default()
+        },
         Duration::from_secs(1),
     )
 }

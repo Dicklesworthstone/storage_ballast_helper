@@ -5,22 +5,22 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use storage_ballast_helper::monitor::pid::{
-        PidPressureController, PressureLevel, PressureReading,
+        PidConfig, PidPressureController, PressureLevel, PressureReading,
     };
 
     #[test]
     fn pid_urgency_spikes_on_clock_skew() {
         let mut pid = PidPressureController::new(
-            0.25,
-            0.08,
-            0.02, // Kd = 0.02
-            100.0,
-            18.0,
-            1.0,
-            20.0,
-            14.0,
-            10.0,
-            6.0,
+            &PidConfig {
+                kp: 0.25,
+                ki: 0.08,
+                kd: 0.02,
+                integral_cap: 100.0,
+                target_free_pct: 18.0,
+                hysteresis_pct: 1.0,
+                thresholds: [20.0, 14.0, 10.0, 6.0],
+                ..PidConfig::default()
+            },
             Duration::from_secs(1),
         );
         let t0 = Instant::now();

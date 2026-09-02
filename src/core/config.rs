@@ -289,6 +289,51 @@ pub struct PressureConfig {
     pub behavior_hysteresis_secs: u64,
     /// Predictive pre-emption settings.
     pub prediction: PredictionConfig,
+    /// `[pressure.controller]`: the per-mount PID's gains.
+    pub controller: ControllerConfig,
+}
+
+/// Gains of the per-mount PID pressure controller (`[pressure.controller]`).
+/// The setpoint and level thresholds come from `[pressure]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControllerConfig {
+    /// Proportional gain at `reference_total_bytes`.
+    pub kp: f64,
+    /// Integral gain.
+    pub ki: f64,
+    /// Derivative gain.
+    pub kd: f64,
+    /// Forecast feedforward gain: `kf * clamp(1 - seconds_to_red /
+    /// action_horizon, 0, 1)` is added to the raw output.
+    pub kf: f64,
+    /// Clamp on the integral term (percent-seconds).
+    pub integral_cap: f64,
+    /// Points of free space a mount must clear beyond a threshold before
+    /// its level steps down.
+    pub hysteresis_pct: f64,
+    /// Volume size at which `kp` applies unscaled; `kp` is multiplied by
+    /// `sqrt(total_bytes / reference_total_bytes)`, clamped to
+    /// `[kp_scale_min, kp_scale_max]`.
+    pub reference_total_bytes: u64,
+    pub kp_scale_min: f64,
+    pub kp_scale_max: f64,
+}
+
+impl Default for ControllerConfig {
+    fn default() -> Self {
+        Self {
+            kp: 0.25,
+            ki: 0.08,
+            kd: 0.02,
+            kf: 0.8,
+            integral_cap: 100.0,
+            hysteresis_pct: 1.0,
+            reference_total_bytes: 1 << 40,
+            kp_scale_min: 0.5,
+            kp_scale_max: 2.0,
+        }
+    }
 }
 
 /// Knobs for predictive pre-emptive action (EWMA → graduated response).
@@ -936,6 +981,7 @@ impl Default for PressureConfig {
             poll_interval_ms: 5_000,
             maintenance_interval_secs: 1_800,
             behavior_hysteresis_secs: 5,
+            controller: ControllerConfig::default(),
             prediction: PredictionConfig::default(),
         }
     }
@@ -2235,6 +2281,34 @@ impl Config {
             return Err(SbhError::InvalidConfig {
                 details: "telemetry.cpu_budget_pct must be 0..=100 (percent of one core)"
                     .to_string(),
+            });
+        }
+        let controller = &self.pressure.controller;
+        for (name, value) in [
+            ("kp", controller.kp),
+            ("ki", controller.ki),
+            ("kd", controller.kd),
+            ("kf", controller.kf),
+            ("integral_cap", controller.integral_cap),
+            ("hysteresis_pct", controller.hysteresis_pct),
+            ("kp_scale_min", controller.kp_scale_min),
+            ("kp_scale_max", controller.kp_scale_max),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(SbhError::InvalidConfig {
+                    details: format!("pressure.controller.{name} must be a finite number >= 0"),
+                });
+            }
+        }
+        if controller.kp_scale_min > controller.kp_scale_max {
+            return Err(SbhError::InvalidConfig {
+                details: "pressure.controller.kp_scale_min must not exceed kp_scale_max"
+                    .to_string(),
+            });
+        }
+        if controller.reference_total_bytes == 0 {
+            return Err(SbhError::InvalidConfig {
+                details: "pressure.controller.reference_total_bytes must be > 0".to_string(),
             });
         }
         if self.scanner.quarantine_max_bytes_pct > 100 {

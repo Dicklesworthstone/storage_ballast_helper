@@ -5,7 +5,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use storage_ballast_helper::monitor::pid::{
-        PidPressureController, PressureLevel, PressureReading,
+        PidConfig, PidPressureController, PressureLevel, PressureReading,
     };
 
     #[test]
@@ -17,16 +17,16 @@ mod tests {
         // Red 6-10%
         // Critical < 6%
         let mut pid = PidPressureController::new(
-            0.25,
-            0.08,
-            0.02,
-            100.0,
-            18.0, // target
-            1.0,  // hysteresis
-            20.0, // green_min
-            14.0, // yellow_min
-            10.0, // orange_min
-            6.0,  // red_min
+            &PidConfig {
+                kp: 0.25,
+                ki: 0.08,
+                kd: 0.02,
+                integral_cap: 100.0,
+                target_free_pct: 18.0,
+                hysteresis_pct: 1.0,
+                thresholds: [20.0, 14.0, 10.0, 6.0],
+                ..PidConfig::default()
+            },
             Duration::from_secs(1),
         );
 

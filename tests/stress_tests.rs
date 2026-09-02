@@ -20,7 +20,9 @@ use storage_ballast_helper::monitor::ewma::DiskRateEstimator;
 use storage_ballast_helper::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, GuardStatus, GuardrailConfig,
 };
-use storage_ballast_helper::monitor::pid::{PidPressureController, PressureLevel, PressureReading};
+use storage_ballast_helper::monitor::pid::{
+    PidConfig, PidPressureController, PressureLevel, PressureReading,
+};
 use storage_ballast_helper::platform::pal::MockPlatform;
 use storage_ballast_helper::scanner::decision_record::ActionRecord;
 use storage_ballast_helper::scanner::patterns::{
@@ -68,16 +70,16 @@ impl StressReport {
 
 fn make_pid() -> PidPressureController {
     PidPressureController::new(
-        0.25,  // kp
-        0.08,  // ki
-        0.02,  // kd
-        100.0, // integral_cap
-        18.0,  // target_free_pct
-        1.0,   // hysteresis_pct
-        20.0,  // green
-        14.0,  // yellow
-        10.0,  // orange
-        6.0,   // red
+        &PidConfig {
+            kp: 0.25,
+            ki: 0.08,
+            kd: 0.02,
+            integral_cap: 100.0,
+            target_free_pct: 18.0,
+            hysteresis_pct: 1.0,
+            thresholds: [20.0, 14.0, 10.0, 6.0],
+            ..PidConfig::default()
+        },
         Duration::from_secs(1),
     )
 }
