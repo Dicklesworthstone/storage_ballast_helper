@@ -178,7 +178,7 @@ const OPAQUE_CANDIDATE_SIZE_FLOOR: u64 = 100 * 1_048_576;
 /// Opaque trees are cargo targets and build caches: tens of thousands of small
 /// files. This bounds a pathological tree from stalling a scan while still
 /// completing for essentially every real candidate.
-const OPAQUE_SIZE_PROBE_BUDGET: usize = 200_000;
+pub const OPAQUE_SIZE_PROBE_BUDGET: usize = 200_000;
 
 /// Measure the allocated size of an opaque (pruned) candidate tree.
 ///
@@ -276,7 +276,12 @@ fn note_opaque_signal(
 
 /// Walk an opaque candidate tree once, measuring size and the newest `mtime`
 /// in the same pass so idleness costs no extra syscalls.
-fn opaque_tree_probe(
+///
+/// The probe also collects the structural signals found anywhere under the
+/// root: the evidence the walker scores an opaque root with, and what an
+/// index replay must reuse so a definite `target/` does not replay as
+/// `unclear`.
+pub fn opaque_tree_probe(
     root: &Path,
     cross_devices: bool,
     root_dev: u64,
@@ -1042,6 +1047,34 @@ fn process_directory(
 
         let _ = send_walk_entry(result_tx, &walk_entry, cancel);
     }
+}
+
+/// The parent-directory context [`classify_opaque_tree`] needs for `path`,
+/// read the way the walker reads it while descending: a Cargo manifest or a
+/// Node manifest/lockfile beside the candidate.
+#[must_use]
+pub fn opaque_context_for_path(path: &Path) -> OpaqueTreeContext {
+    let mut context = OpaqueTreeContext::default();
+    let Some(parent) = path.parent() else {
+        return context;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return context;
+    };
+    for entry in entries.flatten() {
+        match entry.file_name().to_string_lossy().as_ref() {
+            "cargo.toml" | "Cargo.toml" => context.parent_has_cargo_toml = true,
+            "package.json"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb" => context.parent_has_node_manifest = true,
+            _ => {}
+        }
+    }
+    context
 }
 
 /// Structural signals for one directory from its immediate children, for

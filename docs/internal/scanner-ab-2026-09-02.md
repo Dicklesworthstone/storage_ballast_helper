@@ -113,8 +113,13 @@ Mechanism, from `src/daemon/loop_main.rs` at 965c0a6:
    bytes (`v2_pressure_candidate_byte_target`). Here that was 5.7 GB after
    44 entries, so the walk never reached the 30 `Delete`-grade roots the
    one-shot v2 scan finds in the same tree.
-2. Both candidates it did find are `unclear`, so the executor's certainty
-   gate holds them back at Orange. The scanner thread does not learn that.
+2. The walk scored `/data/projects/beads_rust/target` as
+   `opaque-cargo-target` at `definite` certainty (the executor's dry run
+   reported `would_delete=1 ... 5032071168B` on the first pass), but the
+   index replay re-classified the same path from the root directory's own
+   entries, found none of the markers that live under `debug/`, and scored
+   it `unclear`. Every replay was therefore held back by the Orange gate,
+   and the scanner thread never learned that.
 3. The empty-pass cooldown keys on `dispatched_this_pass == 0`. A replay
    pass dispatches the two records again, so it counts as productive,
    `consecutive_empty_passes` resets, and the next pressure tick rescans
@@ -124,8 +129,13 @@ Mechanism, from `src/daemon/loop_main.rs` at 965c0a6:
 This is the production failure shape recorded in the reality check (daemon
 at its CPU quota, thousands of attempts, nothing reclaimed): with the unit's
 `CPUQuota=10%` and `cpu_budget_pct = 25` the loop is throttled rather than
-fixed. Filed as a P0 bug from this capture (see the bead created alongside
-this document).
+fixed. Filed as bd-8aeq from this capture and fixed the same evening (the
+commit carrying that id): the index replay re-classifies opaque records
+the way the walk did and scores them with the subtree probe, and the
+scanner applies the cell's certainty gate itself, so held-back candidates
+are neither dispatched nor counted toward the byte target and the
+empty-pass cooldown arms. The capture above predates that fix and has not
+been repeated yet.
 
 v1 has no such loop because a pass costs 25 s of wall time and the executor
 does reach `would_delete` batches (263 dry-run batches of 4-10 candidates),

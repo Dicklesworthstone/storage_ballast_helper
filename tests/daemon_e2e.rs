@@ -1252,10 +1252,32 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
         state["ballast"]
     );
 
+    // Both engines are expected to reclaim the project target as well; give
+    // the executor time to finish that batch instead of comparing a set that
+    // was cut off mid-flight (under host load v1 has been seen with only
+    // `target/debug` recorded when the daemon was stopped right after the
+    // stale target went).
+    let project_path = fixtures.project_target.clone();
+    run.wait_until(
+        "deletion of the project target",
+        Duration::from_secs(60),
+        |run| run.deleted_paths().iter().any(|p| p == &project_path),
+    )
+    .unwrap_or_else(|e| panic!("[{engine}] {e}"));
+    let deleted = run.deleted_paths();
+
     let status = run.stop();
     assert!(status.success(), "[{engine}] {status}");
     let mut names: Vec<String> = deleted
         .iter()
+        // A tree counts once: v1 walks into `target/` and may record
+        // `target/debug` in an earlier batch than `target` itself, which is
+        // the same reclaim as v2's single opaque root.
+        .filter(|p| {
+            !deleted
+                .iter()
+                .any(|other| other != *p && p.starts_with(other))
+        })
         .map(|p| {
             p.strip_prefix(&fixtures.root)
                 .unwrap()
@@ -1264,6 +1286,7 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
         })
         .collect();
     names.sort();
+    names.dedup();
     names
 }
 
@@ -2183,4 +2206,74 @@ fn check_predict_reads_the_daemon_forecast_and_refuses_stale_state() {
             .is_some_and(|s| s.contains("stale")),
         "{stale_payload}"
     );
+}
+
+/// bd-8aeq: a configured root whose only `Delete` verdict is `unclear` must
+/// not keep the daemon busy at Orange. Before the fix the scanner re-dispatched
+/// the held-back record on every tick (574 zero-duration replay passes in five
+/// minutes on the operator workstation) because the executor's certainty gate
+/// was the only one and a replay counted as reclaim progress. Now the scanner
+/// holds it, the pass is unproductive, and the empty-pass cooldown backs off.
+#[test]
+fn orange_pressure_with_only_unclear_candidates_backs_off_instead_of_replaying() {
+    // Not under /data/tmp: inside a temp root every recognized artifact is
+    // `definite` by rule. The cargo target directory is neither temp nor source.
+    let scratch_base = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
+        PathBuf::from,
+    );
+    fs::create_dir_all(&scratch_base).unwrap();
+    let dir = tempfile::tempdir_in(&scratch_base).unwrap();
+    let root = dir.path().join("root");
+    // `node_modules` beside a package manifest is an opaque candidate whose
+    // certainty is `unclear` outside a temp root (no structural marker can
+    // prove it); the Orange cell dispatches `likely` or better.
+    let project = root.join("proj");
+    let module = project.join("node_modules").join("left-pad");
+    fs::create_dir_all(&module).unwrap();
+    fs::write(project.join("package.json"), "{\"name\":\"proj\"}\n").unwrap();
+    fs::write(module.join("index.js"), vec![b'/'; 64 * 1024]).unwrap();
+    let fixture_mount = dir.path().to_path_buf();
+    let table = injected_table(&[
+        (&fixture_mount, 1_000_000_000_000, 110_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![root],
+        min_file_age_minutes: 0,
+        min_rescan_interval_secs: 5,
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    run.wait_until("the first scan pass", Duration::from_secs(45), |run| {
+        !run.events_of("scan_complete").is_empty()
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    let observed = Duration::from_secs(30);
+    std::thread::sleep(observed);
+
+    let passes = run.events_of("scan_complete").len();
+    let stderr = run.stderr();
+    assert!(
+        run.deleted_paths().is_empty(),
+        "nothing is deletable at Orange: {stderr}"
+    );
+    assert_eq!(
+        run.stderr_count("policy engine approved"),
+        0,
+        "the executor never saw the unclear candidate: {stderr}"
+    );
+    assert!(
+        run.stderr_count("held below likely") >= 1,
+        "the scanner backs off with the held count in the line: {stderr}"
+    );
+    // Base cooldown 5 s doubling per empty pass: 0, 5, 15, 35 s. Leave room
+    // for a maintenance or priority pass; the hot loop produced ~60 in 30 s.
+    assert!(
+        passes <= 6,
+        "{passes} scan passes in {observed:?} is the replay hot loop: {stderr}"
+    );
+    assert!(module.join("index.js").exists());
+    let status = run.stop();
+    assert!(status.success(), "{status}");
 }

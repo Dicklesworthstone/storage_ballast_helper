@@ -311,11 +311,15 @@ re-run).
   574 zero-duration index-replay passes, about two per second, each
   re-dispatching the same two `unclear` candidates that the certainty gate
   holds back. The empty-pass cooldown never armed because a replay pass
-  counts as a dispatch. Filed as a P0 bug from this capture.
+  counts as a dispatch, and the replay had downgraded a `definite` opaque
+  target to `unclear` by re-classifying it from the root's own entries.
+  Filed and fixed the same evening as bd-8aeq (replay keeps the opaque
+  classification and subtree evidence; the scanner applies the certainty
+  gate itself). The capture predates the fix.
 - Verdict: the >= 50x CPU-seconds-per-pass criterion is **not
-  demonstrated** and the retry-backoff criterion is violated in spirit;
-  bd-xtpv.8 stays open until the replay loop is fixed and a forced full
-  pass is compared engine to engine.
+  demonstrated** and the retry-backoff criterion was violated in spirit;
+  bd-xtpv.8 stays open until the daemon capture is repeated after bd-8aeq
+  and a forced full pass is compared engine to engine.
 
 Live A/B capture procedure:
 

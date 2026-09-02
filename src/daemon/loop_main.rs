@@ -4826,6 +4826,7 @@ impl MonitoringDaemon {
         let shutdown = self.signal_handler.shutdown_token();
         let scanner_index_path = self.config.paths.scanner_index_file();
         let cpu_budget = Arc::clone(&self.cpu_budget);
+        let executor_config = Arc::clone(&self.shared_executor_config);
         thread::Builder::new()
             .name("sbh-scanner".to_string())
             .spawn(move || {
@@ -4842,6 +4843,7 @@ impl MonitoringDaemon {
                     &scanner_index_path,
                     &index_feedback_rx,
                     &cpu_budget,
+                    &executor_config,
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -5243,12 +5245,13 @@ fn replay_indexed_record(
     logger: &ActivityLoggerHandle,
 ) -> std::result::Result<CandidacyScore, ReplayDrop> {
     use crate::scanner::active_lease::{ActiveLeaseState, inspect_path};
-    use crate::scanner::index::IndexedIdentity;
-    use crate::scanner::patterns::ArtifactCategory;
+    use crate::scanner::index::{IndexedIdentity, IndexedPruneDecision};
+    use crate::scanner::patterns::{ArtifactCategory, OpaqueTreeDisposition, classify_opaque_tree};
     use crate::scanner::scoring::{CandidateInput, DecisionAction};
     use crate::scanner::walker::{
-        TREE_IDLE_PROBE_MAX_DEPTH, TREE_IDLE_PROBE_MAX_ENTRIES, identity_for_path,
-        is_path_open_by_ancestor, structural_signals_for_path, tree_newest_mtime,
+        OPAQUE_SIZE_PROBE_BUDGET, TREE_IDLE_PROBE_MAX_DEPTH, TREE_IDLE_PROBE_MAX_ENTRIES,
+        identity_for_path, is_path_open_by_ancestor, opaque_context_for_path, opaque_tree_probe,
+        structural_signals_for_path, tree_newest_mtime,
     };
 
     let path = &record.path;
@@ -5281,11 +5284,34 @@ fn replay_indexed_record(
             lease.leased_target.display()
         )));
     }
-    let signals = structural_signals_for_path(path);
+    let mut signals = structural_signals_for_path(path);
     if signals.has_git || signals.has_cargo_toml {
         return Err(ReplayDrop::Vetoed("source tree markers".to_string()));
     }
-    let classification = registry.classify(path, signals);
+    // bd-8aeq: a record the walker pruned as an opaque candidate is
+    // re-classified the way the walker classified it (name plus parent
+    // context) and scored with the structural evidence of its subtree, not
+    // with the root directory's own entries. Without this a definite cargo
+    // `target/` (markers under `debug/`) replayed as `unclear` and could never
+    // pass an Orange cell's certainty gate, however many times it was replayed.
+    let opaque_probe = (record.prune_decision == IndexedPruneDecision::CandidateOpaque)
+        .then(|| classify_opaque_tree(path, opaque_context_for_path(path)))
+        .flatten()
+        .filter(|opaque| opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
+        .map(|opaque| {
+            let probe = opaque_tree_probe(
+                path,
+                scanner_config.cross_devices,
+                identity.device_id,
+                OPAQUE_SIZE_PROBE_BUDGET,
+                &AtomicBool::new(false),
+            );
+            signals = probe.signals;
+            (opaque.classification, probe)
+        });
+    let classification = opaque_probe
+        .as_ref()
+        .map_or_else(|| registry.classify(path, signals), |(c, _)| c.clone());
     if classification.category == ArtifactCategory::Unknown {
         return Err(ReplayDrop::Vetoed(
             "no longer classifies as an artifact".to_string(),
@@ -5300,7 +5326,11 @@ fn replay_indexed_record(
     if let Ok(created) = meta.created() {
         newest = newest.max(created);
     }
-    if meta.is_dir() && classification.category.is_regenerable_tree() {
+    if let Some((_, probe)) = &opaque_probe {
+        if let Some(tree_newest) = probe.newest_mtime {
+            newest = newest.max(tree_newest);
+        }
+    } else if meta.is_dir() && classification.category.is_regenerable_tree() {
         let probe = tree_newest_mtime(path, TREE_IDLE_PROBE_MAX_ENTRIES, TREE_IDLE_PROBE_MAX_DEPTH);
         if let Some(tree_newest) = probe.newest_mtime {
             newest = newest.max(tree_newest);
@@ -5310,12 +5340,15 @@ fn replay_indexed_record(
         .duration_since(newest)
         .unwrap_or(Duration::ZERO);
     #[cfg(unix)]
-    let allocated = {
+    let mut allocated = {
         use std::os::unix::fs::MetadataExt;
         meta.blocks().saturating_mul(512)
     };
     #[cfg(not(unix))]
-    let allocated = meta.len();
+    let mut allocated = meta.len();
+    if let Some((_, probe)) = &opaque_probe {
+        allocated = allocated.saturating_add(probe.allocated_bytes);
+    }
     let input = CandidateInput {
         path: path.clone(),
         size_bytes: record.size_estimate_bytes.max(allocated),
@@ -5536,6 +5569,7 @@ fn scanner_thread_main(
     scanner_index_path: &Path,
     index_feedback_rx: &Receiver<ScannerIndexFeedback>,
     cpu_budget: &Arc<Mutex<CpuBudget>>,
+    executor_config: &Arc<SharedExecutorConfig>,
 ) {
     const DIR_SIZE_FLOOR: u64 = 100 * 1_048_576; // 100 MiB
 
@@ -5921,6 +5955,15 @@ fn scanner_thread_main(
             None
         };
         let mut v2_candidate_bytes_seen = 0u64;
+        // bd-8aeq: the behavior cell's certainty gate, applied here as well as
+        // in the executor. A candidate the executor would only hold back must
+        // not be dispatched, must not count toward the pressure byte target
+        // (otherwise the walk stops on it and never reaches a dispatchable
+        // root), and must not make the pass look productive to the B6
+        // cooldown. Measured before this: 574 zero-duration replay passes in
+        // five minutes, each re-dispatching the same two `unclear` records.
+        let pass_min_certainty = executor_config.min_certainty();
+        let mut held_by_certainty: usize = 0;
 
         if scanner_index_enabled
             && request.pressure_level >= PressureLevel::Orange
@@ -5975,6 +6018,19 @@ fn scanner_thread_main(
                         logger,
                     ) {
                         Ok(score) => {
+                            // bd-8aeq: a record the executor would only hold
+                            // back is not re-dispatched; it stays in the index
+                            // (no cooldown) for a cell that accepts it.
+                            if score.decision.certainty < pass_min_certainty {
+                                held_by_certainty += 1;
+                                eprintln!(
+                                    "[SBH-SCANNER] index replay path={} generation={} verdict=held certainty={} below {pass_min_certainty}",
+                                    record.path.display(),
+                                    record.event_generation,
+                                    score.decision.certainty.label()
+                                );
+                                continue;
+                            }
                             eprintln!(
                                 "[SBH-SCANNER] index replay path={} generation={} verdict=dispatch score={:.3} certainty={}",
                                 record.path.display(),
@@ -6402,7 +6458,10 @@ fn scanner_thread_main(
                                         }),
                                     }
                                 }
-                                if !scanner_index_backoff_active {
+                                if score.decision.certainty < pass_min_certainty {
+                                    // bd-8aeq: same gate as the walk below.
+                                    held_by_certainty += 1;
+                                } else if !scanner_index_backoff_active {
                                     priority_candidates.push(score);
                                 }
                             }
@@ -6924,9 +6983,16 @@ fn scanner_thread_main(
                 continue;
             }
 
-            if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
-                && !score.vetoed
-            {
+            let deletable = score.decision.action
+                == crate::scanner::scoring::DecisionAction::Delete
+                && !score.vetoed;
+            if deletable && score.decision.certainty < pass_min_certainty {
+                // bd-8aeq: indexed above (a cell that accepts this certainty
+                // can replay it) but neither dispatched nor counted toward
+                // the byte target, so the walk keeps looking for a root the
+                // current cell would actually delete.
+                held_by_certainty += 1;
+            } else if deletable {
                 candidates_found += 1;
                 v2_candidate_bytes_seen = v2_candidate_bytes_seen.saturating_add(score.size_bytes);
                 scored.push(score);
@@ -7090,6 +7156,14 @@ fn scanner_thread_main(
         // fixture (`*.sqlite-wal`/`.git`/`.beads`): candidates_found stays high
         // while deleted/freed stays 0, so the old `candidates_found == 0` gate
         // never armed.
+        if held_by_certainty > 0 {
+            logger.send(ActivityEvent::Info {
+                message: format!(
+                    "scanner certainty gate held {held_by_certainty} candidate(s) below {pass_min_certainty} (pressure={:?}); not dispatched, not counted toward the reclaim byte target",
+                    request.pressure_level
+                ),
+            });
+        }
         if dispatched_this_pass == 0 {
             if !scan_timed_out {
                 consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
@@ -7102,7 +7176,7 @@ fn scanner_thread_main(
             .as_secs();
             if next_secs > 0 {
                 eprintln!(
-                    "[SBH-SCANNER] no reclaimable progress this pass ({candidates_found} candidates, 0 dispatched, timed_out={scan_timed_out}); backing off rescans (consecutive={consecutive_empty_passes}, next pressure-driven scan in ≥{next_secs}s)"
+                    "[SBH-SCANNER] no reclaimable progress this pass ({candidates_found} candidates, {held_by_certainty} held below {pass_min_certainty}, 0 dispatched, timed_out={scan_timed_out}); backing off rescans (consecutive={consecutive_empty_passes}, next pressure-driven scan in ≥{next_secs}s)"
                 );
             }
         } else {
@@ -8109,6 +8183,9 @@ mod tests {
             &scanner_index_path,
             &index_feedback_rx,
             &cpu_budget,
+            &Arc::new(SharedExecutorConfig::new(
+                false, 10, 0.0, 60, 3600, false, 0,
+            )),
         );
 
         assert!(
@@ -8281,6 +8358,9 @@ mod tests {
             &scanner_index_path,
             &index_feedback_rx,
             &cpu_budget,
+            &Arc::new(SharedExecutorConfig::new(
+                false, 10, 0.0, 60, 3600, false, 0,
+            )),
         );
 
         assert!(
@@ -8291,6 +8371,261 @@ mod tests {
         let _ = report_rx.try_recv();
         logger.shutdown();
         logger_join.join().unwrap();
+    }
+
+    /// bd-8aeq: a `Delete` verdict below the behavior cell's certainty gate is
+    /// not dispatched by the scanner, does not count as a candidate, and leaves
+    /// the pass unproductive so the empty-pass cooldown arms. Measured before
+    /// the fix: a daemon at Orange re-dispatched the same two `unclear` records
+    /// twice a second for five minutes while the executor held them back.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn scanner_certainty_gate_holds_unclear_candidates_and_arms_the_backoff() {
+        struct Outcome {
+            dispatched: bool,
+            reports: Vec<usize>,
+            log: String,
+        }
+
+        fn run_scan(
+            temp: &Path,
+            root: &Path,
+            min_certainty: ArtifactCertainty,
+            requests: usize,
+            index_name: &str,
+        ) -> Outcome {
+            let mut config = Config::default();
+            config.scanner.root_paths = vec![root.to_path_buf()];
+            config.scanner.min_file_age_minutes = 0;
+            config.scanner.active_reference_min_size_bytes = u64::MAX;
+
+            let log_path = temp.join(format!("activity-{index_name}-{requests}.jsonl"));
+            let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+                sqlite_path: None,
+                jsonl_config: crate::logger::jsonl::JsonlConfig {
+                    path: log_path.clone(),
+                    fallback_path: None,
+                    max_size_bytes: 1_048_576,
+                    max_rotated_files: 0,
+                    fsync_interval_secs: 0,
+                },
+                channel_capacity: 64,
+                run_id: None,
+            })
+            .unwrap();
+            let (scan_tx, scan_rx) = bounded::<ScanRequest>(requests);
+            let (del_tx, del_rx) = bounded::<DeletionBatch>(4);
+            let (report_tx, report_rx) = bounded::<WorkerReport>(4);
+            let (_index_feedback_tx, index_feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+            let cpu_budget = Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0)));
+            let heartbeat = Arc::new(ThreadHeartbeat::new("test-scanner"));
+            let shared_scoring_config = Arc::new(RwLock::new(config.scoring));
+            let shared_scanner_config = Arc::new(RwLock::new(config.scanner));
+            let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let scanner_index_path = temp.join(index_name);
+            let executor_config = Arc::new(SharedExecutorConfig::new(
+                false, 10, 0.0, 60, 3600, false, 0,
+            ));
+            executor_config.set_min_certainty(min_certainty);
+
+            for _ in 0..requests {
+                scan_tx
+                    .send(ScanRequest {
+                        paths: vec![root.to_path_buf()],
+                        urgency: 0.9,
+                        pressure_level: PressureLevel::Orange,
+                        free_pct: Some(9.0),
+                        max_delete_batch: 10,
+                        force_full_scan: false,
+                        config_update: None,
+                        catalog_roots: Vec::new(),
+                        maintenance: false,
+                    })
+                    .unwrap();
+            }
+            drop(scan_tx);
+
+            scanner_thread_main(
+                &scan_rx,
+                &del_tx,
+                &logger,
+                &shared_scoring_config,
+                &shared_scanner_config,
+                &platform,
+                &heartbeat,
+                &report_tx,
+                &shutdown,
+                &scanner_index_path,
+                &index_feedback_rx,
+                &cpu_budget,
+                &executor_config,
+            );
+            logger.shutdown();
+            logger_join.join().unwrap();
+
+            let dispatched = del_rx.try_recv().is_ok();
+            let reports = report_rx
+                .try_iter()
+                .map(|report| match report {
+                    WorkerReport::ScanCompleted { candidates, .. } => candidates,
+                    WorkerReport::DeletionCompleted { .. } => {
+                        panic!("expected scanner completion reports")
+                    }
+                })
+                .collect();
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            Outcome {
+                dispatched,
+                reports,
+                log,
+            }
+        }
+
+        // Not under /tmp or /data/tmp: inside a temp root every recognized
+        // artifact is `definite` by rule, which is the opposite of what this
+        // test needs. The cargo target directory is neither temp nor source.
+        let scratch_base = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+            || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
+            PathBuf::from,
+        );
+        std::fs::create_dir_all(&scratch_base).unwrap();
+        let temp = tempfile::tempdir_in(&scratch_base).unwrap();
+        let root = temp.path().join("scan-root");
+        // `node_modules` beside a package manifest is an opaque candidate whose
+        // certainty is `unclear` outside a temp root: no structural marker can
+        // prove it, so the verdict is `Delete` at `unclear`.
+        let project = root.join("proj");
+        let module = project.join("node_modules").join("left-pad");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(project.join("package.json"), "{\"name\":\"proj\"}\n").unwrap();
+        std::fs::write(module.join("index.js"), vec![b'/'; 8192]).unwrap();
+
+        // Gate open (Red/Critical cells accept `unclear`): the fixture is a
+        // dispatchable candidate, which is the precondition for the rest.
+        let open = run_scan(
+            temp.path(),
+            &root,
+            ArtifactCertainty::Unclear,
+            1,
+            "index-open.json",
+        );
+        assert!(
+            open.dispatched,
+            "precondition: the fixture must be dispatched when the gate accepts unclear: reports={:?}",
+            open.reports
+        );
+        // The pre-scan and the walk each count the tree once.
+        assert!(
+            open.reports.len() == 1 && open.reports[0] >= 1,
+            "{:?}",
+            open.reports
+        );
+
+        // Orange cell (`likely` or better): the same tree dispatches nothing,
+        // counts no candidate, and the second request is absorbed by the
+        // empty-pass cooldown instead of re-walking.
+        let held = run_scan(
+            temp.path(),
+            &root,
+            ArtifactCertainty::Likely,
+            2,
+            "index-held.json",
+        );
+        assert!(
+            !held.dispatched,
+            "an unclear candidate must not reach the executor below the gate"
+        );
+        assert_eq!(
+            held.reports,
+            vec![0],
+            "one unproductive pass, then the cooldown swallows the second request"
+        );
+        assert!(
+            held.log.contains("scanner certainty gate held ")
+                && held.log.contains(" below likely (pressure=Orange)"),
+            "the held count is logged: {}",
+            held.log
+        );
+
+        // The record persisted by the open run is replayed from the index on
+        // the next pass and held there too, without a walk.
+        let replayed = run_scan(
+            temp.path(),
+            &root,
+            ArtifactCertainty::Likely,
+            1,
+            "index-open.json",
+        );
+        assert!(!replayed.dispatched);
+        assert_eq!(replayed.reports, vec![0]);
+        assert!(
+            replayed.log.contains("scanner certainty gate held ")
+                && replayed.log.contains(" below likely (pressure=Orange)"),
+            "{}",
+            replayed.log
+        );
+
+        // The second half of the bug: a definite cargo target (markers under
+        // `debug/`, `CACHEDIR.TAG`) is walked as an opaque candidate, and its
+        // index replay must keep that evidence. Before the fix the replay
+        // re-classified the root from its own entries, came out `unclear`,
+        // and the Orange cell held it forever.
+        let cargo_root = temp.path().join("cargo-root");
+        let cargo_project = cargo_root.join("crate");
+        let target = cargo_project.join("target");
+        let debug = target.join("debug");
+        for sub in ["deps", "incremental", ".fingerprint"] {
+            std::fs::create_dir_all(debug.join(sub)).unwrap();
+        }
+        std::fs::write(
+            cargo_project.join("Cargo.toml"),
+            "[package]\nname = \"crate\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n",
+        )
+        .unwrap();
+        std::fs::write(debug.join("deps").join("libcrate.rlib"), vec![0xA5u8; 8192]).unwrap();
+        std::fs::write(debug.join("incremental").join("unit-0"), b"x").unwrap();
+        std::fs::write(debug.join(".fingerprint").join("lib-crate"), b"x").unwrap();
+
+        let walked = run_scan(
+            temp.path(),
+            &cargo_root,
+            ArtifactCertainty::Likely,
+            1,
+            "index-cargo.json",
+        );
+        assert!(
+            walked.dispatched,
+            "a definite target passes the Orange gate on the walk: {:?}",
+            walked.reports
+        );
+        let replayed_target = run_scan(
+            temp.path(),
+            &cargo_root,
+            ArtifactCertainty::Likely,
+            1,
+            "index-cargo.json",
+        );
+        assert!(
+            replayed_target.log.contains("replayed_records=1"),
+            "the second pass replays the persisted record: {}",
+            replayed_target.log
+        );
+        assert!(
+            replayed_target.dispatched,
+            "the replayed target keeps its definite certainty and is dispatched again: {}",
+            replayed_target.log
+        );
+        assert!(
+            !replayed_target.log.contains("scanner certainty gate held "),
+            "{}",
+            replayed_target.log
+        );
     }
 
     #[test]
@@ -8371,6 +8706,9 @@ mod tests {
             &scanner_index_path,
             &index_feedback_rx,
             &cpu_budget,
+            &Arc::new(SharedExecutorConfig::new(
+                false, 10, 0.0, 60, 3600, false, 0,
+            )),
         );
 
         let report = report_rx
