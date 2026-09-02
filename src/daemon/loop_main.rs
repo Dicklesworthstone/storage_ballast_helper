@@ -145,7 +145,20 @@ const TICK_THROTTLE_MAX_BACKOFF: Duration = Duration::from_mins(1);
 /// channel receives so SIGTERM can stop the daemon even while senders are alive.
 const WORKER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Maximum time to wait for an individual worker thread during shutdown.
-const WORKER_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total time `shutdown()` spends joining the scanner and executor, shared
+/// between them: five seconds under the systemd unit's `TimeoutStopSec=30`
+/// so the final state write and the logger flush still happen before the
+/// service manager would SIGKILL the process.
+const WORKER_SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(25);
+
+/// A worker whose heartbeat is older than this is reported as stalled in
+/// `state.json` and `sbh status`. Distinct from the health-check cadence:
+/// a scan pass or a large deletion may legitimately run for tens of
+/// seconds between beats.
+const THREAD_STALL_THRESHOLD: Duration = Duration::from_secs(60);
+
+/// Entries walked between scanner heartbeats inside a pass.
+const SCANNER_BEAT_EVERY_ENTRIES: usize = 256;
 
 // ──────────────────── shared executor config ────────────────────
 
@@ -2453,7 +2466,7 @@ impl MonitoringDaemon {
                 Arc::clone(&self.scanner_heartbeat),
                 Arc::clone(&self.executor_heartbeat),
             ],
-            THREAD_HEALTH_CHECK_INTERVAL,
+            THREAD_STALL_THRESHOLD,
             response.level,
         );
         let guard = self.shared_guard_diagnostics.read().clone();
@@ -2564,7 +2577,7 @@ impl MonitoringDaemon {
                 Arc::clone(&self.scanner_heartbeat),
                 Arc::clone(&self.executor_heartbeat),
             ],
-            THREAD_HEALTH_CHECK_INTERVAL,
+            THREAD_STALL_THRESHOLD,
             response.level,
         );
         let worker = |index: usize| {
@@ -2573,12 +2586,23 @@ impl MonitoringDaemon {
                 .get(index)
                 .map_or_else(ThreadState::default, ThreadState::from_status)
         };
+        // The logger beats once a second from its own loop, so a thread that
+        // is alive but wedged (a hung SQLite write) shows as stalled, not
+        // running.
         let logger = if self
             .logger_join
             .as_ref()
             .is_some_and(|handle| !handle.is_finished())
         {
-            ThreadState::running_now()
+            let since = self.logger_handle.seconds_since_beat();
+            ThreadState {
+                status: if since.is_some_and(|s| s > THREAD_STALL_THRESHOLD.as_secs()) {
+                    "stalled".to_string()
+                } else {
+                    "running".to_string()
+                },
+                seconds_since_heartbeat: since,
+            }
         } else {
             ThreadState {
                 status: "dead".to_string(),
@@ -4647,14 +4671,25 @@ impl MonitoringDaemon {
         drop(scan_tx);
         drop(del_tx);
 
-        // 2. Wait briefly for worker threads. Long critical-pressure scans must not
-        // trap SIGTERM behind an unbounded join; unfinished workers are abandoned
-        // and the process exits after logger shutdown.
+        // 2. Join the workers within one shared budget (under the unit's
+        // TimeoutStopSec). A long critical-pressure scan must not trap
+        // SIGTERM behind an unbounded join: whatever has not stopped by the
+        // deadline is abandoned and the process exits after the final state
+        // write and logger flush.
+        let join_deadline = Instant::now() + WORKER_SHUTDOWN_JOIN_BUDGET;
         if let Some(h) = scanner_join {
-            join_worker_with_timeout("scanner", h, WORKER_SHUTDOWN_JOIN_TIMEOUT);
+            join_worker_with_timeout(
+                "scanner",
+                h,
+                join_deadline.saturating_duration_since(Instant::now()),
+            );
         }
         if let Some(h) = executor_join {
-            join_worker_with_timeout("executor", h, WORKER_SHUTDOWN_JOIN_TIMEOUT);
+            join_worker_with_timeout(
+                "executor",
+                h,
+                join_deadline.saturating_duration_since(Instant::now()),
+            );
         }
 
         // 3. Log shutdown and stamp the state file so readers can tell a
@@ -6356,6 +6391,9 @@ fn scanner_thread_main(
                 break;
             }
             paths_scanned += 1;
+            if paths_scanned % SCANNER_BEAT_EVERY_ENTRIES == 0 {
+                heartbeat.beat();
+            }
 
             // Budget check: stop processing if we've exceeded entry count or time limits.
             if paths_scanned >= SCAN_ENTRY_BUDGET || Instant::now() >= scan_deadline {
@@ -7113,6 +7151,8 @@ fn executor_thread_main(
             if shutdown.load(Ordering::Relaxed) {
                 return true;
             }
+            // Runs once per candidate: a long batch keeps beating.
+            heartbeat.beat();
             let mut protection = protection.lock();
             should_skip_protected_daemon_candidate(
                 &mut protection,

@@ -591,9 +591,24 @@ fn runner_starts_and_stops_a_daemon() {
             .is_some_and(|id| !id.is_empty())
     );
     assert_eq!(state["threads"]["monitor"]["status"], "running");
+    // Every worker reports through its own heartbeat, the logger included.
+    for thread in ["scanner", "executor", "logger"] {
+        let record = &state["threads"][thread];
+        assert_eq!(record["status"], "running", "{thread}: {record}");
+        assert!(
+            record["seconds_since_heartbeat"].as_u64().is_some(),
+            "{thread}: {record}"
+        );
+    }
 
+    let stopped = Instant::now();
     let status = run.stop();
     assert!(status.success(), "clean SIGTERM exit, got {status}");
+    assert!(
+        stopped.elapsed() < Duration::from_secs(10),
+        "an idle daemon stops well inside the join budget: {:?}",
+        stopped.elapsed()
+    );
     let final_state: Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join("data/state.json")).unwrap())
             .unwrap();
@@ -601,6 +616,28 @@ fn runner_starts_and_stops_a_daemon() {
     assert!(final_state["stopped_at"].as_str().is_some());
     let stderr = fs::read_to_string(dir.path().join("daemon.stderr")).unwrap();
     assert!(stderr.contains("shutdown complete"), "{stderr}");
+
+    // `sbh status` right after a clean stop: not running, the state file is
+    // fresh (no stale flag), and the daemon block says why it stopped.
+    let status = Command::new(common::sbh_bin_path())
+        .arg("--config")
+        .arg(dir.path().join("config.toml"))
+        .args(["--json", "status"])
+        .env_remove("SBH_TEST_MODE")
+        .output()
+        .expect("run sbh status");
+    let payload: Value = serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&status.stdout)));
+    assert_eq!(payload["daemon_running"], false, "{payload}");
+    assert_eq!(payload["state_stale"], false, "{payload}");
+    assert_eq!(
+        payload["daemon"]["exit_reason"], "clean shutdown",
+        "{payload}"
+    );
+    assert!(
+        payload["daemon"]["stopped_at"].as_str().is_some(),
+        "{payload}"
+    );
 }
 
 /// A daemon that exits at once, or never writes a state file, fails the

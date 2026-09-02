@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 
 use crate::core::errors::Result;
 use crate::logger::jsonl::{
@@ -146,9 +148,22 @@ pub enum ActivityEvent {
 pub struct ActivityLoggerHandle {
     tx: Sender<ActivityEvent>,
     dropped_events: Arc<AtomicU64>,
+    /// Epoch milliseconds of the logger thread's last loop iteration.
+    last_beat_ms: Arc<AtomicU64>,
 }
 
 impl ActivityLoggerHandle {
+    /// Seconds since the logger thread last went round its loop (`None`
+    /// before its first iteration).
+    #[must_use]
+    pub fn seconds_since_beat(&self) -> Option<u64> {
+        let beat = self.last_beat_ms.load(Ordering::Relaxed);
+        if beat == 0 {
+            return None;
+        }
+        Some(epoch_ms().saturating_sub(beat) / 1000)
+    }
+
     /// Send an event to the logger thread. Non-blocking.
     ///
     /// If the channel is full the event is dropped and the dropped-events counter
@@ -217,16 +232,28 @@ pub fn spawn_logger(
     let (tx, rx) = bounded::<ActivityEvent>(config.channel_capacity);
     let dropped = Arc::new(AtomicU64::new(0));
     let dropped_clone = Arc::clone(&dropped);
+    // The spawn is the first beat: a state file written before the thread's
+    // first loop iteration (SQLite open, schema check) must not report the
+    // logger as never having beaten.
+    let last_beat = Arc::new(AtomicU64::new(epoch_ms()));
+    let last_beat_clone = Arc::clone(&last_beat);
 
     let handle = ActivityLoggerHandle {
         tx,
         dropped_events: dropped,
+        last_beat_ms: last_beat,
     };
 
     let join = thread::Builder::new()
         .name("sbh-logger".to_string())
         .spawn(move || {
-            logger_thread_main(rx, config.sqlite_path, config.jsonl_config, dropped_clone);
+            logger_thread_main(
+                rx,
+                config.sqlite_path,
+                config.jsonl_config,
+                dropped_clone,
+                last_beat_clone,
+            );
         })
         .map_err(|e| crate::core::errors::SbhError::Runtime {
             details: format!("failed to spawn logger thread: {e}"),
@@ -237,6 +264,13 @@ pub fn spawn_logger(
 
 // ──────────────────── logger thread ────────────────────
 
+/// Milliseconds since the Unix epoch, for the logger heartbeat.
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_lines)]
 fn logger_thread_main(
@@ -244,6 +278,7 @@ fn logger_thread_main(
     sqlite_path: Option<PathBuf>,
     jsonl_config: JsonlConfig,
     dropped: Arc<AtomicU64>,
+    last_beat: Arc<AtomicU64>,
 ) {
     #[cfg(feature = "sqlite")]
     const SQLITE_RECOVERY_INTERVAL: u32 = 50;
@@ -278,7 +313,15 @@ fn logger_thread_main(
 
     // Process events until Shutdown or channel disconnect.
     let mut last_reported_drops: u64 = 0;
-    while let Ok(event) = rx.recv() {
+    loop {
+        // Heartbeat for the daemon's thread health: once a second while
+        // idle, and on every event while busy.
+        last_beat.store(epoch_ms(), Ordering::Relaxed);
+        let event = match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         // Report dropped events periodically (M8: delta, not zeroing).
         let total_dropped = dropped.load(Ordering::Relaxed);
         let d = total_dropped.saturating_sub(last_reported_drops);

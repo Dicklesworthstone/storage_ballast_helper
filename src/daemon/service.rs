@@ -308,6 +308,12 @@ mod service_ownership_policy_tests {
     }
 }
 
+/// The pre-template inline unit writer. Nothing calls it; deleting it
+/// needs operator permission (AGENTS.md rule 1), see bd-rc-master-ajg1.6.3.
+#[deprecated(
+    since = "0.5.2",
+    note = "dead code; the template-based writers above are used (bd-rc-master-ajg1.6.3)"
+)]
 #[allow(dead_code)]
 mod legacy_inline {
 

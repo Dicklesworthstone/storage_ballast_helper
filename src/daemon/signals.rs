@@ -154,11 +154,21 @@ impl Default for SignalHandler {
 
 /// Coordinates graceful shutdown: waits for in-progress operations, flushes
 /// buffers, then exits.
+///
+/// Unused: the daemon's `shutdown()` in `loop_main.rs` is the real sequence
+/// (STOPPING=1, drop senders, bounded worker joins, final state write,
+/// logger flush). Kept only because deleting files needs operator
+/// permission (AGENTS.md rule 1); see bd-rc-master-ajg1.6.3.
+#[deprecated(
+    since = "0.5.2",
+    note = "dead code; the daemon's shutdown() is the real sequence (bd-rc-master-ajg1.6.3)"
+)]
 pub struct ShutdownCoordinator {
     /// Maximum time to wait for in-progress operations.
     pub timeout: Duration,
 }
 
+#[allow(deprecated)]
 impl ShutdownCoordinator {
     /// Create a coordinator with the default 30-second timeout.
     #[must_use]
@@ -195,6 +205,7 @@ impl ShutdownCoordinator {
     }
 }
 
+#[allow(deprecated)]
 impl Default for ShutdownCoordinator {
     fn default() -> Self {
         Self::new()
@@ -309,6 +320,7 @@ impl WatchdogHeartbeat {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
 
     fn noop_service_manager() -> Box<dyn ServiceManager> {

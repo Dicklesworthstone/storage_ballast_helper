@@ -422,6 +422,18 @@ struct ExplainArgs {
     /// Decisions newer than a window (e.g. 30m, 2h, 1d), newest first.
     #[arg(long, value_name = "WINDOW", group = "selector")]
     since: Option<String>,
+    /// Score this path now, run the deletion preflight, and say what keeps
+    /// it from being reclaimed (protection, veto, preflight, or score gap).
+    #[arg(long, value_name = "PATH", group = "selector")]
+    why_not: Option<PathBuf>,
+    /// Re-score a recorded decision's inputs with the current code and
+    /// config and report factor/posterior/action drift.
+    #[arg(long, value_name = "ID", group = "selector")]
+    replay: Option<String>,
+    /// With --why-not: the smallest single change (age, size, or pressure)
+    /// that would flip the outcome to Delete.
+    #[arg(long, requires = "why_not")]
+    counterfactual: bool,
     /// Detail level 0-3.
     #[arg(long, default_value_t = 2, value_name = "LEVEL")]
     level: u8,
@@ -1203,6 +1215,12 @@ fn run_explain(cli: &Cli, args: &ExplainArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
     let level = ExplainLevel::from_int(args.level.min(3));
+    if let Some(path) = &args.why_not {
+        return run_explain_why_not(cli, &config, path, args.counterfactual, level);
+    }
+    if let Some(id) = &args.replay {
+        return run_explain_replay(cli, &config, id);
+    }
     let limit = u32::try_from(args.limit.max(1)).unwrap_or(u32::MAX);
     let selector = if let Some(id) = &args.id {
         let id = id.trim().to_ascii_lowercase();
@@ -1309,6 +1327,752 @@ fn trace_explain_records(
             record.path.display()
         );
     }
+}
+
+// ──────────────────── explain --why-not / --counterfactual / --replay ────────────────────
+
+/// One single-factor change that would flip a scoring outcome to Delete.
+#[derive(Debug, Clone, Serialize)]
+struct Counterfactual {
+    factor: &'static str,
+    current: String,
+    needed: Option<String>,
+    action_after: Option<&'static str>,
+    note: Option<String>,
+}
+
+/// What `sbh explain --why-not` learned about one path, in the order the
+/// rails run: protection, scanner visibility, scoring vetoes, deletion
+/// preflight, then the score and decision.
+struct WhyNotReport {
+    path: PathBuf,
+    verdict: String,
+    protection: Option<String>,
+    excluded: bool,
+    scanner_note: Option<String>,
+    trace: Option<ScanTrace>,
+    preflight: Option<std::result::Result<(), &'static str>>,
+    open_scan_complete: bool,
+    min_score: f64,
+    record: Option<storage_ballast_helper::scanner::decision_record::DecisionRecord>,
+    counterfactuals: Vec<Counterfactual>,
+}
+
+fn run_explain_why_not(
+    cli: &Cli,
+    config: &Config,
+    path: &Path,
+    counterfactual: bool,
+    level: storage_ballast_helper::scanner::decision_record::ExplainLevel,
+) -> Result<(), CliError> {
+    let path = path
+        .canonicalize()
+        .map_err(|e| CliError::User(format!("{}: {e}", path.display())))?;
+    let report = why_not_report(config, &path, counterfactual)?;
+    match output_mode(cli) {
+        OutputMode::Json => write_json_line(&why_not_json(&report, level))?,
+        OutputMode::Human => print!("{}", format_why_not(&report, level)),
+    }
+    Ok(())
+}
+
+/// The scanner's own view of one directory: walk its parent one level with
+/// the configured walker and pick the entry out, so classification, sizes,
+/// and age are exactly what a scan would compute.
+fn walk_single_entry(
+    config: &Config,
+    protection: ProtectionRegistry,
+    path: &Path,
+) -> Result<Option<storage_ballast_helper::scanner::walker::WalkEntry>, CliError> {
+    let Some(parent) = path.parent() else {
+        return Err(CliError::User(
+            "cannot explain the filesystem root; name a directory under a scan root".to_string(),
+        ));
+    };
+    let selected_scanner_engine = SelectedScannerEngine::for_mode(config.scanner.engine);
+    let walker = DirectoryWalker::new(
+        WalkerConfig {
+            root_paths: vec![parent.to_path_buf()],
+            max_depth: 1,
+            follow_symlinks: config.scanner.follow_symlinks,
+            cross_devices: config.scanner.cross_devices,
+            parallelism: 1,
+            excluded_paths: config
+                .scanner
+                .excluded_paths
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            opaque_pruning: selected_scanner_engine.opaque_pruning(),
+        },
+        protection,
+    );
+    let entries = walker
+        .walk()
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    Ok(entries.into_iter().find(|entry| entry.path == path))
+}
+
+#[allow(clippy::too_many_lines)]
+fn why_not_report(
+    config: &Config,
+    path: &Path,
+    with_counterfactuals: bool,
+) -> Result<WhyNotReport, CliError> {
+    use storage_ballast_helper::scanner::decision_record::{DecisionRecordBuilder, PolicyMode};
+    use storage_ballast_helper::scanner::scoring::DecisionAction;
+
+    let min_score = config.scoring.min_score;
+    let protection_patterns = if config.scanner.protected_paths.is_empty() {
+        None
+    } else {
+        Some(config.scanner.protected_paths.as_slice())
+    };
+    let mut protection = ProtectionRegistry::new(protection_patterns)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    // A marker inside the directory protects it; so does one on any ancestor.
+    let _ = protection.discover_markers(path, 1);
+    let _ = protection.discover_ancestor_markers(path);
+    let protection_reason = protection.protection_reason(path);
+    let excluded = config
+        .scanner
+        .excluded_paths
+        .iter()
+        .any(|excluded| path.starts_with(excluded));
+
+    let mut report = WhyNotReport {
+        path: path.to_path_buf(),
+        verdict: String::new(),
+        protection: protection_reason.clone(),
+        excluded,
+        scanner_note: None,
+        trace: None,
+        preflight: None,
+        open_scan_complete: true,
+        min_score,
+        record: None,
+        counterfactuals: Vec::new(),
+    };
+
+    let Some(entry) = walk_single_entry(config, protection, path)? else {
+        report.scanner_note = Some(if !path.is_dir() {
+            "the scanner scores directories, and this is a file: explain its directory instead"
+                .to_string()
+        } else if let Some(reason) = &protection_reason {
+            format!("not visited: {reason}")
+        } else if excluded {
+            "not visited: under scanner.excluded_paths".to_string()
+        } else {
+            "not visited by the walker (a symlink, another device with cross_devices = false, or the interior of an opaque tree)".to_string()
+        });
+        report.verdict = report.scanner_note.clone().unwrap_or_default();
+        return Ok(report);
+    };
+
+    let registry = ArtifactPatternRegistry::default();
+    let classification = if let Some(opaque_tree) = &entry.opaque_tree {
+        match opaque_tree.disposition {
+            OpaqueTreeDisposition::CandidateOpaque => opaque_tree.classification.clone(),
+            OpaqueTreeDisposition::SignalOnly | OpaqueTreeDisposition::ProtectedOpaque => {
+                report.scanner_note = Some(format!(
+                    "part of an opaque tree ({:?}): the scanner scores the tree as a whole, not this directory",
+                    opaque_tree.disposition
+                ));
+                report.verdict = report.scanner_note.clone().unwrap_or_default();
+                return Ok(report);
+            }
+        }
+    } else {
+        registry.classify(&entry.path, entry.structural_signals)
+    };
+    let now = SystemTime::now();
+    let age = now
+        .duration_since(
+            entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
+        )
+        .unwrap_or_default();
+    let mut candidate = CandidateInput {
+        path: entry.path.clone(),
+        size_bytes: entry.metadata.content_size_bytes,
+        age,
+        classification,
+        signals: entry.structural_signals,
+        active_references: ActiveReferenceSummary::default(),
+        is_open: false,
+        excluded: false,
+    };
+
+    // Open files and active references, always (a scan only checks them for
+    // candidates above the threshold; here the question is exactly why not).
+    let scan_roots = vec![
+        path.parent()
+            .map_or_else(|| path.to_path_buf(), Path::to_path_buf),
+    ];
+    let active_reference_scan = active_reference_scan_config(config);
+    let mut open_paths = None;
+    let mut active_reference_index = None;
+    candidate.is_open = open_status_for_candidate(
+        &mut open_paths,
+        &scan_roots,
+        active_reference_scan,
+        &entry.path,
+        entry.metadata.content_size_bytes,
+    );
+    let (active_references, active_reference_checked) = active_references_for_candidate(
+        &mut active_reference_index,
+        &scan_roots,
+        active_reference_scan,
+        &entry.path,
+        Some(entry.metadata.identity()),
+        entry.metadata.content_size_bytes,
+    );
+    candidate.active_references = active_references;
+
+    let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    let sacred_paths = active_sacred_paths(config)?;
+    let (mut score, sacred_overlaps) =
+        score_candidate_with_deferred_sacred_check(&engine, &candidate, 0.0, &sacred_paths, |_| {
+            true
+        });
+    score.identity = Some(entry.metadata.identity());
+    let min_file_age_seconds = config.scanner.min_file_age_minutes.saturating_mul(60);
+    report.trace = Some(build_scan_trace(
+        &candidate,
+        &score,
+        min_file_age_seconds,
+        active_reference_checked,
+        &sacred_overlaps,
+    ));
+
+    // The executor's own preflight, with the open-file set it would use.
+    let (open_set, open_scan_complete) =
+        collect_open_path_ancestors(std::slice::from_ref(&report.path));
+    report.open_scan_complete = open_scan_complete;
+    let executor = DeletionExecutor::new(
+        DeletionConfig {
+            min_score,
+            check_open_files: true,
+            require_identity: matches!(config.scanner.engine, ScannerEngineMode::V2),
+            sacred_paths,
+            ..Default::default()
+        },
+        None,
+    );
+    let preflight = executor
+        .explain_preflight(&score, Some(&open_set))
+        .map_err(|reason| reason.as_str());
+    report.preflight = Some(preflight);
+
+    if with_counterfactuals {
+        report.counterfactuals = explain_counterfactuals(&engine, &candidate, &score);
+    }
+
+    let record = DecisionRecordBuilder::new().build(&score, PolicyMode::DryRun, None, None, None);
+    report.verdict = if let Some(reason) = &report.protection {
+        format!("protected: {reason}")
+    } else if excluded {
+        "excluded by scanner.excluded_paths".to_string()
+    } else if score.vetoed {
+        format!(
+            "vetoed by scoring: {}",
+            score.veto_reason.as_deref().unwrap_or("unspecified")
+        )
+    } else if let Some(Err(reason)) = &report.preflight {
+        format!("refused by the deletion preflight: {reason}")
+    } else if score.total_score < min_score {
+        format!(
+            "score {:.2} is below scoring.min_score {min_score:.2}",
+            score.total_score
+        )
+    } else {
+        match score.decision.action {
+            DecisionAction::Keep => format!(
+                "decided Keep: posterior abandoned {:.2}, expected loss keep {:.2} vs delete {:.2}",
+                score.decision.posterior_abandoned,
+                score.decision.expected_loss_keep,
+                score.decision.expected_loss_delete
+            ),
+            DecisionAction::Review => format!(
+                "decided Review: the keep-vs-delete margin ({:.2}) is inside the review band; `sbh clean` holds it, `sbh emergency` may act",
+                (score.decision.expected_loss_keep - score.decision.expected_loss_delete).abs()
+            ),
+            DecisionAction::Delete => format!(
+                "nothing keeps it: Delete at score {:.2} (a scan or the daemon would list it)",
+                score.total_score
+            ),
+        }
+    };
+    report.record = Some(record);
+    Ok(report)
+}
+
+/// Smallest `x` in `[lo, hi]` for which `flips(x)` holds, assuming the flip
+/// is monotonic in `x` (more age, more bytes, or more pressure never makes
+/// an artifact look less abandoned): a bisection between the endpoints.
+fn smallest_flip(lo: u64, hi: u64, flips: impl Fn(u64) -> bool) -> Option<u64> {
+    if lo > hi || !flips(hi) {
+        return None;
+    }
+    if flips(lo) {
+        return Some(lo);
+    }
+    let (mut bad, mut good) = (lo, hi);
+    while good - bad > 1 {
+        let mid = bad + (good - bad) / 2;
+        if flips(mid) {
+            good = mid;
+        } else {
+            bad = mid;
+        }
+    }
+    Some(good)
+}
+
+/// For a candidate that is not Delete, the smallest single change of age,
+/// size, or pressure urgency that would make the current engine say Delete.
+/// A vetoed candidate has no such change: vetoes are hard rails.
+fn explain_counterfactuals(
+    engine: &ScoringEngine,
+    input: &CandidateInput,
+    current: &CandidacyScore,
+) -> Vec<Counterfactual> {
+    use storage_ballast_helper::scanner::scoring::DecisionAction;
+
+    if current.vetoed {
+        return vec![Counterfactual {
+            factor: "veto",
+            current: current
+                .veto_reason
+                .as_deref()
+                .unwrap_or("unspecified")
+                .to_string(),
+            needed: None,
+            action_after: None,
+            note: Some("not flippable by scoring: a veto is a hard rail".to_string()),
+        }];
+    }
+    if current.decision.action == DecisionAction::Delete {
+        return vec![Counterfactual {
+            factor: "none",
+            current: "Delete".to_string(),
+            needed: None,
+            action_after: Some("Delete"),
+            note: Some("already Delete".to_string()),
+        }];
+    }
+    let deletes = |modified: &CandidateInput, urgency: f64| {
+        engine.score_candidate(modified, urgency).decision.action == DecisionAction::Delete
+    };
+
+    let mut out = Vec::new();
+    let year = 365 * 24 * 60 * 60;
+    let age_needed = smallest_flip(input.age.as_secs().saturating_add(1), year, |secs| {
+        let mut modified = input.clone();
+        modified.age = std::time::Duration::from_secs(secs);
+        deletes(&modified, 0.0)
+    });
+    out.push(Counterfactual {
+        factor: "age",
+        current: format_duration(input.age),
+        needed: age_needed.map(|secs| format_duration(std::time::Duration::from_secs(secs))),
+        action_after: age_needed.map(|_| "Delete"),
+        note: age_needed
+            .is_none()
+            .then(|| "age alone cannot flip it within a year".to_string()),
+    });
+
+    let tebibyte = 1u64 << 40;
+    let size_needed = smallest_flip(input.size_bytes.saturating_add(1), tebibyte, |bytes| {
+        let mut modified = input.clone();
+        modified.size_bytes = bytes;
+        deletes(&modified, 0.0)
+    });
+    out.push(Counterfactual {
+        factor: "size",
+        current: format_bytes(input.size_bytes),
+        needed: size_needed.map(format_bytes),
+        action_after: size_needed.map(|_| "Delete"),
+        note: size_needed
+            .is_none()
+            .then(|| "size alone cannot flip it below 1 TiB".to_string()),
+    });
+
+    let urgency_needed = smallest_flip(0, 100, |hundredths| {
+        deletes(
+            input,
+            f64::from(u32::try_from(hundredths).unwrap_or(100)) / 100.0,
+        )
+    });
+    out.push(Counterfactual {
+        factor: "pressure",
+        current: "urgency 0.00 (Green)".to_string(),
+        needed: urgency_needed.map(|hundredths| {
+            format!(
+                "urgency {:.2}",
+                f64::from(u32::try_from(hundredths).unwrap_or(100)) / 100.0
+            )
+        }),
+        action_after: urgency_needed.map(|_| "Delete"),
+        note: urgency_needed
+            .is_none()
+            .then(|| "pressure alone cannot flip it, even at Critical".to_string()),
+    });
+    out
+}
+
+fn why_not_json(
+    report: &WhyNotReport,
+    level: storage_ballast_helper::scanner::decision_record::ExplainLevel,
+) -> Value {
+    let preflight = report.preflight.as_ref().map(|outcome| match outcome {
+        Ok(()) => json!({ "ok": true, "reason": Value::Null }),
+        Err(reason) => json!({ "ok": false, "reason": reason }),
+    });
+    let trace = report.trace.as_ref().map(|trace| {
+        json!({
+            "pattern_name": trace.pattern_name,
+            "category": trace.category,
+            "mtime_check": trace.mtime_check,
+            "fd_check": trace.fd_check,
+            "exec_check": trace.exec_check,
+            "mmap_check": trace.mmap_check,
+            "sacred_overlap_check": trace.sacred_overlap_check,
+            "final_confidence": trace.final_confidence,
+            "final_action": trace.final_action,
+            "veto_reason": trace.veto_reason,
+        })
+    });
+    json!({
+        "command": "explain",
+        "mode": "why_not",
+        "path": report.path.to_string_lossy(),
+        "verdict": report.verdict,
+        "protection": report.protection,
+        "excluded": report.excluded,
+        "scanner_note": report.scanner_note,
+        "trace": trace,
+        "preflight": preflight,
+        "open_file_scan_complete": report.open_scan_complete,
+        "min_score": report.min_score,
+        "decision": report.record.as_ref().map(|record| record.to_json_at_level(level)),
+        "counterfactuals": report.counterfactuals,
+    })
+}
+
+fn format_why_not(
+    report: &WhyNotReport,
+    level: storage_ballast_helper::scanner::decision_record::ExplainLevel,
+) -> String {
+    use storage_ballast_helper::scanner::decision_record::format_explain;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "Why not: {}", report.path.display());
+    let _ = writeln!(out, "  verdict:    {}", report.verdict);
+    let _ = writeln!(
+        out,
+        "  protection: {}",
+        report.protection.as_deref().unwrap_or("none")
+    );
+    let _ = writeln!(
+        out,
+        "  excluded:   {}",
+        if report.excluded {
+            "yes (scanner.excluded_paths)"
+        } else {
+            "no"
+        }
+    );
+    if let Some(note) = &report.scanner_note {
+        let _ = writeln!(out, "  scanner:    {note}");
+        return out;
+    }
+    if let Some(trace) = &report.trace {
+        let _ = writeln!(
+            out,
+            "  scanner:    {} ({}, confidence {:.2})",
+            trace.category, trace.pattern_name, trace.final_confidence
+        );
+        let _ = writeln!(out, "  age gate:   {}", trace.mtime_check);
+        let _ = writeln!(out, "  open files: {}", trace.fd_check);
+        let _ = writeln!(out, "  executing:  {}", trace.exec_check);
+        let _ = writeln!(out, "  mmap:       {}", trace.mmap_check);
+        let _ = writeln!(out, "  sacred:     {}", trace.sacred_overlap_check);
+    }
+    match &report.preflight {
+        Some(Ok(())) => {
+            let _ = writeln!(out, "  preflight:  ok");
+        }
+        Some(Err(reason)) => {
+            let _ = writeln!(out, "  preflight:  refused ({reason})");
+        }
+        None => {}
+    }
+    if !report.open_scan_complete {
+        let _ = writeln!(
+            out,
+            "  note:       the open-file scan was incomplete; a real batch would refuse the whole batch"
+        );
+    }
+    if let Some(record) = &report.record {
+        let _ = writeln!(
+            out,
+            "  score:      {:.2} (scoring.min_score {:.2}), action {}, id {}",
+            record.total_score, report.min_score, record.action, record.id
+        );
+        let _ = writeln!(out);
+        out.push_str(&format_explain(record, level));
+    }
+    if !report.counterfactuals.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nCounterfactuals (smallest single change that flips to Delete):"
+        );
+        for item in &report.counterfactuals {
+            match (&item.needed, &item.note) {
+                (Some(needed), _) => {
+                    let _ = writeln!(
+                        out,
+                        "  {:<9} {} -> needs {} ({})",
+                        item.factor,
+                        item.current,
+                        needed,
+                        item.action_after.unwrap_or("Delete")
+                    );
+                }
+                (None, Some(note)) => {
+                    let _ = writeln!(out, "  {:<9} {} -> {note}", item.factor, item.current);
+                }
+                (None, None) => {
+                    let _ = writeln!(out, "  {:<9} {}", item.factor, item.current);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A recorded decision re-scored by the current engine.
+struct ReplayReport {
+    id: String,
+    path: PathBuf,
+    recorded_at: String,
+    urgency: f64,
+    rows: Vec<(&'static str, f64, f64)>,
+    stored_action: String,
+    replayed_action: String,
+    stored_vetoed: bool,
+    replayed_veto: Option<String>,
+    drift: bool,
+    approximations: Vec<String>,
+}
+
+fn run_explain_replay(cli: &Cli, config: &Config, id: &str) -> Result<(), CliError> {
+    use storage_ballast_helper::scanner::decision_record::is_decision_id;
+
+    let id = id.trim().to_ascii_lowercase();
+    if !is_decision_id(&id) {
+        return Err(CliError::User(format!(
+            "{id:?} is not a decision id (12 hex characters); find ids with `sbh explain --last 20`"
+        )));
+    }
+    let source = open_explain_source(cli, config)?;
+    let (records, _) = source.select(&ExplainSelector::Id(id.clone()), 1)?;
+    let Some(record) = records.into_iter().next() else {
+        return Err(CliError::User(format!(
+            "no decision with id {id} in the {} ledger",
+            source.label()
+        )));
+    };
+    let replay = replay_decision(config, &record)?;
+    match output_mode(cli) {
+        OutputMode::Json => write_json_line(&json!({
+            "command": "explain",
+            "mode": "replay",
+            "id": replay.id,
+            "path": replay.path.to_string_lossy(),
+            "recorded_at": replay.recorded_at,
+            "urgency": replay.urgency,
+            "stored_action": replay.stored_action,
+            "replayed_action": replay.replayed_action,
+            "stored_vetoed": replay.stored_vetoed,
+            "replayed_veto": replay.replayed_veto,
+            "factors": replay
+                .rows
+                .iter()
+                .map(|(name, stored, replayed)| json!({
+                    "name": name,
+                    "stored": stored,
+                    "replayed": replayed,
+                    "delta": replayed - stored,
+                }))
+                .collect::<Vec<_>>(),
+            "drift": replay.drift,
+            "approximations": replay.approximations,
+        }))?,
+        OutputMode::Human => {
+            println!(
+                "Replay {}  recorded {}  {}",
+                replay.id,
+                replay.recorded_at,
+                replay.path.display()
+            );
+            println!(
+                "  action: stored {} -> replayed {}   drift: {}",
+                replay.stored_action,
+                replay.replayed_action,
+                if replay.drift { "YES" } else { "no" }
+            );
+            if replay.stored_vetoed || replay.replayed_veto.is_some() {
+                println!(
+                    "  veto:   stored {} -> replayed {}",
+                    if replay.stored_vetoed { "yes" } else { "no" },
+                    replay.replayed_veto.as_deref().unwrap_or("no")
+                );
+            }
+            println!("  urgency replayed: {:.2}", replay.urgency);
+            println!(
+                "  {:<22} {:>9} {:>9} {:>9}",
+                "factor", "stored", "replayed", "delta"
+            );
+            for (name, stored, replayed) in &replay.rows {
+                println!(
+                    "  {name:<22} {stored:>9.3} {replayed:>9.3} {:>+9.3}",
+                    replayed - stored
+                );
+            }
+            if !replay.approximations.is_empty() {
+                println!("  approximations:");
+                for note in &replay.approximations {
+                    println!("    - {note}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild the scoring input from a record and score it with the current
+/// engine and config. Inputs the ledger does not persist are approximated
+/// and every approximation is named in the report.
+fn replay_decision(
+    config: &Config,
+    record: &storage_ballast_helper::scanner::decision_record::DecisionRecord,
+) -> Result<ReplayReport, CliError> {
+    use storage_ballast_helper::scanner::decision_record::ActionRecord;
+    use storage_ballast_helper::scanner::patterns::{ArtifactClassification, StructuralSignals};
+    use storage_ballast_helper::scanner::scoring::urgency_for_pressure_multiplier;
+    use storage_ballast_helper::scanner::walker::structural_signals_for_path;
+
+    let category: ArtifactCategory = record
+        .classification
+        .category
+        .parse()
+        .map_err(CliError::User)?;
+    let mut approximations = Vec::new();
+    let combined = record.classification.combined_confidence;
+    let name_confidence = record.classification.name_confidence.unwrap_or_else(|| {
+        approximations.push("name_confidence was not stored; combined_confidence used".to_string());
+        combined
+    });
+    let structural_confidence = record
+        .classification
+        .structural_confidence
+        .unwrap_or_else(|| {
+            approximations
+                .push("structural_confidence was not stored; combined_confidence used".to_string());
+            combined
+        });
+    let signals = if record.path.is_dir() {
+        structural_signals_for_path(&record.path)
+    } else {
+        approximations.push(
+            "the path is gone and structural signals are not persisted; structure scored from no signals"
+                .to_string(),
+        );
+        StructuralSignals::default()
+    };
+    approximations.push(
+        "open-file and active-reference evidence is not persisted; replayed as none".to_string(),
+    );
+    let urgency = urgency_for_pressure_multiplier(record.factors.pressure_multiplier);
+
+    let input = CandidateInput {
+        path: record.path.clone(),
+        size_bytes: record.size_bytes,
+        age: std::time::Duration::from_secs(record.age_secs),
+        classification: ArtifactClassification {
+            pattern_name: std::borrow::Cow::Owned(record.classification.pattern_name.clone()),
+            category,
+            name_confidence,
+            structural_confidence,
+            combined_confidence: combined,
+        },
+        signals,
+        active_references: ActiveReferenceSummary::default(),
+        is_open: false,
+        excluded: false,
+    };
+    let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    let replayed = engine.score_candidate(&input, urgency);
+
+    let rows = vec![
+        (
+            "location",
+            record.factors.location,
+            replayed.factors.location,
+        ),
+        ("name", record.factors.name, replayed.factors.name),
+        ("age", record.factors.age, replayed.factors.age),
+        ("size", record.factors.size, replayed.factors.size),
+        (
+            "structure",
+            record.factors.structure,
+            replayed.factors.structure,
+        ),
+        (
+            "pressure_multiplier",
+            record.factors.pressure_multiplier,
+            replayed.factors.pressure_multiplier,
+        ),
+        ("total_score", record.total_score, replayed.total_score),
+        (
+            "posterior_abandoned",
+            record.posterior_abandoned,
+            replayed.decision.posterior_abandoned,
+        ),
+        (
+            "expected_loss_keep",
+            record.expected_loss_keep,
+            replayed.decision.expected_loss_keep,
+        ),
+        (
+            "expected_loss_delete",
+            record.expected_loss_delete,
+            replayed.decision.expected_loss_delete,
+        ),
+        (
+            "calibration_score",
+            record.calibration_score,
+            replayed.decision.calibration_score,
+        ),
+    ];
+    let replayed_action = ActionRecord::from(replayed.decision.action);
+    let drift = record.action != replayed_action
+        || record.vetoed != replayed.vetoed
+        || (record.total_score - replayed.total_score).abs() > 0.005;
+    Ok(ReplayReport {
+        id: record.id.clone(),
+        path: record.path.clone(),
+        recorded_at: record.timestamp.clone(),
+        urgency,
+        rows,
+        stored_action: record.action.to_string(),
+        replayed_action: replayed_action.to_string(),
+        stored_vetoed: record.vetoed,
+        replayed_veto: replayed.veto_reason.as_ref().map(ToString::to_string),
+        drift,
+        approximations,
+    })
 }
 
 fn run_bootstrap(cli: &Cli, args: &BootstrapArgs) -> Result<(), CliError> {
@@ -7913,6 +8677,8 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     "cpu_budget": state.get("cpu_budget").cloned().unwrap_or(Value::Null),
                     "idle_reason": state.get("idle_reason").cloned().unwrap_or(Value::Null),
                     "threads": state.get("threads").cloned().unwrap_or(Value::Null),
+                    "stopped_at": state.get("stopped_at").cloned().unwrap_or(Value::Null),
+                    "exit_reason": state.get("exit_reason").cloned().unwrap_or(Value::Null),
                 })),
             "config_path": config.paths.config_file.to_string_lossy(),
             "pressure": {
@@ -9378,18 +10144,21 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                     let path_str = truncate_path(&candidate.path, 50);
 
                     println!(
-                        "  {:>3}  {:<50}  {:>10}  {:>10}  {:>6.2}  {:<12}",
+                        "  {:>3}  {:<50}  {:>10}  {:>10}  {:>6.2}  {:<12}  id {}",
                         i + 1,
                         path_str,
                         size_str,
                         age_str,
                         candidate.total_score,
                         type_str,
+                        candidate_decision_id(candidate),
                     );
                 }
                 println!();
                 println!("  Total reclaimable: {}", format_bytes(total_reclaimable));
-                println!("  Use 'sbh clean' to delete these candidates.");
+                println!(
+                    "  Use 'sbh clean' to delete these candidates; 'sbh explain --id <id>' explains one, 'sbh explain --why-not <path>' explains an absence."
+                );
             }
 
             if !report_only.is_empty() {

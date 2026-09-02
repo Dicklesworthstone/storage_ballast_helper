@@ -1450,15 +1450,23 @@ User-scope services use `Type=simple` instead, since user session supervisors ty
 
 #### Shutdown Coordinator
 
-On receiving a shutdown signal, the daemon enters a coordinated shutdown sequence:
+On receiving a shutdown signal, the daemon runs this sequence:
 
-1. Sets the shutdown flag (atomic boolean, visible to all threads).
-2. Completes the current scan/deletion cycle if one is in progress.
-3. Writes a final state file so `sbh status` reports a clean exit.
-4. Joins worker threads with a 30-second timeout (`TimeoutStopSec=30`).
-5. Exits with code 0.
+1. Tells the service manager an orderly stop has begun (`sd_notify STOPPING=1`).
+2. Sets the shutdown flag (atomic boolean, visible to all threads) and drops the
+   work channels; the scanner and executor stop at their next check.
+3. Joins the scanner and executor within one shared 25-second budget, five
+   seconds under the unit's `TimeoutStopSec=30`; a worker still running at the
+   deadline is abandoned rather than trapping the stop behind it.
+4. Writes the final `state.json` (`stopped_at`, `exit_reason`, final counters)
+   so `sbh status` reports a clean exit rather than a stalled daemon.
+5. Logs `daemon_stop`, flushes the logger, releases the lock and exits with
+   code 0.
 
-If threads do not complete within the timeout, systemd sends `SIGKILL`. The state file write ensures the dashboard does not display stale data after a restart.
+`state.json` also carries a `threads` block (`monitor`, `scanner`, `executor`,
+`logger`) with each thread's status and seconds since its last heartbeat; a
+worker is reported `stalled` after 60 seconds without a beat and `dead` when
+its thread has exited.
 
 Source: `src/daemon/signals.rs`, `src/daemon/loop_main.rs`
 
@@ -1781,7 +1789,8 @@ For test harness conventions and structured logging registration, see `docs/test
 ## Troubleshooting
 
 ### "No candidates found, but disk is full"
-- Run `sbh scan <path> --min-score 0.0` to inspect vetoed items.
+- Ask the scorer directly: `sbh explain --why-not <dir>` scores that directory now, runs the deletion preflight, and prints the first thing standing in the way (a `.sbh-protect` marker or protected pattern, an exclusion, a scoring veto, a preflight refusal such as a source tree or an active lease, or a score below `scoring.min_score`) followed by the full factor table. Add `--counterfactual` to see the smallest change of age, size, or pressure that would flip it to Delete, and `--json` for the same report as data.
+- `sbh scan <path> --min-score 0.0` lists everything the scorer saw; each line ends with an id for `sbh explain --id`.
 - Check protections via `sbh protect --list`.
 - Use `sbh emergency <path>` for immediate zero-write triage.
 
