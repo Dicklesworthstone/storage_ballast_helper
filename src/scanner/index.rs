@@ -241,6 +241,12 @@ impl CandidateIndexRecord {
             && self.prune_decision == other.prune_decision
     }
 
+    /// A `CandidacyScore` fabricated from the persisted total score (every
+    /// factor set to it, no vetoes). Never a dispatch verdict: the daemon
+    /// re-scores the path with fresh evidence instead.
+    #[deprecated(
+        note = "persisted scores are hints; re-score the path with fresh evidence (bd-rc-master-ajg1.8.1)"
+    )]
     #[must_use]
     pub fn to_candidate_score(&self) -> CandidacyScore {
         let total_score = self.score.unwrap_or(0.0).clamp(0.0, 1.0);
@@ -372,8 +378,12 @@ impl ScannerCandidateIndex {
         })
     }
 
+    /// The `limit` best persisted candidates (safe or previously failed, scored,
+    /// not cooling down), best score then largest first. These are hints: the
+    /// daemon re-stats and re-scores each one with fresh vetoes before it may
+    /// be dispatched (`replay_indexed_record`).
     #[must_use]
-    pub fn ranked_candidate_scores(&self, now: SystemTime, limit: usize) -> Vec<CandidacyScore> {
+    pub fn ranked_records(&self, now: SystemTime, limit: usize) -> Vec<CandidateIndexRecord> {
         let mut records = self
             .records
             .values()
@@ -391,9 +401,19 @@ impl ScannerCandidateIndex {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.size_estimate_bytes.cmp(&a.size_estimate_bytes))
         });
-        records
-            .into_iter()
-            .take(limit)
+        records.into_iter().take(limit).cloned().collect()
+    }
+
+    /// Persisted scores turned straight into dispatchable candidates. Kept
+    /// for the index's own tests; the daemon never dispatches from it.
+    #[deprecated(
+        note = "persisted scores are hints; use ranked_records and re-score each record (bd-rc-master-ajg1.8.1)"
+    )]
+    #[must_use]
+    pub fn ranked_candidate_scores(&self, now: SystemTime, limit: usize) -> Vec<CandidacyScore> {
+        #[allow(deprecated)]
+        self.ranked_records(now, limit)
+            .iter()
             .map(CandidateIndexRecord::to_candidate_score)
             .collect()
     }
@@ -892,6 +912,7 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
         index.record_failure(cooled, now, Duration::from_secs(10), Duration::from_mins(1));
 
+        #[allow(deprecated)]
         let ranked = index.ranked_candidate_scores(now + Duration::from_secs(5), 8);
 
         assert_eq!(ranked.len(), 2);
@@ -907,12 +928,14 @@ mod tests {
         index.upsert(record(failed, identity(99)));
         index.record_failure(failed, now, Duration::from_secs(10), Duration::from_mins(1));
 
+        #[allow(deprecated)]
         let cooling = index.ranked_candidate_scores(now + Duration::from_secs(5), 8);
         assert!(
             cooling.is_empty(),
             "expected no ranked candidates while the failure cooldown is active, got {cooling:?}"
         );
 
+        #[allow(deprecated)]
         let ranked = index.ranked_candidate_scores(now + Duration::from_secs(11), 8);
 
         assert_eq!(ranked.len(), 1);

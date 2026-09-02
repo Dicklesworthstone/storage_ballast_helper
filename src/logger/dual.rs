@@ -41,6 +41,12 @@ pub struct ScanCompletionTelemetry {
     pub index_records: usize,
     pub candidate_bytes_seen: u64,
     pub timed_out: bool,
+    /// Persisted index records considered for dispatch this pass (each one
+    /// re-stat'ed and re-scored with fresh vetoes first).
+    pub replayed_records: usize,
+    /// Replayed records dropped by the fresh evidence (missing, identity or
+    /// generation changed, vetoed, or no longer a Delete verdict).
+    pub revetoed_records: usize,
 }
 
 /// Events that can be logged through the dual-write coordinator.
@@ -370,7 +376,8 @@ fn scan_completion_details(
     format!(
         "paths_scanned={} candidates={} engine={} dispatch={} reason={} \
          opaque_pruning={} opaque_pruned_dirs={} event_dirty_roots={} \
-         index_event_generation={} index_records={} candidate_bytes_seen={} timed_out={}",
+         index_event_generation={} index_records={} candidate_bytes_seen={} timed_out={} \
+         replayed_records={} revetoed_records={}",
         paths_scanned,
         candidates_found,
         telemetry.engine,
@@ -382,7 +389,9 @@ fn scan_completion_details(
         telemetry.index_event_generation,
         telemetry.index_records,
         telemetry.candidate_bytes_seen,
-        telemetry.timed_out
+        telemetry.timed_out,
+        telemetry.replayed_records,
+        telemetry.revetoed_records
     )
 }
 
@@ -807,6 +816,8 @@ mod tests {
             index_records: 0,
             candidate_bytes_seen: 0,
             timed_out: false,
+            replayed_records: 0,
+            revetoed_records: 0,
         }
     }
 

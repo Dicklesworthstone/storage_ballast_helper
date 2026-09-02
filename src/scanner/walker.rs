@@ -1041,8 +1041,22 @@ fn process_directory(
     }
 }
 
+/// Structural signals for one directory from its immediate children, for
+/// callers that re-examine a single path outside a walk (index replay).
+/// A non-directory or unreadable path yields no signals.
+#[must_use]
+pub fn structural_signals_for_path(path: &Path) -> StructuralSignals {
+    let Ok(entries) = fs::read_dir(path) else {
+        return StructuralSignals::default();
+    };
+    let names: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_lowercase())
+        .collect();
+    signals_from_children(&names)
+}
+
 /// Build `StructuralSignals` by checking presence of well-known child names.
-#[allow(dead_code)]
 fn signals_from_children(child_names: &[String]) -> StructuralSignals {
     let mut signals = StructuralSignals::default();
     let mut object_count = 0u32;
@@ -1125,7 +1139,8 @@ fn allocated_size(meta: &fs::Metadata) -> u64 {
 }
 
 /// Extract `EntryMetadata` from `fs::Metadata` (Unix-specific fields via MetadataExt).
-fn entry_metadata(meta: &fs::Metadata) -> EntryMetadata {
+/// Entry metadata for a stat result (allocated size on Unix, no tree probe).
+pub(crate) fn entry_metadata(meta: &fs::Metadata) -> EntryMetadata {
     let file_type = meta.file_type();
     let kind = if file_type.is_symlink() {
         FsEntryKind::Symlink
@@ -3536,6 +3551,25 @@ mod tests {
             "process_directory should stop promptly when cancellation is requested",
         );
         assert_eq!(result_rx.len(), 1, "no extra entries should be emitted");
+    }
+
+    #[test]
+    fn structural_signals_for_path_reads_a_single_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("target");
+        for child in ["deps", "incremental", ".git"] {
+            fs::create_dir_all(dir.join(child)).unwrap();
+        }
+        fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        let signals = structural_signals_for_path(&dir);
+        assert!(signals.has_deps && signals.has_incremental);
+        assert!(signals.has_git && signals.has_cargo_toml);
+        assert!(!signals.has_build && !signals.has_fingerprint);
+        assert_eq!(
+            structural_signals_for_path(&temp.path().join("absent")),
+            StructuralSignals::default(),
+            "an unreadable path yields no signals"
+        );
     }
 
     #[test]

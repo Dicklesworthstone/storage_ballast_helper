@@ -4260,6 +4260,171 @@ fn daemon_protection_reason(
     Ok(reason)
 }
 
+/// Why a replayed index record was not dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReplayDrop {
+    /// The path is gone or unreadable.
+    Missing,
+    /// Same path, different device/inode: a recreated artifact is a new
+    /// decision, not the persisted one.
+    IdentityChanged,
+    /// The index's event generation advanced since the record was written;
+    /// the walker re-discovers it instead of trusting the stale record.
+    GenerationAdvanced,
+    /// Fresh evidence vetoed it (protection, `.git`, lease, open file,
+    /// classification, scoring vetoes).
+    Vetoed(String),
+    /// Re-scored below a Delete verdict.
+    NotDelete(String),
+}
+
+impl ReplayDrop {
+    fn label(&self) -> String {
+        match self {
+            Self::Missing => "missing".to_string(),
+            Self::IdentityChanged => "identity_changed".to_string(),
+            Self::GenerationAdvanced => "generation_advanced".to_string(),
+            Self::Vetoed(reason) => format!("vetoed:{reason}"),
+            Self::NotDelete(action) => format!("not_delete:{action}"),
+        }
+    }
+}
+
+/// Re-examine one persisted index record with fresh evidence and return the
+/// candidate to dispatch, or why it must not be.
+///
+/// Order: generation, identity, protection/sacred, `.git`, active lease,
+/// structural markers, classification, then the normal scoring engine with
+/// the walker's age rule (newest of mtime, birth time and tree idleness),
+/// open-file detection and the sacred-overlap pass. Only a fresh, unvetoed
+/// `Delete` verdict is returned.
+#[allow(clippy::too_many_arguments)]
+fn replay_indexed_record(
+    record: &CandidateIndexRecord,
+    index_generation: u64,
+    registry: &ArtifactPatternRegistry,
+    engine: &ScoringEngine,
+    scanner_config: &crate::core::config::ScannerConfig,
+    request: &ScanRequest,
+    protection: &mut ProtectionRegistry,
+    sacred_paths: &[crate::platform::types::SacredPath],
+    open_files: &HashSet<PathBuf>,
+    logger: &ActivityLoggerHandle,
+) -> std::result::Result<CandidacyScore, ReplayDrop> {
+    use crate::scanner::active_lease::{ActiveLeaseState, inspect_path};
+    use crate::scanner::index::IndexedIdentity;
+    use crate::scanner::patterns::ArtifactCategory;
+    use crate::scanner::scoring::{CandidateInput, DecisionAction};
+    use crate::scanner::walker::{
+        TREE_IDLE_PROBE_MAX_DEPTH, TREE_IDLE_PROBE_MAX_ENTRIES, identity_for_path,
+        is_path_open_by_ancestor, structural_signals_for_path, tree_newest_mtime,
+    };
+
+    let path = &record.path;
+    if record.event_generation != index_generation {
+        return Err(ReplayDrop::GenerationAdvanced);
+    }
+    let Ok(identity) = identity_for_path(path, scanner_config.follow_symlinks) else {
+        return Err(ReplayDrop::Missing);
+    };
+    if IndexedIdentity::from(identity) != record.identity {
+        return Err(ReplayDrop::IdentityChanged);
+    }
+    if should_skip_protected_daemon_candidate(
+        protection,
+        path,
+        sacred_paths,
+        logger,
+        "index replay",
+    ) {
+        return Err(ReplayDrop::Vetoed("protected".to_string()));
+    }
+    if path.join(".git").exists() {
+        return Err(ReplayDrop::Vetoed("contains .git".to_string()));
+    }
+    if let Some(lease) = inspect_path(path)
+        && lease.state == ActiveLeaseState::Active
+    {
+        return Err(ReplayDrop::Vetoed(format!(
+            "active lease on {}",
+            lease.leased_target.display()
+        )));
+    }
+    let signals = structural_signals_for_path(path);
+    if signals.has_git || signals.has_cargo_toml {
+        return Err(ReplayDrop::Vetoed("source tree markers".to_string()));
+    }
+    let classification = registry.classify(path, signals);
+    if classification.category == ArtifactCategory::Unknown {
+        return Err(ReplayDrop::Vetoed(
+            "no longer classifies as an artifact".to_string(),
+        ));
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Err(ReplayDrop::Missing);
+    };
+    // The walker's age rule: newest of mtime, birth time and (for
+    // regenerable trees) the newest mtime inside the tree.
+    let mut newest = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    if let Ok(created) = meta.created() {
+        newest = newest.max(created);
+    }
+    if meta.is_dir() && classification.category.is_regenerable_tree() {
+        let probe = tree_newest_mtime(path, TREE_IDLE_PROBE_MAX_ENTRIES, TREE_IDLE_PROBE_MAX_DEPTH);
+        if let Some(tree_newest) = probe.newest_mtime {
+            newest = newest.max(tree_newest);
+        }
+    }
+    let age = SystemTime::now()
+        .duration_since(newest)
+        .unwrap_or(Duration::ZERO);
+    #[cfg(unix)]
+    let allocated = {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks().saturating_mul(512)
+    };
+    #[cfg(not(unix))]
+    let allocated = meta.len();
+    let input = CandidateInput {
+        path: path.clone(),
+        size_bytes: record.size_estimate_bytes.max(allocated),
+        age: adjusted_candidate_age(
+            age,
+            scanner_config.min_file_age_minutes,
+            request.pressure_level,
+            path,
+            &classification,
+        ),
+        classification,
+        signals,
+        active_references: ActiveReferenceSummary::default(),
+        is_open: is_path_open_by_ancestor(path, open_files),
+        excluded: false,
+    };
+    let mut score = engine.score_candidate(&input, request.urgency);
+    if !score.vetoed && score.decision.action == DecisionAction::Delete {
+        let overlaps = protection::find_sacred_overlaps(path, sacred_paths)
+            .map_err(|e| ReplayDrop::Vetoed(format!("sacred overlap check failed: {e}")))?;
+        score = engine.score_candidate_with_sacred_overlaps(&input, request.urgency, &overlaps);
+    }
+    if score.vetoed {
+        return Err(ReplayDrop::Vetoed(
+            score
+                .veto_reason
+                .as_deref()
+                .unwrap_or("scoring veto")
+                .to_string(),
+        ));
+    }
+    if score.decision.action != DecisionAction::Delete {
+        return Err(ReplayDrop::NotDelete(
+            format!("{:?}", score.decision.action).to_lowercase(),
+        ));
+    }
+    score.identity = Some(identity);
+    Ok(score)
+}
+
 fn should_skip_protected_daemon_candidate(
     protection: &mut ProtectionRegistry,
     path: &Path,
@@ -4625,6 +4790,9 @@ fn scanner_thread_main(
         };
         let mut scanner_index_records = Vec::new();
         let scan_reason = scan_reason_for_request(&request);
+        // (replayed, re-vetoed) index records this pass; a Cell so the
+        // telemetry closure can read what the replay block writes.
+        let replay_counts = std::cell::Cell::new((0usize, 0usize));
         let scan_completion_telemetry =
             |opaque_pruned_dirs: usize,
              candidate_bytes_seen: u64,
@@ -4640,6 +4808,8 @@ fn scanner_thread_main(
                 index_records,
                 candidate_bytes_seen,
                 timed_out,
+                replayed_records: replay_counts.get().0,
+                revetoed_records: replay_counts.get().1,
             };
         if last_scanner_engine_mode != Some(scanner_engine_mode) {
             logger.send(ActivityEvent::Info {
@@ -4778,10 +4948,90 @@ fn scanner_thread_main(
         if scanner_index_enabled
             && request.pressure_level >= PressureLevel::Orange
             && request.max_delete_batch > 0
-            && let Some(index) = scanner_index.as_ref()
+            && let Some(index) = scanner_index.as_mut()
         {
-            let mut indexed_candidates =
-                index.ranked_candidate_scores(SystemTime::now(), request.max_delete_batch);
+            // Persisted records are hints: each one is re-stat'ed and re-scored
+            // with fresh vetoes (protection, .git, lease, open files, current
+            // classification and age) before it may be dispatched. Anything
+            // the fresh evidence rejects is backed off in the index.
+            let replay_now = SystemTime::now();
+            let records = index.ranked_records(replay_now, request.max_delete_batch);
+            let index_generation = index.event_generation();
+            let mut indexed_candidates: Vec<CandidacyScore> = Vec::with_capacity(records.len());
+            let mut revetoed = 0usize;
+            if !records.is_empty() {
+                let replay_open_files = collect_open_path_ancestors_cached(
+                    &active_scan_paths,
+                    Duration::from_secs(current_scanner_config.active_reference_cache_ttl_secs),
+                )
+                .0;
+                let mut replay_protection =
+                    match ProtectionRegistry::new(Some(&current_scanner_config.protected_paths)) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            logger.send(ActivityEvent::Error {
+                                code: "SBH-1001".to_string(),
+                                message: format!("protection registry init failed: {e}"),
+                            });
+                            continue;
+                        }
+                    };
+                let mut replay_sacred = platform.sacred_paths();
+                replay_sacred.extend(protection::sacred_paths_from_protected_patterns(
+                    &current_scanner_config.protected_paths,
+                ));
+                let replay_engine = ScoringEngine::from_config(
+                    &current_scoring_config,
+                    current_scanner_config.min_file_age_minutes,
+                );
+                for record in &records {
+                    match replay_indexed_record(
+                        record,
+                        index_generation,
+                        &pattern_registry,
+                        &replay_engine,
+                        &current_scanner_config,
+                        &request,
+                        &mut replay_protection,
+                        &replay_sacred,
+                        &replay_open_files,
+                        logger,
+                    ) {
+                        Ok(score) => {
+                            eprintln!(
+                                "[SBH-SCANNER] index replay path={} generation={} verdict=dispatch score={:.3} certainty={}",
+                                record.path.display(),
+                                record.event_generation,
+                                score.total_score,
+                                score.decision.certainty.label()
+                            );
+                            indexed_candidates.push(score);
+                        }
+                        Err(drop) => {
+                            revetoed += 1;
+                            eprintln!(
+                                "[SBH-SCANNER] index replay path={} generation={} verdict=drop reason={}",
+                                record.path.display(),
+                                record.event_generation,
+                                drop.label()
+                            );
+                            if drop != ReplayDrop::GenerationAdvanced {
+                                index.record_failure(
+                                    record.identity,
+                                    replay_now,
+                                    Duration::from_secs(
+                                        current_scanner_config.repeat_deletion_base_cooldown_secs,
+                                    ),
+                                    Duration::from_secs(
+                                        current_scanner_config.repeat_deletion_max_cooldown_secs,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            replay_counts.set((records.len(), revetoed));
             let indexed_bytes = indexed_candidates
                 .iter()
                 .map(|candidate| candidate.size_bytes)
@@ -4813,7 +5063,7 @@ fn scanner_thread_main(
                             0,
                             v2_candidate_bytes_seen,
                             false,
-                            scanner_index.as_ref().map_or(0, ScannerCandidateIndex::len),
+                            index.len(),
                         ),
                     });
                     let root_stats = active_scan_paths
@@ -6405,6 +6655,147 @@ mod tests {
     use crate::scanner::scoring::{DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::path::Path;
     use std::time::Duration;
+
+    /// Persisted index records are hints: the replay must re-examine the
+    /// path and refuse anything fresh evidence rejects, whatever score the
+    /// checkpoint carried.
+    #[test]
+    fn index_replay_rescores_records_with_fresh_vetoes() {
+        use crate::scanner::index::{
+            CandidateIndexRecord, CandidateSafetyState, IndexedPruneDecision,
+        };
+        use crate::scanner::walker::identity_for_path;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: temp.path().join("activity.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+        })
+        .unwrap();
+
+        let target = temp.path().join("proj").join("target");
+        for sub in [
+            "debug/deps",
+            "debug/incremental",
+            "debug/build",
+            "debug/.fingerprint",
+        ] {
+            std::fs::create_dir_all(target.join(sub)).unwrap();
+        }
+        std::fs::write(target.join("debug/deps/libfoo.rlib"), vec![0u8; 8192]).unwrap();
+
+        let mut config = Config::default();
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.root_paths = vec![temp.path().to_path_buf()];
+        let registry = ArtifactPatternRegistry::default();
+        let engine = ScoringEngine::from_config(&config.scoring, 0);
+        let mut protection =
+            ProtectionRegistry::new(Some(&config.scanner.protected_paths)).unwrap();
+        let sacred: Vec<crate::platform::types::SacredPath> = Vec::new();
+        let open_files: HashSet<PathBuf> = HashSet::new();
+        let request = ScanRequest {
+            paths: vec![temp.path().to_path_buf()],
+            urgency: 0.7,
+            pressure_level: PressureLevel::Orange,
+            free_pct: Some(8.0),
+            max_delete_batch: 4,
+            force_full_scan: false,
+            config_update: None,
+        };
+        let identity = identity_for_path(&target, false).unwrap();
+        let record = |generation: u64| CandidateIndexRecord {
+            path: target.clone(),
+            identity: identity.into(),
+            parent_identity: None,
+            parent_mtime_nanos: None,
+            candidate_mtime_nanos: 0,
+            candidate_ctime_nanos: None,
+            size_estimate_bytes: 200 * 1_048_576,
+            prune_decision: IndexedPruneDecision::CandidateOpaque,
+            score: Some(0.95),
+            safety_state: CandidateSafetyState::Safe,
+            fail_count: 0,
+            cooldown_until_nanos: None,
+            event_generation: generation,
+        };
+        let replay = |record: &CandidateIndexRecord,
+                      generation: u64,
+                      protection: &mut ProtectionRegistry| {
+            replay_indexed_record(
+                record,
+                generation,
+                &registry,
+                &engine,
+                &config.scanner,
+                &request,
+                protection,
+                &sacred,
+                &open_files,
+                &logger,
+            )
+        };
+
+        // An intact artifact reaches the scoring layer: the verdict comes
+        // from fresh evidence, not from the persisted 0.95.
+        let verdict = replay(&record(3), 3, &mut protection);
+        assert!(
+            matches!(verdict, Ok(_) | Err(ReplayDrop::NotDelete(_))),
+            "intact artifact is re-scored, not vetoed: {verdict:?}"
+        );
+        if let Ok(score) = &verdict {
+            assert_eq!(score.identity, Some(identity));
+            assert!(!score.vetoed);
+        }
+
+        // A stale generation is never trusted; the walker re-discovers it.
+        assert_eq!(
+            replay(&record(2), 3, &mut protection).unwrap_err(),
+            ReplayDrop::GenerationAdvanced
+        );
+
+        // Planted after the checkpoint: a .git, then a Cargo.toml.
+        std::fs::create_dir_all(target.join(".git")).unwrap();
+        assert_eq!(
+            replay(&record(3), 3, &mut protection).unwrap_err(),
+            ReplayDrop::Vetoed("contains .git".to_string())
+        );
+        std::fs::remove_dir_all(target.join(".git")).unwrap();
+        std::fs::write(target.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert_eq!(
+            replay(&record(3), 3, &mut protection).unwrap_err(),
+            ReplayDrop::Vetoed("source tree markers".to_string())
+        );
+        std::fs::remove_file(target.join("Cargo.toml")).unwrap();
+
+        // Same path, new inode: a recreated artifact is not the old decision.
+        let stale = record(3);
+        std::fs::rename(&target, temp.path().join("proj").join("target.old")).unwrap();
+        std::fs::create_dir_all(target.join("debug").join("deps")).unwrap();
+        assert_eq!(
+            replay(&stale, 3, &mut protection).unwrap_err(),
+            ReplayDrop::IdentityChanged
+        );
+
+        // Gone entirely.
+        let missing = CandidateIndexRecord {
+            path: temp.path().join("nope"),
+            ..record(3)
+        };
+        assert_eq!(
+            replay(&missing, 3, &mut protection).unwrap_err(),
+            ReplayDrop::Missing
+        );
+
+        logger.shutdown();
+        let _ = logger_join.join();
+    }
 
     fn test_candidate(path: &str, total_score: f64) -> CandidacyScore {
         CandidacyScore {
