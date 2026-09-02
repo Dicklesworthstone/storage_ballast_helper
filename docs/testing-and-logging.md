@@ -364,6 +364,8 @@ Stable event IDs follow `<component>.<action>` pattern:
 | Decision plane proof fails | Scoring/ranking invariant violated | Check scoring weights, RRF fusion, or veto logic |
 | Clippy lint | New lint in toolchain update | Add targeted `#[allow]` with justification, or fix |
 | Feature gate error | Missing `--features tui` | TUI tests require explicit feature flag |
+| A `chmod`-based test fails only as root | Root bypasses permission bits, so the provoked `EACCES` never happens | Guard the test with `crate::platform::running_as_root()` and print `SKIP: running as root (<test>)`; the CI job `unit-as-root` counts those lines |
+| `from_source` cargo/rustc probes fail under `sudo` | `sudo` reset `PATH`/`HOME`, so rustup cannot find a toolchain | Run as `sudo -E env "PATH=$PATH" cargo test --lib` (what CI does); this is an environment problem, not a permission one |
 
 ### Isolating TUI Failures
 

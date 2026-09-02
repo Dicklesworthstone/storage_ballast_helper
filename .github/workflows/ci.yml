@@ -174,6 +174,46 @@ jobs:
             bin-test-output.txt
           retention-days: 14
 
+  unit-as-root:
+    name: Unit Tests as root
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - name: Strip local-only TUI path deps
+        run: |
+          # ftui crates use /dp/frankentui/ paths unavailable in CI
+          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
+          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the unit test binary as the runner user
+        run: cargo test $CI_FEATURES --lib --no-run
+      # Root bypasses discretionary permissions, so tests that chmod a path
+      # to provoke EACCES skip themselves under uid 0 (they print SKIP) and
+      # everything else must pass exactly as it does unprivileged.
+      - name: Run unit tests as root
+        run: |
+          set -euo pipefail
+          # Keep the runner's toolchain visible to root: sudo resets HOME,
+          # which is where rustup and cargo live.
+          sudo env "PATH=$PATH" "HOME=$HOME" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "CARGO_TERM_COLOR=$CARGO_TERM_COLOR" "CARGO_INCREMENTAL=$CARGO_INCREMENTAL" "RUSTFLAGS=$RUSTFLAGS" \
+            cargo test $CI_FEATURES --lib -- --nocapture 2>&1 | tee unit-as-root-output.txt
+          skipped=$(grep -c 'SKIP: running as root' unit-as-root-output.txt || true)
+          echo "root-skipped permission tests: ${skipped}"
+          test "${skipped}" -ge 6
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: unit-as-root-logs
+          path: unit-as-root-output.txt
+          retention-days: 14
+
   integration:
     name: Integration Tests
     runs-on: ubuntu-latest

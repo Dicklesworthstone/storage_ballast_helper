@@ -915,7 +915,9 @@ mod tests {
             ..Default::default()
         };
         let report = plan_uninstall(&opts);
-        // In conservative mode, data and config should be kept.
+        // In conservative mode, data, config, assets and the ballast pool are
+        // kept. (The pool only shows up when discovery finds one, e.g. as
+        // root on a host with a system-scope install.)
         for kept in &report.kept {
             assert!(
                 matches!(
@@ -925,8 +927,9 @@ mod tests {
                         | RemovalCategory::SqliteDb
                         | RemovalCategory::JsonlLog
                         | RemovalCategory::AssetCache
+                        | RemovalCategory::BallastPool
                 ),
-                "conservative should keep data/config/assets, got {}",
+                "conservative should keep data/config/assets/ballast, got {}",
                 kept.category
             );
         }

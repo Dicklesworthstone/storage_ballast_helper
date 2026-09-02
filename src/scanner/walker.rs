@@ -2840,6 +2840,11 @@ mod tests {
         // Running as root ignores the permission bits; then nothing is
         // unreadable and the walk legitimately completes.
         if complete {
+            assert!(
+                crate::platform::running_as_root(),
+                "an unprivileged walk must report the unreadable subdir"
+            );
+            eprintln!("SKIP: running as root (opaque_size_probe_survives_an_unreadable_subdir)");
             return;
         }
         assert!(

@@ -2401,6 +2401,15 @@ mod tests {
     fn circuit_breaker_halts_batch_on_consecutive_failures() {
         use std::os::unix::fs::PermissionsExt;
 
+        // chmod 000 does not stop root, so nothing here would fail and the
+        // breaker would never trip.
+        if crate::platform::running_as_root() {
+            eprintln!(
+                "SKIP: running as root (circuit_breaker_halts_batch_on_consecutive_failures)"
+            );
+            return;
+        }
+
         let dir = scratch_dir();
         let mut candidates = Vec::new();
 
@@ -2450,8 +2459,8 @@ mod tests {
 
         // Root bypasses mode bits, so `access(W_OK)` correctly reports a
         // 0o555 directory as writable and the precondition cannot hold.
-        if nix::unistd::Uid::effective().is_root() {
-            eprintln!("skipping is_writable_detects_read_only_directory: running as root");
+        if crate::platform::running_as_root() {
+            eprintln!("SKIP: running as root (is_writable_detects_read_only_directory)");
             return;
         }
 
@@ -2540,8 +2549,8 @@ mod tests {
         // would succeed unexpectedly. CI runs as non-root so this still
         // exercises the path; on dev hosts and root-owned shells we just
         // skip cleanly to avoid a false-positive failure.
-        if nix::unistd::Uid::effective().is_root() {
-            eprintln!("skipping deletion_report_tracks_not_writable_paths: running as root");
+        if crate::platform::running_as_root() {
+            eprintln!("SKIP: running as root (deletion_report_tracks_not_writable_paths)");
             return;
         }
 
@@ -3067,7 +3076,11 @@ mod tests {
 
         // Sanity (non-root only): the plain variant cannot remove this tree.
         // Root bypasses mode bits, so skip the negative assertion there.
-        if !nix::unistd::Uid::effective().is_root() {
+        if crate::platform::running_as_root() {
+            eprintln!(
+                "SKIP: running as root (remove_dir_all_force_defeats_readonly_module_cache_tree: negative half only)"
+            );
+        } else {
             assert!(
                 fs::remove_dir_all(&root).is_err(),
                 "plain remove_dir_all should fail on a 0555 module dir"

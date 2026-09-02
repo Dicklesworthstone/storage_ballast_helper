@@ -27,6 +27,17 @@ pub fn current() -> impl Platform {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("sbh requires Linux or macOS");
 
+/// Whether the effective user is root.
+///
+/// Root bypasses discretionary permission bits, so anything that provokes
+/// `EACCES` with `chmod` (a handful of tests, the writability preflight's
+/// negative path) has no meaning under uid 0. Callers that skip on root
+/// print `SKIP: running as root` so a CI run can count them.
+#[must_use]
+pub fn running_as_root() -> bool {
+    nix::unistd::geteuid().is_root()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Platform, current};
