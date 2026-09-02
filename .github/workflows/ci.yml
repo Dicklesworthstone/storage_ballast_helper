@@ -5,12 +5,10 @@ on:
     branches: [main]
     paths-ignore:
       - '.beads/**'
-      - 'docs/internal/macos-parity-completion-audit.md'
   pull_request:
     branches: [main]
     paths-ignore:
       - '.beads/**'
-      - 'docs/internal/macos-parity-completion-audit.md'
   workflow_call:
 
 concurrency:
@@ -24,9 +22,10 @@ env:
   # Must match rust-toolchain.toml. A bare `nightly` re-resolves on every run and
   # turned the lint gate red twice in August 2026; bump both places together.
   TOOLCHAIN: nightly-2026-08-31
-  # TUI feature depends on local-path frankentui crates unavailable in CI.
-  # Build with all features except tui.
+  # The shipped configuration: every default feature, no TUI. The TUI lane
+  # (`unit-tui`) adds `--features tui`; frankentui is a public git dependency.
   CI_FEATURES: --no-default-features --features cli,daemon,sqlite
+  TUI_FEATURES: --features tui
 
 jobs:
   check:
@@ -39,21 +38,27 @@ jobs:
       - name: Require docs updates for user-facing changes
         if: github.event_name == 'pull_request'
         run: bash scripts/ci_docs_update_check.sh
-      - name: Strip local-only TUI path deps
-        run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI
-          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Lint the workflows themselves
+        run: |
+          set -euo pipefail
+          curl -sSL -A "OpenAI File Downloader, XaiImageApiFetch/1.0" \
+            -o actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          tar -xzf actionlint.tar.gz actionlint
+          # $CI_FEATURES / $TUI_FEATURES are multi-flag variables that must
+          # word-split; every other shellcheck finding is fatal.
+          SHELLCHECK_OPTS="-e SC2086" ./actionlint -color
       - name: Check formatting
         run: cargo fmt --check
-      - name: Run clippy
-        # --lib --bin avoids compiling test files that import tui:: types
-        run: cargo clippy $CI_FEATURES --lib --bin sbh -- -D warnings
+      - name: Run clippy (every target, shipped features)
+        run: cargo clippy $CI_FEATURES --all-targets -- -D warnings
+      - name: Run clippy (every target, tui)
+        run: cargo clippy $TUI_FEATURES --all-targets -- -D warnings
 
   homebrew-formula:
     name: Homebrew Formula Validation
@@ -151,11 +156,6 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v6.0.2
-      - name: Strip local-only TUI path deps
-        run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI
-          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
@@ -180,11 +180,6 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v6.0.2
-      - name: Strip local-only TUI path deps
-        run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI
-          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
@@ -214,17 +209,55 @@ jobs:
           path: unit-as-root-output.txt
           retention-days: 14
 
+  unit-tui:
+    name: Unit Tests (tui)
+    runs-on: ${{ matrix.os }}
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      # The dashboard, its adapters, parity harness, fault injection, and
+      # scenario drills only compile with the TUI: this lane is what keeps
+      # those ~950 tests from silently never running.
+      - name: Run unit tests with the TUI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test $TUI_FEATURES --lib -- --nocapture 2>&1 | tee unit-tui-output.txt
+          executed=$(grep -E '^test result: ok\. [0-9]+ passed' unit-tui-output.txt | sed -E 's/^test result: ok\. ([0-9]+) passed.*/\1/' | tail -n 1)
+          echo "tui lib tests executed: ${executed:-0}"
+          test "${executed:-0}" -ge 950
+      - name: Run binary tests with the TUI
+        run: cargo test $TUI_FEATURES --bin sbh -- --nocapture 2>&1 | tee bin-tui-output.txt
+      - name: Run dashboard and fallback tests with the TUI
+        run: |
+          cargo test $TUI_FEATURES --test dashboard_integration_tests -- --nocapture 2>&1 | tee dashboard-tui-output.txt
+          cargo test $TUI_FEATURES --test fallback_verification -- --nocapture 2>&1 | tee fallback-tui-output.txt
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: unit-tui-logs-${{ matrix.os }}
+          path: |
+            unit-tui-output.txt
+            bin-tui-output.txt
+            dashboard-tui-output.txt
+            fallback-tui-output.txt
+          retention-days: 14
+
   integration:
     name: Integration Tests
     runs-on: ubuntu-latest
     needs: check
     steps:
       - uses: actions/checkout@v6.0.2
-      - name: Strip local-only TUI path deps
-        run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI
-          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
@@ -246,11 +279,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6.0.2
-      - name: Strip local-only TUI path deps
-        run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI
-          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
@@ -315,11 +343,6 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v6.0.2
-      - name: Strip local-only TUI path deps
-        run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI
-          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
@@ -344,11 +367,6 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v6.0.2
-      - name: Strip local-only TUI path deps
-        run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI
-          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
@@ -374,11 +392,6 @@ jobs:
     needs: unit
     steps:
       - uses: actions/checkout@v6.0.2
-      - name: Strip local-only TUI path deps
-        run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI
-          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
@@ -1151,11 +1164,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6.0.2
-      - name: Strip local-only TUI path deps
-        run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI
-          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
@@ -1176,11 +1184,6 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v6.0.2
-      - name: Strip local-only TUI path deps
-        run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI
-          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
@@ -1212,27 +1215,24 @@ jobs:
     needs: [homebrew-formula, unit, integration, linux-arm64, decision-plane, dashboard, e2e, macos-platform, macos-coverage, macos-benchmarks, stress, artifact-contract]
     steps:
       - uses: actions/checkout@v6.0.2
-      - name: Strip local-only TUI path deps
-        run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI
-          sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
-          sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
       - name: Collect provenance
         run: |
           mkdir -p provenance
-          echo "{" > provenance/ci-metadata.json
-          echo "  \"git_sha\": \"${{ github.sha }}\"," >> provenance/ci-metadata.json
-          echo "  \"git_ref\": \"${{ github.ref }}\"," >> provenance/ci-metadata.json
-          echo "  \"run_id\": \"${{ github.run_id }}\"," >> provenance/ci-metadata.json
-          echo "  \"run_number\": ${{ github.run_number }}," >> provenance/ci-metadata.json
-          echo "  \"runner_os\": \"${{ runner.os }}\"," >> provenance/ci-metadata.json
-          echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"," >> provenance/ci-metadata.json
-          echo "  \"rustc_version\": \"$(rustc --version)\"," >> provenance/ci-metadata.json
-          echo "  \"cargo_version\": \"$(cargo --version)\"" >> provenance/ci-metadata.json
-          echo "}" >> provenance/ci-metadata.json
+          {
+            echo "{"
+            echo "  \"git_sha\": \"${{ github.sha }}\","
+            echo "  \"git_ref\": \"${{ github.ref }}\","
+            echo "  \"run_id\": \"${{ github.run_id }}\","
+            echo "  \"run_number\": ${{ github.run_number }},"
+            echo "  \"runner_os\": \"${{ runner.os }}\","
+            echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+            echo "  \"rustc_version\": \"$(rustc --version)\","
+            echo "  \"cargo_version\": \"$(cargo --version)\""
+            echo "}"
+          } > provenance/ci-metadata.json
           cargo tree $CI_FEATURES --depth 1 > provenance/dependency-tree.txt
           cat provenance/ci-metadata.json
       - name: Upload provenance

@@ -82,12 +82,6 @@ jobs:
             archive: tar.xz
     steps:
       - uses: actions/checkout@v6.0.2
-      - name: Strip local-only TUI path deps
-        run: |
-          # ftui crates use /dp/frankentui/ paths unavailable in CI
-          # Use perl for cross-platform compat (macOS sed -i requires different syntax)
-          perl -i -ne 'print unless /^ftui.*=.*\{.*path.*=.*"\/dp\//' Cargo.toml
-          perl -i -pe 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
@@ -460,13 +454,15 @@ jobs:
 
       - name: Collect provenance
         run: |
-          echo "{" > release-provenance.json
-          echo "  \"tag\": \"${GITHUB_REF_NAME}\"," >> release-provenance.json
-          echo "  \"sha\": \"${{ github.sha }}\"," >> release-provenance.json
-          echo "  \"run_id\": \"${{ github.run_id }}\"," >> release-provenance.json
-          echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"," >> release-provenance.json
-          echo "  \"rustc_version\": \"$(rustc --version)\"" >> release-provenance.json
-          echo "}" >> release-provenance.json
+          {
+            echo "{"
+            echo "  \"tag\": \"${GITHUB_REF_NAME}\","
+            echo "  \"sha\": \"${{ github.sha }}\","
+            echo "  \"run_id\": \"${{ github.run_id }}\","
+            echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+            echo "  \"rustc_version\": \"$(rustc --version)\""
+            echo "}"
+          } > release-provenance.json
 
       - name: Check CHANGELOG entry for this tag
         run: scripts/changelog_check.sh --tag "${GITHUB_REF_NAME}" --expect-release
