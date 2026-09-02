@@ -68,7 +68,7 @@ use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
 use crate::platform::types::{
     FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
 };
-use crate::scanner::deletion::{DeletionConfig, DeletionExecutor};
+use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionMode};
 use crate::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use crate::scanner::events::{EventSourceConfig, ScannerEventSource};
 use crate::scanner::index::{
@@ -80,6 +80,7 @@ use crate::scanner::patterns::{
     StructuralSignals,
 };
 use crate::scanner::protection::{self, ProtectionRegistry};
+use crate::scanner::quarantine::QuarantineStore;
 use crate::scanner::scoring::{
     ActiveReferenceSummary, ArtifactCertainty, CandidacyScore, ScoringEngine,
 };
@@ -174,6 +175,9 @@ struct SharedExecutorConfig {
     /// Minimum [`ArtifactCertainty`] rank the current behavior cell dispatches
     /// (set from the cleanup action on every behavior transition).
     min_certainty_rank: AtomicU8,
+    /// Layer 7: Green batches quarantine instead of removing.
+    quarantine_enabled: AtomicBool,
+    quarantine_ttl_secs: AtomicU64,
 }
 
 impl SharedExecutorConfig {
@@ -183,6 +187,8 @@ impl SharedExecutorConfig {
         min_score: f64,
         repeat_base_cooldown: u64,
         repeat_max_cooldown: u64,
+        quarantine_enabled: bool,
+        quarantine_ttl_secs: u64,
     ) -> Self {
         Self {
             dry_run: AtomicBool::new(dry_run),
@@ -191,6 +197,8 @@ impl SharedExecutorConfig {
             repeat_base_cooldown_secs: AtomicU64::new(repeat_base_cooldown),
             repeat_max_cooldown_secs: AtomicU64::new(repeat_max_cooldown),
             min_certainty_rank: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
+            quarantine_enabled: AtomicBool::new(quarantine_enabled),
+            quarantine_ttl_secs: AtomicU64::new(quarantine_ttl_secs),
         }
     }
 
@@ -225,6 +233,8 @@ impl SharedExecutorConfig {
 const MAX_RESPAWNS: u32 = 3;
 const RESPAWN_WINDOW: Duration = Duration::from_mins(5);
 const THREAD_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// How often calm mounts have their quarantine expired and capped (Layer 7).
+const QUARANTINE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 struct ThreadHealth {
     panic_times: Vec<Instant>,
@@ -1270,6 +1280,12 @@ pub struct MonitoringDaemon {
     special_alerts: AlertThrottle,
     /// When the last Green maintenance pass was dispatched.
     last_maintenance_scan: Option<Instant>,
+    /// Layer 7: when the quarantines were last swept for expired entries
+    /// and the size cap (`QUARANTINE_SWEEP_INTERVAL`).
+    last_quarantine_sweep: Option<Instant>,
+    /// Bytes held in quarantine per mount, from the last sweep
+    /// (`state.json` `reserve_state.quarantined_bytes`).
+    quarantine_held: HashMap<PathBuf, u64>,
     special_locations: SpecialLocationRegistry,
     ballast_coordinator: BallastPoolCoordinator,
     release_controller: BallastReleaseController,
@@ -2101,6 +2117,8 @@ impl MonitoringDaemon {
             config.scoring.min_score,
             config.scanner.repeat_deletion_base_cooldown_secs,
             config.scanner.repeat_deletion_max_cooldown_secs,
+            config.scanner.quarantine_enabled,
+            config.scanner.quarantine_ttl_hours.saturating_mul(3600),
         ));
 
         let shared_scoring_config = Arc::new(RwLock::new(config.scoring.clone()));
@@ -2167,6 +2185,8 @@ impl MonitoringDaemon {
             mount_rates: HashMap::new(),
             special_alerts: AlertThrottle::default(),
             last_maintenance_scan: None,
+            last_quarantine_sweep: None,
+            quarantine_held: HashMap::new(),
             special_locations,
             ballast_coordinator,
             release_controller,
@@ -2641,10 +2661,21 @@ impl MonitoringDaemon {
         let inventory = self.ballast_coordinator.inventory();
         for record in &mut controllers {
             let mount = PathBuf::from(&record.mount);
+            let quarantined_bytes = self.quarantine_held.get(&mount).copied().unwrap_or(0);
             let Some(pool) = inventory
                 .iter()
                 .find(|item| item.mount_point == mount && !item.skipped)
             else {
+                // No ballast pool here; the quarantine is still reserve.
+                if quarantined_bytes > 0 {
+                    record.reserve_state = Some(ReserveState {
+                        present_bytes: 0,
+                        target_bytes: 0,
+                        horizon_minutes: None,
+                        floor_limited: false,
+                        quarantined_bytes,
+                    });
+                }
                 continue;
             };
             let rate = self.mount_rates.get(&mount).copied().unwrap_or(0.0);
@@ -2655,6 +2686,7 @@ impl MonitoringDaemon {
                 target_bytes: pool.configured_bytes,
                 horizon_minutes,
                 floor_limited: self.floor_limited.contains(&mount),
+                quarantined_bytes,
             });
         }
         let idle_reason = daemon_idle_reason(&controllers);
@@ -3648,6 +3680,10 @@ impl MonitoringDaemon {
                 self.emergency_mounts.remove(&mount);
             }
         }
+
+        // Layer 7: the quarantine is already-decided space. Pressure drains
+        // it before any new deletion; calm ticks expire and cap it.
+        self.sweep_quarantines(&responses, &root_mounts, now);
 
         // Green maintenance (Q6): once per maintenance interval, a routine
         // pass over the roots the hazard-driven scheduler picks within its
@@ -4681,6 +4717,13 @@ impl MonitoringDaemon {
                         new_config.scanner.repeat_deletion_max_cooldown_secs,
                         Ordering::Relaxed,
                     );
+                    self.shared_executor_config
+                        .quarantine_enabled
+                        .store(new_config.scanner.quarantine_enabled, Ordering::Relaxed);
+                    self.shared_executor_config.quarantine_ttl_secs.store(
+                        new_config.scanner.quarantine_ttl_hours.saturating_mul(3600),
+                        Ordering::Relaxed,
+                    );
 
                     // Update FS collector TTL.
                     self.fs_collector
@@ -4797,6 +4840,84 @@ impl MonitoringDaemon {
             .map_err(|source| SbhError::Runtime {
                 details: format!("failed to spawn scanner thread: {source}"),
             })
+    }
+
+    /// Layer 7 sweep. At Orange and above every quarantine on the pressured
+    /// mount is drained oldest-first, ahead of the scan the same tick
+    /// dispatches: that space was decided already and costs no scoring. On
+    /// calmer mounts, once per `QUARANTINE_SWEEP_INTERVAL`, expired entries
+    /// are removed and the store is capped at
+    /// `scanner.quarantine_max_bytes_pct` of the volume. The bytes still
+    /// held per mount feed `state.json`.
+    fn sweep_quarantines(
+        &mut self,
+        responses: &[MountTickResponse],
+        root_mounts: &[(PathBuf, Option<PathBuf>)],
+        now: Instant,
+    ) {
+        let sweep_due = self
+            .last_quarantine_sweep
+            .is_none_or(|last| now.saturating_duration_since(last) >= QUARANTINE_SWEEP_INTERVAL);
+        let now_unix = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        for tick in responses {
+            let mount = &tick.response.causing_mount;
+            let level = tick.response.level;
+            let pressured = matches!(
+                level,
+                PressureLevel::Orange | PressureLevel::Red | PressureLevel::Critical
+            );
+            if !pressured && !sweep_due {
+                continue;
+            }
+            let cap_bytes = self.fs_collector.collect(mount).ok().map(|stats| {
+                (stats.total_bytes / 100)
+                    .saturating_mul(u64::from(self.config.scanner.quarantine_max_bytes_pct))
+            });
+            let mut held = 0u64;
+            for (root, root_mount) in root_mounts {
+                if root_mount.as_deref() != Some(mount.as_path()) {
+                    continue;
+                }
+                let store = QuarantineStore::under(root);
+                let outcome = if pressured {
+                    store.drain_all().map(|drained| ("pressure", drained))
+                } else {
+                    store.drain_expired(now_unix).and_then(|expired| {
+                        let capped = cap_bytes.map_or(Ok((0, 0)), |cap| store.enforce_cap(cap))?;
+                        Ok(if capped.0 > 0 {
+                            ("size cap", (expired.0 + capped.0, expired.1 + capped.1))
+                        } else {
+                            ("ttl", expired)
+                        })
+                    })
+                };
+                match outcome {
+                    Ok((why, (count, bytes))) if count > 0 => {
+                        let message = format!(
+                            "quarantine under {} drained {count} entr{} ({bytes} bytes) for {why} at {level:?}",
+                            root.display(),
+                            if count == 1 { "y" } else { "ies" }
+                        );
+                        eprintln!("[SBH-QUARANTINE] {message}");
+                        self.logger_handle.send(ActivityEvent::Info { message });
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "[SBH-QUARANTINE] sweep under {} failed: {e}",
+                            root.display()
+                        );
+                    }
+                }
+                held = held.saturating_add(store.held_bytes().unwrap_or(0));
+            }
+            self.quarantine_held.insert(mount.clone(), held);
+        }
+        if sweep_due {
+            self.last_quarantine_sweep = Some(now);
+        }
     }
 
     fn spawn_executor_thread(
@@ -7302,6 +7423,20 @@ fn executor_thread_main(
                     ScannerEngineMode::V2
                 ),
                 sacred_paths: executor_sacred_paths,
+                // Layer 7: at Green there is time to keep the bytes around,
+                // so the batch quarantines; from Yellow up the space is
+                // needed and candidates are removed for good.
+                mode: if shared_config.quarantine_enabled.load(Ordering::Relaxed)
+                    && batch.pressure_level == PressureLevel::Green
+                {
+                    DeletionMode::Quarantine
+                } else {
+                    DeletionMode::Unlink
+                },
+                quarantine_ttl: Duration::from_secs(
+                    shared_config.quarantine_ttl_secs.load(Ordering::Relaxed),
+                ),
+                quarantine_roots: shared_scanner_config.read().root_paths.clone(),
                 ..Default::default()
             },
             Some(logger.clone()),
@@ -8677,7 +8812,7 @@ mod tests {
         }
 
         // The shared config carries the gate to the executor thread.
-        let shared = SharedExecutorConfig::new(false, 10, 0.5, 300, 3600);
+        let shared = SharedExecutorConfig::new(false, 10, 0.5, 300, 3600, true, 86_400);
         assert_eq!(shared.min_certainty(), ArtifactCertainty::Unclear);
         shared.set_min_certainty(ArtifactCertainty::Likely);
         assert_eq!(shared.min_certainty(), ArtifactCertainty::Likely);

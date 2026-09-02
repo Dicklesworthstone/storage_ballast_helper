@@ -443,6 +443,15 @@ impl SqliteLogger {
     }
 
     /// Borrow the underlying connection (for stats/query engines).
+    /// `sbh undo`: the decision's entry left quarantine and is back at its
+    /// original path. Returns the number of ledger rows updated.
+    pub fn mark_decision_restored(&self, decision_id: &str) -> Result<usize> {
+        Ok(self.connection().execute(
+            "UPDATE decision_log SET effective_action = 'restored' WHERE decision_id = ?1",
+            params![decision_id],
+        )?)
+    }
+
     pub(crate) fn connection(&self) -> &rusqlite::Connection {
         &self.conn
     }

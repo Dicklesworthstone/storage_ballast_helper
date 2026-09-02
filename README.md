@@ -362,6 +362,7 @@ For non-interactive environments (CI, automation), `sbh install --auto` applies 
 | `sbh check` | Pre-flight space check and recommendations |
 | `sbh scan` | Manual candidate discovery and scoring report |
 | `sbh clean` | Manual cleanup with confirmation/dry-run |
+| `sbh undo` | Restore quarantined entries (`<decision-id>`, `--path`, `--all-since`, `--list`) |
 | `sbh emergency` | Zero-write recovery mode on critically full disks |
 
 ### Ballast and Protection
@@ -663,6 +664,9 @@ sbh update --prune 3
 
 ```toml
 [scanner]
+quarantine_enabled = true # Layer 7: Green and `sbh clean` candidates go to <root>/.sbh/quarantine (`sbh undo`)
+quarantine_ttl_hours = 24
+quarantine_max_bytes_pct = 5
 engine = "v2"  # default since v0.4.32; set "v1" to opt back into the legacy full-descent walker
 event_source = "auto"
 event_watch_budget = 8192
@@ -1137,6 +1141,28 @@ The first deletion of a given path has no cooldown. After the second deletion, c
 | Maximum cooldown | `scanner.repeat_deletion_max_cooldown_secs` | 3600s (1 hour) |
 
 Red and Critical pressure bypasses all dampening. Disk safety takes priority over anti-churn protection.
+
+#### Layer 7: Quarantine-First Deletion and `sbh undo`
+
+Hard vetoes make the known mis-scorings impossible; they cannot make the next one recoverable. At Green there is time to keep the bytes around, so the daemon does: a Green batch (and every `sbh clean` unless `--no-quarantine`) does not unlink a candidate, it renames it into `<root>/.sbh/quarantine/<decision-id>/<basename>` on the same filesystem, next to a `<decision-id>.json` record naming the original path. The quarantine root carries a `.sbh-protect` marker so no scan ever scores it. The event is still `artifact_delete` with `"quarantined": true` and no bytes freed.
+
+Quarantined space is reclaimable on demand:
+
+| Condition | What happens |
+| --- | --- |
+| Green or Yellow | Once a minute, entries older than `scanner.quarantine_ttl_hours` are removed for good and the store is capped at `scanner.quarantine_max_bytes_pct` of the volume (oldest first). |
+| Orange, Red, Critical | The mount's quarantines are drained oldest-first on the tick, ahead of any new deletion: that space was decided already and costs no scoring. New candidates are removed for good (`Unlink`). |
+| `sbh emergency` | Drains every quarantine under the scan roots before it scans anything. |
+
+Restore with `sbh undo <decision-id>` (the id is on the `[SBH-QUARANTINE]` line, in `sbh explain`, and in `sbh undo --list`), `sbh undo --path <original>`, or `sbh undo --all-since 2h`. A restore is a rename back, byte-identical; it refuses when the original path exists again unless `--force-suffix`, which restores beside it as `<name>.restored-<decision-id>`. The ledger marks the decision `restored`.
+
+A candidate that cannot be quarantined (different filesystem from the root, unusable store) is removed for good and the fallback is logged as `quarantine_unavailable` with its reason. `status` shows the bytes held per mount in the Reserve column; `stats` reports `quarantined_count` and `quarantined_bytes` and excludes held bytes from `total_bytes_freed`.
+
+| Parameter | Config Key | Default |
+| --- | --- | --- |
+| Quarantine on/off | `scanner.quarantine_enabled` | `true` |
+| Time an entry is held | `scanner.quarantine_ttl_hours` | 24 |
+| Size cap per volume | `scanner.quarantine_max_bytes_pct` | 5 |
 
 The tracker periodically prunes entries whose last deletion is older than `max_cooldown`, preventing unbounded memory growth in long-running daemon sessions.
 

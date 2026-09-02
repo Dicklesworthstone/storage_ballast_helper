@@ -100,6 +100,10 @@ pub struct LogEntry {
     /// Stable decision id linking this event to a ledger decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_id: Option<String>,
+    /// `artifact_delete` only: the candidate was moved into quarantine
+    /// (restorable with `sbh undo`) rather than unlinked; no bytes freed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantined: Option<bool>,
     /// Freeform details.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
@@ -142,6 +146,7 @@ impl LogEntry {
             error_message: None,
             mount_point: None,
             decision_id: None,
+            quarantined: None,
             details: None,
             schema_version: None,
             run_id: None,

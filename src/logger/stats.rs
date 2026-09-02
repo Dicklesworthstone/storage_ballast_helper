@@ -43,7 +43,13 @@ pub struct WindowStats {
 #[derive(Debug, Clone, Default)]
 pub struct DeletionStats {
     pub count: u64,
+    /// Bytes actually released (quarantined entries are excluded: they are
+    /// held, not freed).
     pub total_bytes_freed: u64,
+    /// Of `count`, deletions that went into quarantine (Layer 7).
+    pub quarantined_count: u64,
+    /// Bytes held in quarantine by those deletions at decision time.
+    pub quarantined_bytes: u64,
     pub avg_size: u64,
     pub median_size: u64,
     pub largest_deletion: Option<PathInfo>,
@@ -307,6 +313,8 @@ impl<'a> StatsEngine<'a> {
                     "deletions": {
                         "count": w.deletions.count,
                         "total_bytes_freed": w.deletions.total_bytes_freed,
+                        "quarantined_count": w.deletions.quarantined_count,
+                        "quarantined_bytes": w.deletions.quarantined_bytes,
                         "avg_size": w.deletions.avg_size,
                         "median_size": w.deletions.median_size,
                         "largest_deletion": w.deletions.largest_deletion.as_ref().map(|p| {
@@ -369,6 +377,17 @@ impl<'a> StatsEngine<'a> {
                AND timestamp >= ?1",
             params![since],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+
+        // Quarantined deletions (Layer 7) are successes that freed nothing.
+        let (quarantined_count, quarantined_bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)
+             FROM activity_log
+             WHERE event_type = 'artifact_delete' AND success = 1
+               AND details LIKE '%quarantined%'
+               AND timestamp >= ?1",
+            params![since],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
 
         // Median via OFFSET/LIMIT (efficient for sorted data with index).
@@ -448,7 +467,9 @@ impl<'a> StatsEngine<'a> {
 
         Ok(DeletionStats {
             count: count.max(0) as u64,
-            total_bytes_freed: total.max(0) as u64,
+            total_bytes_freed: total.saturating_sub(quarantined_bytes).max(0) as u64,
+            quarantined_count: quarantined_count.max(0) as u64,
+            quarantined_bytes: quarantined_bytes.max(0) as u64,
             avg_size: avg_size as u64,
             median_size,
             largest_deletion: largest,

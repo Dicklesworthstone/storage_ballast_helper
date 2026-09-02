@@ -98,6 +98,9 @@ pub enum ActivityEvent {
         /// Stable decision id of the ledger record that approved this
         /// deletion (see `decision_record::stable_decision_id`).
         decision_id: Option<String>,
+        /// The candidate went into quarantine (restorable) instead of being
+        /// unlinked; `size_bytes` is held, not freed.
+        quarantined: bool,
     },
     ArtifactDeletionFailed {
         path: String,
@@ -586,6 +589,7 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
             free_pct,
             duration_ms,
             decision_id,
+            quarantined,
         } => {
             let mut e = LogEntry::new(EventType::ArtifactDelete, Severity::Info);
             e.path = Some(path.clone());
@@ -597,6 +601,10 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
             e.duration_ms = Some(*duration_ms);
             e.ok = Some(true);
             e.decision_id.clone_from(decision_id);
+            e.quarantined = Some(*quarantined);
+            if *quarantined {
+                e.details = Some("quarantined".to_string());
+            }
             e
         }
         ActivityEvent::PolicyTransition {
@@ -726,6 +734,7 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             free_pct,
             duration_ms,
             decision_id,
+            quarantined,
         } => Some(ActivityRow {
             timestamp: ts,
             event_type: "artifact_delete".to_string(),
@@ -740,7 +749,12 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             success: 1,
             error_code: None,
             error_message: None,
-            details: decision_id.as_ref().map(|id| format!("decision_id={id}")),
+            details: match (decision_id, quarantined) {
+                (Some(id), true) => Some(format!("decision_id={id};quarantined")),
+                (Some(id), false) => Some(format!("decision_id={id}")),
+                (None, true) => Some("quarantined".to_string()),
+                (None, false) => None,
+            },
         }),
         ActivityEvent::ArtifactDeletionFailed {
             path,
@@ -1166,6 +1180,7 @@ mod tests {
             free_pct: 8.3,
             duration_ms: 145,
             decision_id: None,
+            quarantined: false,
         });
         handle.shutdown();
         join.join().unwrap();
@@ -1461,6 +1476,7 @@ mod tests {
             free_pct: 3.2,
             duration_ms: 200,
             decision_id: None,
+            quarantined: false,
         });
         handle.send(ActivityEvent::ArtifactDeletionFailed {
             path: "/data/protected/.target".to_string(),

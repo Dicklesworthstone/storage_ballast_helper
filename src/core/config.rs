@@ -466,6 +466,16 @@ pub struct ScannerConfig {
     pub max_scan_duty_cycle_pct: u8,
     /// Maximum wall-clock seconds for a single scan pass. 0 = use built-in default.
     pub scan_time_budget_secs: u64,
+    /// Layer 7: at Green (and for manual `clean`) candidates are moved into
+    /// `<mount>/.sbh/quarantine` instead of unlinked, restorable with
+    /// `sbh undo <decision-id>`; pressure drains the quarantine oldest-first
+    /// before any new deletion.
+    pub quarantine_enabled: bool,
+    /// Hours a quarantined entry is kept before it is unlinked for good.
+    pub quarantine_ttl_hours: u64,
+    /// Share of the volume the quarantine may hold; beyond it the oldest
+    /// entries are unlinked.
+    pub quarantine_max_bytes_pct: u8,
     /// Seconds to reuse active file/process/mmap evidence before refreshing.
     /// 0 disables caching and forces a fresh probe on demand.
     pub active_reference_cache_ttl_secs: u64,
@@ -1019,6 +1029,9 @@ impl Default for ScannerConfig {
             // entries. Scans timing out before identifying candidates was the
             // failure mode behind the 2026-04-30 100%-disk incident on ts1.
             scan_time_budget_secs: 900,
+            quarantine_enabled: true,
+            quarantine_ttl_hours: 24,
+            quarantine_max_bytes_pct: 5,
             active_reference_cache_ttl_secs: 30,
             active_reference_min_size_bytes: 100 * 1024 * 1024,
             log_truncation: LogTruncationConfig::default(),
@@ -2222,6 +2235,11 @@ impl Config {
             return Err(SbhError::InvalidConfig {
                 details: "telemetry.cpu_budget_pct must be 0..=100 (percent of one core)"
                     .to_string(),
+            });
+        }
+        if self.scanner.quarantine_max_bytes_pct > 100 {
+            return Err(SbhError::InvalidConfig {
+                details: "scanner.quarantine_max_bytes_pct must be 0..=100".to_string(),
             });
         }
 

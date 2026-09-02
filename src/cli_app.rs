@@ -53,12 +53,15 @@ use storage_ballast_helper::platform::types::{
 use storage_ballast_helper::scanner::active_lease::{
     self, ACTIVE_LEASE_TARGET_ENV, ACTIVE_LEASE_TOKEN_ENV, ActiveLease, LeasePolicy,
 };
-use storage_ballast_helper::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionPlan};
+use storage_ballast_helper::scanner::deletion::{
+    DeletionConfig, DeletionExecutor, DeletionMode, DeletionPlan,
+};
 use storage_ballast_helper::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactPatternRegistry, OpaqueTreeDisposition,
 };
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
+use storage_ballast_helper::scanner::quarantine::QuarantineStore;
 use storage_ballast_helper::scanner::scoring::{
     ActiveReferenceSummary, CandidacyScore, CandidateInput, ScoringEngine,
 };
@@ -125,6 +128,8 @@ enum Command {
     Scan(ScanArgs),
     /// Run a manual cleanup pass.
     Clean(CleanArgs),
+    /// Restore quarantined entries to their original paths.
+    Undo(UndoArgs),
     /// Manage ballast pools and files.
     Ballast(BallastArgs),
     /// View and update configuration state.
@@ -528,6 +533,7 @@ struct ScanArgs {
 #[command(
     after_long_help = "Platform notes:\n  On macOS, --thin-local-snapshots asks Time Machine/APFS to reclaim local snapshot space.\n  It does not delete user paths and may require sudo/root."
 )]
+#[allow(clippy::struct_excessive_bools)]
 struct CleanArgs {
     /// Paths to clean (falls back to configured watched paths when omitted).
     #[arg(value_name = "PATH")]
@@ -553,6 +559,10 @@ struct CleanArgs {
     /// Skip interactive confirmation prompt.
     #[arg(long)]
     yes: bool,
+    /// Remove candidates for good instead of moving them into
+    /// `<root>/.sbh/quarantine` (Layer 7; restorable with `sbh undo`).
+    #[arg(long)]
+    no_quarantine: bool,
 }
 
 impl Default for CleanArgs {
@@ -566,8 +576,39 @@ impl Default for CleanArgs {
             max_items: None,
             dry_run: false,
             yes: false,
+            no_quarantine: false,
         }
     }
+}
+
+/// `sbh undo`: restore quarantined entries (Layer 7).
+#[derive(Debug, Clone, Args, Serialize, Default)]
+#[command(
+    after_long_help = "Quarantine:\n  At Green, and for `sbh clean`, candidates are moved into \
+`<root>/.sbh/quarantine/<decision-id>/` instead of removed; the decision id is printed on the \
+`[SBH-QUARANTINE]` line and by `sbh explain`. Entries expire after scanner.quarantine_ttl_hours and \
+are drained oldest-first when the mount reaches Orange."
+)]
+struct UndoArgs {
+    /// Decision id of the entry to restore.
+    #[arg(value_name = "DECISION_ID", conflicts_with_all = ["path", "all_since", "list"])]
+    id: Option<String>,
+    /// Restore the entry whose original path is PATH.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["all_since", "list"])]
+    path: Option<PathBuf>,
+    /// Restore every entry quarantined within WINDOW (e.g. 30m, 2h, 1d).
+    #[arg(long, value_name = "WINDOW", conflicts_with = "list")]
+    all_since: Option<String>,
+    /// List held entries and stop.
+    #[arg(long)]
+    list: bool,
+    /// When the original path exists again, restore beside it as
+    /// `<name>.restored-<decision-id>` instead of refusing.
+    #[arg(long)]
+    force_suffix: bool,
+    /// Scan roots whose quarantine to search (default: scanner.root_paths).
+    #[arg(long = "root", value_name = "PATH")]
+    roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -1026,6 +1067,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Stats(args) => run_stats(cli, args),
         Command::Scan(args) => run_scan(cli, args),
         Command::Clean(args) => run_clean(cli, args),
+        Command::Undo(args) => run_undo(cli, args),
         Command::Ballast(args) => run_ballast(cli, args),
         Command::Config(args) => run_config(cli, args),
         Command::Version(args) => emit_version(cli, args),
@@ -9205,6 +9247,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
 
             let payload = json!({
                 "command": "status",
+                "schema_version": 2,
                 "version": version,
                 "daemon_running": daemon_running,
                 "daemon_state_reason": liveness.reason,
@@ -9500,48 +9543,91 @@ fn capacity_free_pct(capacity: &Capacity) -> f64 {
     bytes_to_pct(capacity.available_bytes, capacity.total_bytes)
 }
 
+/// One mount of `status --json`. `free` is `available_bytes` on every
+/// family; the APFS-only keys (container accounting, purgeable and snapshot
+/// bytes, `free_excludes_purgeable`) appear only when the capacity was
+/// measured on APFS, so a Linux consumer never sees a null APFS field.
 fn status_mount_json(capacity: &Capacity, level: &str, free_pct: f64) -> Value {
-    json!({
+    let mut mount = json!({
         "path": capacity.mount_point.to_string_lossy(),
         "total": capacity.total_bytes,
         "free": capacity.available_bytes,
         "free_pct": free_pct,
         "level": level,
         "fs_type": capacity.fs_type,
-        "container_id": capacity.container_id,
-        "container_total": capacity.container_total_bytes,
-        "container_available": capacity.container_available_bytes,
         "volume_total": capacity.volume_total_bytes,
         "volume_available": capacity.volume_available_bytes,
-        "volume_role": capacity.volume_role,
-        "shared_volumes": capacity.shared_volumes,
-        "is_primary": capacity.is_primary,
-        "purgeable_bytes": capacity.purgeable_bytes,
-        "free_excludes_purgeable": true,
-        "local_snapshot_bytes": capacity.local_snapshot_bytes,
-        "local_snapshot_reclaim_command": local_snapshot_reclaim_command(capacity),
         "platform": capacity_platform_json(capacity),
-    })
+    });
+    if capacity_is_apfs(capacity)
+        && let Some(object) = mount.as_object_mut()
+    {
+        object.insert("container_id".into(), json!(capacity.container_id));
+        object.insert(
+            "container_total".into(),
+            json!(capacity.container_total_bytes),
+        );
+        object.insert(
+            "container_available".into(),
+            json!(capacity.container_available_bytes),
+        );
+        object.insert("volume_role".into(), json!(capacity.volume_role));
+        object.insert("shared_volumes".into(), json!(capacity.shared_volumes));
+        object.insert("is_primary".into(), json!(capacity.is_primary));
+        object.insert("purgeable_bytes".into(), json!(capacity.purgeable_bytes));
+        object.insert("free_excludes_purgeable".into(), json!(true));
+        object.insert(
+            "local_snapshot_bytes".into(),
+            json!(capacity.local_snapshot_bytes),
+        );
+        object.insert(
+            "local_snapshot_reclaim_command".into(),
+            json!(local_snapshot_reclaim_command(capacity)),
+        );
+    }
+    mount
 }
 
+/// Whether a mount's capacity came from APFS container accounting, where
+/// `free` already excludes purgeable space and the container fields mean
+/// something.
+fn capacity_is_apfs(capacity: &Capacity) -> bool {
+    capacity.fs_type.eq_ignore_ascii_case("apfs")
+}
+
+/// The per-family `platform` block: APFS container accounting under
+/// `darwin.apfs`, the filesystem facts sbh has for a Linux mount under
+/// `linux`, and an empty object for anything else. A Linux mount never
+/// carries a null APFS block.
 fn capacity_platform_json(capacity: &Capacity) -> Value {
-    json!({
-        "darwin": {
-            "apfs": {
-                "container_id": capacity.container_id.as_deref(),
-                "container_total_bytes": capacity.container_total_bytes,
-                "container_available_bytes": capacity.container_available_bytes,
-                "volume_total_bytes": capacity.volume_total_bytes,
-                "volume_available_bytes": capacity.volume_available_bytes,
-                "volume_role": capacity.volume_role.as_deref(),
-                "shared_volumes": &capacity.shared_volumes,
-                "is_primary": capacity.is_primary,
-                "purgeable_bytes": capacity.purgeable_bytes,
-                "local_snapshot_bytes": capacity.local_snapshot_bytes,
-                "free_excludes_purgeable": true,
+    if capacity_is_apfs(capacity) {
+        return json!({
+            "darwin": {
+                "apfs": {
+                    "container_id": capacity.container_id.as_deref(),
+                    "container_total_bytes": capacity.container_total_bytes,
+                    "container_available_bytes": capacity.container_available_bytes,
+                    "volume_total_bytes": capacity.volume_total_bytes,
+                    "volume_available_bytes": capacity.volume_available_bytes,
+                    "volume_role": capacity.volume_role.as_deref(),
+                    "shared_volumes": &capacity.shared_volumes,
+                    "is_primary": capacity.is_primary,
+                    "purgeable_bytes": capacity.purgeable_bytes,
+                    "local_snapshot_bytes": capacity.local_snapshot_bytes,
+                    "free_excludes_purgeable": true,
+                }
             }
-        }
-    })
+        });
+    }
+    if cfg!(target_os = "linux") {
+        return json!({
+            "linux": {
+                "fs_type": capacity.fs_type,
+                "is_readonly": capacity.is_readonly,
+            }
+        });
+    }
+    json!({})
 }
 
 fn process_attribution_visibility(platform_name: &str) -> Option<ProcessAttributionVisibility> {
@@ -10905,6 +10991,196 @@ fn record_cli_decisions(
 }
 
 #[allow(clippy::too_many_lines)]
+/// `sbh undo`: put quarantined entries back (Layer 7).
+fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
+    use storage_ballast_helper::scanner::quarantine::QuarantineRecord;
+
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let roots: Vec<PathBuf> = if args.roots.is_empty() {
+        config.scanner.root_paths.clone()
+    } else {
+        args.roots.clone()
+    };
+    // Every held record across the roots' stores, oldest first.
+    let mut held: Vec<(QuarantineStore, QuarantineRecord)> = Vec::new();
+    for root in &roots {
+        let store = QuarantineStore::under(root);
+        let records = store
+            .records()
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
+        held.extend(records.into_iter().map(|record| (store.clone(), record)));
+    }
+    held.sort_by(|a, b| {
+        a.1.quarantined_at
+            .cmp(&b.1.quarantined_at)
+            .then_with(|| a.1.decision_id.cmp(&b.1.decision_id))
+    });
+    let held_bytes = held
+        .iter()
+        .map(|(_, record)| record.size_bytes)
+        .fold(0u64, u64::saturating_add);
+    let now_unix = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    if args.list {
+        match output_mode(cli) {
+            OutputMode::Json => write_json_line(&json!({
+                "command": "undo",
+                "roots": roots,
+                "held_bytes": held_bytes,
+                "held": held.iter().map(|(store, record)| json!({
+                    "decision_id": record.decision_id,
+                    "original_path": record.original_path,
+                    "quarantine_path": record.quarantine_path,
+                    "size_bytes": record.size_bytes,
+                    "quarantined_at": record.quarantined_at,
+                    "expires_at": record.expires_at,
+                    "store": store.root(),
+                })).collect::<Vec<_>>(),
+            }))?,
+            OutputMode::Human => {
+                if held.is_empty() {
+                    println!(
+                        "Quarantine is empty ({} root{} checked).",
+                        roots.len(),
+                        if roots.len() == 1 { "" } else { "s" }
+                    );
+                } else {
+                    println!(
+                        "Quarantined entries ({} held; restore with `sbh undo <decision-id>`):",
+                        format_bytes(held_bytes)
+                    );
+                    for (_, record) in &held {
+                        let left = record.expires_at.saturating_sub(now_unix);
+                        println!(
+                            "  {}  {:>10}  {}  (expires in {})",
+                            record.decision_id,
+                            format_bytes(record.size_bytes),
+                            record.original_path.display(),
+                            format_duration(Duration::from_secs(left))
+                        );
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let selected: Vec<&(QuarantineStore, QuarantineRecord)> = if let Some(id) = &args.id {
+        let id = id.trim().to_ascii_lowercase();
+        held.iter().filter(|(_, r)| r.decision_id == id).collect()
+    } else if let Some(path) = &args.path {
+        let path = if path.is_absolute() {
+            path.clone()
+        } else {
+            std::env::current_dir().map_or_else(|_| path.clone(), |cwd| cwd.join(path))
+        };
+        held.iter()
+            .filter(|(_, r)| r.original_path == path)
+            .collect()
+    } else if let Some(window) = &args.all_since {
+        let since = parse_window_duration(window)?;
+        let cutoff = now_unix.saturating_sub(since.as_secs());
+        held.iter()
+            .filter(|(_, r)| r.quarantined_at >= cutoff)
+            .collect()
+    } else {
+        return Err(CliError::User(
+            "specify a decision id, --path, --all-since, or --list".to_string(),
+        ));
+    };
+    if selected.is_empty() {
+        return Err(CliError::User(format!(
+            "no quarantined entry matches ({} held under {} root{}; see `sbh undo --list`)",
+            held.len(),
+            roots.len(),
+            if roots.len() == 1 { "" } else { "s" }
+        )));
+    }
+
+    let ledger = SqliteLogger::open(&config.paths.sqlite_db).ok();
+    let mut restored = Vec::new();
+    let mut failed = Vec::new();
+    for (store, record) in selected {
+        match store.restore(&record.decision_id, args.force_suffix) {
+            Ok(outcome) => {
+                eprintln!(
+                    "[SBH-UNDO] restored {} -> {} (decision {}, {})",
+                    record.original_path.display(),
+                    outcome.restored_to.display(),
+                    outcome.decision_id,
+                    format_bytes(outcome.size_bytes)
+                );
+                if let Some(ledger) = &ledger
+                    && let Err(e) = ledger.mark_decision_restored(&outcome.decision_id)
+                {
+                    eprintln!(
+                        "[SBH-UNDO] ledger not updated for {}: {e}",
+                        outcome.decision_id
+                    );
+                }
+                restored.push(outcome);
+            }
+            Err(e) => {
+                eprintln!("[SBH-UNDO] {} not restored: {e}", record.decision_id);
+                failed.push((record.decision_id.clone(), e.to_string()));
+            }
+        }
+    }
+    let restored_bytes = restored
+        .iter()
+        .map(|o| o.size_bytes)
+        .fold(0u64, u64::saturating_add);
+    match output_mode(cli) {
+        OutputMode::Json => write_json_line(&json!({
+            "command": "undo",
+            "restored": restored.iter().map(|o| json!({
+                "decision_id": o.decision_id,
+                "restored_to": o.restored_to,
+                "size_bytes": o.size_bytes,
+            })).collect::<Vec<_>>(),
+            "restored_bytes": restored_bytes,
+            "failed": failed.iter().map(|(id, error)| json!({
+                "decision_id": id,
+                "error": error,
+            })).collect::<Vec<_>>(),
+        }))?,
+        OutputMode::Human => {
+            println!(
+                "Restored {} entr{} ({}).",
+                restored.len(),
+                if restored.len() == 1 { "y" } else { "ies" },
+                format_bytes(restored_bytes)
+            );
+            for (id, error) in &failed {
+                println!("  {id}: {error}");
+            }
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else if restored.is_empty() {
+        Err(CliError::Runtime(format!(
+            "{} entr{} not restored",
+            failed.len(),
+            if failed.len() == 1 {
+                "y was"
+            } else {
+                "ies were"
+            }
+        )))
+    } else {
+        Err(CliError::Partial(format!(
+            "{} of {} entries not restored",
+            failed.len(),
+            failed.len() + restored.len()
+        )))
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -11053,6 +11329,16 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
         check_open_files: true,
         require_identity: matches!(config.scanner.engine, ScannerEngineMode::V2),
         sacred_paths,
+        // Layer 7: a manual clean has time to keep the bytes around.
+        mode: if args.no_quarantine || !config.scanner.quarantine_enabled {
+            DeletionMode::Unlink
+        } else {
+            DeletionMode::Quarantine
+        },
+        quarantine_ttl: Duration::from_secs(
+            config.scanner.quarantine_ttl_hours.saturating_mul(3600),
+        ),
+        quarantine_roots: root_paths.clone(),
         ..Default::default()
     };
     let executor = DeletionExecutor::new(deletion_config, None);
@@ -11548,6 +11834,7 @@ fn run_interactive_clean(
     let mut items_deleted: usize = 0;
     let mut skips = InteractiveSkips::default();
     let mut bytes_freed: u64 = 0;
+    let mut bytes_quarantined: u64 = 0;
     let mut delete_all = false;
 
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -11644,6 +11931,13 @@ fn run_interactive_clean(
                             println!("    Deleted.");
                         }
                     }
+                    Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Quarantined) => {
+                        items_deleted += 1;
+                        bytes_quarantined += candidate.size_bytes;
+                        if !delete_all {
+                            println!("    Quarantined (restore with `sbh undo`).");
+                        }
+                    }
                     Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Skipped(
                         skip,
                     )) => {
@@ -11682,6 +11976,7 @@ fn run_interactive_clean(
                 "elapsed_seconds": scan_elapsed.as_secs_f64(),
                 "candidates_count": plan.estimated_items,
                 "items_deleted": items_deleted,
+                "bytes_quarantined": bytes_quarantined,
                 "items_skipped": skips.total,
                 "skipped_by_reason": skips_json(&skips.by_reason),
                 // Mirrors DeletionReport::stalled(): work was queued, nothing freed.
@@ -11754,6 +12049,19 @@ fn print_clean_summary(report: &storage_ballast_helper::scanner::deletion::Delet
             format_bytes(report.bytes_freed),
             report.duration.as_secs_f64(),
         );
+        if report.items_quarantined > 0 {
+            println!(
+                "  Quarantined: {} of those ({}) held under .sbh/quarantine, restorable with `sbh undo <decision-id>` (`sbh undo --list`)",
+                report.items_quarantined,
+                format_bytes(report.bytes_quarantined),
+            );
+        }
+        if report.quarantine_unavailable > 0 {
+            println!(
+                "  Quarantine unavailable for {} item(s): removed for good (reasons on stderr)",
+                report.quarantine_unavailable
+            );
+        }
         if report.items_skipped > 0 {
             println!("  Skipped: {} items", report.items_skipped);
             // Always attribute skips. An unexplained skip count on a full disk
@@ -11865,6 +12173,9 @@ fn emit_clean_report_json(
         "items_skipped": report.items_skipped,
         "items_failed": report.items_failed,
         "bytes_freed": report.bytes_freed,
+        "items_quarantined": report.items_quarantined,
+        "bytes_quarantined": report.bytes_quarantined,
+        "quarantine_unavailable": report.quarantine_unavailable,
         "bytes_would_free": report.bytes_would_free,
         "duration_seconds": report.duration.as_secs_f64(),
         "dry_run": report.dry_run,
@@ -11922,6 +12233,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             OutputMode::Json => {
                 let payload = json!({
                     "command": "check",
+                "schema_version": 2,
                     "status": "critical",
                     "path": check_path.to_string_lossy(),
                     "mount_point": capacity.mount_point.to_string_lossy(),
@@ -11978,6 +12290,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
             OutputMode::Json => {
                 let payload = json!({
                     "command": "check",
+                "schema_version": 2,
                     "status": "critical",
                     "path": check_path.to_string_lossy(),
                     "mount_point": capacity.mount_point.to_string_lossy(),
@@ -12025,20 +12338,21 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                 OutputMode::Human => println!("sbh: {line}"),
                 OutputMode::Json => {
                     let payload = json!({
-                        "command": "check",
-                        "status": "unprotected",
-                        "reason": UNPROTECTED_PRESSURE,
-                        "path": check_path.to_string_lossy(),
-                        "mount_point": capacity.mount_point.to_string_lossy(),
-                        "free_bytes": capacity.available_bytes,
-                        "total_bytes": capacity.total_bytes,
-                        "free_pct": free_pct,
-                        "level": unprotected.level,
-                        "reclaim_capability": unprotected.capability,
-                        "unprotected": unprotected_json,
-                        "platform": capacity_platform_json(&capacity),
-                        "exit_code": 1,
-                    });
+                            "command": "check",
+                            "schema_version": 2,
+                            "status": "unprotected",
+                            "reason": UNPROTECTED_PRESSURE,
+                            "path": check_path.to_string_lossy(),
+                            "mount_point": capacity.mount_point.to_string_lossy(),
+                            "free_bytes": capacity.available_bytes,
+                            "total_bytes": capacity.total_bytes,
+                            "free_pct": free_pct,
+                            "level": unprotected.level,
+                            "reclaim_capability": unprotected.capability,
+                            "unprotected": unprotected_json,
+                            "platform": capacity_platform_json(&capacity),
+                            "exit_code": 1,
+                        });
                     write_json_line(&payload)?;
                 }
             }
@@ -12126,28 +12440,29 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
                         }
                         OutputMode::Json => {
                             let payload = json!({
-                                "command": "check",
-                                "status": "warning",
-                                "path": check_path.to_string_lossy(),
-                                "mount_point": capacity.mount_point.to_string_lossy(),
-                                "free_bytes": capacity.available_bytes,
-                                "total_bytes": capacity.total_bytes,
-                                "free_pct": free_pct,
-                                "rate_bytes_per_sec": forecast.bytes_per_sec,
-                                "seconds_to_red": seconds_left,
-                                "minutes_until_red": minutes_left,
-                                "predict_minutes": predict_minutes,
-                                "forecast": forecast_json,
-                                "container_id": capacity.container_id.as_deref(),
-                                "container_total_bytes": capacity.container_total_bytes,
-                                "container_available_bytes": capacity.container_available_bytes,
-                                "volume_total_bytes": capacity.volume_total_bytes,
-                                "volume_available_bytes": capacity.volume_available_bytes,
-                                "volume_role": capacity.volume_role.as_deref(),
-                                "free_excludes_purgeable": true,
-                                "platform": capacity_platform_json(&capacity),
-                                "exit_code": 1,
-                            });
+                                            "command": "check",
+                                            "schema_version": 2,
+                                            "status": "warning",
+                                            "path": check_path.to_string_lossy(),
+                                            "mount_point": capacity.mount_point.to_string_lossy(),
+                                            "free_bytes": capacity.available_bytes,
+                                            "total_bytes": capacity.total_bytes,
+                                            "free_pct": free_pct,
+                                            "rate_bytes_per_sec": forecast.bytes_per_sec,
+                                            "seconds_to_red": seconds_left,
+                                            "minutes_until_red": minutes_left,
+                                            "predict_minutes": predict_minutes,
+                                            "forecast": forecast_json,
+                                            "container_id": capacity.container_id.as_deref(),
+                                            "container_total_bytes": capacity.container_total_bytes,
+                                            "container_available_bytes": capacity.container_available_bytes,
+                                            "volume_total_bytes": capacity.volume_total_bytes,
+                                            "volume_available_bytes": capacity.volume_available_bytes,
+                                            "volume_role": capacity.volume_role.as_deref(),
+                                            "free_excludes_purgeable": true,
+                                            "platform": capacity_platform_json(&capacity),
+                                            "exit_code": 1,
+                                        });
                             write_json_line(&payload)?;
                         }
                     }
@@ -12666,6 +12981,24 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
         return Err(CliError::User("no valid scan paths found".to_string()));
     }
 
+    // Layer 7: the quarantine is already-decided space. On a critically
+    // full disk it goes first, before anything is scanned or scored.
+    for root in &root_paths {
+        match QuarantineStore::under(root).drain_all() {
+            Ok((count, bytes)) if count > 0 => eprintln!(
+                "[SBH-EMERGENCY] drained {count} quarantined entr{} ({}) under {}",
+                if count == 1 { "y" } else { "ies" },
+                format_bytes(bytes),
+                root.display()
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "[SBH-EMERGENCY] quarantine under {} not drained: {e}",
+                root.display()
+            ),
+        }
+    }
+
     // Marker-only protection: honors .sbh-protect files on disk, no config patterns.
     let protection = ProtectionRegistry::marker_only();
 
@@ -12915,6 +13248,7 @@ fn run_interactive_emergency(
     let mut items_deleted: usize = 0;
     let mut skips = InteractiveSkips::default();
     let mut bytes_freed: u64 = 0;
+    let mut bytes_quarantined: u64 = 0;
     let mut delete_all = false;
 
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -13003,6 +13337,13 @@ fn run_interactive_emergency(
                             eprintln!("    Deleted.");
                         }
                     }
+                    Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Quarantined) => {
+                        items_deleted += 1;
+                        bytes_quarantined += candidate.size_bytes;
+                        if !delete_all {
+                            eprintln!("    Quarantined (restore with `sbh undo`).");
+                        }
+                    }
                     Ok(storage_ballast_helper::scanner::deletion::CheckedDeletion::Skipped(
                         skip,
                     )) => {
@@ -13045,6 +13386,7 @@ fn run_interactive_emergency(
                 "elapsed_seconds": scan_elapsed.as_secs_f64(),
                 "candidates_count": plan.estimated_items,
                 "items_deleted": items_deleted,
+                "bytes_quarantined": bytes_quarantined,
                 "items_skipped": skips.total,
                 "skipped_by_reason": skips_json(&skips.by_reason),
                 // Mirrors DeletionReport::stalled(): work was queued, nothing freed.
@@ -17099,6 +17441,8 @@ mod tests {
             deletions: DeletionStats {
                 count: 10,
                 total_bytes_freed: 1_000_000,
+                quarantined_count: 0,
+                quarantined_bytes: 0,
                 avg_size: 100_000,
                 median_size: 80_000,
                 largest_deletion: None,
@@ -17458,6 +17802,58 @@ mod tests {
         assert_eq!(apfs["purgeable_bytes"], 32);
         assert_eq!(apfs["local_snapshot_bytes"], 64);
         assert_eq!(apfs["free_excludes_purgeable"], true);
+        assert!(payload["platform"].get("linux").is_none());
+    }
+
+    #[test]
+    fn status_mount_json_keys_the_platform_block_by_filesystem_family() {
+        let capacity = Capacity {
+            mount_point: PathBuf::from("/data"),
+            fs_type: "ext4".to_string(),
+            total_bytes: 1_000,
+            free_bytes: 250,
+            available_bytes: 250,
+            is_readonly: false,
+            container_id: None,
+            container_total_bytes: None,
+            container_available_bytes: None,
+            volume_total_bytes: None,
+            volume_available_bytes: None,
+            volume_role: None,
+            shared_volumes: Vec::new(),
+            is_primary: false,
+            purgeable_bytes: None,
+            local_snapshot_bytes: None,
+        };
+
+        let payload = status_mount_json(&capacity, "green", 25.0);
+        assert_eq!(payload["fs_type"], "ext4");
+        assert_eq!(payload["free"], 250);
+        for apfs_only in [
+            "container_id",
+            "container_total",
+            "container_available",
+            "volume_role",
+            "shared_volumes",
+            "is_primary",
+            "purgeable_bytes",
+            "free_excludes_purgeable",
+            "local_snapshot_bytes",
+            "local_snapshot_reclaim_command",
+        ] {
+            assert!(
+                payload.get(apfs_only).is_none(),
+                "{apfs_only} must not appear on a non-APFS mount"
+            );
+        }
+        assert!(payload["platform"].get("darwin").is_none());
+        let platform = capacity_platform_json(&capacity);
+        if cfg!(target_os = "linux") {
+            assert_eq!(platform["linux"]["fs_type"], "ext4");
+            assert_eq!(platform["linux"]["is_readonly"], false);
+        } else {
+            assert_eq!(platform, json!({}));
+        }
     }
 
     #[test]

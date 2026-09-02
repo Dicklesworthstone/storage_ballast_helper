@@ -10,5 +10,6 @@ pub mod log_truncator;
 pub mod merkle;
 pub mod patterns;
 pub mod protection;
+pub mod quarantine;
 pub mod scoring;
 pub mod walker;

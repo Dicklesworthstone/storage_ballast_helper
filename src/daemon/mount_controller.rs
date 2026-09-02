@@ -625,6 +625,10 @@ pub struct ReserveState {
     /// The reserve is short of its target because the headroom floor refused
     /// further files (not because files were released).
     pub floor_limited: bool,
+    /// Bytes held in the mount's quarantine (Layer 7): reclaimable on
+    /// demand, drained oldest-first before any new deletion at Orange+.
+    #[serde(default)]
+    pub quarantined_bytes: u64,
 }
 
 /// Whether pressure on a mount finds sbh unable to do anything about it:
@@ -1259,6 +1263,7 @@ mod tests {
                     target_bytes: 1 << 30,
                     horizon_minutes: None,
                     floor_limited: false,
+                    quarantined_bytes: 0,
                 }),
             };
         assert!(unprotected_pressure(&record(

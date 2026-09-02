@@ -32,10 +32,24 @@ use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, StructuralSignals, is_obvious_build_artifact_basename,
 };
 use crate::scanner::protection::{self, StowawayScanConfig};
+use crate::scanner::quarantine::{self, QuarantineStore, QuarantineUnavailable};
 use crate::scanner::scoring::{CandidacyScore, DecisionAction, ScoreFactors};
 use crate::scanner::walker;
 
 // ──────────────────── configuration ────────────────────
+
+/// What `execute` does to an approved candidate (Layer 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeletionMode {
+    /// Remove for good.
+    #[default]
+    Unlink,
+    /// Rename into `<root>/.sbh/quarantine/<decision-id>/` on the same
+    /// filesystem, restorable with `sbh undo`; when that is impossible
+    /// (cross-device, unusable root) the candidate is removed for good and
+    /// the fallback is logged and counted as `quarantine_unavailable`.
+    Quarantine,
+}
 
 /// Configuration for the deletion executor.
 #[derive(Debug, Clone)]
@@ -81,6 +95,14 @@ pub struct DeletionConfig {
     /// Bounds for the pre-flight containment sub-walk. A walk that exhausts
     /// its budget before proving the subtree marker-free fails closed.
     pub stowaway_scan: StowawayScanConfig,
+    /// Layer 7: what `execute` does by default; a plan may carry its own mode.
+    pub mode: DeletionMode,
+    /// How long a quarantined entry is held before it may be removed.
+    pub quarantine_ttl: Duration,
+    /// The scan roots whose `.sbh/quarantine` receives candidates beneath
+    /// them (longest prefix wins); a candidate under none of them is
+    /// quarantined under its mount point.
+    pub quarantine_roots: Vec<PathBuf>,
 }
 
 impl Default for DeletionConfig {
@@ -96,6 +118,9 @@ impl Default for DeletionConfig {
             include_review: false,
             sacred_paths: cross_platform_sacred_paths().to_vec(),
             stowaway_scan: StowawayScanConfig::default(),
+            mode: DeletionMode::Unlink,
+            quarantine_ttl: Duration::from_secs(quarantine::DEFAULT_TTL_HOURS * 3600),
+            quarantine_roots: Vec::new(),
         }
     }
 }
@@ -108,6 +133,8 @@ pub struct DeletionPlan {
     pub candidates: Vec<CandidacyScore>,
     pub total_reclaimable_bytes: u64,
     pub estimated_items: usize,
+    /// What executing this plan does to each candidate.
+    pub mode: DeletionMode,
 }
 
 /// Summary after a deletion batch completes.
@@ -155,6 +182,12 @@ pub struct DeletionReport {
     /// Candidates whose *deletion* failed with ENOSPC (no room for the
     /// metadata the removal needs): the mount needs recovery.
     pub no_space_paths: Vec<PathBuf>,
+    /// Of `items_deleted`, how many went into quarantine (bytes held, not
+    /// freed: see `bytes_quarantined`).
+    pub items_quarantined: usize,
+    pub bytes_quarantined: u64,
+    /// Quarantine-mode candidates that had to be removed for good instead.
+    pub quarantine_unavailable: usize,
 }
 
 impl DeletionReport {
@@ -443,6 +476,9 @@ fn should_backoff_skip(reason: SkipReason) -> bool {
 pub enum CheckedDeletion {
     /// All pre-flight vetoes passed and the path was removed.
     Deleted,
+    /// All pre-flight vetoes passed and the path was moved into quarantine
+    /// (Layer 7), restorable with `sbh undo`.
+    Quarantined,
     /// A pre-flight veto fired; the path was left untouched.
     Skipped(SkipReason),
 }
@@ -499,6 +535,7 @@ impl DeletionExecutor {
             candidates,
             total_reclaimable_bytes,
             estimated_items,
+            mode: self.config.mode,
         }
     }
 
@@ -532,6 +569,9 @@ impl DeletionExecutor {
             sacred_scan_ms: 0,
             read_only_paths: Vec::new(),
             no_space_paths: Vec::new(),
+            items_quarantined: 0,
+            bytes_quarantined: 0,
+            quarantine_unavailable: 0,
         };
 
         let mut consecutive_failures: u32 = 0;
@@ -660,18 +700,30 @@ impl DeletionExecutor {
                 continue;
             }
 
-            // Actual deletion.
+            // Actual deletion, or quarantine (Layer 7).
             let del_start = Instant::now();
-            match self.delete_path(candidate) {
-                Ok(()) => {
+            let outcome = match plan.mode {
+                DeletionMode::Unlink => self.delete_path(candidate).map(|()| false),
+                DeletionMode::Quarantine => self.quarantine_path(candidate),
+            };
+            match outcome {
+                Ok(quarantined) => {
                     #[allow(clippy::cast_possible_truncation)]
                     let duration_ms = del_start.elapsed().as_millis() as u64;
                     report.items_deleted += 1;
-                    report.bytes_freed += candidate.size_bytes;
                     report.deleted_paths.push(candidate.path.clone());
+                    if quarantined {
+                        report.items_quarantined += 1;
+                        report.bytes_quarantined += candidate.size_bytes;
+                    } else {
+                        report.bytes_freed += candidate.size_bytes;
+                        if plan.mode == DeletionMode::Quarantine {
+                            report.quarantine_unavailable += 1;
+                        }
+                    }
                     consecutive_failures = 0;
 
-                    self.log_deletion_success(candidate, duration_ms);
+                    self.log_deletion_success(candidate, duration_ms, quarantined);
                 }
                 Err(e) => {
                     report.items_failed += 1;
@@ -747,7 +799,14 @@ impl DeletionExecutor {
         if let Err(skip) = self.preflight_check(candidate, open_paths, &mut sacred) {
             return Ok(CheckedDeletion::Skipped(skip));
         }
-        self.delete_path(candidate)?;
+        match self.config.mode {
+            DeletionMode::Quarantine => {
+                if self.quarantine_path(candidate)? {
+                    return Ok(CheckedDeletion::Quarantined);
+                }
+            }
+            DeletionMode::Unlink => self.delete_path(candidate)?,
+        }
         Ok(CheckedDeletion::Deleted)
     }
 
@@ -902,7 +961,9 @@ impl DeletionExecutor {
     }
 
     #[allow(clippy::unused_self)]
-    fn delete_path(&self, candidate: &CandidacyScore) -> Result<()> {
+    /// The last-moment checks shared by removal and quarantine, run right
+    /// before the mutation: lease, symlink and identity re-checks.
+    fn recheck_before_mutation(&self, candidate: &CandidacyScore) -> Result<fs::Metadata> {
         let path = &candidate.path;
         // Recheck immediately before mutation. A lease can begin after the
         // earlier preflight, and deleting despite the newly held lock would
@@ -928,6 +989,12 @@ impl DeletionExecutor {
                     path.display()
                 ),
             })?;
+        Ok(meta)
+    }
+
+    fn delete_path(&self, candidate: &CandidacyScore) -> Result<()> {
+        let path = &candidate.path;
+        let meta = self.recheck_before_mutation(candidate)?;
 
         if meta.is_dir() {
             // Read-only regenerable caches (Go GOCACHE/GOMODCACHE, cargo
@@ -956,6 +1023,57 @@ impl DeletionExecutor {
         Ok(())
     }
 
+    /// Layer 7: move the candidate into the quarantine of the scan root it
+    /// lives under (its mount point when no root matches). `Ok(true)` when
+    /// held, `Ok(false)` when quarantine was unavailable and the candidate
+    /// was removed for good instead.
+    fn quarantine_path(&self, candidate: &CandidacyScore) -> Result<bool> {
+        let path = &candidate.path;
+        self.recheck_before_mutation(candidate)?;
+        let store = QuarantineStore::for_root(&quarantine::quarantine_root_for(
+            path,
+            &self.config.quarantine_roots,
+        ));
+        let decision_id = crate::scanner::decision_record::stable_decision_id(
+            path,
+            candidate.identity,
+            candidate.size_bytes,
+        );
+        match store.quarantine(
+            path,
+            &decision_id,
+            candidate.size_bytes,
+            self.config.quarantine_ttl,
+            None,
+        ) {
+            Ok(record) => {
+                eprintln!(
+                    "[SBH-QUARANTINE] held {} at {} (restore: sbh undo {decision_id})",
+                    path.display(),
+                    record.quarantine_path.display()
+                );
+                Ok(true)
+            }
+            Err(reason) => {
+                let detail = match &reason {
+                    QuarantineUnavailable::CrossDevice => "cross_device".to_string(),
+                    other => other.to_string(),
+                };
+                eprintln!(
+                    "[SBH-QUARANTINE] quarantine_unavailable for {} ({detail}); removing",
+                    path.display()
+                );
+                self.log_event(ActivityEvent::Info {
+                    message: format!(
+                        "quarantine_unavailable path={} decision_id={decision_id} reason={detail}",
+                        path.display()
+                    ),
+                });
+                self.delete_path(candidate).map(|()| false)
+            }
+        }
+    }
+
     // ──────────────────── logging helpers ────────────────────
 
     fn log_event(&self, event: ActivityEvent) {
@@ -964,7 +1082,12 @@ impl DeletionExecutor {
         }
     }
 
-    fn log_deletion_success(&self, candidate: &CandidacyScore, duration_ms: u64) {
+    fn log_deletion_success(
+        &self,
+        candidate: &CandidacyScore,
+        duration_ms: u64,
+        quarantined: bool,
+    ) {
         self.log_event(ActivityEvent::ArtifactDeleted {
             path: candidate.path.to_string_lossy().to_string(),
             size_bytes: candidate.size_bytes,
@@ -978,6 +1101,7 @@ impl DeletionExecutor {
                 candidate.identity,
                 candidate.size_bytes,
             )),
+            quarantined,
         });
     }
 
@@ -1714,6 +1838,9 @@ mod tests {
             sacred_scan_ms: 0,
             read_only_paths: Vec::new(),
             no_space_paths: Vec::new(),
+            items_quarantined: 0,
+            bytes_quarantined: 0,
+            quarantine_unavailable: 0,
         };
         report.record_skip(SkipReason::HardcodedSourceTree);
         report.record_skip(SkipReason::HardcodedSourceTree);
@@ -1786,6 +1913,9 @@ mod tests {
             sacred_scan_ms: 0,
             read_only_paths: Vec::new(),
             no_space_paths: Vec::new(),
+            items_quarantined: 0,
+            bytes_quarantined: 0,
+            quarantine_unavailable: 0,
         };
 
         // Nothing queued at all is not a stall.
@@ -1976,6 +2106,87 @@ mod tests {
         assert_eq!(report.items_skipped, 1);
         assert!(candidate_path.exists());
         assert!(moved_path.exists());
+    }
+
+    #[test]
+    fn quarantine_mode_holds_the_candidate_under_the_scan_root() {
+        let dir = scratch_dir();
+        let root = dir.path().join("proj");
+        let target = root.join("target");
+        fs::create_dir_all(target.join("deps")).unwrap();
+        fs::write(target.join("deps").join("a.o"), "obj").unwrap();
+        let candidate = make_identity_candidate(&target, 3, 0.9);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                require_identity: true,
+                check_open_files: false,
+                mode: DeletionMode::Quarantine,
+                quarantine_roots: vec![root.clone()],
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![candidate.clone()]);
+        assert_eq!(plan.mode, DeletionMode::Quarantine);
+        let report = executor.execute(&plan, None);
+        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.items_quarantined, 1);
+        assert_eq!(report.bytes_quarantined, 3);
+        assert_eq!(report.bytes_freed, 0, "quarantine frees nothing");
+        assert_eq!(report.quarantine_unavailable, 0);
+        assert!(!target.exists());
+
+        let store = QuarantineStore::under(&root);
+        let id =
+            crate::scanner::decision_record::stable_decision_id(&target, candidate.identity, 3);
+        let record = store.record(&id).unwrap().expect("quarantine record");
+        assert_eq!(record.original_path, target);
+        assert!(record.quarantine_path.join("deps").join("a.o").exists());
+        assert!(store.root().join(protection::MARKER_FILENAME).exists());
+
+        // An Unlink plan over the same executor removes for good.
+        let again = root.join("target2");
+        fs::create_dir_all(&again).unwrap();
+        let mut plan = executor.plan(vec![make_identity_candidate(&again, 1, 0.9)]);
+        plan.mode = DeletionMode::Unlink;
+        let report = executor.execute(&plan, None);
+        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.items_quarantined, 0);
+        assert_eq!(report.bytes_freed, 1);
+        assert!(!again.exists());
+    }
+
+    #[test]
+    fn quarantine_mode_removes_for_good_when_the_store_is_unusable() {
+        let dir = scratch_dir();
+        let root = dir.path().join("proj");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("a.o"), "obj").unwrap();
+        // A file squats on the quarantine root: the store cannot be created.
+        fs::create_dir_all(root.join(".sbh")).unwrap();
+        fs::write(
+            root.join(".sbh").join(quarantine::QUARANTINE_DIR_NAME),
+            "squatter",
+        )
+        .unwrap();
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                require_identity: true,
+                check_open_files: false,
+                mode: DeletionMode::Quarantine,
+                quarantine_roots: vec![root],
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![make_identity_candidate(&target, 3, 0.9)]);
+        let report = executor.execute(&plan, None);
+        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.items_quarantined, 0);
+        assert_eq!(report.quarantine_unavailable, 1);
+        assert_eq!(report.bytes_freed, 3);
+        assert!(!target.exists());
     }
 
     #[test]

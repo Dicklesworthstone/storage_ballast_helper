@@ -89,7 +89,10 @@ On macOS, `sbh` combines:
 - Foundation important-usage capacity when available.
 - `tmutil listlocalsnapshots` for local Time Machine snapshot inventory.
 
-Status JSON exposes APFS metadata under the mount payload:
+Status JSON exposes APFS metadata under the mount payload, keyed by
+filesystem family. `status --json` and `check --json` carry
+`"schema_version": 2` at the top level; version 2 is where the platform
+block became family-keyed:
 
 ```json
 {
@@ -108,6 +111,12 @@ Status JSON exposes APFS metadata under the mount payload:
   }
 }
 ```
+
+A Linux mount carries `{"platform": {"linux": {"fs_type": "ext4",
+"is_readonly": false}}}` instead, and the APFS-only mount keys
+(`container_id`, `purgeable_bytes`, `free_excludes_purgeable`, the local
+snapshot fields) are absent rather than null. Any other family gets an
+empty `platform` object. Consumers should key on the family they know.
 
 The important invariant is `free_excludes_purgeable: true`. `sbh` reports
 purgeable storage, but it does not count purgeable bytes as free space when

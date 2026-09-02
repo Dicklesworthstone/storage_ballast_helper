@@ -358,6 +358,7 @@ src/
 | `sbh scan [PATHS...] [--top N] [--min-score N]` | Manual candidate discovery and scoring |
 | `sbh clean [PATHS...] [--target-free N] [--dry-run] [--yes]` | Manual cleanup with confirmation |
 | `sbh emergency [PATHS...] [--target-free N] [--min-age MINUTES] [--yes]` | Zero-write recovery mode for critically full disks; prints a decision id per candidate |
+| `sbh undo <DECISION_ID> \| --path P \| --all-since W \| --list [--force-suffix] [--root R]` | Restore quarantined entries (Layer 7) to their original paths; `--list` shows what is held |
 
 ### Ballast Commands
 
@@ -426,7 +427,7 @@ src/
 | `[core]` | `strict_config` (unknown keys are always reported; `true` makes the daemon refuse to start and `config validate` fail on them) |
 | `[pressure]` | `green_min_free_pct`, `yellow_min_free_pct`, `orange_min_free_pct`, `red_min_free_pct`, `poll_interval_ms` |
 | `[pressure.prediction]` | `enabled`, `action_horizon_minutes`, `warning_horizon_minutes`, `min_confidence`, `min_samples` |
-| `[scanner]` | `engine` (`"v2"` default, `"v1"` rollback), `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run`, `cross_devices` |
+| `[scanner]` | `engine` (`"v2"` default, `"v1"` rollback), `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run`, `cross_devices`, `quarantine_enabled`, `quarantine_ttl_hours`, `quarantine_max_bytes_pct` |
 | `[scoring]` | `min_score`, `location_weight`, `name_weight`, `age_weight`, `size_weight`, `structure_weight` |
 | `[scoring]` (decision-theoretic) | `false_positive_loss`, `false_negative_loss`, `calibration_floor` |
 | `[ballast]` | `file_count`, `file_size_bytes`, `replenish_cooldown_minutes` |
@@ -531,6 +532,8 @@ Additional hard safety vetoes in the deletion executor:
 - Parent directory must be writable
 - Directory must not contain `.git/` (final safety net)
 - Circuit breaker: 3 consecutive failures trigger 30s cooldown
+
+Layer 7, quarantine-first deletion: at Green (and for `sbh clean` without `--no-quarantine`) the executor renames a candidate into `<root>/.sbh/quarantine/<decision-id>/` instead of unlinking it; `sbh undo <decision-id>` renames it back. Pressure at Orange and above drains the quarantine oldest-first before any new deletion; `sbh emergency` drains it first. See `src/scanner/quarantine.rs`.
 
 ---
 
