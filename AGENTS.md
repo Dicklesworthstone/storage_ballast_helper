@@ -357,7 +357,7 @@ src/
 | `sbh check [--target-free N] [--need N] [--predict N]` | Pre-flight space check and recommendations |
 | `sbh scan [PATHS...] [--top N] [--min-score N]` | Manual candidate discovery and scoring |
 | `sbh clean [PATHS...] [--target-free N] [--dry-run] [--yes]` | Manual cleanup with confirmation |
-| `sbh emergency [PATHS...] [--target-free N] [--yes]` | Zero-write recovery mode for critically full disks |
+| `sbh emergency [PATHS...] [--target-free N] [--min-age MINUTES] [--yes]` | Zero-write recovery mode for critically full disks; prints a decision id per candidate |
 
 ### Ballast Commands
 

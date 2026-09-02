@@ -963,6 +963,60 @@ TOML
   tally_case run_case clean_empty_dry_run "no cleanup candidates" \
     "${bin}" clean "${LOG_DIR}/empty_scan_target" --dry-run --yes --min-score 0.0
 
+  # ── Section 7b: Explain (decision ledger) ────────────────────────────────
+
+  log "=== Section 7b: Explain ==="
+
+  # A private ledger, so the dry-run below records its plan somewhere we own.
+  local explain_dir="${LOG_DIR}/explain"
+  mkdir -p "${explain_dir}/data"
+  cat > "${explain_dir}/sbh.toml" <<TOML
+[paths]
+state_file = "${explain_dir}/data/state.json"
+sqlite_db = "${explain_dir}/data/activity.sqlite3"
+jsonl_log = "${explain_dir}/data/activity.jsonl"
+ballast_dir = "${explain_dir}/ballast"
+
+[scanner]
+min_file_age_minutes = 0
+
+[notifications]
+enabled = false
+TOML
+
+  # Nothing recorded yet: explain refuses with the empty-ledger hint.
+  tally_case run_case_expect_fail explain_empty_ledger 1 "no decisions yet" \
+    "${bin}" --config "${explain_dir}/sbh.toml" explain --last 5
+
+  # A dry-run clean records its plan; explain reads it back.
+  tally_case run_case explain_clean_dry_run_records "Scanned" \
+    "${bin}" --config "${explain_dir}/sbh.toml" clean "${artifact_root}" --dry-run --yes --min-score 0.0
+
+  tally_case run_case_json explain_last_json "decisions" \
+    "${bin}" --config "${explain_dir}/sbh.toml" --json explain --last 5
+
+  # Resolve one id at every level, human and JSON, with the verbose trace line.
+  local explain_id
+  explain_id="$("${bin}" --config "${explain_dir}/sbh.toml" --json explain --last 1 2>/dev/null \
+    | python3 -c 'import sys, json; print(json.load(sys.stdin)["decisions"][0]["id"])' 2>/dev/null || true)"
+  if [[ -z "${explain_id}" ]]; then
+    skip_case explain_by_id "no decision id in explain --last 1"
+  else
+    local explain_level
+    for explain_level in 0 1 2 3; do
+      tally_case run_case "explain_by_id_level_${explain_level}" "Decision ${explain_id}" \
+        "${bin}" --config "${explain_dir}/sbh.toml" explain --id "${explain_id}" --level "${explain_level}"
+    done
+    tally_case run_case_json explain_by_id_json "decisions" \
+      "${bin}" --config "${explain_dir}/sbh.toml" --json explain --id "${explain_id}" --level 3
+    tally_case run_case explain_verbose_trace "[SBH-EXPLAIN] decision_id=${explain_id}" \
+      "${bin}" --config "${explain_dir}/sbh.toml" --verbose explain --id "${explain_id}"
+    tally_case run_case explain_since_window "Decision ${explain_id}" \
+      "${bin}" --config "${explain_dir}/sbh.toml" explain --since 1h --limit 100
+  fi
+  tally_case run_case_expect_fail explain_unknown_id 1 "no decision with id" \
+    "${bin}" --config "${explain_dir}/sbh.toml" explain --id 000000000000
+
   # ── Section 8: Ballast lifecycle ─────────────────────────────────────────
 
   log "=== Section 8: Ballast lifecycle ==="

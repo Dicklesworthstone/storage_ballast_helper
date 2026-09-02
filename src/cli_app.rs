@@ -626,6 +626,11 @@ struct EmergencyArgs {
     /// Skip confirmation prompt.
     #[arg(long)]
     yes: bool,
+    /// Leave artifacts modified within this many minutes alone (0 reclaims
+    /// fresh builds too). Emergency mode reads no config, so this is the
+    /// only age floor it has.
+    #[arg(long, default_value_t = 5, value_name = "MINUTES")]
+    min_age: u64,
 }
 
 impl Default for EmergencyArgs {
@@ -634,6 +639,7 @@ impl Default for EmergencyArgs {
             paths: Vec::new(),
             target_free: 10.0,
             yes: false,
+            min_age: 5,
         }
     }
 }
@@ -1243,6 +1249,9 @@ fn run_explain(cli: &Cli, args: &ExplainArgs) -> Result<(), CliError> {
         }
         return Err(CliError::User(format!("{what} ({hint})")));
     }
+    if cli.verbose {
+        trace_explain_records(&records, args.level.min(3), source.label());
+    }
 
     match output_mode(cli) {
         OutputMode::Json => {
@@ -1284,6 +1293,22 @@ fn run_explain(cli: &Cli, args: &ExplainArgs) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+/// One `[SBH-EXPLAIN]` stderr line per record under `--verbose`, so a
+/// scripted explain leaves a trace naming the id, level, and ledger source.
+fn trace_explain_records(
+    records: &[storage_ballast_helper::scanner::decision_record::DecisionRecord],
+    level: u8,
+    source: &str,
+) {
+    for record in records {
+        eprintln!(
+            "[SBH-EXPLAIN] decision_id={} level={level} source={source} path={}",
+            record.id,
+            record.path.display()
+        );
+    }
 }
 
 fn run_bootstrap(cli: &Cli, args: &BootstrapArgs) -> Result<(), CliError> {
@@ -10029,14 +10054,24 @@ fn print_deletion_plan(plan: &DeletionPlan) {
         let path_str = truncate_path(&candidate.path, 60);
 
         println!(
-            "  {:>3}. {} ({}, score {:.2}, {} old)",
+            "  {:>3}. {} ({}, score {:.2}, {} old, id {})",
             i + 1,
             path_str,
             size_str,
             candidate.total_score,
             age_str,
+            candidate_decision_id(candidate),
         );
     }
+}
+
+/// The stable decision id `sbh explain --id` resolves for a candidate.
+fn candidate_decision_id(candidate: &CandidacyScore) -> String {
+    storage_ballast_helper::scanner::decision_record::stable_decision_id(
+        &candidate.path,
+        candidate.identity,
+        candidate.size_bytes,
+    )
 }
 
 /// Build a pressure check closure if --target-free was specified.
@@ -10417,11 +10452,28 @@ fn emit_clean_report_json(
         })
         .collect();
 
+    // The plan the report acted on, each with the id `sbh explain --id`
+    // resolves (emergency runs with no ledger, so stdout is the only trail).
+    let candidates: Vec<Value> = plan
+        .candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "path": candidate.path.to_string_lossy(),
+                "size_bytes": candidate.size_bytes,
+                "total_score": candidate.total_score,
+                "decision": format!("{:?}", candidate.decision.action),
+                "decision_id": candidate_decision_id(candidate),
+            })
+        })
+        .collect();
+
     let payload = json!({
         "command": command,
         "scanned_directories": dir_count,
         "elapsed_seconds": scan_elapsed.as_secs_f64(),
         "candidates_count": plan.estimated_items,
+        "candidates": candidates,
         "items_deleted": report.items_deleted,
         "items_would_delete": report.items_would_delete,
         "items_skipped": report.items_skipped,
@@ -10878,9 +10930,10 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     let mut open_paths = None;
     let mut active_reference_index = None;
 
-    // Classify and score using default weights.
+    // Classify and score using default weights; the age floor is the flag's,
+    // since no config is read.
     let registry = ArtifactPatternRegistry::default();
-    let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    let engine = ScoringEngine::from_config(&config.scoring, args.min_age);
     let sacred_paths = active_sacred_paths(&config)?;
     let now = SystemTime::now();
 

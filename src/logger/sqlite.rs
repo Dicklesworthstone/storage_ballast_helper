@@ -338,10 +338,15 @@ impl SqliteLogger {
     /// Delete decision_log rows older than `retention_days`.
     pub fn prune_decision_log(&self, retention_days: u32) -> Result<usize> {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(retention_days));
-        let cutoff_str = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        self.prune_decision_log_before(&cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    }
+
+    /// Delete decision_log rows whose timestamp sorts before `cutoff`
+    /// (RFC 3339 UTC, as the records are written), returning the count.
+    pub fn prune_decision_log_before(&self, cutoff: &str) -> Result<usize> {
         let deleted = self.conn.execute(
             "DELETE FROM decision_log WHERE timestamp < ?1",
-            params![cutoff_str],
+            params![cutoff],
         )?;
         Ok(deleted)
     }
