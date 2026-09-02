@@ -148,10 +148,13 @@ pub struct PolicyConfig {
     /// `advisory` logs and carries on. Unset: `demote` unless `initial_mode`
     /// is `enforce`, where a fleet that has already earned Enforce keeps it.
     pub calibration_breach_action: Option<FallbackAction>,
-    /// What exhausting `max_canary_deletes_per_hour` does: `demote` enters
-    /// FallbackSafe (the canary paused until clean windows prove it), `keep`
-    /// only refuses further deletions this hour. Either way the decision
-    /// that hit the cap is Keep.
+    /// What exhausting `max_canary_deletes_per_hour` does: `keep` (default)
+    /// refuses further deletions for the rest of the hour and stays in
+    /// Canary, `demote` enters FallbackSafe until clean windows recover it.
+    /// Either way the decision that hit the cap is Keep. `keep` is the
+    /// stricter of the two: a demote-then-recover cycle re-enters Canary
+    /// with a fresh hourly count, so it can delete more per hour than the
+    /// cap, not less.
     pub canary_budget_action: CanaryBudgetAction,
     /// What a failed `state.json` write does: `demote` enters FallbackSafe
     /// (evidence that cannot be persisted must not drive deletions),
@@ -248,7 +251,7 @@ impl Default for PolicyConfig {
             kill_switch: false,
             observe_min_interval_secs: MIN_OBSERVE_INTERVAL_SECS,
             calibration_breach_action: None,
-            canary_budget_action: CanaryBudgetAction::Demote,
+            canary_budget_action: CanaryBudgetAction::Keep,
             serialization_failure_action: FallbackAction::Demote,
             auto_recover_to: AutoRecoverTo::Canary,
             emergency_escalation: None,
@@ -1460,7 +1463,23 @@ impl PolicyEngine {
                 self.apply_transition(ActiveMode::Enforce, "promote");
                 true
             }
-            _ => false,
+            // The operator's way out of FallbackSafe (the only way when
+            // `auto_recover_to = none`): back to the pre-fallback mode capped
+            // at Canary, the mandatory re-proving gate. A kill switch holds.
+            ActiveMode::FallbackSafe => {
+                if self.config.kill_switch {
+                    return false;
+                }
+                let target = match self.pre_fallback_mode {
+                    ActiveMode::Enforce => ActiveMode::Canary,
+                    other => other,
+                };
+                self.fallback_reason = None;
+                self.fallback_entered_at = None;
+                self.apply_transition(target, "promote");
+                true
+            }
+            ActiveMode::Enforce => false,
         }
     }
 
@@ -2462,7 +2481,7 @@ mod tests {
         );
         assert_eq!(
             engine.last_fallback_reason(),
-            Some("calibration breach (2 consecutive windows)")
+            Some("calibration breach (2 windows)")
         );
     }
 
@@ -2502,10 +2521,14 @@ mod tests {
     }
 
     /// Production path for `CanaryBudgetExhausted`: the decision that hits
-    /// the cap is Keep, and with the default `demote` the canary pauses in
-    /// FallbackSafe; with `keep` it stays in Canary.
+    /// the cap is Keep; with `demote` the canary pauses in FallbackSafe,
+    /// with the default `keep` it stays in Canary.
     #[test]
-    fn canary_budget_exhaustion_demotes_by_default_and_keeps_when_told() {
+    fn canary_budget_exhaustion_demotes_or_keeps_as_configured() {
+        assert_eq!(
+            PolicyConfig::default().canary_budget_action,
+            CanaryBudgetAction::Keep
+        );
         for (action, expected_mode) in [
             (CanaryBudgetAction::Demote, ActiveMode::FallbackSafe),
             (CanaryBudgetAction::Keep, ActiveMode::Canary),
@@ -2667,8 +2690,14 @@ mod tests {
 
     #[test]
     fn emergency_escalation_breaks_fallback_deadlock_under_sustained_pressure() {
-        let mut engine = PolicyEngine::new(default_config());
+        // An enforce fleet that opted into escalation landing back where it
+        // was: the pre-2.16 behavior, now spelled out in the config.
+        let mut config = default_config();
+        config.emergency_escalation = Some(true);
+        config.auto_recover_to = AutoRecoverTo::Previous;
+        let mut engine = PolicyEngine::new(config);
         engine.promote(); // canary
+        engine.promote(); // enforce
         engine.set_pressure_level(PressureLevel::Orange);
         engine.evaluate(&[], Some(&failing_guard()));
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
@@ -2716,6 +2745,47 @@ mod tests {
             1,
             "post-escalation the engine must approve safe deletions again"
         );
+    }
+
+    /// Escalation is off for fleets below Enforce unless configured, and it
+    /// lands where `auto_recover_to` points: `canary` caps it at Canary,
+    /// `none` leaves the deadlock to `promote()`.
+    #[test]
+    fn emergency_escalation_is_configured_not_given() {
+        let back_date = |engine: &mut PolicyEngine| {
+            engine.fallback_entered_at = engine.fallback_entered_at.and_then(|entered| {
+                entered.checked_sub(Duration::from_secs(FALLBACK_EMERGENCY_ESCALATION_SECS + 1))
+            });
+        };
+        // Default observe fleet: never escalates.
+        let mut engine = PolicyEngine::new(default_config());
+        engine.promote();
+        engine.enter_fallback(FallbackReason::GuardrailDrift);
+        back_date(&mut engine);
+        assert!(!engine.check_emergency_escalation(true));
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+
+        // Explicitly on with the default target: Enforce lands in Canary.
+        let mut config = default_config();
+        config.emergency_escalation = Some(true);
+        let mut engine = PolicyEngine::new(config);
+        engine.promote();
+        engine.promote();
+        engine.enter_fallback(FallbackReason::GuardrailDrift);
+        back_date(&mut engine);
+        assert!(engine.check_emergency_escalation(true));
+        assert_eq!(engine.mode(), ActiveMode::Canary);
+
+        // Explicitly on but auto_recover_to = none: escalation has nowhere to go.
+        let mut config = default_config();
+        config.emergency_escalation = Some(true);
+        config.auto_recover_to = AutoRecoverTo::None;
+        let mut engine = PolicyEngine::new(config);
+        engine.promote();
+        engine.enter_fallback(FallbackReason::GuardrailDrift);
+        back_date(&mut engine);
+        assert!(!engine.check_emergency_escalation(true));
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
     }
 
     #[test]

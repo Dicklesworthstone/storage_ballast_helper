@@ -844,7 +844,7 @@ mod tests {
 
     #[test]
     fn interactive_wizard_cancel() {
-        let input = "none\n\n\nn\n";
+        let input = "none\n\n\n\nn\n";
         let mut reader = io::Cursor::new(input.as_bytes());
         let mut output = Vec::new();
 

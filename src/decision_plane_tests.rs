@@ -511,6 +511,7 @@ fn policy_no_deletion_in_fallback_safe_under_any_config() {
                             ..PolicyConfig::default()
                         };
                         let mut engine = PolicyEngine::new(config);
+                        engine.bypass_startup_grace();
                         engine.set_pressure_level(crate::monitor::pid::PressureLevel::Red);
                         engine.enter_fallback(reason);
                         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);

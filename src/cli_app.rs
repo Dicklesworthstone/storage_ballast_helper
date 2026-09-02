@@ -15522,6 +15522,7 @@ mod tests {
             user_scope,
             initial_mode: storage_ballast_helper::daemon::policy::ActiveMode::Enforce,
             watched_paths: vec![PathBuf::from("/tmp")],
+            initial_mode: storage_ballast_helper::daemon::policy::ActiveMode::Enforce,
             ballast_preset: storage_ballast_helper::cli::wizard::BallastPreset::Medium,
             ballast_file_count: 10,
             ballast_file_size_bytes: 1_073_741_824,

@@ -415,6 +415,8 @@ sbh --json lease renew --extend 30m
 | `sbh dashboard` | Real-time TUI dashboard |
 | `sbh doctor --pal` | Validate platform integration and macOS runtime prerequisites |
 | `sbh doctor --system` | Check host kernel tuning (writeback / dirty-page limits) |
+| `sbh doctor --service [--user]` | Compare the installed systemd unit (or launchd plist) with what sbh generates: FAIL on missing hardening, a different `Type=`/binary, a drop-in overriding hardening, or a `Condition*=` gate that keeps the unit from starting; WARN on foreign drop-ins and cosmetic differences |
+| `sbh service --systemd reinstall-unit [--purge-dropins]` | Rewrite the unit from the generator with a timestamped backup beside it and `daemon-reload`; drop-ins stay in effect unless `--purge-dropins` moves them into the backup directory |
 | `sbh explain (--id ID \| --last N \| --path P \| --since W) [--level 0-3]` | Explain recorded cleanup decisions: the daemon records one per evaluated candidate, `sbh clean` records its plan; ids are stable per artifact version and appear in `scan --json` and `artifact_delete` events |
 
 On macOS, `sbh doctor --pal` adds PASS/WARN/FAIL checks for the binary signature,
@@ -706,7 +708,7 @@ kill_switch = false            # true holds the daemon in fallback-safe (no dele
 # "demote" unless initial_mode is "enforce" (then "advisory"); unset
 # emergency_escalation means on for enforce fleets, off otherwise.
 # calibration_breach_action = "demote"      # demote | advisory
-# canary_budget_action = "demote"           # demote | keep
+# canary_budget_action = "keep"             # keep | demote
 # serialization_failure_action = "demote"   # demote | advisory
 # auto_recover_to = "canary"                # none | canary | previous
 # emergency_escalation = false
