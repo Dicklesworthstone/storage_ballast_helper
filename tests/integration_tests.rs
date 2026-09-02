@@ -2747,6 +2747,204 @@ fn ballast_status_is_read_only_and_reports_orphans_and_volumes() {
     );
 }
 
+/// Whether this process can drive a user service manager (`systemd-run
+/// --user`). CI containers and rch workers usually cannot; the notify test
+/// skips there and says so.
+#[cfg(target_os = "linux")]
+fn user_systemd_available() -> bool {
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        return false;
+    }
+    let state = Command::new("systemctl")
+        .args(["--user", "is-system-running"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default();
+    matches!(state.as_str(), "running" | "degraded")
+}
+
+#[cfg(target_os = "linux")]
+fn systemctl_user_show(unit: &str, property: &str) -> String {
+    Command::new("systemctl")
+        .args(["--user", "show", "--value", "-p", property, unit])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn user_unit_journal(unit: &str) -> String {
+    Command::new("journalctl")
+        .args(["--user", "--no-pager", "-o", "cat", "-u", unit])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+        .unwrap_or_default()
+}
+
+/// Stops the transient unit even when an assertion fails mid-test.
+#[cfg(target_os = "linux")]
+struct SystemdUserUnitGuard {
+    unit: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SystemdUserUnitGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &self.unit])
+            .output();
+        let _ = Command::new("systemctl")
+            .args(["--user", "reset-failed", &self.unit])
+            .output();
+    }
+}
+
+/// The real systemd proof for the generated unit's `Type=notify` contract:
+/// `systemd-run` only returns success once the daemon has sent `READY=1`
+/// (a daemon that never notifies fails the start job at `TimeoutStartSec`),
+/// `WatchdogSec` stays satisfied by `WATCHDOG=1` heartbeats, the running
+/// unit's MainPID is the pid holding the daemon lock, and `systemctl stop`
+/// ends with `Result=success` and exit status 0 (`STOPPING=1` + orderly
+/// shutdown). Skips where no user service manager is reachable.
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_notify_unit_reaches_active_stays_alive_and_stops_cleanly() {
+    if !user_systemd_available() {
+        eprintln!("skip: no user systemd manager reachable (systemctl --user is-system-running)");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let scan_root = dir.path().join("scan-root");
+    let state_dir = dir.path().join("state");
+    let ballast_dir = dir.path().join("ballast");
+    fs::create_dir_all(&scan_root).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(&ballast_dir).unwrap();
+    let config_path = dir.path().join("config.toml");
+    write_liveness_daemon_config(&config_path, &scan_root, &state_dir, &ballast_dir);
+
+    let unit = format!("sbh-e2e-notify-{}", std::process::id());
+    let _guard = SystemdUserUnitGuard { unit: unit.clone() };
+    let bin = common::sbh_bin_path();
+
+    // Start job: blocks until READY=1 arrives or TimeoutStartSec expires.
+    let started_at = Instant::now();
+    let start = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--collect",
+            "--unit",
+            &unit,
+            "-p",
+            "Type=notify",
+            "-p",
+            "NotifyAccess=main",
+            "-p",
+            "TimeoutStartSec=20",
+            "-p",
+            "WatchdogSec=4",
+            "-p",
+            "TimeoutStopSec=30",
+        ])
+        .arg(&bin)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("daemon")
+        .output()
+        .expect("run systemd-run");
+    assert!(
+        start.status.success(),
+        "start job must complete on READY=1 within TimeoutStartSec; systemd-run: {}\njournal:\n{}",
+        String::from_utf8_lossy(&start.stderr),
+        user_unit_journal(&unit)
+    );
+    let start_elapsed = started_at.elapsed();
+    assert!(
+        start_elapsed < Duration::from_secs(20),
+        "READY=1 must arrive before the start timeout, took {start_elapsed:?}"
+    );
+    assert_eq!(systemctl_user_show(&unit, "ActiveState"), "active");
+    assert_eq!(systemctl_user_show(&unit, "SubState"), "running");
+    assert_eq!(systemctl_user_show(&unit, "NotifyAccess"), "main");
+
+    // The unit's main pid is the daemon holding the lock next to state.json.
+    let main_pid: u64 = systemctl_user_show(&unit, "MainPID")
+        .parse()
+        .expect("MainPID");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let liveness = loop {
+        let liveness = status_liveness(&config_path);
+        if liveness["daemon_running"] == serde_json::Value::Bool(true) || Instant::now() > deadline
+        {
+            break liveness;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(liveness["daemon_state_reason"], "lock_held", "{liveness}");
+    assert_eq!(
+        liveness["daemon_pid"].as_u64(),
+        Some(main_pid),
+        "{liveness}"
+    );
+
+    // Watchdog: heartbeats at WatchdogSec/2 keep the timestamp advancing and
+    // the unit alive well past WatchdogSec.
+    let first_ping: u64 = systemctl_user_show(&unit, "WatchdogTimestampMonotonic")
+        .parse()
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_secs(9));
+    let later_ping: u64 = systemctl_user_show(&unit, "WatchdogTimestampMonotonic")
+        .parse()
+        .unwrap_or(0);
+    assert!(
+        later_ping > first_ping,
+        "WATCHDOG=1 heartbeats must advance WatchdogTimestampMonotonic ({first_ping} -> {later_ping}); journal:\n{}",
+        user_unit_journal(&unit)
+    );
+    assert_eq!(
+        systemctl_user_show(&unit, "ActiveState"),
+        "active",
+        "unit killed by the watchdog; journal:\n{}",
+        user_unit_journal(&unit)
+    );
+    assert_eq!(systemctl_user_show(&unit, "NRestarts"), "0");
+
+    // Orderly stop: STOPPING=1 then exit 0 well inside TimeoutStopSec.
+    let stop_at = Instant::now();
+    let stop = Command::new("systemctl")
+        .args(["--user", "stop", &unit])
+        .output()
+        .expect("systemctl stop");
+    let stop_elapsed = stop_at.elapsed();
+    assert!(
+        stop.status.success(),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        stop_elapsed < Duration::from_secs(30),
+        "stop must complete inside TimeoutStopSec, took {stop_elapsed:?}"
+    );
+    // With --collect the unit is garbage-collected after stopping; whatever
+    // is left to inspect must not say it failed.
+    let result = systemctl_user_show(&unit, "Result");
+    assert!(
+        result.is_empty() || result == "success",
+        "unit result after stop: {result}; journal:\n{}",
+        user_unit_journal(&unit)
+    );
+    let after = status_liveness(&config_path);
+    assert_eq!(
+        after["daemon_running"],
+        serde_json::Value::Bool(false),
+        "{after}"
+    );
+    assert!(
+        !state_dir.join("daemon.lock").exists() || after["daemon_state_reason"] == "lock_released",
+        "lock must be released after an orderly stop: {after}"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_foreground_daemon_idle_energy_budget() {
