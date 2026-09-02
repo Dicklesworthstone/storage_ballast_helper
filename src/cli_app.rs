@@ -1337,6 +1337,8 @@ struct Counterfactual {
     factor: &'static str,
     current: String,
     needed: Option<String>,
+    /// The same threshold as a number: seconds of age, bytes, or urgency.
+    needed_value: Option<f64>,
     action_after: Option<&'static str>,
     note: Option<String>,
 }
@@ -1434,11 +1436,13 @@ fn why_not_report(
     let _ = protection.discover_markers(path, 1);
     let _ = protection.discover_ancestor_markers(path);
     let protection_reason = protection.protection_reason(path);
+    // The walker excludes exact directories, not prefixes (the default list
+    // holds `/`, which would otherwise cover everything).
     let excluded = config
         .scanner
         .excluded_paths
         .iter()
-        .any(|excluded| path.starts_with(excluded));
+        .any(|excluded| excluded == path);
 
     let mut report = WhyNotReport {
         path: path.to_path_buf(),
@@ -1631,6 +1635,7 @@ fn smallest_flip(lo: u64, hi: u64, flips: impl Fn(u64) -> bool) -> Option<u64> {
 /// For a candidate that is not Delete, the smallest single change of age,
 /// size, or pressure urgency that would make the current engine say Delete.
 /// A vetoed candidate has no such change: vetoes are hard rails.
+#[allow(clippy::cast_precision_loss)]
 fn explain_counterfactuals(
     engine: &ScoringEngine,
     input: &CandidateInput,
@@ -1647,6 +1652,7 @@ fn explain_counterfactuals(
                 .unwrap_or("unspecified")
                 .to_string(),
             needed: None,
+            needed_value: None,
             action_after: None,
             note: Some("not flippable by scoring: a veto is a hard rail".to_string()),
         }];
@@ -1656,6 +1662,7 @@ fn explain_counterfactuals(
             factor: "none",
             current: "Delete".to_string(),
             needed: None,
+            needed_value: None,
             action_after: Some("Delete"),
             note: Some("already Delete".to_string()),
         }];
@@ -1675,6 +1682,7 @@ fn explain_counterfactuals(
         factor: "age",
         current: format_duration(input.age),
         needed: age_needed.map(|secs| format_duration(std::time::Duration::from_secs(secs))),
+        needed_value: age_needed.map(|secs| secs as f64),
         action_after: age_needed.map(|_| "Delete"),
         note: age_needed
             .is_none()
@@ -1691,27 +1699,20 @@ fn explain_counterfactuals(
         factor: "size",
         current: format_bytes(input.size_bytes),
         needed: size_needed.map(format_bytes),
+        needed_value: size_needed.map(|bytes| bytes as f64),
         action_after: size_needed.map(|_| "Delete"),
         note: size_needed
             .is_none()
             .then(|| "size alone cannot flip it below 1 TiB".to_string()),
     });
 
-    let urgency_needed = smallest_flip(0, 100, |hundredths| {
-        deletes(
-            input,
-            f64::from(u32::try_from(hundredths).unwrap_or(100)) / 100.0,
-        )
-    });
+    let urgency_of = |hundredths: u64| f64::from(u32::try_from(hundredths).unwrap_or(100)) / 100.0;
+    let urgency_needed = smallest_flip(0, 100, |hundredths| deletes(input, urgency_of(hundredths)));
     out.push(Counterfactual {
         factor: "pressure",
         current: "urgency 0.00 (Green)".to_string(),
-        needed: urgency_needed.map(|hundredths| {
-            format!(
-                "urgency {:.2}",
-                f64::from(u32::try_from(hundredths).unwrap_or(100)) / 100.0
-            )
-        }),
+        needed: urgency_needed.map(|hundredths| format!("urgency {:.2}", urgency_of(hundredths))),
+        needed_value: urgency_needed.map(urgency_of),
         action_after: urgency_needed.map(|_| "Delete"),
         note: urgency_needed
             .is_none()
@@ -1763,6 +1764,7 @@ fn format_why_not(
     report: &WhyNotReport,
     level: storage_ballast_helper::scanner::decision_record::ExplainLevel,
 ) -> String {
+    use std::fmt::Write as _;
     use storage_ballast_helper::scanner::decision_record::format_explain;
 
     let mut out = String::new();
@@ -4001,12 +4003,23 @@ fn run_stats_json(
                     "avg_size": ws.deletions.avg_size,
                     "median_size": ws.deletions.median_size,
                     "failures": ws.deletions.failures,
+                    "failures_by_reason": ws
+                        .deletions
+                        .failures_by_reason
+                        .iter()
+                        .map(|f| json!({ "code": f.code, "count": f.count }))
+                        .collect::<Vec<_>>(),
+                    "avg_age_hours": ws.deletions.avg_age_hours,
                 },
                 "ballast": {
                     "files_released": ws.ballast.files_released,
                     "files_replenished": ws.ballast.files_replenished,
                     "current_inventory": ws.ballast.current_inventory,
                     "bytes_available": ws.ballast.bytes_available,
+                },
+                "policy": {
+                    "transitions": ws.policy.transitions,
+                    "last_transition": ws.policy.last_transition,
                 },
                 "pressure": {
                     "current_level": ws.pressure.current_level.as_str(),
@@ -4099,6 +4112,12 @@ fn print_window_stats_human(ws: &storage_ballast_helper::logger::stats::WindowSt
     }
     if ws.deletions.failures > 0 {
         println!("    Failures:    {}", ws.deletions.failures);
+        for reason in &ws.deletions.failures_by_reason {
+            println!("      {:<12} {}", reason.code, reason.count);
+        }
+    }
+    if ws.deletions.avg_age_hours > 0.0 {
+        println!("    Avg age:     {:.1} h", ws.deletions.avg_age_hours);
     }
 
     println!("  Ballast:");
@@ -4117,6 +4136,12 @@ fn print_window_stats_human(ws: &storage_ballast_helper::logger::stats::WindowSt
     );
     println!("    Worst:       {}", ws.pressure.worst_level_reached);
     println!("    Transitions: {}", ws.pressure.transitions);
+
+    println!("  Policy:");
+    println!("    Transitions: {}", ws.policy.transitions);
+    if let Some(last) = &ws.policy.last_transition {
+        println!("    Last:        {last}");
+    }
 }
 
 #[allow(
@@ -15755,6 +15780,131 @@ mod tests {
         }
     }
 
+    /// Every counterfactual the explainer suggests must actually flip the
+    /// engine's verdict when applied, and a vetoed candidate gets none.
+    #[test]
+    fn counterfactual_suggestions_flip_the_decision_when_applied() {
+        use storage_ballast_helper::scanner::patterns::{
+            ArtifactPatternRegistry, StructuralSignals,
+        };
+        use storage_ballast_helper::scanner::scoring::{
+            ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine,
+        };
+
+        let config = Config::default();
+        let engine = ScoringEngine::from_config(&config.scoring, 0);
+        let registry = ArtifactPatternRegistry::default();
+        let candidate = |path: &str, signals: StructuralSignals, size_bytes: u64| CandidateInput {
+            path: PathBuf::from(path),
+            size_bytes,
+            age: std::time::Duration::from_secs(60),
+            classification: registry.classify(Path::new(path), signals),
+            signals,
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+        // A minute-old Definite target is deleted even at Green, and the
+        // weakest evidence cannot be flipped by any single knob. Take the
+        // first candidate in between: not Delete now, flippable by something.
+        let rust_markers = StructuralSignals {
+            has_incremental: true,
+            has_deps: true,
+            has_build: true,
+            has_fingerprint: true,
+            ..StructuralSignals::default()
+        };
+        let attempts = [
+            candidate("/data/tmp/fixture-proj/target", rust_markers, 256 * 1024),
+            candidate("/data/tmp/fixture-proj/target", rust_markers, 4096),
+            candidate(
+                "/data/tmp/fixture-proj/target",
+                StructuralSignals {
+                    has_deps: true,
+                    ..StructuralSignals::default()
+                },
+                64 * 1024 * 1024,
+            ),
+            candidate(
+                "/data/tmp/fixture-proj/node_modules",
+                StructuralSignals::default(),
+                64 * 1024 * 1024,
+            ),
+            candidate(
+                "/data/tmp/fixture-proj/build",
+                StructuralSignals {
+                    has_build: true,
+                    ..StructuralSignals::default()
+                },
+                64 * 1024 * 1024,
+            ),
+        ];
+        let mut chosen = None;
+        let mut seen = Vec::new();
+        for input in &attempts {
+            let current = engine.score_candidate(input, 0.0);
+            if current.decision.action == DecisionAction::Delete {
+                seen.push(format!("{}: already Delete", input.path.display()));
+                continue;
+            }
+            let suggestions = super::explain_counterfactuals(&engine, input, &current);
+            if suggestions.iter().any(|s| s.needed.is_some()) {
+                chosen = Some((input.clone(), current, suggestions));
+                break;
+            }
+            seen.push(format!(
+                "{}: {:?} with no single-factor flip",
+                input.path.display(),
+                current.decision.action
+            ));
+        }
+        let (input, _current, suggestions) =
+            chosen.unwrap_or_else(|| panic!("no flippable non-Delete candidate among {seen:?}"));
+        let factors: Vec<&str> = suggestions.iter().map(|s| s.factor).collect();
+        assert_eq!(factors, ["age", "size", "pressure"]);
+        let mut flipped = 0;
+        for suggestion in &suggestions {
+            let Some(needed) = &suggestion.needed else {
+                assert!(suggestion.note.is_some(), "{suggestion:?}");
+                continue;
+            };
+            assert_eq!(suggestion.action_after, Some("Delete"));
+            flipped += 1;
+            let value = suggestion
+                .needed_value
+                .unwrap_or_else(|| panic!("{needed} has no numeric value: {suggestion:?}"));
+            let mut modified = input.clone();
+            let urgency = match suggestion.factor {
+                "age" => {
+                    modified.age = std::time::Duration::from_secs_f64(value);
+                    0.0
+                }
+                "size" => {
+                    modified.size_bytes = value.round() as u64;
+                    0.0
+                }
+                "pressure" => value,
+                other => panic!("unexpected factor {other}"),
+            };
+            assert_eq!(
+                engine.score_candidate(&modified, urgency).decision.action,
+                DecisionAction::Delete,
+                "{} -> {needed} must flip to Delete",
+                suggestion.factor
+            );
+        }
+        assert!(
+            flipped > 0,
+            "at least one factor flips a Definite target: {suggestions:?}"
+        );
+
+        let vetoed = engine.hard_veto(&input, "test veto");
+        let none = super::explain_counterfactuals(&engine, &input, &vetoed);
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].factor, "veto");
+        assert!(none[0].needed.is_none());
+    }
+
     #[test]
     fn output_mode_resolution_honors_precedence() {
         assert_eq!(
@@ -16034,6 +16184,7 @@ mod tests {
 
         let config = Config::default();
         let ws = WindowStats {
+            policy: storage_ballast_helper::logger::stats::PolicyStats::default(),
             window: std::time::Duration::from_hours(24),
             deletions: DeletionStats::default(),
             ballast: BallastStats {
@@ -16060,6 +16211,7 @@ mod tests {
 
         let config = Config::default();
         let ws = WindowStats {
+            policy: storage_ballast_helper::logger::stats::PolicyStats::default(),
             window: std::time::Duration::from_hours(24),
             deletions: DeletionStats::default(),
             ballast: BallastStats::default(),
@@ -16092,6 +16244,7 @@ mod tests {
         config.scanner.min_file_age_minutes = 15; // Low value to trigger recommendation.
 
         let ws = WindowStats {
+            policy: storage_ballast_helper::logger::stats::PolicyStats::default(),
             window: std::time::Duration::from_hours(1),
             deletions: DeletionStats {
                 count: 10,
@@ -16103,6 +16256,7 @@ mod tests {
                 avg_score: 0.85,
                 avg_age_hours: 1.0,
                 failures: 5,
+                failures_by_reason: Vec::new(),
             },
             ballast: BallastStats::default(),
             pressure: PressureStats::default(),

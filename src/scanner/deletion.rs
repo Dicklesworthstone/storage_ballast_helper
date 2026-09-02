@@ -753,6 +753,18 @@ impl DeletionExecutor {
 
     // ──────────────────── pre-flight checks ────────────────────
 
+    /// Run the deletion preflight for one candidate without deleting
+    /// anything: the ordered veto chain `sbh explain --why-not` reports. The
+    /// first refusal wins, exactly as it would in a real batch.
+    pub fn explain_preflight(
+        &self,
+        candidate: &CandidacyScore,
+        open_paths: Option<&HashSet<PathBuf>>,
+    ) -> std::result::Result<(), SkipReason> {
+        let mut sacred = SacredScanStats::default();
+        self.preflight_check(candidate, open_paths, &mut sacred)
+    }
+
     fn preflight_check(
         &self,
         candidate: &CandidacyScore,

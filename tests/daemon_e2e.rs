@@ -536,6 +536,24 @@ fn table_of(entries: &[String]) -> String {
     format!(r#"{{"mounts":[{}]}}"#, entries.join(","))
 }
 
+/// C-EVENT conformance: every line of the run's activity log validates at
+/// the current schema version and names this run.
+fn assert_log_conforms(run: &DaemonRun) {
+    let text = fs::read_to_string(run.data_dir.join("activity.jsonl")).unwrap();
+    let report = storage_ballast_helper::logger::schema::validate_jsonl(&text)
+        .unwrap_or_else(|errors| panic!("activity.jsonl does not conform: {errors:?}"));
+    assert!(report.lines > 0, "an empty log proves nothing");
+    assert_eq!(report.v1_lines, 0, "{report:?}");
+    assert_eq!(report.v2_lines, report.lines, "{report:?}");
+    let run_id = run
+        .state()
+        .and_then(|s| s["run_id"].as_str().map(str::to_string));
+    let run_id = run_id.expect("state.json carries run_id");
+    for event in run.events() {
+        assert_eq!(event["run_id"], run_id, "{event}");
+    }
+}
+
 /// `reason=...` from a `scan_complete` event's details.
 fn scan_reason(event: &Value) -> Option<&str> {
     event
@@ -638,6 +656,7 @@ fn runner_starts_and_stops_a_daemon() {
         payload["daemon"]["stopped_at"].as_str().is_some(),
         "{payload}"
     );
+    assert_log_conforms(&dir.path().join("data"));
 }
 
 /// A daemon that exits at once, or never writes a state file, fails the
@@ -1260,8 +1279,28 @@ fn red_pressure_releases_the_whole_pool_before_scanning() {
     assert_eq!(state["ballast"]["available"], 0, "{}", state["ballast"]);
     let record = run.mount_record(&fixture_mount).unwrap();
     assert_eq!(record["level"], "red", "{record}");
+
+    // `sbh stats` counts the releases from the rows the daemon logged, and
+    // the inventory table knows both files are gone.
+    let stats_output = Command::new(common::sbh_bin_path())
+        .arg("--config")
+        .arg(&run.config_path)
+        .args(["--json", "stats", "--window", "1h"])
+        .env_remove("SBH_TEST_MODE")
+        .output()
+        .expect("run sbh stats");
+    let payload: Value = serde_json::from_str(String::from_utf8_lossy(&stats_output.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&stats_output.stdout)));
+    assert_eq!(payload["ballast"]["files_released"], 2, "{payload}");
+    assert_eq!(payload["ballast"]["current_inventory"], 0, "{payload}");
+    assert!(
+        payload["policy"]["transitions"].as_u64().is_some(),
+        "{payload}"
+    );
+
     let status = run.stop();
     assert!(status.success(), "{status}");
+    assert_log_conforms(&dir.path().join("data"));
 }
 
 /// Scenario `forced-scan`: SIGUSR1 at Green produces a forced

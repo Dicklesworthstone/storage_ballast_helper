@@ -676,3 +676,293 @@ fn emergency_prints_decision_ids_and_writes_no_ledger() {
         "emergency must not create a config dir"
     );
 }
+
+// ──────────────────── explain --why-not / --replay ────────────────────
+
+/// A config whose ledger lives under `dir` and whose age floor is off, so a
+/// fixture born now can be scored on its merits. `extra` is appended raw.
+fn explain_config(dir: &Path, extra: &str) -> PathBuf {
+    let data = dir.join("data");
+    fs::create_dir_all(&data).unwrap();
+    let config = format!(
+        r#"[paths]
+ballast_dir = "{ballast}"
+jsonl_log = "{jsonl}"
+sqlite_db = "{sqlite}"
+state_file = "{state}"
+[scanner]
+min_file_age_minutes = 0
+[notifications]
+enabled = false
+{extra}"#,
+        ballast = data.join("ballast").display(),
+        jsonl = data.join("activity.jsonl").display(),
+        sqlite = data.join("activity.sqlite3").display(),
+        state = data.join("state.json").display(),
+    );
+    let path = dir.join("config.toml");
+    fs::write(&path, config).unwrap();
+    path
+}
+
+fn why_not(config: &Path, path: &Path, counterfactual: bool) -> Value {
+    let mut args = vec!["--json", "explain", "--why-not", path.to_str().unwrap()];
+    if counterfactual {
+        args.push("--counterfactual");
+    }
+    let output = sbh(config, &args);
+    assert!(
+        output.status.success(),
+        "explain --why-not {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout_json(&output)
+}
+
+#[test]
+fn why_not_names_the_first_rail_for_each_fixture_class() {
+    let dir = scratch();
+    let config = explain_config(dir.path(), "");
+    let root = dir.path().join("root");
+
+    // A marker inside the directory protects it before anything is scored.
+    let protected = definite_target(&root.join("protected-proj"), Duration::from_hours(48), 4096);
+    fs::write(protected.join(".sbh-protect"), b"keep\n").unwrap();
+    let report = why_not(&config, &protected, false);
+    assert!(
+        report["verdict"]
+            .as_str()
+            .unwrap()
+            .starts_with("protected:"),
+        "{report}"
+    );
+    assert!(report["protection"].is_string(), "{report}");
+
+    // A source tree is refused by scoring or by the preflight, never scored
+    // as reclaimable.
+    let source = root.join("src-proj");
+    fs::create_dir_all(source.join("src")).unwrap();
+    fs::write(source.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    fs::write(source.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+    let report = why_not(&config, &source, true);
+    let verdict = report["verdict"].as_str().unwrap();
+    assert!(
+        verdict.starts_with("vetoed by scoring:")
+            || verdict.starts_with("refused by the deletion preflight:")
+            || verdict.starts_with("score "),
+        "a source tree must not come out reclaimable: {report}"
+    );
+    assert_ne!(
+        report["decision"]["action"], "delete",
+        "a source tree is never Delete: {report}"
+    );
+
+    // A fresh Definite cargo target is scored on its merits with the age
+    // floor off; the counterfactuals cover the three knobs and any flip
+    // they name lands on Delete.
+    let target = definite_target(
+        &root.join("fresh-proj"),
+        Duration::from_hours(48),
+        256 * 1024,
+    );
+    let report = why_not(&config, &target, true);
+    let verdict = report["verdict"].as_str().unwrap();
+    assert!(
+        verdict.starts_with("decided ")
+            || verdict.starts_with("score ")
+            || verdict.starts_with("nothing keeps it"),
+        "{report}"
+    );
+    assert!(report["preflight"]["ok"].as_bool().unwrap(), "{report}");
+    assert!(
+        is_decision_id(report["decision"]["id"].as_str().unwrap()),
+        "{report}"
+    );
+    assert_eq!(report["trace"]["category"], "RustTarget", "{report}");
+    let counterfactuals = report["counterfactuals"].as_array().unwrap();
+    let factors: Vec<&str> = counterfactuals
+        .iter()
+        .map(|c| c["factor"].as_str().unwrap())
+        .collect();
+    if verdict.starts_with("nothing keeps it") {
+        assert_eq!(
+            factors,
+            ["none"],
+            "already Delete needs no change: {report}"
+        );
+    } else {
+        assert_eq!(factors, ["age", "size", "pressure"], "{report}");
+    }
+
+    // Weak evidence (a bare build dir holding one object file) is kept, and
+    // the counterfactuals cover the three knobs; any flip they name lands on
+    // Delete, and anything they cannot flip says so.
+    let weak = root.join("weak-proj").join("build");
+    fs::create_dir_all(&weak).unwrap();
+    fs::write(weak.join("main.o"), vec![0u8; 8192]).unwrap();
+    set_mtime_recursive(
+        &weak,
+        filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_hours(48)),
+    );
+    let report = why_not(&config, &weak, true);
+    let verdict = report["verdict"].as_str().unwrap();
+    assert!(
+        !verdict.starts_with("nothing keeps it"),
+        "a bare build dir is not reclaimable at Green: {report}"
+    );
+    let counterfactuals = report["counterfactuals"].as_array().unwrap();
+    let factors: Vec<&str> = counterfactuals
+        .iter()
+        .map(|c| c["factor"].as_str().unwrap())
+        .collect();
+    assert!(
+        factors == ["age", "size", "pressure"] || factors == ["veto"],
+        "{report}"
+    );
+    for item in counterfactuals {
+        if item["needed"].is_string() {
+            assert_eq!(item["action_after"], "Delete", "{item}");
+            assert!(item["needed_value"].is_number(), "{item}");
+        } else {
+            assert!(item["note"].is_string(), "{item}");
+        }
+    }
+
+    // A file is not what the scanner scores.
+    let file = target.join("CACHEDIR.TAG");
+    let report = why_not(&config, &file, false);
+    assert!(
+        report["scanner_note"]
+            .as_str()
+            .unwrap()
+            .contains("directories"),
+        "{report}"
+    );
+    assert!(report["decision"].is_null());
+
+    // With the default five-minute floor the same target is too young.
+    let floored = explain_config(&dir.path().join("floored"), "");
+    fs::write(
+        &floored,
+        fs::read_to_string(&floored)
+            .unwrap()
+            .replace("min_file_age_minutes = 0", "min_file_age_minutes = 5"),
+    )
+    .unwrap();
+    let report = why_not(&floored, &target, false);
+    assert!(
+        report["trace"]["mtime_check"]
+            .as_str()
+            .unwrap()
+            .contains("below minimum"),
+        "{report}"
+    );
+
+    // Human output carries the same verdict and the factor table.
+    let human = sbh(
+        &config,
+        &[
+            "explain",
+            "--why-not",
+            target.to_str().unwrap(),
+            "--counterfactual",
+        ],
+    );
+    assert!(human.status.success());
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.starts_with("Why not: "), "{text}");
+    assert!(text.contains("verdict:"), "{text}");
+    assert!(text.contains("Counterfactuals"), "{text}");
+}
+
+#[test]
+fn replay_matches_the_record_until_the_config_changes() {
+    let dir = scratch();
+    let config = explain_config(dir.path(), "");
+    let root = dir.path().join("root");
+    definite_target(&root.join("proj"), Duration::from_hours(48), 256 * 1024);
+
+    // A dry-run clean records its plan in the ledger.
+    let clean = sbh(
+        &config,
+        &[
+            "--json",
+            "clean",
+            root.to_str().unwrap(),
+            "--dry-run",
+            "--min-score",
+            "0",
+        ],
+    );
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    let last = stdout_json(&sbh(&config, &["--json", "explain", "--last", "1"]));
+    let id = last["decisions"][0]["id"].as_str().unwrap().to_string();
+
+    // Same code, same config: no drift, every factor reproduces.
+    let replay = stdout_json(&sbh(&config, &["--json", "explain", "--replay", &id]));
+    assert_eq!(replay["mode"], "replay");
+    assert_eq!(replay["id"], id.as_str());
+    assert_eq!(replay["drift"], Value::Bool(false), "{replay}");
+    assert_eq!(
+        replay["stored_action"], replay["replayed_action"],
+        "{replay}"
+    );
+    for factor in replay["factors"].as_array().unwrap() {
+        let delta = factor["delta"].as_f64().unwrap();
+        assert!(delta.abs() < 1e-6, "{factor}");
+    }
+    let approximations = replay["approximations"].as_array().unwrap();
+    assert_eq!(
+        approximations.len(),
+        1,
+        "only the non-persisted open-file evidence is approximated: {approximations:?}"
+    );
+
+    // A heavier structure weight changes the total: drift is reported.
+    let retuned = explain_config(
+        &dir.path().join("retuned"),
+        "[scoring]\nstructure_weight = 0.30\nage_weight = 0.05\n",
+    );
+    fs::write(
+        &retuned,
+        fs::read_to_string(&retuned).unwrap().replace(
+            &format!(
+                "sqlite_db = \"{}\"",
+                dir.path().join("retuned/data/activity.sqlite3").display()
+            ),
+            &format!(
+                "sqlite_db = \"{}\"",
+                dir.path().join("data/activity.sqlite3").display()
+            ),
+        ),
+    )
+    .unwrap();
+    let replay = stdout_json(&sbh(&retuned, &["--json", "explain", "--replay", &id]));
+    assert_eq!(replay["drift"], Value::Bool(true), "{replay}");
+    let structure = replay["factors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "total_score")
+        .unwrap();
+    assert!(
+        structure["delta"].as_f64().unwrap().abs() > 0.005,
+        "{replay}"
+    );
+
+    // Human output and the unknown-id path.
+    let human = sbh(&config, &["explain", "--replay", &id]);
+    assert!(human.status.success());
+    assert!(
+        String::from_utf8_lossy(&human.stdout).starts_with(&format!("Replay {id}")),
+        "{}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+    let unknown = sbh(&config, &["explain", "--replay", "000000000000"]);
+    assert_eq!(unknown.status.code(), Some(1));
+}

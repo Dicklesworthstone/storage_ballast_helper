@@ -48,6 +48,8 @@ pub enum EventType {
     Emergency,
     /// A cleanup decision (the full `DecisionRecord` is in `details`).
     Decision,
+    /// A policy engine mode change (`details`: `kind: from -> to`).
+    PolicyTransition,
 }
 
 /// A single JSONL log entry — all fields optional except `ts`, `event`, `severity`.
@@ -101,6 +103,13 @@ pub struct LogEntry {
     /// Freeform details.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
+    /// C-EVENT schema version of the line; absent on lines written before
+    /// 0.5.2, which readers treat as v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
+    /// The daemon run that wrote the line (`state.json` `run_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// Scoring factor values recorded in the log.
@@ -134,6 +143,8 @@ impl LogEntry {
             mount_point: None,
             decision_id: None,
             details: None,
+            schema_version: None,
+            run_id: None,
         }
     }
 }
@@ -187,6 +198,8 @@ pub struct JsonlWriter {
     last_fsync: SystemTime,
     last_recover_attempt: SystemTime,
     lines_since_fsync: u64,
+    /// Stamped on every line (C-EVENT `run_id`) when set.
+    run_id: Option<String>,
 }
 
 impl JsonlWriter {
@@ -200,13 +213,34 @@ impl JsonlWriter {
             last_fsync: SystemTime::now(),
             last_recover_attempt: UNIX_EPOCH,
             lines_since_fsync: 0,
+            run_id: None,
         };
         w.try_open_primary();
         w
     }
 
-    /// Write a single log entry as one atomic JSONL line.
+    /// The daemon run every subsequent line is attributed to.
+    pub fn set_run_id(&mut self, run_id: String) {
+        self.run_id = Some(run_id);
+    }
+
+    /// Write a single log entry as one atomic JSONL line, stamped with the
+    /// C-EVENT schema version and this run's id unless the entry already
+    /// carries them.
     pub fn write_entry(&mut self, entry: &LogEntry) {
+        let mut stamped;
+        let entry = if entry.schema_version.is_some() && entry.run_id.is_some() {
+            entry
+        } else {
+            stamped = entry.clone();
+            stamped
+                .schema_version
+                .get_or_insert(crate::logger::schema::SCHEMA_VERSION);
+            if stamped.run_id.is_none() {
+                stamped.run_id.clone_from(&self.run_id);
+            }
+            &stamped
+        };
         let line = match serde_json::to_string(entry) {
             Ok(mut json) => {
                 json.push('\n');

@@ -983,6 +983,8 @@ pub struct PolicyEngine {
     total_decisions: u64,
     total_fallback_entries: u64,
     transition_log: Vec<TransitionEntry>,
+    /// Transitions ever recorded; the cursor `transitions_after` works from.
+    transitions_total: u64,
     /// Current disk pressure level. Guard-triggered fallbacks are suppressed
     /// during green pressure. At Orange+, the guard penalty is reduced or
     /// bypassed entirely (decision-theoretic: the loss from disk exhaustion
@@ -1035,6 +1037,7 @@ impl PolicyEngine {
             total_decisions: 0,
             total_fallback_entries: 0,
             transition_log: Vec::new(),
+            transitions_total: 0,
             pressure_level: PressureLevel::Green,
             last_suppression_log: None,
             last_observe_time: None,
@@ -1629,6 +1632,25 @@ impl PolicyEngine {
             at_decision: self.total_decisions,
             reason,
         });
+        self.transitions_total = self.transitions_total.saturating_add(1);
+    }
+
+    /// Transitions recorded over the engine's lifetime (the log itself is
+    /// bounded; this cursor is not).
+    #[must_use]
+    pub const fn transitions_total(&self) -> u64 {
+        self.transitions_total
+    }
+
+    /// The transitions recorded after a caller had seen `seen_total` of
+    /// them: what the daemon still has to log as `policy_transition` events.
+    /// Entries already drained from the bounded log are gone.
+    #[must_use]
+    pub fn transitions_after(&self, seen_total: u64) -> &[TransitionEntry] {
+        let unseen = usize::try_from(self.transitions_total.saturating_sub(seen_total))
+            .unwrap_or(usize::MAX)
+            .min(self.transition_log.len());
+        &self.transition_log[self.transition_log.len() - unseen..]
     }
 
     fn rotate_canary_hour(&mut self) {
@@ -2490,6 +2512,38 @@ mod tests {
         assert_eq!(diag.mode, ActiveMode::Canary);
         assert_eq!(diag.total_decisions, 1);
         assert_eq!(diag.transition_count, 1);
+    }
+
+    #[test]
+    fn transitions_after_is_a_cursor_over_the_bounded_log() {
+        let mut engine = PolicyEngine::new(PolicyConfig::default());
+        assert_eq!(engine.transitions_total(), 0);
+        assert!(engine.transitions_after(0).is_empty());
+        engine.log_transition("promote", ActiveMode::Observe, ActiveMode::Canary, None);
+        engine.log_transition(
+            "demote",
+            ActiveMode::Canary,
+            ActiveMode::Observe,
+            Some("test".to_string()),
+        );
+        assert_eq!(engine.transitions_total(), 2);
+        let unseen = engine.transitions_after(0);
+        assert_eq!(unseen.len(), 2);
+        assert_eq!(unseen[0].transition, "promote");
+        assert_eq!(unseen[1].reason.as_deref(), Some("test"));
+        assert_eq!(engine.transitions_after(1).len(), 1);
+        assert!(engine.transitions_after(2).is_empty());
+        // A cursor behind a drained log yields what is still there.
+        for _ in 0..1200 {
+            engine.log_transition("promote", ActiveMode::Observe, ActiveMode::Canary, None);
+        }
+        assert!(engine.transitions_after(0).len() <= engine.transition_log().len());
+        assert!(
+            engine
+                .transitions_after(engine.transitions_total() - 3)
+                .len()
+                == 3
+        );
     }
 
     #[test]

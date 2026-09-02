@@ -1017,6 +1017,24 @@ TOML
   tally_case run_case_expect_fail explain_unknown_id 1 "no decision with id" \
     "${bin}" --config "${explain_dir}/sbh.toml" explain --id 000000000000
 
+  # "No candidates found, but disk is full": one command answers why.
+  tally_case run_case explain_why_not_target "Why not:" \
+    "${bin}" --config "${explain_dir}/sbh.toml" explain --why-not "${artifact_root}/project_a/target"
+  tally_case run_case explain_why_not_counterfactual "Counterfactuals" \
+    "${bin}" --config "${explain_dir}/sbh.toml" explain --why-not "${artifact_root}/project_a/target" --counterfactual
+  tally_case run_case_json explain_why_not_json "verdict" \
+    "${bin}" --config "${explain_dir}/sbh.toml" --json explain --why-not "${artifact_root}/project_a/target" --counterfactual
+  tally_case run_case explain_why_not_file "directories" \
+    "${bin}" --config "${explain_dir}/sbh.toml" explain --why-not "${artifact_root}/project_a/Cargo.toml"
+  if [[ -n "${explain_id}" ]]; then
+    tally_case run_case_json explain_replay_json "drift" \
+      "${bin}" --config "${explain_dir}/sbh.toml" --json explain --replay "${explain_id}"
+    tally_case run_case explain_replay_human "Replay ${explain_id}" \
+      "${bin}" --config "${explain_dir}/sbh.toml" explain --replay "${explain_id}"
+  fi
+  tally_case run_case_expect_fail explain_replay_unknown 1 "no decision with id" \
+    "${bin}" --config "${explain_dir}/sbh.toml" explain --replay 000000000000
+
   # ── Section 8: Ballast lifecycle ─────────────────────────────────────────
 
   log "=== Section 8: Ballast lifecycle ==="

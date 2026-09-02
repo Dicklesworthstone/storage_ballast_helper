@@ -36,6 +36,7 @@ pub struct WindowStats {
     pub deletions: DeletionStats,
     pub ballast: BallastStats,
     pub pressure: PressureStats,
+    pub policy: PolicyStats,
 }
 
 /// Deletion activity within a time window.
@@ -50,6 +51,25 @@ pub struct DeletionStats {
     pub avg_score: f64,
     pub avg_age_hours: f64,
     pub failures: u64,
+    /// Failed deletions grouped by error code, most frequent first.
+    pub failures_by_reason: Vec<FailureReason>,
+}
+
+/// Failed deletions sharing one error code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureReason {
+    /// `SBH-xxxx`, or `unknown` for rows without a code.
+    pub code: String,
+    pub count: u64,
+}
+
+/// Policy engine activity in the window, from `policy_transition` rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyStats {
+    /// Mode transitions logged in the window.
+    pub transitions: u64,
+    /// The latest transition (`kind: from -> to`), if any.
+    pub last_transition: Option<String>,
 }
 
 /// Info about a specific deleted path (for "largest deletion" reporting).
@@ -188,6 +208,34 @@ impl<'a> StatsEngine<'a> {
             deletions: self.deletion_stats(&since)?,
             ballast: self.ballast_stats(&since)?,
             pressure: self.pressure_stats(&since)?,
+            policy: self.policy_stats(&since)?,
+        })
+    }
+
+    /// Policy engine transitions in the window, from the rows the daemon
+    /// logs on every mode change.
+    #[allow(clippy::cast_sign_loss)]
+    fn policy_stats(&self, since: &str) -> Result<PolicyStats> {
+        let conn = self.db.connection();
+        let transitions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM activity_log
+             WHERE event_type = 'policy_transition' AND timestamp >= ?1",
+            params![since],
+            |row| row.get(0),
+        )?;
+        let last_transition = conn
+            .query_row(
+                "SELECT details FROM activity_log
+                 WHERE event_type = 'policy_transition' AND timestamp >= ?1
+                 ORDER BY id DESC LIMIT 1",
+                params![since],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        Ok(PolicyStats {
+            transitions: transitions.max(0) as u64,
+            last_transition,
         })
     }
 
@@ -349,7 +397,7 @@ impl<'a> StatsEngine<'a> {
         // Most common category (extract from path directory name).
         let most_common = self.most_common_deleted_pattern(since)?;
 
-        // Failed deletions.
+        // Failed deletions, and the same rows grouped by error code.
         let failures: i64 = conn.query_row(
             "SELECT COUNT(*) FROM activity_log
              WHERE event_type = 'artifact_delete' AND success = 0
@@ -357,6 +405,35 @@ impl<'a> StatsEngine<'a> {
             params![since],
             |row| row.get(0),
         )?;
+        let failures_by_reason = conn
+            .prepare(
+                "SELECT COALESCE(error_code, 'unknown') AS code, COUNT(*) AS n
+                 FROM activity_log
+                 WHERE event_type = 'artifact_delete' AND success = 0
+                   AND timestamp >= ?1
+                 GROUP BY code ORDER BY n DESC, code ASC",
+            )?
+            .query_map(params![since], |row| {
+                Ok(FailureReason {
+                    code: row.get(0)?,
+                    count: row.get::<_, i64>(1).map_or(0, |n| n.max(0) as u64),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Age at deletion comes from the evidence ledger: the decision that
+        // approved each deletion recorded the candidate's age.
+        let avg_age_hours: f64 = conn
+            .query_row(
+                "SELECT COALESCE(AVG(json_extract(record, '$.age_secs')), 0.0)
+                 FROM decision_log
+                 WHERE timestamp >= ?1
+                   AND UPPER(COALESCE(effective_action, action)) = 'DELETE'",
+                params![since],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0)
+            / 3600.0;
 
         Ok(DeletionStats {
             count: count.max(0) as u64,
@@ -366,8 +443,9 @@ impl<'a> StatsEngine<'a> {
             largest_deletion: largest,
             most_common_category: most_common,
             avg_score,
-            avg_age_hours: 0.0, // Age at deletion not stored in current schema
+            avg_age_hours,
             failures: failures.max(0) as u64,
+            failures_by_reason,
         })
     }
 
@@ -678,6 +756,105 @@ mod tests {
         assert_eq!(
             ws.deletions.most_common_category.as_deref(),
             Some(".target*")
+        );
+    }
+
+    /// Policy transitions, failures by reason and the age at deletion all
+    /// come from rows the daemon writes, not from placeholders.
+    #[test]
+    fn policy_failures_and_age_come_from_real_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteLogger::open(&dir.path().join("stats.db")).unwrap();
+        let now = chrono::Utc::now();
+        let ts = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let failure = |code: Option<&str>| ActivityRow {
+            timestamp: ts.clone(),
+            event_type: "artifact_delete".to_string(),
+            severity: "warning".to_string(),
+            path: Some("/p/target".to_string()),
+            size_bytes: None,
+            score: None,
+            score_factors: None,
+            pressure_level: None,
+            free_pct: None,
+            duration_ms: None,
+            success: 0,
+            error_code: code.map(str::to_string),
+            error_message: None,
+            details: None,
+        };
+        db.log_activity(&failure(Some("SBH-2003"))).unwrap();
+        db.log_activity(&failure(Some("SBH-2003"))).unwrap();
+        db.log_activity(&failure(Some("SBH-3002"))).unwrap();
+        db.log_activity(&failure(None)).unwrap();
+        for (i, details) in ["promote: observe -> canary", "promote: canary -> enforce"]
+            .iter()
+            .enumerate()
+        {
+            db.log_activity(&ActivityRow {
+                timestamp: (now + chrono::Duration::milliseconds(i as i64))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                event_type: "policy_transition".to_string(),
+                severity: "info".to_string(),
+                path: None,
+                size_bytes: None,
+                score: None,
+                score_factors: None,
+                pressure_level: None,
+                free_pct: None,
+                duration_ms: None,
+                success: 1,
+                error_code: None,
+                error_message: None,
+                details: Some((*details).to_string()),
+            })
+            .unwrap();
+        }
+        // Two approved deletions aged 1 h and 3 h, one keep that must not count.
+        for (id, action, age_secs) in [
+            ("d1", "DELETE", 3600),
+            ("d2", "DELETE", 10800),
+            ("d3", "KEEP", 99999),
+        ] {
+            db.connection()
+                .execute(
+                    "INSERT INTO decision_log (decision_id, timestamp, path, action, policy_mode, \
+                     total_score, posterior_abandoned, expected_loss_keep, expected_loss_delete, record) \
+                     VALUES (?1, ?2, '/p', ?3, 'enforce', 0.9, 0.9, 1.0, 0.1, ?4)",
+                    params![id, ts, action, format!(r#"{{"age_secs":{age_secs}}}"#)],
+                )
+                .unwrap();
+        }
+
+        let engine = StatsEngine::new(&db);
+        let ws = engine.window_stats(Duration::from_hours(1)).unwrap();
+        assert_eq!(ws.deletions.failures, 4);
+        assert_eq!(
+            ws.deletions.failures_by_reason,
+            vec![
+                FailureReason {
+                    code: "SBH-2003".to_string(),
+                    count: 2
+                },
+                FailureReason {
+                    code: "SBH-3002".to_string(),
+                    count: 1
+                },
+                FailureReason {
+                    code: "unknown".to_string(),
+                    count: 1
+                },
+            ]
+        );
+        assert!(
+            (ws.deletions.avg_age_hours - 2.0).abs() < 1e-9,
+            "{}",
+            ws.deletions.avg_age_hours
+        );
+        assert_eq!(ws.policy.transitions, 2);
+        assert_eq!(
+            ws.policy.last_transition.as_deref(),
+            Some("promote: canary -> enforce")
         );
     }
 

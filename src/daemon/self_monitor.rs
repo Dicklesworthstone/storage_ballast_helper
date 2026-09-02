@@ -36,6 +36,17 @@ pub const DAEMON_STATE_WRITE_INTERVAL_SECS: u64 = 30;
 /// (`sbh status`, `sbh check`, `read_daemon_prediction`) never report the
 /// daemon as absent simply because a write cycle hasn't completed yet.
 pub const DAEMON_STATE_STALE_THRESHOLD_SECS: u64 = 90;
+
+/// A fresh run identifier (`<pid hex>-<epoch millis hex>`), shared by the
+/// state file and every activity log line of one daemon run.
+#[must_use]
+pub fn generate_run_id() -> String {
+    format!(
+        "{:x}-{:x}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_millis()
+    )
+}
 pub const DEFAULT_DAEMON_RSS_WARNING_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES: u64 = 500 * 1024 * 1024;
 
@@ -778,6 +789,12 @@ impl SelfMonitor {
         &self.run_id
     }
 
+    /// Use the id the daemon generated before its logger started, so the
+    /// activity log and the state file name the same run.
+    pub fn set_run_id(&mut self, run_id: String) {
+        self.run_id = run_id;
+    }
+
     /// Final write on shutdown: the last state with `stopped_at`,
     /// `exit_reason` and the final uptime, written regardless of the write
     /// interval so readers can tell a stopped daemon from a stalled one.
@@ -832,7 +849,7 @@ impl SelfMonitor {
             threads_snapshot: ThreadsState::default(),
             budget_snapshot: CpuBudgetState::default(),
             idle_reason: None,
-            run_id: format!("{:x}-{:x}", std::process::id(), now.timestamp_millis()),
+            run_id: generate_run_id(),
             last_state: None,
 
             scan_count: 0,

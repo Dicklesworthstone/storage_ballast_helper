@@ -1070,6 +1070,24 @@ fn pressure_multiplier(urgency: f64) -> f64 {
     }
 }
 
+/// The urgency that produced a recorded `pressure_multiplier`: the exact
+/// inverse of [`pressure_multiplier`] on its piecewise-linear segments, so a
+/// replay can score with the pressure the original decision saw.
+#[must_use]
+pub fn urgency_for_pressure_multiplier(multiplier: f64) -> f64 {
+    let m = multiplier.clamp(1.0, 3.0);
+    let urgency = if m <= 1.3 {
+        m - 1.0
+    } else if m <= 1.5 {
+        0.3 + (m - 1.3)
+    } else if m <= 2.0 {
+        (m - 1.5).mul_add(0.3 / 0.5, 0.5)
+    } else {
+        (m - 2.0).mul_add(0.2, 0.8)
+    };
+    urgency.clamp(0.0, 1.0)
+}
+
 fn posterior_from_score(total_score: f64, confidence: f64) -> f64 {
     // Converts the raw score into a probability (0.0 to 1.0) using a sigmoid function.
     // - `total_score / 1.5`: Normalizes the score (typically 0-3) to a 0-2 range, clamped to 0-1.
@@ -2408,6 +2426,20 @@ mod tests {
         assert!((a.total_score - b.total_score).abs() < f64::EPSILON);
         assert_eq!(a.decision, b.decision);
         assert_eq!(a.ledger.summary, b.ledger.summary);
+    }
+
+    #[test]
+    fn urgency_inverts_pressure_multiplier_on_every_segment() {
+        for urgency in [0.0, 0.15, 0.3, 0.4, 0.5, 0.65, 0.8, 0.9, 1.0] {
+            let multiplier = super::pressure_multiplier(urgency);
+            let recovered = super::urgency_for_pressure_multiplier(multiplier);
+            assert!(
+                (recovered - urgency).abs() < 1e-9,
+                "urgency {urgency} -> multiplier {multiplier} -> {recovered}"
+            );
+        }
+        assert!((super::urgency_for_pressure_multiplier(0.5) - 0.0).abs() < f64::EPSILON);
+        assert!((super::urgency_for_pressure_multiplier(9.0) - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

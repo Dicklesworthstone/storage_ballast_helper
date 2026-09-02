@@ -192,6 +192,14 @@ pub struct ClassificationRecord {
     pub category: String,
     /// Combined confidence from name + structural signals.
     pub combined_confidence: f64,
+    /// Name-derived confidence, kept so `sbh explain --replay` can rebuild
+    /// the classifier's exact input. Absent on records written before it
+    /// was stored.
+    #[serde(default)]
+    pub name_confidence: Option<f64>,
+    /// Structure-derived confidence; see `name_confidence`.
+    #[serde(default)]
+    pub structural_confidence: Option<f64>,
 }
 
 /// Serializable factor values.
@@ -348,6 +356,8 @@ impl DecisionRecordBuilder {
                 pattern_name: score.classification.pattern_name.to_string(),
                 category: format!("{:?}", score.classification.category),
                 combined_confidence: score.classification.combined_confidence,
+                name_confidence: Some(score.classification.name_confidence),
+                structural_confidence: Some(score.classification.structural_confidence),
             },
             factors: FactorsRecord::from(score.factors),
             factor_contributions: contributions,

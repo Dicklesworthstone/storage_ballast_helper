@@ -374,6 +374,28 @@ impl SqliteLogger {
         Ok(())
     }
 
+    /// Mark a ballast file as released. A file the inventory never saw
+    /// (a pool provisioned before the daemon logged inventory rows) gets a
+    /// row with only its release recorded, so counts stay truthful.
+    pub fn mark_ballast_released(&self, path: &str, released_at: &str) -> Result<()> {
+        let updated = self
+            .conn
+            .prepare_cached("UPDATE ballast_inventory SET released_at = ?1 WHERE path = ?2")?
+            .execute(params![released_at, path])?;
+        if updated == 0 {
+            self.upsert_ballast(&BallastRow {
+                file_index: ballast_index_from_path(path),
+                path: path.to_string(),
+                size_bytes: 0,
+                created_at: released_at.to_string(),
+                released_at: Some(released_at.to_string()),
+                replenished_at: None,
+                integrity_hash: None,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Get all ballast file records.
     pub fn ballast_inventory(&self) -> Result<Vec<BallastRow>> {
         let mut stmt = self.conn.prepare_cached(
@@ -466,6 +488,23 @@ pub struct PressureRow {
     pub pressure_level: String,
     pub ewma_rate: Option<f64>,
     pub pid_output: Option<f64>,
+}
+
+/// The index a ballast file name carries (`SBH_BALLAST_FILE_00007.dat` is
+/// 7); 0 when the name has none.
+#[must_use]
+pub fn ballast_index_from_path(path: &str) -> i32 {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let stem = name.strip_suffix(".dat").unwrap_or(name);
+    let digits: String = stem
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    digits.parse().unwrap_or(0)
 }
 
 /// Row for the `ballast_inventory` table.

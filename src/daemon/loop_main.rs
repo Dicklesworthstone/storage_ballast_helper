@@ -1246,6 +1246,9 @@ pub struct MonitoringDaemon {
     /// Mounts the executor reported as read-only or out of metadata space
     /// since the last tick; each enters `MountState::Recovery`.
     pending_recovery: HashSet<PathBuf>,
+    /// Policy transitions already logged as `policy_transition` events
+    /// (a cursor into `PolicyEngine::transitions_total`).
+    policy_transitions_seen: u64,
     /// Derived catalog roots per mount (W1 catalog roots), refreshed every
     /// `scanner.catalog_rescan_interval_secs`.
     catalog_root_cache: HashMap<PathBuf, (Instant, Vec<ExpandedCatalogRoot>)>,
@@ -2002,6 +2005,11 @@ impl MonitoringDaemon {
             );
         }
 
+        // 0. One id for this run: stamped on every activity log line and
+        // written to state.json, so a log can be joined to the run that
+        // produced it.
+        let run_id = crate::daemon::self_monitor::generate_run_id();
+
         // 1. Initialize logger.
         let logger_config = DualLoggerConfig {
             sqlite_path: Some(config.paths.sqlite_db.clone()),
@@ -2013,6 +2021,7 @@ impl MonitoringDaemon {
                 fsync_interval_secs: 30,
             },
             channel_capacity: 1024,
+            run_id: Some(run_id.clone()),
         };
         let (logger_handle, logger_join) = spawn_logger(logger_config)?;
 
@@ -2093,11 +2102,12 @@ impl MonitoringDaemon {
         let shared_scanner_config = Arc::new(RwLock::new(config.scanner.clone()));
 
         // 11. Self-monitor (writes state.json for CLI, tracks health).
-        let self_monitor = SelfMonitor::from_telemetry_config(
+        let mut self_monitor = SelfMonitor::from_telemetry_config(
             config.paths.state_file.clone(),
             Arc::clone(&platform),
             &config.telemetry,
         );
+        self_monitor.set_run_id(run_id);
         let process_io_history = ProcessIoHistory::load_or_new(
             ProcessIoHistory::snapshot_path_for_state_file(&config.paths.state_file),
         );
@@ -2143,6 +2153,7 @@ impl MonitoringDaemon {
             mount_responses: Vec::new(),
             wake_next_tick: WakeSignals::default(),
             pending_recovery: HashSet::new(),
+            policy_transitions_seen: 0,
             catalog_root_cache: HashMap::new(),
             catalog_epochs: HashMap::new(),
             emergency_mounts: HashSet::new(),
@@ -2370,6 +2381,38 @@ impl MonitoringDaemon {
                 event.received_at.elapsed(),
             );
         }
+    }
+
+    /// Log every policy engine transition recorded since the last call as a
+    /// `policy_transition` activity event (C-EVENT), in order.
+    fn emit_policy_transitions(&mut self) {
+        let (events, total) = {
+            let policy = self.policy_engine.lock();
+            let events: Vec<ActivityEvent> = policy
+                .transitions_after(self.policy_transitions_seen)
+                .iter()
+                .map(|entry| ActivityEvent::PolicyTransition {
+                    transition: entry.transition.clone(),
+                    from: entry.from.clone(),
+                    to: entry.to.clone(),
+                    reason: entry.reason.clone(),
+                })
+                .collect();
+            (events, policy.transitions_total())
+        };
+        for event in events {
+            if let ActivityEvent::PolicyTransition {
+                transition,
+                from,
+                to,
+                ..
+            } = &event
+            {
+                eprintln!("[SBH-POLICY] {transition}: {from} -> {to}");
+            }
+            self.logger_handle.send(event);
+        }
+        self.policy_transitions_seen = total;
     }
 
     /// Feed the process's CPU time to the budget, log the once-a-minute
@@ -2798,6 +2841,10 @@ impl MonitoringDaemon {
             // 5. Handle pressure response per mount; the tick follows the
             //    tightest mount sbh is actually working on.
             let requested_tick = self.handle_pressure(&response, &scan_tx, &scan_rx);
+
+            // 5b. Policy mode changes since the last tick (the engine runs
+            // on the executor thread; this is the only place they are logged).
+            self.emit_policy_transitions();
 
             // 6. Check special locations independently.
             self.check_special_locations(&scan_tx, &scan_rx);
@@ -7378,6 +7425,7 @@ mod tests {
                 fsync_interval_secs: 0,
             },
             channel_capacity: 64,
+            run_id: None,
         })
         .unwrap();
 
@@ -7716,6 +7764,7 @@ mod tests {
                 fsync_interval_secs: 0,
             },
             channel_capacity: 64,
+            run_id: None,
         })
         .unwrap();
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
@@ -7884,6 +7933,7 @@ mod tests {
                 fsync_interval_secs: 0,
             },
             channel_capacity: 64,
+            run_id: None,
         })
         .unwrap();
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
@@ -7973,6 +8023,7 @@ mod tests {
                 fsync_interval_secs: 0,
             },
             channel_capacity: 64,
+            run_id: None,
         })
         .unwrap();
         let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);

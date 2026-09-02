@@ -37,6 +37,32 @@ impl ArtifactCategory {
     pub const fn is_regenerable_tree(self) -> bool {
         !matches!(self, Self::Unknown)
     }
+
+    /// Every category, in declaration order; the decision ledger stores the
+    /// `Debug` name, and [`std::str::FromStr`] maps it back.
+    pub const ALL: [Self; 9] = [
+        Self::RustTarget,
+        Self::NodeModules,
+        Self::PythonCache,
+        Self::BuildOutput,
+        Self::CacheDir,
+        Self::GoCache,
+        Self::TempDir,
+        Self::AgentWorkspace,
+        Self::Unknown,
+    ];
+}
+
+impl std::str::FromStr for ArtifactCategory {
+    type Err = String;
+
+    /// Parse the `Debug` name a decision record stores (`"RustTarget"`).
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|category| format!("{category:?}") == name)
+            .ok_or_else(|| format!("unknown artifact category {name:?}"))
+    }
 }
 
 /// Structural features collected from a directory tree.

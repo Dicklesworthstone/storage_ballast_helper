@@ -131,6 +131,14 @@ pub enum ActivityEvent {
         details: String,
         free_pct: f64,
     },
+    /// The policy engine changed mode (`observe`, `canary`, `enforce`,
+    /// `fallback_safe`): logged as a `policy_transition` line.
+    PolicyTransition {
+        transition: String,
+        from: String,
+        to: String,
+        reason: Option<String>,
+    },
     /// A cleanup decision (keep, delete, review, veto) for the evidence
     /// ledger: SQLite `decision_log` plus a JSONL `decision` line.
     DecisionRecorded(Box<DecisionRecord>),
@@ -202,6 +210,9 @@ pub struct DualLoggerConfig {
     pub jsonl_config: JsonlConfig,
     /// Bounded channel capacity.
     pub channel_capacity: usize,
+    /// The daemon run id stamped on every JSONL line (C-EVENT `run_id`);
+    /// `None` for one-shot CLI loggers.
+    pub run_id: Option<String>,
 }
 
 impl Default for DualLoggerConfig {
@@ -210,6 +221,7 @@ impl Default for DualLoggerConfig {
             sqlite_path: Some(PathBuf::from(dirs_default_sqlite())),
             jsonl_config: JsonlConfig::default(),
             channel_capacity: CHANNEL_CAPACITY,
+            run_id: None,
         }
     }
 }
@@ -253,6 +265,7 @@ pub fn spawn_logger(
                 config.jsonl_config,
                 dropped_clone,
                 last_beat_clone,
+                config.run_id,
             );
         })
         .map_err(|e| crate::core::errors::SbhError::Runtime {
@@ -263,6 +276,48 @@ pub fn spawn_logger(
 }
 
 // ──────────────────── logger thread ────────────────────
+
+/// `kind: from -> to` plus the reason when there is one.
+fn policy_transition_details(
+    transition: &str,
+    from: &str,
+    to: &str,
+    reason: Option<&str>,
+) -> String {
+    reason.map_or_else(
+        || format!("{transition}: {from} -> {to}"),
+        |reason| format!("{transition}: {from} -> {to} ({reason})"),
+    )
+}
+
+/// Keep the SQLite `ballast_inventory` table in step with the ballast
+/// events: provision and replenish upsert the file's row, release stamps
+/// `released_at`. `None` when the event is not about ballast.
+#[cfg(feature = "sqlite")]
+fn ballast_inventory_write(db: &SqliteLogger, event: &ActivityEvent, ts: &str) -> Option<bool> {
+    use crate::logger::sqlite::{BallastRow, ballast_index_from_path};
+    let row = |path: &str, size_bytes: u64, replenished: bool| BallastRow {
+        file_index: ballast_index_from_path(path),
+        path: path.to_string(),
+        size_bytes: i64::try_from(size_bytes).unwrap_or(i64::MAX),
+        created_at: ts.to_string(),
+        released_at: None,
+        replenished_at: replenished.then(|| ts.to_string()),
+        integrity_hash: None,
+    };
+    match event {
+        ActivityEvent::BallastProvisioned { path, size_bytes } => {
+            Some(db.upsert_ballast(&row(path, *size_bytes, false)).is_ok())
+        }
+        ActivityEvent::BallastReplenished { path, size_bytes } => {
+            Some(db.upsert_ballast(&row(path, *size_bytes, true)).is_ok())
+        }
+        ActivityEvent::BallastReleased { path, .. } => {
+            Some(db.mark_ballast_released(path, ts).is_ok())
+        }
+        _ => None,
+    }
+}
 
 /// Milliseconds since the Unix epoch, for the logger heartbeat.
 fn epoch_ms() -> u64 {
@@ -279,6 +334,7 @@ fn logger_thread_main(
     jsonl_config: JsonlConfig,
     dropped: Arc<AtomicU64>,
     last_beat: Arc<AtomicU64>,
+    run_id: Option<String>,
 ) {
     #[cfg(feature = "sqlite")]
     const SQLITE_RECOVERY_INTERVAL: u32 = 50;
@@ -303,6 +359,9 @@ fn logger_thread_main(
     let _ = sqlite_path;
 
     let mut jsonl = JsonlWriter::open(jsonl_config);
+    if let Some(run_id) = run_id {
+        jsonl.set_run_id(run_id);
+    }
     #[cfg(feature = "sqlite")]
     let mut sqlite_failures: u32 = 0;
     #[cfg(feature = "sqlite")]
@@ -362,15 +421,19 @@ fn logger_thread_main(
                     }
                     _ => None,
                 };
+                let ballast_ok = ballast_inventory_write(db, &event, &jsonl_entry.ts);
                 // Only update the failure counter when at least one write was
                 // attempted.  Events that produce no SQLite rows (e.g.
                 // ConfigReloaded) must not reset the consecutive-failure
                 // counter, otherwise the circuit breaker can never trip.
-                let any_attempted =
-                    activity_ok.is_some() || pressure_ok.is_some() || decision_ok.is_some();
+                let any_attempted = activity_ok.is_some()
+                    || pressure_ok.is_some()
+                    || decision_ok.is_some()
+                    || ballast_ok.is_some();
                 let all_ok = activity_ok.unwrap_or(true)
                     && pressure_ok.unwrap_or(true)
-                    && decision_ok.unwrap_or(true);
+                    && decision_ok.unwrap_or(true)
+                    && ballast_ok.unwrap_or(true);
                 if any_attempted {
                     if all_ok {
                         sqlite_failures = 0;
@@ -534,6 +597,21 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
             e.duration_ms = Some(*duration_ms);
             e.ok = Some(true);
             e.decision_id.clone_from(decision_id);
+            e
+        }
+        ActivityEvent::PolicyTransition {
+            transition,
+            from,
+            to,
+            reason,
+        } => {
+            let mut e = LogEntry::new(EventType::PolicyTransition, Severity::Info);
+            e.details = Some(policy_transition_details(
+                transition,
+                from,
+                to,
+                reason.as_deref(),
+            ));
             e
         }
         ActivityEvent::DecisionRecorded(record) => {
@@ -810,6 +888,32 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
             error_message: None,
             details: None,
         }),
+        ActivityEvent::PolicyTransition {
+            transition,
+            from,
+            to,
+            reason,
+        } => Some(ActivityRow {
+            timestamp: ts,
+            event_type: "policy_transition".to_string(),
+            severity: "info".to_string(),
+            path: None,
+            size_bytes: None,
+            score: None,
+            score_factors: None,
+            pressure_level: None,
+            free_pct: None,
+            duration_ms: None,
+            success: 1,
+            error_code: None,
+            error_message: None,
+            details: Some(policy_transition_details(
+                transition,
+                from,
+                to,
+                reason.as_deref(),
+            )),
+        }),
         ActivityEvent::Emergency { details, free_pct } => Some(ActivityRow {
             timestamp: ts,
             event_type: "emergency".to_string(),
@@ -879,7 +983,107 @@ mod tests {
                 fsync_interval_secs: 60,
             },
             channel_capacity: 64,
+            run_id: None,
         }
+    }
+
+    /// C-EVENT: ballast events keep `ballast_inventory` current, policy
+    /// transitions become `policy_transition` lines, and every JSONL line
+    /// carries the run id and schema version.
+    #[test]
+    fn ballast_events_update_the_inventory_and_lines_carry_the_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.run_id = Some("run-7".to_string());
+        let (handle, join) = spawn_logger(config).unwrap();
+        let first = "/pool/SBH_BALLAST_FILE_00001.dat".to_string();
+        let second = "/pool/SBH_BALLAST_FILE_00002.dat".to_string();
+        handle.send(ActivityEvent::BallastProvisioned {
+            path: first.clone(),
+            size_bytes: 4096,
+        });
+        handle.send(ActivityEvent::BallastProvisioned {
+            path: second.clone(),
+            size_bytes: 4096,
+        });
+        handle.send(ActivityEvent::BallastReleased {
+            path: first.clone(),
+            size_bytes: 4096,
+            pressure: "red".to_string(),
+            free_pct: 4.0,
+        });
+        handle.send(ActivityEvent::BallastReplenished {
+            path: first.clone(),
+            size_bytes: 4096,
+        });
+        handle.send(ActivityEvent::PolicyTransition {
+            transition: "promote".to_string(),
+            from: "observe".to_string(),
+            to: "canary".to_string(),
+            reason: Some("calibrated".to_string()),
+        });
+        handle.shutdown();
+        join.join().unwrap();
+
+        let db = SqliteLogger::open(&dir.path().join("test.db")).unwrap();
+        let mut rows = db.ballast_inventory().unwrap();
+        rows.sort_by_key(|row| row.file_index);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].file_index, 1);
+        assert_eq!(rows[0].path, first);
+        // Replenished after the release: the row is live again.
+        assert!(rows[0].released_at.is_none(), "{:?}", rows[0]);
+        assert!(rows[0].replenished_at.is_some(), "{:?}", rows[0]);
+        assert_eq!(rows[1].file_index, 2);
+        assert!(rows[1].released_at.is_none());
+
+        let text = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(lines.len() >= 5, "{text}");
+        for line in &lines {
+            assert_eq!(line["run_id"], "run-7", "{line}");
+            assert_eq!(
+                line["schema_version"],
+                crate::logger::schema::SCHEMA_VERSION,
+                "{line}"
+            );
+            crate::logger::schema::validate_value(line).unwrap();
+        }
+        let policy = lines
+            .iter()
+            .find(|l| l["event"] == "policy_transition")
+            .unwrap();
+        assert_eq!(policy["details"], "promote: observe -> canary (calibrated)");
+        let released = lines
+            .iter()
+            .find(|l| l["event"] == "ballast_release")
+            .unwrap();
+        assert_eq!(released["path"], first);
+        assert_eq!(released["pressure"], "red");
+    }
+
+    /// A release the inventory never saw still leaves a truthful row.
+    #[test]
+    fn a_release_of_an_unknown_ballast_file_records_the_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteLogger::open(&dir.path().join("x.db")).unwrap();
+        db.mark_ballast_released("/pool/SBH_BALLAST_FILE_00009.dat", "2026-09-02T12:00:00Z")
+            .unwrap();
+        let rows = db.ballast_inventory().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_index, 9);
+        assert_eq!(rows[0].released_at.as_deref(), Some("2026-09-02T12:00:00Z"));
+        assert_eq!(
+            crate::logger::sqlite::ballast_index_from_path("/x/SBH_BALLAST_FILE_00042.dat"),
+            42
+        );
+        assert_eq!(
+            crate::logger::sqlite::ballast_index_from_path("/x/odd.dat"),
+            0
+        );
     }
 
     fn test_scan_telemetry(engine: &str) -> ScanCompletionTelemetry {
@@ -1037,6 +1241,7 @@ mod tests {
                 fsync_interval_secs: 60,
             },
             channel_capacity: 64,
+            run_id: None,
         };
         let (handle, join) = spawn_logger(config).unwrap();
         handle.send(ActivityEvent::Error {
@@ -1064,6 +1269,7 @@ mod tests {
                 fsync_interval_secs: 60,
             },
             channel_capacity: 2, // tiny channel
+            run_id: None,
         };
         let (handle, _join) = spawn_logger(config).unwrap();
         assert_eq!(handle.dropped_events(), 0);
@@ -1089,6 +1295,7 @@ mod tests {
                 fsync_interval_secs: 60,
             },
             channel_capacity: 64,
+            run_id: None,
         };
         let (handle, join) = spawn_logger(config).unwrap();
 
@@ -1136,6 +1343,7 @@ mod tests {
                 fsync_interval_secs: 60,
             },
             channel_capacity: 64,
+            run_id: None,
         };
         let (handle, join) = spawn_logger(config).unwrap();
 
@@ -1167,6 +1375,7 @@ mod tests {
                 fsync_interval_secs: 60,
             },
             channel_capacity: 64,
+            run_id: None,
         };
         let (handle, join) = spawn_logger(config).unwrap();
 
@@ -1201,6 +1410,7 @@ mod tests {
                 fsync_interval_secs: 60,
             },
             channel_capacity: 256,
+            run_id: None,
         };
         let (handle, join) = spawn_logger(config).unwrap();
 
