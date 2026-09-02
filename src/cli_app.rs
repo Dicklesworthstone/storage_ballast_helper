@@ -2017,7 +2017,32 @@ fn replay_decision(
     let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
     let replayed = engine.score_candidate(&input, urgency);
 
-    let rows = vec![
+    let rows = replay_rows(record, &replayed);
+    let replayed_action = ActionRecord::from(replayed.decision.action);
+    let drift = record.action != replayed_action
+        || record.vetoed != replayed.vetoed
+        || (record.total_score - replayed.total_score).abs() > 0.005;
+    Ok(ReplayReport {
+        id: record.id.clone(),
+        path: record.path.clone(),
+        recorded_at: record.timestamp.clone(),
+        urgency,
+        rows,
+        stored_action: record.action.to_string(),
+        replayed_action: replayed_action.to_string(),
+        stored_vetoed: record.vetoed,
+        replayed_veto: replayed.veto_reason.as_ref().map(ToString::to_string),
+        drift,
+        approximations,
+    })
+}
+
+/// `(name, stored, replayed)` for every number a replay compares.
+fn replay_rows(
+    record: &storage_ballast_helper::scanner::decision_record::DecisionRecord,
+    replayed: &CandidacyScore,
+) -> Vec<(&'static str, f64, f64)> {
+    vec![
         (
             "location",
             record.factors.location,
@@ -2057,24 +2082,7 @@ fn replay_decision(
             record.calibration_score,
             replayed.decision.calibration_score,
         ),
-    ];
-    let replayed_action = ActionRecord::from(replayed.decision.action);
-    let drift = record.action != replayed_action
-        || record.vetoed != replayed.vetoed
-        || (record.total_score - replayed.total_score).abs() > 0.005;
-    Ok(ReplayReport {
-        id: record.id.clone(),
-        path: record.path.clone(),
-        recorded_at: record.timestamp.clone(),
-        urgency,
-        rows,
-        stored_action: record.action.to_string(),
-        replayed_action: replayed_action.to_string(),
-        stored_vetoed: record.vetoed,
-        replayed_veto: replayed.veto_reason.as_ref().map(ToString::to_string),
-        drift,
-        approximations,
-    })
+    ]
 }
 
 fn run_bootstrap(cli: &Cli, args: &BootstrapArgs) -> Result<(), CliError> {
@@ -3969,6 +3977,7 @@ fn run_stats(cli: &Cli, args: &StatsArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_stats_json(
     engine: &StatsEngine<'_>,
     args: &StatsArgs,
@@ -9932,6 +9941,9 @@ fn render_catalog_preview(cli: &Cli, config: &Config, mount: &Path) -> Result<()
     Ok(())
 }
 
+// The scan pipeline reads top to bottom: walk, score, rank, render. Splitting
+// it would scatter the state each stage hands to the next.
+#[allow(clippy::too_many_lines)]
 fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;

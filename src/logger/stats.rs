@@ -792,8 +792,9 @@ mod tests {
             .enumerate()
         {
             db.log_activity(&ActivityRow {
-                timestamp: (now + chrono::Duration::milliseconds(i as i64))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                timestamp: (now
+                    + chrono::Duration::milliseconds(i64::try_from(i).unwrap_or(i64::MAX)))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 event_type: "policy_transition".to_string(),
                 severity: "info".to_string(),
                 path: None,

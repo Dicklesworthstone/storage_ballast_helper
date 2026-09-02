@@ -2553,6 +2553,9 @@ impl MonitoringDaemon {
         eprintln!("{payload}");
     }
 
+    // One tick's worth of bookkeeping in program order; splitting it would
+    // only scatter the state-file fields it fills.
+    #[allow(clippy::too_many_lines)]
     fn maybe_write_self_monitor_state(&mut self, response: &PressureResponse) -> SelfMonitorTick {
         // Use the causing mount from the worst response so the state file
         // reflects the mount that actually drove the pressure level, not the
@@ -7876,6 +7879,7 @@ mod tests {
     /// is young by the walker's rule (birth time). The priority pre-scan must
     /// measure it the same way and hold it behind `min_file_age_minutes`.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn scanner_prescan_holds_a_young_tree_with_old_mtimes() {
         fn set_mtime_recursive(path: &Path, mtime: filetime::FileTime) {
             if let Ok(entries) = std::fs::read_dir(path) {

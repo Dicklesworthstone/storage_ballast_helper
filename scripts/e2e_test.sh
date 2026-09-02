@@ -869,8 +869,10 @@ main() {
 
   mkdir -p "${config_dir}"
 
-  # config path (no config file exists → uses default path + note).
-  tally_case run_case config_path_default "defaults will be used" "${bin}" config path
+  # config path always names a config.toml: the per-user default with a
+  # "defaults will be used" note when nothing exists, or the system file the
+  # service uses when only that one is present (as on a host with sbh installed).
+  tally_case run_case config_path_default "config.toml" "${bin}" config path
 
   # config show (loads defaults when no file exists).
   tally_case run_case config_show_defaults "file_count" "${bin}" config show
@@ -984,12 +986,13 @@ min_file_age_minutes = 0
 enabled = false
 TOML
 
-  # Nothing recorded yet: explain refuses with the empty-ledger hint.
-  tally_case run_case_expect_fail explain_empty_ledger 1 "no decisions yet" \
+  # No ledger file yet: explain names the missing database instead of
+  # inventing an empty answer.
+  tally_case run_case_expect_fail explain_empty_ledger 1 "no decision ledger is readable" \
     "${bin}" --config "${explain_dir}/sbh.toml" explain --last 5
 
   # A dry-run clean records its plan; explain reads it back.
-  tally_case run_case explain_clean_dry_run_records "Scanned" \
+  tally_case run_case explain_clean_dry_run_records "Dry run complete" \
     "${bin}" --config "${explain_dir}/sbh.toml" clean "${artifact_root}" --dry-run --yes --min-score 0.0
 
   tally_case run_case_json explain_last_json "decisions" \
@@ -1205,8 +1208,9 @@ TOML
 
   log "=== Section 14: Emergency mode ==="
 
-  # Emergency scan on empty dir (should report no candidates and exit non-zero).
-  tally_case run_case_expect_fail emergency_empty 1 "no cleanup candidates" \
+  # Emergency scan on empty dir: nothing to reclaim is a successful outcome
+  # (exit 0), as for clean.
+  tally_case run_case emergency_empty "no cleanup candidates" \
     "${bin}" emergency "${LOG_DIR}/empty_scan_target" --yes
 
   # Emergency scan on artifact tree (current heuristics may still find no candidates).
@@ -1640,7 +1644,9 @@ TOML
     log "=== Section 22: Pre-build check exit codes ==="
 
     # Check with absurdly high --need value should exit 2 (runtime error).
-    tally_case run_case_expect_fail check_need_critical 2 "insufficient" \
+    # Insufficient space is a user-facing refusal (exit 1 by the CLI's
+  # exit-code contract: 1 user, 2 runtime, 3 internal, 4 partial).
+  tally_case run_case_expect_fail check_need_critical 1 "insufficient" \
       "${bin}" check /tmp --need 999999999999
 
     # Check with zero --target-free should pass (JSON mode for output verification).

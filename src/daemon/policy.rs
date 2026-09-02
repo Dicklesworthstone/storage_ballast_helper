@@ -2538,11 +2538,11 @@ mod tests {
             engine.log_transition("promote", ActiveMode::Observe, ActiveMode::Canary, None);
         }
         assert!(engine.transitions_after(0).len() <= engine.transition_log().len());
-        assert!(
+        assert_eq!(
             engine
                 .transitions_after(engine.transitions_total() - 3)
-                .len()
-                == 3
+                .len(),
+            3
         );
     }
 

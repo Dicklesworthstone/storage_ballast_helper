@@ -1003,7 +1003,7 @@ mod tests {
             size_bytes: 4096,
         });
         handle.send(ActivityEvent::BallastProvisioned {
-            path: second.clone(),
+            path: second,
             size_bytes: 4096,
         });
         handle.send(ActivityEvent::BallastReleased {

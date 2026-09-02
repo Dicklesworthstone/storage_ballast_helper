@@ -2808,6 +2808,7 @@ impl Drop for SystemdUserUnitGuard {
 /// shutdown). Skips where no user service manager is reachable.
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn systemd_notify_unit_reaches_active_stays_alive_and_stops_cleanly() {
     if !user_systemd_available() {
         eprintln!("skip: no user systemd manager reachable (systemctl --user is-system-running)");

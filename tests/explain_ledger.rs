@@ -735,6 +735,7 @@ fn why_not(config: &Path, path: &Path, counterfactual: bool) -> Value {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn why_not_names_the_first_rail_for_each_fixture_class() {
     let dir = scratch();
     let config = explain_config(dir.path(), "");
