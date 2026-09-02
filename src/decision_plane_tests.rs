@@ -467,6 +467,7 @@ fn policy_fallback_recovery_restores_mode() {
 fn policy_no_deletion_in_fallback_safe_under_any_config() {
     use crate::daemon::policy::{AutoRecoverTo, CanaryBudgetAction, FallbackAction};
     let mut rng = SeededRng::new(0xF4_11_BA_C4);
+    let scorer = default_engine();
     let good = crate::monitor::guardrails::GuardDiagnostics {
         status: GuardStatus::Pass,
         observation_count: 60,
@@ -514,8 +515,8 @@ fn policy_no_deletion_in_fallback_safe_under_any_config() {
                         engine.enter_fallback(reason);
                         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
                         let candidates = random_candidates(&mut rng, 12)
-                            .into_iter()
-                            .map(|c| default_engine().score_candidate(&c, 0.95))
+                            .iter()
+                            .map(|c| scorer.score_candidate(c, 0.95))
                             .collect::<Vec<_>>();
                         let decision = engine.evaluate(&candidates, Some(&good));
                         assert!(

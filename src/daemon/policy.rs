@@ -2422,10 +2422,192 @@ mod tests {
         assert_eq!(engine.mode(), ActiveMode::Enforce);
     }
 
+    fn breaching_guard() -> GuardDiagnostics {
+        GuardDiagnostics {
+            status: GuardStatus::Fail,
+            observation_count: 25,
+            median_rate_error: 0.45,
+            conservative_fraction: 0.55,
+            e_process_value: 10.0,
+            e_process_alarm: false,
+            consecutive_clean: 0,
+            reason: "bad calibration".to_string(),
+        }
+    }
+
+    /// Production path: `calibration_breach_windows` consecutive guard-FAIL
+    /// windows under pressure. With the default resolution below Enforce
+    /// (`demote`) the engine enters FallbackSafe with the breach recorded.
+    #[test]
+    fn calibration_breach_demotes_by_default_below_enforce() {
+        let mut config = default_config();
+        config.calibration_breach_windows = 2;
+        assert_eq!(
+            config.resolved_calibration_breach_action(),
+            FallbackAction::Demote
+        );
+        let mut engine = PolicyEngine::new(config);
+        engine.bypass_startup_grace();
+        engine.promote(); // canary
+        engine.set_pressure_level(PressureLevel::Orange);
+        engine.observe_window(&breaching_guard());
+        assert_eq!(engine.mode(), ActiveMode::Canary);
+        engine.observe_window(&breaching_guard());
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+        assert_eq!(
+            engine.fallback_reason(),
+            Some(&FallbackReason::CalibrationBreach {
+                consecutive_windows: 2
+            })
+        );
+        assert_eq!(
+            engine.last_fallback_reason(),
+            Some("calibration breach (2 consecutive windows)")
+        );
+    }
+
+    /// The unset default for an `enforce` fleet is advisory; an explicit
+    /// `advisory` on any fleet logs and keeps the mode.
+    #[test]
+    fn calibration_breach_action_defaults_and_explicit_values() {
+        let enforce = PolicyConfig {
+            initial_mode: ActiveMode::Enforce,
+            ..PolicyConfig::default()
+        };
+        assert_eq!(
+            enforce.resolved_calibration_breach_action(),
+            FallbackAction::Advisory
+        );
+        assert!(enforce.resolved_emergency_escalation());
+        let observe = PolicyConfig {
+            initial_mode: ActiveMode::Observe,
+            ..PolicyConfig::default()
+        };
+        assert_eq!(
+            observe.resolved_calibration_breach_action(),
+            FallbackAction::Demote
+        );
+        assert!(!observe.resolved_emergency_escalation());
+        let explicit = PolicyConfig {
+            initial_mode: ActiveMode::Enforce,
+            calibration_breach_action: Some(FallbackAction::Demote),
+            emergency_escalation: Some(false),
+            ..PolicyConfig::default()
+        };
+        assert_eq!(
+            explicit.resolved_calibration_breach_action(),
+            FallbackAction::Demote
+        );
+        assert!(!explicit.resolved_emergency_escalation());
+    }
+
+    /// Production path for `CanaryBudgetExhausted`: the decision that hits
+    /// the cap is Keep, and with the default `demote` the canary pauses in
+    /// FallbackSafe; with `keep` it stays in Canary.
+    #[test]
+    fn canary_budget_exhaustion_demotes_by_default_and_keeps_when_told() {
+        for (action, expected_mode) in [
+            (CanaryBudgetAction::Demote, ActiveMode::FallbackSafe),
+            (CanaryBudgetAction::Keep, ActiveMode::Canary),
+        ] {
+            let mut config = default_config();
+            config.max_canary_deletes_per_hour = 1;
+            config.canary_budget_action = action;
+            let mut engine = PolicyEngine::new(config);
+            engine.promote(); // canary
+            let candidates = vec![
+                sample_candidate(DecisionAction::Delete, 2.5),
+                sample_candidate(DecisionAction::Delete, 2.3),
+            ];
+            let decision = engine.evaluate(&candidates, Some(&passing_guard()));
+            assert_eq!(decision.approved_for_deletion.len(), 1, "{action:?}");
+            assert_eq!(engine.mode(), expected_mode, "{action:?}");
+            if action == CanaryBudgetAction::Demote {
+                assert_eq!(
+                    engine.fallback_reason(),
+                    Some(&FallbackReason::CanaryBudgetExhausted)
+                );
+            }
+        }
+    }
+
+    /// Production path for `SerializationFailure`: the daemon reports a
+    /// failed state write; `demote` enters FallbackSafe, `advisory` counts.
+    #[test]
+    fn serialization_failure_demotes_or_advises() {
+        let mut engine = PolicyEngine::new(default_config());
+        engine.promote(); // canary
+        engine.note_serialization_failure();
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+        assert_eq!(
+            engine.fallback_reason(),
+            Some(&FallbackReason::SerializationFailure)
+        );
+        assert_eq!(engine.serialization_failures(), 1);
+
+        let mut config = default_config();
+        config.serialization_failure_action = FallbackAction::Advisory;
+        let mut engine = PolicyEngine::new(config);
+        engine.promote();
+        engine.note_serialization_failure();
+        engine.note_serialization_failure();
+        assert_eq!(engine.mode(), ActiveMode::Canary);
+        assert_eq!(engine.serialization_failures(), 2);
+        assert!(engine.fallback_reason().is_none());
+    }
+
+    /// `auto_recover_to`: `none` never leaves FallbackSafe without
+    /// `promote()`; `canary` caps recovery at Canary; `previous` returns to
+    /// the pre-fallback mode, Enforce included.
+    #[test]
+    fn auto_recover_to_decides_where_recovery_lands() {
+        let cases = [
+            (AutoRecoverTo::None, ActiveMode::Enforce, ActiveMode::FallbackSafe),
+            (AutoRecoverTo::Canary, ActiveMode::Enforce, ActiveMode::Canary),
+            (AutoRecoverTo::Canary, ActiveMode::Observe, ActiveMode::Observe),
+            (AutoRecoverTo::Previous, ActiveMode::Enforce, ActiveMode::Enforce),
+        ];
+        for (recover, initial, expected) in cases {
+            let config = PolicyConfig {
+                initial_mode: initial,
+                auto_recover_to: recover,
+                recovery_clean_windows: 1,
+                min_fallback_secs: 0,
+                observe_min_interval_secs: 0,
+                ..PolicyConfig::default()
+            };
+            let mut engine = PolicyEngine::new(config);
+            engine.enter_fallback(FallbackReason::GuardrailDrift);
+            engine.observe_window(&passing_guard());
+            assert_eq!(engine.mode(), expected, "{recover:?} from {initial:?}");
+            assert_eq!(
+                engine.last_fallback_reason(),
+                Some("guardrail drift alarm"),
+                "the last reason survives recovery"
+            );
+        }
+        // `none` still leaves through promote().
+        let config = PolicyConfig {
+            initial_mode: ActiveMode::Canary,
+            auto_recover_to: AutoRecoverTo::None,
+            recovery_clean_windows: 1,
+            min_fallback_secs: 0,
+            observe_min_interval_secs: 0,
+            ..PolicyConfig::default()
+        };
+        let mut engine = PolicyEngine::new(config);
+        engine.enter_fallback(FallbackReason::GuardrailDrift);
+        engine.observe_window(&passing_guard());
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+        assert!(engine.promote());
+        assert_ne!(engine.mode(), ActiveMode::FallbackSafe);
+    }
+
     #[test]
     fn calibration_breach_is_advisory_only() {
         let mut config = default_config();
         config.calibration_breach_windows = 2;
+        config.calibration_breach_action = Some(FallbackAction::Advisory);
         let mut engine = PolicyEngine::new(config);
         engine.bypass_startup_grace();
         engine.promote(); // canary
@@ -2578,6 +2760,7 @@ mod tests {
     fn canary_mode_respects_hourly_budget() {
         let mut config = default_config();
         config.max_canary_deletes_per_hour = 2;
+        config.canary_budget_action = CanaryBudgetAction::Keep;
         let mut engine = PolicyEngine::new(config);
         engine.promote(); // canary
 

@@ -125,6 +125,8 @@ pub struct WizardAnswers {
     pub ballast_file_count: usize,
     /// Ballast file size in bytes.
     pub ballast_file_size_bytes: u64,
+    /// The policy mode the daemon starts in (`[policy] initial_mode`).
+    pub initial_mode: ActiveMode,
     /// Whether the wizard ran in auto mode.
     pub auto_mode: bool,
 }
@@ -145,6 +147,9 @@ impl WizardAnswers {
         // Override ballast settings.
         config.ballast.file_count = self.ballast_file_count;
         config.ballast.file_size_bytes = self.ballast_file_size_bytes;
+
+        // The policy mode chosen in the wizard.
+        config.policy.initial_mode = self.initial_mode;
 
         config
     }
@@ -234,6 +239,8 @@ fn auto_answers_for_defaults(defaults: &WizardPlatformDefaults) -> WizardAnswers
         ballast_preset: preset,
         ballast_file_count: preset.file_count(),
         ballast_file_size_bytes: preset.file_size_bytes(),
+        // Unattended installs keep the daemon's default mode.
+        initial_mode: PolicyConfig::default().initial_mode,
         auto_mode: true,
     }
 }
@@ -340,7 +347,10 @@ fn run_interactive_with_defaults<R: BufRead, W: Write>(
     // Step 4: Ballast sizing.
     let (preset, file_count, file_size) = prompt_ballast(reader, writer)?;
 
-    // Step 5: Confirmation.
+    // Step 5: Initial policy mode.
+    let initial_mode = prompt_initial_mode(reader, writer)?;
+
+    // Step 6: Confirmation.
     let answers = WizardAnswers {
         service,
         user_scope,
@@ -348,6 +358,7 @@ fn run_interactive_with_defaults<R: BufRead, W: Write>(
         ballast_preset: preset,
         ballast_file_count: file_count,
         ballast_file_size_bytes: file_size,
+        initial_mode,
         auto_mode: false,
     };
 
@@ -476,6 +487,52 @@ fn prompt_ballast<R: BufRead, W: Write>(
     Ok((preset, preset.file_count(), preset.file_size_bytes()))
 }
 
+/// Step 4 of 5: the mode the daemon starts in. Defaults to the daemon's
+/// own default so an operator who presses Enter gets today's behavior.
+fn prompt_initial_mode<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> io::Result<ActiveMode> {
+    let default = PolicyConfig::default().initial_mode;
+    let _ = writeln!(writer);
+    let _ = writeln!(writer, "  [4/5] Initial policy mode");
+    let _ = writeln!(
+        writer,
+        "      o) observe  — score and log candidates, delete nothing"
+    );
+    let _ = writeln!(
+        writer,
+        "      c) canary   — capped deletions per hour, promote with `sbh policy promote`"
+    );
+    let _ = writeln!(
+        writer,
+        "      e) enforce  — full deletion pipeline with guardrails and fallback-safe"
+    );
+    let _ = write!(writer, "    Choice [{}]: ", mode_key(default));
+    writer.flush()?;
+
+    let input = read_line(reader)?;
+    let choice = input.trim().to_ascii_lowercase();
+    Ok(match choice.as_str() {
+        "o" | "observe" => ActiveMode::Observe,
+        "c" | "canary" => ActiveMode::Canary,
+        "e" | "enforce" => ActiveMode::Enforce,
+        "" => default,
+        _ => {
+            let _ = writeln!(writer, "    Unrecognized, using {default}.");
+            default
+        }
+    })
+}
+
+const fn mode_key(mode: ActiveMode) -> char {
+    match mode {
+        ActiveMode::Observe => 'o',
+        ActiveMode::Canary => 'c',
+        ActiveMode::Enforce | ActiveMode::FallbackSafe => 'e',
+    }
+}
+
 fn prompt_confirm<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -506,6 +563,7 @@ fn display_summary<W: Write>(writer: &mut W, answers: &WizardAnswers) {
         answers.ballast_file_count,
         answers.ballast_file_size_bytes / 1_073_741_824,
     );
+    let _ = writeln!(writer, "    Policy mode: {}", answers.initial_mode);
 }
 
 fn read_line<R: BufRead>(reader: &mut R) -> io::Result<String> {
