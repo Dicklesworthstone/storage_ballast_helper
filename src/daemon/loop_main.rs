@@ -29,6 +29,10 @@ use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::{Config, ScannerConfig, ScannerEngineMode};
 use crate::core::errors::{Result, SbhError};
+use crate::daemon::mount_controller::{
+    IdleReason, MountController, MountControllerConfig, MountState, MountSurface, MountTickInput,
+    WakeSignals, global_tick,
+};
 use crate::daemon::notifications::{NotificationEvent, NotificationLevel, NotificationManager};
 use crate::daemon::policy::{
     ActiveMode, BallastAction, BehaviorDispatchTable, BehaviorMode, BehaviorPressureLevel,
@@ -36,7 +40,7 @@ use crate::daemon::policy::{
 };
 use crate::daemon::process_io_history::ProcessIoHistory;
 use crate::daemon::self_monitor::{
-    DaemonLock, SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadStatus,
+    DaemonLock, MountPressure, SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadStatus,
 };
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat, resolve_watchdog_sec};
 use crate::logger::dual::{
@@ -327,24 +331,6 @@ pub struct ScanRequest {
         crate::core::config::ScoringConfig,
         crate::core::config::ScannerConfig,
     )>,
-}
-
-/// B5: device-affinity gate. Returns `true` when the daemon must NOT escalate
-/// to aggressive scanning because the pressured device has no scannable
-/// root_path on it and cross-device reclamation is disabled.
-///
-/// With `cross_devices == false`, sbh can only free space on a device by
-/// deleting paths that physically live on that device. If pressure is elevated
-/// on a device but no root_path resides there, re-scanning the (other-device)
-/// root_paths can never relieve it — so the daemon should back off rather than
-/// spin. When `cross_devices == true`, any root_path may help, so we do not gate.
-#[must_use]
-fn should_skip_for_device_affinity(
-    elevated_pressure: bool,
-    no_root_path_on_pressured_device: bool,
-    cross_devices: bool,
-) -> bool {
-    elevated_pressure && no_root_path_on_pressured_device && !cross_devices
 }
 
 /// B6: consecutive no-progress passes after which even Red/Critical pressure
@@ -901,12 +887,12 @@ fn mount_controller_config(config: &Config) -> MountControllerConfig {
 /// ballast directory (or `<mount>/.sbh`), removed again on success.
 fn probe_mount_writable(mount: &Path, ballast_dir: Option<&Path>) -> bool {
     let dir = ballast_dir.map_or_else(|| mount.join(".sbh"), Path::to_path_buf);
-    if fs::create_dir_all(&dir).is_err() {
+    if std::fs::create_dir_all(&dir).is_err() {
         return false;
     }
     let probe = dir.join("probe");
-    let written = fs::write(&probe, [0u8; 4096]).is_ok();
-    let _ = fs::remove_file(&probe);
+    let written = std::fs::write(&probe, [0u8; 4096]).is_ok();
+    let _ = std::fs::remove_file(&probe);
     written
 }
 
@@ -2297,6 +2283,28 @@ impl MonitoringDaemon {
         let dropped_log_events = self.logger_handle.dropped_events();
         let policy_mode = self.policy_engine.lock().mode().to_string();
 
+        // Every mount's reading and control state, not only the worst mount,
+        // so `sbh status` and the dashboard can show what the daemon is doing
+        // on each device and why it is idle on the others.
+        let mounts = self
+            .mount_responses
+            .iter()
+            .map(|tick| MountPressure {
+                path: tick.response.causing_mount.to_string_lossy().into_owned(),
+                free_pct: tick.response.free_pct,
+                level: format!("{:?}", tick.response.level).to_lowercase(),
+                rate_bps: None,
+            })
+            .collect();
+        let now = Instant::now();
+        let mut controllers: Vec<_> = self
+            .mount_controllers
+            .values()
+            .map(|controller| controller.record(now))
+            .collect();
+        controllers.sort_by(|a, b| a.mount.cmp(&b.mount));
+        self.self_monitor.set_mount_snapshot(mounts, controllers);
+
         self.self_monitor.maybe_write_state(
             response.level,
             free_pct,
@@ -2473,8 +2481,9 @@ impl MonitoringDaemon {
                 break;
             }
 
-            // 5. Handle pressure response.
-            self.handle_pressure(&response, &scan_tx, &scan_rx);
+            // 5. Handle pressure response per mount; the tick follows the
+            //    tightest mount sbh is actually working on.
+            let requested_tick = self.handle_pressure(&response, &scan_tx, &scan_rx);
 
             // 6. Check special locations independently.
             self.check_special_locations(&scan_tx, &scan_rx);
@@ -2505,7 +2514,7 @@ impl MonitoringDaemon {
                         self.self_monitor.record_scan(candidates, 0, duration);
                         let now = Instant::now();
                         #[allow(clippy::cast_possible_truncation)]
-                        for stat in root_stats {
+                        for stat in &root_stats {
                             self.voi_scheduler.record_scan_result(
                                 &stat.path,
                                 stat.potential_bytes,
@@ -2516,6 +2525,11 @@ impl MonitoringDaemon {
                             );
                         }
                         self.voi_scheduler.end_window();
+                        // A completed (not timed-out) pass with nothing found
+                        // on a mount parks that mount's controller in Idle.
+                        if !timed_out {
+                            self.note_scan_pass_per_mount(&root_stats, now);
+                        }
                     }
                     WorkerReport::DeletionCompleted {
                         deleted,
@@ -2545,9 +2559,10 @@ impl MonitoringDaemon {
                 }
             }
 
-            // 9. Forced scan signal (SIGUSR1).
+            // 9. Forced scan signal (SIGUSR1). Also wakes idle mounts next tick.
             if self.signal_handler.should_scan() {
                 self.trigger_forced_scan(&scan_tx, &response);
+                self.wake_next_tick.forced_scan = true;
             }
 
             // 10. Thread health check.
@@ -2681,17 +2696,15 @@ impl MonitoringDaemon {
             }
 
             let tick_duration = tick_start.elapsed();
-            let throttle_decision = self.tick_throttle.observe(
-                response.scan_interval,
-                self_monitor_tick,
-                tick_duration,
-            );
+            let throttle_decision =
+                self.tick_throttle
+                    .observe(requested_tick, self_monitor_tick, tick_duration);
             if throttle_decision.stage_changed {
                 let message = format!(
                     "daemon tick throttle stage={:?} reason={:?} requested_ms={} effective_ms={} tick_ms={} rss_bytes={} rss_warning_bytes={}",
                     throttle_decision.stage,
                     throttle_decision.reason,
-                    duration_millis(response.scan_interval),
+                    duration_millis(requested_tick),
                     duration_millis(throttle_decision.interval),
                     duration_millis(tick_duration),
                     self_monitor_tick.rss_bytes,
@@ -2774,6 +2787,7 @@ impl MonitoringDaemon {
         let mut worst_guard_diag: Option<GuardDiagnostics> = None;
         // Reset per-tick predictive action so we track the worst across mounts.
         self.last_predictive_action = PredictiveAction::Clear;
+        self.mount_responses.clear();
 
         // Update monitors for each active mount.
         for (mount_path, stats) in stats_by_mount {
@@ -2957,13 +2971,23 @@ impl MonitoringDaemon {
 
     // ──────────────────── pressure response ────────────────────
 
+    /// Drive every mount from its own reading through its `MountController`
+    /// and return the tick the daemon should sleep for.
+    ///
+    /// `response` is still the worst mount's reading; it feeds the predictive
+    /// safety net and the Critical emergency event. Everything per mount
+    /// (scan dispatch, ballast release and replenish, observe-only reporting)
+    /// comes from `self.mount_responses`. The returned tick is the tightest
+    /// cadence among mounts sbh is working on: a pressured mount it cannot
+    /// act on is observe-only and contributes nothing, so it can no longer
+    /// drag the whole daemon onto the Orange interval (the v0.5.1 hot loop).
     #[allow(clippy::too_many_lines)]
     fn handle_pressure(
         &mut self,
         response: &crate::monitor::pid::PressureResponse,
         scan_tx: &Sender<ScanRequest>,
         scan_rx: &Receiver<ScanRequest>,
-    ) {
+    ) -> Duration {
         // Reset min_score to config default at the start of each tick;
         // PreemptiveCleanup may lower it below.
         self.shared_executor_config
@@ -2973,197 +2997,276 @@ impl MonitoringDaemon {
         let behavior = self.behavior_state.mode;
         let scan_allowed = behavior_allows_scan(behavior);
         let release_ballast = behavior_should_release_ballast(behavior);
+        let base_poll = Duration::from_millis(self.config.pressure.poll_interval_ms.max(1));
+        let now = Instant::now();
+        let wake = std::mem::take(&mut self.wake_next_tick);
+        let controller_config = mount_controller_config(&self.config);
 
-        // Determine scan targets: routine maintenance (Green) scans everything;
-        // elevated pressure targets only the causing volume to maximize ROI.
-        let elevated_pressure = response.level != PressureLevel::Green;
-        let scan_paths = if elevated_pressure {
-            let collector = &self.fs_collector;
-            let target = &response.causing_mount;
-            self.config
-                .scanner
-                .root_paths
+        // Which configured roots live on which mount, resolved once per tick.
+        let root_paths = self.config.scanner.root_paths.clone();
+        let root_mounts: Vec<(PathBuf, Option<PathBuf>)> = root_paths
+            .iter()
+            .map(|root| {
+                let mount = self
+                    .fs_collector
+                    .collect(root)
+                    .ok()
+                    .map(|stats| stats.mount_point);
+                (root.clone(), mount)
+            })
+            .collect();
+        let cross_device_fallback = self.config.scanner.cross_devices && !root_paths.is_empty();
+
+        let responses = std::mem::take(&mut self.mount_responses);
+        let mut cadence = Vec::with_capacity(responses.len());
+        let mut replenished_this_tick = false;
+        let mut pressured_without_surface: Option<(PathBuf, PressureLevel)> = None;
+
+        for tick in &responses {
+            let mount = tick.response.causing_mount.clone();
+            let roots_here: Vec<PathBuf> = root_mounts
                 .iter()
-                .filter(|p| collector.collect(p).is_ok_and(|s| s.mount_point == *target))
-                .cloned()
-                .collect()
-        } else {
-            self.config.scanner.root_paths.clone()
-        };
+                .filter(|(_, root_mount)| root_mount.as_deref() == Some(mount.as_path()))
+                .map(|(root, _)| root.clone())
+                .collect();
+            let (has_pool, releasable_ballast, ballast_dir) = self
+                .ballast_coordinator
+                .pool_for_mount(&mount)
+                .map_or((false, false, None), |pool| {
+                    (
+                        true,
+                        pool.available_count() > 0,
+                        Some(pool.ballast_dir.clone()),
+                    )
+                });
+            let surface = MountSurface {
+                configured_roots: roots_here.len(),
+                catalog_roots: 0,
+                ballast_pool: has_pool,
+                cross_device_fallback,
+            };
+            let controller = self
+                .mount_controllers
+                .entry(mount.clone())
+                .or_insert_with(|| MountController::new(mount.clone(), controller_config));
+            let recovery_probe_ok = (controller.state() == MountState::Recovery)
+                .then(|| probe_mount_writable(&mount, ballast_dir.as_deref()));
+            let decision = controller.observe(MountTickInput {
+                level: tick.response.level,
+                urgency: tick.response.urgency,
+                free_pct: tick.response.free_pct,
+                seconds_to_red: tick.seconds_to_red,
+                prediction_confident: tick.prediction_confident,
+                surface,
+                releasable_ballast,
+                recovery_needed: false,
+                recovery_probe_ok,
+                wake,
+                now,
+            });
+            cadence.push(controller.cadence(base_poll, tick.response.scan_interval));
+            if let Some((from, to)) = decision.transition {
+                let message = format!(
+                    "mount {} {from} -> {to} (level={:?} urgency={:.2} surface={} idle_reason={})",
+                    mount.display(),
+                    tick.response.level,
+                    tick.response.urgency,
+                    surface.kind(),
+                    controller.idle_reason().map_or("none", IdleReason::as_str),
+                );
+                eprintln!("[SBH-MOUNT] {message}");
+                self.logger_handle.send(ActivityEvent::Info { message });
+            }
 
-        // ── B5: device-affinity gate ──────────────────────────────────────
-        // Under elevated pressure on a specific device, sbh only reclaims paths
-        // that physically reside on that device (when cross_devices is false).
-        // If NO root_path lives on the pressured device, scanning the other
-        // root_paths can never free space on it — but the daemon used to fall
-        // back to scanning *all* root_paths, pinning a core in an endless
-        // aggressive scan that does nothing (the trj `/`-pressured /tmp+/data-tmp
-        // hot-loop). In that case, log once and back off instead of spinning.
-        if should_skip_for_device_affinity(
-            elevated_pressure,
-            scan_paths.is_empty(),
-            self.config.scanner.cross_devices,
-        ) {
-            let now = Instant::now();
+            match decision.state {
+                MountState::Reclaim => {
+                    if decision.release_ballast && release_ballast {
+                        let _ = self.release_ballast(&mount, &tick.response);
+                        self.last_tick_cleanup_ran = true;
+                    }
+                    if decision.scan && scan_allowed {
+                        // A mount with no root of its own only reclaims via
+                        // cross_devices, where any configured root may help.
+                        let paths = if roots_here.is_empty() {
+                            root_paths.clone()
+                        } else {
+                            roots_here
+                        };
+                        self.send_scan_request(scan_tx, scan_rx, &tick.response, paths);
+                        self.last_tick_cleanup_ran = true;
+                    }
+                }
+                MountState::Maintain => {
+                    // One replenished file per tick across all pools is
+                    // enough; the release controller paces each mount.
+                    if !replenished_this_tick
+                        && self.maybe_replenish_pool(&mount, tick.response.level)
+                    {
+                        replenished_this_tick = true;
+                    }
+                }
+                MountState::ObserveOnly => {
+                    if tick.response.level != PressureLevel::Green
+                        && pressured_without_surface
+                            .as_ref()
+                            .is_none_or(|(_, level)| tick.response.level > *level)
+                    {
+                        pressured_without_surface = Some((mount, tick.response.level));
+                    }
+                }
+                MountState::Recovery | MountState::Idle => {}
+            }
+        }
+
+        // Predictive safety net on the worst mount at Green. The controllers
+        // already escalate a mount whose own horizon is short; this keeps the
+        // policy's min_score recommendation, the ballast release on the mount
+        // it named, and the FallbackSafe recovery scans.
+        if response.level == PressureLevel::Green {
+            let predictive_min_score = match &self.last_predictive_action {
+                PredictiveAction::PreemptiveCleanup {
+                    recommended_min_score,
+                    ..
+                } => Some(*recommended_min_score),
+                _ => None,
+            };
+            let predictive_ballast_mount = match &self.last_predictive_action {
+                PredictiveAction::ImminentDanger { mount, .. } => Some(mount.clone()),
+                _ => None,
+            };
+            let needs_scan = !matches!(self.last_predictive_action, PredictiveAction::Clear);
+
+            if let Some(min_score) = predictive_min_score {
+                self.shared_executor_config.set_min_score(min_score);
+            }
+            if let Some(ref mount) = predictive_ballast_mount {
+                let _ = self.release_ballast(mount, response);
+                self.last_tick_cleanup_ran = true;
+            }
+            // Force periodic scans when stuck in FallbackSafe at green
+            // pressure so that guard windows can update and recovery can
+            // trigger. Without this, FallbackSafe at green is permanent.
+            let in_fallback = self.policy_engine.lock().mode() == ActiveMode::FallbackSafe;
+            if scan_allowed && (needs_scan || in_fallback) {
+                self.send_scan_request(scan_tx, scan_rx, response, root_paths);
+                if needs_scan {
+                    self.last_tick_cleanup_ran = true;
+                }
+            }
+        }
+
+        if response.level == PressureLevel::Critical {
+            let primary = self.primary_path();
+            let actual_free_pct = self
+                .fs_collector
+                .collect(primary)
+                .map_or(0.0, |s| s.free_pct());
+            self.logger_handle.send(ActivityEvent::Emergency {
+                details: format!(
+                    "critical pressure: urgency={:.2}, releasing all ballast",
+                    response.urgency
+                ),
+                free_pct: actual_free_pct,
+            });
+        }
+
+        // A pressured mount sbh cannot act on is reported (rate-limited), not
+        // spun on: it stays observe-only and never tightens the tick.
+        if let Some((mount, level)) = pressured_without_surface {
             let should_warn = self
                 .last_device_affinity_warn
                 .is_none_or(|last| now.duration_since(last) >= DEVICE_AFFINITY_WARN_INTERVAL);
             if should_warn {
                 self.last_device_affinity_warn = Some(now);
                 let msg = format!(
-                    "pressure on {} ({:?}) but no scannable root_path resides on that device \
-                     and cross_devices=false; cannot reclaim — backing off (no aggressive scan)",
-                    response.causing_mount.display(),
-                    response.level
+                    "pressure on {} ({level:?}) but no root_path, ballast pool or cross_devices \
+                     fallback covers that device; observing only (idle_reason={})",
+                    mount.display(),
+                    IdleReason::NoSurface.as_str()
                 );
                 eprintln!("[SBH-DAEMON] {msg}");
                 self.logger_handle
                     .send(ActivityEvent::Info { message: msg });
             }
-            // Skip ballast handling + scan dispatch for this tick. Ballast on a
-            // device with no root_path is still released by Green-tick logic and
-            // the dedicated release paths; here we only suppress the futile
-            // aggressive scan loop.
-            return;
         }
 
-        // Fallback to all paths if filtering somehow yielded nothing (e.g. config
-        // drift) while cross_devices IS enabled — then any root_path can help.
-        let paths_to_scan = if scan_paths.is_empty() {
-            self.config.scanner.root_paths.clone()
-        } else {
-            scan_paths
+        global_tick(cadence, base_poll)
+    }
+
+    /// Feed a completed scan pass to the per-mount controllers: a mount whose
+    /// roots all came back empty, with nothing left to release, goes idle
+    /// with an exponential rescan backoff.
+    fn note_scan_pass_per_mount(&mut self, root_stats: &[RootScanResult], now: Instant) {
+        let mut found_by_mount: HashMap<PathBuf, usize> = HashMap::new();
+        for stat in root_stats {
+            let Ok(stats) = self.fs_collector.collect(&stat.path) else {
+                continue;
+            };
+            *found_by_mount.entry(stats.mount_point).or_insert(0) += stat.candidates_found;
+        }
+        for (mount, found) in found_by_mount {
+            let releasable = self
+                .ballast_coordinator
+                .pool_for_mount(&mount)
+                .is_some_and(|pool| pool.available_count() > 0);
+            let Some(controller) = self.mount_controllers.get_mut(&mount) else {
+                continue;
+            };
+            if let Some((from, to)) = controller.note_pass(found, releasable, now) {
+                let message = format!(
+                    "mount {} {from} -> {to} (empty_passes={} rescan_in={}s idle_reason={})",
+                    mount.display(),
+                    controller.empty_passes(),
+                    controller.idle_backoff().as_secs(),
+                    controller
+                        .idle_reason()
+                        .map_or("none", crate::daemon::mount_controller::IdleReason::as_str),
+                );
+                eprintln!("[SBH-MOUNT] {message}");
+                self.logger_handle.send(ActivityEvent::Info { message });
+            }
+        }
+    }
+
+    /// Replenish one released ballast file on `mount` if its pool is short and
+    /// the release controller's cooldown allows it. Returns whether a file was
+    /// created.
+    fn maybe_replenish_pool(&mut self, mount: &Path, level: PressureLevel) -> bool {
+        let Some(pool_info) = self
+            .ballast_coordinator
+            .inventory()
+            .into_iter()
+            .find(|item| item.mount_point == mount)
+        else {
+            return false;
         };
-
-        match response.level {
-            PressureLevel::Green => {
-                // Maybe replenish ballast.
-                // We must find a pool that needs replenishment.
-                // Iterating all pools and trying to replenish one is safe because
-                // ReleaseController enforces global rate limits.
-                let collector = &self.fs_collector;
-                let inventory = self.ballast_coordinator.inventory();
-
-                for pool_info in inventory {
-                    let mount_path = pool_info.mount_point.clone();
-                    if self.release_controller.is_ready_for_replenish(
-                        &mount_path,
-                        response.level,
-                        pool_info.files_available,
-                        pool_info.files_total,
-                    ) {
-                        let free_check =
-                            || collector.collect(&mount_path).map_or(0.0, |s| s.free_pct());
-
-                        // Try to replenish this pool.
-                        if let Ok(Some(report)) = self
-                            .ballast_coordinator
-                            .replenish_for_mount(&mount_path, Some(&free_check))
-                            && report.files_created > 0
-                        {
-                            self.release_controller
-                                .on_replenished(&mount_path, report.files_created);
-                            self.notification_manager.notify(
-                                &NotificationEvent::BallastReplenished {
-                                    mount: mount_path.to_string_lossy().to_string(),
-                                    files_replenished: report.files_created,
-                                },
-                            );
-                            // One file replenished globally per tick is sufficient.
-                            break;
-                        }
-                    }
-                }
-
-                // Predictive Safety Net: use the PredictiveActionPolicy to decide
-                // whether to start scanning even when static pressure is Green.
-                // Extract values from the match before calling &mut self methods.
-                let predictive_min_score = match &self.last_predictive_action {
-                    PredictiveAction::PreemptiveCleanup {
-                        recommended_min_score,
-                        ..
-                    } => Some(*recommended_min_score),
-                    _ => None,
-                };
-                let predictive_ballast_mount = match &self.last_predictive_action {
-                    PredictiveAction::ImminentDanger { mount, .. } => Some(mount.clone()),
-                    _ => None,
-                };
-                let needs_scan = !matches!(self.last_predictive_action, PredictiveAction::Clear);
-
-                if let Some(min_score) = predictive_min_score {
-                    self.shared_executor_config.set_min_score(min_score);
-                }
-                if let Some(ref mount) = predictive_ballast_mount {
-                    let _ = self.release_ballast(mount, response);
-                    self.last_tick_cleanup_ran = true;
-                }
-                // Force periodic scans when stuck in FallbackSafe at green
-                // pressure so that guard windows can update and recovery can
-                // trigger. Without this, FallbackSafe at green is permanent.
-                let in_fallback = self.policy_engine.lock().mode() == ActiveMode::FallbackSafe;
-                if scan_allowed && (needs_scan || in_fallback) {
-                    self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
-                    if needs_scan {
-                        self.last_tick_cleanup_ran = true;
-                    }
-                }
-            }
-            PressureLevel::Yellow => {
-                // Increase scan frequency (handled by PID interval).
-                // Light scanning.
-                if release_ballast {
-                    let _ = self.release_ballast(&response.causing_mount, response);
-                }
-                if scan_allowed {
-                    self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
-                    self.last_tick_cleanup_ran = true;
-                }
-            }
-            PressureLevel::Orange => {
-                // Start scanning + gentle cleanup + early ballast release.
-                if release_ballast {
-                    let _ = self.release_ballast(&response.causing_mount, response);
-                }
-                if scan_allowed {
-                    self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
-                    self.last_tick_cleanup_ran = true;
-                }
-            }
-            PressureLevel::Red => {
-                // Release ballast + aggressive scan + delete.
-                if release_ballast {
-                    let _ = self.release_ballast(&response.causing_mount, response);
-                }
-                if scan_allowed {
-                    self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
-                    self.last_tick_cleanup_ran = true;
-                }
-            }
-            PressureLevel::Critical => {
-                // Emergency: release all ballast + delete everything safe.
-                if release_ballast {
-                    let _ = self.release_ballast(&response.causing_mount, response);
-                }
-                if scan_allowed {
-                    self.send_scan_request(scan_tx, scan_rx, response, paths_to_scan);
-                    self.last_tick_cleanup_ran = true;
-                }
-
-                let primary = self.primary_path();
-                let actual_free_pct = self
-                    .fs_collector
-                    .collect(primary)
-                    .map_or(0.0, |s| s.free_pct());
-                self.logger_handle.send(ActivityEvent::Emergency {
-                    details: format!(
-                        "critical pressure: urgency={:.2}, releasing all ballast",
-                        response.urgency
-                    ),
-                    free_pct: actual_free_pct,
-                });
-            }
+        if !self.release_controller.is_ready_for_replenish(
+            mount,
+            level,
+            pool_info.files_available,
+            pool_info.files_total,
+        ) {
+            return false;
         }
+        let collector = &self.fs_collector;
+        let free_check = || collector.collect(mount).map_or(0.0, |s| s.free_pct());
+        let Ok(Some(report)) = self
+            .ballast_coordinator
+            .replenish_for_mount(mount, Some(&free_check))
+        else {
+            return false;
+        };
+        if report.files_created == 0 {
+            return false;
+        }
+        self.release_controller
+            .on_replenished(mount, report.files_created);
+        self.notification_manager
+            .notify(&NotificationEvent::BallastReplenished {
+                mount: mount.to_string_lossy().to_string(),
+                files_replenished: report.files_created,
+            });
+        true
     }
 
     /// Helper to release ballast from the causing mount using the global controller logic.
@@ -3738,6 +3841,13 @@ impl MonitoringDaemon {
                     });
                     self.config = new_config;
                     self.cached_primary_path = compute_primary_path(&self.config);
+                    // Reload may change what sbh can act on: retune the
+                    // per-mount controllers and wake idle mounts next tick.
+                    let controller_config = mount_controller_config(&self.config);
+                    for controller in self.mount_controllers.values_mut() {
+                        controller.set_config(controller_config);
+                    }
+                    self.wake_next_tick.reload = true;
                     eprintln!("[SBH-DAEMON] config reloaded successfully");
                 }
             }
@@ -7448,30 +7558,63 @@ mod tests {
         assert_eq!(v2_active_scan_paths(&request, &dirty), None);
     }
 
+    /// The B5 device-affinity gate became per-mount state (W1.1): a pressured
+    /// mount with no surface is observe-only and contributes nothing to the
+    /// tick, while every other mount keeps its own cadence.
     #[test]
-    fn device_affinity_gate_blocks_aggressive_scan_with_no_root_on_pressured_device() {
-        // Elevated pressure, no root_path on the pressured device, cross_devices
-        // disabled → must back off (skip aggressive scan).
-        assert!(should_skip_for_device_affinity(true, true, false));
-    }
+    fn pressured_mount_without_surface_is_observe_only_and_never_tightens_the_tick() {
+        use crate::daemon::mount_controller::{MountSurface, WakeSignals};
+        let now = Instant::now();
+        let base = Duration::from_secs(60);
+        let config = mount_controller_config(&Config::default());
+        let no_surface = MountSurface::default();
+        let with_root = MountSurface {
+            configured_roots: 1,
+            ..MountSurface::default()
+        };
+        let tick = |level: PressureLevel, surface: MountSurface| MountTickInput {
+            level,
+            urgency: 0.6,
+            free_pct: 12.0,
+            seconds_to_red: None,
+            prediction_confident: false,
+            surface,
+            releasable_ballast: false,
+            recovery_needed: false,
+            recovery_probe_ok: None,
+            wake: WakeSignals::default(),
+            now,
+        };
 
-    #[test]
-    fn device_affinity_gate_allows_scan_when_root_path_present() {
-        // A root_path IS on the pressured device → never gate.
-        assert!(!should_skip_for_device_affinity(true, false, false));
-    }
+        let mut root_mount = MountController::new(PathBuf::from("/"), config);
+        let decision = root_mount.observe(tick(PressureLevel::Orange, no_surface));
+        assert_eq!(decision.state, MountState::ObserveOnly);
+        assert!(!decision.scan);
+        assert_eq!(root_mount.cadence(base, Duration::from_secs(15)), None);
 
-    #[test]
-    fn device_affinity_gate_allows_scan_under_cross_devices() {
-        // cross_devices=true → any root_path may help, so do not gate even with
-        // no root_path on the pressured device.
-        assert!(!should_skip_for_device_affinity(true, true, true));
-    }
+        let mut data_mount = MountController::new(PathBuf::from("/data"), config);
+        let decision = data_mount.observe(tick(PressureLevel::Green, with_root));
+        assert_eq!(decision.state, MountState::Maintain);
+        assert_eq!(
+            global_tick(
+                [
+                    root_mount.cadence(base, Duration::from_secs(15)),
+                    data_mount.cadence(base, Duration::from_secs(15)),
+                ],
+                base
+            ),
+            base,
+            "an observe-only Orange mount must not drag the tick to the Orange interval"
+        );
 
-    #[test]
-    fn device_affinity_gate_inactive_under_green_pressure() {
-        // Green (not elevated) pressure scans everything routinely; never gate.
-        assert!(!should_skip_for_device_affinity(false, true, false));
+        // cross_devices gives the rootless mount a surface again.
+        let cross = MountSurface {
+            cross_device_fallback: true,
+            ..MountSurface::default()
+        };
+        let decision = root_mount.observe(tick(PressureLevel::Orange, cross));
+        assert_eq!(decision.state, MountState::Reclaim);
+        assert!(decision.scan);
     }
 
     fn cooldown_request(pressure: PressureLevel) -> ScanRequest {

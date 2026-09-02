@@ -7495,6 +7495,42 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 }
             }
 
+            // Per-mount control state from the daemon: what it is doing on
+            // each device and why it is idle on the others.
+            if let Some(state) = &daemon_state
+                && let Some(controllers) = state.get("mount_controllers").and_then(Value::as_array)
+                && !controllers.is_empty()
+            {
+                println!("\nMount Control:");
+                println!(
+                    "  {:<20}  {:<12}  {:<8}  {:<12}  {}",
+                    "Mount Point", "State", "Level", "Surface", "Note"
+                );
+                for controller in controllers {
+                    let field = |key: &str| {
+                        controller
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .unwrap_or("-")
+                            .to_string()
+                    };
+                    let mut note = field("idle_reason");
+                    if let Some(secs) = controller.get("rescan_in_secs").and_then(Value::as_u64) {
+                        note = format!("{note} (rescan in {secs}s)");
+                    }
+                    if note == "-" {
+                        note.clear();
+                    }
+                    println!(
+                        "  {:<20}  {:<12}  {:<8}  {:<12}  {note}",
+                        field("mount"),
+                        field("state"),
+                        field("level"),
+                        field("surface"),
+                    );
+                }
+            }
+
             // Ballast info: configured pool vs actually releasable reserve (#16).
             let ballast = BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
             println!("\nBallast:");
@@ -7610,6 +7646,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             "pressure": {
                 "mounts": mounts_json,
                 "overall": overall_level,
+                "mount_controllers": daemon_state
+                    .as_ref()
+                    .and_then(|state| state.get("mount_controllers").cloned())
+                    .unwrap_or_else(|| json!([])),
             },
                 "ballast": {
                     "file_count": config.ballast.file_count,

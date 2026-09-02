@@ -3,6 +3,7 @@
 
 #[cfg(feature = "daemon")]
 pub mod loop_main;
+pub mod mount_controller;
 pub mod notifications;
 pub mod policy;
 #[cfg(feature = "daemon")]

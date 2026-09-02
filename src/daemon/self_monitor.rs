@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::config::TelemetryConfig;
 use crate::core::errors::{Result, SbhError};
+use crate::daemon::mount_controller::MountStateRecord;
 use crate::monitor::pid::PressureLevel;
 use crate::platform::pal::Platform;
 use crate::platform::types::SelfStats;
@@ -407,6 +408,9 @@ pub struct DaemonState {
     pub memory_rss_bytes: u64,
     /// Active policy engine mode (enforce/observe/canary/fallback_safe).
     pub policy_mode: String,
+    /// Per-mount control state: what the daemon is doing on each mount and
+    /// why it is idle on the ones it is not working on.
+    pub mount_controllers: Vec<MountStateRecord>,
 }
 
 /// Current pressure across monitored mounts.
@@ -614,6 +618,10 @@ pub struct SelfMonitor {
     pub errors_total: u64,
     /// Cumulative scan duration for averaging.
     scan_duration_total: Duration,
+    /// Latest per-mount pressure readings, set by the main loop each tick.
+    mount_snapshot: Vec<MountPressure>,
+    /// Latest per-mount controller records, set by the main loop each tick.
+    controller_snapshot: Vec<MountStateRecord>,
 }
 
 impl SelfMonitor {
@@ -625,6 +633,18 @@ impl SelfMonitor {
             DEFAULT_DAEMON_RSS_WARNING_BYTES,
             DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES,
         )
+    }
+
+    /// Record the per-mount readings and controller states the next state
+    /// file write should carry. An empty `mounts` keeps the single
+    /// causing-mount entry the writer builds itself.
+    pub fn set_mount_snapshot(
+        &mut self,
+        mounts: Vec<MountPressure>,
+        controllers: Vec<MountStateRecord>,
+    ) {
+        self.mount_snapshot = mounts;
+        self.controller_snapshot = controllers;
     }
 
     /// Create a new self-monitor using daemon RSS limits from config.
@@ -657,6 +677,8 @@ impl SelfMonitor {
             last_write: None,
             rss_warning_bytes,
             rss_hard_limit_bytes,
+            mount_snapshot: Vec::new(),
+            controller_snapshot: Vec::new(),
 
             scan_count: 0,
             last_scan_at: None,
@@ -722,12 +744,16 @@ impl SelfMonitor {
             last_updated: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             pressure: PressureState {
                 overall: format!("{pressure_level:?}").to_lowercase(),
-                mounts: vec![MountPressure {
-                    path: mount_path.to_string(),
-                    free_pct,
-                    level: format!("{pressure_level:?}").to_lowercase(),
-                    rate_bps: None,
-                }],
+                mounts: if self.mount_snapshot.is_empty() {
+                    vec![MountPressure {
+                        path: mount_path.to_string(),
+                        free_pct,
+                        level: format!("{pressure_level:?}").to_lowercase(),
+                        rate_bps: None,
+                    }]
+                } else {
+                    self.mount_snapshot.clone()
+                },
             },
             ballast: BallastState {
                 available: ballast_available,
@@ -748,6 +774,7 @@ impl SelfMonitor {
             },
             memory_rss_bytes: rss,
             policy_mode: policy_mode.to_string(),
+            mount_controllers: self.controller_snapshot.clone(),
         };
 
         let result = write_state_atomic(&self.state_file_path, &state);
@@ -1013,6 +1040,7 @@ mod tests {
             },
             memory_rss_bytes: 44_040_192,
             policy_mode: "enforce".into(),
+            mount_controllers: Vec::new(),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -1062,6 +1090,7 @@ mod tests {
             },
             memory_rss_bytes: 0,
             policy_mode: String::new(),
+            mount_controllers: Vec::new(),
         };
 
         write_state_atomic(&path, &state).unwrap();
@@ -1113,6 +1142,7 @@ mod tests {
             },
             memory_rss_bytes: 0,
             policy_mode: String::new(),
+            mount_controllers: Vec::new(),
         };
 
         write_state_atomic(&path, &state).unwrap();

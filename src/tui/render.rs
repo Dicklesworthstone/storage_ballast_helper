@@ -5548,6 +5548,7 @@ mod tests {
                 dropped_log_events: 0,
             },
             policy_mode: "enforce".into(),
+            mount_controllers: Vec::new(),
             memory_rss_bytes: 52_428_800,
         }
     }
@@ -5712,6 +5713,7 @@ mod tests {
                 dropped_log_events: 1,
             },
             policy_mode: "enforce".into(),
+            mount_controllers: Vec::new(),
             memory_rss_bytes: 104_857_600,
         }
     }
@@ -5872,6 +5874,7 @@ mod tests {
             action: action.to_string(),
             effective_action: Some(action.to_string()),
             policy_mode: String::from("live"),
+            mount_controllers: Vec::new(),
             factors: FactorBreakdown {
                 location: 0.80,
                 name: 0.75,
@@ -6276,6 +6279,7 @@ mod tests {
             action: action.to_string(),
             effective_action: Some(action.to_string()),
             policy_mode: String::from("live"),
+            mount_controllers: Vec::new(),
             factors: FactorBreakdown {
                 location: 0.80,
                 name: 0.75,

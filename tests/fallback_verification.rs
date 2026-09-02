@@ -68,6 +68,7 @@ fn sample_daemon_state() -> DaemonState {
             dropped_log_events: 0,
         },
         policy_mode: "enforce".into(),
+        mount_controllers: Vec::new(),
         memory_rss_bytes: 1_048_576,
     }
 }
