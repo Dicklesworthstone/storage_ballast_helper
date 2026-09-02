@@ -182,6 +182,7 @@ fn sample_daemon_state() -> DaemonState {
         cpu_secs_total: 0.0,
         cpu_budget: storage_ballast_helper::daemon::cpu_budget::CpuBudgetState::default(),
         idle_reason: None,
+        policy: storage_ballast_helper::daemon::self_monitor::PolicyStateRecord::default(),
         stopped_at: None,
         exit_reason: None,
         memory_rss_bytes: 52_428_800, // 50 MB

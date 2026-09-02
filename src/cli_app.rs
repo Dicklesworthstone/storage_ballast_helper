@@ -8553,6 +8553,24 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                         );
                     }
                 }
+                if let Some(policy) = daemon_state
+                    .as_ref()
+                    .and_then(|state| state.get("policy"))
+                    .filter(|p| p.get("mode").and_then(Value::as_str).is_some_and(|m| !m.is_empty()))
+                {
+                    let field = |key: &str| policy.get(key).and_then(Value::as_str).unwrap_or("-");
+                    let since = policy.get("since_secs").and_then(Value::as_u64).unwrap_or(0);
+                    let mut line = format!(
+                        "  Policy: {} (since {}, auto_recover_to {})",
+                        field("mode"),
+                        format_eta(since as f64),
+                        field("auto_recover_to")
+                    );
+                    if let Some(reason) = policy.get("last_fallback_reason").and_then(Value::as_str) {
+                        line.push_str(&format!(", last fallback: {reason}"));
+                    }
+                    println!("{line}");
+                }
                 println!("\nMount Control:");
                 let (h_mount, h_state, h_level, h_reclaim, h_reserve) =
                     ("Mount Point", "State", "Level", "Reclaim", "Reserve");
@@ -8757,6 +8775,12 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     "stopped_at": state.get("stopped_at").cloned().unwrap_or(Value::Null),
                     "exit_reason": state.get("exit_reason").cloned().unwrap_or(Value::Null),
                 })),
+                // The policy engine: mode, since, last fallback reason and
+                // where automatic recovery lands.
+                "policy": daemon_state
+                    .as_ref()
+                    .and_then(|state| state.get("policy").cloned())
+                    .unwrap_or(Value::Null),
             "config_path": config.paths.config_file.to_string_lossy(),
             "pressure": {
                 "mounts": mounts_json,
