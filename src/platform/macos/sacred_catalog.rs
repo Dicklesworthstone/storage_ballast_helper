@@ -97,7 +97,11 @@ mod tests {
                 entry.pattern
             );
             assert_eq!(entry.source, SacredPathSource::Builtin);
-            assert!(!entry.reason.trim().is_empty());
+            assert!(
+                !entry.reason.trim().is_empty(),
+                "macOS sacred pattern {} must have a non-blank reason",
+                entry.pattern
+            );
         }
     }
 

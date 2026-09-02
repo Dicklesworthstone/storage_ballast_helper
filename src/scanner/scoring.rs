@@ -1335,10 +1335,10 @@ mod tests {
             let engine = default_engine();
             let score = engine.score_candidate(
                 &CandidateInput {
-                    path: pool.clone(),
+                    path: pool,
                     size_bytes: 18_876_190_720,
-                    // Birth-time age, as the walker would have reported it.
-                    age: Duration::from_secs(3 * 24 * 3600),
+                    // Birth-time age (3 days), as the walker would have reported it.
+                    age: Duration::from_hours(72),
                     classification: classification(0.92, ArtifactCategory::RustTarget),
                     signals: StructuralSignals::default(),
                     active_references: ActiveReferenceSummary::default(),
@@ -1374,7 +1374,7 @@ mod tests {
             let stale = pool.join("debug/old.rlib");
             std::fs::write(&stale, b"x").unwrap();
 
-            let long_ago = std::time::SystemTime::now() - Duration::from_secs(200 * 3600);
+            let long_ago = std::time::SystemTime::now() - Duration::from_hours(200);
             let ft = filetime::FileTime::from_system_time(long_ago);
             filetime::set_file_mtime(&stale, ft).unwrap();
             filetime::set_file_mtime(pool.join("debug"), ft).unwrap();
@@ -1400,10 +1400,12 @@ mod tests {
             // rch pool dir immortal. A tree well past the old cap must still
             // resolve to a definite verdict.
             use super::super::{RCH_IDLE_PROBE_MAX_ENTRIES, TreeActivity, rch_tree_activity};
-            assert!(
-                RCH_IDLE_PROBE_MAX_ENTRIES >= 400_000,
-                "cap must stay above realistic cargo target sizes"
-            );
+            const {
+                assert!(
+                    RCH_IDLE_PROBE_MAX_ENTRIES >= 400_000,
+                    "cap must stay above realistic cargo target sizes"
+                );
+            }
 
             let tmp = tempfile::tempdir().unwrap();
             let pool = tmp.path().join(".rch-target-hz1-pool-sized");
@@ -1418,7 +1420,7 @@ mod tests {
             // Everything is fresh, so this must be a definite Active, reached
             // via early exit rather than by exhausting the guard.
             assert_eq!(
-                rch_tree_activity(&pool, Duration::from_secs(168 * 3600)),
+                rch_tree_activity(&pool, Duration::from_hours(168)),
                 TreeActivity::Active
             );
         }

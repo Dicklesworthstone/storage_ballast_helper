@@ -203,6 +203,34 @@ impl Default for ShutdownCoordinator {
 
 // ──────────────────── watchdog heartbeat ────────────────────
 
+/// Resolve the effective watchdog timeout in seconds.
+///
+/// systemd exports the unit's `WatchdogSec=` to the service as
+/// `WATCHDOG_USEC` (microseconds) and, when it targets a specific process,
+/// `WATCHDOG_PID`. An explicit `--watchdog-sec` wins; otherwise the
+/// environment is honored so the generated unit (which does not pass the
+/// flag) still gets heartbeats. A `WATCHDOG_PID` naming another process, or
+/// an unparsable/zero value, disables the watchdog.
+#[must_use]
+pub fn resolve_watchdog_sec(
+    explicit_sec: u64,
+    watchdog_usec: Option<&str>,
+    watchdog_pid: Option<&str>,
+    own_pid: u32,
+) -> u64 {
+    if explicit_sec > 0 {
+        return explicit_sec;
+    }
+    if let Some(pid) = watchdog_pid
+        && pid.trim().parse::<u32>().ok() != Some(own_pid)
+    {
+        return 0;
+    }
+    watchdog_usec
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(0, |usec| usec / 1_000_000)
+}
+
 /// Systemd watchdog heartbeat tracker.
 ///
 /// Tracks when the last heartbeat was sent so the main loop can call
@@ -279,6 +307,27 @@ mod tests {
 
     fn noop_service_manager() -> Box<dyn ServiceManager> {
         Box::<NoopServiceManager>::default()
+    }
+
+    #[test]
+    fn resolve_watchdog_sec_prefers_explicit_then_systemd_env() {
+        // Explicit flag wins regardless of environment.
+        assert_eq!(resolve_watchdog_sec(45, Some("60000000"), None, 100), 45);
+        // Generated unit: no flag, WATCHDOG_USEC from WatchdogSec=60.
+        assert_eq!(resolve_watchdog_sec(0, Some("60000000"), None, 100), 60);
+        // WATCHDOG_PID naming this process is honored; another pid disables.
+        assert_eq!(
+            resolve_watchdog_sec(0, Some("60000000"), Some("100"), 100),
+            60
+        );
+        assert_eq!(
+            resolve_watchdog_sec(0, Some("60000000"), Some("999"), 100),
+            0
+        );
+        // Garbage, sub-second, or absent values disable the watchdog.
+        assert_eq!(resolve_watchdog_sec(0, Some("soon"), None, 100), 0);
+        assert_eq!(resolve_watchdog_sec(0, Some("500000"), None, 100), 0);
+        assert_eq!(resolve_watchdog_sec(0, None, None, 100), 0);
     }
 
     #[test]

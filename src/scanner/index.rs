@@ -903,10 +903,10 @@ mod tests {
         index.upsert(record(failed, identity(99)));
         index.record_failure(failed, now, Duration::from_secs(10), Duration::from_mins(1));
 
+        let cooling = index.ranked_candidate_scores(now + Duration::from_secs(5), 8);
         assert!(
-            index
-                .ranked_candidate_scores(now + Duration::from_secs(5), 8)
-                .is_empty()
+            cooling.is_empty(),
+            "expected no ranked candidates while the failure cooldown is active, got {cooling:?}"
         );
 
         let ranked = index.ranked_candidate_scores(now + Duration::from_secs(11), 8);

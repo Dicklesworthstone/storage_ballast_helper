@@ -2799,7 +2799,11 @@ mod tests {
             "validation artifact must preserve the >=50x deterministic effort proof: {artifact:?}"
         );
         assert!(artifact.v2_delete_subset_of_v1);
-        assert!(artifact.v2_approves_v1_hard_vetoes.is_empty());
+        assert!(
+            artifact.v2_approves_v1_hard_vetoes.is_empty(),
+            "v2 must never approve a candidate v1 hard-vetoes, got {:?}",
+            artifact.v2_approves_v1_hard_vetoes
+        );
         assert!(
             artifact.v2.delete_candidate_bytes > 0,
             "opaque root should retain reclaimable candidate bytes for {}",

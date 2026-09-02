@@ -1700,7 +1700,10 @@ mod tests {
 
     #[test]
     fn current_version_is_not_empty() {
-        assert!(!current_version().is_empty());
+        assert!(
+            !current_version().is_empty(),
+            "current_version() must report the crate version"
+        );
     }
 
     #[test]

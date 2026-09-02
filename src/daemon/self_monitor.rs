@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::core::config::TelemetryConfig;
+use crate::core::errors::{Result, SbhError};
 use crate::monitor::pid::PressureLevel;
 use crate::platform::pal::Platform;
 use crate::platform::types::SelfStats;
@@ -35,6 +36,347 @@ pub const DAEMON_STATE_WRITE_INTERVAL_SECS: u64 = 30;
 pub const DAEMON_STATE_STALE_THRESHOLD_SECS: u64 = 90;
 pub const DEFAULT_DAEMON_RSS_WARNING_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES: u64 = 500 * 1024 * 1024;
+
+// ──────────────────── daemon lock (liveness) ────────────────────
+
+/// Lock file kept next to `state.json`.
+///
+/// A running daemon holds an exclusive advisory lock on it for its whole
+/// life; the kernel drops the lock on any exit, including SIGKILL, so "is the
+/// lock held?" is a race-free answer to "is a daemon running?" — unlike a
+/// pidfile (stale after a crash, and a reused pid can be any process) or the
+/// previous `/proc/*/cmdline` substring scan, which matched any shell whose
+/// command line mentioned "sbh" and "daemon".
+pub const DAEMON_LOCK_FILE_NAME: &str = "daemon.lock";
+
+/// Identity of the daemon that holds the lock, written into the lock file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DaemonLockInfo {
+    pub pid: u32,
+    pub started_at: String,
+    pub version: String,
+}
+
+/// Path of the daemon lock for a given `state.json` path.
+#[must_use]
+pub fn daemon_lock_path(state_file: &Path) -> PathBuf {
+    state_file.with_file_name(DAEMON_LOCK_FILE_NAME)
+}
+
+/// Exclusive daemon lock; held until dropped (or the process exits).
+#[derive(Debug)]
+pub struct DaemonLock {
+    #[cfg(unix)]
+    _lock: nix::fcntl::Flock<fs::File>,
+    path: PathBuf,
+}
+
+impl DaemonLock {
+    /// Acquire the lock, refusing if another daemon already holds it.
+    ///
+    /// The file is created world-readable so an unprivileged `sbh status`
+    /// can probe a root daemon's lock (flock works on a read-only handle).
+    pub fn acquire(state_file: &Path) -> Result<Self> {
+        let path = daemon_lock_path(state_file);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| SbhError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o644);
+        }
+        let file = options.open(&path).map_err(|source| SbhError::Io {
+            path: path.clone(),
+            source,
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+
+            #[allow(deprecated)]
+            let mut lock = nix::fcntl::Flock::lock(
+                file,
+                nix::fcntl::FlockArg::LockExclusiveNonblock,
+            )
+            .map_err(|(file, errno)| {
+                let owner = read_lock_info(&file);
+                SbhError::Runtime {
+                    details: format!(
+                        "another sbh daemon already owns {} (pid {}, started {}, version {}): {errno}",
+                        path.display(),
+                        owner.pid,
+                        if owner.started_at.is_empty() {
+                            "unknown"
+                        } else {
+                            &owner.started_at
+                        },
+                        if owner.version.is_empty() {
+                            "unknown"
+                        } else {
+                            &owner.version
+                        },
+                    ),
+                }
+            })?;
+
+            let info = DaemonLockInfo {
+                pid: std::process::id(),
+                started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+            let payload = serde_json::to_string(&info).map_err(|e| SbhError::Serialization {
+                context: "daemon lock",
+                details: e.to_string(),
+            })?;
+            let write = (|| {
+                lock.set_len(0)?;
+                lock.write_all(payload.as_bytes())?;
+                lock.sync_all()
+            })();
+            write.map_err(|source| SbhError::Io {
+                path: path.clone(),
+                source,
+            })?;
+
+            Ok(Self { _lock: lock, path })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            Ok(Self { path })
+        }
+    }
+
+    /// Path of the lock file.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+fn read_lock_info(file: &fs::File) -> DaemonLockInfo {
+    use std::io::{Read as _, Seek as _};
+    let mut handle = file;
+    let mut raw = String::new();
+    if handle.seek(std::io::SeekFrom::Start(0)).is_err() || handle.read_to_string(&mut raw).is_err()
+    {
+        return DaemonLockInfo::default();
+    }
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// What probing the daemon lock found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonLockProbe {
+    /// A daemon holds the lock.
+    Held(DaemonLockInfo),
+    /// The lock file exists but nobody holds it (daemon exited).
+    Free,
+    /// No lock file (never started, or a daemon older than lock support).
+    Absent,
+    /// The lock file cannot be opened (typically a root daemon probed by an
+    /// unprivileged user on a locked-down state directory).
+    Unreadable(String),
+}
+
+/// Probe the daemon lock without holding it.
+#[must_use]
+pub fn probe_daemon_lock(state_file: &Path) -> DaemonLockProbe {
+    let path = daemon_lock_path(state_file);
+    if !path.exists() {
+        return DaemonLockProbe::Absent;
+    }
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) => return DaemonLockProbe::Unreadable(e.to_string()),
+    };
+    #[cfg(unix)]
+    {
+        #[allow(deprecated)]
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => {
+                drop(lock);
+                DaemonLockProbe::Free
+            }
+            // EWOULDBLOCK is an alias of EAGAIN: the lock is held by someone.
+            Err((file, nix::errno::Errno::EAGAIN)) => DaemonLockProbe::Held(read_lock_info(&file)),
+            Err((_, errno)) => DaemonLockProbe::Unreadable(errno.to_string()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        DaemonLockProbe::Free
+    }
+}
+
+/// The CLI's answer to "is the daemon running?", with the evidence behind it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DaemonLiveness {
+    /// Final verdict.
+    pub running: bool,
+    /// Stable machine-readable reason for the verdict.
+    pub reason: &'static str,
+    /// Seconds since `state.json` was last written, if it exists.
+    pub state_age_secs: Option<u64>,
+    /// Whether `state.json` is missing or older than the stale threshold.
+    pub state_stale: bool,
+    /// Identity from the held lock, when the lock decided the verdict.
+    pub lock: Option<DaemonLockInfo>,
+}
+
+/// Decide daemon liveness from the lock, the state file age, and (optionally)
+/// the service manager's view of the unit.
+///
+/// Precedence: a held lock is authoritative. Without a lock, a fresh
+/// `state.json` or an active unit still counts as running (a daemon older
+/// than lock support); a stale or missing state file with no lock does not.
+/// An unreadable lock defers to the unit state, then to state freshness.
+#[must_use]
+pub fn detect_daemon_liveness(state_file: &Path, service_active: Option<bool>) -> DaemonLiveness {
+    let state_age_secs = fs::metadata(state_file)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .map(|age| age.as_secs());
+    let state_stale = state_age_secs.is_none_or(|age| age > DAEMON_STATE_STALE_THRESHOLD_SECS);
+
+    let verdict =
+        |running: bool, reason: &'static str, lock: Option<DaemonLockInfo>| DaemonLiveness {
+            running,
+            reason,
+            state_age_secs,
+            state_stale,
+            lock,
+        };
+
+    match probe_daemon_lock(state_file) {
+        DaemonLockProbe::Held(info) => verdict(true, "lock_held", Some(info)),
+        // A lock file that nobody holds was left by a lock-aware daemon that
+        // has since exited; a fresh state.json (< 90 s) must not resurrect it.
+        DaemonLockProbe::Free => {
+            if service_active == Some(true) {
+                verdict(true, "unit_active_lock_released", None)
+            } else {
+                verdict(false, "lock_released", None)
+            }
+        }
+        DaemonLockProbe::Absent => {
+            if !state_stale {
+                verdict(true, "state_fresh_no_lock", None)
+            } else if service_active == Some(true) {
+                verdict(true, "unit_active_no_lock", None)
+            } else if state_age_secs.is_some() {
+                verdict(false, "no_lock_state_stale", None)
+            } else {
+                verdict(false, "no_lock_no_state", None)
+            }
+        }
+        DaemonLockProbe::Unreadable(_) => match service_active {
+            Some(true) => verdict(true, "lock_unreadable_unit_active", None),
+            Some(false) => verdict(false, "lock_unreadable_unit_inactive", None),
+            None => verdict(!state_stale, "lock_unreadable_state_age_only", None),
+        },
+    }
+}
+
+#[cfg(all(test, unix))]
+mod daemon_lock_tests {
+    use super::*;
+
+    fn state_file_in(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("state.json")
+    }
+
+    #[test]
+    fn lock_is_exclusive_and_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_file_in(&dir);
+        assert_eq!(probe_daemon_lock(&state_file), DaemonLockProbe::Absent);
+
+        let lock = DaemonLock::acquire(&state_file).expect("first acquire");
+        assert!(lock.path().exists());
+        match probe_daemon_lock(&state_file) {
+            DaemonLockProbe::Held(info) => {
+                assert_eq!(info.pid, std::process::id());
+                assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+            }
+            other => panic!("expected Held while locked, got {other:?}"),
+        }
+
+        let second = DaemonLock::acquire(&state_file);
+        let err = second.expect_err("second acquire must fail").to_string();
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())),
+            "error should name the owner, got: {err}"
+        );
+
+        drop(lock);
+        assert_eq!(probe_daemon_lock(&state_file), DaemonLockProbe::Free);
+        let _relock = DaemonLock::acquire(&state_file).expect("re-acquire after release");
+    }
+
+    #[test]
+    fn liveness_follows_lock_then_state_then_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = state_file_in(&dir);
+
+        // Nothing at all.
+        let v = detect_daemon_liveness(&state_file, None);
+        assert!(!v.running);
+        assert_eq!(v.reason, "no_lock_no_state");
+        assert!(v.state_stale);
+
+        // Fresh state, no lock: an older daemon that predates the lock.
+        fs::write(&state_file, "{}").unwrap();
+        let v = detect_daemon_liveness(&state_file, None);
+        assert!(v.running);
+        assert_eq!(v.reason, "state_fresh_no_lock");
+        assert!(!v.state_stale);
+
+        // Stale state, no lock, unit inactive: not running.
+        let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_mtime(&state_file, old).unwrap();
+        let v = detect_daemon_liveness(&state_file, Some(false));
+        assert!(!v.running);
+        assert_eq!(v.reason, "no_lock_state_stale");
+        assert!(v.state_stale);
+
+        // Stale state, no lock, but the unit says active (old binary under systemd).
+        let v = detect_daemon_liveness(&state_file, Some(true));
+        assert!(v.running);
+        assert_eq!(v.reason, "unit_active_no_lock");
+
+        // The lock wins over a stale state file.
+        let lock = DaemonLock::acquire(&state_file).unwrap();
+        let v = detect_daemon_liveness(&state_file, Some(false));
+        assert!(v.running);
+        assert_eq!(v.reason, "lock_held");
+        assert_eq!(v.lock.map(|l| l.pid), Some(std::process::id()));
+
+        // Daemon exited (lock released) moments after writing a fresh state
+        // file: that is the SIGKILL case and must read as not running.
+        drop(lock);
+        fs::write(&state_file, "{}").unwrap();
+        let v = detect_daemon_liveness(&state_file, None);
+        assert!(!v.running, "released lock must beat a fresh state file");
+        assert_eq!(v.reason, "lock_released");
+        assert!(!v.state_stale);
+        // ...unless the service manager says the unit is active (restarting).
+        let v = detect_daemon_liveness(&state_file, Some(true));
+        assert!(v.running);
+        assert_eq!(v.reason, "unit_active_lock_released");
+    }
+}
 
 // ──────────────────── state file schema ────────────────────
 

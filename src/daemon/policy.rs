@@ -1677,7 +1677,11 @@ mod tests {
             &[sample_candidate(DecisionAction::Delete, 2.5)],
             Some(&passing_guard()),
         );
-        assert!(decision.approved_for_deletion.is_empty());
+        assert!(
+            decision.approved_for_deletion.is_empty(),
+            "policy must approve no deletions here, approved {}",
+            decision.approved_for_deletion.len()
+        );
 
         // Freshly entered fallback: below the escalation threshold, no
         // escalation yet even under sustained pressure.
@@ -1740,7 +1744,11 @@ mod tests {
         let guard = passing_guard();
         let decision = engine.evaluate(&candidates, Some(&guard));
 
-        assert!(decision.approved_for_deletion.is_empty());
+        assert!(
+            decision.approved_for_deletion.is_empty(),
+            "policy must approve no deletions here, approved {}",
+            decision.approved_for_deletion.len()
+        );
         assert_eq!(decision.hypothetical_deletes, 2);
         assert_eq!(decision.records.len(), 2);
         assert_eq!(decision.mode, ActiveMode::Observe);
@@ -1843,7 +1851,11 @@ mod tests {
         };
 
         let decision = engine.evaluate(&[candidate], Some(&guard));
-        assert!(decision.approved_for_deletion.is_empty());
+        assert!(
+            decision.approved_for_deletion.is_empty(),
+            "policy must approve no deletions here, approved {}",
+            decision.approved_for_deletion.len()
+        );
         // Verify effective action is recorded as Keep.
         assert_eq!(
             decision.records[0].effective_action,
@@ -1862,7 +1874,11 @@ mod tests {
         let guard = passing_guard();
         let decision = engine.evaluate(&candidates, Some(&guard));
 
-        assert!(decision.approved_for_deletion.is_empty());
+        assert!(
+            decision.approved_for_deletion.is_empty(),
+            "policy must approve no deletions here, approved {}",
+            decision.approved_for_deletion.len()
+        );
         assert_eq!(decision.mode, ActiveMode::FallbackSafe);
         assert_eq!(
             decision.records[0].effective_action,

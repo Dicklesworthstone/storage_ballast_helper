@@ -1802,7 +1802,7 @@ fn repro_pack_captures_complete_trace() {
     assert_eq!(pack.manifest.step_count, steps.len());
     assert_eq!(pack.traces.len(), steps.len());
     assert_eq!(pack.env.rust_edition, "2024");
-    assert!(!pack.env.sbh_version.is_empty());
+    assert_eq!(pack.env.sbh_version, env!("CARGO_PKG_VERSION"));
 }
 
 #[test]

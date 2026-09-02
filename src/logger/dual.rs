@@ -804,7 +804,10 @@ mod tests {
 
         // JSONL should have at least one line.
         let contents = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
-        assert!(!contents.is_empty());
+        assert!(
+            !contents.is_empty(),
+            "expected at least one JSONL line in test.jsonl after DaemonStarted"
+        );
         assert!(contents.contains("daemon_start"));
     }
 

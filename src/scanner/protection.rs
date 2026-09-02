@@ -1319,7 +1319,10 @@ mod tests {
         let marker = tmp.path().join(MARKER_FILENAME);
         assert!(marker.exists());
         let content = fs::read_to_string(&marker).unwrap();
-        assert!(content.is_empty());
+        assert!(
+            !content.is_empty(),
+            "expected an empty marker file, got {content:?}"
+        );
     }
 
     #[test]
@@ -2010,7 +2013,11 @@ protected_at = "2026-05-07T03:50:00Z"
         .unwrap();
 
         assert!(!result.truncated);
-        assert!(result.matches.is_empty());
+        assert!(
+            result.matches.is_empty(),
+            "expected no stowaway matches in a clean tree, got {:?}",
+            result.matches
+        );
     }
 
     #[test]
@@ -2032,7 +2039,10 @@ protected_at = "2026-05-07T03:50:00Z"
             },
         )
         .unwrap();
-        assert!(shallow.is_empty());
+        assert!(
+            shallow.is_empty(),
+            "expected no stowaway matches within max_depth 3, got {shallow:?}"
+        );
 
         let deep = scan_stowaways_with_config(
             &candidate,
@@ -2095,7 +2105,10 @@ protected_at = "2026-05-07T03:50:00Z"
         )
         .unwrap();
 
-        assert!(matches.is_empty());
+        assert!(
+            matches.is_empty(),
+            "expected no stowaway matches through a symlink, got {matches:?}"
+        );
     }
 
     #[test]

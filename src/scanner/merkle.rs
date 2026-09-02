@@ -877,8 +877,16 @@ mod tests {
         assert_eq!(diff.changed_paths.len(), 1);
         assert_eq!(diff.changed_paths[0], PathBuf::from("/data/target/debug"));
         assert_eq!(diff.unchanged_count, 1);
-        assert!(diff.new_paths.is_empty());
-        assert!(diff.removed_paths.is_empty());
+        assert!(
+            diff.new_paths.is_empty(),
+            "expected no new paths, got {:?}",
+            diff.new_paths
+        );
+        assert!(
+            diff.removed_paths.is_empty(),
+            "expected no removed paths, got {:?}",
+            diff.removed_paths
+        );
         assert!(!diff.budget_exhausted);
     }
 
@@ -1045,9 +1053,21 @@ mod tests {
         let mut budget = ScanBudget::new(100, 0);
         let diff = index.diff(&entries, &mut budget);
 
-        assert!(diff.changed_paths.is_empty());
-        assert!(diff.new_paths.is_empty());
-        assert!(diff.removed_paths.is_empty());
+        assert!(
+            diff.changed_paths.is_empty(),
+            "expected no changed paths, got {:?}",
+            diff.changed_paths
+        );
+        assert!(
+            diff.new_paths.is_empty(),
+            "expected no new paths, got {:?}",
+            diff.new_paths
+        );
+        assert!(
+            diff.removed_paths.is_empty(),
+            "expected no removed paths, got {:?}",
+            diff.removed_paths
+        );
         assert_eq!(diff.unchanged_count, 2);
         assert!(!diff.budget_exhausted);
         assert_eq!(diff.health, IndexHealth::Healthy);
@@ -1177,7 +1197,11 @@ mod tests {
 
         let mut budget = ScanBudget::new(100, 0);
         let diff = index.diff(&fresh, &mut budget);
-        assert!(diff.changed_paths.is_empty());
+        assert!(
+            diff.changed_paths.is_empty(),
+            "expected no changed paths after update_entries, got {:?}",
+            diff.changed_paths
+        );
         assert_eq!(diff.unchanged_count, 2);
     }
 

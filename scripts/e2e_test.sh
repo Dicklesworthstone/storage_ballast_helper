@@ -1215,10 +1215,64 @@ TOML
     "" \
     "${bin}" dashboard --new-dashboard --legacy-dashboard
 
-  # 17d: SBH_DASHBOARD_MODE=new routes to new path, which fails without TUI.
-  tally_case run_case_expect_fail dashboard_env_mode_new_no_tui 2 \
-    "TUI feature not enabled" \
-    env SBH_DASHBOARD_MODE=new "${bin}" dashboard
+  # 17d: SBH_DASHBOARD_MODE=new routes to the new path. A lean build (no tui
+  #      feature) must degrade to the live status view with one stderr line,
+  #      not exit 2 — only an explicit --new-dashboard is refused (17a).
+  dashboard_env_mode_new_case() {
+    local name="dashboard_env_mode_new_lean_fallback"
+    local case_log="${CASE_DIR}/${name}.log"
+    local start_ns
+    start_ns=$(date +%s%N 2>/dev/null || date +%s)
+
+    log "CASE START: ${name}"
+    {
+      echo "name=${name}"
+      echo "command=SBH_DASHBOARD_MODE=new ${bin} dashboard"
+      echo "start_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    } > "${case_log}"
+
+    set +e
+    local output
+    output="$(timeout 3 env SBH_DASHBOARD_MODE=new \
+      SBH_TEST_VERBOSE=1 SBH_OUTPUT_FORMAT=human RUST_BACKTRACE=1 \
+      "${bin}" dashboard 2>&1)"
+    local status=$?
+    set -e
+
+    local end_ns
+    end_ns=$(date +%s%N 2>/dev/null || date +%s)
+    local elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+    {
+      echo "status=${status}"
+      echo "elapsed_ms=${elapsed_ms}"
+      echo "----- output -----"
+      echo "${output}"
+    } >> "${case_log}"
+
+    if echo "${output}" | grep -qF "TUI feature not enabled"; then
+      log "CASE FAIL: ${name} (implicit new-dashboard route exited instead of falling back) [${elapsed_ms}ms]"
+      return 1
+    fi
+    # Expect timeout (124/137): the live status view (lean build) or the
+    # cockpit (tui build) started and kept running.
+    if is_timeout_status "${status}"; then
+      if echo "${output}" | grep -qF "built without the tui feature"; then
+        log "CASE PASS: ${name} (lean fallback to live status view) [${elapsed_ms}ms]"
+      else
+        log "CASE PASS: ${name} (dashboard runtime kept running) [${elapsed_ms}ms]"
+      fi
+      return 0
+    fi
+
+    log "CASE FAIL: ${name} (unexpected status=${status}, expected timeout) [${elapsed_ms}ms]"
+    return 1
+  }
+  if command -v timeout >/dev/null 2>&1; then
+    tally_case dashboard_env_mode_new_case
+  else
+    log "SKIP: dashboard_env_mode_new_lean_fallback (GNU timeout not available)"
+  fi
 
   # 17e: SBH_DASHBOARD_KILL_SWITCH=true forces legacy even with --new-dashboard env mode.
   #      Legacy loop will timeout; we verify it starts, not that --new-dashboard error fires.

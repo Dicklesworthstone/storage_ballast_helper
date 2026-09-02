@@ -1659,6 +1659,158 @@ fn daemon_exits_nonzero_when_rss_hard_cap_exceeded() {
     );
 }
 
+fn write_liveness_daemon_config(
+    config_path: &Path,
+    scan_root: &Path,
+    state_dir: &Path,
+    ballast_dir: &Path,
+) {
+    let state_file = state_dir.join("state.json");
+    let sqlite_db = state_dir.join("activity.sqlite3");
+    let jsonl_log = state_dir.join("activity.jsonl");
+    let config = format!(
+        r#"[paths]
+state_file = "{}"
+sqlite_db = "{}"
+jsonl_log = "{}"
+ballast_dir = "{}"
+
+[pressure]
+poll_interval_ms = 100
+
+[pressure.prediction]
+enabled = false
+
+[scanner]
+root_paths = ["{}"]
+min_file_age_minutes = 60
+max_depth = 1
+parallelism = 1
+dry_run = true
+
+[ballast]
+file_count = 1
+file_size_bytes = 4096
+
+[notifications]
+enabled = false
+"#,
+        toml_path(&state_file),
+        toml_path(&sqlite_db),
+        toml_path(&jsonl_log),
+        toml_path(ballast_dir),
+        toml_path(scan_root),
+    );
+    fs::write(config_path, config).expect("write liveness daemon config");
+}
+
+fn status_liveness(config_path: &Path) -> serde_json::Value {
+    let output = Command::new(common::sbh_bin_path())
+        .arg("--config")
+        .arg(config_path)
+        .arg("--json")
+        .arg("status")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run sbh status --json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or_else(|| panic!("status printed no JSON line; stdout:\n{stdout}"));
+    serde_json::from_str(line).expect("parse status JSON")
+}
+
+/// `sbh status` must decide daemon liveness from the daemon's lock, not from
+/// process command lines: before this test existed, any shell whose argv
+/// mentioned "sbh" and "daemon" made `daemon_running` true for days after the
+/// daemon had been stopped.
+#[cfg(unix)]
+#[test]
+fn status_reports_daemon_liveness_from_lock_not_from_lookalike_processes() {
+    let dir = tempfile::tempdir().expect("create liveness test dir");
+    let scan_root = dir.path().join("scan-root");
+    let state_dir = dir.path().join("state");
+    let ballast_dir = dir.path().join("ballast");
+    fs::create_dir(&scan_root).expect("create scan root");
+    fs::create_dir(&state_dir).expect("create state dir");
+    fs::create_dir(&ballast_dir).expect("create ballast dir");
+    let config_path = dir.path().join("config.toml");
+    write_liveness_daemon_config(&config_path, &scan_root, &state_dir, &ballast_dir);
+
+    // A decoy whose command line contains both words the old heuristic
+    // matched. It runs for the whole test.
+    let _decoy = ChildGuard::new(
+        Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60 # sbh daemon lookalike")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn decoy process"),
+    );
+
+    // 1. No daemon has ever run here: not running, no lock, no state.
+    let before = status_liveness(&config_path);
+    assert_eq!(before["daemon_running"], serde_json::Value::Bool(false));
+    assert_eq!(before["daemon_state_reason"], "no_lock_no_state");
+
+    // 2. A real daemon: running, decided by the held lock, pid reported.
+    let stderr_path = dir.path().join("daemon.stderr");
+    let stderr = fs::File::create(&stderr_path).expect("create daemon stderr log");
+    let mut daemon = ChildGuard::new(
+        Command::new(common::sbh_bin_path())
+            .arg("--config")
+            .arg(&config_path)
+            .arg("daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let running = loop {
+        let status = status_liveness(&config_path);
+        if status["daemon_running"] == serde_json::Value::Bool(true) {
+            break status;
+        }
+        assert!(
+            daemon.child.try_wait().expect("poll daemon").is_none(),
+            "daemon exited early; stderr:\n{}",
+            fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "daemon never reported running; last status: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(running["daemon_state_reason"], "lock_held");
+    assert_eq!(
+        running["daemon_pid"].as_u64(),
+        Some(u64::from(daemon.child.id())),
+        "status must report the lock owner's pid"
+    );
+    assert!(
+        state_dir.join("daemon.lock").exists(),
+        "daemon must create the lock next to state.json"
+    );
+
+    // 3. Kill it (SIGKILL: no orderly shutdown, state.json stays fresh).
+    daemon.child.kill().expect("kill daemon");
+    daemon.child.wait().expect("reap daemon");
+    let after = status_liveness(&config_path);
+    assert_eq!(
+        after["daemon_running"],
+        serde_json::Value::Bool(false),
+        "a killed daemon must not read as running while a lookalike process exists; status: {after}"
+    );
+    assert_eq!(after["daemon_state_reason"], "lock_released");
+    assert_eq!(after["state_stale"], serde_json::Value::Bool(false));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_foreground_daemon_idle_energy_budget() {

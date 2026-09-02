@@ -30,7 +30,9 @@ use storage_ballast_helper::daemon::loop_main::{
     DaemonArgs as RuntimeDaemonArgs, MonitoringDaemon,
 };
 use storage_ballast_helper::daemon::process_io_history::ProcessIoHistory;
-use storage_ballast_helper::daemon::self_monitor::DAEMON_STATE_STALE_THRESHOLD_SECS;
+use storage_ballast_helper::daemon::self_monitor::{
+    DAEMON_STATE_STALE_THRESHOLD_SECS, detect_daemon_liveness,
+};
 use storage_ballast_helper::daemon::service::{
     LAUNCHD_LABEL_ENV, LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport,
     ServiceActionResult, SystemdServiceManager, launchd_labels_for_discovery,
@@ -2426,49 +2428,103 @@ fn parse_window_duration(s: &str) -> Result<std::time::Duration, CliError> {
     Ok(std::time::Duration::from_secs(n * multiplier))
 }
 
-#[allow(clippy::too_many_lines)]
-fn run_stats(cli: &Cli, args: &StatsArgs) -> Result<(), CliError> {
-    let config =
-        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+/// Where a system-scope daemon keeps its activity database when this
+/// invocation would read a different file: the platform system data dir, or
+/// root's XDG data dir for older installs. `None` when running as root (the
+/// configured path is already the daemon's) or when no such file exists.
+fn daemon_activity_db_hint(db_path: &Path) -> Option<PathBuf> {
+    if running_as_root() {
+        return None;
+    }
+    let name = db_path.file_name()?;
+    [
+        storage_ballast_helper::core::config::system_data_dir().join(name),
+        Path::new("/root/.local/share/sbh").join(name),
+    ]
+    .into_iter()
+    .find(|candidate| candidate != db_path && candidate.exists())
+}
 
-    if !config.paths.sqlite_db.exists() {
-        // The activity DB lives under the *invoking user's* data dir. When the
-        // daemon runs as root (the usual install), its history is under root's
-        // home and an unprivileged `sbh stats` legitimately finds nothing here.
-        // Say so explicitly — otherwise this reads as "stats is broken".
-        let root_db = Path::new("/root/.local/share/sbh/activity.sqlite3");
-        let daemon_db_elsewhere = !running_as_root() && root_db.exists();
+/// Open the activity database read-only for a CLI query command, or explain
+/// why it cannot be read and return `Ok(None)`.
+///
+/// Read-side commands never create or migrate the database. Two failure modes
+/// are expected in normal operation and are reported as structured payloads
+/// rather than raw SQLite errors: the file does not exist under this user's
+/// data dir (the daemon runs as another user), or it exists but is not
+/// readable by this user. Both name the daemon's database when it can be
+/// found and point at `sudo`.
+fn open_activity_db_for_reading(
+    cli: &Cli,
+    command: &str,
+    config: &Config,
+) -> Result<Option<SqliteLogger>, CliError> {
+    let db_path = &config.paths.sqlite_db;
+    let hint = daemon_activity_db_hint(db_path);
+
+    let permission_denied = db_path.exists()
+        && matches!(
+            std::fs::File::open(db_path),
+            Err(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied
+        );
+
+    if !db_path.exists() || permission_denied {
+        let error = if permission_denied {
+            "permission_denied"
+        } else {
+            "no_database"
+        };
         match output_mode(cli) {
             OutputMode::Human => {
-                println!(
-                    "No activity database found at {}.",
-                    config.paths.sqlite_db.display()
-                );
-                if daemon_db_elsewhere {
-                    println!("  A root-owned database exists at {}.", root_db.display());
-                    println!("  The daemon appears to run as root — try: sudo sbh stats");
+                if permission_denied {
+                    println!(
+                        "Activity database {} is not readable by this user (it belongs to the daemon's user).",
+                        db_path.display()
+                    );
+                } else {
+                    println!("No activity database found at {}.", db_path.display());
+                }
+                if let Some(path) = &hint {
+                    println!("  The daemon's database is at {}.", path.display());
+                }
+                if permission_denied || hint.is_some() {
+                    println!("  The daemon runs as another user — try: sudo sbh {command}");
                 } else {
                     println!("  Run the daemon to start collecting statistics.");
                 }
             }
             OutputMode::Json => {
                 let mut payload = json!({
-                    "command": "stats",
-                    "error": "no_database",
-                    "db_path": config.paths.sqlite_db.to_string_lossy(),
+                    "command": command,
+                    "error": error,
+                    "db_path": db_path.to_string_lossy(),
                 });
-                if daemon_db_elsewhere {
-                    payload["hint"] = json!("daemon database is root-owned; retry with sudo");
-                    payload["root_db_path"] = json!(root_db.to_string_lossy());
+                if permission_denied || hint.is_some() {
+                    payload["hint"] =
+                        json!("daemon database belongs to another user; retry with sudo");
+                }
+                if let Some(path) = &hint {
+                    payload["root_db_path"] = json!(path.to_string_lossy());
                 }
                 write_json_line(&payload)?;
             }
         }
-        return Ok(());
+        return Ok(None);
     }
 
-    let db = SqliteLogger::open(&config.paths.sqlite_db)
-        .map_err(|e| CliError::Runtime(format!("open stats database: {e}")))?;
+    SqliteLogger::open_read_only(db_path)
+        .map(Some)
+        .map_err(|e| CliError::Runtime(format!("open {command} database: {e}")))
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_stats(cli: &Cli, args: &StatsArgs) -> Result<(), CliError> {
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+
+    let Some(db) = open_activity_db_for_reading(cli, "stats", &config)? else {
+        return Ok(());
+    };
     let engine = StatsEngine::new(&db);
 
     // Determine which window(s) to query.
@@ -3724,12 +3780,18 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
 
     let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
 
-    // Open stats database.
+    // Open stats database (read-only; history only refines recommendations).
     let db = if config.paths.sqlite_db.exists() {
-        Some(
-            SqliteLogger::open(&config.paths.sqlite_db)
-                .map_err(|e| CliError::Runtime(format!("open stats database: {e}")))?,
-        )
+        match SqliteLogger::open_read_only(&config.paths.sqlite_db) {
+            Ok(db) => Some(db),
+            Err(e) => {
+                eprintln!(
+                    "[SBH-TUNE] activity database {} is not readable ({e}); recommendations use live samples only",
+                    config.paths.sqlite_db.display()
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -4797,12 +4859,15 @@ fn run_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Result
         DashboardRuntimeSelection::Legacy => {
             run_live_status_loop(cli, request.refresh_ms, "dashboard", false)
         }
-        DashboardRuntimeSelection::New => run_new_dashboard_runtime(request),
+        DashboardRuntimeSelection::New => run_new_dashboard_runtime(cli, request),
     }
 }
 
 #[cfg(feature = "tui")]
-fn run_new_dashboard_runtime(request: &DashboardRuntimeRequest) -> Result<(), CliError> {
+fn run_new_dashboard_runtime(
+    _cli: &Cli,
+    request: &DashboardRuntimeRequest,
+) -> Result<(), CliError> {
     use storage_ballast_helper::tui::{
         self, DashboardRuntimeConfig as NewDashboardRuntimeConfig, DashboardRuntimeMode,
     };
@@ -4819,11 +4884,31 @@ fn run_new_dashboard_runtime(request: &DashboardRuntimeRequest) -> Result<(), Cl
         .map_err(|e| CliError::Runtime(format!("dashboard runtime failure: {e}")))
 }
 
+/// Without the `tui` feature the cockpit cannot run. An explicit
+/// `--new-dashboard` is an error the operator asked for; every other route to
+/// the new runtime (default, config, env) degrades to the live status view so
+/// `sbh dashboard` on a lean build still shows something useful.
 #[cfg(not(feature = "tui"))]
-fn run_new_dashboard_runtime(_request: &DashboardRuntimeRequest) -> Result<(), CliError> {
-    Err(CliError::Runtime(
-        "TUI feature not enabled. Rebuild with --features tui".to_string(),
-    ))
+fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Result<(), CliError> {
+    if let Some(error) = lean_build_dashboard_refusal(&request._reason) {
+        return Err(error);
+    }
+    eprintln!(
+        "[SBH-DASHBOARD] this binary was built without the tui feature; showing the live status view (rebuild with --features tui for the cockpit)"
+    );
+    run_live_status_loop(cli, request.refresh_ms, "dashboard", false)
+}
+
+/// The one case a lean build refuses outright: the operator explicitly
+/// asked for the cockpit with `--new-dashboard`.
+#[cfg(not(feature = "tui"))]
+fn lean_build_dashboard_refusal(reason: &DashboardSelectionReason) -> Option<CliError> {
+    matches!(reason, DashboardSelectionReason::CliFlagNew).then(|| {
+        CliError::Runtime(
+            "TUI feature not enabled. Rebuild with --features tui, or omit --new-dashboard to use the live status view"
+                .to_string(),
+        )
+    })
 }
 
 fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
@@ -6567,34 +6652,23 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
 
-    // I26: Check file modification time to detect stale state from a crashed daemon.
-    let daemon_running = {
-        let state_file_fresh = daemon_state.is_some() && {
-            let stale_threshold = std::time::Duration::from_secs(DAEMON_STATE_STALE_THRESHOLD_SECS);
-            std::fs::metadata(&config.paths.state_file)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .is_some_and(|modified| {
-                    SystemTime::now()
-                        .duration_since(modified)
-                        .unwrap_or_default()
-                        <= stale_threshold
-                })
-        };
+    // Liveness: the daemon's exclusive lock next to state.json is
+    // authoritative; state-file age and the service manager's view of the
+    // unit are the fallbacks for daemons that predate the lock. (The former
+    // `/proc/*/cmdline` substring scan reported any shell mentioning
+    // "sbh daemon" as a running daemon.)
+    let service_active = platform
+        .service_manager()
+        .status()
+        .ok()
+        .filter(|state| state != "unknown")
+        .map(|state| state == "active");
+    let liveness = detect_daemon_liveness(&config.paths.state_file, service_active);
+    let daemon_running = liveness.running;
 
-        // Cross-user fallback: when the daemon runs as root (systemd) but CLI
-        // runs as ubuntu, the state file paths don't match. Try alternative
-        // detection methods.
-        if state_file_fresh {
-            true
-        } else {
-            detect_daemon_running_fallback()
-        }
-    };
-
-    // Open SQLite database for recent activity (optional).
+    // Open SQLite database for recent activity (optional, read-only).
     let db_stats = if config.paths.sqlite_db.exists() {
-        SqliteLogger::open(&config.paths.sqlite_db)
+        SqliteLogger::open_read_only(&config.paths.sqlite_db)
             .ok()
             .and_then(|db| {
                 let engine = StatsEngine::new(&db);
@@ -6612,9 +6686,22 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             println!("Storage Ballast Helper v{version}");
             println!("  Config: {}", config.paths.config_file.display());
             if daemon_running {
-                println!("  Daemon: running");
+                match &liveness.lock {
+                    Some(lock) => println!(
+                        "  Daemon: running (pid {}, since {}, {})",
+                        lock.pid, lock.started_at, liveness.reason
+                    ),
+                    None => println!("  Daemon: running ({})", liveness.reason),
+                }
             } else {
-                println!("  Daemon: not running (degraded mode)");
+                let age = liveness.state_age_secs.map_or_else(
+                    || "no state file".to_string(),
+                    |s| format!("state {s}s old"),
+                );
+                println!(
+                    "  Daemon: NOT running ({}, {age}) — degraded mode",
+                    liveness.reason
+                );
             }
 
             // Pressure status table.
@@ -6859,6 +6946,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 "command": "status",
                 "version": version,
                 "daemon_running": daemon_running,
+                "daemon_state_reason": liveness.reason,
+                "daemon_pid": liveness.lock.as_ref().map(|l| l.pid),
+                "state_age_secs": liveness.state_age_secs,
+                "state_stale": liveness.state_stale,
             "config_path": config.paths.config_file.to_string_lossy(),
             "pressure": {
                 "mounts": mounts_json,
@@ -7024,46 +7115,6 @@ fn format_log_line(line: &str) -> String {
             }
         },
     )
-}
-
-/// Cross-user daemon detection fallback: check systemd service and /proc.
-/// Used when the state file isn't found (e.g. daemon runs as root, CLI as ubuntu).
-fn detect_daemon_running_fallback() -> bool {
-    // Method 1: Check systemd service status.
-    if let Ok(output) = std::process::Command::new("systemctl")
-        .args(["is-active", "sbh.service"])
-        .stderr(std::process::Stdio::null())
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.trim() == "active" {
-            return true;
-        }
-    }
-
-    // Method 2: Check for running `sbh daemon` process via /proc.
-    if let Ok(entries) = std::fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name_str) = name.to_str() else {
-                continue;
-            };
-            // Only check numeric dirs (PIDs).
-            if !name_str.bytes().all(|b| b.is_ascii_digit()) {
-                continue;
-            }
-            let cmdline_path = entry.path().join("cmdline");
-            if let Ok(cmdline) = std::fs::read(&cmdline_path) {
-                // cmdline is NUL-separated; join for substring matching.
-                let cmdline_str = String::from_utf8_lossy(&cmdline);
-                if cmdline_str.contains("sbh") && cmdline_str.contains("daemon") {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
 }
 
 /// Map free percentage to pressure level string.
@@ -12950,6 +13001,30 @@ mod tests {
         assert!(err_text.contains("does not support --json"));
     }
 
+    /// A lean build (no `tui` feature) must only refuse when the operator
+    /// explicitly asked for the cockpit; every implicit route degrades to the
+    /// live status view instead of exiting 2.
+    #[cfg(not(feature = "tui"))]
+    #[test]
+    fn lean_build_refuses_only_explicit_new_dashboard_flag() {
+        let refusal = lean_build_dashboard_refusal(&DashboardSelectionReason::CliFlagNew)
+            .expect("explicit --new-dashboard must be refused without tui");
+        assert!(
+            refusal.to_string().contains("TUI feature not enabled"),
+            "refusal must name the feature gate, got {refusal}"
+        );
+        for reason in [
+            DashboardSelectionReason::HardcodedDefault,
+            DashboardSelectionReason::EnvVarMode,
+            DashboardSelectionReason::ConfigFileMode,
+        ] {
+            assert!(
+                lean_build_dashboard_refusal(&reason).is_none(),
+                "{reason:?} must fall back to the live status view"
+            );
+        }
+    }
+
     #[test]
     fn dashboard_runtime_flags_conflict() {
         assert!(
@@ -13157,7 +13232,11 @@ mod tests {
 
         assert!(!protected.join(protection::MARKER_FILENAME).exists());
         let sacred = load_sacred_config(&sacred_path).unwrap();
-        assert!(sacred.protected_paths.is_empty());
+        assert!(
+            sacred.protected_paths.is_empty(),
+            "unprotect must leave no protected paths, got {:?}",
+            sacred.protected_paths
+        );
     }
 
     #[test]

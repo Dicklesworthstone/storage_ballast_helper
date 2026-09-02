@@ -21,6 +21,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
+  # Must match rust-toolchain.toml. A bare `nightly` re-resolves on every run and
+  # turned the lint gate red twice in August 2026; bump both places together.
+  TOOLCHAIN: nightly-2026-08-31
   # TUI feature depends on local-path frankentui crates unavailable in CI.
   # Build with all features except tui.
   CI_FEATURES: --no-default-features --features cli,daemon,sqlite
@@ -41,8 +44,9 @@ jobs:
           # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.TOOLCHAIN }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
@@ -152,7 +156,9 @@ jobs:
           # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Run unit tests
         run: cargo test $CI_FEATURES --lib -- --nocapture 2>&1 | tee unit-test-output.txt
@@ -179,7 +185,9 @@ jobs:
           # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Run integration tests
         run: cargo test $CI_FEATURES --test integration_tests -- --nocapture 2>&1 | tee integration-output.txt
@@ -203,7 +211,9 @@ jobs:
           # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: linux-arm64
@@ -270,7 +280,9 @@ jobs:
           # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Run proof harness
         run: cargo test $CI_FEATURES --test proof_harness -- --nocapture 2>&1 | tee proof-harness-output.txt
@@ -297,7 +309,9 @@ jobs:
           # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       # TUI tests skipped — tui feature requires local-path frankentui crates
       # unavailable in CI. TUI is tested locally only.
@@ -325,7 +339,9 @@ jobs:
           # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build $CI_FEATURES --release
@@ -371,7 +387,9 @@ jobs:
           # macOS/BSD and GNU userlands.
           perl -0pi -e 's/^ftui.*=.*\{.*path.*=.*"\/dp\/.*\n//mg; s/^tui = \["dep:ftui.*\]/tui = []/m' Cargo.toml
           grep -q '^tui = \[\]' Cargo.toml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-platform-${{ matrix.os }}
@@ -837,7 +855,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: base
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Strip local-only TUI path deps
         shell: bash
@@ -946,7 +966,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: base
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - name: Strip local-only TUI path deps
         shell: bash
         run: |
@@ -1094,7 +1116,9 @@ jobs:
           # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Run stress tests
         run: cargo test $CI_FEATURES --test stress_tests -- --nocapture 2>&1 | tee stress-output.txt
@@ -1117,7 +1141,9 @@ jobs:
           # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Run artifact contract tests
         run: |
@@ -1151,7 +1177,9 @@ jobs:
           # ftui crates use /dp/frankentui/ paths unavailable in CI
           sed -i '/^ftui.*=.*{.*path.*=.*"\/dp\//d' Cargo.toml
           sed -i 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - name: Collect provenance
         run: |
           mkdir -p provenance

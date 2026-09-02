@@ -642,7 +642,10 @@ mod tests {
     #[test]
     fn sparkline_empty() {
         let spark = render_sparkline(&[]);
-        assert!(spark.is_empty());
+        assert!(
+            spark.is_empty(),
+            "expected an empty sparkline for no values, got {spark:?}"
+        );
     }
 
     #[test]

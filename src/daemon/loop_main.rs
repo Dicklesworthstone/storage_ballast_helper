@@ -35,8 +35,10 @@ use crate::daemon::policy::{
     CleanupAction, NotificationPriority, PolicyEngine, ScanAggressiveness,
 };
 use crate::daemon::process_io_history::ProcessIoHistory;
-use crate::daemon::self_monitor::{SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadStatus};
-use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat};
+use crate::daemon::self_monitor::{
+    DaemonLock, SelfMonitor, SelfMonitorTick, ThreadHeartbeat, ThreadStatus,
+};
+use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat, resolve_watchdog_sec};
 use crate::logger::dual::{
     ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, ScanCompletionTelemetry, spawn_logger,
 };
@@ -985,6 +987,10 @@ pub struct MonitoringDaemon {
     logger_join: Option<thread::JoinHandle<()>>,
     signal_handler: SignalHandler,
     watchdog: WatchdogHeartbeat,
+    /// Exclusive liveness lock next to `state.json`; held until the daemon exits.
+    _daemon_lock: DaemonLock,
+    /// Optional `--pidfile`, removed again on orderly shutdown.
+    pidfile: Option<PathBuf>,
     fs_collector: FsStatsCollector,
     mount_monitors: HashMap<PathBuf, MountMonitor>,
     special_locations: SpecialLocationRegistry,
@@ -1671,6 +1677,19 @@ impl MonitoringDaemon {
         let platform = detect_platform()?;
         let start_time = Instant::now();
 
+        // 0. Liveness lock. Taken before anything else so a second daemon on
+        // the same state directory fails fast instead of racing the first
+        // one for ballast pools, the scanner index, and state.json.
+        let daemon_lock = DaemonLock::acquire(&config.paths.state_file)?;
+        if let Some(pidfile) = &args.pidfile
+            && let Err(error) = std::fs::write(pidfile, format!("{}\n", std::process::id()))
+        {
+            eprintln!(
+                "[SBH-DAEMON] could not write pidfile {}: {error}",
+                pidfile.display()
+            );
+        }
+
         // 1. Initialize logger.
         let logger_config = DualLoggerConfig {
             sqlite_path: Some(config.paths.sqlite_db.clone()),
@@ -1688,8 +1707,15 @@ impl MonitoringDaemon {
         // 2. Signal handler.
         let signal_handler = SignalHandler::new();
 
-        // 3. Watchdog.
-        let watchdog = WatchdogHeartbeat::new(args.watchdog_sec, platform.service_manager());
+        // 3. Watchdog. The generated unit sets WatchdogSec= but does not pass
+        // --watchdog-sec, so the timeout is read from systemd's WATCHDOG_USEC.
+        let watchdog_sec = resolve_watchdog_sec(
+            args.watchdog_sec,
+            std::env::var("WATCHDOG_USEC").ok().as_deref(),
+            std::env::var("WATCHDOG_PID").ok().as_deref(),
+            std::process::id(),
+        );
+        let watchdog = WatchdogHeartbeat::new(watchdog_sec, platform.service_manager());
 
         // 4. Filesystem collector.
         let fs_collector = FsStatsCollector::new(
@@ -1787,6 +1813,8 @@ impl MonitoringDaemon {
             logger_join: Some(logger_join),
             signal_handler,
             watchdog,
+            _daemon_lock: daemon_lock,
+            pidfile: args.pidfile.clone(),
             fs_collector,
             mount_monitors: HashMap::new(),
             special_locations,
@@ -2201,6 +2229,13 @@ impl MonitoringDaemon {
             report_tx.clone(),
             index_feedback_tx.clone(),
         )?);
+
+        // Startup is complete: workers are running and the first state file is
+        // written. Type=notify units wait for this READY=1 and are killed at
+        // TimeoutStartSec without it.
+        if let Err(error) = self.platform.service_manager().notify_ready() {
+            eprintln!("[SBH-DAEMON] sd_notify READY=1 failed: {error}");
+        }
 
         let mut last_health_check = Instant::now();
         let mut shutdown_result = Ok(());
@@ -3603,6 +3638,12 @@ impl MonitoringDaemon {
     ) {
         let uptime_secs = self.start_time.elapsed().as_secs();
 
+        // 0. Tell the service manager an orderly stop has begun so it does not
+        // count the exit against Restart=on-failure while workers drain.
+        if let Err(error) = self.platform.service_manager().notify_stopping() {
+            eprintln!("[SBH-DAEMON] sd_notify STOPPING=1 failed: {error}");
+        }
+
         // 1. Broadcast cancellation, then drop channel senders to signal worker threads to exit.
         self.signal_handler.request_shutdown();
         drop(scan_tx);
@@ -3633,6 +3674,11 @@ impl MonitoringDaemon {
         self.logger_handle.shutdown();
         if let Some(logger_join) = self.logger_join.take() {
             let _ = logger_join.join();
+        }
+
+        if let Some(pidfile) = self.pidfile.take() {
+            // Best effort; the lock, not the pidfile, is the liveness signal.
+            let _ = std::fs::remove_file(pidfile);
         }
 
         eprintln!("[SBH-DAEMON] shutdown complete (uptime={uptime_secs}s)");
@@ -6604,7 +6650,11 @@ mod tests {
             &del_tx,
             &mut 0usize
         ));
-        assert!(scored.is_empty());
+        assert!(
+            scored.is_empty(),
+            "expected no scored candidates, got {}",
+            scored.len()
+        );
         assert!(del_rx.try_recv().is_err());
     }
 
@@ -7403,7 +7453,9 @@ mod tests {
         ));
 
         // A 20s pass at 25% owes 60s of idle; 10s in we must still defer.
-        let finished = now - Duration::from_secs(10);
+        let finished = now
+            .checked_sub(Duration::from_secs(10))
+            .expect("test clock is more than 10s past process start");
         assert!(duty_cycle_defer_active(
             Some(finished),
             Duration::from_secs(20),
@@ -7412,7 +7464,9 @@ mod tests {
             25,
         ));
         // Once the debt is paid, the pass runs.
-        let finished = now - Duration::from_secs(61);
+        let finished = now
+            .checked_sub(Duration::from_secs(61))
+            .expect("test clock is more than 61s past process start");
         assert!(!duty_cycle_defer_active(
             Some(finished),
             Duration::from_secs(20),
@@ -7451,7 +7505,7 @@ mod tests {
     /// worse bug, so the debt is capped.
     #[test]
     fn duty_cycle_debt_is_capped_so_reclaim_cannot_stall() {
-        let budget_exhausting = Duration::from_secs(900);
+        let budget_exhausting = Duration::from_mins(15);
         let unclamped = budget_exhausting * 3; // 45 min at pct=25
         assert!(unclamped > DUTY_CYCLE_MAX_DEBT, "premise of this test");
         assert_eq!(
@@ -7460,7 +7514,7 @@ mod tests {
         );
         // Even a pathological pass length cannot exceed the ceiling.
         assert_eq!(
-            duty_cycle_idle_debt(Duration::from_secs(86_400), 1),
+            duty_cycle_idle_debt(Duration::from_hours(24), 1),
             DUTY_CYCLE_MAX_DEBT
         );
         // The floor and ceiling are ordered, so `clamp` cannot panic.
@@ -8032,7 +8086,11 @@ mod tests {
         let (approved, dampened) =
             tracker.filter_candidates(candidates, PressureLevel::Orange, 0.0);
         assert_eq!(approved.len(), 1);
-        assert!(dampened.is_empty());
+        assert!(
+            dampened.is_empty(),
+            "expected no dampened candidates, got {}",
+            dampened.len()
+        );
     }
 
     #[test]
@@ -8045,7 +8103,11 @@ mod tests {
         let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
         let (approved, dampened) =
             tracker.filter_candidates(candidates, PressureLevel::Orange, 0.0);
-        assert!(approved.is_empty());
+        assert!(
+            approved.is_empty(),
+            "expected the dampener to hold back every candidate, approved {}",
+            approved.len()
+        );
         assert_eq!(dampened.len(), 1);
     }
 
@@ -8063,7 +8125,11 @@ mod tests {
         let (approved, dampened) =
             tracker.filter_candidates(candidates, PressureLevel::Orange, 0.0);
         assert_eq!(approved.len(), 1);
-        assert!(dampened.is_empty());
+        assert!(
+            dampened.is_empty(),
+            "expected no dampened candidates, got {}",
+            dampened.len()
+        );
     }
 
     #[test]
@@ -8118,7 +8184,11 @@ mod tests {
         let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
         let (approved, dampened) = tracker.filter_candidates(candidates, PressureLevel::Red, 0.0);
         assert_eq!(approved.len(), 1);
-        assert!(dampened.is_empty());
+        assert!(
+            dampened.is_empty(),
+            "expected no dampened candidates, got {}",
+            dampened.len()
+        );
     }
 
     #[test]
@@ -8132,7 +8202,11 @@ mod tests {
         let (approved, dampened) =
             tracker.filter_candidates(candidates, PressureLevel::Critical, 0.0);
         assert_eq!(approved.len(), 1);
-        assert!(dampened.is_empty());
+        assert!(
+            dampened.is_empty(),
+            "expected no dampened candidates, got {}",
+            dampened.len()
+        );
     }
 
     #[test]
@@ -8150,7 +8224,11 @@ mod tests {
         let (approved, dampened) =
             tracker.filter_candidates(candidates, PressureLevel::Yellow, 0.95);
         assert_eq!(approved.len(), 1, "high urgency should bypass dampener");
-        assert!(dampened.is_empty());
+        assert!(
+            dampened.is_empty(),
+            "expected no dampened candidates, got {}",
+            dampened.len()
+        );
     }
 
     #[test]
@@ -8164,7 +8242,11 @@ mod tests {
         let candidates = vec![test_candidate("/tmp/target/debug", 0.9)];
         let (approved, dampened) =
             tracker.filter_candidates(candidates, PressureLevel::Yellow, 0.5);
-        assert!(approved.is_empty());
+        assert!(
+            approved.is_empty(),
+            "expected the dampener to hold back every candidate, approved {}",
+            approved.len()
+        );
         assert_eq!(dampened.len(), 1);
     }
 

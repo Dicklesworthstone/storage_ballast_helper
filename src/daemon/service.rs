@@ -446,6 +446,8 @@ mod legacy_inline {
                 writeln!(unit, "Type=simple").ok();
             } else {
                 writeln!(unit, "Type=notify").ok();
+                writeln!(unit, "NotifyAccess=main").ok();
+                writeln!(unit, "TimeoutStartSec=30").ok();
                 writeln!(unit, "WatchdogSec=60").ok();
             }
 
@@ -1137,6 +1139,10 @@ mod tests {
 
         assert!(unit.contains("Type=notify"));
         assert!(unit.contains("WatchdogSec=60"));
+        // Type=notify without a start timeout would hang forever if READY=1
+        // were ever lost; NotifyAccess=main restricts who may send it.
+        assert!(unit.contains("TimeoutStartSec=30"));
+        assert!(unit.contains("NotifyAccess=main"));
     }
 
     #[test]

@@ -628,7 +628,10 @@ mod tests {
         let answers = auto_answers();
         assert!(answers.auto_mode);
         assert!(answers.user_scope);
-        assert!(!answers.watched_paths.is_empty());
+        assert!(
+            !answers.watched_paths.is_empty(),
+            "expected auto-detected answers to include at least one watched path"
+        );
         assert_eq!(answers.ballast_preset, BallastPreset::Medium);
         assert_eq!(answers.ballast_file_count, 10);
         assert_eq!(answers.ballast_file_size_bytes, 1_073_741_824);
@@ -713,7 +716,10 @@ mod tests {
 
         assert_eq!(answers.service, ServiceChoice::Launchd);
         assert!(answers.user_scope);
-        assert!(!answers.watched_paths.is_empty());
+        assert!(
+            !answers.watched_paths.is_empty(),
+            "expected default wizard answers to include at least one watched path"
+        );
         assert_eq!(answers.ballast_preset, BallastPreset::Medium);
         assert!(!answers.auto_mode);
     }

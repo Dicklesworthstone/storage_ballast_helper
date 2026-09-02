@@ -985,7 +985,13 @@ fn effective_uid_is_root() -> bool {
     }
 }
 
-fn system_data_dir() -> PathBuf {
+/// Platform data directory of a system-scope service.
+///
+/// `/var/lib/sbh` on Linux, `/private/var/sbh` on macOS. Read-side CLI
+/// commands use it to point an unprivileged operator at the daemon's real
+/// activity database.
+#[must_use]
+pub fn system_data_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         PathBuf::from("/private/var/sbh")
@@ -2676,7 +2682,11 @@ mod tests {
 
         let real_path = real.to_string_lossy();
         assert!(sacred.remove_protected_path(real_path.as_ref()));
-        assert!(sacred.protected_paths.is_empty());
+        assert!(
+            sacred.protected_paths.is_empty(),
+            "removing the only protected path must leave none, got {:?}",
+            sacred.protected_paths
+        );
     }
 
     #[test]

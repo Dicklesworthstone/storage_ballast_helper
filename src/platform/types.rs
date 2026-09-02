@@ -528,8 +528,14 @@ mod tests {
         ];
 
         for example in examples {
-            assert!(!example.pattern.is_empty());
-            assert!(!example.reason.is_empty());
+            assert!(
+                !example.pattern.is_empty(),
+                "sacred path example must have a non-empty pattern: {example:?}"
+            );
+            assert!(
+                !example.reason.is_empty(),
+                "sacred path example must have a non-empty reason: {example:?}"
+            );
         }
     }
 }

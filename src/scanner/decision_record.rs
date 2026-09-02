@@ -1105,7 +1105,10 @@ mod tests {
             ExplainLevel::L3,
         ] {
             let text = format_explain(&record, level);
-            assert!(!text.is_empty());
+            assert!(
+                !text.is_empty(),
+                "format_explain must render text at level {level:?}"
+            );
         }
     }
 }

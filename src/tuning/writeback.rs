@@ -353,7 +353,11 @@ mod tests {
         let plan = plan_from_bandwidth(512 * MIB, BandwidthSource::HeuristicSsd, &cfg());
         let assessment = assess(&state, &plan, &cfg(), "ext4");
         assert!(!assessment.needs_tuning);
-        assert!(assessment.reasons.is_empty());
+        assert!(
+            assessment.reasons.is_empty(),
+            "expected no tuning reasons for a small-RAM ratio host, got {:?}",
+            assessment.reasons
+        );
     }
 
     #[test]

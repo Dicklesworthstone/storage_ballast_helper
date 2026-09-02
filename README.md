@@ -649,7 +649,7 @@ sbh update --prune 3
 
 ```toml
 [scanner]
-engine = "v1"  # set to "v2" only for the event/index-assisted scanner rollout
+engine = "v2"  # default since v0.4.32; set "v1" to opt back into the legacy full-descent walker
 event_source = "auto"
 event_watch_budget = 8192
 root_paths = ["/data/projects", "/tmp", "/dev/shm"]
@@ -815,7 +815,7 @@ What follows covers the algorithms, control theory, safety mechanisms, and desig
 The daemon runs four threads connected by bounded channels:
 
 1. **Monitor thread** polls filesystem stats at a configurable interval, feeds them to the EWMA forecaster and PID controller, and emits a `ScanRequest` when pressure warrants action.
-2. **Scanner thread** receives scan requests, selects `scanner.engine = "v1"` or `"v2"`, scores discovered artifacts, and produces a ranked `DeletionBatch`. v1 is the production directory-walker path. v2 adds opaque-tree pruning, a persistent candidate index, filesystem event invalidation where available, and pressure-gated reconciliation.
+2. **Scanner thread** receives scan requests, selects `scanner.engine = "v2"` (the default since v0.4.32) or `"v1"`, scores discovered artifacts, and produces a ranked `DeletionBatch`. v2 adds opaque-tree pruning, a persistent candidate index, filesystem event invalidation where available, and pressure-gated reconciliation; v1 is the legacy full-descent directory walker kept as an opt-out.
 3. **Executor thread** receives deletion batches and executes them through the circuit breaker and pre-flight safety checks.
 4. **Logger thread** receives activity events and writes them to both SQLite and JSONL backends.
 
@@ -1362,7 +1362,7 @@ v2 uses the candidate index to avoid cold full walks under pressure. At Green or
 
 For validation and A/B artifacts, `sbh scan --json` reports `scanner_engine`, `scanner_dispatch`, `opaque_pruning`, `opaque_pruned_dirs`, `scanned_entries`, and nullable `process_cpu_micros` alongside the existing candidate totals. Daemon `scan_complete` activity events also include the selected dispatch, pruning state, dirty event-root count, index generation, indexed-record count, candidate bytes seen, and timeout state in their `details` payload. These fields are intended to make v1/v2 scan captures auditable without scraping human output.
 
-The in-repo scanner-v2 validation tests emit focused JSON artifacts for synthetic v1/v2 walk effort and safety parity, event-overflow reconciliation fallback, and memory-pressure transition latency. Those artifacts support rollout review, but the default remains v1 until live A/B runs prove the CPU and deletion-safety targets outside the synthetic harness.
+The in-repo scanner-v2 validation tests emit focused JSON artifacts for synthetic v1/v2 walk effort and safety parity, event-overflow reconciliation fallback, and memory-pressure transition latency. v2 has been the default engine since v0.4.32 (it is what the production fleet runs and it is required for structural detection of caches under arbitrary names, such as Go's `GOCACHE`); the fleet-level A/B evidence the design document asks for is still being collected, and `engine = "v1"` remains available as the rollback.
 
 For a live A/B capture, run the same scan root twice with only the engine override changed:
 

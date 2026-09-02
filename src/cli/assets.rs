@@ -1356,7 +1356,10 @@ mod tests {
         match cache.is_cached(&entry) {
             CacheStatus::Corrupt { expected, actual } => {
                 assert_eq!(expected, entry.sha256);
-                assert!(!actual.is_empty());
+                assert!(
+                    !actual.is_empty(),
+                    "expected a non-empty actual sha256 digest for the corrupt asset"
+                );
             }
             other => panic!("expected Corrupt, got {other:?}"),
         }
@@ -1962,8 +1965,16 @@ mod tests {
 
         let report = offline_readiness_with_bundle(&manifest, &cache, Some(bundle_tmp.path()));
         assert!(report.ready);
-        assert!(report.missing_required.is_empty());
-        assert!(report.corrupt.is_empty());
+        assert!(
+            report.missing_required.is_empty(),
+            "expected no missing required assets, got {:?}",
+            report.missing_required
+        );
+        assert!(
+            report.corrupt.is_empty(),
+            "expected no corrupt assets, got {:?}",
+            report.corrupt
+        );
     }
 
     #[test]
@@ -1993,8 +2004,16 @@ mod tests {
 
         let report = offline_readiness_with_bundle(&manifest, &cache, Some(bundle_tmp.path()));
         assert!(report.ready);
-        assert!(report.missing_required.is_empty());
-        assert!(report.corrupt.is_empty());
+        assert!(
+            report.missing_required.is_empty(),
+            "expected no missing required assets, got {:?}",
+            report.missing_required
+        );
+        assert!(
+            report.corrupt.is_empty(),
+            "expected no corrupt assets, got {:?}",
+            report.corrupt
+        );
     }
 
     #[test]
@@ -2068,7 +2087,11 @@ mod tests {
         let report = offline_readiness_with_bundle(&manifest, &cache, Some(&bundle_root));
         assert!(!report.ready);
         assert!(report.missing_required.contains(&entry.name));
-        assert!(report.corrupt.is_empty());
+        assert!(
+            report.corrupt.is_empty(),
+            "expected no corrupt assets, got {:?}",
+            report.corrupt
+        );
     }
 
     #[test]
@@ -2107,7 +2130,11 @@ mod tests {
 
         let bundle_report = offline_bundle_readiness(&manifest, bundle_tmp.path());
         assert!(bundle_report.ready);
-        assert!(bundle_report.missing_required.is_empty());
+        assert!(
+            bundle_report.missing_required.is_empty(),
+            "expected no missing required assets in the bundle, got {:?}",
+            bundle_report.missing_required
+        );
     }
 
     #[test]

@@ -1191,7 +1191,10 @@ mod tests {
                 .reason_codes
                 .contains(&String::from("sigstore_degraded"))
         );
-        assert!(!outcome.warnings.is_empty());
+        assert!(
+            !outcome.warnings.is_empty(),
+            "a degraded sigstore outcome must surface at least one warning"
+        );
     }
 
     #[test]
@@ -1604,7 +1607,8 @@ mod tests {
             "shasum -a 256 -c \"${checksum_file}\"",
             "SHA256SUMS.txt",
             "Collect provenance",
-            "dtolnay/rust-toolchain@nightly",
+            "dtolnay/rust-toolchain@master",
+            "toolchain: ${{ env.TOOLCHAIN }}",
             "rustc --version",
             "release-provenance.json",
         ] {
@@ -1616,7 +1620,7 @@ mod tests {
 
         let publish_release = workflow_block(release_workflow, "  release:\n", "\n  homebrew-tap:");
         let toolchain_setup = publish_release
-            .find("dtolnay/rust-toolchain@nightly")
+            .find("dtolnay/rust-toolchain@master")
             .expect("publish release job must install the Rust toolchain");
         let provenance = publish_release
             .find("Collect provenance")
@@ -1942,9 +1946,21 @@ mod tests {
     fn repository_toolchain_pins_nightly_for_release_contracts() {
         let toolchain = include_str!("../../rust-toolchain.toml");
 
+        let channel = toolchain
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("channel = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("rust-toolchain.toml must declare a channel");
         assert!(
-            toolchain.contains("channel = \"nightly\""),
-            "release and CI provenance contracts require the repository toolchain to pin nightly"
+            channel.starts_with("nightly"),
+            "release and CI provenance contracts require the repository toolchain to pin nightly, got {channel}"
+        );
+        // A bare `nightly` re-resolves on every rustup update, which is how
+        // clippy drift broke the lint gate twice in August 2026; the channel
+        // must carry a date so a toolchain bump is a deliberate commit.
+        assert!(
+            channel.len() > "nightly-".len() && channel[8..].split('-').count() == 3,
+            "toolchain channel must be a dated nightly (nightly-YYYY-MM-DD), got {channel}"
         );
         assert!(
             !toolchain.contains("channel = \"stable\""),

@@ -1,7 +1,8 @@
 # Design: Event-Driven, Pressure-Gated Scanner (v2)
 
-**Status:** Partially implemented behind `scanner.engine = "v2"`; validation
-harness in progress and default remains `v1` pending promotion evidence · **Author:**
+**Status:** Implemented and the default engine since v0.4.32 (`scanner.engine`
+defaults to `"v2"`; `"v1"` is the opt-out rollback). The fleet-level A/B
+evidence in section 7 is still being collected · **Author:**
 fleet-maintenance investigation, 2026-05-25
 **Supersedes the steady-state behavior of:** `src/scanner/walker.rs`, the open-file
 path in `OpenPathCache`, and the periodic full-walk model.
@@ -201,7 +202,8 @@ cooldown expires.
   dual logging/explain evidence.
 
 ## 5. Rollout
-- Behind typed `scanner.engine = "v1" | "v2"` config (default v1 until validated), with
+- Behind typed `scanner.engine = "v1" | "v2"` config (default `v1` during validation;
+  promoted to `v2` by default in v0.4.32, with `v1` kept as the rollback), with
   env override and config validation.
 - Add v2 shadow mode before enforce-mode deletion.
 - Validate on one box (e.g. css — heaviest cargo-cache load) against v1 for a week:
@@ -281,9 +283,11 @@ large-tree no-descent case, Linux deep-open-file veto for opaque roots, and
 metrics. Focused JSON validation artifacts are produced by
 `scanner_v2_validation_artifact_is_machine_readable`,
 `event_overflow_validation_artifact_records_reconciliation_fallback`, and
-`pressure_latency_validation_artifact_is_machine_readable`. The default remains
-`scanner.engine = "v1"` until live A/B artifacts demonstrate the CPU-seconds/pass
-target and safety parity outside the synthetic harness.
+`pressure_latency_validation_artifact_is_machine_readable`. Since v0.4.32 the
+default is `scanner.engine = "v2"` (see the `ScannerConfig` default in
+`src/core/config.rs`); the live A/B artifacts that demonstrate the
+CPU-seconds/pass target and safety parity outside the synthetic harness are
+still to be recorded here, and `"v1"` remains the rollback.
 
 Live A/B capture procedure:
 

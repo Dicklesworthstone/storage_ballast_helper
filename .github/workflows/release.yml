@@ -9,6 +9,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
+  # Must match rust-toolchain.toml and ci.yml; bump all three together.
+  TOOLCHAIN: nightly-2026-08-31
   # TUI feature depends on local-path frankentui crates unavailable in CI.
   CI_FEATURES: --no-default-features --features cli,daemon,sqlite
 
@@ -86,8 +88,9 @@ jobs:
           # Use perl for cross-platform compat (macOS sed -i requires different syntax)
           perl -i -ne 'print unless /^ftui.*=.*\{.*path.*=.*"\/dp\//' Cargo.toml
           perl -i -pe 's/^tui = \["dep:ftui.*\]/tui = []/' Cargo.toml
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       - name: Install cross (if needed)
@@ -414,7 +417,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8.0.1

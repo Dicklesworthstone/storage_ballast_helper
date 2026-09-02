@@ -662,7 +662,10 @@ mod tests {
         writer.flush();
 
         let contents = fs::read_to_string(&fallback).unwrap();
-        assert!(!contents.is_empty());
+        assert!(
+            !contents.is_empty(),
+            "expected at least one JSONL entry in the fallback file"
+        );
     }
 
     #[test]

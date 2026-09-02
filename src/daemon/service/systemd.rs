@@ -120,7 +120,12 @@ impl SystemdServiceManager {
         if self.config.user_scope {
             writeln!(unit, "Type=simple").ok();
         } else {
+            // The daemon sends READY=1 after its workers are up and the first
+            // state file is written (see MonitoringDaemon::run), STOPPING=1 on
+            // shutdown, and WATCHDOG=1 heartbeats sized from WATCHDOG_USEC.
             writeln!(unit, "Type=notify").ok();
+            writeln!(unit, "NotifyAccess=main").ok();
+            writeln!(unit, "TimeoutStartSec=30").ok();
             writeln!(unit, "WatchdogSec=60").ok();
         }
 
@@ -295,6 +300,28 @@ impl ServiceManager for SystemdServiceManager {
         Ok(())
     }
 
+    fn notify_ready(&self) -> Result<()> {
+        let Some(socket_path) = systemd_notify_socket() else {
+            return Ok(());
+        };
+        sd_notify_send(&sd_ready_message(std::process::id()), &socket_path).map_err(|source| {
+            SbhError::Io {
+                path: PathBuf::from(socket_path),
+                source,
+            }
+        })
+    }
+
+    fn notify_stopping(&self) -> Result<()> {
+        let Some(socket_path) = systemd_notify_socket() else {
+            return Ok(());
+        };
+        sd_notify_send(SD_STOPPING_MESSAGE, &socket_path).map_err(|source| SbhError::Io {
+            path: PathBuf::from(socket_path),
+            source,
+        })
+    }
+
     fn restart(&self) -> Result<()> {
         self.run_systemctl(&["restart", SYSTEMD_UNIT_NAME])?;
         Ok(())
@@ -323,28 +350,54 @@ fn systemd_watchdog_enabled(watchdog_sec: u64, socket_path: Option<&str>) -> boo
     watchdog_sec > 0 && socket_path.is_some_and(|path| !path.is_empty())
 }
 
+/// `sd_notify(3)` message sent once shutdown begins.
+pub const SD_STOPPING_MESSAGE: &str = "STOPPING=1\n";
+
+/// `sd_notify(3)` readiness message. `MAINPID=` is included so a supervisor
+/// that lost track of the main process (re-exec, `--background`) re-learns it.
+#[must_use]
+pub fn sd_ready_message(pid: u32) -> String {
+    format!("READY=1\nMAINPID={pid}\n")
+}
+
+/// `sd_notify(3)` watchdog heartbeat message.
+#[must_use]
+pub fn sd_watchdog_message(status: &str) -> String {
+    format!("WATCHDOG=1\nSTATUS={status}\n")
+}
+
 fn sd_notify_watchdog(status: &str, socket_path: &str) {
+    // Heartbeats are best-effort: a lost datagram costs one beat, and the
+    // next one lands well within WatchdogSec.
+    let _ = sd_notify_send(&sd_watchdog_message(status), socket_path);
+}
+
+/// Send one `sd_notify(3)` datagram to `socket_path`.
+///
+/// Supports filesystem sockets and Linux abstract sockets (`NOTIFY_SOCKET`
+/// values starting with `@`, which systemd uses for some user managers).
+/// Non-Linux platforms have no notify socket and report success without
+/// sending anything.
+pub fn sd_notify_send(message: &str, socket_path: &str) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        sd_notify_linux(status, socket_path);
+        use std::os::linux::net::SocketAddrExt as _;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+        let sock = UnixDatagram::unbound()?;
+        if let Some(abstract_name) = socket_path.strip_prefix('@') {
+            let addr = SocketAddr::from_abstract_name(abstract_name.as_bytes())?;
+            sock.send_to_addr(message.as_bytes(), &addr)?;
+        } else {
+            sock.send_to(message.as_bytes(), socket_path)?;
+        }
+        Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = status;
-        let _ = socket_path;
+        let _ = (message, socket_path);
+        Ok(())
     }
-}
-
-#[cfg(target_os = "linux")]
-fn sd_notify_linux(status: &str, socket_path: &str) {
-    use std::os::unix::net::UnixDatagram;
-
-    let msg = format!("WATCHDOG=1\nSTATUS={status}\n");
-    let Ok(sock) = UnixDatagram::unbound() else {
-        return;
-    };
-
-    let _ = sock.send_to(msg.as_bytes(), socket_path);
 }
 
 fn format_systemctl_failure(
@@ -440,6 +493,74 @@ mod watchdog_tests {
         assert!(!systemd_watchdog_enabled(0, Some("/run/systemd/notify")));
         assert!(!systemd_watchdog_enabled(60, None));
         assert!(!systemd_watchdog_enabled(60, Some("")));
+    }
+
+    #[test]
+    fn sd_notify_messages_follow_the_protocol() {
+        assert_eq!(sd_ready_message(4242), "READY=1\nMAINPID=4242\n");
+        assert_eq!(SD_STOPPING_MESSAGE, "STOPPING=1\n");
+        assert_eq!(
+            sd_watchdog_message("pressure=Green"),
+            "WATCHDOG=1\nSTATUS=pressure=Green\n"
+        );
+    }
+
+    /// The daemon must send READY=1 through the notify socket: a Type=notify
+    /// unit is killed at TimeoutStartSec otherwise. Bind a real datagram
+    /// socket and check the exact bytes that arrive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sd_notify_send_delivers_ready_and_stopping_to_a_path_socket() {
+        use std::os::unix::net::UnixDatagram;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket_path = dir.path().join("notify.sock");
+        let listener = UnixDatagram::bind(&socket_path).expect("bind notify socket");
+        listener
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set read timeout");
+        let socket_str = socket_path.to_string_lossy().into_owned();
+
+        sd_notify_send(&sd_ready_message(7), &socket_str).expect("send READY");
+        sd_notify_send(SD_STOPPING_MESSAGE, &socket_str).expect("send STOPPING");
+
+        let mut buf = [0u8; 256];
+        let n = listener.recv(&mut buf).expect("receive READY datagram");
+        assert_eq!(&buf[..n], b"READY=1\nMAINPID=7\n");
+        let n = listener.recv(&mut buf).expect("receive STOPPING datagram");
+        assert_eq!(&buf[..n], b"STOPPING=1\n");
+    }
+
+    /// `NOTIFY_SOCKET=@name` denotes a Linux abstract socket; the previous
+    /// implementation treated it as a filesystem path and every notification
+    /// silently failed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sd_notify_send_supports_abstract_sockets() {
+        use std::os::linux::net::SocketAddrExt as _;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+        let name = format!("sbh-notify-test-{}", std::process::id());
+        let addr = SocketAddr::from_abstract_name(name.as_bytes()).expect("abstract addr");
+        let listener = UnixDatagram::bind_addr(&addr).expect("bind abstract notify socket");
+        listener
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        sd_notify_send(&sd_watchdog_message("ok"), &format!("@{name}")).expect("send WATCHDOG");
+
+        let mut buf = [0u8; 256];
+        let n = listener.recv(&mut buf).expect("receive datagram");
+        assert_eq!(&buf[..n], b"WATCHDOG=1\nSTATUS=ok\n");
+    }
+
+    #[test]
+    fn sd_notify_send_reports_unreachable_socket() {
+        let missing = "/nonexistent-dir-for-sbh-test/notify.sock";
+        #[cfg(target_os = "linux")]
+        assert!(sd_notify_send("READY=1\n", missing).is_err());
+        #[cfg(not(target_os = "linux"))]
+        assert!(sd_notify_send("READY=1\n", missing).is_ok());
     }
 
     #[test]

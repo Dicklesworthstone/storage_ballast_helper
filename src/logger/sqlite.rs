@@ -56,6 +56,38 @@ impl SqliteLogger {
         })
     }
 
+    /// Open an existing database read-only for CLI queries (`stats`, `status`,
+    /// `tune`, `explain`).
+    ///
+    /// Read-side commands must never open the daemon's database with
+    /// `READ_WRITE | CREATE`: an unprivileged `sbh stats` against a root-owned
+    /// database then fails with "attempt to write a readonly database", and a
+    /// typo'd path silently creates an empty database. This opener creates
+    /// nothing, applies no schema, and sets `query_only` so a query that tries
+    /// to write fails loudly.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+
+        conn.create_scalar_function(
+            "extract_pattern",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            move |ctx| {
+                let path: String = ctx.get(0)?;
+                Ok(crate::scanner::patterns::extract_pattern_label(&path))
+            },
+        )?;
+        conn.pragma_update(None, "query_only", 1)?;
+
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+        })
+    }
+
     /// Path to the database file.
     pub fn path(&self) -> &Path {
         &self.path
@@ -589,6 +621,47 @@ mod tests {
             .count_events_since("scan_complete", "2026-01-01T00:00:00Z")
             .unwrap();
         assert_eq!(count, 1000);
+    }
+
+    #[test]
+    fn open_read_only_queries_but_never_writes_or_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ro.db");
+        {
+            let logger = SqliteLogger::open(&db_path).unwrap();
+            logger
+                .conn
+                .execute(
+                    "INSERT INTO activity_log (timestamp, event_type, severity, details) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params!["2026-09-02T00:00:00Z", "pressure_change", "info", "{}"],
+                )
+                .unwrap();
+        }
+
+        let ro = SqliteLogger::open_read_only(&db_path).unwrap();
+        let rows: i64 = ro
+            .conn
+            .query_row("SELECT COUNT(*) FROM activity_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "read-only handle must see existing rows");
+
+        let write = ro.conn.execute(
+            "INSERT INTO activity_log (timestamp, event_type, severity) VALUES ('t', 'x', 'info')",
+            [],
+        );
+        assert!(
+            write.is_err(),
+            "read-only handle must refuse writes, got {write:?}"
+        );
+
+        // A read-side open must never manufacture a database.
+        let missing = dir.path().join("does-not-exist").join("activity.sqlite3");
+        assert!(SqliteLogger::open_read_only(&missing).is_err());
+        assert!(
+            !missing.exists(),
+            "read-only open created {}",
+            missing.display()
+        );
     }
 
     #[test]

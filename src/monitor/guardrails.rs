@@ -902,10 +902,16 @@ mod tests {
     fn action_decision_reason_is_nonempty() {
         let guard = AdaptiveGuard::with_defaults();
         let d1 = gate_action(&guard, false);
-        assert!(!d1.reason().is_empty());
+        assert!(
+            !d1.reason().is_empty(),
+            "gate decision without a guard must carry a reason"
+        );
 
         let d2 = gate_action(&guard, true);
-        assert!(!d2.reason().is_empty());
+        assert!(
+            !d2.reason().is_empty(),
+            "gate decision with a guard must carry a reason"
+        );
     }
 
     #[test]

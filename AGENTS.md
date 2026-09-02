@@ -422,7 +422,7 @@ src/
 |---------|-------------|
 | `[pressure]` | `green_min_free_pct`, `yellow_min_free_pct`, `orange_min_free_pct`, `red_min_free_pct`, `poll_interval_ms` |
 | `[pressure.prediction]` | `enabled`, `action_horizon_minutes`, `warning_horizon_minutes`, `min_confidence`, `min_samples` |
-| `[scanner]` | `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run` |
+| `[scanner]` | `engine` (`"v2"` default, `"v1"` rollback), `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run`, `cross_devices` |
 | `[scoring]` | `min_score`, `location_weight`, `name_weight`, `age_weight`, `size_weight`, `structure_weight` |
 | `[scoring]` (decision-theoretic) | `false_positive_loss`, `false_negative_loss`, `calibration_floor` |
 | `[ballast]` | `file_count`, `file_size_bytes`, `replenish_cooldown_minutes` |

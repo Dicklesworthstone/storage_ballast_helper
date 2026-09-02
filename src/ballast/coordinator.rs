@@ -792,7 +792,11 @@ mod tests {
         let report = coordinator.provision_all(&platform).unwrap();
 
         assert_eq!(report.total_files_created(), 6); // 3 per volume
-        assert!(report.skipped_volumes.is_empty());
+        assert!(
+            report.skipped_volumes.is_empty(),
+            "expected no skipped volumes, got {:?}",
+            report.skipped_volumes
+        );
         assert!(!report.has_errors());
     }
 
@@ -845,7 +849,11 @@ mod tests {
         assert_eq!(failed.1.errors.len(), 1);
         assert!(failed.1.errors[0].contains("storage exhausted"));
         assert_eq!(succeeded.1.files_created, 3);
-        assert!(report.skipped_volumes.is_empty());
+        assert!(
+            report.skipped_volumes.is_empty(),
+            "a storage-full volume must be reported per-volume, not skipped; got {:?}",
+            report.skipped_volumes
+        );
         assert!(report.has_errors());
     }
 

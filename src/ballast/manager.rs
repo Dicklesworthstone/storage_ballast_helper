@@ -1131,7 +1131,11 @@ mod tests {
 
         assert_eq!(report.files_created, 3);
         assert_eq!(report.files_skipped, 0);
-        assert!(report.errors.is_empty());
+        assert!(
+            report.errors.is_empty(),
+            "expected no provisioning errors, got {:?}",
+            report.errors
+        );
         assert_eq!(mgr.inventory().len(), 3);
 
         // Verify files exist with correct size.
@@ -1341,7 +1345,10 @@ mod tests {
         // Simulate always-low free space.
         let report = mgr.provision(Some(&|| 5.0)).unwrap();
         assert_eq!(report.files_created, 0);
-        assert!(!report.errors.is_empty());
+        assert!(
+            !report.errors.is_empty(),
+            "expected at least one provisioning error when free space stays below the abort floor"
+        );
     }
 
     #[test]

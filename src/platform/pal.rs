@@ -189,6 +189,21 @@ pub trait ServiceManager: Send + Sync {
         Ok(())
     }
 
+    /// Tell the service manager that startup is complete.
+    ///
+    /// systemd `Type=notify` units stay in `activating` until the daemon sends
+    /// `READY=1` and are killed at `TimeoutStartSec` otherwise; managers
+    /// without a readiness protocol accept the default no-op.
+    fn notify_ready(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Tell the service manager that an orderly shutdown has begun
+    /// (`STOPPING=1` for systemd). Default no-op.
+    fn notify_stopping(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn restart(&self) -> Result<()> {
         pal_not_implemented("service", "restart")
     }
