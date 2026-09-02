@@ -1047,6 +1047,10 @@ pub struct MigrateOptions {
     pub backup_dir: Option<PathBuf>,
     /// Clean up stale backup files older than this (seconds). 0 = skip cleanup.
     pub cleanup_backups_older_than: u64,
+    /// Restrict *applied* actions to these kinds; everything else is still
+    /// planned and reported but left for an explicit `sbh bootstrap` run.
+    /// `None` applies every planned action.
+    pub allowed_actions: Option<Vec<ActionKind>>,
 }
 
 impl Default for MigrateOptions {
@@ -1055,8 +1059,26 @@ impl Default for MigrateOptions {
             dry_run: false,
             backup_dir: None,
             cleanup_backups_older_than: 7 * 24 * 3600, // 7 days
+            allowed_actions: None,
         }
     }
+}
+
+/// Actions `sbh install` may apply on its own.
+///
+/// They fix the install it is producing (PATH lines, unit paths, permissions,
+/// missing dirs/state) and never move operator data. Legacy config/state
+/// copies and backup cleanup stay behind an explicit `sbh bootstrap`.
+#[must_use]
+pub const fn install_time_safe_actions() -> &'static [ActionKind] {
+    &[
+        ActionKind::RemoveProfileLine,
+        ActionKind::DeduplicateProfile,
+        ActionKind::FixPermissions,
+        ActionKind::UpdateServicePath,
+        ActionKind::CreateDirectory,
+        ActionKind::InitStateFile,
+    ]
 }
 
 /// Run the full migration pipeline: scan, plan, apply (or dry-run).
@@ -1067,7 +1089,17 @@ pub fn run_migration(opts: &MigrateOptions) -> MigrationReport {
     let (issues_found, _) = count_issues(&footprints);
 
     if !opts.dry_run {
-        apply_actions(&mut actions, opts.backup_dir.as_deref());
+        match &opts.allowed_actions {
+            None => apply_actions(&mut actions, opts.backup_dir.as_deref()),
+            Some(allowed) => {
+                let (mut allowed_actions, deferred): (Vec<_>, Vec<_>) = actions
+                    .into_iter()
+                    .partition(|action| allowed.contains(&action.kind));
+                apply_actions(&mut allowed_actions, opts.backup_dir.as_deref());
+                actions = allowed_actions;
+                actions.extend(deferred);
+            }
+        }
     }
 
     let issues_repaired = actions
@@ -1322,7 +1354,7 @@ fn apply_actions(actions: &mut [MigrationAction], backup_dir: Option<&Path>) {
         let result = match action.kind {
             ActionKind::RemoveProfileLine => apply_remove_profile_line(action, backup_dir),
             ActionKind::DeduplicateProfile => apply_deduplicate_profile(action, backup_dir),
-            ActionKind::FixPermissions => apply_fix_permissions(action),
+            ActionKind::FixPermissions => apply_fix_permissions(action, backup_dir),
             ActionKind::UpdateServicePath => apply_update_service_path(action, backup_dir),
             ActionKind::CopyLegacyConfig => apply_copy_legacy_config(action),
             ActionKind::CopyLegacyState => apply_copy_legacy_state(action),
@@ -1382,8 +1414,16 @@ fn apply_deduplicate_profile(
 }
 
 #[cfg(unix)]
-fn apply_fix_permissions(action: &MigrationAction) -> std::io::Result<()> {
+fn apply_fix_permissions(
+    action: &mut MigrationAction,
+    backup_dir: Option<&Path>,
+) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    // The binary is an existing file being mutated in place: keep the
+    // timestamped-backup promise even though only mode bits change.
+    let backup = create_backup(&action.target, backup_dir)?;
+    action.backup_path = Some(backup);
+
     let meta = fs::metadata(&action.target)?;
     let mut perms = meta.permissions();
     let mode = perms.mode() | 0o111; // add execute bits only, preserve existing rw
@@ -1393,7 +1433,10 @@ fn apply_fix_permissions(action: &MigrationAction) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn apply_fix_permissions(_action: &MigrationAction) -> std::io::Result<()> {
+fn apply_fix_permissions(
+    _action: &mut MigrationAction,
+    _backup_dir: Option<&Path>,
+) -> std::io::Result<()> {
     // No-op on non-Unix platforms.
     Ok(())
 }
@@ -2152,7 +2195,7 @@ mod tests {
         let perms = std::fs::Permissions::from_mode(0o644);
         fs::set_permissions(&binary, perms).unwrap();
 
-        let action = MigrationAction {
+        let mut action = MigrationAction {
             kind: ActionKind::FixPermissions,
             reason: MigrationReason::BinaryPermissions,
             target: binary.clone(),
@@ -2162,11 +2205,26 @@ mod tests {
             error: None,
         };
 
-        apply_fix_permissions(&action).unwrap();
+        let backup_dir = tmp.path().join("backups");
+        apply_fix_permissions(&mut action, Some(&backup_dir)).unwrap();
         let meta = fs::metadata(&binary).unwrap();
         assert!(
             meta.permissions().mode() & 0o111 != 0,
             "should be executable"
+        );
+        // Backup-first: the pre-repair binary is preserved byte-for-byte.
+        let backup = action
+            .backup_path
+            .clone()
+            .expect("permission fix records its backup");
+        assert!(
+            backup.starts_with(&backup_dir),
+            "backup lands in backup_dir"
+        );
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            b"#!/bin/sh\necho test",
+            "backup preserves the original contents"
         );
     }
 

@@ -158,10 +158,20 @@ enum Command {
 
     /// Post-install setup: PATH, completions, and verification.
     Setup(SetupArgs),
+    /// Scan the install footprint and repair stale PATH lines, unit paths,
+    /// permissions, legacy paths, and missing state (backups first).
+    Bootstrap(BootstrapArgs),
     /// View activity log entries.
     Log(LogArgs),
     /// Truncate active append-only logs in place (e.g. agent codex-tui.log).
     TruncateLogs(TruncateLogsArgs),
+}
+
+#[derive(Debug, Clone, Args, Serialize, Default)]
+struct BootstrapArgs {
+    /// Report what would be repaired without changing anything.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -244,6 +254,10 @@ struct InstallArgs {
     /// Show what would be done without executing.
     #[arg(long)]
     dry_run: bool,
+    /// Skip the install-time bootstrap repairs (stale PATH lines, unit paths,
+    /// permissions, missing state).
+    #[arg(long)]
+    no_bootstrap: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
@@ -364,6 +378,10 @@ struct DoctorArgs {
     /// Check host-level tuning (kernel writeback / dirty-page limits).
     #[arg(long)]
     system: bool,
+    /// Check the install footprint (PATH entries, unit files, permissions,
+    /// legacy paths, state) without changing anything.
+    #[arg(long)]
+    env: bool,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -892,8 +910,100 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Update(args) => run_update(cli, args),
         Command::Setup(args) => run_setup(cli, args),
+        Command::Bootstrap(args) => run_bootstrap(cli, args),
         Command::Log(args) => run_log(cli, args),
         Command::TruncateLogs(args) => run_truncate_logs(cli, args),
+    }
+}
+
+fn run_bootstrap(cli: &Cli, args: &BootstrapArgs) -> Result<(), CliError> {
+    use storage_ballast_helper::cli::bootstrap::{
+        EnvironmentHealth, MigrateOptions, format_report_human, run_migration,
+    };
+
+    let report = run_migration(&MigrateOptions {
+        dry_run: args.dry_run,
+        ..MigrateOptions::default()
+    });
+
+    match output_mode(cli) {
+        OutputMode::Json => write_json_line(&json!({
+            "command": "bootstrap",
+            "dry_run": args.dry_run,
+            "report": report,
+        }))?,
+        OutputMode::Human => {
+            if args.dry_run {
+                println!("Bootstrap dry run (nothing changed):\n");
+            }
+            print!("{}", format_report_human(&report));
+        }
+    }
+
+    let unresolved = report
+        .actions
+        .iter()
+        .filter(|action| action.error.is_some())
+        .count();
+    if !args.dry_run && (report.health == EnvironmentHealth::Broken || unresolved > 0) {
+        return Err(CliError::Partial(format!(
+            "bootstrap left the environment {} with {unresolved} action(s) failed; see the report above",
+            report.health
+        )));
+    }
+    Ok(())
+}
+
+/// Run the install-time subset of bootstrap repairs (stale PATH lines, unit
+/// paths, permissions, missing dirs/state) before the service is registered.
+/// Prints one summary line; details are available via `sbh bootstrap --dry-run`.
+fn run_install_bootstrap(cli: &Cli, args: &InstallArgs) {
+    use storage_ballast_helper::cli::bootstrap::{
+        MigrateOptions, install_time_safe_actions, run_migration,
+    };
+
+    if args.no_bootstrap {
+        return;
+    }
+    let report = run_migration(&MigrateOptions {
+        dry_run: args.dry_run,
+        allowed_actions: Some(install_time_safe_actions().to_vec()),
+        ..MigrateOptions::default()
+    });
+    let deferred = report
+        .actions
+        .iter()
+        .filter(|action| !action.applied && action.error.is_none())
+        .count();
+    let failed = report
+        .actions
+        .iter()
+        .filter(|action| action.error.is_some())
+        .count();
+    if output_mode(cli) == OutputMode::Human {
+        println!(
+            "Bootstrap: environment {}; {} issue(s) found, {} repaired, {} deferred to `sbh bootstrap`, {} failed{}",
+            report.health,
+            report.issues_found,
+            report.issues_repaired,
+            deferred,
+            failed,
+            if args.dry_run { " (dry run)" } else { "" }
+        );
+    }
+    if cli.verbose {
+        for action in &report.actions {
+            eprintln!(
+                "[SBH-INSTALL] bootstrap {}: {} ({}{})",
+                if action.applied { "applied" } else { "planned" },
+                action.description,
+                action.reason,
+                action
+                    .error
+                    .as_deref()
+                    .map_or(String::new(), |e| format!(", error: {e}"))
+            );
+        }
     }
 }
 
@@ -1829,6 +1939,9 @@ fn run_install(cli: &Cli, args: &InstallArgs) -> Result<(), CliError> {
             return Ok(());
         }
     }
+
+    // -- install-time bootstrap repairs (safe subset, backups first) ----------
+    run_install_bootstrap(cli, args);
 
     // -- host-level kernel writeback tuning (best-effort, host-wide) -----------
     maybe_apply_writeback_on_install(cli, &config);
@@ -5003,12 +5116,13 @@ struct PalDoctorFollowUp {
 }
 
 fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
-    if !args.pal && !args.release && !args.system {
+    if !args.pal && !args.release && !args.system && !args.env {
         return Err(CliError::User(
-            "specify a diagnostic target, for example: sbh doctor --pal, --system, or --release"
+            "specify a diagnostic target, for example: sbh doctor --pal, --system, --env, or --release"
                 .to_string(),
         ));
     }
+    let env_checks = args.env.then(env_doctor_checks);
 
     let pal_report = if args.pal {
         let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -5030,10 +5144,11 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
         OutputMode::Json => {
             // Preserve the single-target top-level shapes; nest only when targets
             // are combined.
-            let payload = match (args.pal, args.release, args.system) {
-                (true, false, false) => serde_json::to_value(&pal_report)?,
-                (false, true, false) => serde_json::to_value(&release_report)?,
-                (false, false, true) => json!({ "system": { "checks": system_checks } }),
+            let payload = match (args.pal, args.release, args.system, args.env) {
+                (true, false, false, false) => serde_json::to_value(&pal_report)?,
+                (false, true, false, false) => serde_json::to_value(&release_report)?,
+                (false, false, true, false) => json!({ "system": { "checks": system_checks } }),
+                (false, false, false, true) => json!({ "env": { "checks": env_checks } }),
                 _ => {
                     let mut obj = serde_json::Map::new();
                     if let Some(report) = &pal_report {
@@ -5044,6 +5159,9 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
                     }
                     if let Some(checks) = &system_checks {
                         obj.insert("system".to_string(), json!({ "checks": checks }));
+                    }
+                    if let Some(checks) = &env_checks {
+                        obj.insert("env".to_string(), json!({ "checks": checks }));
                     }
                     Value::Object(obj)
                 }
@@ -5067,6 +5185,13 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
                 println!("System tuning checks:");
                 print_doctor_checks(checks);
             }
+            if let Some(checks) = &env_checks {
+                if pal_report.is_some() || release_report.is_some() || system_checks.is_some() {
+                    println!();
+                }
+                println!("Install footprint checks:");
+                print_doctor_checks(checks);
+            }
         }
     }
 
@@ -5077,6 +5202,9 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
             .as_ref()
             .is_some_and(|report| doctor_checks_have_failures(&report.checks))
         || system_checks
+            .as_ref()
+            .is_some_and(|checks| doctor_checks_have_failures(checks))
+        || env_checks
             .as_ref()
             .is_some_and(|checks| doctor_checks_have_failures(checks));
     if failed {
@@ -6033,6 +6161,64 @@ where
         macos_apfs_check(platform),
         macos_state_free_space_check(platform, home),
     ]
+}
+
+/// Read-only install-footprint diagnostics: a dry-run bootstrap scan rendered
+/// as doctor checks. Reasons that stop sbh from working (a non-executable
+/// binary, a unit pointing at a missing binary, an interrupted install, a
+/// missing state file) are FAIL; drift that only degrades it is WARN.
+fn env_doctor_checks() -> Vec<DoctorCheck> {
+    use storage_ballast_helper::cli::bootstrap::{
+        EnvironmentHealth, MigrateOptions, MigrationReason, run_migration,
+    };
+
+    let report = run_migration(&MigrateOptions {
+        dry_run: true,
+        ..MigrateOptions::default()
+    });
+    let mut checks = Vec::new();
+    let summary_status = match report.health {
+        EnvironmentHealth::Healthy => "PASS",
+        EnvironmentHealth::Degraded | EnvironmentHealth::NotInstalled => "WARN",
+        EnvironmentHealth::Broken => "FAIL",
+    };
+    checks.push(doctor_check(
+        "env.health",
+        "Install footprint",
+        summary_status,
+        format!(
+            "environment {}: {} footprint(s), {} issue(s), {} repair action(s) planned",
+            report.health,
+            report.footprints.len(),
+            report.issues_found,
+            report.actions.len()
+        ),
+        (!report.actions.is_empty())
+            .then(|| "Run `sbh bootstrap --dry-run` to review, then `sbh bootstrap` to repair with backups.".to_string()),
+    ));
+    for action in &report.actions {
+        let status = match action.reason {
+            MigrationReason::BinaryPermissions
+            | MigrationReason::SystemdUnitStaleBinary
+            | MigrationReason::LaunchdPlistStaleBinary
+            | MigrationReason::InterruptedInstall
+            | MigrationReason::MissingStateFile => "FAIL",
+            _ => "WARN",
+        };
+        checks.push(doctor_check(
+            "env.migration",
+            "Repair action",
+            status,
+            format!(
+                "{} — {} ({})",
+                action.reason,
+                action.description,
+                action.target.display()
+            ),
+            Some(format!("planned action: {}", action.kind)),
+        ));
+    }
+    checks
 }
 
 fn doctor_check(
