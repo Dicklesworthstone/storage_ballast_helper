@@ -58,7 +58,9 @@ use crate::monitor::pid::{
     PidPressureController, PressureLevel, PressureReading, PressureResponse,
 };
 use crate::monitor::predictive::{PredictiveAction, PredictiveActionPolicy};
-use crate::monitor::special_locations::SpecialLocationRegistry;
+use crate::monitor::special_locations::{
+    AlertThrottle, HorizonRule, SpecialAlert, SpecialLocationRegistry,
+};
 use crate::monitor::voi_scheduler::VoiScheduler;
 use crate::platform::cleanup_catalog::{self, ExpandedCatalogRoot};
 use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
@@ -1166,6 +1168,11 @@ pub struct MonitoringDaemon {
     /// Mounts currently at Critical: the `emergency` event is emitted once
     /// when a mount enters Critical, not on every tick it stays there.
     emergency_mounts: HashSet<PathBuf>,
+    /// Latest EWMA fill rate per mount (bytes per second), for the
+    /// special-location horizon rule.
+    mount_rates: HashMap<PathBuf, f64>,
+    /// Per-location alert throttle for the special-location horizon rule.
+    special_alerts: AlertThrottle,
     special_locations: SpecialLocationRegistry,
     ballast_coordinator: BallastPoolCoordinator,
     release_controller: BallastReleaseController,
@@ -2036,6 +2043,8 @@ impl MonitoringDaemon {
             catalog_root_cache: HashMap::new(),
             catalog_epochs: HashMap::new(),
             emergency_mounts: HashSet::new(),
+            mount_rates: HashMap::new(),
+            special_alerts: AlertThrottle::default(),
             special_locations,
             ballast_coordinator,
             release_controller,
@@ -3029,6 +3038,8 @@ impl MonitoringDaemon {
             }
 
             // Keep this mount's own reading for the per-mount controllers.
+            self.mount_rates
+                .insert(mount_path.clone(), rate_estimate.bytes_per_second);
             self.mount_responses.push(MountTickResponse {
                 response: response.clone(),
                 seconds_to_red: predicted_seconds,
@@ -3897,6 +3908,16 @@ impl MonitoringDaemon {
         let now = Instant::now();
         let locations = self.special_locations.all().to_vec();
 
+        let rule = HorizonRule {
+            alert_horizon: Duration::from_secs(
+                self.config.special_locations.alert_horizon_minutes.max(1) * 60,
+            ),
+            absolute_floor_bytes: self.config.special_locations.absolute_floor_bytes,
+            ..HorizonRule::default()
+        };
+        let alert_interval =
+            Duration::from_secs(self.config.special_locations.alert_interval_minutes.max(1) * 60);
+
         for location in &locations {
             let last_scan = self.last_special_scan.get(&location.path).copied();
             if !location.scan_due(last_scan, now) {
@@ -3909,39 +3930,71 @@ impl MonitoringDaemon {
 
             self.last_special_scan.insert(location.path.clone(), now);
 
-            if location.needs_attention(&stats) {
-                // Compute pressure level first so we can use it in the notification.
-                let urgency = f64::from(location.priority) / 255.0;
-                let free_ratio = stats.free_pct() / f64::from(location.buffer_pct);
-                let pressure_level = if free_ratio < 0.25 {
-                    PressureLevel::Red
-                } else if free_ratio < 0.5 {
-                    PressureLevel::Orange
-                } else {
-                    PressureLevel::Yellow
-                };
+            // Q2: alert on time-to-harm and real shortage of room, not on a
+            // percentage alone. The write rate is the mount's EWMA; a location
+            // on an unmonitored mount (typically /dev/shm) gets the floored
+            // rate, and its fullness rule still applies.
+            let ram_backed = self
+                .platform
+                .is_ram_backed(&location.path)
+                .unwrap_or(matches!(
+                    location.kind,
+                    crate::monitor::special_locations::SpecialKind::Tmpfs
+                        | crate::monitor::special_locations::SpecialKind::DevShm
+                        | crate::monitor::special_locations::SpecialKind::Ramfs
+                ));
+            let rate = self
+                .mount_rates
+                .get(&stats.mount_point)
+                .copied()
+                .unwrap_or(0.0);
+            let assessment = rule.assess(location, &stats, rate, ram_backed);
+            let emit = self.special_alerts.should_emit(
+                &location.path,
+                assessment.alert,
+                now,
+                alert_interval,
+            );
+            if emit {
+                let message = format!(
+                    "special location {:?} ({}) {}: {:.1}% free, {} ({:.0}s horizon, urgency {:.2})",
+                    location.kind,
+                    location.path.display(),
+                    assessment.alert.as_str(),
+                    stats.free_pct(),
+                    assessment.reason,
+                    assessment.horizon_secs,
+                    assessment.urgency,
+                );
+                eprintln!("[SBH-SPECIAL] {message}");
+                match assessment.alert {
+                    SpecialAlert::None => self.logger_handle.send(ActivityEvent::Info { message }),
+                    SpecialAlert::Warning | SpecialAlert::Critical => {
+                        self.logger_handle.send(ActivityEvent::Warning {
+                            code: "SBH-2001".to_string(),
+                            message,
+                        });
+                    }
+                }
+            }
 
-                self.logger_handle.send(ActivityEvent::Error {
-                    code: "SBH-2001".to_string(),
-                    message: format!(
-                        "special location {:?} ({}) at {:.1}% free (buffer={}%)",
-                        location.kind,
-                        location.path.display(),
-                        stats.free_pct(),
-                        location.buffer_pct,
-                    ),
-                });
-                // Only notify when the level for this location actually changes.
-                // Within a 5-minute cooldown, only escalation (higher level) fires.
-                // After cooldown, any level change fires. But the SAME level at the
-                // same location does NOT re-fire — the condition hasn't changed.
-                let should_notify_special = if let Some((prev_level, _prev_time)) =
-                    self.last_special_notify.get(&location.path)
-                {
-                    pressure_level != *prev_level
-                } else {
-                    true
+            if assessment.alert == SpecialAlert::None {
+                self.last_special_notify.remove(&location.path);
+                continue;
+            }
+            {
+                let urgency = assessment.urgency;
+                let pressure_level = match assessment.alert {
+                    SpecialAlert::Critical => PressureLevel::Red,
+                    _ if urgency >= 0.75 => PressureLevel::Orange,
+                    _ => PressureLevel::Yellow,
                 };
+                // Notify on a level change for this location; the same level
+                // does not re-fire (the condition has not changed).
+                let should_notify_special = self
+                    .last_special_notify
+                    .get(&location.path)
+                    .is_none_or(|(prev_level, _)| pressure_level != *prev_level);
 
                 if should_notify_special {
                     self.notification_manager

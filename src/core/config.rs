@@ -66,6 +66,7 @@ pub struct Config {
     /// Memory-by-disk behavior matrix (`preset`, `memory_never_reduces_cleanup`,
     /// `cells`). See [`BehaviorConfig`].
     pub behavior: BehaviorConfig,
+    pub special_locations: SpecialLocationsConfig,
     pub system_tuning: SystemTuningConfig,
     /// Keys the loaded file contained that no section declares. Not part
     /// of the file format (never serialized; excluded from `stable_hash`).
@@ -377,6 +378,35 @@ impl std::str::FromStr for ScannerEventSourceMode {
             other => Err(format!(
                 "invalid scanner event source {other:?}: expected \"auto\" or \"reconciliation-only\""
             )),
+        }
+    }
+}
+
+/// Special-location alerting (Q2): time-to-harm instead of percent alone.
+///
+/// A temp root is an incident when it would run out within
+/// `alert_horizon_minutes` at its observed write rate, or when it is short
+/// of room: below its percent buffer capped at `absolute_floor_bytes` for
+/// disk-backed roots (760 GiB free on a 5.5 TiB volume is not short of
+/// room), below 20% free for RAM-backed ones. One alert per location per
+/// `alert_interval_minutes`; a change of severity is reported at once.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpecialLocationsConfig {
+    /// Cap on the percent buffer for disk-backed temp roots, in bytes.
+    pub absolute_floor_bytes: u64,
+    /// Alert when a location would be exhausted within this many minutes.
+    pub alert_horizon_minutes: u64,
+    /// Minimum minutes between repeated alerts for the same location.
+    pub alert_interval_minutes: u64,
+}
+
+impl Default for SpecialLocationsConfig {
+    fn default() -> Self {
+        Self {
+            absolute_floor_bytes: 32 * 1024 * 1024 * 1024,
+            alert_horizon_minutes: 30,
+            alert_interval_minutes: 15,
         }
     }
 }
