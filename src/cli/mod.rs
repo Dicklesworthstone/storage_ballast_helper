@@ -29,6 +29,41 @@ pub const RELEASE_REPOSITORY: &str = "Dicklesworthstone/storage_ballast_helper";
 /// Canonical binary name used in release artifact names.
 pub const RELEASE_BINARY_NAME: &str = "sbh";
 
+/// Environment variable that points the release *API* at a fake server.
+///
+/// Honored only under `SBH_TEST_MODE=1`, like every other injection hook,
+/// so a stray variable can never redirect a real update.
+pub const RELEASE_API_BASE_ENV: &str = "SBH_RELEASE_API_BASE";
+
+/// Environment variable that points release *downloads* at a fake server.
+///
+/// Honored only under `SBH_TEST_MODE=1`.
+pub const RELEASE_DOWNLOAD_BASE_ENV: &str = "SBH_RELEASE_DOWNLOAD_BASE";
+
+/// The `https://api.github.com` origin, or the test-mode override.
+#[must_use]
+pub fn release_api_base() -> String {
+    test_mode_base_override(RELEASE_API_BASE_ENV)
+        .unwrap_or_else(|| "https://api.github.com".to_string())
+}
+
+/// The `https://github.com` origin releases download from, or the
+/// test-mode override.
+#[must_use]
+pub fn release_download_base() -> String {
+    test_mode_base_override(RELEASE_DOWNLOAD_BASE_ENV)
+        .unwrap_or_else(|| "https://github.com".to_string())
+}
+
+fn test_mode_base_override(var: &str) -> Option<String> {
+    if std::env::var(crate::platform::test_overlay::TEST_MODE_ENV).ok()? != "1" {
+        return None;
+    }
+    let base = std::env::var(var).ok()?;
+    let base = base.trim().trim_end_matches('/');
+    (!base.is_empty()).then(|| base.to_string())
+}
+
 /// CI/CD target triples built and published in release workflows.
 ///
 /// The release.yml matrix MUST match this list exactly. Tests in this module
@@ -389,7 +424,8 @@ impl ReleaseArtifactContract {
     #[must_use]
     pub fn asset_url_for_tag_and_name(&self, release_tag: &str, asset_name: &str) -> String {
         format!(
-            "https://github.com/{}/releases/download/{release_tag}/{asset_name}",
+            "{}/{}/releases/download/{release_tag}/{asset_name}",
+            release_download_base(),
             self.repository
         )
     }
@@ -447,12 +483,14 @@ impl ReleaseArtifactContract {
         let asset = self.asset_name();
         match &self.locator {
             ReleaseLocator::Latest => format!(
-                "https://github.com/{}/releases/latest/download/{asset}",
+                "{}/{}/releases/latest/download/{asset}",
+                release_download_base(),
                 self.repository
             ),
             ReleaseLocator::Tag(tag) => {
                 format!(
-                    "https://github.com/{}/releases/download/{tag}/{asset}",
+                    "{}/{}/releases/download/{tag}/{asset}",
+                    release_download_base(),
                     self.repository
                 )
             }

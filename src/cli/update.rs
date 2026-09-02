@@ -1193,12 +1193,7 @@ where
 }
 
 fn artifact_url_for_tag(contract: &ReleaseArtifactContract, target_tag: &str) -> String {
-    format!(
-        "https://github.com/{}/releases/download/{}/{}",
-        contract.repository,
-        target_tag,
-        contract.asset_name_for_tag(target_tag)
-    )
+    contract.asset_url_for_tag_and_name(target_tag, &contract.asset_name_for_tag(target_tag))
 }
 
 fn normalize_tag(version: &str) -> String {
@@ -1274,7 +1269,8 @@ fn resolve_latest_release_tag(
     contract: &ReleaseArtifactContract,
 ) -> std::result::Result<String, String> {
     let api_url = format!(
-        "https://api.github.com/repos/{}/releases/latest",
+        "{}/repos/{}/releases/latest",
+        super::release_api_base(),
         contract.repository
     );
 
@@ -1295,7 +1291,8 @@ pub fn fetch_release_asset_names(
     tag: &str,
 ) -> std::result::Result<Vec<String>, String> {
     let api_url = format!(
-        "https://api.github.com/repos/{}/releases/tags/{tag}",
+        "{}/repos/{}/releases/tags/{tag}",
+        super::release_api_base(),
         contract.repository
     );
     let json = github_api_json(&api_url)?;

@@ -12,8 +12,10 @@
 mod common;
 
 use std::io;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use storage_ballast_helper::cli::from_source::{
     Prerequisite, PrerequisiteStatus, all_prerequisites_met, check_prerequisites,
@@ -1548,4 +1550,566 @@ fn e2e_host_specifier_from_parts_unsupported_os() {
 fn e2e_host_specifier_from_parts_unsupported_arch() {
     let result = HostSpecifier::from_parts("linux", "mips64", None);
     assert!(result.is_err(), "unsupported arch should fail");
+}
+
+// ============================================================================
+// H: Updater against a fake release (loopback HTTP; real curl, tar, install)
+// ============================================================================
+//
+// Every v0.5.x updater 404'd because it guessed one asset name. These cases
+// publish a release on a local `python3 -m http.server` and drive the real
+// `sbh update` binary at it through the `SBH_TEST_MODE=1` base-URL hooks, so
+// the layout resolution, checksum handling, download, extraction, and
+// atomic install run exactly as they do against GitHub.
+
+/// `python3 -m http.server` rooted at `root`, killed when dropped.
+struct FakeReleaseServer {
+    child: std::process::Child,
+    base_url: String,
+}
+
+impl FakeReleaseServer {
+    /// `None` when `python3` cannot be spawned; the caller skips loudly.
+    fn start(root: &Path) -> Option<Self> {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .ok()?
+            .local_addr()
+            .ok()?
+            .port();
+        let mut child = std::process::Command::new("python3")
+            .args(["-m", "http.server", &port.to_string()])
+            .args(["--bind", "127.0.0.1", "--directory"])
+            .arg(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return Some(Self {
+                    child,
+                    base_url: format!("http://127.0.0.1:{port}"),
+                });
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("fake release server exited before accepting connections: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        panic!("fake release server never listened on 127.0.0.1:{port}");
+    }
+}
+
+impl Drop for FakeReleaseServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// One published release under the fake server's document root, laid out
+/// the way the GitHub API and download URLs expect.
+struct FakeRelease {
+    tag: String,
+    api_file: PathBuf,
+    download_dir: PathBuf,
+    stage_dir: PathBuf,
+    assets: Vec<String>,
+}
+
+impl FakeRelease {
+    fn new(root: &Path, tag: &str) -> Self {
+        let api_dir = root
+            .join("repos")
+            .join(RELEASE_REPOSITORY)
+            .join("releases")
+            .join("tags");
+        let download_dir = root
+            .join(RELEASE_REPOSITORY)
+            .join("releases")
+            .join("download")
+            .join(tag);
+        let stage_dir = root.join("stage").join(tag);
+        for dir in [&api_dir, &download_dir, &stage_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        Self {
+            tag: tag.to_string(),
+            api_file: api_dir.join(tag),
+            download_dir,
+            stage_dir,
+            assets: Vec::new(),
+        }
+    }
+
+    /// The executable a release of this tag ships: a script whose output
+    /// names the tag, so an installed copy proves which asset was used.
+    fn fake_binary(&self) -> Vec<u8> {
+        format!("#!/bin/sh\nprintf 'sbh fake %s\\n' '{}'\n", self.tag).into_bytes()
+    }
+
+    fn publish(&mut self, name: &str, bytes: &[u8]) {
+        std::fs::write(self.download_dir.join(name), bytes).unwrap();
+        self.assets.push(name.to_string());
+    }
+
+    /// List `name` in the API response without serving the file.
+    fn announce_only(&mut self, name: &str) {
+        self.assets.push(name.to_string());
+    }
+
+    /// A `.tar.xz` holding `sbh`, plus its `<name>.sha256` sidecar.
+    fn publish_archive(&mut self, name: &str, valid_checksum: bool) {
+        let binary = self.stage_dir.join("sbh");
+        std::fs::write(&binary, self.fake_binary()).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let archive = self.download_dir.join(name);
+        let status = std::process::Command::new("tar")
+            .arg("-C")
+            .arg(&self.stage_dir)
+            .arg("-cJf")
+            .arg(&archive)
+            .arg("sbh")
+            .status()
+            .expect("tar is available");
+        assert!(status.success(), "tar -cJf failed for {name}");
+        let digest = if valid_checksum {
+            hex_lower(Sha256::digest(std::fs::read(&archive).unwrap()))
+        } else {
+            "0".repeat(64)
+        };
+        self.assets.push(name.to_string());
+        self.publish(
+            &format!("{name}.sha256"),
+            format!("{digest}  {name}\n").as_bytes(),
+        );
+    }
+
+    /// A raw executable plus an aggregate `SHA256SUMS` that also lists a
+    /// decoy entry, so the updater must select the right line.
+    fn publish_raw(&mut self, name: &str, valid_checksum: bool) {
+        let bytes = self.fake_binary();
+        let digest = if valid_checksum {
+            hex_lower(Sha256::digest(&bytes))
+        } else {
+            "0".repeat(64)
+        };
+        self.publish(name, &bytes);
+        let manifest = format!(
+            "{}  sbh_windows_amd64.exe\n{digest}  {name}\n",
+            "f".repeat(64)
+        );
+        self.publish("SHA256SUMS", manifest.as_bytes());
+    }
+
+    /// Write the `releases/tags/<tag>` API document listing every asset.
+    fn finish(&self) {
+        let assets: Vec<serde_json::Value> = self
+            .assets
+            .iter()
+            .map(|name| serde_json::json!({ "name": name }))
+            .collect();
+        let doc = serde_json::json!({ "tag_name": self.tag, "assets": assets });
+        std::fs::write(&self.api_file, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+    }
+}
+
+/// Outcome of one `sbh update` run against the fake server.
+struct FakeUpdateRun {
+    status: std::process::ExitStatus,
+    report: serde_json::Value,
+    base_url: String,
+    installed: PathBuf,
+    seeded: FileIdentity,
+    stderr: String,
+}
+
+/// Enough to prove a file is the very same one that was seeded: the
+/// updater installs by renaming the old binary aside and copying a new one
+/// in, which changes the inode.
+#[derive(Debug, PartialEq, Eq)]
+struct FileIdentity {
+    inode: u64,
+    len: u64,
+    modified: std::time::SystemTime,
+}
+
+fn file_identity(path: &Path) -> FileIdentity {
+    let metadata = std::fs::metadata(path).unwrap();
+    FileIdentity {
+        inode: metadata.ino(),
+        len: metadata.len(),
+        modified: metadata.modified().unwrap(),
+    }
+}
+
+impl FakeUpdateRun {
+    fn steps(&self) -> Vec<(String, Option<String>)> {
+        self.report["steps"]
+            .as_array()
+            .map(|steps| {
+                steps
+                    .iter()
+                    .map(|step| {
+                        (
+                            step["description"].as_str().unwrap_or("").to_string(),
+                            step["error"].as_str().map(str::to_string),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn step_mentioning(&self, needle: &str) -> Option<(String, Option<String>)> {
+        self.steps()
+            .into_iter()
+            .find(|(description, _)| description.contains(needle))
+    }
+
+    fn failed_step(&self) -> Option<(String, String)> {
+        self.steps()
+            .into_iter()
+            .find_map(|(description, error)| error.map(|error| (description, error)))
+    }
+
+    fn installed_identity(&self) -> FileIdentity {
+        file_identity(&self.installed)
+    }
+
+    fn assert_applied(&self, release: &FakeRelease, expected_asset: &str, expected_layout: &str) {
+        assert_eq!(
+            self.report["applied"],
+            serde_json::Value::Bool(true),
+            "{}: update must be applied; steps: {:?}\nstderr: {}",
+            release.tag,
+            self.steps(),
+            self.stderr
+        );
+        assert!(
+            self.failed_step().is_none(),
+            "{}: no step may fail: {:?}",
+            release.tag,
+            self.failed_step()
+        );
+        assert_eq!(
+            std::fs::read(&self.installed).unwrap(),
+            release.fake_binary(),
+            "{}: the installed binary must be the published one",
+            release.tag
+        );
+        let metadata = std::fs::metadata(&self.installed).unwrap();
+        assert_eq!(
+            metadata.permissions().mode() & 0o111,
+            0o111,
+            "{}: installed binary must be executable",
+            release.tag
+        );
+        assert_eq!(
+            self.report["artifact_url"].as_str(),
+            Some(
+                format!(
+                    "{}/{RELEASE_REPOSITORY}/releases/download/{}/{expected_asset}",
+                    self.base_url, release.tag
+                )
+                .as_str()
+            ),
+            "{}: artifact URL must point at the resolved asset",
+            release.tag
+        );
+        let resolved = self
+            .step_mentioning("Resolved release asset")
+            .unwrap_or_else(|| panic!("{}: no asset resolution step", release.tag));
+        assert!(
+            resolved.0.contains(expected_layout),
+            "{}: expected {expected_layout} layout, got {}",
+            release.tag,
+            resolved.0
+        );
+        assert_ne!(
+            self.report["service_restart"]["status"].as_str(),
+            Some("restarted"),
+            "{}: a test install must never restart a service",
+            release.tag
+        );
+        // Whether the (skipped or failed) service restart flips `success` is
+        // a property of the host, not of the release contract under test.
+    }
+
+    fn assert_denied(&self, release: &FakeRelease, failed_step: &str, error_fragment: &str) {
+        assert!(
+            !self.status.success(),
+            "{}: `sbh update` must exit non-zero; stderr: {}",
+            release.tag,
+            self.stderr
+        );
+        assert_eq!(
+            self.report["applied"],
+            serde_json::Value::Bool(false),
+            "{}: nothing may be applied",
+            release.tag
+        );
+        assert_eq!(
+            self.report["success"],
+            serde_json::Value::Bool(false),
+            "{}: the report must not claim success",
+            release.tag
+        );
+        let (description, error) = self
+            .failed_step()
+            .unwrap_or_else(|| panic!("{}: expected a failed step", release.tag));
+        assert_eq!(
+            description, failed_step,
+            "{}: wrong failing step",
+            release.tag
+        );
+        assert!(
+            error.contains(error_fragment),
+            "{}: error {error:?} should mention {error_fragment:?}",
+            release.tag
+        );
+        assert_eq!(
+            self.installed_identity(),
+            self.seeded,
+            "{}: the installed binary must be untouched after a denial",
+            release.tag
+        );
+    }
+}
+
+/// Copy the real `sbh` into a private bin dir (the updater installs next to
+/// the running executable) and run `sbh update --user --version <tag>`
+/// against the fake server, with HOME and the metadata cache isolated.
+fn run_fake_update(tmp: &Path, server: &FakeReleaseServer, release: &FakeRelease) -> FakeUpdateRun {
+    let case_dir = tmp.join("case").join(&release.tag);
+    let bin_dir = case_dir.join("bin");
+    let home = case_dir.join("home");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let installed = bin_dir.join("sbh");
+    // A hard link is enough to seed the bin dir (the updater renames it
+    // aside rather than writing through it); fall back to a copy across
+    // filesystems.
+    if std::fs::hard_link(common::sbh_bin_path(), &installed).is_err() {
+        std::fs::copy(common::sbh_bin_path(), &installed).unwrap();
+    }
+    let seeded = file_identity(&installed);
+
+    let config_path = case_dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[update]\nmetadata_cache_file = \"{}\"\nmetadata_cache_ttl_seconds = 60\n",
+            case_dir.join("cache.json").display()
+        ),
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    let output = std::process::Command::new(&installed)
+        .arg("--config")
+        .arg(&config_path)
+        .args(["--json", "update", "--user", "--version", &release.tag])
+        .env("HOME", &home)
+        .env("SBH_TEST_MODE", "1")
+        .env("SBH_RELEASE_API_BASE", &server.base_url)
+        .env("SBH_RELEASE_DOWNLOAD_BASE", &server.base_url)
+        .output()
+        .expect("spawn sbh update");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    eprintln!(
+        "[{}] sbh update exited {} after {:?}\n--- stderr ---\n{stderr}",
+        release.tag,
+        output.status,
+        started.elapsed()
+    );
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: no JSON report on stdout:\n{stdout}\n{stderr}",
+                release.tag
+            )
+        });
+    let report: serde_json::Value = serde_json::from_str(json_line).unwrap();
+    FakeUpdateRun {
+        status: output.status,
+        report,
+        base_url: server.base_url.clone(),
+        installed,
+        seeded,
+        stderr,
+    }
+}
+
+#[test]
+fn e2e_update_resolves_every_release_layout_against_a_fake_release_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("www");
+    std::fs::create_dir_all(&root).unwrap();
+    let Some(server) = FakeReleaseServer::start(&root) else {
+        eprintln!("SKIP: python3 is not available to serve a fake release");
+        return;
+    };
+    let host = HostSpecifier::detect().unwrap();
+    let contract =
+        resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some("v9.9.0")).unwrap();
+    let raw_name = contract
+        .raw_binary_name()
+        .expect("linux/macos hosts have a raw asset name");
+    let versioned = |tag: &str| contract.asset_name_for_tag(tag);
+    let legacy = contract.release_asset_candidates("v9.9.0")[1]
+        .asset_name
+        .clone();
+
+    // Tarball-only (the release workflow's layout).
+    let mut tarball_only = FakeRelease::new(&root, "v9.9.1");
+    tarball_only.publish_archive(&versioned("v9.9.1"), true);
+    tarball_only.finish();
+    let run = run_fake_update(tmp.path(), &server, &tarball_only);
+    run.assert_applied(&tarball_only, &versioned("v9.9.1"), "VersionedArchive");
+    assert_eq!(
+        run.report["target_version"].as_str(),
+        Some("v9.9.1"),
+        "pinned tag is the target"
+    );
+
+    // Raw-only (the hand-published v0.5.x layout).
+    let mut raw_only = FakeRelease::new(&root, "v9.9.2");
+    raw_only.publish_raw(&raw_name, true);
+    raw_only.finish();
+    let run = run_fake_update(tmp.path(), &server, &raw_only);
+    run.assert_applied(&raw_only, &raw_name, "RawBinary");
+    assert!(
+        run.step_mentioning("selected the")
+            .is_some_and(|(step, _)| step.contains("SHA256SUMS") && step.contains(&raw_name)),
+        "raw layout takes its digest from the manifest entry: {:?}",
+        run.steps()
+    );
+
+    // Mixed: the versioned tarball wins over the raw binary.
+    let mut mixed = FakeRelease::new(&root, "v9.9.3");
+    mixed.publish_raw(&raw_name, true);
+    mixed.publish_archive(&versioned("v9.9.3"), true);
+    mixed.finish();
+    let run = run_fake_update(tmp.path(), &server, &mixed);
+    run.assert_applied(&mixed, &versioned("v9.9.3"), "VersionedArchive");
+
+    // Legacy unversioned tarball still installs.
+    let mut legacy_only = FakeRelease::new(&root, "v9.9.4");
+    legacy_only.publish_archive(&legacy, true);
+    legacy_only.finish();
+    let run = run_fake_update(tmp.path(), &server, &legacy_only);
+    run.assert_applied(&legacy_only, &legacy, "LegacyArchive");
+
+    // Checksum mismatch in the manifest: denied, binary untouched.
+    let mut bad_manifest = FakeRelease::new(&root, "v9.9.5");
+    bad_manifest.publish_raw(&raw_name, false);
+    bad_manifest.finish();
+    let run = run_fake_update(tmp.path(), &server, &bad_manifest);
+    run.assert_denied(&bad_manifest, "Integrity verification", "denied");
+
+    // Checksum mismatch in a sidecar: denied, binary untouched.
+    let mut bad_sidecar = FakeRelease::new(&root, "v9.9.6");
+    bad_sidecar.publish_archive(&versioned("v9.9.6"), false);
+    bad_sidecar.finish();
+    let run = run_fake_update(tmp.path(), &server, &bad_sidecar);
+    run.assert_denied(&bad_sidecar, "Integrity verification", "denied");
+
+    // A release with no layout this host understands names what it found.
+    let mut foreign = FakeRelease::new(&root, "v9.9.7");
+    foreign.publish("sbh_windows_amd64.exe", b"MZ");
+    foreign.publish("SHA256SUMS", b"");
+    foreign.finish();
+    let run = run_fake_update(tmp.path(), &server, &foreign);
+    run.assert_denied(&foreign, "Resolve release asset", "sbh_windows_amd64.exe");
+
+    // Listed but not served: the download step fails, nothing is installed.
+    let mut ghost = FakeRelease::new(&root, "v9.9.8");
+    ghost.announce_only(&versioned("v9.9.8"));
+    ghost.announce_only(&format!("{}.sha256", versioned("v9.9.8")));
+    ghost.finish();
+    let run = run_fake_update(tmp.path(), &server, &ghost);
+    run.assert_denied(&ghost, "Download artifact", "download failed");
+}
+
+/// Without `SBH_TEST_MODE=1` the base-URL variables are inert, so a stray
+/// environment can never redirect a real update.
+#[test]
+fn e2e_update_ignores_release_base_overrides_outside_test_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let output = std::process::Command::new(common::sbh_bin_path())
+        .args(["--json", "update", "--check", "--version", "v9.9.9"])
+        .env("HOME", &home)
+        .env_remove("SBH_TEST_MODE")
+        .env("SBH_RELEASE_API_BASE", "http://127.0.0.1:9")
+        .env("SBH_RELEASE_DOWNLOAD_BASE", "http://127.0.0.1:9")
+        .output()
+        .expect("spawn sbh update");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .expect("JSON report");
+    let url = report["artifact_url"].as_str().unwrap_or_default();
+    assert!(
+        url.starts_with("https://github.com/"),
+        "real GitHub host must be used outside test mode: {url}"
+    );
+}
+
+/// The shell installer and the Rust contract must agree on every asset
+/// name they probe for, for every published target.
+#[test]
+fn e2e_install_script_probes_the_same_asset_names_as_the_rust_contract() {
+    let installer = include_str!("../scripts/install.sh");
+    for (os, arch, abi) in [
+        ("linux", "x86_64", Some("gnu")),
+        ("linux", "aarch64", Some("gnu")),
+        ("macos", "x86_64", None),
+        ("macos", "aarch64", None),
+    ] {
+        let host = HostSpecifier::from_parts(os, arch, abi).unwrap();
+        let contract =
+            resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some("v1.2.3"))
+                .unwrap();
+        let triple = contract.target.triple;
+        let candidates = contract.release_asset_candidates("v1.2.3");
+        assert_eq!(
+            candidates[0].asset_name,
+            format!("sbh-v1.2.3-{triple}.tar.xz"),
+            "versioned archive name for {triple}"
+        );
+        assert_eq!(
+            candidates[1].asset_name,
+            format!("sbh-{triple}.tar.xz"),
+            "legacy archive name for {triple}"
+        );
+        let raw = candidates[2].asset_name.replacen("sbh", "${PROGRAM}", 1);
+        assert!(
+            installer.contains(&format!("{triple})")) && installer.contains(&raw),
+            "install.sh must map {triple} to the raw asset {raw}"
+        );
+        assert_eq!(candidates[2].checksum_name, "SHA256SUMS");
+    }
+    for fragment in [
+        "versioned_archive_name=\"${PROGRAM}-${RELEASE_LOCATOR}-${TARGET_TRIPLE}.tar.xz\"",
+        "local versioned_archive_checksum=\"${versioned_archive_name}.sha256\"",
+        "local archive_name=\"${PROGRAM}-${TARGET_TRIPLE}.tar.xz\"",
+        "for candidate in \"SHA256SUMS\" \"SHA256SUMS.txt\"; do",
+    ] {
+        assert!(
+            installer.contains(fragment),
+            "install.sh must keep the contract fragment: {fragment}"
+        );
+    }
 }
