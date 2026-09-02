@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::notifications::NotificationConfig;
-use crate::daemon::policy::PolicyConfig;
+use crate::daemon::policy::{BehaviorConfig, BehaviorDispatchTable, BehaviorPreset, PolicyConfig};
 
 /// Supplemental protection file written by `sbh protect`.
 pub const SACRED_CONFIG_FILENAME: &str = "sacred.toml";
@@ -31,6 +31,9 @@ pub struct Config {
     pub notifications: NotificationConfig,
     pub dashboard: DashboardConfig,
     pub policy: PolicyConfig,
+    /// Memory-by-disk behavior matrix (`preset`, `memory_never_reduces_cleanup`,
+    /// `cells`). See [`BehaviorConfig`].
+    pub behavior: BehaviorConfig,
     pub system_tuning: SystemTuningConfig,
 }
 
@@ -251,6 +254,12 @@ pub struct ScoringConfig {
     pub false_positive_loss: f64,
     pub false_negative_loss: f64,
     pub calibration_floor: f64,
+    /// Posterior-abandoned floor applied to candidates whose *structural*
+    /// evidence is definite (validated `CACHEDIR.TAG`, Rust build markers, Go
+    /// build cache, `node_modules` under a temp root, DerivedData, Electron
+    /// caches). The floor changes only the prior fed into the expected-loss
+    /// decision; every veto still runs first. Default 0.85.
+    pub posterior_floor_definite: f64,
 }
 
 /// Ballast allocation settings.
@@ -758,6 +767,7 @@ impl Default for ScoringConfig {
             false_positive_loss: 50.0,
             false_negative_loss: 30.0,
             calibration_floor: 0.40,
+            posterior_floor_definite: 0.85,
         }
     }
 }
@@ -1311,6 +1321,10 @@ impl Config {
             "SBH_SCORING_CALIBRATION_FLOOR",
             &mut self.scoring.calibration_floor,
         )?;
+        set_env_f64(
+            "SBH_SCORING_POSTERIOR_FLOOR_DEFINITE",
+            &mut self.scoring.posterior_floor_definite,
+        )?;
 
         // telemetry
         set_env_u64(
@@ -1358,6 +1372,16 @@ impl Config {
 
         // policy
         set_env_bool("SBH_POLICY_KILL_SWITCH", &mut self.policy.kill_switch)?;
+
+        // behavior matrix (rollback: SBH_BEHAVIOR_PRESET=v0.5)
+        if let Some(raw) = env_var("SBH_BEHAVIOR_PRESET") {
+            self.behavior.preset =
+                raw.parse::<BehaviorPreset>()
+                    .map_err(|details| SbhError::ConfigParse {
+                        context: "env",
+                        details: format!("SBH_BEHAVIOR_PRESET={raw:?}: {details}"),
+                    })?;
+        }
 
         // system tuning (kernel writeback)
         set_env_bool(
@@ -1497,6 +1521,13 @@ impl Config {
 
     #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<()> {
+        // Behavior matrix: custom cell keys must name a real cell.
+        BehaviorDispatchTable::from_config(&self.behavior).map_err(|details| {
+            SbhError::InvalidConfig {
+                details: format!("behavior: {details}"),
+            }
+        })?;
+
         // I31: Thresholds must be in 0.0..=100.0.
         for (name, val) in [
             ("green_min_free_pct", self.pressure.green_min_free_pct),
@@ -1608,6 +1639,10 @@ impl Config {
 
         validate_prob("scoring.min_score", self.scoring.min_score)?;
         validate_prob("scoring.calibration_floor", self.scoring.calibration_floor)?;
+        validate_prob(
+            "scoring.posterior_floor_definite",
+            self.scoring.posterior_floor_definite,
+        )?;
 
         // I35: min_score must be <= calibration_floor.
         if self.scoring.min_score > self.scoring.calibration_floor {
@@ -2017,8 +2052,8 @@ fn strip_trailing_separator(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, PathsConfig, SacredConfig, SbhError, ScannerEngineMode, load_sacred_config,
-        sacred_config_path_for, write_sacred_config,
+        BehaviorPreset, Config, PathsConfig, SacredConfig, SbhError, ScannerEngineMode,
+        load_sacred_config, sacred_config_path_for, write_sacred_config,
     };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -2035,6 +2070,62 @@ mod tests {
     fn default_config_is_valid() {
         let cfg = Config::default();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn scoring_posterior_floor_definite_defaults_parses_and_validates() {
+        let cfg = Config::default();
+        assert!((cfg.scoring.posterior_floor_definite - 0.85).abs() < f64::EPSILON);
+
+        let parsed: Config = toml::from_str("[scoring]\nposterior_floor_definite = 0.9\n")
+            .expect("floor should parse");
+        assert!((parsed.scoring.posterior_floor_definite - 0.9).abs() < f64::EPSILON);
+        assert!(parsed.validate().is_ok());
+
+        let mut bad = Config::default();
+        bad.scoring.posterior_floor_definite = 1.5;
+        let err = bad
+            .validate()
+            .expect_err("floor above 1.0 must be rejected");
+        assert!(err.to_string().contains("posterior_floor_definite"));
+    }
+
+    #[test]
+    fn behavior_preset_env_override_and_custom_cell_validation() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.behavior.preset, BehaviorPreset::V0_6);
+        assert!(cfg.behavior.memory_never_reduces_cleanup);
+
+        let parsed: Config = toml::from_str(
+            "[behavior]\npreset = \"custom\"\n[behavior.cells.normal_orange]\nscan = \"aggressive\"\ncleanup = \"identify_only\"\nballast = \"none\"\nnotify = \"low\"\n",
+        )
+        .expect("custom behavior config should parse");
+        assert_eq!(parsed.behavior.preset, BehaviorPreset::Custom);
+        assert!(parsed.validate().is_ok());
+
+        cfg.behavior.preset = BehaviorPreset::Custom;
+        cfg.behavior.cells.insert(
+            "normal_purple".to_string(),
+            parsed.behavior.cells["normal_orange"],
+        );
+        let err = cfg
+            .validate()
+            .expect_err("unknown disk level must be rejected");
+        assert!(err.to_string().contains("normal_purple"), "{err}");
+
+        let mut env_cfg = Config::default();
+        env_cfg
+            .apply_scanner_env_overrides_from(|_| None)
+            .expect("no-op");
+        // The env parser is the same FromStr the daemon uses.
+        assert_eq!(
+            "v0.5".parse::<BehaviorPreset>().expect("parses"),
+            BehaviorPreset::V0_5
+        );
+        assert!(
+            toml::from_str::<Config>("[behavior]\npreset = \"v9\"\n").is_err(),
+            "unknown preset must fail to parse"
+        );
     }
 
     #[test]

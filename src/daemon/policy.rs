@@ -9,7 +9,9 @@
 
 #![allow(clippy::cast_precision_loss)]
 
-use std::fmt;
+use std::collections::BTreeMap;
+use std::fmt::{self, Write as _};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -224,16 +226,6 @@ impl BehaviorPressureLevel {
         }
     }
 
-    /// Normalize the PID disk-pressure signal into the dispatch matrix scale.
-    #[must_use]
-    pub fn from_disk_pressure(level: PressureLevel) -> Self {
-        match level {
-            PressureLevel::Green => Self::Normal,
-            PressureLevel::Yellow | PressureLevel::Orange => Self::Warn,
-            PressureLevel::Red | PressureLevel::Critical => Self::Critical,
-        }
-    }
-
     const fn index(self) -> usize {
         match self {
             Self::Normal => 0,
@@ -318,96 +310,580 @@ pub struct BehaviorMode {
     pub notification_priority: NotificationPriority,
 }
 
-const DEFAULT_BEHAVIOR_CELLS: [[BehaviorMode; 3]; 3] = [
+/// Index of a native disk-pressure level along the behavior matrix's disk axis.
+const fn disk_index(level: PressureLevel) -> usize {
+    match level {
+        PressureLevel::Green => 0,
+        PressureLevel::Yellow => 1,
+        PressureLevel::Orange => 2,
+        PressureLevel::Red => 3,
+        PressureLevel::Critical => 4,
+    }
+}
+
+/// Disk-pressure columns of the behavior matrix, in index order.
+pub const BEHAVIOR_DISK_LEVELS: [PressureLevel; 5] = [
+    PressureLevel::Green,
+    PressureLevel::Yellow,
+    PressureLevel::Orange,
+    PressureLevel::Red,
+    PressureLevel::Critical,
+];
+
+/// Memory-pressure rows of the behavior matrix, in index order.
+pub const BEHAVIOR_MEMORY_LEVELS: [BehaviorPressureLevel; 3] = [
+    BehaviorPressureLevel::Normal,
+    BehaviorPressureLevel::Warn,
+    BehaviorPressureLevel::Critical,
+];
+
+impl BehaviorPressureLevel {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Warn => "warn",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+const fn disk_label(level: PressureLevel) -> &'static str {
+    match level {
+        PressureLevel::Green => "green",
+        PressureLevel::Yellow => "yellow",
+        PressureLevel::Orange => "orange",
+        PressureLevel::Red => "red",
+        PressureLevel::Critical => "critical",
+    }
+}
+
+impl ScanAggressiveness {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Light => "light",
+            Self::Aggressive => "aggressive",
+            Self::DefiniteOnly => "definite_only",
+            Self::Skip => "skip",
+        }
+    }
+}
+
+impl CleanupAction {
+    /// Aggressiveness rank used by the never-reduce rule: a higher rank deletes
+    /// more. `None` < `IdentifyOnly` < `HighConfidenceCandidates` <
+    /// `MostPromisingCandidates` < `DefiniteCandidates` < `AnyDefiniteCandidate`.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::IdentifyOnly => 1,
+            Self::HighConfidenceCandidates => 2,
+            Self::MostPromisingCandidates => 3,
+            Self::DefiniteCandidates => 4,
+            Self::AnyDefiniteCandidate => 5,
+        }
+    }
+
+    const fn at_least(self, floor: Self) -> Self {
+        if floor.rank() > self.rank() {
+            floor
+        } else {
+            self
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::IdentifyOnly => "identify_only",
+            Self::HighConfidenceCandidates => "high_confidence_candidates",
+            Self::MostPromisingCandidates => "most_promising_candidates",
+            Self::DefiniteCandidates => "definite_candidates",
+            Self::AnyDefiniteCandidate => "any_definite_candidate",
+        }
+    }
+}
+
+impl BallastAction {
+    /// Aggressiveness rank used by the never-reduce rule.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Release => 1,
+            Self::ReleaseFirst => 2,
+        }
+    }
+
+    const fn at_least(self, floor: Self) -> Self {
+        if floor.rank() > self.rank() {
+            floor
+        } else {
+            self
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Release => "release",
+            Self::ReleaseFirst => "release_first",
+        }
+    }
+}
+
+impl NotificationPriority {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+            Self::Emergency => "emergency",
+        }
+    }
+}
+
+const fn cell(
+    scan_aggressiveness: ScanAggressiveness,
+    cleanup_action: CleanupAction,
+    ballast_action: BallastAction,
+    notification_priority: NotificationPriority,
+) -> BehaviorMode {
+    BehaviorMode {
+        scan_aggressiveness,
+        cleanup_action,
+        ballast_action,
+        notification_priority,
+    }
+}
+
+/// The v0.6 matrix: reclaim *before* the cliff.
+///
+/// Rows are memory pressure (Normal, Warn, Critical); columns are disk pressure
+/// (Green, Yellow, Orange, Red, Critical). Orange already deletes definite
+/// artifacts and releases ballast; Red and Critical delete any definite
+/// candidate and release ballast first. Green and Yellow delete only
+/// high-confidence candidates (the maintenance and predictive paths), so an
+/// artifact that scores as definitely regenerable is removed while there is
+/// still time, instead of waiting for the volume to reach the state in which
+/// the daemon's own remediation fails.
+const V0_6_CELLS: [[BehaviorMode; 5]; 3] = [
     [
-        BehaviorMode {
-            scan_aggressiveness: ScanAggressiveness::Normal,
-            cleanup_action: CleanupAction::None,
-            ballast_action: BallastAction::None,
-            notification_priority: NotificationPriority::None,
-        },
-        BehaviorMode {
-            scan_aggressiveness: ScanAggressiveness::Aggressive,
-            cleanup_action: CleanupAction::IdentifyOnly,
-            ballast_action: BallastAction::None,
-            notification_priority: NotificationPriority::Low,
-        },
-        BehaviorMode {
-            scan_aggressiveness: ScanAggressiveness::Aggressive,
-            cleanup_action: CleanupAction::DefiniteCandidates,
-            ballast_action: BallastAction::Release,
-            notification_priority: NotificationPriority::High,
-        },
+        cell(
+            ScanAggressiveness::Normal,
+            CleanupAction::HighConfidenceCandidates,
+            BallastAction::None,
+            NotificationPriority::None,
+        ),
+        cell(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::HighConfidenceCandidates,
+            BallastAction::None,
+            NotificationPriority::Low,
+        ),
+        cell(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::DefiniteCandidates,
+            BallastAction::Release,
+            NotificationPriority::Normal,
+        ),
+        cell(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::ReleaseFirst,
+            NotificationPriority::High,
+        ),
+        cell(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::ReleaseFirst,
+            NotificationPriority::Emergency,
+        ),
     ],
     [
-        BehaviorMode {
-            scan_aggressiveness: ScanAggressiveness::Light,
-            cleanup_action: CleanupAction::None,
-            ballast_action: BallastAction::None,
-            notification_priority: NotificationPriority::Low,
-        },
-        BehaviorMode {
-            scan_aggressiveness: ScanAggressiveness::Light,
-            cleanup_action: CleanupAction::HighConfidenceCandidates,
-            ballast_action: BallastAction::Release,
-            notification_priority: NotificationPriority::Normal,
-        },
-        BehaviorMode {
-            scan_aggressiveness: ScanAggressiveness::DefiniteOnly,
-            cleanup_action: CleanupAction::DefiniteCandidates,
-            ballast_action: BallastAction::ReleaseFirst,
-            notification_priority: NotificationPriority::High,
-        },
+        cell(
+            ScanAggressiveness::Light,
+            CleanupAction::HighConfidenceCandidates,
+            BallastAction::None,
+            NotificationPriority::Low,
+        ),
+        cell(
+            ScanAggressiveness::Light,
+            CleanupAction::HighConfidenceCandidates,
+            BallastAction::None,
+            NotificationPriority::Normal,
+        ),
+        cell(
+            ScanAggressiveness::Light,
+            CleanupAction::DefiniteCandidates,
+            BallastAction::Release,
+            NotificationPriority::Normal,
+        ),
+        cell(
+            ScanAggressiveness::DefiniteOnly,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::ReleaseFirst,
+            NotificationPriority::High,
+        ),
+        cell(
+            ScanAggressiveness::DefiniteOnly,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::ReleaseFirst,
+            NotificationPriority::Emergency,
+        ),
     ],
     [
-        BehaviorMode {
-            scan_aggressiveness: ScanAggressiveness::Skip,
-            cleanup_action: CleanupAction::None,
-            ballast_action: BallastAction::None,
-            notification_priority: NotificationPriority::Normal,
-        },
-        BehaviorMode {
-            scan_aggressiveness: ScanAggressiveness::DefiniteOnly,
-            cleanup_action: CleanupAction::MostPromisingCandidates,
-            ballast_action: BallastAction::Release,
-            notification_priority: NotificationPriority::High,
-        },
-        BehaviorMode {
-            scan_aggressiveness: ScanAggressiveness::DefiniteOnly,
-            cleanup_action: CleanupAction::AnyDefiniteCandidate,
-            ballast_action: BallastAction::ReleaseFirst,
-            notification_priority: NotificationPriority::Emergency,
-        },
+        cell(
+            ScanAggressiveness::Skip,
+            CleanupAction::HighConfidenceCandidates,
+            BallastAction::None,
+            NotificationPriority::Normal,
+        ),
+        cell(
+            ScanAggressiveness::DefiniteOnly,
+            CleanupAction::HighConfidenceCandidates,
+            BallastAction::None,
+            NotificationPriority::High,
+        ),
+        cell(
+            ScanAggressiveness::DefiniteOnly,
+            CleanupAction::DefiniteCandidates,
+            BallastAction::Release,
+            NotificationPriority::High,
+        ),
+        cell(
+            ScanAggressiveness::DefiniteOnly,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::ReleaseFirst,
+            NotificationPriority::Emergency,
+        ),
+        cell(
+            ScanAggressiveness::DefiniteOnly,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::ReleaseFirst,
+            NotificationPriority::Emergency,
+        ),
     ],
 ];
 
-/// Dispatch table for the 3x3 memory-pressure by disk-pressure behavior matrix.
+/// The matrix shipped through v0.5.x, kept as the rollback preset.
 ///
-/// Rows are memory pressure (`Normal`, `Warn`, `Critical`) and columns are disk
-/// pressure (`Normal`, `Warn`, `Critical`).
+/// It collapsed Yellow and Orange into one "warn" column and Red and Critical
+/// into one "critical" column, and at normal memory pressure it made the warn
+/// column identify-only with no ballast release, so nothing was reclaimed until
+/// Red. Select it with `[behavior] preset = "v0.5"` or
+/// `SBH_BEHAVIOR_PRESET=v0.5`.
+const V0_5_CELLS: [[BehaviorMode; 5]; 3] = [
+    [
+        cell(
+            ScanAggressiveness::Normal,
+            CleanupAction::None,
+            BallastAction::None,
+            NotificationPriority::None,
+        ),
+        cell(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::IdentifyOnly,
+            BallastAction::None,
+            NotificationPriority::Low,
+        ),
+        cell(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::IdentifyOnly,
+            BallastAction::None,
+            NotificationPriority::Low,
+        ),
+        cell(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::DefiniteCandidates,
+            BallastAction::Release,
+            NotificationPriority::High,
+        ),
+        cell(
+            ScanAggressiveness::Aggressive,
+            CleanupAction::DefiniteCandidates,
+            BallastAction::Release,
+            NotificationPriority::High,
+        ),
+    ],
+    [
+        cell(
+            ScanAggressiveness::Light,
+            CleanupAction::None,
+            BallastAction::None,
+            NotificationPriority::Low,
+        ),
+        cell(
+            ScanAggressiveness::Light,
+            CleanupAction::HighConfidenceCandidates,
+            BallastAction::Release,
+            NotificationPriority::Normal,
+        ),
+        cell(
+            ScanAggressiveness::Light,
+            CleanupAction::HighConfidenceCandidates,
+            BallastAction::Release,
+            NotificationPriority::Normal,
+        ),
+        cell(
+            ScanAggressiveness::DefiniteOnly,
+            CleanupAction::DefiniteCandidates,
+            BallastAction::ReleaseFirst,
+            NotificationPriority::High,
+        ),
+        cell(
+            ScanAggressiveness::DefiniteOnly,
+            CleanupAction::DefiniteCandidates,
+            BallastAction::ReleaseFirst,
+            NotificationPriority::High,
+        ),
+    ],
+    [
+        cell(
+            ScanAggressiveness::Skip,
+            CleanupAction::None,
+            BallastAction::None,
+            NotificationPriority::Normal,
+        ),
+        cell(
+            ScanAggressiveness::DefiniteOnly,
+            CleanupAction::MostPromisingCandidates,
+            BallastAction::Release,
+            NotificationPriority::High,
+        ),
+        cell(
+            ScanAggressiveness::DefiniteOnly,
+            CleanupAction::MostPromisingCandidates,
+            BallastAction::Release,
+            NotificationPriority::High,
+        ),
+        cell(
+            ScanAggressiveness::DefiniteOnly,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::ReleaseFirst,
+            NotificationPriority::Emergency,
+        ),
+        cell(
+            ScanAggressiveness::DefiniteOnly,
+            CleanupAction::AnyDefiniteCandidate,
+            BallastAction::ReleaseFirst,
+            NotificationPriority::Emergency,
+        ),
+    ],
+];
+
+/// Named behavior-matrix presets selectable from `[behavior] preset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BehaviorPreset {
+    /// Reclaim before the cliff (default since v0.6.0).
+    #[default]
+    #[serde(rename = "v0.6")]
+    V0_6,
+    /// The matrix shipped through v0.5.x (rollback).
+    #[serde(rename = "v0.5")]
+    V0_5,
+    /// Start from the v0.6 cells and apply `[behavior.cells.*]` overrides.
+    #[serde(rename = "custom")]
+    Custom,
+}
+
+impl BehaviorPreset {
+    /// All accepted spellings, for error messages.
+    pub const ALLOWED: &'static str = "\"v0.6\", \"v0.5\", \"custom\"";
+
+    const fn base_cells(self) -> [[BehaviorMode; 5]; 3] {
+        match self {
+            Self::V0_6 | Self::Custom => V0_6_CELLS,
+            Self::V0_5 => V0_5_CELLS,
+        }
+    }
+}
+
+impl fmt::Display for BehaviorPreset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::V0_6 => "v0.6",
+            Self::V0_5 => "v0.5",
+            Self::Custom => "custom",
+        })
+    }
+}
+
+impl FromStr for BehaviorPreset {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "v0.6" | "v0_6" | "0.6" => Ok(Self::V0_6),
+            "v0.5" | "v0_5" | "0.5" => Ok(Self::V0_5),
+            "custom" => Ok(Self::Custom),
+            other => Err(format!(
+                "invalid behavior preset {other:?}: expected one of {}",
+                Self::ALLOWED
+            )),
+        }
+    }
+}
+
+/// One matrix cell as written in `[behavior.cells.<memory>_<disk>]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorCellConfig {
+    /// Scanner posture.
+    pub scan: ScanAggressiveness,
+    /// Cleanup posture.
+    pub cleanup: CleanupAction,
+    /// Ballast response.
+    pub ballast: BallastAction,
+    /// Notification severity.
+    pub notify: NotificationPriority,
+}
+
+impl From<BehaviorCellConfig> for BehaviorMode {
+    fn from(config: BehaviorCellConfig) -> Self {
+        Self {
+            scan_aggressiveness: config.scan,
+            cleanup_action: config.cleanup,
+            ballast_action: config.ballast,
+            notification_priority: config.notify,
+        }
+    }
+}
+
+/// `[behavior]` configuration: which matrix the daemon runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BehaviorConfig {
+    /// Matrix preset (`"v0.6"` default, `"v0.5"` rollback, `"custom"`).
+    /// Overridable with `SBH_BEHAVIOR_PRESET`.
+    pub preset: BehaviorPreset,
+    /// When true (default), memory pressure may lower scan aggressiveness but
+    /// never lowers the cleanup or ballast posture below the normal-memory row
+    /// for the same disk level: memory pressure argues for less scanning, not
+    /// for keeping a full disk.
+    pub memory_never_reduces_cleanup: bool,
+    /// Cell overrides keyed `<memory>_<disk>` (memory: `normal`, `warn`,
+    /// `critical`; disk: `green`, `yellow`, `orange`, `red`, `critical`), for
+    /// example `[behavior.cells.normal_orange]`. Applied only when
+    /// `preset = "custom"`; ignored otherwise so an env-var rollback to a
+    /// named preset always works.
+    pub cells: BTreeMap<String, BehaviorCellConfig>,
+}
+
+impl Default for BehaviorConfig {
+    fn default() -> Self {
+        Self {
+            preset: BehaviorPreset::default(),
+            memory_never_reduces_cleanup: true,
+            cells: BTreeMap::new(),
+        }
+    }
+}
+
+fn parse_cell_key(key: &str) -> Result<(BehaviorPressureLevel, PressureLevel), String> {
+    let (memory, disk) = key
+        .split_once('_')
+        .ok_or_else(|| format!("behavior.cells.{key}: expected `<memory>_<disk>`"))?;
+    let memory_level = BEHAVIOR_MEMORY_LEVELS
+        .iter()
+        .copied()
+        .find(|level| level.label() == memory)
+        .ok_or_else(|| {
+            format!("behavior.cells.{key}: unknown memory level {memory:?}, expected normal, warn, or critical")
+        })?;
+    let disk_level = BEHAVIOR_DISK_LEVELS
+        .iter()
+        .copied()
+        .find(|level| disk_label(*level) == disk)
+        .ok_or_else(|| {
+            format!("behavior.cells.{key}: unknown disk level {disk:?}, expected green, yellow, orange, red, or critical")
+        })?;
+    Ok((memory_level, disk_level))
+}
+
+/// Dispatch table for the memory-pressure by disk-pressure behavior matrix.
+///
+/// Rows are memory pressure (`Normal`, `Warn`, `Critical`); columns are the
+/// five native disk-pressure levels (`Green` through `Critical`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BehaviorDispatchTable {
-    cells: [[BehaviorMode; 3]; 3],
+    cells: [[BehaviorMode; 5]; 3],
+    preset: BehaviorPreset,
 }
 
 impl BehaviorDispatchTable {
     /// Build a dispatch table from explicit memory-row by disk-column cells.
     #[must_use]
-    pub const fn new(cells: [[BehaviorMode; 3]; 3]) -> Self {
-        Self { cells }
+    pub const fn new(cells: [[BehaviorMode; 5]; 3]) -> Self {
+        Self {
+            cells,
+            preset: BehaviorPreset::Custom,
+        }
     }
 
-    /// Return the behavior for already-normalized memory and disk pressure levels.
+    /// The matrix for a named preset with the never-reduce rule applied.
+    #[must_use]
+    pub fn from_preset(preset: BehaviorPreset) -> Self {
+        let mut table = Self {
+            cells: preset.base_cells(),
+            preset,
+        };
+        table.apply_never_reduce();
+        table
+    }
+
+    /// Resolve the `[behavior]` configuration into the effective matrix.
+    ///
+    /// Fails only on custom cell keys that name no matrix cell; unknown field
+    /// names inside a cell are rejected by the config parser.
+    pub fn from_config(config: &BehaviorConfig) -> Result<Self, String> {
+        let mut table = Self {
+            cells: config.preset.base_cells(),
+            preset: config.preset,
+        };
+        if config.preset == BehaviorPreset::Custom {
+            for (key, override_cell) in &config.cells {
+                let (memory_level, disk_level) = parse_cell_key(key)?;
+                table.cells[memory_level.index()][disk_index(disk_level)] =
+                    BehaviorMode::from(*override_cell);
+            }
+        }
+        if config.memory_never_reduces_cleanup {
+            table.apply_never_reduce();
+        }
+        Ok(table)
+    }
+
+    fn apply_never_reduce(&mut self) {
+        for column in 0..self.cells[0].len() {
+            let floor = self.cells[BehaviorPressureLevel::Normal.index()][column];
+            for row in [BehaviorPressureLevel::Warn, BehaviorPressureLevel::Critical] {
+                let current = &mut self.cells[row.index()][column];
+                current.cleanup_action = current.cleanup_action.at_least(floor.cleanup_action);
+                current.ballast_action = current.ballast_action.at_least(floor.ballast_action);
+            }
+        }
+    }
+
+    /// Which preset this table was built from.
+    #[must_use]
+    pub const fn preset(&self) -> BehaviorPreset {
+        self.preset
+    }
+
+    /// Return the behavior for a normalized memory level and a native disk level.
     #[must_use]
     pub fn mode_for_levels(
         &self,
         memory_pressure: BehaviorPressureLevel,
-        disk_pressure: BehaviorPressureLevel,
+        disk_pressure: PressureLevel,
     ) -> BehaviorMode {
-        self.cells[memory_pressure.index()][disk_pressure.index()]
+        self.cells[memory_pressure.index()][disk_index(disk_pressure)]
     }
 
-    /// Normalize native pressure readings and return the matching behavior.
+    /// Normalize the platform memory reading and return the matching behavior.
     #[must_use]
     pub fn mode_for(
         &self,
@@ -416,20 +892,40 @@ impl BehaviorDispatchTable {
     ) -> BehaviorMode {
         self.mode_for_levels(
             BehaviorPressureLevel::from_memory_pressure(memory_pressure),
-            BehaviorPressureLevel::from_disk_pressure(disk_pressure),
+            disk_pressure,
         )
     }
 
-    /// Return the raw memory-row by disk-column cells for diagnostics/config export.
+    /// Human-readable rendering of every cell, one line per memory row, for
+    /// the startup and reload logs.
     #[must_use]
-    pub fn cells(&self) -> &[[BehaviorMode; 3]; 3] {
-        &self.cells
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "behavior matrix preset={} (rows: memory; cells: scan/cleanup/ballast/notify)",
+            self.preset
+        );
+        for memory_level in BEHAVIOR_MEMORY_LEVELS {
+            let _ = write!(out, "\n  memory={:<8}", memory_level.label());
+            for disk_level in BEHAVIOR_DISK_LEVELS {
+                let mode = self.mode_for_levels(memory_level, disk_level);
+                let _ = write!(
+                    out,
+                    " {}={}/{}/{}/{}",
+                    disk_label(disk_level),
+                    mode.scan_aggressiveness.label(),
+                    mode.cleanup_action.label(),
+                    mode.ballast_action.label(),
+                    mode.notification_priority.label()
+                );
+            }
+        }
+        out
     }
 }
 
 impl Default for BehaviorDispatchTable {
     fn default() -> Self {
-        Self::new(DEFAULT_BEHAVIOR_CELLS)
+        Self::from_preset(BehaviorPreset::default())
     }
 }
 
@@ -1223,6 +1719,8 @@ mod tests {
                 expected_loss_delete: 1.3,
                 calibration_score: 0.82,
                 fallback_active: false,
+                certainty: crate::scanner::scoring::ArtifactCertainty::Definite,
+                posterior_floor_applied: false,
             },
             ledger: EvidenceLedger {
                 terms: vec![EvidenceTerm {
@@ -1277,109 +1775,220 @@ mod tests {
     }
 
     #[test]
-    fn behavior_dispatch_table_encodes_nine_pressure_cells() {
+    fn v0_6_default_acts_at_orange_and_never_reduces_cleanup_under_memory_pressure() {
         let table = BehaviorDispatchTable::default();
+        assert_eq!(table.preset(), BehaviorPreset::V0_6);
 
-        let cases = [
-            (
-                BehaviorPressureLevel::Normal,
-                BehaviorPressureLevel::Normal,
-                behavior(
-                    ScanAggressiveness::Normal,
-                    CleanupAction::None,
-                    BallastAction::None,
-                    NotificationPriority::None,
-                ),
-            ),
-            (
-                BehaviorPressureLevel::Normal,
-                BehaviorPressureLevel::Warn,
-                behavior(
-                    ScanAggressiveness::Aggressive,
-                    CleanupAction::IdentifyOnly,
-                    BallastAction::None,
-                    NotificationPriority::Low,
-                ),
-            ),
-            (
-                BehaviorPressureLevel::Normal,
-                BehaviorPressureLevel::Critical,
-                behavior(
-                    ScanAggressiveness::Aggressive,
-                    CleanupAction::DefiniteCandidates,
-                    BallastAction::Release,
-                    NotificationPriority::High,
-                ),
-            ),
-            (
-                BehaviorPressureLevel::Warn,
-                BehaviorPressureLevel::Normal,
-                behavior(
-                    ScanAggressiveness::Light,
-                    CleanupAction::None,
-                    BallastAction::None,
-                    NotificationPriority::Low,
-                ),
-            ),
-            (
-                BehaviorPressureLevel::Warn,
-                BehaviorPressureLevel::Warn,
-                behavior(
-                    ScanAggressiveness::Light,
-                    CleanupAction::HighConfidenceCandidates,
-                    BallastAction::Release,
-                    NotificationPriority::Normal,
-                ),
-            ),
-            (
-                BehaviorPressureLevel::Warn,
-                BehaviorPressureLevel::Critical,
-                behavior(
-                    ScanAggressiveness::DefiniteOnly,
-                    CleanupAction::DefiniteCandidates,
-                    BallastAction::ReleaseFirst,
-                    NotificationPriority::High,
-                ),
-            ),
-            (
-                BehaviorPressureLevel::Critical,
-                BehaviorPressureLevel::Normal,
-                behavior(
-                    ScanAggressiveness::Skip,
-                    CleanupAction::None,
-                    BallastAction::None,
-                    NotificationPriority::Normal,
-                ),
-            ),
-            (
-                BehaviorPressureLevel::Critical,
-                BehaviorPressureLevel::Warn,
-                behavior(
-                    ScanAggressiveness::DefiniteOnly,
-                    CleanupAction::MostPromisingCandidates,
-                    BallastAction::Release,
-                    NotificationPriority::High,
-                ),
-            ),
-            (
-                BehaviorPressureLevel::Critical,
-                BehaviorPressureLevel::Critical,
-                behavior(
-                    ScanAggressiveness::DefiniteOnly,
-                    CleanupAction::AnyDefiniteCandidate,
-                    BallastAction::ReleaseFirst,
-                    NotificationPriority::Emergency,
-                ),
-            ),
-        ];
-
-        for (memory_level, disk_level, expected) in cases {
-            assert_eq!(
-                table.mode_for_levels(memory_level, disk_level),
-                expected,
-                "unexpected behavior for memory={memory_level:?} disk={disk_level:?}"
-            );
+        // Normal memory: Orange deletes definite artifacts and releases ballast;
+        // Red/Critical delete any definite candidate and release first.
+        let orange = table.mode_for(MemoryPressureLevel::Normal, PressureLevel::Orange);
+        assert_eq!(orange.cleanup_action, CleanupAction::DefiniteCandidates);
+        assert_eq!(orange.ballast_action, BallastAction::Release);
+        let yellow = table.mode_for(MemoryPressureLevel::Normal, PressureLevel::Yellow);
+        assert_eq!(
+            yellow.cleanup_action,
+            CleanupAction::HighConfidenceCandidates
+        );
+        assert_eq!(yellow.ballast_action, BallastAction::None);
+        for disk in [PressureLevel::Red, PressureLevel::Critical] {
+            let mode = table.mode_for(MemoryPressureLevel::Normal, disk);
+            assert_eq!(mode.cleanup_action, CleanupAction::AnyDefiniteCandidate);
+            assert_eq!(mode.ballast_action, BallastAction::ReleaseFirst);
         }
+        assert_eq!(
+            table
+                .mode_for(MemoryPressureLevel::Normal, PressureLevel::Critical)
+                .notification_priority,
+            NotificationPriority::Emergency
+        );
+
+        // Memory pressure lowers scanning but never the cleanup/ballast posture.
+        for memory in [MemoryPressureLevel::Warn, MemoryPressureLevel::Critical] {
+            for disk in BEHAVIOR_DISK_LEVELS {
+                let floor = table.mode_for(MemoryPressureLevel::Normal, disk);
+                let mode = table.mode_for(memory, disk);
+                assert!(
+                    mode.cleanup_action.rank() >= floor.cleanup_action.rank(),
+                    "memory={memory:?} disk={disk:?} reduced cleanup"
+                );
+                assert!(
+                    mode.ballast_action.rank() >= floor.ballast_action.rank(),
+                    "memory={memory:?} disk={disk:?} reduced ballast"
+                );
+            }
+        }
+        assert_eq!(
+            table
+                .mode_for(MemoryPressureLevel::Critical, PressureLevel::Green)
+                .scan_aggressiveness,
+            ScanAggressiveness::Skip
+        );
+        assert_eq!(
+            table
+                .mode_for(MemoryPressureLevel::Warn, PressureLevel::Orange)
+                .scan_aggressiveness,
+            ScanAggressiveness::Light
+        );
+    }
+
+    #[test]
+    fn v0_5_preset_reproduces_the_legacy_identify_only_cells() {
+        let table = BehaviorDispatchTable::from_preset(BehaviorPreset::V0_5);
+        assert_eq!(table.preset(), BehaviorPreset::V0_5);
+
+        // Yellow and Orange shared one column; Red and Critical shared another.
+        for disk in [PressureLevel::Yellow, PressureLevel::Orange] {
+            let mode = table.mode_for(MemoryPressureLevel::Normal, disk);
+            assert_eq!(mode.cleanup_action, CleanupAction::IdentifyOnly);
+            assert_eq!(mode.ballast_action, BallastAction::None);
+        }
+        for disk in [PressureLevel::Red, PressureLevel::Critical] {
+            let mode = table.mode_for(MemoryPressureLevel::Normal, disk);
+            assert_eq!(mode.cleanup_action, CleanupAction::DefiniteCandidates);
+            assert_eq!(mode.ballast_action, BallastAction::Release);
+        }
+        let green = table.mode_for(MemoryPressureLevel::Normal, PressureLevel::Green);
+        assert_eq!(green.cleanup_action, CleanupAction::None);
+        assert_eq!(
+            table
+                .mode_for(MemoryPressureLevel::Critical, PressureLevel::Yellow)
+                .cleanup_action,
+            CleanupAction::MostPromisingCandidates
+        );
+        assert_eq!(
+            table.mode_for(MemoryPressureLevel::Critical, PressureLevel::Critical),
+            behavior(
+                ScanAggressiveness::DefiniteOnly,
+                CleanupAction::AnyDefiniteCandidate,
+                BallastAction::ReleaseFirst,
+                NotificationPriority::Emergency,
+            )
+        );
+    }
+
+    #[test]
+    fn custom_cells_override_only_under_the_custom_preset() {
+        let quiet_orange = BehaviorCellConfig {
+            scan: ScanAggressiveness::Light,
+            cleanup: CleanupAction::IdentifyOnly,
+            ballast: BallastAction::None,
+            notify: NotificationPriority::Low,
+        };
+        let mut config = BehaviorConfig {
+            preset: BehaviorPreset::Custom,
+            memory_never_reduces_cleanup: false,
+            cells: BTreeMap::from([("normal_orange".to_string(), quiet_orange)]),
+        };
+
+        let table = BehaviorDispatchTable::from_config(&config).expect("valid custom config");
+        assert_eq!(
+            table.mode_for(MemoryPressureLevel::Normal, PressureLevel::Orange),
+            BehaviorMode::from(quiet_orange)
+        );
+        // Untouched cells keep the v0.6 base.
+        assert_eq!(
+            table
+                .mode_for(MemoryPressureLevel::Normal, PressureLevel::Red)
+                .cleanup_action,
+            CleanupAction::AnyDefiniteCandidate
+        );
+
+        // The same cells under a named preset are ignored (env rollback stays safe).
+        config.preset = BehaviorPreset::V0_6;
+        let table =
+            BehaviorDispatchTable::from_config(&config).expect("named preset ignores cells");
+        assert_eq!(
+            table
+                .mode_for(MemoryPressureLevel::Normal, PressureLevel::Orange)
+                .cleanup_action,
+            CleanupAction::DefiniteCandidates
+        );
+    }
+
+    #[test]
+    fn custom_cell_keys_name_a_real_cell_or_are_rejected() {
+        let cell = BehaviorCellConfig {
+            scan: ScanAggressiveness::Normal,
+            cleanup: CleanupAction::None,
+            ballast: BallastAction::None,
+            notify: NotificationPriority::None,
+        };
+        for (key, fragment) in [
+            ("orange", "expected `<memory>_<disk>`"),
+            ("hot_orange", "unknown memory level"),
+            ("normal_purple", "unknown disk level"),
+        ] {
+            let config = BehaviorConfig {
+                preset: BehaviorPreset::Custom,
+                memory_never_reduces_cleanup: true,
+                cells: BTreeMap::from([(key.to_string(), cell)]),
+            };
+            let error =
+                BehaviorDispatchTable::from_config(&config).expect_err("bad key must be rejected");
+            assert!(error.contains(fragment), "{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn never_reduce_rule_lifts_memory_rows_to_the_normal_floor() {
+        let low = BehaviorCellConfig {
+            scan: ScanAggressiveness::Light,
+            cleanup: CleanupAction::None,
+            ballast: BallastAction::None,
+            notify: NotificationPriority::Low,
+        };
+        let config = BehaviorConfig {
+            preset: BehaviorPreset::Custom,
+            memory_never_reduces_cleanup: true,
+            cells: BTreeMap::from([("warn_red".to_string(), low)]),
+        };
+        let table = BehaviorDispatchTable::from_config(&config).expect("valid");
+        let lifted = table.mode_for(MemoryPressureLevel::Warn, PressureLevel::Red);
+        assert_eq!(lifted.scan_aggressiveness, ScanAggressiveness::Light);
+        assert_eq!(lifted.cleanup_action, CleanupAction::AnyDefiniteCandidate);
+        assert_eq!(lifted.ballast_action, BallastAction::ReleaseFirst);
+
+        let config = BehaviorConfig {
+            memory_never_reduces_cleanup: false,
+            ..config
+        };
+        let table = BehaviorDispatchTable::from_config(&config).expect("valid");
+        assert_eq!(
+            table.mode_for(MemoryPressureLevel::Warn, PressureLevel::Red),
+            BehaviorMode::from(low)
+        );
+    }
+
+    #[test]
+    fn preset_parses_every_documented_spelling_and_rejects_others() {
+        assert_eq!("v0.6".parse::<BehaviorPreset>(), Ok(BehaviorPreset::V0_6));
+        assert_eq!("V0_5".parse::<BehaviorPreset>(), Ok(BehaviorPreset::V0_5));
+        assert_eq!(
+            " custom ".parse::<BehaviorPreset>(),
+            Ok(BehaviorPreset::Custom)
+        );
+        let error = "v9".parse::<BehaviorPreset>().expect_err("unknown preset");
+        assert!(error.contains(BehaviorPreset::ALLOWED));
+
+        let parsed: BehaviorConfig =
+            toml::from_str("preset = \"v0.5\"\n").expect("toml preset parses");
+        assert_eq!(parsed.preset, BehaviorPreset::V0_5);
+        assert!(parsed.memory_never_reduces_cleanup);
+        let error = toml::from_str::<BehaviorConfig>("preset = \"v9\"\n")
+            .expect_err("unknown toml preset is rejected");
+        assert!(error.to_string().contains("v9"));
+    }
+
+    #[test]
+    fn render_lists_every_cell_with_its_preset() {
+        let rendered = BehaviorDispatchTable::default().render();
+        assert!(rendered.starts_with("behavior matrix preset=v0.6"));
+        for memory in ["memory=normal", "memory=warn", "memory=critical"] {
+            assert!(rendered.contains(memory), "{rendered}");
+        }
+        assert_eq!(rendered.matches(" green=").count(), 3);
+        assert_eq!(rendered.matches(" critical=").count(), 3);
+        assert!(rendered.contains("orange=aggressive/definite_candidates/release/normal"));
     }
 
     #[test]
@@ -1401,31 +2010,14 @@ mod tests {
             BehaviorPressureLevel::Critical
         );
 
-        for disk_level in [PressureLevel::Yellow, PressureLevel::Orange] {
-            assert_eq!(
-                BehaviorPressureLevel::from_disk_pressure(disk_level),
-                BehaviorPressureLevel::Warn
-            );
-        }
-        for disk_level in [PressureLevel::Red, PressureLevel::Critical] {
-            assert_eq!(
-                BehaviorPressureLevel::from_disk_pressure(disk_level),
-                BehaviorPressureLevel::Critical
-            );
-        }
-        assert_eq!(
-            BehaviorPressureLevel::from_disk_pressure(PressureLevel::Green),
-            BehaviorPressureLevel::Normal
-        );
-
         let table = BehaviorDispatchTable::default();
         assert_eq!(
             table.mode_for(MemoryPressureLevel::Unknown, PressureLevel::Green),
-            table.mode_for_levels(BehaviorPressureLevel::Warn, BehaviorPressureLevel::Normal)
+            table.mode_for_levels(BehaviorPressureLevel::Warn, PressureLevel::Green)
         );
         assert_eq!(
             table.mode_for(MemoryPressureLevel::Warn, PressureLevel::Red),
-            table.mode_for_levels(BehaviorPressureLevel::Warn, BehaviorPressureLevel::Critical)
+            table.mode_for_levels(BehaviorPressureLevel::Warn, PressureLevel::Red)
         );
     }
 
@@ -1467,8 +2059,7 @@ mod tests {
             );
 
             for (disk_source, disk_level) in disk_transitions {
-                let normalized_disk = BehaviorPressureLevel::from_disk_pressure(disk_level);
-                let expected = table.mode_for_levels(normalized_memory, normalized_disk);
+                let expected = table.mode_for_levels(normalized_memory, disk_level);
                 assert_eq!(
                     table.mode_for(linux_memory, disk_level),
                     expected,

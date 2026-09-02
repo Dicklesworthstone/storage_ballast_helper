@@ -655,6 +655,8 @@ mod tests {
                 expected_loss_delete: 1.3,
                 calibration_score: 0.82,
                 fallback_active: false,
+                certainty: crate::scanner::scoring::ArtifactCertainty::Definite,
+                posterior_floor_applied: false,
             },
             ledger: EvidenceLedger {
                 terms: vec![
@@ -740,6 +742,8 @@ mod tests {
                 expected_loss_delete: 10.0,
                 calibration_score: 1.0,
                 fallback_active: true,
+                certainty: crate::scanner::scoring::ArtifactCertainty::Unclear,
+                posterior_floor_applied: false,
             },
             ledger: EvidenceLedger {
                 terms: Vec::new(),

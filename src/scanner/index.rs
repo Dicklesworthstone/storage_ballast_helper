@@ -274,6 +274,8 @@ impl CandidateIndexRecord {
                 expected_loss_delete: 1.0 - total_score,
                 calibration_score: total_score,
                 fallback_active: false,
+                certainty: crate::scanner::scoring::ArtifactCertainty::Unclear,
+                posterior_floor_applied: false,
             },
             ledger: EvidenceLedger {
                 terms: Vec::new(),
@@ -749,6 +751,8 @@ mod tests {
                 expected_loss_delete: 0.1,
                 calibration_score: 0.9,
                 fallback_active: false,
+                certainty: crate::scanner::scoring::ArtifactCertainty::Definite,
+                posterior_floor_applied: false,
             },
             ledger: EvidenceLedger {
                 terms: Vec::new(),

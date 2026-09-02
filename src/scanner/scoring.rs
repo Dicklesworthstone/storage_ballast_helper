@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -44,6 +44,109 @@ pub enum DecisionAction {
     Keep,
     Delete,
     Review,
+}
+
+/// How certain the structural evidence is that a candidate is regenerable.
+///
+/// Computed from evidence that does not depend on the directory's name, so an
+/// arbitrarily named cargo target still classifies.
+///
+/// Ordering is by certainty: `Unclear < Likely < Definite`. The behavior
+/// matrix's cleanup actions gate dispatch on this (see
+/// `min_certainty_for` in the daemon): a `HighConfidenceCandidates` cell
+/// dispatches only `Definite` candidates, `DefiniteCandidates` also dispatches
+/// `Likely`, and `AnyDefiniteCandidate` dispatches every `Delete` verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ArtifactCertainty {
+    /// No structural marker and no confident name match.
+    Unclear,
+    /// A confident name match backed by at least one structural marker, or a
+    /// recognized artifact category inside a temporary root.
+    Likely,
+    /// A validated `CACHEDIR.TAG`, two or more Rust build markers, a Go build
+    /// cache layout, `node_modules` under a temporary root, or a macOS
+    /// regenerable-cache catalog rule (DerivedData, Electron caches).
+    Definite,
+}
+
+impl ArtifactCertainty {
+    /// Stable lowercase label for JSON and log output.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unclear => "unclear",
+            Self::Likely => "likely",
+            Self::Definite => "definite",
+        }
+    }
+
+    /// Numeric rank (`Unclear` = 0, `Likely` = 1, `Definite` = 2).
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Unclear => 0,
+            Self::Likely => 1,
+            Self::Definite => 2,
+        }
+    }
+
+    /// Inverse of [`Self::rank`]; out-of-range values clamp to `Definite`.
+    #[must_use]
+    pub const fn from_rank(rank: u8) -> Self {
+        match rank {
+            0 => Self::Unclear,
+            1 => Self::Likely,
+            _ => Self::Definite,
+        }
+    }
+}
+
+impl fmt::Display for ArtifactCertainty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Classify structural certainty from the classifier output, the structural
+/// signals the walker collected, and the location factor (`>= 0.9` means a
+/// temporary root such as `/tmp` or `/data/tmp`).
+#[must_use]
+pub fn classify_certainty(
+    classification: &ArtifactClassification,
+    signals: StructuralSignals,
+    location_factor: f64,
+) -> ArtifactCertainty {
+    let rust_markers = u8::from(signals.has_incremental)
+        + u8::from(signals.has_deps)
+        + u8::from(signals.has_fingerprint);
+    let in_temp_root = location_factor >= 0.9;
+    let pattern = classification.pattern_name.as_ref();
+
+    let definite = signals.has_cachedir_tag
+        || rust_markers >= 2
+        || (classification.category == ArtifactCategory::GoCache
+            && classification.structural_confidence >= 0.9)
+        || (classification.category == ArtifactCategory::NodeModules && in_temp_root)
+        || pattern == "xcode-derived-data"
+        || pattern.starts_with("electron-");
+    if definite {
+        return ArtifactCertainty::Definite;
+    }
+
+    let has_marker = rust_markers >= 1
+        || signals.has_build
+        || signals.mostly_object_files
+        || signals.has_strong_signal();
+    let recognized_category = !matches!(classification.category, ArtifactCategory::Unknown);
+    let confident_name = classification.name_confidence >= 0.85;
+    if (confident_name && has_marker)
+        || (in_temp_root && recognized_category)
+        || signals.has_strong_signal()
+    {
+        ArtifactCertainty::Likely
+    } else {
+        ArtifactCertainty::Unclear
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -198,6 +301,11 @@ pub struct DecisionOutcome {
     pub expected_loss_delete: f64,
     pub calibration_score: f64,
     pub fallback_active: bool,
+    /// Structural certainty that the candidate is regenerable output.
+    pub certainty: ArtifactCertainty,
+    /// True when `posterior_abandoned` was raised to the configured
+    /// `scoring.posterior_floor_definite` because the candidate is `Definite`.
+    pub posterior_floor_applied: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -250,6 +358,7 @@ pub struct ScoringEngine {
     false_positive_loss: f64,
     false_negative_loss: f64,
     calibration_floor: f64,
+    posterior_floor_definite: f64,
 }
 
 impl ScoringEngine {
@@ -268,6 +377,7 @@ impl ScoringEngine {
             false_positive_loss: scoring.false_positive_loss,
             false_negative_loss: scoring.false_negative_loss,
             calibration_floor: scoring.calibration_floor,
+            posterior_floor_definite: scoring.posterior_floor_definite.clamp(0.0, 1.0),
         }
     }
 
@@ -330,8 +440,20 @@ impl ScoringEngine {
         );
         let total = (base * factors.pressure_multiplier).clamp(0.0, 3.0);
 
-        let posterior_abandoned =
-            posterior_from_score(total, input.classification.combined_confidence);
+        // Definite-artifact fast lane: structural evidence (a validated
+        // CACHEDIR.TAG, Rust build markers, ...) sets a floor on the posterior
+        // that the score-derived sigmoid alone cannot reach for a modest-sized,
+        // hours-old target. Every veto ran before this point; the floor only
+        // changes the prior fed into the expected-loss decision, never a veto.
+        let certainty = classify_certainty(&input.classification, input.signals, factors.location);
+        let raw_posterior = posterior_from_score(total, input.classification.combined_confidence);
+        let posterior_floor_applied = certainty == ArtifactCertainty::Definite
+            && raw_posterior < self.posterior_floor_definite;
+        let posterior_abandoned = if posterior_floor_applied {
+            self.posterior_floor_definite
+        } else {
+            raw_posterior
+        };
         let base_expected_loss_keep = posterior_abandoned * self.false_negative_loss;
         let base_expected_loss_delete = (1.0 - posterior_abandoned) * self.false_positive_loss;
         let calibration = calibration_score(input.classification.combined_confidence, factors);
@@ -370,6 +492,8 @@ impl ScoringEngine {
             calibration,
             uncertainty,
             action,
+            certainty,
+            posterior_floor_applied.then_some(self.posterior_floor_definite),
         );
 
         CandidacyScore {
@@ -389,6 +513,8 @@ impl ScoringEngine {
                 expected_loss_delete,
                 calibration_score: calibration,
                 fallback_active,
+                certainty,
+                posterior_floor_applied,
             },
             ledger,
         }
@@ -503,6 +629,8 @@ impl ScoringEngine {
                 expected_loss_delete: self.false_positive_loss,
                 calibration_score: 0.0,
                 fallback_active: true,
+                certainty: ArtifactCertainty::Unclear,
+                posterior_floor_applied: false,
             },
             ledger: EvidenceLedger {
                 terms: Vec::new(),
@@ -1071,8 +1199,22 @@ fn build_ledger(
     calibration: f64,
     uncertainty: f64,
     action: DecisionAction,
+    certainty: ArtifactCertainty,
+    posterior_floor: Option<f64>,
 ) -> EvidenceLedger {
     let terms = vec![
+        EvidenceTerm {
+            name: "certainty",
+            weight: 1.0,
+            value: f64::from(certainty.rank()),
+            contribution: f64::from(certainty.rank()),
+        },
+        EvidenceTerm {
+            name: "posterior_floor_definite",
+            weight: 1.0,
+            value: posterior_floor.unwrap_or(0.0),
+            contribution: posterior_floor.unwrap_or(0.0),
+        },
         EvidenceTerm {
             name: "location",
             weight: weights.location,
@@ -1142,7 +1284,9 @@ fn build_ledger(
 delete_loss={expected_loss_delete:.2}; base_keep_loss={base_expected_loss_keep:.2}; \
 base_delete_loss={base_expected_loss_delete:.2}; loss_margin={decision_margin:.2}; \
 uncertainty={uncertainty:.3}; calibration={calibration:.3}; delete_advantage={delete_advantage:.2}; \
-required_delete_advantage={required_delete_advantage:.2}; action={action:?}"
+required_delete_advantage={required_delete_advantage:.2}; certainty={certainty}; \
+posterior_floor_applied={}; action={action:?}",
+        posterior_floor.is_some()
     );
     EvidenceLedger { terms, summary }
 }
@@ -1228,8 +1372,8 @@ fn is_system_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveReferenceSummary, CandidateInput, DecisionAction, HARD_REFUSE_BUNDLE_EXTENSIONS,
-        ScoringEngine, is_system_path,
+        ActiveReferenceSummary, ArtifactCertainty, CandidateInput, DecisionAction,
+        HARD_REFUSE_BUNDLE_EXTENSIONS, ScoringEngine, classify_certainty, is_system_path,
     };
     use crate::core::config::ScoringConfig;
     use crate::platform::types::SacredPathSource;
@@ -1764,6 +1908,213 @@ mod tests {
             score.decision.action,
             DecisionAction::Keep,
             "high-confidence target should not be kept"
+        );
+    }
+
+    /// The sandbox fixture from the 2026-09-02 reality check: a 64 MiB cargo
+    /// target with a validated `CACHEDIR.TAG`, `deps/`, `incremental/` and
+    /// `.fingerprint/`, five hours idle, in a temp root, nothing open. Under
+    /// the score-only decision it landed in `Review` (posterior ~0.5) and the
+    /// daemon never dispatched it.
+    fn stale_definite_target(path: &str) -> CandidateInput {
+        CandidateInput {
+            path: PathBuf::from(path),
+            size_bytes: 64 * 1_048_576,
+            age: Duration::from_hours(5),
+            classification: ArtifactClassification {
+                pattern_name: Cow::Borrowed("opaque-cargo-target"),
+                category: ArtifactCategory::RustTarget,
+                name_confidence: 0.65,
+                structural_confidence: 0.95,
+                combined_confidence: 0.65,
+            },
+            signals: StructuralSignals {
+                has_cachedir_tag: true,
+                has_fingerprint: true,
+                has_incremental: true,
+                has_deps: true,
+                ..StructuralSignals::default()
+            },
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        }
+    }
+
+    #[test]
+    fn definite_stale_cargo_target_reaches_delete_at_every_pressure() {
+        // At high urgency the pressure multiplier already lifts the posterior
+        // past the floor; the floor is what makes the Green/Yellow maintenance
+        // and predictive paths (urgency well below 0.6) reach `Delete` too.
+        let engine = default_engine();
+        for urgency in [0.1, 0.2, 0.55, 0.93] {
+            let score =
+                engine.score_candidate(&stale_definite_target("/data/tmp/stale/target"), urgency);
+            assert!(!score.vetoed, "urgency={urgency}: {:?}", score.veto_reason);
+            assert_eq!(score.decision.certainty, ArtifactCertainty::Definite);
+            assert!(
+                score.decision.posterior_abandoned >= 0.85 - 1e-9,
+                "urgency={urgency}: posterior {} below the definite floor",
+                score.decision.posterior_abandoned
+            );
+            assert_eq!(
+                score.decision.action,
+                DecisionAction::Delete,
+                "urgency={urgency}: {}",
+                score.ledger.summary
+            );
+        }
+        let low = engine.score_candidate(&stale_definite_target("/data/tmp/stale/target"), 0.2);
+        assert!(
+            low.decision.posterior_floor_applied,
+            "at low urgency the score-derived posterior must have been below the floor: {}",
+            low.ledger.summary
+        );
+        assert!(low.ledger.summary.contains("certainty=definite"));
+        assert!(low.ledger.summary.contains("posterior_floor_applied=true"));
+    }
+
+    #[test]
+    fn definite_floor_is_disabled_by_config_and_never_overrides_a_veto() {
+        // Without the floor, the same definite target at maintenance urgency is
+        // the 2026-09-02 sandbox result: a verdict the daemon never dispatches.
+        let mut config = ScoringConfig::default();
+        config.posterior_floor_definite = 0.0;
+        let engine = ScoringEngine::from_config(&config, 30);
+        let score = engine.score_candidate(&stale_definite_target("/data/tmp/stale/target"), 0.2);
+        assert_eq!(score.decision.certainty, ArtifactCertainty::Definite);
+        assert!(!score.decision.posterior_floor_applied);
+        assert_ne!(
+            score.decision.action,
+            DecisionAction::Delete,
+            "{}",
+            score.ledger.summary
+        );
+
+        // Same fixture held open by a build: the open-file veto wins.
+        let engine = default_engine();
+        let mut open = stale_definite_target("/data/tmp/stale/target");
+        open.is_open = true;
+        let score = engine.score_candidate(&open, 0.93);
+        assert!(score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert_eq!(score.decision.certainty, ArtifactCertainty::Unclear);
+        assert!(!score.decision.posterior_floor_applied);
+
+        // Too young: the age floor is a veto that runs before the fast lane.
+        let mut fresh = stale_definite_target("/data/tmp/fresh/target");
+        fresh.age = Duration::from_mins(5);
+        let score = engine.score_candidate(&fresh, 0.93);
+        assert!(score.vetoed, "{:?}", score.veto_reason);
+        assert!(!score.decision.posterior_floor_applied);
+    }
+
+    #[test]
+    fn certainty_classifier_follows_structural_evidence_not_names() {
+        fn classification(
+            category: ArtifactCategory,
+            pattern: &'static str,
+            name_confidence: f64,
+            structural_confidence: f64,
+        ) -> ArtifactClassification {
+            ArtifactClassification {
+                pattern_name: Cow::Borrowed(pattern),
+                category,
+                name_confidence,
+                structural_confidence,
+                combined_confidence: name_confidence.max(structural_confidence),
+            }
+        }
+        let temp_root = 0.95;
+        let projects = 0.40;
+
+        // Definite: validated tag alone, under any name and location.
+        let tagged = StructuralSignals {
+            has_cachedir_tag: true,
+            ..StructuralSignals::default()
+        };
+        assert_eq!(
+            classify_certainty(
+                &classification(ArtifactCategory::Unknown, "unknown", 0.0, 0.95),
+                tagged,
+                projects
+            ),
+            ArtifactCertainty::Definite
+        );
+        // Definite: two Rust markers.
+        let two_markers = StructuralSignals {
+            has_fingerprint: true,
+            has_deps: true,
+            ..StructuralSignals::default()
+        };
+        assert_eq!(
+            classify_certainty(
+                &classification(ArtifactCategory::RustTarget, "target", 0.5, 0.9),
+                two_markers,
+                projects
+            ),
+            ArtifactCertainty::Definite
+        );
+        // Definite: Go build cache layout; node_modules under a temp root.
+        assert_eq!(
+            classify_certainty(
+                &classification(ArtifactCategory::GoCache, "go-build-cache", 0.0, 0.95),
+                StructuralSignals::default(),
+                projects
+            ),
+            ArtifactCertainty::Definite
+        );
+        assert_eq!(
+            classify_certainty(
+                &classification(ArtifactCategory::NodeModules, "node_modules", 0.9, 0.5),
+                StructuralSignals::default(),
+                temp_root
+            ),
+            ArtifactCertainty::Definite
+        );
+        // Likely: confident name plus one marker; recognized category in a temp root.
+        let one_marker = StructuralSignals {
+            has_build: true,
+            ..StructuralSignals::default()
+        };
+        assert_eq!(
+            classify_certainty(
+                &classification(ArtifactCategory::BuildOutput, "build", 0.9, 0.4),
+                one_marker,
+                projects
+            ),
+            ArtifactCertainty::Likely
+        );
+        assert_eq!(
+            classify_certainty(
+                &classification(ArtifactCategory::TempDir, "tmp-codex", 0.64, 0.0),
+                StructuralSignals::default(),
+                temp_root
+            ),
+            ArtifactCertainty::Likely
+        );
+        // Unclear: node_modules outside a temp root with no marker; unknown dirs.
+        assert_eq!(
+            classify_certainty(
+                &classification(ArtifactCategory::NodeModules, "node_modules", 0.9, 0.5),
+                StructuralSignals::default(),
+                projects
+            ),
+            ArtifactCertainty::Unclear
+        );
+        assert_eq!(
+            classify_certainty(
+                &classification(ArtifactCategory::Unknown, "unknown", 0.0, 0.0),
+                StructuralSignals::default(),
+                projects
+            ),
+            ArtifactCertainty::Unclear
+        );
+        assert!(ArtifactCertainty::Unclear < ArtifactCertainty::Likely);
+        assert!(ArtifactCertainty::Likely < ArtifactCertainty::Definite);
+        assert_eq!(
+            ArtifactCertainty::from_rank(ArtifactCertainty::Likely.rank()),
+            ArtifactCertainty::Likely
         );
     }
 

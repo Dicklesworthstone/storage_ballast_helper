@@ -8142,6 +8142,8 @@ fn scan_entry_json(entry: &ScoredScanEntry, explain: bool) -> Value {
         "pattern_name": candidate.classification.pattern_name.as_ref(),
         "confidence": candidate.classification.combined_confidence,
         "decision": format!("{:?}", candidate.decision.action),
+        "certainty": candidate.decision.certainty.label(),
+        "posterior_floor_applied": candidate.decision.posterior_floor_applied,
         "veto_reason": candidate.veto_reason.as_deref(),
         "factors": {
             "location": candidate.factors.location,

@@ -17,7 +17,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -70,7 +70,9 @@ use crate::scanner::patterns::{
     StructuralSignals,
 };
 use crate::scanner::protection::{self, ProtectionRegistry};
-use crate::scanner::scoring::{ActiveReferenceSummary, CandidacyScore, ScoringEngine};
+use crate::scanner::scoring::{
+    ActiveReferenceSummary, ArtifactCertainty, CandidacyScore, ScoringEngine,
+};
 use crate::scanner::walker::{
     ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkerConfig,
     collect_active_reference_index_cached, collect_open_path_ancestors_cached,
@@ -146,6 +148,9 @@ struct SharedExecutorConfig {
     min_score_bits: AtomicU64,
     repeat_base_cooldown_secs: AtomicU64,
     repeat_max_cooldown_secs: AtomicU64,
+    /// Minimum [`ArtifactCertainty`] rank the current behavior cell dispatches
+    /// (set from the cleanup action on every behavior transition).
+    min_certainty_rank: AtomicU8,
 }
 
 impl SharedExecutorConfig {
@@ -162,7 +167,17 @@ impl SharedExecutorConfig {
             min_score_bits: AtomicU64::new(min_score.to_bits()),
             repeat_base_cooldown_secs: AtomicU64::new(repeat_base_cooldown),
             repeat_max_cooldown_secs: AtomicU64::new(repeat_max_cooldown),
+            min_certainty_rank: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
         }
+    }
+
+    fn min_certainty(&self) -> ArtifactCertainty {
+        ArtifactCertainty::from_rank(self.min_certainty_rank.load(Ordering::Relaxed))
+    }
+
+    fn set_min_certainty(&self, certainty: ArtifactCertainty) {
+        self.min_certainty_rank
+            .store(certainty.rank(), Ordering::Relaxed);
     }
 
     fn min_score(&self) -> f64 {
@@ -634,8 +649,11 @@ struct PressureBehaviorState {
 }
 
 impl PressureBehaviorState {
-    fn new(memory_level: MemoryPressureLevel, disk_level: PressureLevel) -> Self {
-        let table = BehaviorDispatchTable::default();
+    fn new(
+        table: BehaviorDispatchTable,
+        memory_level: MemoryPressureLevel,
+        disk_level: PressureLevel,
+    ) -> Self {
         let mode = table.mode_for(memory_level, disk_level);
         Self {
             table,
@@ -646,6 +664,22 @@ impl PressureBehaviorState {
             last_recovery_at: None,
             pending_target: None,
         }
+    }
+
+    /// Swap in a reloaded matrix and re-resolve the current cell without
+    /// hysteresis (the pressure levels did not change; the policy did).
+    fn replace_table(&mut self, table: BehaviorDispatchTable) -> Option<BehaviorTransition> {
+        self.table = table;
+        self.pending_target = None;
+        let next_mode = self.table.mode_for(self.memory_level, self.disk_level);
+        if next_mode == self.mode {
+            return None;
+        }
+        Some(self.apply_behavior_transition(self.memory_level, self.disk_level, next_mode))
+    }
+
+    fn table(&self) -> &BehaviorDispatchTable {
+        &self.table
     }
 
     #[cfg(test)]
@@ -784,10 +818,10 @@ fn transition_direction(
         behavior_pressure_rank(BehaviorPressureLevel::from_memory_pressure(to_memory)).cmp(
             &behavior_pressure_rank(BehaviorPressureLevel::from_memory_pressure(from_memory)),
         );
-    let disk_order = behavior_pressure_rank(BehaviorPressureLevel::from_disk_pressure(to_disk))
-        .cmp(&behavior_pressure_rank(
-            BehaviorPressureLevel::from_disk_pressure(from_disk),
-        ));
+    // Disk levels are totally ordered (Green < Yellow < Orange < Red < Critical);
+    // a Yellow -> Orange move is an escalation even though both were one
+    // "warn" column in the v0.5 matrix.
+    let disk_order = to_disk.cmp(&from_disk);
 
     match (memory_order, disk_order) {
         (Ordering::Equal, Ordering::Equal) => None,
@@ -1447,6 +1481,53 @@ fn daemon_activity_error_code(error: &SbhError) -> String {
     error.code().to_string()
 }
 
+/// Resolve the configured behavior matrix. Config validation already rejected
+/// bad custom cells, so a failure here means the file changed underneath us;
+/// fall back to the built-in default rather than refusing to run.
+fn behavior_table_from_config(config: &Config) -> BehaviorDispatchTable {
+    match BehaviorDispatchTable::from_config(&config.behavior) {
+        Ok(table) => table,
+        Err(details) => {
+            eprintln!("[SBH-DAEMON] behavior config rejected ({details}); using the v0.6 preset");
+            BehaviorDispatchTable::default()
+        }
+    }
+}
+
+/// Which structural certainty a cleanup action is willing to dispatch.
+///
+/// `HighConfidenceCandidates` (Green/Yellow in the v0.6 matrix) deletes only
+/// candidates whose structural evidence is definite; `DefiniteCandidates` and
+/// `MostPromisingCandidates` (Orange) also accept `Likely`; `AnyDefiniteCandidate`
+/// (Red/Critical) dispatches every `Delete` verdict. `None`/`IdentifyOnly`
+/// never dispatch (their batch limit is zero), so their gate is moot.
+const fn min_certainty_for(action: CleanupAction) -> ArtifactCertainty {
+    match action {
+        CleanupAction::None
+        | CleanupAction::IdentifyOnly
+        | CleanupAction::HighConfidenceCandidates => ArtifactCertainty::Definite,
+        CleanupAction::DefiniteCandidates | CleanupAction::MostPromisingCandidates => {
+            ArtifactCertainty::Likely
+        }
+        CleanupAction::AnyDefiniteCandidate => ArtifactCertainty::Unclear,
+    }
+}
+
+/// Drop candidates below the behavior cell's certainty gate. Returns the kept
+/// candidates and how many were held back (for the executor log line).
+fn retain_dispatchable_by_certainty(
+    candidates: Vec<CandidacyScore>,
+    min_certainty: ArtifactCertainty,
+) -> (Vec<CandidacyScore>, usize) {
+    let before = candidates.len();
+    let kept: Vec<CandidacyScore> = candidates
+        .into_iter()
+        .filter(|candidate| candidate.decision.certainty >= min_certainty)
+        .collect();
+    let held_back = before - kept.len();
+    (kept, held_back)
+}
+
 fn behavior_allows_scan(mode: BehaviorMode) -> bool {
     mode.scan_aggressiveness != ScanAggressiveness::Skip
 }
@@ -1799,8 +1880,11 @@ impl MonitoringDaemon {
         // 14. Policy engine (progressive delivery gates for deletion pipeline).
         let policy_engine = Arc::new(Mutex::new(PolicyEngine::new(config.policy.clone())));
         let shared_guard_diagnostics = Arc::new(RwLock::new(None));
-        let behavior_state =
-            PressureBehaviorState::new(MemoryPressureLevel::Unknown, PressureLevel::Green);
+        let behavior_state = PressureBehaviorState::new(
+            behavior_table_from_config(&config),
+            MemoryPressureLevel::Unknown,
+            PressureLevel::Green,
+        );
 
         let cached_primary_path = compute_primary_path(&config);
         let prediction_config = config.pressure.prediction.clone();
@@ -1959,6 +2043,17 @@ impl MonitoringDaemon {
             }
         };
         self.update_behavior_mode(memory_level, disk_level, "startup", Duration::ZERO);
+        self.log_behavior_matrix("startup");
+    }
+
+    /// Log the effective behavior matrix so operators can see, in the journal
+    /// and the activity log, which cells the daemon will act on.
+    fn log_behavior_matrix(&self, source: &str) {
+        let rendered = self.behavior_state.table().render();
+        eprintln!("[SBH-DAEMON] {source}: {rendered}");
+        self.logger_handle.send(ActivityEvent::Info {
+            message: format!("{source}: {rendered}"),
+        });
     }
 
     fn update_behavior_mode(
@@ -1980,6 +2075,8 @@ impl MonitoringDaemon {
             hysteresis,
         ) {
             BehaviorUpdate::Applied(transition) => {
+                self.shared_executor_config
+                    .set_min_certainty(min_certainty_for(transition.to_mode.cleanup_action));
                 let message = format!(
                     "behavior mode changed source={source} latency_ms={} memory={:?}->{:?} \
                      disk={:?}->{:?} mode=({}) -> ({})",
@@ -3527,6 +3624,28 @@ impl MonitoringDaemon {
                     self.policy_engine
                         .lock()
                         .update_config(new_config.policy.clone());
+
+                    // Rebuild the behavior matrix; re-resolve the current cell.
+                    if new_config.behavior != self.config.behavior {
+                        let table = behavior_table_from_config(&new_config);
+                        if let Some(transition) = self.behavior_state.replace_table(table) {
+                            self.shared_executor_config
+                                .set_min_certainty(min_certainty_for(
+                                    transition.to_mode.cleanup_action,
+                                ));
+                            let message = format!(
+                                "behavior mode changed source=config_reload memory={:?} \
+                                 disk={:?} mode=({}) -> ({})",
+                                transition.to_memory,
+                                transition.to_disk,
+                                behavior_mode_summary(transition.from_mode),
+                                behavior_mode_summary(transition.to_mode)
+                            );
+                            eprintln!("[SBH-DAEMON] {message}");
+                            self.logger_handle.send(ActivityEvent::Info { message });
+                        }
+                        self.log_behavior_matrix("config_reload");
+                    }
 
                     // Rebuild predictive policy with new thresholds.
                     self.predictive_policy =
@@ -5695,6 +5814,25 @@ fn executor_thread_main(
         let max_batch_size = shared_config.max_batch_size.load(Ordering::Relaxed);
         let min_score = shared_config.min_score();
 
+        // Behavior-cell certainty gate (v0.6 matrix): Green/Yellow cells dispatch
+        // only structurally definite artifacts; Orange adds likely ones; Red and
+        // Critical dispatch every Delete verdict.
+        let min_certainty = shared_config.min_certainty();
+        let (approved_candidates, held_back_by_certainty) =
+            retain_dispatchable_by_certainty(approved_candidates, min_certainty);
+        if held_back_by_certainty > 0 {
+            let message = format!(
+                "certainty gate held back {held_back_by_certainty} candidate(s) below \
+                 {min_certainty} (pressure={:?})",
+                batch.pressure_level
+            );
+            eprintln!("[SBH-EXECUTOR] {message}");
+            logger.send(ActivityEvent::Info { message });
+        }
+        if approved_candidates.is_empty() {
+            continue;
+        }
+
         let pre_plan_count = approved_candidates.len();
         let executor = DeletionExecutor::new(
             DeletionConfig {
@@ -5907,6 +6045,8 @@ mod tests {
                 expected_loss_delete: 0.1,
                 calibration_score: 1.0,
                 fallback_active: false,
+                certainty: crate::scanner::scoring::ArtifactCertainty::Definite,
+                posterior_floor_applied: false,
             },
             ledger: EvidenceLedger {
                 terms: Vec::new(),
@@ -6257,8 +6397,11 @@ mod tests {
 
     #[test]
     fn behavior_state_updates_memory_and_disk_matrix_cells() {
-        let mut state =
-            PressureBehaviorState::new(MemoryPressureLevel::Normal, PressureLevel::Green);
+        let mut state = PressureBehaviorState::new(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+        );
         assert_eq!(state.mode.scan_aggressiveness, ScanAggressiveness::Normal);
 
         let memory_transition = state
@@ -6267,21 +6410,31 @@ mod tests {
         assert_eq!(memory_transition.from_memory, MemoryPressureLevel::Normal);
         assert_eq!(memory_transition.to_memory, MemoryPressureLevel::Warn);
         assert_eq!(state.mode.scan_aggressiveness, ScanAggressiveness::Light);
-        assert_eq!(state.mode.cleanup_action, CleanupAction::None);
+        // Memory pressure lowers scanning, never the cleanup posture (v0.6 rule).
+        assert_eq!(
+            state.mode.cleanup_action,
+            CleanupAction::HighConfidenceCandidates
+        );
 
         let disk_transition = state
             .update(MemoryPressureLevel::Warn, PressureLevel::Red)
             .expect("red disk should change behavior");
         assert_eq!(disk_transition.from_disk, PressureLevel::Green);
         assert_eq!(disk_transition.to_disk, PressureLevel::Red);
-        assert_eq!(state.mode.cleanup_action, CleanupAction::DefiniteCandidates);
+        assert_eq!(
+            state.mode.cleanup_action,
+            CleanupAction::AnyDefiniteCandidate
+        );
         assert_eq!(state.mode.ballast_action, BallastAction::ReleaseFirst);
     }
 
     #[test]
     fn critical_memory_and_disk_transition_builds_emergency_notification() {
-        let mut state =
-            PressureBehaviorState::new(MemoryPressureLevel::Warn, PressureLevel::Yellow);
+        let mut state = PressureBehaviorState::new(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Warn,
+            PressureLevel::Yellow,
+        );
         let transition = state
             .update(MemoryPressureLevel::Critical, PressureLevel::Critical)
             .expect("critical memory plus critical disk should enter emergency cell");
@@ -6299,8 +6452,11 @@ mod tests {
 
     #[test]
     fn non_emergency_behavior_transition_does_not_build_notification() {
-        let mut state =
-            PressureBehaviorState::new(MemoryPressureLevel::Normal, PressureLevel::Green);
+        let mut state = PressureBehaviorState::new(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+        );
         let transition = state
             .update(MemoryPressureLevel::Warn, PressureLevel::Yellow)
             .expect("warning behavior should transition");
@@ -6312,8 +6468,11 @@ mod tests {
     fn behavior_hysteresis_defers_repeated_escalations() {
         let t0 = Instant::now();
         let hysteresis = Duration::from_secs(5);
-        let mut state =
-            PressureBehaviorState::new(MemoryPressureLevel::Normal, PressureLevel::Green);
+        let mut state = PressureBehaviorState::new(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+        );
 
         match state.update_with_hysteresis(
             MemoryPressureLevel::Warn,
@@ -6363,8 +6522,11 @@ mod tests {
     fn behavior_hysteresis_defers_repeated_recoveries() {
         let t0 = Instant::now();
         let hysteresis = Duration::from_secs(5);
-        let mut state =
-            PressureBehaviorState::new(MemoryPressureLevel::Critical, PressureLevel::Critical);
+        let mut state = PressureBehaviorState::new(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Critical,
+            PressureLevel::Critical,
+        );
 
         match state.update_with_hysteresis(
             MemoryPressureLevel::Warn,
@@ -6416,8 +6578,11 @@ mod tests {
     fn behavior_hysteresis_cancels_stale_pending_target() {
         let t0 = Instant::now();
         let hysteresis = Duration::from_secs(5);
-        let mut state =
-            PressureBehaviorState::new(MemoryPressureLevel::Normal, PressureLevel::Green);
+        let mut state = PressureBehaviorState::new(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+        );
 
         assert!(
             state
@@ -6543,44 +6708,44 @@ mod tests {
 
     #[test]
     fn mock_memory_pressure_events_drive_matrix_actions() {
-        use BallastAction::{None as NoBallast, Release, ReleaseFirst};
-        use CleanupAction::{
-            AnyDefiniteCandidate, HighConfidenceCandidates, IdentifyOnly, MostPromisingCandidates,
-            None as NoCleanup,
-        };
+        use BallastAction::{None as NoBallast, ReleaseFirst};
+        use CleanupAction::{AnyDefiniteCandidate, HighConfidenceCandidates};
         use MemoryPressureLevel::{Critical as MemoryCritical, Normal as MemoryNormal, Warn};
         use NotificationPriority::{Emergency, High, Low, Normal as NotifyNormal};
         use PressureLevel::{Critical as DiskCritical, Green, Yellow};
         use ScanAggressiveness::{Aggressive, DefiniteOnly, Light, Skip};
 
         let (tx, rx) = bounded::<MemoryPressureEvent>(8);
-        let mut state =
-            PressureBehaviorState::new(MemoryPressureLevel::Normal, PressureLevel::Green);
+        let mut state = PressureBehaviorState::new(
+            BehaviorDispatchTable::default(),
+            MemoryPressureLevel::Normal,
+            PressureLevel::Green,
+        );
         let configured_limit = 17;
         let cases = [
             MockMatrixCase {
                 memory: Warn,
                 disk: Green,
-                mode: mock_behavior_mode(Light, NoCleanup, NoBallast, Low),
+                mode: mock_behavior_mode(Light, HighConfidenceCandidates, NoBallast, Low),
                 allows_scan: true,
-                delete_limit: 0,
+                delete_limit: configured_limit,
                 releases_ballast: false,
             },
             MockMatrixCase {
                 memory: Warn,
                 disk: Yellow,
-                mode: mock_behavior_mode(Light, HighConfidenceCandidates, Release, NotifyNormal),
+                mode: mock_behavior_mode(Light, HighConfidenceCandidates, NoBallast, NotifyNormal),
                 allows_scan: true,
                 delete_limit: configured_limit,
-                releases_ballast: true,
+                releases_ballast: false,
             },
             MockMatrixCase {
                 memory: MemoryCritical,
                 disk: Yellow,
-                mode: mock_behavior_mode(DefiniteOnly, MostPromisingCandidates, Release, High),
+                mode: mock_behavior_mode(DefiniteOnly, HighConfidenceCandidates, NoBallast, High),
                 allows_scan: true,
                 delete_limit: configured_limit,
-                releases_ballast: true,
+                releases_ballast: false,
             },
             MockMatrixCase {
                 memory: MemoryCritical,
@@ -6598,17 +6763,19 @@ mod tests {
             MockMatrixCase {
                 memory: MemoryCritical,
                 disk: Green,
-                mode: mock_behavior_mode(Skip, NoCleanup, NoBallast, NotifyNormal),
+                // Scanning is skipped; the cleanup posture still never drops
+                // below the normal-memory row.
+                mode: mock_behavior_mode(Skip, HighConfidenceCandidates, NoBallast, NotifyNormal),
                 allows_scan: false,
-                delete_limit: 0,
+                delete_limit: configured_limit,
                 releases_ballast: false,
             },
             MockMatrixCase {
                 memory: MemoryNormal,
                 disk: Yellow,
-                mode: mock_behavior_mode(Aggressive, IdentifyOnly, NoBallast, Low),
+                mode: mock_behavior_mode(Aggressive, HighConfidenceCandidates, NoBallast, Low),
                 allows_scan: true,
-                delete_limit: 0,
+                delete_limit: configured_limit,
                 releases_ballast: false,
             },
         ];
@@ -6620,14 +6787,88 @@ mod tests {
 
     #[test]
     fn behavior_delete_batch_limit_blocks_identify_only_cleanup() {
-        let table = BehaviorDispatchTable::default();
-        let identify_only = table.mode_for(MemoryPressureLevel::Normal, PressureLevel::Yellow);
+        // The v0.5 rollback preset keeps Yellow/Orange identify-only.
+        let legacy =
+            BehaviorDispatchTable::from_preset(crate::daemon::policy::BehaviorPreset::V0_5);
+        let identify_only = legacy.mode_for(MemoryPressureLevel::Normal, PressureLevel::Orange);
         assert_eq!(identify_only.cleanup_action, CleanupAction::IdentifyOnly);
         assert_eq!(behavior_delete_batch_limit(identify_only, 5), 0);
 
-        let cleanup = table.mode_for(MemoryPressureLevel::Warn, PressureLevel::Red);
+        let cleanup = legacy.mode_for(MemoryPressureLevel::Warn, PressureLevel::Red);
         assert_eq!(cleanup.cleanup_action, CleanupAction::DefiniteCandidates);
         assert_eq!(behavior_delete_batch_limit(cleanup, 20), 20);
+
+        // The v0.6 default dispatches at Orange: this is the whole point of the
+        // preset change (the daemon used to identify-only until Red).
+        let current = BehaviorDispatchTable::default();
+        let orange = current.mode_for(MemoryPressureLevel::Normal, PressureLevel::Orange);
+        assert_eq!(behavior_delete_batch_limit(orange, 5), 5);
+        assert!(behavior_should_release_ballast(orange));
+    }
+
+    #[test]
+    fn certainty_gate_follows_the_behavior_cell_and_holds_back_uncertain_candidates() {
+        // Cell -> minimum certainty mapping.
+        assert_eq!(
+            min_certainty_for(CleanupAction::HighConfidenceCandidates),
+            ArtifactCertainty::Definite
+        );
+        assert_eq!(
+            min_certainty_for(CleanupAction::DefiniteCandidates),
+            ArtifactCertainty::Likely
+        );
+        assert_eq!(
+            min_certainty_for(CleanupAction::MostPromisingCandidates),
+            ArtifactCertainty::Likely
+        );
+        assert_eq!(
+            min_certainty_for(CleanupAction::AnyDefiniteCandidate),
+            ArtifactCertainty::Unclear
+        );
+        let table = BehaviorDispatchTable::default();
+        for (disk, expected) in [
+            (PressureLevel::Green, ArtifactCertainty::Definite),
+            (PressureLevel::Yellow, ArtifactCertainty::Definite),
+            (PressureLevel::Orange, ArtifactCertainty::Likely),
+            (PressureLevel::Red, ArtifactCertainty::Unclear),
+            (PressureLevel::Critical, ArtifactCertainty::Unclear),
+        ] {
+            let cell = table.mode_for(MemoryPressureLevel::Normal, disk);
+            assert_eq!(min_certainty_for(cell.cleanup_action), expected, "{disk:?}");
+        }
+
+        // The shared config carries the gate to the executor thread.
+        let shared = SharedExecutorConfig::new(false, 10, 0.5, 300, 3600);
+        assert_eq!(shared.min_certainty(), ArtifactCertainty::Unclear);
+        shared.set_min_certainty(ArtifactCertainty::Likely);
+        assert_eq!(shared.min_certainty(), ArtifactCertainty::Likely);
+
+        // Filtering keeps order and counts what was held back.
+        let mut definite = test_candidate("/tmp/definite", 2.0);
+        definite.decision.certainty = ArtifactCertainty::Definite;
+        let mut likely = test_candidate("/tmp/likely", 1.5);
+        likely.decision.certainty = ArtifactCertainty::Likely;
+        let mut unclear = test_candidate("/tmp/unclear", 1.2);
+        unclear.decision.certainty = ArtifactCertainty::Unclear;
+        let batch = vec![definite.clone(), likely.clone(), unclear.clone()];
+
+        let (kept, held) =
+            retain_dispatchable_by_certainty(batch.clone(), ArtifactCertainty::Definite);
+        assert_eq!(held, 2);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, definite.path);
+
+        let (kept, held) =
+            retain_dispatchable_by_certainty(batch.clone(), ArtifactCertainty::Likely);
+        assert_eq!(held, 1);
+        assert_eq!(
+            kept.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
+            vec![definite.path.clone(), likely.path.clone()]
+        );
+
+        let (kept, held) = retain_dispatchable_by_certainty(batch, ArtifactCertainty::Unclear);
+        assert_eq!(held, 0);
+        assert_eq!(kept.len(), 3);
     }
 
     #[test]
@@ -6906,9 +7147,10 @@ mod tests {
             parsed["policy"]["behavior"]["scan_aggressiveness"],
             "aggressive"
         );
+        // v0.6 matrix: Yellow at normal memory deletes high-confidence candidates.
         assert_eq!(
             parsed["policy"]["behavior"]["cleanup_action"],
-            "identify_only"
+            "high_confidence_candidates"
         );
         assert_eq!(parsed["threads"][0]["status"], "running");
     }
