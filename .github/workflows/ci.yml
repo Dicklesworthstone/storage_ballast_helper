@@ -340,6 +340,48 @@ jobs:
             linux-arm64-smoke-output.txt
           retention-days: 14
 
+  daemon-e2e:
+    name: Daemon E2E (injected pressure + loop-mounted ext4)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      # The injected-pressure scenarios drive a real daemon against fixture
+      # trees with SBH_TEST_MODE=1 + SBH_TEST_FS_STATS. Each one is a daemon
+      # process with timing windows; two at a time keeps a 2-vCPU runner
+      # from starving them (five in parallel made the v1/v2 parity scenario
+      # miss its window locally).
+      - name: Run the daemon e2e scenarios
+        run: cargo test $CI_FEATURES --test daemon_e2e -- --test-threads=2 --nocapture 2>&1 | tee daemon-e2e-output.txt
+      # The ignored scenarios need a real filesystem: a 512 MiB ext4 image
+      # loop-mounted with the runner's passwordless sudo, filled to Orange,
+      # remounted read-only. This is the one place the daemon runs under real
+      # statvfs pressure in CI, so the job fails if the tests did not run.
+      - name: Prepare a loop device
+        run: |
+          set -euo pipefail
+          sudo modprobe loop || true
+          sudo losetup -f
+          mke2fs -V 2>&1 | head -n 1
+      - name: Run the loop-mounted real-pressure scenarios
+        run: |
+          set -euo pipefail
+          cargo test $CI_FEATURES --test daemon_e2e -- --ignored --test-threads=1 --nocapture 2>&1 | tee daemon-loopmount-output.txt
+          grep -E '^test result: ok\. [1-9][0-9]* passed' daemon-loopmount-output.txt
+      - name: Upload daemon e2e logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: daemon-e2e-logs
+          path: |
+            daemon-e2e-output.txt
+            daemon-loopmount-output.txt
+          retention-days: 30
+
   decision-plane:
     name: Decision Plane Tests
     runs-on: ubuntu-latest
