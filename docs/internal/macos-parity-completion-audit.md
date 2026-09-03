@@ -57,6 +57,44 @@ What the 2026-09-02 reality check changed:
   the CLI at close time carry an annotation comment pointing at the work that
   shipped them.
 
+## Evidence Index
+
+The evidence the May audit rested on, kept here in compact form (the unit
+test `macos_completion_audit_maps_goal_to_evidence` checks that this file
+still maps each goal to its proof):
+
+- Bead chain: `bd-r7m7` (epic) with `bd-r7m7.15` (refresh after the release
+  Gatekeeper gate) and `bd-r7m7.16` (no volatile head/run pins); `bd-ykwh`
+  (release engineering) with `bd-ykwh.20` (Gatekeeper acceptance before
+  packaging). `bd-ykwh.20` is closed;
+  release CI now verifies Apple notary log ticketContents
+  (`.github/workflows/release.yml` fails when the notary log ticketContents
+  is not an array).
+- Pinning policy: the audit avoids pinning exact commit hashes or
+  GitHub Actions run ids as durable proof; refresh with `git rev-parse HEAD`,
+  `gh run list --repo Dicklesworthstone/storage_ballast_helper` and
+  `gh run view <latest-run>` before deciding anything.
+- macOS behaviour proven by tests: launchd lifecycle
+  (`macos_launchd_user_service_lifecycle_bootstrap_kickstart_bootout`),
+  APFS capacity accounting against `diskutil`
+  (`macos_status_json_matches_diskutil_apfs_capacity`), blame attribution
+  (`macos_synthetic_writer_surfaces_in_blame_top_rows`) in
+  `tests/integration_tests.rs`; deletion safety
+  (`scanner_prescan_does_not_dispatch_protected_rust_fuzz_target`,
+  `executor_preflight_skips_config_protected_daemon_candidate`) in
+  `src/daemon/loop_main.rs`. They run in the `macos-platform` CI job on
+  `macos-latest` and `macos-15-intel`.
+- CI discipline: Do not treat queued CI as final proof; only a completed
+  run for the current head counts.
+- Release credentials: the 2026-05-10 recheck found one valid local
+  Developer ID Application identity, a working `sbh-notary` keychain
+  profile (`xcrun notarytool history --keychain-profile sbh-notary`), and
+  `HOMEBREW_TAP_SSH_KEY` configured in GitHub Actions.
+  `sbh doctor --release --json` reports an aggregate `ok` boolean plus
+  `passed`, `warnings`, and `failed` counts; since 2026-09-03 it also
+  carries the drift checks and `--assets <dir|tag>` audits a published
+  asset set.
+
 Before any further close decision on `bd-r7m7`, refresh the live head and the
 newest macOS run rather than trusting any literal above:
 
