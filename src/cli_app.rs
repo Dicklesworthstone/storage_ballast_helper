@@ -18462,12 +18462,25 @@ mod tests {
     #[test]
     fn repository_builds_carry_real_build_metadata() {
         let sha: &str = option_env!("SBH_BUILD_GIT_SHA").unwrap_or("");
-        assert!(!sha.is_empty(), "build.rs sets the sha in a checkout");
-        let hex = sha.trim_end_matches("-dirty");
-        assert!(
-            hex.len() >= 7 && hex.chars().all(|c| c.is_ascii_hexdigit()),
-            "{sha}"
-        );
+        // build.rs asks `git rev-parse --short=12 HEAD`. Where that fails at
+        // test time as well (a mirror without .git objects, such as an rch
+        // worker) the sha is legitimately absent; the git-free fields are
+        // still checked.
+        let git_answers = std::process::Command::new("git")
+            .args(["rev-parse", "--short=12", "HEAD"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if git_answers {
+            assert!(!sha.is_empty(), "build.rs sets the sha in a checkout");
+            let hex = sha.trim_end_matches("-dirty");
+            assert!(
+                hex.len() >= 7 && hex.chars().all(|c| c.is_ascii_hexdigit()),
+                "{sha}"
+            );
+        } else {
+            println!("SKIP: git cannot resolve HEAD here; sha check skipped (sha={sha:?})");
+        }
         let target: &str = option_env!("SBH_BUILD_TARGET").unwrap_or("");
         assert!(
             target.contains('-'),
