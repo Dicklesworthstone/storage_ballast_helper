@@ -13,21 +13,60 @@ machine-readable artifacts per section 8 of `tui-rollout-acceptance-gates.md`.
 
 ## Gate Execution Order
 
-Gates run in strict dependency order. A failure at any HARD gate aborts
-subsequent stages. SOFT gate failures are recorded but do not block.
+Gates run in the order below. In `--ci` mode a HARD failure aborts the
+remaining stages; otherwise every stage runs and the summary lists the
+failures. SOFT gate failures are recorded (exit 2) but do not block.
 
-```
-Stage 1: Format         (local)    → correctness
-Stage 2: Check          (rch)      → correctness
-Stage 3: Clippy         (rch)      → correctness + style
-Stage 4: Unit tests     (rch)      → correctness
-Stage 5: Binary tests   (rch)      → CLI correctness
-Stage 6: TUI tests      (rch)      → dashboard correctness
-Stage 7: Integration    (rch)      → cross-component correctness
-Stage 8: Decision plane (rch)      → invariant proofs
-Stage 9: E2E            (local)    → system-level behavior
-Stage 10: Stress/perf   (rch)      → reliability + performance
-```
+Every `test` stage must execute at least one test: the script sums the
+`test result:` lines of the stage log (passed + failed; ignored tests did
+not run) and a stage whose command exits 0 with zero executed tests is
+recorded as **vacuous**, which counts as a failure of that gate. The `e2e`
+stage counts the suite's `summary pass=N fail=M` line; `check` stages
+(fmt, clippy) have no tests. `./scripts/quality-gate.sh --self-test`
+proves the accounting and the vacuous path against fixtures without
+cargo. `summary.json` carries `executed_tests` per stage and in total.
+
+The table is what `./scripts/quality-gate.sh --print-stages --markdown`
+prints from the script's stage table; regenerate it after changing the
+script (bd-rc-master-ajg1.12.2 wires the CI diff).
+
+<!-- sbh-qg:stages:begin -->
+| # | Stage | Gate | Kind | Group | Dimension | Command |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `fmt` | HARD | check | Code Quality | code-style | `cargo fmt --check` |
+| 2 | `clippy` | HARD | check | Code Quality | correctness-warnings | `cargo clippy --all-targets -- -D warnings` |
+| 3 | `unit-lib` | HARD | test | Unit Tests | core-logic | `cargo test --lib -- --test-threads=4` |
+| 4 | `unit-bin` | HARD | test | Unit Tests | cli-routing | `cargo test --bin sbh -- --test-threads=4` |
+| 5 | `cli-exit-codes` | HARD | test | Unit Tests | exit-code-contract | `cargo test --test cli_exit_codes -- --test-threads=4` |
+| 6 | `integration` | HARD | test | Integration Tests | pipeline-correctness | `cargo test --test integration_tests -- --test-threads=4` |
+| 7 | `decision-plane` | HARD | test | Integration Tests | policy-correctness | `cargo test --test proof_harness -- --test-threads=4` |
+| 8 | `decision-e2e` | HARD | test | Integration Tests | policy-lifecycle | `cargo test --test decision_plane_e2e -- --test-threads=4` |
+| 9 | `explain-ledger` | HARD | test | Integration Tests | explainability | `cargo test --test explain_ledger -- --test-threads=4` |
+| 10 | `fallback` | HARD | test | Integration Tests | fallback-safety | `cargo test --test fallback_verification --features tui -- --test-threads=4` |
+| 11 | `tui-unit` | HARD | test | Dashboard / TUI Tests | dashboard-correctness | `cargo test --lib --features tui tui:: -- --test-threads=4` |
+| 12 | `tui-replay` | HARD | test | Dashboard / TUI Tests | deterministic-replay | `cargo test --lib --features tui tui::test_replay -- --test-threads=4` |
+| 13 | `tui-scenarios` | HARD | test | Dashboard / TUI Tests | operator-workflows | `cargo test --lib --features tui tui::test_scenario_drills -- --test-threads=4` |
+| 14 | `tui-properties` | HARD | test | Dashboard / TUI Tests | invariant-safety | `cargo test --lib --features tui tui::test_properties -- --test-threads=4` |
+| 15 | `tui-fault-injection` | HARD | test | Dashboard / TUI Tests | degraded-recovery | `cargo test --lib --features tui tui::test_fault_injection -- --test-threads=4` |
+| 16 | `tui-snapshots` | SOFT | test | Dashboard / TUI Tests | visual-contract | `cargo test --lib --features tui tui::test_snapshot_golden -- --test-threads=4` |
+| 17 | `tui-parity` | HARD | test | Dashboard / TUI Tests | legacy-parity | `cargo test --lib --features tui tui::parity_harness -- --test-threads=4` |
+| 18 | `tui-benchmarks` | SOFT | test | Dashboard / TUI Tests | operator-efficiency | `cargo test --lib --features tui tui::test_operator_benchmark -- --test-threads=4` |
+| 19 | `dashboard-integration` | HARD | test | Dashboard / TUI Tests | dashboard-e2e | `cargo test --test dashboard_integration_tests --features tui -- --test-threads=4` |
+| 20 | `dashboard-pty` | HARD | test | Dashboard / TUI Tests | dashboard-pty-session | `cargo test --test dashboard_pty --features tui -- --test-threads=1` |
+| 21 | `stress` | HARD | test | Stress & Performance | daemon-stability | `cargo test --test stress_tests -- --test-threads=2` |
+| 22 | `fuzz` | SOFT | test | Stress & Performance | parser-robustness | `cargo test --test fuzz_smoke` |
+| 23 | `stress-harness` | SOFT | test | Stress & Performance | concurrency-safety | `cargo test --test stress_harness -- --test-threads=2` |
+| 24 | `tui-stress` | SOFT | test | Stress & Performance | dashboard-endurance | `cargo test --lib --features tui tui::test_stress -- --test-threads=4` |
+| 25 | `daemon-e2e` | SOFT | test | E2E & Installer | daemon-lifecycle | `cargo test --test daemon_e2e -- --test-threads=2` |
+| 26 | `installer` | HARD | test | E2E & Installer | install-safety | `cargo test --test installer_e2e -- --test-threads=4` |
+| 27 | `e2e` | HARD | e2e | E2E & Installer | user-experience | `./scripts/e2e_test.sh` |
+<!-- sbh-qg:stages:end -->
+
+27 stages: 21 HARD, 6 SOFT. `tui` is a default feature since
+bd-rc-master-ajg1.4.7; the TUI and fallback stages still pass
+`--features tui` explicitly so the gate stays honest if the default set
+changes again. The stage details below group the same commands by
+purpose.
 
 ## Stage Details
 
@@ -303,41 +342,17 @@ Required fields: `gate_id`, `status`, `command`, `started_at`, `finished_at`,
 
 ## Quick Reference: Full Gate Sequence
 
+The exact commands are the `Command` column of the generated table above
+(`./scripts/quality-gate.sh --print-stages`). Every cargo command runs
+through `rch exec` by default (`--local` runs it on this host, `--ci`
+likewise and aborts on the first HARD failure); `fmt` and `e2e` always run
+locally. Add `--nocapture` after `--` when you need test output.
+
 ```bash
-# Stage 1: Format (local)
-cargo fmt --check
-
-# Stage 2: Build check (rch)
-rch exec "cargo check --all-targets --features tui"
-
-# Stage 3: Clippy (rch)
-rch exec "cargo clippy --all-targets --features tui -- -D warnings"
-
-# Stage 4: Library tests (rch)
-rch exec "cargo test --lib --features tui --nocapture"
-
-# Stage 5: Binary tests (rch)
-rch exec "cargo test --bin sbh --features tui --nocapture"
-
-# Stage 6: TUI-focused tests (rch, subset of Stage 4 for isolation)
-rch exec "cargo test --lib --features tui -- tui:: --nocapture"
-
-# Stage 7: Integration tests (rch)
-rch exec "cargo test --test integration_tests --features tui --nocapture"
-rch exec "cargo test --test dashboard_integration_tests --features tui --nocapture"
-rch exec "cargo test --test fallback_verification --features tui --nocapture"
-rch exec "cargo test --test installer_e2e --nocapture"
-
-# Stage 8: Decision plane proofs (rch)
-rch exec "cargo test --test proof_harness --nocapture"
-rch exec "cargo test --test decision_plane_e2e --nocapture"
-
-# Stage 9: E2E suite (local, needs binary)
-./scripts/e2e_test.sh
-
-# Stage 10: Stress and performance (rch)
-rch exec "cargo test --test stress_tests --nocapture"
-rch exec "cargo test --test stress_harness --nocapture"
+./scripts/quality-gate.sh                    # the full sequence (rch)
+./scripts/quality-gate.sh --stage tui-unit   # one stage
+./scripts/quality-gate.sh --print-stages     # the table, without running
+./scripts/quality-gate.sh --self-test        # the accounting, without cargo
 ```
 
 ## Contract-to-Test Mapping

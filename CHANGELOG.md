@@ -10,6 +10,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Changed — the quality gate cannot pass vacuously (bd-rc-master-ajg1.1.3)
+
+- `scripts/quality-gate.sh` counts the tests each stage executed (the sum of its `test result:` lines; the e2e suite's `summary pass=N fail=M` line) and records a test stage that exits 0 having selected no test as `vacuous`, a failure of that gate; `summary.json` carries `executed_tests` per stage and in total, and the console shows the count next to each PASS.
+- The stages are one table in the script; `--print-stages [--markdown]` prints it and `docs/quality-gate-runbook.md` and `docs/testing-and-logging.md` embed the Markdown output between `sbh-qg:stages` markers. `--self-test` checks the accounting and the vacuous path against fixtures without cargo.
+- The TUI and fallback stages pass `--features tui` explicitly (it is a default feature since 4.7, so the nine TUI stages and `fallback` that used to select zero tests now execute 900+ and 42). New stages: `cli-exit-codes`, `decision-e2e` (split from `decision-plane`), `explain-ledger`, `dashboard-pty`, and `daemon-e2e` (SOFT: its idle-CPU case is load-sensitive). 27 stages: 21 HARD, 6 SOFT.
+
 ### Added — dashboard ballast actions execute (bd-rc-master-ajg1.4.15)
 
 - On the Ballast screen `Shift-X` releases every available file on the selected volume and `p` replenishes it, each behind the confirmation modal; `x` stays the global one-file quick-release. Enter performs the action: through the running daemon's control socket (scoped to the selected mount), or directly on the pool when no daemon holds it, the way `sbh ballast release`/`replenish` do; a daemon without a control socket is a refusal, not a race. The outcome (files released or recreated, bytes, a free-space floor holding files back, an already-full pool) or the daemon's refusal is the notification, and the dashboard refetches state.
