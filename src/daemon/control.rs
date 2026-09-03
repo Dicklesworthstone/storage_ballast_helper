@@ -50,18 +50,59 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the listener thread checks the shutdown flag while idle.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 
-/// The socket path for a given `state.json` path.
+/// Longest socket path the daemon will try to bind. `sockaddr_un` holds 108
+/// bytes including the terminator; a few are kept in reserve.
+pub const MAX_SOCKET_PATH_BYTES: usize = 100;
+
+/// The preferred socket path for a given `state.json` path: a sibling.
 #[must_use]
 pub fn control_socket_path(state_file: &Path) -> PathBuf {
     state_file.with_file_name(CONTROL_SOCKET_FILE_NAME)
 }
 
-/// The control token of the daemon holding the lock beside `state_file`,
-/// if there is one and its lock file carries a token.
+/// Where the daemon actually binds.
+///
+/// The sibling of `state.json` unless that path is too long for a Unix
+/// socket address, in which case a short path under the temp directory
+/// named by a hash of the preferred path. The chosen path is written into
+/// `daemon.lock`, so clients never derive it.
 #[must_use]
-pub fn read_token(state_file: &Path) -> Option<String> {
+pub fn resolve_control_socket_path(state_file: &Path) -> PathBuf {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let preferred = control_socket_path(state_file);
+    if preferred.as_os_str().len() <= MAX_SOCKET_PATH_BYTES {
+        return preferred;
+    }
+    let mut hasher = std::hash::DefaultHasher::new();
+    preferred.hash(&mut hasher);
+    std::env::temp_dir().join(format!("sbh-control-{:016x}.sock", hasher.finish()))
+}
+
+/// What a client needs to talk to the running daemon: the socket it bound
+/// and this boot's token, both from `daemon.lock`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlEndpoint {
+    /// The socket the daemon bound (see [`resolve_control_socket_path`]).
+    pub socket: PathBuf,
+    /// The per-boot token every request must carry.
+    pub token: String,
+}
+
+/// The endpoint of the daemon holding the lock beside `state_file`, if
+/// there is one and its lock file carries a token. A lock written before
+/// the socket path was recorded falls back to the sibling path.
+#[must_use]
+pub fn read_endpoint(state_file: &Path) -> Option<ControlEndpoint> {
     match probe_daemon_lock(state_file) {
-        DaemonLockProbe::Held(info) if !info.token.is_empty() => Some(info.token),
+        DaemonLockProbe::Held(info) if !info.token.is_empty() => Some(ControlEndpoint {
+            socket: if info.control_socket.is_empty() {
+                control_socket_path(state_file)
+            } else {
+                PathBuf::from(info.control_socket)
+            },
+            token: info.token,
+        }),
         _ => None,
     }
 }
@@ -593,7 +634,7 @@ fn respond(stream: &UnixStream, shared: &Shared) -> ControlResponse {
 }
 
 /// Send one request and read one response. `token` is the daemon's current
-/// token (see [`read_token`]).
+/// token (see [`read_endpoint`]).
 pub fn request(
     socket_path: &Path,
     token: &str,
@@ -900,6 +941,37 @@ mod tests {
         );
         assert!(ok <= MAX_CONCURRENT_CONNECTIONS, "ok={ok}");
         server.stop();
+    }
+
+    #[test]
+    fn socket_path_falls_back_to_a_short_temp_path_when_the_sibling_is_too_long() {
+        let short = PathBuf::from("/var/lib/sbh/state.json");
+        assert_eq!(
+            resolve_control_socket_path(&short),
+            PathBuf::from("/var/lib/sbh/control.sock")
+        );
+
+        let long = PathBuf::from(format!("/{}/state.json", "d".repeat(120)));
+        let resolved = resolve_control_socket_path(&long);
+        assert!(
+            resolved.as_os_str().len() <= MAX_SOCKET_PATH_BYTES,
+            "{}",
+            resolved.display()
+        );
+        assert!(
+            resolved.starts_with(std::env::temp_dir()),
+            "{}",
+            resolved.display()
+        );
+        assert_eq!(
+            resolved,
+            resolve_control_socket_path(&long),
+            "deterministic for the same state file"
+        );
+        assert_ne!(
+            resolved,
+            resolve_control_socket_path(&PathBuf::from(format!("/{}/state.json", "e".repeat(120))))
+        );
     }
 
     #[test]

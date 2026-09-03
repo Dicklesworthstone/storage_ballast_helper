@@ -31,7 +31,7 @@ use crate::core::config::{Config, ScannerConfig, ScannerEngineMode};
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::control::{
     BallastAction as ControlBallastAction, ControlBackend, ControlCommand, ControlResponse,
-    ControlServer, Peer, PolicyAction, control_socket_path, persist_policy_mode,
+    ControlServer, Peer, PolicyAction, persist_policy_mode,
 };
 use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD};
 use crate::daemon::mount_controller::{
@@ -2773,7 +2773,7 @@ impl MonitoringDaemon {
     // ──────────────────── control socket (bd-rc-master-ajg1.4.9) ────────────────────
 
     fn start_control_server(&mut self) {
-        let path = control_socket_path(&self.config.paths.state_file);
+        let path = self.daemon_lock.control_socket_path().to_path_buf();
         let backend = Arc::new(DaemonControlBackend {
             signal_handler: self.signal_handler.clone(),
             control_tx: self.control_tx.clone(),

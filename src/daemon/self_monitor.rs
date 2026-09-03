@@ -89,6 +89,10 @@ pub struct DaemonLockInfo {
     /// Readable by whoever can read the lock file, which is the intended
     /// audience; the socket's own mode is the access control.
     pub token: String,
+    /// Where this daemon bound its control socket: the sibling of
+    /// `state.json`, or a short temp-dir path when the sibling is too long
+    /// for a Unix socket address. Clients read it from here.
+    pub control_socket: String,
 }
 
 /// Path of the daemon lock for a given `state.json` path.
@@ -104,6 +108,7 @@ pub struct DaemonLock {
     _lock: nix::fcntl::Flock<fs::File>,
     path: PathBuf,
     token: String,
+    control_socket: PathBuf,
 }
 
 /// A fresh per-boot control token: 32 hex characters from the process RNG.
@@ -167,11 +172,13 @@ impl DaemonLock {
             })?;
 
             let token = new_control_token();
+            let control_socket = crate::daemon::control::resolve_control_socket_path(state_file);
             let info = DaemonLockInfo {
                 pid: std::process::id(),
                 started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 token: token.clone(),
+                control_socket: control_socket.to_string_lossy().into_owned(),
             };
             let payload = serde_json::to_string(&info).map_err(|e| SbhError::Serialization {
                 context: "daemon lock",
@@ -191,16 +198,24 @@ impl DaemonLock {
                 _lock: lock,
                 path,
                 token,
+                control_socket,
             })
         }
         #[cfg(not(unix))]
         {
             let _ = file;
             Ok(Self {
+                control_socket: crate::daemon::control::resolve_control_socket_path(state_file),
                 path,
                 token: new_control_token(),
             })
         }
+    }
+
+    /// Where the control socket is (or would be) bound for this daemon.
+    #[must_use]
+    pub fn control_socket_path(&self) -> &Path {
+        &self.control_socket
     }
 
     /// Path of the lock file.

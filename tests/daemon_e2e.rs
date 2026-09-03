@@ -2347,7 +2347,7 @@ fn dry_run_orange_pressure_backs_off_after_the_first_dispatch() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn control_socket_serves_ping_scan_now_policy_and_shutdown() {
-    use storage_ballast_helper::daemon::control::{control_socket_path, read_token, request};
+    use storage_ballast_helper::daemon::control::{control_socket_path, read_endpoint, request};
     use storage_ballast_helper::daemon::self_monitor::{DaemonLockProbe, probe_daemon_lock};
 
     let dir = scratch();
@@ -2363,13 +2363,19 @@ fn control_socket_serves_ping_scan_now_policy_and_shutdown() {
     };
     let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
     let state_path = run.state_path();
-    let socket = control_socket_path(&state_path);
     run.wait_until("the control socket", Duration::from_secs(30), |_| {
-        socket.exists()
+        read_endpoint(&state_path).is_some_and(|endpoint| endpoint.socket.exists())
     })
     .unwrap_or_else(|e| panic!("{e}"));
-    let token = read_token(&state_path).expect("daemon.lock carries the control token");
+    let endpoint = read_endpoint(&state_path).expect("daemon.lock carries the control endpoint");
+    let socket = endpoint.socket.clone();
+    let token = endpoint.token;
     assert_eq!(token.len(), 32, "{token}");
+    assert_eq!(
+        socket,
+        control_socket_path(&state_path),
+        "a short data directory binds the sibling path"
+    );
 
     // ping: identity and a latency print (the design target is 50 ms on an
     // idle host; the gate is loose because CI hosts are not idle).

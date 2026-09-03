@@ -1518,8 +1518,12 @@ can connect). One JSON line in, one JSON line out:
 
 The token is minted at every start and written into `daemon.lock`, so a
 client that can read the lock file can talk and a client left over from a
-previous boot cannot. Every command that changes state is logged with the
-caller's uid and pid.
+previous boot cannot. The lock file also records where the socket was
+bound: normally beside `state.json`, but a data directory whose path is
+longer than a Unix socket address allows (about 100 bytes) gets a short
+`sbh-control-<hash>.sock` under the temp directory instead, and clients
+read that path rather than deriving it. Every command that changes state
+is logged with the caller's uid and pid.
 
 | Command | What it does |
 | --- | --- |

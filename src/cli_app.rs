@@ -2384,24 +2384,24 @@ fn control_request(
     ),
     CliError,
 > {
-    use storage_ballast_helper::daemon::control::{control_socket_path, read_token, request};
+    use storage_ballast_helper::daemon::control::{read_endpoint, request};
 
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
-    let socket = control_socket_path(&config.paths.state_file);
+    let Some(endpoint) = read_endpoint(&config.paths.state_file) else {
+        return Err(CliError::User(format!(
+            "no running daemon: the lock beside {} is free or carries no control token (is the daemon running with [core] control_socket_enabled = true, and readable by this user?)",
+            config.paths.state_file.display()
+        )));
+    };
+    let socket = endpoint.socket;
     if !socket.exists() {
         return Err(CliError::User(format!(
-            "no running daemon: control socket {} is absent (is the daemon running with [core] control_socket_enabled = true?)",
+            "the daemon holds its lock but its control socket {} is absent: [core] control_socket_enabled = false, or the socket failed to bind (see the daemon log)",
             socket.display()
         )));
     }
-    let Some(token) = read_token(&config.paths.state_file) else {
-        return Err(CliError::User(format!(
-            "control socket {} exists but the daemon lock beside it carries no readable token; the daemon may be stopping, owned by another user, or older than the control socket",
-            socket.display()
-        )));
-    };
-    let response = request(&socket, &token, cmd, args)
+    let response = request(&socket, &endpoint.token, cmd, args)
         .map_err(|e| CliError::Runtime(format!("control socket {}: {e}", socket.display())))?;
     Ok((socket, response))
 }
@@ -9000,12 +9000,12 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     // write interval old. The state file stays the source when the socket
     // is absent, unreadable, or refuses.
     let status_source = {
-        use storage_ballast_helper::daemon::control::{control_socket_path, read_token, request};
-        let socket = control_socket_path(&config.paths.state_file);
+        use storage_ballast_helper::daemon::control::{read_endpoint, request};
         let refreshed = daemon_running
-            && socket.exists()
-            && read_token(&config.paths.state_file).is_some_and(|token| {
-                request(&socket, &token, "status", &json!({})).is_ok_and(|reply| reply.ok)
+            && read_endpoint(&config.paths.state_file).is_some_and(|endpoint| {
+                endpoint.socket.exists()
+                    && request(&endpoint.socket, &endpoint.token, "status", &json!({}))
+                        .is_ok_and(|reply| reply.ok)
             });
         if refreshed { "socket" } else { "state_file" }
     };
