@@ -451,6 +451,10 @@ sbh dashboard --legacy-dashboard
 
 # Force new cockpit even if kill switch is set
 sbh dashboard --new-dashboard
+
+# Replay a captured activity log for a postmortem (no daemon needed):
+# Space pauses/resumes, , and . step one event, Home/End seek; 10x log time
+sbh dashboard --replay /var/lib/sbh/activity.jsonl --speed 10x --from 2026-08-30T10:00:00Z
 ```
 
 Rollout controls (in `config.toml`):
@@ -530,6 +534,14 @@ The tables are generated from the dashboard's keymap (`sbh docs --section dashbo
 | `n` / `p` | Log Search | Next / previous page of results |
 | `c` | Log Search | Clear the query (newest entries again) |
 | `Enter` | Log Search | Open the selected entry on the Timeline |
+
+**Replay scrubber:**
+
+| Key | Where | Action |
+| --- | --- | --- |
+| `Space` | Replay (`--replay`) | Pause / resume the replay |
+| `,` / `.` | Replay (`--replay`) | Step one event back / forward (pauses) |
+| `Home` / `End` | Replay (`--replay`) | Jump to the first / last event (pauses) |
 <!-- sbh-docs:end -->
 
 Confirmed ballast actions (`x`, `Shift-X`, `p` then `Enter`) go through the running daemon's control socket, scoped to the selected mount; with no daemon running the dashboard changes the pool directly, the way `sbh ballast release`/`replenish` do. The outcome, or the daemon's refusal, is shown as a notification, and each released or recreated file is a `ballast_release`/`ballast_replenish` event on the Timeline.

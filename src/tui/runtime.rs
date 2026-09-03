@@ -62,6 +62,9 @@ pub struct DashboardRuntimeConfig {
     /// What a confirmed ballast action uses when no daemon holds the pool;
     /// `None` makes such an action a typed refusal.
     pub ballast: Option<BallastFallback>,
+    /// `--replay`: drive the cockpit from a captured activity log instead
+    /// of the state file and the live adapters (bd-rc-master-ajg1.4.13).
+    pub replay: Option<super::replay::ReplayConfig>,
 }
 
 /// The `[ballast]` settings and provisioning floor the cockpit needs to
@@ -382,9 +385,30 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
     preference_state.apply_to_model(&mut model, true, true);
     apply_start_screen_override(&mut model, config.start_screen);
 
+    // Replay (bd-rc-master-ajg1.4.13): the captured log replaces the state
+    // file and the live adapters; the driver owns the cursor.
+    let mut replay_driver = match &config.replay {
+        Some(replay) => {
+            let timeline = super::replay::ReplayTimeline::load(&replay.path)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Some(super::replay::ReplayDriver::new(
+                timeline,
+                replay,
+                Instant::now(),
+            ))
+        }
+        None => None,
+    };
+
     // Initialize telemetry adapter.
-    let telemetry_adapter =
-        CompositeTelemetryAdapter::new(config.sqlite_db.as_deref(), config.jsonl_log.as_deref());
+    let telemetry_adapter: Box<dyn TelemetryQueryAdapter> = match &replay_driver {
+        Some(driver) => Box::new(driver.adapter()),
+        None => Box::new(CompositeTelemetryAdapter::new(
+            config.sqlite_db.as_deref(),
+            config.jsonl_log.as_deref(),
+        )),
+    };
+    let telemetry_adapter: &dyn TelemetryQueryAdapter = telemetry_adapter.as_ref();
 
     // Pending notification auto-dismiss timers: (notification_id, expires_at).
     let mut notification_timers: Vec<(u64, Instant)> = Vec::new();
@@ -394,14 +418,65 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
     }
 
     // Initial data fetch.
-    let initial = read_state_file(&config.state_file);
-    update::update(&mut model, DashboardMsg::DataUpdate(initial));
+    if let Some(driver) = &replay_driver {
+        model.replay = Some(driver.status());
+        update::update(
+            &mut model,
+            DashboardMsg::DataUpdate(driver.state().map(Box::new)),
+        );
+        let status = driver.status();
+        let id = model.push_notification(
+            NotificationLevel::Info,
+            format!(
+                "Replay of {} ({} events{}): Space pause/resume, , . step, Home/End seek",
+                status.file,
+                status.total,
+                if status.skipped_lines > 0 {
+                    format!(", {} unparseable line(s) skipped", status.skipped_lines)
+                } else {
+                    String::new()
+                }
+            ),
+        );
+        notification_timers.push((id, Instant::now() + Duration::from_secs(12)));
+    } else {
+        let initial = read_state_file(&config.state_file);
+        update::update(&mut model, DashboardMsg::DataUpdate(initial));
+    }
 
     let mut pool = GraphemePool::new();
     let mut prev_buffer = Buffer::new(cols, rows);
     let mut first_frame = true;
 
     loop {
+        // Replay: run a queued scrubber key, then let time move the cursor;
+        // a moved cursor refeeds the reconstructed state and the screen's
+        // telemetry.
+        if let Some(driver) = replay_driver.as_mut() {
+            let now = Instant::now();
+            let mut moved = false;
+            if let Some(command) = model.replay_pending.take() {
+                moved |= driver.apply(command, now);
+            }
+            moved |= driver.advance(now);
+            model.replay = Some(driver.status());
+            if moved {
+                update::update(
+                    &mut model,
+                    DashboardMsg::DataUpdate(driver.state().map(Box::new)),
+                );
+                execute_cmd(
+                    &mut model,
+                    &config.state_file,
+                    DashboardCmd::FetchTelemetry,
+                    &mut notification_timers,
+                    &mut preference_state,
+                    telemetry_adapter,
+                    config.ballast.as_ref(),
+                );
+            }
+        }
+
         // Render current frame via Frame-based widget pipeline.
         // Clamp to 1×1 minimum: Buffer/Frame panic on zero dimensions.
         let render_cols = model.terminal_size.0.max(1);
@@ -461,7 +536,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
                     cmd,
                     &mut notification_timers,
                     &mut preference_state,
-                    &telemetry_adapter,
+                    telemetry_adapter,
                     config.ballast.as_ref(),
                 );
 
@@ -478,7 +553,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
                 cmd,
                 &mut notification_timers,
                 &mut preference_state,
-                &telemetry_adapter,
+                telemetry_adapter,
                 config.ballast.as_ref(),
             );
         }
@@ -507,8 +582,7 @@ fn execute_cmd(
     match cmd {
         DashboardCmd::None | DashboardCmd::ScheduleTick(_) => {}
         DashboardCmd::FetchData => {
-            let state = read_state_file(state_file);
-            let inner_cmd = update::update(model, DashboardMsg::DataUpdate(state));
+            let inner_cmd = fetch_state(model, state_file);
             execute_cmd(
                 model,
                 state_file,
@@ -571,7 +645,9 @@ fn execute_cmd(
             ballast_dir,
             count,
         } => {
-            let outcome = release_ballast(state_file, ballast, &mount, &ballast_dir, count);
+            let outcome = unless_replay(model, || {
+                release_ballast(state_file, ballast, &mount, &ballast_dir, count)
+            });
             settle_ballast_outcome(
                 model,
                 state_file,
@@ -583,7 +659,9 @@ fn execute_cmd(
             );
         }
         DashboardCmd::ReplenishBallast { mount, ballast_dir } => {
-            let outcome = replenish_ballast(state_file, ballast, &mount, &ballast_dir);
+            let outcome = unless_replay(model, || {
+                replenish_ballast(state_file, ballast, &mount, &ballast_dir)
+            });
             settle_ballast_outcome(
                 model,
                 state_file,
@@ -678,6 +756,32 @@ fn apply_start_screen_override(model: &mut DashboardModel, start_screen: Option<
         model.screen = start.resolve(Some(model.screen));
         model.screen_history.clear();
     }
+}
+
+/// The refusal a ballast action gets during replay.
+const REPLAY_ACTION_REFUSED: &str =
+    "replay: ballast actions are disabled; the log is history, not a running daemon";
+
+/// Run a ballast action unless the cockpit is replaying a log.
+fn unless_replay(
+    model: &DashboardModel,
+    action: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    if model.replay.is_some() {
+        return Err(REPLAY_ACTION_REFUSED.to_string());
+    }
+    action()
+}
+
+/// `FetchData`: read the state file and deliver it, except in replay, where
+/// the driver feeds the reconstructed state and the file beside a config is
+/// not what is being shown.
+fn fetch_state(model: &mut DashboardModel, state_file: &Path) -> DashboardCmd {
+    if model.replay.is_some() {
+        return DashboardCmd::None;
+    }
+    let state = read_state_file(state_file);
+    update::update(model, DashboardMsg::DataUpdate(state))
 }
 
 /// Surface a release outcome as a notification: successes fade after 8 s,
@@ -988,6 +1092,46 @@ mod tests {
         assert!(model.screen_history.is_empty());
     }
 
+    /// bd-rc-master-ajg1.4.13: in replay `FetchData` leaves the reconstructed
+    /// state alone and ballast actions are refused before touching anything.
+    #[test]
+    fn replay_keeps_fetch_data_and_ballast_actions_off_the_host() {
+        use super::super::replay::{ReplaySpeed, ReplayStatus};
+        let mut model = test_model();
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state.json");
+        std::fs::write(&state, "{}").unwrap();
+        model.daemon_state = Some(DaemonState::default());
+        model.replay = Some(ReplayStatus {
+            file: "activity.jsonl".to_string(),
+            cursor_ts: None,
+            applied: 1,
+            total: 1,
+            paused: false,
+            speed: ReplaySpeed::X1,
+            skipped_lines: 0,
+        });
+        assert!(matches!(
+            fetch_state(&mut model, &state),
+            DashboardCmd::None
+        ));
+        assert!(
+            model.daemon_state.is_some(),
+            "the replay state survives FetchData"
+        );
+
+        let refused = unless_replay(&model, || Ok("would have released".to_string()));
+        assert_eq!(refused.unwrap_err(), REPLAY_ACTION_REFUSED);
+        model.replay = None;
+        let allowed = unless_replay(&model, || Ok("released".to_string()));
+        assert_eq!(allowed.unwrap(), "released");
+        // Outside replay the state file is read: an unparseable one clears
+        // the state, which is what the daemon-unavailable path shows.
+        std::fs::write(&state, "not json").unwrap();
+        let _ = fetch_state(&mut model, &state);
+        assert!(model.daemon_state.is_none());
+    }
+
     #[test]
     fn release_without_a_daemon_or_pool_settings_is_a_typed_refusal() {
         let temp = TempDir::new().unwrap();
@@ -1146,6 +1290,7 @@ mod tests {
             jsonl_log: None,
             start_screen: None,
             ballast: None,
+            replay: None,
         };
 
         let legacy = cfg.as_legacy_config();

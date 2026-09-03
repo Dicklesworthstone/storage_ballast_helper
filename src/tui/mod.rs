@@ -14,6 +14,7 @@ pub mod layout;
 pub mod model;
 pub mod preferences;
 pub mod render;
+pub mod replay;
 pub mod runtime;
 pub mod telemetry;
 pub mod terminal_guard;
@@ -44,4 +45,5 @@ mod test_stress;
 #[cfg(test)]
 mod test_unit_coverage;
 
+pub use replay::{ReplayConfig, ReplaySpeed};
 pub use runtime::{BallastFallback, DashboardRuntimeConfig, DashboardRuntimeMode, run_dashboard};

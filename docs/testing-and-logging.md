@@ -124,13 +124,13 @@ macOS-only tests are compiled out here, `#[ignore]` tests are listed.
 <!-- sbh-census:begin -->
 | Target | Tests |
 | --- | --- |
-| `cargo test --lib` (default features, with the TUI) | 2582 |
+| `cargo test --lib` (default features, with the TUI) | 2588 |
 | `cargo test --lib --no-default-features --features cli,daemon,sqlite` (lean) | 1608 |
-| `cargo test --bin sbh` | 138 |
+| `cargo test --bin sbh` | 139 |
 | `cargo test --test cli_exit_codes` | 5 |
 | `cargo test --test daemon_e2e` | 21 |
 | `cargo test --test dashboard_integration_tests` | 31 |
-| `cargo test --test dashboard_pty` | 2 |
+| `cargo test --test dashboard_pty` | 3 |
 | `cargo test --test decision_plane_e2e` | 7 |
 | `cargo test --test explain_ledger` | 4 |
 | `cargo test --test fallback_verification` | 42 |
@@ -152,9 +152,9 @@ macOS-only tests are compiled out here, `#[ignore]` tests are listed.
 | `cargo test --test repro_tui_panic` | 2 |
 | `cargo test --test stress_harness` | 9 |
 | `cargo test --test stress_tests` | 12 |
-| Integration test files (sum of the `--test` rows) | 316 |
+| Integration test files (sum of the `--test` rows) | 317 |
 | E2E shell cases defined in `scripts/e2e_test.sh` | 129 |
-| **Cargo tests on Linux, default features (lib + bin + integration)** | **3036** |
+| **Cargo tests on Linux, default features (lib + bin + integration)** | **3044** |
 <!-- sbh-census:end -->
 
 ### Binary Tests (CLI)

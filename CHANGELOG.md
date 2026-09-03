@@ -10,6 +10,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — incident replay: `sbh dashboard --replay <activity.jsonl>` (bd-rc-master-ajg1.4.13)
+
+- The cockpit can be driven from a captured activity log instead of a daemon: every screen shows the log's events up to a moving cursor, the Overview shows a state reconstructed from them (counters, per-mount pressure, ballast counts, last scan), and the header carries `REPLAY <file> t=<ts> i/n <speed>`. `--speed 1x|10x|max` sets how fast log time runs, `--from <RFC 3339>` starts later; `Space` pauses/resumes, `,`/`.` step one event, `Home`/`End` seek (the keys the bead named, `[`/`]`, stay screen navigation). Lines that do not parse are skipped and counted; ballast actions are refused with a hint. No daemon, socket, or database is touched.
+
 ### Added — Diagnostics thread health and a live VOI overlay (bd-rc-master-ajg1.4.11)
 
 - The Diagnostics screen's Runtime pane lists the daemon's four threads from `state.json` (`running`/`stalled`/`dead` with the heartbeat age), or says the daemon did not report thread health.

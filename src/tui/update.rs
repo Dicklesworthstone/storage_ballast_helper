@@ -62,6 +62,16 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             {
                 return handle_log_search_editing_key(model, key);
             }
+            // Replay scrubber keys (bd-rc-master-ajg1.4.13): queued for the
+            // runtime's driver; Space pauses/resumes, `,`/`.` step, Home/End
+            // seek. Only while `--replay` drives the cockpit.
+            if model.replay.is_some()
+                && model.active_overlay.is_none()
+                && let Some(command) = replay_command_for(key.code)
+            {
+                model.replay_pending = Some(command);
+                return DashboardCmd::None;
+            }
             // Route through the centralized input layer (IA §4.2).
             // Overlay keys → global keys → screen-specific keys.
             let context = InputContext {
@@ -784,9 +794,29 @@ fn handle_ballast_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> Dashbo
     }
 }
 
+/// The scrubber command a key means during replay, if any.
+const fn replay_command_for(code: KeyCode) -> Option<crate::tui::replay::ReplayCommand> {
+    use crate::tui::replay::ReplayCommand;
+    match code {
+        KeyCode::Char(' ') => Some(ReplayCommand::TogglePause),
+        KeyCode::Char(',') => Some(ReplayCommand::StepBack),
+        KeyCode::Char('.') => Some(ReplayCommand::StepForward),
+        KeyCode::Home => Some(ReplayCommand::SeekStart),
+        KeyCode::End => Some(ReplayCommand::SeekEnd),
+        _ => None,
+    }
+}
+
 /// Open the confirmation for a mutating ballast action on the selected
 /// volume, or say why there is nothing to act on. Returns whether it opened.
 fn open_ballast_confirmation(model: &mut DashboardModel, action: ConfirmAction) -> bool {
+    if model.replay.is_some() {
+        model.push_notification(
+            NotificationLevel::Warning,
+            "Replay: ballast actions are disabled (the log is history, not a daemon)".to_string(),
+        );
+        return false;
+    }
     let Some(volume) = model.ballast_selected_volume() else {
         model.push_notification(
             NotificationLevel::Warning,
@@ -3268,6 +3298,75 @@ mod tests {
         assert_eq!(model.screen, Screen::Timeline);
         assert_eq!(model.timeline_selected, 1);
         assert!(!model.timeline_follow);
+    }
+
+    /// bd-rc-master-ajg1.4.13: during replay the scrubber keys queue a
+    /// command for the runtime's driver instead of reaching the screens,
+    /// and ballast actions are refused with a hint.
+    #[test]
+    fn replay_keys_queue_commands_and_actions_are_refused() {
+        use crate::tui::replay::{ReplayCommand, ReplaySpeed, ReplayStatus};
+
+        let mut model = test_model();
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![sample_volume("/data", 2, 5)];
+
+        // Without replay, Space on the Ballast screen toggles the detail pane.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(' '))));
+        assert!(model.replay_pending.is_none());
+        assert!(model.ballast_detail);
+        model.ballast_detail = false;
+
+        model.replay = Some(ReplayStatus {
+            file: "activity.jsonl".to_string(),
+            cursor_ts: Some("2026-08-30T10:00:02Z".to_string()),
+            applied: 2,
+            total: 4,
+            paused: false,
+            speed: ReplaySpeed::X10,
+            skipped_lines: 0,
+        });
+        for (code, expected) in [
+            (KeyCode::Char(' '), ReplayCommand::TogglePause),
+            (KeyCode::Char(','), ReplayCommand::StepBack),
+            (KeyCode::Char('.'), ReplayCommand::StepForward),
+            (KeyCode::Home, ReplayCommand::SeekStart),
+            (KeyCode::End, ReplayCommand::SeekEnd),
+        ] {
+            let cmd = update(&mut model, DashboardMsg::Key(make_key(code)));
+            assert!(matches!(cmd, DashboardCmd::None));
+            assert_eq!(model.replay_pending.take(), Some(expected), "{code:?}");
+        }
+        assert!(
+            !model.ballast_detail,
+            "Space went to the scrubber, not the screen"
+        );
+
+        // Other keys still navigate; overlays take precedence over the scrubber.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('2'))));
+        assert_eq!(model.screen, Screen::Timeline);
+        model.active_overlay = Some(Overlay::Help);
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(' '))));
+        assert!(
+            model.replay_pending.is_none(),
+            "help overlay swallowed Space"
+        );
+        model.active_overlay = None;
+
+        // Quick-release and the Ballast keys refuse with a hint.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('x'))));
+        assert!(model.active_overlay.is_none());
+        assert!(
+            model
+                .notifications
+                .iter()
+                .any(|n| n.message.contains("Replay: ballast actions are disabled")),
+            "{:?}",
+            model.notifications
+        );
+        model.screen = Screen::Ballast;
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('X'))));
+        assert!(model.active_overlay.is_none());
     }
 
     #[test]

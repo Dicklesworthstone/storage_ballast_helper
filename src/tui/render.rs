@@ -70,6 +70,9 @@ pub fn render_to_string(model: &DashboardModel) -> String {
         "SBH Dashboard ({mode})  [{label}]  tick={}  size={}x{}",
         model.tick, model.terminal_size.0, model.terminal_size.1
     );
+    if let Some(replay) = &model.replay {
+        let _ = writeln!(out, "{}", replay.badge());
+    }
     let _ = writeln!(
         out,
         "theme={} spacing={}",
@@ -266,6 +269,16 @@ fn frame_render_header(model: &DashboardModel, theme: &Theme, area: Rect, frame:
                 .bold(),
         ),
     ];
+    if let Some(replay) = &model.replay {
+        title_spans.push(Span::raw(" "));
+        title_spans.push(Span::styled(
+            format!(" {} ", replay.badge()),
+            Style::default()
+                .fg(PackedRgba::rgb(20, 20, 30))
+                .bg(theme.palette.accent_color())
+                .bold(),
+        ));
+    }
     if let Some(ref state) = model.daemon_state
         && !state.policy_mode.is_empty()
     {
@@ -7048,6 +7061,34 @@ mod tests {
         model.daemon_state = None;
         let frame = voi_text(&model);
         assert!(frame.contains("NO DAEMON STATE"), "{frame}");
+    }
+
+    /// bd-rc-master-ajg1.4.13: the header carries the replay badge.
+    #[test]
+    fn header_shows_the_replay_badge() {
+        use crate::tui::replay::{ReplaySpeed, ReplayStatus};
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        let frame = render(&model);
+        assert!(!frame.contains("REPLAY"), "{frame}");
+        model.replay = Some(ReplayStatus {
+            file: "activity.jsonl".to_string(),
+            cursor_ts: Some("2026-08-30T10:00:02Z".to_string()),
+            applied: 2,
+            total: 4,
+            paused: true,
+            speed: ReplaySpeed::Max,
+            skipped_lines: 1,
+        });
+        let frame = render(&model);
+        assert!(
+            frame.contains("REPLAY activity.jsonl t=2026-08-30T10:00:02Z 2/4 max paused"),
+            "{frame}"
+        );
     }
 
     #[test]

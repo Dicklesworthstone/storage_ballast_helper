@@ -319,6 +319,7 @@ fn legacy_config_preserves_all_fields() {
         jsonl_log: None,
         start_screen: None,
         ballast: None,
+        replay: None,
     };
 
     let legacy = cfg.as_legacy_config();
@@ -342,6 +343,7 @@ fn legacy_config_empty_monitor_paths() {
         jsonl_log: None,
         start_screen: None,
         ballast: None,
+        replay: None,
     };
 
     let legacy = cfg.as_legacy_config();

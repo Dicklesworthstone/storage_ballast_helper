@@ -503,6 +503,7 @@ pub fn dashboard_docs() -> Option<DashboardDocs> {
                 .collect::<Vec<_>>()
                 .join(", "),
             KeyContext::Overlay(overlay) => format!("{} overlay", overlay_name(overlay)),
+            KeyContext::Replay => "Replay (`--replay`)".to_string(),
         }
     };
     let group_label = |group: KeyGroup| match group {
@@ -510,6 +511,7 @@ pub fn dashboard_docs() -> Option<DashboardDocs> {
         KeyGroup::Overlays => "Overlays",
         KeyGroup::Incident => "Incident shortcuts",
         KeyGroup::Screen => "Screen-specific",
+        KeyGroup::Replay => "Replay scrubber",
     };
     Some(DashboardDocs {
         screens: screen_catalog()

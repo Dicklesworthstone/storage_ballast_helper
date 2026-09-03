@@ -1681,7 +1681,7 @@ fn read_bool_field(object: &Map<String, Value>, keys: &[&str]) -> Option<bool> {
 // ──────────────────── conversion helpers ────────────────────
 
 /// Convert a JSONL `LogEntry` to a `TimelineEvent`.
-fn logentry_to_timeline(entry: &crate::logger::jsonl::LogEntry) -> TimelineEvent {
+pub(crate) fn logentry_to_timeline(entry: &crate::logger::jsonl::LogEntry) -> TimelineEvent {
     let severity = match entry.severity {
         crate::logger::jsonl::Severity::Info => "info",
         crate::logger::jsonl::Severity::Warning => "warning",
@@ -1768,7 +1768,7 @@ fn record_to_evidence(
 ///
 /// Full decision records live in a separate ledger; this provides a best-effort
 /// projection from the activity log for basic explainability display.
-fn timeline_to_evidence(id: u64, ev: &TimelineEvent) -> DecisionEvidence {
+pub(crate) fn timeline_to_evidence(id: u64, ev: &TimelineEvent) -> DecisionEvidence {
     DecisionEvidence {
         decision_id: id,
         timestamp: ev.timestamp.clone(),

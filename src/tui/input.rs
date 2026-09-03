@@ -122,6 +122,8 @@ pub enum KeyContext {
     Screens(&'static [Screen]),
     /// While the named overlay is open.
     Overlay(Overlay),
+    /// Only while `--replay` drives the cockpit (no overlay open).
+    Replay,
 }
 
 /// README table a binding is listed under.
@@ -131,6 +133,7 @@ pub enum KeyGroup {
     Overlays,
     Incident,
     Screen,
+    Replay,
 }
 
 /// One documented key binding: the keys as the README prints them, one
@@ -412,6 +415,31 @@ pub const KEYMAP: &[KeyBinding] = &[
         group: KeyGroup::Screen,
         context: KeyContext::Screen(Screen::LogSearch),
         description: "Open the selected entry on the Timeline",
+    },
+    // ── Replay scrubber (--replay) ──
+    KeyBinding {
+        keys: "`Space`",
+        probe: KeyCode::Char(' '),
+        ctrl: false,
+        group: KeyGroup::Replay,
+        context: KeyContext::Replay,
+        description: "Pause / resume the replay",
+    },
+    KeyBinding {
+        keys: "`,` / `.`",
+        probe: KeyCode::Char('.'),
+        ctrl: false,
+        group: KeyGroup::Replay,
+        context: KeyContext::Replay,
+        description: "Step one event back / forward (pauses)",
+    },
+    KeyBinding {
+        keys: "`Home` / `End`",
+        probe: KeyCode::Home,
+        ctrl: false,
+        group: KeyGroup::Replay,
+        context: KeyContext::Replay,
+        description: "Jump to the first / last event (pauses)",
     },
 ];
 
@@ -1485,6 +1513,9 @@ mod tests {
                         );
                     }
                 }
+                // Replay keys are intercepted by `update` before resolution
+                // (only while --replay runs), so nothing to resolve here.
+                KeyContext::Replay => {}
             }
         }
         let catalog = screen_catalog();

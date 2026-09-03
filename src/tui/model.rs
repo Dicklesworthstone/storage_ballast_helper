@@ -632,6 +632,12 @@ pub struct DashboardModel {
     /// Query line, filters, and the current page of results.
     pub log_search: LogSearchState,
 
+    // ── Incident replay (bd-rc-master-ajg1.4.13) ──
+    /// Set while `--replay` drives the cockpit: what the header shows.
+    pub replay: Option<super::replay::ReplayStatus>,
+    /// A scrubber key waiting for the runtime's replay driver.
+    pub replay_pending: Option<super::replay::ReplayCommand>,
+
     // ── Explainability screen (S3) state ──
     /// Cached decision evidence for the explainability screen.
     pub explainability_decisions: Vec<DecisionEvidence>,
@@ -747,6 +753,8 @@ impl DashboardModel {
             timeline_partial: false,
             timeline_diagnostics: String::new(),
             log_search: LogSearchState::default(),
+            replay: None,
+            replay_pending: None,
             explainability_decisions: Vec::new(),
             explainability_selected: 0,
             explainability_detail: false,

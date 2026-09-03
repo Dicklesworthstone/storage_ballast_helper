@@ -943,6 +943,25 @@ struct DashboardArgs {
     /// explainability, candidates, ballast, log_search, diagnostics, remember).
     #[arg(long, value_name = "SCREEN")]
     start_screen: Option<String>,
+
+    /// Replay a captured activity log (JSONL) instead of the live daemon:
+    /// the cockpit shows the log's events and a reconstructed state as time
+    /// runs; Space pauses, `,`/`.` step, Home/End seek; actions are disabled.
+    #[arg(
+        long,
+        value_name = "ACTIVITY_JSONL",
+        conflicts_with = "legacy_dashboard"
+    )]
+    replay: Option<PathBuf>,
+
+    /// With --replay: start at the first event at or after this RFC 3339
+    /// timestamp.
+    #[arg(long, value_name = "TIMESTAMP", requires = "replay")]
+    from: Option<String>,
+
+    /// With --replay: how fast log time runs (1x, 10x, or max = all at once).
+    #[arg(long, value_name = "SPEED", default_value = "1x", requires = "replay")]
+    speed: String,
 }
 
 impl Default for DashboardArgs {
@@ -950,6 +969,9 @@ impl Default for DashboardArgs {
         Self {
             refresh_ms: 1_000,
             start_screen: None,
+            replay: None,
+            from: None,
+            speed: "1x".to_string(),
             new_dashboard: false,
             legacy_dashboard: false,
         }
@@ -7340,6 +7362,10 @@ struct DashboardRuntimeRequest {
     /// needs to release or replenish a pool itself when no daemon holds it.
     ballast: storage_ballast_helper::core::config::BallastConfig,
     provision_floor_pct: f64,
+    /// `--replay <file>`, `--from`, `--speed`: validated by the cockpit runtime.
+    replay: Option<PathBuf>,
+    replay_from: Option<String>,
+    replay_speed: String,
 }
 
 /// Resolve dashboard runtime using priority chain:
@@ -7449,12 +7475,41 @@ fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Re
         .map(str::parse::<tui::preferences::StartScreen>)
         .transpose()
         .map_err(CliError::User)?;
+    let replay = request
+        .replay
+        .as_ref()
+        .map(|path| -> Result<tui::ReplayConfig, CliError> {
+            let speed = request
+                .replay_speed
+                .parse::<tui::ReplaySpeed>()
+                .map_err(CliError::User)?;
+            if let Some(from) = request.replay_from.as_deref()
+                && chrono::DateTime::parse_from_rfc3339(from).is_err()
+            {
+                return Err(CliError::User(format!(
+                    "--from {from:?} is not an RFC 3339 timestamp (example: 2026-08-30T10:00:00Z)"
+                )));
+            }
+            if !path.is_file() {
+                return Err(CliError::User(format!(
+                    "--replay {}: not a readable file",
+                    path.display()
+                )));
+            }
+            Ok(tui::ReplayConfig {
+                path: path.clone(),
+                from: request.replay_from.clone(),
+                speed,
+            })
+        })
+        .transpose()?;
 
     // The cockpit takes over the terminal; a pipe or a file gets the plain
     // live status view instead, unless the cockpit was asked for by name.
     if !io::stdout().is_terminal() {
         let explicit = matches!(request.reason, DashboardSelectionReason::CliFlagNew)
-            || start_screen.is_some();
+            || start_screen.is_some()
+            || replay.is_some();
         if explicit {
             return Err(CliError::Runtime(
                 "the cockpit needs an interactive terminal: stdout is not a TTY. Drop \
@@ -7480,6 +7535,7 @@ fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Re
             config: request.ballast.clone(),
             provision_floor_pct: request.provision_floor_pct,
         }),
+        replay,
     };
     tui::run_dashboard(&config)
         .map_err(|e| CliError::Runtime(format!("dashboard runtime failure: {e}")))
@@ -7494,9 +7550,9 @@ fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Re
     if let Some(error) = lean_build_dashboard_refusal(&request.reason) {
         return Err(error);
     }
-    if request.start_screen.is_some() {
+    if request.start_screen.is_some() || request.replay.is_some() {
         return Err(CliError::Runtime(
-            "TUI feature not enabled. --start-screen needs the cockpit; rebuild with --features tui"
+            "TUI feature not enabled. --start-screen and --replay need the cockpit; rebuild with --features tui"
                 .to_string(),
         ));
     }
@@ -7542,6 +7598,9 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
         start_screen: args.start_screen.clone(),
         provision_floor_pct,
         ballast: config.ballast,
+        replay: args.replay.clone(),
+        replay_from: args.from.clone(),
+        replay_speed: args.speed.clone(),
     };
 
     run_dashboard_runtime(cli, &request)
@@ -17770,6 +17829,47 @@ mod tests {
         assert_eq!(args.start_screen.as_deref(), Some("ballast"));
         assert!(!args.new_dashboard && !args.legacy_dashboard);
         assert_eq!(DashboardArgs::default().start_screen, None);
+    }
+
+    /// `--replay FILE [--from TS] [--speed S]` parse together; `--from` and
+    /// `--speed` need `--replay`, and `--replay` excludes the legacy view.
+    #[test]
+    fn dashboard_replay_flags_parse_and_require_each_other() {
+        let cli = Cli::try_parse_from([
+            "sbh",
+            "dashboard",
+            "--replay",
+            "/var/lib/sbh/activity.jsonl",
+            "--from",
+            "2026-08-30T10:00:00Z",
+            "--speed",
+            "10x",
+        ])
+        .expect("replay flags parse");
+        let Command::Dashboard(args) = cli.command else {
+            panic!("expected the dashboard command");
+        };
+        assert_eq!(
+            args.replay.as_deref(),
+            Some(Path::new("/var/lib/sbh/activity.jsonl"))
+        );
+        assert_eq!(args.from.as_deref(), Some("2026-08-30T10:00:00Z"));
+        assert_eq!(args.speed, "10x");
+        assert!(Cli::try_parse_from(["sbh", "dashboard", "--speed", "max"]).is_err());
+        assert!(
+            Cli::try_parse_from(["sbh", "dashboard", "--from", "2026-08-30T10:00:00Z"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sbh",
+                "dashboard",
+                "--replay",
+                "x.jsonl",
+                "--legacy-dashboard"
+            ])
+            .is_err()
+        );
+        assert_eq!(DashboardArgs::default().speed, "1x");
     }
 
     #[cfg(feature = "tui")]

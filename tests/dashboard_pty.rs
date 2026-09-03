@@ -459,6 +459,70 @@ fn pty_session_walks_the_screens_and_releases_one_ballast_file() {
     daemon.stop();
 }
 
+/// Incident replay (4.13): a captured activity log drives the cockpit
+/// with no daemon at all. At max speed the cursor lands on the last event
+/// at once, the Timeline shows the log's events, `,` steps back (and
+/// pauses), and `q` exits.
+#[test]
+fn pty_replay_session_drives_the_cockpit_from_a_captured_log() {
+    use storage_ballast_helper::logger::jsonl::{EventType, LogEntry, Severity};
+
+    if Command::new("setsid").arg("--version").output().is_err() {
+        eprintln!("SKIP: util-linux setsid is not installed; the pty session needs it");
+        return;
+    }
+    let dir = scratch();
+    let config = write_config(dir.path());
+    let log = dir.path().join("captured.jsonl");
+    let mut lines = String::new();
+    for (i, event) in [
+        EventType::BallastProvision,
+        EventType::ScanComplete,
+        EventType::BallastRelease,
+        EventType::ArtifactDelete,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut entry = LogEntry::new(event, Severity::Info);
+        entry.ts = format!("2026-08-30T10:00:0{i}Z");
+        entry.mount_point = Some("/data".to_string());
+        entry.pressure = Some(if i >= 2 { "orange" } else { "green" }.to_string());
+        entry.free_pct = Some(if i >= 2 { 12.0 } else { 40.0 });
+        entry.path = Some(format!("/work/proj{i}/target"));
+        lines.push_str(&serde_json::to_string(&entry).unwrap());
+        lines.push('\n');
+    }
+    lines.push_str("this line is not json\n");
+    fs::write(&log, lines).unwrap();
+
+    let mut replay = PtyDashboard::spawn(
+        &config,
+        &[
+            "--replay",
+            log.to_str().unwrap(),
+            "--speed",
+            "max",
+            "--start-screen",
+            "timeline",
+        ],
+    );
+    replay.wait_for_text_from(0, "REPLAY captured.jsonl", Duration::from_secs(20));
+    replay.wait_for_text_from(0, "4/4 max", Duration::from_secs(10));
+    replay.wait_for_text_from(0, "ballast_release", Duration::from_secs(10));
+    // The frame is drawn as a diff, so only the cells that changed arrive:
+    // the "paused" suffix is new text, the cursor count changes one digit.
+    let from = replay.press(",");
+    replay.wait_for_text_from(from, "paused", Duration::from_secs(10));
+    replay.press("q");
+    let (status, text) = replay.wait_exit(Duration::from_secs(20));
+    assert!(status.success(), "replay exit {status}; output:\n{text}");
+    assert!(
+        text.contains("unparseable line") || text.contains("1 unparseable"),
+        "the skipped line is reported: {text}"
+    );
+}
+
 /// An explicit cockpit request without a terminal is refused with the TTY
 /// message (the e2e shell suite covers the same on a pipe; here it guards
 /// the pty test's premise that the pty is what makes the difference).
