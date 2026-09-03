@@ -8894,7 +8894,6 @@ const fn host_parts_for_triple(
 fn release_latest_assets_check(latest: &std::result::Result<LatestRelease, String>) -> DoctorCheck {
     use storage_ballast_helper::cli::{
         CI_RELEASE_TARGETS, HostSpecifier, ReleaseChannel, resolve_updater_artifact_contract,
-        validate_release_assets,
     };
     const ID: &str = "release.latest_assets";
     const TITLE: &str = "Latest release assets";
@@ -8921,8 +8920,16 @@ fn release_latest_assets_check(latest: &std::result::Result<LatestRelease, Strin
         });
         match contract {
             Ok(contract) => {
-                if let Err(error) = validate_release_assets(&contract, &latest.assets) {
-                    problems.push(error.to_string());
+                // The workflow publishes the archive and its checksum (plus
+                // the aggregate SHA256SUMS.txt); sigstore bundles are an
+                // optional layer the updater tolerates being absent, so
+                // they are not required here either.
+                let missing: Vec<String> = [contract.asset_name(), contract.checksum_name()]
+                    .into_iter()
+                    .filter(|name| !latest.assets.iter().any(|asset| asset == name))
+                    .collect();
+                if !missing.is_empty() {
+                    problems.push(format!("{triple}: missing [{}]", missing.join(", ")));
                 }
             }
             Err(error) => problems.push(format!("{triple}: {error}")),
@@ -8954,8 +8961,8 @@ fn release_latest_assets_check(latest: &std::result::Result<LatestRelease, Strin
         "FAIL",
         format!("{}: {}", latest.tag, problems.join("; ")),
         Some(format!(
-            "Publish the missing assets for {} through the Release workflow (or scripts/release-manual.sh) and re-run `sbh doctor --release --assets {}`; until then `sbh update` cannot resolve that release on those hosts.",
-            latest.tag, latest.tag
+            "Publish the missing assets for {} through the Release workflow (`gh workflow run release.yml`) and re-run `sbh doctor --release`; until then `sbh update` cannot resolve that release on those hosts.",
+            latest.tag
         )),
     )
 }
@@ -16166,19 +16173,25 @@ mod tests {
         }
     }
 
-    /// `gh release view --json tagName,assets` for a release that carries
-    /// every CI target's contract assets plus the provenance document.
+    /// `gh release view --json tagName,assets` for a release shaped like the
+    /// workflow's output: per target the versioned archive and its checksum
+    /// (no sigstore bundle, the workflow publishes none), plus the aggregate
+    /// manifest and the provenance document.
     fn fixture_latest_release_json(tag: &str) -> String {
         use storage_ballast_helper::cli::{
             CI_RELEASE_TARGETS, HostSpecifier, ReleaseChannel, resolve_updater_artifact_contract,
         };
-        let mut names = vec![RELEASE_PROVENANCE_ASSET.to_string()];
+        let mut names = vec![
+            RELEASE_PROVENANCE_ASSET.to_string(),
+            "SHA256SUMS.txt".to_string(),
+        ];
         for triple in CI_RELEASE_TARGETS {
             let (os, arch, abi) = host_parts_for_triple(triple).expect("CI target maps to a host");
             let host = HostSpecifier::from_parts(os, arch, abi).unwrap();
             let contract =
                 resolve_updater_artifact_contract(host, ReleaseChannel::Stable, Some(tag)).unwrap();
-            names.extend(contract.expected_release_assets());
+            names.push(contract.asset_name());
+            names.push(contract.checksum_name());
         }
         json!({
             "tagName": tag,
