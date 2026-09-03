@@ -1083,6 +1083,29 @@ fn unit_is_system_scope(unit_path: &Path) -> bool {
     unit_path.starts_with("/etc/systemd")
 }
 
+/// Whether the current user can rewrite the service file at `path` and
+/// write a backup beside it: root for a system unit, the owner for a user
+/// unit. A missing file is judged on its directory.
+fn can_modify_service_file(path: &Path) -> bool {
+    use nix::unistd::{AccessFlags, access};
+
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    access(dir, AccessFlags::W_OK).is_ok()
+        && (!path.exists() || access(path, AccessFlags::W_OK).is_ok())
+}
+
+/// The note appended to a service-file action the current user cannot
+/// apply; `bootstrap` then leaves it planned instead of failing it.
+fn privilege_note(path: &Path) -> &'static str {
+    if can_modify_service_file(path) {
+        ""
+    } else {
+        " (needs root: rerun with sudo)"
+    }
+}
+
 /// The `ReadWritePaths=` set the unit at `unit_path` needs, derived from the
 /// config its scope loads. `None` when that config cannot be loaded (the
 /// unit is then judged on its binary only).
@@ -1329,7 +1352,7 @@ fn plan_actions(footprints: &[Footprint], opts: &MigrateOptions) -> Vec<Migratio
                             "update ExecStart in {} to {}",
                             fp.path.display(),
                             current_exe.display()
-                        ),
+                        ) + privilege_note(&fp.path),
                         applied: false,
                         backup_path: None,
                         error: None,
@@ -1345,7 +1368,7 @@ fn plan_actions(footprints: &[Footprint], opts: &MigrateOptions) -> Vec<Migratio
                         "replace {} with the unit sbh generates (backup beside it, drop-ins kept): {}",
                         fp.path.display(),
                         fp.detail.clone().unwrap_or_default()
-                    ),
+                    ) + privilege_note(&fp.path),
                     applied: false,
                     backup_path: None,
                     error: None,
@@ -1359,7 +1382,7 @@ fn plan_actions(footprints: &[Footprint], opts: &MigrateOptions) -> Vec<Migratio
                     description: format!(
                         "update ReadWritePaths in {} to the configured scan roots, ballast and data directories",
                         fp.path.display()
-                    ),
+                    ) + privilege_note(&fp.path),
                     applied: false,
                     backup_path: None,
                     error: None,
@@ -1375,7 +1398,7 @@ fn plan_actions(footprints: &[Footprint], opts: &MigrateOptions) -> Vec<Migratio
                             "update ProgramArguments in {} to {}",
                             fp.path.display(),
                             current_exe.display()
-                        ),
+                        ) + privilege_note(&fp.path),
                         applied: false,
                         backup_path: None,
                         error: None,
@@ -1500,6 +1523,14 @@ fn legacy_data_destination_for(source: &Path) -> Option<PathBuf> {
 
 fn apply_actions(actions: &mut [MigrationAction], backup_dir: Option<&Path>) {
     for action in actions.iter_mut() {
+        if matches!(
+            action.kind,
+            ActionKind::UpdateServicePath | ActionKind::ReinstallServiceUnit
+        ) && !can_modify_service_file(&action.target)
+        {
+            // Left planned, not failed: the description names the sudo rerun.
+            continue;
+        }
         let result = match action.kind {
             ActionKind::RemoveProfileLine => apply_remove_profile_line(action, backup_dir),
             ActionKind::DeduplicateProfile => apply_deduplicate_profile(action, backup_dir),
@@ -2732,6 +2763,71 @@ mod tests {
             actions.is_empty(),
             "healthy footprint should generate no actions"
         );
+    }
+
+    #[test]
+    fn plan_actions_system_unit_drift_notes_the_root_requirement() {
+        if nix::unistd::geteuid().is_root() {
+            println!("SKIP: running as root");
+            return;
+        }
+        let footprints = vec![Footprint {
+            kind: FootprintKind::SystemdUnit,
+            path: PathBuf::from("/etc/systemd/system/sbh.service"),
+            healthy: false,
+            issue: Some(MigrationReason::SystemdUnitDrift),
+            detail: Some("missing or changed hardening: ProtectSystem=strict".to_string()),
+        }];
+        let actions = plan_actions(&footprints, &MigrateOptions::default());
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ActionKind::ReinstallServiceUnit);
+        assert!(
+            actions[0]
+                .description
+                .ends_with("(needs root: rerun with sudo)"),
+            "{}",
+            actions[0].description
+        );
+
+        // A user unit the caller owns carries no note.
+        let tmp = TempDir::new().unwrap();
+        let unit = tmp.path().join("sbh.service");
+        fs::write(&unit, "[Service]\n").unwrap();
+        let footprints = vec![Footprint {
+            kind: FootprintKind::SystemdUnit,
+            path: unit,
+            healthy: false,
+            issue: Some(MigrationReason::SystemdUnitDrift),
+            detail: None,
+        }];
+        let actions = plan_actions(&footprints, &MigrateOptions::default());
+        assert_eq!(actions.len(), 1);
+        assert!(
+            !actions[0].description.contains("needs root"),
+            "{}",
+            actions[0].description
+        );
+    }
+
+    #[test]
+    fn apply_actions_leaves_unwritable_service_units_planned() {
+        if nix::unistd::geteuid().is_root() {
+            println!("SKIP: running as root");
+            return;
+        }
+        let mut actions = vec![MigrationAction {
+            kind: ActionKind::ReinstallServiceUnit,
+            reason: MigrationReason::SystemdUnitDrift,
+            target: PathBuf::from("/etc/systemd/system/sbh.service"),
+            description: "replace the unit (needs root: rerun with sudo)".to_string(),
+            applied: false,
+            backup_path: None,
+            error: None,
+        }];
+        apply_actions(&mut actions, None);
+        assert!(!actions[0].applied, "must not attempt a root-only rewrite");
+        assert!(actions[0].error.is_none(), "{:?}", actions[0].error);
+        assert!(actions[0].backup_path.is_none());
     }
 
     #[test]
