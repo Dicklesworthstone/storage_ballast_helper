@@ -10,6 +10,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — README v0.6.0 sections generated from the code: behavior matrix, exit codes, state.json fields (bd-rc-master-ajg1.12.5)
+
+- `sbh docs` sections `behavior-matrix` (both presets, `v0.6` default and `v0.5`, from `daemon::policy::BehaviorPreset::base_cells`: 3 memory rows × 5 disk columns, cell = scan / cleanup / ballast / notify), `exit-codes` (the C-EXIT contract, `cli::docs::EXIT_CODES`, checked by the bin test against `CliError::exit_code` and the help epilog) and `state-fields` (every top-level `state.json` field with its JSON type from a default `DaemonState` and a meaning; the test fails when a field is added without a row). README gains "Behavior Matrix" under the policy engine, "Exit Codes" before "Error Codes" and "state.json Fields (schema 2)" under the state file protocol; AGENTS.md gains "Exit Codes". The `label()` accessors of the behavior enums and `BehaviorPreset::base_cells` are public.
+
 ### Added — doc-contract tests: documented flags and file references must exist (bd-rc-master-ajg1.12.3)
 
 - The bin test `documented_commands_flags_and_file_references_resolve` checks the README "Command Reference" and the AGENTS.md "CLI Command Reference" against clap: every `sbh …` row names a real command and every `--flag` in the row exists on that command, an ancestor, or the global flags (a flag may sit between path words, `sbh service --systemd reinstall-unit`); every backticked `src/`, `docs/`, `scripts/`, `tests/`, `.github/` path in README, AGENTS.md, CHANGELOG and docs/*.md exists. Findings name the file, the row and the flag or path. `cli::docs::{undocumented_flags, missing_file_references}` carry fixture tests including the negative case (a typo'd flag is reported). It found `--purge-dropins` documented on the wrong command (resolver fixed) and a naming example in docs/testing-and-logging.md pointing at a file that never existed (corrected).

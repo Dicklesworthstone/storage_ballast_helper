@@ -409,6 +409,20 @@ src/
 | `-v, --verbose` | Increase verbosity |
 | `-q, --quiet` | Quiet mode (errors only) |
 
+### Exit Codes
+
+One mapping for every command (`CliError::exit_code`, C-EXIT); generated from `cli::docs::EXIT_CODES` by `sbh docs --render AGENTS.md`.
+
+<!-- sbh-docs:begin exit-codes -->
+| Code | Meaning | Examples |
+| --- | --- | --- |
+| 0 | ok | `clean`/`emergency` with nothing to reclaim, `check` above threshold |
+| 1 | user error, or a pressure condition | bad arguments, `check` below threshold or `--need` unmet, predicted full |
+| 2 | runtime or I/O failure | cannot stat a path, config unreadable |
+| 3 | internal error | invariant violation, JSON encoding failure |
+| 4 | partial success | `clean`/`emergency` with failed deletions, `ballast`/`setup` with failed steps |
+<!-- sbh-docs:end -->
+
 ---
 
 ## Configuration

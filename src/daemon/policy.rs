@@ -432,7 +432,9 @@ pub const BEHAVIOR_MEMORY_LEVELS: [BehaviorPressureLevel; 3] = [
 ];
 
 impl BehaviorPressureLevel {
-    const fn label(self) -> &'static str {
+    /// The config spelling of the row (`[behavior.cells.<memory>_<disk>]`).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Normal => "normal",
             Self::Warn => "warn",
@@ -441,7 +443,9 @@ impl BehaviorPressureLevel {
     }
 }
 
-const fn disk_label(level: PressureLevel) -> &'static str {
+/// The config spelling of a disk-pressure column.
+#[must_use]
+pub const fn disk_label(level: PressureLevel) -> &'static str {
     match level {
         PressureLevel::Green => "green",
         PressureLevel::Yellow => "yellow",
@@ -452,7 +456,9 @@ const fn disk_label(level: PressureLevel) -> &'static str {
 }
 
 impl ScanAggressiveness {
-    const fn label(self) -> &'static str {
+    /// The config spelling of the value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Normal => "normal",
             Self::Light => "light",
@@ -487,7 +493,9 @@ impl CleanupAction {
         }
     }
 
-    const fn label(self) -> &'static str {
+    /// The config spelling of the value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::IdentifyOnly => "identify_only",
@@ -518,7 +526,9 @@ impl BallastAction {
         }
     }
 
-    const fn label(self) -> &'static str {
+    /// The config spelling of the value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Release => "release",
@@ -528,7 +538,9 @@ impl BallastAction {
 }
 
 impl NotificationPriority {
-    const fn label(self) -> &'static str {
+    /// The config spelling of the value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Low => "low",
@@ -787,7 +799,10 @@ impl BehaviorPreset {
     /// All accepted spellings, for error messages.
     pub const ALLOWED: &'static str = "\"v0.6\", \"v0.5\", \"custom\"";
 
-    const fn base_cells(self) -> [[BehaviorMode; 5]; 3] {
+    /// The preset's cells before `[behavior.cells.*]` overrides: rows are
+    /// `BEHAVIOR_MEMORY_LEVELS`, columns `BEHAVIOR_DISK_LEVELS`.
+    #[must_use]
+    pub const fn base_cells(self) -> [[BehaviorMode; 5]; 3] {
         match self {
             Self::V0_6 | Self::Custom => V0_6_CELLS,
             Self::V0_5 => V0_5_CELLS,

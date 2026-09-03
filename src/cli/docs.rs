@@ -1592,6 +1592,189 @@ pub fn scoring_weights() -> Vec<ScoringWeightDoc> {
     ]
 }
 
+/// One cell of a behavior matrix: what the daemon does at one memory ×
+/// disk pressure pair.
+#[derive(Debug, Clone, Serialize)]
+pub struct BehaviorCellDoc {
+    pub memory: &'static str,
+    pub disk: &'static str,
+    pub scan: &'static str,
+    pub cleanup: &'static str,
+    pub ballast: &'static str,
+    pub notify: &'static str,
+}
+
+/// One behavior preset's matrix before `[behavior.cells.*]` overrides.
+#[derive(Debug, Clone, Serialize)]
+pub struct BehaviorMatrixDoc {
+    pub preset: String,
+    pub default: bool,
+    pub cells: Vec<BehaviorCellDoc>,
+}
+
+/// The behavior matrices of every named preset, read from `daemon::policy`.
+#[must_use]
+pub fn behavior_matrices() -> Vec<BehaviorMatrixDoc> {
+    use crate::daemon::policy::{
+        BEHAVIOR_DISK_LEVELS, BEHAVIOR_MEMORY_LEVELS, BehaviorPreset, disk_label,
+    };
+    [BehaviorPreset::V0_6, BehaviorPreset::V0_5]
+        .iter()
+        .map(|preset| {
+            let cells = preset.base_cells();
+            let mut docs = Vec::with_capacity(15);
+            for (m, memory) in BEHAVIOR_MEMORY_LEVELS.iter().enumerate() {
+                for (d, disk) in BEHAVIOR_DISK_LEVELS.iter().enumerate() {
+                    let mode = cells[m][d];
+                    docs.push(BehaviorCellDoc {
+                        memory: memory.label(),
+                        disk: disk_label(*disk),
+                        scan: mode.scan_aggressiveness.label(),
+                        cleanup: mode.cleanup_action.label(),
+                        ballast: mode.ballast_action.label(),
+                        notify: mode.notification_priority.label(),
+                    });
+                }
+            }
+            BehaviorMatrixDoc {
+                preset: preset.to_string(),
+                default: *preset == BehaviorPreset::default(),
+                cells: docs,
+            }
+        })
+        .collect()
+}
+
+/// One row of the exit-code contract (C-EXIT).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ExitCodeDoc {
+    pub code: i32,
+    pub meaning: &'static str,
+    pub examples: &'static str,
+}
+
+/// The exit-code contract every command's error goes through.
+///
+/// `CliError::exit_code` in the binary is the mapping; a bin test checks
+/// each class lands on a row here and that the help epilog says the same.
+pub const EXIT_CODES: &[ExitCodeDoc] = &[
+    ExitCodeDoc {
+        code: 0,
+        meaning: "ok",
+        examples: "`clean`/`emergency` with nothing to reclaim, `check` above threshold",
+    },
+    ExitCodeDoc {
+        code: 1,
+        meaning: "user error, or a pressure condition",
+        examples: "bad arguments, `check` below threshold or `--need` unmet, predicted full",
+    },
+    ExitCodeDoc {
+        code: 2,
+        meaning: "runtime or I/O failure",
+        examples: "cannot stat a path, config unreadable",
+    },
+    ExitCodeDoc {
+        code: 3,
+        meaning: "internal error",
+        examples: "invariant violation, JSON encoding failure",
+    },
+    ExitCodeDoc {
+        code: 4,
+        meaning: "partial success",
+        examples: "`clean`/`emergency` with failed deletions, `ballast`/`setup` with failed steps",
+    },
+];
+
+/// One top-level field of `state.json`.
+#[derive(Debug, Clone, Serialize)]
+pub struct StateFieldDoc {
+    pub field: String,
+    pub json_type: &'static str,
+    pub meaning: &'static str,
+}
+
+/// What each top-level `state.json` field means; the test module checks
+/// this list against the keys `DaemonState` serializes, both ways.
+const STATE_FIELD_MEANINGS: &[(&str, &str)] = &[
+    ("version", "Daemon version"),
+    ("pid", "Daemon process id"),
+    ("started_at", "RFC 3339 start time"),
+    ("uptime_seconds", "Seconds since start"),
+    ("last_updated", "RFC 3339 time of this write"),
+    ("pressure", "Per-mount pressure levels and free space"),
+    (
+        "ballast",
+        "Ballast summary: provisioned and released counts",
+    ),
+    (
+        "ballast_pools",
+        "One record per managed pool (mount, directory, counts)",
+    ),
+    ("voi", "VOI scan scheduler snapshot as of the last plan"),
+    ("last_scan", "The last scan pass"),
+    ("counters", "Scans, deletions, errors, bytes freed"),
+    ("memory_rss_bytes", "Daemon RSS at this write"),
+    ("policy_mode", "Policy engine mode name"),
+    (
+        "mount_controllers",
+        "Per-mount control state and idle reasons",
+    ),
+    ("schema_version", "State schema version (2)"),
+    ("run_id", "One daemon run (pid + start time)"),
+    ("rates", "Per-mount EWMA rate estimates, keyed by mount"),
+    ("threads", "Worker thread health"),
+    ("cpu_secs_total", "CPU seconds (user + system) consumed"),
+    (
+        "cpu_budget",
+        "CPU budget: percent, last-minute use, deficit",
+    ),
+    (
+        "idle_reason",
+        "Dominant idle reason when no mount works (absent otherwise)",
+    ),
+    (
+        "policy",
+        "Policy engine record: mode, held since, fallback reason, recovery",
+    ),
+    (
+        "logging",
+        "Where the daemon's own files live relative to what it reclaims",
+    ),
+    ("stopped_at", "Set by the final write on shutdown"),
+    ("exit_reason", "Why the daemon stopped (final write only)"),
+];
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "absent or value",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// The top-level `state.json` fields, typed from a default `DaemonState`.
+#[must_use]
+pub fn state_fields() -> Vec<StateFieldDoc> {
+    let value = serde_json::to_value(crate::daemon::self_monitor::DaemonState::default())
+        .unwrap_or(Value::Null);
+    let Value::Object(map) = value else {
+        return Vec::new();
+    };
+    STATE_FIELD_MEANINGS
+        .iter()
+        .map(|(field, meaning)| StateFieldDoc {
+            field: (*field).to_string(),
+            // A field skipped while `None` (`idle_reason`) is absent from
+            // the default document.
+            json_type: map.get(*field).map_or("absent or value", json_type_name),
+            meaning,
+        })
+        .collect()
+}
+
 /// The whole generated document.
 #[derive(Debug, Clone, Serialize)]
 pub struct DocsDocument {
@@ -1601,9 +1784,12 @@ pub struct DocsDocument {
     pub commands: Vec<CommandDoc>,
     pub dashboard: Option<DashboardDocs>,
     pub error_codes: Vec<ErrorCodeDoc>,
+    pub exit_codes: Vec<ExitCodeDoc>,
     pub constants: Vec<ConstantDoc>,
     pub pressure_levels: Vec<PressureLevelDoc>,
     pub scoring_weights: Vec<ScoringWeightDoc>,
+    pub behavior_matrices: Vec<BehaviorMatrixDoc>,
+    pub state_fields: Vec<StateFieldDoc>,
     pub defaults_toml: String,
 }
 
@@ -1618,9 +1804,12 @@ impl DocsDocument {
             commands: command_docs(cli),
             dashboard: dashboard_docs(),
             error_codes: ERROR_CODES.to_vec(),
+            exit_codes: EXIT_CODES.to_vec(),
             constants: constants(),
             pressure_levels: pressure_levels(),
             scoring_weights: scoring_weights(),
+            behavior_matrices: behavior_matrices(),
+            state_fields: state_fields(),
             defaults_toml: toml::to_string_pretty(&Config::default()).unwrap_or_default(),
         }
     }
@@ -1638,9 +1827,12 @@ impl DocsDocument {
             "env-vars",
             "commands",
             "error-codes",
+            "exit-codes",
             "constants",
             "pressure-levels",
             "scoring-weights",
+            "behavior-matrix",
+            "state-fields",
         ];
         if self.dashboard.is_some() {
             names.extend([
@@ -1661,6 +1853,9 @@ impl DocsDocument {
             "env-vars" => Some(self.render_env_vars()),
             "commands" => Some(self.render_commands()),
             "error-codes" => Some(self.render_error_codes()),
+            "exit-codes" => Some(self.render_exit_codes()),
+            "behavior-matrix" => Some(self.render_behavior_matrix()),
+            "state-fields" => Some(self.render_state_fields()),
             "constants" => Some(self.render_constants()),
             "pressure-levels" => Some(self.render_pressure_levels()),
             "scoring-weights" => Some(self.render_scoring_weights()),
@@ -1690,6 +1885,78 @@ impl DocsDocument {
         let mut out = String::from("| Command | Purpose |\n| --- | --- |\n");
         for command in &self.commands {
             let _ = writeln!(out, "| `sbh {}` | {} |", command.path, command.about);
+        }
+        out
+    }
+
+    fn render_exit_codes(&self) -> String {
+        let mut out = String::from("| Code | Meaning | Examples |\n| --- | --- | --- |\n");
+        for row in &self.exit_codes {
+            let _ = writeln!(out, "| {} | {} | {} |", row.code, row.meaning, row.examples);
+        }
+        out
+    }
+
+    fn render_behavior_matrix(&self) -> String {
+        let mut out = String::new();
+        for (index, matrix) in self.behavior_matrices.iter().enumerate() {
+            if index > 0 {
+                out.push('\n');
+            }
+            let _ = writeln!(
+                out,
+                "**Preset `{}`{}** (cell = scan / cleanup / ballast / notify):\n",
+                matrix.preset,
+                if matrix.default { " (default)" } else { "" }
+            );
+            let mut disks: Vec<&str> = Vec::new();
+            let mut memories: Vec<&str> = Vec::new();
+            for cell in &matrix.cells {
+                if !disks.contains(&cell.disk) {
+                    disks.push(cell.disk);
+                }
+                if !memories.contains(&cell.memory) {
+                    memories.push(cell.memory);
+                }
+            }
+            let _ = write!(out, "| Memory \\ Disk |");
+            for disk in &disks {
+                let _ = write!(out, " {disk} |");
+            }
+            out.push_str("\n| --- |");
+            for _ in &disks {
+                out.push_str(" --- |");
+            }
+            out.push('\n');
+            for memory in &memories {
+                let _ = write!(out, "| **{memory}** |");
+                for disk in &disks {
+                    if let Some(cell) = matrix
+                        .cells
+                        .iter()
+                        .find(|c| c.memory == *memory && c.disk == *disk)
+                    {
+                        let _ = write!(
+                            out,
+                            " {} / {} / {} / {} |",
+                            cell.scan, cell.cleanup, cell.ballast, cell.notify
+                        );
+                    }
+                }
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    fn render_state_fields(&self) -> String {
+        let mut out = String::from("| Field | JSON | Meaning |\n| --- | --- | --- |\n");
+        for row in &self.state_fields {
+            let _ = writeln!(
+                out,
+                "| `{}` | {} | {} |",
+                row.field, row.json_type, row.meaning
+            );
         }
         out
     }
@@ -2157,6 +2424,75 @@ mod tests {
         assert_eq!(fmt_bytes(1500), "1500 B");
         assert_eq!(fmt_duration(Duration::from_millis(250)), "250 ms");
         assert_eq!(fmt_duration(Duration::from_secs(300)), "300 s");
+    }
+
+    /// Both presets render 3 × 5 cells from `daemon::policy`; the v0.6
+    /// default deletes definite artifacts at Orange (the reason the preset
+    /// exists) and the state field list matches `DaemonState` both ways.
+    #[test]
+    fn behavior_matrices_exit_codes_and_state_fields_come_from_the_code() {
+        let matrices = behavior_matrices();
+        assert_eq!(
+            matrices
+                .iter()
+                .map(|m| (m.preset.as_str(), m.default, m.cells.len()))
+                .collect::<Vec<_>>(),
+            vec![("v0.6", true, 15), ("v0.5", false, 15)]
+        );
+        let orange_normal = matrices[0]
+            .cells
+            .iter()
+            .find(|c| c.memory == "normal" && c.disk == "orange")
+            .unwrap();
+        assert_eq!(orange_normal.cleanup, "definite_candidates");
+        assert_ne!(orange_normal.ballast, "none");
+        let rendered = DocsDocument::build(&clap::Command::new("sbh"))
+            .render_section("behavior-matrix")
+            .unwrap();
+        assert!(rendered.starts_with("**Preset `v0.6` (default)"));
+        assert_eq!(rendered.matches("| **normal** |").count(), 2);
+
+        assert_eq!(
+            EXIT_CODES.iter().map(|e| e.code).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+
+        let state =
+            serde_json::to_value(crate::daemon::self_monitor::DaemonState::default()).unwrap();
+        let keys: BTreeSet<&str> = state
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let documented: BTreeSet<&str> = STATE_FIELD_MEANINGS.iter().map(|(k, _)| *k).collect();
+        let undocumented: Vec<&&str> = keys.difference(&documented).collect();
+        assert!(
+            undocumented.is_empty(),
+            "state.json fields without a STATE_FIELD_MEANINGS row: {undocumented:?}"
+        );
+        // `idle_reason` is skipped while `None`, so it is documented but
+        // absent from the default document; nothing else may be.
+        let absent: Vec<&&str> = documented.difference(&keys).collect();
+        assert_eq!(absent, vec![&"idle_reason"]);
+        let populated = crate::daemon::self_monitor::DaemonState {
+            idle_reason: Some("nothing_to_reclaim".to_string()),
+            ..Default::default()
+        };
+        let populated = serde_json::to_value(populated).unwrap();
+        assert!(populated.get("idle_reason").is_some());
+        let fields = state_fields();
+        assert_eq!(fields.len(), documented.len());
+        assert!(
+            fields
+                .iter()
+                .any(|f| f.field == "schema_version" && f.json_type == "number")
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|f| f.field == "idle_reason" && f.json_type == "absent or value")
+        );
     }
 
     /// The pressure table is derived from the default thresholds and the

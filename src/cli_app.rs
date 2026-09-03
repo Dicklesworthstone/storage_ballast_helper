@@ -16843,16 +16843,18 @@ mod tests {
         );
         assert_eq!(CliError::Internal("x".into()).exit_code(), 3);
         assert_eq!(CliError::Partial("x".into()).exit_code(), 4);
+        // The documented contract (`sbh docs --section exit-codes`) lists
+        // exactly the classes above, and the help epilog says the same.
+        let documented: Vec<i32> = storage_ballast_helper::cli::docs::EXIT_CODES
+            .iter()
+            .map(|row| row.code)
+            .collect();
+        assert_eq!(documented, vec![0, 1, 2, 3, 4]);
         let help = Cli::command().render_long_help().to_string();
-        for line in [
-            "Exit codes (C-EXIT):",
-            "0  ok",
-            "1  user error, or a pressure condition",
-            "2  runtime or I/O failure",
-            "3  internal error",
-            "4  partial success",
-        ] {
-            assert!(help.contains(line), "help epilog lacks {line:?}");
+        assert!(help.contains("Exit codes (C-EXIT):"));
+        for row in storage_ballast_helper::cli::docs::EXIT_CODES {
+            let line = format!("{}  {}", row.code, row.meaning);
+            assert!(help.contains(&line), "help epilog lacks {line:?}");
         }
     }
 

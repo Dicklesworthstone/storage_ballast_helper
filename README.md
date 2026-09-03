@@ -1248,6 +1248,28 @@ Recovery from FallbackSafe requires the guardrails to report 3 consecutive clean
 
 When guardrails report a non-Pass status, a penalty (default 50.0) is added to the expected-loss-of-deletion for high-impact candidates. This raises the bar for deletion decisions during periods of reduced confidence without completely halting cleanup.
 
+#### Behavior Matrix
+
+What actually runs at a given pressure is the behavior matrix: memory pressure (rows) crossed with disk pressure (columns) selects a scanner posture, a cleanup posture, a ballast action and a notification severity. `[behavior] preset` (or `SBH_BEHAVIOR_PRESET`) picks `v0.6` (the default: reclaim before the cliff), `v0.5` (the matrix shipped through v0.5.x, for rollback) or `custom` (`v0.6` plus `[behavior.cells.<memory>_<disk>]` overrides, which go through the never-reduce rule in `src/daemon/policy.rs`). The tables are generated from the code by `sbh docs --render README.md`.
+
+<!-- sbh-docs:begin behavior-matrix -->
+**Preset `v0.6` (default)** (cell = scan / cleanup / ballast / notify):
+
+| Memory \ Disk | green | yellow | orange | red | critical |
+| --- | --- | --- | --- | --- | --- |
+| **normal** | normal / high_confidence_candidates / none / none | aggressive / high_confidence_candidates / none / low | aggressive / definite_candidates / release / normal | aggressive / any_definite_candidate / release_first / high | aggressive / any_definite_candidate / release_first / emergency |
+| **warn** | light / high_confidence_candidates / none / low | light / high_confidence_candidates / none / normal | light / definite_candidates / release / normal | definite_only / any_definite_candidate / release_first / high | definite_only / any_definite_candidate / release_first / emergency |
+| **critical** | skip / high_confidence_candidates / none / normal | definite_only / high_confidence_candidates / none / high | definite_only / definite_candidates / release / high | definite_only / any_definite_candidate / release_first / emergency | definite_only / any_definite_candidate / release_first / emergency |
+
+**Preset `v0.5`** (cell = scan / cleanup / ballast / notify):
+
+| Memory \ Disk | green | yellow | orange | red | critical |
+| --- | --- | --- | --- | --- | --- |
+| **normal** | normal / none / none / none | aggressive / identify_only / none / low | aggressive / identify_only / none / low | aggressive / definite_candidates / release / high | aggressive / definite_candidates / release / high |
+| **warn** | light / none / none / low | light / high_confidence_candidates / release / normal | light / high_confidence_candidates / release / normal | definite_only / definite_candidates / release_first / high | definite_only / definite_candidates / release_first / high |
+| **critical** | skip / none / none / normal | definite_only / most_promising_candidates / release / high | definite_only / most_promising_candidates / release / high | definite_only / any_definite_candidate / release_first / emergency | definite_only / any_definite_candidate / release_first / emergency |
+<!-- sbh-docs:end -->
+
 ### Safety Layers
 
 `sbh` uses layered safety: six independent mechanisms, any one of which can veto a deletion regardless of what the others decide.
@@ -1774,6 +1796,40 @@ The schema uses `#[serde(default)]` on all fields, so minor version differences 
 
 Source: `src/daemon/self_monitor.rs`
 
+#### state.json Fields (schema 2)
+
+The top-level fields of the state document, generated from `DaemonState` by `sbh docs --render README.md` (`sbh docs --section state-fields`). Every field defaults, so a file written by an older daemon simply lacks the newer sections; `schema_version` is 2 for the current layout.
+
+<!-- sbh-docs:begin state-fields -->
+| Field | JSON | Meaning |
+| --- | --- | --- |
+| `version` | string | Daemon version |
+| `pid` | number | Daemon process id |
+| `started_at` | string | RFC 3339 start time |
+| `uptime_seconds` | number | Seconds since start |
+| `last_updated` | string | RFC 3339 time of this write |
+| `pressure` | object | Per-mount pressure levels and free space |
+| `ballast` | object | Ballast summary: provisioned and released counts |
+| `ballast_pools` | array | One record per managed pool (mount, directory, counts) |
+| `voi` | object | VOI scan scheduler snapshot as of the last plan |
+| `last_scan` | object | The last scan pass |
+| `counters` | object | Scans, deletions, errors, bytes freed |
+| `memory_rss_bytes` | number | Daemon RSS at this write |
+| `policy_mode` | string | Policy engine mode name |
+| `mount_controllers` | array | Per-mount control state and idle reasons |
+| `schema_version` | number | State schema version (2) |
+| `run_id` | string | One daemon run (pid + start time) |
+| `rates` | object | Per-mount EWMA rate estimates, keyed by mount |
+| `threads` | object | Worker thread health |
+| `cpu_secs_total` | number | CPU seconds (user + system) consumed |
+| `cpu_budget` | object | CPU budget: percent, last-minute use, deficit |
+| `idle_reason` | absent or value | Dominant idle reason when no mount works (absent otherwise) |
+| `policy` | object | Policy engine record: mode, held since, fallback reason, recovery |
+| `logging` | object | Where the daemon's own files live relative to what it reclaims |
+| `stopped_at` | absent or value | Set by the final write on shutdown |
+| `exit_reason` | absent or value | Why the daemon stopped (final write only) |
+<!-- sbh-docs:end -->
+
 ### Service Management
 
 `sbh` generates platform-native service configurations for both Linux (systemd) and macOS (launchd), with security hardening appropriate to each platform.
@@ -2018,6 +2074,20 @@ src/
   platform/
     pal.rs                  Platform abstraction (Linux: procfs/statvfs; macOS: statfs/APFS/libproc)
 ```
+
+### Exit Codes
+
+Every command's error goes through one mapping (C-EXIT). `--json` reports carry `exit_code`; human reports go to stdout and diagnostics to stderr. Vetoes and skips are never an exit-code class: they appear in the report. Generated from the code by `sbh docs --render README.md`; `sbh --help` prints the same list.
+
+<!-- sbh-docs:begin exit-codes -->
+| Code | Meaning | Examples |
+| --- | --- | --- |
+| 0 | ok | `clean`/`emergency` with nothing to reclaim, `check` above threshold |
+| 1 | user error, or a pressure condition | bad arguments, `check` below threshold or `--need` unmet, predicted full |
+| 2 | runtime or I/O failure | cannot stat a path, config unreadable |
+| 3 | internal error | invariant violation, JSON encoding failure |
+| 4 | partial success | `clean`/`emergency` with failed deletions, `ballast`/`setup` with failed steps |
+<!-- sbh-docs:end -->
 
 ### Error Codes
 
