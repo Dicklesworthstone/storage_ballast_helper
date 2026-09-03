@@ -73,3 +73,16 @@ windsurf.mcp.json
 .beads/*-fsqlite-ns-use
 .beads/*.db-wal-cert
 .beads/*.db-wal-cert-head
+
+# === repository hygiene 2026-09-03 (bd-rc-master-ajg1.13.3) ===
+# Accident directories created by mis-quoted shell commands; empty and untracked,
+# ignored so they can never be committed (removal needs operator permission).
+/&&/
+/>/
+/printf/
+/artifact-sync-ok/
+/manual-release-artifacts/rch-artifact-sync-probe.txt/
+# Per-host gate wrapper kept out of the tree.
+.gate_sbh_trj.sh
+# Local daemon/e2e binaries built for the real-daemon scenarios (tests/daemon_e2e.rs).
+.e2e-bin/
