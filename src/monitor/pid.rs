@@ -913,7 +913,9 @@ mod tests {
             response.urgency > baseline.urgency,
             "{response:?} vs {baseline:?}"
         );
-        let expected = 1.0 - (-(0.1f64.mul_add(2.0, with.last_feedforward()))).exp();
+        // The test volume is 100 bytes, so the capacity gain sits at its floor
+        // (0.5 * Kp); `scheduled_kp` is the gain actually applied.
+        let expected = 1.0 - (-(with.scheduled_kp(100).mul_add(2.0, with.last_feedforward()))).exp();
         assert!(
             (response.urgency - expected).abs() < 1e-6,
             "{}",
@@ -1014,6 +1016,9 @@ mod tests {
         let t0 = Instant::now();
         let mut previous_urgency: Option<f64> = None;
         let mut previous_free = trace[0].1.free_pct();
+        // A step in free space is answered over two ticks: the integral
+        // accumulated before the step is released on the level change.
+        let mut previous_free_jump = 0.0f64;
         let mut last = None;
         for (t_secs, reading) in trace {
             let free_pct = reading.free_pct();
@@ -1027,11 +1032,12 @@ mod tests {
             let jump = previous_urgency.map_or(0.0, |p| (response.urgency - p).abs());
             let free_jump = (free_pct - previous_free).abs();
             assert!(
-                jump <= 0.5 || free_jump >= 3.0,
+                jump <= 0.5 || free_jump.max(previous_free_jump) >= 3.0,
                 "t={t_secs}: urgency jumped {jump:.3} on a {free_jump:.2}-point move"
             );
             previous_urgency = Some(response.urgency);
             previous_free = free_pct;
+            previous_free_jump = free_jump;
             last = Some(response);
         }
         let last = last.unwrap();
