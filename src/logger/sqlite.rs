@@ -330,6 +330,19 @@ impl SqliteLogger {
         Ok(())
     }
 
+    /// The batch-planner events (`planner ... json=...`) that name a decision
+    /// id, oldest first: the plans a decision was part of.
+    pub fn planner_events_for_decision(&self, decision_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT details FROM activity_log
+             WHERE event_type = 'info' AND details LIKE 'planner %' AND details LIKE ?1
+             ORDER BY id ASC",
+        )?;
+        let pattern = format!("%\"decision_id\":\"{decision_id}\"%");
+        let rows = stmt.query_map(params![pattern], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
     /// The outcomes recorded for a decision id, oldest first.
     pub fn outcomes_for_decision(&self, decision_id: &str) -> Result<Vec<StoredOutcome>> {
         let mut stmt = self.conn.prepare_cached(

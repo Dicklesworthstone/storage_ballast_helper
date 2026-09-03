@@ -1024,6 +1024,10 @@ High uncertainty inflates the deletion loss more than the keep loss, making the 
 
 When uncertainty is too high to decide, the artifact is placed in a **Review** category rather than being silently kept or deleted. Review items are surfaced in `sbh scan` output and dashboard displays.
 
+#### Batch Planning
+
+When a byte target is known (`sbh clean --target-free N`, or the bytes a pressured mount needs to return to Yellow), the executor no longer takes the top-N candidates by composite score. The batch planner (`src/scanner/planner.rs`) orders the approved candidates by expected reclaim per unit of expected loss (`(1 - posterior) * false_positive_loss`) and takes them while the level's batch size, the risk budget and the target allow, stopping as soon as the target is met: a 40 GiB candidate at posterior 0.85 comes before a 200 MiB one at 0.95. The risk budget is `scoring.batch_risk_budget_by_level` times one false-positive loss (Green 1x, Yellow 2x, Orange 5x, Red 10x, Critical unbounded). Review candidates are never planned outside `sbh emergency`, ties break on bytes then path so identical inputs plan identically, and every batch logs `[SBH-PLANNER] level=.. target_bytes=.. planned_bytes=.. risk_budget=.. risk_used=.. chosen=n skipped_for_budget=m top_n_risk=..` plus a `planner` activity event carrying the plan. `sbh clean --json` and `sbh scan --json` carry the plan as a `plan` block, and `sbh explain --id` quotes it: "chosen 1st: 40.0 GiB at posterior 0.85 (loss 7.5 of budget 250.0) because it reaches the target with 50% of the risk the top-scored set would use".
+
 #### macOS Xcode DerivedData
 
 On macOS, `sbh` recognizes immediate children of `~/Library/Developer/Xcode/DerivedData/` as `xcode-derived-data` cleanup candidates. The DerivedData root itself is not deleted as one broad target; per-project subdirectories are ranked independently and still pass through age, active-file, parent, and sacred-overlap checks.

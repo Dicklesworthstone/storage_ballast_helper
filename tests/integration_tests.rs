@@ -2255,6 +2255,154 @@ fn uninstall_dry_run_json_plans_the_user_footprint_and_changes_nothing() {
 #[cfg(target_os = "linux")]
 #[test]
 #[allow(clippy::too_many_lines)]
+fn clean_plans_the_larger_target_first_and_reports_the_plan() {
+    let base = if Path::new("/private/tmp").is_dir() {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sbh-planner-")
+        .tempdir_in(base)
+        .expect("temp dir");
+    let scan_root = dir.path().join("scan-root");
+    let state_dir = dir.path().join("state");
+    let ballast_dir = dir.path().join("ballast");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(&ballast_dir).unwrap();
+    let small_root = scan_root.join("small");
+    let large_root = scan_root.join("large");
+    fs::create_dir_all(&small_root).unwrap();
+    fs::create_dir_all(&large_root).unwrap();
+    let scan_root = scan_root.canonicalize().unwrap();
+    common::create_fake_rust_target(&small_root, Duration::from_hours(72));
+    let large = common::create_fake_rust_target(&large_root, Duration::from_hours(72));
+    // The large target carries 6 MiB more than the small one.
+    fs::write(
+        large.join("debug").join("deps").join("big.rlib"),
+        vec![0u8; 6 << 20],
+    )
+    .unwrap();
+    let config_path = dir.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"[paths]
+state_file = "{}"
+sqlite_db = "{}"
+jsonl_log = "{}"
+ballast_dir = "{}"
+
+[scanner]
+root_paths = ["{}"]
+min_file_age_minutes = 0
+max_depth = 8
+parallelism = 1
+
+[ballast]
+file_count = 1
+file_size_bytes = 4096
+
+[notifications]
+enabled = false
+"#,
+            toml_path(&state_dir.join("state.json")),
+            toml_path(&state_dir.join("activity.sqlite3")),
+            toml_path(&state_dir.join("activity.jsonl")),
+            toml_path(&ballast_dir),
+            toml_path(&scan_root),
+        ),
+    )
+    .expect("write config");
+    let config_arg = config_path.to_string_lossy().to_string();
+    let root_arg = scan_root.to_string_lossy().to_string();
+    let clean = common::run_cli_case(
+        "clean_dry_run_plans_the_batch",
+        &[
+            "--config",
+            &config_arg,
+            "clean",
+            &root_arg,
+            "--dry-run",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    );
+    assert_cli_success(&clean, "clean --dry-run --json");
+    assert!(
+        clean.stderr.contains("[SBH-PLANNER] level="),
+        "stderr={}",
+        clean.stderr
+    );
+    let report: Value = clean
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|v| v.get("plan").is_some())
+        .unwrap_or_else(|| panic!("no plan in {}", clean.stdout));
+    let plan = &report["plan"];
+    let chosen = plan["chosen"].as_array().expect("chosen array");
+    assert!(chosen.len() >= 2, "{plan}");
+    assert_eq!(chosen[0]["rank"], 1, "{plan}");
+    assert!(
+        chosen[0]["path"]
+            .as_str()
+            .is_some_and(|p| p.contains("/large/")),
+        "the larger target at the same posterior goes first: {plan}"
+    );
+    assert!(
+        chosen[0]["bytes"].as_u64() > chosen[1]["bytes"].as_u64(),
+        "{plan}"
+    );
+    assert!(
+        chosen[0]["decision_id"]
+            .as_str()
+            .is_some_and(|id| id.len() == 12),
+        "{plan}"
+    );
+    assert!(
+        plan["risk_used"].as_f64().is_some_and(|r| r > 0.0),
+        "{plan}"
+    );
+    assert!(
+        plan["risk_used"].as_f64() <= plan["risk_budget"].as_f64(),
+        "{plan}"
+    );
+    // The dry run acts in the planner's order.
+    let candidates = report["candidates"].as_array().unwrap();
+    assert!(
+        candidates[0]["path"]
+            .as_str()
+            .is_some_and(|p| p.contains("/large/")),
+        "{report}"
+    );
+    // The plan is quoted by explain.
+    let id = chosen[0]["decision_id"].as_str().unwrap();
+    let explain = common::run_cli_case(
+        "explain_quotes_the_plan",
+        &["--config", &config_arg, "explain", "--id", id, "--json"],
+    );
+    assert_cli_success(&explain, "explain --id");
+    let payload: Value = explain
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|v| v.get("decisions").is_some())
+        .unwrap_or_else(|| panic!("no explain payload in {}", explain.stdout));
+    let plans = payload["decisions"][0]["plans"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{payload}"));
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.as_str().is_some_and(|t| t.starts_with("chosen 1st:"))),
+        "{payload}"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn clean_quarantines_at_green_and_undo_restores_the_target() {
     // Outside the hardcoded source-tree roots (a remote worker's temp dir
     // can sit under the project) and canonical, as `clean` reports paths.

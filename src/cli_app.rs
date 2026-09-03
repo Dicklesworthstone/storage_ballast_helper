@@ -43,6 +43,7 @@ use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
 use storage_ballast_helper::monitor::burst::BurstStats;
 use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
+use storage_ballast_helper::monitor::pid::{PressureLevel, classify_level};
 use storage_ballast_helper::platform::pal::{
     BlockDeviceInfo, MemoryInfo, Platform, ServiceManager, detect_platform,
 };
@@ -61,6 +62,7 @@ use storage_ballast_helper::scanner::engine::{ScannerEngine, SelectedScannerEngi
 use storage_ballast_helper::scanner::patterns::{
     ArtifactCategory, ArtifactPatternRegistry, OpaqueTreeDisposition,
 };
+use storage_ballast_helper::scanner::planner::{BatchPlan, PlanRequest, plan_batch};
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
 use storage_ballast_helper::scanner::quarantine::QuarantineStore;
 use storage_ballast_helper::scanner::scoring::{
@@ -1395,6 +1397,13 @@ fn run_explain(cli: &Cli, args: &ExplainArgs) -> Result<(), CliError> {
                         if let ExplainSource::Sqlite(db) = &source {
                             value["outcomes"] =
                                 json!(db.outcomes_for_decision(&record.id).unwrap_or_default());
+                            value["plans"] = json!(
+                                db.planner_events_for_decision(&record.id)
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .filter_map(|line| planner_explanation(line, &record.id))
+                                    .collect::<Vec<_>>()
+                            );
                         }
                         value
                     })
@@ -1433,6 +1442,14 @@ fn run_explain(cli: &Cli, args: &ExplainArgs) -> Result<(), CliError> {
                             format_duration(Duration::from_secs(outcome.after_secs)),
                             outcome.detail
                         );
+                    }
+                    for line in db
+                        .planner_events_for_decision(&record.id)
+                        .unwrap_or_default()
+                    {
+                        if let Some(text) = planner_explanation(&line, &record.id) {
+                            println!("  Plan: {text}");
+                        }
                     }
                 }
             }
@@ -1504,6 +1521,105 @@ fn run_explain_why_not(
         OutputMode::Human => print!("{}", format_why_not(&report, level)),
     }
     Ok(())
+}
+
+/// The batch planner's explanation of one decision from a
+/// `planner ... json=...` activity line (`None` when the line does not
+/// name the decision).
+fn planner_explanation(line: &str, decision_id: &str) -> Option<String> {
+    let json = line.split_once(" json=")?.1;
+    let plan: BatchPlan = serde_json::from_str(json).ok()?;
+    if let Some(item) = plan
+        .chosen
+        .iter()
+        .find(|item| item.decision_id == decision_id)
+    {
+        return plan.explain_choice(item.rank);
+    }
+    plan.skipped_for_budget
+        .iter()
+        .find(|item| item.decision_id == decision_id)
+        .map(|item| {
+            format!(
+                "skipped for budget: {} at posterior {:.2} (loss {:.1}) did not fit the remaining budget of {} at {}",
+                format_bytes(item.bytes),
+                item.posterior,
+                item.expected_loss,
+                plan.risk_budget
+                    .map_or_else(|| "unbounded".to_string(), |b| format!("{b:.1}")),
+                plan.level
+            )
+        })
+}
+
+/// The pressure level of the mount under the first root and, for a
+/// `--target-free` percentage, the bytes that reach it (`None` when the
+/// mount already has them).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn clean_plan_target(
+    config: &Config,
+    root_paths: &[PathBuf],
+    target_free: Option<f64>,
+) -> (PressureLevel, Option<u64>) {
+    let Some(root) = root_paths.first() else {
+        return (PressureLevel::Green, None);
+    };
+    let Ok(platform) = detect_platform() else {
+        return (PressureLevel::Green, None);
+    };
+    let collector = FsStatsCollector::new(platform, Duration::from_millis(500));
+    let Ok(stats) = collector.collect(root) else {
+        return (PressureLevel::Green, None);
+    };
+    let pressure = &config.pressure;
+    let level = classify_level(
+        stats.free_pct(),
+        pressure.green_min_free_pct,
+        pressure.yellow_min_free_pct,
+        pressure.orange_min_free_pct,
+        pressure.red_min_free_pct,
+    );
+    let target = target_free
+        .map(|pct| {
+            ((stats.total_bytes as f64 * pct / 100.0) as u64).saturating_sub(stats.available_bytes)
+        })
+        .filter(|bytes| *bytes > 0);
+    (level, target)
+}
+
+/// A manual clean's plan request: the mount's level sets the risk budget.
+fn cli_plan_request(
+    config: &Config,
+    level: PressureLevel,
+    target_bytes: Option<u64>,
+    max_items: usize,
+) -> PlanRequest {
+    PlanRequest {
+        level,
+        target_bytes,
+        max_items,
+        risk_budget: config
+            .scoring
+            .batch_risk_budget_by_level
+            .budget(level, config.scoring.false_positive_loss),
+        false_positive_loss: config.scoring.false_positive_loss,
+        include_review: false,
+    }
+}
+
+/// Reorder an executor plan into the batch planner's order.
+fn order_by_plan(plan: &mut DeletionPlan, batch_plan: &BatchPlan) {
+    plan.candidates.sort_by_key(|candidate| {
+        batch_plan
+            .chosen
+            .iter()
+            .position(|item| item.path == candidate.path)
+            .unwrap_or(usize::MAX)
+    });
 }
 
 /// The per-category regret calibration factors the last 30 days of stored
@@ -11093,7 +11209,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
 
     // Build walker.
     let walker_config = WalkerConfig {
-        root_paths,
+        root_paths: root_paths.clone(),
         max_depth: config.scanner.max_depth,
         follow_symlinks: config.scanner.follow_symlinks,
         cross_devices: config.scanner.cross_devices,
@@ -11365,8 +11481,16 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                 .map(|entry| scan_entry_json(entry, args.explain))
                 .collect();
 
+            // W1 planner: the batch the daemon would execute from these
+            // candidates at the mount's current level.
+            let (scan_level, _) = clean_plan_target(&config, &root_paths, None);
+            let (_, scan_plan) = plan_batch(
+                candidates.iter().map(|entry| entry.score.clone()).collect(),
+                &cli_plan_request(&config, scan_level, None, config.scanner.max_delete_batch),
+            );
             let mut payload = json!({
                 "command": "scan",
+                "plan": scan_plan,
                 "scanner_engine": scanner_engine_mode.to_string(),
                 "scanner_dispatch": scanner_dispatch.to_string(),
                 "opaque_pruning": scanner_opaque_pruning,
@@ -11472,7 +11596,55 @@ fn record_cli_decisions(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Record a manual clean's batch plan as the same `planner ... json=...`
+/// activity row the daemon writes, so `sbh explain --id` can quote it.
+fn record_cli_plan(cli: &Cli, config: &Config, batch_plan: &BatchPlan) {
+    use storage_ballast_helper::logger::sqlite::ActivityRow;
+
+    if batch_plan.chosen.is_empty() && batch_plan.skipped_for_budget.is_empty() {
+        return;
+    }
+    let db = match SqliteLogger::open(&config.paths.sqlite_db) {
+        Ok(db) => db,
+        Err(e) => {
+            if cli.verbose {
+                eprintln!(
+                    "[SBH-CLEAN] decision ledger {} not writable, plan not recorded: {e}",
+                    config.paths.sqlite_db.display()
+                );
+            }
+            return;
+        }
+    };
+    let row = ActivityRow {
+        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        event_type: "info".to_string(),
+        severity: "info".to_string(),
+        path: None,
+        size_bytes: None,
+        score: None,
+        score_factors: None,
+        pressure_level: None,
+        free_pct: None,
+        duration_ms: None,
+        success: 1,
+        error_code: None,
+        error_message: None,
+        details: Some(format!(
+            "planner {} json={}",
+            batch_plan.summary_line(),
+            serde_json::to_string(batch_plan).unwrap_or_default()
+        )),
+    };
+    if let Err(e) = db.log_activity(&row)
+        && cli.verbose
+    {
+        eprintln!("[SBH-CLEAN] plan not recorded: {e}");
+    }
+}
+
 /// `sbh undo`: put quarantined entries back (Layer 7).
+#[allow(clippy::too_many_lines)]
 fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<(), CliError> {
     use storage_ballast_helper::scanner::quarantine::QuarantineRecord;
 
@@ -11827,7 +11999,22 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     // verdicts alike) before planning, so `sbh explain` can also answer
     // "why was this kept?" for CLI runs.
     let recorded_decisions = record_cli_decisions(cli, &config, &scored, args.dry_run);
-    let plan = executor.plan(scored);
+    // W1 planner: the set that reaches --target-free with the least expected
+    // loss inside the mount's risk budget, in that order.
+    let (level, target_bytes) = clean_plan_target(&config, &root_paths, args.target_free);
+    let (chosen, batch_plan) = plan_batch(
+        scored,
+        &cli_plan_request(
+            &config,
+            level,
+            target_bytes,
+            args.max_items.unwrap_or(config.scanner.max_delete_batch),
+        ),
+    );
+    eprintln!("[SBH-PLANNER] {}", batch_plan.summary_line());
+    record_cli_plan(cli, &config, &batch_plan);
+    let mut plan = executor.plan(chosen);
+    order_by_plan(&mut plan, &batch_plan);
     if cli.verbose && recorded_decisions > 0 {
         eprintln!(
             "[SBH-CLEAN] recorded {recorded_decisions} decision(s) in {} (see `sbh explain --last {recorded_decisions}`)",
@@ -11911,6 +12098,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                     scan_elapsed,
                     protected_count,
                     "clean",
+                    Some(&batch_plan),
                 )?;
             }
         }
@@ -11959,6 +12147,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                     scan_elapsed,
                     protected_count,
                     "clean",
+                    Some(&batch_plan),
                 )?;
             }
         }
@@ -12613,6 +12802,7 @@ fn emit_clean_report_json(
     scan_elapsed: std::time::Duration,
     protected_count: usize,
     command: &str,
+    batch_plan: Option<&BatchPlan>,
 ) -> Result<(), CliError> {
     let errors: Vec<Value> = report
         .errors
@@ -12656,6 +12846,7 @@ fn emit_clean_report_json(
         "bytes_freed": report.bytes_freed,
         "items_quarantined": report.items_quarantined,
         "bytes_quarantined": report.bytes_quarantined,
+        "plan": batch_plan,
         "quarantine_unavailable": report.quarantine_unavailable,
         "bytes_would_free": report.bytes_would_free,
         "duration_seconds": report.duration.as_secs_f64(),
@@ -13703,7 +13894,15 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                 );
             }
             OutputMode::Json => {
-                emit_clean_report_json(&plan, &report, dir_count, scan_elapsed, 0, "emergency")?;
+                emit_clean_report_json(
+                    &plan,
+                    &report,
+                    dir_count,
+                    scan_elapsed,
+                    0,
+                    "emergency",
+                    None,
+                )?;
             }
         }
         // C-EXIT: failed deletions are a partial success (4).

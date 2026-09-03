@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::pid::PressureLevel;
+use crate::scanner::decision_record::stable_decision_id;
 use crate::scanner::scoring::{CandidacyScore, DecisionAction};
 
 /// The risk budget per pressure level as a multiple of one false-positive
@@ -95,6 +96,8 @@ pub struct PlanRequest {
 pub struct PlannedItem {
     /// The candidate's path.
     pub path: PathBuf,
+    /// The candidate's stable decision id (`sbh explain --id`).
+    pub decision_id: String,
     /// 1-based position in the batch (0 for a skipped candidate).
     pub rank: usize,
     /// Expected reclaim (the candidate's size estimate).
@@ -168,7 +171,7 @@ impl BatchPlan {
         Some(format!(
             "chosen {}: {} at posterior {:.2} (loss {:.1} of budget {}) because it {}{share}",
             ordinal(rank),
-            crate::scanner::scoring::format_bytes(item.bytes),
+            format_bytes(item.bytes),
             item.posterior,
             item.expected_loss,
             self.risk_budget
@@ -183,6 +186,22 @@ impl BatchPlan {
                 "reclaims the most per unit of risk"
             }
         ))
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -206,6 +225,7 @@ fn plannable(candidate: &CandidacyScore, include_review: bool) -> bool {
         }
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn item(candidate: &CandidacyScore, false_positive_loss: f64) -> PlannedItem {
     let posterior = candidate.decision.posterior_abandoned.clamp(0.0, 1.0);
     // A candidate the model is certain about still carries a floor of loss,
@@ -214,6 +234,7 @@ fn item(candidate: &CandidacyScore, false_positive_loss: f64) -> PlannedItem {
     let expected_loss = ((1.0 - posterior) * false_positive_loss).max(1e-6);
     PlannedItem {
         path: candidate.path.clone(),
+        decision_id: stable_decision_id(&candidate.path, candidate.identity, candidate.size_bytes),
         rank: 0,
         bytes: candidate.size_bytes,
         posterior,
@@ -223,11 +244,12 @@ fn item(candidate: &CandidacyScore, false_positive_loss: f64) -> PlannedItem {
 }
 
 /// Plan a batch: the chosen candidates in execution order, plus the plan.
+///
 /// Candidates that are not plannable (vetoed, `Keep`, `Review` outside
 /// emergency) are dropped silently; the rest are either chosen or listed
 /// under `skipped_for_budget`.
 #[must_use]
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub fn plan_batch(
     candidates: Vec<CandidacyScore>,
     request: &PlanRequest,
@@ -269,33 +291,73 @@ pub fn plan_batch(
             .then_with(|| a.0.path.cmp(&b.0.path))
     });
 
-    let mut chosen = Vec::new();
-    let mut chosen_scores = Vec::new();
-    let mut skipped = Vec::new();
+    // Greedy pass: take in value order whatever the budget, batch size and
+    // target still allow. Skipping past an item that does not fit is what
+    // makes this a set choice rather than a prefix.
+    let mut chosen_idx: Vec<usize> = Vec::new();
     let mut planned_bytes = 0u64;
     let mut risk_used = 0.0f64;
-    for (mut planned, score) in plannable {
+    for (index, (planned, _)) in plannable.iter().enumerate() {
         let target_met = request
             .target_bytes
             .is_some_and(|target| planned_bytes >= target);
         let over_budget = request
             .risk_budget
             .is_some_and(|budget| risk_used + planned.expected_loss > budget + 1e-9);
-        if target_met || chosen.len() >= request.max_items || over_budget {
-            skipped.push(planned);
+        if target_met || chosen_idx.len() >= request.max_items || over_budget {
             continue;
         }
         planned_bytes = planned_bytes.saturating_add(planned.bytes);
         risk_used += planned.expected_loss;
-        planned.rank = chosen.len() + 1;
-        chosen.push(planned);
-        chosen_scores.push(score);
+        chosen_idx.push(index);
+    }
+    let mut target_met = request
+        .target_bytes
+        .is_some_and(|target| planned_bytes >= target);
+    // The 2-approximation: when the greedy set falls short of the target
+    // (or has none), the single largest candidate that fits the budget on
+    // its own beats a bundle of small safe ones if it reclaims more.
+    if !target_met && request.max_items >= 1 {
+        let best_single = plannable
+            .iter()
+            .enumerate()
+            .filter(|(_, (planned, _))| {
+                request
+                    .risk_budget
+                    .is_none_or(|budget| planned.expected_loss <= budget + 1e-9)
+            })
+            .max_by(|(_, (a, _)), (_, (b, _))| {
+                a.bytes.cmp(&b.bytes).then_with(|| b.path.cmp(&a.path))
+            });
+        if let Some((index, (planned, _))) = best_single
+            && planned.bytes > planned_bytes
+        {
+            chosen_idx = vec![index];
+            planned_bytes = planned.bytes;
+            risk_used = planned.expected_loss;
+            target_met = request
+                .target_bytes
+                .is_some_and(|target| planned_bytes >= target);
+        }
+    }
+
+    let mut chosen = Vec::with_capacity(chosen_idx.len());
+    let mut chosen_scores = Vec::with_capacity(chosen_idx.len());
+    let mut skipped = Vec::new();
+    for (index, (mut planned, score)) in plannable.into_iter().enumerate() {
+        if let Some(rank) = chosen_idx
+            .iter()
+            .position(|&chosen_index| chosen_index == index)
+        {
+            planned.rank = rank + 1;
+            chosen.push(planned);
+            chosen_scores.push(score);
+        } else {
+            skipped.push(planned);
+        }
     }
     // Only budget/size skips are worth listing; a target already met is a
     // success, not a skip.
-    let target_met = request
-        .target_bytes
-        .is_some_and(|target| planned_bytes >= target);
     if target_met {
         skipped.clear();
     }
@@ -324,12 +386,25 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    fn candidate(path: &str, bytes: u64, posterior: f64, score: f64, action: DecisionAction) -> CandidacyScore {
+    fn candidate(
+        path: &str,
+        bytes: u64,
+        posterior: f64,
+        score: f64,
+        action: DecisionAction,
+    ) -> CandidacyScore {
         CandidacyScore {
             path: PathBuf::from(path),
             identity: None,
             total_score: score,
-            factors: ScoreFactors::default(),
+            factors: ScoreFactors {
+                location: 0.9,
+                name: 0.9,
+                age: 1.0,
+                size: 0.5,
+                structure: 0.5,
+                pressure_multiplier: 1.0,
+            },
             vetoed: false,
             veto_reason: None,
             classification: ArtifactClassification::unknown(),
@@ -347,7 +422,10 @@ mod tests {
                 regret_calibration: 1.0,
                 category_suspended: false,
             },
-            ledger: EvidenceLedger::default(),
+            ledger: EvidenceLedger {
+                terms: Vec::new(),
+                summary: String::new(),
+            },
         }
     }
 
@@ -372,7 +450,10 @@ mod tests {
             candidate("/p/large", 40 * GIB, 0.85, 1.6, DecisionAction::Delete),
             candidate("/p/medium", 2 * GIB, 0.90, 1.8, DecisionAction::Delete),
         ];
-        let (chosen, plan) = plan_batch(candidates, &request(PressureLevel::Orange, Some(30 * GIB), Some(250.0)));
+        let (chosen, plan) = plan_batch(
+            candidates,
+            &request(PressureLevel::Orange, Some(30 * GIB), Some(250.0)),
+        );
         assert_eq!(chosen.len(), 1, "{plan:?}");
         assert_eq!(chosen[0].path, Path::new("/p/large"));
         assert!(plan.target_met);
@@ -381,13 +462,19 @@ mod tests {
         // Top-N by score would have taken small, medium, large: 2.5 + 5 + 7.5.
         assert!((plan.top_n_risk - 15.0).abs() < 1e-9, "{}", plan.top_n_risk);
         assert!(plan.risk_used < plan.top_n_risk);
-        assert!(plan.skipped_for_budget.is_empty(), "a met target is not a skip");
+        assert!(
+            plan.skipped_for_budget.is_empty(),
+            "a met target is not a skip"
+        );
         let why = plan.explain_choice(1).unwrap();
         assert!(why.contains("chosen 1st"), "{why}");
         assert!(why.contains("posterior 0.85"), "{why}");
         assert!(why.contains("reaches the target"), "{why}");
         assert!(why.contains("50% of the risk"), "{why}");
-        assert!(plan.summary_line().starts_with("level=orange target_bytes="));
+        assert!(
+            plan.summary_line()
+                .starts_with("level=orange target_bytes=")
+        );
     }
 
     #[test]
@@ -396,10 +483,16 @@ mod tests {
             candidate("/p/a", 10 * GIB, 0.60, 1.0, DecisionAction::Delete), // loss 20
             candidate("/p/b", 10 * GIB, 0.70, 1.0, DecisionAction::Delete), // loss 15
             candidate("/p/c", 10 * GIB, 0.90, 1.0, DecisionAction::Delete), // loss 5
-            candidate("/p/d", 1 * GIB, 0.99, 1.0, DecisionAction::Delete),  // loss 0.5
+            candidate("/p/d", GIB, 0.99, 1.0, DecisionAction::Delete),      // loss 0.5
         ];
-        let (chosen, plan) = plan_batch(candidates.clone(), &request(PressureLevel::Green, None, Some(21.0)));
-        let paths: Vec<_> = chosen.iter().map(|c| c.path.to_string_lossy().into_owned()).collect();
+        let (chosen, plan) = plan_batch(
+            candidates.clone(),
+            &request(PressureLevel::Green, None, Some(21.0)),
+        );
+        let paths: Vec<_> = chosen
+            .iter()
+            .map(|c| c.path.to_string_lossy().into_owned())
+            .collect();
         // Greedy by bytes/loss: c (2 GiB/unit), d (2 GiB/unit, fewer bytes), b, a.
         // c (5) + d (0.5) + b (15) = 20.5 fits; a (20) does not.
         assert_eq!(paths, vec!["/p/c", "/p/d", "/p/b"], "{plan:?}");
@@ -419,17 +512,25 @@ mod tests {
         let candidates = vec![
             candidate("/p/review", 5 * GIB, 0.9, 1.0, DecisionAction::Review),
             candidate("/p/keep", 5 * GIB, 0.9, 1.0, DecisionAction::Keep),
-            candidate("/p/delete", 1 * GIB, 0.9, 1.0, DecisionAction::Delete),
+            candidate("/p/delete", GIB, 0.9, 1.0, DecisionAction::Delete),
         ];
-        let (chosen, plan) = plan_batch(candidates.clone(), &request(PressureLevel::Red, None, None));
+        let (chosen, plan) =
+            plan_batch(candidates.clone(), &request(PressureLevel::Red, None, None));
         assert_eq!(chosen.len(), 1);
         assert_eq!(chosen[0].path, Path::new("/p/delete"));
-        assert!(plan.skipped_for_budget.is_empty(), "unplannable candidates are not skips");
+        assert!(
+            plan.skipped_for_budget.is_empty(),
+            "unplannable candidates are not skips"
+        );
         let mut emergency = request(PressureLevel::Critical, None, None);
         emergency.include_review = true;
         let (chosen, _) = plan_batch(candidates, &emergency);
         assert_eq!(chosen.len(), 2);
-        assert!(chosen.iter().all(|c| c.decision.action != DecisionAction::Keep));
+        assert!(
+            chosen
+                .iter()
+                .all(|c| c.decision.action != DecisionAction::Keep)
+        );
     }
 
     #[test]
@@ -466,7 +567,7 @@ mod tests {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
-                let j = (seed % (i as u64 + 1)) as usize;
+                let j = usize::try_from(seed % (i as u64 + 1)).unwrap_or(0);
                 shuffled.swap(i, j);
             }
             let (chosen, plan) = plan_batch(shuffled, &req);
@@ -482,6 +583,7 @@ mod tests {
     /// what the best 0/1 subset within the same budget would, on random
     /// small instances.
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn greedy_is_within_factor_two_of_the_brute_force_optimum() {
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = || {
@@ -496,7 +598,13 @@ mod tests {
                 .map(|i| {
                     let bytes = (1 + next() % 64) * MIB;
                     let posterior = 0.5 + (next() % 50) as f64 / 100.0;
-                    candidate(&format!("/p/{i}"), bytes, posterior, 1.0, DecisionAction::Delete)
+                    candidate(
+                        &format!("/p/{i}"),
+                        bytes,
+                        posterior,
+                        1.0,
+                        DecisionAction::Delete,
+                    )
                 })
                 .collect();
             let losses: Vec<f64> = candidates

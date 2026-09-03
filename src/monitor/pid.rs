@@ -430,7 +430,7 @@ fn classify_with_hysteresis(
     orange_min: f64,
     red_min: f64,
 ) -> PressureLevel {
-    let raw = raw_classify(free_pct, green_min, yellow_min, orange_min, red_min);
+    let raw = classify_level(free_pct, green_min, yellow_min, orange_min, red_min);
 
     // Fast attack: if the new level is more severe than the current level,
     // switch immediately. This ensures we respond to sudden pressure spikes
@@ -479,7 +479,10 @@ fn classify_with_hysteresis(
     }
 }
 
-fn raw_classify(
+/// The level `free_pct` falls in against the four thresholds, with no
+/// hysteresis: what a fresh controller would say.
+#[must_use]
+pub fn classify_level(
     free_pct: f64,
     green_min: f64,
     yellow_min: f64,
@@ -1023,7 +1026,7 @@ mod tests {
         let mut last = None;
         for (t_secs, reading) in trace {
             let free_pct = reading.free_pct();
-            let raw = super::raw_classify(free_pct, 20.0, 14.0, 10.0, 6.0);
+            let raw = super::classify_level(free_pct, 20.0, 14.0, 10.0, 6.0);
             let response = pid.update(reading, None, t0 + Duration::from_secs(t_secs));
             assert!(
                 response.level <= raw || (response.level as u8) <= raw as u8 + 1,

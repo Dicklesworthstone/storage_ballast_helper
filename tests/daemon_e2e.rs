@@ -1854,6 +1854,22 @@ fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
     })
     .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(run.stderr_count("[SBH-REGRET] decision="), 1);
+    // The Orange batch was planned against the bytes needed to return to
+    // Yellow, and the plan reached the ledger as a planner event.
+    assert!(
+        run.stderr()
+            .contains("[SBH-PLANNER] level=orange target_bytes="),
+        "{}",
+        run.stderr()
+    );
+    assert!(
+        run.events_of("info").iter().any(|e| {
+            e["details"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("planner level=orange") && d.contains(" json={"))
+        }),
+        "planner event missing"
+    );
     assert!(
         run.stderr().contains("outcome=regret category=RustTarget"),
         "{}",

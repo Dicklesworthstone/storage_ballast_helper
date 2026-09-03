@@ -88,6 +88,7 @@ use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, OpaqueTreeDisposition,
     StructuralSignals,
 };
+use crate::scanner::planner::{PlanRequest, RiskBudgetByLevel, plan_batch};
 use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::quarantine::QuarantineStore;
 use crate::scanner::regret::{
@@ -194,6 +195,8 @@ struct SharedExecutorConfig {
     /// bd-8aeq: batches that actually removed something; see
     /// [`Self::reclaim_events`].
     reclaim_events: AtomicU64,
+    /// W1 planner: the risk budget table and one false-positive loss.
+    planner: RwLock<(RiskBudgetByLevel, f64)>,
 }
 
 impl SharedExecutorConfig {
@@ -216,7 +219,14 @@ impl SharedExecutorConfig {
             quarantine_enabled: AtomicBool::new(quarantine_enabled),
             quarantine_ttl_secs: AtomicU64::new(quarantine_ttl_secs),
             reclaim_events: AtomicU64::new(0),
+            planner: RwLock::new((RiskBudgetByLevel::default(), 50.0)),
         }
+    }
+
+    /// Set the planner's risk budget table and loss unit (config load and
+    /// reload).
+    fn set_planner(&self, table: RiskBudgetByLevel, false_positive_loss: f64) {
+        *self.planner.write() = (table, false_positive_loss);
     }
 
     fn min_certainty(&self) -> ArtifactCertainty {
@@ -491,6 +501,9 @@ pub struct ScanRequest {
     /// A Green maintenance pass (Q6): the scheduler chose `paths`, so the v2
     /// engine walks them even without dirty event roots.
     pub maintenance: bool,
+    /// W1 planner: the bytes this pass should reclaim to bring the pressured
+    /// mount back to Yellow; `None` while the mount is not pressured.
+    pub target_bytes: Option<u64>,
 }
 
 /// B6: consecutive no-progress passes after which even Red/Critical pressure
@@ -730,6 +743,8 @@ pub struct DeletionBatch {
     pub candidates: Vec<CandidacyScore>,
     pub pressure_level: PressureLevel,
     pub urgency: f64,
+    /// W1 planner: the byte target of the pass that produced the batch.
+    pub target_bytes: Option<u64>,
 }
 
 /// Results reported from worker threads back to the main monitoring loop.
@@ -2111,6 +2126,7 @@ fn event_triggered_request(
         config_update: None,
         catalog_roots: Vec::new(),
         maintenance: false,
+        target_bytes: None,
     })
 }
 
@@ -2641,6 +2657,10 @@ impl MonitoringDaemon {
             config.scanner.quarantine_enabled,
             config.scanner.quarantine_ttl_hours.saturating_mul(3600),
         ));
+        shared_executor_config.set_planner(
+            config.scoring.batch_risk_budget_by_level,
+            config.scoring.false_positive_loss,
+        );
 
         let shared_scoring_config = Arc::new(RwLock::new(config.scoring.clone()));
         let shared_scanner_config = Arc::new(RwLock::new(config.scanner.clone()));
@@ -4509,6 +4529,7 @@ impl MonitoringDaemon {
                     config_update: None,
                     catalog_roots: Vec::new(),
                     maintenance: true,
+                    target_bytes: None,
                 };
                 let response = response.clone();
                 self.enqueue_scan_logged(scan_tx, scan_rx, &response, request);
@@ -4879,6 +4900,19 @@ impl MonitoringDaemon {
             return;
         }
 
+        // W1 planner: the bytes that bring the pressured mount back to
+        // Yellow, so the executor can plan the set that reaches them with
+        // the least expected loss.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let target_bytes = (response.level >= PressureLevel::Orange)
+            .then(|| self.fs_collector.collect(&response.causing_mount).ok())
+            .flatten()
+            .map(|stats| {
+                let wanted = (stats.total_bytes as f64 * self.config.pressure.yellow_min_free_pct
+                    / 100.0) as u64;
+                wanted.saturating_sub(stats.available_bytes)
+            })
+            .filter(|bytes| *bytes > 0);
         let request = ScanRequest {
             paths,
             urgency: response.urgency,
@@ -4892,6 +4926,7 @@ impl MonitoringDaemon {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes,
         };
         self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
     }
@@ -4951,6 +4986,7 @@ impl MonitoringDaemon {
             config_update: None,
             catalog_roots,
             maintenance: false,
+            target_bytes: None,
         };
         self.enqueue_scan_logged(scan_tx, scan_rx, response, request);
     }
@@ -5013,6 +5049,7 @@ impl MonitoringDaemon {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
         // For forced scans, block briefly to ensure delivery.
         let _ = scan_tx.send_timeout(request, Duration::from_millis(100));
@@ -5318,6 +5355,7 @@ impl MonitoringDaemon {
                     config_update: None,
                     catalog_roots: Vec::new(),
                     maintenance: false,
+                    target_bytes: None,
                 };
 
                 match enqueue_scan_request(scan_tx, scan_rx, request, true) {
@@ -5479,6 +5517,10 @@ impl MonitoringDaemon {
                     self.shared_executor_config.quarantine_ttl_secs.store(
                         new_config.scanner.quarantine_ttl_hours.saturating_mul(3600),
                         Ordering::Relaxed,
+                    );
+                    self.shared_executor_config.set_planner(
+                        new_config.scoring.batch_risk_budget_by_level,
+                        new_config.scoring.false_positive_loss,
                     );
 
                     // Update FS collector TTL.
@@ -5915,6 +5957,7 @@ fn dispatch_top_candidates(
         candidates: std::mem::replace(scored, overflow),
         pressure_level: request.pressure_level,
         urgency: request.urgency,
+        target_bytes: request.target_bytes,
     };
     let batch_len = batch.candidates.len();
 
@@ -8423,6 +8466,39 @@ fn executor_thread_main(
         }
 
         let pre_plan_count = approved_candidates.len();
+        // W1 planner (G16): of the approved candidates, the set that reaches
+        // the pass's byte target with the least expected loss inside the
+        // level's risk budget, instead of the top-N by score.
+        let (approved_candidates, batch_plan) = {
+            let (table, false_positive_loss) = *shared_config.planner.read();
+            plan_batch(
+                approved_candidates,
+                &PlanRequest {
+                    level: batch.pressure_level,
+                    target_bytes: batch.target_bytes,
+                    max_items: max_batch_size,
+                    risk_budget: table.budget(batch.pressure_level, false_positive_loss),
+                    false_positive_loss,
+                    include_review: false,
+                },
+            )
+        };
+        if !batch_plan.chosen.is_empty() || !batch_plan.skipped_for_budget.is_empty() {
+            let line = batch_plan.summary_line();
+            eprintln!("[SBH-PLANNER] {line}");
+            logger.send(ActivityEvent::Info {
+                message: format!(
+                    "planner {line} json={}",
+                    serde_json::to_string(&batch_plan).unwrap_or_default()
+                ),
+            });
+        }
+        if approved_candidates.is_empty() {
+            eprintln!(
+                "[SBH-EXECUTOR] planner chose none of {pre_plan_count} approved candidate(s) within the risk budget"
+            );
+            continue;
+        }
         // The executor's pre-flight sacred rail sees the same catalog the
         // scoring stage does: platform builtins plus operator patterns.
         let executor_sacred_paths = {
@@ -8462,7 +8538,16 @@ fn executor_thread_main(
             Some(logger.clone()),
         );
 
-        let plan = executor.plan(approved_candidates);
+        let mut plan = executor.plan(approved_candidates);
+        // Execute in the planner's order (best reclaim per unit of risk
+        // first), not by composite score.
+        plan.candidates.sort_by_key(|candidate| {
+            batch_plan
+                .chosen
+                .iter()
+                .position(|item| item.path == candidate.path)
+                .unwrap_or(usize::MAX)
+        });
 
         if plan.candidates.is_empty() {
             eprintln!(
@@ -8803,6 +8888,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
         let identity = identity_for_path(&target, false).unwrap();
         let record = |generation: u64| CandidateIndexRecord {
@@ -9138,6 +9224,7 @@ mod tests {
                 config_update: None,
                 catalog_roots: Vec::new(),
                 maintenance: false,
+                target_bytes: None,
             })
             .unwrap();
         drop(scan_tx);
@@ -9314,6 +9401,7 @@ mod tests {
                 config_update: None,
                 catalog_roots: Vec::new(),
                 maintenance: false,
+                target_bytes: None,
             })
             .unwrap();
         drop(scan_tx);
@@ -9415,6 +9503,7 @@ mod tests {
                         config_update: None,
                         catalog_roots: Vec::new(),
                         maintenance: false,
+                        target_bytes: None,
                     })
                     .unwrap();
             }
@@ -9690,6 +9779,7 @@ mod tests {
                 config_update: None,
                 catalog_roots: Vec::new(),
                 maintenance: false,
+                target_bytes: None,
             })
             .unwrap();
         drop(scan_tx);
@@ -10223,6 +10313,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
         let mut scored = vec![test_candidate("/tmp/a", 0.4), test_candidate("/tmp/b", 0.6)];
 
@@ -10364,6 +10455,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
         assert_eq!(request.paths.len(), 2);
         assert_eq!(request.urgency.to_bits(), 0.7_f64.to_bits());
@@ -10402,6 +10494,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
         assert_eq!(
             log_truncation_free_pct_for_request(&request).to_bits(),
@@ -10517,6 +10610,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
         // With capacity 0, send blocks until recv is called.
         // We use thread to unblock.
@@ -10532,6 +10626,7 @@ mod tests {
             candidates: Vec::new(),
             pressure_level: PressureLevel::Orange,
             urgency: 0.5,
+            target_bytes: None,
         };
         del_tx.send(batch).unwrap();
         let received_batch = del_rx.recv().unwrap();
@@ -10640,6 +10735,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
 
         assert_eq!(v2_pressure_candidate_byte_target(&request), None);
@@ -10666,6 +10762,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
         let mut dirty = BTreeSet::new();
 
@@ -10694,6 +10791,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
         let dirty = BTreeSet::new();
 
@@ -10810,6 +10908,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         }
     }
 
@@ -11392,6 +11491,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
 
         // Fill the channel to capacity.
@@ -11420,6 +11520,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
 
         // Fill queue with stale requests.
@@ -11490,6 +11591,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
         for _ in 0..SCANNER_CHANNEL_CAP {
             tx.try_send(make_request())
@@ -11512,6 +11614,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
         let (del_tx, del_rx) = bounded::<DeletionBatch>(4);
         let mut scored = vec![
@@ -11546,6 +11649,7 @@ mod tests {
             config_update: None,
             catalog_roots: Vec::new(),
             maintenance: false,
+            target_bytes: None,
         };
         let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
         del_tx
@@ -11553,6 +11657,7 @@ mod tests {
                 candidates: vec![test_candidate("/tmp/already-queued", 0.2)],
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.5,
+                target_bytes: None,
             })
             .expect("prefill channel");
 

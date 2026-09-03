@@ -623,6 +623,9 @@ pub struct ScoringConfig {
     /// How long a category's deletions pause after its regret e-process
     /// alarms.
     pub regret_suspend_minutes: u64,
+    /// W1 batch planner: the expected loss one batch may risk per pressure
+    /// level, as a multiple of `false_positive_loss` (Critical unbounded).
+    pub batch_risk_budget_by_level: crate::scanner::planner::RiskBudgetByLevel,
 }
 
 /// Ballast allocation settings.
@@ -1156,6 +1159,7 @@ impl Default for ScoringConfig {
             regret_alpha_definite: 0.02,
             regret_alpha_likely: 0.005,
             regret_suspend_minutes: 60,
+            batch_risk_budget_by_level: crate::scanner::planner::RiskBudgetByLevel::default(),
         }
     }
 }
@@ -2320,6 +2324,24 @@ impl Config {
                 details: "telemetry.cpu_budget_pct must be 0..=100 (percent of one core)"
                     .to_string(),
             });
+        }
+        {
+            let table = &self.scoring.batch_risk_budget_by_level;
+            for (name, value) in [
+                ("green", table.green),
+                ("yellow", table.yellow),
+                ("orange", table.orange),
+                ("red", table.red),
+                ("critical", table.critical.unwrap_or(0.0)),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(SbhError::InvalidConfig {
+                        details: format!(
+                            "scoring.batch_risk_budget_by_level.{name} must be a finite number >= 0"
+                        ),
+                    });
+                }
+            }
         }
         for (name, value) in [
             ("regret_alpha_definite", self.scoring.regret_alpha_definite),
