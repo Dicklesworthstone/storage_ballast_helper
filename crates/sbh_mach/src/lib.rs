@@ -143,7 +143,11 @@ impl MachError {
 
 impl fmt::Display for MachError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{} failed with kern_return_t {}", self.call, self.code)
+        write!(
+            formatter,
+            "{} failed with kern_return_t {}",
+            self.call, self.code
+        )
     }
 }
 
@@ -299,9 +303,11 @@ pub enum MemoryPressureEvent {
 impl MemoryPressureEvent {
     /// Map a raw `dispatch_source_get_data()` bitmask to the strongest event.
     pub fn from_dispatch_data(data: usize) -> Self {
-        if data & memory_pressure_flag(
-            dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_CRITICAL,
-        ) != 0
+        if data
+            & memory_pressure_flag(
+                dispatch_source_memorypressure_flags_t::DISPATCH_MEMORYPRESSURE_CRITICAL,
+            )
+            != 0
         {
             Self::Critical
         } else if data
@@ -498,9 +504,7 @@ pub fn host_vm_stats() -> Result<VmStats, MachError> {
 
 /// Return all process identifiers visible to the current process.
 pub fn proc_listpids_all() -> io::Result<Vec<i32>> {
-    let initial_bytes = unsafe {
-        libc::proc_listpids(PROC_ALL_PIDS, 0, ptr::null_mut(), 0)
-    };
+    let initial_bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, ptr::null_mut(), 0) };
     if initial_bytes < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -697,7 +701,10 @@ fn ensure_count(
     if actual >= expected {
         Ok(())
     } else {
-        Err(MachError::new(call, mach2::kern_return::KERN_INVALID_ARGUMENT))
+        Err(MachError::new(
+            call,
+            mach2::kern_return::KERN_INVALID_ARGUMENT,
+        ))
     }
 }
 
@@ -762,9 +769,9 @@ extern "C" fn memory_pressure_cancel_handler(context: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::{
-        current_task_basic_info, current_task_thread_times, current_task_usage, host_vm_stats,
-        current_thread_basic_info, subscribe_memory_pressure_events, MemoryPressureEvent,
-        HOST_VM_INFO64_REV0_COUNT,
+        HOST_VM_INFO64_REV0_COUNT, MemoryPressureEvent, current_task_basic_info,
+        current_task_thread_times, current_task_usage, current_thread_basic_info, host_vm_stats,
+        subscribe_memory_pressure_events,
     };
 
     /// REGRESSION: the `HOST_VM_INFO64` count must stay anchored to XNU's rev0
@@ -850,7 +857,8 @@ mod tests {
 
     #[test]
     fn memory_pressure_source_constructs_and_cancels() {
-        let source = subscribe_memory_pressure_events(|_| {}).expect("dispatch source should start");
+        let source =
+            subscribe_memory_pressure_events(|_| {}).expect("dispatch source should start");
         assert!(!source.is_canceled());
         drop(source);
     }

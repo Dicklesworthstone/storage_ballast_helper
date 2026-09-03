@@ -10,6 +10,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — `sbh doctor --release` drift checks (bd-rc-master-ajg1.5.6)
+
+- Four checks join the release doctor, all through GitHub CLI: `release.latest_assets` (the latest release's asset list satisfies the updater contract for every CI target and carries `release-provenance.json`; missing names are listed per target), `release.tap_version` (the tap's `Formula/sbh.rb` version equals the latest tag), `release.workflows_enabled` (`ci.yml`, `release.yml`, `cert-expiration.yml` are registered and active), `release.cert_expiration_run` (the last cert-expiration run concluded successfully). Without GitHub access they warn instead of failing, so `doctor --release` stays usable offline. Fixture tests cover a complete v0.5.1 asset set, a release missing one target and the provenance document, a lagging formula, a disabled workflow, a failed run, and the offline case.
+
 ### Changed — `crates/sbh_mach` is a workspace member and its tests run in the macOS lanes (bd-rc-master-ajg1.1.4)
 
 - The root manifest declares `[workspace] members = [".", "crates/sbh_mach"]`, so `cargo metadata` sees the FFI crate and the `macos-platform` CI job runs `cargo test -p sbh_mach` on both the arm64 and the Intel runner; its eight tests (including the `HOST_VM_INFO64` count regression) had never executed in CI. The root crate still forbids unsafe code; the manifest and AGENTS.md say why the Mach crate cannot.
