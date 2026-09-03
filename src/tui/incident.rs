@@ -216,9 +216,11 @@ pub fn incident_hints(
             });
         }
         Screen::Ballast => {
+            // The keys the screen really has: `r` is refresh everywhere.
             hints.push(IncidentHint {
-                text: "[r] Release selected volume's ballast".to_string(),
-                shortcut: "r",
+                text: "[x] Release one ballast file on the selected volume (X: all, p: replenish)"
+                    .to_string(),
+                shortcut: "x",
             });
         }
         Screen::Timeline => {
@@ -398,6 +400,69 @@ mod tests {
 
     // ── Playbook ──
 
+    /// README's playbook list and palette count are a contract with the
+    /// code (bd-rc-master-ajg1.4.12): the numbered entries under "Triage
+    /// playbook" must be the playbook's labels, in order, with the right
+    /// screen and severity; the palette action count must be the real one.
+    #[test]
+    fn readme_playbook_and_palette_match_the_code() {
+        let readme = include_str!("../../README.md");
+        let start = readme
+            .find("**Triage playbook**")
+            .expect("README documents the triage playbook");
+        let section = &readme[start..];
+        let end = section
+            .find("\n\n")
+            .expect("the playbook list ends with a blank line");
+        let entries: Vec<&str> = section[..end]
+            .lines()
+            .filter(|line| line.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            INCIDENT_PLAYBOOK.len(),
+            "README lists every playbook entry: {entries:?}"
+        );
+        for (index, (line, entry)) in entries.iter().zip(INCIDENT_PLAYBOOK).enumerate() {
+            let expected_prefix = format!("{}. {} (", index + 1, entry.label);
+            assert!(
+                line.starts_with(&expected_prefix),
+                "README entry {} is {line:?}, code label is {:?}",
+                index + 1,
+                entry.label
+            );
+            let screen = match entry.target {
+                Screen::Overview => "Overview screen",
+                Screen::Timeline => "Timeline screen",
+                Screen::Explainability => "Explainability screen",
+                Screen::Candidates => "Candidates screen",
+                Screen::Ballast => "Ballast screen",
+                Screen::LogSearch => "Log Search screen",
+                Screen::Diagnostics => "Diagnostics screen",
+            };
+            assert!(line.contains(screen), "{line:?} names {screen}");
+            let high = entry.min_severity >= IncidentSeverity::High;
+            assert_eq!(
+                line.contains(", High)"),
+                high,
+                "{line:?} severity marker vs {:?}",
+                entry.min_severity
+            );
+        }
+        assert!(
+            section.starts_with("**Triage playbook** (`!` key): Opens a 7-entry"),
+            "the entry count in the README prose is 7"
+        );
+        assert_eq!(INCIDENT_PLAYBOOK.len(), 7);
+
+        let palette = crate::tui::input::command_palette_actions().len();
+        let claim = format!("through {palette} available actions");
+        assert!(
+            readme.contains(&claim),
+            "README's palette count must be {palette}"
+        );
+    }
+
     #[test]
     fn playbook_is_non_empty() {
         assert!(!INCIDENT_PLAYBOOK.is_empty());
@@ -526,7 +591,18 @@ mod tests {
             Screen::Ballast,
             HintVerbosity::Full,
         );
-        assert!(hints.iter().any(|h| h.shortcut == "r"));
+        // The hint names the keys the screen has: x releases one file on the
+        // selected volume, X all of them, p replenishes; `r` is refresh.
+        let release = hints
+            .iter()
+            .find(|h| h.shortcut == "x")
+            .expect("ballast hint");
+        assert!(
+            release.text.contains("X: all, p: replenish"),
+            "{}",
+            release.text
+        );
+        assert!(hints.iter().all(|h| h.shortcut != "r"));
     }
 
     #[test]

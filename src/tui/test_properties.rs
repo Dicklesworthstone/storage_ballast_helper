@@ -52,6 +52,19 @@ fn arb_key_code() -> impl Strategy<Value = KeyCode> {
         Just(KeyCode::Char('d')),
         Just(KeyCode::Char('G')),
         Just(KeyCode::Char('V')),
+        // Incident and ballast actions (4.15): quick-release, release-all,
+        // replenish, the playbook, the VOI overlay, and the confirmation
+        // modal's Enter/Escape are all reachable from these.
+        Just(KeyCode::Char('x')),
+        Just(KeyCode::Char('X')),
+        Just(KeyCode::Char('p')),
+        Just(KeyCode::Char('!')),
+        Just(KeyCode::Char('v')),
+        Just(KeyCode::Char('F')),
+        Just(KeyCode::Char(' ')),
+        Just(KeyCode::Tab),
+        Just(KeyCode::BackTab),
+        Just(KeyCode::Backspace),
         Just(KeyCode::Escape),
         Just(KeyCode::Enter),
         Just(KeyCode::Up),
@@ -684,10 +697,19 @@ proptest! {
     #[test]
     fn random_keys_never_panic(
         keys in prop::collection::vec(arb_key_event(), 1..100),
-        screen in arb_screen()
+        screen in arb_screen(),
+        volumes in prop::collection::vec(arb_ballast_volume(), 0..4),
+        state in prop::option::of(arb_daemon_state())
     ) {
         let mut model = fresh_model();
         model.screen = screen;
+        // With volumes and a pressure state the incident paths (quick-release,
+        // release-all, replenish, the confirmation's Enter) have something to
+        // act on; without them they must refuse without panicking.
+        model.set_ballast_volumes(volumes);
+        if let Some(state) = state {
+            let _ = update::update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state))));
+        }
         for key in keys {
             let _ = update::update(&mut model, DashboardMsg::Key(key));
         }

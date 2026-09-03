@@ -552,14 +552,14 @@ During disk pressure events, the dashboard provides guided triage shortcuts. The
 | High | Orange pressure | Alert banner + all triage hints visible |
 | Critical | Red/emergency | Urgent alert banner + maximum triage guidance |
 
-**Triage playbook** (`!` key): Opens a 7-entry guided playbook ordered by triage priority:
-1. Release ballast (Ballast screen)
-2. Review scan candidates (Candidates screen)
-3. Check decision rationale (Explainability screen)
-4. Inspect timeline events (Timeline screen)
-5. Verify ballast inventory
-6. Review diagnostics
-7. Assess overall pressure (Overview screen)
+**Triage playbook** (`!` key): Opens a 7-entry guided playbook ordered by triage priority (entries marked High appear from Orange pressure on, the rest from Yellow; a test keeps this list equal to the code's):
+1. Release ballast (Ballast screen, High)
+2. Check pressure overview (Overview screen)
+3. Review critical events (Timeline screen)
+4. Inspect deletion decisions (Explainability screen, High)
+5. Review pending candidates (Candidates screen, High)
+6. Check daemon health (Diagnostics screen)
+7. Search logs for errors (Log Search screen)
 
 Use `j`/`k` to navigate entries and `Enter` to jump to the target screen.
 
