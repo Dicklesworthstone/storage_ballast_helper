@@ -156,3 +156,7 @@ Diagnostics must show both the normalized level and the native evidence:
 
 This lets operators compare outcomes across Linux and macOS without hiding the
 platform-specific evidence behind the normalized behavior row.
+
+## Forecast bound (2026-09-02)
+
+`rates.<mount>.seconds_to_red` in `state.json` is the conformal lower bound `tte_lo` when the mount's calibrator is past warm-up, else the EWMA point estimate; `rates.<mount>.forecast` carries `tte_point_s`, `tte_lo_s`, `coverage_target`, `coverage_empirical`, `alpha`, `samples` and `coverage_state`. The PID feedforward, the mount controller's Reclaim trigger and the predictive policy all consume the bound. See README "Conformal Time-to-Red Bound" and `src/monitor/conformal.rs`.

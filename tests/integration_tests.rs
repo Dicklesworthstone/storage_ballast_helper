@@ -5829,6 +5829,7 @@ fn passing_guard_diag() -> GuardDiagnostics {
         e_process_value: 0.3,
         e_process_alarm: false,
         consecutive_clean: 5,
+        forecast: None,
         reason: "all metrics within bounds".to_string(),
     }
 }
@@ -5843,6 +5844,7 @@ fn failing_guard_diag() -> GuardDiagnostics {
         e_process_value: 2.5,
         e_process_alarm: true,
         consecutive_clean: 0,
+        forecast: None,
         reason: "e-process alarm tripped".to_string(),
     }
 }

@@ -119,6 +119,7 @@ fn good_guard() -> GuardDiagnostics {
         e_process_value: 2.0,
         e_process_alarm: false,
         consecutive_clean: 5,
+        forecast: None,
         reason: "calibration verified".to_string(),
     }
 }
@@ -132,6 +133,7 @@ fn failing_guard() -> GuardDiagnostics {
         e_process_value: 25.0,
         e_process_alarm: true,
         consecutive_clean: 0,
+        forecast: None,
         reason: "drift detected".to_string(),
     }
 }
@@ -667,6 +669,7 @@ fn e2e_stale_index_safe_fallback() {
         e_process_value: 1.0,
         e_process_alarm: false,
         consecutive_clean: 0,
+        forecast: None,
         reason: "insufficient data".to_string(),
     };
     let inputs = random_candidates(&mut rng, 10);

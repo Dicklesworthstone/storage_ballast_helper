@@ -207,6 +207,7 @@ fn good_guard() -> GuardDiagnostics {
         e_process_value: 2.0,
         e_process_alarm: false,
         consecutive_clean: 5,
+        forecast: None,
         reason: "calibration verified".to_string(),
     }
 }
@@ -220,6 +221,7 @@ fn failing_guard() -> GuardDiagnostics {
         e_process_value: 25.0,
         e_process_alarm: true,
         consecutive_clean: 0,
+        forecast: None,
         reason: "drift detected".to_string(),
     }
 }
@@ -771,6 +773,7 @@ fn fault_stale_guard_unknown_blocks_adaptive() {
         e_process_value: 1.0,
         e_process_alarm: false,
         consecutive_clean: 0,
+        forecast: None,
         reason: "insufficient data (stale)".to_string(),
     };
 
@@ -883,6 +886,7 @@ fn fault_calibration_breach_cascade_is_advisory() {
         e_process_value: 5.0,
         e_process_alarm: false, // no alarm, but calibration is bad
         consecutive_clean: 0,
+        forecast: None,
         reason: "calibration failed".to_string(),
     };
 

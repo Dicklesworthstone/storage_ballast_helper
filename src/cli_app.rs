@@ -12617,7 +12617,7 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
         match &read {
             ForecastRead::Fresh(Some(forecast)) => {
                 forecast_json = forecast.to_json(min_confidence);
-                let seconds_left = forecast.seconds_to_red.or_else(|| {
+                let seconds_left = forecast.acting_seconds_to_red().or_else(|| {
                     (forecast.bytes_per_sec > 0.0).then(|| {
                         let bytes_until_threshold = capacity.available_bytes.saturating_sub(
                             (threshold_pct / 100.0 * capacity.total_bytes as f64) as u64,
@@ -12900,6 +12900,10 @@ struct MountForecast {
     confidence: f64,
     seconds_to_red: Option<f64>,
     seconds_to_full: Option<f64>,
+    /// The conformal lower bound on `seconds_to_red` (`rates.<mount>.forecast.tte_lo_s`).
+    tte_lo: Option<f64>,
+    /// The daemon's calibration block, passed through to JSON.
+    forecast: Option<Value>,
 }
 
 impl MountForecast {
@@ -12913,7 +12917,18 @@ impl MountForecast {
                 .unwrap_or(0.0),
             seconds_to_red: rate.get("seconds_to_red").and_then(Value::as_f64),
             seconds_to_full: rate.get("seconds_to_full").and_then(Value::as_f64),
+            tte_lo: rate
+                .get("forecast")
+                .and_then(|f| f.get("tte_lo_s"))
+                .and_then(Value::as_f64),
+            forecast: rate.get("forecast").cloned().filter(|f| !f.is_null()),
         })
+    }
+
+    /// The seconds-to-red a decision should use: the conformal lower bound
+    /// when the daemon published one, else the point estimate.
+    fn acting_seconds_to_red(&self) -> Option<f64> {
+        self.tte_lo.or(self.seconds_to_red)
     }
 
     /// Below the configured confidence the estimator is still warming up:
@@ -12928,6 +12943,8 @@ impl MountForecast {
             "accel": self.accel,
             "confidence": self.confidence,
             "seconds_to_red": self.seconds_to_red,
+            "seconds_to_red_lo": self.tte_lo,
+            "forecast": self.forecast,
             "seconds_to_full": self.seconds_to_full,
             "warming": self.warming(min_confidence),
         })
@@ -13016,8 +13033,11 @@ fn rate_line(mount: &str, forecast: &MountForecast, min_confidence: f64) -> Stri
     } else {
         "0 B/s\u{b2}".to_string()
     };
-    let horizon = match forecast.seconds_to_red {
-        Some(secs) if secs.is_finite() => format!("red in {}", format_eta(secs)),
+    let horizon = match (forecast.tte_lo, forecast.seconds_to_red) {
+        (Some(lo), Some(point)) if lo.is_finite() && point.is_finite() && lo < point => {
+            format!("red in >={} (point {})", format_eta(lo), format_eta(point))
+        }
+        (_, Some(secs)) if secs.is_finite() => format!("red in {}", format_eta(secs)),
         _ => "no red horizon".to_string(),
     };
     let status = if forecast.warming(min_confidence) {
@@ -15925,6 +15945,8 @@ mod tests {
                 confidence: 0.8,
                 seconds_to_red: Some(1200.0),
                 seconds_to_full: Some(4000.0),
+                tte_lo: None,
+                forecast: None,
             }))
         );
         assert_eq!(fresh.unknown_reason(), None);
@@ -15959,6 +15981,8 @@ mod tests {
             confidence: 0.9,
             seconds_to_red: Some(2520.0),
             seconds_to_full: None,
+            tte_lo: None,
+            forecast: None,
         };
         let line = rate_line("/data", &confident, 0.6);
         assert!(line.contains("/data"), "{line}");
@@ -15970,7 +15994,7 @@ mod tests {
         let warming = MountForecast {
             confidence: 0.2,
             seconds_to_red: None,
-            ..confident
+            ..confident.clone()
         };
         let line = rate_line("/data", &warming, 0.6);
         assert!(line.contains("warming (confidence 0.20 < 0.60)"), "{line}");

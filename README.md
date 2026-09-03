@@ -1316,11 +1316,22 @@ The guardrail system continuously validates that the EWMA forecaster's predictio
 Each observation window compares the forecaster's predictions against actual outcomes:
 
 - **Rate error**: `|predicted_rate - actual_rate| / |actual_rate|`. Must stay below 0.30 (30%).
-- **TTE conservatism**: The predicted time-to-exhaustion must be less than or equal to the actual time. Overestimates are acceptable (conservative); underestimates are not.
+- **Time-to-red coverage**: the conformal lower bound on the time to red (below) must have covered the true time in at least `coverage_target - 0.05` of the resolved predictions.
 
-A window is considered well-calibrated if the rate error is below threshold *and* the TTE prediction was conservative. Over a rolling window of 50 observations, the median rate error and conservative fraction are tracked.
+Guard status transitions from Unknown to Pass after 60 observations if calibration holds, and transitions to Fail if the median rate error exceeds 0.30, the empirical coverage falls below the tolerance, or the e-process alarms.
 
-Guard status transitions from Unknown to Pass after 10 observations if calibration holds, and transitions to Fail if median rate error exceeds 0.30 or the conservative fraction drops below 0.70.
+#### Conformal Time-to-Red Bound
+
+The EWMA forecaster's time-to-red is a point estimate; acting on it has no stated error rate. Each mount keeps an online split-conformal calibrator (`monitor::conformal`): every prediction inside a two-hour horizon is enrolled while the mount is filling at a material rate, and resolves either when the red threshold is crossed (the elapsed time is the truth) or when its own horizon passes without a crossing (a censored observation scored as zero). Pending predictions are discarded when an intervention (ballast release, a reclaim) changes the trajectory. The nonconformity score is the relative under-prediction of time, and the bound is the point estimate shrunk by the `(1 - alpha)` quantile of the last 500 scores. Adaptive conformal inference keeps the guarantee under a shift such as a build burst by moving `alpha` after every resolved prediction:
+
+```
+s_t       = max(0, tte_pred - tte_actual) / tte_pred
+tte_lo    = tte_pred * (1 - q_{1-alpha}(s))
+err_t     = 1[tte_actual < tte_lo issued with the prediction]
+alpha_t+1 = alpha_t + 0.01 * ((1 - coverage_target) - err_t)
+```
+
+The controllers act on `tte_lo`: it is the PID feedforward input, the mount controller's seconds-to-red, and the predictive policy's estimate (the time to exhaustion is shrunk by the same factor). Below 30 resolved samples the bound is the point estimate and the state is `warming`. `pressure.prediction.coverage_target` (0.90) sets the guarantee; `sbh status` shows `red in >=<lo> (point <estimate>)`, `sbh check --predict` uses the bound, `state.json` carries `rates.<mount>.forecast`, decision records carry the bound and coverage at decision time, and the daemon logs a `forecast mount=.. tte_point=.. tte_lo=.. alpha=.. coverage=.. samples=..` line per filling mount per minute that `sbh stats --json` aggregates as `forecast.coverage_by_day`.
 
 #### E-Process Drift Detection
 

@@ -16,6 +16,7 @@ use storage_ballast_helper::ballast::manager::BallastManager;
 use storage_ballast_helper::core::config::{BallastConfig, ScoringConfig};
 use storage_ballast_helper::daemon::policy::{ActiveMode, PolicyConfig, PolicyEngine};
 use storage_ballast_helper::daemon::self_monitor::{SelfMonitor, ThreadHeartbeat};
+use storage_ballast_helper::monitor::conformal::{ConformalCalibrator, ConformalConfig};
 use storage_ballast_helper::monitor::ewma::DiskRateEstimator;
 use storage_ballast_helper::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, GuardStatus, GuardrailConfig,
@@ -132,6 +133,13 @@ fn stress_rapid_fill_burst() {
 
     let mut ewma = make_ewma();
     let mut pid = make_pid();
+    // The same burst seen through the conformal bound (G15): a second
+    // controller acts on `tte_lo` instead of the point estimate.
+    let mut bounded_pid = make_pid();
+    let mut calibrator = ConformalCalibrator::new(ConformalConfig {
+        warmup: 5,
+        ..ConformalConfig::default()
+    });
     let mut report = StressReport::new("rapid_fill_burst");
 
     let start = Instant::now();
@@ -140,6 +148,9 @@ fn stress_rapid_fill_burst() {
     let mut max_urgency: f64 = 0.0;
     let mut red_reached_at: Option<usize> = None;
     let mut critical_reached_at: Option<usize> = None;
+    let mut point_acted_at: Option<usize> = None;
+    let mut bounded_acted_at: Option<usize> = None;
+    let mut bound_never_above_point = true;
 
     for i in 0..60 {
         // Consume space at burst rate.
@@ -153,7 +164,20 @@ fn stress_rapid_fill_burst() {
             total_bytes: total,
             mount: PathBuf::from("/"),
         };
-        let response = pid.update(reading, Some(estimate.seconds_to_exhaustion), t);
+        let response = pid.update(reading.clone(), Some(estimate.seconds_to_exhaustion), t);
+
+        // Resolve last tick's enrolled predictions, then act on the bound.
+        let _ = calibrator.observe(t, free == 0);
+        let interval = calibrator.lower_bound(estimate.seconds_to_exhaustion);
+        bound_never_above_point &= interval.lo_secs <= interval.point_secs + 1e-9;
+        let bounded = bounded_pid.update(reading, Some(interval.lo_secs), t);
+        if response.urgency > 0.8 && point_acted_at.is_none() {
+            point_acted_at = Some(i);
+        }
+        if bounded.urgency > 0.8 && bounded_acted_at.is_none() {
+            bounded_acted_at = Some(i);
+        }
+        calibrator.enroll(t, estimate.seconds_to_exhaustion);
 
         max_urgency = max_urgency.max(response.urgency);
 
@@ -187,6 +211,25 @@ fn stress_rapid_fill_burst() {
         "should reach Red quickly, took {red_tick} ticks"
     );
 
+    // G15: acting on the conformal bound is never later than acting on the
+    // point estimate, and the bound never exceeds it.
+    assert!(
+        bound_never_above_point,
+        "tte_lo must not exceed the point estimate"
+    );
+    if let Some(point_tick) = point_acted_at {
+        let bounded_tick = bounded_acted_at.expect("the bounded controller acts too");
+        assert!(
+            bounded_tick <= point_tick,
+            "bounded controller acted at tick {bounded_tick}, point at {point_tick}"
+        );
+    }
+    let coverage = calibrator.coverage_empirical();
+    report.metric(
+        "conformal_coverage",
+        coverage.map_or_else(|| "none".to_string(), |c| format!("{c:.3}")),
+    );
+    report.metric("conformal_samples", calibrator.samples());
     report.metric("max_urgency", format!("{max_urgency:.3}"));
     report.metric("red_reached_at_tick", red_tick);
     report.metric(
@@ -854,6 +897,7 @@ fn stress_multi_agent_swarm() {
         e_process_value: 2.0,
         e_process_alarm: false,
         consecutive_clean: 5,
+        forecast: None,
         reason: "calibration verified".to_string(),
     };
     let decision = engine.evaluate(&scored, Some(&guard_diag));

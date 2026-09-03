@@ -429,7 +429,7 @@ src/
 |---------|-------------|
 | `[core]` | `strict_config` (unknown keys are always reported; `true` makes the daemon refuse to start and `config validate` fail on them), `control_socket_enabled` (default `true`: the daemon serves `control.sock` beside `state.json`) |
 | `[pressure]` | `green_min_free_pct`, `yellow_min_free_pct`, `orange_min_free_pct`, `red_min_free_pct`, `poll_interval_ms` |
-| `[pressure.prediction]` | `enabled`, `action_horizon_minutes`, `warning_horizon_minutes`, `min_confidence`, `min_samples` |
+| `[pressure.prediction]` | `enabled`, `action_horizon_minutes`, `warning_horizon_minutes`, `min_confidence`, `min_samples`, `coverage_target` (conformal time-to-red bound) |
 | `[pressure.controller]` | per-mount PID: `kp`, `ki`, `kd`, `kf` (forecast feedforward), `integral_cap`, `hysteresis_pct`, `reference_total_bytes`, `kp_scale_min`, `kp_scale_max` |
 | `[scanner]` | `engine` (`"v2"` default, `"v1"` rollback), `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run`, `cross_devices`, `quarantine_enabled`, `quarantine_ttl_hours`, `quarantine_max_bytes_pct` |
 | `[scoring]` | `min_score`, `location_weight`, `name_weight`, `age_weight`, `size_weight`, `structure_weight` |
