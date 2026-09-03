@@ -1315,6 +1315,7 @@ fn open_explain_source(cli: &Cli, config: &Config) -> Result<ExplainSource, CliE
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_explain(cli: &Cli, args: &ExplainArgs) -> Result<(), CliError> {
     use storage_ballast_helper::scanner::decision_record::{
         ExplainLevel, format_explain, is_decision_id,
@@ -1388,7 +1389,14 @@ fn run_explain(cli: &Cli, args: &ExplainArgs) -> Result<(), CliError> {
                 "count": records.len(),
                 "decisions": records
                     .iter()
-                    .map(|record| record.to_json_at_level(level))
+                    .map(|record| {
+                        let mut value = record.to_json_at_level(level);
+                        if let ExplainSource::Sqlite(db) = &source {
+                            value["outcomes"] =
+                                json!(db.outcomes_for_decision(&record.id).unwrap_or_default());
+                        }
+                        value
+                    })
                     .collect::<Vec<_>>(),
             });
             if let Some(count) = shared_count {
@@ -1415,6 +1423,17 @@ fn run_explain(cli: &Cli, args: &ExplainArgs) -> Result<(), CliError> {
                     source.label()
                 );
                 print!("{}", format_explain(record, level));
+                if let ExplainSource::Sqlite(db) = &source {
+                    for outcome in db.outcomes_for_decision(&record.id).unwrap_or_default() {
+                        println!(
+                            "  Outcome: {} at {} ({} after the decision): {}",
+                            outcome.outcome,
+                            outcome.observed_at,
+                            format_duration(Duration::from_secs(outcome.after_secs)),
+                            outcome.detail
+                        );
+                    }
+                }
             }
         }
     }

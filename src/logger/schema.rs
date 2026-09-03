@@ -31,6 +31,7 @@ pub const EVENT_TYPES: &[&str] = &[
     "error",
     "emergency",
     "decision",
+    "decision_outcome",
 ];
 
 /// Severities the contract allows.
@@ -114,6 +115,10 @@ pub fn validate_value(value: &Value) -> Result<u32, String> {
         "decision" => {
             require("decision_id")?;
             require("path")?;
+            require("details")?;
+        }
+        "decision_outcome" => {
+            require("decision_id")?;
             require("details")?;
         }
         "error" => require("error_code")?,

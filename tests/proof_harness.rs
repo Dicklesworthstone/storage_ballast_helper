@@ -177,6 +177,8 @@ fn make_scored(action: DecisionAction, score: f64) -> CandidacyScore {
             fallback_active: false,
             certainty: storage_ballast_helper::scanner::scoring::ArtifactCertainty::Definite,
             posterior_floor_applied: false,
+            regret_calibration: 1.0,
+            category_suspended: false,
         },
         ledger: EvidenceLedger {
             terms: vec![

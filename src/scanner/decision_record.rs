@@ -142,6 +142,13 @@ pub struct DecisionRecord {
     pub fallback_active: bool,
     /// Reason for fallback, if active.
     pub fallback_reason: Option<String>,
+    /// The regret calibration factor applied at decision time (1 with no
+    /// regret evidence for the category).
+    #[serde(default = "one")]
+    pub regret_calibration: f64,
+    /// The category's deletions were suspended after a regret alarm.
+    #[serde(default)]
+    pub category_suspended: bool,
     /// Whether a hard veto was applied.
     pub vetoed: bool,
     /// Reason for hard veto, if applied.
@@ -277,6 +284,10 @@ impl fmt::Display for ActionRecord {
     }
 }
 
+fn one() -> f64 {
+    1.0
+}
+
 /// Guard status snapshot at decision time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardStatusRecord {
@@ -344,6 +355,8 @@ impl DecisionRecordBuilder {
                 "calibration {:.3} below floor",
                 score.decision.calibration_score
             ))
+        } else if score.decision.category_suspended {
+            Some("category suspended after regrets".to_string())
         } else {
             None
         };
@@ -373,6 +386,8 @@ impl DecisionRecordBuilder {
             calibration_score: score.decision.calibration_score,
             fallback_active: score.decision.fallback_active,
             fallback_reason,
+            regret_calibration: score.decision.regret_calibration,
+            category_suspended: score.decision.category_suspended,
             vetoed: score.vetoed,
             veto_reason: score.veto_reason.as_ref().map(ToString::to_string),
             action: ActionRecord::from(score.decision.action),
@@ -489,6 +504,16 @@ fn format_l2(r: &DecisionRecord) -> String {
     } else {
         let _ = writeln!(out, "  Calibration: {cal:.4}", cal = r.calibration_score);
     }
+    if r.regret_calibration < 1.0 {
+        let _ = writeln!(
+            out,
+            "  Regret calibration: {rc:.3} (past regrets in this category raise the bar to delete)",
+            rc = r.regret_calibration,
+        );
+    }
+    if r.category_suspended {
+        out.push_str("  Category suspended: deletions paused after a regret alarm\n");
+    }
     if let Some(guard) = &r.guard_status {
         let _ = writeln!(
             out,
@@ -589,6 +614,8 @@ impl DecisionRecord {
                 "calibration_score": self.calibration_score,
                 "fallback_active": self.fallback_active,
                 "fallback_reason": self.fallback_reason,
+                "regret_calibration": self.regret_calibration,
+                "category_suspended": self.category_suspended,
                 "guard_status": self.guard_status,
                 "policy_mode": self.policy_mode,
                 "comparator_action": self.comparator_action,
@@ -686,6 +713,34 @@ pub fn decision_summary_line(record: &DecisionRecord) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explain_shows_regret_calibration_and_suspension() {
+        let mut builder = super::DecisionRecordBuilder::new();
+        let mut score = sample_score();
+        score.decision.regret_calibration = 0.4;
+        score.decision.category_suspended = true;
+        let record = builder.build(&score, super::PolicyMode::Live, None, None, None);
+        assert!((record.regret_calibration - 0.4).abs() < 1e-12);
+        assert!(record.category_suspended);
+        assert_eq!(
+            record.fallback_reason.as_deref(),
+            Some("category suspended after regrets")
+        );
+        let text = super::format_explain(&record, super::ExplainLevel::L2);
+        assert!(text.contains("Regret calibration: 0.400"), "{text}");
+        assert!(text.contains("Category suspended"), "{text}");
+        let json = record.to_json_at_level(super::ExplainLevel::L2);
+        assert_eq!(json["regret_calibration"], 0.4);
+        assert_eq!(json["category_suspended"], true);
+        // Older records without the fields deserialize with the defaults.
+        let mut value = serde_json::to_value(&record).unwrap();
+        value.as_object_mut().unwrap().remove("regret_calibration");
+        value.as_object_mut().unwrap().remove("category_suspended");
+        let old: super::DecisionRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(old.regret_calibration, 1.0);
+        assert!(!old.category_suspended);
+    }
+
     use super::*;
     use crate::monitor::guardrails::{GuardDiagnostics, GuardStatus};
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
@@ -729,6 +784,8 @@ mod tests {
                 fallback_active: false,
                 certainty: crate::scanner::scoring::ArtifactCertainty::Definite,
                 posterior_floor_applied: false,
+                regret_calibration: 1.0,
+                category_suspended: false,
             },
             ledger: EvidenceLedger {
                 terms: vec![
@@ -817,6 +874,8 @@ mod tests {
                 fallback_active: true,
                 certainty: crate::scanner::scoring::ArtifactCertainty::Unclear,
                 posterior_floor_applied: false,
+                regret_calibration: 1.0,
+                category_suspended: false,
             },
             ledger: EvidenceLedger {
                 terms: Vec::new(),

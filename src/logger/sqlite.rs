@@ -19,6 +19,33 @@ pub struct SqliteLogger {
     path: PathBuf,
 }
 
+/// A row of `decision_outcome`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StoredOutcome {
+    pub decision_id: String,
+    pub path: String,
+    pub category: String,
+    pub certainty: String,
+    pub outcome: String,
+    /// RFC 3339.
+    pub observed_at: String,
+    pub after_secs: u64,
+    pub detail: String,
+}
+
+fn stored_outcome_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredOutcome> {
+    Ok(StoredOutcome {
+        decision_id: row.get(0)?,
+        path: row.get(1)?,
+        category: row.get(2)?,
+        certainty: row.get(3)?,
+        outcome: row.get(4)?,
+        observed_at: row.get(5)?,
+        after_secs: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+        detail: row.get(7)?,
+    })
+}
+
 impl SqliteLogger {
     /// Open (or create) the database at `path`, applying schema and PRAGMAs.
     pub fn open(path: &Path) -> Result<Self> {
@@ -273,6 +300,51 @@ impl SqliteLogger {
                 payload,
             ])?;
         Ok(())
+    }
+
+    /// Record what became of a deletion (regret label).
+    pub fn log_outcome(&self, outcome: &crate::scanner::regret::DecisionOutcome) -> Result<()> {
+        let observed_at =
+            chrono::DateTime::from_timestamp(i64::try_from(outcome.observed_at).unwrap_or(0), 0)
+                .unwrap_or_default()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        self.conn
+            .prepare_cached(
+                "INSERT INTO decision_outcome (
+                    decision_id, path, category, certainty, outcome, observed_at, after_secs, detail
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            )?
+            .execute(params![
+                outcome.decision_id,
+                outcome.path.to_string_lossy().to_string(),
+                outcome.category,
+                outcome.certainty,
+                outcome.outcome.as_str(),
+                observed_at,
+                i64::try_from(outcome.after_secs).unwrap_or(i64::MAX),
+                outcome.detail,
+            ])?;
+        Ok(())
+    }
+
+    /// The outcomes recorded for a decision id, oldest first.
+    pub fn outcomes_for_decision(&self, decision_id: &str) -> Result<Vec<StoredOutcome>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT decision_id, path, category, certainty, outcome, observed_at, after_secs, detail
+             FROM decision_outcome WHERE decision_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![decision_id], stored_outcome_from_row)?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Every outcome observed at or after `since` (RFC 3339), oldest first.
+    pub fn outcomes_since(&self, since: &str) -> Result<Vec<StoredOutcome>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT decision_id, path, category, certainty, outcome, observed_at, after_secs, detail
+             FROM decision_outcome WHERE observed_at >= ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![since], stored_outcome_from_row)?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
     /// The most recent decision with this stable id, plus how many records
@@ -624,6 +696,20 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             record TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS decision_outcome (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            category TEXT NOT NULL,
+            certainty TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            after_secs INTEGER NOT NULL,
+            detail TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_outcome_decision_id ON decision_outcome(decision_id);
+        CREATE INDEX IF NOT EXISTS idx_outcome_observed_at ON decision_outcome(observed_at);
         CREATE INDEX IF NOT EXISTS idx_decision_id ON decision_log(decision_id);
         CREATE INDEX IF NOT EXISTS idx_decision_path ON decision_log(path);
         CREATE INDEX IF NOT EXISTS idx_decision_timestamp ON decision_log(timestamp);

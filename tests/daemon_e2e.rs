@@ -1787,6 +1787,137 @@ fn green_quarantine_holds_the_stale_target_and_orange_drains_it_first() {
     assert!(status.success(), "{status}");
 }
 
+/// Scenario `regret` (Q4): the fixture mount is Orange, so its stale
+/// target is removed for good; recreating it while a process works under
+/// the project directory is a `regret` outcome, which reaches the ledger,
+/// `sbh explain`, and the next decision on that category as a lowered
+/// regret calibration.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
+    let dir = scratch();
+    let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
+    let fixture_mount = dir.path().to_path_buf();
+    // 1 TB volume at 11% free: Orange on the fixture mount itself, so the
+    // scan is pressure-driven and the executor removes (no quarantine).
+    let table = injected_table(&[
+        (&fixture_mount, 1_000_000_000_000, 110_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![fixtures.root.clone()],
+        min_file_age_minutes: 1,
+        min_rescan_interval_secs: 5,
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    let stale_path = fixtures.stale_target.clone();
+    run.wait_until(
+        "removal of the stale target at Orange",
+        Duration::from_secs(150),
+        |run| {
+            fixtures.touch_fresh();
+            run.events_of("artifact_delete").iter().any(|e| {
+                e["path"] == stale_path.to_string_lossy().as_ref()
+                    && e["quarantined"] != Value::Bool(true)
+            })
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let deletion = run
+        .events_of("artifact_delete")
+        .into_iter()
+        .find(|e| e["path"] == stale_path.to_string_lossy().as_ref())
+        .unwrap();
+    let decision_id = deletion["decision_id"].as_str().unwrap().to_string();
+    assert!(!stale_path.exists());
+
+    // The build comes back: the target is recreated while a process works
+    // in the project directory.
+    fs::create_dir_all(stale_path.join("debug")).unwrap();
+    fs::write(stale_path.join("debug").join("fresh.rlib"), b"rebuilt").unwrap();
+    let mut worker = Command::new("sleep")
+        .arg("300")
+        .current_dir(stale_path.parent().unwrap())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn a worker under the project");
+    run.wait_until("the regret outcome", Duration::from_secs(30), |run| {
+        fixtures.touch_fresh();
+        run.events_of("decision_outcome").iter().any(|e| {
+            e["decision_id"] == decision_id.as_str()
+                && e["details"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("outcome=regret"))
+        })
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(run.stderr_count("[SBH-REGRET] decision="), 1);
+    assert!(
+        run.stderr().contains("outcome=regret category=RustTarget"),
+        "{}",
+        run.stderr()
+    );
+
+    // The ledger and `sbh explain` carry the outcome.
+    let explain = Command::new(common::sbh_bin_path())
+        .arg("--config")
+        .arg(&run.config_path)
+        .args(["--json", "explain", "--id", &decision_id])
+        .env("SBH_TEST_MODE", "1")
+        .env("SBH_TEST_FS_STATS", &table)
+        .output()
+        .expect("run sbh explain");
+    let payload: Value = serde_json::from_str(String::from_utf8_lossy(&explain.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&explain.stdout)));
+    let outcomes = payload["decisions"][0]["outcomes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{payload}"));
+    assert_eq!(outcomes.len(), 1, "{payload}");
+    assert_eq!(outcomes[0]["outcome"], "regret", "{payload}");
+    assert_eq!(outcomes[0]["category"], "RustTarget", "{payload}");
+
+    // The next decision on the recreated target carries the tightened
+    // calibration: one regret in one decision puts the bound at 1, so the
+    // category's factor is 0 and the target is kept, not deleted.
+    let before = run.events_of("decision").len();
+    run.signal("-USR1");
+    run.wait_until(
+        "a decision on the recreated target after the regret",
+        Duration::from_secs(30),
+        |run| {
+            fixtures.touch_fresh();
+            run.events_of("decision")
+                .iter()
+                .skip(before)
+                .any(|e| e["path"] == stale_path.to_string_lossy().as_ref())
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let decision = run
+        .events_of("decision")
+        .into_iter()
+        .skip(before)
+        .find(|e| e["path"] == stale_path.to_string_lossy().as_ref())
+        .unwrap();
+    let record: Value = serde_json::from_str(decision["details"].as_str().unwrap()).unwrap();
+    assert!(
+        record["regret_calibration"]
+            .as_f64()
+            .is_some_and(|c| c < 1e-9),
+        "{record}"
+    );
+    assert_ne!(record["action"], "delete", "{record}");
+    assert_ne!(record["effective_action"], "delete", "{record}");
+    assert!(stale_path.exists(), "the recreated target survives");
+    let _ = worker.kill();
+    let _ = worker.wait();
+    assert_log_conforms(&run.data_dir);
+    let status = run.stop();
+    assert!(status.success(), "{status}");
+}
+
 /// Scenario `reload`: SIGHUP with a new root in the config file logs the
 /// reload and the matrix, and the new root's stale target is reclaimed by
 /// the next maintenance pass.

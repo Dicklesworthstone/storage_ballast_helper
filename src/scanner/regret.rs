@@ -17,6 +17,8 @@
 //! tighten anything. A per-category e-process (H0: regret rate <= alpha)
 //! suspends only that category's deletions for `suspend` when it alarms.
 
+#![allow(clippy::cast_precision_loss)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,21 +41,22 @@ pub struct RegretConfig {
     pub delta: f64,
     /// Strength (pseudo-observations) of the pooled prior.
     pub prior_strength: f64,
-    /// E-process alarm threshold and how long an alarm suspends a category.
+    /// E-process alarm threshold (H0: regret rate <= alpha).
     pub e_threshold: f64,
+    /// How long an alarm suspends the category's deletions.
     pub suspend: Duration,
 }
 
 impl Default for RegretConfig {
     fn default() -> Self {
         Self {
-            window: Duration::from_secs(30 * 60),
+            window: Duration::from_mins(30),
             alpha_definite: 0.02,
             alpha_likely: 0.005,
             delta: 0.05,
             prior_strength: 10.0,
             e_threshold: 20.0,
-            suspend: Duration::from_secs(60 * 60),
+            suspend: Duration::from_hours(1),
         }
     }
 }
@@ -71,6 +74,18 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// The stored outcome for a name (`None` for anything else).
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "regret" => Some(Self::Regret),
+            "clean" => Some(Self::Clean),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    /// The stored name of the outcome.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -85,8 +100,11 @@ impl Outcome {
 /// its name. Survives a delete-and-recreate of the entry itself.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EntryIdentity {
+    /// Device of the parent directory.
     pub parent_device: u64,
+    /// Inode of the parent directory.
     pub parent_inode: u64,
+    /// The entry's file name within that parent.
     pub name: String,
 }
 
@@ -124,25 +142,38 @@ impl EntryIdentity {
 /// A deletion under watch.
 #[derive(Debug, Clone)]
 pub struct Watch {
+    /// The decision that removed the entry.
     pub decision_id: String,
+    /// Where the entry was.
     pub path: PathBuf,
+    /// The entry's identity, captured before the removal.
     pub identity: EntryIdentity,
+    /// Artifact category key (`{:?}` of the classification category).
     pub category: String,
+    /// Structural certainty at decision time.
     pub certainty: ArtifactCertainty,
+    /// When the entry was removed.
     pub deleted_at: Instant,
 }
 
 /// A resolved outcome, ready for the ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionOutcome {
+    /// The decision the outcome belongs to.
     pub decision_id: String,
+    /// The deleted entry's original path.
     pub path: PathBuf,
+    /// Artifact category key at decision time.
     pub category: String,
+    /// `definite`, `likely` or `unclear` at decision time.
+    pub certainty: String,
+    /// What became of the deletion.
     pub outcome: Outcome,
     /// Unix seconds.
     pub observed_at: u64,
     /// Seconds between the deletion and the observation.
     pub after_secs: u64,
+    /// A one-line reason.
     pub detail: String,
 }
 
@@ -163,6 +194,7 @@ pub struct RegretDetector {
 }
 
 impl RegretDetector {
+    /// A detector with no watches; `window` is the regret window.
     #[must_use]
     pub fn new(window: Duration) -> Self {
         Self {
@@ -171,6 +203,7 @@ impl RegretDetector {
         }
     }
 
+    /// Deletions still under watch.
     #[must_use]
     pub fn pending(&self) -> usize {
         self.watches.len()
@@ -186,7 +219,11 @@ impl RegretDetector {
     /// Resolve watches: `look` reports what is at each watched path now.
     /// Recreated entries resolve immediately; the rest resolve `clean`
     /// when their window passes.
-    pub fn check(&mut self, now: Instant, mut look: impl FnMut(&Watch) -> Sighting) -> Vec<DecisionOutcome> {
+    pub fn check(
+        &mut self,
+        now: Instant,
+        mut look: impl FnMut(&Watch) -> Sighting,
+    ) -> Vec<DecisionOutcome> {
         let window = self.window;
         let mut outcomes = Vec::new();
         let mut keep = Vec::with_capacity(self.watches.len());
@@ -197,7 +234,10 @@ impl RegretDetector {
                 if sighting.parent_in_use {
                     Some((Outcome::Regret, "recreated while a process used the parent"))
                 } else {
-                    Some((Outcome::Unknown, "recreated with no live user under the parent"))
+                    Some((
+                        Outcome::Unknown,
+                        "recreated with no live user under the parent",
+                    ))
                 }
             } else if age >= window {
                 Some((Outcome::Clean, "window passed without a recreation"))
@@ -209,6 +249,7 @@ impl RegretDetector {
                     decision_id: watch.decision_id,
                     path: watch.path,
                     category: watch.category,
+                    certainty: certainty_name(watch.certainty).to_string(),
                     outcome,
                     observed_at: now_unix(),
                     after_secs: age.as_secs(),
@@ -222,6 +263,26 @@ impl RegretDetector {
     }
 }
 
+/// The stored name of a certainty class.
+#[must_use]
+pub fn certainty_name(certainty: ArtifactCertainty) -> &'static str {
+    match certainty {
+        ArtifactCertainty::Definite => "definite",
+        ArtifactCertainty::Likely => "likely",
+        ArtifactCertainty::Unclear => "unclear",
+    }
+}
+
+/// The certainty class a stored name denotes (`Unclear` for anything else).
+#[must_use]
+pub fn certainty_from_name(name: &str) -> ArtifactCertainty {
+    match name {
+        "definite" => ArtifactCertainty::Definite,
+        "likely" => ArtifactCertainty::Likely,
+        _ => ArtifactCertainty::Unclear,
+    }
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -231,8 +292,11 @@ fn now_unix() -> u64 {
 /// One category's regret evidence.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CategoryStats {
+    /// Resolved outcomes counted as evidence (`regret` or `clean`).
     pub decisions: u64,
+    /// Of those, regrets.
     pub regrets: u64,
+    /// Of those, decisions whose candidate was Definite.
     pub definite_decisions: u64,
     /// Log e-process value against H0: regret rate <= alpha.
     #[serde(skip)]
@@ -245,8 +309,11 @@ pub struct CategoryStats {
 /// The per-category picture the decision layer and `sbh explain` read.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CategoryCalibration {
+    /// Artifact category key.
     pub category: String,
+    /// Resolved outcomes counted as evidence.
     pub decisions: u64,
+    /// Of those, regrets.
     pub regrets: u64,
     /// Tolerated regret rate for the category.
     pub alpha: f64,
@@ -256,7 +323,9 @@ pub struct CategoryCalibration {
     pub upper_bound: f64,
     /// `1 - excess of the bound over alpha`; 1 with no regrets.
     pub calibration: f64,
+    /// The category's e-process value against H0: rate <= alpha.
     pub e_value: f64,
+    /// Whether the category's deletions are suspended right now.
     pub suspended: bool,
 }
 
@@ -269,6 +338,7 @@ pub struct RegretCalibrator {
 }
 
 impl RegretCalibrator {
+    /// A calibrator with no evidence.
     #[must_use]
     pub fn new(config: RegretConfig) -> Self {
         Self {
@@ -277,13 +347,20 @@ impl RegretCalibrator {
         }
     }
 
+    /// The tunables in force.
     #[must_use]
     pub fn config(&self) -> &RegretConfig {
         &self.config
     }
 
     /// Record an outcome. `Unknown` outcomes are not evidence.
-    pub fn record(&mut self, category: &str, certainty: ArtifactCertainty, outcome: Outcome, now: Instant) {
+    pub fn record(
+        &mut self,
+        category: &str,
+        certainty: ArtifactCertainty,
+        outcome: Outcome,
+        now: Instant,
+    ) {
         if outcome == Outcome::Unknown {
             return;
         }
@@ -309,7 +386,11 @@ impl RegretCalibrator {
     }
 
     /// Rebuild from stored outcomes (daemon start).
-    pub fn replay(&mut self, outcomes: impl IntoIterator<Item = (String, ArtifactCertainty, Outcome)>, now: Instant) {
+    pub fn replay(
+        &mut self,
+        outcomes: impl IntoIterator<Item = (String, ArtifactCertainty, Outcome)>,
+        now: Instant,
+    ) {
         for (category, certainty, outcome) in outcomes {
             self.record(&category, certainty, outcome, now);
         }
@@ -339,7 +420,9 @@ impl RegretCalibrator {
         let (regrets, decisions) = self
             .categories
             .values()
-            .fold((0.0f64, 0.0f64), |(r, n), s| (r + s.regrets as f64, n + s.decisions as f64));
+            .fold((0.0f64, 0.0f64), |(r, n), s| {
+                (r + s.regrets as f64, n + s.decisions as f64)
+            });
         let mean = ((regrets + 0.5) / (decisions + 1.0)).clamp(1e-4, 0.5);
         let strength = self.config.prior_strength.max(1.0);
         (mean * strength, (1.0 - mean) * strength)
@@ -370,8 +453,7 @@ impl RegretCalibrator {
         }
         let alpha = self.alpha_for(category, ArtifactCertainty::Likely);
         let (a0, b0) = self.prior();
-        let posterior_mean =
-            (a0 + stats.regrets as f64) / (a0 + b0 + stats.decisions as f64);
+        let posterior_mean = (a0 + stats.regrets as f64) / (a0 + b0 + stats.decisions as f64);
         let upper_bound = clopper_pearson_upper(stats.regrets, stats.decisions, self.config.delta);
         let calibration = if stats.regrets == 0 {
             1.0
@@ -455,7 +537,10 @@ fn regularized_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
     if x >= 1.0 {
         return 1.0;
     }
-    let ln_front = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln();
+    let ln_front = a.mul_add(
+        x.ln(),
+        b.mul_add((1.0 - x).ln(), ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b)),
+    );
     if x < (a + 1.0) / (a + b + 2.0) {
         ln_front.exp() * beta_continued_fraction(x, a, b) / a
     } else {
@@ -463,6 +548,7 @@ fn regularized_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
     }
 }
 
+#[allow(clippy::many_single_char_names)]
 fn beta_continued_fraction(x: f64, a: f64, b: f64) -> f64 {
     const TINY: f64 = 1e-300;
     const EPS: f64 = 1e-14;
@@ -480,7 +566,7 @@ fn beta_continued_fraction(x: f64, a: f64, b: f64) -> f64 {
         let m = f64::from(m);
         let m2 = 2.0 * m;
         let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
-        d = 1.0 + aa * d;
+        d = aa.mul_add(d, 1.0);
         if d.abs() < TINY {
             d = TINY;
         }
@@ -491,7 +577,7 @@ fn beta_continued_fraction(x: f64, a: f64, b: f64) -> f64 {
         d = 1.0 / d;
         h *= d * c;
         let aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
-        d = 1.0 + aa * d;
+        d = aa.mul_add(d, 1.0);
         if d.abs() < TINY {
             d = TINY;
         }
@@ -521,7 +607,7 @@ fn ln_gamma(x: f64) -> f64 {
     ];
     let mut y = x;
     let tmp = x + 5.5;
-    let tmp = tmp - (x + 0.5) * tmp.ln();
+    let tmp = (x + 0.5).mul_add(-tmp.ln(), tmp);
     let mut ser = 1.000_000_000_190_015;
     for coefficient in COEFFICIENTS {
         y += 1.0;
@@ -553,7 +639,9 @@ mod tests {
     fn incomplete_beta_matches_known_values() {
         assert!((regularized_incomplete_beta(0.5, 1.0, 1.0) - 0.5).abs() < 1e-12);
         // I_x(1, b) = 1 - (1 - x)^b.
-        assert!((regularized_incomplete_beta(0.3, 1.0, 4.0) - (1.0 - 0.7f64.powi(4))).abs() < 1e-10);
+        assert!(
+            (regularized_incomplete_beta(0.3, 1.0, 4.0) - (1.0 - 0.7f64.powi(4))).abs() < 1e-10
+        );
         // I_x(a, 1) = x^a.
         assert!((regularized_incomplete_beta(0.6, 3.0, 1.0) - 0.6f64.powi(3)).abs() < 1e-10);
         // Symmetry: I_x(a, b) = 1 - I_{1-x}(b, a).
@@ -566,7 +654,9 @@ mod tests {
     #[test]
     fn clopper_pearson_bound_is_monotone_in_count_and_matches_the_closed_forms() {
         assert_eq!(clopper_pearson_upper(0, 0, 0.05), 1.0);
-        assert!((clopper_pearson_upper(0, 20, 0.05) - (1.0 - 0.05f64.powf(1.0 / 20.0))).abs() < 1e-12);
+        assert!(
+            (clopper_pearson_upper(0, 20, 0.05) - (1.0 - 0.05f64.powf(1.0 / 20.0))).abs() < 1e-12
+        );
         assert_eq!(clopper_pearson_upper(5, 5, 0.05), 1.0);
         // One regret in ten: the textbook 95% one-sided upper bound is 0.394.
         let one_in_ten = clopper_pearson_upper(1, 10, 0.05);
@@ -591,7 +681,12 @@ mod tests {
         let now = Instant::now();
         let mut calibrator = RegretCalibrator::new(RegretConfig::default());
         for _ in 0..200 {
-            calibrator.record("rust_target", ArtifactCertainty::Definite, Outcome::Clean, now);
+            calibrator.record(
+                "rust_target",
+                ArtifactCertainty::Definite,
+                Outcome::Clean,
+                now,
+            );
         }
         assert_eq!(calibrator.calibration("rust_target"), 1.0);
         assert!(!calibrator.suspended("rust_target", now));
@@ -599,19 +694,32 @@ mod tests {
         assert!(summary.upper_bound < 0.02, "{summary:?}");
 
         for i in 0..100 {
-            let outcome = if i % 10 == 0 { Outcome::Regret } else { Outcome::Clean };
+            let outcome = if i % 10 == 0 {
+                Outcome::Regret
+            } else {
+                Outcome::Clean
+            };
             calibrator.record("node_modules", ArtifactCertainty::Likely, outcome, now);
         }
         let node = calibrator.summary("node_modules").unwrap();
         assert_eq!(node.regrets, 10);
         assert!(node.upper_bound > 0.1 && node.upper_bound < 0.2, "{node:?}");
         assert!(node.calibration < 0.9, "{node:?}");
-        assert_eq!(calibrator.calibration("rust_target"), 1.0, "another category is untouched");
-        assert!(calibrator.calibration("never_seen") == 1.0);
+        assert_eq!(
+            calibrator.calibration("rust_target"),
+            1.0,
+            "another category is untouched"
+        );
+        assert!((calibrator.calibration("never_seen") - 1.0).abs() < f64::EPSILON);
         let factors = calibrator.calibrations();
         assert_eq!(factors.len(), 2);
         // Unknown outcomes are not evidence.
-        calibrator.record("node_modules", ArtifactCertainty::Likely, Outcome::Unknown, now);
+        calibrator.record(
+            "node_modules",
+            ArtifactCertainty::Likely,
+            Outcome::Unknown,
+            now,
+        );
         assert_eq!(calibrator.summary("node_modules").unwrap().decisions, 100);
     }
 
@@ -619,21 +727,36 @@ mod tests {
     fn a_run_of_regrets_suspends_only_that_category_for_the_configured_time() {
         let now = Instant::now();
         let config = RegretConfig {
-            suspend: Duration::from_secs(600),
+            suspend: Duration::from_mins(10),
             ..RegretConfig::default()
         };
         let mut calibrator = RegretCalibrator::new(config);
-        calibrator.record("rust_target", ArtifactCertainty::Definite, Outcome::Clean, now);
+        calibrator.record(
+            "rust_target",
+            ArtifactCertainty::Definite,
+            Outcome::Clean,
+            now,
+        );
         for _ in 0..3 {
             calibrator.record("pip_cache", ArtifactCertainty::Likely, Outcome::Regret, now);
         }
-        assert!(calibrator.suspended("pip_cache", now), "{:?}", calibrator.summary("pip_cache"));
+        assert!(
+            calibrator.suspended("pip_cache", now),
+            "{:?}",
+            calibrator.summary("pip_cache")
+        );
         assert!(!calibrator.suspended("rust_target", now));
         assert!(!calibrator.suspended("pip_cache", now + Duration::from_secs(601)));
         // Replay from the ledger rebuilds the counts but not the suspension.
         let mut rebuilt = RegretCalibrator::new(RegretConfig::default());
         rebuilt.replay(
-            (0..3).map(|_| ("pip_cache".to_string(), ArtifactCertainty::Likely, Outcome::Regret)),
+            (0..3).map(|_| {
+                (
+                    "pip_cache".to_string(),
+                    ArtifactCertainty::Likely,
+                    Outcome::Regret,
+                )
+            }),
             now,
         );
         assert_eq!(rebuilt.summary("pip_cache").unwrap().regrets, 3);
@@ -643,7 +766,7 @@ mod tests {
     #[test]
     fn detector_labels_recreation_in_use_as_regret_and_expiry_as_clean() {
         let t0 = Instant::now();
-        let mut detector = RegretDetector::new(Duration::from_secs(1800));
+        let mut detector = RegretDetector::new(Duration::from_mins(30));
         let a = PathBuf::from("/p/a/target");
         let b = PathBuf::from("/p/b/target");
         let c = PathBuf::from("/p/c/target");
@@ -658,13 +781,16 @@ mod tests {
             parent_in_use: w.path == a,
         });
         assert_eq!(outcomes.len(), 2);
-        let by_id: HashMap<_, _> = outcomes.iter().map(|o| (o.decision_id.as_str(), o)).collect();
+        let by_id: HashMap<_, _> = outcomes
+            .iter()
+            .map(|o| (o.decision_id.as_str(), o))
+            .collect();
         assert_eq!(by_id["d-a"].outcome, Outcome::Regret);
         assert_eq!(by_id["d-b"].outcome, Outcome::Unknown);
         assert_eq!(by_id["d-a"].after_secs, 600);
         assert_eq!(detector.pending(), 1);
         // The window passes for c.
-        let outcomes = detector.check(t0 + Duration::from_secs(1800), |_| Sighting {
+        let outcomes = detector.check(t0 + Duration::from_mins(30), |_| Sighting {
             recreated: false,
             parent_in_use: true,
         });

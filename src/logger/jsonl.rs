@@ -50,6 +50,9 @@ pub enum EventType {
     Decision,
     /// A policy engine mode change (`details`: `kind: from -> to`).
     PolicyTransition,
+    /// What became of a deletion (`regret`, `clean`, `unknown`), keyed by
+    /// `decision_id`.
+    DecisionOutcome,
 }
 
 /// A single JSONL log entry — all fields optional except `ts`, `event`, `severity`.

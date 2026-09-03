@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -306,6 +307,12 @@ pub struct DecisionOutcome {
     /// True when `posterior_abandoned` was raised to the configured
     /// `scoring.posterior_floor_definite` because the candidate is `Definite`.
     pub posterior_floor_applied: bool,
+    /// The regret calibration factor applied to `calibration_score` (1 when
+    /// the category has no regret evidence).
+    pub regret_calibration: f64,
+    /// True when the category's deletions are suspended after a regret
+    /// alarm (a `Delete` verdict became `Review`).
+    pub category_suspended: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -359,9 +366,32 @@ pub struct ScoringEngine {
     false_negative_loss: f64,
     calibration_floor: f64,
     posterior_floor_definite: f64,
+    /// Regret calibration factor per category key (`{:?}` of the
+    /// category); absent means 1.
+    category_calibration: HashMap<String, f64>,
+    /// Categories whose deletions are paused after a regret alarm.
+    suspended_categories: HashSet<String>,
 }
 
 impl ScoringEngine {
+    /// Apply the regret calibrator's view: a factor per category that
+    /// multiplies the classification calibration, and the categories whose
+    /// `Delete` verdicts become `Review` for now.
+    pub fn set_regret(&mut self, calibrations: HashMap<String, f64>, suspended: HashSet<String>) {
+        self.category_calibration = calibrations;
+        self.suspended_categories = suspended;
+    }
+
+    /// The regret calibration factor in force for a category key.
+    #[must_use]
+    pub fn regret_calibration_for(&self, category_key: &str) -> f64 {
+        self.category_calibration
+            .get(category_key)
+            .copied()
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0)
+    }
+
     #[must_use]
     pub fn from_config(scoring: &ScoringConfig, min_file_age_minutes: u64) -> Self {
         Self {
@@ -378,6 +408,8 @@ impl ScoringEngine {
             false_negative_loss: scoring.false_negative_loss,
             calibration_floor: scoring.calibration_floor,
             posterior_floor_definite: scoring.posterior_floor_definite.clamp(0.0, 1.0),
+            category_calibration: HashMap::new(),
+            suspended_categories: HashSet::new(),
         }
     }
 
@@ -407,6 +439,7 @@ impl ScoringEngine {
         self.vetoed(input, reason.into())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn score_candidate_inner(
         &self,
         input: &CandidateInput,
@@ -456,7 +489,13 @@ impl ScoringEngine {
         };
         let base_expected_loss_keep = posterior_abandoned * self.false_negative_loss;
         let base_expected_loss_delete = (1.0 - posterior_abandoned) * self.false_positive_loss;
-        let calibration = calibration_score(input.classification.combined_confidence, factors);
+        // Regret calibration (Q4): what actually happened to this category's
+        // past deletions scales the calibration the decision layer sees, so
+        // a category with observed regret needs a higher posterior to delete.
+        let category_key = format!("{:?}", input.classification.category);
+        let regret_calibration = self.regret_calibration_for(&category_key);
+        let calibration = calibration_score(input.classification.combined_confidence, factors)
+            * regret_calibration;
         let fallback_active = calibration < self.calibration_floor;
         let uncertainty = epistemic_uncertainty(posterior_abandoned, calibration);
         let (expected_loss_keep, expected_loss_delete) = uncertainty_adjusted_losses(
@@ -489,6 +528,14 @@ impl ScoringEngine {
                 uncertainty,
             ),
         );
+        // A suspended category (its regret e-process alarmed) keeps its
+        // evidence but does not delete until the suspension lapses.
+        let category_suspended = self.suspended_categories.contains(&category_key);
+        let action = if category_suspended && action == DecisionAction::Delete {
+            DecisionAction::Review
+        } else {
+            action
+        };
 
         let ledger = build_ledger(
             factors,
@@ -524,6 +571,8 @@ impl ScoringEngine {
                 fallback_active,
                 certainty,
                 posterior_floor_applied,
+                regret_calibration,
+                category_suspended,
             },
             ledger,
         }
@@ -640,6 +689,8 @@ impl ScoringEngine {
                 fallback_active: true,
                 certainty: ArtifactCertainty::Unclear,
                 posterior_floor_applied: false,
+                regret_calibration: 1.0,
+                category_suspended: false,
             },
             ledger: EvidenceLedger {
                 terms: Vec::new(),
@@ -1413,6 +1464,7 @@ mod tests {
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification, StructuralSignals};
     use crate::scanner::protection::{SacredOverlap, SacredOverlapKind};
     use std::borrow::Cow;
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -2005,6 +2057,63 @@ mod tests {
         );
         assert!(low.ledger.summary.contains("certainty=definite"));
         assert!(low.ledger.summary.contains("posterior_floor_applied=true"));
+    }
+
+    #[test]
+    fn regret_calibration_raises_the_bar_only_for_its_category_and_suspension_reviews() {
+        let mut engine = default_engine();
+        let target = stale_definite_target("/data/tmp/stale/target");
+        let baseline = engine.score_candidate(&target, 0.2);
+        assert_eq!(baseline.decision.action, DecisionAction::Delete);
+        assert_eq!(baseline.decision.regret_calibration, 1.0);
+        assert!(!baseline.decision.category_suspended);
+
+        // Regret evidence in another category changes nothing here.
+        engine.set_regret(
+            HashMap::from([("NodeModules".to_string(), 0.2)]),
+            HashSet::from(["NodeModules".to_string()]),
+        );
+        let other = engine.score_candidate(&target, 0.2);
+        assert_eq!(other.decision.action, DecisionAction::Delete);
+        assert_eq!(other.decision.regret_calibration, 1.0);
+        assert!(
+            (other.decision.calibration_score - baseline.decision.calibration_score).abs() < 1e-12
+        );
+
+        // Evidence in this category scales the calibration the decision
+        // layer sees; a heavy factor drops it under the floor (fallback).
+        let key = format!("{:?}", target.classification.category);
+        engine.set_regret(HashMap::from([(key.clone(), 0.5)]), HashSet::new());
+        let tightened = engine.score_candidate(&target, 0.2);
+        assert!((tightened.decision.regret_calibration - 0.5).abs() < 1e-12);
+        assert!(
+            baseline
+                .decision
+                .calibration_score
+                .mul_add(-0.5, tightened.decision.calibration_score)
+                .abs()
+                < 1e-12
+        );
+        assert_ne!(
+            tightened.decision.action,
+            DecisionAction::Delete,
+            "{}",
+            tightened.ledger.summary
+        );
+        engine.set_regret(HashMap::from([(key.clone(), 0.0)]), HashSet::new());
+        let floored = engine.score_candidate(&target, 0.2);
+        assert!(floored.decision.fallback_active);
+        assert_eq!(floored.decision.action, DecisionAction::Keep);
+
+        // A suspended category keeps its evidence but reviews instead of deleting.
+        engine.set_regret(HashMap::new(), HashSet::from([key]));
+        let suspended = engine.score_candidate(&target, 0.2);
+        assert!(suspended.decision.category_suspended);
+        assert_eq!(suspended.decision.action, DecisionAction::Review);
+        assert!(
+            (suspended.decision.posterior_abandoned - baseline.decision.posterior_abandoned).abs()
+                < 1e-9
+        );
     }
 
     #[test]

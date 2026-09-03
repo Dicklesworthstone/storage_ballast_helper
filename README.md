@@ -1163,6 +1163,12 @@ The first deletion of a given path has no cooldown. After the second deletion, c
 
 Red and Critical pressure bypasses all dampening. Disk safety takes priority over anti-churn protection.
 
+#### Layer 8: Regret Labels and Per-Category Calibration
+
+A deletion was a mistake when the same directory entry (parent device and inode plus name) is recreated within `scoring.regret_window_minutes` (30) of the deletion while a process has its working directory or an open file under the parent: something still used it. The daemon watches every removal for good, labels each one `regret`, `clean` (the window passed) or `unknown` (recreated with no live user), stores the label in SQLite `decision_outcome` and as a `decision_outcome` JSONL line, and `sbh explain --id <decision-id>` shows it as an `Outcome:` line.
+
+Labels calibrate the fast lane per artifact category. Each category keeps a Beta posterior on its regret rate under a prior pooled across categories, and a Clopper-Pearson upper bound (95%) on that rate. The bound's excess over the tolerated rate (`scoring.regret_alpha_definite` 0.02 for Definite-dominated categories, `scoring.regret_alpha_likely` 0.005 otherwise) lowers the category's calibration factor, which the decision layer turns into a higher required posterior for Delete; explain shows it as `Regret calibration:`. Zero regrets never tighten anything, and a regret in one category never touches another. A per-category e-process against "regret rate <= alpha" suspends only that category's deletions (Delete verdicts become Review, `fallback_reason: category suspended after regrets`) for `scoring.regret_suspend_minutes` (60) when it alarms. The calibrator is rebuilt from the last 30 days of stored outcomes at daemon start.
+
 #### Layer 7: Quarantine-First Deletion and `sbh undo`
 
 Hard vetoes make the known mis-scorings impossible; they cannot make the next one recoverable. At Green there is time to keep the bytes around, so the daemon does: a Green batch (and every `sbh clean` unless `--no-quarantine`) does not unlink a candidate, it renames it into `<root>/.sbh/quarantine/<decision-id>/<basename>` on the same filesystem, next to a `<decision-id>.json` record naming the original path. The quarantine root carries a `.sbh-protect` marker so no scan ever scores it. The event is still `artifact_delete` with `"quarantined": true` and no bytes freed.

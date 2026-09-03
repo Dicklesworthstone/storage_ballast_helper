@@ -149,6 +149,9 @@ pub enum ActivityEvent {
     /// A cleanup decision (keep, delete, review, veto) for the evidence
     /// ledger: SQLite `decision_log` plus a JSONL `decision` line.
     DecisionRecorded(Box<DecisionRecord>),
+    /// What became of a deletion (regret label): SQLite `decision_outcome`
+    /// plus a JSONL `decision_outcome` line.
+    DecisionOutcome(Box<crate::scanner::regret::DecisionOutcome>),
     /// Sentinel to request graceful shutdown of the logger thread.
     Shutdown,
 }
@@ -426,6 +429,9 @@ fn logger_thread_main(
                     ActivityEvent::DecisionRecorded(record) => {
                         Some(db.log_decision(record).is_ok())
                     }
+                    ActivityEvent::DecisionOutcome(outcome) => {
+                        Some(db.log_outcome(outcome).is_ok())
+                    }
                     _ => None,
                 };
                 let ballast_ok = ballast_inventory_write(db, &event, &jsonl_entry.ts);
@@ -626,6 +632,20 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
                 from,
                 to,
                 reason.as_deref(),
+            ));
+            e
+        }
+        ActivityEvent::DecisionOutcome(outcome) => {
+            let mut e = LogEntry::new(EventType::DecisionOutcome, Severity::Info);
+            e.path = Some(outcome.path.to_string_lossy().to_string());
+            e.decision_id = Some(outcome.decision_id.clone());
+            e.details = Some(format!(
+                "outcome={} category={} certainty={} after_secs={} {}",
+                outcome.outcome.as_str(),
+                outcome.category,
+                outcome.certainty,
+                outcome.after_secs,
+                outcome.detail
             ));
             e
         }

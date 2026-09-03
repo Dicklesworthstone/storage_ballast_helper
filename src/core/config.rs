@@ -612,6 +612,17 @@ pub struct ScoringConfig {
     /// caches). The floor changes only the prior fed into the expected-loss
     /// decision; every veto still runs first. Default 0.85.
     pub posterior_floor_definite: f64,
+    /// Regret labels (Q4): a deletion recreated within this many minutes
+    /// while a process uses the parent directory is a regret.
+    pub regret_window_minutes: u64,
+    /// Tolerated regret rate for categories whose decisions are mostly
+    /// Definite, and for the rest; the Clopper-Pearson bound's excess over
+    /// it lowers the category's calibration factor.
+    pub regret_alpha_definite: f64,
+    pub regret_alpha_likely: f64,
+    /// How long a category's deletions pause after its regret e-process
+    /// alarms.
+    pub regret_suspend_minutes: u64,
 }
 
 /// Ballast allocation settings.
@@ -1141,6 +1152,10 @@ impl Default for ScoringConfig {
             false_negative_loss: 30.0,
             calibration_floor: 0.40,
             posterior_floor_definite: 0.85,
+            regret_window_minutes: 30,
+            regret_alpha_definite: 0.02,
+            regret_alpha_likely: 0.005,
+            regret_suspend_minutes: 60,
         }
     }
 }
@@ -2305,6 +2320,16 @@ impl Config {
                 details: "telemetry.cpu_budget_pct must be 0..=100 (percent of one core)"
                     .to_string(),
             });
+        }
+        for (name, value) in [
+            ("regret_alpha_definite", self.scoring.regret_alpha_definite),
+            ("regret_alpha_likely", self.scoring.regret_alpha_likely),
+        ] {
+            if !(value.is_finite() && value > 0.0 && value <= 0.5) {
+                return Err(SbhError::InvalidConfig {
+                    details: format!("scoring.{name} must be in (0, 0.5]"),
+                });
+            }
         }
         if !(0.5..1.0).contains(&self.pressure.prediction.coverage_target) {
             return Err(SbhError::InvalidConfig {

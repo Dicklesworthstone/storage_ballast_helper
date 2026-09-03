@@ -1952,6 +1952,8 @@ mod tests {
                 fallback_active: false,
                 certainty: crate::scanner::scoring::ArtifactCertainty::Definite,
                 posterior_floor_applied: false,
+                regret_calibration: 1.0,
+                category_suspended: false,
             },
             ledger: EvidenceLedger {
                 terms: vec![EvidenceTerm {

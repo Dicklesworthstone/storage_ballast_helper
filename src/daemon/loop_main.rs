@@ -89,6 +89,10 @@ use crate::scanner::patterns::{
 };
 use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::quarantine::QuarantineStore;
+use crate::scanner::regret::{
+    EntryIdentity, Outcome, RegretCalibrator, RegretConfig, RegretDetector, Sighting, Watch,
+    certainty_from_name,
+};
 use crate::scanner::scoring::{
     ActiveReferenceSummary, ArtifactCertainty, CandidacyScore, ScoringEngine,
 };
@@ -251,6 +255,97 @@ impl SharedExecutorConfig {
     fn repeat_max_cooldown_secs(&self) -> u64 {
         self.repeat_max_cooldown_secs.load(Ordering::Relaxed)
     }
+}
+
+// ──────────────────── regret labels (Q4) ────────────────────
+
+/// The regret detector the executor feeds and the tick resolves, and the
+/// calibrator whose per-category view the scanner applies before scoring.
+struct SharedRegret {
+    detector: Mutex<RegretDetector>,
+    calibrator: Mutex<RegretCalibrator>,
+}
+
+impl SharedRegret {
+    fn new(config: &Config) -> Self {
+        let regret = regret_config(config);
+        Self {
+            detector: Mutex::new(RegretDetector::new(regret.window)),
+            calibrator: Mutex::new(RegretCalibrator::new(regret)),
+        }
+    }
+
+    /// The scoring engine's view: a calibration factor per category and
+    /// the categories whose deletions are suspended right now.
+    fn scoring_view(&self, now: Instant) -> (HashMap<String, f64>, HashSet<String>) {
+        let calibrator = self.calibrator.lock();
+        let suspended = calibrator
+            .summaries()
+            .into_iter()
+            .filter(|summary| calibrator.suspended(&summary.category, now))
+            .map(|summary| summary.category)
+            .collect();
+        (calibrator.calibrations(), suspended)
+    }
+}
+
+fn regret_config(config: &Config) -> RegretConfig {
+    RegretConfig {
+        window: Duration::from_secs(config.scoring.regret_window_minutes.saturating_mul(60)),
+        alpha_definite: config.scoring.regret_alpha_definite,
+        alpha_likely: config.scoring.regret_alpha_likely,
+        suspend: Duration::from_secs(config.scoring.regret_suspend_minutes.saturating_mul(60)),
+        ..RegretConfig::default()
+    }
+}
+
+/// Rebuild the regret calibrator from the last 30 days of stored outcomes
+/// (daemon start); suspensions are not replayed.
+fn replay_regret_outcomes(regret: &SharedRegret, sqlite_db: &Path) {
+    let Ok(db) = crate::logger::sqlite::SqliteLogger::open_read_only(sqlite_db) else {
+        return;
+    };
+    let since = (chrono::Utc::now() - chrono::Duration::days(30))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let Ok(outcomes) = db.outcomes_since(&since) else {
+        return;
+    };
+    let count = outcomes.len();
+    regret.calibrator.lock().replay(
+        outcomes.into_iter().filter_map(|stored| {
+            Outcome::from_name(&stored.outcome).map(|outcome| {
+                (
+                    stored.category,
+                    certainty_from_name(&stored.certainty),
+                    outcome,
+                )
+            })
+        }),
+        Instant::now(),
+    );
+    if count > 0 {
+        eprintln!("[SBH-REGRET] replayed {count} stored outcome(s) into the category calibrator");
+    }
+}
+
+/// Whether a process has its working directory or an open file under
+/// `parent`: the sign that something still used the deleted entry's
+/// neighbourhood when it came back.
+fn parent_in_use(platform: &dyn Platform, parent: &Path) -> bool {
+    if platform
+        .open_files_under(parent)
+        .is_ok_and(|files| !files.is_empty())
+    {
+        return true;
+    }
+    platform.process_list().is_ok_and(|processes| {
+        processes.iter().any(|process| {
+            process
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| cwd.starts_with(parent))
+        })
+    })
 }
 
 // ──────────────────── thread panic tracking ────────────────────
@@ -1630,6 +1725,8 @@ pub struct MonitoringDaemon {
     scoring_engine: ScoringEngine,
     voi_scheduler: VoiScheduler,
     shared_executor_config: Arc<SharedExecutorConfig>,
+    /// Regret labels (Q4).
+    regret: Arc<SharedRegret>,
     shared_scoring_config: Arc<RwLock<crate::core::config::ScoringConfig>>,
     shared_scanner_config: Arc<RwLock<crate::core::config::ScannerConfig>>,
     start_time: Instant,
@@ -2547,6 +2644,11 @@ impl MonitoringDaemon {
         let shared_scoring_config = Arc::new(RwLock::new(config.scoring.clone()));
         let shared_scanner_config = Arc::new(RwLock::new(config.scanner.clone()));
 
+        // Regret labels: rebuilt from the ledger so calibration survives a
+        // restart.
+        let regret = Arc::new(SharedRegret::new(&config));
+        replay_regret_outcomes(&regret, &config.paths.sqlite_db);
+
         // 11. Self-monitor (writes state.json for CLI, tracks health).
         let mut self_monitor = SelfMonitor::from_telemetry_config(
             config.paths.state_file.clone(),
@@ -2620,6 +2722,7 @@ impl MonitoringDaemon {
             scoring_engine,
             voi_scheduler,
             shared_executor_config,
+            regret,
             shared_scoring_config,
             shared_scanner_config,
             start_time,
@@ -4291,6 +4394,7 @@ impl MonitoringDaemon {
         // Layer 7: the quarantine is already-decided space. Pressure drains
         // it before any new deletion; calm ticks expire and cap it.
         self.sweep_quarantines(&responses, &root_mounts, now);
+        self.resolve_regrets(now);
 
         // Green maintenance (Q6): once per maintenance interval, a routine
         // pass over the roots the hazard-driven scheduler picks within its
@@ -5427,6 +5531,7 @@ impl MonitoringDaemon {
         let scanner_index_path = self.config.paths.scanner_index_file();
         let cpu_budget = Arc::clone(&self.cpu_budget);
         let executor_config = Arc::clone(&self.shared_executor_config);
+        let regret = Arc::clone(&self.regret);
         thread::Builder::new()
             .name("sbh-scanner".to_string())
             .spawn(move || {
@@ -5444,11 +5549,76 @@ impl MonitoringDaemon {
                     &index_feedback_rx,
                     &cpu_budget,
                     &executor_config,
+                    &regret,
                 );
             })
             .map_err(|source| SbhError::Runtime {
                 details: format!("failed to spawn scanner thread: {source}"),
             })
+    }
+
+    /// Regret labels (Q4): resolve watched deletions against the filesystem
+    /// and the process table, store each outcome, and feed the category
+    /// calibrator the scanner reads before its next pass.
+    fn resolve_regrets(&self, now: Instant) {
+        let platform = Arc::clone(&self.platform);
+        let outcomes = self.regret.detector.lock().check(now, |watch| {
+            let recreated = std::fs::symlink_metadata(&watch.path).is_ok()
+                && EntryIdentity::of(&watch.path)
+                    .is_some_and(|identity| identity == watch.identity);
+            let parent_in_use = recreated
+                && watch
+                    .path
+                    .parent()
+                    .is_some_and(|parent| parent_in_use(platform.as_ref(), parent));
+            Sighting {
+                recreated,
+                parent_in_use,
+            }
+        });
+        if outcomes.is_empty() {
+            return;
+        }
+        // Record under the lock, log and ship after it: the scanner reads
+        // the calibrator before every pass and must not wait on I/O.
+        let effects: Vec<(f64, bool)> = {
+            let mut calibrator = self.regret.calibrator.lock();
+            outcomes
+                .iter()
+                .map(|outcome| {
+                    calibrator.record(
+                        &outcome.category,
+                        certainty_from_name(&outcome.certainty),
+                        outcome.outcome,
+                        now,
+                    );
+                    (
+                        calibrator
+                            .summary(&outcome.category)
+                            .map_or(1.0, |summary| summary.calibration),
+                        calibrator.suspended(&outcome.category, now),
+                    )
+                })
+                .collect()
+        };
+        for (outcome, (calibration, suspended)) in outcomes.into_iter().zip(effects) {
+            eprintln!(
+                "[SBH-REGRET] decision={} outcome={} category={} after={}s path={} ({}); category calibration now {calibration:.3}{}",
+                outcome.decision_id,
+                outcome.outcome.as_str(),
+                outcome.category,
+                outcome.after_secs,
+                outcome.path.display(),
+                outcome.detail,
+                if suspended {
+                    ", deletions suspended"
+                } else {
+                    ""
+                }
+            );
+            self.logger_handle
+                .send(ActivityEvent::DecisionOutcome(Box::new(outcome)));
+        }
     }
 
     /// Layer 7 sweep. At Orange and above every quarantine on the pressured
@@ -5540,6 +5710,7 @@ impl MonitoringDaemon {
         let shared_config = Arc::clone(&self.shared_executor_config);
         let scanner_config = Arc::clone(&self.shared_scanner_config);
         let policy_engine = Arc::clone(&self.policy_engine);
+        let regret = Arc::clone(&self.regret);
         let shared_guard_diagnostics = Arc::clone(&self.shared_guard_diagnostics);
         let shutdown = self.signal_handler.shutdown_token();
         let platform_sacred_paths = self.platform.sacred_paths();
@@ -5559,6 +5730,7 @@ impl MonitoringDaemon {
                     &shutdown,
                     &index_feedback_tx,
                     &platform_sacred_paths,
+                    &regret,
                 );
             })
             .map_err(|source| SbhError::Runtime {
@@ -6164,6 +6336,7 @@ fn scanner_thread_main(
     index_feedback_rx: &Receiver<ScannerIndexFeedback>,
     cpu_budget: &Arc<Mutex<CpuBudget>>,
     executor_config: &Arc<SharedExecutorConfig>,
+    regret: &Arc<SharedRegret>,
 ) {
     const DIR_SIZE_FLOOR: u64 = 100 * 1_048_576; // 100 MiB
 
@@ -6494,10 +6667,16 @@ fn scanner_thread_main(
             last_scanner_engine_mode = Some(scanner_engine_mode);
         }
 
-        let engine = ScoringEngine::from_config(
+        let mut engine = ScoringEngine::from_config(
             &current_scoring_config,
             current_scanner_config.min_file_age_minutes,
         );
+        // Regret labels (Q4): what happened to this category's past
+        // deletions raises the bar for the next ones.
+        {
+            let (calibrations, suspended) = regret.scoring_view(Instant::now());
+            engine.set_regret(calibrations, suspended);
+        }
 
         // If no paths to scan, skip.
         if request.paths.is_empty() {
@@ -8025,6 +8204,7 @@ fn executor_thread_main(
     shutdown: &Arc<AtomicBool>,
     index_feedback_tx: &Sender<ScannerIndexFeedback>,
     platform_sacred_paths: &[crate::platform::types::SacredPath],
+    regret: &Arc<SharedRegret>,
 ) {
     let mut tracker = RepeatDeletionTracker::new(
         Duration::from_secs(shared_config.repeat_base_cooldown_secs()),
@@ -8277,6 +8457,23 @@ fn executor_thread_main(
             )
         };
 
+        // Regret labels (Q4): the entry identity (parent device and inode,
+        // name) survives the deletion, so capture it now. Only removals for
+        // good are watched: a quarantined entry is restorable and its
+        // recreation is not a regret signal.
+        let watch_identities: HashMap<PathBuf, EntryIdentity> = if plan.mode == DeletionMode::Unlink
+        {
+            plan.candidates
+                .iter()
+                .filter_map(|candidate| {
+                    EntryIdentity::of(&candidate.path)
+                        .map(|identity| (candidate.path.clone(), identity))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         let report = executor.execute(&plan, Some(&skip_protected));
 
         if scanner_config.engine == ScannerEngineMode::V2 {
@@ -8332,6 +8529,34 @@ fn executor_thread_main(
 
         // Record deletions for repeat-deletion dampening.
         tracker.record_deletions(&report.deleted_paths);
+        if !report.dry_run {
+            let watches: Vec<Watch> = report
+                .deleted_paths
+                .iter()
+                .filter_map(|path| {
+                    let identity = watch_identities.get(path)?;
+                    let candidate = plan.candidates.iter().find(|c| &c.path == path)?;
+                    Some(Watch {
+                        decision_id: crate::scanner::decision_record::stable_decision_id(
+                            &candidate.path,
+                            candidate.identity,
+                            candidate.size_bytes,
+                        ),
+                        path: path.clone(),
+                        identity: identity.clone(),
+                        category: format!("{:?}", candidate.classification.category),
+                        certainty: candidate.decision.certainty,
+                        deleted_at: Instant::now(),
+                    })
+                })
+                .collect();
+            if !watches.is_empty() {
+                let mut detector = regret.detector.lock();
+                for watch in watches {
+                    detector.watch(watch);
+                }
+            }
+        }
         if !report.dry_run && report.items_deleted > 0 {
             shared_config.note_reclaim();
         }
@@ -8646,6 +8871,8 @@ mod tests {
                 fallback_active: false,
                 certainty: crate::scanner::scoring::ArtifactCertainty::Definite,
                 posterior_floor_applied: false,
+                regret_calibration: 1.0,
+                category_suspended: false,
             },
             ledger: EvidenceLedger {
                 terms: Vec::new(),
@@ -8882,6 +9109,7 @@ mod tests {
             &Arc::new(SharedExecutorConfig::new(
                 false, 10, 0.0, 60, 3600, false, 0,
             )),
+            &Arc::new(SharedRegret::new(&Config::default())),
         );
 
         assert!(
@@ -9057,6 +9285,7 @@ mod tests {
             &Arc::new(SharedExecutorConfig::new(
                 false, 10, 0.0, 60, 3600, false, 0,
             )),
+            &Arc::new(SharedRegret::new(&Config::default())),
         );
 
         assert!(
@@ -9156,6 +9385,7 @@ mod tests {
                 &index_feedback_rx,
                 &cpu_budget,
                 &executor_config,
+                &Arc::new(SharedRegret::new(&Config::default())),
             );
             logger.shutdown();
             logger_join.join().unwrap();
@@ -9431,6 +9661,7 @@ mod tests {
             &Arc::new(SharedExecutorConfig::new(
                 false, 10, 0.0, 60, 3600, false, 0,
             )),
+            &Arc::new(SharedRegret::new(&Config::default())),
         );
 
         let report = report_rx

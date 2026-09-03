@@ -433,7 +433,8 @@ src/
 | `[pressure.controller]` | per-mount PID: `kp`, `ki`, `kd`, `kf` (forecast feedforward), `integral_cap`, `hysteresis_pct`, `reference_total_bytes`, `kp_scale_min`, `kp_scale_max` |
 | `[scanner]` | `engine` (`"v2"` default, `"v1"` rollback), `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run`, `cross_devices`, `quarantine_enabled`, `quarantine_ttl_hours`, `quarantine_max_bytes_pct` |
 | `[scoring]` | `min_score`, `location_weight`, `name_weight`, `age_weight`, `size_weight`, `structure_weight` |
-| `[scoring]` (decision-theoretic) | `false_positive_loss`, `false_negative_loss`, `calibration_floor` |
+| `[scoring]` (decision-theoretic) | `false_positive_loss`, `false_negative_loss`, `calibration_floor`, `posterior_floor_definite` |
+| `[scoring]` (regret labels) | `regret_window_minutes`, `regret_alpha_definite`, `regret_alpha_likely`, `regret_suspend_minutes` (Layer 8: outcomes in SQLite `decision_outcome`, shown by `sbh explain`) |
 | `[ballast]` | `file_count`, `file_size_bytes`, `replenish_cooldown_minutes` |
 | `[telemetry]` | Structured logging and observability settings |
 | `[paths]` | Override default config/data/log paths |
