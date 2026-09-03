@@ -1490,6 +1490,7 @@ fn palette_route_non_matching_returns_none() {
 
 fn sample_timeline_event(ts: &str, severity: &str) -> super::telemetry::TimelineEvent {
     super::telemetry::TimelineEvent {
+        decision_id: None,
         timestamp: ts.into(),
         event_type: "pressure_change".into(),
         severity: severity.into(),

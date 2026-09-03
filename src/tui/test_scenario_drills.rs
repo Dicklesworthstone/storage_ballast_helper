@@ -242,6 +242,7 @@ fn multi_mount_state() -> DaemonState {
 fn escalation_timeline() -> Vec<TimelineEvent> {
     vec![
         TimelineEvent {
+            decision_id: None,
             timestamp: "2026-02-16T01:00:00Z".into(),
             event_type: "pressure_change".into(),
             severity: "warning".into(),
@@ -257,6 +258,7 @@ fn escalation_timeline() -> Vec<TimelineEvent> {
             details: Some("pressure rose to yellow on /data".into()),
         },
         TimelineEvent {
+            decision_id: Some("dec-alpha".into()),
             timestamp: "2026-02-16T01:05:00Z".into(),
             event_type: "artifact_delete".into(),
             severity: "info".into(),
@@ -272,6 +274,7 @@ fn escalation_timeline() -> Vec<TimelineEvent> {
             details: Some("deleted build artifact, 2.0 GB freed".into()),
         },
         TimelineEvent {
+            decision_id: None,
             timestamp: "2026-02-16T01:10:00Z".into(),
             event_type: "pressure_change".into(),
             severity: "critical".into(),
@@ -287,6 +290,7 @@ fn escalation_timeline() -> Vec<TimelineEvent> {
             details: Some("pressure escalated to red".into()),
         },
         TimelineEvent {
+            decision_id: None,
             timestamp: "2026-02-16T01:12:00Z".into(),
             event_type: "ballast_release".into(),
             severity: "info".into(),
@@ -1090,6 +1094,62 @@ fn drill_explainability_audit_trail() {
         .status(CaseStatus::Pass)
         .finish();
 
+    // Phase 3b (bd-rc-master-ajg1.3.3): the deletion row carries the ledger
+    // id of the decision that approved it; Enter on it opens that decision
+    // on the Explainability screen with the detail pane expanded.
+    {
+        let model = h.model_mut();
+        model.explainability_decisions[0].raw_json =
+            Some(r#"{"id":"dec-alpha","decision_id":1}"#.to_string());
+        model.timeline_follow = false;
+        model.timeline_selected = 1;
+        let linked = model
+            .timeline_selected_event()
+            .and_then(|e| e.decision_id.clone());
+        assert_eq!(linked.as_deref(), Some("dec-alpha"));
+    }
+    let frame_before = capture_frame(&h);
+    assert!(
+        frame_before.text.contains("decision dec-alpha"),
+        "the timeline row names its decision: {}",
+        frame_before.text
+    );
+    h.inject_keycode(ftui::KeyCode::Enter);
+    let jumped_screen = h.screen();
+    assert_eq!(jumped_screen, Screen::Explainability);
+    let (selected_id, detail_open) = {
+        let model = h.model_mut();
+        (
+            model
+                .explainability_selected_decision()
+                .and_then(super::telemetry::DecisionEvidence::stable_id),
+            model.explainability_detail,
+        )
+    };
+    assert_eq!(selected_id.as_deref(), Some("dec-alpha"));
+    assert!(detail_open, "the linked decision opens expanded");
+    collector
+        .start_case("phase3b_timeline_links_to_decision")
+        .section("explainability")
+        .tags(["explainability", "timeline", "ledger"])
+        .frame(capture_frame(&h))
+        .assertion(
+            "Enter on a deletion opens its decision",
+            jumped_screen == Screen::Explainability && detail_open,
+            "explainability, detail open",
+            s(&format!("{jumped_screen:?}, detail={detail_open}")),
+        )
+        .assertion(
+            "the selected decision is the linked one",
+            selected_id.as_deref() == Some("dec-alpha"),
+            "dec-alpha",
+            s(&selected_id.clone().unwrap_or_default()),
+        )
+        .status(CaseStatus::Pass)
+        .finish();
+    // Leave the detail pane the way phase 4 expects to find it.
+    h.inject_char('d');
+
     // Phase 4: Factor breakdown inspection — navigate back to explainability,
     // expand detail on the top decision.
     h.navigate_to_number(3);
@@ -1110,7 +1170,7 @@ fn drill_explainability_audit_trail() {
         .finish();
 
     let bundle = collector.finalize();
-    assert_eq!(bundle.summary.passed, 4);
+    assert_eq!(bundle.summary.passed, 5);
     assert_eq!(bundle.summary.failed, 0);
 }
 

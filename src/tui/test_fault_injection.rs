@@ -159,6 +159,7 @@ fn make_log_entry(
         mount_point: None,
         decision_id: None,
         details: None,
+        quarantined: None,
         schema_version: None,
         run_id: None,
     }

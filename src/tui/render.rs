@@ -1420,6 +1420,12 @@ fn frame_timeline_list_styled<'a>(
                 Style::default().fg(theme.palette.text_secondary()).bg(bg),
             ));
         }
+        if let Some(decision_id) = &event.decision_id {
+            row.push(Span::styled(
+                format!(" \u{2192} decision {decision_id}"),
+                Style::default().fg(theme.palette.accent_color()).bg(bg),
+            ));
+        }
         lines.push(Line::from_spans(row));
     }
     Text::from_lines(lines)
@@ -1893,6 +1899,13 @@ fn frame_explainability_detail_styled<'a>(
                         format!(" {reason}"),
                         Style::default().fg(theme.palette.danger_color()),
                     ),
+                ]));
+            }
+            if let Some(id) = decision.stable_id() {
+                lines.push(Line::from_spans([
+                    Span::styled("  ledger id  ", Style::default().fg(muted)),
+                    Span::styled(id, Style::default().fg(theme.palette.accent_color())),
+                    Span::styled("  (sbh explain --id)", Style::default().fg(muted)),
                 ]));
             }
             lines.push(Line::from(Span::styled(
@@ -4398,9 +4411,13 @@ fn render_event_row(cursor: &str, event: &TimelineEvent, theme: &Theme, out: &mu
         Some(false) => " \u{2717}",
         None => "",
     };
+    let decision_link = event
+        .decision_id
+        .as_deref()
+        .map_or_else(String::new, |id| format!(" \u{2192} decision {id}"));
     let _ = writeln!(
         out,
-        "{cursor} {time} {sev_badge} {:<20} {path_short} {size_str}{success_marker}",
+        "{cursor} {time} {sev_badge} {:<20} {path_short} {size_str}{success_marker}{decision_link}",
         event.event_type,
     );
 }
@@ -6109,6 +6126,7 @@ mod tests {
 
     fn sample_timeline_event(severity: &str, event_type: &str) -> TlEvent {
         TlEvent {
+            decision_id: None,
             timestamp: String::from("2026-02-16T03:15:42Z"),
             event_type: event_type.to_owned(),
             severity: severity.to_owned(),

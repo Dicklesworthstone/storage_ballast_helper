@@ -526,6 +526,9 @@ pub struct DashboardModel {
     pub explainability_selected: usize,
     /// Whether the detail pane is expanded for the selected decision.
     pub explainability_detail: bool,
+    /// A ledger decision id to select as soon as the decisions arrive
+    /// (set when the operator jumps from a Timeline deletion).
+    pub explainability_pending_select: Option<String>,
     /// Backend that sourced the current decision data.
     pub explainability_source: DataSource,
     /// Whether the decision data is known to be incomplete.
@@ -633,6 +636,7 @@ impl DashboardModel {
             explainability_decisions: Vec::new(),
             explainability_selected: 0,
             explainability_detail: false,
+            explainability_pending_select: None,
             explainability_source: DataSource::None,
             explainability_partial: false,
             explainability_diagnostics: String::new(),
@@ -789,6 +793,21 @@ impl DashboardModel {
     /// Toggle the detail pane for the selected decision.
     pub fn explainability_toggle_detail(&mut self) {
         self.explainability_detail = !self.explainability_detail;
+    }
+
+    /// Select the decision with this ledger id and open its detail pane;
+    /// `false` when it is not among the loaded decisions.
+    pub fn select_decision_by_stable_id(&mut self, stable_id: &str) -> bool {
+        let Some(index) = self
+            .explainability_decisions
+            .iter()
+            .position(|decision| decision.stable_id().as_deref() == Some(stable_id))
+        else {
+            return false;
+        };
+        self.explainability_selected = index;
+        self.explainability_detail = true;
+        true
     }
 
     /// Get the currently selected decision, if any.
@@ -1313,6 +1332,7 @@ mod tests {
 
     fn make_event(severity: &str, event_type: &str) -> TimelineEvent {
         TimelineEvent {
+            decision_id: None,
             timestamp: "2026-01-01T00:00:00Z".to_owned(),
             event_type: event_type.to_owned(),
             severity: severity.to_owned(),

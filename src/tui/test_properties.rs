@@ -108,6 +108,7 @@ fn arb_daemon_state() -> impl Strategy<Value = DaemonState> {
 
 fn arb_timeline_event() -> impl Strategy<Value = TimelineEvent> {
     prop_oneof![Just("info"), Just("warning"), Just("critical")].prop_map(|sev| TimelineEvent {
+        decision_id: None,
         timestamp: "2026-01-01T00:00:00Z".to_owned(),
         event_type: "scan".to_owned(),
         severity: sev.to_owned(),
@@ -474,6 +475,7 @@ proptest! {
         // Set up initial timeline data.
         let events: Vec<TimelineEvent> = (0..initial_count)
             .map(|i| TimelineEvent {
+                decision_id: None,
                 timestamp: format!("2026-01-01T00:00:{:02}Z", i % 60),
                 event_type: "scan".to_owned(),
                 severity: "info".to_owned(),
@@ -489,6 +491,7 @@ proptest! {
         // Shrink the data.
         let shrunk: Vec<TimelineEvent> = (0..shrunk_count)
             .map(|i| TimelineEvent {
+                decision_id: None,
                 timestamp: format!("2026-01-01T00:01:{:02}Z", i % 60),
                 event_type: "scan".to_owned(),
                 severity: "info".to_owned(),

@@ -40,6 +40,7 @@ fn make_timeline_events(count: usize) -> Vec<TimelineEvent> {
                 _ => "critical",
             };
             TimelineEvent {
+                decision_id: None,
                 timestamp: format!(
                     "2026-01-01T{:02}:{:02}:{:02}Z",
                     i / 3600,

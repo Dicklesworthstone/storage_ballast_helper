@@ -98,6 +98,11 @@ pub struct TimelineEvent {
     pub duration_ms: Option<u64>,
     /// Freeform details.
     pub details: Option<String>,
+    /// Stable id of the ledger decision behind an `artifact_delete`
+    /// (bd-rc-master-ajg1.3.3): from the JSONL line, or joined from
+    /// `decision_log` for SQLite rows. Absent for other events.
+    #[serde(default)]
+    pub decision_id: Option<String>,
 }
 
 /// Evidence payload for the explainability screen (S3).
@@ -147,6 +152,22 @@ pub struct DecisionEvidence {
 }
 
 /// Individual factor scores for the explainability breakdown.
+impl DecisionEvidence {
+    /// The ledger's stable decision id (`DecisionRecord::id`), read from the
+    /// full record kept in `raw_json`; absent for evidence synthesized from
+    /// the activity log.
+    #[must_use]
+    pub fn stable_id(&self) -> Option<String> {
+        let raw = self.raw_json.as_deref()?;
+        let value: Value = serde_json::from_str(raw).ok()?;
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FactorBreakdown {
     pub location: f64,
@@ -361,6 +382,9 @@ impl TelemetryQueryAdapter for NullTelemetryAdapter {
 pub struct SqliteTelemetryAdapter {
     conn: rusqlite::Connection,
     _path: PathBuf,
+    /// The database carries the decision ledger (`decision_log`); older
+    /// files without it degrade to deletions projected from the activity log.
+    has_decision_log: bool,
 }
 
 #[cfg(feature = "sqlite")]
@@ -379,10 +403,45 @@ impl SqliteTelemetryAdapter {
         .ok()?;
         // Enable WAL read mode and mmap for read performance.
         let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA mmap_size=67108864;");
+        let has_decision_log = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'decision_log'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok_and(|count| count > 0);
         Some(Self {
             conn,
             _path: path.to_path_buf(),
+            has_decision_log,
         })
+    }
+
+    /// Whether the decision ledger is present in this database.
+    #[must_use]
+    pub fn has_decision_log(&self) -> bool {
+        self.has_decision_log
+    }
+
+    /// Recent ledger decisions, newest first, as the explainability screen
+    /// shows them.
+    fn query_decision_log(
+        &self,
+        limit: usize,
+    ) -> std::result::Result<Vec<DecisionEvidence>, rusqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT record FROM decision_log ORDER BY id DESC LIMIT ?1")?;
+        #[allow(clippy::cast_possible_wrap)]
+        let rows = stmt.query_map([limit as i64], |row| row.get::<_, String>(0))?;
+        Ok(rows
+            .filter_map(std::result::Result::ok)
+            .filter_map(|json| {
+                serde_json::from_str::<crate::scanner::decision_record::DecisionRecord>(&json)
+                    .ok()
+                    .map(|record| record_to_evidence(&record, json))
+            })
+            .collect())
     }
 
     fn query_recent_activity(
@@ -393,11 +452,24 @@ impl SqliteTelemetryAdapter {
         use std::fmt::Write as _;
 
         // Build query with optional filters.
-        let mut sql = String::from(
+        // A deletion links to the ledger decision that approved it: the
+        // newest decision on the same path made no later than the event
+        // (bd-rc-master-ajg1.3.3). Databases without the ledger get NULL.
+        let decision_column = if self.has_decision_log {
+            "(SELECT d.decision_id FROM decision_log d
+               WHERE activity_log.event_type = 'artifact_delete'
+                 AND d.path = activity_log.path
+                 AND d.timestamp <= activity_log.timestamp
+               ORDER BY d.id DESC LIMIT 1)"
+        } else {
+            "NULL"
+        };
+        let mut sql = format!(
             "SELECT timestamp, event_type, severity, path, size_bytes, score,
                     score_factors, pressure_level, free_pct, duration_ms,
-                    success, error_code, error_message, details
-             FROM activity_log",
+                    success, error_code, error_message, details,
+                    {decision_column} AS decision_id
+             FROM activity_log"
         );
 
         let mut conditions = Vec::new();
@@ -459,6 +531,7 @@ impl SqliteTelemetryAdapter {
                 error_message: row.get(12)?,
                 duration_ms: duration_i64.map(|v| v.max(0).cast_unsigned()),
                 details: row.get(13)?,
+                decision_id: row.get(14)?,
             })
         })?;
 
@@ -519,8 +592,36 @@ impl TelemetryQueryAdapter for SqliteTelemetryAdapter {
     }
 
     fn recent_decisions(&self, limit: usize) -> TelemetryResult<Vec<DecisionEvidence>> {
-        // Decision records are stored in the activity_log as event_type="artifact_delete"
-        // or "artifact_skip" with score_factors JSON. We extract what we can.
+        // The decision ledger (bd-rc-master-ajg1.3.3): every keep, delete,
+        // review and veto with its factor contributions. A database from
+        // before the ledger degrades to the deletions in the activity log,
+        // flagged partial so the screen says so.
+        let mut ledger_error = None;
+        let mut ledger_empty = false;
+        if self.has_decision_log {
+            match self.query_decision_log(limit) {
+                Ok(evidence) if evidence.is_empty() => ledger_empty = true,
+                Ok(evidence) => {
+                    return TelemetryResult {
+                        data: evidence,
+                        source: DataSource::Sqlite,
+                        partial: false,
+                        diagnostics: String::new(),
+                    };
+                }
+                Err(e) => ledger_error = Some(e.to_string()),
+            }
+        }
+        let degraded = ledger_error.map_or_else(
+            || {
+                if ledger_empty {
+                    "decision_log has no records: showing deletions from activity_log".to_string()
+                } else {
+                    "decision_log absent: showing deletions from activity_log".to_string()
+                }
+            },
+            |e| format!("decision_log query failed ({e}): showing deletions from activity_log"),
+        );
         let filter = EventFilter {
             severities: Vec::new(),
             event_types: vec!["artifact_delete".to_string()],
@@ -532,18 +633,21 @@ impl TelemetryQueryAdapter for SqliteTelemetryAdapter {
                     .enumerate()
                     .map(|(i, ev)| timeline_to_evidence(i as u64, &ev))
                     .collect();
+                // An empty ledger over an empty activity log is simply a
+                // fresh database, not a degraded one.
+                let partial = !(ledger_empty && evidence.is_empty());
                 TelemetryResult {
                     data: evidence,
                     source: DataSource::Sqlite,
-                    partial: false,
-                    diagnostics: String::new(),
+                    partial,
+                    diagnostics: if partial { degraded } else { String::new() },
                 }
             }
             Err(e) => TelemetryResult {
                 data: Vec::new(),
                 source: DataSource::Sqlite,
                 partial: true,
-                diagnostics: format!("SQLite decision query failed: {e}"),
+                diagnostics: format!("{degraded}; SQLite decision query failed: {e}"),
             },
         }
     }
@@ -1064,6 +1168,7 @@ fn parse_jsonl_entry_with_schema_shield(line: &str) -> ParseOutcome {
         error_message: read_string_field(object, &["error_message", "error"]),
         mount_point: read_string_field(object, &["mount_point", "mount"]),
         decision_id: read_string_field(object, &["decision_id"]),
+        quarantined: read_bool_field(object, &["quarantined"]),
         details,
         schema_version: read_u64_field(object, &["schema_version"])
             .and_then(|v| u32::try_from(v).ok()),
@@ -1200,6 +1305,7 @@ fn logentry_to_timeline(entry: &crate::logger::jsonl::LogEntry) -> TimelineEvent
         .to_string();
 
     TimelineEvent {
+        decision_id: entry.decision_id.clone(),
         timestamp: entry.ts.clone(),
         event_type,
         severity: severity.to_string(),
@@ -1213,6 +1319,59 @@ fn logentry_to_timeline(entry: &crate::logger::jsonl::LogEntry) -> TimelineEvent
         error_message: entry.error_message.clone(),
         duration_ms: entry.duration_ms,
         details: entry.details.clone(),
+    }
+}
+
+/// The explainability projection of a ledger record; `raw_json` keeps the
+/// full record (its stable id, factor contributions, regret calibration and
+/// summary) for the detail pane.
+fn record_to_evidence(
+    record: &crate::scanner::decision_record::DecisionRecord,
+    raw_json: String,
+) -> DecisionEvidence {
+    let action_name = |action: &crate::scanner::decision_record::ActionRecord| {
+        serde_json::to_value(action)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("{action:?}").to_lowercase())
+    };
+    let policy_mode = serde_json::to_value(record.policy_mode)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{:?}", record.policy_mode).to_lowercase());
+    let guard_status = record.guard_status.as_ref().map(|guard| {
+        serde_json::to_value(guard)
+            .ok()
+            .and_then(|v| v.get("status").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_else(|| format!("{guard:?}"))
+    });
+    DecisionEvidence {
+        decision_id: record.decision_id,
+        timestamp: record.timestamp.clone(),
+        path: record.path.to_string_lossy().into_owned(),
+        size_bytes: record.size_bytes,
+        age_secs: record.age_secs,
+        action: action_name(&record.action),
+        effective_action: record.effective_action.as_ref().map(action_name),
+        policy_mode,
+        factors: FactorBreakdown {
+            location: record.factors.location,
+            name: record.factors.name,
+            age: record.factors.age,
+            size: record.factors.size,
+            structure: record.factors.structure,
+            pressure_multiplier: record.factors.pressure_multiplier,
+        },
+        total_score: record.total_score,
+        posterior_abandoned: record.posterior_abandoned,
+        expected_loss_keep: record.expected_loss_keep,
+        expected_loss_delete: record.expected_loss_delete,
+        calibration_score: record.calibration_score,
+        vetoed: record.vetoed,
+        veto_reason: record.veto_reason.clone(),
+        guard_status,
+        summary: record.summary.clone(),
+        raw_json: Some(raw_json),
     }
 }
 
@@ -1383,6 +1542,7 @@ mod tests {
             error_message: None,
             mount_point: None,
             decision_id: None,
+            quarantined: None,
             details: Some("test deletion".to_string()),
             schema_version: None,
             run_id: None,
@@ -1403,6 +1563,7 @@ mod tests {
     #[test]
     fn timeline_to_evidence_uses_defaults_for_missing_fields() {
         let ev = TimelineEvent {
+            decision_id: None,
             timestamp: "2026-02-16T00:00:00Z".to_string(),
             event_type: "artifact_delete".to_string(),
             severity: "info".to_string(),
@@ -1431,6 +1592,7 @@ mod tests {
     #[test]
     fn timeline_to_evidence_failed_action_maps_to_keep() {
         let ev = TimelineEvent {
+            decision_id: None,
             timestamp: "2026-02-16T00:00:00Z".to_string(),
             event_type: "artifact_delete".to_string(),
             severity: "warning".to_string(),
@@ -1480,6 +1642,7 @@ mod tests {
                 error_message: None,
                 mount_point: None,
                 decision_id: None,
+                quarantined: None,
                 details: Some("started".to_string()),
                 schema_version: None,
                 run_id: None,
@@ -1501,6 +1664,7 @@ mod tests {
                 error_message: None,
                 mount_point: None,
                 decision_id: None,
+                quarantined: None,
                 details: None,
                 schema_version: None,
                 run_id: None,
@@ -1522,6 +1686,7 @@ mod tests {
                 error_message: Some("IO failure".to_string()),
                 mount_point: None,
                 decision_id: None,
+                quarantined: None,
                 details: None,
                 schema_version: None,
                 run_id: None,
@@ -1629,6 +1794,7 @@ mod tests {
                 error_message: None,
                 mount_point: None,
                 decision_id: None,
+                quarantined: None,
                 details: Some("x".repeat(8192)),
                 schema_version: None,
                 run_id: None,
@@ -1672,6 +1838,7 @@ mod tests {
                 error_message: None,
                 mount_point: None,
                 decision_id: None,
+                quarantined: None,
                 details: None,
                 schema_version: None,
                 run_id: None,
@@ -1693,6 +1860,7 @@ mod tests {
                 error_message: None,
                 mount_point: None,
                 decision_id: None,
+                quarantined: None,
                 details: None,
                 schema_version: None,
                 run_id: None,
@@ -1736,6 +1904,7 @@ mod tests {
                 error_message: None,
                 mount_point: Some("/".to_string()),
                 decision_id: None,
+                quarantined: None,
                 details: None,
                 schema_version: None,
                 run_id: None,
@@ -1757,6 +1926,7 @@ mod tests {
                 error_message: None,
                 mount_point: Some("/data".to_string()),
                 decision_id: None,
+                quarantined: None,
                 details: None,
                 schema_version: None,
                 run_id: None,
@@ -1828,6 +1998,7 @@ mod tests {
             error_message: None,
             mount_point: None,
             decision_id: None,
+            quarantined: None,
             details: Some("started".to_string()),
             schema_version: None,
             run_id: None,
@@ -1873,6 +2044,7 @@ mod tests {
             error_message: None,
             mount_point: None,
             decision_id: None,
+            quarantined: None,
             details: Some("late file".to_string()),
             schema_version: None,
             run_id: None,
@@ -1914,6 +2086,166 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
+    /// A real ledger record, scored by the engine and built the way the
+    /// executor builds them, for `path` with `size_bytes`.
+    fn ledger_record(
+        builder: &mut crate::scanner::decision_record::DecisionRecordBuilder,
+        path: &str,
+        size_bytes: u64,
+    ) -> crate::scanner::decision_record::DecisionRecord {
+        use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
+        use crate::scanner::scoring::{ActiveReferenceSummary, CandidateInput, ScoringEngine};
+        let engine = ScoringEngine::from_config(&crate::core::config::ScoringConfig::default(), 0);
+        let score = engine.score_candidate(
+            &CandidateInput {
+                path: PathBuf::from(path),
+                size_bytes,
+                age: std::time::Duration::from_hours(72),
+                classification: ArtifactClassification {
+                    pattern_name: std::borrow::Cow::Borrowed("cargo-target"),
+                    category: ArtifactCategory::RustTarget,
+                    name_confidence: 0.9,
+                    structural_confidence: 0.9,
+                    combined_confidence: 0.92,
+                },
+                signals: crate::scanner::patterns::StructuralSignals::default(),
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            },
+            0.9,
+        );
+        builder.build(
+            &score,
+            crate::scanner::decision_record::PolicyMode::DryRun,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn activity_delete(timestamp: &str, path: &str) -> crate::logger::sqlite::ActivityRow {
+        crate::logger::sqlite::ActivityRow {
+            timestamp: timestamp.to_string(),
+            event_type: "artifact_delete".to_string(),
+            severity: "info".to_string(),
+            path: Some(path.to_string()),
+            size_bytes: Some(4096),
+            score: Some(0.9),
+            score_factors: None,
+            pressure_level: Some("orange".to_string()),
+            free_pct: Some(9.0),
+            duration_ms: Some(3),
+            success: 1,
+            error_code: None,
+            error_message: None,
+            details: None,
+        }
+    }
+
+    /// bd-rc-master-ajg1.3.3: the explainability data comes from the
+    /// decision ledger (newest first, with the stable id, factors and veto
+    /// state of the real record), and a deletion in the timeline links to
+    /// the decision that approved it.
+    #[test]
+    fn sqlite_adapter_reads_the_decision_ledger_and_links_deletions() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("activity.db");
+        let mut builder = crate::scanner::decision_record::DecisionRecordBuilder::new();
+        let first = ledger_record(&mut builder, "/work/alpha/target", 3 << 30);
+        let second = ledger_record(&mut builder, "/work/beta/target", 1 << 20);
+        {
+            let logger = crate::logger::sqlite::SqliteLogger::open(&db_path).expect("create db");
+            logger.log_decision(&first).unwrap();
+            logger.log_decision(&second).unwrap();
+            // The deletion happened after the first decision, on its path.
+            logger
+                .log_activity(&activity_delete(
+                    "2099-01-01T00:00:10Z",
+                    "/work/alpha/target",
+                ))
+                .unwrap();
+            logger
+                .log_activity(&activity_delete(
+                    "2099-01-01T00:00:11Z",
+                    "/work/never/target",
+                ))
+                .unwrap();
+        }
+        let adapter = SqliteTelemetryAdapter::open(&db_path).expect("open adapter");
+        assert!(adapter.has_decision_log());
+
+        let decisions = adapter.recent_decisions(10);
+        assert!(!decisions.partial, "{}", decisions.diagnostics);
+        assert_eq!(decisions.data.len(), 2);
+        let newest = &decisions.data[0];
+        assert_eq!(newest.decision_id, second.decision_id);
+        assert_eq!(newest.path, "/work/beta/target");
+        assert_eq!(newest.stable_id().as_deref(), Some(second.id.as_str()));
+        assert_eq!(newest.policy_mode, "dry_run");
+        assert!((newest.total_score - second.total_score).abs() < 1e-12);
+        assert!((newest.factors.location - second.factors.location).abs() < 1e-12);
+        assert_eq!(newest.vetoed, second.vetoed);
+        assert_eq!(newest.summary, second.summary);
+        assert!(
+            newest
+                .raw_json
+                .as_deref()
+                .is_some_and(|j| j.contains(&second.id))
+        );
+        assert_eq!(decisions.data[1].path, "/work/alpha/target");
+
+        let events = adapter.recent_events(10, &EventFilter::default());
+        let alpha = events
+            .data
+            .iter()
+            .find(|e| e.path.as_deref() == Some("/work/alpha/target"))
+            .unwrap();
+        assert_eq!(alpha.decision_id.as_deref(), Some(first.id.as_str()));
+        let never = events
+            .data
+            .iter()
+            .find(|e| e.path.as_deref() == Some("/work/never/target"))
+            .unwrap();
+        assert_eq!(never.decision_id, None, "no decision on that path");
+    }
+
+    /// bd-rc-master-ajg1.3.3: a database from before the ledger degrades to
+    /// the activity-log projection and says so.
+    #[test]
+    fn sqlite_adapter_without_the_ledger_degrades_to_activity_deletions() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("activity.db");
+        {
+            let logger = crate::logger::sqlite::SqliteLogger::open(&db_path).expect("create db");
+            logger
+                .log_activity(&activity_delete(
+                    "2099-01-01T00:00:10Z",
+                    "/work/alpha/target",
+                ))
+                .unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("DROP TABLE decision_log").unwrap();
+        }
+        let adapter = SqliteTelemetryAdapter::open(&db_path).expect("open adapter");
+        assert!(!adapter.has_decision_log());
+        let decisions = adapter.recent_decisions(10);
+        assert!(decisions.partial);
+        assert!(
+            decisions.diagnostics.contains("decision_log absent"),
+            "{}",
+            decisions.diagnostics
+        );
+        assert_eq!(decisions.data.len(), 1);
+        assert_eq!(decisions.data[0].path, "/work/alpha/target");
+        assert_eq!(decisions.data[0].stable_id(), None);
+        let events = adapter.recent_events(10, &EventFilter::default());
+        assert!(!events.partial);
+        assert_eq!(events.data[0].decision_id, None);
+    }
+
     #[test]
     fn sqlite_adapter_queries_inserted_activity() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -2129,6 +2461,7 @@ mod tests {
             error_message: None,
             mount_point: None,
             decision_id: None,
+            quarantined: None,
             details: Some("jsonl source".to_string()),
             schema_version: None,
             run_id: None,

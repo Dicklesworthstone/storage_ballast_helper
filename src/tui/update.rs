@@ -207,6 +207,13 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             } else if model.explainability_selected >= model.explainability_decisions.len() {
                 model.explainability_selected = model.explainability_decisions.len() - 1;
             }
+            // A jump from the Timeline that arrived before the decisions.
+            if let Some(pending) = model.explainability_pending_select.take()
+                && !model.select_decision_by_stable_id(&pending)
+            {
+                model.explainability_diagnostics =
+                    format!("decision {pending} is not among the loaded decisions");
+            }
             DashboardCmd::None
         }
 
@@ -483,6 +490,22 @@ fn handle_timeline_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> Dashb
         // F (shift-f): toggle follow mode.
         KeyCode::Char('F') => {
             model.timeline_toggle_follow();
+            DashboardCmd::None
+        }
+        // Enter: a deletion links to its ledger decision; open it on the
+        // Explainability screen (selected now if loaded, or as soon as the
+        // decisions arrive).
+        KeyCode::Enter => {
+            let Some(decision_id) = model
+                .timeline_selected_event()
+                .and_then(|event| event.decision_id.clone())
+            else {
+                return DashboardCmd::None;
+            };
+            model.navigate_to(Screen::Explainability);
+            if !model.select_decision_by_stable_id(&decision_id) {
+                model.explainability_pending_select = Some(decision_id);
+            }
             DashboardCmd::None
         }
         _ => DashboardCmd::None,
@@ -2145,6 +2168,7 @@ mod tests {
 
     fn sample_timeline_event(severity: &str, event_type: &str) -> TimelineEvent {
         TimelineEvent {
+            decision_id: None,
             timestamp: String::from("2026-02-16T03:15:42Z"),
             event_type: event_type.to_owned(),
             severity: severity.to_owned(),

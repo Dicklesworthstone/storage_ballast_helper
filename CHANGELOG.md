@@ -10,6 +10,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Changed — the dashboard reads the decision ledger (bd-rc-master-ajg1.3.3)
+
+- The TUI's SQLite telemetry adapter reads `decision_log` for the Explainability screen (real decision ids, factors, veto reasons, policy mode, and the full record for the detail pane) instead of projecting `artifact_delete` rows; a database without the ledger, or with an empty one, falls back to the activity-log projection and is marked partial with the reason. Timeline `artifact_delete` rows carry the id of the decision that approved them (joined from the ledger for SQLite rows, from the line for JSONL) and `Enter` on such a row opens that decision on the Explainability screen. The `tui` feature also compiles again: its `LogEntry` fixtures had missed the `quarantined` field.
+
 ### Added — the daemon's own files against the volumes it reclaims (bd-rc-master-ajg1.7.4)
 
 - At startup the daemon checks whether the activity database, the JSONL log and `state.json` share a mount with a scan root, a special location or a ballast pool. It logs one `logging.on_monitored_fs=... device=... paths=[...]` line, carries the result in `state.json` under `logging`, and `sbh status` warns; `sbh doctor --system` gains `logging.on_monitored_fs` (WARN, FAIL while that mount is at Orange or worse). While the mount is pressured, every JSONL line is mirrored to the RAM fallback (capped like the fallback) and the daemon says so once per level change.

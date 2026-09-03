@@ -244,6 +244,7 @@ fn multi_mount_divergent_state() -> DaemonState {
 fn sample_timeline_events() -> Vec<TimelineEvent> {
     vec![
         TimelineEvent {
+            decision_id: None,
             timestamp: "2026-02-16T01:00:00Z".into(),
             event_type: "pressure_change".into(),
             severity: "warning".into(),
@@ -259,6 +260,7 @@ fn sample_timeline_events() -> Vec<TimelineEvent> {
             details: Some("pressure rose to yellow".into()),
         },
         TimelineEvent {
+            decision_id: None,
             timestamp: "2026-02-16T01:05:00Z".into(),
             event_type: "artifact_delete".into(),
             severity: "info".into(),
@@ -274,6 +276,7 @@ fn sample_timeline_events() -> Vec<TimelineEvent> {
             details: Some("deleted build artifact".into()),
         },
         TimelineEvent {
+            decision_id: None,
             timestamp: "2026-02-16T01:10:00Z".into(),
             event_type: "pressure_change".into(),
             severity: "critical".into(),
@@ -906,6 +909,7 @@ fn replay_timeline_follow_mode() {
     // New data arrives — cursor should NOT jump to end.
     let mut more_events = events;
     more_events.push(TimelineEvent {
+        decision_id: None,
         timestamp: "2026-02-16T01:15:00Z".into(),
         event_type: "ballast_release".into(),
         severity: "info".into(),
