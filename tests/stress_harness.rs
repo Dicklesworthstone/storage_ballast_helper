@@ -205,7 +205,7 @@ fn free_pct(free_bytes: u64, total_bytes: u64) -> f64 {
 // ──────────────────── shared helpers ────────────────────
 
 fn make_pid() -> PidPressureController {
-    PidPressureController::new(
+    let mut pid = PidPressureController::new(
         &PidConfig {
             kp: 0.25,
             ki: 0.08,
@@ -217,7 +217,9 @@ fn make_pid() -> PidPressureController {
             ..PidConfig::default()
         },
         Duration::from_secs(1),
-    )
+    );
+    pid.set_action_horizon_minutes(30.0);
+    pid
 }
 
 fn make_ewma() -> DiskRateEstimator {
@@ -716,8 +718,8 @@ fn run_scenario_d(seed: u64, iterations: usize) -> ScenarioResult {
 
     for iter in 0..iterations {
         let mut rng = SeededRng::new(seed.wrapping_add(u64_from_usize(iter).saturating_mul(17)));
-        let total = 1_000_000_000_000u64;
-        let initial_free = 250_000_000_000u64;
+        let total = 15_000_000_000u64;
+        let initial_free = 3_750_000_000u64;
         let consume_rate = 200_000_000u64 + (rng.next_u64() % 50_000_000);
         let consume_ticks = 15;
         let recover_rate = 150_000_000u64 + (rng.next_u64() % 50_000_000);
