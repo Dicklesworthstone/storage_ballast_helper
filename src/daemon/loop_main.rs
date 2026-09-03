@@ -9055,13 +9055,21 @@ mod tests {
             }
         }
 
-        // Not under /tmp or /data/tmp: inside a temp root every recognized
-        // artifact is `definite` by rule, which is the opposite of what this
-        // test needs. The cargo target directory is neither temp nor source.
-        let scratch_base = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-            || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
-            PathBuf::from,
-        );
+        // Not under a temp root: inside one every recognized artifact is
+        // `definite` by rule, which is the opposite of what this test needs.
+        // The cargo target directory is neither temp nor source, unless the
+        // build itself runs from a temp root (a scratch worktree, a remote
+        // worker), in which case the user cache directory stands in.
+        let scratch_base = [
+            std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")),
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".cache").join("sbh-test-scratch")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|base| !crate::scanner::scoring::is_volatile_temp_path(base))
+        .expect("a scratch base outside every temp root");
         std::fs::create_dir_all(&scratch_base).unwrap();
         let temp = tempfile::tempdir_in(&scratch_base).unwrap();
         let root = temp.path().join("scan-root");

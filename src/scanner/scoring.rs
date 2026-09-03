@@ -961,7 +961,13 @@ fn is_generic_target_pattern(pattern_name: &str) -> bool {
     )
 }
 
-fn is_volatile_temp_path(path: &Path) -> bool {
+/// Whether `path` lies under a volatile temp root.
+///
+/// Inside one, every recognized artifact is `definite` and the location
+/// factor is at its maximum; test fixtures that need an `unclear` verdict
+/// must live elsewhere.
+#[must_use]
+pub fn is_volatile_temp_path(path: &Path) -> bool {
     path.starts_with("/tmp")
         || path.starts_with("/private/tmp")
         || path.starts_with("/var/tmp")

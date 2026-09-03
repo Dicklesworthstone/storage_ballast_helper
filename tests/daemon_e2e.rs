@@ -2225,14 +2225,26 @@ fn check_predict_reads_the_daemon_forecast_and_refuses_stale_state() {
 /// minutes on the operator workstation) because the executor's certainty gate
 /// was the only one and a replay counted as reclaim progress. Now the scanner
 /// holds it, the pass is unproductive, and the empty-pass cooldown backs off.
+/// A fixture base outside every temp root: inside one every recognized
+/// artifact is `definite` by rule. The cargo target directory is neither temp
+/// nor source, unless the build itself runs from a temp root (a scratch
+/// worktree, a remote worker), in which case the user cache directory stands in.
+fn non_temp_scratch_base() -> PathBuf {
+    [
+        std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")),
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".cache").join("sbh-test-scratch")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|base| !storage_ballast_helper::scanner::scoring::is_volatile_temp_path(base))
+    .expect("a scratch base outside every temp root")
+}
+
 #[test]
 fn orange_pressure_with_only_unclear_candidates_backs_off_instead_of_replaying() {
-    // Not under /data/tmp: inside a temp root every recognized artifact is
-    // `definite` by rule. The cargo target directory is neither temp nor source.
-    let scratch_base = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
-        PathBuf::from,
-    );
+    let scratch_base = non_temp_scratch_base();
     fs::create_dir_all(&scratch_base).unwrap();
     let dir = tempfile::tempdir_in(&scratch_base).unwrap();
     let root = dir.path().join("root");
@@ -2298,10 +2310,7 @@ fn orange_pressure_with_only_unclear_candidates_backs_off_instead_of_replaying()
 /// paces an unconfirmed one like an empty pass.
 #[test]
 fn dry_run_orange_pressure_backs_off_after_the_first_dispatch() {
-    let scratch_base = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
-        PathBuf::from,
-    );
+    let scratch_base = non_temp_scratch_base();
     fs::create_dir_all(&scratch_base).unwrap();
     let dir = tempfile::tempdir_in(&scratch_base).unwrap();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
