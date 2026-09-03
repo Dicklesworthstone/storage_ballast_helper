@@ -1,0 +1,1 @@
+SHA256 (sbh-linux-amd64) = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef

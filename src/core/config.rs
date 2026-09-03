@@ -1637,6 +1637,14 @@ impl Config {
     ///    - macOS: `/Library/Application Support/sbh/config.toml`
     ///
     /// Missing config file is not an error when loading from default path; defaults are used.
+    /// Parse config text the way `load` does (lenient on unknown keys,
+    /// which come back alongside the config) without touching the
+    /// filesystem, the environment or the sacred catalog. The fuzz harness
+    /// and tests use it; `load` remains the daemon's entry point.
+    pub fn parse_toml(raw: &str) -> Result<(Self, Vec<UnknownConfigKey>)> {
+        parse_config_lenient(raw)
+    }
+
     pub fn load(path: Option<&Path>) -> Result<Self> {
         Self::load_with_default_paths(path, PathsConfig::default(), true)
     }
@@ -2091,7 +2099,9 @@ impl Config {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn validate(&self) -> Result<()> {
+    /// Check every invariant the daemon relies on (thresholds ordered, budgets
+    /// in range, paths sane); `load` runs it, the fuzz harness re-runs it.
+    pub fn validate(&self) -> Result<()> {
         // Behavior matrix: custom cell keys must name a real cell.
         BehaviorDispatchTable::from_config(&self.behavior).map_err(|details| {
             SbhError::InvalidConfig {

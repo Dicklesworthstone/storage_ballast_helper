@@ -578,6 +578,18 @@ The test harness:
 - Logs each test case output to timestamped files for debugging
 - Verifies CLI scaffolding and subcommand handlers
 
+### Fuzz Targets
+
+`fuzz/` is a `cargo fuzz` crate (its own workspace) with one target per parser that faces untrusted or operator-authored input: `config_parse`, `jsonl_reader`, `checksum_parsers`, `provenance_manifest`, `control_protocol`, `protect_marker`, `state_json`. The harness bodies live in `src/fuzzing.rs` so the same invariants ("never panics; a successful parse round-trips or validates; renderers of the value do not panic") run without libFuzzer:
+
+```bash
+rch exec "cargo test --test fuzz_smoke"          # every target over fuzz/corpus/<target>/ plus 400 mutations per seed
+rch exec "cargo fuzz build --fuzz-dir fuzz"       # the libFuzzer binaries (nightly; workers need cargo-fuzz)
+cargo fuzz run config_parse --fuzz-dir fuzz -- -max_total_time=60   # coverage-guided, on demand
+```
+
+A crash found by `cargo fuzz` becomes a seed file under `fuzz/corpus/<target>/` (the smoke test then reproduces it forever) and a fix in the parser. `scripts/quality-gate.sh --stage fuzz` runs the smoke test.
+
 ### End-to-End Testing
 
 ```bash

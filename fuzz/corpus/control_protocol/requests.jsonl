@@ -1,0 +1,7 @@
+{"cmd": "ping", "args": {}, "token": "t"}
+{"cmd": "status", "args": {}, "token": "t"}
+{"cmd": "scan-now", "args": {"paths": ["/data/projects"]}, "token": "t"}
+{"cmd": "policy", "args": {"action": "promote"}, "token": "t"}
+{"cmd": "explain", "args": {"id": "0123456789ab"}, "token": "t"}
+{"cmd": "ballast", "args": {"action": "release", "count": 1}, "token": "t"}
+{"cmd": "shutdown", "args": {}, "token": "t"}

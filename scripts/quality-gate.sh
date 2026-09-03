@@ -318,6 +318,13 @@ stage_stress_harness() {
   run_cargo "$1" "cargo test --test stress_harness -- --test-threads=2"
 }
 
+stage_fuzz() {
+  # The fuzz harnesses over their seed corpora and deterministic mutations
+  # (no libFuzzer needed); `cargo fuzz run <target>` in fuzz/ is the
+  # coverage-guided search, run on demand.
+  run_cargo "$1" "cargo test --test fuzz_smoke"
+}
+
 stage_e2e() {
   local logfile="$1"
   (cd "${ROOT_DIR}" && SBH_E2E_LOG_DIR="${LOG_DIR}/e2e" ./scripts/e2e_test.sh) > "${logfile}" 2>&1
@@ -441,6 +448,10 @@ echo "${BLD}Stage 5: Stress & Performance${RST}"
 run_stage "stress" "HARD" "daemon-stability" \
   "Stress test failure — check for deadlocks, channel starvation, or OOM" \
   stage_stress
+
+run_stage "fuzz" "SOFT" "parser-robustness" \
+  "A harness in src/fuzzing.rs panicked: reproduce with 'cargo test --test fuzz_smoke', add the input as a seed under fuzz/corpus/<target>/ and fix the parser" \
+  stage_fuzz
 
 run_stage "stress-harness" "SOFT" "concurrency-safety" \
   "Stress harness failure — may indicate timing sensitivity (check thread count)" \

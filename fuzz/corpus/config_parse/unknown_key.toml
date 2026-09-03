@@ -1,0 +1,4 @@
+[scanner]
+root_pahts = ["/data/projects"]
+[pressure]
+green_min_free_pct = 30.0

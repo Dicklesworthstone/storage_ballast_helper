@@ -1,0 +1,1 @@
+{"version": "0.5.1", "assets": [{"name": "sbh-linux-amd64", "version": "0.5.1", "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "url": "https://example.invalid/sbh-linux-amd64", "mirrors": [], "size_bytes": 1234, "required": true, "description": "linux build"}]}

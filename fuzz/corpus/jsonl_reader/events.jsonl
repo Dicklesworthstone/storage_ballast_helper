@@ -1,0 +1,6 @@
+{"ts":"2026-09-02T12:00:00.000Z","event":"artifact_delete","severity":"info","schema_version":2,"run_id":"1a2b-3c4d","path":"/data/p/target","size":1024,"ok":true,"decision_id":"d-1"}
+{"ts":"2026-08-18T09:15:02.417Z","event":"artifact_delete","severity":"info","path":"/data/p/target","size":1024,"ok":true}
+{"ts":"2026-09-02T12:00:00Z","event":"error","severity":"critical","schema_version":2,"run_id":"r","error_code":"SBH-2004","error_message":"refused writes"}
+{"ts":"2026-09-02T12:00:00Z","event":"pressure_change","severity":"info","pressure":"Green->Orange","free_pct":11.0,"mount_point":"/data"}
+{"ts":"2026-09-02T12:00:00Z","event":"scan_complete","severity":"info","duration_ms":52,"ok":true,"details":"paths_scanned=2 candidates=1 engine=v2 reason=orange_pressure"}
+{"ts":"2026-09-02T12:00:00Z","event":"info","severity":"info","ok":true,"details":"planner level=orange target_bytes=1 planned_bytes=1 risk_budget=250.00 risk_used=7.50 chosen=1 skipped_for_budget=0 top_n_risk=7.50 json={}"}

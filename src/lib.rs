@@ -30,6 +30,7 @@ pub mod ballast;
 pub mod cli;
 pub mod core;
 pub mod daemon;
+pub mod fuzzing;
 pub mod logger;
 pub mod monitor;
 pub mod platform;

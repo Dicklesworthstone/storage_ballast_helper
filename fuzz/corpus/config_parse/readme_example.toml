@@ -1,0 +1,129 @@
+[scanner]
+quarantine_enabled = true # Layer 7: Green and `sbh clean` candidates go to <root>/.sbh/quarantine (`sbh undo`)
+quarantine_ttl_hours = 24
+quarantine_max_bytes_pct = 5
+engine = "v2"  # default since v0.4.32; set "v1" to opt back into the legacy full-descent walker
+event_source = "auto"
+event_watch_budget = 8192
+root_paths = ["/data/projects", "/tmp", "/dev/shm"]
+cross_devices = false
+protected_paths = ["/data/projects/production-*", "/home/*/critical-builds"]
+
+[core]
+strict_config = false  # true: refuse to start when the file has keys no section declares
+control_socket_enabled = true  # serve control.sock beside state.json for `sbh daemon ping|scan-now|reload|shutdown`, `sbh policy`, live `sbh status`
+
+[pressure]
+green_min_free_pct = 35.0
+yellow_min_free_pct = 20.0
+orange_min_free_pct = 10.0
+red_min_free_pct = 5.0
+poll_interval_ms = 2000
+
+[ballast]
+auto_provision = true          # false: the daemon never builds the pool; use `sbh ballast provision`
+file_count = 5
+file_size_bytes = 1073741824   # 1 GiB per file
+
+[ballast.overrides."/data"]
+file_count = 10
+file_size_bytes = 2147483648
+
+[ballast.overrides."/tmp"]
+enabled = false
+
+[scoring]
+location_weight = 0.25
+name_weight = 0.25
+age_weight = 0.20
+size_weight = 0.15
+structure_weight = 0.15
+calibration_floor = 0.75
+
+[policy]
+initial_mode = "observe"       # observe | canary | enforce
+max_canary_deletes_per_hour = 5
+kill_switch = false            # true holds the daemon in fallback-safe (no deletions)
+# What each fallback trigger does. Unset calibration_breach_action means
+# "demote" unless initial_mode is "enforce" (then "advisory"); unset
+# emergency_escalation means on for enforce fleets, off otherwise.
+# calibration_breach_action = "demote"      # demote | advisory
+# canary_budget_action = "keep"             # keep | demote
+# serialization_failure_action = "demote"   # demote | advisory
+# auto_recover_to = "canary"                # none | canary | previous
+# emergency_escalation = false
+
+[paths]
+sqlite_db = "/var/lib/sbh/activity.sqlite3"
+jsonl_log = "/var/lib/sbh/activity.jsonl"
+
+[pressure.prediction]
+enabled = true
+action_horizon_minutes = 30.0
+warning_horizon_minutes = 60.0
+min_confidence = 0.7
+min_samples = 5
+imminent_danger_minutes = 5.0
+critical_danger_minutes = 2.0
+
+[pressure.controller]
+# Per-mount PID gains (see "PID Pressure Controller"); the setpoint is green_min_free_pct.
+kp = 0.25
+ki = 0.08
+kd = 0.02
+kf = 0.8                        # forecast feedforward gain
+integral_cap = 100.0
+hysteresis_pct = 1.0
+reference_total_bytes = 1099511627776   # 1 TiB: kp applies unscaled here
+kp_scale_min = 0.5
+kp_scale_max = 2.0
+
+[scheduler]
+enabled = true
+scan_budget_per_interval = 5
+exploration_quota_fraction = 0.20
+io_cost_weight = 0.1
+fp_risk_weight = 0.15
+exploration_weight = 0.25
+forecast_error_threshold = 0.5
+fallback_trigger_windows = 3
+recovery_trigger_windows = 5
+
+[notifications]
+enabled = true
+channels = ["journal", "file"]
+min_notify_interval_secs = 60
+urgent_notify_interval_secs = 300
+
+[notifications.desktop]
+enabled = false
+min_level = "orange"
+
+[notifications.webhook]
+enabled = false
+url = ""
+min_level = "red"
+template = '{"text": "sbh: ${SUMMARY}"}'
+
+[notifications.file]
+path = "~/.local/share/sbh/notifications.jsonl"
+
+[notifications.journal]
+min_level = "warning"
+
+[dashboard]
+mode = "new"       # "legacy" | "new"
+kill_switch = false
+
+[system_tuning]
+# Kernel writeback (dirty-page) tuning. Linux-only; macOS treats it as not-applicable.
+writeback_enabled = true
+writeback_auto_apply_on_install = true   # apply + persist during `sbh install` when run as root
+writeback_target_drain_secs = 1.0        # size dirty_background_bytes to drain in ~1s
+writeback_hard_ratio = 4                  # dirty_bytes = 4 × dirty_background_bytes
+writeback_min_background_bytes = 268435456    # 256 MiB floor
+writeback_max_background_bytes = 2147483648   # 2 GiB ceiling
+writeback_benchmark_enabled = true        # measure device bandwidth on --apply
+writeback_benchmark_bytes = 100663296     # 96 MiB micro-benchmark budget
+writeback_pool_warn_bytes = 4294967296    # doctor WARN above ~4 GiB effective dirty pool
+writeback_sysctl_path = "/etc/sysctl.d/99-sbh-writeback.conf"

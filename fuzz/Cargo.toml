@@ -1,0 +1,68 @@
+[package]
+name = "storage_ballast_helper-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.storage_ballast_helper]
+path = ".."
+
+# Its own workspace: the fuzz crate is excluded from the main package's
+# build, clippy and test runs and only built by `cargo fuzz`.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jsonl_reader"
+path = "fuzz_targets/jsonl_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "checksum_parsers"
+path = "fuzz_targets/checksum_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provenance_manifest"
+path = "fuzz_targets/provenance_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_protocol"
+path = "fuzz_targets/control_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protect_marker"
+path = "fuzz_targets/protect_marker.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_json"
+path = "fuzz_targets/state_json.rs"
+test = false
+doc = false
+bench = false
