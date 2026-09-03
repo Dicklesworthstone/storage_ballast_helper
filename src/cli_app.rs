@@ -41,6 +41,7 @@ use storage_ballast_helper::daemon::service::{
 };
 use storage_ballast_helper::logger::sqlite::SqliteLogger;
 use storage_ballast_helper::logger::stats::{StatsEngine, window_label};
+use storage_ballast_helper::monitor::burst::BurstStats;
 use storage_ballast_helper::monitor::fs_stats::FsStatsCollector;
 use storage_ballast_helper::platform::pal::{
     BlockDeviceInfo, MemoryInfo, Platform, ServiceManager, detect_platform,
@@ -5830,6 +5831,15 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
     if let Some(ref tuning) = writeback {
         recs.extend(tuning.recommendations.clone());
     }
+    // bd-rc-master-ajg1.2.18: pool sizes from the daemon's burst windows.
+    let bursts = BurstStats::load_or_new(BurstStats::snapshot_path_for_state_file(
+        &config.paths.state_file,
+    ));
+    recs.extend(burst_reserve_recommendations(
+        &config,
+        &bursts,
+        &reserve_pools(cli, &config),
+    ));
     recs.sort_by(|a, b| {
         b.confidence
             .partial_cmp(&a.confidence)
@@ -7332,7 +7342,16 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
         let platform = detect_platform().map_err(|e| CliError::Runtime(e.to_string()))?;
         let config =
             Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
-        Some(system_doctor_checks(platform.as_ref(), &config))
+        let pools = reserve_pools(cli, &config);
+        let bursts = BurstStats::load_or_new(BurstStats::snapshot_path_for_state_file(
+            &config.paths.state_file,
+        ));
+        Some(system_doctor_checks(
+            platform.as_ref(),
+            &config,
+            &bursts,
+            &pools,
+        ))
     } else {
         None
     };
@@ -7408,13 +7427,188 @@ fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
 
 /// Host-level tuning diagnostics (kernel writeback / dirty-page limits) plus
 /// emergency-reserve integrity.
-fn system_doctor_checks(platform: &dyn Platform, config: &Config) -> Vec<DoctorCheck> {
+fn system_doctor_checks(
+    platform: &dyn Platform,
+    config: &Config,
+    bursts: &BurstStats,
+    pools: &[ReservePool],
+) -> Vec<DoctorCheck> {
     let mut checks = vec![
         writeback_doctor_check(platform, config),
         ballast_reserve_doctor_check(config),
     ];
+    checks.extend(reserve_coverage_doctor_checks(config, bursts, pools));
     checks.extend(reclaim_capability_doctor_checks(config));
     checks
+}
+
+/// A ballast pool as the reserve-sizing checks see it: the mount and what
+/// is releasable there right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReservePool {
+    mount: PathBuf,
+    releasable_bytes: u64,
+}
+
+/// Every pool the daemon would manage, reduced to what reserve sizing needs.
+fn reserve_pools(cli: &Cli, config: &Config) -> Vec<ReservePool> {
+    ballast_volume_inventory(cli, config)
+        .into_iter()
+        .filter(|volume| !volume.skipped)
+        .map(|volume| ReservePool {
+            mount: volume.mount_point,
+            releasable_bytes: volume.releasable_bytes,
+        })
+        .collect()
+}
+
+/// bd-rc-master-ajg1.2.18: each pool's releasable bytes against the reserve
+/// the mount's observed write bursts require. FAIL below full coverage; a
+/// mount without burst windows yet passes with a note.
+fn reserve_coverage_doctor_checks(
+    config: &Config,
+    bursts: &BurstStats,
+    pools: &[ReservePool],
+) -> Vec<DoctorCheck> {
+    if pools.is_empty() {
+        return vec![doctor_check(
+            "ballast.reserve_coverage",
+            "Reserve covers observed write bursts",
+            "PASS",
+            "no ballast pool to size (see ballast.reserve)",
+            None,
+        )];
+    }
+    pools
+        .iter()
+        .map(|pool| {
+            let mount_key = pool.mount.to_string_lossy();
+            let file_size = config.ballast.effective_file_size_bytes(&mount_key);
+            let Some(estimate) = bursts.estimate(&pool.mount, file_size) else {
+                return doctor_check(
+                    "ballast.reserve_coverage",
+                    "Reserve covers observed write bursts",
+                    "PASS",
+                    format!(
+                        "{mount_key}: no reaction windows observed yet; the daemon sizes the \
+                         reserve after its first {}-second window",
+                        bursts.reaction_window().secs().round()
+                    ),
+                    None,
+                );
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let coverage = if estimate.bytes == 0 {
+                1.0
+            } else {
+                pool.releasable_bytes as f64 / estimate.bytes as f64
+            };
+            let detail = format!(
+                "{mount_key}: {} releasable vs {} required ({} bursts of at most {} per {:.0} s \
+                 window, {} windows, {} estimate): coverage {coverage:.2}",
+                format_bytes(pool.releasable_bytes),
+                format_bytes(estimate.bytes),
+                "99% of",
+                format_bytes(estimate.burst_q99_bytes),
+                estimate.window_secs,
+                estimate.windows,
+                estimate.method.as_str(),
+            );
+            if coverage >= 1.0 {
+                doctor_check(
+                    "ballast.reserve_coverage",
+                    "Reserve covers observed write bursts",
+                    "PASS",
+                    detail,
+                    None,
+                )
+            } else {
+                doctor_check(
+                    "ballast.reserve_coverage",
+                    "Reserve covers observed write bursts",
+                    "FAIL",
+                    detail,
+                    Some(format!(
+                        "Raise the pool to {} files of {} (`sbh tune` recommends it; `sbh tune \
+                         --apply --yes` writes it), then `sbh ballast provision`.",
+                        estimate.file_count(file_size),
+                        format_bytes(file_size),
+                    )),
+                )
+            }
+        })
+        .collect()
+}
+
+/// bd-rc-master-ajg1.2.18: `file_count` per pool from the observed bursts,
+/// `ceil(reserve / file_size)`, when it differs from the configured count.
+/// One pool without an override is tuned through `ballast.file_count`; any
+/// other pool through its `ballast.overrides` entry. A mount whose path
+/// contains a dot cannot be addressed by the dotted key `tune --apply`
+/// writes, so it is left to the operator.
+fn burst_reserve_recommendations(
+    config: &Config,
+    bursts: &BurstStats,
+    pools: &[ReservePool],
+) -> Vec<Recommendation> {
+    let mut recs = Vec::new();
+    for pool in pools {
+        let mount_key = pool.mount.to_string_lossy().into_owned();
+        let file_size = config.ballast.effective_file_size_bytes(&mount_key);
+        let Some(estimate) = bursts.estimate(&pool.mount, file_size) else {
+            continue;
+        };
+        if file_size == 0 {
+            continue;
+        }
+        let current = config.ballast.effective_file_count(&mount_key) as u64;
+        let suggested = estimate.file_count(file_size);
+        if suggested == current {
+            continue;
+        }
+        let has_override = config
+            .ballast
+            .overrides
+            .contains_key(mount_key.trim_end_matches('/'));
+        let config_key = if pools.len() == 1 && !has_override {
+            "ballast.file_count".to_string()
+        } else if mount_key.contains('.') {
+            continue;
+        } else {
+            format!(
+                "ballast.overrides.{}.file_count",
+                mount_key.trim_end_matches('/')
+            )
+        };
+        let confidence = match estimate.method {
+            storage_ballast_helper::monitor::burst::ReserveMethod::Quantile => 0.8,
+            storage_ballast_helper::monitor::burst::ReserveMethod::Tail => 0.55,
+            storage_ballast_helper::monitor::burst::ReserveMethod::Floor => 0.3,
+        };
+        recs.push(Recommendation {
+            category: TuningCategory::Ballast,
+            config_key,
+            current_value: current.to_string(),
+            suggested_value: suggested.to_string(),
+            rationale: format!(
+                "{mount_key}: 99% of {:.0}-second reaction windows grew by at most {} ({} windows, \
+                 {} estimate); the reserve should hold {} = {suggested} files of {}",
+                estimate.window_secs,
+                format_bytes(estimate.burst_q99_bytes),
+                estimate.windows,
+                estimate.method.as_str(),
+                format_bytes(estimate.bytes),
+                format_bytes(file_size),
+            ),
+            confidence,
+            risk: if suggested > current {
+                TuningRisk::Low
+            } else {
+                TuningRisk::Medium
+            },
+        });
+    }
+    recs
 }
 
 /// #16: fail loudly when a ballast reserve is configured but not actually
@@ -9327,6 +9521,24 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                             }
                             if reserve.get("floor_limited") == Some(&Value::Bool(true)) {
                                 text.push_str(" floor");
+                            }
+                            // bd-rc-master-ajg1.2.18: what the observed
+                            // bursts say the reserve should be.
+                            if let Some(burst) = reserve.get("burst") {
+                                let recommended = burst
+                                    .get("recommended_bytes")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0);
+                                let windows =
+                                    burst.get("windows").and_then(Value::as_u64).unwrap_or(0);
+                                let method = burst
+                                    .get("method")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("floor");
+                                text = format!(
+                                    "{text} need {} ({method}, {windows} windows)",
+                                    format_bytes(recommended)
+                                );
                             }
                             text
                         },
@@ -17621,6 +17833,94 @@ mod tests {
         let config = Config::default();
         let recs = generate_recommendations(&config, &[]);
         assert!(recs.is_empty());
+    }
+
+    /// bd-rc-master-ajg1.2.18: the pool size follows the observed bursts and
+    /// the doctor check compares what is releasable against it.
+    #[test]
+    fn burst_windows_size_the_pool_and_gate_the_doctor_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bursts = BurstStats::new(dir.path().join("burst_stats.bin"));
+        let mount = PathBuf::from("/data");
+        let mut config = Config::default();
+        config.ballast.file_count = 4;
+        config.ballast.file_size_bytes = 64 << 20;
+        let file_size = config.ballast.effective_file_size_bytes("/data");
+        assert_eq!(file_size, 64 << 20);
+        let pools = vec![ReservePool {
+            mount: mount.clone(),
+            releasable_bytes: 4 * file_size,
+        }];
+
+        // No windows yet: nothing to recommend, the doctor passes with a note.
+        assert!(burst_reserve_recommendations(&config, &bursts, &pools).is_empty());
+        let checks = reserve_coverage_doctor_checks(&config, &bursts, &pools);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, "PASS");
+        assert!(
+            checks[0].message.contains("no reaction windows"),
+            "{:?}",
+            checks[0]
+        );
+
+        // Sixty windows: fifty-nine quiet, one 1 GiB burst; q99 lands on it.
+        for _ in 0..59 {
+            bursts.mount_mut(&mount).push_sample(1e6);
+        }
+        bursts.mount_mut(&mount).push_sample(f64::from(1u32 << 30));
+        let recs = burst_reserve_recommendations(&config, &bursts, &pools);
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        let rec = &recs[0];
+        assert_eq!(rec.config_key, "ballast.file_count");
+        assert_eq!(rec.category, TuningCategory::Ballast);
+        assert_eq!(rec.current_value, "4");
+        // 1 GiB / 64 MiB = 16 files.
+        assert_eq!(rec.suggested_value, "16");
+        assert!(
+            rec.rationale.contains("reaction windows"),
+            "{}",
+            rec.rationale
+        );
+        assert!(rec.confidence > 0.7);
+        assert_eq!(rec.risk, TuningRisk::Low);
+
+        let checks = reserve_coverage_doctor_checks(&config, &bursts, &pools);
+        assert_eq!(checks[0].status, "FAIL", "{:?}", checks[0]);
+        assert!(
+            checks[0].message.contains("coverage 0.25"),
+            "{}",
+            checks[0].message
+        );
+        assert!(
+            checks[0]
+                .remediation
+                .as_deref()
+                .is_some_and(|r| r.contains("16 files")),
+            "{:?}",
+            checks[0].remediation
+        );
+
+        // A pool holding the recommendation passes; per-mount keys are used
+        // once a second pool exists.
+        let covered = vec![
+            ReservePool {
+                mount: mount.clone(),
+                releasable_bytes: 16 * file_size,
+            },
+            ReservePool {
+                mount: PathBuf::from("/home"),
+                releasable_bytes: 0,
+            },
+        ];
+        let checks = reserve_coverage_doctor_checks(&config, &bursts, &covered);
+        assert_eq!(checks[0].status, "PASS", "{:?}", checks[0]);
+        let recs = burst_reserve_recommendations(&config, &bursts, &covered);
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert_eq!(recs[0].config_key, "ballast.overrides./data.file_count");
+        // No pools at all: one PASS check saying so.
+        let none = reserve_coverage_doctor_checks(&config, &bursts, &[]);
+        assert_eq!(none.len(), 1);
+        assert!(none[0].message.contains("no ballast pool"));
     }
 
     #[test]

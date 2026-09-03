@@ -36,7 +36,7 @@ use crate::daemon::control::{
 use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD};
 use crate::daemon::mount_controller::{
     IdleReason, MountController, MountControllerConfig, MountState, MountStateRecord, MountSurface,
-    MountTickInput, ReserveState, WakeSignals, global_tick,
+    MountTickInput, ReserveBurst, ReserveState, WakeSignals, global_tick,
 };
 use crate::daemon::notifications::{NotificationEvent, NotificationLevel, NotificationManager};
 use crate::daemon::policy::{
@@ -53,6 +53,7 @@ use crate::logger::dual::{
     ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, ScanCompletionTelemetry, spawn_logger,
 };
 use crate::logger::jsonl::JsonlConfig;
+use crate::monitor::burst::BurstStats;
 use crate::monitor::conformal::{ConformalCalibrator, ConformalConfig, TteInterval};
 use crate::monitor::ewma::{DiskRateEstimator, RateEstimate};
 use crate::monitor::fs_stats::FsStatsCollector;
@@ -1766,6 +1767,12 @@ pub struct MonitoringDaemon {
     last_full_disk_access_state: Option<FullDiskAccessState>,
     full_disk_access_granted_logged: bool,
     process_io_history: ProcessIoHistory,
+    /// Per-mount write-burst windows and the reserve they imply
+    /// (bd-rc-master-ajg1.2.18), persisted beside `state.json`.
+    burst_stats: BurstStats,
+    /// When the last scan pass completed and how long it took, so the next
+    /// deletion report can close a reaction-window cycle.
+    last_scan_completed: Option<(Instant, Duration)>,
     self_monitor: SelfMonitor,
     tick_throttle: AdaptiveTickThrottle,
     policy_engine: Arc<Mutex<PolicyEngine>>,
@@ -2659,6 +2666,9 @@ impl MonitoringDaemon {
         let process_io_history = ProcessIoHistory::load_or_new(
             ProcessIoHistory::snapshot_path_for_state_file(&config.paths.state_file),
         );
+        let burst_stats = BurstStats::load_or_new(BurstStats::snapshot_path_for_state_file(
+            &config.paths.state_file,
+        ));
 
         // 12. Thread heartbeats for worker health detection.
         let scanner_heartbeat = ThreadHeartbeat::new("sbh-scanner");
@@ -2753,6 +2763,8 @@ impl MonitoringDaemon {
             last_full_disk_access_state: None,
             full_disk_access_granted_logged: false,
             process_io_history,
+            burst_stats,
+            last_scan_completed: None,
             self_monitor,
             tick_throttle: AdaptiveTickThrottle::default(),
             control_tx,
@@ -2802,6 +2814,25 @@ impl MonitoringDaemon {
                 });
             }
         }
+    }
+
+    /// The reserve the mount's observed write bursts call for, and how long
+    /// `present_bytes` would last at that burst rate; `None` until the mount
+    /// has closed a reaction window.
+    fn burst_reserve(&self, mount: &Path, present_bytes: u64) -> Option<ReserveBurst> {
+        let file_size = self
+            .config
+            .ballast
+            .effective_file_size_bytes(&mount.to_string_lossy());
+        let estimate = self.burst_stats.estimate(mount, file_size)?;
+        Some(ReserveBurst {
+            recommended_bytes: estimate.bytes,
+            q99_bytes: estimate.burst_q99_bytes,
+            windows: estimate.windows,
+            reaction_window_secs: estimate.window_secs,
+            method: estimate.method,
+            horizon_minutes: estimate.horizon_minutes(present_bytes),
+        })
     }
 
     fn sample_process_io_history(&mut self) {
@@ -3337,13 +3368,15 @@ impl MonitoringDaemon {
                 .find(|item| item.mount_point == mount && !item.skipped)
             else {
                 // No ballast pool here; the quarantine is still reserve.
-                if quarantined_bytes > 0 {
+                let burst = self.burst_reserve(&mount, quarantined_bytes);
+                if quarantined_bytes > 0 || burst.is_some() {
                     record.reserve_state = Some(ReserveState {
                         present_bytes: 0,
                         target_bytes: 0,
                         horizon_minutes: None,
                         floor_limited: false,
                         quarantined_bytes,
+                        burst,
                     });
                 }
                 continue;
@@ -3357,6 +3390,7 @@ impl MonitoringDaemon {
                 horizon_minutes,
                 floor_limited: self.floor_limited.contains(&mount),
                 quarantined_bytes,
+                burst: self.burst_reserve(&mount, pool.releasable_bytes + quarantined_bytes),
             });
         }
         let idle_reason = daemon_idle_reason(&controllers);
@@ -3636,6 +3670,7 @@ impl MonitoringDaemon {
                         }
                         self.summary_candidates += candidates as u64;
                         self.self_monitor.record_scan(candidates, 0, duration);
+                        self.last_scan_completed = Some((Instant::now(), duration));
                         let now = Instant::now();
                         #[allow(clippy::cast_possible_truncation)]
                         for stat in &root_stats {
@@ -3667,6 +3702,15 @@ impl MonitoringDaemon {
                         self.summary_failed += failed;
                         self.summary_bytes_freed += bytes_freed;
                         self.self_monitor.record_deletions(deleted, bytes_freed);
+                        // One reaction cycle: poll, scan, then the reclaim
+                        // that followed it; it sizes the burst windows.
+                        if let Some((scan_completed_at, scan_duration)) =
+                            self.last_scan_completed.take()
+                        {
+                            let poll = Duration::from_millis(self.config.pressure.poll_interval_ms);
+                            self.burst_stats
+                                .record_cycle(poll + scan_duration + scan_completed_at.elapsed());
+                        }
                         // Mount incidents: park the owning mounts in recovery
                         // on the next tick instead of retrying.
                         for path in &recovery_paths {
@@ -4041,6 +4085,13 @@ impl MonitoringDaemon {
             // Keep this mount's own reading for the per-mount controllers.
             self.mount_rates
                 .insert(mount_path.clone(), rate_estimate.bytes_per_second);
+            // One used-bytes reading per tick feeds the reserve-sizing
+            // windows (peak growth per reaction window).
+            self.burst_stats.observe(
+                &mount_path,
+                now,
+                stats.total_bytes.saturating_sub(stats.available_bytes),
+            );
             self.mount_responses.push(MountTickResponse {
                 response: response.clone(),
                 seconds_to_red: predicted_seconds,
@@ -5752,6 +5803,8 @@ impl MonitoringDaemon {
 
         // The control socket goes first: a client must not reach a daemon
         // that is draining, and the socket file must be gone when we exit.
+        // The burst windows are a week of evidence; keep them across restarts.
+        self.burst_stats.persist();
         if let Some(server) = self.control_server.take() {
             server.stop();
         }

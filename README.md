@@ -415,7 +415,7 @@ sbh --json lease renew --extend 30m
 | `sbh blame` | Attribute artifact pressure by process/agent |
 | `sbh dashboard` | Real-time TUI dashboard |
 | `sbh doctor --pal` | Validate platform integration and macOS runtime prerequisites |
-| `sbh doctor --system` | Check host kernel tuning (writeback / dirty-page limits) |
+| `sbh doctor --system` | Check host kernel tuning (writeback / dirty-page limits) and whether each ballast pool covers the reserve its observed write bursts require |
 | `sbh doctor --service [--user]` | Compare the installed systemd unit (or launchd plist) with what sbh generates: FAIL on missing hardening, a different `Type=`/binary, a drop-in overriding hardening, or a `Condition*=` gate that keeps the unit from starting; WARN on foreign drop-ins and cosmetic differences |
 | `sbh service --systemd reinstall-unit [--purge-dropins]` | Rewrite the unit from the generator with a timestamped backup beside it and `daemon-reload`; drop-ins stay in effect unless `--purge-dropins` moves them into the backup directory |
 | `sbh explain (--id ID \| --last N \| --path P \| --since W) [--level 0-3]` | Explain recorded cleanup decisions: the daemon records one per evaluated candidate, `sbh clean` records its plan; ids are stable per artifact version and appear in `scan --json` and `artifact_delete` events |
@@ -1710,6 +1710,8 @@ sudo sbh tune --revert-writeback
 Configure under `[system_tuning]` (see the config example) or via `SBH_SYSTEM_TUNING_WRITEBACK_*` environment variables.
 
 `sbh uninstall` deliberately does **not** revert this tuning — the byte limits are a beneficial host setting that should outlive sbh, and undoing them would silently reintroduce the write-burst stalls. Run `sudo sbh tune --revert-writeback` first if you want the original `vm.dirty_*` behavior back.
+
+**Reserve sizing from observed bursts.** The daemon also measures, per mount, how much used space grows inside each *reaction window* (an EWMA of poll + scan + reclaim latency, five-minute prior) and keeps those samples in a t-digest persisted as `burst_stats.bin` beside `state.json`. The reserve a mount needs is the 0.99 quantile of the windows: the digest's quantile after 50 windows, a generalized Pareto tail extrapolated from the exceedances above the 0.9 quantile from 10 windows, and never less than two ballast files. `sbh tune` turns it into `file_count = ceil(reserve / file_size)` (`ballast.file_count` for a single pool without an override, otherwise `ballast.overrides.<mount>.file_count`, which `--apply` writes), `sbh doctor --system` reports `ballast.reserve_coverage` and FAILs when a pool's releasable bytes fall short, `sbh status` shows the required bytes with the estimate method and window count, and `state.json` carries `reserve_state.burst` per mount (`recommended_bytes`, `q99_bytes`, `windows`, `reaction_window_secs`, `method`, and `horizon_minutes`, how long the present reserve buys at the burst rate).
 
 Source: `src/tuning/writeback.rs`, `src/tuning/bandwidth.rs`, `src/platform/linux/writeback.rs`
 

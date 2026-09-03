@@ -242,6 +242,16 @@ pub fn render(state: &DaemonState, git_sha: &str) -> String {
         "Bytes held in quarantine on the mount.",
         "gauge",
     );
+    let mut reserve_recommended = Family::new(
+        "sbh_reserve_recommended_bytes",
+        "Reserve the mount's observed write bursts call for (0.99 quantile per reaction window, floored at two ballast files).",
+        "gauge",
+    );
+    let mut burst_q99 = Family::new(
+        "sbh_burst_q99_bytes",
+        "0.99 quantile of used-bytes growth per reaction window on the mount.",
+        "gauge",
+    );
     for record in &state.mount_controllers {
         let capability_name = serde_plain_name(&record.reclaim_capability);
         for name in [
@@ -267,6 +277,10 @@ pub fn render(state: &DaemonState, git_sha: &str) -> String {
             ballast_present.sample(&[("mount", &record.mount)], reserve.present_bytes);
             ballast_target.sample(&[("mount", &record.mount)], reserve.target_bytes);
             quarantined.sample(&[("mount", &record.mount)], reserve.quarantined_bytes);
+            if let Some(burst) = &reserve.burst {
+                reserve_recommended.sample(&[("mount", &record.mount)], burst.recommended_bytes);
+                burst_q99.sample(&[("mount", &record.mount)], burst.q99_bytes);
+            }
         }
     }
     families.push(capability);
@@ -274,6 +288,8 @@ pub fn render(state: &DaemonState, git_sha: &str) -> String {
     families.push(ballast_present);
     families.push(ballast_target);
     families.push(quarantined);
+    families.push(reserve_recommended);
+    families.push(burst_q99);
 
     let mut ballast_files = Family::new(
         "sbh_ballast_files",
@@ -537,7 +553,7 @@ mod tests {
     use super::*;
     use crate::daemon::cpu_budget::CpuBudgetState;
     use crate::daemon::mount_controller::{
-        MountState, MountStateRecord, ReclaimCapability, ReserveState, SurfaceKind,
+        MountState, MountStateRecord, ReclaimCapability, ReserveBurst, ReserveState, SurfaceKind,
     };
     use crate::daemon::self_monitor::{
         BallastState, Counters, LastScanState, MountPressure, MountRateState, PolicyStateRecord,
@@ -615,6 +631,14 @@ mod tests {
                     horizon_minutes: Some(30.0),
                     floor_limited: false,
                     quarantined_bytes: 0,
+                    burst: Some(ReserveBurst {
+                        recommended_bytes: 2 << 30,
+                        q99_bytes: 1_500_000_000,
+                        windows: 72,
+                        reaction_window_secs: 240.0,
+                        method: crate::monitor::burst::ReserveMethod::Quantile,
+                        horizon_minutes: Some(0.001),
+                    }),
                 }),
             }],
             schema_version: 2,

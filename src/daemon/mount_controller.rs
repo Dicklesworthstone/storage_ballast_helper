@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::monitor::burst::ReserveMethod;
 use crate::monitor::pid::PressureLevel;
 
 /// Poll interval while a mount is in [`MountState::Recovery`]: fast enough to
@@ -629,6 +630,44 @@ pub struct ReserveState {
     /// demand, drained oldest-first before any new deletion at Orange+.
     #[serde(default)]
     pub quarantined_bytes: u64,
+    /// What the observed write bursts say the reserve should be
+    /// (bd-rc-master-ajg1.2.18); absent until the mount has been observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<ReserveBurst>,
+}
+
+/// The reserve target derived from the mount's write bursts: the 0.99
+/// quantile of used-bytes growth per reaction window, floored at two
+/// ballast files.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReserveBurst {
+    /// Bytes the reserve should hold.
+    pub recommended_bytes: u64,
+    /// The 0.99 burst quantile before the floor.
+    pub q99_bytes: u64,
+    /// Reaction windows observed so far.
+    pub windows: u64,
+    /// Length of the reaction window the samples were taken over.
+    pub reaction_window_secs: f64,
+    /// `floor`, `tail` (Pareto extrapolation) or `quantile`.
+    pub method: ReserveMethod,
+    /// Minutes the present reserve buys at the 0.99 burst rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizon_minutes: Option<f64>,
+}
+
+impl Default for ReserveBurst {
+    fn default() -> Self {
+        Self {
+            recommended_bytes: 0,
+            q99_bytes: 0,
+            windows: 0,
+            reaction_window_secs: 0.0,
+            method: ReserveMethod::Floor,
+            horizon_minutes: None,
+        }
+    }
 }
 
 /// Whether pressure on a mount finds sbh unable to do anything about it:
@@ -1264,6 +1303,7 @@ mod tests {
                     horizon_minutes: None,
                     floor_limited: false,
                     quarantined_bytes: 0,
+                    burst: None,
                 }),
             };
         assert!(unprotected_pressure(&record(

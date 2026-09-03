@@ -10,6 +10,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — reserve sizing from observed write bursts (bd-rc-master-ajg1.2.18)
+
+- The daemon measures, per mount, the peak used-bytes growth inside each reaction window (an EWMA of poll + scan + reclaim latency, five-minute prior) and keeps the samples in a t-digest persisted as `burst_stats.bin` beside `state.json`. The reserve target is the 0.99 quantile of those windows: the digest's own quantile after 50 windows, a generalized Pareto tail fit above the 0.9 quantile from 10 windows, and never below two ballast files. `state.json` carries it per mount as `reserve_state.burst` (`recommended_bytes`, `q99_bytes`, `windows`, `reaction_window_secs`, `method`, `horizon_minutes` at the burst rate); `metrics.prom` exports `sbh_reserve_recommended_bytes` and `sbh_burst_q99_bytes`.
+- `sbh tune` recommends `file_count = ceil(reserve / file_size)` per pool (`ballast.file_count` for a single un-overridden pool, `ballast.overrides.<mount>.file_count` otherwise) and `sbh doctor --system` gains `ballast.reserve_coverage`, which FAILs when a pool's releasable bytes fall short of that reserve. `sbh status` shows the required bytes, the estimate method and the window count in the reserve column.
+
 ### Changed — event-scoped Green passes (bd-rc-master-ajg1.8.8)
 
 - A filesystem event no longer dirties the whole configured root: it resolves to the project directory below the root that contains the change (the root itself when the change is at the root, when that directory is an artifact tree, or when more than 64 projects are dirty at once). The scanner polls the event source every 2 seconds while idle and runs the scoped pass itself at Green or Yellow, reported as `reason=event` in `scan_complete` and paced by the base `min_rescan_interval_secs` only. Before, Green passes only happened on the maintenance interval and walked everything.
