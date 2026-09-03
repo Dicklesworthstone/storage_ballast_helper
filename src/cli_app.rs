@@ -1506,6 +1506,42 @@ fn run_explain_why_not(
     Ok(())
 }
 
+/// The per-category regret calibration factors the last 30 days of stored
+/// outcomes imply (empty when the ledger is missing or unreadable).
+fn ledger_regret_calibrations(config: &Config) -> HashMap<String, f64> {
+    use storage_ballast_helper::scanner::regret::{
+        Outcome, RegretCalibrator, RegretConfig, certainty_from_name,
+    };
+    let Ok(db) = SqliteLogger::open_read_only(&config.paths.sqlite_db) else {
+        return HashMap::new();
+    };
+    let since = (chrono::Utc::now() - chrono::Duration::days(30))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let Ok(outcomes) = db.outcomes_since(&since) else {
+        return HashMap::new();
+    };
+    let mut calibrator = RegretCalibrator::new(RegretConfig {
+        window: Duration::from_secs(config.scoring.regret_window_minutes.saturating_mul(60)),
+        alpha_definite: config.scoring.regret_alpha_definite,
+        alpha_likely: config.scoring.regret_alpha_likely,
+        suspend: Duration::from_secs(config.scoring.regret_suspend_minutes.saturating_mul(60)),
+        ..RegretConfig::default()
+    });
+    calibrator.replay(
+        outcomes.into_iter().filter_map(|stored| {
+            Outcome::from_name(&stored.outcome).map(|outcome| {
+                (
+                    stored.category,
+                    certainty_from_name(&stored.certainty),
+                    outcome,
+                )
+            })
+        }),
+        std::time::Instant::now(),
+    );
+    calibrator.calibrations()
+}
+
 /// The scanner's own view of one directory: walk its parent one level with
 /// the configured walker and pick the entry out, so classification, sizes,
 /// and age are exactly what a scan would compute.
@@ -1660,7 +1696,13 @@ fn why_not_report(
     );
     candidate.active_references = active_references;
 
-    let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    let mut engine =
+        ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    // Regret labels (Q4): the ledger's outcomes raise the bar the same way
+    // they do in the daemon, so the explanation names the threshold the
+    // daemon would apply now (suspensions are daemon runtime state and are
+    // not replayed here).
+    engine.set_regret(ledger_regret_calibrations(config), HashSet::new());
     let sacred_paths = active_sacred_paths(config)?;
     let (mut score, sacred_overlaps) =
         score_candidate_with_deferred_sacred_check(&engine, &candidate, 0.0, &sacred_paths, |_| {

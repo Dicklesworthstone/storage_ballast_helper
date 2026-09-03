@@ -1878,46 +1878,54 @@ fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
     assert_eq!(outcomes[0]["outcome"], "regret", "{payload}");
     assert_eq!(outcomes[0]["category"], "RustTarget", "{payload}");
 
-    // The next decision on the recreated target carries the tightened
-    // calibration: one regret in one decision puts the bound at 1, so the
-    // category's factor is 0 and the target is kept, not deleted.
-    // The rebuilt target is younger than the one-minute age floor; age it
-    // the way the fixtures are aged and let the floor pass before forcing
-    // the scan that re-decides it.
+    // The threshold change: the regret puts the category's bound at 1, so
+    // its calibration factor is 0 and the target is kept, not deleted. Age
+    // the rebuilt target past the one-minute floor first, then force a scan
+    // and ask `sbh explain --why-not` what the daemon would decide now.
     set_mtime_recursive(
         &stale_path,
         filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_hours(5)),
     );
     std::thread::sleep(Duration::from_secs(65));
-    let before = run.events_of("decision").len();
+    let forced_before = run
+        .events_of("scan_complete")
+        .iter()
+        .filter(|e| scan_reason(e) == Some("forced"))
+        .count();
     run.signal("-USR1");
     run.wait_until(
-        "a decision on the recreated target after the regret",
+        "the forced scan after the regret",
         Duration::from_secs(60),
         |run| {
             fixtures.touch_fresh();
-            run.events_of("decision")
+            run.events_of("scan_complete")
                 .iter()
-                .skip(before)
-                .any(|e| e["path"] == stale_path.to_string_lossy().as_ref())
+                .filter(|e| scan_reason(e) == Some("forced"))
+                .count()
+                > forced_before
         },
     )
     .unwrap_or_else(|e| panic!("{e}"));
-    let decision = run
-        .events_of("decision")
-        .into_iter()
-        .skip(before)
-        .find(|e| e["path"] == stale_path.to_string_lossy().as_ref())
-        .unwrap();
-    let record: Value = serde_json::from_str(decision["details"].as_str().unwrap()).unwrap();
+    let why_not = Command::new(common::sbh_bin_path())
+        .arg("--config")
+        .arg(&run.config_path)
+        .args(["--json", "explain", "--why-not"])
+        .arg(&stale_path)
+        .args(["--level", "2"])
+        .env("SBH_TEST_MODE", "1")
+        .env("SBH_TEST_FS_STATS", &table)
+        .output()
+        .expect("run sbh explain --why-not");
+    let payload: Value = serde_json::from_str(String::from_utf8_lossy(&why_not.stdout).trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&why_not.stdout)));
+    let decision = &payload["decision"];
     assert!(
-        record["regret_calibration"]
+        decision["regret_calibration"]
             .as_f64()
             .is_some_and(|c| c < 1e-9),
-        "{record}"
+        "{payload}"
     );
-    assert_ne!(record["action"], "delete", "{record}");
-    assert_ne!(record["effective_action"], "delete", "{record}");
+    assert_ne!(decision["action"], "delete", "{payload}");
     assert!(stale_path.exists(), "the recreated target survives");
     let _ = worker.kill();
     let _ = worker.wait();

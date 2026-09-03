@@ -6725,11 +6725,11 @@ fn scanner_thread_main(
             current_scanner_config.min_file_age_minutes,
         );
         // Regret labels (Q4): what happened to this category's past
-        // deletions raises the bar for the next ones.
-        {
-            let (calibrations, suspended) = regret.scoring_view(Instant::now());
-            engine.set_regret(calibrations, suspended);
-        }
+        // deletions raises the bar for the next ones, on every engine this
+        // pass scores with (the walk, the index replay, the priority
+        // pre-scan).
+        let regret_view = regret.scoring_view(Instant::now());
+        engine.set_regret(regret_view.0.clone(), regret_view.1.clone());
 
         // If no paths to scan, skip.
         if request.paths.is_empty() {
@@ -6903,10 +6903,11 @@ fn scanner_thread_main(
                 replay_sacred.extend(protection::sacred_paths_from_protected_patterns(
                     &current_scanner_config.protected_paths,
                 ));
-                let replay_engine = ScoringEngine::from_config(
+                let mut replay_engine = ScoringEngine::from_config(
                     &current_scoring_config,
                     current_scanner_config.min_file_age_minutes,
                 );
+                replay_engine.set_regret(regret_view.0.clone(), regret_view.1.clone());
                 for record in &records {
                     match replay_indexed_record(
                         record,
@@ -7068,10 +7069,11 @@ fn scanner_thread_main(
         // after 500K small files exhaust the entry budget.
         let mut priority_candidates: Vec<CandidacyScore> = Vec::new();
         {
-            let prescan_engine = ScoringEngine::from_config(
+            let mut prescan_engine = ScoringEngine::from_config(
                 &current_scoring_config,
                 current_scanner_config.min_file_age_minutes,
             );
+            prescan_engine.set_regret(regret_view.0.clone(), regret_view.1.clone());
             'priority_roots: for root in &active_scan_paths {
                 if shutdown.load(Ordering::Relaxed) {
                     scanner_should_exit = true;
