@@ -10,6 +10,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Changed — event-scoped Green passes (bd-rc-master-ajg1.8.8)
+
+- A filesystem event no longer dirties the whole configured root: it resolves to the project directory below the root that contains the change (the root itself when the change is at the root, when that directory is an artifact tree, or when more than 64 projects are dirty at once). The scanner polls the event source every 2 seconds while idle and runs the scoped pass itself at Green or Yellow, reported as `reason=event` in `scan_complete` and paced by the base `min_rescan_interval_secs` only. Before, Green passes only happened on the maintenance interval and walked everything.
+
 ### Changed — inotify watch budget allocation (bd-rc-master-ajg1.8.4)
 
 - The scanner's recursive inotify plan always watches every root and depth-1 directory and spends the rest of `scanner.event_watch_budget` on the most active directories (per-directory event-rate EWMA, directory-mtime prior for never-watched subtrees). Directories left unwatched under a watched parent are reconciled as their own scan paths instead of dirtying the whole root, and an incomplete plan is re-allocated every 15 minutes from observed rates without losing events.

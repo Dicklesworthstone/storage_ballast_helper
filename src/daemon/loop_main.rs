@@ -76,7 +76,9 @@ use crate::platform::types::{
 };
 use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionMode};
 use crate::scanner::engine::{ScannerEngine, SelectedScannerEngine};
-use crate::scanner::events::{EventSourceConfig, EventSourceStats, ScannerEventSource};
+use crate::scanner::events::{
+    EventInvalidation, EventSourceConfig, EventSourceStats, ScannerEventSource,
+};
 use crate::scanner::index::{
     CandidateIndexRecord, IndexedIdentity, ScannerCandidateIndex, ScannerIndexContext,
     ScannerIndexLoadStatus,
@@ -1934,6 +1936,78 @@ fn v2_pressure_candidate_byte_target(request: &ScanRequest) -> Option<u64> {
         V2_PRESSURE_RECLAIM_BYTES_PER_CANDIDATE
             .saturating_mul(request.max_delete_batch.max(1) as u64),
     )
+}
+
+/// How often the idle scanner polls the event source for changes.
+const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// What an event-triggered pass inherits from the last request the main
+/// loop sent: the configured roots and the mount's level and free space.
+struct EventPassTemplate {
+    paths: Vec<PathBuf>,
+    pressure_level: PressureLevel,
+    free_pct: Option<f64>,
+    max_delete_batch: usize,
+}
+
+impl EventPassTemplate {
+    fn from_request(request: &ScanRequest) -> Self {
+        Self {
+            paths: request.paths.clone(),
+            pressure_level: request.pressure_level,
+            free_pct: request.free_pct,
+            max_delete_batch: request.max_delete_batch,
+        }
+    }
+}
+
+/// Poll the event source while the scanner is idle and, when events left
+/// scan paths dirty at Green or Yellow, build the pass that reconciles them.
+/// Under Orange and above the main loop drives passes on its own cadence.
+/// The invalidation accumulates in `pending` until a pass consumes it, so a
+/// pass deferred by pacing loses nothing.
+fn event_triggered_request(
+    source: Option<&mut ScannerEventSource>,
+    pending: &mut Option<EventInvalidation>,
+    last_poll: &mut Instant,
+    template: Option<&EventPassTemplate>,
+) -> Option<ScanRequest> {
+    if last_poll.elapsed() < EVENT_POLL_INTERVAL {
+        return None;
+    }
+    *last_poll = Instant::now();
+    let source = source?;
+    let template = template?;
+    if !matches!(
+        template.pressure_level,
+        PressureLevel::Green | PressureLevel::Yellow
+    ) {
+        return None;
+    }
+    let fresh = source.drain();
+    if fresh.requires_reconciliation() {
+        match pending.as_mut() {
+            Some(kept) => kept.merge(fresh),
+            None => *pending = Some(fresh),
+        }
+    }
+    if pending
+        .as_ref()
+        .is_none_or(|kept| !kept.requires_reconciliation())
+    {
+        return None;
+    }
+    Some(ScanRequest {
+        paths: template.paths.clone(),
+        urgency: 0.0,
+        pressure_level: template.pressure_level,
+        free_pct: template.free_pct,
+        max_delete_batch: template.max_delete_batch,
+        force_full_scan: false,
+        config_update: None,
+        catalog_roots: Vec::new(),
+        maintenance: false,
+    })
 }
 
 /// Dirty scan paths may be unwatched frontier subtrees below a configured
@@ -6101,6 +6175,14 @@ fn scanner_thread_main(
     let mut scan_cursor = ScanCursor::new();
     let mut scanner_index: Option<ScannerCandidateIndex> = None;
     let mut scanner_event_source: Option<ScannerEventSource> = None;
+    // bd-rc-master-ajg1.8.8: while idle the scanner drains the event source
+    // itself, so a change at Green becomes a pass scoped to its project
+    // instead of waiting for the next maintenance walk. The invalidation is
+    // kept until the pass that consumes it runs; the template is the last
+    // request the main loop sent, which carries the roots and the level.
+    let mut pending_event_invalidation: Option<EventInvalidation> = None;
+    let mut last_event_poll = Instant::now();
+    let mut event_request_template: Option<EventPassTemplate> = None;
 
     // Cache of directories known to contain .git — these are valid project
     // roots that should never be deleted. Persists across scan passes to
@@ -6140,13 +6222,29 @@ fn scanner_thread_main(
             break;
         }
 
+        let request_from_events;
         let request = match scan_rx.recv_timeout(WORKER_SHUTDOWN_POLL_INTERVAL) {
-            Ok(request) => request,
+            Ok(request) => {
+                request_from_events = false;
+                if request.catalog_roots.is_empty() {
+                    event_request_template = Some(EventPassTemplate::from_request(&request));
+                }
+                request
+            }
             Err(RecvTimeoutError::Timeout) => {
                 // Idle is alive: "stalled" must mean stuck inside a pass,
                 // not waiting for one.
                 heartbeat.beat();
-                continue;
+                let Some(request) = event_triggered_request(
+                    scanner_event_source.as_mut(),
+                    &mut pending_event_invalidation,
+                    &mut last_event_poll,
+                    event_request_template.as_ref(),
+                ) else {
+                    continue;
+                };
+                request_from_events = true;
+                request
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
@@ -6186,7 +6284,15 @@ fn scanner_thread_main(
         // nothing reclaimable and the (backed-off) cooldown has not elapsed.
         // Operator/forced scans, config reloads, and Red/Critical pressure
         // always run.
-        if empty_pass_cooldown_active(
+        // An event-triggered pass carries new information (something under a
+        // project changed), so it waits out the base interval only, not the
+        // exponential backoff that blind rescans earn.
+        if request_from_events {
+            let base = Duration::from_secs(current_scanner_config.min_rescan_interval_secs.max(1));
+            if last_empty_pass_at.is_some_and(|last| last.elapsed() < base) {
+                continue;
+            }
+        } else if empty_pass_cooldown_active(
             last_empty_pass_at,
             Instant::now(),
             effective_empty_pass_cooldown(
@@ -6287,7 +6393,10 @@ fn scanner_thread_main(
                 }
             }
             if let Some(source) = scanner_event_source.as_mut() {
-                let invalidation = source.drain();
+                let mut invalidation = source.drain();
+                if let Some(pending) = pending_event_invalidation.take() {
+                    invalidation.merge(pending);
+                }
                 scanner_event_dirty_roots.clone_from(invalidation.dirty_roots());
                 scanner_event_stats = source.stats();
                 if invalidation.requires_reconciliation() {
@@ -6338,7 +6447,21 @@ fn scanner_thread_main(
             0
         };
         let mut scanner_index_records = Vec::new();
-        let scan_reason = scan_reason_for_request(&request);
+        // A Green/Yellow pass that exists because events dirtied scan paths
+        // is an event pass, whoever issued the request.
+        let scan_reason = if !scanner_event_dirty_roots.is_empty()
+            && !request.maintenance
+            && !request.force_full_scan
+            && request.config_update.is_none()
+            && request.catalog_roots.is_empty()
+            && matches!(
+                request.pressure_level,
+                PressureLevel::Green | PressureLevel::Yellow
+            ) {
+            "event"
+        } else {
+            scan_reason_for_request(&request)
+        };
         // (replayed, re-vetoed) index records this pass; a Cell so the
         // telemetry closure can read what the replay block writes.
         let replay_counts = std::cell::Cell::new((0usize, 0usize));

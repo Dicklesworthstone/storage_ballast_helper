@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 use crate::core::config::{ScannerConfig, ScannerEventSourceMode};
 use crate::scanner::index::ScannerCandidateIndex;
+use crate::scanner::patterns::classify_opaque_tree;
+use crate::scanner::walker::opaque_context_for_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EventBackendKind {
@@ -650,13 +652,56 @@ impl EventInvalidation {
         self.reasons.insert(reason.into());
     }
 
+    /// Record a changed path. The scan path it implies is resolved once per
+    /// drain by [`Self::resolve_scan_roots`]; a path under no configured
+    /// root reconciles everything.
     fn mark_dirty_path(&mut self, roots: &[PathBuf], path: &Path, reason: impl Into<String>) {
         let reason = reason.into();
         self.dirty_paths.insert(path.to_path_buf());
-        if let Some(root) = root_for_path(roots, path) {
-            self.mark_dirty_root(root, reason);
+        if root_for_path(roots, path).is_some() {
+            self.reasons.insert(reason);
         } else {
             self.mark_all_roots(roots, reason, true);
+        }
+    }
+
+    /// Turn the dirty paths into scan paths: the project directory directly
+    /// below the configured root that contains the change, so a Green or
+    /// Yellow pass walks one project instead of the whole root. The root
+    /// itself is used when the change sits at the root, when the project
+    /// directory is itself an artifact (the walker evaluates a scan path's
+    /// children, never the path), or when one root has more than
+    /// [`MAX_EVENT_SCAN_PATHS_PER_ROOT`] distinct projects to reconcile.
+    /// Scan paths under another dirty scan path are dropped.
+    pub fn resolve_scan_roots(&mut self, roots: &[PathBuf]) {
+        let mut per_root: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+        let mut memo: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+        for path in &self.dirty_paths {
+            let Some(root) = root_for_path(roots, path) else {
+                continue;
+            };
+            let scan_root = event_scan_root(&root, path, &mut memo);
+            per_root.entry(root).or_default().insert(scan_root);
+        }
+        for (root, scan_roots) in per_root {
+            if scan_roots.len() > MAX_EVENT_SCAN_PATHS_PER_ROOT || scan_roots.contains(&root) {
+                self.dirty_roots.insert(root);
+            } else {
+                self.dirty_roots.extend(scan_roots);
+            }
+        }
+        let covered: Vec<PathBuf> = self
+            .dirty_roots
+            .iter()
+            .filter(|path| {
+                self.dirty_roots
+                    .iter()
+                    .any(|other| other.as_path() != path.as_path() && path.starts_with(other))
+            })
+            .cloned()
+            .collect();
+        for path in covered {
+            self.dirty_roots.remove(&path);
         }
     }
 
@@ -671,7 +716,7 @@ impl EventInvalidation {
         self.generation_bump |= generation_bump;
     }
 
-    fn merge(&mut self, other: Self) {
+    pub fn merge(&mut self, other: Self) {
         self.dirty_roots.extend(other.dirty_roots);
         self.dirty_paths.extend(other.dirty_paths);
         self.generation_bump |= other.generation_bump;
@@ -862,6 +907,7 @@ impl ScannerEventSource {
         if self.should_replan(now) {
             invalidation.merge(self.replan(now));
         }
+        invalidation.resolve_scan_roots(self.config.root_paths());
         invalidation
     }
 
@@ -1153,6 +1199,39 @@ fn sorted_child_paths(path: &Path) -> std::io::Result<Vec<PathBuf>> {
         .collect::<Vec<_>>();
     paths.sort();
     Ok(paths)
+}
+
+/// Distinct project scan paths one root may carry per drain before the
+/// whole root is reconciled instead.
+const MAX_EVENT_SCAN_PATHS_PER_ROOT: usize = 64;
+
+/// The scan path for a change at `path` under `root`: the depth-1 directory
+/// containing it, unless the change is at depth ≤ 1 or that directory is an
+/// opaque artifact tree itself, in which case the root. `memo` caches the
+/// classification per depth-1 directory for one drain.
+fn event_scan_root(root: &Path, path: &Path, memo: &mut BTreeMap<PathBuf, PathBuf>) -> PathBuf {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return root.to_path_buf();
+    };
+    let mut components = relative.components();
+    let Some(first) = components.next() else {
+        return root.to_path_buf();
+    };
+    if components.next().is_none() {
+        return root.to_path_buf();
+    }
+    let project = root.join(first.as_os_str());
+    memo.entry(project.clone())
+        .or_insert_with(|| {
+            let is_artifact =
+                classify_opaque_tree(&project, opaque_context_for_path(&project)).is_some();
+            if is_artifact {
+                root.to_path_buf()
+            } else {
+                project.clone()
+            }
+        })
+        .clone()
 }
 
 fn root_for_path(roots: &[PathBuf], path: &Path) -> Option<PathBuf> {
@@ -1586,18 +1665,77 @@ mod tests {
         );
     }
 
+    /// bd-rc-master-ajg1.8.8: a path event resolves to the project directory
+    /// below the configured root, so a Green pass walks one project. The
+    /// root itself is the scan path when the change is at the root, when
+    /// the depth-1 directory is an artifact tree (the walker evaluates a
+    /// scan path's children, never the path), or when too many projects are
+    /// dirty at once; nested scan paths collapse into their ancestor.
     #[test]
-    fn path_event_marks_owning_root_dirty_without_generation_bump() {
+    fn path_events_resolve_to_project_scan_paths_without_generation_bump() {
         let root = PathBuf::from("/tmp/root");
-        let tracker = DirtyRootTracker::new(std::slice::from_ref(&root));
+        let roots = vec![root.clone()];
+        let tracker = DirtyRootTracker::new(&roots);
+        let event = |path: PathBuf| {
+            tracker.apply_event(FsEvent {
+                kind: FsEventKind::Modify,
+                path: Some(path),
+            })
+        };
 
-        let invalidation = tracker.apply_event(FsEvent {
-            kind: FsEventKind::Modify,
-            path: Some(root.join("target").join("debug")),
-        });
+        // Deep change inside a project: the project is the scan path.
+        let mut deep = event(root.join("proj").join("src").join("main.rs"));
+        assert!(deep.dirty_roots().is_empty(), "unresolved: {deep:?}");
+        assert!(!deep.requires_reconciliation());
+        deep.resolve_scan_roots(&roots);
+        assert_eq!(
+            deep.dirty_roots().iter().cloned().collect::<Vec<_>>(),
+            vec![root.join("proj")]
+        );
+        assert!(deep.requires_reconciliation());
+        assert!(!deep.requires_index_generation_bump());
 
-        assert!(invalidation.dirty_roots().contains(&root));
-        assert!(!invalidation.requires_index_generation_bump());
+        // The depth-1 directory is a cargo target: only the root's walk can
+        // evaluate it, so the root is the scan path.
+        let mut artifact = event(root.join("target").join("debug"));
+        artifact.resolve_scan_roots(&roots);
+        assert_eq!(
+            artifact.dirty_roots().iter().cloned().collect::<Vec<_>>(),
+            vec![root.clone()]
+        );
+
+        // A change at depth 1 (a project created or removed) is the root's.
+        let mut shallow = event(root.join("newproj"));
+        shallow.resolve_scan_roots(&roots);
+        assert_eq!(
+            shallow.dirty_roots().iter().cloned().collect::<Vec<_>>(),
+            vec![root.clone()]
+        );
+
+        // Many projects at once collapse into the root; a nested scan path
+        // under an explicitly dirty ancestor is dropped.
+        let mut many = EventInvalidation::empty();
+        for i in 0..=MAX_EVENT_SCAN_PATHS_PER_ROOT {
+            many.merge(event(root.join(format!("p{i}")).join("src").join("x")));
+        }
+        many.resolve_scan_roots(&roots);
+        assert_eq!(
+            many.dirty_roots().iter().cloned().collect::<Vec<_>>(),
+            vec![root.clone()]
+        );
+        let mut nested = event(root.join("proj").join("src").join("x"));
+        nested.mark_dirty_root(root.join("proj").join("src"), "frontier");
+        nested.resolve_scan_roots(&roots);
+        assert_eq!(
+            nested.dirty_roots().iter().cloned().collect::<Vec<_>>(),
+            vec![root.join("proj")]
+        );
+
+        // A path under no configured root reconciles everything.
+        let mut foreign = event(PathBuf::from("/elsewhere/x"));
+        foreign.resolve_scan_roots(&roots);
+        assert!(foreign.dirty_roots().contains(&root));
+        assert!(foreign.requires_index_generation_bump());
     }
 
     #[test]
@@ -1640,7 +1778,9 @@ mod tests {
         while Instant::now() < deadline {
             let invalidation = source.drain();
             if invalidation.dirty_paths().contains(&changed) {
-                assert!(invalidation.dirty_roots().contains(&root));
+                // The scan path is the project directory, not the root.
+                assert!(invalidation.dirty_roots().contains(&nested));
+                assert!(!invalidation.dirty_roots().contains(&root));
                 return;
             }
             thread::sleep(Duration::from_millis(20));
@@ -1697,9 +1837,16 @@ mod tests {
                 .reason_summary()
                 .contains("WatchBudgetExceeded")
             {
-                // `z` is its own scan path; the Create event on `a` still
-                // dirties the configured root (path events do that today).
-                assert!(invalidation.dirty_roots().contains(&z), "{invalidation:?}");
+                // `z` is a scan path, or is covered by its project `a`, which
+                // the Create event resolved to; the root is never dirtied.
+                assert!(
+                    invalidation.dirty_roots().iter().any(|d| z.starts_with(d)),
+                    "{invalidation:?}"
+                );
+                assert!(
+                    !invalidation.dirty_roots().contains(&root),
+                    "{invalidation:?}"
+                );
                 assert!(!invalidation.requires_index_generation_bump());
                 saw_budget_exceeded = true;
                 break;
@@ -1723,9 +1870,12 @@ mod tests {
         assert_eq!(source.stats().replans, 1, "{:?}", source.stats());
         assert_eq!(source.capability().watched_dirs, 3);
         assert_eq!(source.capability().frontier_dirs, 2);
-        assert!(replanned.dirty_roots().contains(&y), "{replanned:?}");
-        assert!(replanned.dirty_roots().contains(&z), "{replanned:?}");
+        // y and z are the new frontier; the mtime touch on x was itself an
+        // event on `a`, whose project scan path covers them both.
+        let covered = |path: &Path| replanned.dirty_roots().iter().any(|d| path.starts_with(d));
+        assert!(covered(&y) && covered(&z), "{replanned:?}");
         assert!(!replanned.dirty_roots().contains(&x), "{replanned:?}");
+        assert!(!replanned.dirty_roots().contains(&root), "{replanned:?}");
         assert!(!replanned.requires_index_generation_bump());
 
         // The new backend is live: a file inside x is reported.

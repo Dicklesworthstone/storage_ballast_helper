@@ -1487,6 +1487,115 @@ fn sigusr1_forces_a_green_scan_within_two_seconds() {
     assert!(status.success(), "{status}");
 }
 
+/// `key=<n>` from a `scan_complete` event's details.
+fn scan_detail(event: &Value, key: &str) -> Option<u64> {
+    event
+        .get("details")?
+        .as_str()?
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
+}
+
+/// bd-rc-master-ajg1.8.8: at Green a filesystem event scopes the next pass
+/// to the project it happened in. `proj-small` holds a handful of entries
+/// and `proj-wide` a few hundred; after a file lands in `proj-small/src`,
+/// the pass that reconciles it walks a fraction of what the forced full
+/// pass over the root walked, and the event log names one dirty scan path.
+#[cfg(target_os = "linux")]
+#[test]
+fn green_event_scopes_the_pass_to_the_changed_project() {
+    let dir = scratch();
+    let root = dir.path().join("root");
+    let small = root.join("proj-small");
+    let wide = root.join("proj-wide");
+    fs::create_dir_all(small.join("src")).unwrap();
+    fs::write(small.join("src").join("lib.rs"), b"fn a() {}\n").unwrap();
+    // `paths_scanned` counts directories, so width comes from module dirs.
+    for module in 0..400 {
+        let module_dir = wide.join(format!("mod-{module:03}"));
+        fs::create_dir_all(&module_dir).unwrap();
+        fs::write(module_dir.join("mod.rs"), b"x").unwrap();
+    }
+    let fixture_mount = dir.path().to_path_buf();
+    let table = injected_table(&[
+        (&fixture_mount, 1_000_000_000_000, 500_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![root],
+        min_rescan_interval_secs: 1,
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    run.wait_until("the daemon start event", Duration::from_secs(30), |run| {
+        !run.events_of("daemon_start").is_empty()
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    std::thread::sleep(Duration::from_secs(3));
+
+    // A forced pass walks the whole root: the baseline.
+    let forced_passes = |run: &DaemonRun| {
+        run.events_of("scan_complete")
+            .into_iter()
+            .filter(|e| scan_reason(e) == Some("forced"))
+            .collect::<Vec<_>>()
+    };
+    run.signal("-USR1");
+    run.wait_until("the forced full pass", Duration::from_secs(20), |run| {
+        !forced_passes(run).is_empty()
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    let baseline = forced_passes(&run)
+        .iter()
+        .filter_map(|e| scan_detail(e, "paths_scanned"))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        baseline >= 300,
+        "full pass walked only {baseline} directories"
+    );
+
+    // One change inside the small project.
+    let before = run.events_of("scan_complete").len();
+    fs::write(small.join("src").join("new.rs"), b"fn b() {}\n").unwrap();
+    let scoped_pass = |run: &DaemonRun| {
+        run.events_of("scan_complete")
+            .into_iter()
+            .skip(before)
+            .find(|e| {
+                scan_reason(e) == Some("event")
+                    && scan_detail(e, "event_dirty_roots") == Some(1)
+                    && scan_detail(e, "paths_scanned").is_some_and(|n| n > 0)
+            })
+    };
+    run.wait_until("an event-scoped pass", Duration::from_secs(120), |run| {
+        scoped_pass(run).is_some()
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    let scoped = scoped_pass(&run).unwrap();
+    let walked = scan_detail(&scoped, "paths_scanned").unwrap();
+    assert!(
+        walked * 4 < baseline,
+        "event-scoped pass walked {walked} of the {baseline} the full pass walked: {scoped}"
+    );
+    assert!(
+        run.events_of("info").iter().any(|e| {
+            e["details"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("scanner_events: dirty_roots=1 dirty_paths=1 "))
+        }),
+        "no scanner_events line with one dirty scan path: {:?}",
+        run.events_of("info")
+            .iter()
+            .filter_map(|e| e["details"].as_str().map(str::to_string))
+            .filter(|d| d.starts_with("scanner_events"))
+            .collect::<Vec<_>>()
+    );
+    assert!(run.deleted_paths().is_empty(), "{:?}", run.deleted_paths());
+    let status = run.stop();
+    assert!(status.success(), "{status}");
+}
+
 /// Scenario `quarantine` (Layer 7): the Green maintenance passes move the
 /// two stale targets (the git project's included) into
 /// `<root>/.sbh/quarantine/<decision-id>/` instead of removing them, the

@@ -123,6 +123,22 @@ overflows into a single deferred reconciliation. `allocation_respects_budget_and
 `event_source_overflow_bumps_generation_then_backs_off` pin the backoff, and
 `linux_replan_moves_watches_to_the_hot_frontier` drives a live replan.
 
+Event-scoped passes (bd-rc-master-ajg1.8.8, 2026-09-03): a path event used to dirty
+the configured root, so the next Green pass walked the whole root, and at Green the
+main loop only requests maintenance walks, so events waited for the next one. Now
+`EventInvalidation::resolve_scan_roots` maps each dirty path to the depth-1 project
+directory containing it (the root when the change is at the root, when that directory
+classifies as an opaque artifact tree, since the walker evaluates a scan path's
+children and never the path itself, or when more than 64 projects are dirty in one
+drain; nested scan paths collapse into their ancestor), and the scanner thread polls
+the event source every 2 s while idle, issuing its own Green/Yellow request from the
+last main-loop request's roots and level. Such a pass is `reason=event` in
+`scan_complete` and is paced by the base `min_rescan_interval_secs`, not the
+empty-pass exponential backoff. `path_events_resolve_to_project_scan_paths_without_generation_bump`
+pins the resolution rules; the daemon e2e `green_event_scopes_the_pass_to_the_changed_project`
+shows a file written under a small project producing an event pass that walks a
+fraction of the directories the forced full pass walked.
+
 ### 3.2 Pressure-gated effort
 - Drive everything off the existing cheap `statfs` pressure poll. Effort ladder:
   - **green:** event subscription only + one shallow top-level reconciliation every
