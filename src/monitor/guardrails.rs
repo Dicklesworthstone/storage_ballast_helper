@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ──────────────────── guard status ────────────────────
 
@@ -251,7 +251,12 @@ pub struct GuardrailConfig {
     /// Below this threshold, the forecast is "well-calibrated".
     pub max_rate_error: f64,
     /// Minimum fraction of observations that must be conservative for TTE calibration.
-    pub min_conservative_fraction: f64,
+    /// Target coverage of the conformal time-to-red bound
+    /// (`pressure.prediction.coverage_target`).
+    pub coverage_target: f64,
+    /// Empirical coverage may fall this far below the target before the
+    /// guard fails.
+    pub coverage_tolerance: f64,
     /// E-process evidence threshold for triggering drift alarm.
     pub e_process_threshold: f64,
     /// E-process likelihood ratio for each miscalibrated observation.
@@ -268,7 +273,8 @@ impl Default for GuardrailConfig {
             min_observations: 60,
             window_size: 500,
             max_rate_error: 0.30,
-            min_conservative_fraction: 0.70,
+            coverage_target: 0.90,
+            coverage_tolerance: 0.05,
             e_process_threshold: 20.0,
             e_process_penalty: 1.5,
             // Symmetric in log-space: ln(1/1.5) = -ln(1.5).
@@ -282,6 +288,57 @@ impl Default for GuardrailConfig {
 
 // ──────────────────── guard diagnostics ────────────────────
 
+/// The conformal time-to-red bound at a point in time (see
+/// `monitor::conformal`): what the controllers acted on, and how well the
+/// bound has been covering the truth.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForecastSnapshot {
+    /// The EWMA point estimate (seconds), if the mount is filling.
+    pub tte_point_s: Option<f64>,
+    /// The conformal lower bound (seconds); the point while warming.
+    pub tte_lo_s: Option<f64>,
+    /// The configured coverage target of the bound.
+    pub coverage_target: f64,
+    /// Fraction of resolved predictions the bound covered.
+    pub coverage_empirical: Option<f64>,
+    /// The ACI miscoverage level in force.
+    pub alpha: f64,
+    /// Resolved calibration samples in the window.
+    pub samples: usize,
+    /// Whether the bound carries its guarantee yet.
+    pub coverage_state: crate::monitor::conformal::CoverageState,
+}
+
+impl ForecastSnapshot {
+    /// Build from a calibrator's interval.
+    #[must_use]
+    pub fn from_interval(
+        interval: &crate::monitor::conformal::TteInterval,
+        coverage_target: f64,
+    ) -> Self {
+        let finite = |v: f64| (v.is_finite() && v >= 0.0).then_some(v);
+        Self {
+            tte_point_s: finite(interval.point_secs),
+            tte_lo_s: finite(interval.lo_secs),
+            coverage_target,
+            coverage_empirical: interval.coverage_empirical,
+            alpha: interval.alpha,
+            samples: interval.samples,
+            coverage_state: interval.coverage_state,
+        }
+    }
+
+    /// Whether the bound is calibrated and its coverage is at least
+    /// `target - tolerance` (or has nothing resolved yet).
+    #[must_use]
+    pub fn coverage_ok(&self, tolerance: f64) -> bool {
+        self.coverage_state != crate::monitor::conformal::CoverageState::Calibrated
+            || self
+                .coverage_empirical
+                .is_none_or(|c| c >= self.coverage_target - tolerance)
+    }
+}
+
 /// Diagnostic summary of the current guard state for explainability.
 #[derive(Debug, Clone, Serialize)]
 pub struct GuardDiagnostics {
@@ -291,8 +348,11 @@ pub struct GuardDiagnostics {
     pub observation_count: usize,
     /// Median absolute rate error ratio in the window.
     pub median_rate_error: f64,
-    /// Fraction of TTE predictions that were conservative.
+    /// Fraction of per-tick TTE predictions that were conservative (a
+    /// legacy measure; the gate uses `forecast.coverage_empirical`).
     pub conservative_fraction: f64,
+    /// The conformal forecast in force for this tick, if any.
+    pub forecast: Option<ForecastSnapshot>,
     /// Current e-process evidence value (log scale).
     pub e_process_value: f64,
     /// Whether e-process alarm is active.
@@ -322,6 +382,8 @@ pub struct AdaptiveGuard {
     /// Rate floor below which observations are neutral; set per mount from
     /// its headroom (see [`material_rate_for_headroom`]).
     material_rate: f64,
+    /// The conformal forecast set for the current tick.
+    forecast: Option<ForecastSnapshot>,
 }
 
 impl AdaptiveGuard {
@@ -335,7 +397,39 @@ impl AdaptiveGuard {
             status: GuardStatus::Unknown,
             consecutive_clean: 0,
             material_rate: NOISE_FLOOR_RATE_BYTES_PER_SEC,
+            forecast: None,
         }
+    }
+
+    /// Set the conformal forecast the gate and the diagnostics report
+    /// for this tick.
+    pub fn set_forecast(&mut self, forecast: Option<ForecastSnapshot>) {
+        self.forecast = forecast;
+    }
+
+    /// The conformal forecast in force.
+    #[must_use]
+    pub fn forecast(&self) -> Option<&ForecastSnapshot> {
+        self.forecast.as_ref()
+    }
+
+    /// A resolved time-to-red prediction: the e-process rewards a covered
+    /// one and penalises a miss, so a run of misses raises the anytime-valid
+    /// drift alarm the same way rate under-prediction does.
+    pub fn observe_coverage(&mut self, covered: bool) {
+        let lr = if covered {
+            self.config.e_process_reward.ln()
+        } else {
+            self.config.e_process_penalty.ln()
+        };
+        self.e_process_log = (self.e_process_log + lr).clamp(-5.0, 3.5);
+        self.recompute_status(covered);
+    }
+
+    fn coverage_ok(&self) -> bool {
+        self.forecast
+            .as_ref()
+            .is_none_or(|f| f.coverage_ok(self.config.coverage_tolerance))
     }
 
     /// Set the rate below which observations are neutral for calibration.
@@ -433,7 +527,16 @@ impl AdaptiveGuard {
                 } else if median_error > self.config.max_rate_error {
                     format!("Rate calibration failed (median error={median_error:.2})")
                 } else {
-                    format!("TTE coverage low ({:.1}%)", conservative_frac * 100.0)
+                    let coverage = self
+                        .forecast
+                        .as_ref()
+                        .and_then(|f| f.coverage_empirical)
+                        .unwrap_or(conservative_frac);
+                    format!(
+                        "TTE coverage low ({:.1}% vs target {:.1}%)",
+                        coverage * 100.0,
+                        self.config.coverage_target * 100.0
+                    )
                 }
             }
         };
@@ -447,6 +550,7 @@ impl AdaptiveGuard {
             e_process_alarm: alarm,
             consecutive_clean: self.consecutive_clean,
             reason,
+            forecast: self.forecast.clone(),
         }
     }
 
@@ -476,9 +580,11 @@ impl AdaptiveGuard {
         let e_val = self.e_process_log.exp();
         let alarm = e_val >= self.config.e_process_threshold;
 
-        let calibrated = median_error <= self.config.max_rate_error
-            && conservative_frac >= self.config.min_conservative_fraction
-            && !alarm;
+        // Coverage of the conformal bound replaces the per-tick
+        // "conservative fraction" as the TTE gate: a stated error rate with
+        // a guarantee, not a heuristic threshold.
+        let _ = conservative_frac;
+        let calibrated = median_error <= self.config.max_rate_error && self.coverage_ok() && !alarm;
 
         match self.status {
             GuardStatus::Pass => {

@@ -371,6 +371,9 @@ pub struct PredictionConfig {
     /// Minimum confidence required during detected bursts. Higher than normal
     /// min_confidence to avoid false alarms from transient compilation spikes.
     pub burst_min_confidence: f64,
+    /// Target probability that the conformal lower bound on time-to-red
+    /// covers the true time (`monitor::conformal`); 0.5 <= value < 1.
+    pub coverage_target: f64,
 }
 
 /// Scanner runtime implementation selector.
@@ -1016,6 +1019,7 @@ impl Default for PredictionConfig {
             imminent_danger_minutes: 5.0,
             critical_danger_minutes: 2.0,
             burst_min_confidence: 0.85,
+            coverage_target: 0.90,
         }
     }
 }
@@ -2300,6 +2304,11 @@ impl Config {
             return Err(SbhError::InvalidConfig {
                 details: "telemetry.cpu_budget_pct must be 0..=100 (percent of one core)"
                     .to_string(),
+            });
+        }
+        if !(0.5..1.0).contains(&self.pressure.prediction.coverage_target) {
+            return Err(SbhError::InvalidConfig {
+                details: "pressure.prediction.coverage_target must be in [0.5, 1.0)".to_string(),
             });
         }
         let controller = &self.pressure.controller;

@@ -528,6 +528,10 @@ pub struct MountRateState {
     pub seconds_to_red: Option<f64>,
     /// Predicted seconds until the mount is full, if it is filling.
     pub seconds_to_full: Option<f64>,
+    /// The conformal lower bound on `seconds_to_red` and its calibration
+    /// (`monitor::conformal`); what the controllers act on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<crate::monitor::guardrails::ForecastSnapshot>,
 }
 
 /// Health of one daemon thread.
@@ -1318,6 +1322,7 @@ mod state_schema_tests {
                 confidence: 0.8,
                 seconds_to_red: Some(900.0),
                 seconds_to_full: Some(3600.0),
+                forecast: None,
             },
         );
         v2.threads = ThreadsState {

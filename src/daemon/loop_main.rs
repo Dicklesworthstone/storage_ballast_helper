@@ -53,8 +53,10 @@ use crate::logger::dual::{
     ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, ScanCompletionTelemetry, spawn_logger,
 };
 use crate::logger::jsonl::JsonlConfig;
+use crate::monitor::conformal::{ConformalCalibrator, ConformalConfig, TteInterval};
 use crate::monitor::ewma::{DiskRateEstimator, RateEstimate};
 use crate::monitor::fs_stats::FsStatsCollector;
+use crate::monitor::guardrails::ForecastSnapshot;
 use crate::monitor::guardrails::{
     AdaptiveGuard, CalibrationObservation, DeletionFailureMonitor, GuardDiagnostics, GuardStatus,
     PredictionScorecard,
@@ -254,6 +256,8 @@ impl SharedExecutorConfig {
 const MAX_RESPAWNS: u32 = 3;
 const RESPAWN_WINDOW: Duration = Duration::from_mins(5);
 const THREAD_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// How often a filling mount logs its `[SBH-FORECAST]` calibration line.
+const FORECAST_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// How often calm mounts have their quarantine expired and capped (Layer 7).
 const QUARANTINE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -1151,6 +1155,8 @@ struct MountMonitor {
     pressure_controller: PidPressureController,
     guard: AdaptiveGuard,
     last_guard_sample: Option<GuardSample>,
+    /// Conformal calibration of the time-to-red forecast.
+    conformal: ConformalCalibrator,
 }
 
 /// One mount's reading from `check_pressure`, kept so `handle_pressure` can
@@ -1167,6 +1173,74 @@ struct MountTickResponse {
 /// A finite, positive prediction or nothing.
 fn finite_positive(seconds: f64) -> Option<f64> {
     (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+}
+
+/// Once per `FORECAST_LOG_INTERVAL` per filling mount, the calibration
+/// line that makes the coverage guarantee auditable in the field
+/// (`stats --json .forecast.coverage_by_day` aggregates it).
+fn log_forecast(
+    last_forecast_log: &mut HashMap<PathBuf, Instant>,
+    logger: &ActivityLoggerHandle,
+    mount: &Path,
+    estimate: &RateEstimate,
+    interval: Option<&TteInterval>,
+    now: Instant,
+) {
+    let Some(interval) = interval else {
+        return;
+    };
+    if interval.samples == 0 {
+        return;
+    }
+    let due = last_forecast_log
+        .get(mount)
+        .is_none_or(|last| now.saturating_duration_since(*last) >= FORECAST_LOG_INTERVAL);
+    if !due {
+        return;
+    }
+    last_forecast_log.insert(mount.to_path_buf(), now);
+    let coverage = interval
+        .coverage_empirical
+        .map_or_else(|| "-".to_string(), |c| format!("{c:.3}"));
+    let message = format!(
+        "forecast mount={} tte_point={:.0} tte_lo={:.0} alpha={:.3} coverage={coverage} samples={} state={:?} rate={:.0}",
+        mount.display(),
+        interval.point_secs,
+        interval.lo_secs,
+        interval.alpha,
+        interval.samples,
+        interval.coverage_state,
+        estimate.bytes_per_second
+    );
+    eprintln!("[SBH-FORECAST] {message}");
+    logger.send(ActivityEvent::Info { message });
+}
+
+/// Conformal calibration tunables derived from config.
+fn conformal_config(config: &Config) -> ConformalConfig {
+    ConformalConfig {
+        coverage_target: config.pressure.prediction.coverage_target,
+        ..ConformalConfig::default()
+    }
+}
+
+/// The estimate the predictive policy and the controllers act on: the
+/// point forecast shrunk to the conformal lower bound (the same relative
+/// factor applies to the time to exhaustion).
+fn calibrated_estimate(estimate: &RateEstimate, interval: Option<&TteInterval>) -> RateEstimate {
+    let mut calibrated = estimate.clone();
+    if let Some(interval) = interval
+        && interval.point_secs.is_finite()
+        && interval.point_secs > 0.0
+        && interval.lo_secs.is_finite()
+    {
+        let factor = (interval.lo_secs / interval.point_secs).clamp(0.0, 1.0);
+        calibrated.seconds_to_threshold = interval.lo_secs;
+        if calibrated.seconds_to_exhaustion.is_finite() {
+            calibrated.seconds_to_exhaustion *= factor;
+        }
+    }
+    calibrated
 }
 
 /// Controller tunables derived from config.
@@ -1353,10 +1427,20 @@ impl MountMonitor {
             pressure_controller,
             guard: AdaptiveGuard::new(guard_config),
             last_guard_sample: None,
+            conformal: ConformalCalibrator::new(conformal_config(config)),
         }
     }
 
+    /// The conformal lower bound for a point estimate, from this mount's
+    /// calibration.
+    fn forecast_interval(&self, predicted_tte: f64) -> TteInterval {
+        self.conformal.lower_bound(predicted_tte)
+    }
+
     fn update_config(&mut self, config: &Config) {
+        if self.conformal.config() != &conformal_config(config) {
+            self.conformal = ConformalCalibrator::new(conformal_config(config));
+        }
         self.rate_estimator.update_params(
             config.telemetry.ewma_base_alpha,
             config.telemetry.ewma_min_alpha,
@@ -1416,6 +1500,25 @@ impl MountMonitor {
                     actual_tte,
                     burst_outlier,
                 });
+                // Conformal calibration: a recovery worth more than 1% of the
+                // red threshold is an intervention (ballast, a reclaim, an
+                // external delete), so the trajectory the pending predictions
+                // were made on is gone; otherwise they resolve against a
+                // crossing or their own horizon, and each resolution is a
+                // coverage outcome for the guard's e-process.
+                let recovered = available_bytes.saturating_sub(previous.available_bytes);
+                if recovered > threshold_bytes / 100 {
+                    self.conformal.discard_pending();
+                }
+                let crossed = previous.available_bytes > threshold_bytes
+                    && available_bytes <= threshold_bytes;
+                let resolved = self.conformal.observe(now, crossed);
+                for _ in 0..resolved.covered {
+                    self.guard.observe_coverage(true);
+                }
+                for _ in 0..resolved.missed {
+                    self.guard.observe_coverage(false);
+                }
             }
         }
 
@@ -1431,6 +1534,17 @@ impl MountMonitor {
         } else {
             f64::INFINITY
         };
+        // Only a mount filling at a material rate contributes calibration
+        // samples (idle neutrality); the bound is published either way.
+        if predicted_rate > self.guard.material_rate() {
+            self.conformal.enroll(now, predicted_tte);
+        }
+        let interval = self.conformal.lower_bound(predicted_tte);
+        self.guard
+            .set_forecast(Some(ForecastSnapshot::from_interval(
+                &interval,
+                self.conformal.config().coverage_target,
+            )));
         self.last_guard_sample = Some(GuardSample {
             at: now,
             available_bytes,
@@ -1502,6 +1616,8 @@ pub struct MonitoringDaemon {
     /// Layer 7: when the quarantines were last swept for expired entries
     /// and the size cap (`QUARANTINE_SWEEP_INTERVAL`).
     last_quarantine_sweep: Option<Instant>,
+    /// When each mount's `[SBH-FORECAST]` calibration line was last logged.
+    last_forecast_log: HashMap<PathBuf, Instant>,
     /// Bytes held in quarantine per mount, from the last sweep
     /// (`state.json` `reserve_state.quarantined_bytes`).
     quarantine_held: HashMap<PathBuf, u64>,
@@ -2414,6 +2530,7 @@ impl MonitoringDaemon {
             special_alerts: AlertThrottle::default(),
             last_maintenance_scan: None,
             last_quarantine_sweep: None,
+            last_forecast_log: HashMap::new(),
             quarantine_held: HashMap::new(),
             special_locations,
             ballast_coordinator,
@@ -3667,14 +3784,30 @@ impl MonitoringDaemon {
                 &rate_estimate,
             );
 
-            // Predicted time to red threshold.
-            let predicted_seconds = if rate_estimate.seconds_to_threshold.is_finite()
+            // Predicted time to red threshold: the point estimate, and the
+            // conformal lower bound the controllers act on.
+            let predicted_point = if rate_estimate.seconds_to_threshold.is_finite()
                 && rate_estimate.seconds_to_threshold > 0.0
             {
                 Some(rate_estimate.seconds_to_threshold)
             } else {
                 None
             };
+            let interval = predicted_point.map(|point| monitor.forecast_interval(point));
+            let predicted_seconds = interval
+                .as_ref()
+                .map(|i| i.lo_secs)
+                .filter(|lo| lo.is_finite() && *lo >= 0.0)
+                .or(predicted_point);
+            let rate_estimate = calibrated_estimate(&rate_estimate, interval.as_ref());
+            log_forecast(
+                &mut self.last_forecast_log,
+                &self.logger_handle,
+                &mount_path,
+                &rate_estimate,
+                interval.as_ref(),
+                now,
+            );
 
             // Run PID controller. Anti-windup on actionability: a mount
             // that had no actuator last tick (observe-only, idle after an
@@ -3735,6 +3868,12 @@ impl MonitoringDaemon {
                     confidence: rate_estimate.confidence,
                     seconds_to_red: predicted_seconds,
                     seconds_to_full: finite_positive(rate_estimate.seconds_to_exhaustion),
+                    forecast: interval.as_ref().map(|i| {
+                        ForecastSnapshot::from_interval(
+                            i,
+                            self.config.pressure.prediction.coverage_target,
+                        )
+                    }),
                 },
             });
 

@@ -1,6 +1,7 @@
 //! Filesystem monitoring: stats collection, EWMA rate estimation, PID pressure control,
 //! special location registry, predictive action pipeline, VOI scan scheduling.
 
+pub mod conformal;
 pub mod ewma;
 pub mod fs_stats;
 pub mod guardrails;

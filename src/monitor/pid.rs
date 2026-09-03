@@ -915,7 +915,8 @@ mod tests {
         );
         // The test volume is 100 bytes, so the capacity gain sits at its floor
         // (0.5 * Kp); `scheduled_kp` is the gain actually applied.
-        let expected = 1.0 - (-(with.scheduled_kp(100).mul_add(2.0, with.last_feedforward()))).exp();
+        let expected =
+            1.0 - (-(with.scheduled_kp(100).mul_add(2.0, with.last_feedforward()))).exp();
         assert!(
             (response.urgency - expected).abs() < 1e-6,
             "{}",

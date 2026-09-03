@@ -28,6 +28,8 @@
 //! prediction is discarded when an intervention (ballast release, a
 //! reclaim) changes the trajectory it was made on.
 
+#![allow(clippy::cast_precision_loss)]
+
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -75,10 +77,13 @@ pub enum CoverageState {
 /// A point forecast with its conformal lower bound.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TteInterval {
+    /// The point estimate (seconds to red).
     pub point_secs: f64,
+    /// The conformal lower bound (seconds); the point while warming.
     pub lo_secs: f64,
     /// The miscoverage level in force when the bound was computed.
     pub alpha: f64,
+    /// Whether the bound carries its guarantee yet.
     pub coverage_state: CoverageState,
     /// Resolved samples in the window.
     pub samples: usize,
@@ -117,6 +122,7 @@ pub struct ConformalCalibrator {
 }
 
 impl ConformalCalibrator {
+    /// A calibrator with no history; `alpha` starts at `1 - coverage_target`.
     #[must_use]
     pub fn new(config: ConformalConfig) -> Self {
         let alpha = (1.0 - config.coverage_target).clamp(0.0, 1.0);
@@ -130,6 +136,7 @@ impl ConformalCalibrator {
         }
     }
 
+    /// The tunables in force.
     #[must_use]
     pub fn config(&self) -> &ConformalConfig {
         &self.config
@@ -159,6 +166,7 @@ impl ConformalCalibrator {
         self.resolved_total
     }
 
+    /// `Warming` below `warmup` resolved samples, else `Calibrated`.
     #[must_use]
     pub fn coverage_state(&self) -> CoverageState {
         if self.scores.len() < self.config.warmup {
@@ -182,6 +190,7 @@ impl ConformalCalibrator {
     /// finite-sample correction `ceil((n + 1)(1 - alpha))`; `1.0` (the most
     /// conservative bound, `tte_lo = 0`) when the window is empty.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn quantile(&self) -> f64 {
         let n = self.scores.len();
         if n == 0 {
@@ -200,9 +209,7 @@ impl ConformalCalibrator {
     #[must_use]
     pub fn lower_bound(&self, tte_pred: f64) -> TteInterval {
         let state = self.coverage_state();
-        let lo = if !tte_pred.is_finite() || tte_pred < 0.0 {
-            tte_pred
-        } else if state == CoverageState::Warming {
+        let lo = if !tte_pred.is_finite() || tte_pred < 0.0 || state == CoverageState::Warming {
             tte_pred
         } else {
             (tte_pred * (1.0 - self.quantile())).clamp(0.0, tte_pred)
@@ -246,7 +253,9 @@ impl ConformalCalibrator {
         let mut batch = ResolvedBatch::default();
         let mut keep = VecDeque::with_capacity(self.pending.len());
         while let Some(pending) = self.pending.pop_front() {
-            let elapsed = now.saturating_duration_since(pending.issued_at).as_secs_f64();
+            let elapsed = now
+                .saturating_duration_since(pending.issued_at)
+                .as_secs_f64();
             let outcome = if crossed {
                 self.record(pending.tte_pred, elapsed, pending.lo_at_issue)
             } else if elapsed >= pending.tte_pred {
@@ -335,7 +344,7 @@ mod tests {
 
         /// Uniform in `[lo, hi)`.
         fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
-            lo + (hi - lo) * self.next_f64()
+            (hi - lo).mul_add(self.next_f64(), lo)
         }
     }
 
@@ -376,7 +385,11 @@ mod tests {
         assert_eq!(calibrator.coverage_state(), CoverageState::Calibrated);
         let reported = calibrator.coverage_empirical().unwrap();
         assert!((reported - 0.90).abs() <= 0.03, "reported {reported}");
-        assert!(calibrator.alpha() > 0.0 && calibrator.alpha() < 0.3, "{}", calibrator.alpha());
+        assert!(
+            calibrator.alpha() > 0.0 && calibrator.alpha() < 0.3,
+            "{}",
+            calibrator.alpha()
+        );
     }
 
     #[test]
@@ -403,7 +416,11 @@ mod tests {
         // Within those 100 samples the adaptive bound is covering again.
         let tail = rate(&shifted_a[50..]);
         assert!(tail >= 0.80, "adaptive coverage over the last 50: {tail}");
-        assert!(adaptive.alpha() < 0.10, "alpha tightened to {}", adaptive.alpha());
+        assert!(
+            adaptive.alpha() < 0.10,
+            "alpha tightened to {}",
+            adaptive.alpha()
+        );
     }
 
     #[test]
@@ -418,7 +435,10 @@ mod tests {
             assert_eq!(interval.lo_secs, 600.0, "sample {i}");
             let _ = calibrator.record(600.0, 400.0, interval.lo_secs);
         }
-        assert_eq!(calibrator.lower_bound(600.0).coverage_state, CoverageState::Warming);
+        assert_eq!(
+            calibrator.lower_bound(600.0).coverage_state,
+            CoverageState::Warming
+        );
         let _ = calibrator.record(600.0, 400.0, 600.0);
         let interval = calibrator.lower_bound(600.0);
         assert_eq!(interval.coverage_state, CoverageState::Calibrated);
@@ -444,10 +464,18 @@ mod tests {
         assert!(calibrator.enroll(t0, 120.0));
         assert_eq!(calibrator.pending(), 1);
         // Half-way: nothing resolves.
-        assert_eq!(calibrator.observe(t0 + Duration::from_secs(60), false).resolved, 0);
+        assert_eq!(
+            calibrator
+                .observe(t0 + Duration::from_secs(60), false)
+                .resolved,
+            0
+        );
         // The horizon passes without a crossing: censored, score 0, covered.
         let censored = calibrator.observe(t0 + Duration::from_secs(121), false);
-        assert_eq!((censored.resolved, censored.covered, censored.missed), (1, 1, 0));
+        assert_eq!(
+            (censored.resolved, censored.covered, censored.missed),
+            (1, 1, 0)
+        );
         assert_eq!(calibrator.samples(), 1);
         assert_eq!(calibrator.coverage_empirical(), Some(1.0));
         assert_eq!(calibrator.quantile(), 0.0);
@@ -479,7 +507,10 @@ mod tests {
             let pred = rng.uniform(1.0, 5_000.0);
             let actual = rng.uniform(0.0, 6_000.0);
             let interval = calibrator.lower_bound(pred);
-            assert!(interval.lo_secs <= interval.point_secs + 1e-9, "{interval:?}");
+            assert!(
+                interval.lo_secs <= interval.point_secs + 1e-9,
+                "{interval:?}"
+            );
             assert!(interval.lo_secs >= 0.0, "{interval:?}");
             let _ = calibrator.record(pred, actual, interval.lo_secs);
         }

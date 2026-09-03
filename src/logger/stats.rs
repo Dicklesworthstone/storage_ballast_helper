@@ -6,6 +6,7 @@
 
 #![allow(missing_docs)]
 
+use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -59,6 +60,19 @@ pub struct DeletionStats {
     pub failures: u64,
     /// Failed deletions grouped by error code, most frequent first.
     pub failures_by_reason: Vec<FailureReason>,
+}
+
+/// One day's empirical coverage of the conformal time-to-red bound.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ForecastCoverageDay {
+    /// `YYYY-MM-DD` (UTC).
+    pub day: String,
+    /// Mean of the `coverage=` values logged that day.
+    pub coverage: f64,
+    /// The largest calibration window reported that day.
+    pub samples: u64,
+    /// Forecast lines aggregated.
+    pub lines: u64,
 }
 
 /// Failed deletions sharing one error code.
@@ -245,6 +259,57 @@ impl<'a> StatsEngine<'a> {
         })
     }
 
+    /// Empirical coverage of the conformal time-to-red bound per day, from
+    /// the daemon's `forecast mount=..` info lines (one per filling mount
+    /// per minute): the field audit of `pressure.prediction.coverage_target`.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn forecast_coverage_by_day(&self, window: Duration) -> Result<Vec<ForecastCoverageDay>> {
+        let since = since_timestamp(window);
+        let conn = self.db.connection();
+        let mut stmt = conn.prepare(
+            "SELECT timestamp, details FROM activity_log
+             WHERE event_type = 'info' AND details LIKE 'forecast mount=%'
+               AND timestamp >= ?1
+             ORDER BY timestamp ASC",
+        )?;
+        let rows = stmt.query_map(params![since], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut days: Vec<ForecastCoverageDay> = Vec::new();
+        for row in rows {
+            let (timestamp, details) = row?;
+            let field = |name: &str| {
+                details
+                    .split_whitespace()
+                    .find_map(|kv| kv.strip_prefix(name))
+                    .and_then(|v| v.parse::<f64>().ok())
+            };
+            let Some(coverage) = field("coverage=") else {
+                continue;
+            };
+            let samples = field("samples=").unwrap_or(0.0);
+            let day = timestamp.chars().take(10).collect::<String>();
+            match days.last_mut() {
+                Some(last) if last.day == day => {
+                    last.lines += 1;
+                    last.coverage += (coverage - last.coverage) / last.lines as f64;
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    {
+                        last.samples = last.samples.max(samples.max(0.0) as u64);
+                    }
+                }
+                _ => days.push(ForecastCoverageDay {
+                    day,
+                    coverage,
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    samples: samples.max(0.0) as u64,
+                    lines: 1,
+                }),
+            }
+        }
+        Ok(days)
+    }
+
     #[allow(clippy::cast_sign_loss)]
     pub fn top_patterns(&self, n: usize, window: Duration) -> Result<Vec<PatternStat>> {
         let since = since_timestamp(window);
@@ -356,7 +421,13 @@ impl<'a> StatsEngine<'a> {
             })
             .collect();
 
-        Ok(serde_json::json!({ "windows": json_windows }))
+        let coverage_by_day = self
+            .forecast_coverage_by_day(Duration::from_hours(24 * 30))
+            .unwrap_or_default();
+        Ok(serde_json::json!({
+            "windows": json_windows,
+            "forecast": { "coverage_by_day": coverage_by_day },
+        }))
     }
 
     // ──────────────────── private helpers ────────────────────

@@ -288,6 +288,10 @@ pub struct GuardStatusRecord {
     pub e_process_value: f64,
     /// Whether e-process alarm is active.
     pub e_process_alarm: bool,
+    /// The conformal time-to-red bound the daemon acted on at decision
+    /// time (absent for CLI runs and older records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<crate::monitor::guardrails::ForecastSnapshot>,
 }
 
 impl GuardStatusRecord {
@@ -299,6 +303,7 @@ impl GuardStatusRecord {
             observation_count: diag.observation_count,
             e_process_value: diag.e_process_value,
             e_process_alarm: diag.e_process_alarm,
+            forecast: diag.forecast.clone(),
         }
     }
 }
@@ -774,6 +779,7 @@ mod tests {
             e_process_value: 3.5,
             e_process_alarm: false,
             consecutive_clean: 5,
+            forecast: None,
             reason: "calibration verified".to_string(),
         }
     }
