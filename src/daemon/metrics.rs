@@ -555,6 +555,7 @@ mod tests {
                 confidence: 0.9,
                 seconds_to_red: Some(3600.0),
                 seconds_to_full: None,
+                forecast: None,
             },
         );
         DaemonState {
