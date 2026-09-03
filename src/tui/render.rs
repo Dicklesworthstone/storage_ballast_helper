@@ -3628,6 +3628,10 @@ fn frame_render_overlay(
                     "Release ALL ballast files on this mount",
                     theme.palette.danger_color(),
                 ),
+                super::model::ConfirmAction::BallastReplenish => (
+                    "Replenish the released ballast files on this mount",
+                    theme.palette.success_color(),
+                ),
             };
             let mut lines = vec![
                 Line::from_spans([Span::styled(

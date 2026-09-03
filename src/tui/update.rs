@@ -108,30 +108,39 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
 
             model.daemon_state = state.map(|s| *s);
 
-            // Synthesize ballast volume data from daemon state so the
-            // Ballast screen (S5) has something to display even without
-            // a telemetry adapter.
-            if let Some(ref ds) = model.daemon_state
-                && ds.ballast.total > 0
-                && model.ballast_volumes.is_empty()
-            {
-                let mount = ds
-                    .pressure
-                    .mounts
-                    .first()
-                    .map_or_else(|| "/".to_string(), |m| m.path.clone());
-                model.ballast_volumes = vec![BallastVolume {
-                    mount_point: mount,
-                    ballast_dir: String::new(),
-                    fs_type: String::new(),
-                    strategy: String::new(),
-                    files_available: ds.ballast.available,
-                    files_total: ds.ballast.total,
-                    releasable_bytes: 0,
-                    skipped: false,
-                    skip_reason: None,
-                }];
-                model.ballast_source = crate::tui::telemetry::DataSource::None;
+            // The Ballast screen lists the daemon's own per-mount inventory.
+            // A daemon older than that field gives only the aggregate, so
+            // one volume is synthesized on the first monitored mount (it
+            // has no pool directory, so a release on it can only go
+            // through the daemon).
+            if let Some(ref ds) = model.daemon_state {
+                if !ds.ballast_pools.is_empty() {
+                    let volumes = ds
+                        .ballast_pools
+                        .iter()
+                        .map(BallastVolume::from_pool_state)
+                        .collect();
+                    model.set_ballast_volumes(volumes);
+                    model.ballast_source = crate::tui::telemetry::DataSource::None;
+                } else if ds.ballast.total > 0 && model.ballast_volumes.is_empty() {
+                    let mount = ds
+                        .pressure
+                        .mounts
+                        .first()
+                        .map_or_else(|| "/".to_string(), |m| m.path.clone());
+                    model.set_ballast_volumes(vec![BallastVolume {
+                        mount_point: mount,
+                        ballast_dir: String::new(),
+                        fs_type: String::new(),
+                        strategy: String::new(),
+                        files_available: ds.ballast.available,
+                        files_total: ds.ballast.total,
+                        releasable_bytes: 0,
+                        skipped: false,
+                        skip_reason: None,
+                    }]);
+                    model.ballast_source = crate::tui::telemetry::DataSource::None;
+                }
             }
 
             DashboardCmd::None
@@ -243,7 +252,7 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
             model.ballast_source = result.source;
             model.ballast_partial = result.partial;
             model.ballast_diagnostics = result.diagnostics;
-            model.ballast_volumes = result.data;
+            model.set_ballast_volumes(result.data);
             // Clamp cursor to valid range after data refresh.
             if model.ballast_volumes.is_empty() {
                 model.ballast_selected = 0;
@@ -406,13 +415,16 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
             DashboardCmd::None
         }
         InputAction::IncidentQuickRelease => {
-            // Jump directly to ballast screen and open release confirmation.
+            // Jump to the Ballast screen, land on a volume that has files to
+            // give (the selected one if it does), and open the confirmation.
             model.navigate_to(Screen::Ballast);
-            model.active_overlay = Some(Overlay::Confirmation(ConfirmAction::BallastRelease));
-            model.push_notification(
-                NotificationLevel::Warning,
-                "Quick-release: confirm ballast release on selected volume".to_string(),
-            );
+            model.select_ballast_volume_with_files();
+            if open_ballast_confirmation(model, ConfirmAction::BallastRelease) {
+                model.push_notification(
+                    NotificationLevel::Warning,
+                    "Quick-release: confirm ballast release on selected volume".to_string(),
+                );
+            }
             DashboardCmd::None
         }
         InputAction::ConfirmOverlay => {
@@ -427,16 +439,33 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
                 );
                 return DashboardCmd::None;
             };
-            let count = match action {
-                ConfirmAction::BallastRelease => 1,
-                ConfirmAction::BallastReleaseAll => volume.files_available.max(1),
-            };
             let mount = volume.mount_point.clone();
-            model.push_notification(
-                NotificationLevel::Info,
-                format!("Releasing {count} ballast file(s) on {mount}…"),
-            );
-            DashboardCmd::ReleaseBallast { mount, count }
+            let ballast_dir = volume.ballast_dir.clone();
+            match action {
+                ConfirmAction::BallastRelease | ConfirmAction::BallastReleaseAll => {
+                    let count = if action == ConfirmAction::BallastRelease {
+                        1
+                    } else {
+                        volume.files_available.max(1)
+                    };
+                    model.push_notification(
+                        NotificationLevel::Info,
+                        format!("Releasing {count} ballast file(s) on {mount}…"),
+                    );
+                    DashboardCmd::ReleaseBallast {
+                        mount,
+                        ballast_dir,
+                        count,
+                    }
+                }
+                ConfirmAction::BallastReplenish => {
+                    model.push_notification(
+                        NotificationLevel::Info,
+                        format!("Replenishing ballast on {mount}…"),
+                    );
+                    DashboardCmd::ReplenishBallast { mount, ballast_dir }
+                }
+            }
         }
         InputAction::IncidentPlaybookNavigate => {
             let severity =
@@ -623,8 +652,50 @@ fn handle_ballast_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> Dashbo
             }
             DashboardCmd::None
         }
+        // X (shift-x): release every available file on the selected volume,
+        // behind the confirmation. Plain `x` is the global single-file
+        // quick-release.
+        KeyCode::Char('X') => {
+            open_ballast_confirmation(model, ConfirmAction::BallastReleaseAll);
+            DashboardCmd::None
+        }
+        // p: recreate the released files on the selected volume.
+        KeyCode::Char('p') => {
+            open_ballast_confirmation(model, ConfirmAction::BallastReplenish);
+            DashboardCmd::None
+        }
         _ => DashboardCmd::None,
     }
+}
+
+/// Open the confirmation for a mutating ballast action on the selected
+/// volume, or say why there is nothing to act on. Returns whether it opened.
+fn open_ballast_confirmation(model: &mut DashboardModel, action: ConfirmAction) -> bool {
+    let Some(volume) = model.ballast_selected_volume() else {
+        model.push_notification(
+            NotificationLevel::Warning,
+            "No ballast volume selected".to_string(),
+        );
+        return false;
+    };
+    let mount = volume.mount_point.clone();
+    let blocked = match action {
+        ConfirmAction::BallastRelease | ConfirmAction::BallastReleaseAll
+            if volume.files_available == 0 =>
+        {
+            Some(format!("No ballast file available to release on {mount}"))
+        }
+        ConfirmAction::BallastReplenish if volume.files_available >= volume.files_total => {
+            Some(format!("Ballast pool on {mount} is already full"))
+        }
+        _ => None,
+    };
+    if let Some(reason) = blocked {
+        model.push_notification(NotificationLevel::Warning, reason);
+        return false;
+    }
+    model.active_overlay = Some(Overlay::Confirmation(action));
+    true
 }
 
 /// Handle keys specific to the Diagnostics screen (S7).
@@ -2775,8 +2846,13 @@ mod tests {
         model.active_overlay = Some(Overlay::Confirmation(ConfirmAction::BallastRelease));
         let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
         match cmd {
-            DashboardCmd::ReleaseBallast { mount, count } => {
+            DashboardCmd::ReleaseBallast {
+                mount,
+                ballast_dir,
+                count,
+            } => {
                 assert_eq!(mount, "/data");
+                assert_eq!(ballast_dir, "/data/.sbh/ballast");
                 assert_eq!(count, 1);
             }
             other => panic!("expected ReleaseBallast, got {other:?}"),
@@ -2790,13 +2866,57 @@ mod tests {
             "operator is told what was asked for"
         );
 
-        // Release-all: every available file on the selected mount.
-        model.active_overlay = Some(Overlay::Confirmation(ConfirmAction::BallastReleaseAll));
+        // Release-all: X on the Ballast screen opens the confirmation, Enter
+        // asks for every available file on the selected mount.
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('X'))));
+        assert!(matches!(cmd, DashboardCmd::None));
+        assert_eq!(
+            model.active_overlay,
+            Some(Overlay::Confirmation(ConfirmAction::BallastReleaseAll))
+        );
         let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
         assert!(
-            matches!(cmd, DashboardCmd::ReleaseBallast { ref mount, count } if mount == "/data" && count == 2),
+            matches!(cmd, DashboardCmd::ReleaseBallast { ref mount, count, .. } if mount == "/data" && count == 2),
             "{cmd:?}"
         );
+
+        // Replenish: p opens its confirmation, Enter emits the replenish.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('p'))));
+        assert_eq!(
+            model.active_overlay,
+            Some(Overlay::Confirmation(ConfirmAction::BallastReplenish))
+        );
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(
+            matches!(cmd, DashboardCmd::ReplenishBallast { ref mount, ref ballast_dir } if mount == "/data" && ballast_dir == "/data/.sbh/ballast"),
+            "{cmd:?}"
+        );
+
+        // A full pool has nothing to replenish, an empty one nothing to
+        // release: the confirmation does not open and the reason is shown.
+        model.ballast_volumes[1] = sample_volume("/data", 5, 5);
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('p'))));
+        assert!(model.active_overlay.is_none());
+        assert!(
+            model
+                .notifications
+                .iter()
+                .any(|n| n.message.contains("already full")),
+            "{:?}",
+            model.notifications
+        );
+        model.ballast_volumes[1] = sample_volume("/data", 0, 5);
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('X'))));
+        assert!(model.active_overlay.is_none());
+        assert!(
+            model
+                .notifications
+                .iter()
+                .any(|n| n.message.contains("No ballast file available")),
+            "{:?}",
+            model.notifications
+        );
+        model.ballast_volumes[1] = sample_volume("/data", 2, 5);
 
         // No volume selected: nothing is sent to the daemon.
         model.ballast_volumes.clear();
@@ -2811,6 +2931,108 @@ mod tests {
         let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Escape)));
         assert!(matches!(cmd, DashboardCmd::None), "{cmd:?}");
         assert!(model.active_overlay.is_none());
+    }
+
+    #[test]
+    fn daemon_pool_records_drive_the_volume_list_and_quick_release() {
+        use crate::daemon::self_monitor::BallastPoolState;
+
+        let pool = |mount: &str, dir: &str, available: usize, total: usize| BallastPoolState {
+            mount: mount.to_string(),
+            ballast_dir: dir.to_string(),
+            fs_type: "ext4".to_string(),
+            strategy: "fallocate".to_string(),
+            available,
+            total,
+            releasable_bytes: available as u64 * 1_048_576,
+            skipped: false,
+            skip_reason: None,
+        };
+        let mut model = test_model();
+        // Written in one order by the daemon, listed sorted by mount.
+        let state = DaemonState {
+            ballast_pools: vec![
+                pool("/data", "/data/.sbh/ballast", 2, 2),
+                pool("/", "/.sbh/ballast", 0, 0),
+            ],
+            ..Default::default()
+        };
+        update(&mut model, DashboardMsg::DataUpdate(Some(Box::new(state))));
+        let mounts: Vec<&str> = model
+            .ballast_volumes
+            .iter()
+            .map(|v| v.mount_point.as_str())
+            .collect();
+        assert_eq!(mounts, vec!["/", "/data"]);
+        assert_eq!(model.ballast_volumes[1].ballast_dir, "/data/.sbh/ballast");
+        assert_eq!(model.ballast_selected, 0, "cursor starts on the first row");
+
+        // Quick-release lands on the volume that has files, not the root
+        // row without a pool, and opens the confirmation there.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('x'))));
+        assert_eq!(model.screen, Screen::Ballast);
+        assert_eq!(model.ballast_selected, 1);
+        assert_eq!(
+            model.active_overlay,
+            Some(Overlay::Confirmation(ConfirmAction::BallastRelease))
+        );
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(
+            matches!(cmd, DashboardCmd::ReleaseBallast { ref mount, ref ballast_dir, count: 1 } if mount == "/data" && ballast_dir == "/data/.sbh/ballast"),
+            "{cmd:?}"
+        );
+
+        // A refresh keeps the cursor on the same mount even when the list
+        // order changes, and an older daemon (no pool records) still gets
+        // the synthesized aggregate volume.
+        let refreshed = DaemonState {
+            ballast_pools: vec![
+                pool("/", "/.sbh/ballast", 0, 0),
+                pool("/data", "/data/.sbh/ballast", 1, 2),
+            ],
+            ..Default::default()
+        };
+        update(
+            &mut model,
+            DashboardMsg::DataUpdate(Some(Box::new(refreshed))),
+        );
+        assert_eq!(
+            model.ballast_selected_volume().unwrap().mount_point,
+            "/data"
+        );
+        assert_eq!(model.ballast_selected_volume().unwrap().files_available, 1);
+
+        let mut legacy = test_model();
+        let old_daemon = DaemonState {
+            ballast: BallastState {
+                available: 3,
+                total: 4,
+                released: 1,
+            },
+            ..Default::default()
+        };
+        update(
+            &mut legacy,
+            DashboardMsg::DataUpdate(Some(Box::new(old_daemon))),
+        );
+        assert_eq!(legacy.ballast_volumes.len(), 1);
+        assert_eq!(legacy.ballast_volumes[0].files_available, 3);
+        assert!(legacy.ballast_volumes[0].ballast_dir.is_empty());
+
+        // Quick-release with nothing to give explains itself instead of
+        // opening a confirmation that could only fail.
+        let mut empty = test_model();
+        empty.ballast_volumes = vec![sample_volume("/", 0, 5)];
+        update(&mut empty, DashboardMsg::Key(make_key(KeyCode::Char('x'))));
+        assert!(empty.active_overlay.is_none());
+        assert!(
+            empty
+                .notifications
+                .iter()
+                .any(|n| n.message.contains("No ballast file available")),
+            "{:?}",
+            empty.notifications
+        );
     }
 
     #[test]

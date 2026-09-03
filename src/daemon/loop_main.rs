@@ -3294,42 +3294,58 @@ impl MonitoringDaemon {
         }
         let mut pools = Vec::new();
         for mount in mounts {
+            // Operator-driven changes are logged like the daemon's own so the
+            // Timeline and `sbh stats` see them; the release controller is
+            // told too, so an operator's release is not refilled at once.
             let outcome = match action {
-                ControlBallastAction::Release { count, .. } => self
-                    .ballast_coordinator
-                    .release_for_mount(&mount, *count)
-                    .map(|report| {
-                        report.map_or_else(
-                            || json!({ "mount": mount, "released": 0, "bytes_freed": 0, "note": "no pool or nothing to release" }),
-                            |report| {
-                                json!({
-                                    "mount": mount,
-                                    "released": report.files_released,
-                                    "bytes_freed": report.bytes_freed,
-                                    "warnings": report.warnings,
-                                    "errors": report.errors,
-                                })
-                            },
-                        )
-                    }),
-                ControlBallastAction::Replenish { .. } => self
-                    .ballast_coordinator
-                    .replenish_for_mount(&mount, None)
-                    .map(|report| {
-                        report.map_or_else(
-                            || json!({ "mount": mount, "created": 0, "note": "no pool on this mount" }),
-                            |report| {
-                                json!({
-                                    "mount": mount,
-                                    "created": report.files_created,
-                                    "skipped": report.files_skipped,
-                                    "skipped_for_floor": report.skipped_for_floor,
-                                    "bytes": report.total_bytes,
-                                    "errors": report.errors,
-                                })
-                            },
-                        )
-                    }),
+                ControlBallastAction::Release { count, .. } => {
+                    match self.ballast_coordinator.release_for_mount(&mount, *count) {
+                        Ok(Some(report)) => {
+                            self.release_controller
+                                .on_released(&mount, report.files_released);
+                            self.log_control_ballast_release(&mount, &report.released);
+                            Ok(json!({
+                                "mount": mount,
+                                "released": report.files_released,
+                                "bytes_freed": report.bytes_freed,
+                                "warnings": report.warnings,
+                                "errors": report.errors,
+                            }))
+                        }
+                        Ok(None) => Ok(
+                            json!({ "mount": mount, "released": 0, "bytes_freed": 0, "note": "no pool or nothing to release" }),
+                        ),
+                        Err(error) => Err(error),
+                    }
+                }
+                ControlBallastAction::Replenish { .. } => {
+                    match self.ballast_coordinator.replenish_for_mount(&mount, None) {
+                        Ok(Some(report)) => {
+                            if report.files_created > 0 {
+                                self.release_controller
+                                    .on_replenished(&mount, report.files_created);
+                            }
+                            for (path, size_bytes) in &report.created {
+                                self.logger_handle.send(ActivityEvent::BallastReplenished {
+                                    path: path.display().to_string(),
+                                    size_bytes: *size_bytes,
+                                });
+                            }
+                            Ok(json!({
+                                "mount": mount,
+                                "created": report.files_created,
+                                "skipped": report.files_skipped,
+                                "skipped_for_floor": report.skipped_for_floor,
+                                "bytes": report.total_bytes,
+                                "errors": report.errors,
+                            }))
+                        }
+                        Ok(None) => Ok(
+                            json!({ "mount": mount, "created": 0, "note": "no pool on this mount" }),
+                        ),
+                        Err(error) => Err(error),
+                    }
+                }
             };
             match outcome {
                 Ok(value) => pools.push(value),
@@ -3337,6 +3353,23 @@ impl MonitoringDaemon {
             }
         }
         Ok(json!({ "pools": pools }))
+    }
+
+    /// Activity events for a release the operator asked for over the control
+    /// socket: `pressure` says so, `free_pct` is the mount's current figure.
+    fn log_control_ballast_release(&self, mount: &Path, released: &[(PathBuf, u64)]) {
+        let free_pct = self
+            .fs_collector
+            .collect(mount)
+            .map_or(0.0, |stats| stats.free_pct());
+        for (path, size_bytes) in released {
+            self.logger_handle.send(ActivityEvent::BallastReleased {
+                path: path.display().to_string(),
+                size_bytes: *size_bytes,
+                pressure: "control".to_string(),
+                free_pct,
+            });
+        }
     }
 
     fn emit_status_dump(&self, response: &PressureResponse) {
@@ -3425,6 +3458,36 @@ impl MonitoringDaemon {
             .iter()
             .map(|i| i.files_total)
             .sum();
+        // The per-mount inventory the dashboard lists and scopes its
+        // release/replenish to; sorted so two writes agree on the order.
+        let mut pools: Vec<super::self_monitor::BallastPoolState> = self
+            .ballast_coordinator
+            .inventory()
+            .into_iter()
+            .map(|pool| super::self_monitor::BallastPoolState {
+                mount: pool.mount_point.display().to_string(),
+                ballast_dir: pool.ballast_dir.display().to_string(),
+                fs_type: pool.fs_type,
+                strategy: match pool.strategy {
+                    super::super::ballast::coordinator::ProvisionStrategy::Fallocate => {
+                        "fallocate".to_string()
+                    }
+                    super::super::ballast::coordinator::ProvisionStrategy::RandomData => {
+                        "random_data".to_string()
+                    }
+                    super::super::ballast::coordinator::ProvisionStrategy::Skip => {
+                        "skip".to_string()
+                    }
+                },
+                available: pool.files_available,
+                total: pool.files_total,
+                releasable_bytes: pool.releasable_bytes,
+                skipped: pool.skipped,
+                skip_reason: pool.skip_reason,
+            })
+            .collect();
+        pools.sort_by(|a, b| a.mount.cmp(&b.mount));
+        self.self_monitor.set_ballast_pools(pools);
         let dropped_log_events = self.logger_handle.dropped_events();
         let policy_mode = {
             let policy = self.policy_engine.lock();

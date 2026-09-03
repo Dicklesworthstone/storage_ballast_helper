@@ -17,6 +17,8 @@
 use super::e2e_artifact::{
     ArtifactCollector, AssertionRecord, CaseStatus, DiagnosticEntry, FrameCapture,
 };
+use ftui::KeyCode;
+
 use super::model::{BallastVolume, DashboardMsg, Overlay, Screen};
 use super::telemetry::{
     DataSource, DecisionEvidence, FactorBreakdown, TelemetryResult, TimelineEvent,
@@ -895,8 +897,67 @@ fn drill_ballast_operations_under_pressure() {
         .status(CaseStatus::Pass)
         .finish();
 
+    // Phase 6: Pressure again — the operator quick-releases from the
+    // Ballast screen: `x` opens the confirmation, Enter dispatches the
+    // release (the runtime sends it to the daemon) and closes the modal.
+    h.feed_state(yellow_state());
+    h.tick();
+    h.inject_msg(DashboardMsg::TelemetryBallast(ballast_result(vec![
+        BallastVolume {
+            mount_point: "/data".into(),
+            ballast_dir: "/data/.sbh-ballast".into(),
+            fs_type: "ext4".into(),
+            strategy: "fallocate".into(),
+            files_available: 3,
+            files_total: 10,
+            releasable_bytes: 3_221_225_472,
+            skipped: false,
+            skip_reason: None,
+        },
+    ])));
+    let notifications_before = h.notification_count();
+    h.inject_char('x');
+    let confirmation_open = h.overlay()
+        == Some(Overlay::Confirmation(
+            crate::tui::model::ConfirmAction::BallastRelease,
+        ));
+    let confirm_frame = capture_frame(&h);
+    h.inject_keycode(KeyCode::Enter);
+    let confirmation_closed = h.overlay().is_none();
+    let dispatched = h.model_mut().notifications.iter().any(|note| {
+        note.message
+            .contains("Releasing 1 ballast file(s) on /data")
+    });
+    let notifications_after = h.notification_count();
+
+    collector
+        .start_case("phase6_quick_release_confirmed")
+        .section("ballast_operations")
+        .tags(["ballast", "pressure", "release"])
+        .frame(confirm_frame)
+        .assertion(
+            "x opens the release confirmation",
+            confirmation_open,
+            "Confirmation(BallastRelease)",
+            s(&format!("{:?}", h.overlay())),
+        )
+        .assertion(
+            "Enter closes the confirmation",
+            confirmation_closed,
+            "None",
+            s(&format!("{:?}", h.overlay())),
+        )
+        .assertion(
+            "release dispatched for the selected mount",
+            dispatched,
+            "Releasing 1 ballast file(s) on /data",
+            s(&(notifications_after - notifications_before)),
+        )
+        .status(CaseStatus::Pass)
+        .finish();
+
     let bundle = collector.finalize();
-    assert_eq!(bundle.summary.passed, 5);
+    assert_eq!(bundle.summary.passed, 6);
     assert_eq!(bundle.summary.failed, 0);
 }
 

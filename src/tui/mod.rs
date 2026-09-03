@@ -44,4 +44,4 @@ mod test_stress;
 #[cfg(test)]
 mod test_unit_coverage;
 
-pub use runtime::{DashboardRuntimeConfig, DashboardRuntimeMode, run_dashboard};
+pub use runtime::{BallastFallback, DashboardRuntimeConfig, DashboardRuntimeMode, run_dashboard};

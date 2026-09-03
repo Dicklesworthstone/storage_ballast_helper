@@ -27,11 +27,13 @@ use super::telemetry::{
 };
 use super::theme::AccessibilityProfile;
 use super::{input, render, update};
+use crate::ballast::manager::BallastManager;
 #[cfg(feature = "legacy-crossterm-dashboard")]
 use crate::cli::dashboard::{self, DashboardConfig as LegacyDashboardConfig};
+use crate::core::config::BallastConfig;
 use crate::core::hex_lower;
 use crate::daemon::control;
-use crate::daemon::self_monitor::DaemonState;
+use crate::daemon::self_monitor::{DaemonLockProbe, DaemonState, probe_daemon_lock};
 
 /// Which runtime path to execute.
 ///
@@ -57,6 +59,17 @@ pub struct DashboardRuntimeConfig {
     /// `--start-screen`: the screen to open on for this session, beating the
     /// persisted preference without touching it.
     pub start_screen: Option<StartScreen>,
+    /// What a confirmed ballast action uses when no daemon holds the pool;
+    /// `None` makes such an action a typed refusal.
+    pub ballast: Option<BallastFallback>,
+}
+
+/// The `[ballast]` settings and provisioning floor the cockpit needs to
+/// change a pool itself, the way `sbh ballast release`/`replenish` do.
+#[derive(Debug, Clone)]
+pub struct BallastFallback {
+    pub config: BallastConfig,
+    pub provision_floor_pct: f64,
 }
 
 impl DashboardRuntimeConfig {
@@ -449,6 +462,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
                     &mut notification_timers,
                     &mut preference_state,
                     &telemetry_adapter,
+                    config.ballast.as_ref(),
                 );
 
                 if model.quit {
@@ -465,6 +479,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
                 &mut notification_timers,
                 &mut preference_state,
                 &telemetry_adapter,
+                config.ballast.as_ref(),
             );
         }
 
@@ -487,6 +502,7 @@ fn execute_cmd(
     timers: &mut Vec<(u64, Instant)>,
     preference_state: &mut PreferenceRuntimeState,
     telemetry: &dyn TelemetryQueryAdapter,
+    ballast: Option<&BallastFallback>,
 ) {
     match cmd {
         DashboardCmd::None | DashboardCmd::ScheduleTick(_) => {}
@@ -500,50 +516,11 @@ fn execute_cmd(
                 timers,
                 preference_state,
                 telemetry,
+                ballast,
             );
         }
         DashboardCmd::FetchTelemetry => {
-            let inner_cmd = match model.screen {
-                Screen::Overview => {
-                    let events =
-                        telemetry.recent_events(80, &crate::tui::telemetry::EventFilter::default());
-                    let decisions = telemetry.recent_decisions(40);
-                    let candidates = crate::tui::telemetry::TelemetryResult {
-                        data: decisions.data.clone(),
-                        source: decisions.source,
-                        partial: decisions.partial,
-                        diagnostics: decisions.diagnostics.clone(),
-                    };
-                    let cmds = vec![
-                        update::update(model, DashboardMsg::TelemetryTimeline(events)),
-                        update::update(model, DashboardMsg::TelemetryDecisions(decisions)),
-                        update::update(model, DashboardMsg::TelemetryCandidates(candidates)),
-                    ];
-                    DashboardCmd::Batch(cmds)
-                }
-                Screen::Timeline => {
-                    let result =
-                        telemetry.recent_events(50, &model.timeline_filter.to_event_filter());
-                    update::update(model, DashboardMsg::TelemetryTimeline(result))
-                }
-                Screen::Explainability => {
-                    let result = telemetry.recent_decisions(20);
-                    update::update(model, DashboardMsg::TelemetryDecisions(result))
-                }
-                Screen::Candidates => {
-                    // Candidate ranking derived from recent decision evidence.
-                    let result = telemetry.recent_decisions(40);
-                    update::update(model, DashboardMsg::TelemetryCandidates(result))
-                }
-                Screen::Ballast => {
-                    // Ballast inventory is in DaemonState (handled by FetchData),
-                    // but we might want history or other details.
-                    // For now, FetchData handles the inventory list.
-                    // If we needed historical ballast ops, we'd query here.
-                    DashboardCmd::None
-                }
-                _ => DashboardCmd::None,
-            };
+            let inner_cmd = fetch_telemetry_for_screen(model, telemetry);
             execute_cmd(
                 model,
                 state_file,
@@ -551,6 +528,7 @@ fn execute_cmd(
                 timers,
                 preference_state,
                 telemetry,
+                ballast,
             );
         }
         DashboardCmd::Quit => {
@@ -558,7 +536,15 @@ fn execute_cmd(
         }
         DashboardCmd::Batch(cmds) => {
             for c in cmds {
-                execute_cmd(model, state_file, c, timers, preference_state, telemetry);
+                execute_cmd(
+                    model,
+                    state_file,
+                    c,
+                    timers,
+                    preference_state,
+                    telemetry,
+                    ballast,
+                );
             }
         }
         DashboardCmd::ScheduleNotificationExpiry { id, after } => {
@@ -580,19 +566,102 @@ fn execute_cmd(
                 }
             }
         }
-        DashboardCmd::ReleaseBallast { mount, count } => {
-            notify_release_outcome(model, timers, release_ballast(state_file, &mount, count));
-            // The pool changed (or the operator needs to see it did not).
-            execute_cmd(
+        DashboardCmd::ReleaseBallast {
+            mount,
+            ballast_dir,
+            count,
+        } => {
+            let outcome = release_ballast(state_file, ballast, &mount, &ballast_dir, count);
+            settle_ballast_outcome(
                 model,
                 state_file,
-                DashboardCmd::FetchData,
                 timers,
                 preference_state,
                 telemetry,
+                ballast,
+                outcome,
+            );
+        }
+        DashboardCmd::ReplenishBallast { mount, ballast_dir } => {
+            let outcome = replenish_ballast(state_file, ballast, &mount, &ballast_dir);
+            settle_ballast_outcome(
+                model,
+                state_file,
+                timers,
+                preference_state,
+                telemetry,
+                ballast,
+                outcome,
             );
         }
     }
+}
+
+/// The telemetry the current screen needs, delivered through `update` so
+/// the follow-up command (if any) can be executed by the caller.
+fn fetch_telemetry_for_screen(
+    model: &mut DashboardModel,
+    telemetry: &dyn TelemetryQueryAdapter,
+) -> DashboardCmd {
+    match model.screen {
+        Screen::Overview => {
+            let events =
+                telemetry.recent_events(80, &crate::tui::telemetry::EventFilter::default());
+            let decisions = telemetry.recent_decisions(40);
+            let candidates = crate::tui::telemetry::TelemetryResult {
+                data: decisions.data.clone(),
+                source: decisions.source,
+                partial: decisions.partial,
+                diagnostics: decisions.diagnostics.clone(),
+            };
+            let cmds = vec![
+                update::update(model, DashboardMsg::TelemetryTimeline(events)),
+                update::update(model, DashboardMsg::TelemetryDecisions(decisions)),
+                update::update(model, DashboardMsg::TelemetryCandidates(candidates)),
+            ];
+            DashboardCmd::Batch(cmds)
+        }
+        Screen::Timeline => {
+            let result = telemetry.recent_events(50, &model.timeline_filter.to_event_filter());
+            update::update(model, DashboardMsg::TelemetryTimeline(result))
+        }
+        Screen::Explainability => {
+            let result = telemetry.recent_decisions(20);
+            update::update(model, DashboardMsg::TelemetryDecisions(result))
+        }
+        Screen::Candidates => {
+            // Candidate ranking derived from recent decision evidence.
+            let result = telemetry.recent_decisions(40);
+            update::update(model, DashboardMsg::TelemetryCandidates(result))
+        }
+        // Ballast inventory arrives with the daemon state (FetchData); the
+        // remaining screens have no telemetry query of their own.
+        Screen::Ballast | Screen::LogSearch | Screen::Diagnostics => DashboardCmd::None,
+    }
+}
+
+/// After a confirmed ballast action: show the outcome and refetch the
+/// state, because the pool changed (or the operator needs to see that it
+/// did not).
+fn settle_ballast_outcome(
+    model: &mut DashboardModel,
+    state_file: &Path,
+    timers: &mut Vec<(u64, Instant)>,
+    preference_state: &mut PreferenceRuntimeState,
+    telemetry: &dyn TelemetryQueryAdapter,
+    ballast: Option<&BallastFallback>,
+    outcome: Result<String, String>,
+) {
+    notify_release_outcome(model, timers, outcome);
+    execute_cmd(
+        model,
+        state_file,
+        DashboardCmd::FetchData,
+        timers,
+        preference_state,
+        telemetry,
+        ballast,
+    );
 }
 
 /// `--start-screen` for this session: `Remember` keeps whatever the
@@ -622,14 +691,157 @@ fn notify_release_outcome(
     timers.push((id, Instant::now() + Duration::from_secs(hold)));
 }
 
-/// Release `count` ballast files on `mount` through the daemon beside
-/// `state_file`. The Ok/Err strings are the operator-facing notification.
-fn release_ballast(state_file: &Path, mount: &str, count: usize) -> Result<String, String> {
-    let endpoint = control::read_endpoint(state_file).ok_or_else(|| {
-        "ballast release: no running daemon beside the state file (start sbh, or run `sbh ballast release`)"
-            .to_string()
+/// Who performs a confirmed ballast action.
+enum BallastRoute {
+    /// A daemon holds the pool: go through its control socket.
+    Daemon(control::ControlEndpoint),
+    /// No daemon: change the pool directly, as the CLI does.
+    Direct,
+}
+
+/// A running daemon owns its pools, so the action must go through it; a
+/// daemon without a control socket (a lock written by an older build) is
+/// a refusal rather than a race; only a free or absent lock allows the
+/// direct route.
+fn ballast_route(state_file: &Path) -> Result<BallastRoute, String> {
+    if let Some(endpoint) = control::read_endpoint(state_file) {
+        return Ok(BallastRoute::Daemon(endpoint));
+    }
+    match probe_daemon_lock(state_file) {
+        DaemonLockProbe::Free | DaemonLockProbe::Absent => Ok(BallastRoute::Direct),
+        DaemonLockProbe::Held(_) => Err(
+            "a daemon is running without a control socket; use `sbh ballast release` on the host"
+                .to_string(),
+        ),
+        DaemonLockProbe::Unreadable(detail) => {
+            Err(format!("cannot tell whether a daemon is running: {detail}"))
+        }
+    }
+}
+
+/// The pool manager for the direct route, or the refusal when the cockpit
+/// was not given the pool settings.
+fn direct_pool(
+    fallback: Option<&BallastFallback>,
+    ballast_dir: &str,
+) -> Result<BallastManager, String> {
+    let fallback = fallback.ok_or_else(|| {
+        "no running daemon and no pool settings; start sbh or use `sbh ballast release`".to_string()
     })?;
-    release_ballast_at(&endpoint, mount, count)
+    let mut manager = BallastManager::new(PathBuf::from(ballast_dir), fallback.config.clone())
+        .map_err(|err| format!("ballast pool {ballast_dir}: {err}"))?;
+    manager.set_provision_floor(fallback.provision_floor_pct);
+    Ok(manager)
+}
+
+/// Release `count` ballast files on `mount`, through the daemon beside
+/// `state_file` when one runs, else directly on `ballast_dir`. The Ok/Err
+/// strings are the operator-facing notification.
+fn release_ballast(
+    state_file: &Path,
+    fallback: Option<&BallastFallback>,
+    mount: &str,
+    ballast_dir: &str,
+    count: usize,
+) -> Result<String, String> {
+    match ballast_route(state_file)? {
+        BallastRoute::Daemon(endpoint) => release_ballast_at(&endpoint, mount, count),
+        BallastRoute::Direct => {
+            let mut manager = direct_pool(fallback, ballast_dir)?;
+            if manager.available_count() == 0 {
+                return Err(format!("ballast release on {mount}: no file available"));
+            }
+            let report = manager
+                .release(count)
+                .map_err(|err| format!("ballast release on {mount} failed: {err}"))?;
+            if report.files_released == 0 {
+                return Err(format!("ballast release on {mount}: nothing released"));
+            }
+            Ok(format!(
+                "released {} ballast file(s) on {mount} directly (no daemon), {} freed",
+                report.files_released,
+                super::widgets::human_bytes(report.bytes_freed)
+            ))
+        }
+    }
+}
+
+/// Recreate the released ballast files on `mount`, through the daemon or
+/// directly (see [`release_ballast`]).
+fn replenish_ballast(
+    state_file: &Path,
+    fallback: Option<&BallastFallback>,
+    mount: &str,
+    ballast_dir: &str,
+) -> Result<String, String> {
+    match ballast_route(state_file)? {
+        BallastRoute::Daemon(endpoint) => replenish_ballast_at(&endpoint, mount),
+        BallastRoute::Direct => {
+            let mut manager = direct_pool(fallback, ballast_dir)?;
+            let report = manager
+                .replenish(None)
+                .map_err(|err| format!("ballast replenish on {mount} failed: {err}"))?;
+            summarise_replenish(
+                mount,
+                report.files_created,
+                report.skipped_for_floor,
+                report.total_bytes,
+                " directly (no daemon)",
+            )
+        }
+    }
+}
+
+/// One `ballast` request with `replenish = true` scoped to `mount`.
+fn replenish_ballast_at(
+    endpoint: &control::ControlEndpoint,
+    mount: &str,
+) -> Result<String, String> {
+    let args = serde_json::json!({ "replenish": true, "mount": mount });
+    let response = control::request(&endpoint.socket, &endpoint.token, "ballast", &args)
+        .map_err(|err| format!("ballast replenish failed: {err}"))?;
+    if !response.ok {
+        let detail = response
+            .error
+            .map_or_else(|| "daemon refused".to_string(), |err| err.message);
+        return Err(format!("ballast replenish refused: {detail}"));
+    }
+    let pools = response.result["pools"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let sum = |key: &str| -> u64 { pools.iter().filter_map(|pool| pool[key].as_u64()).sum() };
+    let created = usize::try_from(sum("created")).unwrap_or(usize::MAX);
+    let skipped_for_floor = usize::try_from(sum("skipped_for_floor")).unwrap_or(usize::MAX);
+    summarise_replenish(mount, created, skipped_for_floor, sum("bytes"), "")
+}
+
+/// The replenish notification: created files are a success, a floor-limited
+/// pool says so, and nothing created with nothing skipped means it was full.
+fn summarise_replenish(
+    mount: &str,
+    created: usize,
+    skipped_for_floor: usize,
+    bytes: u64,
+    suffix: &str,
+) -> Result<String, String> {
+    if created > 0 {
+        let floor = if skipped_for_floor > 0 {
+            format!(", {skipped_for_floor} held back by the free-space floor")
+        } else {
+            String::new()
+        };
+        return Ok(format!(
+            "recreated {created} ballast file(s) on {mount}{suffix} ({}{floor})",
+            super::widgets::human_bytes(bytes)
+        ));
+    }
+    if skipped_for_floor > 0 {
+        return Err(format!(
+            "ballast replenish on {mount}: {skipped_for_floor} file(s) held back by the free-space floor"
+        ));
+    }
+    Err(format!("ballast replenish on {mount}: pool already full"))
 }
 
 /// The control-socket half of [`release_ballast`]: one `ballast` request
@@ -773,11 +985,59 @@ mod tests {
     }
 
     #[test]
-    fn release_without_a_daemon_is_a_typed_refusal() {
+    fn release_without_a_daemon_or_pool_settings_is_a_typed_refusal() {
         let temp = TempDir::new().unwrap();
         let state = temp.path().join("state.json");
-        let err = release_ballast(&state, "/data", 1).unwrap_err();
+        let dir = temp.path().join("ballast").display().to_string();
+        let err = release_ballast(&state, None, "/data", &dir, 1).unwrap_err();
         assert!(err.contains("no running daemon"), "{err}");
+        let err = replenish_ballast(&state, None, "/data", &dir).unwrap_err();
+        assert!(err.contains("no running daemon"), "{err}");
+    }
+
+    #[test]
+    fn without_a_daemon_the_cockpit_changes_the_pool_directly() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state.json");
+        let dir = temp.path().join("ballast");
+        let config = BallastConfig {
+            file_count: 2,
+            file_size_bytes: 4096,
+            ..BallastConfig::default()
+        };
+        let mut manager = BallastManager::new(dir.clone(), config.clone()).unwrap();
+        manager.provision(None).unwrap();
+        assert_eq!(manager.available_count(), 2);
+        drop(manager);
+        let fallback = BallastFallback {
+            config,
+            provision_floor_pct: 0.0,
+        };
+        let dir_text = dir.display().to_string();
+
+        let ok = release_ballast(&state, Some(&fallback), "/data", &dir_text, 1).unwrap();
+        assert!(
+            ok.contains("released 1 ballast file(s) on /data directly"),
+            "{ok}"
+        );
+        let left = BallastManager::new(dir.clone(), fallback.config.clone()).unwrap();
+        assert_eq!(left.available_count(), 1, "one file is gone from disk");
+
+        let ok = replenish_ballast(&state, Some(&fallback), "/data", &dir_text).unwrap();
+        assert!(
+            ok.contains("recreated 1 ballast file(s) on /data directly"),
+            "{ok}"
+        );
+        let full = BallastManager::new(dir, fallback.config.clone()).unwrap();
+        assert_eq!(full.available_count(), 2);
+
+        let err = replenish_ballast(&state, Some(&fallback), "/data", &dir_text).unwrap_err();
+        assert!(err.contains("already full"), "{err}");
+
+        // Release everything, then a further release has nothing to give.
+        release_ballast(&state, Some(&fallback), "/data", &dir_text, 2).unwrap();
+        let err = release_ballast(&state, Some(&fallback), "/data", &dir_text, 1).unwrap_err();
+        assert!(err.contains("no file available"), "{err}");
     }
 
     #[test]
@@ -806,7 +1066,16 @@ mod tests {
                                         "bytes_freed": count as u64 * 1_073_741_824 }]
                         }))
                     }
-                    _ => ControlResponse::failure("bad_request", "not a release"),
+                    ControlCommand::Ballast(BallastAction::Replenish { mount }) => {
+                        let mount = mount.map(|m| m.display().to_string()).unwrap_or_default();
+                        let (created, floor) = if mount == "/floor" { (0, 2) } else { (2, 0) };
+                        ControlResponse::success(serde_json::json!({
+                            "pools": [{ "mount": mount, "created": created,
+                                        "skipped_for_floor": floor,
+                                        "bytes": created * 1_048_576 }]
+                        }))
+                    }
+                    _ => ControlResponse::failure("bad_request", "not a ballast action"),
                 }
             }
         }
@@ -831,6 +1100,27 @@ mod tests {
             "{nothing}"
         );
 
+        let replenished = replenish_ballast_at(&endpoint, "/data").unwrap();
+        assert!(
+            replenished.contains("recreated 2 ballast file(s) on /data"),
+            "{replenished}"
+        );
+        assert!(replenished.contains("2.0 MB"), "{replenished}");
+        let floored = replenish_ballast_at(&endpoint, "/floor").unwrap_err();
+        assert!(
+            floored.contains("held back by the free-space floor"),
+            "{floored}"
+        );
+
+        // No lock beside a state file means the direct route; a live daemon
+        // (its lock carries the token) is always routed through the socket.
+        let temp_state = temp.path().join("state.json");
+        std::fs::write(&temp_state, "{}").unwrap();
+        assert!(
+            matches!(ballast_route(&temp_state), Ok(BallastRoute::Direct)),
+            "no lock beside the state file means the direct route"
+        );
+
         let wrong_token = ControlEndpoint {
             socket,
             token: "wrong".to_string(),
@@ -851,6 +1141,7 @@ mod tests {
             sqlite_db: None,
             jsonl_log: None,
             start_screen: None,
+            ballast: None,
         };
 
         let legacy = cfg.as_legacy_config();

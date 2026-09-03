@@ -132,6 +132,8 @@ pub enum ConfirmAction {
     BallastRelease,
     /// Release all ballast files on the selected mount.
     BallastReleaseAll,
+    /// Recreate the released ballast files on the selected mount.
+    BallastReplenish,
 }
 
 /// Source tier for the currently applied dashboard preference profile.
@@ -231,6 +233,22 @@ pub struct BallastVolume {
 }
 
 impl BallastVolume {
+    /// The dashboard's view of one pool record from the daemon state.
+    #[must_use]
+    pub fn from_pool_state(pool: &crate::daemon::self_monitor::BallastPoolState) -> Self {
+        Self {
+            mount_point: pool.mount.clone(),
+            ballast_dir: pool.ballast_dir.clone(),
+            fs_type: pool.fs_type.clone(),
+            strategy: pool.strategy.clone(),
+            files_available: pool.available,
+            files_total: pool.total,
+            releasable_bytes: pool.releasable_bytes,
+            skipped: pool.skipped,
+            skip_reason: pool.skip_reason.clone(),
+        }
+    }
+
     /// Status level for display badges.
     #[must_use]
     pub fn status_level(&self) -> &'static str {
@@ -912,6 +930,39 @@ impl DashboardModel {
     }
 
     /// Get the currently selected volume, if any.
+    /// Replace the volume list, sorted by mount so refreshes agree on the
+    /// order, keeping the cursor on the mount it was on when it survives.
+    pub fn set_ballast_volumes(&mut self, mut volumes: Vec<BallastVolume>) {
+        volumes.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+        let keep = self
+            .ballast_selected_volume()
+            .map(|v| v.mount_point.clone())
+            .and_then(|mount| volumes.iter().position(|v| v.mount_point == mount));
+        self.ballast_volumes = volumes;
+        self.ballast_selected = keep.unwrap_or_else(|| {
+            self.ballast_selected
+                .min(self.ballast_volumes.len().saturating_sub(1))
+        });
+    }
+
+    /// Quick-release lands on a volume with files to give: the selected
+    /// one when it has any, else the first that does (else unchanged).
+    pub fn select_ballast_volume_with_files(&mut self) {
+        if self
+            .ballast_selected_volume()
+            .is_some_and(|v| v.files_available > 0)
+        {
+            return;
+        }
+        if let Some(index) = self
+            .ballast_volumes
+            .iter()
+            .position(|v| !v.skipped && v.files_available > 0)
+        {
+            self.ballast_selected = index;
+        }
+    }
+
     #[must_use]
     pub fn ballast_selected_volume(&self) -> Option<&BallastVolume> {
         self.ballast_volumes.get(self.ballast_selected)
@@ -1080,9 +1131,17 @@ pub enum DashboardCmd {
     ScheduleNotificationExpiry { id: u64, after: Duration },
     /// Execute a preference mutation and apply updated profile values.
     ExecutePreferenceAction(PreferenceAction),
-    /// Ask the daemon, over its control socket, to release `count` ballast
-    /// files on `mount` (the confirmed quick-release), then refetch state.
-    ReleaseBallast { mount: String, count: usize },
+    /// Release `count` ballast files on `mount` (the confirmed release):
+    /// through the daemon's control socket when one runs, else directly on
+    /// `ballast_dir`; then refetch state.
+    ReleaseBallast {
+        mount: String,
+        ballast_dir: String,
+        count: usize,
+    },
+    /// Recreate the released ballast files on `mount` (the confirmed
+    /// replenish), through the daemon or directly on `ballast_dir`.
+    ReplenishBallast { mount: String, ballast_dir: String },
 }
 
 // ──────────────────── tests ────────────────────

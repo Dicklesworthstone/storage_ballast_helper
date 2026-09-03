@@ -10,6 +10,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — dashboard ballast actions execute (bd-rc-master-ajg1.4.15)
+
+- On the Ballast screen `Shift-X` releases every available file on the selected volume and `p` replenishes it, each behind the confirmation modal; `x` stays the global one-file quick-release. Enter performs the action: through the running daemon's control socket (scoped to the selected mount), or directly on the pool when no daemon holds it, the way `sbh ballast release`/`replenish` do; a daemon without a control socket is a refusal, not a race. The outcome (files released or recreated, bytes, a free-space floor holding files back, an already-full pool) or the daemon's refusal is the notification, and the dashboard refetches state.
+- Operator-driven releases and replenishes through the control socket are now logged like the daemon's own (`ballast_release` with `pressure = "control"`, `ballast_replenish`), so they appear on the Timeline and in `sbh stats`, and the release controller is told so an operator's release is not refilled at once.
+- `state.json` carries `ballast_pools`, one record per mount (mount, pool directory, filesystem, strategy, available/total files, releasable bytes, skipped and why), sorted by mount. The Ballast screen lists those instead of a single volume synthesized on whichever monitored mount came first, so a release is scoped to a mount that has a pool; quick-release lands on a volume with files to give. A state file from an older daemon still parses (the list is empty and the aggregate volume is synthesized as before).
+- `tests/dashboard_pty.rs` drives the shipped binary under a pseudo-terminal against a sandbox daemon: screens 1–7 draw their headers, `x` then Enter releases one ballast file (the daemon's event and pool count prove it), and `q` exits cleanly.
+
 ### Changed — the cockpit ships in the default build (bd-rc-master-ajg1.4.7)
 
 - `tui` is a default feature: `cargo install`, the release workflow, and CI all build the same feature set (`cli,daemon,sqlite,tui`), so `sbh dashboard` is the frankentui cockpit on every shipped binary. A lean build still exists with `--no-default-features --features cli,daemon,sqlite`.

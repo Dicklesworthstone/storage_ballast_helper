@@ -7215,6 +7215,10 @@ struct DashboardRuntimeRequest {
     /// `--start-screen`, validated by the cockpit runtime (it is the only
     /// consumer, and a lean build refuses it with the feature message).
     start_screen: Option<String>,
+    /// `[ballast]` settings and the provisioning floor: what the cockpit
+    /// needs to release or replenish a pool itself when no daemon holds it.
+    ballast: storage_ballast_helper::core::config::BallastConfig,
+    provision_floor_pct: f64,
 }
 
 /// Resolve dashboard runtime using priority chain:
@@ -7351,6 +7355,10 @@ fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Re
         sqlite_db: request.sqlite_db.clone(),
         jsonl_log: request.jsonl_log.clone(),
         start_screen,
+        ballast: Some(tui::BallastFallback {
+            config: request.ballast.clone(),
+            provision_floor_pct: request.provision_floor_pct,
+        }),
     };
     tui::run_dashboard(&config)
         .map_err(|e| CliError::Runtime(format!("dashboard runtime failure: {e}")))
@@ -7401,6 +7409,7 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
         eprintln!("[dashboard] runtime={selection:?}, reason={reason}");
     }
 
+    let provision_floor_pct = config.ballast_provision_floor_pct();
     let request = DashboardRuntimeRequest {
         refresh_ms: normalize_refresh_ms(args.refresh_ms),
         state_file: config.paths.state_file.clone(),
@@ -7410,6 +7419,8 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
         sqlite_db: Some(config.paths.sqlite_db.clone()),
         jsonl_log: Some(config.paths.jsonl_log),
         start_screen: args.start_screen.clone(),
+        provision_floor_pct,
+        ballast: config.ballast,
     };
 
     run_dashboard_runtime(cli, &request)

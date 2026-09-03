@@ -472,6 +472,10 @@ pub struct DaemonState {
     pub last_updated: String,
     pub pressure: PressureState,
     pub ballast: BallastState,
+    /// Every pool the daemon manages, one record per mount (empty from a
+    /// daemon older than this field).
+    #[serde(default)]
+    pub ballast_pools: Vec<BallastPoolState>,
     pub last_scan: LastScanState,
     pub counters: Counters,
     pub memory_rss_bytes: u64,
@@ -516,6 +520,34 @@ pub struct DaemonState {
 }
 
 /// Current state file schema version.
+/// One ballast pool as the daemon sees it: what the dashboard's Ballast
+/// screen lists and what a confirmed release or replenish is scoped to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BallastPoolState {
+    /// Mount point the pool protects.
+    pub mount: String,
+    /// Directory holding the pool's files.
+    pub ballast_dir: String,
+    /// Filesystem type of the mount.
+    #[serde(default)]
+    pub fs_type: String,
+    /// Provisioning strategy (`fallocate`, `random_data`, `skip`).
+    #[serde(default)]
+    pub strategy: String,
+    /// Files present and releasable.
+    pub available: usize,
+    /// Files the configuration asks for.
+    pub total: usize,
+    /// Bytes a full release would free.
+    pub releasable_bytes: u64,
+    /// The pool was not provisioned on this mount.
+    #[serde(default)]
+    pub skipped: bool,
+    /// Why it was skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+}
+
 pub const STATE_SCHEMA_VERSION: u32 = 2;
 
 /// Where the daemon's own files live relative to the filesystems it reclaims.
@@ -884,6 +916,7 @@ pub struct SelfMonitor {
     /// Latest policy engine snapshot.
     policy_snapshot: PolicyStateRecord,
     logging_snapshot: LoggingState,
+    pools_snapshot: Vec<BallastPoolState>,
     /// Latest thread health, set by the main loop each tick.
     threads_snapshot: ThreadsState,
     /// Identifies this daemon run.
@@ -940,6 +973,11 @@ impl SelfMonitor {
     /// Where the daemon's own files live relative to what it reclaims.
     pub fn set_logging_snapshot(&mut self, logging: LoggingState) {
         self.logging_snapshot = logging;
+    }
+
+    /// The per-mount pool inventory the next state file write carries.
+    pub fn set_ballast_pools(&mut self, pools: Vec<BallastPoolState>) {
+        self.pools_snapshot = pools;
     }
 
     pub fn set_policy_snapshot(&mut self, policy: PolicyStateRecord) {
@@ -1032,6 +1070,7 @@ impl SelfMonitor {
             idle_reason: None,
             policy_snapshot: PolicyStateRecord::default(),
             logging_snapshot: LoggingState::default(),
+            pools_snapshot: Vec::new(),
             run_id: generate_run_id(),
             last_state: None,
             metrics_enabled: true,
@@ -1141,6 +1180,7 @@ impl SelfMonitor {
             idle_reason: self.idle_reason.clone(),
             policy: self.policy_snapshot.clone(),
             logging: self.logging_snapshot.clone(),
+            ballast_pools: self.pools_snapshot.clone(),
             stopped_at: None,
             exit_reason: None,
         };
@@ -1485,6 +1525,40 @@ mod tests {
     use super::*;
 
     use crate::platform::pal::MockPlatform;
+
+    /// bd-rc-master-ajg1.4.15: the per-pool records the dashboard scopes its
+    /// ballast actions to round-trip, and a state written by an older
+    /// daemon (no `ballast_pools` key) still parses with an empty list.
+    #[test]
+    fn ballast_pool_records_round_trip_and_default_to_empty() {
+        let state = DaemonState {
+            ballast_pools: vec![BallastPoolState {
+                mount: "/data".to_string(),
+                ballast_dir: "/data/.sbh/ballast".to_string(),
+                fs_type: "ext4".to_string(),
+                strategy: "fallocate".to_string(),
+                available: 1,
+                total: 2,
+                releasable_bytes: 1_048_576,
+                skipped: false,
+                skip_reason: None,
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: DaemonState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ballast_pools, state.ballast_pools);
+        assert!(
+            !json.contains("skip_reason"),
+            "absent reasons are not written"
+        );
+
+        let older: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut older = older.as_object().cloned().unwrap();
+        older.remove("ballast_pools");
+        let parsed: DaemonState = serde_json::from_value(serde_json::Value::Object(older)).unwrap();
+        assert!(parsed.ballast_pools.is_empty());
+    }
 
     /// bd-rc-master-ajg1.7.4: the daemon's files against the reclaimed
     /// mounts. Two volumes with the files on the other one pass; a single
