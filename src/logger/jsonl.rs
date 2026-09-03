@@ -197,6 +197,49 @@ impl Default for JsonlConfig {
     }
 }
 
+/// The daemon's JSONL rotation size (bd-rc-master-ajg1.7.2).
+///
+/// These constants are the single source the README quotes: rotation at
+/// 50 MiB keeping 5 files, fsync every 30 s (a pressured disk must not take
+/// an fsync every 10 s), and a RAM-backed fallback that is capped rather
+/// than rotated.
+pub const DAEMON_MAX_SIZE_BYTES: u64 = 50 * 1024 * 1024;
+pub const DAEMON_MAX_ROTATED_FILES: u32 = 5;
+pub const DAEMON_FSYNC_INTERVAL_SECS: u64 = 30;
+/// The fallback file lives in RAM: it is never rotated and is truncated
+/// when it would exceed this size, so a long outage of the primary path
+/// cannot fill `/dev/shm`.
+pub const FALLBACK_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+impl JsonlConfig {
+    /// The daemon's configuration for the activity log at `path`.
+    #[must_use]
+    pub fn for_daemon(path: PathBuf) -> Self {
+        Self {
+            path,
+            fallback_path: Some(ram_fallback_path()),
+            max_size_bytes: DAEMON_MAX_SIZE_BYTES,
+            max_rotated_files: DAEMON_MAX_ROTATED_FILES,
+            fsync_interval_secs: DAEMON_FSYNC_INTERVAL_SECS,
+        }
+    }
+}
+
+/// Where the RAM-backed fallback lives: `/dev/shm/sbh-<uid>.jsonl` on
+/// Linux (per user, so a user-scope and a system-scope daemon never share
+/// one file), the temp directory elsewhere (`$TMPDIR` on macOS).
+#[must_use]
+pub fn ram_fallback_path() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        let shm = Path::new("/dev/shm");
+        if shm.is_dir() {
+            return shm.join(format!("sbh-{}.jsonl", nix::unistd::getuid()));
+        }
+    }
+    std::env::temp_dir().join("sbh.jsonl")
+}
+
 /// Append-only JSONL log writer with rotation and multi-level fallback.
 pub struct JsonlWriter {
     config: JsonlConfig,
@@ -206,6 +249,8 @@ pub struct JsonlWriter {
     last_fsync: SystemTime,
     last_recover_attempt: SystemTime,
     lines_since_fsync: u64,
+    /// fsyncs performed so far (the idle timer test reads it).
+    fsync_count: u64,
     /// Stamped on every line (C-EVENT `run_id`) when set.
     run_id: Option<String>,
 }
@@ -221,6 +266,7 @@ impl JsonlWriter {
             last_fsync: SystemTime::now(),
             last_recover_attempt: UNIX_EPOCH,
             lines_since_fsync: 0,
+            fsync_count: 0,
             run_id: None,
         };
         w.try_open_primary();
@@ -273,12 +319,38 @@ impl JsonlWriter {
 
     /// Force an fsync on the underlying file.
     pub fn fsync(&mut self) {
+        self.fsync_at(SystemTime::now());
+    }
+
+    fn fsync_at(&mut self, now: SystemTime) {
         if let Some(w) = self.writer.as_mut() {
             let _ = w.flush();
             let _ = w.get_ref().sync_data();
-            self.last_fsync = SystemTime::now();
+            self.last_fsync = now;
             self.lines_since_fsync = 0;
+            self.fsync_count += 1;
         }
+    }
+
+    /// The idle timer: fsync lines written since the last fsync once the
+    /// interval has elapsed, even when no further line arrives to trigger
+    /// it. The logger thread calls this once a second while idle.
+    pub fn tick(&mut self, now: SystemTime) {
+        if self.lines_since_fsync == 0 {
+            return;
+        }
+        let elapsed = now
+            .duration_since(self.last_fsync)
+            .unwrap_or(Duration::ZERO);
+        if elapsed.as_secs() >= self.config.fsync_interval_secs {
+            self.fsync_at(now);
+        }
+    }
+
+    /// fsyncs performed since the writer was opened.
+    #[must_use]
+    pub fn fsync_count(&self) -> u64 {
+        self.fsync_count
     }
 
     /// Current degradation state.
@@ -301,12 +373,22 @@ impl JsonlWriter {
     fn write_line(&mut self, line: &str) {
         self.maybe_try_recover();
 
-        // Check if rotation is needed before writing.
-        if self.bytes_written + line.len() as u64 > self.config.max_size_bytes
-            && self.bytes_written > 0
-            && matches!(self.state, WriterState::Normal | WriterState::Fallback)
-        {
-            self.rotate();
+        // Check if rotation is needed before writing. The RAM-backed
+        // fallback is never rotated: it is truncated at its cap instead.
+        match self.state {
+            WriterState::Normal
+                if self.bytes_written + line.len() as u64 > self.config.max_size_bytes
+                    && self.bytes_written > 0 =>
+            {
+                self.rotate();
+            }
+            WriterState::Fallback
+                if self.bytes_written + line.len() as u64 > FALLBACK_MAX_BYTES
+                    && self.bytes_written > 0 =>
+            {
+                self.truncate_fallback();
+            }
+            _ => {}
         }
 
         match self.state {
@@ -340,6 +422,25 @@ impl JsonlWriter {
             .unwrap_or(Duration::ZERO);
         if elapsed.as_secs() >= self.config.fsync_interval_secs {
             self.fsync();
+        }
+    }
+
+    /// Start the fallback file over: the primary has been unavailable long
+    /// enough to fill the RAM cap, and old fallback lines are worth less
+    /// than the memory they hold.
+    fn truncate_fallback(&mut self) {
+        let Some(w) = self.writer.as_mut() else {
+            return;
+        };
+        let _ = w.flush();
+        if w.get_ref().set_len(0).is_ok() {
+            self.bytes_written = 0;
+            let _ = writeln!(
+                io::stderr(),
+                "[SBH-JSONL] fallback log reached {FALLBACK_MAX_BYTES} bytes; truncated"
+            );
+        } else {
+            self.degrade();
         }
     }
 
@@ -600,6 +701,94 @@ fn format_utc_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-rc-master-ajg1.7.2: the daemon's settings are the documented chain.
+    #[test]
+    fn daemon_config_is_the_documented_chain() {
+        let config = JsonlConfig::for_daemon(PathBuf::from("/var/lib/sbh/activity.jsonl"));
+        assert_eq!(config.max_size_bytes, 50 * 1024 * 1024);
+        assert_eq!(config.max_rotated_files, 5);
+        assert_eq!(config.fsync_interval_secs, 30);
+        let fallback = config.fallback_path.expect("RAM fallback enabled");
+        assert_eq!(fallback, ram_fallback_path());
+        if cfg!(target_os = "linux") && Path::new("/dev/shm").is_dir() {
+            assert!(fallback.starts_with("/dev/shm"), "{}", fallback.display());
+            assert_eq!(fallback.extension().and_then(|e| e.to_str()), Some("jsonl"));
+            assert!(
+                fallback
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("sbh-")),
+                "{}",
+                fallback.display()
+            );
+        } else {
+            assert!(fallback.starts_with(std::env::temp_dir()));
+        }
+    }
+
+    /// bd-rc-master-ajg1.7.2: one line, then silence; the idle timer fsyncs
+    /// it exactly once after the interval and never again without new lines.
+    #[test]
+    fn idle_tick_fsyncs_once_after_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = SystemTime::now();
+        let mut writer = JsonlWriter::open(JsonlConfig {
+            path: dir.path().join("activity.jsonl"),
+            fallback_path: None,
+            max_size_bytes: 1024 * 1024,
+            max_rotated_files: 1,
+            fsync_interval_secs: 30,
+        });
+        writer.write_entry(&LogEntry::new(EventType::DaemonStart, Severity::Info));
+        assert_eq!(writer.fsync_count(), 0);
+        writer.tick(t0 + Duration::from_secs(29));
+        assert_eq!(writer.fsync_count(), 0);
+        writer.tick(t0 + Duration::from_secs(31));
+        assert_eq!(writer.fsync_count(), 1);
+        // Nothing new: the timer stays quiet however long it runs.
+        writer.tick(t0 + Duration::from_secs(32));
+        writer.tick(t0 + Duration::from_secs(120));
+        assert_eq!(writer.fsync_count(), 1);
+        // A new line after a long quiet spell: the interval since the last
+        // fsync has long elapsed, so the next tick makes it durable.
+        writer.write_entry(&LogEntry::new(EventType::DaemonStop, Severity::Info));
+        assert_eq!(writer.fsync_count(), 1, "the write itself is not an fsync");
+        writer.tick(t0 + Duration::from_secs(121));
+        assert_eq!(writer.fsync_count(), 2);
+    }
+
+    /// bd-rc-master-ajg1.7.2: the RAM-backed fallback is capped, not rotated.
+    #[test]
+    fn fallback_is_truncated_at_its_cap_instead_of_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = dir.path().join("fallback.jsonl");
+        let mut writer = JsonlWriter::open(JsonlConfig {
+            path: uncreatable_path(dir.path(), "primary.jsonl"),
+            fallback_path: Some(fallback.clone()),
+            max_size_bytes: 1024,
+            max_rotated_files: 3,
+            fsync_interval_secs: 3600,
+        });
+        assert_eq!(writer.state(), "fallback");
+        let mut entry = LogEntry::new(EventType::Info, Severity::Info);
+        entry.details = Some("x".repeat(4000));
+        let line_bytes = serde_json::to_string(&entry).unwrap().len() as u64 + 1;
+        let lines = FALLBACK_MAX_BYTES / line_bytes + 3;
+        for _ in 0..lines {
+            writer.write_entry(&entry);
+        }
+        writer.flush();
+        assert_eq!(writer.state(), "fallback");
+        let size = fs::metadata(&fallback).unwrap().len();
+        assert!(size < FALLBACK_MAX_BYTES, "fallback grew to {size}");
+        assert!(size > 0, "fallback must keep writing after truncation");
+        assert!(
+            !rotated_name(&fallback, 1).exists(),
+            "the fallback must never be rotated"
+        );
+        assert!(!rotated_name(&fallback, 2).exists());
+    }
 
     /// A path no process can create — root included: its parent is a regular
     /// FILE inside the tempdir, so `create_dir_all` fails with `ENOTDIR`

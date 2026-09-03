@@ -75,7 +75,10 @@ impl SqliteLogger {
             },
         )?;
 
-        apply_pragmas(&conn)?;
+        // Opening does not change an existing file's size; a new database is
+        // still empty here, so it gets `auto_vacuum = FULL` before its schema.
+        let db_bytes = std::fs::metadata(path).map_or(0, |m| m.len());
+        apply_pragmas(&conn, db_bytes)?;
         apply_schema(&conn)?;
 
         Ok(Self {
@@ -602,13 +605,21 @@ pub struct BallastRow {
 
 // ──────────────────── schema & pragmas ────────────────────
 
-fn apply_pragmas(conn: &Connection) -> Result<()> {
+/// Databases at or below this size keep whatever `auto_vacuum` they have.
+///
+/// Converting them costs a full rewrite for nothing worth reclaiming, and a
+/// new database gets `auto_vacuum = FULL` before its first table anyway.
+pub const VACUUM_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+fn apply_pragmas(conn: &Connection, db_bytes: u64) -> Result<()> {
     // auto_vacuum can only be changed before the first table is created.
-    // For existing databases the PRAGMA is silently ignored, so we check
-    // the current value and run VACUUM to convert if needed.  This must
-    // happen before setting WAL mode because VACUUM resets journal_mode.
+    // For an existing database the PRAGMA alone is silently ignored, so a
+    // mismatch needs a VACUUM to convert; that rewrite is only worth it
+    // once the file is large enough for page frees to matter
+    // (bd-rc-master-ajg1.7.2). This must happen before setting WAL mode
+    // because VACUUM resets journal_mode.
     let current_av: i32 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
-    if current_av != 1 {
+    if current_av != 1 && (db_bytes == 0 || db_bytes > VACUUM_MIN_BYTES) {
         // 1 = FULL.  Setting it and running VACUUM converts the database
         // in-place so future page frees actually reclaim space.
         if conn
@@ -729,6 +740,65 @@ fn apply_schema(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A database created outside the logger with `auto_vacuum = NONE` and
+    /// roughly `payload_bytes` of rows, closed cleanly.
+    fn legacy_db(path: &Path, payload_bytes: usize) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA auto_vacuum = NONE;
+             CREATE TABLE filler (blob BLOB);",
+        )
+        .unwrap();
+        let chunk = vec![0x5Au8; 1024 * 1024];
+        let chunks = payload_bytes.div_ceil(chunk.len());
+        for _ in 0..chunks {
+            conn.execute("INSERT INTO filler (blob) VALUES (?1)", [&chunk])
+                .unwrap();
+        }
+        let av: i32 = conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(av, 0, "fixture must start without auto_vacuum");
+    }
+
+    fn auto_vacuum(logger: &SqliteLogger) -> i32 {
+        logger
+            .conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// bd-rc-master-ajg1.7.2: a mismatched `auto_vacuum` is converted with
+    /// one VACUUM only above the 64 MiB floor; a small database keeps its
+    /// setting, and a new one starts out FULL.
+    #[test]
+    fn vacuum_converts_only_databases_above_the_size_floor() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let small = dir.path().join("small.db");
+        legacy_db(&small, 1024 * 1024);
+        let before = std::fs::metadata(&small).unwrap().len();
+        assert!(before <= VACUUM_MIN_BYTES, "{before}");
+        let logger = SqliteLogger::open(&small).unwrap();
+        assert_eq!(auto_vacuum(&logger), 0, "small database left alone");
+        drop(logger);
+
+        let large = dir.path().join("large.db");
+        legacy_db(&large, 65 * 1024 * 1024);
+        let before = std::fs::metadata(&large).unwrap().len();
+        assert!(before > VACUUM_MIN_BYTES, "{before}");
+        let logger = SqliteLogger::open(&large).unwrap();
+        assert_eq!(auto_vacuum(&logger), 1, "large database converted to FULL");
+        // Converting is idempotent: reopening finds FULL and leaves it.
+        drop(logger);
+        let logger = SqliteLogger::open(&large).unwrap();
+        assert_eq!(auto_vacuum(&logger), 1);
+
+        let fresh = dir.path().join("fresh.db");
+        let logger = SqliteLogger::open(&fresh).unwrap();
+        assert_eq!(auto_vacuum(&logger), 1, "new database starts FULL");
+    }
 
     fn temp_db() -> (tempfile::TempDir, SqliteLogger) {
         let dir = tempfile::tempdir().unwrap();

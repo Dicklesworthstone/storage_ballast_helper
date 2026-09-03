@@ -1375,18 +1375,20 @@ Automatic retention pruning removes rows older than 30 days, triggered every 360
 
 The JSONL writer appends one JSON object per line to a file, providing a portable, grep-friendly, append-only log. Lines are assembled in memory and written atomically to prevent interleaved partial lines when multiple tools tail the file.
 
-Rotation triggers when the file exceeds 100 MiB, keeping up to 5 rotated files. Fsync runs every 10 seconds (frequent enough to limit data loss, infrequent enough to avoid IO stalls).
+In the daemon, rotation triggers when the file exceeds 50 MiB, keeping up to 5 rotated files, and fsync runs every 30 seconds: on the next write once the interval has passed, or from an idle timer when no write arrives, so a burst of lines before a quiet spell is still made durable. (The library defaults, used by tools that embed the writer, are 100 MiB and 10 seconds.)
 
 #### Degradation Chain
 
 If the SQLite backend fails (disk full, corruption, permission error), the logger falls through a degradation chain:
 
-1. Track consecutive SQLite failures.
-2. After 50 consecutive failures, disable SQLite and log only to JSONL.
-3. Periodically attempt to reopen the SQLite connection.
-4. If JSONL also fails, fall back to a RAM-backed path (`/dev/shm/sbh.jsonl`).
+1. Track consecutive SQLite write failures (events that produce no SQLite row do not reset the count).
+2. After 3 consecutive failures, disable SQLite and log only to JSONL.
+3. Every 50 events while disabled, attempt to reopen the SQLite connection; on success the counter resets and rows resume from the next event.
+4. If the JSONL file cannot be written, fall back to a RAM-backed file: `/dev/shm/sbh-<uid>.jsonl` on Linux, `$TMPDIR/sbh.jsonl` on macOS. The fallback is never rotated; it is truncated when it would exceed 16 MiB, so a long outage of the primary path cannot fill `/dev/shm`. The primary path is retried periodically and writing returns to it as soon as it works.
 5. If that fails, write to stderr with `[SBH-JSONL]` prefix.
 6. If even stderr fails, silently discard (the daemon never blocks on logging).
+
+At open, a database whose `auto_vacuum` is not `FULL` is converted with one `VACUUM` only when it is larger than 64 MiB; smaller files keep their setting, because the rewrite would cost more than it could ever reclaim.
 
 The logger thread runs on a bounded channel (capacity 1024). When the channel is full, events are dropped and a counter is incremented. The drop count is reported periodically as a delta (not cumulative) to avoid alarm fatigue.
 

@@ -2561,13 +2561,7 @@ impl MonitoringDaemon {
         // 1. Initialize logger.
         let logger_config = DualLoggerConfig {
             sqlite_path: Some(config.paths.sqlite_db.clone()),
-            jsonl_config: JsonlConfig {
-                path: config.paths.jsonl_log.clone(),
-                fallback_path: None,
-                max_size_bytes: 50 * 1024 * 1024,
-                max_rotated_files: 5,
-                fsync_interval_secs: 30,
-            },
+            jsonl_config: JsonlConfig::for_daemon(config.paths.jsonl_log.clone()),
             channel_capacity: 1024,
             run_id: Some(run_id.clone()),
         };

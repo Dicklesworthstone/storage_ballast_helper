@@ -388,7 +388,12 @@ fn logger_thread_main(
         last_beat.store(epoch_ms(), Ordering::Relaxed);
         let event = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(event) => event,
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                // Idle fsync timer: lines written before a quiet spell are
+                // made durable once the interval passes, with no new event.
+                jsonl.tick(std::time::SystemTime::now());
+                continue;
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         };
         // Report dropped events periodically (M8: delta, not zeroing).
@@ -1012,6 +1017,67 @@ fn event_to_pressure_row(event: &ActivityEvent) -> Option<PressureRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-rc-master-ajg1.7.2: three consecutive SQLite write failures trip
+    /// the backend, the fiftieth event while tripped reopens it, and rows
+    /// resume from the next event. The failures are real: a second
+    /// connection holds the write lock, so each write fails after the
+    /// busy timeout.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_trips_after_three_failures_and_reopens_after_fifty_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let db_path = dir.path().join("test.db");
+        drop(SqliteLogger::open(&db_path).unwrap());
+        let (handle, join) = spawn_logger(config).unwrap();
+
+        let blocker = rusqlite::Connection::open(&db_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        for i in 0..3 {
+            handle.send(ActivityEvent::Error {
+                code: format!("SBH-LOCKED-{i}"),
+                message: "write lock held by another connection".to_string(),
+            });
+        }
+        // Each attempt waits out the 5 s busy timeout before failing.
+        thread::sleep(Duration::from_secs(17));
+        blocker.execute_batch("COMMIT;").unwrap();
+        drop(blocker);
+
+        // Tripped: these go to JSONL only, and the fiftieth reopens SQLite.
+        for i in 0..50 {
+            handle.send(ActivityEvent::Error {
+                code: format!("SBH-TRIPPED-{i}"),
+                message: "sqlite disabled".to_string(),
+            });
+        }
+        for i in 0..5 {
+            handle.send(ActivityEvent::Error {
+                code: format!("SBH-AFTER-{i}"),
+                message: "sqlite recovered".to_string(),
+            });
+        }
+        handle.shutdown();
+        join.join().unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count = |prefix: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM activity_log WHERE error_code LIKE ?1",
+                [format!("{prefix}%")],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("SBH-LOCKED-"), 0, "locked writes must not land");
+        assert_eq!(count("SBH-TRIPPED-"), 0, "tripped events are JSONL-only");
+        assert_eq!(count("SBH-AFTER-"), 5, "rows resume after the reopen");
+        let jsonl = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        assert_eq!(jsonl.matches("SBH-LOCKED-").count(), 3);
+        assert_eq!(jsonl.matches("SBH-TRIPPED-").count(), 50);
+        assert_eq!(jsonl.matches("SBH-AFTER-").count(), 5);
+    }
 
     fn test_config(dir: &std::path::Path) -> DualLoggerConfig {
         DualLoggerConfig {

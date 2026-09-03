@@ -10,6 +10,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Changed — one logging degradation chain (bd-rc-master-ajg1.7.2)
+
+- The daemon's JSONL settings are now a single definition (`JsonlConfig::for_daemon`): rotation at 50 MiB keeping 5 files, fsync every 30 seconds, and the RAM-backed fallback enabled (`/dev/shm/sbh-<uid>.jsonl` on Linux, `$TMPDIR/sbh.jsonl` elsewhere), never rotated and truncated at 16 MiB. An idle timer in the logger thread fsyncs lines written before a quiet spell once the interval passes. SQLite trips after 3 consecutive write failures and is retried every 50 events, which is what the code always did; the README said 50 failures. At open, a database whose `auto_vacuum` is not FULL is converted only when it is larger than 64 MiB.
+
 ### Added — reserve sizing from observed write bursts (bd-rc-master-ajg1.2.18)
 
 - The daemon measures, per mount, the peak used-bytes growth inside each reaction window (an EWMA of poll + scan + reclaim latency, five-minute prior) and keeps the samples in a t-digest persisted as `burst_stats.bin` beside `state.json`. The reserve target is the 0.99 quantile of those windows: the digest's own quantile after 50 windows, a generalized Pareto tail fit above the 0.9 quantile from 10 windows, and never below two ballast files. `state.json` carries it per mount as `reserve_state.burst` (`recommended_bytes`, `q99_bytes`, `windows`, `reaction_window_secs`, `method`, `horizon_minutes` at the burst rate); `metrics.prom` exports `sbh_reserve_recommended_bytes` and `sbh_burst_q99_bytes`.
