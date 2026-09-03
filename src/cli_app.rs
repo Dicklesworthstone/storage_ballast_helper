@@ -17744,43 +17744,7 @@ mod tests {
                 .map(|c| c.path)
                 .collect();
 
-        let section_start = readme
-            .find("## Command Reference")
-            .expect("README has a Command Reference");
-        let section_end = readme[section_start..]
-            .find("\n## ")
-            .map_or(readme.len(), |end| section_start + end);
-        let mut missing = Vec::new();
-        for line in readme[section_start..section_end].lines() {
-            let Some(rest) = line.strip_prefix("| `sbh ") else {
-                continue;
-            };
-            let Some(cell_end) = rest.find('`') else {
-                continue;
-            };
-            let words: Vec<&str> = rest[..cell_end]
-                .split_whitespace()
-                .take_while(|w| !w.starts_with('-') && !w.starts_with('<') && !w.starts_with('['))
-                .collect();
-            let mut path = String::new();
-            for word in words {
-                // `config show|set|…` documents alternatives in one cell.
-                let word = word.split('|').next().unwrap_or(word);
-                let candidate = if path.is_empty() {
-                    word.to_string()
-                } else {
-                    format!("{path} {word}")
-                };
-                if known.contains(&candidate) {
-                    path = candidate;
-                } else {
-                    break;
-                }
-            }
-            if path.is_empty() {
-                missing.push(line.to_string());
-            }
-        }
+        let missing = storage_ballast_helper::cli::docs::undocumented_commands(&readme, &known);
         assert!(
             missing.is_empty(),
             "README documents commands that do not exist: {missing:#?}"

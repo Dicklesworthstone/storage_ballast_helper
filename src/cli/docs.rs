@@ -815,6 +815,55 @@ pub fn check_file(path: &Path, document: &DocsDocument) -> Result<Vec<String>> {
     render_regions(&text, document).map(|(_, changed)| changed)
 }
 
+/// README "Command Reference" rows naming a command clap does not have.
+///
+/// A row's command is the longest prefix of its `sbh …` words that is a
+/// known command path; flags, placeholders and `a|b` alternatives are not
+/// part of the path (bd-rc-master-ajg1.12.3).
+#[must_use]
+pub fn undocumented_commands(
+    readme: &str,
+    known: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let Some(section_start) = readme.find("## Command Reference") else {
+        return vec!["README has no \"## Command Reference\" section".to_string()];
+    };
+    let section_end = readme[section_start..]
+        .find("\n## ")
+        .map_or(readme.len(), |end| section_start + end);
+    let mut missing = Vec::new();
+    for line in readme[section_start..section_end].lines() {
+        let Some(rest) = line.strip_prefix("| `sbh ") else {
+            continue;
+        };
+        let Some(cell_end) = rest.find('`') else {
+            continue;
+        };
+        let mut path = String::new();
+        for word in rest[..cell_end].split_whitespace() {
+            if word.starts_with('-') || word.starts_with('<') || word.starts_with('[') {
+                break;
+            }
+            // `config show|set|…` documents alternatives in one cell.
+            let word = word.split('|').next().unwrap_or(word);
+            let candidate = if path.is_empty() {
+                word.to_string()
+            } else {
+                format!("{path} {word}")
+            };
+            if known.contains(&candidate) {
+                path = candidate;
+            } else {
+                break;
+            }
+        }
+        if path.is_empty() {
+            missing.push(line.trim().to_string());
+        }
+    }
+    missing
+}
+
 fn bad(details: impl Into<String>) -> SbhError {
     SbhError::ConfigParse {
         context: "docs",
@@ -974,6 +1023,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no end marker"), "{err}");
+    }
+
+    /// The documented-commands check flags a command clap lacks and accepts
+    /// flags, placeholders and `a|b` alternatives after a real command.
+    #[test]
+    fn undocumented_commands_flags_only_unknown_commands() {
+        let known: BTreeSet<String> = [
+            "status",
+            "ballast",
+            "ballast release",
+            "config",
+            "lease",
+            "lease run",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let readme = "intro\n## Command Reference\n\n| Command | Purpose |\n| --- | --- |\n\
+                      | `sbh status --json` | ok |\n\
+                      | `sbh ballast release N` | ok |\n\
+                      | `sbh config show|set|validate` | ok |\n\
+                      | `sbh lease run --target PATH -- COMMAND...` | ok |\n\
+                      | `sbh nosuch --flag` | flagged |\n\
+                      | `sbh ballast nosub` | ok: ballast exists, the word is treated as an argument |\n\
+                      \n## Next section\n| `sbh other` | outside the section |\n";
+        let missing = undocumented_commands(readme, &known);
+        assert_eq!(missing, vec!["| `sbh nosuch --flag` | flagged |"]);
+        assert_eq!(
+            undocumented_commands("no reference here", &known),
+            vec!["README has no \"## Command Reference\" section"]
+        );
     }
 
     #[cfg(feature = "tui")]
