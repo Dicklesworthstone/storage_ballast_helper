@@ -1221,7 +1221,10 @@ TOML
   if [[ "${SKIP_DESTRUCTIVE}" == "1" ]]; then
     skip_case emergency_with_artifacts "SBH_E2E_SKIP_DESTRUCTIVE=1"
   else
-    tally_case run_case_expect_fail emergency_with_artifacts 1 "no cleanup candidates" \
+    # C-EXIT (bd-rc-master-ajg1.4.4, tests/cli_exit_codes.rs): nothing to
+    # reclaim is a successful outcome for emergency, as for clean — exit 0
+    # with the no-candidates line, not exit 1.
+    tally_case run_case emergency_with_artifacts "no cleanup candidates" \
       "${bin}" emergency "${emergency_tree}" --yes --target-free 0.1
   fi
 
@@ -1276,10 +1279,78 @@ TOML
 
   # ── Dashboard: runtime mode selection ──
 
-  # 17a: --new-dashboard requires TUI feature (binary built without it).
-  tally_case run_case_expect_fail dashboard_new_requires_tui 2 \
-    "TUI feature not enabled" \
+  # 17a: the shipped binary carries the cockpit (tui is a default feature),
+  #      and an explicit --new-dashboard with stdout on a pipe is refused with
+  #      the TTY message rather than the lean-build feature error.
+  tally_case run_case_expect_fail dashboard_new_needs_a_tty 2 \
+    "stdout is not a TTY" \
     "${bin}" dashboard --new-dashboard
+
+  # 17a2: under a pseudo-terminal the cockpit starts, draws, and quits on `q`
+  #       with exit 0. `script` (util-linux/BSD) provides the PTY; the `q` is
+  #       sent after the runtime has had time to enter raw mode.
+  dashboard_cockpit_pty_case() {
+    local name="dashboard_cockpit_starts_under_a_pty"
+    local case_log="${CASE_DIR}/${name}.log"
+    local start_ns
+    start_ns=$(date +%s%N 2>/dev/null || date +%s)
+
+    log "CASE START: ${name}"
+    {
+      echo "name=${name}"
+      echo "command=script -qfec '${bin} dashboard --new-dashboard --start-screen ballast' /dev/null"
+      echo "start_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    } > "${case_log}"
+
+    set +e
+    local output
+    output="$( (sleep 3; printf 'q') | timeout 30 env SBH_TEST_VERBOSE=1 SBH_OUTPUT_FORMAT=human \
+      RUST_BACKTRACE=1 TERM=xterm-256color COLUMNS=100 LINES=30 \
+      script -qfec "${bin} dashboard --new-dashboard --start-screen ballast" /dev/null 2>&1)"
+    local status=$?
+    set -e
+
+    local end_ns
+    end_ns=$(date +%s%N 2>/dev/null || date +%s)
+    local elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+    {
+      echo "status=${status}"
+      echo "elapsed_ms=${elapsed_ms}"
+      echo "----- output (escape sequences stripped) -----"
+      printf '%s\n' "${output}" | tr -d '\000-\010\013-\037' | head -c 20000
+    } >> "${case_log}"
+
+    if printf '%s' "${output}" | grep -qF "TUI feature not enabled"; then
+      log "CASE FAIL: ${name} (binary lacks the cockpit) [${elapsed_ms}ms]"
+      return 1
+    fi
+    if printf '%s' "${output}" | grep -qF "stdout is not a TTY"; then
+      log "CASE FAIL: ${name} (PTY not detected as a terminal) [${elapsed_ms}ms]"
+      return 1
+    fi
+    if [[ ${status} -eq 0 ]]; then
+      log "CASE PASS: ${name} (cockpit ran under a PTY and quit on q) [${elapsed_ms}ms]"
+      return 0
+    fi
+    if is_timeout_status "${status}"; then
+      log "CASE FAIL: ${name} (cockpit started but did not quit on q) [${elapsed_ms}ms]"
+      return 1
+    fi
+    log "CASE FAIL: ${name} (unexpected status=${status}) [${elapsed_ms}ms]"
+    return 1
+  }
+  if command -v script >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 \
+    && script -qfec "true" /dev/null >/dev/null 2>&1; then
+    tally_case dashboard_cockpit_pty_case
+  else
+    log "SKIP: dashboard_cockpit_starts_under_a_pty (util-linux script/timeout not available)"
+  fi
+
+  # 17a3: an unknown --start-screen is a usage error naming the choices.
+  tally_case run_case_expect_fail dashboard_start_screen_unknown 1 \
+    "unknown start screen" \
+    "${bin}" dashboard --start-screen settings
 
   # 17b: --json output mode is rejected for dashboard.
   tally_case run_case_expect_fail dashboard_json_rejected 1 \
@@ -1291,9 +1362,10 @@ TOML
     "" \
     "${bin}" dashboard --new-dashboard --legacy-dashboard
 
-  # 17d: SBH_DASHBOARD_MODE=new routes to the new path. A lean build (no tui
-  #      feature) must degrade to the live status view with one stderr line,
-  #      not exit 2 — only an explicit --new-dashboard is refused (17a).
+  # 17d: SBH_DASHBOARD_MODE=new routes to the new path. With stdout on a pipe
+  #      (this harness) the cockpit build degrades to the live status view
+  #      with one stderr line, as does a lean build (no tui feature) — only an
+  #      explicit --new-dashboard is refused (17a).
   dashboard_env_mode_new_case() {
     local name="dashboard_env_mode_new_lean_fallback"
     local case_log="${CASE_DIR}/${name}.log"
@@ -1335,6 +1407,8 @@ TOML
     if is_timeout_status "${status}"; then
       if echo "${output}" | grep -qF "built without the tui feature"; then
         log "CASE PASS: ${name} (lean fallback to live status view) [${elapsed_ms}ms]"
+      elif echo "${output}" | grep -qF "stdout is not a terminal"; then
+        log "CASE PASS: ${name} (no-TTY fallback to live status view) [${elapsed_ms}ms]"
       else
         log "CASE PASS: ${name} (dashboard runtime kept running) [${elapsed_ms}ms]"
       fi
@@ -1507,14 +1581,14 @@ TOML
     log "SKIP: dashboard_legacy_renders_status (GNU timeout not available)"
   fi
 
-  # 17h: --no-color with --new-dashboard still reports the feature-gate error.
+  # 17h: --no-color with --new-dashboard still reports the no-TTY refusal.
   tally_case run_case_expect_fail dashboard_no_color_new 2 \
-    "TUI feature not enabled" \
+    "stdout is not a TTY" \
     "${bin}" --no-color dashboard --new-dashboard
 
   # 17i: --refresh-ms is accepted (non-default value).
   tally_case run_case_expect_fail dashboard_refresh_ms_new 2 \
-    "TUI feature not enabled" \
+    "stdout is not a TTY" \
     "${bin}" dashboard --new-dashboard --refresh-ms 250
 
   # ── Section 18: --no-color flag ──────────────────────────────────────────

@@ -3,6 +3,7 @@
 #![allow(missing_docs)]
 
 use std::env;
+use std::ffi::OsStr;
 
 use ftui::{PackedRgba, Style};
 
@@ -48,9 +49,21 @@ impl Default for AccessibilityProfile {
 impl AccessibilityProfile {
     #[must_use]
     pub const fn from_no_color_flag(no_color: bool) -> Self {
+        Self::from_flags(no_color, false)
+    }
+
+    /// A profile from the two environment switches: `no_color` disables
+    /// color output, `reduce_motion` disables sparkline animation and
+    /// notification motion.
+    #[must_use]
+    pub const fn from_flags(no_color: bool, reduce_motion: bool) -> Self {
         Self {
             contrast: ContrastMode::Standard,
-            motion: MotionMode::Full,
+            motion: if reduce_motion {
+                MotionMode::Reduced
+            } else {
+                MotionMode::Full
+            },
             color: if no_color {
                 ColorMode::Disabled
             } else {
@@ -59,10 +72,15 @@ impl AccessibilityProfile {
         }
     }
 
+    /// `NO_COLOR` counts when present at all (the no-color.org rule);
+    /// `REDUCE_MOTION` follows the same rule except for the explicit off
+    /// values `0`, `false`, `no`, and `off`.
     #[must_use]
     pub fn from_environment() -> Self {
         let no_color = env::var_os("NO_COLOR").is_some();
-        Self::from_no_color_flag(no_color)
+        let reduce_motion =
+            env::var_os("REDUCE_MOTION").is_some_and(|value| env_switch_is_on(&value));
+        Self::from_flags(no_color, reduce_motion)
     }
 
     #[must_use]
@@ -74,6 +92,17 @@ impl AccessibilityProfile {
     pub const fn reduced_motion(self) -> bool {
         matches!(self.motion, MotionMode::Reduced)
     }
+}
+
+/// An environment switch is on unless it spells out an off value
+/// (`0`, `false`, `no`, `off`, any case, surrounding space ignored).
+fn env_switch_is_on(value: &OsStr) -> bool {
+    value.to_str().is_none_or(|text| {
+        !matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
 }
 
 /// Semantic token category independent of concrete color codes.
@@ -397,6 +426,28 @@ mod tests {
     fn no_color_profile_disables_color_mode() {
         let profile = AccessibilityProfile::from_no_color_flag(true);
         assert!(profile.no_color());
+        assert!(!profile.reduced_motion());
+    }
+
+    #[test]
+    fn reduce_motion_switch_selects_reduced_motion() {
+        let profile = AccessibilityProfile::from_flags(false, true);
+        assert!(profile.reduced_motion());
+        assert!(!profile.no_color());
+        assert_eq!(profile.contrast, ContrastMode::Standard);
+
+        for on in ["1", "true", "yes", "", "anything"] {
+            assert!(
+                env_switch_is_on(OsStr::new(on)),
+                "{on:?} should count as on"
+            );
+        }
+        for off in ["0", "false", "no", "off", " FALSE "] {
+            assert!(
+                !env_switch_is_on(OsStr::new(off)),
+                "{off:?} should count as off"
+            );
+        }
     }
 
     #[test]

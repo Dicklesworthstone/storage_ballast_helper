@@ -1080,6 +1080,9 @@ pub enum DashboardCmd {
     ScheduleNotificationExpiry { id: u64, after: Duration },
     /// Execute a preference mutation and apply updated profile values.
     ExecutePreferenceAction(PreferenceAction),
+    /// Ask the daemon, over its control socket, to release `count` ballast
+    /// files on `mount` (the confirmed quick-release), then refetch state.
+    ReleaseBallast { mount: String, count: usize },
 }
 
 // ──────────────────── tests ────────────────────

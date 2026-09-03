@@ -20,15 +20,17 @@ use super::model::{
     DashboardCmd, DashboardModel, DashboardMsg, NotificationLevel, Overlay, PreferenceAction,
     PreferenceProfileMode, Screen,
 };
-use super::preferences::{self, ResolvedPreferences, UserPreferences};
+use super::preferences::{self, ResolvedPreferences, StartScreen, UserPreferences};
 use super::telemetry::{
     CompositeTelemetryAdapter, NullTelemetryHook, TelemetryHook, TelemetryQueryAdapter,
     TelemetrySample,
 };
 use super::theme::AccessibilityProfile;
 use super::{input, render, update};
+#[cfg(feature = "legacy-crossterm-dashboard")]
 use crate::cli::dashboard::{self, DashboardConfig as LegacyDashboardConfig};
 use crate::core::hex_lower;
+use crate::daemon::control;
 use crate::daemon::self_monitor::DaemonState;
 
 /// Which runtime path to execute.
@@ -52,10 +54,14 @@ pub struct DashboardRuntimeConfig {
     pub mode: DashboardRuntimeMode,
     pub sqlite_db: Option<PathBuf>,
     pub jsonl_log: Option<PathBuf>,
+    /// `--start-screen`: the screen to open on for this session, beating the
+    /// persisted preference without touching it.
+    pub start_screen: Option<StartScreen>,
 }
 
 impl DashboardRuntimeConfig {
     /// Build the underlying legacy dashboard config.
+    #[cfg(feature = "legacy-crossterm-dashboard")]
     #[must_use]
     pub fn as_legacy_config(&self) -> LegacyDashboardConfig {
         LegacyDashboardConfig {
@@ -361,6 +367,7 @@ fn run_new_cockpit(config: &DashboardRuntimeConfig) -> io::Result<()> {
     );
     let (mut preference_state, preference_warning) = PreferenceRuntimeState::load();
     preference_state.apply_to_model(&mut model, true, true);
+    apply_start_screen_override(&mut model, config.start_screen);
 
     // Initialize telemetry adapter.
     let telemetry_adapter =
@@ -573,7 +580,100 @@ fn execute_cmd(
                 }
             }
         }
+        DashboardCmd::ReleaseBallast { mount, count } => {
+            notify_release_outcome(model, timers, release_ballast(state_file, &mount, count));
+            // The pool changed (or the operator needs to see it did not).
+            execute_cmd(
+                model,
+                state_file,
+                DashboardCmd::FetchData,
+                timers,
+                preference_state,
+                telemetry,
+            );
+        }
     }
+}
+
+/// `--start-screen` for this session: `Remember` keeps whatever the
+/// preferences chose, any other value replaces it and clears the back
+/// history so Backspace does not lead to a screen the operator never saw.
+fn apply_start_screen_override(model: &mut DashboardModel, start_screen: Option<StartScreen>) {
+    if let Some(start) = start_screen
+        && start != StartScreen::Remember
+    {
+        model.screen = start.resolve(Some(model.screen));
+        model.screen_history.clear();
+    }
+}
+
+/// Surface a release outcome as a notification: successes fade after 8 s,
+/// refusals stay a little longer so the reason can be read.
+fn notify_release_outcome(
+    model: &mut DashboardModel,
+    timers: &mut Vec<(u64, Instant)>,
+    outcome: Result<String, String>,
+) {
+    let (level, message, hold) = match outcome {
+        Ok(message) => (NotificationLevel::Info, message, 8),
+        Err(message) => (NotificationLevel::Error, message, 12),
+    };
+    let id = model.push_notification(level, message);
+    timers.push((id, Instant::now() + Duration::from_secs(hold)));
+}
+
+/// Release `count` ballast files on `mount` through the daemon beside
+/// `state_file`. The Ok/Err strings are the operator-facing notification.
+fn release_ballast(state_file: &Path, mount: &str, count: usize) -> Result<String, String> {
+    let endpoint = control::read_endpoint(state_file).ok_or_else(|| {
+        "ballast release: no running daemon beside the state file (start sbh, or run `sbh ballast release`)"
+            .to_string()
+    })?;
+    release_ballast_at(&endpoint, mount, count)
+}
+
+/// The control-socket half of [`release_ballast`]: one `ballast` request
+/// with `release = count` scoped to `mount`, summarised from the daemon's
+/// per-pool report.
+fn release_ballast_at(
+    endpoint: &control::ControlEndpoint,
+    mount: &str,
+    count: usize,
+) -> Result<String, String> {
+    let args = serde_json::json!({ "release": count, "mount": mount });
+    let response = control::request(&endpoint.socket, &endpoint.token, "ballast", &args)
+        .map_err(|err| format!("ballast release failed: {err}"))?;
+    if !response.ok {
+        let detail = response
+            .error
+            .map_or_else(|| "daemon refused".to_string(), |err| err.message);
+        return Err(format!("ballast release refused: {detail}"));
+    }
+    let pools = response.result["pools"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let released: u64 = pools
+        .iter()
+        .filter_map(|pool| pool["released"].as_u64())
+        .sum();
+    let bytes_freed: u64 = pools
+        .iter()
+        .filter_map(|pool| pool["bytes_freed"].as_u64())
+        .sum();
+    if released == 0 {
+        let note = pools
+            .iter()
+            .find_map(|pool| pool["note"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "no ballast file was available".to_string());
+        return Err(format!(
+            "ballast release on {mount}: nothing released ({note})"
+        ));
+    }
+    Ok(format!(
+        "released {released} ballast file(s) on {mount}, {} freed",
+        super::widgets::human_bytes(bytes_freed)
+    ))
 }
 
 /// Read and parse the daemon state file. Returns `None` on any error.
@@ -583,8 +683,22 @@ fn read_state_file(path: &Path) -> Option<Box<DaemonState>> {
     Some(Box::new(state))
 }
 
+#[cfg(feature = "legacy-crossterm-dashboard")]
 fn run_legacy_fallback(config: &DashboardRuntimeConfig) -> io::Result<()> {
     dashboard::run(&config.as_legacy_config())
+}
+
+/// Without the `legacy-crossterm-dashboard` feature the fallback mode is a
+/// typed refusal: the CLI never selects it (its `--legacy-dashboard` is the
+/// live status view), so reaching here means a caller asked for a renderer
+/// this binary does not carry.
+#[cfg(not(feature = "legacy-crossterm-dashboard"))]
+fn run_legacy_fallback(_config: &DashboardRuntimeConfig) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the legacy crossterm dashboard is not compiled into this binary (feature \
+         legacy-crossterm-dashboard); use `sbh dashboard --legacy-dashboard` for the live status view",
+    ))
 }
 
 #[cfg(test)]
@@ -638,6 +752,96 @@ mod tests {
     }
 
     #[test]
+    fn start_screen_override_replaces_the_preference_screen() {
+        let mut model = test_model();
+        model.screen = Screen::Timeline;
+        model.screen_history.push(Screen::Overview);
+
+        // Remember keeps what the preferences chose.
+        apply_start_screen_override(&mut model, Some(StartScreen::Remember));
+        assert_eq!(model.screen, Screen::Timeline);
+        assert_eq!(model.screen_history, vec![Screen::Overview]);
+
+        // None is the plain launch.
+        apply_start_screen_override(&mut model, None);
+        assert_eq!(model.screen, Screen::Timeline);
+
+        // A concrete screen replaces it and clears the back history.
+        apply_start_screen_override(&mut model, Some(StartScreen::Candidates));
+        assert_eq!(model.screen, Screen::Candidates);
+        assert!(model.screen_history.is_empty());
+    }
+
+    #[test]
+    fn release_without_a_daemon_is_a_typed_refusal() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state.json");
+        let err = release_ballast(&state, "/data", 1).unwrap_err();
+        assert!(err.contains("no running daemon"), "{err}");
+    }
+
+    #[test]
+    fn release_over_the_control_socket_summarises_the_daemon_report() {
+        use crate::daemon::control::{
+            BallastAction, ControlBackend, ControlCommand, ControlEndpoint, ControlResponse,
+            ControlServer, Peer, control_socket_path,
+        };
+
+        /// Answers a scoped release with the daemon's per-pool document
+        /// shape and refuses everything else.
+        struct PoolBackend;
+        impl ControlBackend for PoolBackend {
+            fn handle(&self, command: ControlCommand, _peer: Option<Peer>) -> ControlResponse {
+                match command {
+                    ControlCommand::Ballast(BallastAction::Release { count, mount }) => {
+                        let mount = mount.map(|m| m.display().to_string()).unwrap_or_default();
+                        if mount == "/empty" {
+                            return ControlResponse::success(serde_json::json!({
+                                "pools": [{ "mount": mount, "released": 0, "bytes_freed": 0,
+                                            "note": "no pool or no available file" }]
+                            }));
+                        }
+                        ControlResponse::success(serde_json::json!({
+                            "pools": [{ "mount": mount, "released": count,
+                                        "bytes_freed": count as u64 * 1_073_741_824 }]
+                        }))
+                    }
+                    _ => ControlResponse::failure("bad_request", "not a release"),
+                }
+            }
+        }
+
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state.json");
+        let socket = control_socket_path(&state);
+        let server = ControlServer::start(&socket, "secret", Arc::new(PoolBackend)).unwrap();
+        let endpoint = ControlEndpoint {
+            socket: socket.clone(),
+            token: "secret".to_string(),
+        };
+
+        let ok = release_ballast_at(&endpoint, "/data", 2).unwrap();
+        assert!(ok.contains("released 2 ballast file(s) on /data"), "{ok}");
+        assert!(ok.contains("2.0 GB freed"), "{ok}");
+
+        let nothing = release_ballast_at(&endpoint, "/empty", 1).unwrap_err();
+        assert!(nothing.contains("nothing released"), "{nothing}");
+        assert!(
+            nothing.contains("no pool or no available file"),
+            "{nothing}"
+        );
+
+        let wrong_token = ControlEndpoint {
+            socket,
+            token: "wrong".to_string(),
+        };
+        let refused = release_ballast_at(&wrong_token, "/data", 1).unwrap_err();
+        assert!(refused.contains("refused"), "{refused}");
+        server.stop();
+    }
+
+    #[cfg(feature = "legacy-crossterm-dashboard")]
+    #[test]
     fn runtime_config_maps_to_legacy_config() {
         let cfg = DashboardRuntimeConfig {
             state_file: PathBuf::from("/tmp/state.json"),
@@ -646,6 +850,7 @@ mod tests {
             mode: DashboardRuntimeMode::LegacyFallback,
             sqlite_db: None,
             jsonl_log: None,
+            start_screen: None,
         };
 
         let legacy = cfg.as_legacy_config();

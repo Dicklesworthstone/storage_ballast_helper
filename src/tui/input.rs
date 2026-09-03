@@ -51,6 +51,8 @@ pub enum InputAction {
     IncidentShowPlaybook,
     /// Quick-release ballast: jump to ballast screen with release confirmation.
     IncidentQuickRelease,
+    /// Enter on a confirmation overlay: run the action it guards.
+    ConfirmOverlay,
     /// Navigate to the playbook entry at the cursor position.
     IncidentPlaybookNavigate,
     /// Move playbook cursor up.
@@ -243,6 +245,10 @@ fn resolve_overlay_key(key: &KeyEvent, overlay: Overlay) -> InputResolution {
         }
         KeyCode::Enter if overlay == Overlay::IncidentPlaybook => {
             InputResolution::action(InputAction::IncidentPlaybookNavigate)
+        }
+        // ── Confirmation overlay: the modal advertises Enter/Esc ──
+        KeyCode::Enter if matches!(overlay, Overlay::Confirmation(_)) => {
+            InputResolution::action(InputAction::ConfirmOverlay)
         }
         _ => InputResolution::consumed_without_action(),
     }
@@ -1055,6 +1061,32 @@ mod tests {
         let res = resolve_key_event(&key(KeyCode::Char('q')), ctx);
         assert!(res.consumed);
         assert!(res.action.is_none()); // consumed but no action
+    }
+
+    #[test]
+    fn confirmation_overlay_enter_confirms_both_actions() {
+        for action in [
+            crate::tui::model::ConfirmAction::BallastRelease,
+            crate::tui::model::ConfirmAction::BallastReleaseAll,
+        ] {
+            let ctx = InputContext {
+                screen: Screen::Ballast,
+                active_overlay: Some(Overlay::Confirmation(action)),
+            };
+            let res = resolve_key_event(&key(KeyCode::Enter), ctx);
+            assert_eq!(res.action, Some(InputAction::ConfirmOverlay), "{action:?}");
+            assert!(res.consumed);
+        }
+        // Enter elsewhere keeps its old meaning: the help overlay swallows it.
+        let ctx = InputContext {
+            screen: Screen::Ballast,
+            active_overlay: Some(Overlay::Help),
+        };
+        assert!(
+            resolve_key_event(&key(KeyCode::Enter), ctx)
+                .action
+                .is_none()
+        );
     }
 
     // ── Voi overlay resolution ──

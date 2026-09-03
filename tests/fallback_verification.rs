@@ -27,7 +27,9 @@ use storage_ballast_helper::tui::adapters::{
 };
 use storage_ballast_helper::tui::model::{DashboardModel, DashboardMsg, NotificationLevel, Screen};
 use storage_ballast_helper::tui::preferences::{self, LoadOutcome, UserPreferences};
-use storage_ballast_helper::tui::runtime::{DashboardRuntimeConfig, DashboardRuntimeMode};
+#[cfg(feature = "legacy-crossterm-dashboard")]
+use storage_ballast_helper::tui::runtime::DashboardRuntimeConfig;
+use storage_ballast_helper::tui::runtime::DashboardRuntimeMode;
 use storage_ballast_helper::tui::update::update;
 
 // ══════════════════════════════════════════════════════════════════
@@ -301,6 +303,7 @@ fn empty_kill_switch_env_var_is_not_active() {
 // when converting to legacy config for fallback operation.
 // ══════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "legacy-crossterm-dashboard")]
 #[test]
 fn legacy_config_preserves_all_fields() {
     let cfg = DashboardRuntimeConfig {
@@ -314,6 +317,7 @@ fn legacy_config_preserves_all_fields() {
         mode: DashboardRuntimeMode::LegacyFallback,
         sqlite_db: None,
         jsonl_log: None,
+        start_screen: None,
     };
 
     let legacy = cfg.as_legacy_config();
@@ -325,6 +329,7 @@ fn legacy_config_preserves_all_fields() {
     assert_eq!(legacy.monitor_paths[2], PathBuf::from("/tmp"));
 }
 
+#[cfg(feature = "legacy-crossterm-dashboard")]
 #[test]
 fn legacy_config_empty_monitor_paths() {
     let cfg = DashboardRuntimeConfig {
@@ -334,6 +339,7 @@ fn legacy_config_empty_monitor_paths() {
         mode: DashboardRuntimeMode::LegacyFallback,
         sqlite_db: None,
         jsonl_log: None,
+        start_screen: None,
     };
 
     let legacy = cfg.as_legacy_config();

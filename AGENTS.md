@@ -600,7 +600,7 @@ The E2E script runs real CLI invocations with per-case logging.
 
 ### What CI gates
 
-`.github/workflows/ci.yml` runs `cargo clippy --all-targets -- -D warnings` twice (shipped features, then `--features tui`), the unit suite as root (`unit-as-root`, chmod-based tests must print `SKIP: running as root`), a `unit-tui` lane that must execute at least 950 library tests, and actionlint over the workflows. Anything that only compiles with the TUI still has to pass clippy, so keep `--features tui` building.
+`.github/workflows/ci.yml` runs `cargo clippy --all-targets -- -D warnings` twice (shipped features, which include `tui`, then with the off-by-default `legacy-crossterm-dashboard` added), the unit suite as root (`unit-as-root`, chmod-based tests must print `SKIP: running as root`), a `unit-tui` lane that must execute at least 950 library tests, and actionlint over the workflows. Anything that only compiles with the TUI still has to pass clippy, so keep `--features tui` building.
 
 ### Test Conventions
 

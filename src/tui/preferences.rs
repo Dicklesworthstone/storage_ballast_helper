@@ -148,6 +148,46 @@ impl StartScreen {
             Self::Remember => last_screen.unwrap_or(Screen::Overview),
         }
     }
+
+    /// The names `--start-screen` and the preferences file accept, in
+    /// screen order.
+    pub const NAMES: [&'static str; 8] = [
+        "overview",
+        "timeline",
+        "explainability",
+        "candidates",
+        "ballast",
+        "log_search",
+        "diagnostics",
+        "remember",
+    ];
+}
+
+impl std::str::FromStr for StartScreen {
+    type Err = String;
+
+    /// The serde names, case-insensitively, with `log-search` and
+    /// `logsearch` accepted for the underscored screen.
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        let normalized = name.trim().to_ascii_lowercase().replace('-', "_");
+        let screen = match normalized.as_str() {
+            "overview" => Self::Overview,
+            "timeline" => Self::Timeline,
+            "explainability" => Self::Explainability,
+            "candidates" => Self::Candidates,
+            "ballast" => Self::Ballast,
+            "log_search" | "logsearch" => Self::LogSearch,
+            "diagnostics" => Self::Diagnostics,
+            "remember" => Self::Remember,
+            _ => {
+                return Err(format!(
+                    "unknown start screen {name:?}; expected one of {}",
+                    Self::NAMES.join(", ")
+                ));
+            }
+        };
+        Ok(screen)
+    }
 }
 
 /// Visual density.
@@ -686,6 +726,38 @@ mod tests {
             StartScreen::Remember.resolve(Some(Screen::Ballast)),
             Screen::Ballast,
         );
+    }
+
+    #[test]
+    fn start_screen_parses_its_documented_names() {
+        for (name, expected) in StartScreen::NAMES.iter().zip([
+            StartScreen::Overview,
+            StartScreen::Timeline,
+            StartScreen::Explainability,
+            StartScreen::Candidates,
+            StartScreen::Ballast,
+            StartScreen::LogSearch,
+            StartScreen::Diagnostics,
+            StartScreen::Remember,
+        ]) {
+            assert_eq!(name.parse::<StartScreen>(), Ok(expected), "{name}");
+            // The serde name and the CLI name are the same string.
+            let json = serde_json::to_string(&expected).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+        }
+        assert_eq!(" Ballast ".parse::<StartScreen>(), Ok(StartScreen::Ballast));
+        assert_eq!(
+            "log-search".parse::<StartScreen>(),
+            Ok(StartScreen::LogSearch)
+        );
+        assert_eq!(
+            "logsearch".parse::<StartScreen>(),
+            Ok(StartScreen::LogSearch)
+        );
+
+        let err = "settings".parse::<StartScreen>().unwrap_err();
+        assert!(err.contains("\"settings\""), "{err}");
+        assert!(err.contains("log_search"), "{err}");
     }
 
     #[test]

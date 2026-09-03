@@ -576,7 +576,7 @@ Check Diagnostics (key `7`) for daemon connection details and error counts.
 
 ### Preferences
 
-Dashboard preferences persist across sessions in `~/.config/sbh/dashboard-preferences.json`:
+Dashboard preferences persist across sessions in `~/.config/sbh/preferences.json` (`--start-screen <screen>` overrides the start screen for one session without touching the file):
 
 - **Start screen**: Which screen to show on launch (`overview`, `timeline`, etc.)
 - **Density**: Visual density mode (`compact`, `comfortable`)

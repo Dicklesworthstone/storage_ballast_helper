@@ -10,6 +10,15 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Changed — the cockpit ships in the default build (bd-rc-master-ajg1.4.7)
+
+- `tui` is a default feature: `cargo install`, the release workflow, and CI all build the same feature set (`cli,daemon,sqlite,tui`), so `sbh dashboard` is the frankentui cockpit on every shipped binary. A lean build still exists with `--no-default-features --features cli,daemon,sqlite`.
+- The pre-cockpit crossterm dashboard (`src/cli/dashboard.rs`) moved behind the off-by-default `legacy-crossterm-dashboard` feature; `sbh dashboard --legacy-dashboard` remains the plain live status view.
+- `sbh dashboard --start-screen <overview|timeline|explainability|candidates|ballast|log_search|diagnostics|remember>` opens the cockpit on that screen for the session without touching the saved preference; an unknown name is a usage error listing the choices.
+- `REDUCE_MOTION` (any value but `0`/`false`/`no`/`off`) selects reduced motion the same way `NO_COLOR` disables color; the README's preferences path is the real `~/.config/sbh/preferences.json`.
+- Enter on the ballast release confirmation (quick-release `x`, or the Ballast screen's release keys) now performs the release through the daemon's control socket, scoped to the selected mount (one file, or every available file for release-all), and refetches state; the result, or the daemon's refusal, is the notification.
+- Without an interactive terminal the cockpit route degrades to the live status view with one stderr line; an explicit `--new-dashboard`/`--start-screen` on a pipe is refused with a "stdout is not a TTY" error. The e2e dashboard cases run the cockpit under a PTY (`script`) and quit it with `q`.
+
 ### Added — build metadata in every build path (bd-rc-master-ajg1.5.4)
 
 - A `build.rs` records the git sha (with `-dirty` when the tree has uncommitted changes, or the packager's `SBH_BUILD_GIT_SHA` outside a checkout), the target triple, the profile and a reproducible RFC 3339 timestamp (`SOURCE_DATE_EPOCH`, else the commit time, else the build time). `sbh version --verbose` and the `sbh_info` metrics line read them; a build with none of the sources still says `unknown` instead of failing.

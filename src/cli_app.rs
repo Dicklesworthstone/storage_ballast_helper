@@ -916,12 +916,18 @@ struct DashboardArgs {
     /// Force legacy dashboard behavior during migration or incident fallback.
     #[arg(long, conflicts_with = "new_dashboard")]
     legacy_dashboard: bool,
+
+    /// Open the cockpit on this screen for the session (overview, timeline,
+    /// explainability, candidates, ballast, log_search, diagnostics, remember).
+    #[arg(long, value_name = "SCREEN")]
+    start_screen: Option<String>,
 }
 
 impl Default for DashboardArgs {
     fn default() -> Self {
         Self {
             refresh_ms: 1_000,
+            start_screen: None,
             new_dashboard: false,
             legacy_dashboard: false,
         }
@@ -7206,6 +7212,9 @@ struct DashboardRuntimeRequest {
     reason: DashboardSelectionReason,
     sqlite_db: Option<PathBuf>,
     jsonl_log: Option<PathBuf>,
+    /// `--start-screen`, validated by the cockpit runtime (it is the only
+    /// consumer, and a lean build refuses it with the feature message).
+    start_screen: Option<String>,
 }
 
 /// Resolve dashboard runtime using priority chain:
@@ -7309,6 +7318,31 @@ fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Re
         eprintln!("[dashboard] starting cockpit runtime ({})", request.reason);
     }
 
+    let start_screen = request
+        .start_screen
+        .as_deref()
+        .map(str::parse::<tui::preferences::StartScreen>)
+        .transpose()
+        .map_err(CliError::User)?;
+
+    // The cockpit takes over the terminal; a pipe or a file gets the plain
+    // live status view instead, unless the cockpit was asked for by name.
+    if !io::stdout().is_terminal() {
+        let explicit = matches!(request.reason, DashboardSelectionReason::CliFlagNew)
+            || start_screen.is_some();
+        if explicit {
+            return Err(CliError::Runtime(
+                "the cockpit needs an interactive terminal: stdout is not a TTY. Drop \
+                 --new-dashboard/--start-screen for the live status view, or use `sbh status`"
+                    .to_string(),
+            ));
+        }
+        eprintln!(
+            "[SBH-DASHBOARD] stdout is not a terminal; showing the live status view (the cockpit needs a TTY)"
+        );
+        return run_live_status_loop(cli, request.refresh_ms, "dashboard", false);
+    }
+
     let config = NewDashboardRuntimeConfig {
         state_file: request.state_file.clone(),
         refresh: std::time::Duration::from_millis(request.refresh_ms),
@@ -7316,6 +7350,7 @@ fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Re
         mode: DashboardRuntimeMode::NewCockpit,
         sqlite_db: request.sqlite_db.clone(),
         jsonl_log: request.jsonl_log.clone(),
+        start_screen,
     };
     tui::run_dashboard(&config)
         .map_err(|e| CliError::Runtime(format!("dashboard runtime failure: {e}")))
@@ -7329,6 +7364,12 @@ fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Re
 fn run_new_dashboard_runtime(cli: &Cli, request: &DashboardRuntimeRequest) -> Result<(), CliError> {
     if let Some(error) = lean_build_dashboard_refusal(&request.reason) {
         return Err(error);
+    }
+    if request.start_screen.is_some() {
+        return Err(CliError::Runtime(
+            "TUI feature not enabled. --start-screen needs the cockpit; rebuild with --features tui"
+                .to_string(),
+        ));
     }
     eprintln!(
         "[SBH-DASHBOARD] this binary was built without the tui feature; showing the live status view (rebuild with --features tui for the cockpit)"
@@ -7368,6 +7409,7 @@ fn run_dashboard(cli: &Cli, args: &DashboardArgs) -> Result<(), CliError> {
         reason,
         sqlite_db: Some(config.paths.sqlite_db.clone()),
         jsonl_log: Some(config.paths.jsonl_log),
+        start_screen: args.start_screen.clone(),
     };
 
     run_dashboard_runtime(cli, &request)
@@ -17552,6 +17594,31 @@ mod tests {
         let (sel, reason) = resolve_dashboard_runtime(&legacy_args, &cfg);
         assert_eq!(sel, DashboardRuntimeSelection::Legacy);
         assert_eq!(reason, DashboardSelectionReason::CliFlagLegacy);
+    }
+
+    /// `--start-screen` rides along as the raw name; the cockpit runtime is
+    /// the one place it is validated, so the clap layer accepts any string.
+    #[test]
+    fn dashboard_start_screen_flag_is_carried_verbatim() {
+        let cli = Cli::try_parse_from(["sbh", "dashboard", "--start-screen", "ballast"])
+            .expect("--start-screen parses");
+        let Command::Dashboard(args) = cli.command else {
+            panic!("expected the dashboard command");
+        };
+        assert_eq!(args.start_screen.as_deref(), Some("ballast"));
+        assert!(!args.new_dashboard && !args.legacy_dashboard);
+        assert_eq!(DashboardArgs::default().start_screen, None);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn dashboard_start_screen_names_match_the_cockpit_parser() {
+        use storage_ballast_helper::tui::preferences::StartScreen;
+        for name in StartScreen::NAMES {
+            assert!(name.parse::<StartScreen>().is_ok(), "{name}");
+        }
+        let err = "settings".parse::<StartScreen>().unwrap_err();
+        assert!(err.contains("unknown start screen"), "{err}");
     }
 
     #[test]

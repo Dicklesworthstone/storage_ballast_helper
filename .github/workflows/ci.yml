@@ -28,10 +28,11 @@ env:
   # Must match rust-toolchain.toml. A bare `nightly` re-resolves on every run and
   # turned the lint gate red twice in August 2026; bump both places together.
   TOOLCHAIN: nightly-2026-08-31
-  # The shipped configuration: every default feature, no TUI. The TUI lane
-  # (`unit-tui`) adds `--features tui`; frankentui is a public git dependency.
-  CI_FEATURES: --no-default-features --features cli,daemon,sqlite
-  TUI_FEATURES: --features tui
+  # The shipped configuration: every default feature, TUI included (frankentui
+  # is a public git dependency). The second lane (`unit-tui`) adds the
+  # off-by-default legacy crossterm dashboard so it keeps compiling.
+  CI_FEATURES: --no-default-features --features cli,daemon,sqlite,tui
+  TUI_FEATURES: --features tui,legacy-crossterm-dashboard
 
 jobs:
   check:

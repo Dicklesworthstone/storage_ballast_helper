@@ -415,6 +415,29 @@ fn apply_input_action(model: &mut DashboardModel, action: InputAction) -> Dashbo
             );
             DashboardCmd::None
         }
+        InputAction::ConfirmOverlay => {
+            let Some(Overlay::Confirmation(action)) = model.active_overlay else {
+                return DashboardCmd::None;
+            };
+            model.active_overlay = None;
+            let Some(volume) = model.ballast_selected_volume() else {
+                model.push_notification(
+                    NotificationLevel::Warning,
+                    "No ballast volume selected; nothing released".to_string(),
+                );
+                return DashboardCmd::None;
+            };
+            let count = match action {
+                ConfirmAction::BallastRelease => 1,
+                ConfirmAction::BallastReleaseAll => volume.files_available.max(1),
+            };
+            let mount = volume.mount_point.clone();
+            model.push_notification(
+                NotificationLevel::Info,
+                format!("Releasing {count} ballast file(s) on {mount}…"),
+            );
+            DashboardCmd::ReleaseBallast { mount, count }
+        }
         InputAction::IncidentPlaybookNavigate => {
             let severity =
                 super::incident::IncidentSeverity::from_daemon_state(model.daemon_state.as_ref());
@@ -2739,6 +2762,55 @@ mod tests {
 
         update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('k'))));
         assert_eq!(model.ballast_selected, 0);
+    }
+
+    #[test]
+    fn enter_on_the_release_confirmation_emits_a_control_release() {
+        let mut model = test_model();
+        model.screen = Screen::Ballast;
+        model.ballast_volumes = vec![sample_volume("/", 3, 5), sample_volume("/data", 2, 5)];
+        model.ballast_selected = 1;
+
+        // Single release: one file on the selected mount.
+        model.active_overlay = Some(Overlay::Confirmation(ConfirmAction::BallastRelease));
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        match cmd {
+            DashboardCmd::ReleaseBallast { mount, count } => {
+                assert_eq!(mount, "/data");
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected ReleaseBallast, got {other:?}"),
+        }
+        assert!(model.active_overlay.is_none(), "confirmation closes");
+        assert!(
+            model
+                .notifications
+                .iter()
+                .any(|n| n.message.contains("Releasing 1 ballast file")),
+            "operator is told what was asked for"
+        );
+
+        // Release-all: every available file on the selected mount.
+        model.active_overlay = Some(Overlay::Confirmation(ConfirmAction::BallastReleaseAll));
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(
+            matches!(cmd, DashboardCmd::ReleaseBallast { ref mount, count } if mount == "/data" && count == 2),
+            "{cmd:?}"
+        );
+
+        // No volume selected: nothing is sent to the daemon.
+        model.ballast_volumes.clear();
+        model.active_overlay = Some(Overlay::Confirmation(ConfirmAction::BallastRelease));
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(matches!(cmd, DashboardCmd::None), "{cmd:?}");
+        assert!(model.active_overlay.is_none());
+
+        // Escape still cancels without a command.
+        model.ballast_volumes = vec![sample_volume("/", 3, 5)];
+        model.active_overlay = Some(Overlay::Confirmation(ConfirmAction::BallastReleaseAll));
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Escape)));
+        assert!(matches!(cmd, DashboardCmd::None), "{cmd:?}");
+        assert!(model.active_overlay.is_none());
     }
 
     #[test]

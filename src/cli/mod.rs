@@ -3,6 +3,11 @@
 
 pub mod assets;
 pub mod bootstrap;
+/// The pre-cockpit crossterm dashboard.
+///
+/// Compiled only with the off-by-default `legacy-crossterm-dashboard`
+/// feature; the shipped binary carries the frankentui cockpit alone.
+#[cfg(feature = "legacy-crossterm-dashboard")]
 pub mod dashboard;
 pub mod from_source;
 pub mod install;

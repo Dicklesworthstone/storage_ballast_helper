@@ -11,8 +11,9 @@ env:
   RUSTFLAGS: -D warnings
   # Must match rust-toolchain.toml and ci.yml; bump all three together.
   TOOLCHAIN: nightly-2026-08-31
-  # TUI feature depends on local-path frankentui crates unavailable in CI.
-  CI_FEATURES: --no-default-features --features cli,daemon,sqlite
+  # The shipped feature set, TUI included (frankentui is a public git
+  # dependency). Must match ci.yml.
+  CI_FEATURES: --no-default-features --features cli,daemon,sqlite,tui
 
 permissions:
   contents: write

@@ -20,15 +20,20 @@ name = "macos_performance"
 harness = false
 
 [features]
-# `tui` is intentionally NOT a default feature: the released binaries are built
-# without it (CI uses --no-default-features --features cli,daemon,sqlite), and a
-# default `cargo install --git` must resolve/build without the frankentui TUI
-# crates. Build the TUI explicitly with `--features tui` (sbh#12).
-default = ["cli", "daemon", "sqlite"]
-cli = ["dep:clap", "dep:clap_complete", "dep:colored", "dep:crossterm", "sqlite", "daemon"]
+# `tui` ships by default (bd-rc-master-ajg1.4.7): `sbh dashboard` is the
+# cockpit, and CI builds the feature set the release binaries carry
+# (`--no-default-features --features cli,daemon,sqlite,tui`; frankentui is a
+# public git dependency). A lean build drops it with
+# `--no-default-features --features cli,daemon,sqlite`.
+default = ["cli", "daemon", "sqlite", "tui"]
+cli = ["dep:clap", "dep:clap_complete", "dep:colored", "sqlite", "daemon"]
 daemon = ["dep:signal-hook"]
 sqlite = ["dep:rusqlite"]
 tui = ["dep:ftui", "dep:ftui-backend", "dep:ftui-tty"]
+# The pre-cockpit crossterm dashboard (`src/cli/dashboard.rs`). Off by default
+# so the shipped binary carries one rendering stack; `sbh dashboard
+# --legacy-dashboard` is the plain live status view, not this module.
+legacy-crossterm-dashboard = ["dep:crossterm"]
 [dependencies]
 # CLI (optional — gated behind "cli" feature)
 clap = { version = "4.5", features = ["derive"], optional = true }
