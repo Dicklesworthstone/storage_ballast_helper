@@ -349,7 +349,7 @@ fn replay_regret_outcomes(regret: &SharedRegret, sqlite_db: &Path) {
 fn parent_in_use(platform: &dyn Platform, parent: &Path) -> bool {
     if platform
         .open_files_under(parent)
-        .is_ok_and(|files| !files.is_empty())
+        .is_ok_and(|result| !result.files.is_empty())
     {
         return true;
     }

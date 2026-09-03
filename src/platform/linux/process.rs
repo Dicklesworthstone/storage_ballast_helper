@@ -4,11 +4,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::core::errors::{Result, SbhError};
 use crate::core::paths::resolve_absolute_path;
 use crate::platform::types::{
-    MappedRegion, OpenFile, OpenFileKind, OpenFileMode, PalError, ProcessInfo, ProcessIo, SelfStats,
+    ExecutablesResult, MappedRegion, OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, OpenFile,
+    OpenFileKind, OpenFileMode, OpenFilesResult, PalError, ProcessInfo, ProcessIo, SelfStats,
 };
 
 const PROC_SELF_STATUS: &str = "/proc/self/status";
@@ -59,11 +61,20 @@ pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
     Ok(processes)
 }
 
-pub(super) fn read_open_files_under(root: &Path) -> Result<Vec<OpenFile>> {
+pub(super) fn read_open_files_under(root: &Path) -> Result<OpenFilesResult> {
     let root = resolve_absolute_path(root);
     let mut open_files = Vec::new();
+    let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
+    let mut pids_scanned: usize = 0;
+    let mut incomplete = false;
+
     for pid in proc_pids()? {
+        if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
+            incomplete = true;
+            break;
+        }
         if pid > 0 {
+            pids_scanned += 1;
             open_files.extend(open_files_for_pid_under(pid, &root));
         }
     }
@@ -73,31 +84,48 @@ pub(super) fn read_open_files_under(root: &Path) -> Result<Vec<OpenFile>> {
             .then_with(|| left.fd.cmp(&right.fd))
             .then_with(|| left.path.cmp(&right.path))
     });
-    Ok(open_files)
+    Ok(OpenFilesResult {
+        files: open_files,
+        complete: !incomplete,
+    })
 }
 
-pub(super) fn read_executables_under(root: &Path) -> Result<Vec<ProcessInfo>> {
+pub(super) fn read_executables_under(root: &Path) -> Result<ExecutablesResult> {
     let root = resolve_absolute_path(root);
     let boot_time_unix_ms = read_proc_file(PROC_STAT)
         .ok()
         .and_then(|raw| parse_proc_boot_time_unix_ms(&raw).ok());
-    let mut processes = proc_pids()?
-        .into_iter()
-        .filter(|pid| *pid > 0)
-        .filter_map(|pid| process_info_for_pid(pid, boot_time_unix_ms))
-        .filter(|process| {
-            process
-                .executable
-                .as_deref()
-                .is_some_and(|executable| resolve_absolute_path(executable).starts_with(&root))
-        })
-        .collect::<Vec<_>>();
+    let mut processes = Vec::new();
+    let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
+    let mut pids_scanned: usize = 0;
+    let mut incomplete = false;
+
+    for pid in proc_pids()? {
+        if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
+            incomplete = true;
+            break;
+        }
+        if pid > 0 {
+            pids_scanned += 1;
+            if let Some(process) = process_info_for_pid(pid, boot_time_unix_ms)
+                && process
+                    .executable
+                    .as_deref()
+                    .is_some_and(|executable| resolve_absolute_path(executable).starts_with(&root))
+            {
+                processes.push(process);
+            }
+        }
+    }
     processes.sort_by(|left, right| {
         left.pid
             .cmp(&right.pid)
             .then_with(|| left.name.cmp(&right.name))
     });
-    Ok(processes)
+    Ok(ExecutablesResult {
+        processes,
+        complete: !incomplete,
+    })
 }
 
 pub(super) fn read_mmap_regions_under(root: &Path) -> Result<Vec<MappedRegion>> {
@@ -735,13 +763,18 @@ mod tests {
         let resolved_path = resolve_absolute_path(&path);
         let current_pid = i32::try_from(std::process::id()).expect("pid should fit i32");
 
-        let open_files =
+        let result =
             read_open_files_under(dir.path()).expect("open files should be readable from /proc");
-        let actual = open_files
+        assert!(result.complete);
+        let actual = result
+            .files
             .iter()
             .find(|open_file| open_file.pid == current_pid && open_file.path == resolved_path)
             .unwrap_or_else(|| {
-                panic!("current process open file was not reported; open_files={open_files:?}")
+                panic!(
+                    "current process open file was not reported; open_files={:?}",
+                    result.files
+                )
             });
 
         assert_eq!(actual.kind, OpenFileKind::Regular);
@@ -758,10 +791,11 @@ mod tests {
         let resolved_exe = resolve_absolute_path(&exe);
         let current_pid = i32::try_from(std::process::id()).expect("pid should fit i32");
 
-        let processes =
+        let result =
             read_executables_under(root).expect("executables should be readable from /proc");
+        assert!(result.complete);
 
-        assert!(processes.iter().any(|process| {
+        assert!(result.processes.iter().any(|process| {
             process.pid == current_pid && process.executable.as_ref() == Some(&resolved_exe)
         }));
     }

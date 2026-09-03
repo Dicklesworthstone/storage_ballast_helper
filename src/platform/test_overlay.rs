@@ -30,9 +30,9 @@ use crate::platform::pal::{
     BlockDeviceInfo, FsStats, MemoryInfo, MountPoint, Platform, PlatformPaths, ServiceManager,
 };
 use crate::platform::types::{
-    Capacity, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion, MemoryPressure,
-    MemoryPressureCallback, MountInfo, OpenFile, ProcessInfo, ProcessIo, SacredPath, SelfStats,
-    ServiceKind, SubscriptionHandle,
+    Capacity, ExecutablesResult, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion,
+    MemoryPressure, MemoryPressureCallback, MountInfo, OpenFilesResult, ProcessInfo, ProcessIo,
+    SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
 };
 use crate::tuning::writeback::WritebackState;
 
@@ -337,11 +337,11 @@ impl Platform for TestOverlayPlatform {
         self.inner.process_io(pid)
     }
 
-    fn open_files_under(&self, path: &Path) -> Result<Vec<OpenFile>> {
+    fn open_files_under(&self, path: &Path) -> Result<OpenFilesResult> {
         self.inner.open_files_under(path)
     }
 
-    fn executables_under(&self, path: &Path) -> Result<Vec<ProcessInfo>> {
+    fn executables_under(&self, path: &Path) -> Result<ExecutablesResult> {
         self.inner.executables_under(path)
     }
 

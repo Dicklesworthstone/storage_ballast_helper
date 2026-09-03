@@ -1414,7 +1414,6 @@ fn normalized_open_roots(root_paths: &[PathBuf]) -> Vec<(PathBuf, usize)> {
         .collect()
 }
 
-#[cfg(any(not(target_os = "linux"), test))]
 fn common_open_file_probe_root(normalized_roots: &[(PathBuf, usize)]) -> Option<PathBuf> {
     let (first, _) = normalized_roots.first()?;
     let mut candidate = first.as_path();
@@ -1527,15 +1526,18 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf
     (ancestors, !incomplete)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn collect_open_path_ancestors_platform(root_paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
+/// Collect open path ancestors using a specific platform implementation.
+pub fn collect_open_path_ancestors_with_platform(
+    platform: &dyn crate::platform::pal::Platform,
+    root_paths: &[PathBuf],
+) -> (HashSet<PathBuf>, bool) {
     let normalized_roots = normalized_open_roots(root_paths);
     if normalized_roots.is_empty() {
         return (HashSet::new(), true);
     }
 
-    let platform = crate::platform::current();
     let mut ancestors = HashSet::with_capacity(4096);
+    let mut incomplete = false;
     let probe_roots = common_open_file_probe_root(&normalized_roots).map_or_else(
         || {
             normalized_roots
@@ -1546,15 +1548,23 @@ fn collect_open_path_ancestors_platform(root_paths: &[PathBuf]) -> (HashSet<Path
         |root| vec![root],
     );
     for root in &probe_roots {
-        let Ok(open_files) = platform.open_files_under(root) else {
+        let Ok(result) = platform.open_files_under(root) else {
             return (ancestors, false);
         };
-        for open_file in open_files {
+        if !result.complete {
+            incomplete = true;
+        }
+        for open_file in result.files {
             add_open_path_ancestor_chain(&mut ancestors, &open_file.path, &normalized_roots);
         }
     }
 
-    (ancestors, true)
+    (ancestors, !incomplete)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn collect_open_path_ancestors_platform(root_paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
+    collect_open_path_ancestors_with_platform(&crate::platform::current(), root_paths)
 }
 
 #[derive(Debug, Clone)]
@@ -1721,8 +1731,11 @@ pub fn collect_active_reference_index(
 
     for root in &roots {
         match platform.open_files_under(root) {
-            Ok(open_files) => {
-                for open_file in open_files {
+            Ok(result) => {
+                if !result.complete {
+                    index.complete = false;
+                }
+                for open_file in result.files {
                     let name = process_names.get(&open_file.pid).cloned();
                     index.add_reference(&roots, &open_file.path, |summary| {
                         summary.add_open_file_descriptor(open_file.pid, name.clone());
@@ -1733,8 +1746,11 @@ pub fn collect_active_reference_index(
         }
 
         match platform.executables_under(root) {
-            Ok(processes) => {
-                for process in processes {
+            Ok(result) => {
+                if !result.complete {
+                    index.complete = false;
+                }
+                for process in result.processes {
                     if let Some(executable) = process.executable.as_deref() {
                         let name = Some(process.name.clone());
                         index.add_reference(&roots, executable, |summary| {
@@ -2077,15 +2093,22 @@ mod tests {
             Ok(self.processes.clone())
         }
 
-        fn open_files_under(&self, _path: &Path) -> Result<Vec<crate::platform::types::OpenFile>> {
-            Ok(self.open_files.clone())
+        fn open_files_under(
+            &self,
+            _path: &Path,
+        ) -> Result<crate::platform::types::OpenFilesResult> {
+            Ok(crate::platform::types::OpenFilesResult::complete(
+                self.open_files.clone(),
+            ))
         }
 
         fn executables_under(
             &self,
             _path: &Path,
-        ) -> Result<Vec<crate::platform::types::ProcessInfo>> {
-            Ok(self.executables.clone())
+        ) -> Result<crate::platform::types::ExecutablesResult> {
+            Ok(crate::platform::types::ExecutablesResult::complete(
+                self.executables.clone(),
+            ))
         }
 
         fn mmap_regions_under(

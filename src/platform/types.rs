@@ -356,6 +356,62 @@ pub struct OpenFile {
     pub mode: OpenFileMode,
 }
 
+/// Maximum time to spend scanning processes for open files or executables (5 s).
+pub const OPEN_FILES_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Maximum number of PIDs to scan before bailing out (50,000).
+pub const OPEN_FILES_MAX_PIDS: usize = 50_000;
+
+/// Result of querying open files under a path, including completion status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenFilesResult {
+    pub files: Vec<OpenFile>,
+    pub complete: bool,
+}
+
+impl OpenFilesResult {
+    #[must_use]
+    pub fn complete(files: Vec<OpenFile>) -> Self {
+        Self {
+            files,
+            complete: true,
+        }
+    }
+
+    #[must_use]
+    pub fn incomplete(files: Vec<OpenFile>) -> Self {
+        Self {
+            files,
+            complete: false,
+        }
+    }
+}
+
+/// Result of querying running executables under a path, including completion status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutablesResult {
+    pub processes: Vec<ProcessInfo>,
+    pub complete: bool,
+}
+
+impl ExecutablesResult {
+    #[must_use]
+    pub fn complete(processes: Vec<ProcessInfo>) -> Self {
+        Self {
+            processes,
+            complete: true,
+        }
+    }
+
+    #[must_use]
+    pub fn incomplete(processes: Vec<ProcessInfo>) -> Self {
+        Self {
+            processes,
+            complete: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MappedRegion {
     pub pid: i32,

@@ -25,8 +25,8 @@ use crate::platform::pal::{
 use crate::platform::sacred_catalog::cross_platform_sacred_paths;
 #[cfg(target_os = "linux")]
 use crate::platform::types::{
-    MemoryPressure, MemoryPressureCallback, PalError, ProcessInfo, ProcessIo, SacredPath,
-    SelfStats, ServiceKind, SubscriptionHandle,
+    ExecutablesResult, MemoryPressure, MemoryPressureCallback, OpenFilesResult, PalError,
+    ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
 };
 
 #[cfg(target_os = "linux")]
@@ -147,11 +147,11 @@ impl Platform for LinuxPal {
         process::read_process_io(pid)
     }
 
-    fn open_files_under(&self, path: &Path) -> Result<Vec<crate::platform::types::OpenFile>> {
+    fn open_files_under(&self, path: &Path) -> Result<OpenFilesResult> {
         process::read_open_files_under(path)
     }
 
-    fn executables_under(&self, path: &Path) -> Result<Vec<ProcessInfo>> {
+    fn executables_under(&self, path: &Path) -> Result<ExecutablesResult> {
         process::read_executables_under(path)
     }
 

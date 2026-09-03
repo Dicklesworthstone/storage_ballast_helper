@@ -21,11 +21,13 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::errors::{Result, SbhError};
 use crate::logger::dual::{ActivityEvent, ActivityLoggerHandle};
 use crate::logger::jsonl::ScoreFactorsRecord;
+use crate::platform::pal::Platform;
 use crate::platform::sacred_catalog::cross_platform_sacred_paths;
 use crate::platform::types::SacredPath;
 use crate::scanner::active_lease;
@@ -331,6 +333,9 @@ pub enum SkipReason {
     /// mount can succeed until it is remounted, so the daemon parks the mount
     /// in recovery instead of retrying.
     FilesystemReadOnly,
+    /// Open file or process scan could not complete within the 5s deadline or
+    /// 50,000 PID cap; the executor fails conservative (bd-rc-master-ajg1.10.2).
+    OpenScanIncomplete,
 }
 
 impl SkipReason {
@@ -340,7 +345,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -358,6 +363,7 @@ impl SkipReason {
         Self::ActiveLease,
         Self::SacredStowaway,
         Self::FilesystemReadOnly,
+        Self::OpenScanIncomplete,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -389,6 +395,7 @@ impl SkipReason {
             Self::ActiveLease => "active_lease",
             Self::SacredStowaway => "sacred_stowaway",
             Self::FilesystemReadOnly => "filesystem_read_only",
+            Self::OpenScanIncomplete => "open_scan_incomplete",
         }
     }
 
@@ -423,6 +430,10 @@ impl SkipReason {
             Self::FilesystemReadOnly => {
                 "filesystem is mounted read-only (EROFS) — remount or repair the volume; \
                  the daemon pauses deletions on it until a probe write succeeds"
+            }
+            Self::OpenScanIncomplete => {
+                "open file or process scan incomplete due to system load (deadline/budget exceeded) — \
+                 aborted batch for safety"
             }
         }
     }
@@ -490,12 +501,24 @@ pub enum CheckedDeletion {
 pub struct DeletionExecutor {
     config: DeletionConfig,
     logger: Option<ActivityLoggerHandle>,
+    platform: Option<Arc<dyn Platform>>,
 }
 
 impl DeletionExecutor {
     /// Create a new executor with the given config and optional logger handle.
     pub fn new(config: DeletionConfig, logger: Option<ActivityLoggerHandle>) -> Self {
-        Self { config, logger }
+        Self {
+            config,
+            logger,
+            platform: None,
+        }
+    }
+
+    /// Attach a platform instance to query open files, processes, and sacred paths.
+    #[must_use]
+    pub fn with_platform(mut self, platform: Arc<dyn Platform>) -> Self {
+        self.platform = Some(platform);
+        self
     }
 
     /// Build a deletion plan from scored candidates.
@@ -589,7 +612,12 @@ impl DeletionExecutor {
                 .take(limit)
                 .map(|candidate| candidate.path.clone())
                 .collect::<Vec<_>>();
-            let (paths, complete) = walker::collect_open_path_ancestors(&roots);
+            let (paths, complete) = self.platform.as_ref().map_or_else(
+                || walker::collect_open_path_ancestors(&roots),
+                |platform| {
+                    walker::collect_open_path_ancestors_with_platform(platform.as_ref(), &roots)
+                },
+            );
 
             if !complete {
                 self.log_event(ActivityEvent::Error {
@@ -604,6 +632,7 @@ impl DeletionExecutor {
                 // Mark all candidates as skipped/failed due to safety check.
                 report.items_failed = limit;
                 for candidate in plan.candidates.iter().take(limit) {
+                    report.record_skip(SkipReason::OpenScanIncomplete);
                     report.errors.push(DeletionError {
                         path: candidate.path.clone(),
                         error: "safety check incomplete".to_string(),
@@ -1795,6 +1824,7 @@ mod tests {
                 SkipReason::ActiveLease => 14,
                 SkipReason::SacredStowaway => 15,
                 SkipReason::FilesystemReadOnly => 16,
+                SkipReason::OpenScanIncomplete => 17,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];
@@ -3359,5 +3389,80 @@ mod tests {
         assert_eq!(report.items_deleted, 0, "real source must stay vetoed");
         assert_eq!(report.items_skipped, 1);
         assert!(src_dir.exists());
+    }
+
+    #[test]
+    fn incomplete_open_files_scan_vetoes_batch_and_records_skip_reason() {
+        let dir = scratch_dir();
+        let target_dir = dir.path().join("target");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(target_dir.join("artifact.bin"), b"artifact data").unwrap();
+
+        let candidate = make_candidate(&target_dir, 1024, 0.95);
+        let mock_platform =
+            Arc::new(crate::platform::pal::MockPlatform::healthy().with_open_files_complete(false));
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: true,
+                dry_run: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .with_platform(mock_platform);
+
+        let plan = executor.plan(vec![candidate]);
+        let report = executor.execute(&plan, None);
+
+        // Entire batch must be vetoed / skipped safely
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.items_failed, 1);
+        assert_eq!(
+            report.skipped_by_reason.get("open_scan_incomplete"),
+            Some(&1),
+            "candidate must be attributed to SkipReason::OpenScanIncomplete"
+        );
+        assert!(
+            report.errors.iter().any(|err| err.error_code == "SBH-3003"),
+            "safety check incomplete error must be recorded"
+        );
+        assert!(target_dir.exists(), "candidate must not be deleted");
+    }
+
+    #[test]
+    fn fake_process_lister_exceeding_deadline_marks_open_scan_incomplete() {
+        let dir = scratch_dir();
+        let target_dir = dir.path().join("target");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(target_dir.join("build.bin"), b"build bytes").unwrap();
+
+        let candidate = make_candidate(&target_dir, 2048, 0.96);
+        let mock_platform = Arc::new(
+            crate::platform::pal::MockPlatform::healthy()
+                .with_name("slow-mock")
+                .with_open_files_complete(false),
+        );
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: true,
+                dry_run: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .with_platform(mock_platform);
+
+        let plan = executor.plan(vec![candidate]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(
+            report.skipped_by_reason.get("open_scan_incomplete"),
+            Some(&1)
+        );
+        assert!(target_dir.exists());
     }
 }

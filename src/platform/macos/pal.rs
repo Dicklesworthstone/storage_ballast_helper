@@ -24,9 +24,10 @@ use crate::platform::pal::{
     verify_preallocated_blocks,
 };
 use crate::platform::types::{
-    Capacity, FullDiskAccessState, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion,
-    MemoryPressure, MemoryPressureCallback, MemoryPressureLevel, MountInfo, OpenFile, OpenFileKind,
-    OpenFileMode, PalError, ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind,
+    Capacity, ExecutablesResult, FullDiskAccessState, FullDiskAccessStatus, LocalSnapshotInfo,
+    MappedRegion, MemoryPressure, MemoryPressureCallback, MemoryPressureLevel, MountInfo,
+    OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, OpenFile, OpenFileKind, OpenFileMode,
+    OpenFilesResult, PalError, ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind,
     SubscriptionHandle,
 };
 use parking_lot::RwLock;
@@ -47,6 +48,7 @@ struct CachedOpenFilesUnder {
     root: PathBuf,
     collected_at: Instant,
     open_files: Vec<OpenFile>,
+    complete: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -197,26 +199,42 @@ impl Platform for MacOsPal {
         })
     }
 
-    fn open_files_under(&self, path: &Path) -> Result<Vec<OpenFile>> {
+    fn open_files_under(&self, path: &Path) -> Result<OpenFilesResult> {
         let root = process_observed_path(path);
         cached_open_files_under(&root)
     }
 
-    fn executables_under(&self, path: &Path) -> Result<Vec<ProcessInfo>> {
+    fn executables_under(&self, path: &Path) -> Result<ExecutablesResult> {
         let root = process_observed_path(path);
         let root_variants = macos_process_path_variants(&root);
-        let mut processes: Vec<ProcessInfo> = process_pids_current_first()
+        let mut processes: Vec<ProcessInfo> = Vec::new();
+        let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
+        let mut pids_scanned: usize = 0;
+        let mut incomplete = false;
+
+        for pid in process_pids_current_first()
             .map_err(|error| macos_method_error("executables_under", &error))?
-            .into_iter()
-            .filter_map(process_info_for_pid_without_command_line)
-            .filter(|process| executable_is_under(process, &root_variants))
-            .collect();
+        {
+            if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
+                incomplete = true;
+                break;
+            }
+            pids_scanned += 1;
+            if let Some(process) = process_info_for_pid_without_command_line(pid) {
+                if executable_is_under(&process, &root_variants) {
+                    processes.push(process);
+                }
+            }
+        }
         processes.sort_by(|left, right| {
             left.pid
                 .cmp(&right.pid)
                 .then_with(|| left.name.cmp(&right.name))
         });
-        Ok(processes)
+        Ok(ExecutablesResult {
+            processes,
+            complete: !incomplete,
+        })
     }
 
     fn mmap_regions_under(&self, path: &Path) -> Result<Vec<MappedRegion>> {
@@ -313,7 +331,7 @@ impl Platform for MacOsPal {
     }
 }
 
-fn cached_open_files_under(root: &Path) -> Result<Vec<OpenFile>> {
+fn cached_open_files_under(root: &Path) -> Result<OpenFilesResult> {
     let now = Instant::now();
     let cache = OPEN_FILES_UNDER_CACHE.get_or_init(|| RwLock::new(Vec::new()));
     {
@@ -321,17 +339,21 @@ fn cached_open_files_under(root: &Path) -> Result<Vec<OpenFile>> {
         if let Some(entry) = cached.iter().find(|entry| entry.root == root)
             && now.duration_since(entry.collected_at) <= OPEN_FILES_CACHE_TTL
         {
-            return Ok(entry.open_files.clone());
+            return Ok(OpenFilesResult {
+                files: entry.open_files.clone(),
+                complete: entry.complete,
+            });
         }
     }
 
-    let open_files = collect_open_files_under(root)?;
+    let result = collect_open_files_under(root)?;
     {
         let mut cache = cache.write();
         cache.retain(|entry| now.duration_since(entry.collected_at) <= OPEN_FILES_CACHE_TTL);
         if let Some(entry) = cache.iter_mut().find(|entry| entry.root == root) {
             entry.collected_at = now;
-            entry.open_files.clone_from(&open_files);
+            entry.open_files.clone_from(&result.files);
+            entry.complete = result.complete;
         } else {
             if cache.len() >= OPEN_FILES_CACHE_MAX_ENTRIES {
                 cache.remove(0);
@@ -339,27 +361,42 @@ fn cached_open_files_under(root: &Path) -> Result<Vec<OpenFile>> {
             cache.push(CachedOpenFilesUnder {
                 root: root.to_path_buf(),
                 collected_at: now,
-                open_files: open_files.clone(),
+                open_files: result.files.clone(),
+                complete: result.complete,
             });
         }
     }
-    Ok(open_files)
+    Ok(result)
 }
 
-fn collect_open_files_under(root: &Path) -> Result<Vec<OpenFile>> {
-    let mut open_files: Vec<OpenFile> = proc_listpids_safe()
-        .map_err(|error| macos_method_error("open_files_under", &error))?
-        .into_iter()
-        .filter(|pid| *pid > 0)
-        .flat_map(|pid| open_files_for_pid_under(pid, root))
-        .collect();
+fn collect_open_files_under(root: &Path) -> Result<OpenFilesResult> {
+    let pids =
+        proc_listpids_safe().map_err(|error| macos_method_error("open_files_under", &error))?;
+    let mut open_files: Vec<OpenFile> = Vec::new();
+    let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
+    let mut pids_scanned: usize = 0;
+    let mut incomplete = false;
+
+    for pid in pids {
+        if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
+            incomplete = true;
+            break;
+        }
+        if pid > 0 {
+            pids_scanned += 1;
+            open_files.extend(open_files_for_pid_under(pid, root));
+        }
+    }
     open_files.sort_by(|left, right| {
         left.pid
             .cmp(&right.pid)
             .then_with(|| left.fd.cmp(&right.fd))
             .then_with(|| left.path.cmp(&right.path))
     });
-    Ok(open_files)
+    Ok(OpenFilesResult {
+        files: open_files,
+        complete: !incomplete,
+    })
 }
 
 fn macos_method_error(
@@ -1887,8 +1924,10 @@ mod tests {
         let open_files = platform
             .open_files_under(dir.path())
             .expect("macOS open fd scan should be readable");
+        assert!(open_files.complete);
 
         let actual = open_files
+            .files
             .iter()
             .find(|open_file| {
                 open_file.pid == super::current_process_pid() && open_file.path == expected
@@ -1918,7 +1957,8 @@ mod tests {
         let first = platform
             .open_files_under(dir.path())
             .expect("first macOS open fd scan should be readable");
-        assert!(first.iter().any(|open_file| {
+        assert!(first.complete);
+        assert!(first.files.iter().any(|open_file| {
             open_file.pid == super::current_process_pid() && open_file.path == expected
         }));
 
@@ -1927,8 +1967,9 @@ mod tests {
         let second = platform
             .open_files_under(dir.path())
             .expect("cached macOS open fd scan should be readable");
+        assert!(second.complete);
         assert!(
-            second.iter().any(|open_file| {
+            second.files.iter().any(|open_file| {
                 open_file.pid == super::current_process_pid() && open_file.path == expected
             }),
             "recent open_files_under calls should reuse the cached 30s snapshot"
@@ -1948,8 +1989,9 @@ mod tests {
         let processes = platform
             .executables_under(root)
             .expect("macOS executable scan should be readable");
+        assert!(processes.complete);
 
-        assert!(processes.iter().any(|process| {
+        assert!(processes.processes.iter().any(|process| {
             process.pid == super::current_process_pid()
                 && process.executable.as_deref() == Some(expected.as_path())
         }));

@@ -5360,8 +5360,8 @@ fn collect_blame_open_files(
 
     for root in roots {
         match platform.open_files_under(root) {
-            Ok(open_files) => {
-                for open_file in open_files {
+            Ok(result) => {
+                for open_file in result.files {
                     by_pid
                         .entry(open_file.pid)
                         .or_default()

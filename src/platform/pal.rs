@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 use crate::core::config::PathsConfig;
 use crate::core::errors::{Result, SbhError};
 use crate::platform::types::{
-    Capacity, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion, MemoryPressure,
-    MemoryPressureCallback, MemoryPressureLevel, MountInfo, OpenFile, PalError, ProcessInfo,
-    ProcessIo, SacredPath, SelfStats, ServiceKind, SubscriptionHandle,
+    Capacity, ExecutablesResult, FullDiskAccessStatus, LocalSnapshotInfo, MappedRegion,
+    MemoryPressure, MemoryPressureCallback, MemoryPressureLevel, MountInfo, OpenFile,
+    OpenFilesResult, PalError, ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind,
+    SubscriptionHandle,
 };
 
 /// Filesystem statistics for a path/mount.
@@ -267,11 +268,11 @@ pub trait Platform: Send + Sync {
         pal_not_implemented(self.name(), "process_io")
     }
 
-    fn open_files_under(&self, _path: &Path) -> Result<Vec<OpenFile>> {
+    fn open_files_under(&self, _path: &Path) -> Result<OpenFilesResult> {
         pal_not_implemented(self.name(), "open_files_under")
     }
 
-    fn executables_under(&self, _path: &Path) -> Result<Vec<ProcessInfo>> {
+    fn executables_under(&self, _path: &Path) -> Result<ExecutablesResult> {
         pal_not_implemented(self.name(), "executables_under")
     }
 
@@ -397,6 +398,8 @@ pub struct MockPlatform {
     cache_roots: Vec<PathBuf>,
     sacred_paths: Vec<SacredPath>,
     service_kind: ServiceKind,
+    open_files_complete: bool,
+    executables_complete: bool,
 }
 
 impl MockPlatform {
@@ -431,6 +434,8 @@ impl MockPlatform {
             cache_roots: vec![PathBuf::from("/home/mock/.cache")],
             sacred_paths: Vec::new(),
             service_kind: ServiceKind::None,
+            open_files_complete: true,
+            executables_complete: true,
         }
     }
 
@@ -516,6 +521,18 @@ impl MockPlatform {
     #[must_use]
     pub fn with_mmap_region(mut self, region: MappedRegion) -> Self {
         self.mmap_regions.push(region);
+        self
+    }
+
+    #[must_use]
+    pub fn with_open_files_complete(mut self, complete: bool) -> Self {
+        self.open_files_complete = complete;
+        self
+    }
+
+    #[must_use]
+    pub fn with_executables_complete(mut self, complete: bool) -> Self {
+        self.executables_complete = complete;
         self
     }
 
@@ -653,30 +670,36 @@ impl Platform for MockPlatform {
             .ok_or_else(|| PalError::not_implemented(self.name(), "process_io").into())
     }
 
-    fn open_files_under(&self, path: &Path) -> Result<Vec<OpenFile>> {
+    fn open_files_under(&self, path: &Path) -> Result<OpenFilesResult> {
         let root = crate::core::paths::resolve_absolute_path(path);
-        Ok(self
-            .open_files
-            .iter()
-            .filter(|open_file| {
-                crate::core::paths::resolve_absolute_path(&open_file.path).starts_with(&root)
-            })
-            .cloned()
-            .collect())
+        Ok(OpenFilesResult {
+            files: self
+                .open_files
+                .iter()
+                .filter(|open_file| {
+                    crate::core::paths::resolve_absolute_path(&open_file.path).starts_with(&root)
+                })
+                .cloned()
+                .collect(),
+            complete: self.open_files_complete,
+        })
     }
 
-    fn executables_under(&self, path: &Path) -> Result<Vec<ProcessInfo>> {
+    fn executables_under(&self, path: &Path) -> Result<ExecutablesResult> {
         let root = crate::core::paths::resolve_absolute_path(path);
-        Ok(self
-            .executables
-            .iter()
-            .filter(|process| {
-                process.executable.as_deref().is_some_and(|executable| {
-                    crate::core::paths::resolve_absolute_path(executable).starts_with(&root)
+        Ok(ExecutablesResult {
+            processes: self
+                .executables
+                .iter()
+                .filter(|process| {
+                    process.executable.as_deref().is_some_and(|executable| {
+                        crate::core::paths::resolve_absolute_path(executable).starts_with(&root)
+                    })
                 })
-            })
-            .cloned()
-            .collect())
+                .cloned()
+                .collect(),
+            complete: self.executables_complete,
+        })
     }
 
     fn mmap_regions_under(&self, path: &Path) -> Result<Vec<MappedRegion>> {
@@ -897,11 +920,16 @@ mod tests {
         assert_eq!(platform.name(), "mock-macos");
         assert_eq!(platform.process_list().unwrap()[0].pid, 42);
         assert_eq!(platform.process_io(42).unwrap().bytes_written_total, 20);
-        assert_eq!(platform.open_files_under(&root).unwrap()[0].path, open_path);
         assert_eq!(
-            platform.executables_under(&root).unwrap()[0].executable,
+            platform.open_files_under(&root).unwrap().files[0].path,
+            open_path
+        );
+        assert!(platform.open_files_under(&root).unwrap().complete);
+        assert_eq!(
+            platform.executables_under(&root).unwrap().processes[0].executable,
             Some(executable_path)
         );
+        assert!(platform.executables_under(&root).unwrap().complete);
         assert_eq!(
             platform.mmap_regions_under(&root).unwrap()[0].path,
             mmap_path
