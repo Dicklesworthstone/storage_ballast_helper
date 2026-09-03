@@ -526,6 +526,10 @@ The tables are generated from the dashboard's keymap (`sbh docs --section dashbo
 | `Shift-X` | Ballast | Release every available ballast file on the selected volume (confirmation) |
 | `p` | Ballast | Replenish the released ballast files on the selected volume (confirmation) |
 | `Shift-V` | Diagnostics | Toggle verbose frame metrics |
+| `/` | Log Search | Edit the search query inline (`Enter` runs it, `Esc` cancels); words match path/event/message, tokens `type:`, `level:`, `path:`, `id:`, `since:` |
+| `n` / `p` | Log Search | Next / previous page of results |
+| `c` | Log Search | Clear the query (newest entries again) |
+| `Enter` | Log Search | Open the selected entry on the Timeline |
 <!-- sbh-docs:end -->
 
 Confirmed ballast actions (`x`, `Shift-X`, `p` then `Enter`) go through the running daemon's control socket, scoped to the selected mount; with no daemon running the dashboard changes the pool directly, the way `sbh ballast release`/`replenish` do. The outcome, or the daemon's refusal, is shown as a notification, and each released or recreated file is a `ballast_release`/`ballast_replenish` event on the Timeline.

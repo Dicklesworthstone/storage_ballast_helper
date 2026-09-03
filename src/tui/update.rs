@@ -54,6 +54,14 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
         }
 
         DashboardMsg::Key(key) => {
+            // The Log Search query editor owns every key while it is open
+            // (Esc cancels, Enter runs), ahead of the global bindings.
+            if model.screen == Screen::LogSearch
+                && model.log_search.editing
+                && model.active_overlay.is_none()
+            {
+                return handle_log_search_editing_key(model, key);
+            }
             // Route through the centralized input layer (IA §4.2).
             // Overlay keys → global keys → screen-specific keys.
             let context = InputContext {
@@ -183,6 +191,11 @@ pub fn update(model: &mut DashboardModel, msg: DashboardMsg) -> DashboardCmd {
                 id,
                 after: std::time::Duration::from_secs(10),
             }
+        }
+
+        DashboardMsg::TelemetryLogSearch(result) => {
+            model.log_search.accept(result);
+            DashboardCmd::None
         }
 
         DashboardMsg::TelemetryTimeline(result) => {
@@ -517,6 +530,109 @@ fn handle_screen_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> Dashboa
         Screen::Candidates => handle_candidates_key(model, key),
         Screen::Diagnostics => handle_diagnostics_key(model, key),
         Screen::Ballast => handle_ballast_key(model, key),
+        Screen::LogSearch => handle_log_search_key(model, key),
+        Screen::Overview => DashboardCmd::None,
+    }
+}
+
+/// Keys on the Log Search screen (S6) outside the query editor.
+fn handle_log_search_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> DashboardCmd {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            model.log_search.cursor_up();
+            DashboardCmd::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            model.log_search.cursor_down();
+            DashboardCmd::None
+        }
+        // /: edit the query (the current one is the starting text).
+        KeyCode::Char('/') => {
+            model.log_search.draft = model.log_search.query.clone();
+            model.log_search.editing = true;
+            DashboardCmd::None
+        }
+        // n / p: next and previous page of the same query.
+        KeyCode::Char('n') => {
+            if model.log_search.has_more {
+                model.log_search.page += 1;
+                model.log_search.selected = 0;
+                DashboardCmd::FetchTelemetry
+            } else {
+                DashboardCmd::None
+            }
+        }
+        KeyCode::Char('p') => {
+            if model.log_search.page > 0 {
+                model.log_search.page -= 1;
+                model.log_search.selected = 0;
+                DashboardCmd::FetchTelemetry
+            } else {
+                DashboardCmd::None
+            }
+        }
+        // c: clear the query and show the newest entries again.
+        KeyCode::Char('c') => {
+            model.log_search.query.clear();
+            model.log_search.page = 0;
+            model.log_search.selected = 0;
+            DashboardCmd::FetchTelemetry
+        }
+        // Enter: open the selected entry on the Timeline.
+        KeyCode::Enter => {
+            let Some(entry) = model.log_search.selected_entry() else {
+                return DashboardCmd::None;
+            };
+            let target = entry.timestamp.clone();
+            let target_path = entry.path.clone();
+            model.navigate_to(Screen::Timeline);
+            let position = model
+                .timeline_filtered_events()
+                .iter()
+                .position(|e| e.timestamp == target && e.path == target_path);
+            if let Some(index) = position {
+                model.timeline_selected = index;
+                model.timeline_follow = false;
+            } else {
+                model.push_notification(
+                    NotificationLevel::Info,
+                    "Entry is not in the Timeline's current window".to_string(),
+                );
+            }
+            DashboardCmd::None
+        }
+        _ => DashboardCmd::None,
+    }
+}
+
+/// Keys while the Log Search query editor is open: printable characters
+/// and Backspace edit the draft, Enter runs it from page 0, Esc cancels.
+fn handle_log_search_editing_key(model: &mut DashboardModel, key: ftui::KeyEvent) -> DashboardCmd {
+    match key.code {
+        KeyCode::Char('c') if key.ctrl() => DashboardCmd::Quit,
+        KeyCode::Escape => {
+            model.log_search.editing = false;
+            model.log_search.draft.clear();
+            DashboardCmd::None
+        }
+        KeyCode::Enter => {
+            model.log_search.query = model.log_search.draft.trim().to_string();
+            model.log_search.editing = false;
+            model.log_search.draft.clear();
+            model.log_search.page = 0;
+            model.log_search.selected = 0;
+            DashboardCmd::FetchTelemetry
+        }
+        KeyCode::Backspace => {
+            model.log_search.draft.pop();
+            DashboardCmd::None
+        }
+        KeyCode::Char(c) if !key.ctrl() => {
+            if model.log_search.draft.chars().count() < 200 {
+                model.log_search.draft.push(c);
+            }
+            DashboardCmd::None
+        }
         _ => DashboardCmd::None,
     }
 }
@@ -857,17 +973,16 @@ fn handle_log_search_mouse(model: &mut DashboardModel, event: MouseEvent) -> Das
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(idx) = log_search_row_hit(model, event.x, event.y) {
-                model.timeline_selected = idx;
-                model.timeline_follow = false;
+                model.log_search.selected = idx;
             }
             DashboardCmd::None
         }
         MouseEventKind::ScrollUp if point_in_body(model, event.x, event.y) => {
-            model.timeline_cursor_up();
+            model.log_search.cursor_up();
             DashboardCmd::None
         }
         MouseEventKind::ScrollDown if point_in_body(model, event.x, event.y) => {
-            model.timeline_cursor_down();
+            model.log_search.cursor_down();
             DashboardCmd::None
         }
         _ => DashboardCmd::None,
@@ -995,9 +1110,9 @@ fn log_search_row_hit(model: &DashboardModel, x: u16, y: u16) -> Option<usize> {
         .into_iter()
         .find(|p| p.visible && p.pane == LogSearchPane::LogList)?;
     let rel_row = pane_content_row(x, local_y, list.rect)?;
-    let total = model.timeline_events.len();
+    let total = model.log_search.results.len();
     let rows = usize::from(list.rect.height.saturating_sub(2).max(1));
-    let (start, end) = centered_window(model.timeline_selected, total, rows);
+    let (start, end) = centered_window(model.log_search.selected, total, rows);
     let visible = end.saturating_sub(start);
     (rel_row < visible).then_some(start + rel_row)
 }
@@ -1555,27 +1670,29 @@ mod tests {
     }
 
     #[test]
-    fn log_search_wheel_scrolls_timeline_selection() {
+    fn log_search_wheel_scrolls_the_search_selection() {
         let mut model = test_model();
         model.screen = Screen::LogSearch;
-        model.timeline_events = vec![
+        model.log_search.results = vec![
             sample_timeline_event("info", "a"),
             sample_timeline_event("warning", "b"),
             sample_timeline_event("critical", "c"),
         ];
-        model.timeline_selected = 1;
+        model.log_search.selected = 1;
         let rect = log_list_rect(&model);
         let (x, y) = pane_row_click(rect, 0);
         update(
             &mut model,
             DashboardMsg::Mouse(make_mouse(MouseEventKind::ScrollDown, x, y)),
         );
-        assert_eq!(model.timeline_selected, 2);
+        assert_eq!(model.log_search.selected, 2);
         update(
             &mut model,
             DashboardMsg::Mouse(make_mouse(MouseEventKind::ScrollUp, x, y)),
         );
-        assert_eq!(model.timeline_selected, 1);
+        assert_eq!(model.log_search.selected, 1);
+        // The Timeline's own cursor is untouched by the search list.
+        assert_eq!(model.timeline_selected, 0);
     }
 
     #[test]
@@ -3033,6 +3150,124 @@ mod tests {
             "{:?}",
             empty.notifications
         );
+    }
+
+    fn log_event(timestamp: &str, path: &str) -> crate::tui::telemetry::TimelineEvent {
+        crate::tui::telemetry::TimelineEvent {
+            timestamp: timestamp.to_string(),
+            event_type: "artifact_delete".to_string(),
+            severity: "info".to_string(),
+            path: Some(path.to_string()),
+            size_bytes: None,
+            score: None,
+            pressure_level: None,
+            free_pct: None,
+            success: Some(true),
+            error_code: None,
+            error_message: None,
+            duration_ms: None,
+            details: None,
+            decision_id: None,
+        }
+    }
+
+    fn log_page(
+        events: Vec<crate::tui::telemetry::TimelineEvent>,
+        page: usize,
+        has_more: bool,
+    ) -> DashboardMsg {
+        DashboardMsg::TelemetryLogSearch(crate::tui::telemetry::TelemetryResult {
+            data: crate::tui::telemetry::LogSearchPage {
+                events,
+                page,
+                page_size: 50,
+                has_more,
+            },
+            source: crate::tui::telemetry::DataSource::Sqlite,
+            partial: false,
+            diagnostics: String::new(),
+        })
+    }
+
+    /// bd-rc-master-ajg1.4.10: `/` edits the query inline and owns every key
+    /// until Enter runs it or Esc cancels; n/p page, c clears, Enter opens
+    /// the entry on the Timeline.
+    #[test]
+    fn log_search_query_editing_paging_and_open_on_timeline() {
+        let mut model = test_model();
+        model.screen = Screen::LogSearch;
+        update(
+            &mut model,
+            log_page(vec![log_event("t1", "/a"), log_event("t2", "/b")], 0, true),
+        );
+        assert!(model.log_search.ran);
+        assert_eq!(model.log_search.results.len(), 2);
+
+        // / opens the editor; typed keys (even q) go to the draft.
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('/'))));
+        assert!(matches!(cmd, DashboardCmd::None));
+        assert!(model.log_search.editing);
+        for c in ['q', 'u', 'e', 'r', 'y'] {
+            update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(c))));
+        }
+        assert!(!model.quit, "q while editing is text, not quit");
+        assert_eq!(model.log_search.draft, "query");
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Backspace)));
+        assert_eq!(model.log_search.draft, "quer");
+
+        // Esc cancels: query unchanged, editor closed.
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Escape)));
+        assert!(matches!(cmd, DashboardCmd::None));
+        assert!(!model.log_search.editing);
+        assert!(model.log_search.query.is_empty());
+        assert_eq!(model.screen, Screen::LogSearch, "Esc did not navigate back");
+
+        // Enter runs the draft from page 0 and asks for telemetry.
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('/'))));
+        for c in "type:artifact_delete".chars() {
+            update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char(c))));
+        }
+        model.log_search.page = 3;
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert!(matches!(cmd, DashboardCmd::FetchTelemetry), "{cmd:?}");
+        assert_eq!(model.log_search.query, "type:artifact_delete");
+        assert_eq!(model.log_search.page, 0);
+        assert!(!model.log_search.editing);
+        let query = model.log_search.to_query();
+        assert_eq!(query.event_type.as_deref(), Some("artifact_delete"));
+        assert_eq!(query.page_size, crate::tui::model::LOG_SEARCH_PAGE_SIZE);
+
+        // n pages forward only while more exists; p back only above page 0.
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('n'))));
+        assert!(matches!(cmd, DashboardCmd::FetchTelemetry));
+        assert_eq!(model.log_search.page, 1);
+        update(&mut model, log_page(vec![log_event("t3", "/c")], 1, false));
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('n'))));
+        assert!(matches!(cmd, DashboardCmd::None));
+        assert_eq!(model.log_search.page, 1);
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('p'))));
+        assert!(matches!(cmd, DashboardCmd::FetchTelemetry));
+        assert_eq!(model.log_search.page, 0);
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('p'))));
+        assert!(matches!(cmd, DashboardCmd::None));
+
+        // c clears the query.
+        let cmd = update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('c'))));
+        assert!(matches!(cmd, DashboardCmd::FetchTelemetry));
+        assert!(model.log_search.query.is_empty());
+
+        // Enter on a result opens it on the Timeline when it is there.
+        update(
+            &mut model,
+            log_page(vec![log_event("t1", "/a"), log_event("t2", "/b")], 0, false),
+        );
+        model.timeline_events = vec![log_event("t0", "/z"), log_event("t2", "/b")];
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Char('j'))));
+        assert_eq!(model.log_search.selected, 1);
+        update(&mut model, DashboardMsg::Key(make_key(KeyCode::Enter)));
+        assert_eq!(model.screen, Screen::Timeline);
+        assert_eq!(model.timeline_selected, 1);
+        assert!(!model.timeline_follow);
     }
 
     #[test]

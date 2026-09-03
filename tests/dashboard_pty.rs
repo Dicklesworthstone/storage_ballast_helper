@@ -411,6 +411,18 @@ fn pty_session_walks_the_screens_and_releases_one_ballast_file() {
     // count is current rather than whatever the periodic write last saw.
     wait_for_status_available(&config, 1, Duration::from_secs(20));
 
+    // Log Search (4.10): the release the daemon just logged is findable —
+    // `/`, a typed query, Enter — and the query line shows what was typed.
+    let from = cockpit.press("6");
+    cockpit.wait_for_text_from(from, "Log Entries", Duration::from_secs(10));
+    cockpit.press("/");
+    let from = cockpit.press("type:ballast_release");
+    cockpit.wait_for_text_from(from, "type:ballast_release", Duration::from_secs(10));
+    let from = cockpit.press("\r");
+    cockpit.wait_for_text_from(from, "type=ballast_release", Duration::from_secs(10));
+    // Exactly the one release the daemon logged is on the page.
+    cockpit.wait_for_text_from(from, "page 1 (1 entries)", Duration::from_secs(10));
+
     cockpit.press("q");
     let (status, text) = cockpit.wait_exit(Duration::from_secs(20));
     assert!(status.success(), "dashboard exit {status}; output:\n{text}");

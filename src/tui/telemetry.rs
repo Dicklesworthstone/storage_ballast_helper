@@ -294,17 +294,218 @@ impl<T: Default> TelemetryResult<T> {
 }
 
 /// Which backend sourced a query result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DataSource {
     /// Data came from SQLite.
     Sqlite,
     /// Data came from JSONL fallback.
     Jsonl,
     /// No backend available.
+    #[default]
     None,
 }
 
 // ──────────────────── adapter trait ────────────────────
+
+/// One page of Log Search results (bd-rc-master-ajg1.4.10), newest first.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LogSearchPage {
+    pub events: Vec<TimelineEvent>,
+    pub page: usize,
+    pub page_size: usize,
+    /// A later page exists.
+    pub has_more: bool,
+}
+
+/// A Log Search query as typed on the screen's query line.
+///
+/// Free words must all appear (case-insensitively) in an entry's path,
+/// event type, severity, error message, error code, pressure level or
+/// details. Tokens: `type:<event>`, `level:<info|warning|critical>` (a
+/// minimum), `path:<prefix>`, `id:<decision-id>`, `since:<15m|1h|24h|7d>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogSearchQuery {
+    /// Lower-cased free words.
+    pub words: Vec<String>,
+    pub event_type: Option<String>,
+    pub min_severity: Option<String>,
+    pub path_prefix: Option<String>,
+    pub decision_id: Option<String>,
+    /// Inclusive timestamp floor, in the log's own `YYYY-MM-DDTHH:MM:SSZ`.
+    pub since: Option<String>,
+    pub page: usize,
+    pub page_size: usize,
+    /// Tokens that looked typed but did not parse (shown to the operator).
+    pub unknown_tokens: Vec<String>,
+}
+
+impl LogSearchQuery {
+    /// Parse a query line; `since:` is resolved against the current time.
+    #[must_use]
+    pub fn parse(line: &str) -> Self {
+        Self::parse_at(line, chrono::Utc::now())
+    }
+
+    /// Parse a query line, resolving `since:` against `now`.
+    #[must_use]
+    pub fn parse_at(line: &str, now: chrono::DateTime<chrono::Utc>) -> Self {
+        let mut query = Self {
+            page_size: 50,
+            ..Self::default()
+        };
+        for token in line.split_whitespace() {
+            let lower = token.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("type:") {
+                query.event_type = Some(value.to_string());
+            } else if let Some(value) = lower.strip_prefix("level:") {
+                if severity_rank(value).is_some() {
+                    query.min_severity = Some(value.to_string());
+                } else {
+                    query.unknown_tokens.push(token.to_string());
+                }
+            } else if let Some(value) = token.strip_prefix("path:") {
+                query.path_prefix = Some(value.to_string());
+            } else if let Some(value) = token.strip_prefix("id:") {
+                query.decision_id = Some(value.to_string());
+            } else if let Some(value) = lower.strip_prefix("since:") {
+                match parse_since(value) {
+                    Some(window) => {
+                        query.since = Some((now - window).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+                    }
+                    None => query.unknown_tokens.push(token.to_string()),
+                }
+            } else {
+                query.words.push(lower);
+            }
+        }
+        query
+    }
+
+    /// No words and no filters: the newest entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+            && self.event_type.is_none()
+            && self.min_severity.is_none()
+            && self.path_prefix.is_none()
+            && self.decision_id.is_none()
+            && self.since.is_none()
+    }
+
+    /// Whether `event` satisfies every word and filter.
+    #[must_use]
+    pub fn matches(&self, event: &TimelineEvent) -> bool {
+        if let Some(wanted) = &self.event_type
+            && !event.event_type.eq_ignore_ascii_case(wanted)
+        {
+            return false;
+        }
+        if let Some(min) = &self.min_severity
+            && severity_rank(&event.severity).unwrap_or(0) < severity_rank(min).unwrap_or(0)
+        {
+            return false;
+        }
+        if let Some(prefix) = &self.path_prefix
+            && !event
+                .path
+                .as_deref()
+                .is_some_and(|p| p.starts_with(prefix.as_str()))
+        {
+            return false;
+        }
+        if let Some(id) = &self.decision_id
+            && event.decision_id.as_deref() != Some(id.as_str())
+        {
+            return false;
+        }
+        if let Some(since) = &self.since
+            && event.timestamp.as_str() < since.as_str()
+        {
+            return false;
+        }
+        if self.words.is_empty() {
+            return true;
+        }
+        let haystack = [
+            event.path.as_deref().unwrap_or(""),
+            event.event_type.as_str(),
+            event.severity.as_str(),
+            event.error_message.as_deref().unwrap_or(""),
+            event.error_code.as_deref().unwrap_or(""),
+            event.pressure_level.as_deref().unwrap_or(""),
+            event.details.as_deref().unwrap_or(""),
+        ]
+        .join("\n")
+        .to_ascii_lowercase();
+        self.words
+            .iter()
+            .all(|word| haystack.contains(word.as_str()))
+    }
+
+    /// The active filters for the screen header (`type=x level≥y …`).
+    #[must_use]
+    pub fn describe_filters(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(t) = &self.event_type {
+            parts.push(format!("type={t}"));
+        }
+        if let Some(l) = &self.min_severity {
+            parts.push(format!("level\u{2265}{l}"));
+        }
+        if let Some(p) = &self.path_prefix {
+            parts.push(format!("path={p}"));
+        }
+        if let Some(id) = &self.decision_id {
+            parts.push(format!("id={id}"));
+        }
+        if let Some(s) = &self.since {
+            parts.push(format!("since={s}"));
+        }
+        parts.join(" ")
+    }
+}
+
+/// `info` < `warning` < `critical` (with the spellings the logs use).
+#[must_use]
+pub fn severity_rank(severity: &str) -> Option<u8> {
+    match severity.to_ascii_lowercase().as_str() {
+        "info" | "debug" | "trace" => Some(0),
+        "warning" | "warn" => Some(1),
+        "critical" | "error" => Some(2),
+        _ => None,
+    }
+}
+
+/// `15m`, `2h`, `7d` → a duration.
+#[must_use]
+pub fn parse_since(value: &str) -> Option<chrono::Duration> {
+    let (digits, unit) = value.split_at(
+        value
+            .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+            .len(),
+    );
+    let amount: i64 = digits.parse().ok().filter(|n| *n > 0)?;
+    match unit {
+        "m" => Some(chrono::Duration::minutes(amount)),
+        "h" => Some(chrono::Duration::hours(amount)),
+        "d" => Some(chrono::Duration::days(amount)),
+        _ => None,
+    }
+}
+
+/// The requested page of an already-filtered, newest-first list.
+#[must_use]
+pub fn page_of(matched: Vec<TimelineEvent>, page: usize, page_size: usize) -> LogSearchPage {
+    let page_size = page_size.max(1);
+    let start = page.saturating_mul(page_size);
+    let has_more = matched.len() > start.saturating_add(page_size);
+    LogSearchPage {
+        events: matched.into_iter().skip(start).take(page_size).collect(),
+        page,
+        page_size,
+        has_more,
+    }
+}
 
 /// Read-only query interface for telemetry data.
 ///
@@ -332,6 +533,31 @@ pub trait TelemetryQueryAdapter {
 
     /// Report the health of underlying backends.
     fn health(&self) -> TelemetryHealth;
+
+    /// One page of entries matching `query`, newest first. The default
+    /// filters a bounded window of recent events in memory (enough for
+    /// the page asked for, times eight); backends with an index override it.
+    fn search_events(&self, query: &LogSearchQuery) -> TelemetryResult<LogSearchPage> {
+        let page_size = query.page_size.max(1);
+        let needed = (query.page + 1).saturating_mul(page_size).saturating_add(1);
+        let scan = needed.saturating_mul(8).max(200);
+        let filter = EventFilter {
+            severities: Vec::new(),
+            event_types: query.event_type.iter().cloned().collect(),
+        };
+        let result = self.recent_events(scan, &filter);
+        let matched: Vec<TimelineEvent> = result
+            .data
+            .into_iter()
+            .filter(|event| query.matches(event))
+            .collect();
+        TelemetryResult {
+            data: page_of(matched, query.page, page_size),
+            source: result.source,
+            partial: result.partial,
+            diagnostics: result.diagnostics,
+        }
+    }
 }
 
 // ──────────────────── null adapter (scaffold) ────────────────────
@@ -513,29 +739,103 @@ impl SqliteTelemetryAdapter {
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| &**p).collect();
 
         let mut stmt = self.conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            let success_int: i32 = row.get(10)?;
-            let size_i64: Option<i64> = row.get(4)?;
-            let duration_i64: Option<i64> = row.get(9)?;
-            Ok(TimelineEvent {
-                timestamp: row.get(0)?,
-                event_type: row.get(1)?,
-                severity: row.get(2)?,
-                path: row.get(3)?,
-                size_bytes: size_i64.map(|v| v.max(0).cast_unsigned()),
-                score: row.get(5)?,
-                pressure_level: row.get(7)?,
-                free_pct: row.get(8)?,
-                success: Some(success_int != 0),
-                error_code: row.get(11)?,
-                error_message: row.get(12)?,
-                duration_ms: duration_i64.map(|v| v.max(0).cast_unsigned()),
-                details: row.get(13)?,
-                decision_id: row.get(14)?,
-            })
-        })?;
+        let rows = stmt.query_map(param_refs.as_slice(), activity_row_to_event)?;
 
         rows.collect()
+    }
+
+    /// The Log Search query against `activity_log`: filters become WHERE
+    /// clauses (`LIKE` with escaped wildcards for words and the path
+    /// prefix, `timestamp >=` for `since:`), the page is `LIMIT/OFFSET`,
+    /// and one extra row tells whether a later page exists.
+    fn query_activity_search(
+        &self,
+        query: &LogSearchQuery,
+    ) -> std::result::Result<LogSearchPage, rusqlite::Error> {
+        use std::fmt::Write as _;
+
+        let decision_column = if self.has_decision_log {
+            "(SELECT d.decision_id FROM decision_log d
+               WHERE activity_log.event_type = 'artifact_delete'
+                 AND d.path = activity_log.path
+                 AND d.timestamp <= activity_log.timestamp
+               ORDER BY d.id DESC LIMIT 1)"
+        } else {
+            "NULL"
+        };
+        let mut sql = format!(
+            "SELECT timestamp, event_type, severity, path, size_bytes, score,
+                    score_factors, pressure_level, free_pct, duration_ms,
+                    success, error_code, error_message, details,
+                    {decision_column} AS decision_id
+             FROM activity_log"
+        );
+        let mut conditions = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let bind = |params: &mut Vec<Box<dyn rusqlite::types::ToSql>>, value: String| {
+            params.push(Box::new(value));
+            format!("?{}", params.len())
+        };
+        if let Some(event_type) = &query.event_type {
+            let p = bind(&mut params, event_type.clone());
+            conditions.push(format!("lower(event_type) = {p}"));
+        }
+        if let Some(min) = query.min_severity.as_deref().and_then(severity_rank) {
+            let allowed: Vec<String> = ["info", "warning", "critical"]
+                .into_iter()
+                .filter(|s| severity_rank(s).unwrap_or(0) >= min)
+                .map(|s| bind(&mut params, s.to_string()))
+                .collect();
+            conditions.push(format!("lower(severity) IN ({})", allowed.join(",")));
+        }
+        if let Some(prefix) = &query.path_prefix {
+            let p = bind(&mut params, format!("{}%", like_escape(prefix)));
+            conditions.push(format!("path LIKE {p} ESCAPE '\\'"));
+        }
+        if let Some(since) = &query.since {
+            let p = bind(&mut params, since.clone());
+            conditions.push(format!("timestamp >= {p}"));
+        }
+        for word in &query.words {
+            let p = bind(&mut params, format!("%{}%", like_escape(word)));
+            conditions.push(format!(
+                "(lower(coalesce(path, '')) LIKE {p} ESCAPE '\\'
+                  OR lower(event_type) LIKE {p} ESCAPE '\\'
+                  OR lower(severity) LIKE {p} ESCAPE '\\'
+                  OR lower(coalesce(error_message, '')) LIKE {p} ESCAPE '\\'
+                  OR lower(coalesce(error_code, '')) LIKE {p} ESCAPE '\\'
+                  OR lower(coalesce(pressure_level, '')) LIKE {p} ESCAPE '\\'
+                  OR lower(coalesce(details, '')) LIKE {p} ESCAPE '\\')"
+            ));
+        }
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        let page_size = query.page_size.max(1);
+        let limit = bind(&mut params, (page_size + 1).to_string());
+        let offset = bind(
+            &mut params,
+            query.page.saturating_mul(page_size).to_string(),
+        );
+        let _ = write!(sql, " ORDER BY id DESC LIMIT {limit} OFFSET {offset}");
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| &**p).collect();
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), activity_row_to_event)?;
+        let mut events: Vec<TimelineEvent> = rows.collect::<std::result::Result<_, _>>()?;
+        // `id:` matches the derived ledger link, filtered after the fetch.
+        if let Some(id) = &query.decision_id {
+            events.retain(|event| event.decision_id.as_deref() == Some(id.as_str()));
+        }
+        let has_more = events.len() > page_size;
+        events.truncate(page_size);
+        Ok(LogSearchPage {
+            events,
+            page: query.page,
+            page_size,
+            has_more,
+        })
     }
 
     fn query_pressure_history(
@@ -568,8 +868,64 @@ impl SqliteTelemetryAdapter {
     }
 }
 
+/// One `activity_log` row (the SELECT list both queries share) as an event.
+#[cfg(feature = "sqlite")]
+fn activity_row_to_event(
+    row: &rusqlite::Row<'_>,
+) -> std::result::Result<TimelineEvent, rusqlite::Error> {
+    let success_int: i32 = row.get(10)?;
+    let size_i64: Option<i64> = row.get(4)?;
+    let duration_i64: Option<i64> = row.get(9)?;
+    Ok(TimelineEvent {
+        timestamp: row.get(0)?,
+        event_type: row.get(1)?,
+        severity: row.get(2)?,
+        path: row.get(3)?,
+        size_bytes: size_i64.map(|v| v.max(0).cast_unsigned()),
+        score: row.get(5)?,
+        pressure_level: row.get(7)?,
+        free_pct: row.get(8)?,
+        success: Some(success_int != 0),
+        error_code: row.get(11)?,
+        error_message: row.get(12)?,
+        duration_ms: duration_i64.map(|v| v.max(0).cast_unsigned()),
+        details: row.get(13)?,
+        decision_id: row.get(14)?,
+    })
+}
+
+/// Escape `%`, `_` and `\` for a `LIKE … ESCAPE '\'` pattern.
+#[cfg(feature = "sqlite")]
+fn like_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(feature = "sqlite")]
 impl TelemetryQueryAdapter for SqliteTelemetryAdapter {
+    fn search_events(&self, query: &LogSearchQuery) -> TelemetryResult<LogSearchPage> {
+        match self.query_activity_search(query) {
+            Ok(page) => TelemetryResult {
+                data: page,
+                source: DataSource::Sqlite,
+                partial: false,
+                diagnostics: String::new(),
+            },
+            Err(e) => TelemetryResult {
+                data: LogSearchPage::default(),
+                source: DataSource::Sqlite,
+                partial: true,
+                diagnostics: format!("SQLite search failed: {e}"),
+            },
+        }
+    }
+
     fn recent_events(
         &self,
         limit: usize,
@@ -966,6 +1322,39 @@ impl CompositeTelemetryAdapter {
 }
 
 impl TelemetryQueryAdapter for CompositeTelemetryAdapter {
+    fn search_events(&self, query: &LogSearchQuery) -> TelemetryResult<LogSearchPage> {
+        // SQLite's indexed search first, then the bounded JSONL tail scan.
+        #[cfg(feature = "sqlite")]
+        {
+            let sqlite_result = self
+                .sqlite
+                .as_ref()
+                .map(|sqlite| sqlite.search_events(query))
+                .or_else(|| {
+                    self.sqlite_path
+                        .as_deref()
+                        .and_then(SqliteTelemetryAdapter::open)
+                        .map(|sqlite| sqlite.search_events(query))
+                });
+            if let Some(result) = sqlite_result
+                && !result.partial
+            {
+                return result;
+            }
+        }
+        if let Some(ref jsonl) = self.jsonl {
+            return jsonl.search_events(query);
+        }
+        if let Some(jsonl) = self
+            .jsonl_path
+            .as_deref()
+            .and_then(JsonlTelemetryAdapter::open)
+        {
+            return jsonl.search_events(query);
+        }
+        TelemetryResult::unavailable("no telemetry backend available".to_string())
+    }
+
     fn recent_events(
         &self,
         limit: usize,
@@ -2147,6 +2536,250 @@ mod tests {
     /// decision ledger (newest first, with the stable id, factors and veto
     /// state of the real record), and a deletion in the timeline links to
     /// the decision that approved it.
+    fn search_event(
+        timestamp: &str,
+        event_type: &str,
+        severity: &str,
+        path: &str,
+    ) -> TimelineEvent {
+        TimelineEvent {
+            timestamp: timestamp.to_string(),
+            event_type: event_type.to_string(),
+            severity: severity.to_string(),
+            path: Some(path.to_string()),
+            size_bytes: None,
+            score: None,
+            pressure_level: Some("orange".to_string()),
+            free_pct: None,
+            success: Some(true),
+            error_code: None,
+            error_message: Some("disk pressure".to_string()),
+            duration_ms: None,
+            details: None,
+            decision_id: Some("dec-7".to_string()),
+        }
+    }
+
+    /// bd-rc-master-ajg1.4.10: the query grammar and in-memory matching.
+    #[test]
+    fn log_search_query_parses_tokens_and_matches_events() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let loose = LogSearchQuery::parse("Target bogus:x");
+        assert_eq!(
+            loose.words,
+            vec!["target", "bogus:x"],
+            "an unknown prefix is just a word"
+        );
+        let query = LogSearchQuery::parse_at(
+            "Target type:artifact_delete level:warning path:/work id:dec-7 since:1h level:nope",
+            now,
+        );
+        assert_eq!(query.words, vec!["target"]);
+        assert_eq!(query.event_type.as_deref(), Some("artifact_delete"));
+        assert_eq!(query.min_severity.as_deref(), Some("warning"));
+        assert_eq!(query.path_prefix.as_deref(), Some("/work"));
+        assert_eq!(query.decision_id.as_deref(), Some("dec-7"));
+        assert_eq!(query.since.as_deref(), Some("2026-09-03T11:00:00Z"));
+        assert_eq!(query.unknown_tokens, vec!["level:nope"]);
+        assert!(!query.is_empty());
+        assert!(LogSearchQuery::parse("").is_empty());
+        assert!(query.describe_filters().contains("type=artifact_delete"));
+        assert!(query.describe_filters().contains("level\u{2265}warning"));
+
+        let hit = search_event(
+            "2026-09-03T11:30:00Z",
+            "artifact_delete",
+            "warning",
+            "/work/alpha/target",
+        );
+        assert!(query.matches(&hit));
+        let too_old = search_event(
+            "2026-09-03T10:00:00Z",
+            "artifact_delete",
+            "warning",
+            "/work/alpha/target",
+        );
+        assert!(!query.matches(&too_old));
+        let too_quiet = search_event(
+            "2026-09-03T11:30:00Z",
+            "artifact_delete",
+            "info",
+            "/work/alpha/target",
+        );
+        assert!(!query.matches(&too_quiet));
+        let other_path = search_event(
+            "2026-09-03T11:30:00Z",
+            "artifact_delete",
+            "critical",
+            "/home/alpha/target",
+        );
+        assert!(!query.matches(&other_path));
+        let other_type = search_event(
+            "2026-09-03T11:30:00Z",
+            "ballast_release",
+            "critical",
+            "/work/alpha/target",
+        );
+        assert!(!query.matches(&other_type));
+
+        // Free words match the message and pressure level too, case-insensitively.
+        let words = LogSearchQuery::parse("PRESSURE orange");
+        assert!(words.matches(&hit));
+        assert!(!LogSearchQuery::parse("pressure nothere").matches(&hit));
+
+        let page = page_of(
+            (0..7)
+                .map(|i| {
+                    search_event(
+                        &format!("2026-09-03T11:0{i}:00Z"),
+                        "scan_complete",
+                        "info",
+                        "/x",
+                    )
+                })
+                .collect(),
+            1,
+            3,
+        );
+        assert_eq!(page.events.len(), 3);
+        assert_eq!(page.events[0].timestamp, "2026-09-03T11:03:00Z");
+        assert!(page.has_more, "7 events, page 1 of 3: one more page");
+        let last = page_of(
+            (0..7)
+                .map(|i| search_event(&format!("t{i}"), "scan_complete", "info", "/x"))
+                .collect(),
+            2,
+            3,
+        );
+        assert_eq!(last.events.len(), 1);
+        assert!(!last.has_more);
+        assert_eq!(parse_since("15m"), Some(chrono::Duration::minutes(15)));
+        assert_eq!(parse_since("7d"), Some(chrono::Duration::days(7)));
+        assert_eq!(parse_since("0h"), None);
+        assert_eq!(parse_since("soon"), None);
+    }
+
+    /// SQLite answers a search with WHERE clauses and LIMIT/OFFSET paging;
+    /// the words search every text column and LIKE wildcards are literal.
+    #[test]
+    fn sqlite_adapter_searches_the_activity_log() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("activity.db");
+        {
+            let logger = crate::logger::sqlite::SqliteLogger::open(&db_path).expect("create db");
+            for i in 0..5 {
+                logger
+                    .log_activity(&activity_delete(
+                        &format!("2099-01-01T00:00:0{i}Z"),
+                        &format!("/work/proj{i}/target"),
+                    ))
+                    .unwrap();
+            }
+            logger
+                .log_activity(&crate::logger::sqlite::ActivityRow {
+                    event_type: "ballast_release".to_string(),
+                    severity: "warning".to_string(),
+                    path: Some("/data/.sbh/ballast/SBH_BALLAST_FILE_0001".to_string()),
+                    error_message: Some("100%_full".to_string()),
+                    ..activity_delete("2099-01-01T00:00:10Z", "/unused")
+                })
+                .unwrap();
+        }
+        let adapter = SqliteTelemetryAdapter::open(&db_path).expect("open adapter");
+
+        // Paging over the deletions, newest first.
+        let mut query = LogSearchQuery::parse("type:artifact_delete");
+        query.page_size = 2;
+        let first = adapter.search_events(&query);
+        assert_eq!(first.source, DataSource::Sqlite);
+        assert!(!first.partial, "{}", first.diagnostics);
+        assert_eq!(first.data.events.len(), 2);
+        assert_eq!(
+            first.data.events[0].path.as_deref(),
+            Some("/work/proj4/target")
+        );
+        assert!(first.data.has_more);
+        query.page = 2;
+        let third = adapter.search_events(&query);
+        assert_eq!(third.data.events.len(), 1);
+        assert!(!third.data.has_more);
+
+        // Words search the message; a `%` in the query is a literal percent.
+        let percent = adapter.search_events(&LogSearchQuery::parse("100%_full"));
+        assert_eq!(percent.data.events.len(), 1);
+        assert_eq!(percent.data.events[0].event_type, "ballast_release");
+        // "10%full" would match "100%_full" only if `%` were a wildcard, and
+        // "100%xfull" only if `_` were a one-character wildcard.
+        let wildcard_abuse = adapter.search_events(&LogSearchQuery::parse("10%full"));
+        assert!(
+            wildcard_abuse.data.events.is_empty(),
+            "`%` must not act as a wildcard"
+        );
+        let underscore_abuse = adapter.search_events(&LogSearchQuery::parse("100%xfull"));
+        assert!(
+            underscore_abuse.data.events.is_empty(),
+            "`_` in stored text is not a wildcard for the query's `x`"
+        );
+
+        // Minimum level and path prefix.
+        let warnings = adapter.search_events(&LogSearchQuery::parse("level:warning"));
+        assert_eq!(warnings.data.events.len(), 1);
+        let under_work = adapter.search_events(&LogSearchQuery::parse("path:/work/proj1"));
+        assert_eq!(under_work.data.events.len(), 1);
+        let none = adapter.search_events(&LogSearchQuery::parse("id:not-a-decision"));
+        assert!(none.data.events.is_empty());
+        let everything = adapter.search_events(&LogSearchQuery::parse(""));
+        assert_eq!(everything.data.events.len(), 6);
+    }
+
+    /// Without SQLite the default search filters the JSONL tail in memory,
+    /// and the composite adapter reports that source.
+    #[test]
+    fn jsonl_and_composite_adapters_search_the_tail() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("activity.jsonl");
+        let mut lines = String::new();
+        for i in 0..4 {
+            let event = if i == 2 {
+                crate::logger::jsonl::EventType::BallastRelease
+            } else {
+                crate::logger::jsonl::EventType::ArtifactDelete
+            };
+            let mut entry =
+                crate::logger::jsonl::LogEntry::new(event, crate::logger::jsonl::Severity::Info);
+            entry.ts = format!("2026-02-16T00:00:0{i}Z");
+            entry.path = Some(format!("/tmp/target{i}"));
+            entry.size = Some(4096);
+            entry.pressure = Some("yellow".to_string());
+            entry.ok = Some(true);
+            lines.push_str(&serde_json::to_string(&entry).unwrap());
+            lines.push('\n');
+        }
+        std::fs::write(&path, lines).unwrap();
+
+        let jsonl = JsonlTelemetryAdapter::open(&path).expect("open jsonl");
+        let releases = jsonl.search_events(&LogSearchQuery::parse("type:ballast_release"));
+        assert_eq!(releases.source, DataSource::Jsonl);
+        assert_eq!(releases.data.events.len(), 1);
+        assert_eq!(
+            releases.data.events[0].path.as_deref(),
+            Some("/tmp/target2")
+        );
+        let by_path = jsonl.search_events(&LogSearchQuery::parse("target3"));
+        assert_eq!(by_path.data.events.len(), 1);
+
+        let composite = CompositeTelemetryAdapter::new(None, Some(&path));
+        let via_composite = composite.search_events(&LogSearchQuery::parse("yellow"));
+        assert_eq!(via_composite.source, DataSource::Jsonl);
+        assert_eq!(via_composite.data.events.len(), 4);
+        let nothing = CompositeTelemetryAdapter::new(None, None);
+        let unavailable = nothing.search_events(&LogSearchQuery::parse("x"));
+        assert_eq!(unavailable.source, DataSource::None);
+        assert!(unavailable.partial);
+    }
+
     #[test]
     fn sqlite_adapter_reads_the_decision_ledger_and_links_deletions() {
         let tmp = tempfile::TempDir::new().expect("tempdir");

@@ -634,9 +634,13 @@ fn fetch_telemetry_for_screen(
             let result = telemetry.recent_decisions(40);
             update::update(model, DashboardMsg::TelemetryCandidates(result))
         }
-        // Ballast inventory arrives with the daemon state (FetchData); the
-        // remaining screens have no telemetry query of their own.
-        Screen::Ballast | Screen::LogSearch | Screen::Diagnostics => DashboardCmd::None,
+        Screen::LogSearch => {
+            let result = telemetry.search_events(&model.log_search.to_query());
+            update::update(model, DashboardMsg::TelemetryLogSearch(result))
+        }
+        // Ballast inventory arrives with the daemon state (FetchData);
+        // Diagnostics has no telemetry query of its own.
+        Screen::Ballast | Screen::Diagnostics => DashboardCmd::None,
     }
 }
 

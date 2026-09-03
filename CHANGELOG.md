@@ -10,6 +10,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — the dashboard's Log Search screen searches (bd-rc-master-ajg1.4.10)
+
+- Screen 6 was a read-only mirror of the Timeline with a `<not-yet-editable>` query line. It now has one: `/` edits the query inline (Enter runs it, Esc cancels, and the editor owns every key meanwhile), `n`/`p` page through results, `c` clears, `Enter` opens the selected entry on the Timeline. The grammar is free words (every word must appear in the entry's path, event type, severity, message, error code, pressure level or details, case-insensitively) plus `type:<event>`, `level:<info|warning|critical>` (a minimum), `path:<prefix>`, `id:<decision-id>` and `since:<15m|1h|24h|7d>`; the header shows the active filters, the page, and the backend that answered.
+- Data: the telemetry adapters gained `search_events`. SQLite answers with `WHERE` clauses (`LIKE` with escaped wildcards for words and the path prefix, `timestamp >=` for `since:`) and `LIMIT/OFFSET` paging; JSONL filters a bounded tail in memory; the composite prefers SQLite and falls back to JSONL, and says which one answered.
+
 ### Changed — test counts in the docs are generated (bd-rc-master-ajg1.1.5)
 
 - `scripts/test-census.sh` counts every cargo test target with `cargo test <target> -- --list` (library with the default features and with the lean set, the binary, every integration file) plus the e2e shell cases the suite defines, and prints a Markdown table; `docs/testing-and-logging.md` embeds it between `sbh-census` markers, `--check` fails on drift, `--write` rewrites it, `--self-test` checks the counting. The hand-typed summary it replaces was stale by 35–270 % per row. The quality gate runs `--check` as the SOFT `test-census` stage.

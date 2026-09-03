@@ -2733,17 +2733,66 @@ fn frame_render_log_search(model: &DashboardModel, theme: &Theme, area: Rect, fr
     }
 }
 
+/// The query line as shown: the draft with a cursor while editing, else the
+/// query that produced the results (or the newest-entries default).
+fn log_search_query_text(model: &DashboardModel) -> String {
+    let search = &model.log_search;
+    if search.editing {
+        format!("{}\u{258F}", search.draft)
+    } else if search.query.is_empty() {
+        "(newest entries)".to_string()
+    } else {
+        search.query.clone()
+    }
+}
+
+/// `page N` plus what the active filters are, for the header.
+fn log_search_status_text(model: &DashboardModel) -> String {
+    let search = &model.log_search;
+    let query = search.to_query();
+    let mut parts = Vec::new();
+    let filters = query.describe_filters();
+    if !filters.is_empty() {
+        parts.push(filters);
+    }
+    if !query.unknown_tokens.is_empty() {
+        parts.push(format!("unknown: {}", query.unknown_tokens.join(" ")));
+    }
+    let more = if search.has_more { "+" } else { "" };
+    parts.push(format!(
+        "page {}{more} ({} entries)",
+        search.page + 1,
+        search.results.len()
+    ));
+    parts.join("  ")
+}
+
+/// What the list says when it has nothing to show.
+fn log_search_empty_text(model: &DashboardModel) -> &'static str {
+    let search = &model.log_search;
+    if search.editing {
+        "Type a query, then Enter (Esc cancels)."
+    } else if !search.ran {
+        "Loading log entries… press / to search."
+    } else if search.query.is_empty() {
+        "No log entries yet. Press / to search once the daemon has logged activity."
+    } else {
+        "No entries match. Press / to edit the query, c to clear it."
+    }
+}
+
 #[allow(dead_code)]
 fn frame_log_search_header_text(model: &DashboardModel) -> String {
     format!(
-        "query=<not-yet-editable>  source={}  timeline-events={}  mode=preview",
-        data_source_label(model.timeline_source),
-        model.timeline_events.len(),
+        "query={}  source={}  {}",
+        log_search_query_text(model),
+        data_source_label(model.log_search.source),
+        log_search_status_text(model),
     )
 }
 
 fn frame_log_entries(model: &DashboardModel) -> Vec<&TimelineEvent> {
-    model.timeline_events.iter().collect()
+    model.log_search.results.iter().collect()
 }
 
 #[allow(dead_code)]
@@ -2751,10 +2800,13 @@ fn frame_log_search_list_text(model: &DashboardModel, theme: &Theme, rows: usize
     use std::fmt::Write as _;
     let entries = frame_log_entries(model);
     if entries.is_empty() {
-        return String::from("No log entries loaded. Timeline telemetry powers this preview.");
+        return log_search_empty_text(model).to_string();
     }
     let mut out = String::new();
-    let selected = model.timeline_selected.min(entries.len().saturating_sub(1));
+    let selected = model
+        .log_search
+        .selected
+        .min(entries.len().saturating_sub(1));
     let (start, end) = centered_window(selected, entries.len(), rows);
     for (idx, event) in entries.iter().enumerate().take(end).skip(start) {
         let event = *event;
@@ -2785,14 +2837,22 @@ fn frame_log_search_detail_text(model: &DashboardModel, theme: &Theme) -> String
 }
 
 fn frame_log_search_header_styled<'a>(model: &'a DashboardModel, theme: &'a Theme) -> Text<'a> {
+    let search = &model.log_search;
+    let query_color = if search.editing {
+        theme.palette.accent_color()
+    } else if search.query.is_empty() {
+        theme.palette.muted_color()
+    } else {
+        theme.palette.text_primary()
+    };
     let row = vec![
         Span::styled(
             "query ",
             Style::default().fg(theme.palette.text_secondary()),
         ),
         Span::styled(
-            "<not-yet-editable>",
-            Style::default().fg(theme.palette.muted_color()),
+            log_search_query_text(model),
+            Style::default().fg(query_color).bold(),
         ),
         Span::raw("  "),
         Span::styled(
@@ -2800,16 +2860,23 @@ fn frame_log_search_header_styled<'a>(model: &'a DashboardModel, theme: &'a Them
             Style::default().fg(theme.palette.text_secondary()),
         ),
         styled_badge(
-            data_source_label(model.timeline_source),
+            data_source_label(search.source),
             theme.palette.accent_color(),
         ),
         Span::raw("  "),
         Span::styled(
-            format!("events={}", model.timeline_events.len()),
+            log_search_status_text(model),
             Style::default().fg(theme.palette.text_secondary()),
         ),
     ];
-    Text::from_lines(vec![Line::from_spans(row)])
+    let mut lines = vec![Line::from_spans(row)];
+    if search.partial && !search.diagnostics.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  degraded: {}", search.diagnostics),
+            Style::default().fg(theme.palette.warning_color()),
+        )));
+    }
+    Text::from_lines(lines)
 }
 
 fn frame_log_search_list_styled<'a>(
@@ -2821,12 +2888,15 @@ fn frame_log_search_list_styled<'a>(
     let entries = frame_log_entries(model);
     if entries.is_empty() {
         return Text::from_lines(vec![Line::from(Span::styled(
-            "No log entries loaded. Timeline telemetry powers this preview.",
+            log_search_empty_text(model),
             Style::default().fg(theme.palette.muted_color()),
         ))]);
     }
     let mut lines = Vec::new();
-    let selected = model.timeline_selected.min(entries.len().saturating_sub(1));
+    let selected = model
+        .log_search
+        .selected
+        .min(entries.len().saturating_sub(1));
     let (start, end) = centered_window(selected, entries.len(), rows);
     for (idx, event) in entries.iter().enumerate().take(end).skip(start) {
         let is_selected = idx == selected;
@@ -2872,7 +2942,10 @@ fn frame_log_search_detail_styled<'a>(model: &'a DashboardModel, theme: &'a Them
             Style::default().fg(theme.palette.muted_color()),
         ))]);
     }
-    let selected = model.timeline_selected.min(entries.len().saturating_sub(1));
+    let selected = model
+        .log_search
+        .selected
+        .min(entries.len().saturating_sub(1));
     styled_event_detail(entries[selected], theme)
 }
 
@@ -4482,29 +4555,30 @@ fn render_log_search(model: &DashboardModel, theme: &Theme, out: &mut String) {
     use std::fmt::Write as _;
 
     let layout = build_log_search_layout(model.terminal_size.0, model.terminal_size.1);
-    let source_label = match model.timeline_source {
+    let source_label = match model.log_search.source {
         DataSource::Sqlite => "SQLite",
         DataSource::Jsonl => "JSONL",
         DataSource::None => "none",
     };
     let _ = writeln!(
         out,
-        "query=<preview> source={source_label} entries={} mode=timeline-mirror",
-        model.timeline_events.len(),
+        "query={} source={source_label} {}",
+        log_search_query_text(model),
+        log_search_status_text(model),
     );
-    if !model.timeline_diagnostics.is_empty() {
-        let _ = writeln!(out, "  diag: {}", model.timeline_diagnostics);
+    if !model.log_search.diagnostics.is_empty() {
+        let _ = writeln!(out, "  diag: {}", model.log_search.diagnostics);
     }
 
-    let entries = &model.timeline_events;
+    let entries = &model.log_search.results;
     let _ = writeln!(out);
     if entries.is_empty() {
-        let _ = writeln!(
-            out,
-            "No log entries loaded. Timeline telemetry powers this preview."
-        );
+        let _ = writeln!(out, "{}", log_search_empty_text(model));
     } else {
-        let selected = model.timeline_selected.min(entries.len().saturating_sub(1));
+        let selected = model
+            .log_search
+            .selected
+            .min(entries.len().saturating_sub(1));
         let list_visible = layout
             .placements
             .iter()
@@ -4530,7 +4604,10 @@ fn render_log_search(model: &DashboardModel, theme: &Theme, out: &mut String) {
         .iter()
         .any(|p| p.pane == LogSearchPane::EntryDetail && p.visible);
     if detail_visible && !entries.is_empty() {
-        let selected = model.timeline_selected.min(entries.len().saturating_sub(1));
+        let selected = model
+            .log_search
+            .selected
+            .min(entries.len().saturating_sub(1));
         let _ = writeln!(out);
         let width = usize::from(model.terminal_size.0).max(40);
         let _ = writeln!(out, "{}", section_header("Entry Detail", width));
@@ -4540,8 +4617,8 @@ fn render_log_search(model: &DashboardModel, theme: &Theme, out: &mut String) {
     write_navigation_hint(
         model,
         out,
-        "j/k or wheel navigate  click row focus  r refresh  ? help  : palette",
-        "j/k or wheel navigate  click row focus  r refresh",
+        "/ search  n/p page  c clear  j/k navigate  Enter open on Timeline  r refresh  ? help  : palette",
+        "/ search  n/p page  c clear  j/k navigate  Enter open on Timeline",
     );
 }
 
@@ -5682,7 +5759,7 @@ mod tests {
         model.screen = Screen::LogSearch;
         let frame = render(&model);
         assert!(frame.contains("[S6 Logs]"));
-        assert!(frame.contains("query=<preview>"));
+        assert!(frame.contains("query=(newest entries)"), "{frame}");
         assert!(!frame.contains("implementation pending"));
     }
 
@@ -6641,6 +6718,57 @@ mod tests {
         assert!(frame.contains("reads=95"));
         assert!(frame.contains("errors=5"));
         assert!(frame.contains("DEGRADED")); // 5% error rate < 10%
+    }
+
+    /// bd-rc-master-ajg1.4.10: the Log Search header shows the query (or the
+    /// draft with a cursor), the page, and the results.
+    #[test]
+    fn log_search_renders_query_page_and_entries() {
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 30),
+        );
+        model.screen = Screen::LogSearch;
+        let frame = render(&model);
+        assert!(frame.contains("Loading log entries"), "{frame}");
+
+        model.log_search.query = "type:ballast_release since:1h".to_string();
+        model.log_search.ran = true;
+        model.log_search.has_more = true;
+        model.log_search.source = DataSource::Sqlite;
+        model.log_search.results = vec![crate::tui::telemetry::TimelineEvent {
+            timestamp: "2026-09-03T08:00:00Z".to_string(),
+            event_type: "ballast_release".to_string(),
+            severity: "info".to_string(),
+            path: Some("/data/.sbh/ballast/SBH_BALLAST_FILE_0001".to_string()),
+            size_bytes: Some(1_048_576),
+            score: None,
+            pressure_level: Some("control".to_string()),
+            free_pct: Some(40.0),
+            success: Some(true),
+            error_code: None,
+            error_message: None,
+            duration_ms: None,
+            details: None,
+            decision_id: None,
+        }];
+        let frame = render(&model);
+        assert!(frame.contains("type:ballast_release since:1h"), "{frame}");
+        assert!(frame.contains("page 1+"), "{frame}");
+        assert!(frame.contains("ballast_release"), "{frame}");
+        assert!(frame.contains("type=ballast_release"), "{frame}");
+
+        model.log_search.editing = true;
+        model.log_search.draft = "path:/work".to_string();
+        let frame = render(&model);
+        assert!(frame.contains("path:/work\u{258F}"), "{frame}");
+
+        model.log_search.editing = false;
+        model.log_search.results.clear();
+        let frame = render(&model);
+        assert!(frame.contains("No entries match"), "{frame}");
     }
 
     #[test]

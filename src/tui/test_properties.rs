@@ -62,6 +62,10 @@ fn arb_key_code() -> impl Strategy<Value = KeyCode> {
         Just(KeyCode::Char('v')),
         Just(KeyCode::Char('F')),
         Just(KeyCode::Char(' ')),
+        // Log Search (4.10): the inline editor and paging.
+        Just(KeyCode::Char('/')),
+        Just(KeyCode::Char('n')),
+        Just(KeyCode::Char('c')),
         Just(KeyCode::Tab),
         Just(KeyCode::BackTab),
         Just(KeyCode::Backspace),

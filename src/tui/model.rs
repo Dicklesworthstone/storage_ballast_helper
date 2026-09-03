@@ -125,6 +125,97 @@ pub enum Overlay {
     IncidentPlaybook,
 }
 
+/// Results per page on the Log Search screen.
+pub const LOG_SEARCH_PAGE_SIZE: usize = 50;
+
+/// The Log Search screen (S6): a query line the operator edits inline,
+/// the page of results it produced, and where the cursor is.
+///
+/// The query grammar is free text (every word must appear in the entry's
+/// path, event type, message, or details, case-insensitively) plus the
+/// tokens `type:<event>`, `level:<info|warning|critical>` (minimum),
+/// `path:<prefix>`, `id:<decision-id>`, and `since:<15m|1h|24h|7d>`.
+#[derive(Debug, Clone, Default, PartialEq)]
+// `editing`, `has_more`, `ran` and `partial` are four independent facts, not
+// a state machine in disguise.
+#[allow(clippy::struct_excessive_bools)]
+pub struct LogSearchState {
+    /// The query that produced `results` (empty = the newest entries).
+    pub query: String,
+    /// `/` opened the inline editor; keys go to `draft` until Enter/Esc.
+    pub editing: bool,
+    /// The text being edited.
+    pub draft: String,
+    /// Zero-based page of `query`.
+    pub page: usize,
+    /// The current page of matching entries, newest first.
+    pub results: Vec<TimelineEvent>,
+    /// Cursor within `results`.
+    pub selected: usize,
+    /// Whether a later page exists.
+    pub has_more: bool,
+    /// Whether any search has run (an empty result then means "no match").
+    pub ran: bool,
+    /// Backend that answered.
+    pub source: DataSource,
+    /// The answer is known to be incomplete.
+    pub partial: bool,
+    /// Adapter diagnostics for the footer.
+    pub diagnostics: String,
+}
+
+impl LogSearchState {
+    /// The query the runtime runs for the current page.
+    #[must_use]
+    pub fn to_query(&self) -> super::telemetry::LogSearchQuery {
+        let mut query = super::telemetry::LogSearchQuery::parse(&self.query);
+        query.page = self.page;
+        query.page_size = LOG_SEARCH_PAGE_SIZE;
+        query
+    }
+
+    /// The selected entry, if any.
+    #[must_use]
+    pub fn selected_entry(&self) -> Option<&TimelineEvent> {
+        self.results.get(self.selected)
+    }
+
+    /// Move the cursor up; `true` when it moved.
+    pub fn cursor_up(&mut self) -> bool {
+        if self.selected > 0 {
+            self.selected -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the cursor down; `true` when it moved.
+    pub fn cursor_down(&mut self) -> bool {
+        if self.selected + 1 < self.results.len() {
+            self.selected += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Accept a page of results, keeping the cursor in range.
+    pub fn accept(
+        &mut self,
+        page: super::telemetry::TelemetryResult<super::telemetry::LogSearchPage>,
+    ) {
+        self.source = page.source;
+        self.partial = page.partial;
+        self.diagnostics = page.diagnostics;
+        self.page = page.data.page;
+        self.has_more = page.data.has_more;
+        self.results = page.data.events;
+        self.ran = true;
+        self.selected = self.selected.min(self.results.len().saturating_sub(1));
+    }
+}
+
 /// Actions that require modal confirmation before execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmAction {
@@ -537,6 +628,10 @@ pub struct DashboardModel {
     /// Diagnostic message from the telemetry adapter.
     pub timeline_diagnostics: String,
 
+    // ── Log Search screen (S6) state ──
+    /// Query line, filters, and the current page of results.
+    pub log_search: LogSearchState,
+
     // ── Explainability screen (S3) state ──
     /// Cached decision evidence for the explainability screen.
     pub explainability_decisions: Vec<DecisionEvidence>,
@@ -651,6 +746,7 @@ impl DashboardModel {
             timeline_source: DataSource::None,
             timeline_partial: false,
             timeline_diagnostics: String::new(),
+            log_search: LogSearchState::default(),
             explainability_decisions: Vec::new(),
             explainability_selected: 0,
             explainability_detail: false,
@@ -1097,6 +1193,8 @@ pub enum DashboardMsg {
     Error(DashboardError),
     /// Timeline events arrived from the telemetry adapter.
     TelemetryTimeline(TelemetryResult<Vec<TimelineEvent>>),
+    /// A page of log search results for the Log Search screen (S6).
+    TelemetryLogSearch(TelemetryResult<super::telemetry::LogSearchPage>),
     /// Decision evidence arrived from the telemetry adapter.
     TelemetryDecisions(TelemetryResult<Vec<DecisionEvidence>>),
     /// Candidate ranking data arrived from the telemetry adapter.

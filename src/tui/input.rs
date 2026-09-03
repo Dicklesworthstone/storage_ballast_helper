@@ -381,6 +381,38 @@ pub const KEYMAP: &[KeyBinding] = &[
         context: KeyContext::Screen(Screen::Diagnostics),
         description: "Toggle verbose frame metrics",
     },
+    KeyBinding {
+        keys: "`/`",
+        probe: KeyCode::Char('/'),
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screen(Screen::LogSearch),
+        description: "Edit the search query inline (`Enter` runs it, `Esc` cancels); words match path/event/message, tokens `type:`, `level:`, `path:`, `id:`, `since:`",
+    },
+    KeyBinding {
+        keys: "`n` / `p`",
+        probe: KeyCode::Char('n'),
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screen(Screen::LogSearch),
+        description: "Next / previous page of results",
+    },
+    KeyBinding {
+        keys: "`c`",
+        probe: KeyCode::Char('c'),
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screen(Screen::LogSearch),
+        description: "Clear the query (newest entries again)",
+    },
+    KeyBinding {
+        keys: "`Enter`",
+        probe: KeyCode::Enter,
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screen(Screen::LogSearch),
+        description: "Open the selected entry on the Timeline",
+    },
 ];
 
 /// One screen as the README's "Screens" table lists it.
