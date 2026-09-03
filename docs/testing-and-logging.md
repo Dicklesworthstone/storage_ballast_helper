@@ -70,25 +70,26 @@ For TUI/dashboard rollout work:
 
 | Module | File(s) | Tests | Coverage |
 | --- | --- | --- | --- |
-| Config | `config.rs` | validation, TOML roundtrip, defaults | Config schema, pressure thresholds |
-| Errors | `errors.rs` | error types, display formatting | Error taxonomy |
-| Platform | `platform.rs` | detect_platform, PAL dispatch | Linux/macOS abstraction |
-| Protection | `scanner/protection.rs` | marker files, config globs, dual-mode | .sbh-protect markers, glob exclusions |
-| EWMA | `monitoring/ewma.rs` | rate estimation, confidence, prediction | Disk rate trending |
-| PID | `monitoring/pid_controller.rs` | 4-level escalation, config reload | Pressure response |
-| Guardrails | `monitoring/guardrails.rs` | e-process drift, calibration, alarms | Statistical safety bounds |
-| Predictive | `monitoring/predictive_action.rs` | horizon warnings, danger detection | Proactive action triggers |
-| Scoring | `scanner/scoring.rs` | multi-factor, veto logic, evidence | Artifact classification |
-| Walker | `scanner/walker.rs` | traversal, exclusion, parallelism | Directory scanning |
-| Patterns | `scanner/pattern_registry.rs` | artifact type classification | Build artifact detection |
-| Deletion | `scanner/deletion_executor.rs` | batch planning, circuit breaker | Safe cleanup execution |
-| Merkle | `scanner/merkle.rs` | incremental index, checkpointing | Change detection |
-| Ballast | `ballast/manager.rs`, `ballast/coordinator.rs` | provision, release, verify, replenish | Ballast file lifecycle |
-| Policy | `daemon/policy.rs` | observe/canary/enforce/fallback | Decision mode transitions |
-| Notifications | `daemon/notifications.rs` | event dispatch, channel handling | Alert delivery |
-| Self-monitor | `daemon/self_monitor.rs` | respawn, staleness, resource limits | Daemon health |
-| Logger | `logger/*.rs` | SQLite, JSONL, stats, dual-write | Activity recording |
-| CLI | `cli_app.rs` | argument parsing, routing, output | Command interface |
+| Config | `src/core/config.rs` | validation, TOML roundtrip, defaults, README example | Config schema, pressure thresholds |
+| Errors | `src/core/errors.rs` | error types, display formatting, `ERROR_CODES` catalog | Error taxonomy |
+| Platform | `src/platform/pal.rs`, `src/platform/types.rs` | detect_platform, PAL dispatch | Linux/macOS abstraction |
+| Protection | `src/scanner/protection.rs` | marker files, config globs, dual-mode | .sbh-protect markers, glob exclusions |
+| EWMA | `src/monitor/ewma.rs` | rate estimation, confidence, prediction | Disk rate trending |
+| PID | `src/monitor/pid.rs` | level classification, response table, config reload, README formulas | Pressure response |
+| Guardrails | `src/monitor/guardrails.rs` | e-process drift, calibration, alarms | Statistical safety bounds |
+| Predictive | `src/monitor/predictive.rs` | horizon warnings, danger detection | Proactive action triggers |
+| Scoring | `src/scanner/scoring.rs` | multi-factor, veto logic, evidence | Artifact classification |
+| Walker | `src/scanner/walker.rs` | traversal, exclusion, parallelism | Directory scanning |
+| Patterns | `src/scanner/patterns.rs` | artifact type classification | Build artifact detection |
+| Deletion | `src/scanner/deletion.rs` | batch planning, circuit breaker | Safe cleanup execution |
+| Merkle | `src/scanner/merkle.rs` | incremental index, checkpointing | Change detection |
+| Ballast | `src/ballast/manager.rs`, `src/ballast/coordinator.rs` | provision, release, verify, replenish | Ballast file lifecycle |
+| Policy | `src/daemon/policy.rs` | observe/canary/enforce/fallback, behavior matrix | Decision mode transitions |
+| Notifications | `src/daemon/notifications.rs` | event dispatch, channel handling | Alert delivery |
+| Self-monitor | `src/daemon/self_monitor.rs` | respawn, staleness, resource limits | Daemon health |
+| Logger | `src/logger/dual.rs`, `src/logger/sqlite.rs`, `src/logger/jsonl.rs`, `src/logger/stats.rs` | SQLite, JSONL, stats, dual-write | Activity recording |
+| Docs generator | `src/cli/docs.rs` | env-var registry, command/flag parity, file references, generated regions | README/AGENTS.md truth |
+| CLI | `src/cli_app.rs` | argument parsing, routing, output, doc contract | Command interface |
 
 ### Dashboard / TUI Tests
 
@@ -98,16 +99,17 @@ All TUI tests require `--features tui`. Without it, these modules are excluded f
 
 | Test Module | File | Tests | What It Validates |
 | --- | --- | --- | --- |
-| `test_unit_coverage` | `tui/test_unit_coverage.rs` | model/adapter/keymap/render helpers | C-08..C-18 contract compliance |
-| `test_properties` | `tui/test_properties.rs` | reducer invariants, navigation, scheduler | No panics on random input, quit monotonicity |
-| `test_replay` | `tui/test_replay.rs` | deterministic state replay regression | Same inputs produce same state (trace digest) |
-| `test_scenario_drills` | `tui/test_scenario_drills.rs` | multi-phase operator workflows | Pressure escalation, ballast ops, explainability, incidents |
-| `test_fault_injection` | `tui/test_fault_injection.rs` | adapter/state degradation and recovery | Safe degraded mode, recovery transitions |
-| `test_snapshot_golden` | `tui/test_snapshot_golden.rs` | per-screen golden frame hashes | Visual output stability across changes |
-| `test_operator_benchmark` | `tui/test_operator_benchmark.rs` | task-time, error-rate, keystroke count | Workflow efficiency vs legacy baseline |
-| `test_stress` | `tui/test_stress.rs` | long-run stability, burst telemetry | Memory stability, frame-time consistency |
-| `parity_harness` | `tui/parity_harness.rs` | legacy-vs-new frozen contract matrix | Zero behavior regression from old dashboard |
-| `test_artifact` | `tui/test_artifact.rs` | e2e artifact schema validation | ArtifactCollector/CaseBuilder correctness |
+| `test_unit_coverage` | `src/tui/test_unit_coverage.rs` | model/adapter/keymap/render helpers | C-08..C-18 contract compliance |
+| `test_properties` | `src/tui/test_properties.rs` | reducer invariants, navigation, scheduler | No panics on random input, quit monotonicity |
+| `test_replay` | `src/tui/test_replay.rs` | deterministic state replay regression | Same inputs produce same state (trace digest) |
+| `test_scenario_drills` | `src/tui/test_scenario_drills.rs` | multi-phase operator workflows | Pressure escalation, ballast ops, explainability, incidents |
+| `test_fault_injection` | `src/tui/test_fault_injection.rs` | adapter/state degradation and recovery | Safe degraded mode, recovery transitions |
+| `test_snapshot_golden` | `src/tui/test_snapshot_golden.rs` | per-screen golden frame hashes | Visual output stability across changes |
+| `test_operator_benchmark` | `src/tui/test_operator_benchmark.rs` | task-time, error-rate, keystroke count | Workflow efficiency vs legacy baseline |
+| `test_stress` | `src/tui/test_stress.rs` | long-run stability, burst telemetry | Memory stability, frame-time consistency |
+| `parity_harness` | `src/tui/parity_harness.rs` | legacy-vs-new frozen contract matrix | Zero behavior regression from old dashboard |
+| `test_artifact` | `src/tui/test_artifact.rs` | e2e artifact schema validation | ArtifactCollector/CaseBuilder correctness |
+| `replay` | `src/tui/replay.rs` | log timeline load/reconstruction, scrubber driver, replay adapter | `sbh dashboard --replay` |
 
 **Running a single TUI test module:**
 ```bash
