@@ -141,6 +141,19 @@ v1 has no such loop because a pass costs 25 s of wall time and the executor
 does reach `would_delete` batches (263 dry-run batches of 4-10 candidates),
 but it spends two cores for the whole five minutes doing it.
 
+### After the fix (same capture, same table, dry-run)
+
+| Binary | CPU-s / 300 s | `used_pct_1m` at end | scan_complete events | what the passes did |
+|---|---:|---:|---:|---|
+| cb7e4d5 (first pass of bd-8aeq) | 322.7 (58 user + 265 sys) | 25% | 127 | 1 walk, then 126 replay passes that each re-probed the 5 GB target subtree and re-dispatched it; dry-run dispatches counted as progress, so the cooldown never armed |
+| 8d5f1ea (second pass) | **8.6** (3 user + 6 sys) | 1.4% | 4 | 1 walk (2.2 s, 44 entries, 2 dispatchable candidates), then replays at +20 s, +60 s, +140 s: each replays 7 records in 0 ms, dispatches the definite target, and is paced as an empty pass because the dry-run executor reclaimed nothing (`the last pass dispatched candidates but nothing was reclaimed ... pacing it as an empty pass`, 4 occurrences) |
+
+Against v1's 601.7 CPU-s on the same tree and table, the fixed v2 daemon
+spends 70x less CPU over the five minutes, but that is the pacing (four
+passes against three) more than the per-pass cost: v2's one real walk
+stopped after 44 entries on the pressure byte target, so a forced full
+pass has still not been compared engine to engine.
+
 ## 3. Verdict against section 7
 
 | Criterion | Result |
@@ -149,14 +162,15 @@ but it spends two cores for the whole five minutes doing it.
 | No full descent; >= 50x CPU-s per pass vs v1 on a large tree | **Not demonstrated.** A full v2 walk of the same tree costs 3.4x v1 (section 1). The daemon's v2 pass was 2.6 s against v1's 25 s only because it walked 44 entries instead of 231,053 (early stop), which is different work, not a cheaper pass. |
 | Zero `canonicalize` per entry | Not measured here (covered by unit counters). |
 | Active-reference check O(open refs + indexed candidates) | Not measured here. |
-| Deletion-failure retry bounded by backoff | **Violated in spirit:** the same two held-back candidates were re-dispatched 575 times in five minutes. |
+| Deletion-failure retry bounded by backoff | **Violated before bd-8aeq:** the same two held-back candidates were re-dispatched 575 times in five minutes. After 8d5f1ea the same capture shows 4 passes in five minutes with the empty-pass backoff (20, 40, 80 s) doing the pacing. |
 | v2 never approves what v1 hard-vetoes | Vacuous on this tree (v1 vetoed nothing); v2 was strictly more conservative. |
 | Docs match code | README and design doc updated with this document on 2026-09-02. |
 
-bd-xtpv.8 therefore stays open. The blocking item is the replay hot loop;
-after it is fixed the daemon capture above should be re-run (same commands)
-and the CPU-per-pass comparison should be made on a forced full pass
-(`force_full_scan`) so both engines walk the whole tree.
+bd-xtpv.8 therefore stays open. The replay hot loop is fixed and the
+re-run above shows the daemon pacing itself; what is still missing for the
+promotion criteria is a CPU-per-pass comparison on a forced full pass
+(`force_full_scan`, or `SIGUSR1`) so both engines walk the whole tree, and
+a Green steady-state measurement.
 
 ## 4. Follow-ups noticed
 

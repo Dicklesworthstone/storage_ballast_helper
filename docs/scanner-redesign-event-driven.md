@@ -313,13 +313,16 @@ re-run).
   holds back. The empty-pass cooldown never armed because a replay pass
   counts as a dispatch, and the replay had downgraded a `definite` opaque
   target to `unclear` by re-classifying it from the root's own entries.
-  Filed and fixed the same evening as bd-8aeq (replay keeps the opaque
-  classification and subtree evidence; the scanner applies the certainty
-  gate itself). The capture predates the fix.
-- Verdict: the >= 50x CPU-seconds-per-pass criterion is **not
-  demonstrated** and the retry-backoff criterion was violated in spirit;
-  bd-xtpv.8 stays open until the daemon capture is repeated after bd-8aeq
-  and a forced full pass is compared engine to engine.
+  Filed and fixed the same evening as bd-8aeq (cb7e4d5 + 8d5f1ea: replay
+  keeps the opaque classification and the walk's persisted structural
+  signals; the scanner applies the certainty gate itself; a dispatch that
+  reclaims nothing is paced as an empty pass). The same capture on 8d5f1ea:
+  4 passes and 8.6 CPU-s in 300 s, backoff at 20/40/80 s.
+- Verdict: the retry-backoff criterion now holds on the real tree; the
+  >= 50x CPU-seconds-per-pass criterion is still **not demonstrated**
+  because the daemon's one walk stopped on the pressure byte target after
+  44 entries. bd-xtpv.8 stays open until a forced full pass is compared
+  engine to engine and a Green steady state is measured.
 
 Live A/B capture procedure:
 
