@@ -510,7 +510,12 @@ fallback only when the hosted release run is stuck before runner assignment and
 the operator has explicitly approved publishing outside the workflow. Do not
 publish from chat notes, historical provenance, or a missing `/tmp` directory:
 the complete artifact set must exist on disk and pass verification immediately
-before upload.
+before upload. The verification is `sbh doctor --release --assets "$ARTIFACT_DIR"`
+(a locally built `sbh` is fine): it fails on any missing archive or sidecar,
+checksum or `SHA256SUMS.txt` mismatch, missing or differing legacy mirror,
+a tarball whose binary is not the labelled architecture, or a provenance
+document with the wrong tag. The hosted workflow runs the same audit against
+the published release in its `asset-audit` job before the tap update.
 
 Use a durable working directory outside `/tmp` so cleanup tools do not remove
 the prepared bundle before publication:

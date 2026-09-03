@@ -478,9 +478,40 @@ jobs:
             SHA256SUMS.txt
             release-provenance.json
 
+  asset-audit:
+    name: Post-publish Asset Audit
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download the Linux x86_64 build artifact
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: sbh-x86_64-unknown-linux-gnu
+          path: audit-tool
+      - name: Extract the published sbh
+        run: |
+          tar -xJf "audit-tool/sbh-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.xz" -C audit-tool
+          ./audit-tool/sbh version
+      # Downloads the release just published and audits every CI target's
+      # archive, checksum, legacy mirror, manifest entry and binary
+      # architecture, plus the provenance document (bd-rc-master-ajg1.5.3).
+      # A mislabeled tarball (the v0.4.23 shape) fails here and blocks the
+      # tap update.
+      - name: Audit the published release assets
+        run: ./audit-tool/sbh --json doctor --release --assets "${GITHUB_REF_NAME}" | tee asset-audit.json
+      - name: Upload the audit
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: asset-audit
+          path: asset-audit.json
+          if-no-files-found: ignore
+
   homebrew-tap:
     name: Update Homebrew Tap
-    needs: release
+    needs: [release, asset-audit]
     runs-on: ubuntu-latest
     env:
       HOMEBREW_TAP_REPOSITORY: git@github.com:Dicklesworthstone/homebrew-sbh.git
