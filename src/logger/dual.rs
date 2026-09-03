@@ -39,6 +39,10 @@ pub struct ScanCompletionTelemetry {
     pub opaque_pruning: bool,
     pub opaque_pruned_dirs: usize,
     pub event_dirty_roots: usize,
+    /// inotify queue overflows seen by the event source (coalesced ones included).
+    pub event_overflows: u64,
+    /// Rate-driven re-allocations of the inotify watch budget.
+    pub event_watch_replans: u64,
     pub index_event_generation: u64,
     pub index_records: usize,
     pub candidate_bytes_seen: u64,
@@ -497,6 +501,7 @@ fn scan_completion_details(
     format!(
         "paths_scanned={} candidates={} engine={} dispatch={} reason={} \
          opaque_pruning={} opaque_pruned_dirs={} event_dirty_roots={} \
+         event_overflows={} event_watch_replans={} \
          index_event_generation={} index_records={} candidate_bytes_seen={} timed_out={} \
          replayed_records={} revetoed_records={}",
         paths_scanned,
@@ -507,6 +512,8 @@ fn scan_completion_details(
         telemetry.opaque_pruning,
         telemetry.opaque_pruned_dirs,
         telemetry.event_dirty_roots,
+        telemetry.event_overflows,
+        telemetry.event_watch_replans,
         telemetry.index_event_generation,
         telemetry.index_records,
         telemetry.candidate_bytes_seen,
@@ -1108,6 +1115,8 @@ mod tests {
             opaque_pruning: false,
             opaque_pruned_dirs: 0,
             event_dirty_roots: 0,
+            event_overflows: 0,
+            event_watch_replans: 0,
             index_event_generation: 0,
             index_records: 0,
             candidate_bytes_seen: 0,

@@ -76,7 +76,7 @@ use crate::platform::types::{
 };
 use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionMode};
 use crate::scanner::engine::{ScannerEngine, SelectedScannerEngine};
-use crate::scanner::events::{EventSourceConfig, ScannerEventSource};
+use crate::scanner::events::{EventSourceConfig, EventSourceStats, ScannerEventSource};
 use crate::scanner::index::{
     CandidateIndexRecord, IndexedIdentity, ScannerCandidateIndex, ScannerIndexContext,
     ScannerIndexLoadStatus,
@@ -1934,6 +1934,12 @@ fn v2_pressure_candidate_byte_target(request: &ScanRequest) -> Option<u64> {
         V2_PRESSURE_RECLAIM_BYTES_PER_CANDIDATE
             .saturating_mul(request.max_delete_batch.max(1) as u64),
     )
+}
+
+/// Dirty scan paths may be unwatched frontier subtrees below a configured
+/// root, so a root counts as dirty when any dirty path lies under it.
+fn dirty_under(dirty_roots: &BTreeSet<PathBuf>, path: &Path) -> bool {
+    dirty_roots.contains(path) || dirty_roots.iter().any(|dirty| dirty.starts_with(path))
 }
 
 fn v2_active_scan_paths(
@@ -6230,6 +6236,7 @@ fn scanner_thread_main(
         let scanner_opaque_pruning = selected_scanner_engine.opaque_pruning();
         let scanner_index_enabled = scanner_engine_mode == ScannerEngineMode::V2;
         let mut scanner_event_dirty_roots = BTreeSet::new();
+        let mut scanner_event_stats = EventSourceStats::default();
         let scanner_index_event_generation = if scanner_index_enabled {
             let context =
                 ScannerIndexContext::from_roots_and_config(&request.paths, &current_scanner_config);
@@ -6268,10 +6275,11 @@ fn scanner_thread_main(
                     let capability = source.capability();
                     logger.send(ActivityEvent::Info {
                         message: format!(
-                            "scanner_events: backend={} complete={} watched_dirs={} dirty_roots={} reason={}",
+                            "scanner_events: backend={} complete={} watched_dirs={} frontier_dirs={} dirty_roots={} reason={}",
                             capability.selected_backend,
                             capability.complete,
                             capability.watched_dirs,
+                            capability.frontier_dirs,
                             capability.dirty_roots.len(),
                             capability.reason
                         ),
@@ -6281,13 +6289,20 @@ fn scanner_thread_main(
             if let Some(source) = scanner_event_source.as_mut() {
                 let invalidation = source.drain();
                 scanner_event_dirty_roots.clone_from(invalidation.dirty_roots());
+                scanner_event_stats = source.stats();
                 if invalidation.requires_reconciliation() {
                     logger.send(ActivityEvent::Info {
                         message: format!(
-                            "scanner_events: dirty_roots={} dirty_paths={} generation_bump={} reason={}",
+                            "scanner_events: dirty_roots={} dirty_paths={} generation_bump={} \
+                             overflows={} backoff_secs={} replans={} watched_dirs={} frontier_dirs={} reason={}",
                             invalidation.dirty_roots().len(),
                             invalidation.dirty_paths().len(),
                             invalidation.requires_index_generation_bump(),
+                            scanner_event_stats.overflows,
+                            scanner_event_stats.backoff_secs,
+                            scanner_event_stats.replans,
+                            scanner_event_stats.watched_dirs,
+                            scanner_event_stats.frontier_dirs,
                             invalidation.reason_summary()
                         ),
                     });
@@ -6338,6 +6353,8 @@ fn scanner_thread_main(
                 opaque_pruning: scanner_opaque_pruning,
                 opaque_pruned_dirs,
                 event_dirty_roots: scanner_event_dirty_roots.len(),
+                event_overflows: scanner_event_stats.overflows,
+                event_watch_replans: scanner_event_stats.replans,
                 index_event_generation: scanner_index_event_generation,
                 index_records,
                 candidate_bytes_seen,
@@ -6394,7 +6411,7 @@ fn scanner_thread_main(
                     potential_bytes: 0,
                     false_positives: 0,
                     duration: Duration::ZERO,
-                    dirty: scanner_event_dirty_roots.contains(path),
+                    dirty: dirty_under(&scanner_event_dirty_roots, path),
                 })
                 .collect();
             let _ = report_tx.try_send(WorkerReport::ScanCompleted {
@@ -6639,7 +6656,7 @@ fn scanner_thread_main(
                             potential_bytes: if index == 0 { indexed_bytes } else { 0 },
                             false_positives: 0,
                             duration: Duration::ZERO,
-                            dirty: scanner_event_dirty_roots.contains(path),
+                            dirty: dirty_under(&scanner_event_dirty_roots, path),
                         })
                         .collect();
                     let _ = report_tx.try_send(WorkerReport::ScanCompleted {
@@ -7094,7 +7111,7 @@ fn scanner_thread_main(
                     potential_bytes: 0,
                     false_positives: 0,
                     duration,
-                    dirty: scanner_event_dirty_roots.contains(path),
+                    dirty: dirty_under(&scanner_event_dirty_roots, path),
                 })
                 .collect();
             let _ = report_tx.send(WorkerReport::ScanCompleted {
@@ -7164,7 +7181,7 @@ fn scanner_thread_main(
                     },
                     false_positives: 0,
                     duration,
-                    dirty: scanner_event_dirty_roots.contains(path),
+                    dirty: dirty_under(&scanner_event_dirty_roots, path),
                 })
                 .collect();
             let _ = report_tx.try_send(WorkerReport::ScanCompleted {
@@ -7289,7 +7306,7 @@ fn scanner_thread_main(
                     potential_bytes: 0,
                     false_positives: 0,
                     duration: Duration::ZERO,
-                    dirty: scanner_event_dirty_roots.contains(root),
+                    dirty: dirty_under(&scanner_event_dirty_roots, root),
                 },
             );
         }

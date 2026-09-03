@@ -10,6 +10,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Changed — inotify watch budget allocation (bd-rc-master-ajg1.8.4)
+
+- The scanner's recursive inotify plan always watches every root and depth-1 directory and spends the rest of `scanner.event_watch_budget` on the most active directories (per-directory event-rate EWMA, directory-mtime prior for never-watched subtrees). Directories left unwatched under a watched parent are reconciled as their own scan paths instead of dirtying the whole root, and an incomplete plan is re-allocated every 15 minutes from observed rates without losing events.
+- inotify queue overflows reconcile everything once and then back off (30 s, doubling per consecutive overflow, capped at 30 min); overflows inside the window are coalesced into one deferred reconciliation. `scan_complete` details gained `event_overflows` and `event_watch_replans`; the `scanner_events:` log lines gained `frontier_dirs`, `overflows`, `backoff_secs` and `replans`.
+
 ### Added — daemon control socket
 
 - The daemon serves `control.sock` beside `state.json` (mode 0600, per-boot token in `daemon.lock`, JSON line in / JSON line out). `sbh daemon ping|scan-now|reload|shutdown` and `sbh policy status|promote|demote` talk to it; `sbh status --json` asks a running daemon to rewrite `state.json` first and reports `"source": "socket"`. Promotions persist `[policy] initial_mode` after a config backup. `[core] control_socket_enabled = false` turns the socket off.

@@ -107,6 +107,22 @@ Linux host. The capability report (`scanner_events:` at startup, `sbh scan --jso
 carries the probe reasons, and `capability_report_is_honest_about_the_platform`
 pins them.
 
+Watch budget allocation (bd-rc-master-ajg1.8.4, 2026-09-02): the planner enumerates
+directories breadth-first up to four times the budget, always watches every root and
+depth-1 directory, and spends the remainder in decreasing observed event rate (a
+per-directory EWMA, time constant 10 min, with a directory-mtime prior for never-watched
+subtrees). Unwatched directories directly below a watched one are the frontier: each is
+its own dirty scan path (a root with more than 256 of them is reconciled whole), and the
+rest of the time they rely on the maintenance pass. An incomplete plan is re-allocated
+every 15 min once events have been observed; the replacement inotify instance starts
+before the old one is dropped. `Q_OVERFLOW` reconciles everything once, then a backoff
+window (30 s, doubling per consecutive overflow, capped at 30 min) coalesces further
+overflows into a single deferred reconciliation. `allocation_respects_budget_and_mandatory_set`
+(proptest) pins the budget/mandatory/coverage invariants,
+`overflow_backoff_reconciles_first_then_coalesces_and_doubles` and
+`event_source_overflow_bumps_generation_then_backs_off` pin the backoff, and
+`linux_replan_moves_watches_to_the_hot_frontier` drives a live replan.
+
 ### 3.2 Pressure-gated effort
 - Drive everything off the existing cheap `statfs` pressure poll. Effort ladder:
   - **green:** event subscription only + one shallow top-level reconciliation every
