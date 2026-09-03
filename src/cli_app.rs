@@ -11015,12 +11015,11 @@ fn status_mount_json(capacity: &Capacity, level: &str, free_pct: f64) -> Value {
         object.insert("volume_role".into(), json!(capacity.volume_role));
         object.insert("shared_volumes".into(), json!(capacity.shared_volumes));
         object.insert("is_primary".into(), json!(capacity.is_primary));
-        object.insert("purgeable_bytes".into(), json!(capacity.purgeable_bytes));
-        object.insert("free_excludes_purgeable".into(), json!(true));
         object.insert(
-            "local_snapshot_bytes".into(),
-            json!(capacity.local_snapshot_bytes),
+            "estimated_reclaimable_by_snapshot_thinning".into(),
+            json!(capacity.estimated_reclaimable_by_snapshot_thinning),
         );
+        object.insert("free_excludes_purgeable".into(), json!(true));
         object.insert(
             "local_snapshot_reclaim_command".into(),
             json!(local_snapshot_reclaim_command(capacity)),
@@ -11053,8 +11052,7 @@ fn capacity_platform_json(capacity: &Capacity) -> Value {
                     "volume_role": capacity.volume_role.as_deref(),
                     "shared_volumes": &capacity.shared_volumes,
                     "is_primary": capacity.is_primary,
-                    "purgeable_bytes": capacity.purgeable_bytes,
-                    "local_snapshot_bytes": capacity.local_snapshot_bytes,
+                    "estimated_reclaimable_by_snapshot_thinning": &capacity.estimated_reclaimable_by_snapshot_thinning,
                     "free_excludes_purgeable": true,
                 }
             }
@@ -11147,6 +11145,17 @@ fn purgeable_storage_notice(capacity: &Capacity) -> Option<String> {
 }
 
 fn local_snapshot_warning(capacity: &Capacity) -> Option<String> {
+    if let Some(est) = &capacity.estimated_reclaimable_by_snapshot_thinning
+        && est.bytes > 0
+    {
+        return Some(format!(
+            "{} has approximately {} reclaimable by snapshot thinning (method: {}). Reclaim via: {}",
+            capacity.mount_point.display(),
+            format_bytes(est.bytes),
+            est.method,
+            local_snapshot_reclaim_command(capacity)?
+        ));
+    }
     let bytes = capacity.local_snapshot_bytes.filter(|bytes| *bytes > 0)?;
     Some(format!(
         "{} has approximately {} retained by local Time Machine snapshots. Reclaim via: {}",
@@ -11157,8 +11166,18 @@ fn local_snapshot_warning(capacity: &Capacity) -> Option<String> {
 }
 
 fn local_snapshot_reclaim_command(capacity: &Capacity) -> Option<String> {
-    capacity.local_snapshot_bytes.filter(|bytes| *bytes > 0)?;
-    Some(local_snapshot_thin_shell_command(&capacity.mount_point))
+    let has_bytes = capacity
+        .estimated_reclaimable_by_snapshot_thinning
+        .as_ref()
+        .map_or_else(
+            || capacity.local_snapshot_bytes.is_some_and(|bytes| bytes > 0),
+            |est| est.bytes > 0,
+        );
+    if has_bytes {
+        Some(local_snapshot_thin_shell_command(&capacity.mount_point))
+    } else {
+        None
+    }
 }
 
 fn local_snapshot_thin_shell_command(mount: &Path) -> String {
@@ -15865,7 +15884,7 @@ mod tests {
     use storage_ballast_helper::platform::pal::{FsStats, MockPlatform, MountPoint, PlatformPaths};
     use storage_ballast_helper::platform::types::{
         FullDiskAccessState, FullDiskAccessStatus, OpenFile, OpenFileKind, OpenFileMode,
-        ProcessInfo, ProcessIo,
+        ProcessInfo, ProcessIo, SnapshotThinningEstimate,
     };
     use tempfile::TempDir;
 
@@ -20283,6 +20302,7 @@ mod tests {
             is_primary: true,
             purgeable_bytes: None,
             local_snapshot_bytes: None,
+            estimated_reclaimable_by_snapshot_thinning: None,
         };
 
         assert!((capacity_free_pct(&capacity) - 25.0).abs() < f64::EPSILON);
@@ -20307,6 +20327,7 @@ mod tests {
             is_primary: true,
             purgeable_bytes: Some(500),
             local_snapshot_bytes: None,
+            estimated_reclaimable_by_snapshot_thinning: None,
         };
 
         assert!((capacity_free_pct(&capacity) - 10.0).abs() < f64::EPSILON);
@@ -20329,8 +20350,12 @@ mod tests {
             volume_role: Some("Data".to_string()),
             shared_volumes: vec!["Macintosh HD".to_string(), "VM".to_string()],
             is_primary: true,
-            purgeable_bytes: Some(32),
-            local_snapshot_bytes: Some(64),
+            purgeable_bytes: None,
+            local_snapshot_bytes: None,
+            estimated_reclaimable_by_snapshot_thinning: Some(SnapshotThinningEstimate::new(
+                64,
+                "foundation",
+            )),
         };
 
         let payload = status_mount_json(&capacity, "yellow", 25.0);
@@ -20346,9 +20371,14 @@ mod tests {
         assert_eq!(payload["volume_role"], "Data");
         assert_eq!(payload["shared_volumes"], json!(["Macintosh HD", "VM"]));
         assert_eq!(payload["is_primary"], true);
-        assert_eq!(payload["purgeable_bytes"], 32);
+        assert_eq!(
+            payload["estimated_reclaimable_by_snapshot_thinning"],
+            json!({
+                "bytes": 64,
+                "method": "foundation"
+            })
+        );
         assert_eq!(payload["free_excludes_purgeable"], true);
-        assert_eq!(payload["local_snapshot_bytes"], 64);
         assert_eq!(
             payload["local_snapshot_reclaim_command"],
             "sudo tmutil thinlocalsnapshots /System/Volumes/Data 9999999999999999 4"
@@ -20363,8 +20393,13 @@ mod tests {
         assert_eq!(apfs["volume_role"], "Data");
         assert_eq!(apfs["shared_volumes"], json!(["Macintosh HD", "VM"]));
         assert_eq!(apfs["is_primary"], true);
-        assert_eq!(apfs["purgeable_bytes"], 32);
-        assert_eq!(apfs["local_snapshot_bytes"], 64);
+        assert_eq!(
+            apfs["estimated_reclaimable_by_snapshot_thinning"],
+            json!({
+                "bytes": 64,
+                "method": "foundation"
+            })
+        );
         assert_eq!(apfs["free_excludes_purgeable"], true);
         assert!(payload["platform"].get("linux").is_none());
     }
@@ -20388,6 +20423,7 @@ mod tests {
             is_primary: false,
             purgeable_bytes: None,
             local_snapshot_bytes: None,
+            estimated_reclaimable_by_snapshot_thinning: None,
         };
 
         let payload = status_mount_json(&capacity, "green", 25.0);
@@ -20400,9 +20436,8 @@ mod tests {
             "volume_role",
             "shared_volumes",
             "is_primary",
-            "purgeable_bytes",
+            "estimated_reclaimable_by_snapshot_thinning",
             "free_excludes_purgeable",
-            "local_snapshot_bytes",
             "local_snapshot_reclaim_command",
         ] {
             assert!(
@@ -20523,6 +20558,7 @@ mod tests {
             is_primary: true,
             purgeable_bytes: Some(64),
             local_snapshot_bytes: None,
+            estimated_reclaimable_by_snapshot_thinning: None,
         };
 
         let notice = purgeable_storage_notice(&capacity).expect("notice should be present");
@@ -20549,12 +20585,78 @@ mod tests {
             is_primary: true,
             purgeable_bytes: None,
             local_snapshot_bytes: Some(64),
+            estimated_reclaimable_by_snapshot_thinning: None,
         };
 
         let warning = local_snapshot_warning(&capacity).expect("warning should be present");
 
         assert!(warning.contains("64 B retained by local Time Machine snapshots"));
         assert!(warning.contains("sudo tmutil thinlocalsnapshots / 9999999999999999 4"));
+    }
+
+    #[test]
+    fn local_snapshot_warning_with_snapshot_thinning_estimate() {
+        let capacity = Capacity {
+            mount_point: PathBuf::from("/System/Volumes/Data"),
+            fs_type: "apfs".to_string(),
+            total_bytes: 1_000,
+            free_bytes: 250,
+            available_bytes: 250,
+            is_readonly: false,
+            container_id: Some("/dev/disk3".to_string()),
+            container_total_bytes: Some(1_000),
+            container_available_bytes: Some(250),
+            volume_total_bytes: Some(400),
+            volume_available_bytes: Some(100),
+            volume_role: Some("Data".to_string()),
+            shared_volumes: Vec::new(),
+            is_primary: true,
+            purgeable_bytes: None,
+            local_snapshot_bytes: None,
+            estimated_reclaimable_by_snapshot_thinning: Some(SnapshotThinningEstimate::new(
+                64,
+                "foundation",
+            )),
+        };
+
+        let warning = local_snapshot_warning(&capacity).expect("warning should be present");
+        assert!(warning.contains("64 B reclaimable by snapshot thinning (method: foundation)"));
+        assert!(
+            warning
+                .contains("sudo tmutil thinlocalsnapshots /System/Volumes/Data 9999999999999999 4")
+        );
+    }
+
+    #[test]
+    fn status_mount_json_matches_snapshot() {
+        let capacity = Capacity {
+            mount_point: PathBuf::from("/System/Volumes/Data"),
+            fs_type: "apfs".to_string(),
+            total_bytes: 1_000,
+            free_bytes: 250,
+            available_bytes: 250,
+            is_readonly: false,
+            container_id: Some("/dev/disk3".to_string()),
+            container_total_bytes: Some(1_000),
+            container_available_bytes: Some(250),
+            volume_total_bytes: Some(400),
+            volume_available_bytes: Some(100),
+            volume_role: Some("Data".to_string()),
+            shared_volumes: vec!["Macintosh HD".to_string(), "VM".to_string()],
+            is_primary: true,
+            purgeable_bytes: None,
+            local_snapshot_bytes: None,
+            estimated_reclaimable_by_snapshot_thinning: Some(SnapshotThinningEstimate::new(
+                64,
+                "foundation",
+            )),
+        };
+        let payload = status_mount_json(&capacity, "yellow", 25.0);
+        let rendered = serde_json::to_string_pretty(&payload).expect("snapshot JSON renders");
+
+        cli_app_snapshot_settings(|| {
+            insta::assert_snapshot!("status_mount_json_apfs", rendered);
+        });
     }
 
     #[test]

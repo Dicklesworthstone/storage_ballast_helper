@@ -146,10 +146,9 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         EnvArea::Service,
         "Leased target `sbh lease run` hands the leased command (default for `lease status`/`renew`)",
     ),
-    var(
+    cfg(
         "SBH_MACOS_QUERY_FOUNDATION_PURGEABLE",
-        EnvArea::Service,
-        "Ask Foundation for purgeable space on macOS (opt-in, slower)",
+        "`platform.macos.query_foundation_purgeable`",
     ),
     cfg("SBH_BEHAVIOR_PRESET", "`pressure.behavior_preset`"),
     cfg("SBH_POLICY_KILL_SWITCH", "`policy.kill_switch`"),

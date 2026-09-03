@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::core::config::ScoringConfig;
-use crate::platform::cleanup_catalog::{CleanupRule, ReclaimCommand};
+use crate::platform::cleanup_catalog::{CleanupConfidence, CleanupRule, ReclaimCommand};
 use crate::platform::{linux, macos};
 use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, StructuralSignals, is_cargo_registry_internal_path,
@@ -1230,8 +1230,10 @@ fn manual_review_override(
     action: DecisionAction,
 ) -> DecisionAction {
     if action == DecisionAction::Delete
-        && cleanup_rule_for_classification(classification)
-            .is_some_and(|rule| rule.reclaim_command == ReclaimCommand::PromptBeforeRemove)
+        && cleanup_rule_for_classification(classification).is_some_and(|rule| {
+            rule.reclaim_command == ReclaimCommand::PromptBeforeRemove
+                && rule.confidence != CleanupConfidence::Definite
+        })
     {
         DecisionAction::Review
     } else {

@@ -61,7 +61,7 @@ The generated plist sets:
 - `RunAtLoad=true`, so the daemon starts on login or boot.
 - `KeepAlive` with `SuccessfulExit=false`, so crashes restart but clean exits
   stay stopped.
-- `ThrottleInterval=10`, to avoid rapid restart loops.
+- `ThrottleInterval=60`, to avoid rapid restart loops.
 - `Nice=19` and `LowPriorityIO=true`, so cleanup work yields to foreground
   user work and builds.
 
@@ -103,8 +103,10 @@ block became family-keyed:
         "container_total_bytes": 1000,
         "container_available_bytes": 250,
         "volume_role": "Data",
-        "purgeable_bytes": 32,
-        "local_snapshot_bytes": 64,
+        "estimated_reclaimable_by_snapshot_thinning": {
+          "bytes": 64,
+          "method": "foundation"
+        },
         "free_excludes_purgeable": true
       }
     }
@@ -114,24 +116,26 @@ block became family-keyed:
 
 A Linux mount carries `{"platform": {"linux": {"fs_type": "ext4",
 "is_readonly": false}}}` instead, and the APFS-only mount keys
-(`container_id`, `purgeable_bytes`, `free_excludes_purgeable`, the local
-snapshot fields) are absent rather than null. Any other family gets an
+(`container_id`, `estimated_reclaimable_by_snapshot_thinning`, `free_excludes_purgeable`,
+`local_snapshot_reclaim_command`) are absent rather than null. Any other family gets an
 empty `platform` object. Consumers should key on the family they know.
 
 The important invariant is `free_excludes_purgeable: true`. `sbh` reports
-purgeable storage, but it does not count purgeable bytes as free space when
-making pressure decisions. Purgeable storage is controlled by macOS and may not
-be immediately reclaimable when a build or daemon needs space right now.
+purgeable storage and snapshot estimates separately, but it does not count those bytes
+as free space when making pressure decisions. Purgeable storage is controlled by macOS
+and may not be immediately reclaimable when a build or daemon needs space right now.
 
-## Purgeable Space
+## Purgeable Space And Snapshot Thinning
 
 Finder and System Settings may show "available" space that includes purgeable
-content. `sbh` separates that from real free space because cleanup decisions
-must be conservative.
+content or space held by local snapshots. Instead of reporting separate and potentially
+duplicative purgeable and snapshot bytes, `sbh` reports a unified
+`estimated_reclaimable_by_snapshot_thinning` field with the estimation `method`
+(`foundation` or `apfs_unattributed`).
 
-When purgeable APFS storage is present, `sbh status` prints a separate
-Purgeable Storage section and JSON includes `purgeable_bytes`. Treat it as
-diagnostic context, not as guaranteed emergency headroom.
+Foundation purgeable querying is default-on via `[platform.macos] query_foundation_purgeable = true`
+(overridable with the `SBH_MACOS_QUERY_FOUNDATION_PURGEABLE` environment variable).
+Treat this estimate as diagnostic context, not as guaranteed emergency headroom.
 
 ## Local Time Machine Snapshots
 
@@ -712,6 +716,8 @@ the exhaustive operator trust document is `docs/cleanup-rules-macos.md`.
 - Time Machine snapshot thinning uses `tmutil`; it is not path deletion.
 - `~/.Trash` and iCloud Drive trash are report-only. `sbh` does not auto-empty
   user trash.
+- `~/Library/Caches/<app>` cleanup targets individual application cache directories
+  older than 7 days, defaulting to Review unless confirmed Definite.
 
 Every cleanup candidate still passes hard vetoes: sacred-overlap checks,
 `.sbh-protect` markers, parent checks, active-reference evidence where visible,
@@ -720,6 +726,19 @@ minimum age, and source-root checks.
 User-scope macOS runs can have incomplete visibility into other users'
 processes. When active-reference checks are incomplete, `sbh` surfaces that
 reason in scan output instead of silently pretending visibility is complete.
+
+## Platform Abstraction Layer (PAL) Architecture
+
+`sbh` abstracts all platform-dependent filesystem, process, and service calls behind
+the `Platform` trait in `src/platform/pal.rs`:
+
+- `MacOsPal`: The production macOS implementation (`src/platform/macos/pal.rs`) using
+  `statfs`, APFS container accounting (`diskutil apfs list -plist`), Foundation
+  `important_usage_available_bytes`, `tmutil`, `libproc` (`crates/sbh_mach`), and launchd.
+- `LinuxPal`: The production Linux implementation (`src/platform/linux/mod.rs`) using
+  `statvfs`, `/proc/mounts`, `/proc/<pid>/fd`, and systemd.
+- `MockPlatform`: The in-memory test implementation (`src/platform/pal.rs`) providing
+  fully deterministic filesystem, capacity, and process listings for CI and unit tests.
 
 ## Security Model
 

@@ -28,7 +28,7 @@ use crate::platform::types::{
     MappedRegion, MemoryPressure, MemoryPressureCallback, MemoryPressureLevel, MountInfo,
     OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, OpenFile, OpenFileKind, OpenFileMode,
     OpenFilesResult, PalError, ProcessInfo, ProcessIo, SacredPath, SelfStats, ServiceKind,
-    SubscriptionHandle,
+    SnapshotThinningEstimate, SubscriptionHandle,
 };
 use parking_lot::RwLock;
 
@@ -109,12 +109,14 @@ impl Platform for MacOsPal {
         let inventory = sys::apfs_inventory().ok();
         let local_snapshot_bytes = local_snapshot_bytes_for_capacity(&stats, inventory.as_ref());
         let mut capacity = statfs_to_capacity(stats, inventory.as_ref());
-        capacity.purgeable_bytes = purgeable_bytes_for_volume(
+        let thinning_estimate = estimate_reclaimable_by_snapshot_thinning(
             &capacity.mount_point,
             capacity.available_bytes,
             inventory.as_ref(),
             capacity.container_id.as_deref(),
         );
+        capacity.purgeable_bytes = thinning_estimate.as_ref().map(|est| est.bytes);
+        capacity.estimated_reclaimable_by_snapshot_thinning = thinning_estimate;
         capacity.local_snapshot_bytes = local_snapshot_bytes;
         Ok(capacity)
     }
@@ -778,6 +780,7 @@ fn statfs_to_capacity(stats: StatfsSnapshot, inventory: Option<&ApfsInventory>) 
         is_primary,
         purgeable_bytes: None,
         local_snapshot_bytes: None,
+        estimated_reclaimable_by_snapshot_thinning: None,
     }
 }
 
@@ -828,12 +831,13 @@ fn statfs_to_mount_info(
     let effective_available_bytes = volume
         .and_then(|volume| volume.container_available_bytes)
         .unwrap_or(available_bytes);
-    let purgeable_bytes = purgeable_bytes_for_volume(
+    let thinning_estimate = estimate_reclaimable_by_snapshot_thinning(
         &stats.mount_point,
         effective_available_bytes,
         inventory,
         volume.map(|volume| volume.container_id.as_str()),
     );
+    let purgeable_bytes = thinning_estimate.as_ref().map(|est| est.bytes);
     let mount_point = stats.mount_point;
     MountInfo {
         device: stats.device,
@@ -846,6 +850,7 @@ fn statfs_to_mount_info(
         available_bytes: Some(effective_available_bytes),
         purgeable_bytes,
         local_snapshot_bytes,
+        estimated_reclaimable_by_snapshot_thinning: thinning_estimate,
         is_readonly: stats.is_readonly,
         is_ram_backed,
         is_apfs_data_volume,
@@ -854,26 +859,49 @@ fn statfs_to_mount_info(
     }
 }
 
+fn estimate_reclaimable_by_snapshot_thinning(
+    mount_point: &Path,
+    counted_available_bytes: u64,
+    inventory: Option<&ApfsInventory>,
+    container_id: Option<&str>,
+) -> Option<SnapshotThinningEstimate> {
+    let query_foundation = std::env::var("SBH_MACOS_QUERY_FOUNDATION_PURGEABLE")
+        .ok()
+        .map_or(true, |val| {
+            !matches!(
+                val.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        });
+
+    if query_foundation {
+        if let Ok(Some(important_available)) = sys::important_usage_available_bytes(mount_point) {
+            if let Some(bytes) = purgeable_bytes_from_important_available(
+                important_available,
+                counted_available_bytes,
+            ) {
+                return Some(SnapshotThinningEstimate::new(bytes, "foundation"));
+            }
+        }
+    }
+
+    purgeable_bytes_from_apfs_inventory(inventory, container_id)
+        .map(|bytes| SnapshotThinningEstimate::new(bytes, "apfs_unattributed"))
+}
+
 fn purgeable_bytes_for_volume(
     mount_point: &Path,
     counted_available_bytes: u64,
     inventory: Option<&ApfsInventory>,
     container_id: Option<&str>,
 ) -> Option<u64> {
-    let foundation_estimate =
-        std::env::var_os("SBH_MACOS_QUERY_FOUNDATION_PURGEABLE").and_then(|_| {
-            sys::important_usage_available_bytes(mount_point)
-                .ok()
-                .flatten()
-                .and_then(|important_available| {
-                    purgeable_bytes_from_important_available(
-                        important_available,
-                        counted_available_bytes,
-                    )
-                })
-        });
-
-    foundation_estimate.or_else(|| purgeable_bytes_from_apfs_inventory(inventory, container_id))
+    estimate_reclaimable_by_snapshot_thinning(
+        mount_point,
+        counted_available_bytes,
+        inventory,
+        container_id,
+    )
+    .map(|est| est.bytes)
 }
 
 fn purgeable_bytes_from_important_available(
@@ -1537,6 +1565,7 @@ mod tests {
             is_primary: true,
             purgeable_bytes: Some(50),
             local_snapshot_bytes: Some(64),
+            estimated_reclaimable_by_snapshot_thinning: None,
         };
 
         let stats = super::capacity_to_fs_stats(capacity);

@@ -1,0 +1,50 @@
+---
+source: src/cli_app.rs
+---
+{
+  "container_available": 250,
+  "container_id": "/dev/disk3",
+  "container_total": 1000,
+  "estimated_reclaimable_by_snapshot_thinning": {
+    "bytes": 64,
+    "method": "foundation"
+  },
+  "free": 250,
+  "free_excludes_purgeable": true,
+  "free_pct": 25.0,
+  "fs_type": "apfs",
+  "is_primary": true,
+  "level": "YELLOW",
+  "local_snapshot_reclaim_command": "sudo tmutil thinlocalsnapshots /System/Volumes/Data 9999999999999999 4",
+  "path": "/System/Volumes/Data",
+  "platform": {
+    "darwin": {
+      "apfs": {
+        "container_available_bytes": 250,
+        "container_id": "/dev/disk3",
+        "container_total_bytes": 1000,
+        "estimated_reclaimable_by_snapshot_thinning": {
+          "bytes": 64,
+          "method": "foundation"
+        },
+        "free_excludes_purgeable": true,
+        "is_primary": true,
+        "shared_volumes": [
+          "Macintosh HD",
+          "VM"
+        ],
+        "volume_available_bytes": 100,
+        "volume_role": "Data",
+        "volume_total_bytes": 400
+      }
+    }
+  },
+  "shared_volumes": [
+    "Macintosh HD",
+    "VM"
+  ],
+  "total": 1000,
+  "volume_available": 100,
+  "volume_role": "Data",
+  "volume_total": 400
+}

@@ -2072,7 +2072,7 @@ src/
     terminal_guard.rs       Raw mode cleanup and signal-safe terminal restore
 
   platform/
-    pal.rs                  Platform abstraction (Linux: procfs/statvfs; macOS: statfs/APFS/libproc)
+    pal.rs                  Platform trait and implementations: LinuxPal (procfs/statvfs), MacOsPal (statfs/APFS/libproc), MockPlatform
 ```
 
 ### Exit Codes

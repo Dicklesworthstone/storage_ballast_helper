@@ -263,6 +263,15 @@ pub const MESSAGES_LIBRARY_SACRED: CleanupRule =
 pub const FINAL_CUT_LIBRARY_SACRED: CleanupRule =
     sacred_rule("final-cut-library-sacred", "~/Movies/*.fcpbundle");
 
+pub const USER_LIBRARY_CACHES_APP: CleanupRule = cleanup_rule(
+    "user-library-caches-app",
+    "~/Library/Caches/*",
+    AgeThreshold::from_days(7),
+    CheckRequirement::Required,
+    ReclaimCommand::PromptBeforeRemove,
+    CleanupConfidence::Unclear,
+);
+
 pub const MAC_CLEANUP_RULES: &[CleanupRule] = &[
     XCODE_DERIVED_DATA,
     CORE_SIMULATOR_CACHES,
@@ -286,6 +295,7 @@ pub const MAC_CLEANUP_RULES: &[CleanupRule] = &[
     USER_NAMED_TRASH,
     RELEASE_WORK_BUILDROOT,
     USER_LOGS,
+    USER_LIBRARY_CACHES_APP,
     IPSW_SOFTWARE_UPDATES,
     HOME_TRASH_REPORT,
     ICLOUD_TRASH_REPORT,
@@ -364,9 +374,9 @@ mod tests {
         MAIL_LIBRARY_SACRED, MESSAGES_LIBRARY_SACRED, PHOTOS_LIBRARY_SACRED,
         RELEASE_WORK_BUILDROOT, ReclaimCommand, SPOTLIGHT_INDEX_REPORT,
         TIME_MACHINE_LOCAL_SNAPSHOTS, TMP_DASH_TARGET, TMP_TARGET_UNDERSCORE_PREFIX,
-        TMP_UNDERSCORE_TARGET, USER_LOGS, USER_NAMED_TRASH, USER_NAMED_TRASH_EXACT,
-        USER_NAMED_TRASHED_EXACT, XCODE_DERIVED_DATA, cleanup_rules, find_rule,
-        match_path_scanner_rule, match_rule,
+        TMP_UNDERSCORE_TARGET, USER_LIBRARY_CACHES_APP, USER_LOGS, USER_NAMED_TRASH,
+        USER_NAMED_TRASH_EXACT, USER_NAMED_TRASHED_EXACT, XCODE_DERIVED_DATA, cleanup_rules,
+        find_rule, match_path_scanner_rule, match_rule,
     };
 
     #[test]
@@ -688,5 +698,22 @@ mod tests {
         assert_eq!(rule.reclaim_command, reclaim_command);
         assert_eq!(rule.age_threshold, age_threshold);
         assert_eq!(rule.sacred_overlaps_check, CheckRequirement::Required);
+    }
+
+    #[test]
+    fn user_library_caches_app_rule_matches_app_cache_directory() {
+        assert_rule(
+            USER_LIBRARY_CACHES_APP,
+            "user-library-caches-app",
+            "~/Library/Caches/*",
+            CleanupConfidence::Unclear,
+            ReclaimCommand::PromptBeforeRemove,
+            AgeThreshold::from_days(7),
+        );
+        let app_cache = Path::new("/Users/developer/Library/Caches/com.apple.dt.Xcode");
+        let matched = match_rule(app_cache).expect("must match user-library-caches-app");
+        assert_eq!(matched.name, "user-library-caches-app");
+        assert_eq!(matched.confidence, CleanupConfidence::Unclear);
+        assert_eq!(matched.reclaim_command, ReclaimCommand::PromptBeforeRemove);
     }
 }

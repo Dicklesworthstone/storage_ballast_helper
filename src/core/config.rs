@@ -82,6 +82,7 @@ pub struct Config {
     pub behavior: BehaviorConfig,
     pub special_locations: SpecialLocationsConfig,
     pub system_tuning: SystemTuningConfig,
+    pub platform: PlatformConfig,
     /// Keys the loaded file contained that no section declares. Not part
     /// of the file format (never serialized; excluded from `stable_hash`).
     #[serde(skip)]
@@ -833,6 +834,29 @@ impl Default for SystemTuningConfig {
             writeback_benchmark_bytes: 96 * 1024 * 1024,
             writeback_pool_warn_bytes: 4 * 1024 * 1024 * 1024,
             writeback_sysctl_path: PathBuf::from("/etc/sysctl.d/99-sbh-writeback.conf"),
+        }
+    }
+}
+
+/// Platform-specific configuration options (`[platform]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PlatformConfig {
+    pub macos: PlatformMacOsConfig,
+}
+
+/// macOS platform configuration (`[platform.macos]`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PlatformMacOsConfig {
+    /// Query Foundation for purgeable space on macOS (default: true).
+    pub query_foundation_purgeable: bool,
+}
+
+impl Default for PlatformMacOsConfig {
+    fn default() -> Self {
+        Self {
+            query_foundation_purgeable: true,
         }
     }
 }
@@ -1954,6 +1978,12 @@ impl Config {
         set_env_u64(
             "SBH_SYSTEM_TUNING_WRITEBACK_POOL_WARN_BYTES",
             &mut self.system_tuning.writeback_pool_warn_bytes,
+        )?;
+
+        // platform
+        set_env_bool(
+            "SBH_MACOS_QUERY_FOUNDATION_PURGEABLE",
+            &mut self.platform.macos.query_foundation_purgeable,
         )?;
 
         Ok(())

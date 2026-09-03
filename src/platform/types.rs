@@ -131,6 +131,23 @@ pub struct Capacity {
     pub is_primary: bool,
     pub purgeable_bytes: Option<u64>,
     pub local_snapshot_bytes: Option<u64>,
+    pub estimated_reclaimable_by_snapshot_thinning: Option<SnapshotThinningEstimate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotThinningEstimate {
+    pub bytes: u64,
+    pub method: String,
+}
+
+impl SnapshotThinningEstimate {
+    #[must_use]
+    pub fn new(bytes: u64, method: impl Into<String>) -> Self {
+        Self {
+            bytes,
+            method: method.into(),
+        }
+    }
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -144,6 +161,7 @@ pub struct MountInfo {
     pub available_bytes: Option<u64>,
     pub purgeable_bytes: Option<u64>,
     pub local_snapshot_bytes: Option<u64>,
+    pub estimated_reclaimable_by_snapshot_thinning: Option<SnapshotThinningEstimate>,
     pub is_readonly: bool,
     pub is_ram_backed: bool,
     pub is_apfs_data_volume: bool,

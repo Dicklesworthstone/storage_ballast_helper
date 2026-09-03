@@ -270,7 +270,7 @@ pub const CATALOG_ROOTS: &[CatalogRoot] = &[
     catalog_root(
         "catalog-user-library-cache-entry",
         "$HOME/Library/Caches/*",
-        AgeThreshold::from_days(14),
+        AgeThreshold::from_days(7),
         CleanupConfidence::Unclear,
     ),
     catalog_root(

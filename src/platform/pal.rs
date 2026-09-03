@@ -105,6 +105,7 @@ impl From<FsStats> for Capacity {
             is_primary: false,
             purgeable_bytes: None,
             local_snapshot_bytes: None,
+            estimated_reclaimable_by_snapshot_thinning: None,
         }
     }
 }
@@ -120,6 +121,7 @@ impl From<MountPoint> for MountInfo {
             available_bytes: None,
             purgeable_bytes: None,
             local_snapshot_bytes: None,
+            estimated_reclaimable_by_snapshot_thinning: None,
             is_readonly: false,
             is_ram_backed: value.is_ram_backed,
             is_apfs_data_volume: false,
