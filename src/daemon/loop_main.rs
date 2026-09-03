@@ -7002,6 +7002,9 @@ fn scanner_thread_main(
         // cooldown. Measured before this: 574 zero-duration replay passes in
         // five minutes, each re-dispatching the same two `unclear` records.
         let pass_min_certainty = executor_config.min_certainty();
+        // Counted once per path: the index replay, the priority pre-scan and
+        // the walk can each hold the same directory in one pass.
+        let mut held_paths: BTreeSet<PathBuf> = BTreeSet::new();
         let mut held_by_certainty: usize = 0;
 
         if scanner_index_enabled
@@ -7062,7 +7065,9 @@ fn scanner_thread_main(
                             // back is not re-dispatched; it stays in the index
                             // (no cooldown) for a cell that accepts it.
                             if score.decision.certainty < pass_min_certainty {
-                                held_by_certainty += 1;
+                                if held_paths.insert(record.path.clone()) {
+                                    held_by_certainty += 1;
+                                }
                                 eprintln!(
                                     "[SBH-SCANNER] index replay path={} generation={} verdict=held certainty={} below {pass_min_certainty}",
                                     record.path.display(),
@@ -7367,8 +7372,19 @@ fn scanner_thread_main(
                             ) {
                                 continue;
                             }
-                            let candidate_class = pattern_registry
-                                .classify(&candidate_path, StructuralSignals::default());
+                            // One read_dir of the candidate gives the pre-scan
+                            // the walk's structural evidence (CACHEDIR.TAG,
+                            // deps/, incremental/), so its certainty is the
+                            // walk's: a definite target is dispatched here
+                            // instead of being held as `unclear` (which, at
+                            // Orange and above, held everything the pre-scan
+                            // nominated and left the dispatch to the walk).
+                            let candidate_signals =
+                                crate::scanner::walker::structural_signals_for_path(
+                                    &candidate_path,
+                                );
+                            let candidate_class =
+                                pattern_registry.classify(&candidate_path, candidate_signals);
                             if candidate_class.category
                                 == crate::scanner::patterns::ArtifactCategory::Unknown
                             {
@@ -7399,7 +7415,7 @@ fn scanner_thread_main(
                                     &candidate_class,
                                 ),
                                 classification: candidate_class,
-                                signals: StructuralSignals::default(),
+                                signals: candidate_signals,
                                 active_references: ActiveReferenceSummary::default(),
                                 is_open: false,
                                 excluded: false,
@@ -7511,7 +7527,9 @@ fn scanner_thread_main(
                                 }
                                 if score.decision.certainty < pass_min_certainty {
                                     // bd-8aeq: same gate as the walk below.
-                                    held_by_certainty += 1;
+                                    if held_paths.insert(candidate_path.clone()) {
+                                        held_by_certainty += 1;
+                                    }
                                 } else if !scanner_index_backoff_active {
                                     priority_candidates.push(score);
                                 }
@@ -8052,7 +8070,9 @@ fn scanner_thread_main(
                 // can replay it) but neither dispatched nor counted toward
                 // the byte target, so the walk keeps looking for a root the
                 // current cell would actually delete.
-                held_by_certainty += 1;
+                if held_paths.insert(entry.path.clone()) {
+                    held_by_certainty += 1;
+                }
             } else if deletable {
                 candidates_found += 1;
                 v2_candidate_bytes_seen = v2_candidate_bytes_seen.saturating_add(score.size_bytes);
@@ -9713,9 +9733,10 @@ mod tests {
             "one unproductive pass, then the cooldown swallows the second request"
         );
         assert!(
-            held.log.contains("scanner certainty gate held ")
-                && held.log.contains(" below likely (pressure=Orange)"),
-            "the held count is logged: {}",
+            held.log.contains(
+                "scanner certainty gate held 1 candidate(s) below likely (pressure=Orange)"
+            ),
+            "the held count is logged once per path (the pre-scan and the walk both see it): {}",
             held.log
         );
 
@@ -9731,9 +9752,10 @@ mod tests {
         assert!(!replayed.dispatched);
         assert_eq!(replayed.reports, vec![0]);
         assert!(
-            replayed.log.contains("scanner certainty gate held ")
-                && replayed.log.contains(" below likely (pressure=Orange)"),
-            "{}",
+            replayed.log.contains(
+                "scanner certainty gate held 1 candidate(s) below likely (pressure=Orange)"
+            ),
+            "the replayed record, the pre-scan and the walk hold one path: {}",
             replayed.log
         );
 
