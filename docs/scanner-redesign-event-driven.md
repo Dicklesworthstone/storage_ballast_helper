@@ -330,11 +330,18 @@ re-run).
   signals; the scanner applies the certainty gate itself; a dispatch that
   reclaims nothing is paced as an empty pass). The same capture on 8d5f1ea:
   4 passes and 8.6 CPU-s in 300 s, backoff at 20/40/80 s.
+- Forced full pass, engine to engine (`sbh daemon scan-now` at injected
+  Green, 8b0d4b9): v1 8.6 s / 18.9 CPU-s over 231,162 paths; v2 14.2 s /
+  19.1 CPU-s over 150,062 paths with 220 opaque roots pruned and
+  re-measured. Parity, not 50x: what v2 saves by not descending it spends
+  on the opaque size probes. Over a 300 s Green window each engine ran one
+  startup maintenance pass and nothing else (v1 13.9 CPU-s, v2 18.7).
 - Verdict: the retry-backoff criterion now holds on the real tree; the
-  >= 50x CPU-seconds-per-pass criterion is still **not demonstrated**
-  because the daemon's one walk stopped on the pressure byte target after
-  44 entries. bd-xtpv.8 stays open until a forced full pass is compared
-  engine to engine and a Green steady state is measured.
+  >= 50x CPU-seconds-per-pass criterion is **not met** on a forced full
+  pass, and the Green "< 1% of one core" criterion is not isolated from the
+  startup pass yet. bd-xtpv.8 stays open; the operator decides whether the
+  per-pass criterion still stands (the pressure-scoped early stop, not the
+  per-pass cost, is what makes v2 cheap in practice) or is waived.
 
 Live A/B capture procedure:
 

@@ -158,8 +158,8 @@ pass has still not been compared engine to engine.
 
 | Criterion | Result |
 |---|---|
-| Steady state < 1% of one core (Green, no FS activity) | Not measured (both runs were at Orange by construction). |
-| No full descent; >= 50x CPU-s per pass vs v1 on a large tree | **Not demonstrated.** A full v2 walk of the same tree costs 3.4x v1 (section 1). The daemon's v2 pass was 2.6 s against v1's 25 s only because it walked 44 entries instead of 231,053 (early stop), which is different work, not a cheaper pass. |
+| Steady state < 1% of one core (Green, no FS activity) | Partly measured (section 5): over a 300 s Green window each engine ran one startup maintenance pass and nothing else; v1 spent 13.9 CPU-s in the window, v2 18.7. The pass dominates; the ticks between passes were not isolated. |
+| No full descent; >= 50x CPU-s per pass vs v1 on a large tree | **Not demonstrated.** A one-shot v2 walk of the same tree costs 3.4x v1 (section 1), and a forced full daemon pass costs the same on both engines (section 5: v1 18.9 CPU-s over 231,162 paths, v2 19.1 CPU-s over 150,062 paths with 220 opaque roots pruned and re-measured). The Orange v2 pass was 2.6 s against v1's 25 s only because it walked 44 entries (early stop), which is different work, not a cheaper pass. |
 | Zero `canonicalize` per entry | Not measured here (covered by unit counters). |
 | Active-reference check O(open refs + indexed candidates) | Not measured here. |
 | Deletion-failure retry bounded by backoff | **Violated before bd-8aeq:** the same two held-back candidates were re-dispatched 575 times in five minutes. After 8d5f1ea the same capture shows 4 passes in five minutes with the empty-pass backoff (20, 40, 80 s) doing the pacing. |
@@ -171,6 +171,34 @@ re-run above shows the daemon pacing itself; what is still missing for the
 promotion criteria is a CPU-per-pass comparison on a forced full pass
 (`force_full_scan`, or `SIGUSR1`) so both engines walk the whole tree, and
 a Green steady-state measurement.
+
+## 5. Green idle and a forced full pass (2026-09-02 evening, 8b0d4b9)
+
+Same host and binary lineage (release build of 8b0d4b9, which carries the
+bd-8aeq fixes and the control socket), same root, both mounts injected
+Green (40% free), dry-run, `maintenance_interval_secs = 3600`. Each
+daemon ran 300 s idle, then `sbh daemon scan-now` (the SIGUSR1 path) and
+the run ended when the forced `scan_complete` appeared. CPU is
+`utime + stime` from `/proc/<pid>/stat`.
+
+| Engine | Startup maintenance pass | CPU-s over the 300 s Green window | Forced full pass | Forced pass CPU-s |
+|---|---|---:|---|---:|
+| v1 | 8.9 s, 231,162 paths, 214 candidates | 13.9 | 8.6 s, 231,162 paths, 215 candidates | 18.9 |
+| v2 | 15.1 s, 150,062 paths, 101 candidates | 18.7 | 14.2 s, 150,062 paths, 38 candidates, 220 opaque roots pruned, 2,623 index records | 19.1 |
+
+- A forced full pass costs the same CPU on both engines. v2 visits 35%
+  fewer paths (it prunes 220 opaque roots) and spends the saving on
+  measuring those roots with the size probe; it also takes longer in wall
+  time because the probes are serial.
+- The Green window's CPU is the one startup maintenance pass on each side
+  plus the two-second ticks; the ticks were not isolated, so the "< 1% of
+  one core at Green" criterion is neither confirmed nor refuted by this
+  capture. Steady state after the startup pass produced no further
+  `scan_complete` events in either run.
+- The first attempt at this capture failed because the scratch data
+  directory's path exceeded the Unix socket address limit; 8b0d4b9 records
+  the bound socket path in `daemon.lock` and falls back to a short temp
+  path, which is why the capture reports that commit.
 
 ## 4. Follow-ups noticed
 
