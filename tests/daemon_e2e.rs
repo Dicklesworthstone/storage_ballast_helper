@@ -1881,11 +1881,19 @@ fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
     // The next decision on the recreated target carries the tightened
     // calibration: one regret in one decision puts the bound at 1, so the
     // category's factor is 0 and the target is kept, not deleted.
+    // The rebuilt target is younger than the one-minute age floor; age it
+    // the way the fixtures are aged and let the floor pass before forcing
+    // the scan that re-decides it.
+    set_mtime_recursive(
+        &stale_path,
+        filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_hours(5)),
+    );
+    std::thread::sleep(Duration::from_secs(65));
     let before = run.events_of("decision").len();
     run.signal("-USR1");
     run.wait_until(
         "a decision on the recreated target after the regret",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         |run| {
             fixtures.touch_fresh();
             run.events_of("decision")
