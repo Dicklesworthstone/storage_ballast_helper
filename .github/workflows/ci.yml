@@ -537,6 +537,12 @@ jobs:
         run: |
           cargo test $CI_FEATURES --lib -- --nocapture 2>&1 | tee macos-unit-lib-output.txt
           cargo test $CI_FEATURES --bin sbh -- --nocapture 2>&1 | tee macos-unit-bin-output.txt
+      - name: Run sbh_mach FFI tests (workspace member, macOS only)
+        shell: bash
+        run: |
+          cargo test -p sbh_mach -- --nocapture 2>&1 | tee macos-sbh-mach-output.txt
+          grep -E '^test result: ok\. [1-9][0-9]* passed' macos-sbh-mach-output.txt \
+            || { echo "sbh_mach executed no tests"; exit 1; }
       - name: Run integration tests
         shell: bash
         run: cargo test $CI_FEATURES --test integration_tests -- --nocapture 2>&1 | tee macos-integration-output.txt

@@ -110,6 +110,10 @@ codegen-units = 1
 panic = "abort"
 strip = true
 [lints.rust]
+# The daemon and CLI never touch raw FFI: every unsafe call the project needs
+# (Mach task/host statistics, libproc, the dispatch memory-pressure source)
+# lives in the workspace member `crates/sbh_mach`, which keeps its own
+# `unsafe_op_in_unsafe_fn = "deny"` and is tested in the macOS CI lanes.
 unsafe_code = "forbid"
 missing_docs = "warn"
 unused = { level = "warn", priority = -1 }
@@ -126,3 +130,10 @@ doc_markdown = "allow"
 # most in the TUI tests); the lint only asks for `assert_eq!` to print the
 # value, and the failing assertion text already names it.
 assert_is_empty = "allow"
+
+# `crates/sbh_mach` is a member (not only a path dependency) so `cargo metadata`
+# lists it and the macOS CI lanes can run `cargo test -p sbh_mach`; off macOS it
+# compiles to nothing (`#![cfg(target_os = "macos")]`), so Linux jobs that build
+# the root package alone are unaffected.
+[workspace]
+members = [".", "crates/sbh_mach"]

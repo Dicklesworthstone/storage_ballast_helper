@@ -68,7 +68,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Toolchain:** Nightly (see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml only
-- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` in both `lib.rs` and `main.rs`)
+- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` in both `lib.rs` and `main.rs`). The one exception is the workspace member `crates/sbh_mach`, which holds the macOS Mach/libproc/dispatch FFI behind safe wrappers with `unsafe_op_in_unsafe_fn = "deny"`; it compiles to nothing off macOS and its tests run in the macOS CI lanes (`cargo test -p sbh_mach`)
 
 ### Key Dependencies
 

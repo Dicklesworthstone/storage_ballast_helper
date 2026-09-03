@@ -10,6 +10,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Changed — `crates/sbh_mach` is a workspace member and its tests run in the macOS lanes (bd-rc-master-ajg1.1.4)
+
+- The root manifest declares `[workspace] members = [".", "crates/sbh_mach"]`, so `cargo metadata` sees the FFI crate and the `macos-platform` CI job runs `cargo test -p sbh_mach` on both the arm64 and the Intel runner; its eight tests (including the `HOST_VM_INFO64` count regression) had never executed in CI. The root crate still forbids unsafe code; the manifest and AGENTS.md say why the Mach crate cannot.
+
 ### Added — claims registry: numbers in README prose are checked against the code (bd-rc-master-ajg1.12.4)
 
 - Prose can carry `<!-- claim:<id> -->value<!-- /claim -->` markers; `sbh docs --check` verifies each value against the generated document (ids `constants.<area>.<name>[.raw]`, `pressure.<level>.<column>`, `scoring.<factor>`, `exit.<code>`) and `sbh docs --render` rewrites only the value between the markers. Findings name the claim, its line, the expected and the found value; unknown ids fail. 49 numbers in README "How It Works" carry claims now (controller gains, thresholds, breaker, channel bounds, logger rotation, guardrail bounds, scoring losses and weights, regret rates, ballast layout, RSS limits, VOI budget, inotify budget, control-socket limits).
