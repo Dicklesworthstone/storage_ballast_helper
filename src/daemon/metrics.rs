@@ -21,11 +21,16 @@ use crate::daemon::self_monitor::DaemonState;
 /// File name of the export, a sibling of `state.json`.
 pub const METRICS_FILE_NAME: &str = "metrics.prom";
 
-/// The git sha this binary was built from, as the build script exposes it
-/// (`unknown` outside a git checkout).
+/// The git sha this binary was built from, as `build.rs` exposes it.
+///
+/// Git's answer in a checkout, the packager's `SBH_BUILD_GIT_SHA`
+/// elsewhere, `unknown` when neither existed at build time
+/// (bd-rc-master-ajg1.5.4). The older `VERGEN_GIT_SHA`/`GIT_SHA` names are
+/// still honored.
 #[must_use]
 pub fn build_git_sha() -> &'static str {
-    option_env!("VERGEN_GIT_SHA")
+    option_env!("SBH_BUILD_GIT_SHA")
+        .or(option_env!("VERGEN_GIT_SHA"))
         .or(option_env!("GIT_SHA"))
         .unwrap_or("unknown")
 }

@@ -10,6 +10,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — build metadata in every build path (bd-rc-master-ajg1.5.4)
+
+- A `build.rs` records the git sha (with `-dirty` when the tree has uncommitted changes, or the packager's `SBH_BUILD_GIT_SHA` outside a checkout), the target triple, the profile and a reproducible RFC 3339 timestamp (`SOURCE_DATE_EPOCH`, else the commit time, else the build time). `sbh version --verbose` and the `sbh_info` metrics line read them; a build with none of the sources still says `unknown` instead of failing.
+
 ### Changed — the dashboard reads the decision ledger (bd-rc-master-ajg1.3.3)
 
 - The TUI's SQLite telemetry adapter reads `decision_log` for the Explainability screen (real decision ids, factors, veto reasons, policy mode, and the full record for the detail pane) instead of projecting `artifact_delete` rows; a database without the ledger, or with an empty one, falls back to the activity-log projection and is marked partial with the reason. Timeline `artifact_delete` rows carry the id of the decision that approved them (joined from the ledger for SQLite rows, from the line for JSONL) and `Enter` on such a row opens that decision on the Explainability screen. The `tui` feature also compiles again: its `LogEntry` fixtures had missed the `quarantined` field.

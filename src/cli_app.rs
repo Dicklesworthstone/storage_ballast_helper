@@ -14258,17 +14258,34 @@ fn truncate_path(path: &std::path::Path, max_len: usize) -> String {
     }
 }
 
+/// The first build-time value that exists, else `unknown`
+/// (bd-rc-master-ajg1.5.4): `build.rs` sets the `SBH_BUILD_*` names in
+/// every build path it can (git checkout, packager environment,
+/// `SOURCE_DATE_EPOCH`); the older names stay honored.
+fn build_field<'a>(candidates: &[Option<&'a str>]) -> &'a str {
+    candidates
+        .iter()
+        .flatten()
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty())
+        .unwrap_or("unknown")
+}
+
 fn emit_version(cli: &Cli, args: &VersionArgs) -> Result<(), CliError> {
     let version = env!("CARGO_PKG_VERSION");
     let package = env!("CARGO_PKG_NAME");
-    let target = option_env!("TARGET").unwrap_or("unknown");
-    let profile = option_env!("PROFILE").unwrap_or("unknown");
-    let git_sha = option_env!("VERGEN_GIT_SHA")
-        .or(option_env!("GIT_SHA"))
-        .unwrap_or("unknown");
-    let build_timestamp = option_env!("VERGEN_BUILD_TIMESTAMP")
-        .or(option_env!("BUILD_TIMESTAMP"))
-        .unwrap_or("unknown");
+    let target = build_field(&[option_env!("SBH_BUILD_TARGET"), option_env!("TARGET")]);
+    let profile = build_field(&[option_env!("SBH_BUILD_PROFILE"), option_env!("PROFILE")]);
+    let git_sha = build_field(&[
+        option_env!("SBH_BUILD_GIT_SHA"),
+        option_env!("VERGEN_GIT_SHA"),
+        option_env!("GIT_SHA"),
+    ]);
+    let build_timestamp = build_field(&[
+        option_env!("SBH_BUILD_TIMESTAMP"),
+        option_env!("VERGEN_BUILD_TIMESTAMP"),
+        option_env!("BUILD_TIMESTAMP"),
+    ]);
 
     match output_mode(cli) {
         OutputMode::Human => {
@@ -18348,6 +18365,48 @@ mod tests {
         }];
         let pooled = logging_placement_doctor_check(&platform, &config, &pools);
         assert_eq!(pooled.status, "WARN", "{pooled:?}");
+    }
+
+    /// bd-rc-master-ajg1.5.4: the first present value wins, blanks are
+    /// skipped, and nothing at all is "unknown", never a panic.
+    #[test]
+    fn build_field_prefers_the_first_present_value() {
+        assert_eq!(build_field(&[None, None]), "unknown");
+        assert_eq!(build_field(&[]), "unknown");
+        assert_eq!(build_field(&[Some(""), Some("  "), Some("abc")]), "abc");
+        assert_eq!(build_field(&[Some("first"), Some("second")]), "first");
+        assert_eq!(build_field(&[None, Some(" deadbeef ")]), "deadbeef");
+    }
+
+    /// bd-rc-master-ajg1.5.4: a repository build carries real metadata from
+    /// build.rs: a git sha (optionally `-dirty`), a target triple, the
+    /// profile, and an RFC 3339 UTC timestamp.
+    #[test]
+    fn repository_builds_carry_real_build_metadata() {
+        let sha: &str = option_env!("SBH_BUILD_GIT_SHA").unwrap_or("");
+        assert!(!sha.is_empty(), "build.rs sets the sha in a checkout");
+        let hex = sha.trim_end_matches("-dirty");
+        assert!(
+            hex.len() >= 7 && hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "{sha}"
+        );
+        let target: &str = option_env!("SBH_BUILD_TARGET").unwrap_or("");
+        assert!(
+            target.contains('-'),
+            "build.rs re-exports TARGET: {target:?}"
+        );
+        let profile: &str = option_env!("SBH_BUILD_PROFILE").unwrap_or("");
+        assert!(
+            matches!(profile, "debug" | "release"),
+            "build.rs re-exports PROFILE: {profile:?}"
+        );
+        let stamp: &str = option_env!("SBH_BUILD_TIMESTAMP").unwrap_or("");
+        assert_eq!(stamp.len(), 20, "build.rs sets the timestamp: {stamp:?}");
+        assert!(
+            stamp.ends_with('Z') && stamp.as_bytes()[10] == b'T',
+            "{stamp}"
+        );
+        assert!(stamp.starts_with("20"), "{stamp}");
     }
 
     #[test]
