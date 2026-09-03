@@ -593,7 +593,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | controller | `kf` | `0.8` | Feedforward weight of the time-to-red forecast | `src/core/config.rs` |
 | controller | `integral_cap` | `100` | Anti-windup bound on the integral term | `src/core/config.rs` |
 | controller | `hysteresis_pct` | `1` | Free-% band before a level change is accepted | `src/core/config.rs` |
-| controller | `reference_total_bytes` | `1024 GiB` | Volume size at which Kp is unscaled | `src/core/config.rs` |
+| controller | `reference_total_bytes` | `1 TiB` | Volume size at which Kp is unscaled | `src/core/config.rs` |
 | controller | `kp_scale_min` | `0.5` | Lower clamp of the capacity gain schedule | `src/core/config.rs` |
 | controller | `kp_scale_max` | `2` | Upper clamp of the capacity gain schedule | `src/core/config.rs` |
 | controller | `BATCH_SLOPE_KNEE` | `0.5` | Urgency above which Red/Critical batches grow | `src/monitor/pid.rs` |
@@ -684,6 +684,20 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | daemon | `daemon_rss_warning_bytes` | `256 MiB` | Config-side RSS warning | `src/core/config.rs` |
 | daemon | `daemon_rss_hard_limit_bytes` | `500 MiB` | Config-side RSS hard limit | `src/core/config.rs` |
 | logger | `CHANNEL_CAPACITY` | `1024` | Logger channel bound (try_send, drops when full) | `src/logger/dual.rs` |
+| logger | `SQLITE_FAILURE_TRIP` | `3` | Consecutive SQLite write failures that switch to JSONL only | `src/logger/dual.rs` |
+| logger | `DAEMON_MAX_SIZE_BYTES` | `50 MiB` | JSONL size that triggers rotation in the daemon | `src/logger/jsonl.rs` |
+| logger | `DAEMON_MAX_ROTATED_FILES` | `5` | Rotated JSONL files kept | `src/logger/jsonl.rs` |
+| logger | `DAEMON_FSYNC_INTERVAL_SECS` | `30` | JSONL fsync cadence in the daemon | `src/logger/jsonl.rs` |
+| logger | `FALLBACK_MAX_BYTES` | `16 MiB` | Cap of the fallback log when the primary path fails | `src/logger/jsonl.rs` |
+| control | `MAX_CONCURRENT_CONNECTIONS` | `8` | Control-socket clients served at once | `src/daemon/control.rs` |
+| control | `MAX_REQUESTS_PER_SECOND` | `10` | Control-socket request rate limit | `src/daemon/control.rs` |
+| control | `MAX_LINE_BYTES` | `64 KiB` | Longest request line accepted | `src/daemon/control.rs` |
+| control | `IO_TIMEOUT` | `5 s` | Read/write timeout per control connection | `src/daemon/control.rs` |
+| service | `SYSTEMD_MEMORY_MAX` | `256M` | MemoryMax= in the generated systemd unit | `src/daemon/service.rs` |
+| scanner | `event_watch_budget` | `8192` | inotify watches planned across the roots (Linux) | `src/core/config.rs` |
+| control | `MAX_SOCKET_PATH_BYTES` | `100` | Longest socket path a Unix address can carry | `src/daemon/control.rs` |
+| voi | `ewma_alpha` | `0.3` | Smoothing of the scheduler's expected-reclaim estimates | `src/core/config.rs` |
+| voi | `scan_budget_per_interval` | `5` | Paths the VOI scheduler scans per cycle | `src/core/config.rs` |
 | daemon | `SCANNER_CHANNEL_CAP` | `2` | Monitor → scanner requests in flight | `src/daemon/loop_main.rs` |
 | daemon | `EXECUTOR_CHANNEL_CAP` | `64` | Scanner → executor batches in flight | `src/daemon/loop_main.rs` |
 | daemon | `MEMORY_PRESSURE_CHANNEL_CAP` | `16` | Memory-pressure samples buffered | `src/daemon/loop_main.rs` |

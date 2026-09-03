@@ -592,10 +592,33 @@ pub struct ConstantDoc {
     pub name: &'static str,
     /// The value, rendered for people (durations in s/ms, sizes in KiB/MiB/GiB).
     pub value: String,
+    /// The bare number behind `value` (bytes, seconds or milliseconds) for
+    /// prose that quotes it unformatted (`<!-- claim:….raw -->`).
+    pub raw: String,
     /// What the value controls.
     pub meaning: &'static str,
     /// The file that owns it.
     pub source: &'static str,
+}
+
+/// The bare number behind a rendered value: `fmt_bytes`/`fmt_duration`
+/// only emit exact multiples, so "4 KiB" is 4096 and "250 ms" is 250.
+fn raw_of(value: &str) -> String {
+    let Some((number, unit)) = value.split_once(' ') else {
+        return value.to_string();
+    };
+    let Ok(n) = number.parse::<u64>() else {
+        return value.to_string();
+    };
+    let factor: u64 = match unit {
+        "TiB" => 1 << 40,
+        "GiB" => 1 << 30,
+        "MiB" => 1 << 20,
+        "KiB" => 1 << 10,
+        "B" | "s" | "ms" => 1,
+        _ => return value.to_string(),
+    };
+    n.saturating_mul(factor).to_string()
 }
 
 /// One row of the pressure-level table, derived from the default
@@ -630,7 +653,10 @@ fn fmt_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
     const GIB: u64 = MIB * 1024;
-    if bytes >= GIB && bytes.is_multiple_of(GIB) {
+    const TIB: u64 = GIB * 1024;
+    if bytes >= TIB && bytes.is_multiple_of(TIB) {
+        format!("{} TiB", bytes / TIB)
+    } else if bytes >= GIB && bytes.is_multiple_of(GIB) {
         format!("{} GiB", bytes / GIB)
     } else if bytes >= MIB && bytes.is_multiple_of(MIB) {
         format!("{} MiB", bytes / MIB)
@@ -650,10 +676,12 @@ fn constant(
     meaning: &'static str,
     source: &'static str,
 ) -> ConstantDoc {
+    let value = value.to_string();
     ConstantDoc {
         area,
         name,
-        value: value.to_string(),
+        raw: raw_of(&value),
+        value,
         meaning,
         source,
     }
@@ -1406,6 +1434,104 @@ pub fn constants() -> Vec<ConstantDoc> {
             "Logger channel bound (try_send, drops when full)",
             "src/logger/dual.rs",
         ),
+        constant(
+            "logger",
+            "SQLITE_FAILURE_TRIP",
+            crate::logger::dual::SQLITE_FAILURE_TRIP,
+            "Consecutive SQLite write failures that switch to JSONL only",
+            "src/logger/dual.rs",
+        ),
+        constant(
+            "logger",
+            "DAEMON_MAX_SIZE_BYTES",
+            fmt_bytes(crate::logger::jsonl::DAEMON_MAX_SIZE_BYTES),
+            "JSONL size that triggers rotation in the daemon",
+            "src/logger/jsonl.rs",
+        ),
+        constant(
+            "logger",
+            "DAEMON_MAX_ROTATED_FILES",
+            crate::logger::jsonl::DAEMON_MAX_ROTATED_FILES,
+            "Rotated JSONL files kept",
+            "src/logger/jsonl.rs",
+        ),
+        constant(
+            "logger",
+            "DAEMON_FSYNC_INTERVAL_SECS",
+            crate::logger::jsonl::DAEMON_FSYNC_INTERVAL_SECS,
+            "JSONL fsync cadence in the daemon",
+            "src/logger/jsonl.rs",
+        ),
+        constant(
+            "logger",
+            "FALLBACK_MAX_BYTES",
+            fmt_bytes(crate::logger::jsonl::FALLBACK_MAX_BYTES),
+            "Cap of the fallback log when the primary path fails",
+            "src/logger/jsonl.rs",
+        ),
+        constant(
+            "control",
+            "MAX_CONCURRENT_CONNECTIONS",
+            crate::daemon::control::MAX_CONCURRENT_CONNECTIONS,
+            "Control-socket clients served at once",
+            "src/daemon/control.rs",
+        ),
+        constant(
+            "control",
+            "MAX_REQUESTS_PER_SECOND",
+            crate::daemon::control::MAX_REQUESTS_PER_SECOND,
+            "Control-socket request rate limit",
+            "src/daemon/control.rs",
+        ),
+        constant(
+            "control",
+            "MAX_LINE_BYTES",
+            fmt_bytes(crate::daemon::control::MAX_LINE_BYTES as u64),
+            "Longest request line accepted",
+            "src/daemon/control.rs",
+        ),
+        constant(
+            "control",
+            "IO_TIMEOUT",
+            fmt_duration(crate::daemon::control::IO_TIMEOUT),
+            "Read/write timeout per control connection",
+            "src/daemon/control.rs",
+        ),
+        constant(
+            "service",
+            "SYSTEMD_MEMORY_MAX",
+            crate::daemon::service::SYSTEMD_MEMORY_MAX,
+            "MemoryMax= in the generated systemd unit",
+            "src/daemon/service.rs",
+        ),
+        constant(
+            "scanner",
+            "event_watch_budget",
+            scanner.event_watch_budget,
+            "inotify watches planned across the roots (Linux)",
+            CONFIG,
+        ),
+        constant(
+            "control",
+            "MAX_SOCKET_PATH_BYTES",
+            crate::daemon::control::MAX_SOCKET_PATH_BYTES,
+            "Longest socket path a Unix address can carry",
+            "src/daemon/control.rs",
+        ),
+        constant(
+            "voi",
+            "ewma_alpha",
+            crate::core::config::VoiConfig::default().ewma_alpha,
+            "Smoothing of the scheduler's expected-reclaim estimates",
+            CONFIG,
+        ),
+        constant(
+            "voi",
+            "scan_budget_per_interval",
+            crate::core::config::VoiConfig::default().scan_budget_per_interval,
+            "Paths the VOI scheduler scans per cycle",
+            CONFIG,
+        ),
     ];
     rows.extend(daemon_constants());
     rows
@@ -2150,13 +2276,162 @@ pub fn render_regions(text: &str, document: &DocsDocument) -> Result<(String, Ve
     Ok((out, changed))
 }
 
-/// Rewrite `path` in place; returns the regions that changed.
+/// Start of a prose claim: `<!-- claim:<id> -->value<!-- /claim -->`.
+pub const CLAIM_BEGIN: &str = "<!-- claim:";
+/// End of a prose claim.
+pub const CLAIM_END: &str = "<!-- /claim -->";
+
+/// A prose claim whose value disagrees with the code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClaimDrift {
+    pub id: String,
+    pub line: usize,
+    pub expected: String,
+    pub found: String,
+}
+
+impl DocsDocument {
+    /// The value a claim id resolves to.
+    ///
+    /// Ids: `constants.<area>.<name>` (rendered value) or
+    /// `constants.<area>.<name>.raw` (the bare number),
+    /// `pressure.<level>.<free|interval|release|batch>`,
+    /// `scoring.<factor>` (weight), `exit.<code>` (meaning).
+    #[must_use]
+    pub fn claim_value(&self, id: &str) -> Option<String> {
+        let mut parts = id.split('.');
+        let value = match parts.next()? {
+            "constants" => {
+                let area = parts.next()?;
+                let name = parts.next()?;
+                let raw = match parts.next() {
+                    None => false,
+                    Some("raw") => true,
+                    Some(_) => return None,
+                };
+                let row = self
+                    .constants
+                    .iter()
+                    .find(|c| c.area == area && c.name == name)?;
+                if raw {
+                    row.raw.clone()
+                } else {
+                    row.value.clone()
+                }
+            }
+            "pressure" => {
+                let level = parts.next()?;
+                let row = self
+                    .pressure_levels
+                    .iter()
+                    .find(|r| r.level.eq_ignore_ascii_case(level))?;
+                match parts.next()? {
+                    "free" => row.free_range.clone(),
+                    "interval" => row.scan_interval.clone(),
+                    "release" => row.ballast_release.clone(),
+                    "batch" => row.delete_batch.clone(),
+                    _ => return None,
+                }
+            }
+            "scoring" => {
+                let factor = parts.next()?;
+                self.scoring_weights
+                    .iter()
+                    .find(|w| w.factor == factor)?
+                    .weight
+                    .to_string()
+            }
+            "exit" => {
+                let code: i32 = parts.next()?.parse().ok()?;
+                self.exit_codes
+                    .iter()
+                    .find(|e| e.code == code)?
+                    .meaning
+                    .to_string()
+            }
+            _ => return None,
+        };
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(value)
+    }
+}
+
+/// Rewrite every claim value in `text` to what the code says.
+///
+/// Returns the text and the claims that differed (with the line of the
+/// marker). Only the value between the markers changes; an unknown id, a
+/// value spanning lines, or an unterminated marker is an error.
+pub fn render_claims(text: &str, document: &DocsDocument) -> Result<(String, Vec<ClaimDrift>)> {
+    let mut out = String::with_capacity(text.len());
+    let mut drift = Vec::new();
+    let mut rest = text;
+    let mut consumed = 0usize;
+    while let Some(at) = rest.find(CLAIM_BEGIN) {
+        let (before, from_marker) = rest.split_at(at);
+        out.push_str(before);
+        consumed += before.len();
+        let marker_end = from_marker
+            .find("-->")
+            .ok_or_else(|| bad("unterminated claim marker"))?;
+        let id = from_marker[CLAIM_BEGIN.len()..marker_end].trim();
+        let after_marker = &from_marker[marker_end + 3..];
+        let end_at = after_marker
+            .find(CLAIM_END)
+            .ok_or_else(|| bad(format!("claim {id:?} has no end marker")))?;
+        let found = &after_marker[..end_at];
+        if found.contains('\n') || found.contains(CLAIM_BEGIN) {
+            return Err(bad(format!(
+                "claim {id:?}: the value must stay on one line and cannot nest"
+            )));
+        }
+        let expected = document
+            .claim_value(id)
+            .ok_or_else(|| bad(format!("unknown claim id {id:?}")))?;
+        if found != expected {
+            drift.push(ClaimDrift {
+                id: id.to_string(),
+                line: text[..consumed].matches('\n').count() + 1,
+                expected: expected.clone(),
+                found: found.to_string(),
+            });
+        }
+        let _ = write!(
+            out,
+            "{}-->{expected}{CLAIM_END}",
+            &from_marker[..marker_end]
+        );
+        let advance = marker_end + 3 + end_at + CLAIM_END.len();
+        consumed += advance;
+        rest = &from_marker[advance..];
+    }
+    out.push_str(rest);
+    Ok((out, drift))
+}
+
+/// Regions and claims of `text` rendered from the code; the second value
+/// names each region that changed and each claim that drifted
+/// (`claim:<id> (line N: expected …, found …)`).
+pub fn render_all(text: &str, document: &DocsDocument) -> Result<(String, Vec<String>)> {
+    let (rendered, mut changed) = render_regions(text, document)?;
+    let (rendered, drift) = render_claims(&rendered, document)?;
+    changed.extend(drift.iter().map(|d| {
+        format!(
+            "claim:{} (line {}: expected {:?}, found {:?})",
+            d.id, d.line, d.expected, d.found
+        )
+    }));
+    Ok((rendered, changed))
+}
+
+/// Rewrite `path` in place; returns the regions and claims that changed.
 pub fn render_file(path: &Path, document: &DocsDocument) -> Result<Vec<String>> {
     let text = fs::read_to_string(path).map_err(|source| SbhError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    let (rendered, changed) = render_regions(&text, document)?;
+    let (rendered, changed) = render_all(&text, document)?;
     if !changed.is_empty() {
         fs::write(path, rendered).map_err(|source| SbhError::Io {
             path: path.to_path_buf(),
@@ -2166,13 +2441,130 @@ pub fn render_file(path: &Path, document: &DocsDocument) -> Result<Vec<String>> 
     Ok(changed)
 }
 
-/// The regions of `path` that differ from what the code generates.
+/// The regions and claims of `path` that differ from what the code says.
 pub fn check_file(path: &Path, document: &DocsDocument) -> Result<Vec<String>> {
     let text = fs::read_to_string(path).map_err(|source| SbhError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    render_regions(&text, document).map(|(_, changed)| changed)
+    render_all(&text, document).map(|(_, changed)| changed)
+}
+
+/// Bare numbers in the prose between the `from` heading and the `to`
+/// heading that no claim marker, generated region, table, code block,
+/// backtick span, link target or HTML comment covers, with their lines.
+///
+/// A number is a digit run (with `.`/`,`/`_` inside, optional `%`) not
+/// glued to a word (`v0.6`, `ext4`, `sha256`, `C-18` do not count).
+#[must_use]
+pub fn unmarked_numbers(text: &str, from: &str, to: &str) -> Vec<(usize, String)> {
+    let Some(start) = text.find(from) else {
+        return Vec::new();
+    };
+    let end = text[start..]
+        .find(to)
+        .map_or(text.len(), |offset| start + offset);
+    let first_line = text[..start].matches('\n').count();
+    let mut found = Vec::new();
+    let mut in_fence = false;
+    let mut in_region = false;
+    for (offset, line) in text[start..end].lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if trimmed.starts_with(BEGIN_MARKER) {
+            in_region = true;
+            continue;
+        }
+        if trimmed.starts_with(END_MARKER) {
+            in_region = false;
+            continue;
+        }
+        if in_fence || in_region || trimmed.starts_with('|') || trimmed.starts_with('#') {
+            continue;
+        }
+        // An ordered-list marker (`3. `) is structure, not a claim.
+        let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+        let body = if digits > 0 && trimmed[digits..].starts_with(". ") {
+            &trimmed[digits + 2..]
+        } else {
+            line
+        };
+        let prose = strip_spans(body);
+        for number in bare_numbers(&prose) {
+            found.push((first_line + offset + 1, number));
+        }
+    }
+    found
+}
+
+/// `line` without backtick spans, claim spans, HTML comments and link
+/// targets (each replaced by a space so words do not merge).
+fn strip_spans(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    loop {
+        let next = [
+            rest.find('`').map(|at| (at, "`", "`")),
+            rest.find(CLAIM_BEGIN)
+                .map(|at| (at, CLAIM_BEGIN, CLAIM_END)),
+            rest.find("<!--").map(|at| (at, "<!--", "-->")),
+            rest.find("](").map(|at| (at, "](", ")")),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|(at, _, _)| *at);
+        let Some((at, open, close)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at]);
+        out.push(' ');
+        let after = &rest[at + open.len()..];
+        let Some(close_at) = after.find(close) else {
+            return out;
+        };
+        rest = &after[close_at + close.len()..];
+    }
+}
+
+fn bare_numbers(prose: &str) -> Vec<String> {
+    let bytes = prose.as_bytes();
+    let mut numbers = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let glued_before = i > 0 && {
+            let prev = bytes[i - 1];
+            prev.is_ascii_alphanumeric() || matches!(prev, b'-' | b'_' | b'.' | b'/' | b'+')
+        };
+        let mut j = i;
+        while j < bytes.len()
+            && (bytes[j].is_ascii_digit() || matches!(bytes[j], b'.' | b',' | b'_'))
+        {
+            j += 1;
+        }
+        while j > i && matches!(bytes[j - 1], b'.' | b',' | b'_') {
+            j -= 1;
+        }
+        let mut token_end = j;
+        if token_end < bytes.len() && bytes[token_end] == b'%' {
+            token_end += 1;
+        }
+        let glued_after = token_end < bytes.len()
+            && (bytes[token_end].is_ascii_alphanumeric()
+                || matches!(bytes[token_end], b'-' | b'_'));
+        if !glued_before && !glued_after {
+            numbers.push(prose[i..token_end].to_string());
+        }
+        i = token_end.max(i + 1);
+    }
+    numbers
 }
 
 /// README "Command Reference" rows naming a command clap does not have.
@@ -2424,6 +2816,123 @@ mod tests {
         assert_eq!(fmt_bytes(1500), "1500 B");
         assert_eq!(fmt_duration(Duration::from_millis(250)), "250 ms");
         assert_eq!(fmt_duration(Duration::from_secs(300)), "300 s");
+    }
+
+    /// Claim ids resolve against the document; `render_claims` rewrites
+    /// only the value between the markers, reports drift with the marker's
+    /// line, is idempotent, and rejects unknown ids and multi-line values.
+    #[test]
+    fn claims_resolve_render_and_report_drift() {
+        let document = DocsDocument::build(&clap::Command::new("sbh"));
+        assert_eq!(
+            document.claim_value("constants.controller.kp").as_deref(),
+            Some("0.25")
+        );
+        assert_eq!(
+            document
+                .claim_value("constants.ballast.HEADER_SIZE.raw")
+                .as_deref(),
+            Some("4096")
+        );
+        assert_eq!(
+            document
+                .claim_value("constants.ballast.HEADER_SIZE")
+                .as_deref(),
+            Some("4 KiB")
+        );
+        assert_eq!(
+            document
+                .claim_value("pressure.critical.interval")
+                .as_deref(),
+            Some("100 ms")
+        );
+        assert_eq!(document.claim_value("scoring.age").as_deref(), Some("0.2"));
+        assert_eq!(
+            document.claim_value("exit.4").as_deref(),
+            Some("partial success")
+        );
+        for bad_id in [
+            "constants.controller",
+            "constants.controller.kp.extra",
+            "constants.nope.kp",
+            "pressure.critical.colour",
+            "unknown.thing",
+        ] {
+            assert!(document.claim_value(bad_id).is_none(), "{bad_id} resolved");
+        }
+        assert_eq!(raw_of("1 TiB"), (1u64 << 40).to_string());
+        assert_eq!(raw_of("250 ms"), "250");
+        assert_eq!(raw_of("half the CPU count"), "half the CPU count");
+
+        let text = "Kp is <!-- claim:constants.controller.kp -->0.3<!-- /claim --> here.\n\
+                    Header <!-- claim:constants.ballast.HEADER_SIZE.raw -->4096<!-- /claim --> bytes\n\
+                    and cooldown <!-- claim:constants.deletion.circuit_breaker_cooldown -->0 s<!-- /claim -->.\n";
+        let (fixed, drift) = render_claims(text, &document).unwrap();
+        assert_eq!(
+            drift,
+            vec![
+                ClaimDrift {
+                    id: "constants.controller.kp".to_string(),
+                    line: 1,
+                    expected: "0.25".to_string(),
+                    found: "0.3".to_string(),
+                },
+                ClaimDrift {
+                    id: "constants.deletion.circuit_breaker_cooldown".to_string(),
+                    line: 3,
+                    expected: "30 s".to_string(),
+                    found: "0 s".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            fixed,
+            "Kp is <!-- claim:constants.controller.kp -->0.25<!-- /claim --> here.\n\
+             Header <!-- claim:constants.ballast.HEADER_SIZE.raw -->4096<!-- /claim --> bytes\n\
+             and cooldown <!-- claim:constants.deletion.circuit_breaker_cooldown -->30 s<!-- /claim -->.\n"
+        );
+        let (again, drift) = render_claims(&fixed, &document).unwrap();
+        assert_eq!(again, fixed, "rendering is idempotent");
+        assert!(drift.is_empty());
+        assert!(render_claims("<!-- claim:nope.x -->1<!-- /claim -->", &document).is_err());
+        assert!(
+            render_claims(
+                "<!-- claim:constants.controller.kp -->1\n2<!-- /claim -->",
+                &document
+            )
+            .is_err()
+        );
+        assert!(render_claims("<!-- claim:constants.controller.kp -->1", &document).is_err());
+        // A claim inside a generated-region file is handled by render_all
+        // together with the regions.
+        let (all, changed) = render_all(text, &document).unwrap();
+        assert_eq!(all, fixed);
+        assert_eq!(changed.len(), 2);
+        assert!(changed[0].starts_with("claim:constants.controller.kp (line 1:"));
+    }
+
+    /// The coverage guard sees bare numbers in prose only: not inside claims,
+    /// regions, tables, code, backticks, links or comments, and not glued to
+    /// identifiers.
+    #[test]
+    fn unmarked_numbers_skip_everything_that_is_not_prose() {
+        let text = "## How It Works\n\
+                    Every 30 seconds the daemon writes; Kp is <!-- claim:constants.controller.kp -->0.25<!-- /claim -->.\n\
+                    `cargo test --lib -- 2` and v0.6 and ext4 and C-18 and sha256 and 60K+ do not count.\n\
+                    | table | 42 |\n\
+                    ```\n99 in code\n```\n\
+                    <!-- sbh-docs:begin x -->\n| 7 |\n<!-- sbh-docs:end -->\n\
+                    See [the 2026 plan](docs/plan-2026.md) at 12.5% or 1,000 entries <!-- 5 --> ok.\n\
+                    ## Testing\nNot 77 here.\n";
+        assert_eq!(
+            unmarked_numbers(text, "## How It Works", "## Testing"),
+            vec![
+                (2, "30".to_string()),
+                (11, "2026".to_string()),
+                (11, "12.5%".to_string()),
+                (11, "1,000".to_string()),
+            ]
+        );
     }
 
     /// Both presets render 3 × 5 cells from `daemon::policy`; the v0.6

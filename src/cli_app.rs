@@ -17826,6 +17826,38 @@ mod tests {
         }
     }
 
+    /// Claims coverage guard (bd-rc-master-ajg1.12.4): bare numbers in the
+    /// README "How It Works" prose that no `<!-- claim:… -->` marker or
+    /// generated region covers may not grow. Mark a new number with a claim
+    /// (see `cli::docs::claim_value` for the ids) or, for a number that is
+    /// not a constant of the code, lower nothing and raise the budget with
+    /// a reason in the commit.
+    #[test]
+    fn readme_how_it_works_unmarked_numbers_do_not_grow() {
+        // 2026-09-03: 103 after the first marking pass (bd-rc-master-ajg1.12.4);
+        // the rest are illustrative examples, formula coefficients that are
+        // not named constants, or external facts (Time Machine, kernel).
+        const UNMARKED_NUMBER_BUDGET: usize = 103;
+        let readme =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+                .expect("README.md");
+        let unmarked = storage_ballast_helper::cli::docs::unmarked_numbers(
+            &readme,
+            "\n## How It Works",
+            "\n## Testing",
+        );
+        assert!(
+            unmarked.len() <= UNMARKED_NUMBER_BUDGET,
+            "{} unmarked numbers in README \"How It Works\" (budget {UNMARKED_NUMBER_BUDGET}); mark them with claims or raise the budget deliberately:\n{}",
+            unmarked.len(),
+            unmarked
+                .iter()
+                .map(|(line, number)| format!("README.md:{line}: {number}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     /// Doc contract (bd-rc-master-ajg1.12.3): the command tables in README
     /// and AGENTS.md name only commands and `--flags` clap has, and every
     /// backticked `src/…`, `docs/…`, `scripts/…`, `tests/…`, `.github/…`

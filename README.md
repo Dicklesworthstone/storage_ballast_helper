@@ -1000,7 +1000,7 @@ The daemon runs four threads connected by bounded channels:
 3. **Executor thread** receives deletion batches and executes them through the circuit breaker and pre-flight safety checks.
 4. **Logger thread** receives activity events and writes them to both SQLite and JSONL backends.
 
-Channels use bounded capacities (scanner: 2, executor: 64, logger: 1024) to provide natural backpressure. If the scanner can't keep up with pressure changes, the newest request wins and older ones are dropped. If the logger falls behind, a dropped-event counter is incremented and reported periodically rather than blocking the monitor loop.
+Channels use bounded capacities (scanner: <!-- claim:constants.daemon.SCANNER_CHANNEL_CAP -->2<!-- /claim -->, executor: <!-- claim:constants.daemon.EXECUTOR_CHANNEL_CAP -->64<!-- /claim -->, logger: <!-- claim:constants.logger.CHANNEL_CAPACITY -->1024<!-- /claim -->) to provide natural backpressure. If the scanner can't keep up with pressure changes, the newest request wins and older ones are dropped. If the logger falls behind, a dropped-event counter is incremented and reported periodically rather than blocking the monitor loop.
 
 Each worker thread has panic recovery: up to 3 respawns within a 5-minute window before the daemon shuts down. Thread health is tracked by the self-monitor, which also watches RSS memory usage and state-file write success.
 
@@ -1018,7 +1018,7 @@ alpha = 0.20 * burstiness + base_alpha
 alpha = clamp(alpha, 0.1, 0.8)
 ```
 
-When disk consumption is steady, `burstiness` is low and alpha stays near the base value (0.3), producing smooth estimates. When a burst hits (e.g., a large `cargo build` starts), burstiness spikes, alpha increases, and the estimator tracks the new rate within a few samples rather than lagging behind.
+When disk consumption is steady, `burstiness` is low and alpha stays near the base value (<!-- claim:constants.ewma.ewma_base_alpha -->0.3<!-- /claim -->), producing smooth estimates. When a burst hits (e.g., a large `cargo build` starts), burstiness spikes, alpha increases, and the estimator tracks the new rate within a few samples rather than lagging behind.
 
 The estimator also tracks acceleration (rate of rate change) using the same EWMA formula, enabling quadratic time-to-exhaustion predictions:
 
@@ -1028,7 +1028,7 @@ time_to_exhaustion = solve(distance = rate * t + 0.5 * accel * t^2)
 
 For non-zero acceleration, the quadratic is solved using the numerically stable conjugate form to avoid catastrophic cancellation when the discriminant is close to `rate^2`.
 
-A confidence metric combines sample count adequacy (70% weight) with residual tracking (30% weight). When confidence drops below 0.2 or fewer than 3 samples exist, the estimator enters fallback mode and reports uncertainty rather than potentially misleading predictions.
+A confidence metric combines sample count adequacy (70% weight) with residual tracking (30% weight). When confidence drops below 0.2 or fewer than <!-- claim:constants.ewma.ewma_min_samples -->3<!-- /claim --> samples exist, the estimator enters fallback mode and reports uncertainty rather than potentially misleading predictions.
 
 Trend classification uses fixed thresholds: recovering (rate < -1.0 bytes/sec), accelerating (accel > 64.0 bytes/sec^2), decelerating (accel < -64.0 bytes/sec^2), or stable.
 
@@ -1036,7 +1036,7 @@ Trend classification uses fixed thresholds: recovering (rate < -1.0 bytes/sec), 
 
 The PID controller converts the gap between target free space and actual free space into an urgency signal (0.0 to 1.0) that drives scan frequency, deletion batch sizes, and ballast release counts.
 
-There is one controller per mount. Default gains (`[pressure.controller]`): **Kp=0.25**, **Ki=0.08**, **Kd=0.02**, **Kf=0.8**, integral cap 100.0, hysteresis 1.0 point. The setpoint is `green_min_free_pct` (20% by default). The block below is `monitor::pid::FORMULAS`, and a test keeps this copy identical to the code:
+There is one controller per mount. Default gains (`[pressure.controller]`): **Kp=<!-- claim:constants.controller.kp -->0.25<!-- /claim -->**, **Ki=<!-- claim:constants.controller.ki -->0.08<!-- /claim -->**, **Kd=<!-- claim:constants.controller.kd -->0.02<!-- /claim -->**, **Kf=<!-- claim:constants.controller.kf -->0.8<!-- /claim -->**, integral cap <!-- claim:constants.controller.integral_cap -->100<!-- /claim -->, hysteresis <!-- claim:constants.controller.hysteresis_pct -->1<!-- /claim --> point. The setpoint is `green_min_free_pct` (<!-- claim:constants.pressure.green_min_free_pct -->20<!-- /claim -->% by default). The block below is `monitor::pid::FORMULAS`, and a test keeps this copy identical to the code:
 
 ```
 error = target_free_pct - current_free_pct
@@ -1050,8 +1050,8 @@ urgency = 1 - exp(-max(0, raw))
 
 Three things make this a controller that cannot wind up while it has no actuator:
 
-- **Capacity gain scheduling.** Errors are in percent, and one point is 55 GiB on a 5.5 TB pool but 1 GiB on a small root. `Kp` is scaled by `sqrt(total / reference_total_bytes)` (reference 1 TiB), clamped to `[0.5, 2] x Kp`, so large volumes answer a one-point error harder and tiny ones softer.
-- **Forecast feedforward.** The EWMA forecast enters as a smooth term that grows from 0 at the action horizon (`pressure.prediction.action_horizon_minutes`, 30 by default) to `Kf` at zero seconds-to-red, instead of stepped urgency boosts. Urgency is monotone in the forecast: a nearer red never lowers it.
+- **Capacity gain scheduling.** Errors are in percent, and one point is 55 GiB on a 5.5 TB pool but 1 GiB on a small root. `Kp` is scaled by `sqrt(total / reference_total_bytes)` (reference <!-- claim:constants.controller.reference_total_bytes -->1 TiB<!-- /claim -->), clamped to [<!-- claim:constants.controller.kp_scale_min -->0.5<!-- /claim -->, <!-- claim:constants.controller.kp_scale_max -->2<!-- /claim -->] x `Kp`, so large volumes answer a one-point error harder and tiny ones softer.
+- **Forecast feedforward.** The EWMA forecast enters as a smooth term that grows from 0 at the action horizon (`pressure.prediction.action_horizon_minutes`, <!-- claim:constants.prediction.action_horizon_minutes -->30<!-- /claim --> by default) to `Kf` at zero seconds-to-red, instead of stepped urgency boosts. Urgency is monotone in the forecast: a nearer red never lowers it.
 - **Anti-windup on actionability.** The integral is frozen while the mount's controller is observe-only (no root path on the device), idle after an empty pass, or recovering from a read-only or full filesystem. A mount sbh cannot act on no longer accumulates a Red urgency it could do nothing with; the integral also resets on every level change.
 
 The `1 - exp(-x)` transform maps the raw output to a 0-1 range with a natural saturation curve: small errors produce proportionally small urgency, while large errors quickly approach 1.0 without overshooting.
@@ -1070,7 +1070,7 @@ Pressure levels are defined by free-space thresholds; the table is generated fro
 
 Critical is any free space below the Red threshold (`red_min_free_pct`). At Red and Critical levels, delete batch sizes scale dynamically with PID urgency output, allowing the system to be more aggressive when pressure is rising rapidly versus slowly. At Critical, the controller issues maximum-urgency responses regardless of PID output. Whether a level's response actually runs also depends on the memory-state behavior matrix in `src/daemon/policy.rs`.
 
-When predictive forecasting is enabled, the time-to-red estimate feeds the controller's feedforward term: a forecast inside the action horizon (default 30 minutes) raises urgency smoothly, up to `Kf` at zero seconds, even while current pressure is only Yellow. This lets the system start scanning and releasing ballast *before* pressure actually reaches dangerous levels.
+When predictive forecasting is enabled, the time-to-red estimate feeds the controller's feedforward term: a forecast inside the action horizon (default <!-- claim:constants.prediction.action_horizon_minutes -->30<!-- /claim --> minutes) raises urgency smoothly, up to `Kf` at zero seconds, even while current pressure is only Yellow. This lets the system start scanning and releasing ballast *before* pressure actually reaches dangerous levels.
 
 ### Artifact Scoring: Decision-Theoretic Ranking
 
@@ -1078,7 +1078,7 @@ Every file and directory discovered during a scan receives a composite score fro
 
 #### The Five Scoring Factors
 
-**Location** (default weight 0.25) rates directories by how likely they are to contain safely deletable artifacts:
+**Location** (default weight <!-- claim:scoring.location -->0.25<!-- /claim -->) rates directories by how likely they are to contain safely deletable artifacts:
 
 | Path pattern | Score |
 | --- | --- |
@@ -1092,9 +1092,9 @@ Every file and directory discovered during a scan receives a composite score fro
 | `*/documents/*` | 0.10 |
 | System paths (`/`, `/bin`, `/lib`) | 0.00 |
 
-**Name** (default weight 0.25) matches against a pattern registry of known artifact types: `.o` files, `node_modules`, `__pycache__`, `.class` files, `.wasm` intermediates, and hundreds of others. Each pattern carries a confidence score.
+**Name** (default weight <!-- claim:scoring.name -->0.25<!-- /claim -->) matches against a pattern registry of known artifact types: `.o` files, `node_modules`, `__pycache__`, `.class` files, `.wasm` intermediates, and hundreds of others. Each pattern carries a confidence score.
 
-**Age** (default weight 0.20) uses an effective age timestamp that differs by entry type. For **files**, the modification time (`mtime`) is used because content change is what matters. For **directories**, the creation (birth) time is preferred when available, because directory `mtime` updates whenever any direct child is added or removed — making active build caches like `target/` appear perpetually young when `mtime` is used alone. Birth time reflects when the directory was actually created and is stable across rebuilds. If birth time is unavailable, `mtime` is used as a fallback.
+**Age** (default weight <!-- claim:scoring.age -->0.2<!-- /claim -->) uses an effective age timestamp that differs by entry type. For **files**, the modification time (`mtime`) is used because content change is what matters. For **directories**, the creation (birth) time is preferred when available, because directory `mtime` updates whenever any direct child is added or removed — making active build caches like `target/` appear perpetually young when `mtime` is used alone. Birth time reflects when the directory was actually created and is stable across rebuilds. If birth time is unavailable, `mtime` is used as a fallback.
 
 The age-to-score curve is non-monotonic, peaking at 4-10 hours (the sweet spot for stale build artifacts) and dropping for very old files (which might be intentionally archived):
 
@@ -1109,7 +1109,7 @@ The age-to-score curve is non-monotonic, peaking at 4-10 hours (the sweet spot f
 | 7 - 30 days | 0.40 | Probably forgotten |
 | > 30 days | 0.25 | Ancient, but might be archived intentionally |
 
-**Size** (default weight 0.15) favors larger artifacts (more space reclaimed per deletion) with diminishing returns at extremes:
+**Size** (default weight <!-- claim:scoring.size -->0.15<!-- /claim -->) favors larger artifacts (more space reclaimed per deletion) with diminishing returns at extremes:
 
 | Size | Score |
 | --- | --- |
@@ -1121,7 +1121,7 @@ The age-to-score curve is non-monotonic, peaking at 4-10 hours (the sweet spot f
 | 10 - 50 GiB | 0.90 |
 | > 50 GiB | 0.75 |
 
-**Structure** (default weight 0.15) examines directory contents for signals: presence of `.git/` (score 0.0, never delete), Cargo fingerprint/incremental directories (0.95), `deps` + `build` directories together (0.85), or mostly object files (0.90).
+**Structure** (default weight <!-- claim:scoring.structure -->0.15<!-- /claim -->) examines directory contents for signals: presence of `.git/` (score 0.0, never delete), Cargo fingerprint/incremental directories (0.95), `deps` + `build` directories together (0.85), or mostly object files (0.90).
 
 #### Pressure Multiplier
 
@@ -1150,10 +1150,10 @@ posterior_abandoned = sigmoid(logit)
 
 Then the expected loss of each action is computed:
 
-- **Loss of keeping an abandoned artifact**: `posterior * false_negative_loss` (default: 30.0)
-- **Loss of deleting a useful artifact**: `(1 - posterior) * false_positive_loss` (default: 50.0)
+- **Loss of keeping an abandoned artifact**: `posterior * false_negative_loss` (default: <!-- claim:constants.scoring.false_negative_loss -->30<!-- /claim -->)
+- **Loss of deleting a useful artifact**: `(1 - posterior) * false_positive_loss` (default: <!-- claim:constants.scoring.false_positive_loss -->50<!-- /claim -->)
 
-The asymmetric defaults (50 vs. 30) encode the design principle that wrongly deleting something useful is costlier than failing to clean up something stale, while remaining aggressive enough to actually reclaim space under pressure.
+The asymmetric defaults (<!-- claim:constants.scoring.false_positive_loss -->50<!-- /claim --> vs. <!-- claim:constants.scoring.false_negative_loss -->30<!-- /claim -->) encode the design principle that wrongly deleting something useful is costlier than failing to clean up something stale, while remaining aggressive enough to actually reclaim space under pressure.
 
 These base losses are then adjusted by epistemic uncertainty, which combines entropy of the posterior with calibration confidence:
 
@@ -1242,7 +1242,7 @@ Demotion to FallbackSafe is automatic and triggered by any of:
 
 #### Recovery with Mandatory Canary Gate
 
-Recovery from FallbackSafe requires the guardrails to report 3 consecutive clean observation windows (configurable via `recovery_clean_windows`). When recovery occurs, the system does *not* return directly to its pre-fallback mode if that mode was Enforce. Instead, it recovers to Canary, requiring an explicit re-promotion to Enforce. This mandatory canary gate ensures the system re-proves itself under limited-deletion conditions before resuming full enforcement.
+Recovery from FallbackSafe requires the guardrails to report <!-- claim:constants.guardrails.recovery_clean_windows -->3<!-- /claim --> consecutive clean observation windows (configurable via `recovery_clean_windows`). When recovery occurs, the system does *not* return directly to its pre-fallback mode if that mode was Enforce. Instead, it recovers to Canary, requiring an explicit re-promotion to Enforce. This mandatory canary gate ensures the system re-proves itself under limited-deletion conditions before resuming full enforcement.
 
 #### Guard Penalty
 
@@ -1304,7 +1304,7 @@ Any single check failure causes the candidate to be skipped (not failed), so it 
 
 #### Layer 3: Circuit Breaker
 
-The deletion executor tracks consecutive failures. After 3 consecutive deletion errors (not skips), the circuit breaker trips and halts the entire batch. The daemon waits 30 seconds before retrying. This prevents cascading failures when the filesystem is in a degraded state (e.g., hardware errors, NFS timeouts).
+The deletion executor tracks consecutive failures. After <!-- claim:constants.deletion.circuit_breaker_threshold -->5<!-- /claim --> consecutive deletion errors (not skips), the circuit breaker trips and halts the entire batch. The daemon waits <!-- claim:constants.deletion.circuit_breaker_cooldown.raw -->30<!-- /claim --> seconds before retrying. This prevents cascading failures when the filesystem is in a degraded state (e.g., hardware errors, NFS timeouts).
 
 #### Layer 4: Policy Engine Gates
 
@@ -1333,9 +1333,9 @@ Red and Critical pressure bypasses all dampening. Disk safety takes priority ove
 
 #### Layer 8: Regret Labels and Per-Category Calibration
 
-A deletion was a mistake when the same directory entry (parent device and inode plus name) is recreated within `scoring.regret_window_minutes` (30) of the deletion while a process has its working directory or an open file under the parent: something still used it. The daemon watches every removal for good, labels each one `regret`, `clean` (the window passed) or `unknown` (recreated with no live user), stores the label in SQLite `decision_outcome` and as a `decision_outcome` JSONL line, and `sbh explain --id <decision-id>` shows it as an `Outcome:` line.
+A deletion was a mistake when the same directory entry (parent device and inode plus name) is recreated within `scoring.regret_window_minutes` (<!-- claim:constants.scoring.regret_window_minutes -->30<!-- /claim -->) of the deletion while a process has its working directory or an open file under the parent: something still used it. The daemon watches every removal for good, labels each one `regret`, `clean` (the window passed) or `unknown` (recreated with no live user), stores the label in SQLite `decision_outcome` and as a `decision_outcome` JSONL line, and `sbh explain --id <decision-id>` shows it as an `Outcome:` line.
 
-Labels calibrate the fast lane per artifact category. Each category keeps a Beta posterior on its regret rate under a prior pooled across categories, and a Clopper-Pearson upper bound (95%) on that rate. The bound's excess over the tolerated rate (`scoring.regret_alpha_definite` 0.02 for Definite-dominated categories, `scoring.regret_alpha_likely` 0.005 otherwise) lowers the category's calibration factor, which the decision layer turns into a higher required posterior for Delete; explain shows it as `Regret calibration:`. Zero regrets never tighten anything, and a regret in one category never touches another. A per-category e-process against "regret rate <= alpha" suspends only that category's deletions (Delete verdicts become Review, `fallback_reason: category suspended after regrets`) for `scoring.regret_suspend_minutes` (60) when it alarms. The calibrator is rebuilt from the last 30 days of stored outcomes at daemon start.
+Labels calibrate the fast lane per artifact category. Each category keeps a Beta posterior on its regret rate under a prior pooled across categories, and a Clopper-Pearson upper bound (95%) on that rate. The bound's excess over the tolerated rate (`scoring.regret_alpha_definite` <!-- claim:constants.scoring.regret_alpha_definite -->0.02<!-- /claim --> for Definite-dominated categories, `scoring.regret_alpha_likely` <!-- claim:constants.scoring.regret_alpha_likely -->0.005<!-- /claim --> otherwise) lowers the category's calibration factor, which the decision layer turns into a higher required posterior for Delete; explain shows it as `Regret calibration:`. Zero regrets never tighten anything, and a regret in one category never touches another. A per-category e-process against "regret rate <= alpha" suspends only that category's deletions (Delete verdicts become Review, `fallback_reason: category suspended after regrets`) for `scoring.regret_suspend_minutes` (60) when it alarms. The calibrator is rebuilt from the last 30 days of stored outcomes at daemon start.
 
 #### Layer 7: Quarantine-First Deletion and `sbh undo`
 
@@ -1369,16 +1369,16 @@ Ballast files are pre-allocated sacrificial space that can be released instantly
 
 #### Provisioning
 
-Each watched volume gets its own ballast pool. Files are named `SBH_BALLAST_FILE_00001.dat` through `SBH_BALLAST_FILE_NNNNN.dat`, with a 4096-byte JSON header containing the magic string `SBH_BALLAST_v1`, file index, creation timestamp, and size metadata.
+Each watched volume gets its own ballast pool. Files are named `SBH_BALLAST_FILE_00001.dat` through `SBH_BALLAST_FILE_NNNNN.dat`, with a <!-- claim:constants.ballast.HEADER_SIZE.raw -->4096<!-- /claim -->-byte JSON header containing the magic string `SBH_BALLAST_v1`, file index, creation timestamp, and size metadata.
 
 On macOS, service scope controls the default pool path: user LaunchAgents use `~/Library/Application Support/sbh/ballast.bin`; system LaunchDaemons use `/private/var/sbh/ballast.bin`. This path is still a ballast pool directory in the current multi-file implementation, and `[paths].ballast_dir` remains the override for custom placement.
 
 The data payload is written differently depending on the filesystem:
 
 - **ext4/xfs**: Uses `fallocate()` for near-instant allocation without writing actual data.
-- **btrfs/zfs**: Writes 4 MiB chunks of random data to defeat copy-on-write deduplication, which would otherwise make the ballast files share physical blocks and release nothing when deleted.
+- **btrfs/zfs**: Writes <!-- claim:constants.ballast.CHUNK_SIZE -->4 MiB<!-- /claim --> chunks of random data to defeat copy-on-write deduplication, which would otherwise make the ballast files share physical blocks and release nothing when deleted.
 
-All writes are fsynced every 64 MiB to ensure durability. Provisioning aborts if free space drops below 20% to avoid filling the disk while trying to reserve space against future fills.
+All writes are fsynced every <!-- claim:constants.ballast.FSYNC_EVERY_BYTES -->64 MiB<!-- /claim --> to ensure durability. Provisioning aborts if free space drops below the provisioning floor, `max(orange_min_free_pct, red_min_free_pct + 2)` (<!-- claim:constants.ballast.ballast_provision_floor_pct() -->10<!-- /claim -->% with the default thresholds), to avoid filling the disk while trying to reserve space against future fills.
 
 Per-volume configuration overrides allow different file counts and sizes for different mount points. A 2 TiB data volume might use 10 x 2 GiB ballast files (20 GiB total), while a 100 GiB root volume uses 5 x 512 MiB files (2.5 GiB).
 
@@ -1410,13 +1410,13 @@ The daemon manages one pool per eligible mount, not just the configured `ballast
 
 ### VOI Scan Scheduling
 
-Fixed-interval full scans waste IO bandwidth when most directories haven't changed. For v1, the Value-of-Information (VOI) scheduler allocates a limited scan budget (default: 5 paths per cycle) to the paths most likely to yield reclaimable space. For v2, the same pressure signal decides when to use the persistent candidate index, event-dirty roots, or bounded reconciliation instead of recursively walking every configured root.
+Fixed-interval full scans waste IO bandwidth when most directories haven't changed. For v1, the Value-of-Information (VOI) scheduler allocates a limited scan budget (default: <!-- claim:constants.voi.scan_budget_per_interval -->5<!-- /claim --> paths per cycle) to the paths most likely to yield reclaimable space. For v2, the same pressure signal decides when to use the persistent candidate index, event-dirty roots, or bounded reconciliation instead of recursively walking every configured root.
 
 #### Per-Path Statistics
 
 The scheduler maintains EWMA-smoothed statistics for each watched path:
 
-- **Expected reclaim**: Bytes recovered per scan of this path (smoothed with alpha 0.3).
+- **Expected reclaim**: Bytes recovered per scan of this path (smoothed with alpha <!-- claim:constants.voi.ewma_alpha -->0.3<!-- /claim -->).
 - **IO cost**: Estimated filesystem reads per scan (initialized at 1000, updated from actuals).
 - **False positive rate**: Fraction of scanned candidates that were later skipped or failed pre-flight checks.
 
@@ -1489,10 +1489,10 @@ The guardrail system continuously validates that the EWMA forecaster's predictio
 
 Each observation window compares the forecaster's predictions against actual outcomes:
 
-- **Rate error**: `|predicted_rate - actual_rate| / |actual_rate|`. Must stay below 0.30 (30%).
+- **Rate error**: `|predicted_rate - actual_rate| / |actual_rate|`. Must stay below <!-- claim:constants.guardrails.max_rate_error -->0.3<!-- /claim --> (30%).
 - **Time-to-red coverage**: the conformal lower bound on the time to red (below) must have covered the true time in at least `coverage_target - 0.05` of the resolved predictions.
 
-Guard status transitions from Unknown to Pass after 60 observations if calibration holds, and transitions to Fail if the median rate error exceeds 0.30, the empirical coverage falls below the tolerance, or the e-process alarms.
+Guard status transitions from Unknown to Pass after <!-- claim:constants.guardrails.min_observations -->60<!-- /claim --> observations if calibration holds, and transitions to Fail if the median rate error exceeds <!-- claim:constants.guardrails.max_rate_error -->0.3<!-- /claim -->, the empirical coverage falls below the tolerance, or the e-process alarms.
 
 #### Conformal Time-to-Red Bound
 
@@ -1522,10 +1522,10 @@ alarm = (e_process_value >= 20.0)
 ```
 
 The clamping bounds serve specific purposes:
-- **Lower bound (-5.0)**: Prevents "banking" too much credit from long good streaks. `exp(-5) ~ 0.0067`, ensuring that even after extended good behavior, the alarm can fire within ~10-15 bad observations.
-- **Upper bound (5.0)**: Prevents runaway alarm state. `exp(5) ~ 148`, ensuring recovery is possible within ~10 good observations after the anomaly passes.
+- **Lower bound (<!-- claim:constants.guardrails.E_PROCESS_LOG_MIN -->-5<!-- /claim -->)**: Prevents "banking" too much credit from long good streaks. `exp(-5) ~ 0.0067`, ensuring that even after extended good behavior, the alarm can fire within ~10-15 bad observations.
+- **Upper bound (<!-- claim:constants.guardrails.E_PROCESS_LOG_MAX -->3.5<!-- /claim -->)**: Prevents runaway alarm state. `exp(3.5) ~ 33`, so an alarm clears after a bounded number of good observations once the anomaly passes.
 
-When the e-process value reaches the threshold (20.0), it signals systematic drift in the forecaster's calibration and triggers GuardrailDrift fallback in the policy engine. On recovery from fallback, the e-process resets to 0.0 so accumulated history doesn't bias future detection.
+When the e-process value reaches the threshold (<!-- claim:constants.guardrails.e_process_threshold -->20<!-- /claim -->), it signals systematic drift in the forecaster's calibration and triggers GuardrailDrift fallback in the policy engine. On recovery from fallback, the e-process resets to 0.0 so accumulated history doesn't bias future detection.
 
 ### Dual Logging and Observability
 
@@ -1543,16 +1543,16 @@ Automatic retention pruning removes rows older than 30 days, triggered every 360
 
 The JSONL writer appends one JSON object per line to a file, providing a portable, grep-friendly, append-only log. Lines are assembled in memory and written atomically to prevent interleaved partial lines when multiple tools tail the file.
 
-In the daemon, rotation triggers when the file exceeds 50 MiB, keeping up to 5 rotated files, and fsync runs every 30 seconds: on the next write once the interval has passed, or from an idle timer when no write arrives, so a burst of lines before a quiet spell is still made durable. (The library defaults, used by tools that embed the writer, are 100 MiB and 10 seconds.)
+In the daemon, rotation triggers when the file exceeds <!-- claim:constants.logger.DAEMON_MAX_SIZE_BYTES -->50 MiB<!-- /claim -->, keeping up to <!-- claim:constants.logger.DAEMON_MAX_ROTATED_FILES -->5<!-- /claim --> rotated files, and fsync runs every <!-- claim:constants.logger.DAEMON_FSYNC_INTERVAL_SECS -->30<!-- /claim --> seconds: on the next write once the interval has passed, or from an idle timer when no write arrives, so a burst of lines before a quiet spell is still made durable. (The library defaults, used by tools that embed the writer, are 100 MiB and 10 seconds.)
 
 #### Degradation Chain
 
 If the SQLite backend fails (disk full, corruption, permission error), the logger falls through a degradation chain:
 
 1. Track consecutive SQLite write failures (events that produce no SQLite row do not reset the count).
-2. After 3 consecutive failures, disable SQLite and log only to JSONL.
+2. After <!-- claim:constants.logger.SQLITE_FAILURE_TRIP -->3<!-- /claim --> consecutive failures, disable SQLite and log only to JSONL.
 3. Every 50 events while disabled, attempt to reopen the SQLite connection; on success the counter resets and rows resume from the next event.
-4. If the JSONL file cannot be written, fall back to a RAM-backed file: `/dev/shm/sbh-<uid>.jsonl` on Linux, `$TMPDIR/sbh.jsonl` on macOS. The fallback is never rotated; it is truncated when it would exceed 16 MiB, so a long outage of the primary path cannot fill `/dev/shm`. The primary path is retried periodically and writing returns to it as soon as it works.
+4. If the JSONL file cannot be written, fall back to a RAM-backed file: `/dev/shm/sbh-<uid>.jsonl` on Linux, `$TMPDIR/sbh.jsonl` on macOS. The fallback is never rotated; it is truncated when it would exceed <!-- claim:constants.logger.FALLBACK_MAX_BYTES -->16 MiB<!-- /claim -->, so a long outage of the primary path cannot fill `/dev/shm`. The primary path is retried periodically and writing returns to it as soon as it works.
 5. If that fails, write to stderr with `[SBH-JSONL]` prefix.
 6. If even stderr fails, silently discard (the daemon never blocks on logging).
 
@@ -1560,7 +1560,7 @@ At open, a database whose `auto_vacuum` is not `FULL` is converted with one `VAC
 
 **The daemon's own files on a volume it reclaims.** A full disk breaks the logger exactly when it matters, so at startup the daemon checks whether the activity database, the JSONL log and `state.json` share a mount with a scan root, a special location or a ballast pool. It is not a refusal (single-volume hosts are common): the daemon logs one `logging.on_monitored_fs=... device=... paths=[...]` line, records it in `state.json` under `logging`, `sbh status` prints a warning, and `sbh doctor --system` reports `logging.on_monitored_fs` (WARN, or FAIL while that mount is at Orange or worse). While the mount is pressured the daemon mirrors every JSONL line to the RAM fallback as well and says so once per level change. `state.json` itself is padded to a fixed 64 KiB and, when the atomic temp-file write cannot allocate, is rewritten in place, so status keeps updating on a full volume.
 
-The logger thread runs on a bounded channel (capacity 1024). When the channel is full, events are dropped and a counter is incremented. The drop count is reported periodically as a delta (not cumulative) to avoid alarm fatigue.
+The logger thread runs on a bounded channel (capacity <!-- claim:constants.logger.CHANNEL_CAPACITY -->1024<!-- /claim -->). When the channel is full, events are dropped and a counter is incremented. The drop count is reported periodically as a delta (not cumulative) to avoid alarm fatigue.
 
 ### Notification Channels
 
@@ -1624,7 +1624,7 @@ v2 uses the candidate index to avoid cold full walks under pressure. At Green or
 
 What feeds the index is platform-specific, and the daemon says which at startup (`scanner_events: backend=... complete=... reason=...` in the activity log, `sbh scan --json` capability fields):
 
-- **Linux:** recursive `inotify` watches over the configured roots, planned against `scanner.event_watch_budget` (8,192 by default). Every root and every depth-1 directory always gets a watch; the rest of the budget goes to the most active directories, ranked by a per-directory event-rate EWMA with a directory-mtime prior for subtrees that have never been watched. Directories left without a watch under a watched parent form the *frontier*: they are reconciled as their own scan paths (never the whole root, unless a root has more than 256 of them) and afterwards rely on the maintenance pass. While the plan is incomplete the daemon re-plans every 15 minutes from the observed rates, restarting the watches without losing events. A change under a project resolves to that project directory (the depth-1 directory below the configured root) as the scan path; the root itself is used when the change is at the root, when that directory is an artifact tree, or when more than 64 projects are dirty at once. The scanner polls the event source every 2 seconds while idle and runs the scoped pass itself at Green or Yellow (`reason=event` in `scan_complete`), paced by the base `min_rescan_interval_secs` only, so a new `target/` is seen within seconds instead of at the next maintenance walk. An inotify queue overflow reconciles everything once and then backs off: overflows inside the backoff window (30 s, doubling per consecutive overflow up to 30 min) are coalesced into one deferred reconciliation. The activity log carries `frontier_dirs`, `overflows`, `backoff_secs` and `replans`, and `scan_complete` details carry `event_overflows` and `event_watch_replans`. `fanotify` is **not implemented**: the crate forbids `unsafe`, the safe wrapper available to it does not report file handles (`FAN_REPORT_FID`), and filesystem-wide marks need `CAP_SYS_ADMIN`, which a user-scope service does not have. The capability probe reports it as deferred.
+- **Linux:** recursive `inotify` watches over the configured roots, planned against `scanner.event_watch_budget` (<!-- claim:constants.scanner.event_watch_budget -->8192<!-- /claim --> by default). Every root and every depth-1 directory always gets a watch; the rest of the budget goes to the most active directories, ranked by a per-directory event-rate EWMA with a directory-mtime prior for subtrees that have never been watched. Directories left without a watch under a watched parent form the *frontier*: they are reconciled as their own scan paths (never the whole root, unless a root has more than 256 of them) and afterwards rely on the maintenance pass. While the plan is incomplete the daemon re-plans every 15 minutes from the observed rates, restarting the watches without losing events. A change under a project resolves to that project directory (the depth-1 directory below the configured root) as the scan path; the root itself is used when the change is at the root, when that directory is an artifact tree, or when more than 64 projects are dirty at once. The scanner polls the event source every 2 seconds while idle and runs the scoped pass itself at Green or Yellow (`reason=event` in `scan_complete`), paced by the base `min_rescan_interval_secs` only, so a new `target/` is seen within seconds instead of at the next maintenance walk. An inotify queue overflow reconciles everything once and then backs off: overflows inside the backoff window (30 s, doubling per consecutive overflow up to 30 min) are coalesced into one deferred reconciliation. The activity log carries `frontier_dirs`, `overflows`, `backoff_secs` and `replans`, and `scan_complete` details carry `event_overflows` and `event_watch_replans`. `fanotify` is **not implemented**: the crate forbids `unsafe`, the safe wrapper available to it does not report file handles (`FAN_REPORT_FID`), and filesystem-wide marks need `CAP_SYS_ADMIN`, which a user-scope service does not have. The capability probe reports it as deferred.
 - **macOS and everything else:** reconciliation only. There is no FSEvents backend; the bound on staleness is the maintenance cadence (`pressure.maintenance_interval_secs`) plus the pressure-driven passes. An FSEvents backend through a safe crate is a decision recorded on bd-rc-master-ajg1.8.5 and needs the macOS CI lane to prove it before it ships.
 
 For validation and A/B artifacts, `sbh scan --json` reports `scanner_engine`, `scanner_dispatch`, `opaque_pruning`, `opaque_pruned_dirs`, `scanned_entries`, and nullable `process_cpu_micros` alongside the existing candidate totals. Daemon `scan_complete` activity events also include the selected dispatch, pruning state, dirty event-root count, index generation, indexed-record count, candidate bytes seen, and timeout state in their `details` payload. These fields are intended to make v1/v2 scan captures auditable without scraping human output.
@@ -1650,13 +1650,13 @@ The walker is the scanner's "eyes": it discovers candidate files and directories
 
 #### Work-Stealing Parallelism
 
-The walker uses a bounded work queue (capacity 4096) shared across `N` worker threads (configurable via `scanner.parallelism`). Root paths are seeded into the queue, and each worker pulls a directory, processes its entries, and enqueues discovered subdirectories back onto the shared queue. Workers that find an empty queue wait briefly (50ms timeout) before checking whether all work is complete. This design provides natural load balancing — workers that finish fast directories steal work from threads processing slower ones — without requiring explicit work-stealing data structures.
+The walker uses an unbounded work queue shared across `N` worker threads (configurable via `scanner.parallelism`) and a bounded result channel (capacity <!-- claim:constants.walker.RESULT_CHANNEL_CAP -->10000<!-- /claim -->) back to the collector. Root paths are seeded into the queue, and each worker pulls a directory, processes its entries, and enqueues discovered subdirectories back onto the shared queue. Workers that find an empty queue wait briefly (50ms timeout) before checking whether all work is complete. This design provides natural load balancing — workers that finish fast directories steal work from threads processing slower ones — without requiring explicit work-stealing data structures.
 
 An atomic `in_flight` counter tracks work items that have been dequeued but not yet processed. When the last item completes (counter reaches zero), workers exit. Results flow through an unbounded channel for throughput: the walker should never block on result delivery.
 
 #### Per-Directory Iteration Cap
 
-Directories with tens of thousands of entries (e.g., `/data/tmp` with 60K+ children, `node_modules` flats) can monopolize a worker thread for seconds. Each directory is capped at 65,536 child entries. Structural signals (`.git`, `Cargo.lock`, `deps/`, `build/`) are detected early during iteration, so the cap rarely affects scoring accuracy. This prevents any single pathological directory from starving other workers.
+Directories with tens of thousands of entries (e.g., `/data/tmp` with 60K+ children, `node_modules` flats) can monopolize a worker thread for seconds. Each directory is capped at <!-- claim:constants.walker.MAX_ENTRIES_PER_DIR -->65536<!-- /claim --> child entries. Structural signals (`.git`, `Cargo.lock`, `deps/`, `build/`) are detected early during iteration, so the cap rarely affects scoring accuracy. This prevents any single pathological directory from starving other workers.
 
 #### Open-File Detection
 
@@ -1709,7 +1709,7 @@ The token is minted at every start and written into `daemon.lock`, so a
 client that can read the lock file can talk and a client left over from a
 previous boot cannot. The lock file also records where the socket was
 bound: normally beside `state.json`, but a data directory whose path is
-longer than a Unix socket address allows (about 100 bytes) gets a short
+longer than a Unix socket address allows (<!-- claim:constants.control.MAX_SOCKET_PATH_BYTES -->100<!-- /claim --> bytes) gets a short
 `sbh-control-<hash>.sock` under the temp directory instead, and clients
 read that path rather than deriving it. Every command that changes state
 is logged with the caller's uid and pid.
@@ -1726,7 +1726,7 @@ is logged with the caller's uid and pid.
 | `sbh daemon shutdown` | A clean stop; the socket file is removed as part of it |
 
 The socket serves eight connections at a time, ten requests per second,
-and drops request lines over 64 KiB. `[core] control_socket_enabled = false`
+and drops request lines over <!-- claim:constants.control.MAX_LINE_BYTES -->64 KiB<!-- /claim -->. `[core] control_socket_enabled = false`
 turns it off, in which case the daemon answers signals and the state file
 only and `sbh daemon ping` explains that no socket exists.
 
@@ -1753,7 +1753,7 @@ On receiving a shutdown signal, the daemon runs this sequence:
 
 `state.json` also carries a `threads` block (`monitor`, `scanner`, `executor`,
 `logger`) with each thread's status and seconds since its last heartbeat; a
-worker is reported `stalled` after 60 seconds without a beat and `dead` when
+worker is reported `stalled` after <!-- claim:constants.daemon.THREAD_STALL_THRESHOLD.raw -->60<!-- /claim --> seconds without a beat and `dead` when
 its thread has exited.
 
 Source: `src/daemon/signals.rs`, `src/daemon/loop_main.rs`
@@ -1764,13 +1764,13 @@ The self-monitor tracks daemon health from within, providing introspection data 
 
 #### Prometheus Textfile Export
 
-With every `state.json` write (every 30 seconds, or on request from `sbh status`) the daemon also renders `metrics.prom` beside it, atomically and world-readable, in the Prometheus text exposition format. Point node_exporter's textfile collector at the data directory (`--collector.textfile.directory=/var/lib/sbh` for a system install) and the `sbh_*` families appear with no network surface and no new dependency; `sbh metrics` prints the same text for hosts without a collector.
+With every `state.json` write (every <!-- claim:constants.daemon.DAEMON_STATE_WRITE_INTERVAL_SECS -->30<!-- /claim --> seconds, or on request from `sbh status`) the daemon also renders `metrics.prom` beside it, atomically and world-readable, in the Prometheus text exposition format. Point node_exporter's textfile collector at the data directory (`--collector.textfile.directory=/var/lib/sbh` for a system install) and the `sbh_*` families appear with no network surface and no new dependency; `sbh metrics` prints the same text for hosts without a collector.
 
 The families are a view of the state document, so they never disagree with `sbh status`: `sbh_up`, `sbh_info{version,git_sha,policy_mode,run_id}`, `sbh_daemon_uptime_seconds`, `sbh_daemon_cpu_seconds_total`, `sbh_daemon_rss_bytes`, `sbh_daemon_cpu_budget_used_ratio`, `sbh_daemon_cpu_budget_deficit_seconds`; per mount `sbh_mount_free_ratio`, `sbh_mount_pressure_level{level}` (one-hot), `sbh_mount_fill_rate_bytes_per_second`, `sbh_mount_seconds_to_red`, `sbh_mount_reclaim_capability{capability}`, `sbh_mount_controller_state{state}`, `sbh_ballast_present_bytes`, `sbh_ballast_target_bytes`, `sbh_quarantine_bytes`; `sbh_ballast_files{state}`, `sbh_ballast_releases_total`, `sbh_scans_total`, `sbh_deletions_total`, `sbh_bytes_freed_total`, `sbh_errors_total`, `sbh_log_events_dropped_total`, `sbh_last_scan_candidates`, `sbh_policy_mode{mode}` (one-hot), `sbh_policy_mode_seconds`, `sbh_thread_up{thread}`. Scan CPU seconds, per-engine scan counts and guard e-values are not exported yet because the state document does not carry them. `[telemetry] metrics_enabled = false` turns the export off and removes a stale file at startup.
 
 #### Thread Heartbeats
 
-Each worker thread (monitor, scanner, executor, logger) periodically calls a heartbeat function that updates a monotonic timestamp. The self-monitor checks these timestamps against a staleness threshold (60 seconds). If a thread misses its window, its status transitions from `Running` to `Stalled`. If a thread panics and is not respawned, its status becomes `Dead` with the captured error message.
+Each worker thread (monitor, scanner, executor, logger) periodically calls a heartbeat function that updates a monotonic timestamp. The self-monitor checks these timestamps against a staleness threshold (<!-- claim:constants.daemon.THREAD_STALL_THRESHOLD.raw -->60<!-- /claim --> seconds). If a thread misses its window, its status transitions from `Running` to `Stalled`. If a thread panics and is not respawned, its status becomes `Dead` with the captured error message.
 
 The heartbeat uses a process-local monotonic clock (`Instant`) rather than `SystemTime` to avoid false readings when the system clock is adjusted (NTP corrections, daylight saving changes, manual adjustments).
 
@@ -1778,9 +1778,9 @@ Thread statuses are reported in the state file and displayed on the dashboard Di
 
 #### RSS Memory Tracking
 
-The daemon samples its own RSS through the PAL `self_stats()` method on each state file write. Linux uses `/proc/self` data; macOS uses Mach task and libproc resource usage. If RSS exceeds the configured limit (256 MB by default, matching the systemd `MemoryMax` directive on Linux), a warning is logged to stderr. The RSS value is included in the state file for external monitoring tools.
+The daemon samples its own RSS through the PAL `self_stats()` method on each state file write. Linux uses `/proc/self` data; macOS uses Mach task and libproc resource usage. If RSS exceeds the configured warning level (<!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> by default, matching the systemd `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->` directive on Linux), a warning is logged to stderr. The RSS value is included in the state file for external monitoring tools.
 
-The 256 MB limit ensures `sbh` never competes with build workloads for memory. On machines with constrained RAM, the limit can be adjusted via the systemd unit file or by direct configuration.
+The daemon warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> of RSS and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim --> so the service manager restarts it clean; the generated systemd unit caps the cgroup at `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->`, which is the limit that binds in practice. Both keep `sbh` from competing with build workloads for memory; on machines with constrained RAM, lower them in the unit file (`sbh service --systemd reinstall-unit` rewrites it) or in `[telemetry]`.
 
 #### State File Protocol
 
@@ -1788,8 +1788,8 @@ The state file (`state.json`) is the primary mechanism for CLI-to-daemon communi
 
 | Parameter | Value | Purpose |
 | --- | --- | --- |
-| Write interval | 30 seconds | Balances freshness with IO overhead |
-| Stale threshold | 90 seconds | `>= 2x` write interval, prevents false "daemon absent" reports |
+| Write interval | <!-- claim:constants.daemon.DAEMON_STATE_WRITE_INTERVAL_SECS -->30<!-- /claim --> seconds | Balances freshness with IO overhead |
+| Stale threshold | <!-- claim:constants.daemon.DAEMON_STATE_STALE_THRESHOLD_SECS -->90<!-- /claim --> seconds | `>= 2x` write interval, prevents false "daemon absent" reports |
 | Write method | Atomic rename | Guarantees CLI always reads a complete JSON document |
 
 The schema uses `#[serde(default)]` on all fields, so minor version differences between daemon and CLI (e.g., during a rolling update) degrade gracefully: new fields are ignored by old CLI versions, and missing fields use defaults rather than causing parse failures. The dashboard adapter layer detects schema drift and surfaces warnings rather than crashing.
@@ -2210,7 +2210,7 @@ For test harness conventions and structured logging registration, see `docs/test
 - If using systemd with `Type=notify`, the watchdog will auto-restart after 60 seconds of no heartbeat.
 
 ### "Memory usage keeps growing"
-- The daemon enforces a 256 MB RSS limit. Check `sbh status --json | jq '.memory_rss_bytes'`.
+- The daemon warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> of RSS and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim -->; the systemd unit caps it at `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->`. Check `sbh status --json | jq '.memory_rss_bytes'`.
 - Systemd's `MemoryMax=256M` provides a hard ceiling.
 - Large Merkle scan indexes on machines with many directories can increase baseline memory. Consider reducing `scanner.root_paths` scope.
 
@@ -2247,7 +2247,7 @@ Send `SIGUSR1` to the daemon: `kill -USR1 $(pidof sbh)`. This bypasses the VOI s
 Yes. The index is checkpointed to disk with SHA-256 integrity verification. On restart, the daemon loads the checkpoint and resumes incremental scanning. If the checkpoint is corrupt or missing, it falls back to a full scan.
 
 ### How much memory does `sbh` use?
-Under normal operation, 20-60 MB of RSS. The hard limit is 256 MB (enforced by both the daemon self-monitor and the systemd `MemoryMax` directive). Machines with hundreds of thousands of directories in watched paths will use more due to the Merkle scan index.
+Under normal operation, 20-60 MB of RSS. The systemd unit's `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->` is the binding cap; the daemon's own self-monitor warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim --> (which only binds without a cgroup cap, as on launchd). Machines with hundreds of thousands of directories in watched paths will use more due to the Merkle scan index.
 
 ### Is this Linux-only?
 No. It is cross-platform, with service integration for `systemd` (Linux) and `launchd` (macOS). Open-file vetoes are platform-specific internally: Linux uses `/proc/*/fd`, while macOS uses PAL/libproc evidence for visible processes. Other safety layers, including age, sacred-path, protected-path, active executable/mmap, and `.git` guards, remain active on both platforms.

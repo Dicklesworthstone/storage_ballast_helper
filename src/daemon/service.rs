@@ -11,6 +11,11 @@ mod systemd;
 use std::path::{Path, PathBuf};
 
 use crate::core::errors::Result;
+
+/// `MemoryMax=` written into the generated systemd unit: the cgroup cap,
+/// above the daemon's own RSS warning and below nothing else (the daemon
+/// exits at its hard limit first only when that is lower).
+pub const SYSTEMD_MEMORY_MAX: &str = "256M";
 use crate::platform::pal::{NoopServiceManager, Platform, ServiceManager};
 use crate::platform::types::ServiceKind;
 
@@ -494,7 +499,12 @@ mod legacy_inline {
 
             // -- Resource limits -----------------------------------------------
             writeln!(unit, "# Resource limits").ok();
-            writeln!(unit, "MemoryMax=256M").ok();
+            writeln!(
+                unit,
+                "MemoryMax={}",
+                crate::daemon::service::SYSTEMD_MEMORY_MAX
+            )
+            .ok();
             writeln!(unit, "CPUQuota=10%").ok();
             writeln!(unit).ok();
 

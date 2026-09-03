@@ -28,6 +28,10 @@ use crate::scanner::decision_record::DecisionRecord;
 /// Default bounded channel capacity for log events.
 pub const CHANNEL_CAPACITY: usize = 1024;
 
+/// Consecutive SQLite write failures that trip the backend (JSONL-only
+/// until the periodic reopen succeeds).
+pub const SQLITE_FAILURE_TRIP: u32 = 3;
+
 // ──────────────────── public event type ────────────────────
 
 /// Structured scan-completion fields used for scanner rollout validation.
@@ -471,7 +475,7 @@ fn logger_thread_main(
                         sqlite_failures = 0;
                     } else {
                         sqlite_failures += 1;
-                        if sqlite_failures >= 3 {
+                        if sqlite_failures >= SQLITE_FAILURE_TRIP {
                             eprintln!(
                                 "[SBH-DUAL] SQLite write failed {sqlite_failures} times, disabling"
                             );
