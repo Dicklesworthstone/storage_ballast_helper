@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use storage_ballast_helper::scanner::active_lease::ActiveLease;
 
 // ──────────────────── fixtures ────────────────────
@@ -2338,4 +2338,169 @@ fn dry_run_orange_pressure_backs_off_after_the_first_dispatch() {
     );
     let status = run.stop();
     assert!(status.success(), "{status}");
+}
+
+/// bd-rc-master-ajg1.4.9: the control socket answers `ping` with the
+/// daemon's identity, refuses a wrong token, queues a forced scan, moves
+/// the policy mode and persists it, makes `status --json` report
+/// `source = "socket"`, and stops the daemon cleanly with the socket gone.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn control_socket_serves_ping_scan_now_policy_and_shutdown() {
+    use storage_ballast_helper::daemon::control::{control_socket_path, read_token, request};
+    use storage_ballast_helper::daemon::self_monitor::{DaemonLockProbe, probe_daemon_lock};
+
+    let dir = scratch();
+    let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
+    let fixture_mount = dir.path().to_path_buf();
+    let table = injected_table(&[
+        (&fixture_mount, 1_000_000_000_000, 550_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![fixtures.root],
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    let state_path = run.state_path();
+    let socket = control_socket_path(&state_path);
+    run.wait_until("the control socket", Duration::from_secs(30), |_| {
+        socket.exists()
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    let token = read_token(&state_path).expect("daemon.lock carries the control token");
+    assert_eq!(token.len(), 32, "{token}");
+
+    // ping: identity and a latency print (the design target is 50 ms on an
+    // idle host; the gate is loose because CI hosts are not idle).
+    let started = Instant::now();
+    let ping = request(&socket, &token, "ping", &json!({})).unwrap();
+    let latency = started.elapsed();
+    assert!(ping.ok, "{ping:?}");
+    assert_eq!(ping.result["version"], env!("CARGO_PKG_VERSION"));
+    assert!(ping.result["pid"].as_u64().is_some_and(|pid| pid > 0));
+    assert!(ping.result["policy_mode"].is_string(), "{ping:?}");
+    assert!(
+        latency < Duration::from_millis(500),
+        "ping took {latency:?}"
+    );
+    let _ = writeln!(
+        std::io::stderr(),
+        "control socket ping latency: {latency:?}"
+    );
+
+    let refused = request(&socket, "not-the-token", "shutdown", &json!({})).unwrap();
+    assert!(!refused.ok);
+    assert_eq!(refused.error.as_ref().unwrap().code, "unauthorized");
+    let unknown = request(&socket, &token, "explain", &json!({"id": "000000000000"})).unwrap();
+    assert_eq!(
+        unknown.error.as_ref().unwrap().code,
+        "not_found",
+        "{unknown:?}"
+    );
+
+    let config_path = run.config_path.clone();
+    let cli = |args: &[&str]| {
+        Command::new(common::sbh_bin_path())
+            .arg("--config")
+            .arg(&config_path)
+            .args(args)
+            .env("SBH_TEST_MODE", "1")
+            .env("SBH_TEST_FS_STATS", &table)
+            .output()
+            .expect("run sbh")
+    };
+    let payload_of = |output: &std::process::Output| -> Value {
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stdout)))
+    };
+
+    let ping_cli = cli(&["--json", "daemon", "ping"]);
+    let payload = payload_of(&ping_cli);
+    assert_eq!(ping_cli.status.code(), Some(0), "{payload}");
+    assert_eq!(payload["ok"], true, "{payload}");
+    assert_eq!(payload["result"]["version"], env!("CARGO_PKG_VERSION"));
+
+    // scan-now: the next tick runs a forced scan.
+    let before = run.events_of("scan_complete").len();
+    let scan = cli(&["--json", "daemon", "scan-now"]);
+    assert_eq!(
+        scan.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&scan.stderr)
+    );
+    run.wait_until("the forced scan", Duration::from_secs(30), |run| {
+        run.events_of("scan_complete")
+            .iter()
+            .skip(before)
+            .any(|event| scan_reason(event) == Some("forced"))
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+
+    // policy: status, then a persisted transition and back.
+    let status = payload_of(&cli(&["--json", "policy", "status"]));
+    let mode = status["result"]["mode"].as_str().unwrap().to_string();
+    assert!(
+        ["observe", "canary", "enforce"].contains(&mode.as_str()),
+        "{status}"
+    );
+    let (step, back) = if mode == "enforce" {
+        ("demote", "promote")
+    } else {
+        ("promote", "demote")
+    };
+    let moved = payload_of(&cli(&["--json", "policy", step]));
+    assert_eq!(moved["ok"], true, "{moved}");
+    assert_eq!(moved["result"]["changed"], true, "{moved}");
+    let new_mode = moved["result"]["mode"].as_str().unwrap().to_string();
+    assert_ne!(new_mode, mode, "{moved}");
+    let config_text = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        config_text.contains(&format!("initial_mode = \"{new_mode}\"")),
+        "the mode is persisted: {config_text}"
+    );
+    assert!(
+        moved["result"]["backup"]
+            .as_str()
+            .is_some_and(|backup| Path::new(backup).exists()),
+        "a backup of the config precedes the rewrite: {moved}"
+    );
+    let restored = payload_of(&cli(&["--json", "policy", back]));
+    assert_eq!(restored["result"]["mode"], mode, "{restored}");
+
+    // status --json prefers the socket and says so.
+    let status_cli = payload_of(&cli(&["--json", "status"]));
+    assert_eq!(status_cli["source"], "socket", "{status_cli}");
+    assert_eq!(status_cli["daemon_running"], true, "{status_cli}");
+
+    // shutdown: the daemon exits 0 by itself and unlinks the socket.
+    let halt = cli(&["--json", "daemon", "shutdown"]);
+    assert_eq!(
+        halt.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&halt.stderr)
+    );
+    // `wait_until` treats an exited daemon as a failure; here the exit is
+    // the point, so poll the socket and the lock directly.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while socket.exists() || !matches!(probe_daemon_lock(&state_path), DaemonLockProbe::Free) {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not stop within 20 s: {}",
+            run.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let status = run.stop();
+    assert!(status.success(), "{status}");
+
+    let gone = cli(&["--json", "daemon", "ping"]);
+    assert_ne!(gone.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&gone.stderr).contains("no running daemon"),
+        "{}",
+        String::from_utf8_lossy(&gone.stderr)
+    );
 }

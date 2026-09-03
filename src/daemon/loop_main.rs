@@ -29,6 +29,10 @@ use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::{Config, ScannerConfig, ScannerEngineMode};
 use crate::core::errors::{Result, SbhError};
+use crate::daemon::control::{
+    BallastAction as ControlBallastAction, ControlBackend, ControlCommand, ControlResponse,
+    ControlServer, Peer, PolicyAction, control_socket_path, persist_policy_mode,
+};
 use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD};
 use crate::daemon::mount_controller::{
     IdleReason, MountController, MountControllerConfig, MountState, MountStateRecord, MountSurface,
@@ -662,6 +666,209 @@ enum WorkerReport {
     },
 }
 
+/// Commands the control socket cannot run on its own thread: they need the
+/// main loop's state (the self monitor, the ballast coordinator).
+const CONTROL_CHANNEL_CAP: usize = 16;
+
+#[derive(Debug)]
+enum MainLoopCommand {
+    /// Break the tick sleep so a signal-flag request runs now.
+    Wake,
+    /// Write `state.json` on this tick and answer when it is on disk.
+    WriteState(Sender<()>),
+    /// Release or replenish ballast through the coordinator.
+    Ballast {
+        action: ControlBallastAction,
+        reply: Sender<std::result::Result<Value, String>>,
+    },
+}
+
+/// The daemon side of the control socket: signal-flag commands and ledger
+/// lookups are answered on the connection thread, everything else goes to
+/// the main loop through [`MainLoopCommand`].
+struct DaemonControlBackend {
+    signal_handler: SignalHandler,
+    control_tx: Sender<MainLoopCommand>,
+    logger: ActivityLoggerHandle,
+    policy_engine: Arc<Mutex<PolicyEngine>>,
+    state_file: PathBuf,
+    sqlite_db: PathBuf,
+    config_file: PathBuf,
+    started_at: String,
+    start_instant: Instant,
+}
+
+impl DaemonControlBackend {
+    fn wake(&self) {
+        let _ = self.control_tx.try_send(MainLoopCommand::Wake);
+    }
+
+    fn policy(&self, action: PolicyAction, peer: Option<Peer>) -> ControlResponse {
+        let (before, after, changed) = {
+            let mut engine = self.policy_engine.lock();
+            let before = engine.mode();
+            let changed = match action {
+                PolicyAction::Status => false,
+                PolicyAction::Promote => engine.promote(),
+                PolicyAction::Demote => engine.demote(),
+            };
+            (before, engine.mode(), changed)
+        };
+        let mut result = json!({
+            "action": action.as_str(),
+            "mode": after.to_string(),
+            "previous_mode": before.to_string(),
+            "changed": changed,
+        });
+        if changed {
+            match persist_policy_mode(&self.config_file, &after.to_string()) {
+                Ok(backup) => {
+                    result["config_file"] = json!(self.config_file);
+                    result["backup"] = json!(backup);
+                }
+                Err(error) => {
+                    result["persist_error"] = json!(error.to_string());
+                }
+            }
+            self.logger.send(ActivityEvent::Info {
+                message: format!(
+                    "control socket: policy {} {before} -> {after} (uid {}, pid {}); persisted={}",
+                    action.as_str(),
+                    peer.map_or_else(|| "?".to_string(), |p| p.uid.to_string()),
+                    peer.map_or_else(|| "?".to_string(), |p| p.pid.to_string()),
+                    result.get("backup").is_some() || !self.config_file.exists()
+                ),
+            });
+        }
+        ControlResponse::success(result)
+    }
+
+    fn status(&self) -> ControlResponse {
+        let (reply_tx, reply_rx) = bounded::<()>(1);
+        if self
+            .control_tx
+            .try_send(MainLoopCommand::WriteState(reply_tx))
+            .is_err()
+        {
+            return ControlResponse::failure("busy", "the main loop command queue is full");
+        }
+        match reply_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(()) => match SelfMonitor::read_state(&self.state_file) {
+                Ok(state) => match serde_json::to_value(state) {
+                    Ok(value) => ControlResponse::success(value),
+                    Err(error) => ControlResponse::failure("unavailable", error.to_string()),
+                },
+                Err(error) => ControlResponse::failure("unavailable", error),
+            },
+            Err(_) => ControlResponse::failure(
+                "timeout",
+                "the main loop did not write state.json within 10 s",
+            ),
+        }
+    }
+
+    fn explain(&self, id: &str) -> ControlResponse {
+        let ledger = match crate::logger::sqlite::SqliteLogger::open_read_only(&self.sqlite_db) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                return ControlResponse::failure(
+                    "unavailable",
+                    format!("decision ledger {}: {error}", self.sqlite_db.display()),
+                );
+            }
+        };
+        match ledger.decision_by_id(id) {
+            Ok(Some((record, occurrences))) => match serde_json::to_value(&record) {
+                Ok(record) => ControlResponse::success(json!({
+                    "record": record,
+                    "occurrences": occurrences,
+                })),
+                Err(error) => ControlResponse::failure("unavailable", error.to_string()),
+            },
+            Ok(None) => ControlResponse::failure(
+                "not_found",
+                format!("no decision {id} in {}", self.sqlite_db.display()),
+            ),
+            Err(error) => ControlResponse::failure("unavailable", error.to_string()),
+        }
+    }
+
+    fn ballast(&self, action: ControlBallastAction) -> ControlResponse {
+        let (reply_tx, reply_rx) = bounded::<std::result::Result<Value, String>>(1);
+        if self
+            .control_tx
+            .try_send(MainLoopCommand::Ballast {
+                action,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return ControlResponse::failure("busy", "the main loop command queue is full");
+        }
+        match reply_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(Ok(result)) => ControlResponse::success(result),
+            Ok(Err(error)) => ControlResponse::failure("failed", error),
+            Err(_) => ControlResponse::failure(
+                "timeout",
+                "the main loop did not finish the ballast action within 60 s",
+            ),
+        }
+    }
+}
+
+impl ControlBackend for DaemonControlBackend {
+    fn handle(&self, command: ControlCommand, peer: Option<Peer>) -> ControlResponse {
+        if command.is_mutating() {
+            self.logger.send(ActivityEvent::Info {
+                message: format!(
+                    "control socket: {} requested by uid {} pid {}",
+                    command.name(),
+                    peer.map_or_else(|| "?".to_string(), |p| p.uid.to_string()),
+                    peer.map_or_else(|| "?".to_string(), |p| p.pid.to_string()),
+                ),
+            });
+        }
+        match command {
+            ControlCommand::Ping => ControlResponse::success(json!({
+                "pid": std::process::id(),
+                "started_at": self.started_at,
+                "version": env!("CARGO_PKG_VERSION"),
+                "uptime_secs": self.start_instant.elapsed().as_secs(),
+                "policy_mode": self.policy_engine.lock().mode().to_string(),
+            })),
+            ControlCommand::Status => self.status(),
+            ControlCommand::ScanNow { paths, force } => {
+                if !paths.is_empty() {
+                    return ControlResponse::failure(
+                        "bad_request",
+                        "scan-now: per-path scans are not supported yet; the forced scan covers the configured roots",
+                    );
+                }
+                self.signal_handler.request_scan();
+                self.wake();
+                ControlResponse::success(json!({
+                    "queued": true,
+                    "force": force,
+                    "note": "the next tick runs a forced scan of the configured roots (the SIGUSR1 path)",
+                }))
+            }
+            ControlCommand::Reload => {
+                self.signal_handler.request_reload();
+                self.wake();
+                ControlResponse::success(json!({ "queued": true }))
+            }
+            ControlCommand::Policy(action) => self.policy(action, peer),
+            ControlCommand::Explain { id } => self.explain(&id),
+            ControlCommand::Ballast(action) => self.ballast(action),
+            ControlCommand::Shutdown => {
+                self.signal_handler.request_shutdown();
+                self.wake();
+                ControlResponse::success(json!({ "stopping": true }))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ScannerIndexFeedback {
     identity: IndexedIdentity,
@@ -1250,7 +1457,7 @@ pub struct MonitoringDaemon {
     /// consulted by the scanner before each discretionary pass.
     cpu_budget: Arc<Mutex<CpuBudget>>,
     /// Exclusive liveness lock next to `state.json`; held until the daemon exits.
-    _daemon_lock: DaemonLock,
+    daemon_lock: DaemonLock,
     /// Optional `--pidfile`, removed again on orderly shutdown.
     pidfile: Option<PathBuf>,
     fs_collector: FsStatsCollector,
@@ -1347,6 +1554,14 @@ pub struct MonitoringDaemon {
     self_monitor: SelfMonitor,
     tick_throttle: AdaptiveTickThrottle,
     policy_engine: Arc<Mutex<PolicyEngine>>,
+    /// bd-rc-master-ajg1.4.9: the control socket's channel into the main
+    /// loop (fresh state writes, ballast actions, wake-ups), the running
+    /// listener, and the `status` requests waiting for the next state write.
+    control_tx: Sender<MainLoopCommand>,
+    control_rx: Receiver<MainLoopCommand>,
+    control_server: Option<ControlServer>,
+    pending_control: Vec<MainLoopCommand>,
+    pending_state_replies: Vec<Sender<()>>,
     behavior_state: PressureBehaviorState,
     shared_guard_diagnostics: Arc<RwLock<Option<GuardDiagnostics>>>,
     scanner_heartbeat: Arc<ThreadHeartbeat>,
@@ -2156,6 +2371,7 @@ impl MonitoringDaemon {
 
         // 14. Policy engine (progressive delivery gates for deletion pipeline).
         let policy_engine = Arc::new(Mutex::new(PolicyEngine::new(config.policy.clone())));
+        let (control_tx, control_rx) = bounded::<MainLoopCommand>(CONTROL_CHANNEL_CAP);
         let shared_guard_diagnostics = Arc::new(RwLock::new(None));
         let behavior_state = PressureBehaviorState::new(
             behavior_table_from_config(&config),
@@ -2180,7 +2396,7 @@ impl MonitoringDaemon {
             signal_handler,
             watchdog,
             cpu_budget,
-            _daemon_lock: daemon_lock,
+            daemon_lock,
             pidfile: args.pidfile.clone(),
             fs_collector,
             mount_monitors: HashMap::new(),
@@ -2239,6 +2455,11 @@ impl MonitoringDaemon {
             process_io_history,
             self_monitor,
             tick_throttle: AdaptiveTickThrottle::default(),
+            control_tx,
+            control_rx,
+            control_server: None,
+            pending_control: Vec::new(),
+            pending_state_replies: Vec::new(),
             behavior_state,
             scanner_heartbeat,
             executor_heartbeat,
@@ -2522,20 +2743,157 @@ impl MonitoringDaemon {
             }
 
             let wait = remaining.min(MEMORY_PRESSURE_WAKE_INTERVAL);
-            match rx.recv_timeout(wait) {
-                Ok(event) => {
-                    self.update_behavior_mode(
-                        event.pressure.level,
-                        disk_level,
-                        "memory_pressure",
-                        event.received_at.elapsed(),
-                    );
-                    self.drain_memory_pressure_events(rx, disk_level);
+            // A control-socket command ends the sleep so the next tick runs
+            // it at once instead of after the remaining interval.
+            let control_rx = self.control_rx.clone();
+            crossbeam_channel::select! {
+                recv(rx) -> event => match event {
+                    Ok(event) => {
+                        self.update_behavior_mode(
+                            event.pressure.level,
+                            disk_level,
+                            "memory_pressure",
+                            event.received_at.elapsed(),
+                        );
+                        self.drain_memory_pressure_events(rx, disk_level);
+                    }
+                    Err(_) => break,
+                },
+                recv(control_rx) -> command => {
+                    if let Ok(command) = command {
+                        self.pending_control.push(command);
+                    }
+                    break;
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+                default(wait) => {}
             }
         }
+    }
+
+    // ──────────────────── control socket (bd-rc-master-ajg1.4.9) ────────────────────
+
+    fn start_control_server(&mut self) {
+        let path = control_socket_path(&self.config.paths.state_file);
+        let backend = Arc::new(DaemonControlBackend {
+            signal_handler: self.signal_handler.clone(),
+            control_tx: self.control_tx.clone(),
+            logger: self.logger_handle.clone(),
+            policy_engine: Arc::clone(&self.policy_engine),
+            state_file: self.config.paths.state_file.clone(),
+            sqlite_db: self.config.paths.sqlite_db.clone(),
+            config_file: self.config.paths.config_file.clone(),
+            started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            start_instant: self.start_time,
+        });
+        match ControlServer::start(&path, self.daemon_lock.token(), backend) {
+            Ok(server) => {
+                eprintln!("[SBH-CONTROL] listening on {}", server.path().display());
+                self.control_server = Some(server);
+            }
+            Err(error) => {
+                eprintln!("[SBH-CONTROL] control socket unavailable: {error}");
+                self.logger_handle.send(ActivityEvent::Error {
+                    code: error.code().to_string(),
+                    message: format!("control socket unavailable at {}: {error}", path.display()),
+                });
+            }
+        }
+    }
+
+    /// Run everything the control socket queued for the main loop.
+    fn drain_control_commands(&mut self) {
+        let mut commands = std::mem::take(&mut self.pending_control);
+        while let Ok(command) = self.control_rx.try_recv() {
+            commands.push(command);
+        }
+        for command in commands {
+            match command {
+                MainLoopCommand::Wake => {}
+                MainLoopCommand::WriteState(reply) => {
+                    self.self_monitor.force_next_write();
+                    self.pending_state_replies.push(reply);
+                }
+                MainLoopCommand::Ballast { action, reply } => {
+                    let result = self.execute_ballast_action(&action);
+                    let _ = reply.try_send(result);
+                }
+            }
+        }
+    }
+
+    /// Answer the `status` requests that waited for this tick's state write.
+    fn flush_state_replies(&mut self) {
+        for reply in self.pending_state_replies.drain(..) {
+            let _ = reply.try_send(());
+        }
+    }
+
+    fn execute_ballast_action(
+        &mut self,
+        action: &ControlBallastAction,
+    ) -> std::result::Result<Value, String> {
+        let requested = match action {
+            ControlBallastAction::Release { mount, .. }
+            | ControlBallastAction::Replenish { mount } => mount.clone(),
+        };
+        let mounts: Vec<PathBuf> = requested.map_or_else(
+            || {
+                self.ballast_coordinator
+                    .inventory()
+                    .into_iter()
+                    .map(|pool| pool.mount_point)
+                    .collect()
+            },
+            |mount| vec![mount],
+        );
+        if mounts.is_empty() {
+            return Err("no ballast pool is configured".to_string());
+        }
+        let mut pools = Vec::new();
+        for mount in mounts {
+            let outcome = match action {
+                ControlBallastAction::Release { count, .. } => self
+                    .ballast_coordinator
+                    .release_for_mount(&mount, *count)
+                    .map(|report| {
+                        report.map_or_else(
+                            || json!({ "mount": mount, "released": 0, "bytes_freed": 0, "note": "no pool or nothing to release" }),
+                            |report| {
+                                json!({
+                                    "mount": mount,
+                                    "released": report.files_released,
+                                    "bytes_freed": report.bytes_freed,
+                                    "warnings": report.warnings,
+                                    "errors": report.errors,
+                                })
+                            },
+                        )
+                    }),
+                ControlBallastAction::Replenish { .. } => self
+                    .ballast_coordinator
+                    .replenish_for_mount(&mount, None)
+                    .map(|report| {
+                        report.map_or_else(
+                            || json!({ "mount": mount, "created": 0, "note": "no pool on this mount" }),
+                            |report| {
+                                json!({
+                                    "mount": mount,
+                                    "created": report.files_created,
+                                    "skipped": report.files_skipped,
+                                    "skipped_for_floor": report.skipped_for_floor,
+                                    "bytes": report.total_bytes,
+                                    "errors": report.errors,
+                                })
+                            },
+                        )
+                    }),
+            };
+            match outcome {
+                Ok(value) => pools.push(value),
+                Err(error) => return Err(format!("{}: {error}", mount.display())),
+            }
+        }
+        Ok(json!({ "pools": pools }))
     }
 
     fn emit_status_dump(&self, response: &PressureResponse) {
@@ -2833,6 +3191,10 @@ impl MonitoringDaemon {
             index_feedback_tx.clone(),
         )?);
 
+        if self.config.core.control_socket_enabled {
+            self.start_control_server();
+        }
+
         // Startup is complete: workers are running and the first state file is
         // written. Type=notify units wait for this READY=1 and are killed at
         // TimeoutStartSec without it.
@@ -2852,6 +3214,7 @@ impl MonitoringDaemon {
                 eprintln!("[SBH-DAEMON] shutdown requested");
                 break;
             }
+            self.drain_control_commands();
 
             // 2. Check config reload signal.
             if self.signal_handler.should_reload() {
@@ -2926,6 +3289,7 @@ impl MonitoringDaemon {
             // RSS breach should exit promptly for the service manager restart
             // path instead of spending another tick on scans or deletions.
             let self_monitor_tick = self.maybe_write_self_monitor_state(&response);
+            self.flush_state_replies();
             // Evidence that cannot be persisted must not keep driving
             // deletions: the policy engine decides what a failed state
             // write means (`policy.serialization_failure_action`).
@@ -4994,6 +5358,12 @@ impl MonitoringDaemon {
         exit_reason: &str,
     ) {
         let uptime_secs = self.start_time.elapsed().as_secs();
+
+        // The control socket goes first: a client must not reach a daemon
+        // that is draining, and the socket file must be gone when we exit.
+        if let Some(server) = self.control_server.take() {
+            server.stop();
+        }
 
         // 0. Tell the service manager an orderly stop has begun so it does not
         // count the exit against Restart=on-failure while workers drain.

@@ -85,6 +85,10 @@ pub struct DaemonLockInfo {
     pub pid: u32,
     pub started_at: String,
     pub version: String,
+    /// Per-boot secret a control-socket client must present (bd-rc-master-ajg1.4.9).
+    /// Readable by whoever can read the lock file, which is the intended
+    /// audience; the socket's own mode is the access control.
+    pub token: String,
 }
 
 /// Path of the daemon lock for a given `state.json` path.
@@ -99,6 +103,12 @@ pub struct DaemonLock {
     #[cfg(unix)]
     _lock: nix::fcntl::Flock<fs::File>,
     path: PathBuf,
+    token: String,
+}
+
+/// A fresh per-boot control token: 32 hex characters from the process RNG.
+fn new_control_token() -> String {
+    format!("{:032x}", rand::random::<u128>())
 }
 
 impl DaemonLock {
@@ -156,10 +166,12 @@ impl DaemonLock {
                 }
             })?;
 
+            let token = new_control_token();
             let info = DaemonLockInfo {
                 pid: std::process::id(),
                 started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                token: token.clone(),
             };
             let payload = serde_json::to_string(&info).map_err(|e| SbhError::Serialization {
                 context: "daemon lock",
@@ -175,12 +187,19 @@ impl DaemonLock {
                 source,
             })?;
 
-            Ok(Self { _lock: lock, path })
+            Ok(Self {
+                _lock: lock,
+                path,
+                token,
+            })
         }
         #[cfg(not(unix))]
         {
             let _ = file;
-            Ok(Self { path })
+            Ok(Self {
+                path,
+                token: new_control_token(),
+            })
         }
     }
 
@@ -188,6 +207,12 @@ impl DaemonLock {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The per-boot control-socket token written into the lock file.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
     }
 }
 
@@ -810,6 +835,12 @@ impl SelfMonitor {
     /// Record the policy engine snapshot the next state file write carries.
     pub fn set_policy_snapshot(&mut self, policy: PolicyStateRecord) {
         self.policy_snapshot = policy;
+    }
+
+    /// Make the next `maybe_write_state` call write regardless of the
+    /// interval (a control-socket `status` request wants a fresh file).
+    pub fn force_next_write(&mut self) {
+        self.last_write = None;
     }
 
     /// This run's identifier, as written to the state file.

@@ -6,6 +6,31 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ---
 
+## Unreleased
+
+Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
+
+### Added — daemon control socket
+
+- The daemon serves `control.sock` beside `state.json` (mode 0600, per-boot token in `daemon.lock`, JSON line in / JSON line out). `sbh daemon ping|scan-now|reload|shutdown` and `sbh policy status|promote|demote` talk to it; `sbh status --json` asks a running daemon to rewrite `state.json` first and reports `"source": "socket"`. Promotions persist `[policy] initial_mode` after a config backup. `[core] control_socket_enabled = false` turns the socket off.
+
+### Fixed — daemon scanner hot loops at Orange (bd-8aeq)
+
+- A definite cargo `target/` replayed from the scanner index was re-classified from the root directory's own entries and downgraded to `unclear`, so the Orange cell held it back forever while the replay re-dispatched it twice a second. Index records now persist the walk's structural signals (checkpoint version 2; an old index is walked once more) and replays score with them.
+- The scanner applies the behavior cell's certainty gate itself: held-back candidates are neither dispatched nor counted toward the pressure byte target, and a pass whose dispatches reclaimed nothing (dry-run, observe mode, dampened or failed batches) is paced like an empty pass. Measured on the operator workstation at injected Orange: 575 passes / 92.8 CPU-s per five minutes before, 4 passes / 8.6 CPU-s after.
+
+### Changed — status and check JSON schema 2
+
+- `status --json` and `check --json` carry `"schema_version": 2`; each mount's `platform` block is keyed by filesystem family (`darwin.apfs` on APFS, `linux { fs_type, is_ram_backed, is_readonly, device_id }` on Linux, `{}` elsewhere) and the APFS-only mount keys, including `free_excludes_purgeable`, appear only on APFS.
+
+### Added — diagnostics and recovery
+
+- `sbh doctor --service [--user]` diffs the installed systemd unit or launchd plist against the generator (hardening directives, `Type=`, binary, drop-ins, condition gates); `sbh service --systemd reinstall-unit [--purge-dropins]` rewrites the unit with a backup beside it.
+- `sbh explain --why-not DIR [--counterfactual]` scores a directory now and names the first rail that stops it; `sbh explain --replay ID` re-scores a recorded decision with the current code.
+- `sbh emergency --min-age MINUTES` (default 5) is emergency mode's only age floor; emergency prints a decision id per candidate.
+
+---
+
 ## v0.5.1 **[release]**
 
 ### Fixed — rch target dirs are reclaimed on idle time, not birth time (regression from v0.5.0)

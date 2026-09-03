@@ -38,13 +38,27 @@ impl std::fmt::Display for UnknownConfigKey {
     }
 }
 
-/// `[core]`: behaviour of the config loader itself.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// `[core]`: behaviour of the config loader itself and daemon-wide toggles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CoreConfig {
     /// Refuse to start the daemon (and fail `config validate`) when the file
     /// contains keys no section declares, instead of warning about them.
     pub strict_config: bool,
+    /// Serve the daemon control socket (`control.sock` beside `state.json`)
+    /// that `sbh daemon ping|scan-now|reload|shutdown`, `sbh policy` and a
+    /// live `sbh status` talk to. Off, the daemon answers only signals and
+    /// the state file.
+    pub control_socket_enabled: bool,
+}
+
+impl Default for CoreConfig {
+    fn default() -> Self {
+        Self {
+            strict_config: false,
+            control_socket_enabled: true,
+        }
+    }
 }
 
 /// Full SBH configuration model.

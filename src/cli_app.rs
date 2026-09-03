@@ -114,6 +114,8 @@ pub struct Cli {
 enum Command {
     /// Run the monitoring daemon.
     Daemon(DaemonArgs),
+    /// Show or change the running daemon's policy mode over the control socket.
+    Policy(PolicyArgs),
     /// Install sbh as a system service.
     Install(InstallArgs),
     /// Remove sbh system integration.
@@ -209,6 +211,41 @@ struct DaemonArgs {
     /// Systemd watchdog timeout in seconds (0 disables).
     #[arg(long, default_value_t = 0, value_name = "SECONDS")]
     watchdog_sec: u64,
+    /// Talk to the running daemon over its control socket instead of
+    /// starting one.
+    #[command(subcommand)]
+    action: Option<DaemonAction>,
+}
+
+/// Requests for a running daemon (`control.sock` beside `state.json`).
+#[derive(Debug, Clone, Subcommand, Serialize)]
+enum DaemonAction {
+    /// Liveness: pid, start time, version, uptime, policy mode.
+    Ping,
+    /// Queue a forced scan of the configured roots on the next tick.
+    #[command(name = "scan-now")]
+    ScanNow,
+    /// Re-read the config file (the SIGHUP path).
+    Reload,
+    /// Ask the daemon to stop cleanly.
+    Shutdown,
+}
+
+/// `sbh policy`: the policy engine's mode, live from the daemon.
+#[derive(Debug, Clone, Args, Serialize)]
+struct PolicyArgs {
+    #[command(subcommand)]
+    action: PolicyCliAction,
+}
+
+#[derive(Debug, Clone, Copy, Subcommand, Serialize)]
+enum PolicyCliAction {
+    /// Show the active mode (observe, canary, enforce).
+    Status,
+    /// observe -> canary, canary -> enforce; persisted to `[policy] initial_mode`.
+    Promote,
+    /// enforce -> canary, canary -> observe; persisted to `[policy] initial_mode`.
+    Demote,
 }
 
 #[derive(Debug, Clone, Args, Serialize, Default)]
@@ -1060,6 +1097,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
 
     match &cli.command {
         Command::Daemon(args) => run_daemon(cli, args),
+        Command::Policy(args) => run_policy(cli, args),
         Command::Install(args) => run_install(cli, args),
         Command::Uninstall(args) => run_uninstall(cli, args),
         Command::Status(args) => run_status(cli, args),
@@ -2304,6 +2342,9 @@ fn to_runtime_daemon_args(args: &DaemonArgs) -> RuntimeDaemonArgs {
 }
 
 fn run_daemon(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
+    if let Some(action) = &args.action {
+        return run_daemon_control(cli, action);
+    }
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
     // A key nobody reads is a setting the operator believes is in force.
@@ -2328,6 +2369,109 @@ fn run_daemon(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
     daemon
         .run()
         .map_err(|e| CliError::Runtime(format!("daemon runtime failure: {e}")))
+}
+
+/// One request to the running daemon's control socket. Errors name the
+/// socket path so "no daemon" and "wrong state dir" are distinguishable.
+fn control_request(
+    cli: &Cli,
+    cmd: &str,
+    args: &Value,
+) -> Result<
+    (
+        PathBuf,
+        storage_ballast_helper::daemon::control::ControlResponse,
+    ),
+    CliError,
+> {
+    use storage_ballast_helper::daemon::control::{control_socket_path, read_token, request};
+
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let socket = control_socket_path(&config.paths.state_file);
+    if !socket.exists() {
+        return Err(CliError::User(format!(
+            "no running daemon: control socket {} is absent (is the daemon running with [core] control_socket_enabled = true?)",
+            socket.display()
+        )));
+    }
+    let Some(token) = read_token(&config.paths.state_file) else {
+        return Err(CliError::User(format!(
+            "control socket {} exists but the daemon lock beside it carries no readable token; the daemon may be stopping, owned by another user, or older than the control socket",
+            socket.display()
+        )));
+    };
+    let response = request(&socket, &token, cmd, args)
+        .map_err(|e| CliError::Runtime(format!("control socket {}: {e}", socket.display())))?;
+    Ok((socket, response))
+}
+
+/// Print a control response the way the rest of the CLI does and turn a
+/// refused request into a non-zero exit.
+fn report_control_response(
+    cli: &Cli,
+    command: &str,
+    socket: &Path,
+    response: &storage_ballast_helper::daemon::control::ControlResponse,
+) -> Result<(), CliError> {
+    match output_mode(cli) {
+        OutputMode::Json => {
+            let payload = json!({
+                "command": command,
+                "socket": socket,
+                "ok": response.ok,
+                "result": response.result,
+                "error": response.error,
+            });
+            write_json_line(&payload)?;
+        }
+        OutputMode::Human => {
+            if response.ok {
+                println!("{command}: ok");
+                if let Some(object) = response.result.as_object() {
+                    for (key, value) in object {
+                        println!("  {key}: {value}");
+                    }
+                } else if !response.result.is_null() {
+                    println!("  {}", response.result);
+                }
+            } else if let Some(error) = &response.error {
+                eprintln!("sbh: {command}: {} ({})", error.message, error.code);
+            }
+        }
+    }
+    if response.ok {
+        Ok(())
+    } else {
+        Err(CliError::User(format!(
+            "{command} refused by the daemon: {}",
+            response
+                .error
+                .as_ref()
+                .map_or_else(|| "unknown error".to_string(), |e| e.message.clone())
+        )))
+    }
+}
+
+fn run_daemon_control(cli: &Cli, action: &DaemonAction) -> Result<(), CliError> {
+    let cmd = match action {
+        DaemonAction::Ping => "ping",
+        DaemonAction::ScanNow => "scan-now",
+        DaemonAction::Reload => "reload",
+        DaemonAction::Shutdown => "shutdown",
+    };
+    let (socket, response) = control_request(cli, cmd, &json!({}))?;
+    report_control_response(cli, &format!("daemon {cmd}"), &socket, &response)
+}
+
+fn run_policy(cli: &Cli, args: &PolicyArgs) -> Result<(), CliError> {
+    let action = match args.action {
+        PolicyCliAction::Status => "status",
+        PolicyCliAction::Promote => "promote",
+        PolicyCliAction::Demote => "demote",
+    };
+    let (socket, response) = control_request(cli, "policy", &json!({ "action": action }))?;
+    report_control_response(cli, &format!("policy {action}"), &socket, &response)
 }
 
 fn install_requests_service(args: &InstallArgs) -> bool {
@@ -8851,6 +8995,20 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
         .map(|state| state == "active");
     let liveness = detect_daemon_liveness(&config.paths.state_file, service_active);
     let daemon_running = liveness.running;
+    // bd-rc-master-ajg1.4.9: a running daemon rewrites state.json on request,
+    // so the rest of this report reads a fresh file instead of one up to a
+    // write interval old. The state file stays the source when the socket
+    // is absent, unreadable, or refuses.
+    let status_source = {
+        use storage_ballast_helper::daemon::control::{control_socket_path, read_token, request};
+        let socket = control_socket_path(&config.paths.state_file);
+        let refreshed = daemon_running
+            && socket.exists()
+            && read_token(&config.paths.state_file).is_some_and(|token| {
+                request(&socket, &token, "status", &json!({})).is_ok_and(|reply| reply.ok)
+            });
+        if refreshed { "socket" } else { "state_file" }
+    };
 
     // Open SQLite database for recent activity (optional, read-only).
     let db_stats = if config.paths.sqlite_db.exists() {
@@ -9250,6 +9408,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 "schema_version": 2,
                 "version": version,
                 "daemon_running": daemon_running,
+                "source": status_source,
                 "daemon_state_reason": liveness.reason,
                 "daemon_pid": liveness.lock.as_ref().map(|l| l.pid),
                 "state_age_secs": liveness.state_age_secs,
@@ -15587,6 +15746,7 @@ mod tests {
             background: true,
             pidfile: Some(PathBuf::from("/tmp/sbh.pid")),
             watchdog_sec: 42,
+            action: None,
         };
         let runtime = to_runtime_daemon_args(&args);
         assert!(!runtime.foreground);

@@ -353,6 +353,8 @@ src/
 | Command | Purpose |
 |---------|---------|
 | `sbh daemon` | Run the monitoring loop and policy engine |
+| `sbh daemon ping\|scan-now\|reload\|shutdown` | Talk to the running daemon over `control.sock` (beside `state.json`, token in `daemon.lock`): identity/uptime, a forced scan on the next tick, config reload, clean stop |
+| `sbh policy status\|promote\|demote` | The policy engine's live mode; promote/demote move observe↔canary↔enforce and persist `[policy] initial_mode` with a config backup |
 | `sbh status [--watch]` | Real-time health, pressure, and controller state |
 | `sbh check [--target-free N] [--need N] [--predict N]` | Pre-flight space check and recommendations |
 | `sbh scan [PATHS...] [--top N] [--min-score N]` | Manual candidate discovery and scoring |
@@ -424,7 +426,7 @@ src/
 
 | Section | Key Settings |
 |---------|-------------|
-| `[core]` | `strict_config` (unknown keys are always reported; `true` makes the daemon refuse to start and `config validate` fail on them) |
+| `[core]` | `strict_config` (unknown keys are always reported; `true` makes the daemon refuse to start and `config validate` fail on them), `control_socket_enabled` (default `true`: the daemon serves `control.sock` beside `state.json`) |
 | `[pressure]` | `green_min_free_pct`, `yellow_min_free_pct`, `orange_min_free_pct`, `red_min_free_pct`, `poll_interval_ms` |
 | `[pressure.prediction]` | `enabled`, `action_horizon_minutes`, `warning_horizon_minutes`, `min_confidence`, `min_samples` |
 | `[pressure.controller]` | per-mount PID: `kp`, `ki`, `kd`, `kf` (forecast feedforward), `integral_cap`, `hysteresis_pct`, `reference_total_bytes`, `kp_scale_min`, `kp_scale_max` |

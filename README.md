@@ -676,6 +676,7 @@ protected_paths = ["/data/projects/production-*", "/home/*/critical-builds"]
 
 [core]
 strict_config = false  # true: refuse to start when the file has keys no section declares
+control_socket_enabled = true  # serve control.sock beside state.json for `sbh daemon ping|scan-now|reload|shutdown`, `sbh policy`, live `sbh status`
 
 [pressure]
 green_min_free_pct = 35.0
@@ -1497,6 +1498,39 @@ The daemon responds to Unix signals for graceful lifecycle management. All signa
 | `SIGUSR1` | Immediate scan trigger: bypasses the VOI scheduler and runs a full scan on the next iteration |
 
 Signal registration uses the `signal-hook` crate for safe, portable signal handling. Registration is best-effort: failures are logged to stderr but do not prevent daemon startup. The `SignalHandler` can also be triggered programmatically (e.g., by the watchdog timeout or error escalation logic) for shutdown requests that originate from within the daemon.
+
+#### Control Socket
+
+A running daemon also answers requests on a Unix domain socket,
+`control.sock` beside `state.json` (mode `0600`, so only the daemon's user
+can connect). One JSON line in, one JSON line out:
+
+```text
+{"cmd": "ping", "args": {}, "token": "<32 hex characters>"}
+{"ok": true, "result": {"pid": 4242, "started_at": "...", "version": "0.5.1", "uptime_secs": 91, "policy_mode": "enforce"}}
+{"ok": false, "result": null, "error": {"code": "unauthorized", "message": "token does not match the running daemon's lock file"}}
+```
+
+The token is minted at every start and written into `daemon.lock`, so a
+client that can read the lock file can talk and a client left over from a
+previous boot cannot. Every command that changes state is logged with the
+caller's uid and pid.
+
+| Command | What it does |
+| --- | --- |
+| `sbh daemon ping` | Identity and liveness from the process itself: pid, start time, version, uptime, policy mode |
+| `sbh status` | Asks the daemon to rewrite `state.json` first; the JSON reports `"source": "socket"` (or `"state_file"` when no daemon answered) |
+| `sbh daemon scan-now` | Queues a forced scan of the configured roots on the next tick (the `SIGUSR1` path) |
+| `sbh daemon reload` | Re-reads the config (the `SIGHUP` path) |
+| `sbh policy status\|promote\|demote` | Shows or moves the policy mode (observe → canary → enforce and back) and persists the new mode to `[policy] initial_mode` after backing the config file up |
+| `explain {id}` (protocol only) | The decision ledger record for a decision id, read-only |
+| `ballast {release: N \| replenish: true}` (protocol only) | Releases or rebuilds ballast through the coordinator |
+| `sbh daemon shutdown` | A clean stop; the socket file is removed as part of it |
+
+The socket serves eight connections at a time, ten requests per second,
+and drops request lines over 64 KiB. `[core] control_socket_enabled = false`
+turns it off, in which case the daemon answers signals and the state file
+only and `sbh daemon ping` explains that no socket exists.
 
 #### Systemd Watchdog
 
