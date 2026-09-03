@@ -3124,6 +3124,175 @@ fn frame_diagnostics_health_styled<'a>(model: &'a DashboardModel, theme: &'a The
     Text::from_lines(lines)
 }
 
+/// The live part of the VOI overlay (bd-rc-master-ajg1.4.11): the budget,
+/// split, mode, calibration and last plan the daemon wrote into
+/// `state.json`'s `voi` block, or why there is none.
+fn voi_live_lines<'a>(model: &'a DashboardModel, theme: &'a Theme) -> Vec<Line<'a>> {
+    let accent = theme.palette.accent_color();
+    let muted = theme.palette.muted_color();
+    let secondary = theme.palette.text_secondary();
+    let heading = |text: &'static str| {
+        Line::from_spans([Span::styled(
+            text,
+            Style::default().fg(theme.palette.text_primary()).bold(),
+        )])
+    };
+    let Some(voi) = model.daemon_state.as_ref().map(|s| &s.voi) else {
+        return vec![
+            heading("Live"),
+            Line::from_spans([
+                Span::styled("  ", Style::default()),
+                styled_badge("NO DAEMON STATE", muted),
+                Span::styled(
+                    " no state.json loaded; the numbers appear once the daemon runs",
+                    Style::default().fg(secondary),
+                ),
+            ]),
+        ];
+    };
+    if !voi.reported {
+        return vec![
+            heading("Live"),
+            Line::from_spans([
+                Span::styled("  ", Style::default()),
+                styled_badge("NOT REPORTED", theme.palette.warning_color()),
+                Span::styled(
+                    " this daemon predates the voi block in state.json; restart it on the current build",
+                    Style::default().fg(secondary),
+                ),
+            ]),
+        ];
+    }
+    let mut lines = vec![heading("Live")];
+    if model.degraded {
+        lines.push(Line::from_spans([
+            Span::styled("  ", Style::default()),
+            styled_badge("STALE", theme.palette.warning_color()),
+            Span::styled(
+                " the state file is older than the stale threshold",
+                Style::default().fg(secondary),
+            ),
+        ]));
+    }
+    let (mode_label, mode_color) = if !voi.enabled {
+        ("DISABLED", muted)
+    } else if voi.fallback_active {
+        ("FALLBACK round-robin", theme.palette.warning_color())
+    } else {
+        ("VOI ranking", theme.palette.success_color())
+    };
+    lines.push(Line::from_spans([
+        Span::styled("  mode         ", Style::default().fg(muted)),
+        styled_badge(mode_label, mode_color),
+    ]));
+    let budget_text = voi.budget_total.to_string();
+    lines.push(Line::from_spans([
+        Span::styled("  paths/cycle  ", Style::default().fg(muted)),
+        styled_badge(&budget_text, accent),
+        Span::styled(
+            format!(" ({} used by the last plan)", voi.budget_used),
+            Style::default().fg(secondary),
+        ),
+    ]));
+    let explore_pct = (voi.exploration_quota_fraction * 100.0).round();
+    let exploit_pct = 100.0 - explore_pct;
+    let exploit_text = format!("{exploit_pct:.0}%");
+    let explore_text = format!("{explore_pct:.0}%");
+    lines.push(Line::from_spans([
+        Span::styled("  split        ", Style::default().fg(muted)),
+        styled_badge(&exploit_text, theme.palette.success_color()),
+        Span::styled(" exploit  ", Style::default().fg(secondary)),
+        styled_badge(&explore_text, theme.palette.warning_color()),
+        Span::styled(" explore", Style::default().fg(secondary)),
+    ]));
+    let mape = voi
+        .recent_mapes
+        .last()
+        .map_or_else(|| "n/a".to_string(), |m| format!("{:.0}%", m * 100.0));
+    lines.push(Line::from_spans([Span::styled(
+        format!(
+            "  calibration  last MAPE {mape}, bad windows {}, good windows {}, {} paths tracked",
+            voi.consecutive_bad_windows, voi.consecutive_good_windows, voi.paths_tracked
+        ),
+        Style::default().fg(secondary),
+    )]));
+    match voi.last_plan_at.as_deref() {
+        None => lines.push(Line::from_spans([Span::styled(
+            "  last plan    none yet (the first maintenance pass makes one)",
+            Style::default().fg(secondary),
+        )])),
+        Some(at) => {
+            lines.push(Line::from_spans([Span::styled(
+                format!("  last plan    {at}"),
+                Style::default().fg(secondary),
+            )]));
+            for entry in &voi.top_paths {
+                let tag = if entry.is_exploration {
+                    "explore"
+                } else {
+                    "exploit"
+                };
+                // A forecast is a byte count in f64 clothing; whole bytes suffice.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let forecast = entry.forecast_reclaim_bytes.max(0.0).round() as u64;
+                lines.push(Line::from_spans([Span::styled(
+                    format!(
+                        "    {tag} {:<40} utility {:.2}  forecast {}",
+                        truncate_path(&entry.path, 40),
+                        entry.utility,
+                        human_bytes(forecast),
+                    ),
+                    Style::default().fg(secondary),
+                )]));
+            }
+        }
+    }
+    lines
+}
+
+/// One line per daemon thread from `state.json`'s `threads` block, or why
+/// there are none (bd-rc-master-ajg1.4.11).
+fn diagnostics_thread_lines<'a>(model: &'a DashboardModel, theme: &'a Theme) -> Vec<Line<'a>> {
+    let muted = theme.palette.muted_color();
+    let secondary = theme.palette.text_secondary();
+    let Some(state) = &model.daemon_state else {
+        return Vec::new();
+    };
+    let threads = [
+        ("monitor ", &state.threads.monitor),
+        ("scanner ", &state.threads.scanner),
+        ("executor", &state.threads.executor),
+        ("logger  ", &state.threads.logger),
+    ];
+    if threads.iter().all(|(_, t)| t.status.is_empty()) {
+        return vec![Line::from_spans([Span::styled(
+            "threads  not reported by this daemon (state schema without thread health)",
+            Style::default().fg(muted),
+        )])];
+    }
+    threads
+        .into_iter()
+        .map(|(name, thread)| {
+            let (label, color) = match thread.status.as_str() {
+                "running" => ("RUNNING", theme.palette.success_color()),
+                "stalled" => ("STALLED", theme.palette.warning_color()),
+                "dead" => ("DEAD", theme.palette.danger_color()),
+                "" => ("N/A", muted),
+                _ => ("UNKNOWN", muted),
+            };
+            let heartbeat = thread.seconds_since_heartbeat.map_or_else(
+                || "heartbeat n/a".to_string(),
+                |s| format!("heartbeat {s}s ago"),
+            );
+            Line::from_spans([
+                Span::styled(format!("{name} "), Style::default().fg(muted)),
+                styled_badge(label, color),
+                Span::styled(format!(" {heartbeat}"), Style::default().fg(secondary)),
+            ])
+        })
+        .collect()
+}
+
 fn frame_diagnostics_runtime_styled<'a>(model: &'a DashboardModel, theme: &'a Theme) -> Text<'a> {
     let muted = theme.palette.muted_color();
     let secondary = theme.palette.text_secondary();
@@ -3169,6 +3338,9 @@ fn frame_diagnostics_runtime_styled<'a>(model: &'a DashboardModel, theme: &'a Th
             Style::default().fg(secondary),
         )]));
     }
+
+    // Thread health (bd-rc-master-ajg1.4.11).
+    lines.extend(diagnostics_thread_lines(model, theme));
 
     // Data sources.
     let sources = [
@@ -3610,7 +3782,7 @@ fn frame_render_overlay(
             let voi_accent = theme.palette.accent_color();
             let muted = theme.palette.muted_color();
             let secondary = theme.palette.text_secondary();
-            let lines = vec![
+            let mut lines = vec![
                 Line::from_spans([Span::styled(
                     "VOI (Value-of-Information) Scan Scheduler",
                     Style::default().fg(voi_accent).bold(),
@@ -3625,22 +3797,9 @@ fn frame_render_overlay(
                     Style::default().fg(secondary),
                 )]),
                 Line::from(""),
-                // Budget section.
-                Line::from_spans([Span::styled(
-                    "Budget",
-                    Style::default().fg(theme.palette.text_primary()).bold(),
-                )]),
-                Line::from_spans([
-                    Span::styled("  paths/cycle  ", Style::default().fg(muted)),
-                    styled_badge("5", voi_accent),
-                ]),
-                Line::from_spans([
-                    Span::styled("  split        ", Style::default().fg(muted)),
-                    styled_badge("80%", theme.palette.success_color()),
-                    Span::styled(" exploit  ", Style::default().fg(secondary)),
-                    styled_badge("20%", theme.palette.warning_color()),
-                    Span::styled(" explore", Style::default().fg(secondary)),
-                ]),
+            ];
+            lines.extend(voi_live_lines(model, theme));
+            lines.extend([
                 Line::from(""),
                 // Exploitation section.
                 Line::from_spans([Span::styled(
@@ -3688,7 +3847,7 @@ fn frame_render_overlay(
                     "Config: [scheduler] section in config.toml",
                     Style::default().fg(muted),
                 )]),
-            ];
+            ]);
             Paragraph::new(Text::from_lines(lines)).render(inner, frame);
         }
         super::model::Overlay::Confirmation(action) => {
@@ -5340,6 +5499,29 @@ fn render_diagnostics(model: &DashboardModel, theme: &Theme, out: &mut String) {
                 state.counters.errors,
                 state.counters.dropped_log_events,
             );
+            // Thread health (bd-rc-master-ajg1.4.11).
+            let threads = [
+                ("monitor", &state.threads.monitor),
+                ("scanner", &state.threads.scanner),
+                ("executor", &state.threads.executor),
+                ("logger", &state.threads.logger),
+            ];
+            if threads.iter().all(|(_, t)| t.status.is_empty()) {
+                let _ = writeln!(out, "  threads: not reported by this daemon");
+            } else {
+                for (name, thread) in threads {
+                    let status = if thread.status.is_empty() {
+                        "n/a".to_string()
+                    } else {
+                        thread.status.to_ascii_uppercase()
+                    };
+                    let heartbeat = thread.seconds_since_heartbeat.map_or_else(
+                        || "heartbeat n/a".to_string(),
+                        |s| format!("heartbeat {s}s ago"),
+                    );
+                    let _ = writeln!(out, "  thread {name:<8} {status:<8} {heartbeat}");
+                }
+            }
         } else {
             let _ = writeln!(out, "  daemon not connected");
         }
@@ -6769,6 +6951,103 @@ mod tests {
         model.log_search.results.clear();
         let frame = render(&model);
         assert!(frame.contains("No entries match"), "{frame}");
+    }
+
+    /// bd-rc-master-ajg1.4.11: Diagnostics lists the daemon's threads with
+    /// their status, or says the daemon did not report them; the VOI overlay
+    /// shows the scheduler block, or why there is none.
+    #[test]
+    fn diagnostics_threads_and_voi_overlay_come_from_the_state_file() {
+        use crate::daemon::self_monitor::{ThreadState, VoiPathState, VoiState};
+
+        let mut model = DashboardModel::new(
+            PathBuf::from("/tmp/state.json"),
+            vec![],
+            Duration::from_secs(1),
+            (120, 40),
+        );
+        model.screen = Screen::Diagnostics;
+        // The text renderer's Daemon Process section is behind the verbose
+        // toggle (V); the frame renderer's Runtime pane always shows it.
+        model.diagnostics_verbose = true;
+        let mut state = sample_state("green", 40.0);
+        model.daemon_state = Some(state.clone());
+        let frame = render(&model);
+        assert!(frame.contains("not reported by this daemon"), "{frame}");
+
+        state.threads.monitor = ThreadState {
+            status: "running".to_string(),
+            seconds_since_heartbeat: Some(1),
+        };
+        state.threads.scanner = ThreadState {
+            status: "stalled".to_string(),
+            seconds_since_heartbeat: Some(95),
+        };
+        state.threads.executor = ThreadState {
+            status: "dead".to_string(),
+            seconds_since_heartbeat: None,
+        };
+        state.threads.logger = ThreadState {
+            status: "running".to_string(),
+            seconds_since_heartbeat: Some(2),
+        };
+        model.daemon_state = Some(state.clone());
+        let frame = render(&model);
+        assert!(frame.contains("STALLED"), "{frame}");
+        assert!(frame.contains("DEAD"), "{frame}");
+        assert!(frame.contains("heartbeat 95s ago"), "{frame}");
+        assert!(frame.contains("heartbeat n/a"), "{frame}");
+
+        // VOI overlay (frame pipeline): its live lines as plain text.
+        let theme = Theme::for_terminal(120, AccessibilityProfile::default());
+        let voi_text = |model: &DashboardModel| -> String {
+            voi_live_lines(model, &theme)
+                .iter()
+                .map(|line| line.spans().iter().map(Span::as_str).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // An old daemon (block absent) says so ...
+        let frame = voi_text(&model);
+        assert!(frame.contains("NOT REPORTED"), "{frame}");
+
+        // ... a current one shows the live numbers and the last plan.
+        state.voi = VoiState {
+            reported: true,
+            enabled: true,
+            budget_total: 5,
+            budget_used: 3,
+            exploration_quota_fraction: 0.2,
+            fallback_active: false,
+            consecutive_bad_windows: 1,
+            consecutive_good_windows: 4,
+            recent_mapes: vec![0.4, 0.12],
+            paths_tracked: 9,
+            last_plan_at: Some("2026-09-03T08:00:00Z".to_string()),
+            top_paths: vec![VoiPathState {
+                path: "/work/alpha".to_string(),
+                utility: 1.5,
+                is_exploration: true,
+                forecast_reclaim_bytes: 3_221_225_472.0,
+            }],
+        };
+        model.daemon_state = Some(state.clone());
+        let frame = voi_text(&model);
+        assert!(frame.contains("VOI ranking"), "{frame}");
+        assert!(frame.contains("3 used by the last plan"), "{frame}");
+        assert!(frame.contains("80%"), "{frame}");
+        assert!(frame.contains("last MAPE 12%"), "{frame}");
+        assert!(frame.contains("explore /work/alpha"), "{frame}");
+        assert!(frame.contains("2026-09-03T08:00:00Z"), "{frame}");
+
+        state.voi.fallback_active = true;
+        model.daemon_state = Some(state);
+        let frame = voi_text(&model);
+        assert!(frame.contains("FALLBACK round-robin"), "{frame}");
+
+        model.daemon_state = None;
+        let frame = voi_text(&model);
+        assert!(frame.contains("NO DAEMON STATE"), "{frame}");
     }
 
     #[test]

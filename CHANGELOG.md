@@ -10,6 +10,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — Diagnostics thread health and a live VOI overlay (bd-rc-master-ajg1.4.11)
+
+- The Diagnostics screen's Runtime pane lists the daemon's four threads from `state.json` (`running`/`stalled`/`dead` with the heartbeat age), or says the daemon did not report thread health.
+- `state.json` carries a `voi` block (enabled, budget and its use by the last plan, exploration split, fallback state, calibration windows and recent MAPE, paths tracked, when the last maintenance plan was made and its top paths). The VOI overlay (`v`) renders it instead of the literal "5 paths/cycle, 80/20" it used to print, flags a stale state file, and explains when a daemon predates the block or no state is loaded.
+
 ### Added — the dashboard's Log Search screen searches (bd-rc-master-ajg1.4.10)
 
 - Screen 6 was a read-only mirror of the Timeline with a `<not-yet-editable>` query line. It now has one: `/` edits the query inline (Enter runs it, Esc cancels, and the editor owns every key meanwhile), `n`/`p` page through results, `c` clears, `Enter` opens the selected entry on the Timeline. The grammar is free words (every word must appear in the entry's path, event type, severity, message, error code, pressure level or details, case-insensitively) plus `type:<event>`, `level:<info|warning|critical>` (a minimum), `path:<prefix>`, `id:<decision-id>` and `since:<15m|1h|24h|7d>`; the header shows the active filters, the page, and the backend that answered.

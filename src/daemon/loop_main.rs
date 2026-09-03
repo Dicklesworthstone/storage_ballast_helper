@@ -1748,6 +1748,9 @@ pub struct MonitoringDaemon {
     notification_manager: NotificationManager,
     scoring_engine: ScoringEngine,
     voi_scheduler: VoiScheduler,
+    /// When the last maintenance plan was made and what it chose, for the
+    /// state file's `voi` block (bd-rc-master-ajg1.4.11).
+    last_voi_plan: Option<(String, crate::monitor::voi_scheduler::ScanPlan)>,
     shared_executor_config: Arc<SharedExecutorConfig>,
     /// Regret labels (Q4).
     regret: Arc<SharedRegret>,
@@ -2811,6 +2814,7 @@ impl MonitoringDaemon {
             policy_engine,
             scoring_engine,
             voi_scheduler,
+            last_voi_plan: None,
             shared_executor_config,
             regret,
             shared_scoring_config,
@@ -3488,6 +3492,13 @@ impl MonitoringDaemon {
             .collect();
         pools.sort_by(|a, b| a.mount.cmp(&b.mount));
         self.self_monitor.set_ballast_pools(pools);
+        self.self_monitor
+            .set_voi_snapshot(super::self_monitor::VoiState::from_scheduler(
+                &self.config.scheduler,
+                &self.voi_scheduler.calibration_summary(),
+                self.voi_scheduler.is_fallback_active(),
+                self.last_voi_plan.as_ref(),
+            ));
         let dropped_log_events = self.logger_handle.dropped_events();
         let policy_mode = {
             let policy = self.policy_engine.lock();
@@ -4648,6 +4659,7 @@ impl MonitoringDaemon {
                 .is_none_or(|last| now.saturating_duration_since(last) >= maintenance_interval)
         {
             let plan = self.voi_scheduler.schedule(now);
+            self.last_voi_plan = Some((chrono::Utc::now().to_rfc3339(), plan.clone()));
             // Only roots whose own mount is in Maintain: a root on a mount
             // parked in Recovery (or reclaiming, or idle after an empty
             // pass) is that mount's business, not the routine pass's.

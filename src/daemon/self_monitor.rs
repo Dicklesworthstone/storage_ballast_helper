@@ -476,6 +476,10 @@ pub struct DaemonState {
     /// daemon older than this field).
     #[serde(default)]
     pub ballast_pools: Vec<BallastPoolState>,
+    /// The VOI scan scheduler as of the last maintenance plan (defaults
+    /// from a daemon older than this field; `reported` is false then).
+    #[serde(default)]
+    pub voi: VoiState,
     pub last_scan: LastScanState,
     pub counters: Counters,
     pub memory_rss_bytes: u64,
@@ -546,6 +550,85 @@ pub struct BallastPoolState {
     /// Why it was skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,
+}
+
+/// One path in the last VOI scan plan, as the dashboard's overlay lists it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VoiPathState {
+    pub path: String,
+    /// Expected reclaim per unit of scan cost, as ranked.
+    pub utility: f64,
+    /// Chosen by the exploration quota rather than by utility.
+    pub is_exploration: bool,
+    pub forecast_reclaim_bytes: f64,
+}
+
+/// The VOI (value-of-information) scan scheduler as the daemon last saw it
+/// (bd-rc-master-ajg1.4.11): the budget and split from the config, the
+/// calibration guard's state, and the paths of the last plan.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiState {
+    /// The daemon wrote this block (false in a state file from before it).
+    pub reported: bool,
+    /// `scheduler.enabled`.
+    pub enabled: bool,
+    /// Paths the scheduler may scan per maintenance interval.
+    pub budget_total: usize,
+    /// Paths the last plan used.
+    pub budget_used: usize,
+    /// `scheduler.exploration_quota_fraction`.
+    pub exploration_quota_fraction: f64,
+    /// Round-robin fallback (disabled, or calibration tripped).
+    pub fallback_active: bool,
+    pub consecutive_bad_windows: u32,
+    pub consecutive_good_windows: u32,
+    /// Recent forecast error (MAPE) per window, newest last.
+    pub recent_mapes: Vec<f64>,
+    pub paths_tracked: usize,
+    /// When the last plan was made (RFC 3339), if any.
+    pub last_plan_at: Option<String>,
+    /// The last plan's paths, best first.
+    pub top_paths: Vec<VoiPathState>,
+}
+
+impl VoiState {
+    /// The block the daemon writes: config, calibration, and the last plan.
+    #[must_use]
+    pub fn from_scheduler(
+        config: &crate::core::config::VoiConfig,
+        summary: &crate::monitor::voi_scheduler::CalibrationSummary,
+        fallback_active: bool,
+        last_plan: Option<&(String, crate::monitor::voi_scheduler::ScanPlan)>,
+    ) -> Self {
+        Self {
+            reported: true,
+            enabled: config.enabled,
+            budget_total: last_plan.map_or(config.scan_budget_per_interval, |(_, plan)| {
+                plan.budget_total
+            }),
+            budget_used: last_plan.map_or(0, |(_, plan)| plan.budget_used),
+            exploration_quota_fraction: config.exploration_quota_fraction,
+            fallback_active,
+            consecutive_bad_windows: summary.consecutive_bad_windows,
+            consecutive_good_windows: summary.consecutive_good_windows,
+            recent_mapes: summary.recent_mapes.clone(),
+            paths_tracked: summary.total_paths_tracked,
+            last_plan_at: last_plan.map(|(at, _)| at.clone()),
+            top_paths: last_plan.map_or_else(Vec::new, |(_, plan)| {
+                plan.paths
+                    .iter()
+                    .take(8)
+                    .map(|entry| VoiPathState {
+                        path: entry.path.display().to_string(),
+                        utility: entry.utility,
+                        is_exploration: entry.is_exploration,
+                        forecast_reclaim_bytes: entry.forecast_reclaim_bytes,
+                    })
+                    .collect()
+            }),
+        }
+    }
 }
 
 pub const STATE_SCHEMA_VERSION: u32 = 2;
@@ -917,6 +1000,7 @@ pub struct SelfMonitor {
     policy_snapshot: PolicyStateRecord,
     logging_snapshot: LoggingState,
     pools_snapshot: Vec<BallastPoolState>,
+    voi_snapshot: VoiState,
     /// Latest thread health, set by the main loop each tick.
     threads_snapshot: ThreadsState,
     /// Identifies this daemon run.
@@ -978,6 +1062,11 @@ impl SelfMonitor {
     /// The per-mount pool inventory the next state file write carries.
     pub fn set_ballast_pools(&mut self, pools: Vec<BallastPoolState>) {
         self.pools_snapshot = pools;
+    }
+
+    /// The VOI scheduler snapshot the next state file write carries.
+    pub fn set_voi_snapshot(&mut self, voi: VoiState) {
+        self.voi_snapshot = voi;
     }
 
     pub fn set_policy_snapshot(&mut self, policy: PolicyStateRecord) {
@@ -1071,6 +1160,7 @@ impl SelfMonitor {
             policy_snapshot: PolicyStateRecord::default(),
             logging_snapshot: LoggingState::default(),
             pools_snapshot: Vec::new(),
+            voi_snapshot: VoiState::default(),
             run_id: generate_run_id(),
             last_state: None,
             metrics_enabled: true,
@@ -1181,6 +1271,7 @@ impl SelfMonitor {
             policy: self.policy_snapshot.clone(),
             logging: self.logging_snapshot.clone(),
             ballast_pools: self.pools_snapshot.clone(),
+            voi: self.voi_snapshot.clone(),
             stopped_at: None,
             exit_reason: None,
         };
@@ -1525,6 +1616,81 @@ mod tests {
     use super::*;
 
     use crate::platform::pal::MockPlatform;
+
+    /// bd-rc-master-ajg1.4.11: the VOI block is built from the config, the
+    /// calibration summary and the last plan; an older state file parses
+    /// with `reported == false`.
+    #[test]
+    fn voi_state_from_scheduler_and_old_state_files() {
+        use crate::monitor::voi_scheduler::{CalibrationSummary, ScanPlan, ScanPlanEntry};
+        let config = crate::core::config::VoiConfig {
+            enabled: true,
+            scan_budget_per_interval: 5,
+            exploration_quota_fraction: 0.25,
+            ..crate::core::config::VoiConfig::default()
+        };
+        let summary = CalibrationSummary {
+            fallback_active: false,
+            consecutive_bad_windows: 2,
+            consecutive_good_windows: 0,
+            recent_mapes: vec![0.6, 0.55],
+            total_paths_tracked: 3,
+        };
+        let plan = ScanPlan {
+            paths: vec![
+                ScanPlanEntry {
+                    path: std::path::PathBuf::from("/work/a"),
+                    utility: 2.0,
+                    is_exploration: false,
+                    forecast_reclaim_bytes: 1.0e9,
+                },
+                ScanPlanEntry {
+                    path: std::path::PathBuf::from("/work/b"),
+                    utility: 0.5,
+                    is_exploration: true,
+                    forecast_reclaim_bytes: 2.0e8,
+                },
+            ],
+            fallback_active: false,
+            budget_used: 2,
+            budget_total: 5,
+        };
+        let planned = ("2026-09-03T08:00:00Z".to_string(), plan);
+        let voi = VoiState::from_scheduler(&config, &summary, true, Some(&planned));
+        assert!(voi.reported && voi.enabled && voi.fallback_active);
+        assert_eq!((voi.budget_total, voi.budget_used), (5, 2));
+        assert!((voi.exploration_quota_fraction - 0.25).abs() < f64::EPSILON);
+        assert_eq!(voi.consecutive_bad_windows, 2);
+        assert_eq!(voi.recent_mapes, vec![0.6, 0.55]);
+        assert_eq!(voi.paths_tracked, 3);
+        assert_eq!(voi.last_plan_at.as_deref(), Some("2026-09-03T08:00:00Z"));
+        assert_eq!(voi.top_paths.len(), 2);
+        assert_eq!(voi.top_paths[1].path, "/work/b");
+        assert!(voi.top_paths[1].is_exploration);
+
+        let no_plan = VoiState::from_scheduler(&config, &summary, false, None);
+        assert_eq!(
+            no_plan.budget_total, 5,
+            "the configured budget before any plan"
+        );
+        assert!(no_plan.last_plan_at.is_none() && no_plan.top_paths.is_empty());
+
+        let state = DaemonState {
+            voi: voi.clone(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: DaemonState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.voi, voi);
+        let mut older = serde_json::from_str::<serde_json::Value>(&json)
+            .unwrap()
+            .as_object()
+            .cloned()
+            .unwrap();
+        older.remove("voi");
+        let parsed: DaemonState = serde_json::from_value(serde_json::Value::Object(older)).unwrap();
+        assert!(!parsed.voi.reported);
+    }
 
     /// bd-rc-master-ajg1.4.15: the per-pool records the dashboard scopes its
     /// ballast actions to round-trip, and a state written by an older

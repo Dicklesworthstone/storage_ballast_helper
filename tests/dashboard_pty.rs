@@ -378,6 +378,13 @@ fn pty_session_walks_the_screens_and_releases_one_ballast_file() {
         let from = cockpit.press(key);
         cockpit.wait_for_text_from(from, pane, Duration::from_secs(10));
     }
+    // The VOI overlay shows the daemon's scheduler block (4.11).
+    let from = cockpit.press("v");
+    cockpit.wait_for_text_from(from, "VOI Scheduler", Duration::from_secs(10));
+    cockpit.wait_for_text_from(from, "paths/cycle", Duration::from_secs(10));
+    cockpit.wait_for_text_from(from, "last plan", Duration::from_secs(10));
+    cockpit.press("\u{1b}");
+
     // Help opens and closes; the palette opens and closes.
     let from = cockpit.press("?");
     cockpit.wait_for_text_from(from, "Help", Duration::from_secs(10));
