@@ -45,8 +45,9 @@ use crate::daemon::policy::{
 };
 use crate::daemon::process_io_history::ProcessIoHistory;
 use crate::daemon::self_monitor::{
-    DaemonLock, MountPressure, MountRateState, PolicyStateRecord, SelfMonitor, SelfMonitorTick,
-    ThreadHeartbeat, ThreadState, ThreadStatus, ThreadsState,
+    DaemonLock, LoggingState, MountPressure, MountRateState, PolicyStateRecord, SelfMonitor,
+    SelfMonitorTick, ThreadHeartbeat, ThreadState, ThreadStatus, ThreadsState,
+    assess_logging_placement, nearest_existing_ancestor,
 };
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat, resolve_watchdog_sec};
 use crate::logger::dual::{
@@ -1722,6 +1723,13 @@ pub struct MonitoringDaemon {
     /// Latest EWMA fill rate per mount (bytes per second), for the
     /// special-location horizon rule.
     mount_rates: HashMap<PathBuf, f64>,
+    /// Where the daemon's own files live relative to what it reclaims
+    /// (bd-rc-master-ajg1.7.4), and whether the JSONL log is currently
+    /// mirrored to the RAM fallback because that mount is pressured.
+    logging_placement: LoggingState,
+    /// The level last reported for the logging mount, so the log line and
+    /// the mirror switch happen per level change, never per tick.
+    logging_level_logged: Option<PressureLevel>,
     /// Per-location alert throttle for the special-location horizon rule.
     special_alerts: AlertThrottle,
     /// When the last Green maintenance pass was dispatched.
@@ -2618,6 +2626,61 @@ impl MonitoringDaemon {
             Some(config.paths.ballast_dir.as_path()),
         )?;
         ballast_coordinator.set_provision_floor(config.ballast_provision_floor_pct());
+        // bd-rc-master-ajg1.7.4: the daemon's own files against the mounts
+        // it reclaims. Not a refusal (single-volume hosts are common), but
+        // said once at startup, carried in state.json, and acted on while
+        // that mount is pressured (JSONL mirrored to the RAM fallback).
+        let logging_placement = {
+            let mut monitored: BTreeSet<PathBuf> = BTreeSet::new();
+            for path in config
+                .scanner
+                .root_paths
+                .iter()
+                .chain(special_locations.all().iter().map(|l| &l.path))
+            {
+                if let Ok(stats) = fs_collector.collect(path) {
+                    monitored.insert(stats.mount_point);
+                }
+            }
+            monitored.extend(
+                ballast_coordinator
+                    .inventory()
+                    .into_iter()
+                    .filter(|pool| !pool.skipped)
+                    .map(|pool| pool.mount_point),
+            );
+            assess_logging_placement(
+                |path| {
+                    nearest_existing_ancestor(path)
+                        .and_then(|existing| fs_collector.collect(&existing).ok())
+                        .map(|stats| stats.mount_point)
+                },
+                &[
+                    config.paths.sqlite_db.as_path(),
+                    config.paths.jsonl_log.as_path(),
+                    config.paths.state_file.as_path(),
+                ],
+                &monitored,
+            )
+        };
+        eprintln!(
+            "[SBH-DAEMON] logging.on_monitored_fs={} device={} paths=[{}]",
+            logging_placement.on_monitored_fs,
+            logging_placement.device,
+            logging_placement.paths.join(", ")
+        );
+        if logging_placement.on_monitored_fs {
+            logger_handle.send(ActivityEvent::Warning {
+                code: "SBH-1105".to_string(),
+                message: format!(
+                    "the activity database, JSONL log or state file live on {}, which sbh \
+                     reclaims ({}): move them to a volume sbh does not reclaim, or accept \
+                     that logging degrades to the RAM fallback under pressure",
+                    logging_placement.device,
+                    logging_placement.paths.join(", ")
+                ),
+            });
+        }
         // Surface the resolved ballast directories so the configured
         // `[paths] ballast_dir` is observable at startup (issue #14).
         eprintln!(
@@ -2677,6 +2740,7 @@ impl MonitoringDaemon {
             &config.telemetry,
         );
         self_monitor.set_run_id(run_id);
+        self_monitor.set_logging_snapshot(logging_placement.clone());
         let process_io_history = ProcessIoHistory::load_or_new(
             ProcessIoHistory::snapshot_path_for_state_file(&config.paths.state_file),
         );
@@ -2733,6 +2797,8 @@ impl MonitoringDaemon {
             catalog_epochs: HashMap::new(),
             emergency_mounts: HashSet::new(),
             mount_rates: HashMap::new(),
+            logging_placement,
+            logging_level_logged: None,
             special_alerts: AlertThrottle::default(),
             last_maintenance_scan: None,
             last_quarantine_sweep: None,
@@ -2828,6 +2894,38 @@ impl MonitoringDaemon {
                 });
             }
         }
+    }
+
+    /// bd-rc-master-ajg1.7.4: when the mount carrying the daemon's own files
+    /// is a reclaim target, its level drives the JSONL mirror. Orange or
+    /// worse turns the RAM mirror on; Yellow or better turns it off. One log
+    /// line per level change, never per tick.
+    fn note_logging_mount_level(&mut self, mount: &Path, level: PressureLevel) {
+        if !self.logging_placement.on_monitored_fs
+            || mount.to_string_lossy() != self.logging_placement.device
+        {
+            return;
+        }
+        if self.logging_level_logged == Some(level) {
+            return;
+        }
+        self.logging_level_logged = Some(level);
+        let pressured = matches!(
+            level,
+            PressureLevel::Orange | PressureLevel::Red | PressureLevel::Critical
+        );
+        let level_name = format!("{level:?}").to_lowercase();
+        self.logging_placement.level = Some(level_name.clone());
+        if pressured != self.logging_placement.mirroring {
+            self.logging_placement.mirroring = pressured;
+            self.logger_handle.mirror_jsonl(pressured);
+        }
+        eprintln!(
+            "[SBH-DAEMON] logging.on_monitored_fs=true device={} level={level_name} mirror_to_ram={}",
+            self.logging_placement.device, self.logging_placement.mirroring
+        );
+        self.self_monitor
+            .set_logging_snapshot(self.logging_placement.clone());
     }
 
     /// The reserve the mount's observed write bursts call for, and how long
@@ -4106,6 +4204,7 @@ impl MonitoringDaemon {
                 now,
                 stats.total_bytes.saturating_sub(stats.available_bytes),
             );
+            self.note_logging_mount_level(&mount_path, response.level);
             self.mount_responses.push(MountTickResponse {
                 response: response.clone(),
                 seconds_to_red: predicted_seconds,

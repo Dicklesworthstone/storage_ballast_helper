@@ -32,7 +32,7 @@ use storage_ballast_helper::daemon::loop_main::{
 use storage_ballast_helper::daemon::mount_controller::{MountStateRecord, unprotected_pressure};
 use storage_ballast_helper::daemon::process_io_history::ProcessIoHistory;
 use storage_ballast_helper::daemon::self_monitor::{
-    DAEMON_STATE_STALE_THRESHOLD_SECS, detect_daemon_liveness,
+    DAEMON_STATE_STALE_THRESHOLD_SECS, assess_logging_placement, detect_daemon_liveness,
 };
 use storage_ballast_helper::daemon::service::{
     LAUNCHD_LABEL_ENV, LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport,
@@ -7596,8 +7596,90 @@ fn system_doctor_checks(
         ballast_reserve_doctor_check(config),
     ];
     checks.extend(reserve_coverage_doctor_checks(config, bursts, pools));
+    checks.push(logging_placement_doctor_check(platform, config, pools));
     checks.extend(reclaim_capability_doctor_checks(config));
     checks
+}
+
+/// bd-rc-master-ajg1.7.4: the activity database, JSONL log and state file
+/// against the mounts sbh reclaims (scan roots, special locations, ballast
+/// pools). WARN when they share a mount, FAIL when that mount is at Orange
+/// or worse right now (from a fresh daemon state), PASS otherwise.
+fn logging_placement_doctor_check(
+    platform: &dyn Platform,
+    config: &Config,
+    pools: &[ReservePool],
+) -> DoctorCheck {
+    use storage_ballast_helper::monitor::special_locations::SpecialLocationRegistry;
+    let mount_of = |path: &Path| {
+        platform
+            .fs_stats(&nearest_existing_ancestor(path))
+            .ok()
+            .map(|stats| stats.mount_point)
+    };
+    let mut monitored: std::collections::BTreeSet<PathBuf> = config
+        .scanner
+        .root_paths
+        .iter()
+        .filter_map(|root| mount_of(root))
+        .collect();
+    if let Ok(special) = SpecialLocationRegistry::discover(platform, &[]) {
+        monitored.extend(special.all().iter().filter_map(|l| mount_of(&l.path)));
+    }
+    monitored.extend(pools.iter().map(|pool| pool.mount.clone()));
+    let placement = assess_logging_placement(
+        mount_of,
+        &[
+            config.paths.sqlite_db.as_path(),
+            config.paths.jsonl_log.as_path(),
+            config.paths.state_file.as_path(),
+        ],
+        &monitored,
+    );
+    if !placement.on_monitored_fs {
+        return doctor_check(
+            "logging.on_monitored_fs",
+            "Daemon files off the reclaimed volumes",
+            "PASS",
+            format!(
+                "activity database, JSONL log and state file are on {}, which sbh does not reclaim",
+                placement.device
+            ),
+            None,
+        );
+    }
+    let level = read_fresh_daemon_state(&config.paths.state_file)
+        .and_then(|state| {
+            let records: Vec<MountStateRecord> =
+                serde_json::from_value(state.get("mount_controllers").cloned()?).ok()?;
+            records
+                .into_iter()
+                .find(|record| record.mount == placement.device)
+                .map(|record| record.level)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let pressured = matches!(level.as_str(), "orange" | "red" | "critical");
+    doctor_check(
+        "logging.on_monitored_fs",
+        "Daemon files off the reclaimed volumes",
+        if pressured { "FAIL" } else { "WARN" },
+        format!(
+            "{} share {} with a reclaim target (level {level}): a full volume breaks the \
+             logger exactly when it matters{}",
+            placement.paths.join(", "),
+            placement.device,
+            if pressured {
+                "; the daemon mirrors JSONL to the RAM fallback while it stays pressured"
+            } else {
+                ""
+            }
+        ),
+        Some(format!(
+            "Move {} to a volume sbh does not reclaim (`[paths]` in the config), or accept \
+             degraded logging under pressure.",
+            placement.paths.join(", ")
+        )),
+    )
 }
 
 /// A ballast pool as the reserve-sizing checks see it: the mount and what
@@ -9610,6 +9692,27 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                             "  CPU budget: {pct}% of a core (used {used:.1}% last minute{idle})"
                         );
                     }
+                }
+                // bd-rc-master-ajg1.7.4: the daemon's own files on a volume
+                // it reclaims.
+                if let Some(logging) = daemon_state.as_ref().and_then(|state| state.get("logging"))
+                    && logging.get("on_monitored_fs") == Some(&Value::Bool(true))
+                {
+                    let device = logging.get("device").and_then(Value::as_str).unwrap_or("?");
+                    let level = logging
+                        .get("level")
+                        .and_then(Value::as_str)
+                        .map_or_else(String::new, |level| format!(", now {level}"));
+                    let mirror = if logging.get("mirroring") == Some(&Value::Bool(true)) {
+                        "; JSONL is being mirrored to the RAM fallback"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "  WARNING: the activity database/JSONL/state live on {device}, which \
+                         sbh reclaims{level}{mirror}. Move [paths] to a volume sbh does not \
+                         reclaim, or accept degraded logging under pressure."
+                    );
                 }
                 if let Some(policy) = daemon_state
                     .as_ref()
@@ -18162,6 +18265,89 @@ mod tests {
         let none = reserve_coverage_doctor_checks(&config, &bursts, &[]);
         assert_eq!(none.len(), 1);
         assert!(none[0].message.contains("no ballast pool"));
+    }
+
+    /// bd-rc-master-ajg1.7.4: the doctor names the shared mount and grades it
+    /// WARN without a fresh daemon state, PASS when nothing is reclaimed there.
+    #[test]
+    fn logging_placement_doctor_check_grades_the_shared_mount() {
+        use std::collections::HashMap;
+        use storage_ballast_helper::platform::pal::{
+            FsStats, MemoryInfo, MockPlatform, MountPoint, PlatformPaths,
+        };
+        // Two mounts: "/" (where the special locations live) and "/state"
+        // for the daemon's own files.
+        let stats = |mount: &str| FsStats {
+            total_bytes: 1_000_000_000_000,
+            free_bytes: 500_000_000_000,
+            available_bytes: 500_000_000_000,
+            fs_type: "mockfs".to_string(),
+            mount_point: PathBuf::from(mount),
+            is_readonly: false,
+        };
+        let mount = |path: &str| MountPoint {
+            path: PathBuf::from(path),
+            device: format!("mock{path}"),
+            fs_type: "mockfs".to_string(),
+            is_ram_backed: false,
+        };
+        // The files' mount is a real directory, because paths resolve
+        // through their nearest existing ancestor before the mock lookup.
+        let dir = tempfile::tempdir().unwrap();
+        let state_mount = dir.path().to_string_lossy().into_owned();
+        let mut stats_by_mount = HashMap::new();
+        stats_by_mount.insert(PathBuf::from("/"), stats("/"));
+        stats_by_mount.insert(dir.path().to_path_buf(), stats(&state_mount));
+        let platform = MockPlatform::new(
+            vec![mount("/"), mount(&state_mount)],
+            stats_by_mount,
+            MemoryInfo {
+                total_bytes: 64 << 30,
+                available_bytes: 32 << 30,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            },
+            PlatformPaths::default(),
+        );
+        let mut config = Config::default();
+        config.paths.state_file = dir.path().join("sbh").join("state.json");
+        config.paths.sqlite_db = dir.path().join("sbh").join("activity.sqlite3");
+        config.paths.jsonl_log = dir.path().join("sbh").join("activity.jsonl");
+        config.scanner.root_paths = vec![PathBuf::from("/")];
+
+        // Scan root and special locations on "/", the files on their own mount.
+        let clear = logging_placement_doctor_check(&platform, &config, &[]);
+        assert_eq!(clear.id, "logging.on_monitored_fs");
+        assert_eq!(clear.status, "PASS", "{clear:?}");
+        assert!(clear.message.contains(&state_mount), "{}", clear.message);
+
+        // A scan root on the files' mount: WARN without a fresh daemon
+        // state (the level is unknown), never FAIL.
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        config.scanner.root_paths = vec![work];
+        let shared = logging_placement_doctor_check(&platform, &config, &[]);
+        assert_eq!(shared.status, "WARN", "{shared:?}");
+        assert!(
+            shared.message.contains("level unknown"),
+            "{}",
+            shared.message
+        );
+        assert!(
+            shared.message.contains("activity.jsonl"),
+            "{}",
+            shared.message
+        );
+        assert!(shared.remediation.is_some());
+
+        // A ballast pool on the mount counts as a reclaim target too.
+        config.scanner.root_paths = vec![PathBuf::from("/")];
+        let pools = vec![ReservePool {
+            mount: dir.path().to_path_buf(),
+            releasable_bytes: 0,
+        }];
+        let pooled = logging_placement_doctor_check(&platform, &config, &pools);
+        assert_eq!(pooled.status, "WARN", "{pooled:?}");
     }
 
     #[test]

@@ -271,6 +271,7 @@ fn multi_mount_state() -> DaemonState {
         stopped_at: None,
         exit_reason: None,
         memory_rss_bytes: 104_857_600,
+        ..Default::default()
     }
 }
 
@@ -315,6 +316,7 @@ fn state_without_rates() -> DaemonState {
         stopped_at: None,
         exit_reason: None,
         memory_rss_bytes: 16_000_000,
+        ..Default::default()
     }
 }
 
@@ -359,6 +361,7 @@ fn state_no_scan_history() -> DaemonState {
         stopped_at: None,
         exit_reason: None,
         memory_rss_bytes: 8_000_000,
+        ..Default::default()
     }
 }
 

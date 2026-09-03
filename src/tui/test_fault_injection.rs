@@ -123,6 +123,7 @@ fn sample_state() -> DaemonState {
         stopped_at: None,
         exit_reason: None,
         memory_rss_bytes: 1_048_576,
+        ..Default::default()
     }
 }
 

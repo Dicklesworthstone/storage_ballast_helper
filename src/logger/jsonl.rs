@@ -251,6 +251,11 @@ pub struct JsonlWriter {
     lines_since_fsync: u64,
     /// fsyncs performed so far (the idle timer test reads it).
     fsync_count: u64,
+    /// While the primary's volume is pressured, every line is also written
+    /// here (the RAM fallback), so the log survives the primary filling up
+    /// (bd-rc-master-ajg1.7.4).
+    mirror: Option<BufWriter<File>>,
+    mirror_bytes: u64,
     /// Stamped on every line (C-EVENT `run_id`) when set.
     run_id: Option<String>,
 }
@@ -267,6 +272,8 @@ impl JsonlWriter {
             last_recover_attempt: UNIX_EPOCH,
             lines_since_fsync: 0,
             fsync_count: 0,
+            mirror: None,
+            mirror_bytes: 0,
             run_id: None,
         };
         w.try_open_primary();
@@ -315,6 +322,9 @@ impl JsonlWriter {
         if let Some(w) = self.writer.as_mut() {
             let _ = w.flush();
         }
+        if let Some(mirror) = self.mirror.as_mut() {
+            let _ = mirror.flush();
+        }
     }
 
     /// Force an fsync on the underlying file.
@@ -351,6 +361,67 @@ impl JsonlWriter {
     #[must_use]
     pub fn fsync_count(&self) -> u64 {
         self.fsync_count
+    }
+
+    /// Mirror every line to the RAM fallback as well (`on`), or stop. The
+    /// primary keeps being written; the mirror is capped like the fallback.
+    /// A writer already running on the fallback has nothing to mirror to.
+    pub fn set_mirror(&mut self, on: bool) {
+        if !on {
+            if let Some(mut mirror) = self.mirror.take() {
+                let _ = mirror.flush();
+            }
+            self.mirror_bytes = 0;
+            return;
+        }
+        if self.mirror.is_some() || self.state != WriterState::Normal {
+            return;
+        }
+        let Some(path) = self.config.fallback_path.clone() else {
+            return;
+        };
+        match open_append(&path) {
+            Ok((file, size)) => {
+                self.mirror = Some(BufWriter::with_capacity(64 * 1024, file));
+                self.mirror_bytes = size;
+                let _ = writeln!(
+                    io::stderr(),
+                    "[SBH-JSONL] mirroring the log to {} while its volume is pressured",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "[SBH-JSONL] cannot open the mirror {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// Whether lines are currently mirrored to the RAM fallback.
+    #[must_use]
+    pub fn mirroring(&self) -> bool {
+        self.mirror.is_some()
+    }
+
+    fn write_mirror(&mut self, line: &str) {
+        let Some(mirror) = self.mirror.as_mut() else {
+            return;
+        };
+        if self.mirror_bytes + line.len() as u64 > FALLBACK_MAX_BYTES && self.mirror_bytes > 0 {
+            let _ = mirror.flush();
+            if mirror.get_ref().set_len(0).is_ok() {
+                self.mirror_bytes = 0;
+            }
+        }
+        if mirror.write_all(line.as_bytes()).is_ok() {
+            self.mirror_bytes += line.len() as u64;
+        } else {
+            self.mirror = None;
+            self.mirror_bytes = 0;
+        }
     }
 
     /// Current degradation state.
@@ -391,6 +462,9 @@ impl JsonlWriter {
             _ => {}
         }
 
+        if self.state == WriterState::Normal {
+            self.write_mirror(line);
+        }
         match self.state {
             WriterState::Normal | WriterState::Fallback => {
                 if let Some(w) = self.writer.as_mut() {
@@ -788,6 +862,53 @@ mod tests {
             "the fallback must never be rotated"
         );
         assert!(!rotated_name(&fallback, 2).exists());
+    }
+
+    /// bd-rc-master-ajg1.7.4: while mirroring, every line lands in both the
+    /// primary and the RAM fallback; the mirror is capped, and switching it
+    /// off leaves the primary untouched.
+    #[test]
+    fn mirror_writes_every_line_to_the_fallback_while_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("activity.jsonl");
+        let fallback = dir.path().join("fallback.jsonl");
+        let mut writer = JsonlWriter::open(JsonlConfig {
+            path: primary.clone(),
+            fallback_path: Some(fallback.clone()),
+            max_size_bytes: 1024 * 1024,
+            max_rotated_files: 1,
+            fsync_interval_secs: 3600,
+        });
+        assert!(!writer.mirroring());
+        writer.write_entry(&LogEntry::new(EventType::DaemonStart, Severity::Info));
+        writer.set_mirror(true);
+        assert!(writer.mirroring());
+        writer.write_entry(&LogEntry::new(EventType::ScanComplete, Severity::Info));
+        writer.write_entry(&LogEntry::new(EventType::ArtifactDelete, Severity::Info));
+        writer.set_mirror(false);
+        assert!(!writer.mirroring());
+        writer.write_entry(&LogEntry::new(EventType::DaemonStop, Severity::Info));
+        writer.flush();
+
+        let primary_text = fs::read_to_string(&primary).unwrap();
+        let fallback_text = fs::read_to_string(&fallback).unwrap();
+        assert_eq!(primary_text.lines().count(), 4);
+        assert_eq!(fallback_text.lines().count(), 2, "{fallback_text}");
+        assert!(fallback_text.contains("scan_complete"));
+        assert!(fallback_text.contains("artifact_delete"));
+        assert!(!fallback_text.contains("daemon_stop"));
+        assert_eq!(writer.state(), "normal");
+
+        // A writer without a fallback path has nothing to mirror to.
+        let mut lone = JsonlWriter::open(JsonlConfig {
+            path: dir.path().join("lone.jsonl"),
+            fallback_path: None,
+            max_size_bytes: 1024 * 1024,
+            max_rotated_files: 1,
+            fsync_interval_secs: 3600,
+        });
+        lone.set_mirror(true);
+        assert!(!lone.mirroring());
     }
 
     /// A path no process can create — root included: its parent is a regular

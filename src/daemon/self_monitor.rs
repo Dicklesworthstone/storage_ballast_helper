@@ -505,6 +505,10 @@ pub struct DaemonState {
     /// reason and where automatic recovery lands.
     #[serde(default)]
     pub policy: PolicyStateRecord,
+    /// Where the daemon's own files live relative to what it reclaims
+    /// (bd-rc-master-ajg1.7.4).
+    #[serde(default)]
+    pub logging: LoggingState,
     /// Set by the final write on shutdown.
     pub stopped_at: Option<String>,
     /// Why the daemon stopped (final write only).
@@ -513,6 +517,83 @@ pub struct DaemonState {
 
 /// Current state file schema version.
 pub const STATE_SCHEMA_VERSION: u32 = 2;
+
+/// Where the daemon's own files live relative to the filesystems it reclaims.
+///
+/// A full disk breaks the logger exactly when it matters
+/// (bd-rc-master-ajg1.7.4), so the activity database, JSONL log and state
+/// file sharing a mount with a reclaim target is reported, and while that
+/// mount is pressured the JSONL lines are mirrored to the RAM fallback.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoggingState {
+    /// The mount carrying the daemon's own files (the first one that is
+    /// also a reclaim target when `on_monitored_fs`).
+    pub device: String,
+    /// At least one of the daemon's files shares a mount with a scan root,
+    /// a special location or a ballast pool.
+    pub on_monitored_fs: bool,
+    /// The daemon's files on that mount.
+    pub paths: Vec<String>,
+    /// The mount's pressure level while the files are at risk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// JSONL lines are being mirrored to the RAM fallback right now.
+    pub mirroring: bool,
+}
+
+/// The daemon's own files against the mounts it reclaims.
+///
+/// `mount_of` resolves a path (or its nearest existing ancestor) to a mount
+/// point. The device reported is the first of the daemon's files that
+/// shares a mount with a reclaim target, or the first file's mount
+/// otherwise.
+pub fn assess_logging_placement(
+    mount_of: impl Fn(&Path) -> Option<PathBuf>,
+    own_files: &[&Path],
+    monitored: &std::collections::BTreeSet<PathBuf>,
+) -> LoggingState {
+    let mut state = LoggingState::default();
+    let mut first_device: Option<PathBuf> = None;
+    for path in own_files {
+        let Some(mount) = mount_of(path) else {
+            continue;
+        };
+        if first_device.is_none() {
+            first_device = Some(mount.clone());
+        }
+        if monitored.contains(&mount) {
+            if !state.on_monitored_fs {
+                state.on_monitored_fs = true;
+                state.device = mount.to_string_lossy().into_owned();
+            }
+            if mount.to_string_lossy() == state.device {
+                state.paths.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    if !state.on_monitored_fs
+        && let Some(device) = first_device
+    {
+        state.device = device.to_string_lossy().into_owned();
+    }
+    state
+}
+
+/// The nearest existing ancestor of `path` (the path itself when it
+/// exists), so a file the daemon has not created yet still resolves to a
+/// mount.
+#[must_use]
+pub fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.exists() {
+            return Some(candidate.to_path_buf());
+        }
+        current = candidate.parent();
+    }
+    None
+}
 
 /// EWMA rate estimate for one mount.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -802,6 +883,7 @@ pub struct SelfMonitor {
     idle_reason: Option<String>,
     /// Latest policy engine snapshot.
     policy_snapshot: PolicyStateRecord,
+    logging_snapshot: LoggingState,
     /// Latest thread health, set by the main loop each tick.
     threads_snapshot: ThreadsState,
     /// Identifies this daemon run.
@@ -855,6 +937,11 @@ impl SelfMonitor {
     }
 
     /// Record the policy engine snapshot the next state file write carries.
+    /// Where the daemon's own files live relative to what it reclaims.
+    pub fn set_logging_snapshot(&mut self, logging: LoggingState) {
+        self.logging_snapshot = logging;
+    }
+
     pub fn set_policy_snapshot(&mut self, policy: PolicyStateRecord) {
         self.policy_snapshot = policy;
     }
@@ -944,6 +1031,7 @@ impl SelfMonitor {
             budget_snapshot: CpuBudgetState::default(),
             idle_reason: None,
             policy_snapshot: PolicyStateRecord::default(),
+            logging_snapshot: LoggingState::default(),
             run_id: generate_run_id(),
             last_state: None,
             metrics_enabled: true,
@@ -1052,6 +1140,7 @@ impl SelfMonitor {
             cpu_budget: self.budget_snapshot.clone(),
             idle_reason: self.idle_reason.clone(),
             policy: self.policy_snapshot.clone(),
+            logging: self.logging_snapshot.clone(),
             stopped_at: None,
             exit_reason: None,
         };
@@ -1238,7 +1327,12 @@ fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let json = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
+    let mut json = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
+    // Fixed-size file (bd-rc-master-ajg1.7.4): padded with JSON whitespace
+    // to a reserved length, so that when the volume is full and the
+    // temp-file-and-rename path cannot allocate, the existing file can be
+    // rewritten in place without a single new block.
+    pad_state_json(&mut json);
 
     let result = (|| {
         {
@@ -1260,8 +1354,45 @@ fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
 
     if result.is_err() {
         let _ = fs::remove_file(&tmp_path);
+        // The atomic path needs new blocks; a full volume has none. The
+        // existing file's blocks are still ours: rewrite them in place.
+        if write_state_in_place(path, &json).is_ok() {
+            return Ok(());
+        }
     }
     result
+}
+
+/// Reserved length of `state.json`.
+///
+/// The JSON is padded with spaces up to it (a multiple of it for an
+/// unusually large state), so every write has the same size and the
+/// in-place fallback never needs to grow the file.
+pub const STATE_FILE_RESERVED_BYTES: usize = 64 * 1024;
+
+fn pad_state_json(json: &mut String) {
+    let target = json.len().div_ceil(STATE_FILE_RESERVED_BYTES) * STATE_FILE_RESERVED_BYTES;
+    json.extend(std::iter::repeat_n(' ', target.saturating_sub(json.len())));
+}
+
+/// Overwrite the existing state file in place, without truncating first:
+/// the padding keeps every write the same length, so no new blocks are
+/// needed and readers see either the old or the new JSON plus whitespace.
+fn write_state_in_place(path: &Path, json: &str) -> std::io::Result<()> {
+    use std::io::{Seek, Write};
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    let existing = file.metadata()?.len();
+    file.seek(std::io::SeekFrom::Start(0))?;
+    file.write_all(json.as_bytes())?;
+    if (json.len() as u64) < existing {
+        // A shorter reservation than the file on disk: blank the tail so no
+        // stale JSON trails the new document.
+        let tail = existing - json.len() as u64;
+        #[allow(clippy::cast_possible_truncation)]
+        let blanks = vec![b' '; tail as usize];
+        file.write_all(&blanks)?;
+    }
+    file.sync_all()
 }
 
 fn empty_self_stats() -> SelfStats {
@@ -1355,6 +1486,110 @@ mod tests {
 
     use crate::platform::pal::MockPlatform;
 
+    /// bd-rc-master-ajg1.7.4: the daemon's files against the reclaimed
+    /// mounts. Two volumes with the files on the other one pass; a single
+    /// volume host is reported (WARN-grade), never refused; the device and
+    /// the offending paths are named; unresolvable paths are skipped.
+    #[test]
+    fn logging_placement_names_the_shared_mount_and_its_files() {
+        let mount_of = |path: &Path| -> Option<PathBuf> {
+            let text = path.to_string_lossy();
+            if text.starts_with("/data") {
+                Some(PathBuf::from("/data"))
+            } else if text.starts_with("/var") || text == "/" {
+                Some(PathBuf::from("/"))
+            } else {
+                None
+            }
+        };
+        let monitored: std::collections::BTreeSet<PathBuf> =
+            std::iter::once(PathBuf::from("/data")).collect();
+        let db = Path::new("/var/lib/sbh/activity.sqlite3");
+        let jsonl = Path::new("/var/lib/sbh/activity.jsonl");
+        let state = Path::new("/var/lib/sbh/state.json");
+
+        let apart = assess_logging_placement(mount_of, &[db, jsonl, state], &monitored);
+        assert!(!apart.on_monitored_fs);
+        assert_eq!(apart.device, "/");
+        assert!(apart.paths.is_empty());
+        assert!(!apart.mirroring);
+
+        let jsonl_on_data = Path::new("/data/sbh/activity.jsonl");
+        let mixed = assess_logging_placement(mount_of, &[db, jsonl_on_data, state], &monitored);
+        assert!(mixed.on_monitored_fs);
+        assert_eq!(mixed.device, "/data");
+        assert_eq!(
+            mixed.paths,
+            vec![jsonl_on_data.to_string_lossy().into_owned()]
+        );
+
+        // Single-volume host: everything shares the one reclaimed mount.
+        let single: std::collections::BTreeSet<PathBuf> =
+            std::iter::once(PathBuf::from("/")).collect();
+        let shared = assess_logging_placement(mount_of, &[db, jsonl, state], &single);
+        assert!(shared.on_monitored_fs);
+        assert_eq!(shared.device, "/");
+        assert_eq!(shared.paths.len(), 3);
+
+        let unknown = assess_logging_placement(mount_of, &[Path::new("/nowhere/x")], &single);
+        assert!(!unknown.on_monitored_fs);
+        assert_eq!(unknown.device, "");
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not").join("yet").join("state.json");
+        assert_eq!(
+            nearest_existing_ancestor(&missing),
+            Some(dir.path().to_path_buf())
+        );
+        assert_eq!(
+            nearest_existing_ancestor(dir.path()),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    /// bd-rc-master-ajg1.7.4: state.json is padded to a fixed size, parses
+    /// as usual, and when the temp file cannot be created the existing file
+    /// is rewritten in place.
+    #[test]
+    fn state_file_is_fixed_size_and_survives_an_unwritable_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = DaemonState {
+            version: "0.1.0".to_string(),
+            pid: 7,
+            ..Default::default()
+        };
+        write_state_atomic(&path, &state).unwrap();
+        let len = fs::metadata(&path).unwrap().len();
+        assert_eq!(len, STATE_FILE_RESERVED_BYTES as u64);
+        let parsed: DaemonState =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.pid, 7);
+
+        // A directory that refuses new files (the temp file) but still holds
+        // a writable state file: the in-place path takes over. Root ignores
+        // directory modes, so the check is skipped there.
+        #[cfg(unix)]
+        if !nix::unistd::Uid::effective().is_root() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+            state.pid = 8;
+            state.policy_mode = "enforce".to_string();
+            let result = write_state_atomic(&path, &state);
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            result.unwrap();
+            assert!(!path.with_extension("json.tmp").exists());
+            let parsed: DaemonState =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(parsed.pid, 8);
+            assert_eq!(parsed.policy_mode, "enforce");
+            assert_eq!(
+                fs::metadata(&path).unwrap().len(),
+                STATE_FILE_RESERVED_BYTES as u64
+            );
+        }
+    }
+
     fn test_self_stats(rss_bytes: u64) -> SelfStats {
         SelfStats {
             rss_bytes,
@@ -1421,6 +1656,7 @@ mod tests {
             policy: PolicyStateRecord::default(),
             stopped_at: None,
             exit_reason: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -1481,6 +1717,7 @@ mod tests {
             policy: PolicyStateRecord::default(),
             stopped_at: None,
             exit_reason: None,
+            ..Default::default()
         };
 
         write_state_atomic(&path, &state).unwrap();
@@ -1543,6 +1780,7 @@ mod tests {
             policy: PolicyStateRecord::default(),
             stopped_at: None,
             exit_reason: None,
+            ..Default::default()
         };
 
         write_state_atomic(&path, &state).unwrap();

@@ -186,6 +186,7 @@ fn sample_daemon_state() -> DaemonState {
         stopped_at: None,
         exit_reason: None,
         memory_rss_bytes: 52_428_800, // 50 MB
+        ..Default::default()
     }
 }
 

@@ -415,7 +415,7 @@ sbh --json lease renew --extend 30m
 | `sbh blame` | Attribute artifact pressure by process/agent |
 | `sbh dashboard` | Real-time TUI dashboard |
 | `sbh doctor --pal` | Validate platform integration and macOS runtime prerequisites |
-| `sbh doctor --system` | Check host kernel tuning (writeback / dirty-page limits) and whether each ballast pool covers the reserve its observed write bursts require |
+| `sbh doctor --system` | Check host kernel tuning (writeback / dirty-page limits), whether each ballast pool covers the reserve its observed write bursts require, and that the daemon's own files do not live on a volume it reclaims |
 | `sbh doctor --service [--user]` | Compare the installed systemd unit (or launchd plist) with what sbh generates: FAIL on missing hardening, a different `Type=`/binary, a drop-in overriding hardening, or a `Condition*=` gate that keeps the unit from starting; WARN on foreign drop-ins and cosmetic differences |
 | `sbh service --systemd reinstall-unit [--purge-dropins]` | Rewrite the unit from the generator with a timestamped backup beside it and `daemon-reload`; drop-ins stay in effect unless `--purge-dropins` moves them into the backup directory |
 | `sbh explain (--id ID \| --last N \| --path P \| --since W) [--level 0-3]` | Explain recorded cleanup decisions: the daemon records one per evaluated candidate, `sbh clean` records its plan; ids are stable per artifact version and appear in `scan --json` and `artifact_delete` events |
@@ -1393,6 +1393,8 @@ If the SQLite backend fails (disk full, corruption, permission error), the logge
 6. If even stderr fails, silently discard (the daemon never blocks on logging).
 
 At open, a database whose `auto_vacuum` is not `FULL` is converted with one `VACUUM` only when it is larger than 64 MiB; smaller files keep their setting, because the rewrite would cost more than it could ever reclaim.
+
+**The daemon's own files on a volume it reclaims.** A full disk breaks the logger exactly when it matters, so at startup the daemon checks whether the activity database, the JSONL log and `state.json` share a mount with a scan root, a special location or a ballast pool. It is not a refusal (single-volume hosts are common): the daemon logs one `logging.on_monitored_fs=... device=... paths=[...]` line, records it in `state.json` under `logging`, `sbh status` prints a warning, and `sbh doctor --system` reports `logging.on_monitored_fs` (WARN, or FAIL while that mount is at Orange or worse). While the mount is pressured the daemon mirrors every JSONL line to the RAM fallback as well and says so once per level change. `state.json` itself is padded to a fixed 64 KiB and, when the atomic temp-file write cannot allocate, is rewritten in place, so status keeps updating on a full volume.
 
 The logger thread runs on a bounded channel (capacity 1024). When the channel is full, events are dropped and a counter is incremented. The drop count is reported periodically as a delta (not cumulative) to avoid alarm fatigue.
 

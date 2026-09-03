@@ -1277,6 +1277,59 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
     .unwrap_or_else(|e| panic!("[{engine}] {e}"));
     let deleted = run.deleted_paths();
 
+    // bd-rc-master-ajg1.7.4: the daemon's own files sit on the fixture mount,
+    // which is a scan root's mount at injected Orange: state.json says so,
+    // the JSONL is mirrored to the RAM fallback while it stays pressured,
+    // and the mirror carries this run's lines.
+    run.wait_until(
+        "the logging placement in state.json",
+        Duration::from_secs(40),
+        |run| {
+            run.state()
+                .and_then(|state| state.get("logging").cloned())
+                .is_some_and(|logging| logging["mirroring"] == Value::Bool(true))
+        },
+    )
+    .unwrap_or_else(|e| panic!("[{engine}] {e}"));
+    let state = run.state().unwrap();
+    let logging = &state["logging"];
+    assert_eq!(
+        logging["on_monitored_fs"],
+        Value::Bool(true),
+        "[{engine}] {logging}"
+    );
+    assert_eq!(
+        logging["level"],
+        Value::String("orange".to_string()),
+        "[{engine}] {logging}"
+    );
+    assert!(
+        logging["paths"]
+            .as_array()
+            .is_some_and(|paths| paths.len() == 3),
+        "[{engine}] {logging}"
+    );
+    assert!(
+        run.stderr_count("logging.on_monitored_fs=true") >= 2,
+        "{}",
+        run.stderr()
+    );
+    assert!(
+        run.stderr_count("mirror_to_ram=true") >= 1,
+        "{}",
+        run.stderr()
+    );
+    let run_id = state["run_id"].as_str().unwrap().to_string();
+    let mirror = storage_ballast_helper::logger::jsonl::ram_fallback_path();
+    let mirrored = fs::read_to_string(&mirror).unwrap_or_default();
+    assert!(
+        mirrored
+            .lines()
+            .any(|line| line.contains(&run_id) && line.contains("artifact_delete")),
+        "[{engine}] no mirrored artifact_delete line for run {run_id} in {}",
+        mirror.display()
+    );
+
     let status = run.stop();
     assert!(status.success(), "[{engine}] {status}");
     let mut names: Vec<String> = deleted

@@ -679,6 +679,7 @@ mod tests {
             },
             stopped_at: None,
             exit_reason: None,
+            ..Default::default()
         }
     }
 

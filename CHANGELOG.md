@@ -10,6 +10,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — the daemon's own files against the volumes it reclaims (bd-rc-master-ajg1.7.4)
+
+- At startup the daemon checks whether the activity database, the JSONL log and `state.json` share a mount with a scan root, a special location or a ballast pool. It logs one `logging.on_monitored_fs=... device=... paths=[...]` line, carries the result in `state.json` under `logging`, and `sbh status` warns; `sbh doctor --system` gains `logging.on_monitored_fs` (WARN, FAIL while that mount is at Orange or worse). While the mount is pressured, every JSONL line is mirrored to the RAM fallback (capped like the fallback) and the daemon says so once per level change.
+- `state.json` is padded to a fixed 64 KiB; when the atomic temp-file write cannot allocate on a full volume, the file is rewritten in place, so status keeps updating exactly when the disk is full.
+
 ### Changed — one logging degradation chain (bd-rc-master-ajg1.7.2)
 
 - The daemon's JSONL settings are now a single definition (`JsonlConfig::for_daemon`): rotation at 50 MiB keeping 5 files, fsync every 30 seconds, and the RAM-backed fallback enabled (`/dev/shm/sbh-<uid>.jsonl` on Linux, `$TMPDIR/sbh.jsonl` elsewhere), never rotated and truncated at 16 MiB. An idle timer in the logger thread fsyncs lines written before a quiet spell once the interval passes. SQLite trips after 3 consecutive write failures and is retried every 50 events, which is what the code always did; the README said 50 failures. At open, a database whose `auto_vacuum` is not FULL is converted only when it is larger than 64 MiB.

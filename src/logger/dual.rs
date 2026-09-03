@@ -152,6 +152,9 @@ pub enum ActivityEvent {
     /// What became of a deletion (regret label): SQLite `decision_outcome`
     /// plus a JSONL `decision_outcome` line.
     DecisionOutcome(Box<crate::scanner::regret::DecisionOutcome>),
+    /// Control message: mirror every JSONL line to the RAM fallback (or
+    /// stop). Consumed by the logger thread, never written.
+    MirrorJsonl(bool),
     /// Sentinel to request graceful shutdown of the logger thread.
     Shutdown,
 }
@@ -207,6 +210,13 @@ impl ActivityLoggerHandle {
         // Blocking send: acceptable during shutdown — we *must* deliver the
         // sentinel even if the channel is temporarily full.
         let _ = self.tx.send(ActivityEvent::Shutdown);
+    }
+
+    /// Mirror every JSONL line to the RAM fallback as well (or stop doing
+    /// so). Blocking send: a control message must not be dropped under
+    /// back-pressure.
+    pub fn mirror_jsonl(&self, on: bool) {
+        let _ = self.tx.send(ActivityEvent::MirrorJsonl(on));
     }
 }
 
@@ -410,6 +420,10 @@ fn logger_thread_main(
             jsonl.flush();
             jsonl.fsync();
             break;
+        }
+        if let ActivityEvent::MirrorJsonl(on) = event {
+            jsonl.set_mirror(on);
+            continue;
         }
 
         // Build log representations.
@@ -728,6 +742,10 @@ fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
         ActivityEvent::Shutdown => {
             // Should not reach here; handled above.
             LogEntry::new(EventType::DaemonStop, Severity::Info)
+        }
+        ActivityEvent::MirrorJsonl(_) => {
+            // Control message, consumed before logging; never written.
+            LogEntry::new(EventType::Info, Severity::Info)
         }
     }
 }
@@ -1077,6 +1095,46 @@ mod tests {
         assert_eq!(jsonl.matches("SBH-LOCKED-").count(), 3);
         assert_eq!(jsonl.matches("SBH-TRIPPED-").count(), 50);
         assert_eq!(jsonl.matches("SBH-AFTER-").count(), 5);
+    }
+
+    /// bd-rc-master-ajg1.7.4: the mirror control reaches the writer through
+    /// the logger thread and is never itself logged.
+    #[test]
+    fn mirror_control_switches_the_fallback_copy_on_and_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = dir.path().join("fallback.jsonl");
+        let mut config = test_config(dir.path());
+        config.sqlite_path = None;
+        config.jsonl_config.fallback_path = Some(fallback.clone());
+        let (handle, join) = spawn_logger(config).unwrap();
+        handle.send(ActivityEvent::Error {
+            code: "SBH-BEFORE".to_string(),
+            message: "not mirrored".to_string(),
+        });
+        handle.mirror_jsonl(true);
+        handle.send(ActivityEvent::Error {
+            code: "SBH-DURING".to_string(),
+            message: "mirrored".to_string(),
+        });
+        handle.mirror_jsonl(false);
+        handle.send(ActivityEvent::Error {
+            code: "SBH-AFTER".to_string(),
+            message: "not mirrored".to_string(),
+        });
+        handle.shutdown();
+        join.join().unwrap();
+
+        let primary = std::fs::read_to_string(dir.path().join("test.jsonl")).unwrap();
+        let mirrored = std::fs::read_to_string(&fallback).unwrap();
+        assert!(primary.contains("SBH-BEFORE") && primary.contains("SBH-DURING"));
+        assert!(primary.contains("SBH-AFTER"));
+        assert!(
+            !primary.contains("MirrorJsonl"),
+            "control messages are never logged"
+        );
+        assert!(mirrored.contains("SBH-DURING"), "{mirrored}");
+        assert!(!mirrored.contains("SBH-BEFORE"));
+        assert!(!mirrored.contains("SBH-AFTER"));
     }
 
     fn test_config(dir: &std::path::Path) -> DualLoggerConfig {

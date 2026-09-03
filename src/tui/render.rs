@@ -5573,6 +5573,7 @@ mod tests {
             stopped_at: None,
             exit_reason: None,
             memory_rss_bytes: 52_428_800,
+            ..Default::default()
         }
     }
 
@@ -5748,6 +5749,7 @@ mod tests {
             stopped_at: None,
             exit_reason: None,
             memory_rss_bytes: 104_857_600,
+            ..Default::default()
         }
     }
 
