@@ -1915,43 +1915,180 @@ pub fn check_file(path: &Path, document: &DocsDocument) -> Result<Vec<String>> {
 /// part of the path (bd-rc-master-ajg1.12.3).
 #[must_use]
 pub fn undocumented_commands(
-    readme: &str,
+    text: &str,
+    section: &str,
     known: &std::collections::BTreeSet<String>,
 ) -> Vec<String> {
-    let Some(section_start) = readme.find("## Command Reference") else {
-        return vec!["README has no \"## Command Reference\" section".to_string()];
+    let Some(body) = section_body(text, section) else {
+        return vec![format!("no {section:?} section")];
     };
-    let section_end = readme[section_start..]
-        .find("\n## ")
-        .map_or(readme.len(), |end| section_start + end);
     let mut missing = Vec::new();
-    for line in readme[section_start..section_end].lines() {
+    for line in body.lines() {
         let Some(rest) = line.strip_prefix("| `sbh ") else {
             continue;
         };
         let Some(cell_end) = rest.find('`') else {
             continue;
         };
-        let mut path = String::new();
-        for word in rest[..cell_end].split_whitespace() {
-            if word.starts_with('-') || word.starts_with('<') || word.starts_with('[') {
-                break;
-            }
-            // `config show|set|…` documents alternatives in one cell.
-            let word = word.split('|').next().unwrap_or(word);
-            let candidate = if path.is_empty() {
+        if command_path_of(&rest[..cell_end], known).is_empty() {
+            missing.push(line.trim().to_string());
+        }
+    }
+    missing
+}
+
+/// The text of the markdown section that starts with `heading` (a `## …`
+/// line) up to the next `## ` heading.
+fn section_body<'a>(text: &'a str, heading: &str) -> Option<&'a str> {
+    let start = text.find(heading)?;
+    let end = text[start..]
+        .find("\n## ")
+        .map_or(text.len(), |end| start + end);
+    Some(&text[start..end])
+}
+
+/// The longest known command path at the start of a documented `sbh …`
+/// cell (`"config show|set"` resolves to `config show`; flags, placeholders
+/// and `[…]` end the path).
+fn command_path_of(cell: &str, known: &std::collections::BTreeSet<String>) -> String {
+    let mut path = String::new();
+    for word in cell.split_whitespace() {
+        if word.starts_with('<') || word.starts_with('[') {
+            break;
+        }
+        // `sbh service --systemd reinstall-unit`: a flag may sit between
+        // the path words.
+        if word.starts_with('-') {
+            continue;
+        }
+        // `config show|set|…` (or `show\|set` inside a table) documents
+        // alternatives in one cell.
+        let word = word
+            .split('|')
+            .next()
+            .unwrap_or(word)
+            .trim_end_matches('\\');
+        let candidate = if path.is_empty() {
+            word.to_string()
+        } else {
+            format!("{path} {word}")
+        };
+        if known.contains(&candidate) {
+            path = candidate;
+        } else if path.is_empty() {
+            break;
+        }
+        // A flag value (`--mount M`) may also sit between path words: an
+        // unknown word after a known prefix is skipped.
+    }
+    path
+}
+
+/// The `--long` flags mentioned in a table row.
+fn long_flags_in(row: &str) -> Vec<&str> {
+    let mut flags = Vec::new();
+    let mut rest = row;
+    while let Some(at) = rest.find("--") {
+        let after = &rest[at + 2..];
+        let len = after
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'-')
+            .count();
+        if len > 0 && after.as_bytes()[0].is_ascii_alphabetic() {
+            flags.push(&after[..len]);
+        }
+        rest = &after[len..];
+    }
+    flags
+}
+
+/// Rows of the command table under `section` whose `--flag` mentions name
+/// a flag the resolved subcommand (or the global flags) does not have.
+///
+/// Each finding is `"<row>: --flag"`, so the fix is one edit away.
+#[must_use]
+pub fn undocumented_flags(text: &str, section: &str, root: &clap::Command) -> Vec<String> {
+    let docs = command_docs(root);
+    let known: std::collections::BTreeSet<String> = docs.iter().map(|c| c.path.clone()).collect();
+    let flags_of: BTreeMap<&str, Vec<&str>> = docs
+        .iter()
+        .map(|c| {
+            (
+                c.path.as_str(),
+                c.args.iter().filter_map(|a| a.long.as_deref()).collect(),
+            )
+        })
+        .collect();
+    let globals: Vec<&str> = root
+        .get_arguments()
+        .filter_map(clap::Arg::get_long)
+        .chain(["help", "version"])
+        .collect();
+    let Some(body) = section_body(text, section) else {
+        return vec![format!("no {section:?} section")];
+    };
+    let mut findings = Vec::new();
+    for line in body.lines() {
+        let Some(rest) = line.strip_prefix("| `sbh ") else {
+            continue;
+        };
+        let Some(cell_end) = rest.find('`') else {
+            continue;
+        };
+        let path = command_path_of(&rest[..cell_end], &known);
+        if path.is_empty() {
+            continue; // reported by undocumented_commands
+        }
+        // A flag may belong to the row's command or to any ancestor
+        // (`sbh ballast release` rows may mention `sbh ballast` flags).
+        let mut allowed: Vec<&str> = globals.clone();
+        let mut prefix = String::new();
+        for word in path.split(' ') {
+            prefix = if prefix.is_empty() {
                 word.to_string()
             } else {
-                format!("{path} {word}")
+                format!("{prefix} {word}")
             };
-            if known.contains(&candidate) {
-                path = candidate;
-            } else {
-                break;
+            if let Some(flags) = flags_of.get(prefix.as_str()) {
+                allowed.extend(flags);
             }
         }
-        if path.is_empty() {
-            missing.push(line.trim().to_string());
+        for flag in long_flags_in(line) {
+            if !allowed.contains(&flag) {
+                findings.push(format!("{}: --{flag}", line.trim()));
+            }
+        }
+    }
+    findings
+}
+
+/// Backticked repository paths (`src/…`, `docs/…`, `scripts/…`, `tests/…`,
+/// `.github/…`) in `text` that do not exist under `root`.
+#[must_use]
+pub fn missing_file_references(text: &str, root: &Path) -> Vec<String> {
+    const PREFIXES: [&str; 5] = ["src/", "docs/", "scripts/", "tests/", ".github/"];
+    let mut missing = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, line) in text.lines().enumerate() {
+        let mut rest = line;
+        while let Some(open) = rest.find('`') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('`') else {
+                break;
+            };
+            let token = after[..close].trim_end_matches(['/', ':']);
+            rest = &after[close + 1..];
+            let is_path = PREFIXES.iter().any(|p| token.starts_with(p))
+                && !token.chars().any(|c| {
+                    c.is_whitespace() || matches!(c, '*' | '<' | '>' | '{' | '}' | '…' | '|')
+                });
+            if is_path
+                && !token.ends_with('/')
+                && seen.insert(token.to_string())
+                && !root.join(token).exists()
+            {
+                missing.push(format!("line {}: `{token}`", index + 1));
+            }
         }
     }
     missing
@@ -2229,11 +2366,84 @@ mod tests {
                       | `sbh nosuch --flag` | flagged |\n\
                       | `sbh ballast nosub` | ok: ballast exists, the word is treated as an argument |\n\
                       \n## Next section\n| `sbh other` | outside the section |\n";
-        let missing = undocumented_commands(readme, &known);
+        let missing = undocumented_commands(readme, "## Command Reference", &known);
         assert_eq!(missing, vec!["| `sbh nosuch --flag` | flagged |"]);
         assert_eq!(
-            undocumented_commands("no reference here", &known),
-            vec!["README has no \"## Command Reference\" section"]
+            undocumented_commands("no reference here", "## Command Reference", &known),
+            vec!["no \"## Command Reference\" section"]
+        );
+        // AGENTS.md escapes the alternatives as `show\|set`.
+        assert!(
+            undocumented_commands(
+                "## CLI Command Reference\n| `sbh config show\\|set` | ok |\n",
+                "## CLI Command Reference",
+                &known
+            )
+            .is_empty()
+        );
+    }
+
+    fn fixture_cli() -> clap::Command {
+        use clap::{Arg, Command};
+        Command::new("sbh")
+            .arg(Arg::new("json").long("json").global(true))
+            .subcommand(Command::new("status").arg(Arg::new("watch").long("watch")))
+            .subcommand(
+                Command::new("ballast")
+                    .arg(Arg::new("mount").long("mount"))
+                    .subcommand(Command::new("release").arg(Arg::new("count").long("count"))),
+            )
+    }
+
+    /// A documented flag must exist on the row's command, an ancestor, or
+    /// the global flags; a made-up one is reported with its row (the
+    /// negative self-test the CI check relies on).
+    #[test]
+    fn documented_flags_must_exist_on_their_command() {
+        let root = fixture_cli();
+        let good = "## Command Reference\n\
+                    | `sbh status --watch --json` | ok |\n\
+                    | `sbh ballast release --count N --mount M` | ancestor flag ok |\n\
+                    | `sbh ballast --mount M release [--count N]` | flag between path words |\n\
+                    | `sbh status` | mentions `--help` too |\n\
+                    | `sbh nosuch --whatever` | unknown commands are not this check's job |\n\
+                    \n## Next\n| `sbh status --bogus` | outside |\n";
+        assert!(undocumented_flags(good, "## Command Reference", &root).is_empty());
+
+        let bad = "## Command Reference\n| `sbh status --wach` | typo |\n\
+                   | `sbh ballast --count 1` | subcommand flag on the parent |\n";
+        assert_eq!(
+            undocumented_flags(bad, "## Command Reference", &root),
+            vec![
+                "| `sbh status --wach` | typo |: --wach".to_string(),
+                "| `sbh ballast --count 1` | subcommand flag on the parent |: --count".to_string(),
+            ]
+        );
+        assert_eq!(
+            long_flags_in("a -- b --x1 --two-words --9 --"),
+            vec!["x1", "two-words"]
+        );
+    }
+
+    /// Backticked repository paths must exist; wildcards, placeholders and
+    /// paths outside the tracked prefixes are ignored.
+    #[test]
+    fn backticked_repository_paths_must_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src/tui")).unwrap();
+        fs::write(dir.path().join("src/tui/replay.rs"), "").unwrap();
+        fs::create_dir_all(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("docs/a.md"), "").unwrap();
+        let text = "see `src/tui/replay.rs` and `docs/a.md:` and `src/tui/` (a directory)\n\
+                    globs `src/**/*.rs`, placeholders `docs/<name>.md`, braces `src/tui/{a,b}.rs`\n\
+                    outside `target/debug/sbh` and `/etc/sbh/config.toml`\n\
+                    missing `src/tui/gone.rs` and `scripts/nope.sh`; repeated `src/tui/gone.rs`\n";
+        assert_eq!(
+            missing_file_references(text, dir.path()),
+            vec![
+                "line 4: `src/tui/gone.rs`".to_string(),
+                "line 4: `scripts/nope.sh`".to_string()
+            ]
         );
     }
 

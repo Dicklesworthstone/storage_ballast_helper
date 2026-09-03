@@ -17803,7 +17803,11 @@ mod tests {
                 .map(|c| c.path)
                 .collect();
 
-        let missing = storage_ballast_helper::cli::docs::undocumented_commands(&readme, &known);
+        let missing = storage_ballast_helper::cli::docs::undocumented_commands(
+            &readme,
+            "## Command Reference",
+            &known,
+        );
         assert!(
             missing.is_empty(),
             "README documents commands that do not exist: {missing:#?}"
@@ -17818,6 +17822,63 @@ mod tests {
                 "{name} generated regions drifted: {drifted:?}; run `sbh docs --render {name}`"
             );
         }
+    }
+
+    /// Doc contract (bd-rc-master-ajg1.12.3): the command tables in README
+    /// and AGENTS.md name only commands and `--flags` clap has, and every
+    /// backticked `src/…`, `docs/…`, `scripts/…`, `tests/…`, `.github/…`
+    /// path in README, AGENTS.md and docs/*.md exists.
+    #[test]
+    fn documented_commands_flags_and_file_references_resolve() {
+        use storage_ballast_helper::cli::docs::{
+            command_docs, missing_file_references, undocumented_commands, undocumented_flags,
+        };
+        let root_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cli = Cli::command();
+        let known: std::collections::BTreeSet<String> =
+            command_docs(&cli).into_iter().map(|c| c.path).collect();
+
+        let mut findings = Vec::new();
+        for (file, section) in [
+            ("README.md", "## Command Reference"),
+            ("AGENTS.md", "## CLI Command Reference"),
+        ] {
+            let text = std::fs::read_to_string(root_dir.join(file)).expect(file);
+            for row in undocumented_commands(&text, section, &known) {
+                findings.push(format!("{file}: unknown command in {row}"));
+            }
+            for row in undocumented_flags(&text, section, &cli) {
+                findings.push(format!("{file}: unknown flag in {row}"));
+            }
+        }
+
+        let mut doc_files = vec![
+            root_dir.join("README.md"),
+            root_dir.join("AGENTS.md"),
+            root_dir.join("CHANGELOG.md"),
+        ];
+        let mut docs: Vec<_> = std::fs::read_dir(root_dir.join("docs"))
+            .expect("docs/")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        docs.sort();
+        doc_files.extend(docs);
+        for path in doc_files {
+            let text = std::fs::read_to_string(&path).expect("doc file");
+            for finding in missing_file_references(&text, root_dir) {
+                findings.push(format!(
+                    "{}: missing file {finding}",
+                    path.strip_prefix(root_dir).unwrap_or(&path).display()
+                ));
+            }
+        }
+        assert!(
+            findings.is_empty(),
+            "doc contract violations:\n{}",
+            findings.join("\n")
+        );
     }
 
     /// `--start-screen` rides along as the raw name; the cockpit runtime is

@@ -40,12 +40,16 @@ docs_drift_check() {
     error "docs drift check: sbh binary not found at ${bin}"
     return 3
   fi
-  if (cd "${root}" && "${bin}" docs --check README.md AGENTS.md); then
-    echo "docs-drift-check: generated README and AGENTS.md regions match the code"
-    return 0
+  if ! (cd "${root}" && "${bin}" docs --check README.md AGENTS.md); then
+    error "generated README/AGENTS.md regions have drifted; run: sbh docs --render README.md AGENTS.md"
+    return 1
   fi
-  error "generated README/AGENTS.md regions have drifted; run: sbh docs --render README.md AGENTS.md"
-  return 1
+  if ! "${root}/scripts/quality-gate.sh" --check-stages; then
+    error "the embedded quality-gate stage tables are stale; run: scripts/quality-gate.sh --write-stages"
+    return 1
+  fi
+  echo "docs-drift-check: generated README and AGENTS.md regions and the stage tables match the code"
+  return 0
 }
 
 # ── check 1: companion docs for user-facing changes ──────────────────────────

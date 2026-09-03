@@ -124,9 +124,9 @@ macOS-only tests are compiled out here, `#[ignore]` tests are listed.
 <!-- sbh-census:begin -->
 | Target | Tests |
 | --- | --- |
-| `cargo test --lib` (default features, with the TUI) | 2591 |
-| `cargo test --lib --no-default-features --features cli,daemon,sqlite` (lean) | 1611 |
-| `cargo test --bin sbh` | 139 |
+| `cargo test --lib` (default features, with the TUI) | 2593 |
+| `cargo test --lib --no-default-features --features cli,daemon,sqlite` (lean) | 1613 |
+| `cargo test --bin sbh` | 140 |
 | `cargo test --test cli_exit_codes` | 5 |
 | `cargo test --test daemon_e2e` | 21 |
 | `cargo test --test dashboard_integration_tests` | 31 |
@@ -154,7 +154,7 @@ macOS-only tests are compiled out here, `#[ignore]` tests are listed.
 | `cargo test --test stress_tests` | 12 |
 | Integration test files (sum of the `--test` rows) | 317 |
 | E2E shell cases defined in `scripts/e2e_test.sh` | 129 |
-| **Cargo tests on Linux, default features (lib + bin + integration)** | **3047** |
+| **Cargo tests on Linux, default features (lib + bin + integration)** | **3050** |
 <!-- sbh-census:end -->
 
 ### Binary Tests (CLI)
@@ -529,7 +529,7 @@ Installer/update flows should emit phase-level records that include:
   - command execution helpers
   - verbose test logging
   - per-case trace artifacts
-- Name files by scope, e.g. `tests/integration_tests.rs`, `tests/scanner_integration.rs`.
+- Name files by scope, e.g. `tests/integration_tests.rs`, `tests/dashboard_pty.rs`.
 
 ### 3. End-to-End Tests
 

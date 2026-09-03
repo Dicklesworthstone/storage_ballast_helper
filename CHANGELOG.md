@@ -10,6 +10,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — doc-contract tests: documented flags and file references must exist (bd-rc-master-ajg1.12.3)
+
+- The bin test `documented_commands_flags_and_file_references_resolve` checks the README "Command Reference" and the AGENTS.md "CLI Command Reference" against clap: every `sbh …` row names a real command and every `--flag` in the row exists on that command, an ancestor, or the global flags (a flag may sit between path words, `sbh service --systemd reinstall-unit`); every backticked `src/`, `docs/`, `scripts/`, `tests/`, `.github/` path in README, AGENTS.md, CHANGELOG and docs/*.md exists. Findings name the file, the row and the flag or path. `cli::docs::{undocumented_flags, missing_file_references}` carry fixture tests including the negative case (a typo'd flag is reported). It found `--purge-dropins` documented on the wrong command (resolver fixed) and a naming example in docs/testing-and-logging.md pointing at a file that never existed (corrected).
+- `scripts/ci_docs_update_check.sh` also runs `quality-gate.sh --check-stages` in its drift phase.
+
 ### Changed — the pressure, scoring, error-code and constants tables are generated from the code (bd-rc-master-ajg1.12.2)
 
 - `sbh docs` gains the sections `constants` (117 named defaults and limits: pressure thresholds, controller gains, prediction, EWMA, guardrails, deletion breaker, scanner and walker budgets, scoring and risk budgets, ballast, quarantine, daemon channels and self-monitor, logger), `pressure-levels` (the default thresholds crossed with the controller's response table), `scoring-weights` and `error-codes`; `sbh docs --json` carries them. The README pressure and error-code tables and the AGENTS.md pressure, scoring, error-code tables plus a new Runtime Constants section are rendered regions; `sbh docs --check README.md AGENTS.md` runs in the bin tests, `scripts/ci_docs_update_check.sh`, the quality-gate `docs-drift` stage and CI.
