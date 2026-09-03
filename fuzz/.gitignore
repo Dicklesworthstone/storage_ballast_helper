@@ -1,3 +1,5 @@
 target
 artifacts
 coverage
+# libFuzzer work corpora (fuzz_run.sh); curated seeds live in corpus/
+work

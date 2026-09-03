@@ -182,8 +182,8 @@ pub fn protect_marker(data: &[u8]) {
 }
 
 /// `state.json` across versions: parsing never panics, a parsed state
-/// round-trips exactly, and the Prometheus rendering of any state is a
-/// valid exposition.
+/// round-trips to a stable form, and the Prometheus rendering of any state
+/// is a valid exposition.
 pub fn state_json(data: &[u8]) {
     let Ok(text) = std::str::from_utf8(data) else {
         return;
@@ -191,10 +191,18 @@ pub fn state_json(data: &[u8]) {
     let Ok(state) = serde_json::from_str::<DaemonState>(text) else {
         return;
     };
+    // JSON has no non-finite numbers: `1e999` parses as infinity and
+    // serializes as `null`, so the first round-trip may normalise the value
+    // (a fuzz finding, seed `non_finite_floats.json`). The invariant is that
+    // the normalised form is stable: a second round-trip changes nothing.
     let rendered = serde_json::to_string(&state).expect("a parsed state serializes");
     let again: DaemonState =
         serde_json::from_str(&rendered).expect("a serialized state parses back");
-    assert_eq!(again, state, "state round-trip changed the value");
+    let rendered_again = serde_json::to_string(&again).expect("a re-parsed state serializes");
+    assert_eq!(
+        rendered_again, rendered,
+        "state round-trip is not idempotent after one normalisation"
+    );
     let exposition = metrics::render(&state, "fuzz");
     if let Err(problem) = metrics::validate_exposition(&exposition) {
         panic!("metrics rendered from a parsed state are invalid: {problem}\n{exposition}");

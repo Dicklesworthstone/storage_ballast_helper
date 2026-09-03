@@ -12,6 +12,12 @@ use std::path::{Path, PathBuf};
 use storage_ballast_helper::fuzzing::{TARGETS, run};
 
 const MUTATIONS_PER_SEED: usize = 400;
+/// Curated seeds replayed per target (sorted by name), so a large corpus
+/// never turns the smoke test into a fuzz campaign.
+const MAX_SEEDS_PER_TARGET: usize = 32;
+/// Above this a single input is reported; above the limit it fails.
+const SLOW_INPUT: std::time::Duration = std::time::Duration::from_millis(500);
+const SLOW_INPUT_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn corpus_dir(target: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -20,19 +26,30 @@ fn corpus_dir(target: &str) -> PathBuf {
         .join(target)
 }
 
+/// A libFuzzer-generated corpus entry (a 40-hex SHA-1 name). `cargo fuzz
+/// run` writes those into whatever corpus directory it is given; the smoke
+/// test replays only the curated, named seeds so its runtime stays bounded
+/// wherever the directory has been used as a work corpus.
+fn is_generated_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.len() == 40 && name.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 fn seeds(target: &str) -> Vec<(PathBuf, Vec<u8>)> {
     let mut seeds: Vec<(PathBuf, Vec<u8>)> = fs::read_dir(corpus_dir(target))
         .unwrap_or_else(|e| panic!("corpus for {target}: {e}"))
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.is_file())
+        .filter(|path| path.is_file() && !is_generated_name(path))
         .map(|path| {
             let bytes = fs::read(&path).unwrap();
             (path, bytes)
         })
         .collect();
     seeds.sort();
-    assert!(!seeds.is_empty(), "{target} has no seed corpus");
+    seeds.truncate(MAX_SEEDS_PER_TARGET);
+    assert!(!seeds.is_empty(), "{target} has no curated seed corpus");
     seeds
 }
 
@@ -127,14 +144,38 @@ fn every_target_survives_its_corpus_and_mutations() {
         let bodies: Vec<Vec<u8>> = seeds.iter().map(|(_, b)| b.clone()).collect();
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ target.len() as u64);
         for (path, seed) in &seeds {
+            let started = std::time::Instant::now();
             run(target, seed);
             for _ in 0..MUTATIONS_PER_SEED {
                 let mutated = mutate(seed, &bodies, &mut rng);
+                let one = std::time::Instant::now();
                 run(target, &mutated);
+                let took = one.elapsed();
+                // A single input must not take seconds: a slow parse is a
+                // finding too (a DoS on operator-authored input). Print it
+                // so it can become a seed and be fixed.
+                if took > SLOW_INPUT {
+                    eprintln!(
+                        "[FUZZ-SMOKE] SLOW {target}: {:?} for {} bytes: {}",
+                        took,
+                        mutated.len(),
+                        String::from_utf8_lossy(&mutated)
+                            .chars()
+                            .take(400)
+                            .collect::<String>()
+                            .replace('\n', "\\n")
+                    );
+                }
+                assert!(
+                    took < SLOW_INPUT_LIMIT,
+                    "{target}: one input took {took:?} ({} bytes)",
+                    mutated.len()
+                );
             }
             eprintln!(
-                "[FUZZ-SMOKE] {target}: {} + {MUTATIONS_PER_SEED} mutations ok",
-                path.file_name().unwrap().to_string_lossy()
+                "[FUZZ-SMOKE] {target}: {} + {MUTATIONS_PER_SEED} mutations ok in {:?}",
+                path.file_name().unwrap().to_string_lossy(),
+                started.elapsed()
             );
         }
         run(target, b"");

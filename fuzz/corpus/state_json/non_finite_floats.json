@@ -1,0 +1,1 @@
+{"schema_version":2,"cpu_secs_total":1e999,"rates":{"/":{"bytes_per_sec":1e999,"accel":-1e999,"confidence":0.5,"seconds_to_red":1e999,"seconds_to_full":null}},"pressure":{"overall":"green","mounts":[{"path":"/","free_pct":1e999,"level":"green","rate_bps":1e999}]}}
