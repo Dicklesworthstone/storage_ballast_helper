@@ -708,6 +708,16 @@ fn effective_empty_pass_cooldown(base_secs: u64, consecutive_empty_passes: u32) 
     Duration::from_secs(base_secs.saturating_mul(multiplier))
 }
 
+/// Process CPU (user+system) this process has consumed so far, in micros.
+fn current_scan_cpu_micros() -> Option<u64> {
+    let stats = crate::platform::current().self_stats().ok()?;
+    Some(
+        stats
+            .cpu_user_micros
+            .saturating_add(stats.cpu_system_micros),
+    )
+}
+
 #[must_use]
 fn scan_reason_for_request(request: &ScanRequest) -> &'static str {
     if !request.catalog_roots.is_empty() {
@@ -6929,7 +6939,8 @@ fn scanner_thread_main(
             |opaque_pruned_dirs: usize,
              candidate_bytes_seen: u64,
              timed_out: bool,
-             index_records: usize| ScanCompletionTelemetry {
+             index_records: usize,
+             process_cpu_micros: Option<u64>| ScanCompletionTelemetry {
                 engine: scanner_engine_mode.to_string(),
                 dispatch: scanner_dispatch.to_string(),
                 scan_reason: scan_reason.to_string(),
@@ -6944,6 +6955,7 @@ fn scanner_thread_main(
                 timed_out,
                 replayed_records: replay_counts.get().0,
                 revetoed_records: replay_counts.get().1,
+                process_cpu_micros,
             };
         if last_scanner_engine_mode != Some(scanner_engine_mode) {
             logger.send(ActivityEvent::Info {
@@ -6989,6 +7001,7 @@ fn scanner_thread_main(
                     0,
                     false,
                     scanner_index.as_ref().map_or(0, ScannerCandidateIndex::len),
+                    None,
                 ),
             });
             let root_stats = request
@@ -7067,6 +7080,7 @@ fn scanner_thread_main(
         }
 
         let scan_start = Instant::now();
+        let scan_start_cpu_micros = current_scan_cpu_micros();
         let mut scan_deadline =
             scan_start + effective_scan_budget(&current_scanner_config, request.pressure_level);
         // Q7: the walker's deadline checks end the pass when the CPU budget
@@ -7240,6 +7254,7 @@ fn scanner_thread_main(
                             v2_candidate_bytes_seen,
                             false,
                             index.len(),
+                            None,
                         ),
                     });
                     let root_stats = active_scan_paths
@@ -7741,6 +7756,9 @@ fn scanner_thread_main(
                     logger,
                 );
             }
+            let process_cpu_micros = scan_start_cpu_micros
+                .zip(current_scan_cpu_micros())
+                .map(|(start, end)| end.saturating_sub(start));
             logger.send(ActivityEvent::ScanCompleted {
                 paths_scanned: 0,
                 candidates_found,
@@ -7750,6 +7768,7 @@ fn scanner_thread_main(
                     v2_candidate_bytes_seen,
                     true,
                     scanner_index.as_ref().map_or(0, ScannerCandidateIndex::len),
+                    process_cpu_micros,
                 ),
             });
             continue;
@@ -7766,6 +7785,9 @@ fn scanner_thread_main(
                     logger,
                 );
             }
+            let process_cpu_micros = scan_start_cpu_micros
+                .zip(current_scan_cpu_micros())
+                .map(|(start, end)| end.saturating_sub(start));
             logger.send(ActivityEvent::ScanCompleted {
                 paths_scanned: 0,
                 candidates_found,
@@ -7775,6 +7797,7 @@ fn scanner_thread_main(
                     v2_candidate_bytes_seen,
                     false,
                     scanner_index.as_ref().map_or(0, ScannerCandidateIndex::len),
+                    process_cpu_micros,
                 ),
             });
             let root_stats = active_scan_paths
@@ -8259,6 +8282,10 @@ fn scanner_thread_main(
         }
 
         // Log scan completion.
+        let process_cpu_micros = scan_start_cpu_micros
+            .zip(current_scan_cpu_micros())
+            .map(|(start, end)| end.saturating_sub(start));
+
         logger.send(ActivityEvent::ScanCompleted {
             paths_scanned,
             candidates_found,
@@ -8268,6 +8295,7 @@ fn scanner_thread_main(
                 v2_candidate_bytes_seen,
                 scan_timed_out,
                 scanner_index.as_ref().map_or(0, ScannerCandidateIndex::len),
+                process_cpu_micros,
             ),
         });
 

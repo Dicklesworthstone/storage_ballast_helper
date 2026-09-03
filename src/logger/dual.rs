@@ -57,6 +57,8 @@ pub struct ScanCompletionTelemetry {
     /// Replayed records dropped by the fresh evidence (missing, identity or
     /// generation changed, vetoed, or no longer a Delete verdict).
     pub revetoed_records: usize,
+    /// Process CPU (user+system) consumed by the pass, when measured.
+    pub process_cpu_micros: Option<u64>,
 }
 
 /// Events that can be logged through the dual-write coordinator.
@@ -527,12 +529,17 @@ fn scan_completion_details(
     candidates_found: usize,
     telemetry: &ScanCompletionTelemetry,
 ) -> String {
+    let cpu_suffix = telemetry
+        .process_cpu_micros
+        .map_or_else(String::new, |micros| {
+            format!(" process_cpu_micros={micros}")
+        });
     format!(
         "paths_scanned={} candidates={} engine={} dispatch={} reason={} \
          opaque_pruning={} opaque_pruned_dirs={} event_dirty_roots={} \
          event_overflows={} event_watch_replans={} \
          index_event_generation={} index_records={} candidate_bytes_seen={} timed_out={} \
-         replayed_records={} revetoed_records={}",
+         replayed_records={} revetoed_records={}{}",
         paths_scanned,
         candidates_found,
         telemetry.engine,
@@ -548,7 +555,8 @@ fn scan_completion_details(
         telemetry.candidate_bytes_seen,
         telemetry.timed_out,
         telemetry.replayed_records,
-        telemetry.revetoed_records
+        telemetry.revetoed_records,
+        cpu_suffix
     )
 }
 
@@ -1271,7 +1279,25 @@ mod tests {
             timed_out: false,
             replayed_records: 0,
             revetoed_records: 0,
+            process_cpu_micros: None,
         }
+    }
+
+    #[test]
+    fn scan_details_carry_process_cpu_micros_when_measured() {
+        let mut telemetry = test_scan_telemetry("v2");
+        telemetry.process_cpu_micros = Some(1_234_567);
+        let with_cpu = scan_completion_details(10, 2, &telemetry);
+        assert!(
+            with_cpu.contains("process_cpu_micros=1234567"),
+            "{with_cpu}"
+        );
+        telemetry.process_cpu_micros = None;
+        let without_cpu = scan_completion_details(10, 2, &telemetry);
+        assert!(
+            !without_cpu.contains("process_cpu_micros"),
+            "{without_cpu}"
+        );
     }
 
     /// A path no process can create — root included — because its parent is a

@@ -75,6 +75,23 @@ pub struct ForecastCoverageDay {
     pub lines: u64,
 }
 
+/// One day's scanner cost, aggregated from `scan_complete` events.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScannerDayStat {
+    /// `YYYY-MM-DD` (UTC).
+    pub day: String,
+    /// Scan passes completed that day.
+    pub passes: u64,
+    /// CPU seconds (user+system) across those passes.
+    pub cpu_seconds: f64,
+    /// Entries visited by the walker across those passes.
+    pub entries_scanned: u64,
+    /// Opaque trees pruned from those passes.
+    pub opaque_pruned_dirs: u64,
+    /// Passes whose rows predate the `process_cpu_micros=` telemetry key.
+    pub passes_without_cpu_evidence: u64,
+}
+
 /// Failed deletions sharing one error code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureReason {
@@ -424,10 +441,63 @@ impl<'a> StatsEngine<'a> {
         let coverage_by_day = self
             .forecast_coverage_by_day(Duration::from_hours(24 * 30))
             .unwrap_or_default();
+        let scanner_days = self
+            .scanner_stats(Duration::from_hours(24 * 7))
+            .unwrap_or_default();
         Ok(serde_json::json!({
             "windows": json_windows,
             "forecast": { "coverage_by_day": coverage_by_day },
+            "scanner": scanner_json(&scanner_days),
         }))
+    }
+
+    /// Scanner cost per UTC day over the window, from `scan_complete` events.
+    ///
+    /// CPU seconds come from the `process_cpu_micros=` key in the event
+    /// details; entries and pruning from `paths_scanned=` /
+    /// `opaque_pruned_dirs=`. Rows written before the CPU key existed count
+    /// toward `passes_without_cpu_evidence` instead of the CPU total.
+    pub fn scanner_stats(&self, window: Duration) -> Result<Vec<ScannerDayStat>> {
+        let since = since_timestamp(window);
+        let conn = self.db.connection();
+        let mut stmt = conn.prepare(
+            "SELECT timestamp, details FROM activity_log
+             WHERE event_type = 'scan_complete' AND timestamp >= ?1
+             ORDER BY timestamp ASC",
+        )?;
+        let rows = stmt.query_map(params![since], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })?;
+        let mut days: Vec<ScannerDayStat> = Vec::new();
+        for row in rows {
+            let (timestamp, details) = row?;
+            let parsed = parse_scan_details(details.as_deref());
+            let day = timestamp.get(..10).unwrap_or(&timestamp).to_string();
+            let bucket = if let Some(last) = days.last_mut()
+                && last.day == day
+            {
+                last
+            } else if let Some(existing) = days.iter_mut().find(|d| d.day == day) {
+                existing
+            } else {
+                days.push(ScannerDayStat {
+                    day,
+                    passes: 0,
+                    cpu_seconds: 0.0,
+                    entries_scanned: 0,
+                    opaque_pruned_dirs: 0,
+                    passes_without_cpu_evidence: 0,
+                });
+                days
+                    .last_mut()
+                    .expect("day bucket was just pushed")
+            };
+            merge_scan_day(bucket, &parsed);
+        }
+        Ok(days)
     }
 
     // ──────────────────── private helpers ────────────────────
@@ -718,6 +788,62 @@ fn sqlite_nonnegative_i64_to_u64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
+/// `scan_complete` metrics parsed out of the `key=value` details string.
+#[derive(Debug, Default)]
+struct ParsedScanDetails {
+    cpu_micros: Option<u64>,
+    paths_scanned: u64,
+    opaque_pruned_dirs: u64,
+}
+
+fn parse_scan_details(details: Option<&str>) -> ParsedScanDetails {
+    let mut parsed = ParsedScanDetails::default();
+    let Some(details) = details else {
+        return parsed;
+    };
+    for token in details.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        let Ok(number) = value.parse::<u64>() else {
+            continue;
+        };
+        match key {
+            "process_cpu_micros" => parsed.cpu_micros = Some(number),
+            "paths_scanned" => parsed.paths_scanned = number,
+            "opaque_pruned_dirs" => parsed.opaque_pruned_dirs = number,
+            _ => {}
+        }
+    }
+    parsed
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn merge_scan_day(day: &mut ScannerDayStat, parsed: &ParsedScanDetails) {
+    day.passes += 1;
+    if let Some(micros) = parsed.cpu_micros {
+        day.cpu_seconds += micros as f64 / 1_000_000.0;
+    } else {
+        day.passes_without_cpu_evidence += 1;
+    }
+    day.entries_scanned = day.entries_scanned.saturating_add(parsed.paths_scanned);
+    day.opaque_pruned_dirs = day
+        .opaque_pruned_dirs
+        .saturating_add(parsed.opaque_pruned_dirs);
+}
+
+/// The `scanner` block of `stats --json`: per-day CPU cost plus totals.
+fn scanner_json(days: &[ScannerDayStat]) -> serde_json::Value {
+    serde_json::json!({
+        "window": "7d",
+        "cpu_seconds_by_day": days,
+        "passes": days.iter().map(|d| d.passes).sum::<u64>(),
+        "entries_scanned": days.iter().map(|d| d.entries_scanned).sum::<u64>(),
+        "opaque_pruned_dirs": days.iter().map(|d| d.opaque_pruned_dirs).sum::<u64>(),
+        "cpu_seconds_total": days.iter().map(|d| d.cpu_seconds).sum::<f64>(),
+    })
+}
+
 // ──────────────────── utility functions ────────────────────
 
 /// Compute an ISO 8601 timestamp for "now minus duration".
@@ -794,6 +920,76 @@ mod tests {
         }
     }
 
+
+    fn scan_complete_row(timestamp: String, details: Option<String>) -> ActivityRow {
+        ActivityRow {
+            timestamp,
+            event_type: "scan_complete".to_string(),
+            severity: "info".to_string(),
+            path: None,
+            size_bytes: None,
+            score: None,
+            score_factors: None,
+            pressure_level: None,
+            free_pct: None,
+            duration_ms: None,
+            success: 1,
+            error_code: None,
+            error_message: None,
+            details,
+        }
+    }
+
+    #[test]
+    fn scanner_stats_aggregates_cpu_by_day() {
+        let (_dir, db) = temp_db();
+        let now = chrono::Utc::now();
+        let fmt =
+            |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        db.log_activity(&scan_complete_row(
+            fmt(now),
+            Some("paths_scanned=10 candidates=0 process_cpu_micros=1000000".to_string()),
+        ))
+        .unwrap();
+        db.log_activity(&scan_complete_row(
+            fmt(now),
+            Some("paths_scanned=5 candidates=0 process_cpu_micros=500000 opaque_pruned_dirs=2".to_string()),
+        ))
+        .unwrap();
+        db.log_activity(&scan_complete_row(
+            fmt(now),
+            Some("paths_scanned=3 candidates=0".to_string()),
+        ))
+        .unwrap();
+        db.log_activity(&scan_complete_row(
+            fmt(now - chrono::Duration::hours(25)),
+            Some("paths_scanned=7 candidates=0 process_cpu_micros=2000000".to_string()),
+        ))
+        .unwrap();
+        db.log_activity(&scan_complete_row(
+            fmt(now - chrono::Duration::hours(24 * 30)),
+            Some("paths_scanned=99 candidates=0 process_cpu_micros=1".to_string()),
+        ))
+        .unwrap();
+
+        let engine = StatsEngine::new(&db);
+        let days = engine
+            .scanner_stats(Duration::from_hours(24 * 7))
+            .unwrap();
+        assert_eq!(days.len(), 2, "{days:?}");
+
+        let older = &days[0];
+        assert_eq!(older.passes, 1);
+        assert!((older.cpu_seconds - 2.0).abs() < 1e-9, "{}", older.cpu_seconds);
+        assert_eq!(older.entries_scanned, 7);
+
+        let today = &days[1];
+        assert_eq!(today.passes, 3);
+        assert!((today.cpu_seconds - 1.5).abs() < 1e-9, "{}", today.cpu_seconds);
+        assert_eq!(today.entries_scanned, 18);
+        assert_eq!(today.opaque_pruned_dirs, 2);
+        assert_eq!(today.passes_without_cpu_evidence, 1);
+    }
     #[test]
     fn deletion_stats_computed_correctly() {
         let (_dir, db) = temp_db();
