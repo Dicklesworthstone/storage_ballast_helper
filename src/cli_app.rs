@@ -518,6 +518,13 @@ struct DoctorArgs {
     /// cert-expiration run).
     #[arg(long)]
     release: bool,
+    /// With --release: audit a published asset set instead of the host's
+    /// credentials. A directory is audited in place; a tag is downloaded
+    /// with `gh release download` first. Checks every CI target's archive,
+    /// `.sha256`, legacy mirror, `SHA256SUMS.txt` entry and the binary's
+    /// architecture inside the tarball, plus the provenance document.
+    #[arg(long, requires = "release", value_name = "DIR|TAG")]
+    assets: Option<String>,
     /// Check host-level tuning (kernel writeback / dirty-page limits).
     #[arg(long)]
     system: bool,
@@ -7710,12 +7717,94 @@ fn print_doctor_reports(
     }
 }
 
+/// `sbh doctor --release --assets <DIR|TAG>`: audit a release asset set.
+fn run_release_asset_audit(cli: &Cli, target: &str) -> Result<(), CliError> {
+    use storage_ballast_helper::cli::release_audit::{audit_release_dir, tag_of_release_dir};
+
+    let path = Path::new(target);
+    let (dir, tag) = if path.is_dir() {
+        let tag = tag_of_release_dir(path).map_err(|e| CliError::User(e.to_string()))?;
+        (path.to_path_buf(), tag)
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("sbh-release-{target}-{nanos}"));
+        std::fs::create_dir_all(&dir).map_err(CliError::Io)?;
+        let args = vec![
+            "release".to_string(),
+            "download".to_string(),
+            target.to_string(),
+            "--repo".to_string(),
+            RELEASE_REPOSITORY.to_string(),
+            "--dir".to_string(),
+            dir.display().to_string(),
+        ];
+        let outcome = run_doctor_command("gh", &args).map_err(|e| {
+            CliError::Runtime(format!("gh release download {target} did not run: {e}"))
+        })?;
+        if !outcome.success {
+            return Err(CliError::Runtime(format!(
+                "gh release download {target} failed: {}",
+                command_detail(&outcome)
+            )));
+        }
+        (dir, target.to_string())
+    };
+    let audit = audit_release_dir(&dir, &tag);
+    match output_mode(cli) {
+        OutputMode::Json => {
+            write_json_line(&json!({ "release_assets": audit }))?;
+        }
+        OutputMode::Human => {
+            println!(
+                "Release asset audit: {} in {}",
+                audit.tag,
+                audit.dir.display()
+            );
+            println!(
+                "  ok={} passed={} warnings={} failed={}",
+                audit.ok, audit.passed, audit.warnings, audit.failed
+            );
+            for finding in &audit.findings {
+                println!(
+                    "  [{:<4}] {:<18} {:<48} {}",
+                    finding.status, finding.id, finding.subject, finding.message
+                );
+            }
+        }
+    }
+    if audit.ok {
+        Ok(())
+    } else {
+        Err(CliError::User(format!(
+            "release asset audit failed for {}: {}",
+            audit.tag,
+            audit
+                .failures()
+                .iter()
+                .map(|f| format!("{} {}: {}", f.id, f.subject, f.message))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )))
+    }
+}
+
+/// The error for `sbh doctor` without a target.
+fn doctor_needs_a_target(args: &DoctorArgs) -> Result<(), CliError> {
+    if args.pal || args.release || args.system || args.env || args.service {
+        return Ok(());
+    }
+    Err(CliError::User(
+        "specify a diagnostic target, for example: sbh doctor --pal, --system, --env, --service, or --release"
+            .to_string(),
+    ))
+}
+
 fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
-    if !args.pal && !args.release && !args.system && !args.env && !args.service {
-        return Err(CliError::User(
-            "specify a diagnostic target, for example: sbh doctor --pal, --system, --env, --service, or --release"
-                .to_string(),
-        ));
+    doctor_needs_a_target(args)?;
+    if let Some(target) = args.assets.as_deref() {
+        return run_release_asset_audit(cli, target);
     }
     let env_checks = args.env.then(env_doctor_checks);
     let service_checks = if args.service {
@@ -16162,6 +16251,217 @@ mod tests {
         let check = writeback_doctor_check(&platform, &config);
         assert_eq!(check.status, "PASS");
         assert!(check.message.contains("disabled"));
+    }
+
+    /// A minimal executable header for `triple`: ELF64 little-endian with
+    /// the right `e_machine`, or 64-bit Mach-O with the right `cputype`,
+    /// padded so `tar` has something to archive.
+    fn fixture_binary(triple: &str) -> Vec<u8> {
+        let mut bytes = vec![0u8; 4096];
+        match triple {
+            "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu" => {
+                bytes[..4].copy_from_slice(b"\x7fELF");
+                bytes[4] = 2; // ELFCLASS64
+                bytes[5] = 1; // little-endian
+                let machine: u16 = if triple.starts_with("x86_64") {
+                    0x3E
+                } else {
+                    0xB7
+                };
+                bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+            }
+            _ => {
+                bytes[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+                let cputype: u32 = if triple.starts_with("x86_64") {
+                    0x0100_0007
+                } else {
+                    0x0100_000C
+                };
+                bytes[4..8].copy_from_slice(&cputype.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+        let mut hex = String::with_capacity(64);
+        for byte in Sha256::digest(bytes) {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex
+    }
+
+    /// A release directory shaped exactly like the workflow's upload for
+    /// `tag`: per target the versioned archive, its sidecar, the legacy
+    /// mirror and its sidecar; `SHA256SUMS.txt`; `release-provenance.json`.
+    /// `binary_for` picks which target's binary goes into each archive, so a
+    /// test can mislabel one.
+    fn fixture_release_dir(dir: &Path, tag: &str, binary_for: impl Fn(&str) -> String) {
+        use std::fmt::Write as _;
+        use storage_ballast_helper::cli::{
+            CI_RELEASE_TARGETS, ReleaseChannel, release_audit::ci_target_host,
+            resolve_updater_artifact_contract,
+        };
+        let mut manifest = String::new();
+        for triple in CI_RELEASE_TARGETS {
+            let contract = resolve_updater_artifact_contract(
+                ci_target_host(triple).unwrap(),
+                ReleaseChannel::Stable,
+                Some(tag),
+            )
+            .unwrap();
+            let stage = dir.join(format!("stage-{triple}"));
+            std::fs::create_dir_all(&stage).unwrap();
+            std::fs::write(stage.join("sbh"), fixture_binary(&binary_for(triple))).unwrap();
+            let archive = contract.asset_name();
+            let status = std::process::Command::new("tar")
+                .arg("-cJf")
+                .arg(dir.join(&archive))
+                .arg("-C")
+                .arg(&stage)
+                .arg("sbh")
+                .status()
+                .expect("tar available");
+            assert!(status.success());
+            let bytes = std::fs::read(dir.join(&archive)).unwrap();
+            let hash = sha256_hex(&bytes);
+            std::fs::write(
+                dir.join(contract.checksum_name()),
+                format!("{hash}  {archive}\n"),
+            )
+            .unwrap();
+            let _ = writeln!(manifest, "{hash}  {archive}");
+            let legacy = format!("sbh-{triple}.tar.xz");
+            std::fs::write(dir.join(&legacy), &bytes).unwrap();
+            std::fs::write(
+                dir.join(format!("{legacy}.sha256")),
+                format!("{hash}  {legacy}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("SHA256SUMS.txt"), manifest).unwrap();
+        std::fs::write(
+            dir.join("release-provenance.json"),
+            json!({
+                "tag": tag,
+                "sha": "0123456789abcdef0123456789abcdef01234567",
+                "run_id": "12345",
+                "timestamp": "2026-09-03T00:00:00Z",
+                "rustc_version": "rustc 1.95.0-nightly"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// A workflow-shaped asset set passes the audit; one tarball carrying
+    /// another target's binary (the v0.4.23 incident shape), a wrong
+    /// sidecar, a missing legacy mirror and a provenance tag mismatch each
+    /// fail with a finding that names the file.
+    #[test]
+    fn release_asset_audit_passes_a_complete_set_and_fails_a_mislabeled_tarball() {
+        use storage_ballast_helper::cli::release_audit::{audit_release_dir, tag_of_release_dir};
+        let dir = tempfile::tempdir().unwrap();
+        fixture_release_dir(dir.path(), "v0.5.1", str::to_string);
+        assert_eq!(tag_of_release_dir(dir.path()).unwrap(), "v0.5.1");
+        let audit = audit_release_dir(dir.path(), "v0.5.1");
+        assert!(audit.ok, "{:#?}", audit.failures());
+        assert_eq!(audit.failed, 0);
+        assert_eq!(audit.warnings, 1, "only the macOS signing warning");
+        assert_eq!(audit.passed, 1 + 4 * 5 + 1);
+
+        // Mislabel: the aarch64 darwin tarball carries the x86_64 darwin binary.
+        let bad = tempfile::tempdir().unwrap();
+        fixture_release_dir(bad.path(), "v0.5.1", |triple| {
+            if triple == "aarch64-apple-darwin" {
+                "x86_64-apple-darwin".to_string()
+            } else {
+                triple.to_string()
+            }
+        });
+        std::fs::write(
+            bad.path().join("sbh-v0.5.1-x86_64-unknown-linux-gnu.tar.xz.sha256"),
+            "0000000000000000000000000000000000000000000000000000000000000000  sbh-v0.5.1-x86_64-unknown-linux-gnu.tar.xz\n",
+        )
+        .unwrap();
+        std::fs::remove_file(bad.path().join("sbh-aarch64-unknown-linux-gnu.tar.xz")).unwrap();
+        std::fs::write(
+            bad.path().join("release-provenance.json"),
+            json!({
+                "tag": "v0.5.0",
+                "sha": "0123456789abcdef0123456789abcdef01234567",
+                "run_id": "12345",
+                "timestamp": "2026-09-03T00:00:00Z",
+                "rustc_version": "rustc 1.95.0-nightly"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let audit = audit_release_dir(bad.path(), "v0.5.1");
+        assert!(!audit.ok);
+        let failures: Vec<String> = audit
+            .failures()
+            .iter()
+            .map(|f| format!("{} {}: {}", f.id, f.subject, f.message))
+            .collect();
+        assert!(
+            failures.iter().any(|f| f
+                .starts_with("assets.binary sbh-v0.5.1-aarch64-apple-darwin.tar.xz")
+                && f.contains("Mach-O x86_64")
+                && f.contains("expected Mach-O arm64")),
+            "{failures:#?}"
+        );
+        assert!(
+            failures.iter().any(|f| f
+                .starts_with("assets.checksum sbh-v0.5.1-x86_64-unknown-linux-gnu.tar.xz.sha256")),
+            "{failures:#?}"
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|f| f
+                    .starts_with("assets.legacy sbh-aarch64-unknown-linux-gnu.tar.xz: missing")),
+            "{failures:#?}"
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.starts_with("assets.provenance") && f.contains("records tag v0.5.0")),
+            "{failures:#?}"
+        );
+        assert_eq!(
+            audit.failed, 4,
+            "exactly the four planted failures: {failures:#?}"
+        );
+        // A directory audited under the wrong tag reports every archive missing.
+        let wrong_tag = audit_release_dir(dir.path(), "v0.5.2");
+        assert_eq!(
+            wrong_tag
+                .failures()
+                .iter()
+                .filter(|f| f.id == "assets.archive" && f.message == "missing")
+                .count(),
+            4
+        );
+    }
+
+    /// `--assets` needs `--release`; a directory that is not a release fails
+    /// before any audit runs.
+    #[test]
+    fn doctor_assets_flag_requires_release_and_a_release_shaped_directory() {
+        assert!(Cli::try_parse_from(["sbh", "doctor", "--assets", "/tmp/x"]).is_err());
+        let parsed =
+            Cli::try_parse_from(["sbh", "doctor", "--release", "--assets", "v0.5.1"]).unwrap();
+        let Command::Doctor(args) = parsed.command else {
+            panic!("doctor");
+        };
+        assert_eq!(args.assets.as_deref(), Some("v0.5.1"));
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            storage_ballast_helper::cli::release_audit::tag_of_release_dir(empty.path()).is_err()
+        );
     }
 
     fn fixture_ok(stdout: String) -> DoctorCommandOutcome {

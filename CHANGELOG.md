@@ -10,6 +10,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — `sbh doctor --release --assets <dir|tag>`: post-publish release asset audit (bd-rc-master-ajg1.5.3)
+
+- `src/cli/release_audit.rs` audits a release asset directory (or a tag, downloaded first with `gh release download`) the way the workflow guards itself: for every CI target the versioned archive, its `.sha256` sidecar, its `SHA256SUMS.txt` entry, the byte-identical legacy unversioned mirror with its sidecar, and the architecture of the `sbh` inside the tarball (ELF `e_machine` / Mach-O `cputype` against the labelled triple, the v0.4.23 incident shape); plus `release-provenance.json` with non-empty `tag`, `sha`, `run_id`, `timestamp`, `rustc_version` and the right tag. macOS codesign/notarization is reported as a warning, not checked. Exit 1 on any failure; `--json` carries the findings. Fixture tests build a workflow-shaped set with real `tar -cJf` archives and fail it four ways (mislabeled tarball, wrong sidecar, missing mirror, provenance tag mismatch). The release doctor's drift check reuses `release_audit::ci_target_host`.
+
 ### Added — real-pressure scenario: a loop-mounted ext4 written to ENOSPC (bd-rc-master-ajg1.11.3)
 
 - `tests/daemon_e2e.rs` gains `zero_free_volume_releases_the_pool_and_keeps_writing_state` (sudo-gated like the other loop-mount scenarios, run with `--ignored`): a 512 MiB ext4 image with a provisioned four-file 16 MiB pool and a stale Definite target is written until the filesystem refuses (`ENOSPC`), repeatedly, because the daemon releases ballast while the fill is still running. The daemon, on real statvfs and without injection, must record Orange→Critical, release all four files, delete the stale target, keep rewriting `state.json` (on the root filesystem) through the incident, and leave the filler untouched. On this host: 491 MB to ENOSPC over two fills, the whole incident in 96 s. The CI `daemon-e2e` job's loop-mount step already runs the ignored scenarios on ubuntu.
