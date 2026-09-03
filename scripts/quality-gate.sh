@@ -17,6 +17,9 @@
 #   --skip STAGE     Skip the named stage (repeatable)
 #   --print-stages   Print the stage table (what would run) and exit
 #   --markdown       With --print-stages: emit a Markdown table (docs embed it)
+#   --write-stages   Rewrite the stage table embedded in the docs (between
+#                    <!-- sbh-qg:stages:begin --> and <!-- sbh-qg:stages:end -->)
+#   --check-stages   Exit 1 when an embedded stage table differs from this script
 #   --self-test      Check the executed-test accounting and the vacuous
 #                    failure path against fixtures, without cargo; exit 0/3
 #   --verbose        Show full command output (default: summary only)
@@ -64,6 +67,7 @@ SKIP_STAGES=()
 PRINT_STAGES=0
 MARKDOWN=0
 SELF_TEST=0
+STAGE_DOCS_MODE=""
 
 # ── argument parsing ─────────────────────────────────────────────────────────
 
@@ -75,6 +79,8 @@ while [[ $# -gt 0 ]]; do
     --skip)   SKIP_STAGES+=("$2"); shift 2 ;;
     --print-stages) PRINT_STAGES=1; shift ;;
     --markdown) MARKDOWN=1; shift ;;
+    --write-stages) STAGE_DOCS_MODE="write"; shift ;;
+    --check-stages) STAGE_DOCS_MODE="check"; shift ;;
     --self-test) SELF_TEST=1; USE_RCH=0; shift ;;
     --verbose) VERBOSE=1; shift ;;
     --no-color) NO_COLOR=1; shift ;;
@@ -97,6 +103,8 @@ STAGES=(
   "fmt|HARD|check|Code Quality|code-style|cargo fmt --check|Run 'cargo fmt' to auto-fix formatting"
   "clippy|HARD|check|Code Quality|correctness-warnings|cargo clippy --all-targets -- -D warnings|Fix clippy warnings — check stage log for specific lints"
   "docs-drift|SOFT|check|Code Quality|generated-docs|cargo run --quiet --bin sbh -- docs --check README.md|A generated README region no longer matches the code: run 'sbh docs --render README.md' and commit the result"
+  "test-census|SOFT|check|Code Quality|generated-test-counts|./scripts/test-census.sh --check|The test counts in docs/testing-and-logging.md no longer match the targets: run './scripts/test-census.sh --write' and commit the result"
+  "stage-docs|SOFT|check|Code Quality|generated-stage-table|./scripts/quality-gate.sh --check-stages|The stage table embedded in the docs no longer matches this script: run './scripts/quality-gate.sh --write-stages' and commit the result"
   "unit-lib|HARD|test|Unit Tests|core-logic|cargo test --lib -- --test-threads=4|Check failing test → module → recent changes. Run with --nocapture for details"
   "unit-bin|HARD|test|Unit Tests|cli-routing|cargo test --bin sbh -- --test-threads=4|CLI argument parsing or output formatting regression"
   "cli-exit-codes|HARD|test|Unit Tests|exit-code-contract|cargo test --test cli_exit_codes -- --test-threads=4|C-EXIT contract broken — a command's exit code or stream discipline changed"
@@ -153,12 +161,14 @@ print_stages() {
       printf '%-3d %-22s %-4s %-5s %-24s %-24s %s\n' "${n}" "${name}" "${level}" "${kind}" "${group}" "${dimension}" "${command}"
     fi
   done
-  if [[ "${MARKDOWN}" -eq 0 ]]; then
-    local hard=0 soft=0
-    for record in "${STAGES[@]}"; do
-      if [[ "$(stage_field "${record}" 2)" == "HARD" ]]; then hard=$((hard + 1)); else soft=$((soft + 1)); fi
-    done
-    echo ""
+  local hard=0 soft=0
+  for record in "${STAGES[@]}"; do
+    if [[ "$(stage_field "${record}" 2)" == "HARD" ]]; then hard=$((hard + 1)); else soft=$((soft + 1)); fi
+  done
+  echo ""
+  if [[ "${MARKDOWN}" -eq 1 ]]; then
+    echo "${n} stages: ${hard} HARD, ${soft} SOFT."
+  else
     echo "${n} stages: ${hard} HARD, ${soft} SOFT"
   fi
 }
@@ -166,6 +176,49 @@ print_stages() {
 if [[ "${PRINT_STAGES}" -eq 1 ]]; then
   print_stages
   exit 0
+fi
+
+# The docs that embed the Markdown stage table (between the markers).
+STAGE_DOCS=(
+  "${ROOT_DIR}/docs/quality-gate-runbook.md"
+  "${ROOT_DIR}/docs/testing-and-logging.md"
+)
+STAGE_DOCS_BEGIN="<!-- sbh-qg:stages:begin -->"
+STAGE_DOCS_END="<!-- sbh-qg:stages:end -->"
+
+extract_stage_region() {
+  awk -v b="${STAGE_DOCS_BEGIN}" -v e="${STAGE_DOCS_END}" '$0==b{f=1;next} $0==e{f=0} f' "$1"
+}
+
+if [[ -n "${STAGE_DOCS_MODE}" ]]; then
+  table="$(MARKDOWN=1; print_stages)"
+  drifted=0
+  for doc in "${STAGE_DOCS[@]}"; do
+    if ! grep -qF "${STAGE_DOCS_BEGIN}" "${doc}"; then
+      echo "stage-docs: ${doc} has no ${STAGE_DOCS_BEGIN} marker" >&2
+      exit 3
+    fi
+    embedded="$(extract_stage_region "${doc}")"
+    if [[ "${embedded}" == "${table}" ]]; then
+      echo "stage-docs: ${doc} matches the script"
+      continue
+    fi
+    if [[ "${STAGE_DOCS_MODE}" == "check" ]]; then
+      echo "stage-docs: ${doc} has drifted from the script; run ./scripts/quality-gate.sh --write-stages" >&2
+      diff <(printf '%s\n' "${embedded}") <(printf '%s\n' "${table}") >&2 || true
+      drifted=1
+      continue
+    fi
+    tmp="${doc}.stages.tmp"
+    awk -v b="${STAGE_DOCS_BEGIN}" -v e="${STAGE_DOCS_END}" -v table="${table}" '
+      $0==b { print; print table; skip=1; next }
+      $0==e { skip=0 }
+      !skip { print }
+    ' "${doc}" > "${tmp}"
+    mv -f "${tmp}" "${doc}"
+    echo "stage-docs: ${doc} rewritten"
+  done
+  exit "${drifted}"
 fi
 
 # ── color helpers ────────────────────────────────────────────────────────────

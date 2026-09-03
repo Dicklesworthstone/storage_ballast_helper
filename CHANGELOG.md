@@ -10,6 +10,11 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Changed — test counts in the docs are generated (bd-rc-master-ajg1.1.5)
+
+- `scripts/test-census.sh` counts every cargo test target with `cargo test <target> -- --list` (library with the default features and with the lean set, the binary, every integration file) plus the e2e shell cases the suite defines, and prints a Markdown table; `docs/testing-and-logging.md` embeds it between `sbh-census` markers, `--check` fails on drift, `--write` rewrites it, `--self-test` checks the counting. The hand-typed summary it replaces was stale by 35–270 % per row. The quality gate runs `--check` as the SOFT `test-census` stage.
+- `scripts/quality-gate.sh --write-stages` rewrites the stage table embedded in `docs/quality-gate-runbook.md` and `docs/testing-and-logging.md` (the "N stages: H HARD, S SOFT." line included), `--check-stages` fails on drift, and the SOFT `stage-docs` stage runs that check; with `docs-drift` and `test-census` the gate has 30 stages (21 HARD, 9 SOFT).
+
 ### Added — `sbh docs`: README tables generated from the code (bd-rc-master-ajg1.12.2, first slice)
 
 - `sbh docs` prints a versioned JSON document built from the binary's own tables: every `SBH_*` environment variable (a registry a test keeps equal to the names the code reads, each config override naming its `config.toml` key), every command and flag from clap, the dashboard's screens, keymap, palette actions and playbook, and the default configuration as TOML. `--section <name>` prints one section's Markdown.
