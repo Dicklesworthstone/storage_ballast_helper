@@ -178,6 +178,9 @@ struct SharedExecutorConfig {
     /// Layer 7: Green batches quarantine instead of removing.
     quarantine_enabled: AtomicBool,
     quarantine_ttl_secs: AtomicU64,
+    /// bd-8aeq: batches that actually removed something; see
+    /// [`Self::reclaim_events`].
+    reclaim_events: AtomicU64,
 }
 
 impl SharedExecutorConfig {
@@ -199,11 +202,25 @@ impl SharedExecutorConfig {
             min_certainty_rank: AtomicU8::new(ArtifactCertainty::Unclear.rank()),
             quarantine_enabled: AtomicBool::new(quarantine_enabled),
             quarantine_ttl_secs: AtomicU64::new(quarantine_ttl_secs),
+            reclaim_events: AtomicU64::new(0),
         }
     }
 
     fn min_certainty(&self) -> ArtifactCertainty {
         ArtifactCertainty::from_rank(self.min_certainty_rank.load(Ordering::Relaxed))
+    }
+
+    /// Number of executor batches that removed at least one item for real
+    /// (not dry-run). The scanner compares it across passes: a pass whose
+    /// dispatches moved this counter made progress, one whose dispatches did
+    /// not (dry-run, observe mode, every candidate dampened or failed) is
+    /// paced like an empty pass.
+    fn reclaim_events(&self) -> u64 {
+        self.reclaim_events.load(Ordering::Relaxed)
+    }
+
+    fn note_reclaim(&self) {
+        self.reclaim_events.fetch_add(1, Ordering::Relaxed);
     }
 
     fn set_min_certainty(&self, certainty: ArtifactCertainty) {
@@ -5249,9 +5266,9 @@ fn replay_indexed_record(
     use crate::scanner::patterns::{ArtifactCategory, OpaqueTreeDisposition, classify_opaque_tree};
     use crate::scanner::scoring::{CandidateInput, DecisionAction};
     use crate::scanner::walker::{
-        OPAQUE_SIZE_PROBE_BUDGET, TREE_IDLE_PROBE_MAX_DEPTH, TREE_IDLE_PROBE_MAX_ENTRIES,
-        identity_for_path, is_path_open_by_ancestor, opaque_context_for_path, opaque_tree_probe,
-        structural_signals_for_path, tree_newest_mtime,
+        TREE_IDLE_PROBE_MAX_DEPTH, TREE_IDLE_PROBE_MAX_ENTRIES, identity_for_path,
+        is_path_open_by_ancestor, opaque_context_for_path, structural_signals_for_path,
+        tree_newest_mtime,
     };
 
     let path = &record.path;
@@ -5294,24 +5311,19 @@ fn replay_indexed_record(
     // with the root directory's own entries. Without this a definite cargo
     // `target/` (markers under `debug/`) replayed as `unclear` and could never
     // pass an Orange cell's certainty gate, however many times it was replayed.
-    let opaque_probe = (record.prune_decision == IndexedPruneDecision::CandidateOpaque)
+    let opaque = (record.prune_decision == IndexedPruneDecision::CandidateOpaque)
         .then(|| classify_opaque_tree(path, opaque_context_for_path(path)))
         .flatten()
-        .filter(|opaque| opaque.disposition == OpaqueTreeDisposition::CandidateOpaque)
-        .map(|opaque| {
-            let probe = opaque_tree_probe(
-                path,
-                scanner_config.cross_devices,
-                identity.device_id,
-                OPAQUE_SIZE_PROBE_BUDGET,
-                &AtomicBool::new(false),
-            );
-            signals = probe.signals;
-            (opaque.classification, probe)
-        });
-    let classification = opaque_probe
-        .as_ref()
-        .map_or_else(|| registry.classify(path, signals), |(c, _)| c.clone());
+        .filter(|opaque| opaque.disposition == OpaqueTreeDisposition::CandidateOpaque);
+    let classification = match opaque {
+        Some(opaque) => {
+            // The evidence the walk's subtree probe found, persisted in the
+            // record; the size estimate below comes from the same probe.
+            signals = record.structural_signals;
+            opaque.classification
+        }
+        None => registry.classify(path, signals),
+    };
     if classification.category == ArtifactCategory::Unknown {
         return Err(ReplayDrop::Vetoed(
             "no longer classifies as an artifact".to_string(),
@@ -5326,11 +5338,7 @@ fn replay_indexed_record(
     if let Ok(created) = meta.created() {
         newest = newest.max(created);
     }
-    if let Some((_, probe)) = &opaque_probe {
-        if let Some(tree_newest) = probe.newest_mtime {
-            newest = newest.max(tree_newest);
-        }
-    } else if meta.is_dir() && classification.category.is_regenerable_tree() {
+    if meta.is_dir() && classification.category.is_regenerable_tree() {
         let probe = tree_newest_mtime(path, TREE_IDLE_PROBE_MAX_ENTRIES, TREE_IDLE_PROBE_MAX_DEPTH);
         if let Some(tree_newest) = probe.newest_mtime {
             newest = newest.max(tree_newest);
@@ -5340,15 +5348,12 @@ fn replay_indexed_record(
         .duration_since(newest)
         .unwrap_or(Duration::ZERO);
     #[cfg(unix)]
-    let mut allocated = {
+    let allocated = {
         use std::os::unix::fs::MetadataExt;
         meta.blocks().saturating_mul(512)
     };
     #[cfg(not(unix))]
-    let mut allocated = meta.len();
-    if let Some((_, probe)) = &opaque_probe {
-        allocated = allocated.saturating_add(probe.allocated_bytes);
-    }
+    let allocated = meta.len();
     let input = CandidateInput {
         path: path.clone(),
         size_bytes: record.size_estimate_bytes.max(allocated),
@@ -5597,6 +5602,12 @@ fn scanner_thread_main(
     // stays pressured with nothing to reclaim, and resets on a productive pass.
     let mut last_empty_pass_at: Option<Instant> = None;
     let mut consecutive_empty_passes: u32 = 0;
+    // bd-8aeq: the executor's reclaim counter as it stood when the last
+    // dispatching pass started. Confirmed at the next pass start: if the
+    // counter has not moved, those dispatches reclaimed nothing (dry-run,
+    // observe mode, every candidate dampened or failed) and the pass is paced
+    // like an empty one instead of rescanning every tick.
+    let mut unconfirmed_dispatch: Option<u64> = None;
     // The level of the last completed pass: a rise since then is new
     // information and clears the pacing (`pressure_escalated`).
     let mut last_pass_level: Option<PressureLevel> = None;
@@ -5631,6 +5642,16 @@ fn scanner_thread_main(
         // Read latest config at the start of each scan.
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
+
+        if let Some(reclaim_before) = unconfirmed_dispatch.take()
+            && executor_config.reclaim_events() == reclaim_before
+        {
+            consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
+            last_empty_pass_at = Some(Instant::now());
+            eprintln!(
+                "[SBH-SCANNER] the last pass dispatched candidates but nothing was reclaimed (dry-run, observe, dampened or failed); pacing it as an empty pass (consecutive={consecutive_empty_passes})"
+            );
+        }
 
         // A rise in pressure since the last pass is new information: the
         // pacing built up by routine empty passes on a calm mount (routine
@@ -5947,6 +5968,7 @@ fn scanner_thread_main(
         // the B6 empty-pass cooldown). A pass can surface many candidates yet
         // dispatch zero when they are all protected/dampened.
         let mut dispatched_this_pass: usize = 0;
+        let reclaim_at_pass_start = executor_config.reclaim_events();
         let mut scanner_should_exit = false;
         let mut scan_timed_out = false;
         let v2_candidate_byte_target = if scanner_index_enabled {
@@ -6117,6 +6139,15 @@ fn scanner_thread_main(
                         root_stats,
                         timed_out: false,
                     });
+                    if held_by_certainty > 0 {
+                        logger.send(ActivityEvent::Info {
+                            message: format!(
+                                "scanner certainty gate held {held_by_certainty} candidate(s) below {pass_min_certainty} (pressure={:?}); not dispatched, not counted toward the reclaim byte target",
+                                request.pressure_level
+                            ),
+                        });
+                    }
+                    unconfirmed_dispatch = Some(reclaim_at_pass_start);
                     continue;
                 }
             }
@@ -6436,6 +6467,7 @@ fn scanner_thread_main(
                                     match CandidateIndexRecord::from_candidate_score(
                                         &score,
                                         None,
+                                        input.signals,
                                         scanner_index_event_generation,
                                     ) {
                                         Ok(Some(record)) => {
@@ -6632,6 +6664,15 @@ fn scanner_thread_main(
                 root_stats,
                 timed_out: false,
             });
+            if held_by_certainty > 0 {
+                logger.send(ActivityEvent::Info {
+                    message: format!(
+                        "scanner certainty gate held {held_by_certainty} candidate(s) below {pass_min_certainty} (pressure={:?}); not dispatched, not counted toward the reclaim byte target",
+                        request.pressure_level
+                    ),
+                });
+            }
+            unconfirmed_dispatch = Some(reclaim_at_pass_start);
             continue;
         }
 
@@ -6956,6 +6997,7 @@ fn scanner_thread_main(
                 match CandidateIndexRecord::from_candidate_score(
                     &score,
                     entry.opaque_tree.as_ref(),
+                    entry.structural_signals,
                     scanner_index_event_generation,
                 ) {
                     Ok(Some(record)) => {
@@ -7182,6 +7224,7 @@ fn scanner_thread_main(
         } else {
             consecutive_empty_passes = 0;
             last_empty_pass_at = None;
+            unconfirmed_dispatch = Some(reclaim_at_pass_start);
         }
 
         // #15: record this pass's cost so the next pressure-driven pass owes
@@ -7640,6 +7683,9 @@ fn executor_thread_main(
 
         // Record deletions for repeat-deletion dampening.
         tracker.record_deletions(&report.deleted_paths);
+        if !report.dry_run && report.items_deleted > 0 {
+            shared_config.note_reclaim();
+        }
 
         if report.dry_run {
             if report.items_would_delete > 0 || report.items_failed > 0 {
@@ -7850,6 +7896,7 @@ mod tests {
             fail_count: 0,
             cooldown_until_nanos: None,
             event_generation: generation,
+            structural_signals: StructuralSignals::default(),
         };
         let replay = |record: &CandidateIndexRecord,
                       generation: u64,
@@ -8625,6 +8672,24 @@ mod tests {
             !replayed_target.log.contains("scanner certainty gate held "),
             "{}",
             replayed_target.log
+        );
+
+        // Dispatch without reclaim is not progress: nothing bumps the
+        // executor's reclaim counter here (as in dry-run or observe mode),
+        // so the second request is paced as if the first pass were empty.
+        let paced = run_scan(
+            temp.path(),
+            &cargo_root,
+            ArtifactCertainty::Likely,
+            2,
+            "index-cargo.json",
+        );
+        assert!(paced.dispatched);
+        assert_eq!(
+            paced.reports.len(),
+            1,
+            "the unconfirmed dispatch arms the cooldown: {:?}",
+            paced.reports
         );
     }
 

@@ -66,8 +66,12 @@ impl std::str::FromStr for ArtifactCategory {
 }
 
 /// Structural features collected from a directory tree.
+///
+/// Serialized into the scanner index so a replayed opaque candidate is scored
+/// with the evidence the walk found under it, not with the root's own entries.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct StructuralSignals {
     pub has_incremental: bool,
     pub has_deps: bool,

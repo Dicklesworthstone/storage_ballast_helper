@@ -178,7 +178,7 @@ const OPAQUE_CANDIDATE_SIZE_FLOOR: u64 = 100 * 1_048_576;
 /// Opaque trees are cargo targets and build caches: tens of thousands of small
 /// files. This bounds a pathological tree from stalling a scan while still
 /// completing for essentially every real candidate.
-pub const OPAQUE_SIZE_PROBE_BUDGET: usize = 200_000;
+const OPAQUE_SIZE_PROBE_BUDGET: usize = 200_000;
 
 /// Measure the allocated size of an opaque (pruned) candidate tree.
 ///
@@ -278,10 +278,9 @@ fn note_opaque_signal(
 /// in the same pass so idleness costs no extra syscalls.
 ///
 /// The probe also collects the structural signals found anywhere under the
-/// root: the evidence the walker scores an opaque root with, and what an
-/// index replay must reuse so a definite `target/` does not replay as
-/// `unclear`.
-pub fn opaque_tree_probe(
+/// root: the evidence the walker scores an opaque root with. The scanner
+/// index persists those signals so a replay does not repeat this walk.
+fn opaque_tree_probe(
     root: &Path,
     cross_devices: bool,
     root_dev: u64,

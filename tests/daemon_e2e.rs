@@ -124,6 +124,8 @@ pub struct ScenarioConfig {
     pub ballast_file_bytes: u64,
     /// Scanner engine: `v2` (default) or the `v1` rollback engine.
     pub engine: &'static str,
+    /// `scanner.dry_run`: plan deletions without removing anything.
+    pub dry_run: bool,
     /// When set, notifications go to this file (JSON lines) instead of
     /// being disabled.
     pub notify_file: Option<PathBuf>,
@@ -151,6 +153,7 @@ impl Default for ScenarioConfig {
             ballast_files: 1,
             ballast_file_bytes: 1_048_576,
             engine: "v2",
+            dry_run: false,
             notify_file: None,
             extra_toml: String::new(),
             duty_cycle_pct: 25,
@@ -196,6 +199,7 @@ orange_min_free_pct = {orange}
 red_min_free_pct = {red}
 [scanner]
 engine = {engine:?}
+dry_run = {dry_run}
 cross_devices = {cross}
 catalog_roots_on_pressured_device = {catalog}
 root_paths = [{roots}]
@@ -216,6 +220,7 @@ cpu_budget_pct = {budget}
         poll = scenario.poll_interval_ms,
         maint = scenario.maintenance_interval_secs,
         engine = scenario.engine,
+        dry_run = scenario.dry_run,
         cross = scenario.cross_devices,
         catalog = scenario.catalog_roots,
         roots = roots,
@@ -2274,6 +2279,63 @@ fn orange_pressure_with_only_unclear_candidates_backs_off_instead_of_replaying()
         "{passes} scan passes in {observed:?} is the replay hot loop: {stderr}"
     );
     assert!(module.join("index.js").exists());
+    let status = run.stop();
+    assert!(status.success(), "{status}");
+}
+
+/// bd-8aeq, second half: a pass that dispatches candidates the executor then
+/// does not remove (dry-run here; observe mode and dampened or failed batches
+/// behave the same) is not progress either. The post-fix capture on the
+/// operator workstation showed a dry-run daemon re-dispatching the same
+/// definite target every tick, 127 passes in five minutes. The scanner now
+/// confirms a dispatching pass against the executor's reclaim counter and
+/// paces an unconfirmed one like an empty pass.
+#[test]
+fn dry_run_orange_pressure_backs_off_after_the_first_dispatch() {
+    let scratch_base = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
+        PathBuf::from,
+    );
+    fs::create_dir_all(&scratch_base).unwrap();
+    let dir = tempfile::tempdir_in(&scratch_base).unwrap();
+    let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
+    let fixture_mount = dir.path().to_path_buf();
+    let table = injected_table(&[
+        (&fixture_mount, 1_000_000_000_000, 110_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![fixtures.root.clone()],
+        min_file_age_minutes: 0,
+        min_rescan_interval_secs: 5,
+        dry_run: true,
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    run.wait_until("the first dry-run batch", Duration::from_secs(45), |run| {
+        run.stderr_count("dry-run would_delete=") >= 1
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    let observed = Duration::from_secs(30);
+    std::thread::sleep(observed);
+
+    let passes = run.events_of("scan_complete").len();
+    let stderr = run.stderr();
+    assert!(
+        run.deleted_paths().is_empty(),
+        "dry-run removes nothing: {stderr}"
+    );
+    assert!(fixtures.stale_target.exists());
+    assert!(
+        run.stderr_count("pacing it as an empty pass") >= 1,
+        "an unconfirmed dispatch is paced as empty: {stderr}"
+    );
+    // Base cooldown 5 s doubling per unconfirmed pass: 0, 5, 15, 35 s, plus
+    // one pass to notice; the unpaced daemon produced about sixty in 30 s.
+    assert!(
+        passes <= 7,
+        "{passes} scan passes in {observed:?}: dry-run dispatches still count as progress: {stderr}"
+    );
     let status = run.stop();
     assert!(status.success(), "{status}");
 }

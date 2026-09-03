@@ -20,13 +20,16 @@ use crate::core::config::ScannerConfig;
 use crate::core::errors::{Result, SbhError};
 use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, OpaqueTreeClassification, OpaqueTreeDisposition,
+    StructuralSignals,
 };
 use crate::scanner::scoring::{
     CandidacyScore, DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors,
 };
 use crate::scanner::walker::{FsEntryKind, FsIdentity};
 
-const CHECKPOINT_VERSION: u32 = 1;
+/// Bumped to 2 when records gained `structural_signals`; a version-1
+/// checkpoint is rejected and the next pass walks the roots once.
+const CHECKPOINT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum IndexedEntryKind {
@@ -163,12 +166,19 @@ pub struct CandidateIndexRecord {
     pub fail_count: u32,
     pub cooldown_until_nanos: Option<u128>,
     pub event_generation: u64,
+    /// The structural evidence the walk found under the candidate (markers
+    /// under `debug/`, a `CACHEDIR.TAG`, object files). A replay scores with
+    /// this instead of re-walking the subtree or, worse, looking only at the
+    /// root's own entries and downgrading a definite target to `unclear`.
+    #[serde(default)]
+    pub structural_signals: StructuralSignals,
 }
 
 impl CandidateIndexRecord {
     pub fn from_candidate_score(
         score: &CandidacyScore,
         opaque_tree: Option<&OpaqueTreeClassification>,
+        structural_signals: StructuralSignals,
         event_generation: u64,
     ) -> Result<Option<Self>> {
         let Some(identity) = score.identity else {
@@ -194,6 +204,7 @@ impl CandidateIndexRecord {
             fail_count: 0,
             cooldown_until_nanos: None,
             event_generation,
+            structural_signals,
         }))
     }
 
@@ -737,6 +748,7 @@ mod tests {
             fail_count: 0,
             cooldown_until_nanos: None,
             event_generation: 0,
+            structural_signals: StructuralSignals::default(),
         }
     }
 
@@ -967,6 +979,7 @@ mod tests {
         let record = CandidateIndexRecord::from_candidate_score(
             &score,
             Some(&opaque),
+            StructuralSignals::default(),
             index.event_generation(),
         )
         .unwrap()
