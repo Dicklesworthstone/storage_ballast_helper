@@ -666,6 +666,19 @@ See `docs/cleanup-rules-macos.md` for the exhaustive macOS cleanup contract and
 `docs/sacred-paths.md` for the built-in sacred catalog and the reasoning for
 every protected pattern.
 
+## Scanner Events
+
+The v2 scanner on macOS runs reconciliation-only: there is no FSEvents
+backend, so the daemon does not learn about filesystem changes between
+passes. Every configured root is treated as dirty, the maintenance pass
+(`pressure.maintenance_interval_secs`) and the pressure-driven passes are
+the bound on how stale the candidate index can be, and the daemon logs
+`scanner_events: backend=reconciliation-only ... reason=safe kernel scanner
+event backend is unavailable on this platform` at startup so nobody has to
+guess. Adding FSEvents through a safe crate is tracked on
+bd-rc-master-ajg1.8.5; it needs the macOS CI lane to prove it, not a Linux
+host.
+
 ## Migrating From Visual Cleanup Tools
 
 If you already use CleanMyMac, OmniDiskSweeper, DaisyDisk, or GrandPerspective,

@@ -904,4 +904,50 @@ mod tests {
         }
         panic!("expected nested inotify event for {}", changed.display());
     }
+
+    /// bd-rc-master-ajg1.8.5: the capability report must say what the event
+    /// source really is on this platform. Linux plans recursive inotify and
+    /// reports fanotify as deferred; every other platform reconciles only,
+    /// with every root dirty, and says why.
+    #[test]
+    fn capability_report_is_honest_about_the_platform() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let scanner_config = ScannerConfig {
+            event_watch_budget: 16,
+            ..Default::default()
+        };
+        let config =
+            EventSourceConfig::from_scanner_config(std::slice::from_ref(&root), &scanner_config);
+        let plan = EventSourcePlan::for_config(&config);
+        let capability = EventSourceCapability::from_plan(&plan);
+
+        assert!(!capability.fanotify.available, "{capability:?}");
+        assert!(
+            capability.fanotify.reason.contains("deferred"),
+            "{}",
+            capability.fanotify.reason
+        );
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                capability.selected_backend,
+                EventBackendKind::RecursiveInotify
+            );
+            assert!(capability.recursive_inotify.available, "{capability:?}");
+            assert!(capability.complete, "{capability:?}");
+        } else {
+            assert_eq!(
+                capability.selected_backend,
+                EventBackendKind::ReconciliationOnly
+            );
+            assert!(!capability.recursive_inotify.available, "{capability:?}");
+            assert_eq!(capability.dirty_roots, vec![root]);
+            assert!(
+                capability.reason.contains("unavailable on this platform"),
+                "{}",
+                capability.reason
+            );
+        }
+    }
 }

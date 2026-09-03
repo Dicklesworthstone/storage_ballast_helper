@@ -95,6 +95,18 @@ invalidation, and reconciliation fallback. `fanotify` remains an explicit capabi
 probe marked unavailable until a safe backend is wired. macOS and other platforms remain
 reconciliation-only.
 
+Decision (bd-rc-master-ajg1.8.5, 2026-09-02): `fanotify` stays deferred. The safe
+wrapper this crate could use does not expose `FAN_REPORT_FID`, filesystem-wide marks
+need `CAP_SYS_ADMIN` (absent in the user-scope unit), and the recursive `inotify`
+plan with the watch budget covers the cases that matter as long as a root that
+exhausts the budget is treated as dirty and reconciled, which it is. macOS is
+reconciliation-only by decision, with `pressure.maintenance_interval_secs` and the
+pressure-driven passes as the staleness bound; an FSEvents backend via a safe crate
+is worth doing only once the macOS CI lane can prove it, so it is not started from a
+Linux host. The capability report (`scanner_events:` at startup, `sbh scan --json`)
+carries the probe reasons, and `capability_report_is_honest_about_the_platform`
+pins them.
+
 ### 3.2 Pressure-gated effort
 - Drive everything off the existing cheap `statfs` pressure poll. Effort ladder:
   - **green:** event subscription only + one shallow top-level reconciliation every
