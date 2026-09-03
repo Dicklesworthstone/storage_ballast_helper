@@ -2267,6 +2267,204 @@ fn read_only_volume_parks_deletions_in_recovery_until_remount() {
     assert!(status.success(), "{status}");
 }
 
+/// Write real bytes until the filesystem refuses (`ENOSPC`): the volume
+/// then has zero bytes available, which no injected table can imitate.
+fn fill_until_enospc(vol: &LoopMount) -> u64 {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(vol.path.join("filler.bin"))
+        .unwrap();
+    let chunk = vec![0xA5u8; 256 * 1024];
+    let mut written = 0u64;
+    loop {
+        match file.write_all(&chunk) {
+            Ok(()) => written += chunk.len() as u64,
+            Err(error) => {
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(libc::ENOSPC),
+                    "expected ENOSPC after {written} bytes, got {error}"
+                );
+                break;
+            }
+        }
+    }
+    let _ = file.sync_all();
+    written
+}
+
+/// Ballast files currently in `pool` (the directory may hold other files).
+fn ballast_files_in(pool: &Path) -> usize {
+    fs::read_dir(pool).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("SBH_BALLAST_FILE_")
+            })
+            .count()
+    })
+}
+
+/// Write the volume to ENOSPC until the daemon has released every ballast
+/// file: it polls every 500 ms and releases while the fill is still
+/// running, so one ENOSPC is not the end. Returns `(bytes written, fills)`.
+fn fill_until_pool_released(run: &mut DaemonRun, vol: &LoopMount, pool: &Path) -> (u64, usize) {
+    let mut written = 0u64;
+    let mut rounds = 0;
+    loop {
+        // The refused write is the proof of zero bytes free; by the time
+        // stats are read the daemon may already have released a file.
+        written += fill_until_enospc(vol);
+        rounds += 1;
+        if ballast_files_in(pool) == 0 {
+            break;
+        }
+        assert!(
+            rounds < 8,
+            "pool still has {} files after {rounds} fills",
+            ballast_files_in(pool)
+        );
+        // Let the daemon see zero bytes and act before the next fill.
+        run.wait_until("a release after the fill", Duration::from_secs(60), |_| {
+            ballast_files_in(pool) == 0 || vol.stats().1 >= 1024 * 1024
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+    // With the pool gone, one more fill leaves the volume full for real:
+    // nothing but a concurrent target deletion (a few MiB) can free space
+    // now, so less than one ballast file's worth may be available.
+    written += fill_until_enospc(vol);
+    rounds += 1;
+    let (_, available_full) = vol.stats();
+    assert!(
+        available_full < 16 * 1024 * 1024,
+        "the pool came back: {available_full} bytes available after {written} written"
+    );
+    (written, rounds)
+}
+
+/// Scenario `zero-free` (privileged, bd-rc-master-ajg1.11.3): a 512 MiB
+/// ext4 volume with a provisioned four-file pool and a stale Definite target
+/// is written to `ENOSPC`. The daemon, reading real statvfs, must classify
+/// the mount Critical, release the whole pool, delete the stale target, and
+/// keep rewriting `state.json` (which lives on the root filesystem) the whole
+/// time; the volume ends above the Red threshold with the filler intact.
+#[test]
+#[ignore = "needs passwordless sudo for a loop-mounted ext4 image; run with --ignored"]
+fn zero_free_volume_releases_the_pool_and_keeps_writing_state() {
+    let dir = scratch();
+    let vol = LoopMount::create(dir.path(), 512);
+    let root = vol.path.join("root");
+    let stale = definite_target(
+        &root.join("stale-proj"),
+        Duration::from_hours(5),
+        8 * 1024 * 1024,
+    );
+    let scenario = ScenarioConfig {
+        root_paths: vec![root],
+        min_file_age_minutes: 1,
+        maintenance_interval_secs: 5,
+        ballast_files: 4,
+        ballast_file_bytes: 16 * 1024 * 1024,
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, None);
+    let pool = vol.path.join(".sbh").join("ballast");
+    let pool_prefix = pool.to_string_lossy().into_owned();
+    run.wait_until("the four-file pool", Duration::from_secs(90), |run| {
+        run.events_of("ballast_provision")
+            .iter()
+            .filter(|e| {
+                e["path"]
+                    .as_str()
+                    .is_some_and(|p| p.starts_with(&pool_prefix))
+            })
+            .count()
+            >= 4
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    let (total, available_before) = vol.stats();
+    assert!(available_before > total / 5, "pool left the volume Green");
+
+    // The daemon polls every 500 ms and releases ballast while the fill is
+    // still running, so one ENOSPC is not the end: keep writing until the
+    // pool is gone and the volume is full for real.
+    let full_at = Instant::now();
+    let state_at_full = run
+        .state()
+        .and_then(|s| s["last_updated"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let (written, rounds) = fill_until_pool_released(&mut run, &vol, &pool);
+    let released = run
+        .events_of("ballast_release")
+        .iter()
+        .filter(|e| {
+            e["path"]
+                .as_str()
+                .is_some_and(|p| p.starts_with(&pool_prefix))
+        })
+        .count();
+    assert_eq!(released, 4, "{:?}", run.events_of("ballast_release"));
+    println!("zero-free: {written} bytes to ENOSPC over {rounds} fills; pool released in full");
+
+    // Then the stale target, once Critical/Red scanning reaches it.
+    run.wait_until("the stale target", Duration::from_secs(180), |run| {
+        run.deleted_paths().contains(&stale)
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(!stale.exists(), "{}", stale.display());
+    assert!(
+        vol.path.join("filler.bin").exists(),
+        "the filler is not a candidate"
+    );
+
+    // state.json kept moving through the incident (it is on the root FS).
+    let final_state = run
+        .wait_for_state("a fresh state write", Duration::from_secs(60), |snapshot| {
+            snapshot["last_updated"]
+                .as_str()
+                .is_some_and(|t| t > state_at_full.as_str())
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    let levels: Vec<String> = run
+        .events_of("pressure_change")
+        .iter()
+        .filter(|e| e["mount_point"] == vol.path.to_string_lossy().as_ref())
+        .filter_map(|e| e["pressure"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        levels
+            .iter()
+            .any(|l| l.ends_with("Critical") || l.ends_with("Red")),
+        "no Red/Critical transition for the volume: {levels:?}"
+    );
+    let record = final_state["mount_controllers"]
+        .as_array()
+        .and_then(|c| {
+            c.iter()
+                .find(|c| c["mount"] == vol.path.to_string_lossy().as_ref())
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("no controller record for the volume: {final_state}"));
+    println!(
+        "zero-free: {written} bytes to ENOSPC, incident {:.1}s, controller {} at the end, levels {levels:?}",
+        full_at.elapsed().as_secs_f64(),
+        record["state"]
+    );
+
+    // The stale target's bytes came back; the filler was never touched.
+    let (total, available_after) = vol.stats();
+    assert!(
+        available_after >= 8 * 1024 * 1024,
+        "the reclaimed target should free at least 8 MiB, available {available_after} of {total}"
+    );
+    let status = run.stop();
+    assert!(status.success(), "{status}");
+}
+
 // ──────────────────── CPU budget (Q7) ────────────────────
 
 /// A root with `projects` Definite cargo targets of `files` fresh files

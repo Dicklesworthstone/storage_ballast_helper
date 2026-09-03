@@ -10,6 +10,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — real-pressure scenario: a loop-mounted ext4 written to ENOSPC (bd-rc-master-ajg1.11.3)
+
+- `tests/daemon_e2e.rs` gains `zero_free_volume_releases_the_pool_and_keeps_writing_state` (sudo-gated like the other loop-mount scenarios, run with `--ignored`): a 512 MiB ext4 image with a provisioned four-file 16 MiB pool and a stale Definite target is written until the filesystem refuses (`ENOSPC`), repeatedly, because the daemon releases ballast while the fill is still running. The daemon, on real statvfs and without injection, must record Orange→Critical, release all four files, delete the stale target, keep rewriting `state.json` (on the root filesystem) through the incident, and leave the filler untouched. On this host: 491 MB to ENOSPC over two fills, the whole incident in 96 s. The CI `daemon-e2e` job's loop-mount step already runs the ignored scenarios on ubuntu.
+
 ### Added — `sbh doctor --release` drift checks (bd-rc-master-ajg1.5.6)
 
 - Four checks join the release doctor, all through GitHub CLI: `release.latest_assets` (the latest release's asset list satisfies the updater contract for every CI target and carries `release-provenance.json`; missing names are listed per target), `release.tap_version` (the tap's `Formula/sbh.rb` version equals the latest tag), `release.workflows_enabled` (`ci.yml`, `release.yml`, `cert-expiration.yml` are registered and active), `release.cert_expiration_run` (the last cert-expiration run concluded successfully). Without GitHub access they warn instead of failing, so `doctor --release` stays usable offline. Fixture tests cover a complete v0.5.1 asset set, a release missing one target and the provenance document, a lagging formula, a disabled workflow, a failed run, and the offline case.
