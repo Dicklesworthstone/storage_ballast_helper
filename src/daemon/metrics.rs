@@ -535,22 +535,39 @@ fn check_name(name: &str, line: usize) -> std::result::Result<(), String> {
 }
 
 /// Split `name{labels} value` (or `name value`) into the name and the value
-/// text, validating that a label block closes and its values are quoted.
+/// text, validating that a label block closes and every label value is a
+/// quoted string. Commas, braces and escaped quotes inside a quoted value
+/// are data, not separators (a fuzz finding: `policy_mode="enforce,"`).
 fn split_sample(line: &str) -> Option<(&str, &str)> {
-    if let Some(open) = line.find('{') {
-        let close = line[open..].find('}')? + open;
-        let labels = &line[open + 1..close];
-        for pair in labels.split(',') {
-            let (_, value) = pair.split_once('=')?;
-            if !(value.starts_with('"') && value.ends_with('"') && value.len() >= 2) {
-                return None;
+    let Some(open) = line.find('{') else {
+        return line.split_once(' ');
+    };
+    let bytes = line.as_bytes();
+    let mut at = open + 1;
+    while bytes.get(at) != Some(&b'}') {
+        let eq = line[at..].find('=')? + at;
+        if eq == at || line[at..eq].contains(',') {
+            return None;
+        }
+        if bytes.get(eq + 1) != Some(&b'"') {
+            return None;
+        }
+        let mut end = eq + 2;
+        loop {
+            match bytes.get(end)? {
+                b'\\' => end += 2,
+                b'"' => break,
+                _ => end += 1,
             }
         }
-        Some((&line[..open], &line[close + 1..]))
-    } else {
-        let (name, value) = line.split_once(' ')?;
-        Some((name, value))
+        at = end + 1;
+        match bytes.get(at)? {
+            b',' => at += 1,
+            b'}' => {}
+            _ => return None,
+        }
     }
+    Some((&line[..open], line.get(at + 1..)?))
 }
 
 #[cfg(test)]
@@ -718,6 +735,30 @@ mod tests {
             "sbh_thread_up{thread=\"scanner\"} 1\n",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in\n{text}");
+        }
+    }
+
+    #[test]
+    fn split_sample_treats_quoted_commas_braces_and_escapes_as_data() {
+        let cases = [
+            (r#"sbh_info{policy_mode="enforce,",run_id=""} 1"#, "1"),
+            (r#"a{x="a\"b\\c",y="{}"} 2.5"#, "2.5"),
+            ("a{} 3", "3"),
+            ("a 4", "4"),
+        ];
+        for (line, value) in cases {
+            let (name, rest) = split_sample(line).unwrap_or_else(|| panic!("{line}"));
+            assert!(name == "sbh_info" || name == "a", "{line}");
+            assert_eq!(rest.trim(), value, "{line}");
+        }
+        for bad in [
+            r#"a{x="unterminated} 1"#,
+            "a{x=bare} 1",
+            r#"a{x="1"y="2"} 1"#,
+            r#"a{="1"} 1"#,
+            "a{x=\"1\"",
+        ] {
+            assert!(split_sample(bad).is_none(), "{bad}");
         }
     }
 

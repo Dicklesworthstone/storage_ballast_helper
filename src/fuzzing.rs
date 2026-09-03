@@ -195,6 +195,8 @@ pub fn state_json(data: &[u8]) {
     // serializes as `null`, so the first round-trip may normalise the value
     // (a fuzz finding, seed `non_finite_floats.json`). The invariant is that
     // the normalised form is stable: a second round-trip changes nothing.
+    // That needs serde_json's `float_roundtrip` feature (seed
+    // `float_parse_rounding.json`: a 111-digit mantissa parsed one ulp off).
     let rendered = serde_json::to_string(&state).expect("a parsed state serializes");
     let again: DaemonState =
         serde_json::from_str(&rendered).expect("a serialized state parses back");
