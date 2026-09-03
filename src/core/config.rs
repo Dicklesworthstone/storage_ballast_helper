@@ -751,6 +751,10 @@ pub struct TelemetryConfig {
     /// yields (never at Critical, never for ballast release, state writes or
     /// heartbeats). 0 disables pacing; accounting still shows in `sbh status`.
     pub cpu_budget_pct: u8,
+    /// Write a Prometheus textfile export (`metrics.prom` beside
+    /// `state.json`) with every state write, for node_exporter's textfile
+    /// collector. Off removes any stale export at startup.
+    pub metrics_enabled: bool,
 }
 
 /// Update-check behavior, cache policy, and opt-out controls.
@@ -1163,6 +1167,7 @@ impl Default for TelemetryConfig {
             daemon_rss_warning_bytes: 256 * 1024 * 1024,
             daemon_rss_hard_limit_bytes: 500 * 1024 * 1024,
             cpu_budget_pct: 25,
+            metrics_enabled: true,
         }
     }
 }

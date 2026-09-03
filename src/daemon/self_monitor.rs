@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::config::TelemetryConfig;
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::cpu_budget::CpuBudgetState;
+use crate::daemon::metrics;
 use crate::daemon::mount_controller::MountStateRecord;
 use crate::monitor::pid::PressureLevel;
 use crate::platform::pal::Platform;
@@ -804,6 +805,8 @@ pub struct SelfMonitor {
     /// The last state written, so the final write on shutdown can stamp
     /// `stopped_at` and `exit_reason` onto an otherwise complete record.
     last_state: Option<DaemonState>,
+    /// Write `metrics.prom` beside the state file with every state write.
+    metrics_enabled: bool,
 }
 
 impl SelfMonitor {
@@ -852,6 +855,16 @@ impl SelfMonitor {
         self.policy_snapshot = policy;
     }
 
+    /// Turn the Prometheus export on or off. Turning it off removes a stale
+    /// export so a collector never scrapes a file the daemon stopped
+    /// updating.
+    pub fn set_metrics_enabled(&mut self, enabled: bool) {
+        self.metrics_enabled = enabled;
+        if !enabled {
+            let _ = fs::remove_file(metrics::metrics_file_path(&self.state_file_path));
+        }
+    }
+
     /// Make the next `maybe_write_state` call write regardless of the
     /// interval (a control-socket `status` request wants a fresh file).
     pub fn force_next_write(&mut self) {
@@ -894,12 +907,14 @@ impl SelfMonitor {
         platform: Arc<dyn Platform>,
         telemetry: &TelemetryConfig,
     ) -> Self {
-        Self::with_rss_limits(
+        let mut monitor = Self::with_rss_limits(
             state_file_path,
             platform,
             telemetry.daemon_rss_warning_bytes,
             telemetry.daemon_rss_hard_limit_bytes,
-        )
+        );
+        monitor.set_metrics_enabled(telemetry.metrics_enabled);
+        monitor
     }
 
     fn with_rss_limits(
@@ -927,6 +942,7 @@ impl SelfMonitor {
             policy_snapshot: PolicyStateRecord::default(),
             run_id: generate_run_id(),
             last_state: None,
+            metrics_enabled: true,
 
             scan_count: 0,
             last_scan_at: None,
@@ -1037,6 +1053,17 @@ impl SelfMonitor {
         };
 
         let result = write_state_atomic(&self.state_file_path, &state);
+        if result.is_ok() && self.metrics_enabled {
+            // bd-rc-master-ajg1.7.3: the Prometheus export is a view of the
+            // document just written, so it can never disagree with it and it
+            // obeys the same write gate (no state write, no metrics write).
+            let text = metrics::render(&state, metrics::build_git_sha());
+            if let Err(e) =
+                metrics::write_atomic(&metrics::metrics_file_path(&self.state_file_path), &text)
+            {
+                eprintln!("[SBH-SELFMON] failed to write metrics export: {e}");
+            }
+        }
         self.last_state = Some(state);
         if let Err(e) = &result {
             eprintln!("[SBH-SELFMON] failed to write state file: {e}");

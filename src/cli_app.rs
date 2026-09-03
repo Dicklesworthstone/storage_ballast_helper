@@ -161,6 +161,8 @@ enum Command {
     Dashboard(DashboardArgs),
     /// Run diagnostics.
     Doctor(DoctorArgs),
+    /// Print the daemon's Prometheus textfile export (`metrics.prom`).
+    Metrics,
     /// Generate shell completions.
     Completions(CompletionsArgs),
     /// Check for and apply updates.
@@ -1119,6 +1121,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Blame(args) => run_blame(cli, args),
         Command::Dashboard(args) => run_dashboard(cli, args),
         Command::Doctor(args) => run_doctor(cli, args),
+        Command::Metrics => run_metrics(cli),
         Command::Completions(args) => {
             let mut command = Cli::command();
             let binary_name = command.get_name().to_string();
@@ -2472,6 +2475,34 @@ fn run_policy(cli: &Cli, args: &PolicyArgs) -> Result<(), CliError> {
     };
     let (socket, response) = control_request(cli, "policy", &json!({ "action": action }))?;
     report_control_response(cli, &format!("policy {action}"), &socket, &response)
+}
+
+/// `sbh metrics`: print the daemon's Prometheus textfile export verbatim.
+/// The daemon writes it beside `state.json` with every state write; this
+/// command only reads it, so it says why when there is nothing to read.
+fn run_metrics(cli: &Cli) -> Result<(), CliError> {
+    use storage_ballast_helper::daemon::metrics::metrics_file_path;
+
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let path = metrics_file_path(&config.paths.state_file);
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        CliError::User(format!(
+            "no metrics export at {}: {e} (the daemon writes it with every state write while [telemetry] metrics_enabled = true)",
+            path.display()
+        ))
+    })?;
+    if output_mode(cli) == OutputMode::Json {
+        let payload = json!({
+            "command": "metrics",
+            "path": path,
+            "text": text,
+        });
+        write_json_line(&payload)?;
+    } else {
+        print!("{text}");
+    }
+    Ok(())
 }
 
 fn install_requests_service(args: &InstallArgs) -> bool {

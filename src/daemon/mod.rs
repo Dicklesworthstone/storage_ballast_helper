@@ -5,6 +5,7 @@ pub mod control;
 pub mod cpu_budget;
 #[cfg(feature = "daemon")]
 pub mod loop_main;
+pub mod metrics;
 pub mod mount_controller;
 pub mod notifications;
 pub mod policy;

@@ -1573,6 +1573,12 @@ Source: `src/daemon/signals.rs`, `src/daemon/loop_main.rs`
 
 The self-monitor tracks daemon health from within, providing introspection data for the dashboard's Diagnostics screen and for `sbh status` queries.
 
+#### Prometheus Textfile Export
+
+With every `state.json` write (every 30 seconds, or on request from `sbh status`) the daemon also renders `metrics.prom` beside it, atomically and world-readable, in the Prometheus text exposition format. Point node_exporter's textfile collector at the data directory (`--collector.textfile.directory=/var/lib/sbh` for a system install) and the `sbh_*` families appear with no network surface and no new dependency; `sbh metrics` prints the same text for hosts without a collector.
+
+The families are a view of the state document, so they never disagree with `sbh status`: `sbh_up`, `sbh_info{version,git_sha,policy_mode,run_id}`, `sbh_daemon_uptime_seconds`, `sbh_daemon_cpu_seconds_total`, `sbh_daemon_rss_bytes`, `sbh_daemon_cpu_budget_used_ratio`, `sbh_daemon_cpu_budget_deficit_seconds`; per mount `sbh_mount_free_ratio`, `sbh_mount_pressure_level{level}` (one-hot), `sbh_mount_fill_rate_bytes_per_second`, `sbh_mount_seconds_to_red`, `sbh_mount_reclaim_capability{capability}`, `sbh_mount_controller_state{state}`, `sbh_ballast_present_bytes`, `sbh_ballast_target_bytes`, `sbh_quarantine_bytes`; `sbh_ballast_files{state}`, `sbh_ballast_releases_total`, `sbh_scans_total`, `sbh_deletions_total`, `sbh_bytes_freed_total`, `sbh_errors_total`, `sbh_log_events_dropped_total`, `sbh_last_scan_candidates`, `sbh_policy_mode{mode}` (one-hot), `sbh_policy_mode_seconds`, `sbh_thread_up{thread}`. Scan CPU seconds, per-engine scan counts and guard e-values are not exported yet because the state document does not carry them. `[telemetry] metrics_enabled = false` turns the export off and removes a stale file at startup.
+
 #### Thread Heartbeats
 
 Each worker thread (monitor, scanner, executor, logger) periodically calls a heartbeat function that updates a monotonic timestamp. The self-monitor checks these timestamps against a staleness threshold (60 seconds). If a thread misses its window, its status transitions from `Running` to `Stalled`. If a thread panics and is not respawned, its status becomes `Dead` with the captured error message.

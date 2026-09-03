@@ -14,6 +14,10 @@ Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_
 
 - The daemon serves `control.sock` beside `state.json` (mode 0600, per-boot token in `daemon.lock`, JSON line in / JSON line out). `sbh daemon ping|scan-now|reload|shutdown` and `sbh policy status|promote|demote` talk to it; `sbh status --json` asks a running daemon to rewrite `state.json` first and reports `"source": "socket"`. Promotions persist `[policy] initial_mode` after a config backup. `[core] control_socket_enabled = false` turns the socket off.
 
+### Added — Prometheus textfile export
+
+- The daemon writes `metrics.prom` beside `state.json` with every state write (atomic, world-readable) for node_exporter's textfile collector: daemon identity/uptime/CPU/RSS/budget, per-mount free ratio, pressure level, fill rate, forecast, reclaim capability, controller state and ballast bytes, plus scan/deletion/byte counters, policy mode and thread liveness. `sbh metrics` prints it; `[telemetry] metrics_enabled = false` turns it off and removes a stale file.
+
 ### Fixed — daemon scanner hot loops at Orange (bd-8aeq)
 
 - A definite cargo `target/` replayed from the scanner index was re-classified from the root directory's own entries and downgraded to `unclear`, so the Orange cell held it back forever while the replay re-dispatched it twice a second. Index records now persist the walk's structural signals (checkpoint version 2; an old index is walked once more) and replays score with them.

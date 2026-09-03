@@ -111,6 +111,7 @@ fn set_mtime_recursive(path: &Path, mtime: filetime::FileTime) {
 // ──────────────────── config ────────────────────
 
 /// Knobs a scenario sets; everything else is the daemon's default.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ScenarioConfig {
     pub root_paths: Vec<PathBuf>,
     pub poll_interval_ms: u64,
@@ -126,6 +127,8 @@ pub struct ScenarioConfig {
     pub engine: &'static str,
     /// `scanner.dry_run`: plan deletions without removing anything.
     pub dry_run: bool,
+    /// `telemetry.metrics_enabled`: write `metrics.prom` with every state write.
+    pub metrics_enabled: bool,
     /// When set, notifications go to this file (JSON lines) instead of
     /// being disabled.
     pub notify_file: Option<PathBuf>,
@@ -154,6 +157,7 @@ impl Default for ScenarioConfig {
             ballast_file_bytes: 1_048_576,
             engine: "v2",
             dry_run: false,
+            metrics_enabled: true,
             notify_file: None,
             extra_toml: String::new(),
             duty_cycle_pct: 25,
@@ -210,6 +214,7 @@ max_depth = 6
 parallelism = 2
 [telemetry]
 cpu_budget_pct = {budget}
+metrics_enabled = {metrics}
 {notifications}{extra}",
         ballast = data.join("ballast").display().to_string(),
         jsonl = data.join("activity.jsonl").display().to_string(),
@@ -228,6 +233,7 @@ cpu_budget_pct = {budget}
         rescan = scenario.min_rescan_interval_secs,
         duty = scenario.duty_cycle_pct,
         budget = scenario.cpu_budget_pct,
+        metrics = scenario.metrics_enabled,
         extra = scenario.extra_toml,
     );
     let path = dir.join("config.toml");
@@ -2338,6 +2344,153 @@ fn dry_run_orange_pressure_backs_off_after_the_first_dispatch() {
     );
     let status = run.stop();
     assert!(status.success(), "{status}");
+}
+
+/// bd-rc-master-ajg1.7.3: the daemon writes `metrics.prom` beside
+/// `state.json` with every state write, the text passes the exposition
+/// rules, `sbh metrics` prints it verbatim, counters do not go backwards
+/// across writes, and `[telemetry] metrics_enabled = false` leaves no file
+/// behind, not even a stale one from an earlier run.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn metrics_export_is_written_with_state_and_validates() {
+    use storage_ballast_helper::daemon::metrics::{metrics_file_path, validate_exposition};
+
+    let dir = scratch();
+    let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
+    let fixture_mount = dir.path().to_path_buf();
+    let table = injected_table(&[
+        (&fixture_mount, 1_000_000_000_000, 550_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![fixtures.root.clone()],
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    let metrics_path = metrics_file_path(&run.state_path());
+    run.wait_until("the metrics export", Duration::from_secs(30), |_| {
+        metrics_path.exists()
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    let first = fs::read_to_string(&metrics_path).unwrap();
+    validate_exposition(&first).unwrap_or_else(|e| panic!("{e}\n{first}"));
+    assert!(first.contains("sbh_up 1\n"), "{first}");
+    assert!(
+        first.contains("# TYPE sbh_scans_total counter\n"),
+        "{first}"
+    );
+    assert!(
+        first.contains(&format!("version=\"{}\"", env!("CARGO_PKG_VERSION"))),
+        "{first}"
+    );
+    let scans_before = counter_value(&first, "sbh_scans_total");
+
+    let config_path = run.config_path.clone();
+    let cli = |args: &[&str]| {
+        Command::new(common::sbh_bin_path())
+            .arg("--config")
+            .arg(&config_path)
+            .args(args)
+            .env("SBH_TEST_MODE", "1")
+            .env("SBH_TEST_FS_STATS", &table)
+            .output()
+            .expect("run sbh")
+    };
+    // A piped stdout defaults to JSON; the collector wants the text.
+    let printed = Command::new(common::sbh_bin_path())
+        .arg("--config")
+        .arg(&config_path)
+        .arg("metrics")
+        .env("SBH_TEST_MODE", "1")
+        .env("SBH_TEST_FS_STATS", &table)
+        .env("SBH_OUTPUT_FORMAT", "human")
+        .output()
+        .expect("run sbh metrics");
+    assert_eq!(
+        printed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&printed.stdout);
+    validate_exposition(&stdout).unwrap_or_else(|e| panic!("{e}\n{stdout}"));
+    assert!(stdout.contains("sbh_up 1\n"), "{stdout}");
+
+    // A forced scan plus a status request (which forces a state write)
+    // rewrite the export; the scan counter must not go backwards.
+    assert_eq!(cli(&["daemon", "scan-now"]).status.code(), Some(0));
+    run.wait_until("the forced scan", Duration::from_secs(30), |run| {
+        run.events_of("scan_complete")
+            .iter()
+            .any(|event| scan_reason(event) == Some("forced"))
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    // The main loop books the completed scan on a later tick than the
+    // scanner logs it, so keep forcing state writes until the counter shows.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut second = String::new();
+    let mut scans_after = 0.0;
+    while Instant::now() < deadline {
+        assert_eq!(cli(&["--json", "status"]).status.code(), Some(0));
+        second = fs::read_to_string(&metrics_path).unwrap();
+        validate_exposition(&second).unwrap_or_else(|e| panic!("{e}\n{second}"));
+        scans_after = counter_value(&second, "sbh_scans_total");
+        if scans_after >= 1.0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        scans_after >= scans_before,
+        "counters are monotonic: {scans_before} -> {scans_after}"
+    );
+    assert!(scans_after >= 1.0, "{second}");
+    let first_started = run
+        .state()
+        .and_then(|state| state["started_at"].as_str().map(str::to_string))
+        .expect("the first daemon wrote a state file");
+    let status = run.stop();
+    assert!(status.success(), "{status}");
+
+    // Disabled: a stale export from the run above must not survive startup.
+    assert!(
+        metrics_path.exists(),
+        "the stopped daemon leaves its last export"
+    );
+    let disabled = ScenarioConfig {
+        root_paths: vec![fixtures.root],
+        metrics_enabled: false,
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &disabled, Some(&table));
+    // The old state file is still there, so wait for the new daemon's own
+    // write (a different start time) before judging the export.
+    run.wait_until(
+        "a state write by the new daemon",
+        Duration::from_secs(30),
+        |run| {
+            run.state()
+                .is_some_and(|state| state["started_at"].as_str() != Some(first_started.as_str()))
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        !metrics_path.exists(),
+        "metrics_enabled = false removes the stale export and writes none; config:\n{}\nstderr:\n{}",
+        fs::read_to_string(&run.config_path).unwrap_or_default(),
+        run.stderr()
+    );
+    let status = run.stop();
+    assert!(status.success(), "{status}");
+}
+
+/// The value of an unlabelled sample in an exposition text.
+fn counter_value(text: &str, name: &str) -> f64 {
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no sample {name} in\n{text}"))
 }
 
 /// bd-rc-master-ajg1.4.9: the control socket answers `ping` with the

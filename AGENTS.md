@@ -355,6 +355,7 @@ src/
 | `sbh daemon` | Run the monitoring loop and policy engine |
 | `sbh daemon ping\|scan-now\|reload\|shutdown` | Talk to the running daemon over `control.sock` (beside `state.json`, token in `daemon.lock`): identity/uptime, a forced scan on the next tick, config reload, clean stop |
 | `sbh policy status\|promote\|demote` | The policy engine's live mode; promote/demote move observe↔canary↔enforce and persist `[policy] initial_mode` with a config backup |
+| `sbh metrics` | Print `metrics.prom`, the Prometheus textfile export the daemon writes beside `state.json` with every state write (`[telemetry] metrics_enabled`) |
 | `sbh status [--watch]` | Real-time health, pressure, and controller state |
 | `sbh check [--target-free N] [--need N] [--predict N]` | Pre-flight space check and recommendations |
 | `sbh scan [PATHS...] [--top N] [--min-score N]` | Manual candidate discovery and scoring |
