@@ -12,7 +12,8 @@
 //! 6. Candidate identity still matches the object observed by the scanner
 //! 7. Candidate is not covered by a kernel-held active-target lease
 //!
-//! Circuit breaker: 3 consecutive failures -> halt batch (daemon retries next cycle).
+//! Circuit breaker: `circuit_breaker_threshold` consecutive failures (see
+//! `DeletionConfig::default`) halt the batch; the daemon retries next cycle.
 
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]

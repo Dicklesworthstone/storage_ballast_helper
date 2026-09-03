@@ -24,6 +24,30 @@ matrix (docs/frankentui-triage-matrix.md) will be adapted into SBH's codebase
 using SBH's existing toolchain and dependencies. No FrankentUI crate will be
 added to Cargo.toml.
 
+## Amendment (2026-09-03): what shipped
+
+The paragraph above is kept as the record of the original decision; the
+implementation moved past it and the code is the truth:
+
+- `Cargo.toml` **does** depend on FrankentUI: `ftui`, `ftui-backend`, and
+  `ftui-tty` are git dependencies pinned at tag `v0.6.0`, gated by the `tui`
+  feature. The cockpit in `src/tui/` renders through ftui's frame pipeline;
+  the crossterm direct-draw dashboard survives only behind the off-by-default
+  `legacy-crossterm-dashboard` feature (`--legacy-dashboard`).
+- The `tui` feature is in the crate's default feature set, so `cargo install`
+  and the release binaries carry the cockpit; CI builds
+  `--no-default-features --features cli,daemon,sqlite,tui` and, separately,
+  the legacy feature.
+- The toolchain is nightly (`rust-toolchain.toml`), so the "SBH policy forbids
+  nightly" argument under alternative (A) no longer applies; what remains of
+  it is the dependency-size concern, answered by `default-features = false`
+  on `ftui` and by the release profile.
+- `--new-dashboard` is accepted for compatibility and is the default route;
+  `--replay <activity.jsonl>` drives the same cockpit from a captured log.
+
+The Decision Invariants below still hold (invariant 1 already anticipated
+"ftui-* crate dependencies").
+
 ## Decision Invariants
 
 The following constraints are mandatory for all downstream work:

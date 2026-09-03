@@ -124,8 +124,8 @@ macOS-only tests are compiled out here, `#[ignore]` tests are listed.
 <!-- sbh-census:begin -->
 | Target | Tests |
 | --- | --- |
-| `cargo test --lib` (default features, with the TUI) | 2588 |
-| `cargo test --lib --no-default-features --features cli,daemon,sqlite` (lean) | 1608 |
+| `cargo test --lib` (default features, with the TUI) | 2591 |
+| `cargo test --lib --no-default-features --features cli,daemon,sqlite` (lean) | 1611 |
 | `cargo test --bin sbh` | 139 |
 | `cargo test --test cli_exit_codes` | 5 |
 | `cargo test --test daemon_e2e` | 21 |
@@ -154,7 +154,7 @@ macOS-only tests are compiled out here, `#[ignore]` tests are listed.
 | `cargo test --test stress_tests` | 12 |
 | Integration test files (sum of the `--test` rows) | 317 |
 | E2E shell cases defined in `scripts/e2e_test.sh` | 129 |
-| **Cargo tests on Linux, default features (lib + bin + integration)** | **3044** |
+| **Cargo tests on Linux, default features (lib + bin + integration)** | **3047** |
 <!-- sbh-census:end -->
 
 ### Binary Tests (CLI)
@@ -234,7 +234,7 @@ clippy) have no tests.
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | `fmt` | HARD | check | Code Quality | code-style | `cargo fmt --check` |
 | 2 | `clippy` | HARD | check | Code Quality | correctness-warnings | `cargo clippy --all-targets -- -D warnings` |
-| 3 | `docs-drift` | SOFT | check | Code Quality | generated-docs | `cargo run --quiet --bin sbh -- docs --check README.md` |
+| 3 | `docs-drift` | SOFT | check | Code Quality | generated-docs | `cargo run --quiet --bin sbh -- docs --check README.md AGENTS.md` |
 | 4 | `test-census` | SOFT | check | Code Quality | generated-test-counts | `./scripts/test-census.sh --check` |
 | 5 | `stage-docs` | SOFT | check | Code Quality | generated-stage-table | `./scripts/quality-gate.sh --check-stages` |
 | 6 | `unit-lib` | HARD | test | Unit Tests | core-logic | `cargo test --lib -- --test-threads=4` |

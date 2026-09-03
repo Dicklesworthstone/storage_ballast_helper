@@ -36,7 +36,7 @@ and in docs/testing-and-logging.md after a change to the script, and
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | `fmt` | HARD | check | Code Quality | code-style | `cargo fmt --check` |
 | 2 | `clippy` | HARD | check | Code Quality | correctness-warnings | `cargo clippy --all-targets -- -D warnings` |
-| 3 | `docs-drift` | SOFT | check | Code Quality | generated-docs | `cargo run --quiet --bin sbh -- docs --check README.md` |
+| 3 | `docs-drift` | SOFT | check | Code Quality | generated-docs | `cargo run --quiet --bin sbh -- docs --check README.md AGENTS.md` |
 | 4 | `test-census` | SOFT | check | Code Quality | generated-test-counts | `./scripts/test-census.sh --check` |
 | 5 | `stage-docs` | SOFT | check | Code Quality | generated-stage-table | `./scripts/quality-gate.sh --check-stages` |
 | 6 | `unit-lib` | HARD | test | Unit Tests | core-logic | `cargo test --lib -- --test-threads=4` |

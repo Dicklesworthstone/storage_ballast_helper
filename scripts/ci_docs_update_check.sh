@@ -40,11 +40,11 @@ docs_drift_check() {
     error "docs drift check: sbh binary not found at ${bin}"
     return 3
   fi
-  if (cd "${root}" && "${bin}" docs --check README.md); then
-    echo "docs-drift-check: generated README regions match the code"
+  if (cd "${root}" && "${bin}" docs --check README.md AGENTS.md); then
+    echo "docs-drift-check: generated README and AGENTS.md regions match the code"
     return 0
   fi
-  error "generated README regions have drifted; run: sbh docs --render README.md"
+  error "generated README/AGENTS.md regions have drifted; run: sbh docs --render README.md AGENTS.md"
   return 1
 }
 

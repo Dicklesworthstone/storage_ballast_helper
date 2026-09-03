@@ -502,6 +502,109 @@ pub fn classify_level(
     }
 }
 
+/// How a level derives its scan interval from the configured poll interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntervalRule {
+    /// `base / by`, never below `floor_ms`.
+    Divide { by: u64, floor_ms: u64 },
+    /// A fixed interval regardless of the base poll.
+    Fixed { ms: u64 },
+}
+
+/// One row of the per-level response table.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LevelResponse {
+    pub level: PressureLevel,
+    pub interval: IntervalRule,
+    /// Urgency above which `release_above_knee` ballast files are released
+    /// instead of `release_below_knee`.
+    pub release_knee: f64,
+    pub release_below_knee: usize,
+    pub release_above_knee: usize,
+    /// Deletion batch size before urgency scaling: the largest `batch_steps`
+    /// entry whose urgency threshold is exceeded, else `batch_base`.
+    pub batch_base: usize,
+    pub batch_steps: &'static [(f64, usize)],
+    /// Added to the batch: `batch_urgency_slope * max(urgency - BATCH_SLOPE_KNEE, 0)`.
+    pub batch_urgency_slope: f64,
+}
+
+/// Urgency above which the sloped levels grow their deletion batch.
+pub const BATCH_SLOPE_KNEE: f64 = 0.5;
+
+/// The response table `response_policy` reads, one row per level; `sbh docs`
+/// renders it, so a change here shows up in the generated README table.
+pub const RESPONSE_TABLE: [LevelResponse; 5] = [
+    LevelResponse {
+        level: PressureLevel::Green,
+        interval: IntervalRule::Divide { by: 1, floor_ms: 1 },
+        release_knee: 1.0,
+        release_below_knee: 0,
+        release_above_knee: 0,
+        batch_base: 2,
+        batch_steps: &[(0.5, 5), (0.8, 10)],
+        batch_urgency_slope: 0.0,
+    },
+    LevelResponse {
+        level: PressureLevel::Yellow,
+        interval: IntervalRule::Divide {
+            by: 2,
+            floor_ms: 500,
+        },
+        release_knee: 0.55,
+        release_below_knee: 0,
+        release_above_knee: 1,
+        batch_base: 5,
+        batch_steps: &[],
+        batch_urgency_slope: 0.0,
+    },
+    LevelResponse {
+        level: PressureLevel::Orange,
+        interval: IntervalRule::Divide {
+            by: 4,
+            floor_ms: 250,
+        },
+        release_knee: 0.75,
+        release_below_knee: 1,
+        release_above_knee: 3,
+        batch_base: 10,
+        batch_steps: &[],
+        batch_urgency_slope: 0.0,
+    },
+    LevelResponse {
+        level: PressureLevel::Red,
+        interval: IntervalRule::Divide {
+            by: 8,
+            floor_ms: 125,
+        },
+        release_knee: 0.85,
+        release_below_knee: 3,
+        release_above_knee: 5,
+        batch_base: 20,
+        batch_steps: &[],
+        batch_urgency_slope: 60.0,
+    },
+    LevelResponse {
+        level: PressureLevel::Critical,
+        interval: IntervalRule::Fixed { ms: 100 },
+        release_knee: 1.0,
+        release_below_knee: 10,
+        release_above_knee: 10,
+        batch_base: 40,
+        batch_steps: &[],
+        batch_urgency_slope: 120.0,
+    },
+];
+
+/// The response row for `level`.
+#[must_use]
+pub fn level_response(level: PressureLevel) -> &'static LevelResponse {
+    RESPONSE_TABLE
+        .iter()
+        .find(|row| row.level == level)
+        .unwrap_or(&RESPONSE_TABLE[0])
+}
+
 fn response_policy(
     base_poll: Duration,
     level: PressureLevel,
@@ -509,51 +612,85 @@ fn response_policy(
 ) -> (Duration, usize, usize) {
     #[allow(clippy::cast_possible_truncation)]
     let base_ms = base_poll.as_millis().min(u128::from(u64::MAX)) as u64;
-    match level {
-        PressureLevel::Green => {
-            let batch = if urgency > 0.8 {
-                10
-            } else if urgency > 0.5 {
-                5
-            } else {
-                2
-            };
-            (Duration::from_millis(base_ms.max(1)), 0, batch)
-        }
-        PressureLevel::Yellow => (
-            Duration::from_millis((base_ms / 2).max(500)),
-            usize::from(urgency > 0.55),
-            5,
-        ),
-        PressureLevel::Orange => (
-            Duration::from_millis((base_ms / 4).max(250)),
-            if urgency > 0.75 { 3 } else { 1 },
-            10,
-        ),
-        PressureLevel::Red => (
-            Duration::from_millis((base_ms / 8).max(125)),
-            if urgency > 0.85 { 5 } else { 3 },
-            // Dynamic batch scaling: 20 base + up to 30 more based on urgency > 0.5
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            {
-                20 + ((urgency - 0.5).max(0.0) * 60.0) as usize
-            },
-        ),
-        PressureLevel::Critical => (
-            Duration::from_millis(100),
-            10,
-            // Aggressive scaling: 40 base + up to 60 more
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            {
-                40 + ((urgency - 0.5).max(0.0) * 120.0) as usize
-            },
-        ),
-    }
+    let row = level_response(level);
+    let interval_ms = match row.interval {
+        IntervalRule::Divide { by, floor_ms } => (base_ms / by.max(1)).max(floor_ms),
+        IntervalRule::Fixed { ms } => ms,
+    };
+    let release = if urgency > row.release_knee {
+        row.release_above_knee
+    } else {
+        row.release_below_knee
+    };
+    let stepped = row
+        .batch_steps
+        .iter()
+        .rev()
+        .find(|(knee, _)| urgency > *knee)
+        .map_or(row.batch_base, |(_, batch)| *batch);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let scaled = (row.batch_urgency_slope * (urgency - BATCH_SLOPE_KNEE).max(0.0)) as usize;
+    (
+        Duration::from_millis(interval_ms),
+        release,
+        stepped + scaled,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{PidConfig, PidPressureController, PressureLevel, PressureReading};
+
+    /// The response table has one row per level in severity order, and
+    /// `response_policy` reads it: the pre-table literals are reproduced here
+    /// so a table edit that changes behavior is a visible test change.
+    #[test]
+    fn response_table_covers_every_level_and_matches_the_old_policy() {
+        use super::{IntervalRule, RESPONSE_TABLE, level_response, response_policy};
+        use std::time::Duration;
+
+        let levels: Vec<PressureLevel> = RESPONSE_TABLE.iter().map(|row| row.level).collect();
+        assert_eq!(
+            levels,
+            vec![
+                PressureLevel::Green,
+                PressureLevel::Yellow,
+                PressureLevel::Orange,
+                PressureLevel::Red,
+                PressureLevel::Critical
+            ]
+        );
+        assert_eq!(
+            level_response(PressureLevel::Critical).interval,
+            IntervalRule::Fixed { ms: 100 }
+        );
+
+        let base = Duration::from_millis(5_000);
+        let cases = [
+            (PressureLevel::Green, 0.3, 5_000, 0, 2),
+            (PressureLevel::Green, 0.6, 5_000, 0, 5),
+            (PressureLevel::Green, 0.9, 5_000, 0, 10),
+            (PressureLevel::Yellow, 0.5, 2_500, 0, 5),
+            (PressureLevel::Yellow, 0.6, 2_500, 1, 5),
+            (PressureLevel::Orange, 0.7, 1_250, 1, 10),
+            (PressureLevel::Orange, 0.8, 1_250, 3, 10),
+            (PressureLevel::Red, 0.5, 625, 3, 20),
+            (PressureLevel::Red, 0.9, 625, 5, 44),
+            (PressureLevel::Critical, 0.2, 100, 10, 40),
+            (PressureLevel::Critical, 1.0, 100, 10, 100),
+        ];
+        for (level, urgency, interval_ms, release, batch) in cases {
+            let (interval, got_release, got_batch) = response_policy(base, level, urgency);
+            assert_eq!(
+                (interval.as_millis(), got_release, got_batch),
+                (interval_ms, release, batch),
+                "{level:?} at urgency {urgency}"
+            );
+        }
+        // The floors apply when the base poll is short.
+        let (interval, _, _) = response_policy(Duration::from_millis(400), PressureLevel::Red, 0.0);
+        assert_eq!(interval.as_millis(), 125);
+    }
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 

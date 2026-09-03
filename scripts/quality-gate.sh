@@ -102,7 +102,7 @@ done
 STAGES=(
   "fmt|HARD|check|Code Quality|code-style|cargo fmt --check|Run 'cargo fmt' to auto-fix formatting"
   "clippy|HARD|check|Code Quality|correctness-warnings|cargo clippy --all-targets -- -D warnings|Fix clippy warnings — check stage log for specific lints"
-  "docs-drift|SOFT|check|Code Quality|generated-docs|cargo run --quiet --bin sbh -- docs --check README.md|A generated README region no longer matches the code: run 'sbh docs --render README.md' and commit the result"
+  "docs-drift|SOFT|check|Code Quality|generated-docs|cargo run --quiet --bin sbh -- docs --check README.md AGENTS.md|A generated README/AGENTS region no longer matches the code: run 'sbh docs --render README.md AGENTS.md' and commit the result"
   "test-census|SOFT|check|Code Quality|generated-test-counts|./scripts/test-census.sh --check|The test counts in docs/testing-and-logging.md no longer match the targets: run './scripts/test-census.sh --write' and commit the result"
   "stage-docs|SOFT|check|Code Quality|generated-stage-table|./scripts/quality-gate.sh --check-stages|The stage table embedded in the docs no longer matches this script: run './scripts/quality-gate.sh --write-stages' and commit the result"
   "unit-lib|HARD|test|Unit Tests|core-logic|cargo test --lib -- --test-threads=4|Check failing test → module → recent changes. Run with --nocapture for details"

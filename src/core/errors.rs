@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
 use thiserror::Error;
 
 /// Shared `Result` alias for the project.
@@ -70,6 +71,137 @@ pub enum SbhError {
     #[error("[SBH-3900] runtime failure: {details}")]
     Runtime { details: String },
 }
+
+/// One row of the error-code catalog that `sbh docs` renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ErrorCodeDoc {
+    /// The stable code, for example `SBH-2003`.
+    pub code: &'static str,
+    /// The `SbhError` variant that carries it.
+    pub variant: &'static str,
+    /// The family the code range stands for.
+    pub category: &'static str,
+    /// Whether `is_retryable` says a retry might help.
+    pub retryable: bool,
+    /// Typical cause, as documented for operators.
+    pub cause: &'static str,
+}
+
+const fn row(
+    code: &'static str,
+    variant: &'static str,
+    category: &'static str,
+    retryable: bool,
+    cause: &'static str,
+) -> ErrorCodeDoc {
+    ErrorCodeDoc {
+        code,
+        variant,
+        category,
+        retryable,
+        cause,
+    }
+}
+
+/// Every error code with its variant, family, retry flag and typical cause.
+///
+/// The test module builds one value of every variant and checks this table
+/// against `code()` and `is_retryable()`, so a new variant without a row, or
+/// a row that disagrees with the code, fails the unit suite.
+pub const ERROR_CODES: &[ErrorCodeDoc] = &[
+    row(
+        "SBH-1001",
+        "InvalidConfig",
+        "Configuration",
+        false,
+        "A config value or structure failed validation",
+    ),
+    row(
+        "SBH-1002",
+        "MissingConfig",
+        "Configuration",
+        false,
+        "No config file at the expected path",
+    ),
+    row(
+        "SBH-1003",
+        "ConfigParse",
+        "Configuration",
+        false,
+        "Invalid TOML syntax or types",
+    ),
+    row(
+        "SBH-1101",
+        "UnsupportedPlatform",
+        "Platform",
+        false,
+        "The feature is unavailable on this OS",
+    ),
+    row(
+        "SBH-1102",
+        "Pal",
+        "Platform",
+        false,
+        "A platform abstraction call is not implemented or failed",
+    ),
+    row(
+        "SBH-2001",
+        "FsStats",
+        "Runtime",
+        true,
+        "Cannot stat a watched path or special location",
+    ),
+    row(
+        "SBH-2002",
+        "MountParse",
+        "Runtime",
+        false,
+        "The mount table could not be parsed",
+    ),
+    row(
+        "SBH-2003",
+        "SafetyVeto",
+        "Runtime",
+        false,
+        "A hard veto stopped a deletion",
+    ),
+    row(
+        "SBH-2101",
+        "Serialization",
+        "Serialization",
+        false,
+        "JSON or TOML encoding/decoding failed",
+    ),
+    row(
+        "SBH-2102",
+        "Sql",
+        "Serialization",
+        true,
+        "SQLite query, schema, or lock failure",
+    ),
+    row(
+        "SBH-3001",
+        "PermissionDenied",
+        "System",
+        false,
+        "Insufficient filesystem permissions",
+    ),
+    row("SBH-3002", "Io", "System", true, "File read/write error"),
+    row(
+        "SBH-3003",
+        "ChannelClosed",
+        "System",
+        true,
+        "A daemon thread went away; its channel is closed",
+    ),
+    row(
+        "SBH-3900",
+        "Runtime",
+        "System",
+        true,
+        "Any other runtime failure",
+    ),
+];
 
 impl SbhError {
     /// Stable machine-parseable error code.
@@ -205,6 +337,39 @@ mod tests {
             codes.len(),
             unique.len(),
             "error codes must be unique: {codes:?}"
+        );
+
+        // The catalog `sbh docs` renders covers every variant, agrees with
+        // `code()`/`is_retryable()`, and lists the codes in order.
+        assert_eq!(
+            ERROR_CODES.len(),
+            errors.len(),
+            "one catalog row per variant"
+        );
+        for err in &errors {
+            let row = ERROR_CODES
+                .iter()
+                .find(|row| row.code == err.code())
+                .unwrap_or_else(|| panic!("{} has no ERROR_CODES row", err.code()));
+            assert_eq!(
+                row.retryable,
+                err.is_retryable(),
+                "{} retry flag disagrees with is_retryable()",
+                row.code
+            );
+            let debug = format!("{err:?}");
+            assert!(
+                debug.starts_with(row.variant),
+                "{} names variant {} but the value is {debug}",
+                row.code,
+                row.variant
+            );
+        }
+        assert!(
+            ERROR_CODES
+                .windows(2)
+                .all(|pair| pair[0].code < pair[1].code),
+            "ERROR_CODES must be sorted by code"
         );
     }
 

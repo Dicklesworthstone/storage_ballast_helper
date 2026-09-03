@@ -18,12 +18,16 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::core::config::Config;
-use crate::core::errors::{Result, SbhError};
+use crate::core::errors::{ERROR_CODES, ErrorCodeDoc, Result, SbhError};
+use crate::monitor::pid::{
+    BATCH_SLOPE_KNEE, IntervalRule, LevelResponse, PressureLevel, RESPONSE_TABLE,
+};
 
 /// Bumped when a section's shape changes.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -579,6 +583,1015 @@ pub fn dashboard_docs() -> Option<DashboardDocs> {
     None
 }
 
+/// One named runtime constant or default, read from the code that uses it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConstantDoc {
+    /// Subsystem the constant belongs to.
+    pub area: &'static str,
+    /// The identifier or config key.
+    pub name: &'static str,
+    /// The value, rendered for people (durations in s/ms, sizes in KiB/MiB/GiB).
+    pub value: String,
+    /// What the value controls.
+    pub meaning: &'static str,
+    /// The file that owns it.
+    pub source: &'static str,
+}
+
+/// One row of the pressure-level table, derived from the default
+/// thresholds and the controller's response table.
+#[derive(Debug, Clone, Serialize)]
+pub struct PressureLevelDoc {
+    pub level: String,
+    pub free_range: String,
+    pub scan_interval: String,
+    pub ballast_release: String,
+    pub delete_batch: String,
+}
+
+/// One scoring factor with its default weight.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScoringWeightDoc {
+    pub factor: &'static str,
+    pub weight: f64,
+    pub measures: &'static str,
+}
+
+fn fmt_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis.is_multiple_of(1000) {
+        format!("{} s", duration.as_secs())
+    } else {
+        format!("{millis} ms")
+    }
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB && bytes.is_multiple_of(GIB) {
+        format!("{} GiB", bytes / GIB)
+    } else if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+// The callers pass numbers and temporaries; by value keeps the table readable.
+#[allow(clippy::needless_pass_by_value)]
+fn constant(
+    area: &'static str,
+    name: &'static str,
+    value: impl ToString,
+    meaning: &'static str,
+    source: &'static str,
+) -> ConstantDoc {
+    ConstantDoc {
+        area,
+        name,
+        value: value.to_string(),
+        meaning,
+        source,
+    }
+}
+
+/// The runtime constants and defaults, read from the code that owns them.
+///
+/// Rows that depend on the host (the walker's parallelism) describe the
+/// rule rather than this machine's number, so the rendered table is the
+/// same everywhere.
+#[must_use]
+#[allow(clippy::too_many_lines)] // one row per constant; splitting hides nothing
+pub fn constants() -> Vec<ConstantDoc> {
+    use crate::ballast::manager as ballast;
+    use crate::core::config::{
+        BallastConfig, PressureConfig, ScannerConfig, ScoringConfig, TelemetryConfig,
+    };
+    use crate::daemon::self_monitor;
+    use crate::monitor::{ewma, guardrails, pid};
+    use crate::scanner::{deletion, planner, quarantine, walker};
+
+    const CONFIG: &str = "src/core/config.rs";
+    let pressure = PressureConfig::default();
+    let controller = &pressure.controller;
+    let prediction = &pressure.prediction;
+    let telemetry = TelemetryConfig::default();
+    let guard = guardrails::GuardrailConfig::default();
+    let deletion = deletion::DeletionConfig::default();
+    let scanner = ScannerConfig::default();
+    let scoring = ScoringConfig::default();
+    let budget = planner::RiskBudgetByLevel::default();
+    let ballast_cfg = BallastConfig::default();
+
+    let mut rows = vec![
+        constant(
+            "pressure",
+            "green_min_free_pct",
+            pressure.green_min_free_pct,
+            "Green above this free %",
+            CONFIG,
+        ),
+        constant(
+            "pressure",
+            "yellow_min_free_pct",
+            pressure.yellow_min_free_pct,
+            "Yellow at or above this free %",
+            CONFIG,
+        ),
+        constant(
+            "pressure",
+            "orange_min_free_pct",
+            pressure.orange_min_free_pct,
+            "Orange at or above this free %",
+            CONFIG,
+        ),
+        constant(
+            "pressure",
+            "red_min_free_pct",
+            pressure.red_min_free_pct,
+            "Red at or above this free %; Critical below it",
+            CONFIG,
+        ),
+        constant(
+            "pressure",
+            "poll_interval_ms",
+            pressure.poll_interval_ms,
+            "Base poll interval the response table divides",
+            CONFIG,
+        ),
+        constant(
+            "pressure",
+            "maintenance_interval_secs",
+            pressure.maintenance_interval_secs,
+            "Green maintenance pass cadence",
+            CONFIG,
+        ),
+        constant(
+            "pressure",
+            "behavior_hysteresis_secs",
+            pressure.behavior_hysteresis_secs,
+            "Dwell before a behavior cell change takes effect",
+            CONFIG,
+        ),
+        constant(
+            "controller",
+            "kp",
+            controller.kp,
+            "Proportional gain per point of free-% error",
+            CONFIG,
+        ),
+        constant("controller", "ki", controller.ki, "Integral gain", CONFIG),
+        constant("controller", "kd", controller.kd, "Derivative gain", CONFIG),
+        constant(
+            "controller",
+            "kf",
+            controller.kf,
+            "Feedforward weight of the time-to-red forecast",
+            CONFIG,
+        ),
+        constant(
+            "controller",
+            "integral_cap",
+            controller.integral_cap,
+            "Anti-windup bound on the integral term",
+            CONFIG,
+        ),
+        constant(
+            "controller",
+            "hysteresis_pct",
+            controller.hysteresis_pct,
+            "Free-% band before a level change is accepted",
+            CONFIG,
+        ),
+        constant(
+            "controller",
+            "reference_total_bytes",
+            fmt_bytes(controller.reference_total_bytes),
+            "Volume size at which Kp is unscaled",
+            CONFIG,
+        ),
+        constant(
+            "controller",
+            "kp_scale_min",
+            controller.kp_scale_min,
+            "Lower clamp of the capacity gain schedule",
+            CONFIG,
+        ),
+        constant(
+            "controller",
+            "kp_scale_max",
+            controller.kp_scale_max,
+            "Upper clamp of the capacity gain schedule",
+            CONFIG,
+        ),
+        constant(
+            "controller",
+            "BATCH_SLOPE_KNEE",
+            pid::BATCH_SLOPE_KNEE,
+            "Urgency above which Red/Critical batches grow",
+            "src/monitor/pid.rs",
+        ),
+        constant(
+            "prediction",
+            "enabled",
+            prediction.enabled,
+            "Forecast-driven early action",
+            CONFIG,
+        ),
+        constant(
+            "prediction",
+            "action_horizon_minutes",
+            prediction.action_horizon_minutes,
+            "Forecast inside this raises urgency (feedforward)",
+            CONFIG,
+        ),
+        constant(
+            "prediction",
+            "warning_horizon_minutes",
+            prediction.warning_horizon_minutes,
+            "Forecast inside this warns",
+            CONFIG,
+        ),
+        constant(
+            "prediction",
+            "min_confidence",
+            prediction.min_confidence,
+            "Forecast confidence needed to act",
+            CONFIG,
+        ),
+        constant(
+            "prediction",
+            "min_samples",
+            prediction.min_samples,
+            "Rate samples needed before forecasting",
+            CONFIG,
+        ),
+        constant(
+            "prediction",
+            "imminent_danger_minutes",
+            prediction.imminent_danger_minutes,
+            "Time-to-red treated as imminent",
+            CONFIG,
+        ),
+        constant(
+            "prediction",
+            "critical_danger_minutes",
+            prediction.critical_danger_minutes,
+            "Time-to-red treated as critical",
+            CONFIG,
+        ),
+        constant(
+            "prediction",
+            "burst_min_confidence",
+            prediction.burst_min_confidence,
+            "Confidence needed to act on a burst forecast",
+            CONFIG,
+        ),
+        constant(
+            "prediction",
+            "coverage_target",
+            prediction.coverage_target,
+            "Conformal coverage of the time-to-red bound",
+            CONFIG,
+        ),
+        constant(
+            "ewma",
+            "fs_cache_ttl_ms",
+            telemetry.fs_cache_ttl_ms,
+            "Filesystem stats cache lifetime",
+            CONFIG,
+        ),
+        constant(
+            "ewma",
+            "ewma_base_alpha",
+            telemetry.ewma_base_alpha,
+            "Base smoothing factor of the rate estimator",
+            CONFIG,
+        ),
+        constant(
+            "ewma",
+            "ewma_min_alpha",
+            telemetry.ewma_min_alpha,
+            "Smallest adaptive alpha",
+            CONFIG,
+        ),
+        constant(
+            "ewma",
+            "ewma_max_alpha",
+            telemetry.ewma_max_alpha,
+            "Largest adaptive alpha",
+            CONFIG,
+        ),
+        constant(
+            "ewma",
+            "ewma_min_samples",
+            telemetry.ewma_min_samples,
+            "Samples before the rate estimate is trusted",
+            CONFIG,
+        ),
+        constant(
+            "ewma",
+            "ewma_rate_history_size",
+            telemetry.ewma_rate_history_size,
+            "Rate samples kept for burst calibration",
+            CONFIG,
+        ),
+        constant(
+            "ewma",
+            "DEFAULT_RATE_HISTORY_CAP",
+            ewma::DEFAULT_RATE_HISTORY_CAP,
+            "Estimator's own history cap",
+            "src/monitor/ewma.rs",
+        ),
+        constant(
+            "ewma",
+            "BURST_CALIBRATION_MIN",
+            ewma::BURST_CALIBRATION_MIN,
+            "Samples before burstiness is calibrated",
+            "src/monitor/ewma.rs",
+        ),
+        constant(
+            "guardrails",
+            "min_observations",
+            guard.min_observations,
+            "Observations before the guard can alarm",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "window_size",
+            guard.window_size,
+            "Rolling calibration window",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "max_rate_error",
+            guard.max_rate_error,
+            "Relative rate error tolerated per window",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "coverage_target",
+            guard.coverage_target,
+            "Target conformal coverage",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "coverage_tolerance",
+            guard.coverage_tolerance,
+            "Coverage shortfall tolerated",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "e_process_threshold",
+            guard.e_process_threshold,
+            "E-process value that raises the alarm",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "e_process_penalty",
+            guard.e_process_penalty,
+            "E-process multiplier for a bad window",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "e_process_reward",
+            guard.e_process_reward,
+            "E-process multiplier for a good window",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "recovery_clean_windows",
+            guard.recovery_clean_windows,
+            "Clean windows that clear an alarm",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "E_PROCESS_LOG_MIN",
+            guardrails::E_PROCESS_LOG_MIN,
+            "Lower clamp of the e-process log value",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "E_PROCESS_LOG_MAX",
+            guardrails::E_PROCESS_LOG_MAX,
+            "Upper clamp of the e-process log value",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "NOISE_FLOOR_RATE_BYTES_PER_SEC",
+            guardrails::NOISE_FLOOR_RATE_BYTES_PER_SEC,
+            "Rates below this are noise, not drift",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "MATERIAL_RATE_HORIZON_SECS",
+            guardrails::MATERIAL_RATE_HORIZON_SECS,
+            "Horizon over which a rate must matter",
+            "src/monitor/guardrails.rs",
+        ),
+        constant(
+            "guardrails",
+            "guardrail_window_size",
+            telemetry.guardrail_window_size,
+            "Config-side window size fed to the guard",
+            CONFIG,
+        ),
+        constant(
+            "guardrails",
+            "guardrail_min_observations",
+            telemetry.guardrail_min_observations,
+            "Config-side minimum observations",
+            CONFIG,
+        ),
+        constant(
+            "deletion",
+            "circuit_breaker_threshold",
+            deletion.circuit_breaker_threshold,
+            "Consecutive failures that halt the batch",
+            "src/scanner/deletion.rs",
+        ),
+        constant(
+            "deletion",
+            "circuit_breaker_cooldown",
+            fmt_duration(deletion.circuit_breaker_cooldown),
+            "Pause after the breaker trips",
+            "src/scanner/deletion.rs",
+        ),
+        constant(
+            "deletion",
+            "max_batch_size",
+            deletion.max_batch_size,
+            "Executor batch cap before the planner applies",
+            "src/scanner/deletion.rs",
+        ),
+        constant(
+            "scanner",
+            "max_depth",
+            scanner.max_depth,
+            "Walker depth limit",
+            CONFIG,
+        ),
+        constant(
+            "scanner",
+            "parallelism",
+            "half the CPU count, at least 1",
+            "Walker threads (computed on the host)",
+            CONFIG,
+        ),
+        constant(
+            "scanner",
+            "min_rescan_interval_secs",
+            scanner.min_rescan_interval_secs,
+            "Shortest gap between scans of one root",
+            CONFIG,
+        ),
+        constant(
+            "scanner",
+            "max_scan_duty_cycle_pct",
+            scanner.max_scan_duty_cycle_pct,
+            "Share of wall time the scanner may use",
+            CONFIG,
+        ),
+        constant(
+            "scanner",
+            "scan_time_budget_secs",
+            scanner.scan_time_budget_secs,
+            "Longest single scan",
+            CONFIG,
+        ),
+        constant(
+            "scanner",
+            "quarantine_ttl_hours",
+            scanner.quarantine_ttl_hours,
+            "Quarantined entries expire after this",
+            CONFIG,
+        ),
+        constant(
+            "scanner",
+            "quarantine_max_bytes_pct",
+            scanner.quarantine_max_bytes_pct,
+            "Quarantine size cap as % of the volume",
+            CONFIG,
+        ),
+        constant(
+            "scanner",
+            "active_reference_cache_ttl_secs",
+            scanner.active_reference_cache_ttl_secs,
+            "Active-reference (open file) cache lifetime",
+            CONFIG,
+        ),
+        constant(
+            "scanner",
+            "active_reference_min_size_bytes",
+            fmt_bytes(scanner.active_reference_min_size_bytes),
+            "Smallest entry checked for active references",
+            CONFIG,
+        ),
+        constant(
+            "walker",
+            "RESULT_CHANNEL_CAP",
+            walker::RESULT_CHANNEL_CAP,
+            "Worker → collector channel bound",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
+            "WORK_RECV_TIMEOUT",
+            fmt_duration(walker::WORK_RECV_TIMEOUT),
+            "Idle wait before a worker re-checks shutdown",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
+            "SEND_TIMEOUT",
+            fmt_duration(walker::SEND_TIMEOUT),
+            "Wait on a full channel before dropping the entry",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
+            "MAX_ENTRIES_PER_DIR",
+            walker::MAX_ENTRIES_PER_DIR,
+            "Entries read per directory before it is cut off",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
+            "OPEN_FILES_SCAN_BUDGET",
+            fmt_duration(walker::OPEN_FILES_SCAN_BUDGET),
+            "Time budget of one /proc open-file sweep",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
+            "OPEN_FILES_MAX_PIDS",
+            walker::OPEN_FILES_MAX_PIDS,
+            "Processes inspected per open-file sweep",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
+            "OPAQUE_CANDIDATE_SIZE_FLOOR",
+            fmt_bytes(walker::OPAQUE_CANDIDATE_SIZE_FLOOR),
+            "Opaque trees smaller than this are not sized",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
+            "OPAQUE_SIZE_PROBE_BUDGET",
+            walker::OPAQUE_SIZE_PROBE_BUDGET,
+            "Entries an opaque-tree size probe may visit",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
+            "TREE_IDLE_PROBE_MAX_ENTRIES",
+            walker::TREE_IDLE_PROBE_MAX_ENTRIES,
+            "Entries an idle (mtime) probe may visit",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
+            "TREE_IDLE_PROBE_MAX_DEPTH",
+            walker::TREE_IDLE_PROBE_MAX_DEPTH,
+            "Depth of an idle (mtime) probe",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "scoring",
+            "min_score",
+            scoring.min_score,
+            "Lowest score that becomes a candidate",
+            CONFIG,
+        ),
+        constant(
+            "scoring",
+            "false_positive_loss",
+            scoring.false_positive_loss,
+            "Loss of deleting something wanted",
+            CONFIG,
+        ),
+        constant(
+            "scoring",
+            "false_negative_loss",
+            scoring.false_negative_loss,
+            "Loss of keeping an artifact",
+            CONFIG,
+        ),
+        constant(
+            "scoring",
+            "calibration_floor",
+            scoring.calibration_floor,
+            "Calibration needed for adaptive actions",
+            CONFIG,
+        ),
+        constant(
+            "scoring",
+            "posterior_floor_definite",
+            scoring.posterior_floor_definite,
+            "Posterior needed for a definite label",
+            CONFIG,
+        ),
+        constant(
+            "scoring",
+            "regret_window_minutes",
+            scoring.regret_window_minutes,
+            "Window in which a recreated path counts as regret",
+            CONFIG,
+        ),
+        constant(
+            "scoring",
+            "regret_alpha_definite",
+            scoring.regret_alpha_definite,
+            "Regret rate tolerated for definite deletions",
+            CONFIG,
+        ),
+        constant(
+            "scoring",
+            "regret_alpha_likely",
+            scoring.regret_alpha_likely,
+            "Regret rate tolerated for likely deletions",
+            CONFIG,
+        ),
+        constant(
+            "scoring",
+            "regret_suspend_minutes",
+            scoring.regret_suspend_minutes,
+            "Suspension after the regret rate is exceeded",
+            CONFIG,
+        ),
+        constant(
+            "scoring",
+            "batch_risk_budget.green",
+            budget.green,
+            "Expected loss per batch at Green (× false_positive_loss)",
+            "src/scanner/planner.rs",
+        ),
+        constant(
+            "scoring",
+            "batch_risk_budget.yellow",
+            budget.yellow,
+            "Expected loss per batch at Yellow",
+            "src/scanner/planner.rs",
+        ),
+        constant(
+            "scoring",
+            "batch_risk_budget.orange",
+            budget.orange,
+            "Expected loss per batch at Orange",
+            "src/scanner/planner.rs",
+        ),
+        constant(
+            "scoring",
+            "batch_risk_budget.red",
+            budget.red,
+            "Expected loss per batch at Red",
+            "src/scanner/planner.rs",
+        ),
+        constant(
+            "scoring",
+            "batch_risk_budget.critical",
+            budget
+                .critical
+                .map_or_else(|| "unbounded".to_string(), |v| v.to_string()),
+            "Expected loss per batch at Critical",
+            "src/scanner/planner.rs",
+        ),
+        constant(
+            "ballast",
+            "file_count",
+            ballast_cfg.file_count,
+            "Ballast files per volume",
+            CONFIG,
+        ),
+        constant(
+            "ballast",
+            "file_size_bytes",
+            fmt_bytes(ballast_cfg.file_size_bytes),
+            "Size of one ballast file",
+            CONFIG,
+        ),
+        constant(
+            "ballast",
+            "replenish_cooldown_minutes",
+            ballast_cfg.replenish_cooldown_minutes,
+            "Wait before released ballast is rebuilt",
+            CONFIG,
+        ),
+        constant(
+            "ballast",
+            "auto_provision",
+            ballast_cfg.auto_provision,
+            "Provision pools at daemon start",
+            CONFIG,
+        ),
+        constant(
+            "ballast",
+            "HEADER_SIZE",
+            fmt_bytes(ballast::HEADER_SIZE as u64),
+            "Ballast file header; also the smallest valid file",
+            "src/ballast/manager.rs",
+        ),
+        constant(
+            "ballast",
+            "MAGIC",
+            ballast::MAGIC,
+            "Header magic string",
+            "src/ballast/manager.rs",
+        ),
+        constant(
+            "ballast",
+            "CHUNK_SIZE",
+            fmt_bytes(ballast::CHUNK_SIZE as u64),
+            "Write chunk when filling a ballast file",
+            "src/ballast/manager.rs",
+        ),
+        constant(
+            "ballast",
+            "FSYNC_EVERY_BYTES",
+            fmt_bytes(ballast::FSYNC_EVERY_BYTES),
+            "fsync cadence while filling",
+            "src/ballast/manager.rs",
+        ),
+        constant(
+            "ballast",
+            "DEFAULT_PROVISION_FLOOR_PCT",
+            ballast::DEFAULT_PROVISION_FLOOR_PCT,
+            "Manager's floor before the config applies",
+            "src/ballast/manager.rs",
+        ),
+        constant(
+            "ballast",
+            "ballast_provision_floor_pct()",
+            Config::default().ballast_provision_floor_pct(),
+            "Effective floor with default thresholds: max(orange, red + 2)",
+            CONFIG,
+        ),
+        constant(
+            "quarantine",
+            "DEFAULT_TTL_HOURS",
+            quarantine::DEFAULT_TTL_HOURS,
+            "Quarantine TTL used without config",
+            "src/scanner/quarantine.rs",
+        ),
+        constant(
+            "quarantine",
+            "DEFAULT_MAX_BYTES_PCT",
+            quarantine::DEFAULT_MAX_BYTES_PCT,
+            "Quarantine size cap used without config",
+            "src/scanner/quarantine.rs",
+        ),
+        constant(
+            "daemon",
+            "DAEMON_STATE_WRITE_INTERVAL_SECS",
+            self_monitor::DAEMON_STATE_WRITE_INTERVAL_SECS,
+            "state.json write cadence",
+            "src/daemon/self_monitor.rs",
+        ),
+        constant(
+            "daemon",
+            "DAEMON_STATE_STALE_THRESHOLD_SECS",
+            self_monitor::DAEMON_STATE_STALE_THRESHOLD_SECS,
+            "state.json older than this is stale",
+            "src/daemon/self_monitor.rs",
+        ),
+        constant(
+            "daemon",
+            "DEFAULT_DAEMON_RSS_WARNING_BYTES",
+            fmt_bytes(self_monitor::DEFAULT_DAEMON_RSS_WARNING_BYTES),
+            "RSS that logs a warning",
+            "src/daemon/self_monitor.rs",
+        ),
+        constant(
+            "daemon",
+            "DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES",
+            fmt_bytes(self_monitor::DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES),
+            "RSS at which the daemon restarts itself",
+            "src/daemon/self_monitor.rs",
+        ),
+        constant(
+            "daemon",
+            "daemon_rss_warning_bytes",
+            fmt_bytes(telemetry.daemon_rss_warning_bytes),
+            "Config-side RSS warning",
+            CONFIG,
+        ),
+        constant(
+            "daemon",
+            "daemon_rss_hard_limit_bytes",
+            fmt_bytes(telemetry.daemon_rss_hard_limit_bytes),
+            "Config-side RSS hard limit",
+            CONFIG,
+        ),
+        constant(
+            "logger",
+            "CHANNEL_CAPACITY",
+            crate::logger::dual::CHANNEL_CAPACITY,
+            "Logger channel bound (try_send, drops when full)",
+            "src/logger/dual.rs",
+        ),
+    ];
+    rows.extend(daemon_constants());
+    rows
+}
+
+#[cfg(feature = "daemon")]
+fn daemon_constants() -> Vec<ConstantDoc> {
+    use crate::daemon::loop_main as daemon;
+    const SOURCE: &str = "src/daemon/loop_main.rs";
+    vec![
+        constant(
+            "daemon",
+            "SCANNER_CHANNEL_CAP",
+            daemon::SCANNER_CHANNEL_CAP,
+            "Monitor → scanner requests in flight",
+            SOURCE,
+        ),
+        constant(
+            "daemon",
+            "EXECUTOR_CHANNEL_CAP",
+            daemon::EXECUTOR_CHANNEL_CAP,
+            "Scanner → executor batches in flight",
+            SOURCE,
+        ),
+        constant(
+            "daemon",
+            "MEMORY_PRESSURE_CHANNEL_CAP",
+            daemon::MEMORY_PRESSURE_CHANNEL_CAP,
+            "Memory-pressure samples buffered",
+            SOURCE,
+        ),
+        constant(
+            "daemon",
+            "CONTROL_CHANNEL_CAP",
+            daemon::CONTROL_CHANNEL_CAP,
+            "Control-socket requests buffered",
+            SOURCE,
+        ),
+        constant(
+            "daemon",
+            "REPORT_CHANNEL_CAP",
+            daemon::REPORT_CHANNEL_CAP,
+            "Executor reports and index feedback buffered",
+            SOURCE,
+        ),
+        constant(
+            "daemon",
+            "MAX_RESPAWNS",
+            daemon::MAX_RESPAWNS,
+            "Thread respawns allowed per window",
+            SOURCE,
+        ),
+        constant(
+            "daemon",
+            "RESPAWN_WINDOW",
+            fmt_duration(daemon::RESPAWN_WINDOW),
+            "Window for the respawn limit",
+            SOURCE,
+        ),
+        constant(
+            "daemon",
+            "THREAD_HEALTH_CHECK_INTERVAL",
+            fmt_duration(daemon::THREAD_HEALTH_CHECK_INTERVAL),
+            "Thread liveness check cadence",
+            SOURCE,
+        ),
+        constant(
+            "daemon",
+            "THREAD_STALL_THRESHOLD",
+            fmt_duration(daemon::THREAD_STALL_THRESHOLD),
+            "Heartbeat age that counts as a stall",
+            SOURCE,
+        ),
+        constant(
+            "daemon",
+            "CATALOG_PROBE_MAX_ENTRIES",
+            daemon::CATALOG_PROBE_MAX_ENTRIES,
+            "Entries a catalog freshness probe may visit",
+            SOURCE,
+        ),
+        constant(
+            "daemon",
+            "CATALOG_PROBE_MAX_DEPTH",
+            daemon::CATALOG_PROBE_MAX_DEPTH,
+            "Depth of a catalog freshness probe",
+            SOURCE,
+        ),
+    ]
+}
+
+#[cfg(not(feature = "daemon"))]
+fn daemon_constants() -> Vec<ConstantDoc> {
+    Vec::new()
+}
+
+fn scan_interval_text(rule: IntervalRule) -> String {
+    match rule {
+        IntervalRule::Divide { by: 1, .. } => "base interval".to_string(),
+        IntervalRule::Divide { by, floor_ms } => format!("base/{by} (at least {floor_ms} ms)"),
+        IntervalRule::Fixed { ms } => format!("{ms} ms"),
+    }
+}
+
+fn ballast_release_text(row: &LevelResponse) -> String {
+    if row.release_below_knee == row.release_above_knee {
+        format!("{} files", row.release_below_knee)
+    } else {
+        format!(
+            "{}-{} files (urgency > {})",
+            row.release_below_knee, row.release_above_knee, row.release_knee
+        )
+    }
+}
+
+fn delete_batch_text(row: &LevelResponse) -> String {
+    let mut text = row.batch_base.to_string();
+    for (knee, batch) in row.batch_steps {
+        let _ = write!(text, ", {batch} above urgency {knee}");
+    }
+    if row.batch_urgency_slope > 0.0 {
+        let _ = write!(
+            text,
+            " + {} x max(urgency - {}, 0)",
+            row.batch_urgency_slope, BATCH_SLOPE_KNEE
+        );
+    }
+    text
+}
+
+/// The pressure-level table from the default thresholds and the response table.
+#[must_use]
+pub fn pressure_levels() -> Vec<PressureLevelDoc> {
+    use crate::core::config::PressureConfig;
+    let p = PressureConfig::default();
+    let free_range = |level: PressureLevel| match level {
+        PressureLevel::Green => format!("> {}%", p.green_min_free_pct),
+        PressureLevel::Yellow => format!("{}-{}%", p.yellow_min_free_pct, p.green_min_free_pct),
+        PressureLevel::Orange => format!("{}-{}%", p.orange_min_free_pct, p.yellow_min_free_pct),
+        PressureLevel::Red => format!("{}-{}%", p.red_min_free_pct, p.orange_min_free_pct),
+        PressureLevel::Critical => format!("< {}%", p.red_min_free_pct),
+    };
+    RESPONSE_TABLE
+        .iter()
+        .map(|row| PressureLevelDoc {
+            level: format!("{:?}", row.level),
+            free_range: free_range(row.level),
+            scan_interval: scan_interval_text(row.interval),
+            ballast_release: ballast_release_text(row),
+            delete_batch: delete_batch_text(row),
+        })
+        .collect()
+}
+
+/// The five scoring factors with their default weights.
+#[must_use]
+pub fn scoring_weights() -> Vec<ScoringWeightDoc> {
+    let s = crate::core::config::ScoringConfig::default();
+    vec![
+        ScoringWeightDoc {
+            factor: "location",
+            weight: s.location_weight,
+            measures: "How safe the directory is (temp > build > source)",
+        },
+        ScoringWeightDoc {
+            factor: "name",
+            weight: s.name_weight,
+            measures: "Pattern match against known artifact names (`target/`, `node_modules`, `.o`)",
+        },
+        ScoringWeightDoc {
+            factor: "age",
+            weight: s.age_weight,
+            measures: "Time since last access or modification",
+        },
+        ScoringWeightDoc {
+            factor: "size",
+            weight: s.size_weight,
+            measures: "Bytes reclaimable (larger scores higher)",
+        },
+        ScoringWeightDoc {
+            factor: "structure",
+            weight: s.structure_weight,
+            measures: "Directory structure signals (depth, siblings, markers)",
+        },
+    ]
+}
+
 /// The whole generated document.
 #[derive(Debug, Clone, Serialize)]
 pub struct DocsDocument {
@@ -587,6 +1600,10 @@ pub struct DocsDocument {
     pub env_vars: Vec<EnvVarDoc>,
     pub commands: Vec<CommandDoc>,
     pub dashboard: Option<DashboardDocs>,
+    pub error_codes: Vec<ErrorCodeDoc>,
+    pub constants: Vec<ConstantDoc>,
+    pub pressure_levels: Vec<PressureLevelDoc>,
+    pub scoring_weights: Vec<ScoringWeightDoc>,
     pub defaults_toml: String,
 }
 
@@ -600,6 +1617,10 @@ impl DocsDocument {
             env_vars: ENV_VARS.to_vec(),
             commands: command_docs(cli),
             dashboard: dashboard_docs(),
+            error_codes: ERROR_CODES.to_vec(),
+            constants: constants(),
+            pressure_levels: pressure_levels(),
+            scoring_weights: scoring_weights(),
             defaults_toml: toml::to_string_pretty(&Config::default()).unwrap_or_default(),
         }
     }
@@ -613,7 +1634,14 @@ impl DocsDocument {
     /// The section names this build can render.
     #[must_use]
     pub fn section_names(&self) -> Vec<&'static str> {
-        let mut names = vec!["env-vars", "commands"];
+        let mut names = vec![
+            "env-vars",
+            "commands",
+            "error-codes",
+            "constants",
+            "pressure-levels",
+            "scoring-weights",
+        ];
         if self.dashboard.is_some() {
             names.extend([
                 "dashboard-screens",
@@ -632,6 +1660,10 @@ impl DocsDocument {
         match name {
             "env-vars" => Some(self.render_env_vars()),
             "commands" => Some(self.render_commands()),
+            "error-codes" => Some(self.render_error_codes()),
+            "constants" => Some(self.render_constants()),
+            "pressure-levels" => Some(self.render_pressure_levels()),
+            "scoring-weights" => Some(self.render_scoring_weights()),
             "dashboard-screens" => self.dashboard.as_ref().map(render_screens),
             "dashboard-keymap" => self.dashboard.as_ref().map(render_keymap),
             "dashboard-palette" => self.dashboard.as_ref().map(render_palette),
@@ -658,6 +1690,65 @@ impl DocsDocument {
         let mut out = String::from("| Command | Purpose |\n| --- | --- |\n");
         for command in &self.commands {
             let _ = writeln!(out, "| `sbh {}` | {} |", command.path, command.about);
+        }
+        out
+    }
+
+    fn render_constants(&self) -> String {
+        let mut out = String::from(
+            "| Area | Constant | Value | Meaning | Where |\n| --- | --- | --- | --- | --- |\n",
+        );
+        for row in &self.constants {
+            let _ = writeln!(
+                out,
+                "| {} | `{}` | `{}` | {} | `{}` |",
+                row.area, row.name, row.value, row.meaning, row.source
+            );
+        }
+        out
+    }
+
+    fn render_pressure_levels(&self) -> String {
+        let mut out = String::from(
+            "| Level | Default free % | Scan interval | Ballast release | Max delete batch |\n| --- | --- | --- | --- | --- |\n",
+        );
+        for row in &self.pressure_levels {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} |",
+                row.level, row.free_range, row.scan_interval, row.ballast_release, row.delete_batch
+            );
+        }
+        out
+    }
+
+    fn render_scoring_weights(&self) -> String {
+        let mut out =
+            String::from("| Factor | Default weight | What it measures |\n| --- | --- | --- |\n");
+        for row in &self.scoring_weights {
+            let _ = writeln!(
+                out,
+                "| `{}` | {} | {} |",
+                row.factor, row.weight, row.measures
+            );
+        }
+        out
+    }
+
+    fn render_error_codes(&self) -> String {
+        let mut out = String::from(
+            "| Code | Variant | Family | Retryable | Typical cause |\n| --- | --- | --- | --- | --- |\n",
+        );
+        for row in &self.error_codes {
+            let _ = writeln!(
+                out,
+                "| `{}` | `{}` | {} | {} | {} |",
+                row.code,
+                row.variant,
+                row.category,
+                if row.retryable { "yes" } else { "no" },
+                row.cause
+            );
         }
         out
     }
@@ -877,6 +1968,94 @@ fn bad(details: impl Into<String>) -> SbhError {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// The constants table reads each value where the code uses it: the
+    /// breaker threshold and the walker channel bound come back as the
+    /// defaults, no (area, name) repeats, and nothing in it depends on the
+    /// host the docs were rendered on.
+    #[test]
+    fn constants_read_the_values_at_their_point_of_use() {
+        let rows = constants();
+        let find = |name: &str| {
+            rows.iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("no constants row named {name}"))
+        };
+        assert_eq!(
+            find("circuit_breaker_threshold").value,
+            crate::scanner::deletion::DeletionConfig::default()
+                .circuit_breaker_threshold
+                .to_string()
+        );
+        assert_eq!(
+            find("RESULT_CHANNEL_CAP").value,
+            crate::scanner::walker::RESULT_CHANNEL_CAP.to_string()
+        );
+        assert_eq!(find("circuit_breaker_cooldown").value, "30 s");
+        assert_eq!(find("E_PROCESS_LOG_MAX").value, "3.5");
+        assert_eq!(
+            find("parallelism").value,
+            "half the CPU count, at least 1",
+            "host-dependent values describe the rule, not this machine"
+        );
+        let mut seen = BTreeSet::new();
+        for row in &rows {
+            assert!(!row.value.is_empty(), "{} has an empty value", row.name);
+            assert!(
+                seen.insert((row.area, row.name)),
+                "duplicate constants row {}/{}",
+                row.area,
+                row.name
+            );
+        }
+        if cfg!(feature = "daemon") {
+            assert_eq!(
+                find("SCANNER_CHANNEL_CAP").value,
+                crate::daemon::loop_main::SCANNER_CHANNEL_CAP.to_string()
+            );
+        }
+        assert_eq!(fmt_bytes(1 << 30), "1 GiB");
+        assert_eq!(fmt_bytes(256 * 1024 * 1024), "256 MiB");
+        assert_eq!(fmt_bytes(4096), "4 KiB");
+        assert_eq!(fmt_bytes(1500), "1500 B");
+        assert_eq!(fmt_duration(Duration::from_millis(250)), "250 ms");
+        assert_eq!(fmt_duration(Duration::from_secs(300)), "300 s");
+    }
+
+    /// The pressure table is derived from the default thresholds and the
+    /// response table, one row per level in order.
+    #[test]
+    fn pressure_levels_follow_the_response_table() {
+        let rows = pressure_levels();
+        let p = crate::core::config::PressureConfig::default();
+        let levels: Vec<&str> = rows.iter().map(|row| row.level.as_str()).collect();
+        assert_eq!(levels, vec!["Green", "Yellow", "Orange", "Red", "Critical"]);
+        assert_eq!(rows[0].free_range, format!("> {}%", p.green_min_free_pct));
+        assert_eq!(rows[4].free_range, format!("< {}%", p.red_min_free_pct));
+        assert_eq!(rows[0].scan_interval, "base interval");
+        let yellow = &RESPONSE_TABLE[1];
+        assert_eq!(
+            rows[1].ballast_release,
+            format!(
+                "{}-{} files (urgency > {})",
+                yellow.release_below_knee, yellow.release_above_knee, yellow.release_knee
+            )
+        );
+        assert_eq!(rows[4].ballast_release, "10 files");
+        assert_eq!(
+            rows[0].delete_batch,
+            "2, 5 above urgency 0.5, 10 above urgency 0.8"
+        );
+        assert_eq!(rows[3].delete_batch, "20 + 60 x max(urgency - 0.5, 0)");
+        assert_eq!(rows[4].scan_interval, "100 ms");
+
+        let weights = scoring_weights();
+        let sum: f64 = weights.iter().map(|w| w.weight).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "default weights sum to 1, got {sum}"
+        );
+    }
 
     /// Every `"SBH_…"` literal under `src/` (a name the code reads) minus the
     /// known non-variables.

@@ -81,10 +81,10 @@ struct SampleState {
 }
 
 /// Default capacity for the rate history ring buffer used by burst detection.
-const DEFAULT_RATE_HISTORY_CAP: usize = 200;
+pub const DEFAULT_RATE_HISTORY_CAP: usize = 200;
 
 /// Minimum samples in rate_history before burst detection is considered calibrated.
-const BURST_CALIBRATION_MIN: usize = 30;
+pub const BURST_CALIBRATION_MIN: usize = 30;
 
 /// Online EWMA estimator with adaptive alpha and fallback signaling.
 #[derive(Debug, Clone)]

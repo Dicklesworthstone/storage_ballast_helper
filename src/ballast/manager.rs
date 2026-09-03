@@ -29,10 +29,10 @@ use crate::platform::pal::Platform;
 
 // ──────────────────── constants ────────────────────
 
-const HEADER_SIZE: usize = 4096;
-const MAGIC: &str = "SBH_BALLAST_v1";
-const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB write chunks
-const FSYNC_EVERY_BYTES: u64 = 64 * 1024 * 1024; // fsync every 64 MB
+pub const HEADER_SIZE: usize = 4096;
+pub const MAGIC: &str = "SBH_BALLAST_v1";
+pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB write chunks
+pub const FSYNC_EVERY_BYTES: u64 = 64 * 1024 * 1024; // fsync every 64 MB
 /// Provisioning floor used until a caller derives one from config.
 ///
 /// A ballast file is created only if the volume stays at or above this much

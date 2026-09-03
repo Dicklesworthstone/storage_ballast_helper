@@ -29,6 +29,17 @@ use crate::scanner::scoring::ActiveReferenceSummary;
 
 pub const DEFAULT_ACTIVE_REFERENCE_CACHE_TTL_SECS: u64 = 30;
 pub const DEFAULT_ACTIVE_REFERENCE_MIN_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Bound of the worker → collector result channel; a full channel makes a
+/// worker wait `SEND_TIMEOUT` and then drop the entry rather than deadlock.
+pub const RESULT_CHANNEL_CAP: usize = 10_000;
+
+/// How long a worker waits for work before re-checking the shutdown flag.
+pub const WORK_RECV_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// How long a worker waits on a full work or result channel before giving
+/// up on that send (the walk then counts the entry as skipped).
+pub const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 pub const MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING: &str =
     "fd check incomplete: other-user processes not visible";
 
@@ -171,14 +182,14 @@ struct WorkItem {
     opaque_tree: Option<OpaqueTreeClassification>,
 }
 
-const OPAQUE_CANDIDATE_SIZE_FLOOR: u64 = 100 * 1_048_576;
+pub const OPAQUE_CANDIDATE_SIZE_FLOOR: u64 = 100 * 1_048_576;
 
 /// Entry budget for [`opaque_tree_allocated_size`].
 ///
 /// Opaque trees are cargo targets and build caches: tens of thousands of small
 /// files. This bounds a pathological tree from stalling a scan while still
 /// completing for essentially every real candidate.
-const OPAQUE_SIZE_PROBE_BUDGET: usize = 200_000;
+pub const OPAQUE_SIZE_PROBE_BUDGET: usize = 200_000;
 
 /// Measure the allocated size of an opaque (pruned) candidate tree.
 ///
@@ -574,7 +585,7 @@ impl DirectoryWalker {
         // Result channel bounded to 10,000 entries to prevent unbounded memory growth
         // on large trees (previously unbounded, causing 14GB+ RSS on trj).
         let (work_tx, work_rx) = channel::unbounded::<WorkItem>();
-        let (result_tx, result_rx) = channel::bounded::<WalkEntry>(10_000);
+        let (result_tx, result_rx) = channel::bounded::<WalkEntry>(RESULT_CHANNEL_CAP);
 
         // Track in-flight work items so workers know when to stop.
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -663,7 +674,7 @@ fn walker_thread(
             hb();
         }
 
-        match work_rx.recv_timeout(Duration::from_millis(50)) {
+        match work_rx.recv_timeout(WORK_RECV_TIMEOUT) {
             Ok(item) => {
                 process_directory(
                     &item.path,
@@ -702,7 +713,7 @@ fn send_walk_entry(
     cancel: &AtomicBool,
 ) -> bool {
     loop {
-        match result_tx.send_timeout(walk_entry.clone(), Duration::from_millis(100)) {
+        match result_tx.send_timeout(walk_entry.clone(), SEND_TIMEOUT) {
             Ok(()) => return true,
             Err(channel::SendTimeoutError::Timeout(_)) => {
                 if cancel.load(Ordering::Relaxed) {
@@ -1000,7 +1011,7 @@ fn process_directory(
                     root_device_id: root_dev,
                     opaque_tree: opaque_tree.clone(),
                 },
-                Duration::from_millis(100),
+                SEND_TIMEOUT,
             ) {
                 Ok(()) => break,
                 Err(channel::SendTimeoutError::Timeout(_)) => {
@@ -1316,21 +1327,22 @@ fn collect_open_files_linux() -> HashSet<(u64, u64)> {
 }
 
 /// Maximum child entries iterated per directory for signal collection.
-/// Increased to 65536 to ensure full coverage of large project directories (e.g.
-/// node_modules or flat object directories). Iteration is reasonably cheap; missing
-/// entries causes permanent blind spots.
-const MAX_ENTRIES_PER_DIR: u32 = 65_536;
+///
+/// Large enough to cover big project directories in full (node_modules,
+/// flat object directories): iteration is reasonably cheap, and missing
+/// entries cause permanent blind spots.
+pub const MAX_ENTRIES_PER_DIR: u32 = 65_536;
 
 /// Maximum time to spend scanning /proc for open file ancestors.
 /// On agent swarms with many processes, /proc scanning can take minutes.
 /// A 5-second budget captures enough data for reliable veto decisions.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const OPEN_FILES_SCAN_BUDGET: Duration = Duration::from_secs(5);
+pub const OPEN_FILES_SCAN_BUDGET: Duration = Duration::from_secs(5);
 
 /// Maximum number of PIDs to scan before bailing out.
 /// Increased to 50,000 to handle busy swarm machines without false-negative open checks.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const OPEN_FILES_MAX_PIDS: usize = 50_000;
+pub const OPEN_FILES_MAX_PIDS: usize = 50_000;
 
 /// Collect absolute open-path ancestors for open file descriptors under `root_paths`.
 ///

@@ -26,7 +26,7 @@ use crate::scanner::decision_record::DecisionRecord;
 // ──────────────────── channel capacity ────────────────────
 
 /// Default bounded channel capacity for log events.
-const CHANNEL_CAPACITY: usize = 1024;
+pub const CHANNEL_CAPACITY: usize = 1024;
 
 // ──────────────────── public event type ────────────────────
 

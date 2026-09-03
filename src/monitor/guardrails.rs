@@ -58,6 +58,14 @@ pub const NOISE_FLOOR_RATE_BYTES_PER_SEC: f64 = 10.0;
 /// underestimation dangerous.
 pub const MATERIAL_RATE_HORIZON_SECS: f64 = 86_400.0;
 
+/// Lower clamp of the e-process log value: `exp(-5)` is about 0.0067, so a
+/// long clean run cannot bank unlimited credit against a later drift.
+pub const E_PROCESS_LOG_MIN: f64 = -5.0;
+
+/// Upper clamp of the e-process log value: `exp(3.5)` is about 33, so an
+/// alarm clears after a bounded number of clean windows.
+pub const E_PROCESS_LOG_MAX: f64 = 3.5;
+
 /// The fill rate (bytes per second) that matters for calibration on a mount
 /// with `headroom_bytes` above its red threshold.
 ///
@@ -193,7 +201,8 @@ impl DeletionFailureMonitor {
     /// A deletion succeeded.
     pub fn observe_success(&mut self) {
         self.successes += 1;
-        self.e_process_log = (self.e_process_log + self.reward_log).clamp(-5.0, 3.5);
+        self.e_process_log =
+            (self.e_process_log + self.reward_log).clamp(E_PROCESS_LOG_MIN, E_PROCESS_LOG_MAX);
     }
 
     /// A deletion attempt failed for `reason` (a `SkipReason` key or
@@ -201,7 +210,8 @@ impl DeletionFailureMonitor {
     pub fn observe_failure(&mut self, reason: &'static str) {
         self.failures += 1;
         *self.failures_by_reason.entry(reason).or_insert(0) += 1;
-        self.e_process_log = (self.e_process_log + self.penalty_log).clamp(-5.0, 3.5);
+        self.e_process_log =
+            (self.e_process_log + self.penalty_log).clamp(E_PROCESS_LOG_MIN, E_PROCESS_LOG_MAX);
     }
 
     /// Current evidence against H0 (the e-process value).
@@ -422,7 +432,7 @@ impl AdaptiveGuard {
         } else {
             self.config.e_process_penalty.ln()
         };
-        self.e_process_log = (self.e_process_log + lr).clamp(-5.0, 3.5);
+        self.e_process_log = (self.e_process_log + lr).clamp(E_PROCESS_LOG_MIN, E_PROCESS_LOG_MAX);
         self.recompute_status(covered);
     }
 
@@ -489,7 +499,9 @@ impl AdaptiveGuard {
         // - Upper bound (3.5): prevents prolonged alarm state (exp(3.5) ~ 33),
         //   ensuring we can recover within ~7 good observations after the anomaly passes.
         //   (Prior cap of 5.0 → exp(5)=148 caused prolonged FAIL on Green machines.)
-        self.e_process_log = self.e_process_log.clamp(-5.0, 3.5);
+        self.e_process_log = self
+            .e_process_log
+            .clamp(E_PROCESS_LOG_MIN, E_PROCESS_LOG_MAX);
 
         // Recompute guard status.
         self.recompute_status(obs_good);

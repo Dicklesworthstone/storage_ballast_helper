@@ -17810,11 +17810,14 @@ mod tests {
         );
 
         let document = DocsDocument::build(&root);
-        let drifted = check_file(&readme_path, &document).expect("README regions render");
-        assert!(
-            drifted.is_empty(),
-            "README generated regions drifted: {drifted:?}; run `sbh docs --render README.md`"
-        );
+        for name in ["README.md", "AGENTS.md"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+            let drifted = check_file(&path, &document).expect("generated regions render");
+            assert!(
+                drifted.is_empty(),
+                "{name} generated regions drifted: {drifted:?}; run `sbh docs --render {name}`"
+            );
+        }
     }
 
     /// `--start-screen` rides along as the raw name; the cockpit runtime is

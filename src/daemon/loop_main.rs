@@ -106,12 +106,14 @@ use crate::scanner::walker::{
 
 // ──────────────────── channel capacities ────────────────────
 
-/// Monitor → Scanner: bounded(2). Allows one buffered request while scanner
-/// processes another. Under urgent pressure we replace one stale queued request
-/// with the latest signal so high-priority actions are not starved.
-const SCANNER_CHANNEL_CAP: usize = 2;
+/// Monitor → Scanner: bounded(2), one buffered request while the scanner
+/// processes another.
+///
+/// Under urgent pressure we replace one stale queued request with the latest
+/// signal so high-priority actions are not starved.
+pub const SCANNER_CHANNEL_CAP: usize = 2;
 /// Scanner → Executor: bounded(64). Natural backpressure — scanner blocks on send.
-const EXECUTOR_CHANNEL_CAP: usize = 64;
+pub const EXECUTOR_CHANNEL_CAP: usize = 64;
 /// Candidate count threshold for dispatching a deletion batch before walk completion.
 const EARLY_DISPATCH_MULTIPLIER: usize = 4;
 /// Max time to wait before dispatching first non-empty deletion batch during a scan.
@@ -144,7 +146,7 @@ const TEMP_FAST_TRACK_MIN_OBSERVED_AGE: Duration = Duration::from_mins(2);
 const FULL_DISK_ACCESS_RECHECK_INTERVAL: Duration = Duration::from_mins(5);
 /// Memory pressure callbacks wake the monitor loop instead of waiting for the
 /// next disk-pressure poll.
-const MEMORY_PRESSURE_CHANNEL_CAP: usize = 16;
+pub const MEMORY_PRESSURE_CHANNEL_CAP: usize = 16;
 /// Maximum time the monitor loop may wait between memory-pressure event checks.
 const MEMORY_PRESSURE_WAKE_INTERVAL: Duration = Duration::from_millis(500);
 /// Per-tick daemon work budget before the self-throttle treats ticks as expensive.
@@ -168,10 +170,11 @@ const WORKER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WORKER_SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(25);
 
 /// A worker whose heartbeat is older than this is reported as stalled in
-/// `state.json` and `sbh status`. Distinct from the health-check cadence:
-/// a scan pass or a large deletion may legitimately run for tens of
-/// seconds between beats.
-const THREAD_STALL_THRESHOLD: Duration = Duration::from_secs(60);
+/// `state.json` and `sbh status`.
+///
+/// Distinct from the health-check cadence: a scan pass or a large deletion
+/// may legitimately run for tens of seconds between beats.
+pub const THREAD_STALL_THRESHOLD: Duration = Duration::from_secs(60);
 
 /// Entries walked between scanner heartbeats inside a pass.
 const SCANNER_BEAT_EVERY_ENTRIES: usize = 256;
@@ -362,9 +365,9 @@ fn parent_in_use(platform: &dyn Platform, parent: &Path) -> bool {
 
 // ──────────────────── thread panic tracking ────────────────────
 
-const MAX_RESPAWNS: u32 = 3;
-const RESPAWN_WINDOW: Duration = Duration::from_mins(5);
-const THREAD_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+pub const MAX_RESPAWNS: u32 = 3;
+pub const RESPAWN_WINDOW: Duration = Duration::from_mins(5);
+pub const THREAD_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// How often a filling mount logs its `[SBH-FORECAST]` calibration line.
 const FORECAST_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// How often calm mounts have their quarantine expired and capped (Layer 7).
@@ -786,7 +789,7 @@ enum WorkerReport {
 
 /// Commands the control socket cannot run on its own thread: they need the
 /// main loop's state (the self monitor, the ballast coordinator).
-const CONTROL_CHANNEL_CAP: usize = 16;
+pub const CONTROL_CHANNEL_CAP: usize = 16;
 
 #[derive(Debug)]
 enum MainLoopCommand {
@@ -1239,7 +1242,7 @@ const fn behavior_pressure_rank(level: BehaviorPressureLevel) -> u8 {
 }
 
 /// Bounded capacity for the worker→monitor results channel.
-const REPORT_CHANNEL_CAP: usize = 64;
+pub const REPORT_CHANNEL_CAP: usize = 64;
 
 // ──────────────────── daemon configuration ────────────────────
 
@@ -1369,14 +1372,15 @@ fn mount_controller_config(config: &Config) -> MountControllerConfig {
     }
 }
 
-/// Entry budget for sizing one catalog root. A catalog scan probes every
-/// derived root (a hundred or more under one home), so the per-root budget
-/// is what bounds the whole pass: a truncated probe reports a size lower
-/// bound and the tree's newest sampled mtime, which is enough to rank and
-/// gate the root.
-const CATALOG_PROBE_MAX_ENTRIES: usize = 50_000;
+/// Entry budget for sizing one catalog root.
+///
+/// A catalog scan probes every derived root (a hundred or more under one
+/// home), so the per-root budget is what bounds the whole pass: a truncated
+/// probe reports a size lower bound and the tree's newest sampled mtime,
+/// which is enough to rank and gate the root.
+pub const CATALOG_PROBE_MAX_ENTRIES: usize = 50_000;
 /// Depth budget for the catalog root probe.
-const CATALOG_PROBE_MAX_DEPTH: usize = 5;
+pub const CATALOG_PROBE_MAX_DEPTH: usize = 5;
 
 /// Turn derived catalog roots into opaque candidate units for the scanner
 /// loop. Each root is probed once (allocated size, newest mtime, structural

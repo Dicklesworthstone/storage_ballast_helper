@@ -1056,17 +1056,19 @@ Three things make this a controller that cannot wind up while it has no actuator
 
 The `1 - exp(-x)` transform maps the raw output to a 0-1 range with a natural saturation curve: small errors produce proportionally small urgency, while large errors quickly approach 1.0 without overshooting.
 
-Pressure levels are defined by free-space thresholds:
+Pressure levels are defined by free-space thresholds; the table is generated from `PressureConfig::default()` and the controller's `RESPONSE_TABLE` by `sbh docs --render README.md`:
 
-| Level | Default Free % | Scan Interval | Ballast Release | Max Delete Batch |
+<!-- sbh-docs:begin pressure-levels -->
+| Level | Default free % | Scan interval | Ballast release | Max delete batch |
 | --- | --- | --- | --- | --- |
-| Green | > 20% | base interval | 0 files | 2 |
-| Yellow | 14-20% | base/2 | 0-1 files | 5 |
-| Orange | 10-14% | base/4 | 1-3 files | 10 |
-| Red | 6-10% | base/8 | 3-5 files | 20 + urgency scaling |
-| Critical | < 3% | 100ms | 10 files | 40 + urgency scaling |
+| Green | > 20% | base interval | 0 files | 2, 5 above urgency 0.5, 10 above urgency 0.8 |
+| Yellow | 14-20% | base/2 (at least 500 ms) | 0-1 files (urgency > 0.55) | 5 |
+| Orange | 10-14% | base/4 (at least 250 ms) | 1-3 files (urgency > 0.75) | 10 |
+| Red | 6-10% | base/8 (at least 125 ms) | 3-5 files (urgency > 0.85) | 20 + 60 x max(urgency - 0.5, 0) |
+| Critical | < 6% | 100 ms | 10 files | 40 + 120 x max(urgency - 0.5, 0) |
+<!-- sbh-docs:end -->
 
-Critical is triggered when free space drops below half the Red threshold (`red_min / 2.0`). At Red and Critical levels, delete batch sizes scale dynamically with PID urgency output, allowing the system to be more aggressive when pressure is rising rapidly versus slowly. At Critical, the controller issues maximum-urgency responses regardless of PID output.
+Critical is any free space below the Red threshold (`red_min_free_pct`). At Red and Critical levels, delete batch sizes scale dynamically with PID urgency output, allowing the system to be more aggressive when pressure is rising rapidly versus slowly. At Critical, the controller issues maximum-urgency responses regardless of PID output. Whether a level's response actually runs also depends on the memory-state behavior matrix in `src/daemon/policy.rs`.
 
 When predictive forecasting is enabled, the time-to-red estimate feeds the controller's feedforward term: a forecast inside the action horizon (default 30 minutes) raises urgency smoothly, up to `Kf` at zero seconds, even while current pressure is only Yellow. This lets the system start scanning and releasing ballast *before* pressure actually reaches dangerous levels.
 
@@ -2019,13 +2021,26 @@ src/
 
 ### Error Codes
 
-`sbh` uses structured error codes in the format `SBH-XXXX` for machine-parseable error identification:
+`sbh` uses structured error codes in the format `SBH-XXXX` for machine-parseable error identification. The catalog below is generated from the code by `sbh docs --render README.md` (`sbh docs --section error-codes` prints it):
 
-| Range | Category | Examples |
-| --- | --- | --- |
-| SBH-1xxx | Configuration | Invalid values (1001), missing config (1002), parse failure (1003), unsupported platform (1101) |
-| SBH-2xxx | Runtime/IO | Filesystem stats failure (2001), safety veto (2003), SQL failure (2102) |
-| SBH-3xxx | System | Permission denied (3001), IO failure (3002), channel error, runtime error |
+<!-- sbh-docs:begin error-codes -->
+| Code | Variant | Family | Retryable | Typical cause |
+| --- | --- | --- | --- | --- |
+| `SBH-1001` | `InvalidConfig` | Configuration | no | A config value or structure failed validation |
+| `SBH-1002` | `MissingConfig` | Configuration | no | No config file at the expected path |
+| `SBH-1003` | `ConfigParse` | Configuration | no | Invalid TOML syntax or types |
+| `SBH-1101` | `UnsupportedPlatform` | Platform | no | The feature is unavailable on this OS |
+| `SBH-1102` | `Pal` | Platform | no | A platform abstraction call is not implemented or failed |
+| `SBH-2001` | `FsStats` | Runtime | yes | Cannot stat a watched path or special location |
+| `SBH-2002` | `MountParse` | Runtime | no | The mount table could not be parsed |
+| `SBH-2003` | `SafetyVeto` | Runtime | no | A hard veto stopped a deletion |
+| `SBH-2101` | `Serialization` | Serialization | no | JSON or TOML encoding/decoding failed |
+| `SBH-2102` | `Sql` | Serialization | yes | SQLite query, schema, or lock failure |
+| `SBH-3001` | `PermissionDenied` | System | no | Insufficient filesystem permissions |
+| `SBH-3002` | `Io` | System | yes | File read/write error |
+| `SBH-3003` | `ChannelClosed` | System | yes | A daemon thread went away; its channel is closed |
+| `SBH-3900` | `Runtime` | System | yes | Any other runtime failure |
+<!-- sbh-docs:end -->
 
 All errors implement `code()` for the stable string code, `is_retryable()` to indicate whether retry might help, and standard `Display` formatting with the code prefix.
 

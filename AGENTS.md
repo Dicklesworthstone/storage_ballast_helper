@@ -453,19 +453,28 @@ SBH uses structured error codes in the format `SBH-XXXX`:
 | SBH-2xxx | Runtime/IO | Filesystem, serialization, SQL, and safety errors |
 | SBH-3xxx | System | Permission, IO, channel, and runtime errors |
 
-### Common Error Codes
+### Error Code Catalog
 
-| Code | Error | Typical Cause |
-|------|-------|---------------|
-| `SBH-1001` | Invalid config | Bad config values or structure |
-| `SBH-1002` | Missing config | Config file not found at expected path |
-| `SBH-1003` | Config parse failure | Invalid TOML syntax |
-| `SBH-1101` | Unsupported platform | Feature unavailable on current OS |
-| `SBH-2001` | Filesystem stats failure | Cannot stat a watched path |
-| `SBH-2003` | Safety veto | Hard veto prevented deletion |
-| `SBH-2102` | SQL failure | SQLite query or schema error |
-| `SBH-3001` | Permission denied | Insufficient filesystem permissions |
-| `SBH-3002` | IO failure | File read/write error |
+Generated from `ERROR_CODES` in `src/core/errors.rs` by `sbh docs --render AGENTS.md`; do not edit inside the markers.
+
+<!-- sbh-docs:begin error-codes -->
+| Code | Variant | Family | Retryable | Typical cause |
+| --- | --- | --- | --- | --- |
+| `SBH-1001` | `InvalidConfig` | Configuration | no | A config value or structure failed validation |
+| `SBH-1002` | `MissingConfig` | Configuration | no | No config file at the expected path |
+| `SBH-1003` | `ConfigParse` | Configuration | no | Invalid TOML syntax or types |
+| `SBH-1101` | `UnsupportedPlatform` | Platform | no | The feature is unavailable on this OS |
+| `SBH-1102` | `Pal` | Platform | no | A platform abstraction call is not implemented or failed |
+| `SBH-2001` | `FsStats` | Runtime | yes | Cannot stat a watched path or special location |
+| `SBH-2002` | `MountParse` | Runtime | no | The mount table could not be parsed |
+| `SBH-2003` | `SafetyVeto` | Runtime | no | A hard veto stopped a deletion |
+| `SBH-2101` | `Serialization` | Serialization | no | JSON or TOML encoding/decoding failed |
+| `SBH-2102` | `Sql` | Serialization | yes | SQLite query, schema, or lock failure |
+| `SBH-3001` | `PermissionDenied` | System | no | Insufficient filesystem permissions |
+| `SBH-3002` | `Io` | System | yes | File read/write error |
+| `SBH-3003` | `ChannelClosed` | System | yes | A daemon thread went away; its channel is closed |
+| `SBH-3900` | `Runtime` | System | yes | Any other runtime failure |
+<!-- sbh-docs:end -->
 
 All errors implement `code()` for stable machine-parseable codes and `is_retryable()` to indicate whether retry might help.
 
@@ -473,15 +482,17 @@ All errors implement `code()` for stable machine-parseable codes and `is_retryab
 
 ## Scoring Engine
 
-The artifact scoring system uses five weighted factors to rank deletion candidates:
+The artifact scoring system uses five weighted factors to rank deletion candidates (generated from `ScoringConfig::default()` by `sbh docs --render AGENTS.md`):
 
-| Factor | Default Weight | What It Measures |
-|--------|---------------|-----------------|
-| `location` | 0.25 | How "safe" the directory is (temp > build > source) |
-| `name` | 0.25 | Pattern match against known artifact names (`.o`, `node_modules`, `target/`) |
-| `age` | 0.20 | Time since last access/modification |
-| `size` | 0.15 | Bytes reclaimable (larger = higher score) |
-| `structure` | 0.15 | Directory structure signals (depth, sibling count) |
+<!-- sbh-docs:begin scoring-weights -->
+| Factor | Default weight | What it measures |
+| --- | --- | --- |
+| `location` | 0.25 | How safe the directory is (temp > build > source) |
+| `name` | 0.25 | Pattern match against known artifact names (`target/`, `node_modules`, `.o`) |
+| `age` | 0.2 | Time since last access or modification |
+| `size` | 0.15 | Bytes reclaimable (larger scores higher) |
+| `structure` | 0.15 | Directory structure signals (depth, siblings, markers) |
+<!-- sbh-docs:end -->
 
 **Decision-theoretic tuning:** `false_positive_loss` and `false_negative_loss` control the cost asymmetry between wrongly deleting (expensive) vs. missing a candidate (less costly). `calibration_floor` sets the minimum acceptable calibration level for adaptive actions.
 
@@ -489,12 +500,17 @@ The artifact scoring system uses five weighted factors to rank deletion candidat
 
 ## Pressure Levels
 
-| Level | Default Threshold | Daemon Response |
-|-------|------------------|-----------------|
-| Green | > 35% free | Normal monitoring, no action |
-| Yellow | 20-35% free | Increase scan frequency |
-| Orange | 10-20% free | Begin ballast release + cleanup |
-| Red | < 5% free | Emergency mode: aggressive cleanup |
+Generated from `PressureConfig::default()` and the controller's `RESPONSE_TABLE` (`src/monitor/pid.rs`) by `sbh docs --render AGENTS.md`; the behavior matrix in `src/daemon/policy.rs` decides which of these responses actually run at a given memory state.
+
+<!-- sbh-docs:begin pressure-levels -->
+| Level | Default free % | Scan interval | Ballast release | Max delete batch |
+| --- | --- | --- | --- | --- |
+| Green | > 20% | base interval | 0 files | 2, 5 above urgency 0.5, 10 above urgency 0.8 |
+| Yellow | 14-20% | base/2 (at least 500 ms) | 0-1 files (urgency > 0.55) | 5 |
+| Orange | 10-14% | base/4 (at least 250 ms) | 1-3 files (urgency > 0.75) | 10 |
+| Red | 6-10% | base/8 (at least 125 ms) | 3-5 files (urgency > 0.85) | 20 + 60 x max(urgency - 0.5, 0) |
+| Critical | < 6% | 100 ms | 10 files | 40 + 120 x max(urgency - 0.5, 0) |
+<!-- sbh-docs:end -->
 
 One PID controller per mount smooths transitions between levels: `Kp` is scaled by volume size, the EWMA time-to-red enters as a feedforward term, and the integral is frozen while the mount has no actuator (observe-only, idle, recovering). See `src/monitor/pid.rs` `FORMULAS`.
 
@@ -537,9 +553,135 @@ Additional hard safety vetoes in the deletion executor:
 - Path must not be currently open by any process (Linux: `/proc/*/fd` check)
 - Parent directory must be writable
 - Directory must not contain `.git/` (final safety net)
-- Circuit breaker: 3 consecutive failures trigger 30s cooldown
+- Circuit breaker: `circuit_breaker_threshold` consecutive failures halt the batch for `circuit_breaker_cooldown` (defaults in the Runtime Constants table below)
 
 Layer 7, quarantine-first deletion: at Green (and for `sbh clean` without `--no-quarantine`) the executor renames a candidate into `<root>/.sbh/quarantine/<decision-id>/` instead of unlinking it; `sbh undo <decision-id>` renames it back. Pressure at Orange and above drains the quarantine oldest-first before any new deletion; `sbh emergency` drains it first. See `src/scanner/quarantine.rs`.
+
+---
+
+## Runtime Constants
+
+Every tunable default and hard-coded limit the daemon runs with, read from the code by `sbh docs` (`sbh docs --section constants` prints it; `sbh docs --check AGENTS.md` fails CI when this table is stale). Change the constant, run `sbh docs --render README.md AGENTS.md`, commit both.
+
+<!-- sbh-docs:begin constants -->
+| Area | Constant | Value | Meaning | Where |
+| --- | --- | --- | --- | --- |
+| pressure | `green_min_free_pct` | `20` | Green above this free % | `src/core/config.rs` |
+| pressure | `yellow_min_free_pct` | `14` | Yellow at or above this free % | `src/core/config.rs` |
+| pressure | `orange_min_free_pct` | `10` | Orange at or above this free % | `src/core/config.rs` |
+| pressure | `red_min_free_pct` | `6` | Red at or above this free %; Critical below it | `src/core/config.rs` |
+| pressure | `poll_interval_ms` | `5000` | Base poll interval the response table divides | `src/core/config.rs` |
+| pressure | `maintenance_interval_secs` | `1800` | Green maintenance pass cadence | `src/core/config.rs` |
+| pressure | `behavior_hysteresis_secs` | `5` | Dwell before a behavior cell change takes effect | `src/core/config.rs` |
+| controller | `kp` | `0.25` | Proportional gain per point of free-% error | `src/core/config.rs` |
+| controller | `ki` | `0.08` | Integral gain | `src/core/config.rs` |
+| controller | `kd` | `0.02` | Derivative gain | `src/core/config.rs` |
+| controller | `kf` | `0.8` | Feedforward weight of the time-to-red forecast | `src/core/config.rs` |
+| controller | `integral_cap` | `100` | Anti-windup bound on the integral term | `src/core/config.rs` |
+| controller | `hysteresis_pct` | `1` | Free-% band before a level change is accepted | `src/core/config.rs` |
+| controller | `reference_total_bytes` | `1024 GiB` | Volume size at which Kp is unscaled | `src/core/config.rs` |
+| controller | `kp_scale_min` | `0.5` | Lower clamp of the capacity gain schedule | `src/core/config.rs` |
+| controller | `kp_scale_max` | `2` | Upper clamp of the capacity gain schedule | `src/core/config.rs` |
+| controller | `BATCH_SLOPE_KNEE` | `0.5` | Urgency above which Red/Critical batches grow | `src/monitor/pid.rs` |
+| prediction | `enabled` | `true` | Forecast-driven early action | `src/core/config.rs` |
+| prediction | `action_horizon_minutes` | `30` | Forecast inside this raises urgency (feedforward) | `src/core/config.rs` |
+| prediction | `warning_horizon_minutes` | `60` | Forecast inside this warns | `src/core/config.rs` |
+| prediction | `min_confidence` | `0.7` | Forecast confidence needed to act | `src/core/config.rs` |
+| prediction | `min_samples` | `5` | Rate samples needed before forecasting | `src/core/config.rs` |
+| prediction | `imminent_danger_minutes` | `5` | Time-to-red treated as imminent | `src/core/config.rs` |
+| prediction | `critical_danger_minutes` | `2` | Time-to-red treated as critical | `src/core/config.rs` |
+| prediction | `burst_min_confidence` | `0.85` | Confidence needed to act on a burst forecast | `src/core/config.rs` |
+| prediction | `coverage_target` | `0.9` | Conformal coverage of the time-to-red bound | `src/core/config.rs` |
+| ewma | `fs_cache_ttl_ms` | `1000` | Filesystem stats cache lifetime | `src/core/config.rs` |
+| ewma | `ewma_base_alpha` | `0.3` | Base smoothing factor of the rate estimator | `src/core/config.rs` |
+| ewma | `ewma_min_alpha` | `0.1` | Smallest adaptive alpha | `src/core/config.rs` |
+| ewma | `ewma_max_alpha` | `0.75` | Largest adaptive alpha | `src/core/config.rs` |
+| ewma | `ewma_min_samples` | `3` | Samples before the rate estimate is trusted | `src/core/config.rs` |
+| ewma | `ewma_rate_history_size` | `200` | Rate samples kept for burst calibration | `src/core/config.rs` |
+| ewma | `DEFAULT_RATE_HISTORY_CAP` | `200` | Estimator's own history cap | `src/monitor/ewma.rs` |
+| ewma | `BURST_CALIBRATION_MIN` | `30` | Samples before burstiness is calibrated | `src/monitor/ewma.rs` |
+| guardrails | `min_observations` | `60` | Observations before the guard can alarm | `src/monitor/guardrails.rs` |
+| guardrails | `window_size` | `500` | Rolling calibration window | `src/monitor/guardrails.rs` |
+| guardrails | `max_rate_error` | `0.3` | Relative rate error tolerated per window | `src/monitor/guardrails.rs` |
+| guardrails | `coverage_target` | `0.9` | Target conformal coverage | `src/monitor/guardrails.rs` |
+| guardrails | `coverage_tolerance` | `0.05` | Coverage shortfall tolerated | `src/monitor/guardrails.rs` |
+| guardrails | `e_process_threshold` | `20` | E-process value that raises the alarm | `src/monitor/guardrails.rs` |
+| guardrails | `e_process_penalty` | `1.5` | E-process multiplier for a bad window | `src/monitor/guardrails.rs` |
+| guardrails | `e_process_reward` | `0.6666666666666666` | E-process multiplier for a good window | `src/monitor/guardrails.rs` |
+| guardrails | `recovery_clean_windows` | `3` | Clean windows that clear an alarm | `src/monitor/guardrails.rs` |
+| guardrails | `E_PROCESS_LOG_MIN` | `-5` | Lower clamp of the e-process log value | `src/monitor/guardrails.rs` |
+| guardrails | `E_PROCESS_LOG_MAX` | `3.5` | Upper clamp of the e-process log value | `src/monitor/guardrails.rs` |
+| guardrails | `NOISE_FLOOR_RATE_BYTES_PER_SEC` | `10` | Rates below this are noise, not drift | `src/monitor/guardrails.rs` |
+| guardrails | `MATERIAL_RATE_HORIZON_SECS` | `86400` | Horizon over which a rate must matter | `src/monitor/guardrails.rs` |
+| guardrails | `guardrail_window_size` | `500` | Config-side window size fed to the guard | `src/core/config.rs` |
+| guardrails | `guardrail_min_observations` | `60` | Config-side minimum observations | `src/core/config.rs` |
+| deletion | `circuit_breaker_threshold` | `5` | Consecutive failures that halt the batch | `src/scanner/deletion.rs` |
+| deletion | `circuit_breaker_cooldown` | `30 s` | Pause after the breaker trips | `src/scanner/deletion.rs` |
+| deletion | `max_batch_size` | `10` | Executor batch cap before the planner applies | `src/scanner/deletion.rs` |
+| scanner | `max_depth` | `10` | Walker depth limit | `src/core/config.rs` |
+| scanner | `parallelism` | `half the CPU count, at least 1` | Walker threads (computed on the host) | `src/core/config.rs` |
+| scanner | `min_rescan_interval_secs` | `90` | Shortest gap between scans of one root | `src/core/config.rs` |
+| scanner | `max_scan_duty_cycle_pct` | `25` | Share of wall time the scanner may use | `src/core/config.rs` |
+| scanner | `scan_time_budget_secs` | `900` | Longest single scan | `src/core/config.rs` |
+| scanner | `quarantine_ttl_hours` | `24` | Quarantined entries expire after this | `src/core/config.rs` |
+| scanner | `quarantine_max_bytes_pct` | `5` | Quarantine size cap as % of the volume | `src/core/config.rs` |
+| scanner | `active_reference_cache_ttl_secs` | `30` | Active-reference (open file) cache lifetime | `src/core/config.rs` |
+| scanner | `active_reference_min_size_bytes` | `100 MiB` | Smallest entry checked for active references | `src/core/config.rs` |
+| walker | `RESULT_CHANNEL_CAP` | `10000` | Worker → collector channel bound | `src/scanner/walker.rs` |
+| walker | `WORK_RECV_TIMEOUT` | `50 ms` | Idle wait before a worker re-checks shutdown | `src/scanner/walker.rs` |
+| walker | `SEND_TIMEOUT` | `100 ms` | Wait on a full channel before dropping the entry | `src/scanner/walker.rs` |
+| walker | `MAX_ENTRIES_PER_DIR` | `65536` | Entries read per directory before it is cut off | `src/scanner/walker.rs` |
+| walker | `OPEN_FILES_SCAN_BUDGET` | `5 s` | Time budget of one /proc open-file sweep | `src/scanner/walker.rs` |
+| walker | `OPEN_FILES_MAX_PIDS` | `50000` | Processes inspected per open-file sweep | `src/scanner/walker.rs` |
+| walker | `OPAQUE_CANDIDATE_SIZE_FLOOR` | `100 MiB` | Opaque trees smaller than this are not sized | `src/scanner/walker.rs` |
+| walker | `OPAQUE_SIZE_PROBE_BUDGET` | `200000` | Entries an opaque-tree size probe may visit | `src/scanner/walker.rs` |
+| walker | `TREE_IDLE_PROBE_MAX_ENTRIES` | `4096` | Entries an idle (mtime) probe may visit | `src/scanner/walker.rs` |
+| walker | `TREE_IDLE_PROBE_MAX_DEPTH` | `3` | Depth of an idle (mtime) probe | `src/scanner/walker.rs` |
+| scoring | `min_score` | `0.35` | Lowest score that becomes a candidate | `src/core/config.rs` |
+| scoring | `false_positive_loss` | `50` | Loss of deleting something wanted | `src/core/config.rs` |
+| scoring | `false_negative_loss` | `30` | Loss of keeping an artifact | `src/core/config.rs` |
+| scoring | `calibration_floor` | `0.4` | Calibration needed for adaptive actions | `src/core/config.rs` |
+| scoring | `posterior_floor_definite` | `0.85` | Posterior needed for a definite label | `src/core/config.rs` |
+| scoring | `regret_window_minutes` | `30` | Window in which a recreated path counts as regret | `src/core/config.rs` |
+| scoring | `regret_alpha_definite` | `0.02` | Regret rate tolerated for definite deletions | `src/core/config.rs` |
+| scoring | `regret_alpha_likely` | `0.005` | Regret rate tolerated for likely deletions | `src/core/config.rs` |
+| scoring | `regret_suspend_minutes` | `60` | Suspension after the regret rate is exceeded | `src/core/config.rs` |
+| scoring | `batch_risk_budget.green` | `1` | Expected loss per batch at Green (× false_positive_loss) | `src/scanner/planner.rs` |
+| scoring | `batch_risk_budget.yellow` | `2` | Expected loss per batch at Yellow | `src/scanner/planner.rs` |
+| scoring | `batch_risk_budget.orange` | `5` | Expected loss per batch at Orange | `src/scanner/planner.rs` |
+| scoring | `batch_risk_budget.red` | `10` | Expected loss per batch at Red | `src/scanner/planner.rs` |
+| scoring | `batch_risk_budget.critical` | `unbounded` | Expected loss per batch at Critical | `src/scanner/planner.rs` |
+| ballast | `file_count` | `10` | Ballast files per volume | `src/core/config.rs` |
+| ballast | `file_size_bytes` | `1 GiB` | Size of one ballast file | `src/core/config.rs` |
+| ballast | `replenish_cooldown_minutes` | `10` | Wait before released ballast is rebuilt | `src/core/config.rs` |
+| ballast | `auto_provision` | `true` | Provision pools at daemon start | `src/core/config.rs` |
+| ballast | `HEADER_SIZE` | `4 KiB` | Ballast file header; also the smallest valid file | `src/ballast/manager.rs` |
+| ballast | `MAGIC` | `SBH_BALLAST_v1` | Header magic string | `src/ballast/manager.rs` |
+| ballast | `CHUNK_SIZE` | `4 MiB` | Write chunk when filling a ballast file | `src/ballast/manager.rs` |
+| ballast | `FSYNC_EVERY_BYTES` | `64 MiB` | fsync cadence while filling | `src/ballast/manager.rs` |
+| ballast | `DEFAULT_PROVISION_FLOOR_PCT` | `20` | Manager's floor before the config applies | `src/ballast/manager.rs` |
+| ballast | `ballast_provision_floor_pct()` | `10` | Effective floor with default thresholds: max(orange, red + 2) | `src/core/config.rs` |
+| quarantine | `DEFAULT_TTL_HOURS` | `24` | Quarantine TTL used without config | `src/scanner/quarantine.rs` |
+| quarantine | `DEFAULT_MAX_BYTES_PCT` | `5` | Quarantine size cap used without config | `src/scanner/quarantine.rs` |
+| daemon | `DAEMON_STATE_WRITE_INTERVAL_SECS` | `30` | state.json write cadence | `src/daemon/self_monitor.rs` |
+| daemon | `DAEMON_STATE_STALE_THRESHOLD_SECS` | `90` | state.json older than this is stale | `src/daemon/self_monitor.rs` |
+| daemon | `DEFAULT_DAEMON_RSS_WARNING_BYTES` | `256 MiB` | RSS that logs a warning | `src/daemon/self_monitor.rs` |
+| daemon | `DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES` | `500 MiB` | RSS at which the daemon restarts itself | `src/daemon/self_monitor.rs` |
+| daemon | `daemon_rss_warning_bytes` | `256 MiB` | Config-side RSS warning | `src/core/config.rs` |
+| daemon | `daemon_rss_hard_limit_bytes` | `500 MiB` | Config-side RSS hard limit | `src/core/config.rs` |
+| logger | `CHANNEL_CAPACITY` | `1024` | Logger channel bound (try_send, drops when full) | `src/logger/dual.rs` |
+| daemon | `SCANNER_CHANNEL_CAP` | `2` | Monitor → scanner requests in flight | `src/daemon/loop_main.rs` |
+| daemon | `EXECUTOR_CHANNEL_CAP` | `64` | Scanner → executor batches in flight | `src/daemon/loop_main.rs` |
+| daemon | `MEMORY_PRESSURE_CHANNEL_CAP` | `16` | Memory-pressure samples buffered | `src/daemon/loop_main.rs` |
+| daemon | `CONTROL_CHANNEL_CAP` | `16` | Control-socket requests buffered | `src/daemon/loop_main.rs` |
+| daemon | `REPORT_CHANNEL_CAP` | `64` | Executor reports and index feedback buffered | `src/daemon/loop_main.rs` |
+| daemon | `MAX_RESPAWNS` | `3` | Thread respawns allowed per window | `src/daemon/loop_main.rs` |
+| daemon | `RESPAWN_WINDOW` | `300 s` | Window for the respawn limit | `src/daemon/loop_main.rs` |
+| daemon | `THREAD_HEALTH_CHECK_INTERVAL` | `10 s` | Thread liveness check cadence | `src/daemon/loop_main.rs` |
+| daemon | `THREAD_STALL_THRESHOLD` | `60 s` | Heartbeat age that counts as a stall | `src/daemon/loop_main.rs` |
+| daemon | `CATALOG_PROBE_MAX_ENTRIES` | `50000` | Entries a catalog freshness probe may visit | `src/daemon/loop_main.rs` |
+| daemon | `CATALOG_PROBE_MAX_DEPTH` | `5` | Depth of a catalog freshness probe | `src/daemon/loop_main.rs` |
+<!-- sbh-docs:end -->
 
 ---
 
