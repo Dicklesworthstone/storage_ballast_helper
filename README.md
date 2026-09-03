@@ -477,41 +477,48 @@ Environment overrides: `SBH_DASHBOARD_MODE`, `SBH_DASHBOARD_KILL_SWITCH`.
 
 ### Keybindings
 
+The tables are generated from the dashboard's keymap (`sbh docs --section dashboard-keymap`); a test resolves every global and overlay binding.
+
+<!-- sbh-docs:begin dashboard-keymap -->
 **Navigation:**
 
-| Key | Action |
-| --- | --- |
-| `1`-`7` | Jump directly to screen |
-| `[` / `]` | Previous / next screen |
-| `Tab` / `Shift-Tab` | Cycle focused pane on Overview |
-| `Enter` / `Space` (Overview) | Open focused pane target screen |
-| `b` | Jump to Ballast screen |
-| `Esc` | Close overlay, then close open detail pane, then back, then quit |
-| `q` | Quit dashboard |
-| `Ctrl-C` | Immediate quit |
+| Key | Where | Action |
+| --- | --- | --- |
+| `1`-`7` | Global | Jump directly to screen |
+| `[` / `]` | Global | Previous / next screen |
+| `Tab` / `Shift-Tab` | Overview | Cycle focused pane on Overview |
+| `Enter` / `Space` | Overview | Open focused pane target screen |
+| `b` | Global | Jump to Ballast screen |
+| `Esc` | Global | Close overlay, then close open detail pane, then back, then quit |
+| `q` | Global | Quit dashboard |
+| `Ctrl-C` | Global | Immediate quit |
 
 **Overlays:**
 
-| Key | Action |
-| --- | --- |
-| `?` | Toggle help overlay (contextual keybinding reference) |
-| `Ctrl-P` or `:` | Open command palette (fuzzy search 36 actions) |
-| `v` | Toggle VOI scheduler overlay |
-| `r` | Force data refresh |
+| Key | Where | Action |
+| --- | --- | --- |
+| `?` | Global | Toggle help overlay (contextual keybinding reference) |
+| `Ctrl-P` or `:` | Global | Open command palette (fuzzy search over every palette action) |
+| `v` | Global | Toggle VOI scheduler overlay |
+| `r` | Global | Force data refresh |
+| type, `Backspace`, `Up`/`Down`, `Enter` | Command palette overlay | Filter, move through, and run the selected palette action |
+| `j`/`k` or arrows, `Enter` | Incident playbook overlay | Move through the playbook and jump to the entry's screen |
+| `Enter` / `Esc` | Confirmation overlay | Confirm or cancel the ballast action |
 
-**Incident shortcuts (active during pressure events):**
+**Incident shortcuts:**
 
-| Key | Action |
-| --- | --- |
-| `!` | Open incident triage playbook overlay |
-| `x` | Quick-release ballast (jumps to Ballast + opens release confirmation) |
+| Key | Where | Action |
+| --- | --- | --- |
+| `!` | Global | Open incident triage playbook overlay |
+| `x` | Global | Quick-release ballast (jumps to Ballast, selects a volume with files, opens the release confirmation) |
 
-**Screen-specific keys:**
+**Screen-specific:**
 
-| Key | Screens | Action |
+| Key | Where | Action |
 | --- | --- | --- |
 | `j` / `k` or arrows | Timeline, Candidates, Explainability, Ballast | Cursor navigation |
 | `Enter` or `Space` | Candidates, Explainability, Ballast | Toggle detail view |
+| `Enter` | Timeline | Open the linked decision on Explainability |
 | `d` | Candidates, Explainability, Ballast | Close detail panel |
 | `f` | Timeline | Cycle severity filter |
 | `Shift-F` | Timeline | Toggle follow mode (auto-scroll to latest) |
@@ -519,6 +526,7 @@ Environment overrides: `SBH_DASHBOARD_MODE`, `SBH_DASHBOARD_KILL_SWITCH`.
 | `Shift-X` | Ballast | Release every available ballast file on the selected volume (confirmation) |
 | `p` | Ballast | Replenish the released ballast files on the selected volume (confirmation) |
 | `Shift-V` | Diagnostics | Toggle verbose frame metrics |
+<!-- sbh-docs:end -->
 
 Confirmed ballast actions (`x`, `Shift-X`, `p` then `Enter`) go through the running daemon's control socket, scoped to the selected mount; with no daemon running the dashboard changes the pool directly, the way `sbh ballast release`/`replenish` do. The outcome, or the daemon's refusal, is shown as a notification, and each released or recreated file is a `ballast_release`/`ballast_replenish` event on the Timeline.
 
@@ -534,12 +542,55 @@ Confirmed ballast actions (`x`, `Shift-X`, `p` then `Enter`) go through the runn
 
 Press `:` or `Ctrl-P` to open the command palette. Type to fuzzy-search through 36 available actions including navigation, preference changes, overview pane controls, and incident commands. Press `Enter` to execute, `Esc` to cancel. Palette actions include:
 
-- `nav.overview` through `nav.diagnostics` (screen navigation)
-- `pref.density.compact`, `pref.density.comfortable` (visual density)
-- `pref.hints.off`, `pref.hints.minimal`, `pref.hints.full` (hint verbosity)
-- `pref.start.*` (startup screen)
-- `action.overview.focus-next`, `action.overview.focus-prev`, `action.overview.open-focused` (overview pane navigation)
-- `incident.playbook`, `incident.quick-release`, `incident.triage` (incident shortcuts)
+<!-- sbh-docs:begin dashboard-palette -->
+All 36 actions, by family (`id` — title, shortcut where one exists):
+
+- `action.*` (3):
+  - `action.refresh` — Force refresh (`r`)
+  - `action.jump_ballast` — Jump to ballast quick-actions (`b`)
+  - `action.quit` — Quit dashboard (`q`)
+- `action.overview.*` (3):
+  - `action.overview.focus-next` — Overview pane focus next (`Tab`)
+  - `action.overview.focus-prev` — Overview pane focus previous (`Shift-Tab`)
+  - `action.overview.open-focused` — Open focused overview pane (`Enter`)
+- `incident.*` (3):
+  - `incident.playbook` — Show incident triage playbook (`!`)
+  - `incident.quick-release` — Quick-release ballast (incident) (`x`)
+  - `incident.triage` — Start incident triage (overview) (`!`)
+- `nav.*` (9):
+  - `nav.overview` — Go to Overview (`1`)
+  - `nav.timeline` — Go to Timeline (`2`)
+  - `nav.explainability` — Go to Explainability (`3`)
+  - `nav.candidates` — Go to Candidates (`4`)
+  - `nav.ballast` — Go to Ballast (`5`)
+  - `nav.logs` — Go to Log Search (`6`)
+  - `nav.diagnostics` — Go to Diagnostics (`7`)
+  - `nav.prev` — Previous screen (`[`)
+  - `nav.next` — Next screen (`]`)
+- `overlay.*` (3):
+  - `overlay.help` — Open help overlay (`?`)
+  - `overlay.voi` — Open VOI overlay (`v`)
+  - `overlay.palette` — Open command palette (`Ctrl-P / :`)
+- `pref.density.*` (2):
+  - `pref.density.compact` — Set density: Compact (`prefs`)
+  - `pref.density.comfortable` — Set density: Comfortable (`prefs`)
+- `pref.hints.*` (3):
+  - `pref.hints.full` — Set hints: Full (`prefs`)
+  - `pref.hints.minimal` — Set hints: Minimal (`prefs`)
+  - `pref.hints.off` — Set hints: Off (`prefs`)
+- `pref.reset.*` (2):
+  - `pref.reset.persisted` — Reset session to persisted preferences (`prefs`)
+  - `pref.reset.defaults` — Revert preferences to defaults (`prefs`)
+- `pref.start.*` (8):
+  - `pref.start.overview` — Set default start screen: Overview (`prefs`)
+  - `pref.start.timeline` — Set default start screen: Timeline (`prefs`)
+  - `pref.start.explainability` — Set default start screen: Explainability (`prefs`)
+  - `pref.start.candidates` — Set default start screen: Candidates (`prefs`)
+  - `pref.start.ballast` — Set default start screen: Ballast (`prefs`)
+  - `pref.start.logs` — Set default start screen: Log Search (`prefs`)
+  - `pref.start.diagnostics` — Set default start screen: Diagnostics (`prefs`)
+  - `pref.start.remember` — Set default start screen: Remember Last (`prefs`)
+<!-- sbh-docs:end -->
 
 ### Incident Workflows
 
@@ -552,7 +603,8 @@ During disk pressure events, the dashboard provides guided triage shortcuts. The
 | High | Orange pressure | Alert banner + all triage hints visible |
 | Critical | Red/emergency | Urgent alert banner + maximum triage guidance |
 
-**Triage playbook** (`!` key): Opens a 7-entry guided playbook ordered by triage priority (entries marked High appear from Orange pressure on, the rest from Yellow; a test keeps this list equal to the code's):
+**Triage playbook** (`!` key): Opens a 7-entry guided playbook ordered by triage priority (entries marked High appear from Orange pressure on, the rest from Yellow; the list is generated from the code and a test keeps it so):
+<!-- sbh-docs:begin dashboard-playbook -->
 1. Release ballast (Ballast screen, High)
 2. Check pressure overview (Overview screen)
 3. Review critical events (Timeline screen)
@@ -560,6 +612,7 @@ During disk pressure events, the dashboard provides guided triage shortcuts. The
 5. Review pending candidates (Candidates screen, High)
 6. Check daemon health (Diagnostics screen)
 7. Search logs for errors (Log Search screen)
+<!-- sbh-docs:end -->
 
 Use `j`/`k` to navigate entries and `Enter` to jump to the target screen.
 
@@ -804,30 +857,95 @@ Every section rejects keys it does not declare. `sbh config validate` lists unkn
 
 ## Environment Variable Overrides
 
-Operator automation can override configuration via environment variables. These take precedence over config file values.
+Operator automation can override configuration via environment variables. These take precedence over config file values. The table is generated from the binary's own registry (`sbh docs --section env-vars`; a test keeps the registry equal to the variables the code reads); a config override names the `config.toml` key it sets.
 
-| Variable | Controls |
-| --- | --- |
-| `SBH_UPDATE_ENABLED` | Enable/disable update checks |
-| `SBH_UPDATE_BACKGROUND_REFRESH` | Background metadata refresh |
-| `SBH_UPDATE_OPT_OUT` | Opt out of update system entirely |
-| `SBH_UPDATE_METADATA_CACHE_TTL_SECONDS` | Cache TTL for update metadata |
-| `SBH_UPDATE_METADATA_CACHE_FILE` | On-disk cache path |
-| `SBH_UPDATE_NOTICES_ENABLED` | Human follow-up prompts in update output |
-| `SBH_DASHBOARD_MODE` | Dashboard mode (`legacy` or `new`) |
-| `SBH_DASHBOARD_KILL_SWITCH` | Emergency fallback to legacy dashboard |
-| `SBH_PREDICTION_ENABLED` | Enable/disable predictive forecasting |
-| `SBH_SCANNER_REPEAT_DELETION_BASE_COOLDOWN_SECS` | Base cooldown for repeat-deletion dampening |
-| `SBH_SCANNER_REPEAT_DELETION_MAX_COOLDOWN_SECS` | Max cooldown for repeat-deletion dampening |
-| `SBH_SYSTEM_TUNING_WRITEBACK_ENABLED` | Enable/disable kernel writeback tuning detection |
-| `SBH_SYSTEM_TUNING_WRITEBACK_AUTO_APPLY_ON_INSTALL` | Apply writeback tuning during `sbh install` (root) |
-| `SBH_SYSTEM_TUNING_WRITEBACK_TARGET_DRAIN_SECS` | Background dirty-pool drain target (seconds) |
-| `SBH_SYSTEM_TUNING_WRITEBACK_HARD_RATIO` | `dirty_bytes` as a multiple of `dirty_background_bytes` |
-| `SBH_SYSTEM_TUNING_WRITEBACK_MIN_BACKGROUND_BYTES` | Floor for `vm.dirty_background_bytes` |
-| `SBH_SYSTEM_TUNING_WRITEBACK_MAX_BACKGROUND_BYTES` | Ceiling for `vm.dirty_background_bytes` |
-| `SBH_SYSTEM_TUNING_WRITEBACK_BENCHMARK_ENABLED` | Allow the on-volume bandwidth micro-benchmark |
-| `SBH_SYSTEM_TUNING_WRITEBACK_BENCHMARK_BYTES` | Byte budget for the bandwidth micro-benchmark |
-| `SBH_SYSTEM_TUNING_WRITEBACK_POOL_WARN_BYTES` | Dirty-pool size above which `doctor` warns |
+<!-- sbh-docs:begin env-vars -->
+| Variable | Area | Controls |
+| --- | --- | --- |
+| `SBH_CONFIG` | paths | Config file path when `--config` is not given |
+| `SBH_CONFIG_PATH` | service | Config file path the launchd plist hands the daemon |
+| `SBH_USE_XDG_PATHS` | paths | Use XDG user paths (`~/.config/sbh`, `~/.local/share/sbh`) instead of the system paths |
+| `SBH_OUTPUT_FORMAT` | output | `human` or `json` when neither `--json` nor a terminal decides |
+| `SBH_PREFERENCES_FILE` | dashboard | Dashboard preferences file (default `~/.config/sbh/preferences.json`) |
+| `SBH_DASHBOARD_MODE` | config override | `dashboard.mode` (`legacy` or `new`) |
+| `SBH_DASHBOARD_KILL_SWITCH` | config override | `dashboard.kill_switch` (force the live status view) |
+| `SBH_LAUNCHD_LABEL` | service | launchd job label override for the macOS service |
+| `SBH_SYSTEMD_UNIT_DIR` | service | Directory the systemd unit is written to and read from |
+| `SBH_ACTIVE_LEASE_TOKEN` | service | Renewal token `sbh lease run` hands the leased command (`lease renew` reads it) |
+| `SBH_ACTIVE_LEASE_TARGET` | service | Leased target `sbh lease run` hands the leased command (default for `lease status`/`renew`) |
+| `SBH_MACOS_QUERY_FOUNDATION_PURGEABLE` | service | Ask Foundation for purgeable space on macOS (opt-in, slower) |
+| `SBH_BEHAVIOR_PRESET` | config override | `pressure.behavior_preset` |
+| `SBH_POLICY_KILL_SWITCH` | config override | `policy.kill_switch` |
+| `SBH_PREDICTION_ENABLED` | config override | `prediction.enabled` |
+| `SBH_PREDICTION_MIN_SAMPLES` | config override | `prediction.min_samples` |
+| `SBH_PREDICTION_MIN_CONFIDENCE` | config override | `prediction.min_confidence` |
+| `SBH_PREDICTION_WARNING_HORIZON_MINUTES` | config override | `prediction.warning_horizon_minutes` |
+| `SBH_PREDICTION_ACTION_HORIZON_MINUTES` | config override | `prediction.action_horizon_minutes` |
+| `SBH_PREDICTION_IMMINENT_DANGER_MINUTES` | config override | `prediction.imminent_danger_minutes` |
+| `SBH_PREDICTION_CRITICAL_DANGER_MINUTES` | config override | `prediction.critical_danger_minutes` |
+| `SBH_PRESSURE_POLL_INTERVAL_MS` | config override | `pressure.poll_interval_ms` |
+| `SBH_PRESSURE_GREEN_MIN_FREE_PCT` | config override | `pressure.green_min_free_pct` |
+| `SBH_PRESSURE_YELLOW_MIN_FREE_PCT` | config override | `pressure.yellow_min_free_pct` |
+| `SBH_PRESSURE_ORANGE_MIN_FREE_PCT` | config override | `pressure.orange_min_free_pct` |
+| `SBH_PRESSURE_RED_MIN_FREE_PCT` | config override | `pressure.red_min_free_pct` |
+| `SBH_PRESSURE_BEHAVIOR_HYSTERESIS_SECS` | config override | `pressure.behavior_hysteresis_secs` |
+| `SBH_SCANNER_ENGINE` | config override | `scanner.engine` |
+| `SBH_SCANNER_EVENT_SOURCE` | config override | `scanner.event_source` |
+| `SBH_SCANNER_EVENT_WATCH_BUDGET` | config override | `scanner.event_watch_budget` |
+| `SBH_SCANNER_DRY_RUN` | config override | `scanner.dry_run` |
+| `SBH_SCANNER_CROSS_DEVICES` | config override | `scanner.cross_devices` |
+| `SBH_SCANNER_FOLLOW_SYMLINKS` | config override | `scanner.follow_symlinks` |
+| `SBH_SCANNER_MAX_DEPTH` | config override | `scanner.max_depth` |
+| `SBH_SCANNER_PARALLELISM` | config override | `scanner.parallelism` |
+| `SBH_SCANNER_MAX_DELETE_BATCH` | config override | `scanner.max_delete_batch` |
+| `SBH_SCANNER_MIN_FILE_AGE_MINUTES` | config override | `scanner.min_file_age_minutes` |
+| `SBH_SCANNER_MIN_RESCAN_INTERVAL_SECS` | config override | `scanner.min_rescan_interval_secs` |
+| `SBH_SCANNER_MAX_SCAN_DUTY_CYCLE_PCT` | config override | `scanner.max_scan_duty_cycle_pct` |
+| `SBH_SCANNER_ACTIVE_REFERENCE_CACHE_TTL_SECS` | config override | `scanner.active_reference_cache_ttl_secs` |
+| `SBH_SCANNER_ACTIVE_REFERENCE_MIN_SIZE_BYTES` | config override | `scanner.active_reference_min_size_bytes` |
+| `SBH_SCANNER_REPEAT_DELETION_BASE_COOLDOWN_SECS` | config override | `scanner.repeat_deletion_base_cooldown_secs` |
+| `SBH_SCANNER_REPEAT_DELETION_MAX_COOLDOWN_SECS` | config override | `scanner.repeat_deletion_max_cooldown_secs` |
+| `SBH_SCORING_LOCATION_WEIGHT` | config override | `scoring.location_weight` |
+| `SBH_SCORING_NAME_WEIGHT` | config override | `scoring.name_weight` |
+| `SBH_SCORING_AGE_WEIGHT` | config override | `scoring.age_weight` |
+| `SBH_SCORING_SIZE_WEIGHT` | config override | `scoring.size_weight` |
+| `SBH_SCORING_STRUCTURE_WEIGHT` | config override | `scoring.structure_weight` |
+| `SBH_SCORING_MIN_SCORE` | config override | `scoring.min_score` |
+| `SBH_SCORING_CALIBRATION_FLOOR` | config override | `scoring.calibration_floor` |
+| `SBH_SCORING_POSTERIOR_FLOOR_DEFINITE` | config override | `scoring.posterior_floor_definite` |
+| `SBH_SCORING_FALSE_POSITIVE_LOSS` | config override | `scoring.false_positive_loss` |
+| `SBH_SCORING_FALSE_NEGATIVE_LOSS` | config override | `scoring.false_negative_loss` |
+| `SBH_SYSTEM_TUNING_WRITEBACK_ENABLED` | config override | `system_tuning.writeback.enabled` |
+| `SBH_SYSTEM_TUNING_WRITEBACK_AUTO_APPLY_ON_INSTALL` | config override | `system_tuning.writeback.auto_apply_on_install` |
+| `SBH_SYSTEM_TUNING_WRITEBACK_TARGET_DRAIN_SECS` | config override | `system_tuning.writeback.target_drain_secs` |
+| `SBH_SYSTEM_TUNING_WRITEBACK_HARD_RATIO` | config override | `system_tuning.writeback.hard_ratio` |
+| `SBH_SYSTEM_TUNING_WRITEBACK_MIN_BACKGROUND_BYTES` | config override | `system_tuning.writeback.min_background_bytes` |
+| `SBH_SYSTEM_TUNING_WRITEBACK_MAX_BACKGROUND_BYTES` | config override | `system_tuning.writeback.max_background_bytes` |
+| `SBH_SYSTEM_TUNING_WRITEBACK_BENCHMARK_ENABLED` | config override | `system_tuning.writeback.benchmark_enabled` |
+| `SBH_SYSTEM_TUNING_WRITEBACK_BENCHMARK_BYTES` | config override | `system_tuning.writeback.benchmark_bytes` |
+| `SBH_SYSTEM_TUNING_WRITEBACK_POOL_WARN_BYTES` | config override | `system_tuning.writeback.pool_warn_bytes` |
+| `SBH_TELEMETRY_CPU_BUDGET_PCT` | config override | `telemetry.cpu_budget_pct` |
+| `SBH_TELEMETRY_FS_CACHE_TTL_MS` | config override | `telemetry.fs_cache_ttl_ms` |
+| `SBH_TELEMETRY_EWMA_BASE_ALPHA` | config override | `telemetry.ewma_base_alpha` |
+| `SBH_TELEMETRY_EWMA_MIN_ALPHA` | config override | `telemetry.ewma_min_alpha` |
+| `SBH_TELEMETRY_EWMA_MAX_ALPHA` | config override | `telemetry.ewma_max_alpha` |
+| `SBH_TELEMETRY_EWMA_MIN_SAMPLES` | config override | `telemetry.ewma_min_samples` |
+| `SBH_TELEMETRY_DAEMON_RSS_WARNING_BYTES` | config override | `telemetry.daemon_rss_warning_bytes` |
+| `SBH_TELEMETRY_DAEMON_RSS_HARD_LIMIT_BYTES` | config override | `telemetry.daemon_rss_hard_limit_bytes` |
+| `SBH_UPDATE_ENABLED` | config override | `update.enabled` |
+| `SBH_UPDATE_BACKGROUND_REFRESH` | config override | `update.background_refresh` |
+| `SBH_UPDATE_OPT_OUT` | config override | `update.opt_out` |
+| `SBH_UPDATE_METADATA_CACHE_TTL_SECONDS` | config override | `update.metadata_cache_ttl_seconds` |
+| `SBH_UPDATE_METADATA_CACHE_FILE` | config override | `update.metadata_cache_file` |
+| `SBH_UPDATE_NOTICES_ENABLED` | config override | `update.notices_enabled` |
+| `SBH_RELEASE_API_BASE` | release | Point the release API at another server (honored only under `SBH_TEST_MODE=1`) |
+| `SBH_RELEASE_DOWNLOAD_BASE` | release | Point release downloads at another server (honored only under `SBH_TEST_MODE=1`) |
+| `SBH_TEST_MODE` | test | `1` enables the test overlays (injected filesystem stats, release server overrides); the daemon refuses to start under a service manager in this mode |
+| `SBH_TEST_FS_STATS` | test | Injected per-mount filesystem statistics table (test mode) |
+| `SBH_ARTIFACT_DIR` | test | Where the dashboard e2e artifact bundles are written |
+| `SBH_TUI_ARTIFACT_DIR` | test | Where the TUI test artifacts are written |
+| `SBH_TUI_ARTIFACT_FRAMES` | test | Include rendered frame text in the TUI test artifacts |
+<!-- sbh-docs:end -->
 
 ## Architecture
 

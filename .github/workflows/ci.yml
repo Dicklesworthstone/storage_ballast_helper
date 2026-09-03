@@ -66,6 +66,8 @@ jobs:
         run: cargo clippy $CI_FEATURES --all-targets -- -D warnings
       - name: Run clippy (every target, tui)
         run: cargo clippy $TUI_FEATURES --all-targets -- -D warnings
+      - name: Generated README regions match the code (sbh docs --check)
+        run: cargo run $CI_FEATURES --quiet --bin sbh -- docs --check README.md
 
   homebrew-formula:
     name: Homebrew Formula Validation

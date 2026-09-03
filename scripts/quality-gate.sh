@@ -96,6 +96,7 @@ done
 STAGES=(
   "fmt|HARD|check|Code Quality|code-style|cargo fmt --check|Run 'cargo fmt' to auto-fix formatting"
   "clippy|HARD|check|Code Quality|correctness-warnings|cargo clippy --all-targets -- -D warnings|Fix clippy warnings — check stage log for specific lints"
+  "docs-drift|SOFT|check|Code Quality|generated-docs|cargo run --quiet --bin sbh -- docs --check README.md|A generated README region no longer matches the code: run 'sbh docs --render README.md' and commit the result"
   "unit-lib|HARD|test|Unit Tests|core-logic|cargo test --lib -- --test-threads=4|Check failing test → module → recent changes. Run with --nocapture for details"
   "unit-bin|HARD|test|Unit Tests|cli-routing|cargo test --bin sbh -- --test-threads=4|CLI argument parsing or output formatting regression"
   "cli-exit-codes|HARD|test|Unit Tests|exit-code-contract|cargo test --test cli_exit_codes -- --test-threads=4|C-EXIT contract broken — a command's exit code or stream discipline changed"

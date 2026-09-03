@@ -1,9 +1,54 @@
 #!/usr/bin/env bash
+# ci_docs_update_check.sh — documentation keeps up with the code.
+#
+# Two checks:
+#   1. Companion docs (PRs): user-facing source changes must come with a
+#      README/CHANGELOG/docs/help-text update; new clap annotations need help
+#      text; new config fields need config docs. Driven by the changed files
+#      between DOCS_UPDATE_BASE and DOCS_UPDATE_HEAD (or the PR base), or the
+#      list in DOCS_UPDATE_CHANGED_FILES.
+#   2. Generated regions (bd-rc-master-ajg1.12.2): the README regions between
+#      `<!-- sbh-docs:begin <section> -->` and `<!-- sbh-docs:end -->` must
+#      match what the binary generates (`sbh docs --check`). Runs when
+#      SBH_BIN names a built sbh, or when SBH_DOCS_DRIFT=1 asks for a build.
+#      The quality gate's `docs-drift` stage runs the same check.
+#
+# Usage:
+#   bash scripts/ci_docs_update_check.sh
+#   DOCS_UPDATE_BASE=origin/main DOCS_UPDATE_HEAD=HEAD bash scripts/ci_docs_update_check.sh
+#   SBH_BIN=target/debug/sbh bash scripts/ci_docs_update_check.sh
 set -euo pipefail
 
 error() {
   echo "::error::$1" >&2
 }
+
+# ── check 2: generated regions ───────────────────────────────────────────────
+
+docs_drift_check() {
+  local bin="${SBH_BIN:-}"
+  if [[ -z "${bin}" && "${SBH_DOCS_DRIFT:-0}" != "1" ]]; then
+    return 0
+  fi
+  local root
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [[ -z "${bin}" ]]; then
+    (cd "${root}" && "${SBH_DOCS_CARGO:-cargo}" build --quiet --bin sbh)
+    bin="${CARGO_TARGET_DIR:-${root}/target}/debug/sbh"
+  fi
+  if [[ ! -x "${bin}" ]]; then
+    error "docs drift check: sbh binary not found at ${bin}"
+    return 3
+  fi
+  if (cd "${root}" && "${bin}" docs --check README.md); then
+    echo "docs-drift-check: generated README regions match the code"
+    return 0
+  fi
+  error "generated README regions have drifted; run: sbh docs --render README.md"
+  return 1
+}
+
+# ── check 1: companion docs for user-facing changes ──────────────────────────
 
 changed_files_from_git() {
   local base="${DOCS_UPDATE_BASE:-}"
@@ -39,7 +84,8 @@ changed_files="$(printf '%s\n' "${changed_files}" | sed '/^[[:space:]]*$/d')"
 
 if [[ -z "${changed_files}" ]]; then
   echo "docs-update-check: no changed files to inspect"
-  exit 0
+  docs_drift_check
+  exit $?
 fi
 
 has_changed_path() {
@@ -93,3 +139,4 @@ if [[ "${failed}" -ne 0 ]]; then
 fi
 
 echo "docs-update-check: user-facing changes have docs/help coverage"
+docs_drift_check

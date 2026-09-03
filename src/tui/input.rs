@@ -111,6 +111,313 @@ pub struct ContextualHelp {
     pub bindings: Vec<HelpBinding>,
 }
 
+/// Where a key binding applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyContext {
+    /// Any screen, no overlay open.
+    Global,
+    /// One screen, no overlay open.
+    Screen(Screen),
+    /// Several screens, no overlay open.
+    Screens(&'static [Screen]),
+    /// While the named overlay is open.
+    Overlay(Overlay),
+}
+
+/// README table a binding is listed under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyGroup {
+    Navigation,
+    Overlays,
+    Incident,
+    Screen,
+}
+
+/// One documented key binding: the keys as the README prints them, one
+/// representative key the tests resolve, where it applies, and what it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyBinding {
+    pub keys: &'static str,
+    pub probe: KeyCode,
+    pub ctrl: bool,
+    pub group: KeyGroup,
+    pub context: KeyContext,
+    pub description: &'static str,
+}
+
+const LIST_SCREENS: &[Screen] = &[
+    Screen::Timeline,
+    Screen::Candidates,
+    Screen::Explainability,
+    Screen::Ballast,
+];
+const DETAIL_SCREENS: &[Screen] = &[Screen::Candidates, Screen::Explainability, Screen::Ballast];
+
+/// The dashboard keymap: what `sbh docs` renders into the README and what
+/// the contract tests resolve (bd-rc-master-ajg1.4.12 / 12.2).
+///
+/// Global and overlay entries go through [`resolve_key_event`]; screen
+/// entries are the per-screen handlers in `update.rs`.
+pub const KEYMAP: &[KeyBinding] = &[
+    // ── Navigation ──
+    KeyBinding {
+        keys: "`1`-`7`",
+        probe: KeyCode::Char('1'),
+        ctrl: false,
+        group: KeyGroup::Navigation,
+        context: KeyContext::Global,
+        description: "Jump directly to screen",
+    },
+    KeyBinding {
+        keys: "`[` / `]`",
+        probe: KeyCode::Char('['),
+        ctrl: false,
+        group: KeyGroup::Navigation,
+        context: KeyContext::Global,
+        description: "Previous / next screen",
+    },
+    KeyBinding {
+        keys: "`Tab` / `Shift-Tab`",
+        probe: KeyCode::Tab,
+        ctrl: false,
+        group: KeyGroup::Navigation,
+        context: KeyContext::Screen(Screen::Overview),
+        description: "Cycle focused pane on Overview",
+    },
+    KeyBinding {
+        keys: "`Enter` / `Space`",
+        probe: KeyCode::Enter,
+        ctrl: false,
+        group: KeyGroup::Navigation,
+        context: KeyContext::Screen(Screen::Overview),
+        description: "Open focused pane target screen",
+    },
+    KeyBinding {
+        keys: "`b`",
+        probe: KeyCode::Char('b'),
+        ctrl: false,
+        group: KeyGroup::Navigation,
+        context: KeyContext::Global,
+        description: "Jump to Ballast screen",
+    },
+    KeyBinding {
+        keys: "`Esc`",
+        probe: KeyCode::Escape,
+        ctrl: false,
+        group: KeyGroup::Navigation,
+        context: KeyContext::Global,
+        description: "Close overlay, then close open detail pane, then back, then quit",
+    },
+    KeyBinding {
+        keys: "`q`",
+        probe: KeyCode::Char('q'),
+        ctrl: false,
+        group: KeyGroup::Navigation,
+        context: KeyContext::Global,
+        description: "Quit dashboard",
+    },
+    KeyBinding {
+        keys: "`Ctrl-C`",
+        probe: KeyCode::Char('c'),
+        ctrl: true,
+        group: KeyGroup::Navigation,
+        context: KeyContext::Global,
+        description: "Immediate quit",
+    },
+    // ── Overlays ──
+    KeyBinding {
+        keys: "`?`",
+        probe: KeyCode::Char('?'),
+        ctrl: false,
+        group: KeyGroup::Overlays,
+        context: KeyContext::Global,
+        description: "Toggle help overlay (contextual keybinding reference)",
+    },
+    KeyBinding {
+        keys: "`Ctrl-P` or `:`",
+        probe: KeyCode::Char(':'),
+        ctrl: false,
+        group: KeyGroup::Overlays,
+        context: KeyContext::Global,
+        description: "Open command palette (fuzzy search over every palette action)",
+    },
+    KeyBinding {
+        keys: "`v`",
+        probe: KeyCode::Char('v'),
+        ctrl: false,
+        group: KeyGroup::Overlays,
+        context: KeyContext::Global,
+        description: "Toggle VOI scheduler overlay",
+    },
+    KeyBinding {
+        keys: "`r`",
+        probe: KeyCode::Char('r'),
+        ctrl: false,
+        group: KeyGroup::Overlays,
+        context: KeyContext::Global,
+        description: "Force data refresh",
+    },
+    KeyBinding {
+        keys: "type, `Backspace`, `Up`/`Down`, `Enter`",
+        probe: KeyCode::Enter,
+        ctrl: false,
+        group: KeyGroup::Overlays,
+        context: KeyContext::Overlay(Overlay::CommandPalette),
+        description: "Filter, move through, and run the selected palette action",
+    },
+    KeyBinding {
+        keys: "`j`/`k` or arrows, `Enter`",
+        probe: KeyCode::Enter,
+        ctrl: false,
+        group: KeyGroup::Overlays,
+        context: KeyContext::Overlay(Overlay::IncidentPlaybook),
+        description: "Move through the playbook and jump to the entry's screen",
+    },
+    KeyBinding {
+        keys: "`Enter` / `Esc`",
+        probe: KeyCode::Enter,
+        ctrl: false,
+        group: KeyGroup::Overlays,
+        context: KeyContext::Overlay(Overlay::Confirmation(
+            super::model::ConfirmAction::BallastRelease,
+        )),
+        description: "Confirm or cancel the ballast action",
+    },
+    // ── Incident shortcuts ──
+    KeyBinding {
+        keys: "`!`",
+        probe: KeyCode::Char('!'),
+        ctrl: false,
+        group: KeyGroup::Incident,
+        context: KeyContext::Global,
+        description: "Open incident triage playbook overlay",
+    },
+    KeyBinding {
+        keys: "`x`",
+        probe: KeyCode::Char('x'),
+        ctrl: false,
+        group: KeyGroup::Incident,
+        context: KeyContext::Global,
+        description: "Quick-release ballast (jumps to Ballast, selects a volume with files, opens the release confirmation)",
+    },
+    // ── Screen-specific ──
+    KeyBinding {
+        keys: "`j` / `k` or arrows",
+        probe: KeyCode::Char('j'),
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screens(LIST_SCREENS),
+        description: "Cursor navigation",
+    },
+    KeyBinding {
+        keys: "`Enter` or `Space`",
+        probe: KeyCode::Enter,
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screens(DETAIL_SCREENS),
+        description: "Toggle detail view",
+    },
+    KeyBinding {
+        keys: "`Enter`",
+        probe: KeyCode::Enter,
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screen(Screen::Timeline),
+        description: "Open the linked decision on Explainability",
+    },
+    KeyBinding {
+        keys: "`d`",
+        probe: KeyCode::Char('d'),
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screens(DETAIL_SCREENS),
+        description: "Close detail panel",
+    },
+    KeyBinding {
+        keys: "`f`",
+        probe: KeyCode::Char('f'),
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screen(Screen::Timeline),
+        description: "Cycle severity filter",
+    },
+    KeyBinding {
+        keys: "`Shift-F`",
+        probe: KeyCode::Char('F'),
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screen(Screen::Timeline),
+        description: "Toggle follow mode (auto-scroll to latest)",
+    },
+    KeyBinding {
+        keys: "`s`",
+        probe: KeyCode::Char('s'),
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screen(Screen::Candidates),
+        description: "Cycle sort order (Score, Size, Age, Path)",
+    },
+    KeyBinding {
+        keys: "`Shift-X`",
+        probe: KeyCode::Char('X'),
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screen(Screen::Ballast),
+        description: "Release every available ballast file on the selected volume (confirmation)",
+    },
+    KeyBinding {
+        keys: "`p`",
+        probe: KeyCode::Char('p'),
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screen(Screen::Ballast),
+        description: "Replenish the released ballast files on the selected volume (confirmation)",
+    },
+    KeyBinding {
+        keys: "`Shift-V`",
+        probe: KeyCode::Char('V'),
+        ctrl: false,
+        group: KeyGroup::Screen,
+        context: KeyContext::Screen(Screen::Diagnostics),
+        description: "Toggle verbose frame metrics",
+    },
+];
+
+/// One screen as the README's "Screens" table lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenDoc {
+    pub number: u8,
+    pub name: &'static str,
+    pub hint: &'static str,
+}
+
+/// The seven screens in number order, with the hint the help overlay shows.
+#[must_use]
+pub fn screen_catalog() -> Vec<ScreenDoc> {
+    (1..=7)
+        .filter_map(Screen::from_number)
+        .map(|screen| ScreenDoc {
+            number: screen.number(),
+            name: screen_name(screen),
+            hint: screen_hint(screen),
+        })
+        .collect()
+}
+
+/// The screen's name as the docs print it.
+#[must_use]
+pub const fn screen_name(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Overview => "Overview",
+        Screen::Timeline => "Timeline",
+        Screen::Explainability => "Explainability",
+        Screen::Candidates => "Candidates",
+        Screen::Ballast => "Ballast",
+        Screen::LogSearch => "Log Search",
+        Screen::Diagnostics => "Diagnostics",
+    }
+}
+
 /// Route a terminal key event into the dashboard message stream.
 #[must_use]
 pub fn map_key_event(key: KeyEvent) -> DashboardMsg {
@@ -1061,6 +1368,98 @@ mod tests {
         let res = resolve_key_event(&key(KeyCode::Char('q')), ctx);
         assert!(res.consumed);
         assert!(res.action.is_none()); // consumed but no action
+    }
+
+    /// The documented keymap is the real one: every global and overlay
+    /// binding resolves to an action in its context, every screen binding
+    /// is left to the screen handler (no global key shadows it), and the
+    /// catalog lists the seven screens in order.
+    #[test]
+    fn keymap_bindings_resolve_in_their_context() {
+        assert!(!KEYMAP.is_empty());
+        for binding in KEYMAP {
+            let event = if binding.ctrl {
+                ctrl(binding.probe)
+            } else {
+                key(binding.probe)
+            };
+            assert!(!binding.keys.is_empty() && !binding.description.is_empty());
+            match binding.context {
+                KeyContext::Global => {
+                    let res = resolve_key_event(
+                        &event,
+                        InputContext {
+                            screen: Screen::Timeline,
+                            active_overlay: None,
+                        },
+                    );
+                    assert!(res.action.is_some(), "global {:?} resolves", binding.keys);
+                }
+                KeyContext::Overlay(overlay) => {
+                    let res = resolve_key_event(
+                        &event,
+                        InputContext {
+                            screen: Screen::Ballast,
+                            active_overlay: Some(overlay),
+                        },
+                    );
+                    assert!(
+                        res.action.is_some(),
+                        "{:?} resolves in {overlay:?}",
+                        binding.keys
+                    );
+                }
+                KeyContext::Screen(Screen::Overview) => {
+                    let res = resolve_key_event(
+                        &event,
+                        InputContext {
+                            screen: Screen::Overview,
+                            active_overlay: None,
+                        },
+                    );
+                    assert!(
+                        res.action.is_some(),
+                        "{:?} resolves on Overview",
+                        binding.keys
+                    );
+                }
+                KeyContext::Screen(screen) => {
+                    let res = resolve_key_event(
+                        &event,
+                        InputContext {
+                            screen,
+                            active_overlay: None,
+                        },
+                    );
+                    assert!(
+                        !res.consumed,
+                        "{:?} must reach the {screen:?} handler",
+                        binding.keys
+                    );
+                }
+                KeyContext::Screens(screens) => {
+                    for screen in screens {
+                        let res = resolve_key_event(
+                            &event,
+                            InputContext {
+                                screen: *screen,
+                                active_overlay: None,
+                            },
+                        );
+                        assert!(
+                            !res.consumed,
+                            "{:?} must reach the {screen:?} handler",
+                            binding.keys
+                        );
+                    }
+                }
+            }
+        }
+        let catalog = screen_catalog();
+        assert_eq!(catalog.len(), 7);
+        assert_eq!(catalog[0].name, "Overview");
+        assert_eq!(catalog[6].number, 7);
+        assert!(catalog.iter().all(|s| !s.hint.is_empty()));
     }
 
     #[test]

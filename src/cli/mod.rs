@@ -9,6 +9,7 @@ pub mod bootstrap;
 /// feature; the shipped binary carries the frankentui cockpit alone.
 #[cfg(feature = "legacy-crossterm-dashboard")]
 pub mod dashboard;
+pub mod docs;
 pub mod from_source;
 pub mod install;
 pub mod uninstall;

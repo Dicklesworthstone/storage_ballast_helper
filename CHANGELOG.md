@@ -10,6 +10,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 
+### Added — `sbh docs`: README tables generated from the code (bd-rc-master-ajg1.12.2, first slice)
+
+- `sbh docs` prints a versioned JSON document built from the binary's own tables: every `SBH_*` environment variable (a registry a test keeps equal to the names the code reads, each config override naming its `config.toml` key), every command and flag from clap, the dashboard's screens, keymap, palette actions and playbook, and the default configuration as TOML. `--section <name>` prints one section's Markdown.
+- `sbh docs --render <file>` rewrites the regions a file marks with `<!-- sbh-docs:begin <section> -->` … `<!-- sbh-docs:end -->`; `--check <file>` exits 1 naming the drifted regions. README's environment-variable table, dashboard keybinding tables, palette list and triage playbook are such regions now; `scripts/ci_docs_update_check.sh` runs the check and the quality gate has a `docs-drift` stage.
+- Contract tests: the keymap resolves every global and overlay binding in its context and no global key shadows a documented screen key; every `sbh <command>` in README's Command Reference exists in clap; README's generated regions match the build.
+
 ### Changed — the quality gate cannot pass vacuously (bd-rc-master-ajg1.1.3)
 
 - `scripts/quality-gate.sh` counts the tests each stage executed (the sum of its `test result:` lines; the e2e suite's `summary pass=N fail=M` line) and records a test stage that exits 0 having selected no test as `vacuous`, a failure of that gate; `summary.json` carries `executed_tests` per stage and in total, and the console shows the count next to each PASS.

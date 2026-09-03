@@ -162,6 +162,9 @@ enum Command {
     Explain(ExplainArgs),
     /// Live TUI-style dashboard.
     Dashboard(DashboardArgs),
+    /// Generated documentation: the document as JSON, or render/check the
+    /// marked regions of a file (README tables come from here).
+    Docs(DocsArgs),
     /// Run diagnostics.
     Doctor(DoctorArgs),
     /// Print the daemon's Prometheus textfile export (`metrics.prom`).
@@ -904,6 +907,25 @@ impl Default for BlameArgs {
 }
 
 #[derive(Debug, Clone, Args, Serialize)]
+struct DocsArgs {
+    /// Print one section's Markdown instead of the JSON document
+    /// (env-vars, commands, dashboard-screens, dashboard-keymap,
+    /// dashboard-palette, dashboard-playbook).
+    #[arg(long, value_name = "SECTION", conflicts_with_all = ["render", "check"])]
+    section: Option<String>,
+
+    /// Rewrite the `<!-- sbh-docs:begin <section> -->` … `<!-- sbh-docs:end -->`
+    /// regions of these files in place.
+    #[arg(long, value_name = "FILE", num_args = 1.., conflicts_with = "check")]
+    render: Vec<PathBuf>,
+
+    /// Report the regions of these files that differ from the code; exit 1
+    /// on drift (the CI docs-drift check).
+    #[arg(long, value_name = "FILE", num_args = 1..)]
+    check: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args, Serialize)]
 struct DashboardArgs {
     /// Refresh interval for live view.
     #[arg(long, default_value_t = 1_000, value_name = "MILLISECONDS")]
@@ -1131,6 +1153,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Dashboard(args) => run_dashboard(cli, args),
         Command::Doctor(args) => run_doctor(cli, args),
         Command::Metrics => run_metrics(cli),
+        Command::Docs(args) => run_docs(cli, args),
         Command::Completions(args) => {
             let mut command = Cli::command();
             let binary_name = command.get_name().to_string();
@@ -2664,6 +2687,104 @@ fn run_policy(cli: &Cli, args: &PolicyArgs) -> Result<(), CliError> {
 /// `sbh metrics`: print the daemon's Prometheus textfile export verbatim.
 /// The daemon writes it beside `state.json` with every state write; this
 /// command only reads it, so it says why when there is nothing to read.
+/// `sbh docs`: the generated document as JSON (the default, and `--json`),
+/// one section's Markdown (`--section`), or the marked regions of files
+/// rewritten (`--render`) or verified (`--check`, exit 1 on drift).
+fn run_docs(cli: &Cli, args: &DocsArgs) -> Result<(), CliError> {
+    use storage_ballast_helper::cli::docs::{DocsDocument, check_file, render_file};
+
+    let document = DocsDocument::build(&Cli::command());
+
+    if !args.check.is_empty() {
+        let mut drifted: Vec<(PathBuf, Vec<String>)> = Vec::new();
+        for path in &args.check {
+            let changed = check_file(path, &document).map_err(|e| CliError::User(e.to_string()))?;
+            if !changed.is_empty() {
+                drifted.push((path.clone(), changed));
+            }
+        }
+        if output_mode(cli) == OutputMode::Json {
+            let payload = json!({
+                "command": "docs",
+                "check": args.check,
+                "drifted": drifted.iter().map(|(path, sections)| json!({ "path": path, "sections": sections })).collect::<Vec<_>>(),
+                "ok": drifted.is_empty(),
+            });
+            write_json_line(&payload)?;
+        } else if drifted.is_empty() {
+            println!(
+                "docs: generated regions match the code in {}",
+                args.check
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        } else {
+            for (path, sections) in &drifted {
+                eprintln!(
+                    "docs: {} has drifted in: {}",
+                    path.display(),
+                    sections.join(", ")
+                );
+            }
+        }
+        if drifted.is_empty() {
+            return Ok(());
+        }
+        return Err(CliError::User(format!(
+            "generated documentation regions have drifted; run `sbh docs --render {}`",
+            drifted
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        )));
+    }
+
+    if !args.render.is_empty() {
+        let mut report = Vec::new();
+        for path in &args.render {
+            let changed =
+                render_file(path, &document).map_err(|e| CliError::User(e.to_string()))?;
+            report.push((path.clone(), changed));
+        }
+        if output_mode(cli) == OutputMode::Json {
+            let payload = json!({
+                "command": "docs",
+                "rendered": report.iter().map(|(path, sections)| json!({ "path": path, "changed": sections })).collect::<Vec<_>>(),
+            });
+            write_json_line(&payload)?;
+        } else {
+            for (path, changed) in &report {
+                if changed.is_empty() {
+                    println!("docs: {} already matched the code", path.display());
+                } else {
+                    println!(
+                        "docs: {} rewritten ({})",
+                        path.display(),
+                        changed.join(", ")
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(section) = args.section.as_deref() {
+        let markdown = document.render_section(section).ok_or_else(|| {
+            CliError::User(format!(
+                "unknown docs section {section:?}; this build renders: {}",
+                document.section_names().join(", ")
+            ))
+        })?;
+        print!("{markdown}");
+        return Ok(());
+    }
+
+    write_json_line(&document.to_json())
+}
+
 fn run_metrics(cli: &Cli) -> Result<(), CliError> {
     use storage_ballast_helper::daemon::metrics::metrics_file_path;
 
@@ -17605,6 +17726,72 @@ mod tests {
         let (sel, reason) = resolve_dashboard_runtime(&legacy_args, &cfg);
         assert_eq!(sel, DashboardRuntimeSelection::Legacy);
         assert_eq!(reason, DashboardSelectionReason::CliFlagLegacy);
+    }
+
+    /// Every `sbh <command>` the README's Command Reference lists exists in
+    /// clap (bd-rc-master-ajg1.12.3's first check), and the README's
+    /// generated regions match this build (`sbh docs --check README.md`).
+    #[test]
+    fn readme_commands_exist_and_generated_regions_are_current() {
+        use storage_ballast_helper::cli::docs::{DocsDocument, check_file};
+
+        let readme_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let readme = std::fs::read_to_string(&readme_path).expect("README.md");
+        let root = Cli::command();
+        let known: std::collections::BTreeSet<String> =
+            storage_ballast_helper::cli::docs::command_docs(&root)
+                .into_iter()
+                .map(|c| c.path)
+                .collect();
+
+        let section_start = readme
+            .find("## Command Reference")
+            .expect("README has a Command Reference");
+        let section_end = readme[section_start..]
+            .find("\n## ")
+            .map_or(readme.len(), |end| section_start + end);
+        let mut missing = Vec::new();
+        for line in readme[section_start..section_end].lines() {
+            let Some(rest) = line.strip_prefix("| `sbh ") else {
+                continue;
+            };
+            let Some(cell_end) = rest.find('`') else {
+                continue;
+            };
+            let words: Vec<&str> = rest[..cell_end]
+                .split_whitespace()
+                .take_while(|w| !w.starts_with('-') && !w.starts_with('<') && !w.starts_with('['))
+                .collect();
+            let mut path = String::new();
+            for word in words {
+                // `config show|set|…` documents alternatives in one cell.
+                let word = word.split('|').next().unwrap_or(word);
+                let candidate = if path.is_empty() {
+                    word.to_string()
+                } else {
+                    format!("{path} {word}")
+                };
+                if known.contains(&candidate) {
+                    path = candidate;
+                } else {
+                    break;
+                }
+            }
+            if path.is_empty() {
+                missing.push(line.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "README documents commands that do not exist: {missing:#?}"
+        );
+
+        let document = DocsDocument::build(&root);
+        let drifted = check_file(&readme_path, &document).expect("README regions render");
+        assert!(
+            drifted.is_empty(),
+            "README generated regions drifted: {drifted:?}; run `sbh docs --render README.md`"
+        );
     }
 
     /// `--start-screen` rides along as the raw name; the cockpit runtime is
