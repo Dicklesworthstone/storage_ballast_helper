@@ -1999,6 +1999,27 @@ mod tests {
     }
 
     #[test]
+    fn preallocate_64mib_ballast_file_in_under_one_second() {
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let path = dir.path().join("ballast-64mib.bin");
+        let size = 64 * 1024 * 1024;
+        let platform = MacOsPal::new();
+
+        let start = std::time::Instant::now();
+        platform
+            .preallocate_file(&path, size)
+            .expect("macOS 64 MiB preallocation should succeed");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "64 MiB preallocation took {elapsed:?}, expected < 1s"
+        );
+        let metadata = std::fs::metadata(&path).expect("preallocated file should exist");
+        assert_eq!(metadata.len(), size);
+    }
+
+    #[test]
     fn mmap_regions_under_reports_current_process_executable_mapping() {
         let current_exe = std::env::current_exe().expect("current executable should be known");
         let root = current_exe

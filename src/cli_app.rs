@@ -10522,6 +10522,11 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                             if reserve.get("floor_limited") == Some(&Value::Bool(true)) {
                                 text.push_str(" floor");
                             }
+                            if let Some(eta) =
+                                reserve.get("release_efficiency").and_then(Value::as_f64)
+                            {
+                                text = format!("{text} (eta {eta:.2})");
+                            }
                             // bd-rc-master-ajg1.2.18: what the observed
                             // bursts say the reserve should be.
                             if let Some(burst) = reserve.get("burst") {
@@ -10559,6 +10564,21 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                         field("level"),
                         field("reclaim_capability"),
                     );
+                }
+                for controller in controllers {
+                    if let Some(reserve) = controller.get("reserve_state")
+                        && let Some(eta) = reserve.get("release_efficiency").and_then(Value::as_f64)
+                    {
+                        let mount_str = controller
+                            .get("mount")
+                            .and_then(Value::as_str)
+                            .unwrap_or("/");
+                        if let Some(warning) =
+                            ballast_release_efficiency_warning(Path::new(mount_str), eta)
+                        {
+                            println!("  WARNING: {warning}");
+                        }
+                    }
                 }
             }
 
@@ -11148,6 +11168,20 @@ fn local_snapshot_thin_shell_command(mount: &Path) -> String {
         LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES,
         LOCAL_SNAPSHOT_THIN_URGENCY
     )
+}
+
+fn ballast_release_efficiency_warning(mount: &Path, eta_m: f64) -> Option<String> {
+    if eta_m < 0.5 {
+        Some(format!(
+            "Ballast release effectiveness low on {} (eta={:.2} < 0.50). \
+             Local snapshots may retain deleted blocks. Thin with: {}",
+            mount.display(),
+            eta_m,
+            local_snapshot_thin_shell_command(mount)
+        ))
+    } else {
+        None
+    }
 }
 
 fn bytes_to_pct(value: u64, total: u64) -> f64 {
@@ -20521,6 +20555,18 @@ mod tests {
 
         assert!(warning.contains("64 B retained by local Time Machine snapshots"));
         assert!(warning.contains("sudo tmutil thinlocalsnapshots / 9999999999999999 4"));
+    }
+
+    #[test]
+    fn ballast_release_efficiency_warning_prints_eta_and_tmutil() {
+        let mount = Path::new("/");
+        let warning =
+            ballast_release_efficiency_warning(mount, 0.25).expect("warning should be present");
+        assert!(warning.contains("eta=0.25 < 0.50"));
+        assert!(warning.contains("sudo tmutil thinlocalsnapshots / 9999999999999999 4"));
+
+        assert!(ballast_release_efficiency_warning(mount, 0.50).is_none());
+        assert!(ballast_release_efficiency_warning(mount, 0.85).is_none());
     }
 
     #[test]

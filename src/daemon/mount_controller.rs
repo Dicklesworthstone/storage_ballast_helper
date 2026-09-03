@@ -634,6 +634,9 @@ pub struct ReserveState {
     /// (bd-rc-master-ajg1.2.18); absent until the mount has been observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub burst: Option<ReserveBurst>,
+    /// Observed release effectiveness EWMA (eta_m): delta_free / bytes_released (bd-rc-master-ajg1.9.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_efficiency: Option<f64>,
 }
 
 /// The reserve target derived from the mount's write bursts: the 0.99
@@ -1304,6 +1307,7 @@ mod tests {
                     floor_limited: false,
                     quarantined_bytes: 0,
                     burst: None,
+                    release_efficiency: None,
                 }),
             };
         assert!(unprotected_pressure(&record(

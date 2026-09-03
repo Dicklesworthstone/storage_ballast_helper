@@ -24,8 +24,22 @@ use crate::monitor::pid::{PressureLevel, PressureResponse};
 
 // ──────────────────── release controller ────────────────────
 
+/// Minimum duration to wait after a release before measuring observed delta free (5 seconds).
+pub const RELEASE_SETTLE_DURATION: Duration = Duration::from_secs(5);
+
+/// A pending ballast release awaiting effectiveness measurement after the settle period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingRelease {
+    /// Bytes released in this batch.
+    pub bytes_released: u64,
+    /// Free bytes observed immediately before the release.
+    pub free_before: u64,
+    /// Timestamp when the release occurred.
+    pub released_at: Instant,
+}
+
 /// Per-mount state for release/replenishment tracking.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MountReleaseState {
     /// When we last released ballast (for cooldown calculation).
     last_release_time: Option<Instant>,
@@ -42,6 +56,25 @@ struct MountReleaseState {
     /// is rebuilding, not a cap on replenishment (a reserve short for any
     /// other reason is rebuilt too).
     released_since_green: usize,
+    /// Observed release effectiveness EWMA (eta_m): delta_free / bytes_released.
+    /// Prior 1.0, EWMA alpha 0.3, clamp [0.05, 1.0].
+    release_efficiency: f64,
+    /// Pending release awaiting the >= 5s settle measurement.
+    pending_release: Option<PendingRelease>,
+}
+
+impl Default for MountReleaseState {
+    fn default() -> Self {
+        Self {
+            last_release_time: None,
+            green_since: None,
+            last_replenish_time: None,
+            non_green_interruptions: 0,
+            released_since_green: 0,
+            release_efficiency: 1.0,
+            pending_release: None,
+        }
+    }
 }
 
 /// Non-Green ticks tolerated inside a replenish cooldown before it restarts.
@@ -121,7 +154,17 @@ impl BallastReleaseController {
         // Calculate how many MORE files need to be released to reach the target state.
         let needed = target_released.saturating_sub(already_released);
 
-        needed.min(available)
+        let state = self.states.entry(mount_path.to_path_buf()).or_default();
+        let eta = state.release_efficiency.clamp(0.05, 1.0);
+        let scaled_needed = if needed > 0 && eta < 1.0 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let count = ((needed as f64) / eta).ceil() as usize;
+            count
+        } else {
+            needed
+        };
+
+        scaled_needed.min(available)
     }
 
     /// Execute a pressure-driven release cycle.
@@ -160,6 +203,56 @@ impl BallastReleaseController {
         state.green_since = None;
         state.non_green_interruptions = 0;
         state.released_since_green = state.released_since_green.saturating_add(count);
+    }
+
+    /// Record a ballast release event and queue it for effectiveness measurement.
+    pub fn record_release(
+        &mut self,
+        mount_path: &Path,
+        bytes_released: u64,
+        free_before: u64,
+        now: Instant,
+    ) {
+        let state = self.states.entry(mount_path.to_path_buf()).or_default();
+        state.pending_release = Some(PendingRelease {
+            bytes_released,
+            free_before,
+            released_at: now,
+        });
+    }
+
+    /// Update release effectiveness on a tick if at least 5s has elapsed since release.
+    /// Uses EWMA with alpha = 0.3, clamped to [0.05, 1.0]. Never blocks or sleeps.
+    pub fn update_effectiveness(&mut self, mount_path: &Path, free_now: u64, now: Instant) -> f64 {
+        let state = self.states.entry(mount_path.to_path_buf()).or_default();
+        if let Some(pending) = state.pending_release
+            && now.duration_since(pending.released_at) >= RELEASE_SETTLE_DURATION
+        {
+            let observed_delta = free_now.saturating_sub(pending.free_before);
+            if pending.bytes_released > 0 {
+                let observed_eta = (observed_delta as f64) / (pending.bytes_released as f64);
+                let alpha = 0.3;
+                let new_eta =
+                    f64::mul_add(1.0 - alpha, state.release_efficiency, alpha * observed_eta);
+                state.release_efficiency = new_eta.clamp(0.05, 1.0);
+            }
+            state.pending_release = None;
+        }
+        state.release_efficiency
+    }
+
+    /// Get current release efficiency for `mount_path` (prior 1.0).
+    #[must_use]
+    pub fn release_efficiency(&self, mount_path: &Path) -> f64 {
+        self.states
+            .get(mount_path)
+            .map_or(1.0, |s| s.release_efficiency)
+    }
+
+    /// Set release efficiency for `mount_path` (for test setup or persistence restore).
+    pub fn set_release_efficiency(&mut self, mount_path: &Path, efficiency: f64) {
+        let state = self.states.entry(mount_path.to_path_buf()).or_default();
+        state.release_efficiency = efficiency.clamp(0.05, 1.0);
     }
 
     /// Feed one tick's pressure level for `mount_path`. Runs every tick from
@@ -580,5 +673,43 @@ mod tests {
         ctrl.maybe_release(mount, &mut mgr, &red_response).unwrap();
         // Should release 2 more to reach 3 total.
         assert_eq!(mgr.available_count(), 2);
+    }
+
+    #[test]
+    fn with_eta_0_25_controller_requests_4x_files_capped() {
+        let mut ctrl = BallastReleaseController::new(30);
+        let mount = Path::new("/test");
+        ctrl.set_release_efficiency(mount, 0.25);
+
+        // Target 1 file (Orange pressure)
+        let r = test_response(PressureLevel::Orange, 0.4, 0);
+        // With 10 available, 1 / 0.25 = 4 files requested
+        assert_eq!(ctrl.files_to_release(mount, &r, 10, 10), 4);
+
+        // When only 3 files are available in a 3-file pool, capped at available count
+        assert_eq!(ctrl.files_to_release(mount, &r, 3, 3), 3);
+    }
+
+    #[test]
+    fn effectiveness_settle_measurement_and_ewma() {
+        let mut ctrl = BallastReleaseController::new(30);
+        let mount = Path::new("/test");
+        let start = Instant::now();
+
+        // 100 MB released when free was 1000 MB
+        ctrl.record_release(mount, 100_000_000, 1_000_000_000, start);
+
+        // Tick before 5s settle duration: no change
+        let free_at_4s = 1_025_000_000; // only 25 MB freed
+        let eta_early =
+            ctrl.update_effectiveness(mount, free_at_4s, start + Duration::from_secs(4));
+        assert!((eta_early - 1.0).abs() < 1e-6);
+
+        // Tick after 5s settle duration: observed eta = 25 MB / 100 MB = 0.25
+        // EWMA: 0.3 * 0.25 + 0.7 * 1.0 = 0.075 + 0.700 = 0.775
+        let eta_settled =
+            ctrl.update_effectiveness(mount, free_at_4s, start + Duration::from_secs(6));
+        assert!((eta_settled - 0.775).abs() < 1e-6);
+        assert_eq!(ctrl.release_efficiency(mount), eta_settled);
     }
 }

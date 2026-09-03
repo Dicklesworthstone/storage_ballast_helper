@@ -3094,6 +3094,7 @@ mod tests {
             releasable_bytes: available as u64 * 1_048_576,
             skipped: false,
             skip_reason: None,
+            release_efficiency: None,
         };
         let mut model = test_model();
         // Written in one order by the daemon, listed sorted by mount.

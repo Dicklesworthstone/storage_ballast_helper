@@ -526,7 +526,7 @@ pub struct DaemonState {
 /// Current state file schema version.
 /// One ballast pool as the daemon sees it: what the dashboard's Ballast
 /// screen lists and what a confirmed release or replenish is scoped to.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BallastPoolState {
     /// Mount point the pool protects.
     pub mount: String,
@@ -550,6 +550,9 @@ pub struct BallastPoolState {
     /// Why it was skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,
+    /// Observed release effectiveness EWMA (eta_m): delta_free / bytes_released (bd-rc-master-ajg1.9.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_efficiency: Option<f64>,
 }
 
 /// One path in the last VOI scan plan, as the dashboard's overlay lists it.
@@ -1708,6 +1711,7 @@ mod tests {
                 releasable_bytes: 1_048_576,
                 skipped: false,
                 skip_reason: None,
+                release_efficiency: None,
             }],
             ..Default::default()
         };

@@ -661,6 +661,7 @@ mod tests {
                         method: crate::monitor::burst::ReserveMethod::Quantile,
                         horizon_minutes: Some(0.001),
                     }),
+                    release_efficiency: None,
                 }),
             }],
             schema_version: 2,

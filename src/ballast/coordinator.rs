@@ -24,8 +24,8 @@ use crate::platform::pal::{MountPoint, Platform};
 /// Subdirectory name placed on each volume for ballast files.
 const BALLAST_SUBDIR: &str = ".sbh/ballast";
 
-/// Filesystem types where `fallocate()` reserves real blocks.
-const FALLOCATE_FRIENDLY: &[&str] = &["ext4", "xfs", "ext3", "ext2"];
+/// Filesystem types where `fallocate()` / `F_PREALLOCATE` reserves real blocks.
+const FALLOCATE_FRIENDLY: &[&str] = &["ext4", "xfs", "ext3", "ext2", "apfs"];
 
 /// CoW filesystems where fallocate doesn't prevent dedup — random data required.
 const COW_FILESYSTEMS: &[&str] = &["btrfs", "zfs", "bcachefs"];
@@ -41,13 +41,23 @@ const NETWORK_FILESYSTEMS: &[&str] = &["nfs", "nfs4", "cifs", "smbfs", "fuse.ssh
 /// Provisioning strategy based on filesystem type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvisionStrategy {
-    /// Use fallocate for instant block allocation (ext4, xfs).
+    /// Use fallocate / preallocate for instant block allocation (ext4, xfs, apfs).
     Fallocate,
     /// Write random data to defeat CoW dedup (btrfs, zfs).
     RandomData,
     /// Skip entirely — ballast on this FS type is counterproductive.
     Skip,
 }
+
+impl ProvisionStrategy {
+    /// Preallocate alias matching platform preallocation terminology.
+    #[allow(non_upper_case_globals)]
+    pub const Preallocate: Self = Self::Fallocate;
+}
+
+/// Convenience alias for `ProvisionStrategy::Fallocate` / `ProvisionStrategy::Preallocate`.
+#[allow(non_upper_case_globals)]
+pub const Preallocate: ProvisionStrategy = ProvisionStrategy::Fallocate;
 
 /// A single per-volume ballast pool.
 pub struct BallastPool {
@@ -675,7 +685,15 @@ pub(crate) fn resolve_ballast_dir(mount_path: &Path, configured: Option<&Path>) 
     mount_path.join(BALLAST_SUBDIR)
 }
 
-fn provision_strategy(fs_type: &str) -> ProvisionStrategy {
+/// Provisioning strategy for a given filesystem type.
+#[must_use]
+pub fn strategy_for_fs(fs_type: &str) -> ProvisionStrategy {
+    provision_strategy(fs_type)
+}
+
+/// Determine the provisioning strategy based on filesystem type.
+#[must_use]
+pub fn provision_strategy(fs_type: &str) -> ProvisionStrategy {
     if RAM_FILESYSTEMS.contains(&fs_type) || NETWORK_FILESYSTEMS.contains(&fs_type) {
         return ProvisionStrategy::Skip;
     }
@@ -1347,6 +1365,9 @@ mod tests {
     fn provision_strategy_detection() {
         assert_eq!(provision_strategy("ext4"), ProvisionStrategy::Fallocate);
         assert_eq!(provision_strategy("xfs"), ProvisionStrategy::Fallocate);
+        assert_eq!(provision_strategy("apfs"), ProvisionStrategy::Fallocate);
+        assert_eq!(strategy_for_fs("apfs"), Preallocate);
+        assert_eq!(strategy_for_fs("ext4"), Preallocate);
         assert_eq!(provision_strategy("btrfs"), ProvisionStrategy::RandomData);
         assert_eq!(provision_strategy("zfs"), ProvisionStrategy::RandomData);
         assert_eq!(provision_strategy("tmpfs"), ProvisionStrategy::Skip);

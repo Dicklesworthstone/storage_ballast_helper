@@ -3492,6 +3492,10 @@ impl MonitoringDaemon {
                 releasable_bytes: pool.releasable_bytes,
                 skipped: pool.skipped,
                 skip_reason: pool.skip_reason,
+                release_efficiency: Some(
+                    self.release_controller
+                        .release_efficiency(&pool.mount_point),
+                ),
             })
             .collect();
         pools.sort_by(|a, b| a.mount.cmp(&b.mount));
@@ -3567,6 +3571,7 @@ impl MonitoringDaemon {
                         floor_limited: false,
                         quarantined_bytes,
                         burst,
+                        release_efficiency: None,
                     });
                 }
                 continue;
@@ -3581,6 +3586,7 @@ impl MonitoringDaemon {
                 floor_limited: self.floor_limited.contains(&mount),
                 quarantined_bytes,
                 burst: self.burst_reserve(&mount, pool.releasable_bytes + quarantined_bytes),
+                release_efficiency: Some(self.release_controller.release_efficiency(&mount)),
             });
         }
         let idle_reason = daemon_idle_reason(&controllers);
@@ -4180,6 +4186,9 @@ impl MonitoringDaemon {
 
         // Update monitors for each active mount.
         for (mount_path, stats) in stats_by_mount {
+            self.release_controller
+                .update_effectiveness(&mount_path, stats.available_bytes, now);
+
             let monitor = self
                 .mount_monitors
                 .entry(mount_path.clone())
@@ -5024,24 +5033,34 @@ impl MonitoringDaemon {
             .files_to_release(mount, response, available, expected);
 
         let mut released = 0;
-        if count > 0
-            && let Some(report) = self.ballast_coordinator.release_for_mount(mount, count)?
-        {
-            for warning in &report.warnings {
-                eprintln!("[sbh] warning: {warning}");
+        if count > 0 {
+            let free_before = self
+                .fs_collector
+                .collect(mount)
+                .map_or(0, |s| s.available_bytes);
+            if let Some(report) = self.ballast_coordinator.release_for_mount(mount, count)? {
+                for warning in &report.warnings {
+                    eprintln!("[sbh] warning: {warning}");
+                }
+
+                released = report.files_released;
+                self.release_controller
+                    .on_released(mount, report.files_released);
+                self.release_controller.record_release(
+                    mount,
+                    report.bytes_freed,
+                    free_before,
+                    Instant::now(),
+                );
+                self.log_ballast_releases(&report.released, response);
+
+                self.notification_manager
+                    .notify(&NotificationEvent::BallastReleased {
+                        mount: mount.to_string_lossy().to_string(),
+                        files_released: report.files_released,
+                        bytes_freed: report.bytes_freed,
+                    });
             }
-
-            released = report.files_released;
-            self.release_controller
-                .on_released(mount, report.files_released);
-            self.log_ballast_releases(&report.released, response);
-
-            self.notification_manager
-                .notify(&NotificationEvent::BallastReleased {
-                    mount: mount.to_string_lossy().to_string(),
-                    files_released: report.files_released,
-                    bytes_freed: report.bytes_freed,
-                });
         }
         Ok(released)
     }
