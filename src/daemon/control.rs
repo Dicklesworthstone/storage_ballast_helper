@@ -895,11 +895,15 @@ mod tests {
         assert!(reply.ok, "{reply:?}");
         assert_eq!(reply.result["command"], "ping");
         assert_eq!(reply.result["mutating"], false);
-        assert_eq!(
-            reply.result["peer_uid"],
-            json!(nix::unistd::getuid().as_raw()),
-            "SO_PEERCRED reports the client"
-        );
+        // SO_PEERCRED is Linux-only; off-Linux Peer::of degrades to None and
+        // the echo reports no uid (peer is audit-only, see Peer::of).
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                reply.result["peer_uid"],
+                json!(nix::unistd::getuid().as_raw()),
+                "SO_PEERCRED reports the client"
+            );
+        }
         assert!(
             latency < Duration::from_millis(500),
             "ping took {latency:?}; the design target is 50 ms on an idle host"

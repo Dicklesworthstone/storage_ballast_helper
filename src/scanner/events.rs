@@ -236,6 +236,7 @@ impl EventSourcePlan {
 
 /// Directories enumerated per unit of watch budget before planning stops
 /// descending. Subtrees below the enumeration cap rely on reconciliation.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const WATCH_PLAN_ENUMERATION_FACTOR: usize = 4;
 /// Above this many unwatched frontier directories under one root, the root
 /// itself is reconciled instead of thousands of tiny scan paths.
@@ -252,6 +253,7 @@ const OVERFLOW_BACKOFF_MAX: Duration = Duration::from_mins(30);
 /// Time constant of the directory-mtime prior. A directory that has never
 /// been watched cannot have an observed event rate, so a recent mtime stands
 /// in for it: modified just now counts like one event just now.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const MTIME_PRIOR_TAU: Duration = Duration::from_hours(1);
 
 /// Observed event rate for a directory, or the mtime prior when the
