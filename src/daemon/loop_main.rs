@@ -9687,12 +9687,6 @@ mod tests {
         logger_join.join().unwrap();
     }
 
-    /// bd-8aeq: a `Delete` verdict below the behavior cell's certainty gate is
-    /// not dispatched by the scanner, does not count as a candidate, and leaves
-    /// the pass unproductive so the empty-pass cooldown arms. Measured before
-    /// the fix: a daemon at Orange re-dispatched the same two `unclear` records
-    /// twice a second for five minutes while the executor held them back.
-
     /// bd-awc5 diagnostic: on macOS the prescan reported a just-created tree
     /// (mtimes reset 5 h back) as hours old. This probe always passes; it
     /// prints the measured metadata facts into the CI log so the birth-time
@@ -9739,6 +9733,12 @@ mod tests {
             );
         }
     }
+
+    /// bd-8aeq: a `Delete` verdict below the behavior cell's certainty gate is
+    /// not dispatched by the scanner, does not count as a candidate, and leaves
+    /// the pass unproductive so the empty-pass cooldown arms. Measured before
+    /// the fix: a daemon at Orange re-dispatched the same two `unclear` records
+    /// twice a second for five minutes while the executor held them back.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn scanner_certainty_gate_holds_unclear_candidates_and_arms_the_backoff() {
