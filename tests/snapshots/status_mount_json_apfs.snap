@@ -14,7 +14,7 @@ source: src/cli_app.rs
   "free_pct": 25.0,
   "fs_type": "apfs",
   "is_primary": true,
-  "level": "YELLOW",
+  "level": "yellow",
   "local_snapshot_reclaim_command": "sudo tmutil thinlocalsnapshots /System/Volumes/Data 9999999999999999 4",
   "path": "/System/Volumes/Data",
   "platform": {
