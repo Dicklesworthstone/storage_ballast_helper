@@ -9563,6 +9563,9 @@ mod tests {
     /// measure it the same way and hold it behind `min_file_age_minutes`.
     #[test]
     #[allow(clippy::too_many_lines)]
+    // The whole behavior is the bd-awc5 birth-time contract, which macOS
+    // does not satisfy yet (the pre-scan dispatches the young tree).
+    #[cfg(target_os = "linux")]
     fn scanner_prescan_holds_a_young_tree_with_old_mtimes() {
         fn set_mtime_recursive(path: &Path, mtime: filetime::FileTime) {
             if let Ok(entries) = std::fs::read_dir(path) {

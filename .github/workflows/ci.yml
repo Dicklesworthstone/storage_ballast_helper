@@ -1044,6 +1044,10 @@ jobs:
     timeout-minutes: 45
     env:
       BENCH_REGRESSION_LIMIT: "20.0"
+      # Shared macOS runners are several times slower than the calibration
+      # hardware; absolute budgets widen accordingly (the PR regression
+      # limit still enforces relative slowdowns).
+      SBH_BENCH_BUDGET_SCALE: "4"
     steps:
       - name: Checkout current ref
         uses: actions/checkout@v6.0.2

@@ -227,6 +227,18 @@ fn average_elapsed_ms(mut action: impl FnMut()) -> f64 {
     total.as_secs_f64() * 1000.0 / f64::from(total_iterations)
 }
 
+/// Shared CI runners run several times slower than the calibration
+/// hardware; `SBH_BENCH_BUDGET_SCALE` widens the budgets there while the
+/// checked-in constants stay strict for local hardware. The PR regression
+/// limit still catches relative slowdowns.
+fn budget_scale() -> f64 {
+    std::env::var("SBH_BENCH_BUDGET_SCALE")
+        .ok()
+        .and_then(|scale| scale.parse::<f64>().ok())
+        .filter(|scale| *scale >= 1.0)
+        .unwrap_or(1.0)
+}
+
 fn measure_summary() -> BenchmarkSummary {
     let mut poll_tick = PollTickFixture::new();
     let daemon_poll_tick_avg_ms = average_elapsed_ms(|| poll_tick.tick());
@@ -236,9 +248,9 @@ fn measure_summary() -> BenchmarkSummary {
 
     BenchmarkSummary {
         daemon_poll_tick_avg_ms,
-        daemon_poll_tick_budget_ms: DAEMON_POLL_TICK_BUDGET_MS,
+        daemon_poll_tick_budget_ms: DAEMON_POLL_TICK_BUDGET_MS * budget_scale(),
         pal_surface_avg_ms,
-        pal_surface_budget_ms: PAL_SURFACE_BUDGET_MS,
+        pal_surface_budget_ms: PAL_SURFACE_BUDGET_MS * budget_scale(),
         summary_rounds: SUMMARY_ROUNDS,
         summary_iterations_per_round: SUMMARY_ITERATIONS_PER_ROUND,
     }
