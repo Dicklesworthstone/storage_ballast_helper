@@ -243,6 +243,7 @@ const MAX_FRONTIER_DIRS_PER_ROOT: usize = 256;
 /// Time constant of the per-directory event-rate EWMA.
 const EVENT_RATE_TAU: Duration = Duration::from_mins(10);
 /// How often an incomplete plan is re-allocated by observed event rate.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const WATCH_REPLAN_INTERVAL: Duration = Duration::from_mins(15);
 /// First overflow backoff window; doubles per consecutive overflow.
 const OVERFLOW_BACKOFF_BASE: Duration = Duration::from_secs(30);
@@ -792,6 +793,7 @@ pub struct ScannerEventSource {
     pending: EventInvalidation,
     rates: EventRateTracker,
     backoff: OverflowBackoff,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     planned_at: Instant,
     replans: u64,
 }

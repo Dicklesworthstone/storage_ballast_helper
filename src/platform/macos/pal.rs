@@ -889,21 +889,6 @@ fn estimate_reclaimable_by_snapshot_thinning(
         .map(|bytes| SnapshotThinningEstimate::new(bytes, "apfs_unattributed"))
 }
 
-fn purgeable_bytes_for_volume(
-    mount_point: &Path,
-    counted_available_bytes: u64,
-    inventory: Option<&ApfsInventory>,
-    container_id: Option<&str>,
-) -> Option<u64> {
-    estimate_reclaimable_by_snapshot_thinning(
-        mount_point,
-        counted_available_bytes,
-        inventory,
-        container_id,
-    )
-    .map(|est| est.bytes)
-}
-
 fn purgeable_bytes_from_important_available(
     important_available_bytes: u64,
     counted_available_bytes: u64,

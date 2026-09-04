@@ -961,19 +961,6 @@ jobs:
         with:
           toolchain: ${{ env.TOOLCHAIN }}
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Strip local-only TUI path deps
-        shell: bash
-        run: |
-          set -euo pipefail
-          sanitize_ci_cargo() {
-            local dir="$1"
-            perl -0pi -e 's/^ftui.*=.*\{.*path.*=.*"\/dp\/.*\n//mg; s/^tui = \["dep:ftui.*\]/tui = []/m' "${dir}/Cargo.toml"
-            grep -q '^tui = \[\]' "${dir}/Cargo.toml"
-          }
-          sanitize_ci_cargo current
-          if [ -d base ]; then
-            sanitize_ci_cargo base
-          fi
       - name: Generate current macOS coverage
         shell: bash
         working-directory: current
@@ -1071,19 +1058,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.TOOLCHAIN }}
-      - name: Strip local-only TUI path deps
-        shell: bash
-        run: |
-          set -euo pipefail
-          sanitize_ci_cargo() {
-            local dir="$1"
-            perl -0pi -e 's/^ftui.*=.*\{.*path.*=.*"\/dp\/.*\n//mg; s/^tui = \["dep:ftui.*\]/tui = []/m' "${dir}/Cargo.toml"
-            grep -q '^tui = \[\]' "${dir}/Cargo.toml"
-          }
-          sanitize_ci_cargo current
-          if [ -d base ]; then
-            sanitize_ci_cargo base
-          fi
       - name: Generate current macOS benchmark summary
         shell: bash
         working-directory: current
