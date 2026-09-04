@@ -217,6 +217,11 @@ impl SacredScanStats {
     /// and walk budget. Unreadable or budget-exhausted subtrees count as
     /// sacred (fail-closed).
     fn contains_sacred(&mut self, path: &Path, config: &DeletionConfig) -> bool {
+        // Matched paths are stored normalized (resolve_absolute_path maps
+        // /var -> /private/var on macOS), so the containment reuse must
+        // compare normalized-to-normalized; otherwise the reuse silently
+        // misses and every nested candidate pays its own walk.
+        let path = &crate::core::paths::resolve_absolute_path(path);
         if self.matched.iter().any(|matched| matched.starts_with(path)) {
             return true;
         }

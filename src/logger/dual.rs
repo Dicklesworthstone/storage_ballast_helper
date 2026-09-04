@@ -1070,8 +1070,12 @@ mod tests {
                 message: "write lock held by another connection".to_string(),
             });
         }
-        // Each attempt waits out the 5 s busy timeout before failing.
-        thread::sleep(Duration::from_secs(17));
+        // Each attempt waits out the 5 s busy timeout before failing. The
+        // margin has to cover three full attempts on slow runners: if the
+        // blocker is released while the third attempt is still inside its
+        // busy window, the write lands and the trip never happens (seen on
+        // shared macOS runners).
+        thread::sleep(Duration::from_secs(40));
         blocker.execute_batch("COMMIT;").unwrap();
         drop(blocker);
 
