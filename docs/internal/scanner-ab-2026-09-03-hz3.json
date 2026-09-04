@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "command": "scan_ab",
+  "roots": [
+    "/data/projects/storage_ballast_helper"
+  ],
+  "min_score": 0.7,
+  "warmup": "untimed v2 pass",
+  "captured": "2026-09-03",
+  "host": "rch worker hz3 (194.140.197.98)",
+  "v1": {
+    "candidates": [],
+    "dispatch": "v1_directory_walker",
+    "elapsed_seconds": 0.191104302,
+    "engine": "v1",
+    "hard_vetoes": {
+      "count": 2127,
+      "first_10": [
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-target",
+          "reason": "age 0s below minimum 300s"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-target-hz3-pool-9f0861eb25d7f42bf0a969d1e067bab9",
+          "reason": "rch pooled target dir has file activity within rch's 168h idle floor"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-target-hz3-pool-e3a05f9fa6f42ffb5f4421dc8ed68903",
+          "reason": "rch pooled target dir has file activity within rch's 168h idle floor"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-target/release",
+          "reason": "age 2s below minimum 300s"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-target/release/build/storage_ballast_helper/ddb447e74b02e24e/out",
+          "reason": "age 3s below minimum 300s"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-tmp",
+          "reason": "age 8s below minimum 300s"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-tmp/rch-cargo-cache-hz3",
+          "reason": "age 60s below minimum 300s"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-tmp/rch-cargo-cache-hz3/git/checkouts/frankentui-dde2964fb7081591",
+          "reason": "inside a cargo registry/git store: crate source, not build output"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-tmp/rch-cargo-cache-hz3/git/checkouts/frankentui-dde2964fb7081591/436e917",
+          "reason": "path contains .git"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-tmp/rch-cargo-cache-hz3/git/checkouts/frankentui-dde2964fb7081591/436e917/.beads",
+          "reason": "inside a cargo registry/git store: crate source, not build output"
+        }
+      ]
+    },
+    "opaque_pruned_dirs": 0,
+    "process_cpu_micros": 770000,
+    "scanned_entries": 6092
+  },
+  "v2": {
+    "candidates": [],
+    "dispatch": "v2_opaque_pruning_walker",
+    "elapsed_seconds": 0.185264251,
+    "engine": "v2",
+    "hard_vetoes": {
+      "count": 7,
+      "first_10": [
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-target",
+          "reason": "age 1s below minimum 300s"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-target-hz3-pool-9f0861eb25d7f42bf0a969d1e067bab9",
+          "reason": "rch pooled target dir has file activity within rch's 168h idle floor"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-target-hz3-pool-e3a05f9fa6f42ffb5f4421dc8ed68903",
+          "reason": "rch pooled target dir has file activity within rch's 168h idle floor"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-tmp",
+          "reason": "age 8s below minimum 300s"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/.rch-tmp/rch-cargo-cache-hz3",
+          "reason": "age 60s below minimum 300s"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/crates/sbh_mach",
+          "reason": "contains Cargo.toml without build-artifact markers"
+        },
+        {
+          "path": "/data/projects/storage_ballast_helper/fuzz",
+          "reason": "contains Cargo.toml without build-artifact markers"
+        }
+      ]
+    },
+    "opaque_pruned_dirs": 3,
+    "process_cpu_micros": 300000,
+    "scanned_entries": 108
+  },
+  "diff": {
+    "cpu_ratio_v1_over_v2": 2.566666666666667,
+    "entries_ratio_v1_over_v2": 56.407407407407405,
+    "only_in_v1": [],
+    "only_in_v2": [],
+    "v2_candidates_vetoed_by_v1": []
+  }
+}

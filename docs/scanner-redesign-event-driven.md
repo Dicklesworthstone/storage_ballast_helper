@@ -383,6 +383,15 @@ re-run).
   `/data/projects/mcp_agent_mail_rust/.codex-target` (v2 candidate, v1
   hard-veto). Summarized artifact:
   `docs/internal/scanner-ab-2026-09-03.json`.
+- First fleet host via `rch exec --job` (worker hz3, 2026-09-03,
+  `sbh scan --ab` over the worker's synced repo copy): v1 6,092 entries /
+  0.77 CPU-s / 2,127 hard vetoes; v2 **108 entries** / 3 opaque roots
+  pruned / 0.30 CPU-s / 7 hard vetoes — entries_ratio 56.4, cpu_ratio
+  2.57 in v2's favor, identical candidate sets, `v2_candidates_vetoed_
+  by_v1` empty. On target-pool-heavy worker trees the opaque pruning
+  delivers exactly the designed collapse. Summarized artifact:
+  `docs/internal/scanner-ab-2026-09-03-hz3.json`; full artifact
+  `.sbh-fleet/hz3.json`.
 
 Live A/B capture procedure (one command):
 
