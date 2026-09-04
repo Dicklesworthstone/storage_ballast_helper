@@ -361,14 +361,27 @@ pub struct Peer {
 
 impl Peer {
     fn of(stream: &UnixStream) -> Option<Self> {
-        let creds =
-            nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
-                .ok()?;
-        Some(Self {
-            uid: creds.uid(),
-            gid: creds.gid(),
-            pid: creds.pid(),
-        })
+        // Linux: SO_PEERCRED gives uid/gid/pid. Other platforms have no
+        // safe (forbid(unsafe_code)) peer-credential API in nix; `peer` is
+        // audit-log-only, so None ("?") is honest there. The macOS socket
+        // is a user-scoped LaunchAgent socket (same user), and mutating
+        // commands are not gated on the uid.
+        #[cfg(target_os = "linux")]
+        {
+            let creds =
+                nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+                    .ok()?;
+            Some(Self {
+                uid: creds.uid(),
+                gid: creds.gid(),
+                pid: creds.pid(),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = stream;
+            None
+        }
     }
 }
 

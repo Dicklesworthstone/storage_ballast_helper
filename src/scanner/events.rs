@@ -140,6 +140,7 @@ impl EventSourcePlan {
     /// Plan watches using observed per-directory event rates so a budget that
     /// cannot cover the tree lands on the hottest directories.
     #[must_use]
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     pub fn with_rates(config: &EventSourceConfig, rates: &EventRateTracker, now: Instant) -> Self {
         if config.mode == ScannerEventSourceMode::ReconciliationOnly {
             return Self::reconciliation_only(
