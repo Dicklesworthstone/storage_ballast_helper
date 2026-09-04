@@ -2606,7 +2606,7 @@ mod tests {
             "Linux reads `/proc/mounts`; macOS uses its PAL mount inventory from `statfs`/`getmntinfo` and APFS metadata.",
             "The daemon samples its own RSS through the PAL `self_stats()` method on each state file write.",
             "Linux uses `/proc/self` data; macOS uses Mach task and libproc resource usage.",
-            "Platform abstraction (Linux: procfs/statvfs; macOS: statfs/APFS/libproc)",
+            "LinuxPal (procfs/statvfs), MacOsPal (statfs/APFS/libproc)",
         ] {
             assert!(
                 readme.contains(required),
