@@ -12735,6 +12735,13 @@ fn run_scan_ab(cli: &Cli, args: &ScanArgs, config: &Config) -> Result<(), CliErr
     if let Some(out) = &args.out {
         let bytes = serde_json::to_vec_pretty(&artifact)
             .map_err(|e| CliError::Runtime(format!("artifact serialization failed: {e}")))?;
+        if let Some(parent) = out.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                CliError::Runtime(format!("cannot create {}: {e}", parent.display()))
+            })?;
+        }
         std::fs::write(out, bytes)
             .map_err(|e| CliError::Runtime(format!("cannot write {}: {e}", out.display())))?;
     }
