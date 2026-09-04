@@ -1294,10 +1294,7 @@ mod tests {
         );
         telemetry.process_cpu_micros = None;
         let without_cpu = scan_completion_details(10, 2, &telemetry);
-        assert!(
-            !without_cpu.contains("process_cpu_micros"),
-            "{without_cpu}"
-        );
+        assert!(!without_cpu.contains("process_cpu_micros"), "{without_cpu}");
     }
 
     /// A path no process can create — root included — because its parent is a

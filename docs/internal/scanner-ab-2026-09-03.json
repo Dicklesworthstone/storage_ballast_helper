@@ -1,0 +1,874 @@
+{
+  "schema_version": 1,
+  "command": "scan_ab",
+  "roots": [
+    "/data/projects"
+  ],
+  "min_score": 0.7,
+  "warmup": "untimed v2 pass",
+  "captured": "2026-09-03",
+  "v1": {
+    "candidates": [
+      {
+        "action": "Delete",
+        "path": "/data/projects/.dsr-cargo-target-pi_agent_rust-linux-amd64/x86_64-unknown-linux-gnu/release",
+        "score": 0.74475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/.dsr-cargo-target-pi_agent_rust-linux-arm64/aarch64-unknown-linux-gnu/release",
+        "score": 0.74475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/beads_rust/target-gate",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/beads_rust/target-gate/debug",
+        "score": 0.8897499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/beads_rust/target/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/beads_rust/target/perf-campaign",
+        "score": 0.7525,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/beads_rust/target/release",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/beads_rust/target/x86_64-unknown-linux-gnu",
+        "score": 0.7525,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/coding_agent_usage_tracker/target-gate",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/coding_agent_usage_tracker/target-gate/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/coding_agent_usage_tracker/target-gate2",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/coding_agent_usage_tracker/target-gate2/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/cross_agent_session_resumer/target-rel",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/cross_agent_session_resumer/target-rel/x86_64-unknown-linux-musl",
+        "score": 0.7525,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/fastmcp_rust/target",
+        "score": 0.78125,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/fastmcp_rust/target/aarch64-unknown-linux-gnu",
+        "score": 0.7525,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/fastmcp_rust/target/release",
+        "score": 0.81475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/fastmcp_rust/target/x86_64-unknown-linux-gnu",
+        "score": 0.7525,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/franken_lean/target/sandycondor-fln-amv13",
+        "score": 0.7525,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/franken_lean/target/structure-guard-expand",
+        "score": 0.7525,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/franken_ocr/target-codex-verify",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/franken_ocr/target-codex-verify/debug",
+        "score": 0.84475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankengit/target-yuckpre",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankengit/target/verify",
+        "score": 0.7525,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankenscipy/target",
+        "score": 0.78125,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankenscipy/target/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankenscipy/target/release",
+        "score": 0.81475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankensearch/.rch-target-nightly-2026-08-25",
+        "score": 0.7,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankensearch/target_azurecove",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankenterm/target",
+        "score": 0.78125,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankenterm/target/release",
+        "score": 0.84475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankentui/target",
+        "score": 0.78125,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankentui/target/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/meta_skill/target-gate-triage",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/meta_skill/target-gate-triage/debug",
+        "score": 0.93475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/meta_skill/target-gate113",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/meta_skill/target-gate113/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/meta_skill/target-rel",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/meta_skill/target-rel/release",
+        "score": 0.84475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/pi_agent_rust/target",
+        "score": 0.78125,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/pi_agent_rust/target-gate",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/pi_agent_rust/target-gate/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/pi_agent_rust/target/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/pi_agent_rust/target/release",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/pi_agent_rust/target/x86_64-unknown-linux-gnu",
+        "score": 0.7525,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target/aarch64-unknown-linux-gnu",
+        "score": 0.7525,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target/release",
+        "score": 0.84475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target/x86_64-unknown-linux-musl",
+        "score": 0.7525,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_codex_rch18",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_codex_rch18/debug",
+        "score": 0.8897499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_deploy_784xt",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_deploy_784xt/release",
+        "score": 0.84475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_gate_perf/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_v32",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_v32/release",
+        "score": 0.84475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_v33",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_v33/release",
+        "score": 0.84475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/rust_scriptbots/target",
+        "score": 0.78125,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/rust_scriptbots/target/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/storage_ballast_helper/target",
+        "score": 0.78125,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/storage_ballast_helper/target/debug",
+        "score": 0.8897499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/xf/target-rel",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/xf/target-rel-a64",
+        "score": 0.7999999999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/xf/target-rel-a64/aarch64-unknown-linux-gnu",
+        "score": 0.7525,
+        "vetoes": []
+      }
+    ],
+    "dispatch": "v1_directory_walker",
+    "elapsed_seconds": 2.041603746,
+    "engine": "v1",
+    "hard_vetoes": {
+      "count": 2418,
+      "first_10": [
+        {
+          "path": "/data/projects/.beads",
+          "reason": "path contains .git"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-3rdya-ubs-baseline",
+          "reason": "path contains .git"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-3rdya-ubs-baseline/fuzz",
+          "reason": "contains Cargo.toml without build-artifact markers"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-lessons-ubs-baseline",
+          "reason": "path contains .git"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-lessons-ubs-baseline/fuzz",
+          "reason": "contains Cargo.toml without build-artifact markers"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-psg4o-ubs-baseline",
+          "reason": "path contains .git"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-psg4o-ubs-baseline/fuzz",
+          "reason": "contains Cargo.toml without build-artifact markers"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-yl88t-ubs-baseline",
+          "reason": "path contains .git"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-yl88t-ubs-baseline/fuzz",
+          "reason": "contains Cargo.toml without build-artifact markers"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/frankensqlite-138-gate-20260714T1257Z",
+          "reason": "path contains .git"
+        }
+      ]
+    },
+    "opaque_pruned_dirs": 0,
+    "process_cpu_micros": 3770000,
+    "scanned_entries": 15181
+  },
+  "v2": {
+    "candidates": [
+      {
+        "action": "Delete",
+        "path": "/data/projects/.dsr-cargo-target-pi_agent_rust-linux-amd64/x86_64-unknown-linux-gnu/release",
+        "score": 0.74475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/.dsr-cargo-target-pi_agent_rust-linux-arm64/aarch64-unknown-linux-gnu/release",
+        "score": 0.74475,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/agentic_coding_flywheel_setup/node_modules",
+        "score": 0.7,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/beads_rust/.cargo/git",
+        "score": 0.7025,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/beads_rust/.cargo/registry",
+        "score": 0.7775,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/beads_rust/target",
+        "score": 0.9425,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/beads_rust/target-gate/debug",
+        "score": 0.8897499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/cass_memory_system/node_modules",
+        "score": 0.7,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/coding_agent_usage_tracker/target-gate/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/coding_agent_usage_tracker/target-gate2/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/communitai/node_modules",
+        "score": 0.745,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/cross_agent_session_resumer/target-rel/x86_64-unknown-linux-musl",
+        "score": 0.7525,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/eidetic_engine_cli/target",
+        "score": 0.8150000000000001,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/fastmcp_rust/target",
+        "score": 0.9425,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/flywheel_gateway/node_modules",
+        "score": 0.7,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/flywheel_private/control_plane/node_modules",
+        "score": 0.7,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/franken_numpy/target",
+        "score": 0.8150000000000001,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/franken_ocr/target-codex-verify/debug",
+        "score": 0.84475,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/frankengit/target",
+        "score": 0.9275,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/frankenmermaid/scripts/node_modules",
+        "score": 0.7,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankenscipy/target",
+        "score": 0.8975,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankensearch/.rch-target-nightly-2026-08-25",
+        "score": 0.7975,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/frankensqlite/node_modules",
+        "score": 0.7,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankenterm/target",
+        "score": 0.9425,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/frankentui/target",
+        "score": 0.9425,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/frankentui_website/node_modules",
+        "score": 0.7,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/hfdt_website/node_modules",
+        "score": 0.7,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/jeffreys-skills.md/node_modules",
+        "score": 0.745,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/mcp_agent_mail_rust/.codex-target",
+        "score": 0.805,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/mcp_agent_mail_rust/.rch-target",
+        "score": 0.8425,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/meta_skill/target-gate-triage/debug",
+        "score": 0.93475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/meta_skill/target-gate113/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/meta_skill/target-rel/release",
+        "score": 0.84475,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/midas_edge/node_modules",
+        "score": 0.745,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/midas_edge_api/target",
+        "score": 0.7400000000000001,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/ntm/.gocache",
+        "score": 0.7150000000000001,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/pi_agent_rust/scripts/node_modules",
+        "score": 0.7,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/pi_agent_rust/target-gate/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target",
+        "score": 0.9275,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_codex_rch18/debug",
+        "score": 0.8897499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_deploy_784xt/release",
+        "score": 0.84475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_gate_perf/debug",
+        "score": 0.7922499999999999,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_v32/release",
+        "score": 0.84475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/remote_compilation_helper/target_v33/release",
+        "score": 0.84475,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/rust_scriptbots/target",
+        "score": 0.9425,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/source_to_prompt_tui/node_modules",
+        "score": 0.7,
+        "vetoes": []
+      },
+      {
+        "action": "Review",
+        "path": "/data/projects/stock_dashboard_hub/web/node_modules",
+        "score": 0.7674999999999998,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/storage_ballast_helper/target",
+        "score": 0.9425,
+        "vetoes": []
+      },
+      {
+        "action": "Delete",
+        "path": "/data/projects/xf/target-rel-a64/aarch64-unknown-linux-gnu",
+        "score": 0.7525,
+        "vetoes": []
+      }
+    ],
+    "dispatch": "v2_opaque_pruning_walker",
+    "elapsed_seconds": 2.896275545,
+    "engine": "v2",
+    "hard_vetoes": {
+      "count": 2338,
+      "first_10": [
+        {
+          "path": "/data/projects/.beads",
+          "reason": "path contains .git"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-3rdya-ubs-baseline",
+          "reason": "path contains .git"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-3rdya-ubs-baseline/fuzz",
+          "reason": "contains Cargo.toml without build-artifact markers"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-lessons-ubs-baseline",
+          "reason": "path contains .git"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-lessons-ubs-baseline/fuzz",
+          "reason": "contains Cargo.toml without build-artifact markers"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-psg4o-ubs-baseline",
+          "reason": "path contains .git"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-psg4o-ubs-baseline/fuzz",
+          "reason": "contains Cargo.toml without build-artifact markers"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-yl88t-ubs-baseline",
+          "reason": "path contains .git"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/cass-yl88t-ubs-baseline/fuzz",
+          "reason": "contains Cargo.toml without build-artifact markers"
+        },
+        {
+          "path": "/data/projects/.codex-worktrees/frankensqlite-138-gate-20260714T1257Z",
+          "reason": "path contains .git"
+        }
+      ]
+    },
+    "opaque_pruned_dirs": 53,
+    "process_cpu_micros": 12660000,
+    "scanned_entries": 12140
+  },
+  "diff": {
+    "cpu_ratio_v1_over_v2": 0.29778830963665087,
+    "entries_ratio_v1_over_v2": 1.250494233937397,
+    "only_in_v1": [
+      "/data/projects/beads_rust/target-gate",
+      "/data/projects/beads_rust/target/debug",
+      "/data/projects/beads_rust/target/perf-campaign",
+      "/data/projects/beads_rust/target/release",
+      "/data/projects/beads_rust/target/x86_64-unknown-linux-gnu",
+      "/data/projects/coding_agent_usage_tracker/target-gate",
+      "/data/projects/coding_agent_usage_tracker/target-gate2",
+      "/data/projects/cross_agent_session_resumer/target-rel",
+      "/data/projects/fastmcp_rust/target/aarch64-unknown-linux-gnu",
+      "/data/projects/fastmcp_rust/target/release",
+      "/data/projects/fastmcp_rust/target/x86_64-unknown-linux-gnu",
+      "/data/projects/franken_lean/target/sandycondor-fln-amv13",
+      "/data/projects/franken_lean/target/structure-guard-expand",
+      "/data/projects/franken_ocr/target-codex-verify",
+      "/data/projects/frankengit/target-yuckpre",
+      "/data/projects/frankengit/target/verify",
+      "/data/projects/frankenscipy/target/debug",
+      "/data/projects/frankenscipy/target/release",
+      "/data/projects/frankensearch/target_azurecove",
+      "/data/projects/frankenterm/target/release",
+      "/data/projects/frankentui/target/debug",
+      "/data/projects/meta_skill/target-gate-triage",
+      "/data/projects/meta_skill/target-gate113",
+      "/data/projects/meta_skill/target-rel",
+      "/data/projects/pi_agent_rust/target",
+      "/data/projects/pi_agent_rust/target-gate",
+      "/data/projects/pi_agent_rust/target/debug",
+      "/data/projects/pi_agent_rust/target/release",
+      "/data/projects/pi_agent_rust/target/x86_64-unknown-linux-gnu",
+      "/data/projects/remote_compilation_helper/target/aarch64-unknown-linux-gnu",
+      "/data/projects/remote_compilation_helper/target/release",
+      "/data/projects/remote_compilation_helper/target/x86_64-unknown-linux-musl",
+      "/data/projects/remote_compilation_helper/target_codex_rch18",
+      "/data/projects/remote_compilation_helper/target_deploy_784xt",
+      "/data/projects/remote_compilation_helper/target_v32",
+      "/data/projects/remote_compilation_helper/target_v33",
+      "/data/projects/rust_scriptbots/target/debug",
+      "/data/projects/storage_ballast_helper/target/debug",
+      "/data/projects/xf/target-rel",
+      "/data/projects/xf/target-rel-a64"
+    ],
+    "only_in_v2": [
+      "/data/projects/agentic_coding_flywheel_setup/node_modules",
+      "/data/projects/beads_rust/.cargo/git",
+      "/data/projects/beads_rust/.cargo/registry",
+      "/data/projects/beads_rust/target",
+      "/data/projects/cass_memory_system/node_modules",
+      "/data/projects/communitai/node_modules",
+      "/data/projects/eidetic_engine_cli/target",
+      "/data/projects/flywheel_gateway/node_modules",
+      "/data/projects/flywheel_private/control_plane/node_modules",
+      "/data/projects/franken_numpy/target",
+      "/data/projects/frankengit/target",
+      "/data/projects/frankenmermaid/scripts/node_modules",
+      "/data/projects/frankensqlite/node_modules",
+      "/data/projects/frankentui_website/node_modules",
+      "/data/projects/hfdt_website/node_modules",
+      "/data/projects/jeffreys-skills.md/node_modules",
+      "/data/projects/mcp_agent_mail_rust/.codex-target",
+      "/data/projects/mcp_agent_mail_rust/.rch-target",
+      "/data/projects/midas_edge/node_modules",
+      "/data/projects/midas_edge_api/target",
+      "/data/projects/ntm/.gocache",
+      "/data/projects/pi_agent_rust/scripts/node_modules",
+      "/data/projects/remote_compilation_helper/target",
+      "/data/projects/source_to_prompt_tui/node_modules",
+      "/data/projects/stock_dashboard_hub/web/node_modules"
+    ],
+    "v2_candidates_vetoed_by_v1": [
+      "/data/projects/mcp_agent_mail_rust/.codex-target"
+    ]
+  }
+}

@@ -466,10 +466,7 @@ impl<'a> StatsEngine<'a> {
              ORDER BY timestamp ASC",
         )?;
         let rows = stmt.query_map(params![since], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
         let mut days: Vec<ScannerDayStat> = Vec::new();
         for row in rows {
@@ -491,9 +488,7 @@ impl<'a> StatsEngine<'a> {
                     opaque_pruned_dirs: 0,
                     passes_without_cpu_evidence: 0,
                 });
-                days
-                    .last_mut()
-                    .expect("day bucket was just pushed")
+                days.last_mut().expect("day bucket was just pushed")
             };
             merge_scan_day(bucket, &parsed);
         }
@@ -840,7 +835,8 @@ fn scanner_json(days: &[ScannerDayStat]) -> serde_json::Value {
         "passes": days.iter().map(|d| d.passes).sum::<u64>(),
         "entries_scanned": days.iter().map(|d| d.entries_scanned).sum::<u64>(),
         "opaque_pruned_dirs": days.iter().map(|d| d.opaque_pruned_dirs).sum::<u64>(),
-        "cpu_seconds_total": days.iter().map(|d| d.cpu_seconds).sum::<f64>(),
+        // `+ 0.0` normalizes the IEEE `-0.0` an empty fold can surface.
+        "cpu_seconds_total": days.iter().map(|d| d.cpu_seconds).sum::<f64>() + 0.0,
     })
 }
 
@@ -920,7 +916,6 @@ mod tests {
         }
     }
 
-
     fn scan_complete_row(timestamp: String, details: Option<String>) -> ActivityRow {
         ActivityRow {
             timestamp,
@@ -944,8 +939,9 @@ mod tests {
     fn scanner_stats_aggregates_cpu_by_day() {
         let (_dir, db) = temp_db();
         let now = chrono::Utc::now();
-        let fmt =
-            |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let fmt = |t: chrono::DateTime<chrono::Utc>| {
+            t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
         db.log_activity(&scan_complete_row(
             fmt(now),
             Some("paths_scanned=10 candidates=0 process_cpu_micros=1000000".to_string()),
@@ -953,7 +949,10 @@ mod tests {
         .unwrap();
         db.log_activity(&scan_complete_row(
             fmt(now),
-            Some("paths_scanned=5 candidates=0 process_cpu_micros=500000 opaque_pruned_dirs=2".to_string()),
+            Some(
+                "paths_scanned=5 candidates=0 process_cpu_micros=500000 opaque_pruned_dirs=2"
+                    .to_string(),
+            ),
         ))
         .unwrap();
         db.log_activity(&scan_complete_row(
@@ -973,19 +972,25 @@ mod tests {
         .unwrap();
 
         let engine = StatsEngine::new(&db);
-        let days = engine
-            .scanner_stats(Duration::from_hours(24 * 7))
-            .unwrap();
+        let days = engine.scanner_stats(Duration::from_hours(24 * 7)).unwrap();
         assert_eq!(days.len(), 2, "{days:?}");
 
         let older = &days[0];
         assert_eq!(older.passes, 1);
-        assert!((older.cpu_seconds - 2.0).abs() < 1e-9, "{}", older.cpu_seconds);
+        assert!(
+            (older.cpu_seconds - 2.0).abs() < 1e-9,
+            "{}",
+            older.cpu_seconds
+        );
         assert_eq!(older.entries_scanned, 7);
 
         let today = &days[1];
         assert_eq!(today.passes, 3);
-        assert!((today.cpu_seconds - 1.5).abs() < 1e-9, "{}", today.cpu_seconds);
+        assert!(
+            (today.cpu_seconds - 1.5).abs() < 1e-9,
+            "{}",
+            today.cpu_seconds
+        );
         assert_eq!(today.entries_scanned, 18);
         assert_eq!(today.opaque_pruned_dirs, 2);
         assert_eq!(today.passes_without_cpu_evidence, 1);

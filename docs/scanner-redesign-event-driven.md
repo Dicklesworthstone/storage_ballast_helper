@@ -374,23 +374,37 @@ re-run).
   startup pass yet. bd-xtpv.8 stays open; the operator decides whether the
   per-pass criterion still stands (the pressure-scoped early stop, not the
   per-pass cost, is what makes v2 cheap in practice) or is waived.
+- One-command artifact (`sbh scan --ab /data/projects --top 200 --out`,
+  2026-09-03, release build, page cache warmed by the untimed v2 pass):
+  v1 3.77 CPU-s / 15,181 entries / 64 candidates; v2 12.66 CPU-s / 12,140
+  entries / 53 opaque roots pruned / 49 candidates (cpu_ratio 0.30,
+  entries_ratio 1.25) — consistent with the 3.4x one-shot finding above.
+  The diff flagged one promotion-blocker path for the operator:
+  `/data/projects/mcp_agent_mail_rust/.codex-target` (v2 candidate, v1
+  hard-veto). Summarized artifact:
+  `docs/internal/scanner-ab-2026-09-03.json`.
 
-Live A/B capture procedure:
+Live A/B capture procedure (one command):
 
-1. Pick the same representative scan root for both runs, preferably a large
-   Cargo/cache-heavy tree on the pressure-sensitive mount.
-2. Run the manual scanner twice with only the engine override changed:
-   ```bash
-   SBH_SCANNER_ENGINE=v1 sbh --json scan /data/projects --top 200 > scan-v1.json
-   SBH_SCANNER_ENGINE=v2 sbh --json scan /data/projects --top 200 > scan-v2.json
-   ```
-3. Archive both JSON payloads with daemon `scan_complete` activity events from
-   the same time window. The required fields are `scanner_engine`,
-   `scanner_dispatch`, `opaque_pruning`, `opaque_pruned_dirs`,
-   `scanned_entries`, `elapsed_seconds`, `process_cpu_micros`,
-   `candidates_count`, `total_reclaimable_bytes`, and each candidate path plus
-   veto/explanation data when `--explain` is used.
-4. Promotion remains blocked unless v2 has no candidate that v1 hard-vetoes,
-   event-overflow or backend-loss windows force reconciliation instead of stale
-   index reuse, and the live CPU-seconds/pass reduction supports the ≥50x target
-   when normalized from `process_cpu_micros`.
+`sbh scan --ab PATH` runs v1 then v2 in-process over the same roots — the page
+cache is warmed by an untimed v2 pass first, so both measured passes see the
+same cache state — and emits the comparison artifact (schema version 1): per
+engine `scanned_entries`, `opaque_pruned_dirs`, `elapsed_seconds`,
+`process_cpu_micros`, the candidate list (`path`, `score`, `action`) and the
+hard-veto list (`path`, `reason`), plus the diff `only_in_v1`, `only_in_v2`,
+`v2_candidates_vetoed_by_v1`, `cpu_ratio_v1_over_v2`, and
+`entries_ratio_v1_over_v2`.
+
+```bash
+sbh scan --ab /data/projects --top 200                  # human summary
+sbh scan --ab /data/projects --top 200 --json --out ab.json   # artifact JSON
+```
+
+Archive the artifact beside the daemon `scan_complete` activity events from
+the same window; `sbh stats --json` aggregates those events into the
+`scanner` block (`cpu_seconds_by_day`, `passes`, `entries_scanned`,
+`opaque_pruned_dirs`) using the `process_cpu_micros=` key in the event
+`details`. Promotion remains blocked unless `v2_candidates_vetoed_by_v1` is
+empty, event-overflow or backend-loss windows force reconciliation instead of
+stale index reuse, and the live CPU-seconds/pass reduction supports the >= 50x
+target.

@@ -581,6 +581,17 @@ struct ScanArgs {
     /// Trash, /var/tmp/*, ...) with their size and idle time. No scoring.
     #[arg(long, value_name = "MOUNT", num_args = 0..=1, default_missing_value = "/")]
     catalog: Option<PathBuf>,
+    /// Run the configured roots twice (v1, then v2) in one process and emit
+    /// the A/B comparison artifact from docs/scanner-redesign-event-driven.md
+    /// section 7: per-engine metrics, candidate diffs, and the promotion
+    /// blocker `v2_candidates_vetoed_by_v1` (must be empty to promote v2).
+    #[arg(long)]
+    ab: bool,
+    /// With --ab: write the comparison artifact JSON to FILE (the human
+    /// summary still prints). Without it, the artifact goes to stdout
+    /// under --json.
+    #[arg(long, value_name = "FILE", requires = "ab")]
+    out: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args, Serialize)]
@@ -4869,6 +4880,18 @@ fn run_stats(cli: &Cli, args: &StatsArgs) -> Result<(), CliError> {
             print_window_stats_human(ws);
             println!();
         }
+
+        let scanner_days = engine
+            .scanner_stats(std::time::Duration::from_hours(24 * 7))
+            .unwrap_or_default();
+        // `+ 0.0` normalizes the IEEE `-0.0` an empty fold can surface.
+        let scanner_cpu_total: f64 =
+            scanner_days.iter().map(|day| day.cpu_seconds).sum::<f64>() + 0.0;
+        println!(
+            "Scanner CPU: {:.1} s/day (7-day avg, {} passes)",
+            scanner_cpu_total / 7.0,
+            scanner_days.iter().map(|day| day.passes).sum::<u64>()
+        );
     }
 
     // Top patterns.
@@ -12051,26 +12074,22 @@ fn render_catalog_preview(cli: &Cli, config: &Config, mount: &Path) -> Result<()
     Ok(())
 }
 
-// The scan pipeline reads top to bottom: walk, score, rank, render. Splitting
-// it would scatter the state each stage hands to the next.
-#[allow(clippy::too_many_lines)]
-fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
-    let config =
-        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
-    if let Some(mount) = &args.catalog {
-        return render_catalog_preview(cli, &config, mount);
-    }
-    let cpu_start_micros = current_process_cpu_micros();
-    let start = std::time::Instant::now();
-
-    // Determine scan roots: CLI paths or configured watched paths.
-    // Canonicalize to ensure absolute paths for system protection checks.
-    let raw_roots = if args.paths.is_empty() {
-        config.scanner.root_paths.clone()
+// The scan pipeline's shared stages (root resolution, walk + score passes)
+// live in the helpers below so `scan` and `scan --ab` run the identical
+// derivation.
+/// Resolve scan roots: CLI paths, or the configured watched paths when no
+/// paths are given. Canonicalized to absolute paths for protection checks;
+/// invalid paths are skipped with a human-mode warning.
+fn resolve_scan_roots(
+    cli: &Cli,
+    requested: &[PathBuf],
+    configured: &[PathBuf],
+) -> Result<Vec<PathBuf>, CliError> {
+    let raw_roots = if requested.is_empty() {
+        configured.to_vec()
     } else {
-        args.paths.clone()
+        requested.to_vec()
     };
-
     let root_paths: Vec<PathBuf> = raw_roots
         .into_iter()
         .filter_map(|p| match p.canonicalize() {
@@ -12083,10 +12102,27 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
             }
         })
         .collect();
-
     if root_paths.is_empty() {
         return Err(CliError::User("no valid scan paths found".to_string()));
     }
+    Ok(root_paths)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
+    let config =
+        Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
+    if let Some(mount) = &args.catalog {
+        return render_catalog_preview(cli, &config, mount);
+    }
+    if args.ab {
+        return run_scan_ab(cli, args, &config);
+    }
+    let cpu_start_micros = current_process_cpu_micros();
+    let start = std::time::Instant::now();
+
+    // Determine scan roots: CLI paths or configured watched paths.
+    let root_paths = resolve_scan_roots(cli, &args.paths, &config.scanner.root_paths)?;
     let scan_roots = root_paths.clone();
     let selected_scanner_engine = SelectedScannerEngine::for_mode(config.scanner.engine);
     let scanner_engine_mode = selected_scanner_engine.mode();
@@ -12447,6 +12483,328 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+// ──────────────────── scan --ab ────────────────────
+
+/// One engine's pass over the roots, captured for the `scan --ab` artifact.
+#[derive(Debug, serde::Serialize)]
+struct ScanAbCandidate {
+    path: String,
+    score: f64,
+    action: String,
+    vetoes: Vec<String>,
+}
+
+/// A hard veto recorded during an A/B pass.
+#[derive(Debug, serde::Serialize)]
+struct ScanAbVeto {
+    path: String,
+    reason: String,
+}
+
+/// Metrics and candidate sets captured for one engine in `scan --ab`.
+#[derive(Debug, serde::Serialize)]
+struct ScanAbPass {
+    engine: String,
+    dispatch: String,
+    scanned_entries: usize,
+    opaque_pruned_dirs: usize,
+    elapsed_seconds: f64,
+    process_cpu_micros: Option<u64>,
+    candidates: Vec<ScanAbCandidate>,
+    hard_vetoes: Vec<ScanAbVeto>,
+}
+
+/// Candidate-set differences between the two A/B passes (all sorted by path).
+#[derive(Debug)]
+struct ScanAbDiff {
+    only_in_v1: Vec<String>,
+    only_in_v2: Vec<String>,
+    v2_candidates_vetoed_by_v1: Vec<String>,
+}
+
+/// Score one full walk + classify + score pass with the given engine mode.
+#[allow(clippy::too_many_lines)]
+fn scan_ab_pass(
+    config: &Config,
+    root_paths: &[PathBuf],
+    mode: ScannerEngineMode,
+    min_score: f64,
+) -> Result<ScanAbPass, CliError> {
+    let selected_scanner_engine = SelectedScannerEngine::for_mode(mode);
+    let cpu_start_micros = current_process_cpu_micros();
+    let start = std::time::Instant::now();
+
+    let protection_patterns = if config.scanner.protected_paths.is_empty() {
+        None
+    } else {
+        Some(config.scanner.protected_paths.as_slice())
+    };
+    let protection = ProtectionRegistry::new(protection_patterns)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let walker_config = WalkerConfig {
+        root_paths: root_paths.to_vec(),
+        max_depth: config.scanner.max_depth,
+        follow_symlinks: config.scanner.follow_symlinks,
+        cross_devices: config.scanner.cross_devices,
+        parallelism: config.scanner.parallelism,
+        excluded_paths: config
+            .scanner
+            .excluded_paths
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>(),
+        opaque_pruning: selected_scanner_engine.opaque_pruning(),
+    };
+    let entries = DirectoryWalker::new(walker_config, protection)
+        .walk()
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+
+    let registry = ArtifactPatternRegistry::default();
+    let engine = ScoringEngine::from_config(&config.scoring, config.scanner.min_file_age_minutes);
+    let sacred_paths = active_sacred_paths(config)?;
+    let now = SystemTime::now();
+    let mut opaque_pruned_dirs = 0usize;
+    let mut candidates: Vec<ScanAbCandidate> = Vec::new();
+    let mut hard_vetoes: Vec<ScanAbVeto> = Vec::new();
+
+    for entry in &entries {
+        let classification = if let Some(opaque_tree) = &entry.opaque_tree {
+            match opaque_tree.disposition {
+                OpaqueTreeDisposition::CandidateOpaque => {
+                    opaque_pruned_dirs += 1;
+                    opaque_tree.classification.clone()
+                }
+                OpaqueTreeDisposition::SignalOnly | OpaqueTreeDisposition::ProtectedOpaque => {
+                    continue;
+                }
+            }
+        } else {
+            registry.classify(&entry.path, entry.structural_signals)
+        };
+        let age = now
+            .duration_since(
+                entry.effective_age_timestamp(classification.category.is_regenerable_tree()),
+            )
+            .unwrap_or_default();
+        let candidate = CandidateInput {
+            path: entry.path.clone(),
+            size_bytes: entry.metadata.content_size_bytes,
+            age,
+            classification,
+            signals: entry.structural_signals,
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+        let (score, _) = score_candidate_with_deferred_sacred_check(
+            &engine,
+            &candidate,
+            0.0,
+            &sacred_paths,
+            |_| false,
+        );
+        if score.vetoed {
+            hard_vetoes.push(ScanAbVeto {
+                path: score.path.to_string_lossy().into_owned(),
+                reason: score
+                    .veto_reason
+                    .unwrap_or_else(|| "vetoed".into())
+                    .into_owned(),
+            });
+        } else if score.total_score >= min_score {
+            candidates.push(ScanAbCandidate {
+                path: score.path.to_string_lossy().into_owned(),
+                score: score.total_score,
+                action: format!("{:?}", score.decision.action),
+                vetoes: Vec::new(),
+            });
+        }
+    }
+
+    candidates.sort_by(|a, b| a.path.cmp(&b.path));
+    hard_vetoes.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(ScanAbPass {
+        engine: mode.to_string(),
+        dispatch: selected_scanner_engine.dispatch().to_string(),
+        scanned_entries: entries.len(),
+        opaque_pruned_dirs,
+        elapsed_seconds: start.elapsed().as_secs_f64(),
+        process_cpu_micros: cpu_start_micros
+            .zip(current_process_cpu_micros())
+            .map(|(start, end)| end.saturating_sub(start)),
+        candidates,
+        hard_vetoes,
+    })
+}
+
+/// Compute the A/B candidate-set differences (all outputs sorted by path).
+fn scan_ab_diff(v1: &ScanAbPass, v2: &ScanAbPass) -> ScanAbDiff {
+    let v1_paths: HashSet<&str> = v1.candidates.iter().map(|c| c.path.as_str()).collect();
+    let v2_paths: HashSet<&str> = v2.candidates.iter().map(|c| c.path.as_str()).collect();
+    let v1_vetoed: HashSet<&str> = v1.hard_vetoes.iter().map(|v| v.path.as_str()).collect();
+
+    let mut only_in_v1: Vec<String> = v1
+        .candidates
+        .iter()
+        .filter(|c| !v2_paths.contains(c.path.as_str()))
+        .map(|c| c.path.clone())
+        .collect();
+    only_in_v1.sort();
+    let mut only_in_v2: Vec<String> = v2
+        .candidates
+        .iter()
+        .filter(|c| !v1_paths.contains(c.path.as_str()))
+        .map(|c| c.path.clone())
+        .collect();
+    only_in_v2.sort();
+    // The section-7 promotion blocker: v2 wants to delete a path v1 refused.
+    let mut v2_candidates_vetoed_by_v1: Vec<String> = v2
+        .candidates
+        .iter()
+        .filter(|c| v1_vetoed.contains(c.path.as_str()))
+        .map(|c| c.path.clone())
+        .collect();
+    v2_candidates_vetoed_by_v1.sort();
+    ScanAbDiff {
+        only_in_v1,
+        only_in_v2,
+        v2_candidates_vetoed_by_v1,
+    }
+}
+
+/// v1 CPU over v2 CPU; `None` when either pass lacks a CPU measurement.
+#[allow(clippy::cast_precision_loss)]
+fn scan_ab_cpu_ratio(v1: Option<u64>, v2: Option<u64>) -> Option<f64> {
+    let (v1, v2) = v1.zip(v2)?;
+    if v1 == 0 || v2 == 0 {
+        return None;
+    }
+    Some(v1 as f64 / v2 as f64)
+}
+
+/// v1 entries over v2 entries (>= 1.0 means v2 visited fewer).
+#[allow(clippy::cast_precision_loss)]
+fn scan_ab_entries_ratio(v1: usize, v2: usize) -> f64 {
+    v1 as f64 / v2.max(1) as f64
+}
+
+/// `sbh scan --ab`: v1 vs v2 comparison artifact (design doc section 7).
+fn run_scan_ab(cli: &Cli, args: &ScanArgs, config: &Config) -> Result<(), CliError> {
+    let root_paths = resolve_scan_roots(cli, &args.paths, &config.scanner.root_paths)?;
+
+    // Warm the page cache with an untimed v2 pass so both measured passes
+    // see the same cache state.
+    if output_mode(cli) == OutputMode::Human {
+        println!(
+            "Scanner A/B: {} root(s), min_score {:.2}; warming page cache (untimed v2 pass)...",
+            root_paths.len(),
+            args.min_score
+        );
+    }
+    let _warmup = scan_ab_pass(config, &root_paths, ScannerEngineMode::V2, args.min_score)?;
+
+    let v1 = scan_ab_pass(config, &root_paths, ScannerEngineMode::V1, args.min_score)?;
+    let v2 = scan_ab_pass(config, &root_paths, ScannerEngineMode::V2, args.min_score)?;
+    let diff = scan_ab_diff(&v1, &v2);
+    let cpu_ratio = scan_ab_cpu_ratio(v1.process_cpu_micros, v2.process_cpu_micros);
+    let entries_ratio = scan_ab_entries_ratio(v1.scanned_entries, v2.scanned_entries);
+
+    let artifact = json!({
+        "schema_version": 1,
+        "command": "scan_ab",
+        "roots": root_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
+        "min_score": args.min_score,
+        "warmup": "untimed v2 pass",
+        "v1": &v1,
+        "v2": &v2,
+        "diff": {
+            "only_in_v1": &diff.only_in_v1,
+            "only_in_v2": &diff.only_in_v2,
+            "v2_candidates_vetoed_by_v1": &diff.v2_candidates_vetoed_by_v1,
+            "cpu_ratio_v1_over_v2": cpu_ratio,
+            "entries_ratio_v1_over_v2": entries_ratio,
+        },
+    });
+
+    if let Some(out) = &args.out {
+        let bytes = serde_json::to_vec_pretty(&artifact)
+            .map_err(|e| CliError::Runtime(format!("artifact serialization failed: {e}")))?;
+        std::fs::write(out, bytes)
+            .map_err(|e| CliError::Runtime(format!("cannot write {}: {e}", out.display())))?;
+    }
+
+    match output_mode(cli) {
+        OutputMode::Json if args.out.is_none() => write_json_line(&artifact)?,
+        OutputMode::Json => {}
+        OutputMode::Human => {
+            print_scan_ab_summary(&v1, &v2, &diff, cpu_ratio, entries_ratio);
+            if let Some(out) = &args.out {
+                println!("\n  Artifact written to {}", out.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn print_scan_ab_summary(
+    v1: &ScanAbPass,
+    v2: &ScanAbPass,
+    diff: &ScanAbDiff,
+    cpu_ratio: Option<f64>,
+    entries_ratio: f64,
+) {
+    let cpu_label = |micros: Option<u64>| {
+        micros.map_or_else(
+            || "n/a".to_string(),
+            |m| format!("{:.2}", m as f64 / 1_000_000.0),
+        )
+    };
+    println!("Scanner A/B Comparison");
+    println!(
+        "  {:<6} {:>10} {:>13} {:>10} {:>10} {:>9} {:>8}",
+        "Engine", "Entries", "OpaquePruned", "CPU s", "Wall s", "Cands", "Vetoes"
+    );
+    for pass in [v1, v2] {
+        println!(
+            "  {:<6} {:>10} {:>13} {:>10} {:>10.2} {:>9} {:>8}",
+            pass.engine,
+            pass.scanned_entries,
+            pass.opaque_pruned_dirs,
+            cpu_label(pass.process_cpu_micros),
+            pass.elapsed_seconds,
+            pass.candidates.len(),
+            pass.hard_vetoes.len(),
+        );
+    }
+    println!();
+    println!(
+        "  cpu_ratio (v1/v2): {}; entries_ratio (v1/v2): {:.2}",
+        cpu_ratio.map_or_else(|| "n/a".to_string(), |r| format!("{r:.2}")),
+        entries_ratio
+    );
+    println!(
+        "  only_in_v1: {} path(s); only_in_v2: {} path(s)",
+        diff.only_in_v1.len(),
+        diff.only_in_v2.len()
+    );
+    if diff.v2_candidates_vetoed_by_v1.is_empty() {
+        println!("  Promotion blocker v2_candidates_vetoed_by_v1: 0 (PASS)");
+    } else {
+        println!(
+            "  Promotion blocker v2_candidates_vetoed_by_v1: {} (FAIL)",
+            diff.v2_candidates_vetoed_by_v1.len()
+        );
+        for path in &diff.v2_candidates_vetoed_by_v1 {
+            println!("    {path}");
+        }
+    }
 }
 
 /// Record the CLI's cleanup decisions in the evidence ledger (SQLite
@@ -20709,5 +21067,76 @@ mod tests {
             swap_free_bytes: 16 * 1024 * 1024 * 1024,
         };
         assert!(!is_swap_thrash_risk(&low_swap));
+    }
+
+    fn ab_candidate(path: &str, score: f64) -> ScanAbCandidate {
+        ScanAbCandidate {
+            path: path.to_string(),
+            score,
+            action: "Delete".to_string(),
+            vetoes: Vec::new(),
+        }
+    }
+
+    fn ab_veto(path: &str, reason: &str) -> ScanAbVeto {
+        ScanAbVeto {
+            path: path.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    fn ab_pass_fixture(
+        candidates: Vec<ScanAbCandidate>,
+        hard_vetoes: Vec<ScanAbVeto>,
+    ) -> ScanAbPass {
+        ScanAbPass {
+            engine: "v1".to_string(),
+            dispatch: "test-dispatch".to_string(),
+            scanned_entries: 100,
+            opaque_pruned_dirs: 0,
+            elapsed_seconds: 1.0,
+            process_cpu_micros: Some(1_000_000),
+            candidates,
+            hard_vetoes,
+        }
+    }
+
+    #[test]
+    fn scan_ab_diff_separates_candidate_sets_and_flags_blocker() {
+        let v1 = ab_pass_fixture(
+            vec![ab_candidate("/a", 0.9), ab_candidate("/b", 0.8)],
+            vec![ab_veto("/c", "contains .git")],
+        );
+        let v2 = ab_pass_fixture(
+            vec![ab_candidate("/b", 0.8), ab_candidate("/c", 0.85)],
+            Vec::new(),
+        );
+        let diff = scan_ab_diff(&v1, &v2);
+        assert_eq!(diff.only_in_v1, vec!["/a"]);
+        assert_eq!(diff.only_in_v2, vec!["/c"]);
+        // /c is a v2 candidate but v1 hard-vetoed it: the promotion blocker.
+        assert_eq!(diff.v2_candidates_vetoed_by_v1, vec!["/c"]);
+    }
+
+    #[test]
+    fn scan_ab_blocker_is_empty_when_engines_agree() {
+        let v1 = ab_pass_fixture(vec![ab_candidate("/a", 0.9)], Vec::new());
+        let v2 = ab_pass_fixture(vec![ab_candidate("/a", 0.9)], Vec::new());
+        let diff = scan_ab_diff(&v1, &v2);
+        assert!(diff.only_in_v1.is_empty());
+        assert!(diff.only_in_v2.is_empty());
+        assert!(diff.v2_candidates_vetoed_by_v1.is_empty());
+    }
+
+    #[test]
+    fn scan_ab_ratios_handle_missing_and_zero_cpu() {
+        assert_eq!(
+            scan_ab_cpu_ratio(Some(2_000_000), Some(1_000_000)),
+            Some(2.0)
+        );
+        assert_eq!(scan_ab_cpu_ratio(None, Some(1)), None);
+        assert_eq!(scan_ab_cpu_ratio(Some(1), Some(0)), None);
+        assert!((scan_ab_entries_ratio(200, 100) - 2.0).abs() < 1e-9);
+        assert!((scan_ab_entries_ratio(0, 0) - 0.0).abs() < 1e-9);
     }
 }
