@@ -889,7 +889,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_SYSTEMD_UNIT_DIR` | service | Directory the systemd unit is written to and read from |
 | `SBH_ACTIVE_LEASE_TOKEN` | service | Renewal token `sbh lease run` hands the leased command (`lease renew` reads it) |
 | `SBH_ACTIVE_LEASE_TARGET` | service | Leased target `sbh lease run` hands the leased command (default for `lease status`/`renew`) |
-| `SBH_MACOS_QUERY_FOUNDATION_PURGEABLE` | service | Ask Foundation for purgeable space on macOS (opt-in, slower) |
+| `SBH_MACOS_QUERY_FOUNDATION_PURGEABLE` | config override | `platform.macos.query_foundation_purgeable` |
 | `SBH_BEHAVIOR_PRESET` | config override | `pressure.behavior_preset` |
 | `SBH_POLICY_KILL_SWITCH` | config override | `policy.kill_switch` |
 | `SBH_PREDICTION_ENABLED` | config override | `prediction.enabled` |
