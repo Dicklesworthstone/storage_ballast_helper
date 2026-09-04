@@ -9692,6 +9692,53 @@ mod tests {
     /// the pass unproductive so the empty-pass cooldown arms. Measured before
     /// the fix: a daemon at Orange re-dispatched the same two `unclear` records
     /// twice a second for five minutes while the executor held them back.
+
+    /// bd-awc5 diagnostic: on macOS the prescan reported a just-created tree
+    /// (mtimes reset 5 h back) as hours old. This probe always passes; it
+    /// prints the measured metadata facts into the CI log so the birth-time
+    /// gap can be fixed against numbers instead of inference. When the fix
+    /// lands, the non-Linux arm turns into the Linux assertion.
+    #[test]
+    fn prescan_birth_time_probe_reports_measured_facts() {
+        fn set_mtime_recursive(path: &Path, mtime: filetime::FileTime) {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    set_mtime_recursive(&entry.path(), mtime);
+                }
+            }
+            let _ = filetime::set_file_mtime(path, mtime);
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("proj").join("target");
+        std::fs::create_dir_all(target.join("debug").join("deps")).unwrap();
+        std::fs::write(
+            target.join("debug").join("deps").join("libx.rlib"),
+            [0xA5u8; 4096],
+        )
+        .unwrap();
+        let old = filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_hours(5));
+        set_mtime_recursive(&target, old);
+
+        let meta = std::fs::metadata(&target).unwrap();
+        let entry = crate::scanner::walker::entry_metadata(&meta);
+        let age = prescan_age(&target);
+        eprintln!(
+            "bd-awc5 probe: prescan_age={age:?} std_created={:?} std_modified={:?} \
+             entry_created={:?} entry_modified={:?} entry_is_dir={}",
+            meta.created(),
+            meta.modified(),
+            entry.created,
+            entry.modified,
+            entry.is_dir,
+        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                age < Duration::from_secs(60),
+                "linux contract: a just-created tree is young (age {age:?})"
+            );
+        }
+    }
     #[test]
     #[allow(clippy::too_many_lines)]
     fn scanner_certainty_gate_holds_unclear_candidates_and_arms_the_backoff() {

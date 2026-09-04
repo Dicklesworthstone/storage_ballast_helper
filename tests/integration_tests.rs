@@ -2708,9 +2708,17 @@ enabled = false
         !decisions.is_empty(),
         "clean recorded at least one decision"
     );
+    // clean canonicalizes its scan roots (resolve_scan_roots), so on macOS
+    // the recorded path carries the /private/var prefix of the tempdir.
+    // Accept either spelling of the same tree.
+    let target_canonical = target.canonicalize().unwrap_or_else(|_| target.clone());
     let decision = decisions
         .iter()
-        .find(|d| d["path"].as_str().is_some_and(|p| Path::new(p) == target))
+        .find(|d| {
+            d["path"]
+                .as_str()
+                .is_some_and(|p| Path::new(p) == target || Path::new(p) == target_canonical)
+        })
         .unwrap_or_else(|| panic!("no decision for {}: {decisions:?}", target.display()));
     let id = decision["id"].as_str().expect("decision id").to_string();
     assert_eq!(id.len(), 12, "stable ids are 12 hex chars: {id}");
