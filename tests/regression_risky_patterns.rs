@@ -206,6 +206,11 @@ mod tests {
             "mail-library-sacred" => (fake_home.join("Library/Mail/V10"), None, true),
             "messages-library-sacred" => (fake_home.join("Library/Messages/chat.db"), None, true),
             "final-cut-library-sacred" => (fake_home.join("Movies/Cut.fcpbundle"), None, true),
+            // ajg1.10.3: the ~/Library/Caches/<app> rule (age >= 7 d, Review
+            // unless Definite) — any single app-cache directory matches.
+            "user-library-caches-app" => {
+                (fake_home.join("Library/Caches/com.example.app"), None, true)
+            }
             name => panic!("missing mac cleanup fixture for {name}"),
         }
     }
