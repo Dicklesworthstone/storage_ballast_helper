@@ -12522,6 +12522,12 @@ struct ScanAbDiff {
     only_in_v1: Vec<String>,
     only_in_v2: Vec<String>,
     v2_candidates_vetoed_by_v1: Vec<String>,
+    /// The subset of `v2_candidates_vetoed_by_v1` whose v2 action is
+    /// `Delete` (auto-deletable). `Review` candidates never auto-delete, so
+    /// a strict-mode blocker that only contains Review items is a v1/v2
+    /// classification divergence, not a deletion-safety regression
+    /// (bd-pwid).
+    v2_delete_candidates_vetoed_by_v1: Vec<String>,
 }
 
 /// Score one full walk + classify + score pass with the given engine mode.
@@ -12668,10 +12674,18 @@ fn scan_ab_diff(v1: &ScanAbPass, v2: &ScanAbPass) -> ScanAbDiff {
         .map(|c| c.path.clone())
         .collect();
     v2_candidates_vetoed_by_v1.sort();
+    let mut v2_delete_candidates_vetoed_by_v1: Vec<String> = v2
+        .candidates
+        .iter()
+        .filter(|c| c.action == "Delete" && v1_vetoed.contains(c.path.as_str()))
+        .map(|c| c.path.clone())
+        .collect();
+    v2_delete_candidates_vetoed_by_v1.sort();
     ScanAbDiff {
         only_in_v1,
         only_in_v2,
         v2_candidates_vetoed_by_v1,
+        v2_delete_candidates_vetoed_by_v1,
     }
 }
 
@@ -12727,6 +12741,7 @@ fn run_scan_ab(cli: &Cli, args: &ScanArgs, config: &Config) -> Result<(), CliErr
             "only_in_v1": &diff.only_in_v1,
             "only_in_v2": &diff.only_in_v2,
             "v2_candidates_vetoed_by_v1": &diff.v2_candidates_vetoed_by_v1,
+            "v2_delete_candidates_vetoed_by_v1": &diff.v2_delete_candidates_vetoed_by_v1,
             "cpu_ratio_v1_over_v2": cpu_ratio,
             "entries_ratio_v1_over_v2": entries_ratio,
         },
@@ -12805,8 +12820,10 @@ fn print_scan_ab_summary(
         println!("  Promotion blocker v2_candidates_vetoed_by_v1: 0 (PASS)");
     } else {
         println!(
-            "  Promotion blocker v2_candidates_vetoed_by_v1: {} (FAIL)",
-            diff.v2_candidates_vetoed_by_v1.len()
+            "  Promotion blocker v2_candidates_vetoed_by_v1: {} ({} Delete-action; \
+             Review items never auto-delete - bd-pwid)",
+            diff.v2_candidates_vetoed_by_v1.len(),
+            diff.v2_delete_candidates_vetoed_by_v1.len()
         );
         for path in &diff.v2_candidates_vetoed_by_v1 {
             println!("    {path}");
@@ -21076,6 +21093,14 @@ mod tests {
         assert!(!is_swap_thrash_risk(&low_swap));
     }
 
+    fn ab_candidate_action(path: &str, score: f64, action: &str) -> ScanAbCandidate {
+        ScanAbCandidate {
+            path: path.to_string(),
+            score,
+            action: action.to_string(),
+            vetoes: Vec::new(),
+        }
+    }
     fn ab_candidate(path: &str, score: f64) -> ScanAbCandidate {
         ScanAbCandidate {
             path: path.to_string(),
@@ -21112,17 +21137,23 @@ mod tests {
     fn scan_ab_diff_separates_candidate_sets_and_flags_blocker() {
         let v1 = ab_pass_fixture(
             vec![ab_candidate("/a", 0.9), ab_candidate("/b", 0.8)],
-            vec![ab_veto("/c", "contains .git")],
+            vec![ab_veto("/c", "contains .git"), ab_veto("/e", "too young")],
         );
         let v2 = ab_pass_fixture(
-            vec![ab_candidate("/b", 0.8), ab_candidate("/c", 0.85)],
+            vec![
+                ab_candidate_action("/b", 0.8, "Delete"),
+                ab_candidate_action("/c", 0.85, "Review"),
+                ab_candidate_action("/e", 0.9, "Delete"),
+            ],
             Vec::new(),
         );
         let diff = scan_ab_diff(&v1, &v2);
         assert_eq!(diff.only_in_v1, vec!["/a"]);
-        assert_eq!(diff.only_in_v2, vec!["/c"]);
-        // /c is a v2 candidate but v1 hard-vetoed it: the promotion blocker.
-        assert_eq!(diff.v2_candidates_vetoed_by_v1, vec!["/c"]);
+        assert_eq!(diff.only_in_v2, vec!["/c", "/e"]);
+        // Strict blocker counts every v2 candidate v1 vetoed, Review or not.
+        assert_eq!(diff.v2_candidates_vetoed_by_v1, vec!["/c", "/e"]);
+        // The deletion-safety subset only counts auto-deletable actions.
+        assert_eq!(diff.v2_delete_candidates_vetoed_by_v1, vec!["/e"]);
     }
 
     #[test]
@@ -21133,6 +21164,7 @@ mod tests {
         assert!(diff.only_in_v1.is_empty());
         assert!(diff.only_in_v2.is_empty());
         assert!(diff.v2_candidates_vetoed_by_v1.is_empty());
+        assert!(diff.v2_delete_candidates_vetoed_by_v1.is_empty());
     }
 
     #[test]
