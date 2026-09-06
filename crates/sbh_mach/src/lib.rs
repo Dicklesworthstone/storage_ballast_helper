@@ -4,6 +4,7 @@
 //! the platform FFI boundary narrow and exposes copied scalar values only.
 
 #![cfg(target_os = "macos")]
+#![deny(unsafe_code)]
 
 use std::ffi::{CStr, OsStr, c_void};
 use std::fmt;
@@ -109,6 +110,7 @@ struct MachThreadBasicInfoRaw {
     sleep_time: integer_t,
 }
 
+#[allow(unsafe_code)]
 unsafe extern "C" {
     fn thread_info(
         target_act: thread_act_t,
@@ -224,6 +226,29 @@ pub struct VmStats {
     pub compressor_page_count: u64,
     /// Throttled pages.
     pub throttled_count: u64,
+}
+
+/// Mounted filesystem snapshot from `getfsstat(2)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatfsEntry {
+    /// Directory where the file system is mounted.
+    pub mount_point: PathBuf,
+    /// Device or resource mounted.
+    pub device: String,
+    /// Type of the file system (e.g. `apfs`, `hfs`, `devfs`).
+    pub fs_type: String,
+    /// Fundamental file system block size in bytes.
+    pub block_size: u64,
+    /// Total data blocks in the file system.
+    pub blocks: u64,
+    /// Free blocks in the file system.
+    pub blocks_free: u64,
+    /// Free blocks available to non-superusers.
+    pub blocks_available: u64,
+    /// Whether the file system is mounted read-only.
+    pub is_readonly: bool,
+    /// Whether the file system is mounted from a local device.
+    pub is_local: bool,
 }
 
 /// Darwin `proc_regioninfo` layout used by `PROC_PIDREGIONPATHINFO`.
@@ -370,10 +395,13 @@ impl VmStats {
 /// Apple headers mark older `TASK_BASIC_INFO_64` flavors as compatibility
 /// forms and recommend `MACH_TASK_BASIC_INFO`; this uses the recommended
 /// always-64-bit flavor and copies out scalar values immediately.
+#[allow(unsafe_code)]
 pub fn current_task_basic_info() -> Result<TaskBasicInfo, MachError> {
     let mut info = MaybeUninit::<mach_task_basic_info>::zeroed();
     let mut count = MACH_TASK_BASIC_INFO_COUNT;
 
+    // SAFETY: task_info called with mach_task_self() and valid pointer to MaybeUninit buffer
+    // with matching count for MACH_TASK_BASIC_INFO.
     let code = unsafe {
         task_info(
             mach_task_self(),
@@ -389,8 +417,10 @@ pub fn current_task_basic_info() -> Result<TaskBasicInfo, MachError> {
         MACH_TASK_BASIC_INFO_COUNT,
     )?;
 
+    // SAFETY: ensure_success and ensure_count verified kernel populated the buffer completely.
     let info = unsafe { info.assume_init() };
     Ok(TaskBasicInfo {
+        // SAFETY: addr_of! and read_unaligned safely extract scalar fields without alignment assumptions.
         virtual_size_bytes: unsafe { ptr::addr_of!(info.virtual_size).read_unaligned() },
         resident_size_bytes: unsafe { ptr::addr_of!(info.resident_size).read_unaligned() },
         resident_size_max_bytes: unsafe { ptr::addr_of!(info.resident_size_max).read_unaligned() },
@@ -404,10 +434,12 @@ pub fn current_task_basic_info() -> Result<TaskBasicInfo, MachError> {
 }
 
 /// Read `TASK_THREAD_TIMES_INFO` for live threads in the current task.
+#[allow(unsafe_code)]
 pub fn current_task_thread_times() -> Result<TaskThreadTimes, MachError> {
     let mut info = MaybeUninit::<task_thread_times_info>::zeroed();
     let mut count = TASK_THREAD_TIMES_INFO_COUNT;
 
+    // SAFETY: task_info called with mach_task_self() and valid pointer to MaybeUninit buffer.
     let code = unsafe {
         task_info(
             mach_task_self(),
@@ -423,8 +455,10 @@ pub fn current_task_thread_times() -> Result<TaskThreadTimes, MachError> {
         TASK_THREAD_TIMES_INFO_COUNT,
     )?;
 
+    // SAFETY: ensure_success and ensure_count verified kernel populated the buffer completely.
     let info = unsafe { info.assume_init() };
     Ok(TaskThreadTimes {
+        // SAFETY: addr_of! and read_unaligned safely extract scalar fields.
         user_time_micros: time_value_to_micros(unsafe {
             ptr::addr_of!(info.user_time).read_unaligned()
         }),
@@ -435,9 +469,12 @@ pub fn current_task_thread_times() -> Result<TaskThreadTimes, MachError> {
 }
 
 /// Read `THREAD_BASIC_INFO` for the calling thread.
+#[allow(unsafe_code)]
 pub fn current_thread_basic_info() -> Result<ThreadBasicInfo, MachError> {
+    // SAFETY: mach_thread_self returns a mach port for the calling thread.
     let thread = unsafe { mach_thread_self() };
     let result = thread_basic_info_for_port(thread);
+    // SAFETY: mach_port_deallocate releases the mach port right obtained above.
     let _ = unsafe { mach_port_deallocate(mach_task_self(), thread) };
     result
 }
@@ -459,11 +496,14 @@ pub fn current_task_usage() -> Result<CurrentTaskUsage, MachError> {
 }
 
 /// Read `HOST_VM_INFO64` for the current host.
+#[allow(unsafe_code)]
 pub fn host_vm_stats() -> Result<VmStats, MachError> {
     let mut info = MaybeUninit::<libc::vm_statistics64>::zeroed();
     let mut count = HOST_VM_INFO64_REV0_COUNT;
 
+    // SAFETY: mach_host_self returns a host port for the current host.
     let host = unsafe { mach_host_self() };
+    // SAFETY: host_statistics64 is called with valid host port, rev0 count and pointer.
     let code = unsafe {
         libc::host_statistics64(
             host,
@@ -472,6 +512,7 @@ pub fn host_vm_stats() -> Result<VmStats, MachError> {
             &mut count,
         )
     };
+    // SAFETY: mach_port_deallocate releases the host port.
     let _ = unsafe { mach_port_deallocate(mach_task_self(), host) };
 
     ensure_success("host_statistics64(HOST_VM_INFO64)", code)?;
@@ -481,9 +522,11 @@ pub fn host_vm_stats() -> Result<VmStats, MachError> {
         HOST_VM_INFO64_REV0_COUNT,
     )?;
 
+    // SAFETY: ensure_success and ensure_count verified kernel populated the buffer completely.
     let info = unsafe { info.assume_init() };
     Ok(VmStats {
         page_size_bytes: page_size_bytes()?,
+        // SAFETY: addr_of! and read_unaligned safely extract scalar fields.
         free_count: natural_to_u64(unsafe { ptr::addr_of!(info.free_count).read_unaligned() }),
         active_count: natural_to_u64(unsafe { ptr::addr_of!(info.active_count).read_unaligned() }),
         inactive_count: natural_to_u64(unsafe {
@@ -503,7 +546,9 @@ pub fn host_vm_stats() -> Result<VmStats, MachError> {
 }
 
 /// Return all process identifiers visible to the current process.
+#[allow(unsafe_code)]
 pub fn proc_listpids_all() -> io::Result<Vec<i32>> {
+    // SAFETY: proc_listpids with null pointer and 0 size queries required buffer byte size.
     let initial_bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, ptr::null_mut(), 0) };
     if initial_bytes < 0 {
         return Err(io::Error::last_os_error());
@@ -522,6 +567,7 @@ pub fn proc_listpids_all() -> io::Result<Vec<i32>> {
             .checked_mul(pid_size)
             .and_then(|bytes| i32::try_from(bytes).ok())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pid buffer too large"))?;
+        // SAFETY: pids has capacity for buffer_bytes, pointer is valid and writable.
         let returned_bytes = unsafe {
             libc::proc_listpids(
                 PROC_ALL_PIDS,
@@ -546,6 +592,7 @@ pub fn proc_listpids_all() -> io::Result<Vec<i32>> {
             ));
         }
         let len = returned_bytes / pid_size;
+        // SAFETY: proc_listpids populated exactly len pid_t elements.
         unsafe {
             pids.set_len(len);
         }
@@ -554,10 +601,12 @@ pub fn proc_listpids_all() -> io::Result<Vec<i32>> {
 }
 
 /// Return the executable path for a process.
+#[allow(unsafe_code)]
 pub fn proc_pidpath(pid: i32) -> io::Result<PathBuf> {
     let buffer_size = usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid pid path buffer size"))?;
     let mut buffer = vec![0_i8; buffer_size];
+    // SAFETY: buffer is allocated to PROC_PIDPATHINFO_MAXSIZE and passed with its length.
     let returned_bytes = unsafe {
         libc::proc_pidpath(
             pid,
@@ -571,26 +620,32 @@ pub fn proc_pidpath(pid: i32) -> io::Result<PathBuf> {
         return Err(io::Error::last_os_error());
     }
 
+    // SAFETY: proc_pidpath returned positive bytes indicating a null-terminated C string in buffer.
     let path = unsafe { CStr::from_ptr(buffer.as_ptr()) };
     Ok(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
 }
 
 /// Return Darwin `RUSAGE_INFO_V4` counters for a process.
+#[allow(unsafe_code)]
 pub fn proc_pid_rusage_v4(pid: i32) -> io::Result<RUsageInfoV4> {
     let mut usage = MaybeUninit::<RUsageInfoV4>::zeroed();
     let buffer_ptr = usage.as_mut_ptr().cast::<c_void>();
+    // SAFETY: proc_pid_rusage called with valid pid, RUSAGE_INFO_V4 flavor and writable buffer pointer.
     let result = unsafe { libc::proc_pid_rusage(pid, RUSAGE_INFO_V4, buffer_ptr.cast()) };
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: proc_pid_rusage succeeded, buffer is initialized.
     Ok(unsafe { usage.assume_init() })
 }
 
 /// Return mapped-region path information for a process address.
+#[allow(unsafe_code)]
 pub fn proc_pid_region_path(pid: i32, address: u64) -> io::Result<ProcRegionWithPathInfo> {
     let mut info = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
     let buffer_size = i32::try_from(size_of::<ProcRegionWithPathInfo>())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "region buffer too large"))?;
+    // SAFETY: proc_pidinfo called with valid PROC_PIDREGIONPATHINFO flavor and buffer size.
     let returned_bytes = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -615,10 +670,92 @@ pub fn proc_pid_region_path(pid: i32, address: u64) -> io::Result<ProcRegionWith
             format!("unexpected region byte count {returned_bytes} != {buffer_size}"),
         ));
     }
+    // SAFETY: proc_pidinfo populated exact buffer_size bytes of ProcRegionWithPathInfo.
     Ok(unsafe { info.assume_init() })
 }
 
+/// Enumerate all mounted file systems using `getfsstat(2)`.
+///
+/// This issues a direct kernel call without spawning `/sbin/mount` or any child
+/// process, returning filesystem metadata, mount flags, and space statistics
+/// in a single operation.
+#[allow(unsafe_code)]
+pub fn getfsstat() -> io::Result<Vec<StatfsEntry>> {
+    // SAFETY: getfsstat with null buffer and 0 size queries the count of mounted file systems.
+    let count = unsafe { libc::getfsstat(ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let alloc_count = usize::try_from(count)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative mount count"))?
+        .saturating_add(8);
+    let mut buf = Vec::<libc::statfs>::with_capacity(alloc_count);
+    let buf_bytes = i32::try_from(buf.capacity().saturating_mul(size_of::<libc::statfs>()))
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "statfs buffer size exceeds i32")
+        })?;
+
+    // SAFETY: buf has capacity for buf_bytes, pointer is valid and writable.
+    let actual_count = unsafe { libc::getfsstat(buf.as_mut_ptr(), buf_bytes, libc::MNT_NOWAIT) };
+    if actual_count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let actual_len = usize::try_from(actual_count)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative actual mount count"))?;
+    // SAFETY: getfsstat returned actual_count successfully initialized struct statfs elements.
+    unsafe {
+        buf.set_len(actual_len);
+    }
+
+    let mut entries = Vec::with_capacity(buf.len());
+    for raw in buf {
+        let mount_point = c_chars_to_path(&raw.f_mntonname);
+        let device = c_chars_to_string(&raw.f_mntfromname);
+        let fs_type = c_chars_to_string(&raw.f_fstypename);
+        let is_readonly = (raw.f_flags & (libc::MNT_RDONLY as u32)) != 0;
+        let is_local = (raw.f_flags & (libc::MNT_LOCAL as u32)) != 0;
+
+        entries.push(StatfsEntry {
+            mount_point,
+            device,
+            fs_type,
+            block_size: u64::from(raw.f_bsize),
+            blocks: raw.f_blocks,
+            blocks_free: raw.f_bfree,
+            blocks_available: raw.f_bavail,
+            is_readonly,
+            is_local,
+        });
+    }
+
+    Ok(entries)
+}
+
+fn c_chars_to_bytes(chars: &[libc::c_char]) -> Vec<u8> {
+    chars
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c.cast_unsigned())
+        .collect()
+}
+
+fn c_chars_to_path(chars: &[libc::c_char]) -> PathBuf {
+    let bytes = c_chars_to_bytes(chars);
+    PathBuf::from(OsStr::from_bytes(&bytes))
+}
+
+fn c_chars_to_string(chars: &[libc::c_char]) -> String {
+    let bytes = c_chars_to_bytes(chars);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Subscribe to native `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` events.
+#[allow(unsafe_code)]
 pub fn subscribe_memory_pressure_events<F>(callback: F) -> Result<MemoryPressureSource, MachError>
 where
     F: Fn(MemoryPressureEvent) + Send + Sync + 'static,
@@ -627,6 +764,7 @@ where
         DispatchQoS::Utility,
     ));
     let mask = memory_pressure_event_mask();
+    // SAFETY: DispatchSource::new is called with valid memorypressure dispatch type pointer and target queue.
     let source = unsafe {
         DispatchSource::new(
             ptr::addr_of!(_dispatch_source_type_memorypressure).cast_mut(),
@@ -642,6 +780,7 @@ where
     });
     let state_ptr = Box::into_raw(state).cast::<c_void>();
 
+    // SAFETY: set_context passes a raw pointer to an allocated Box maintained until cancel handler.
     unsafe {
         source.set_context(state_ptr);
     }
@@ -652,10 +791,12 @@ where
     Ok(MemoryPressureSource { source })
 }
 
+#[allow(unsafe_code)]
 fn thread_basic_info_for_port(thread: thread_act_t) -> Result<ThreadBasicInfo, MachError> {
     let mut info = MaybeUninit::<MachThreadBasicInfoRaw>::zeroed();
     let mut count = THREAD_BASIC_INFO_COUNT;
 
+    // SAFETY: thread_info called with valid thread port, THREAD_BASIC_INFO flavor and buffer pointer.
     let code = unsafe {
         thread_info(
             thread,
@@ -671,8 +812,10 @@ fn thread_basic_info_for_port(thread: thread_act_t) -> Result<ThreadBasicInfo, M
         THREAD_BASIC_INFO_COUNT,
     )?;
 
+    // SAFETY: thread_info succeeded and verified count, info is initialized.
     let info = unsafe { info.assume_init() };
     Ok(ThreadBasicInfo {
+        // SAFETY: addr_of! and read_unaligned safely extract scalar fields.
         user_time_micros: time_value_to_micros(unsafe {
             ptr::addr_of!(info.user_time).read_unaligned()
         }),
@@ -721,7 +864,9 @@ fn time_value_to_micros(value: mach2::time_value::time_value_t) -> u64 {
         .saturating_add(u64::try_from(micros).unwrap_or(0))
 }
 
+#[allow(unsafe_code)]
 fn page_size_bytes() -> Result<u64, MachError> {
+    // SAFETY: sysconf(_SC_PAGESIZE) is a standard POSIX system query with no pointer manipulation.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     u64::try_from(page_size)
         .ok()
@@ -745,22 +890,28 @@ const fn memory_pressure_event_mask() -> usize {
         )
 }
 
+#[allow(unsafe_code)]
 extern "C" fn memory_pressure_event_handler(context: *mut c_void) {
     if context.is_null() {
         return;
     }
 
+    // SAFETY: context is non-null and points to the valid MemoryPressureState set in subscribe_memory_pressure_events.
     let state = unsafe { &*context.cast::<MemoryPressureState>() };
+    // SAFETY: state.source points to the valid DispatchSource.
     let source = unsafe { &*state.source };
     let event = MemoryPressureEvent::from_dispatch_data(source.data());
     let _ = catch_unwind(AssertUnwindSafe(|| (state.callback)(event)));
 }
 
+#[allow(unsafe_code)]
 extern "C" fn memory_pressure_cancel_handler(context: *mut c_void) {
     if context.is_null() {
         return;
     }
 
+    // SAFETY: context is non-null and was created with Box::into_raw in subscribe_memory_pressure_events;
+    // cancel handler is invoked exactly once when the source is canceled.
     unsafe {
         drop(Box::from_raw(context.cast::<MemoryPressureState>()));
     }
@@ -861,5 +1012,43 @@ mod tests {
             subscribe_memory_pressure_events(|_| {}).expect("dispatch source should start");
         assert!(!source.is_canceled());
         drop(source);
+    }
+
+    #[test]
+    fn getfsstat_enumerates_plausible_mounts() {
+        let mounts = super::getfsstat().expect("getfsstat should succeed on macOS");
+        assert!(
+            !mounts.is_empty(),
+            "getfsstat should return at least root mount"
+        );
+        let root = mounts
+            .iter()
+            .find(|m| m.mount_point == std::path::Path::new("/"));
+        assert!(
+            root.is_some(),
+            "root filesystem / must be enumerated by getfsstat"
+        );
+        let root = root.unwrap();
+        assert!(root.block_size > 0, "root block size must be positive");
+        assert!(root.blocks > 0, "root blocks must be positive");
+    }
+
+    #[test]
+    fn getfsstat_matches_mount_command_mount_points() {
+        let mounts = super::getfsstat().expect("getfsstat should succeed on macOS");
+        let output = std::process::Command::new("/sbin/mount")
+            .output()
+            .expect("/sbin/mount should run in test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for entry in &mounts {
+            if entry.is_local {
+                let mnt = entry.mount_point.to_string_lossy();
+                let pattern = format!(" on {mnt} (");
+                assert!(
+                    stdout.contains(&pattern),
+                    "local mount point {mnt} from getfsstat should appear in /sbin/mount output: {stdout}"
+                );
+            }
+        }
     }
 }

@@ -12,11 +12,30 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, mpsc};
+
 use nix::mount::MntFlags;
 use nix::sys::statfs::{Statfs, statfs as nix_statfs};
 use parking_lot::RwLock;
 use plist::Value;
-use std::sync::{OnceLock, mpsc};
+
+static CHILD_SPAWNS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Number of child processes spawned while test mode is enabled.
+#[must_use]
+pub fn child_spawns_total() -> u64 {
+    CHILD_SPAWNS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset child process spawn counter (for tests).
+pub fn reset_child_spawns_total() {
+    CHILD_SPAWNS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+fn is_test_mode() -> bool {
+    std::env::var_os(crate::platform::test_overlay::TEST_MODE_ENV).is_some() || cfg!(test)
+}
 
 const STATFS_STRUCT_SIZE_BYTES: usize = core::mem::size_of::<libc::statfs>();
 const STATFS_MOUNT_NAME_BYTES: usize = core::mem::size_of::<[libc::c_char; 1024]>();
@@ -329,16 +348,38 @@ pub fn mounted_filesystems() -> io::Result<Vec<StatfsSnapshot>> {
     }
 
     let mut filesystems = Vec::new();
-    for mount in mount_command_entries()? {
-        if !mount.is_local {
-            continue;
+    match sbh_mach::getfsstat() {
+        Ok(entries) => {
+            for entry in entries {
+                if !entry.is_local {
+                    continue;
+                }
+                filesystems.push(StatfsSnapshot {
+                    mount_point: entry.mount_point,
+                    device: entry.device,
+                    fs_type: entry.fs_type,
+                    block_size: entry.block_size,
+                    blocks: entry.blocks,
+                    blocks_free: entry.blocks_free,
+                    blocks_available: entry.blocks_available,
+                    is_readonly: entry.is_readonly,
+                });
+            }
         }
-        match statfs_for_mount(&mount.mount_point, OsStr::new(&mount.device)) {
-            Ok(snapshot) => filesystems.push(snapshot),
-            Err(error) => eprintln!(
-                "[sbh] warning: skipping macOS mount {}: {error}",
-                mount.mount_point.display()
-            ),
+        Err(error) => {
+            eprintln!("[sbh] warning: getfsstat failed: {error}; falling back to mount command");
+            for mount in mount_command_entries()? {
+                if !mount.is_local {
+                    continue;
+                }
+                match statfs_for_mount(&mount.mount_point, OsStr::new(&mount.device)) {
+                    Ok(snapshot) => filesystems.push(snapshot),
+                    Err(error) => eprintln!(
+                        "[sbh] warning: skipping macOS mount {}: {error}",
+                        mount.mount_point.display()
+                    ),
+                }
+            }
         }
     }
     filesystems.sort_by(|left, right| {
@@ -460,6 +501,9 @@ fn command_output_with_timeout_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    if is_test_mode() {
+        CHILD_SPAWNS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
     let mut stdout = child.stdout.take().map(spawn_command_stream_reader);
     let mut stderr = child.stderr.take().map(spawn_command_stream_reader);
     let deadline = Instant::now() + timeout;
@@ -595,6 +639,94 @@ fn parse_mount_command_output(raw: &str) -> Vec<MountCommandEntry> {
         .collect()
 }
 
+fn diskutil_cli_cache_path() -> PathBuf {
+    let tmp = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let uid = nix::unistd::getuid().as_raw();
+    tmp.join(format!("sbh-diskutil-{uid}.plist"))
+}
+
+fn diskutil_daemon_system_cache_path() -> PathBuf {
+    let uid = nix::unistd::getuid().as_raw();
+    crate::core::config::system_data_dir().join(format!("sbh-diskutil-{uid}.plist"))
+}
+
+fn diskutil_daemon_user_cache_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let uid = nix::unistd::getuid().as_raw();
+    Some(
+        home.join("Library")
+            .join("Application Support")
+            .join("sbh")
+            .join(format!("sbh-diskutil-{uid}.plist")),
+    )
+}
+
+fn read_cached_diskutil_inventory() -> Option<ApfsInventory> {
+    let mut candidates = vec![
+        diskutil_cli_cache_path(),
+        diskutil_daemon_system_cache_path(),
+    ];
+    if let Some(user_cache) = diskutil_daemon_user_cache_path() {
+        candidates.push(user_cache);
+    }
+
+    for path in candidates {
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(elapsed) = modified.elapsed() else {
+            continue;
+        };
+        if elapsed >= APFS_CACHE_TTL {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        if let Ok(inventory) = parse_apfs_inventory(&bytes) {
+            return Some(inventory);
+        }
+    }
+    None
+}
+
+fn write_cached_diskutil_plist(data: &[u8]) {
+    let cli_path = diskutil_cli_cache_path();
+    write_cache_file_atomically(&cli_path, data);
+
+    let daemon_path = diskutil_daemon_system_cache_path();
+    if let Some(parent) = daemon_path.parent()
+        && parent.is_dir()
+    {
+        write_cache_file_atomically(&daemon_path, data);
+    }
+
+    if let Some(user_path) = diskutil_daemon_user_cache_path()
+        && let Some(parent) = user_path.parent()
+        && parent.is_dir()
+    {
+        write_cache_file_atomically(&user_path, data);
+    }
+}
+
+fn write_cache_file_atomically(path: &Path, data: &[u8]) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    if fs::write(&tmp_path, data).is_ok() {
+        let _ = fs::rename(&tmp_path, path);
+    }
+}
+
 pub fn apfs_inventory() -> io::Result<ApfsInventory> {
     let cache = APFS_INVENTORY_CACHE.get_or_init(|| RwLock::new(None));
     {
@@ -604,6 +736,11 @@ pub fn apfs_inventory() -> io::Result<ApfsInventory> {
         {
             return Ok(inventory.clone());
         }
+    }
+
+    if let Some(inventory) = read_cached_diskutil_inventory() {
+        *cache.write() = Some((Instant::now(), inventory.clone()));
+        return Ok(inventory);
     }
 
     let mut command = Command::new("/usr/sbin/diskutil");
@@ -624,6 +761,7 @@ pub fn apfs_inventory() -> io::Result<ApfsInventory> {
     }
 
     let inventory = parse_apfs_inventory(&output.stdout)?;
+    write_cached_diskutil_plist(&output.stdout);
     *cache.write() = Some((Instant::now(), inventory.clone()));
     Ok(inventory)
 }
@@ -2090,6 +2228,20 @@ com.apple.os.update-abc
                 OsString::from("9999999999999999"),
                 OsString::from("4"),
             ]
+        );
+    }
+
+    #[test]
+    fn mounted_filesystems_spawns_zero_children_hot_path() {
+        super::reset_child_spawns_total();
+        for _ in 0..60 {
+            let mounts = mounted_filesystems().expect("mounted filesystems should succeed");
+            assert!(!mounts.is_empty(), "must find mounted filesystems");
+        }
+        let spawns = super::child_spawns_total();
+        assert_eq!(
+            spawns, 0,
+            "mounted_filesystems must spawn zero child processes in the hot path (was {spawns})"
         );
     }
 }

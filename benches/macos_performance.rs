@@ -6,6 +6,7 @@ use std::env;
 use std::fs;
 use std::hint::black_box;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,8 @@ use storage_ballast_helper::platform::pal::{
 const GIB: u64 = 1024 * 1024 * 1024;
 const DAEMON_POLL_TICK_BUDGET_MS: f64 = 200.0;
 const PAL_SURFACE_BUDGET_MS: f64 = 5.0;
+const STATUS_COLD_START_BUDGET_MS: f64 = 250.0;
+const STATUS_COLD_START_SAMPLES: usize = 5;
 const SUMMARY_ROUNDS: u32 = 7;
 const SUMMARY_ITERATIONS_PER_ROUND: u32 = 2_048;
 
@@ -30,6 +33,8 @@ struct BenchmarkSummary {
     daemon_poll_tick_budget_ms: f64,
     pal_surface_avg_ms: f64,
     pal_surface_budget_ms: f64,
+    status_cold_start_p50_ms: f64,
+    status_cold_start_budget_ms: f64,
     summary_rounds: u32,
     summary_iterations_per_round: u32,
 }
@@ -46,6 +51,13 @@ impl BenchmarkSummary {
             self.pal_surface_avg_ms,
             self.pal_surface_budget_ms,
         );
+        if self.status_cold_start_p50_ms > 0.0 && (budget_scale() - 1.0).abs() < f64::EPSILON {
+            assert_at_most_ms(
+                "status cold-start p50",
+                self.status_cold_start_p50_ms,
+                self.status_cold_start_budget_ms,
+            );
+        }
     }
 }
 
@@ -239,6 +251,75 @@ fn budget_scale() -> f64 {
         .unwrap_or(1.0)
 }
 
+fn find_sbh_bin() -> Option<PathBuf> {
+    if let Ok(path) = env::var("SBH_BIN").map(PathBuf::from)
+        && path.is_file()
+    {
+        return Some(path);
+    }
+    if let Ok(path) = env::var("CARGO_BIN_EXE_sbh").map(PathBuf::from)
+        && path.is_file()
+    {
+        return Some(path);
+    }
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(deps_dir) = current_exe.parent()
+    {
+        if let Some(target_dir) = deps_dir.parent() {
+            let candidate = target_dir.join(format!("sbh{}", env::consts::EXE_SUFFIX));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let candidate = deps_dir.join(format!("sbh{}", env::consts::EXE_SUFFIX));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    for rel in ["target/release/sbh", "target/debug/sbh"] {
+        let candidate = PathBuf::from(rel);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn measure_status_cold_start_p50_ms() -> f64 {
+    let Some(sbh_bin) = find_sbh_bin() else {
+        eprintln!(
+            "[sbh-bench] warning: sbh binary not found, status cold-start measurement skipped"
+        );
+        return 0.0;
+    };
+
+    let mut samples_ms = Vec::with_capacity(STATUS_COLD_START_SAMPLES);
+    for _ in 0..STATUS_COLD_START_SAMPLES {
+        let started = Instant::now();
+        let Ok(status) = Command::new(&sbh_bin)
+            .args(["status", "--json"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        else {
+            eprintln!(
+                "[sbh-bench] warning: failed to spawn sbh binary for status cold-start measurement"
+            );
+            return 0.0;
+        };
+
+        if !status.success() {
+            eprintln!("[sbh-bench] warning: sbh status --json exited with non-zero status");
+            return 0.0;
+        }
+        samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    samples_ms.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let median_index = samples_ms.len() / 2;
+    samples_ms.get(median_index).copied().unwrap_or(0.0)
+}
+
 fn measure_summary() -> BenchmarkSummary {
     let mut poll_tick = PollTickFixture::new();
     let daemon_poll_tick_avg_ms = average_elapsed_ms(|| poll_tick.tick());
@@ -246,11 +327,15 @@ fn measure_summary() -> BenchmarkSummary {
     let pal_surface = PalSurfaceFixture::new();
     let pal_surface_avg_ms = average_elapsed_ms(|| pal_surface.sample());
 
+    let status_cold_start_p50_ms = measure_status_cold_start_p50_ms();
+
     BenchmarkSummary {
         daemon_poll_tick_avg_ms,
         daemon_poll_tick_budget_ms: DAEMON_POLL_TICK_BUDGET_MS * budget_scale(),
         pal_surface_avg_ms,
         pal_surface_budget_ms: PAL_SURFACE_BUDGET_MS * budget_scale(),
+        status_cold_start_p50_ms,
+        status_cold_start_budget_ms: STATUS_COLD_START_BUDGET_MS * budget_scale(),
         summary_rounds: SUMMARY_ROUNDS,
         summary_iterations_per_round: SUMMARY_ITERATIONS_PER_ROUND,
     }
@@ -284,6 +369,17 @@ fn macos_performance(c: &mut Criterion) {
         let fixture = PalSurfaceFixture::new();
         bench.iter(|| fixture.sample());
     });
+    if let Some(sbh_bin) = find_sbh_bin() {
+        group.bench_function("status_cold_start", |bench| {
+            bench.iter(|| {
+                let _ = Command::new(&sbh_bin)
+                    .args(["status", "--json"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            });
+        });
+    }
     group.finish();
 }
 

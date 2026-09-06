@@ -1072,6 +1072,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ../bench
+          cargo build $CI_FEATURES --release --bin sbh
+          SBH_BIN="$(pwd)/target/release/sbh" \
           SBH_BENCH_SUMMARY=../bench/current-summary.json \
             cargo bench $CI_FEATURES --bench macos_performance -- --sample-size 10 --warm-up-time 1 --measurement-time 2 \
             2>&1 | tee ../bench/current-output.txt
@@ -1085,6 +1087,8 @@ jobs:
             echo "Base ref has no macos_performance bench; skipping base comparison." | tee ../bench/base-output.txt
             exit 0
           fi
+          cargo build $CI_FEATURES --release --bin sbh || true
+          SBH_BIN="$(pwd)/target/release/sbh" \
           SBH_BENCH_SUMMARY=../bench/base-summary.json \
             cargo bench $CI_FEATURES --bench macos_performance -- --sample-size 10 --warm-up-time 1 --measurement-time 2 \
             2>&1 | tee ../bench/base-output.txt
@@ -1099,8 +1103,9 @@ jobs:
           import sys
 
           metrics = [
-              ("daemon_poll_tick_avg_ms", "daemon poll tick", "daemon_poll_tick_budget_ms"),
-              ("pal_surface_avg_ms", "PAL surface pass", "pal_surface_budget_ms"),
+              ("daemon_poll_tick_avg_ms", "daemon poll tick", "daemon_poll_tick_budget_ms", False),
+              ("pal_surface_avg_ms", "PAL surface pass", "pal_surface_budget_ms", False),
+              ("status_cold_start_p50_ms", "status cold-start p50", "status_cold_start_budget_ms", True),
           ]
 
           def load_summary(path: str) -> dict:
@@ -1116,23 +1121,33 @@ jobs:
           }
           failed = False
 
-          for key, label, budget_key in metrics:
+          for key, label, budget_key, is_soft in metrics:
+              if key not in current or budget_key not in current:
+                  continue
               actual = float(current[key])
+              if actual <= 0.0:
+                  print(f"{label}: skipped (not measured)")
+                  continue
               budget = float(current[budget_key])
               print(f"{label}: current={actual:.3f} ms budget={budget:.3f} ms")
               if actual > budget:
-                  print(f"::error::{label} exceeded budget: {actual:.3f} ms > {budget:.3f} ms")
-                  failed = True
+                  if is_soft:
+                      print(f"::warning::{label} exceeded soft budget: {actual:.3f} ms > {budget:.3f} ms")
+                  else:
+                      print(f"::error::{label} exceeded budget: {actual:.3f} ms > {budget:.3f} ms")
+                      failed = True
 
           base_path = pathlib.Path("bench/base-summary.json")
           if base_path.exists():
               base = load_summary(str(base_path))
               output["base"] = base
-              for key, label, _budget_key in metrics:
+              for key, label, _budget_key, is_soft in metrics:
+                  if key not in current or key not in base:
+                      continue
                   current_value = float(current[key])
                   base_value = float(base[key])
-                  if base_value <= 0.0:
-                      print(f"::warning::{label} base value is non-positive; skipping regression comparison")
+                  if base_value <= 0.0 or current_value <= 0.0:
+                      print(f"::warning::{label} base or current value is non-positive; skipping regression comparison")
                       continue
                   delta_percent = ((current_value - base_value) / base_value) * 100.0
                   comparison = {
@@ -1148,11 +1163,17 @@ jobs:
                       f"delta={delta_percent:.2f}%"
                   )
                   if delta_percent > regression_limit:
-                      print(
-                          f"::error::{label} regressed by {delta_percent:.2f}% "
-                          f"(limit {regression_limit:.2f}%)"
-                      )
-                      failed = True
+                      if is_soft:
+                          print(
+                              f"::warning::{label} regressed by {delta_percent:.2f}% "
+                              f"(soft limit {regression_limit:.2f}%)"
+                          )
+                      else:
+                          print(
+                              f"::error::{label} regressed by {delta_percent:.2f}% "
+                              f"(limit {regression_limit:.2f}%)"
+                          )
+                          failed = True
           else:
               print("No base benchmark summary available; enforcing hard budgets only.")
 
@@ -1160,11 +1181,12 @@ jobs:
           if step_summary:
               with open(step_summary, "a", encoding="utf-8") as handle:
                   handle.write("### macOS performance budgets\n\n")
-                  for key, label, budget_key in metrics:
-                      handle.write(
-                          f"- {label}: {float(current[key]):.3f} ms "
-                          f"(budget {float(current[budget_key]):.3f} ms)\n"
-                      )
+                  for key, label, budget_key, _is_soft in metrics:
+                      if key in current and budget_key in current:
+                          handle.write(
+                              f"- {label}: {float(current[key]):.3f} ms "
+                              f"(budget {float(current[budget_key]):.3f} ms)\n"
+                          )
                   if output["comparisons"]:
                       handle.write(f"- Regression limit: {regression_limit:.2f}%\n")
                       for comparison in output["comparisons"]:
