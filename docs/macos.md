@@ -521,6 +521,8 @@ a tarball whose binary is not the labelled architecture, or a provenance
 document with the wrong tag. The hosted workflow runs the same audit against
 the published release in its `asset-audit` job before the tap update.
 
+The entire fallback build, packaging, and pre-upload audit can be run directly using `scripts/release-manual.sh --tag $TAG` (or previewed with `--dry-run`).
+
 Use a durable working directory outside `/tmp` so cleanup tools do not remove
 the prepared bundle before publication:
 

@@ -57,6 +57,10 @@ file_count = 2
 file_size_bytes = 1048576
 [pressure]
 poll_interval_ms = 500
+green_min_free_pct = 0.04
+yellow_min_free_pct = 0.03
+orange_min_free_pct = 0.02
+red_min_free_pct = 0.01
 [scanner]
 root_paths = [{root:?}]
 [notifications]
