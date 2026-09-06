@@ -48,11 +48,21 @@ What the 2026-09-02 reality check changed:
   published assets. Restoring the pipeline is `bd-rc-master-ajg1.5` (workflow,
   asset audit, `v0.5.2` cut); the release-engineering beads `bd-ykwh` and
   `bd-ykwh.3` were closed on 2026-09-03 with the v0.4.22–v0.4.28 evidence.
-- The macOS closeout that remains (getfsstat, cold-start budget, open-file
-  deadlines, snapshot estimate, docs, the parity re-audit and the closing of
-  `bd-r7m7.17` / `bd-r7m7`) is `bd-rc-master-ajg1.10` and its children;
-  `crates/sbh_mach` became a workspace member whose tests run in the macOS
-  lanes under `bd-rc-master-ajg1.1.4`.
+- The macOS closeout under `bd-rc-master-ajg1.10` is complete:
+  - W9.1 (`bd-rc-master-ajg1.10.1`): Replaced `/sbin/mount` with `sbh_mach::getfsstat()`,
+    eliminating subprocess forks on the hot path (zero child spawns verified by test),
+    cached `diskutil apfs` (5-min TTL), and budgeted cold-start `sbh status` at 250 ms
+    in `benches/macos_performance.rs` and `.github/workflows/ci.yml`.
+  - W9.2 (`bd-rc-master-ajg1.10.2`): Added deadlines and pid caps to `open_files_under`
+    and `executables_under` (fail-closed like Linux).
+  - W9.3 (`bd-rc-master-ajg1.10.3`): Unified APFS snapshot reporting into
+    `estimated_reclaimable_by_snapshot_thinning`, added `~/Library/Caches` cleanup rule,
+    and fixed launchd documentation (`ThrottleInterval` 60, service names).
+  - W9.4 (`bd-rc-master-ajg1.10.4`): Refreshed acceptance criteria (250 ms cold-start
+    budget; `macos-latest` + `macos-15-intel` / `macos-15-large` runner matrix and dsr
+    mmini fleet verification), closed `bd-r7m7.17` and `bd-r7m7`.
+  - `crates/sbh_mach` workspace member safe FFI wrappers with `#![deny(unsafe_code)]`
+    and per-item `// SAFETY:` proofs under `bd-rc-master-ajg1.1.4` and `10.1`.
 - Beads this audit counted as delivered but whose deliverable did not exist in
   the CLI at close time carry an annotation comment pointing at the work that
   shipped them.
