@@ -1014,11 +1014,11 @@ The EWMA (Exponentially Weighted Moving Average) estimator tracks the rate of fr
 
 ```
 burstiness = |instantaneous_rate - ewma_rate| / (|ewma_rate| + 1.0)
-alpha = 0.20 * burstiness + base_alpha
-alpha = clamp(alpha, 0.1, 0.8)
+damping = 1.0 / (1.0 + 2.0 * burstiness)
+alpha = clamp(base_alpha * damping, 0.10, 0.75)
 ```
 
-When disk consumption is steady, `burstiness` is low and alpha stays near the base value (<!-- claim:constants.ewma.ewma_base_alpha -->0.3<!-- /claim -->), producing smooth estimates. When a burst hits (e.g., a large `cargo build` starts), burstiness spikes, alpha increases, and the estimator tracks the new rate within a few samples rather than lagging behind.
+When disk consumption is steady, `burstiness` is low, damping is near 1.0, and alpha stays near the base value (<!-- claim:constants.ewma.ewma_base_alpha -->0.3<!-- /claim -->), producing smooth rate estimates. When a sudden burst hits (e.g., a large `cargo build` starts), burstiness spikes, damping decreases alpha toward its floor (`0.10`), and the estimator becomes stickier so transient spikes do not cause wild overreactions.
 
 The estimator also tracks acceleration (rate of rate change) using the same EWMA formula, enabling quadratic time-to-exhaustion predictions:
 
@@ -1028,7 +1028,7 @@ time_to_exhaustion = solve(distance = rate * t + 0.5 * accel * t^2)
 
 For non-zero acceleration, the quadratic is solved using the numerically stable conjugate form to avoid catastrophic cancellation when the discriminant is close to `rate^2`.
 
-A confidence metric combines sample count adequacy (70% weight) with residual tracking (30% weight). When confidence drops below 0.2 or fewer than <!-- claim:constants.ewma.ewma_min_samples -->3<!-- /claim --> samples exist, the estimator enters fallback mode and reports uncertainty rather than potentially misleading predictions.
+A confidence metric combines sample count adequacy (`50%` weight), residual tracking (`20%` weight), and prediction stability (`30%` weight). When confidence drops below `0.2` or fewer than <!-- claim:constants.ewma.ewma_min_samples -->3<!-- /claim --> samples exist, the estimator enters fallback mode and reports uncertainty rather than potentially misleading predictions.
 
 Trend classification uses fixed thresholds: recovering (rate < -1.0 bytes/sec), accelerating (accel > 64.0 bytes/sec^2), decelerating (accel < -64.0 bytes/sec^2), or stable.
 
@@ -1082,32 +1082,30 @@ Every file and directory discovered during a scan receives a composite score fro
 
 | Path pattern | Score |
 | --- | --- |
-| `/tmp`, `/var/tmp`, `/dev/shm` | 0.95 |
-| `*/.tmp_*` patterns | 0.90 |
-| `*/.target` (hidden build dirs) | 0.85 |
-| `*/target` (Rust/Java build dirs) | 0.80 |
+| `/tmp`, `/private/tmp`, `/var/tmp`, `/data/tmp`, `/dev/shm` | 0.95 |
+| `/data/projects/*/.tmp_*` patterns | 0.90 |
+| `/Library/Developer/Xcode/DerivedData/*` | 0.90 |
+| `/data/projects/*/.target` (hidden build dirs) | 0.85 |
+| macOS Application Support caches (`/Library/Application Support/.../Cache*`) | 0.82 |
+| `/data/projects/*/target` (Rust/Java build dirs) | 0.80 |
 | `*/.cache/*` | 0.60 |
 | Generic `*/projects/*` | 0.40 |
 | Default unknown | 0.30 |
 | `*/documents/*` | 0.10 |
-| System paths (`/`, `/bin`, `/lib`) | 0.00 |
+| System paths (`/`, `/bin`, `/lib`, `/usr`) | 0.00 |
 
 **Name** (default weight <!-- claim:scoring.name -->0.25<!-- /claim -->) matches against a pattern registry of known artifact types: `.o` files, `node_modules`, `__pycache__`, `.class` files, `.wasm` intermediates, and hundreds of others. Each pattern carries a confidence score.
 
 **Age** (default weight <!-- claim:scoring.age -->0.2<!-- /claim -->) uses an effective age timestamp that differs by entry type. For **files**, the modification time (`mtime`) is used because content change is what matters. For **directories**, the creation (birth) time is preferred when available, because directory `mtime` updates whenever any direct child is added or removed — making active build caches like `target/` appear perpetually young when `mtime` is used alone. Birth time reflects when the directory was actually created and is stable across rebuilds. If birth time is unavailable, `mtime` is used as a fallback.
 
-The age-to-score curve is non-monotonic, peaking at 4-10 hours (the sweet spot for stale build artifacts) and dropping for very old files (which might be intentionally archived):
+The age-to-score curve is monotonic, capping at 1.0 (older artifacts are always at least as likely to be abandoned as younger ones):
 
 | Age | Score | Rationale |
 | --- | --- | --- |
 | < 30 min | 0.00 | Likely in active use |
 | 30 min - 2 hours | 0.20 | Possibly still needed |
 | 2 - 4 hours | 0.70 | Probably stale |
-| 4 - 10 hours | 1.00 | Peak staleness for build artifacts |
-| 10 - 24 hours | 0.85 | Likely stale |
-| 1 - 7 days | 0.60 | Old but possibly intentional |
-| 7 - 30 days | 0.40 | Probably forgotten |
-| > 30 days | 0.25 | Ancient, but might be archived intentionally |
+| >= 4 hours | 1.00 | Peak staleness; older artifacts remain fully eligible |
 
 **Size** (default weight <!-- claim:scoring.size -->0.15<!-- /claim -->) favors larger artifacts (more space reclaimed per deletion) with diminishing returns at extremes:
 
@@ -1304,7 +1302,7 @@ Any single check failure causes the candidate to be skipped (not failed), so it 
 
 #### Layer 3: Circuit Breaker
 
-The deletion executor tracks consecutive failures. After <!-- claim:constants.deletion.circuit_breaker_threshold -->5<!-- /claim --> consecutive deletion errors (not skips), the circuit breaker trips and halts the entire batch. The daemon waits <!-- claim:constants.deletion.circuit_breaker_cooldown.raw -->30<!-- /claim --> seconds before retrying. This prevents cascading failures when the filesystem is in a degraded state (e.g., hardware errors, NFS timeouts).
+The deletion executor tracks consecutive failures. After <!-- claim:constants.deletion.circuit_breaker_threshold -->5<!-- /claim --> consecutive deletion errors (not skips), the circuit breaker trips and halts the entire batch. The daemon waits <!-- claim:constants.deletion.circuit_breaker_cooldown.raw -->30<!-- /claim --> seconds before retrying, backing off exponentially up to 5 minutes on sustained errors. This prevents cascading failures when the filesystem is in a degraded state (e.g., hardware errors, NFS timeouts).
 
 #### Layer 4: Policy Engine Gates
 
@@ -1457,7 +1455,7 @@ The registry asks the active Platform Abstraction Layer (PAL) for mount inventor
 
 #### Swap-Thrash Detection
 
-The daemon monitors swap usage relative to available RAM. When swap utilization exceeds 70% while at least 8 GiB of RAM remains free, the system flags a swap-thrash risk. This condition indicates the host experienced memory pressure and is now paging memory back in slowly, which degrades IO performance for both scanning and deletion.
+The daemon monitors swap usage relative to available RAM. When swap utilization exceeds `70%` while available RAM drops below `8 GiB`, the system flags a swap-thrash risk. If available RAM remains ample, high swap usage is treated as normal cold-page offloading rather than thrashing.
 
 Swap-thrash warnings are rate-limited to one per 15-minute window to avoid log noise during sustained pressure.
 
@@ -1480,6 +1478,26 @@ Constraints:
 Green and Yellow pressure levels do not trigger fast-tracking.
 
 Source: `src/daemon/loop_main.rs`
+
+### Active Log Truncation
+
+Some agent workloads hold long-lived write handles (`O_WRONLY`) on log files (such as `codex-tui.log`) that grow without bound. The standard deletion path is prevented by open-file safety vetoes, and unlinking an open file would orphan the inode without releasing disk blocks until the process exits.
+
+Under `[scanner.log_truncation]`, `sbh` reclaims this space in place via `ftruncate(2)` (Rust `File::set_len(0)`):
+- Inode size drops to zero immediately, returning blocks to the filesystem.
+- The inode and file descriptor remain valid, so active writers continue appending without disruption.
+
+Configuration:
+```toml
+[scanner.log_truncation]
+enabled = true
+min_size_bytes = 104857600   # 100 MiB threshold before truncation
+paths = ["/data/projects/*/*.log", "~/.local/share/*/logs/*.log"]
+```
+
+Manual operator truncation is available via `sbh truncate-logs [--dry-run] [--yes]`.
+
+Source: `src/scanner/log_truncator.rs`
 
 ### Guardrails and Drift Detection
 
@@ -1652,7 +1670,7 @@ The walker is the scanner's "eyes": it discovers candidate files and directories
 
 The walker uses an unbounded work queue shared across `N` worker threads (configurable via `scanner.parallelism`) and a bounded result channel (capacity <!-- claim:constants.walker.RESULT_CHANNEL_CAP -->10000<!-- /claim -->) back to the collector. Root paths are seeded into the queue, and each worker pulls a directory, processes its entries, and enqueues discovered subdirectories back onto the shared queue. Workers that find an empty queue wait briefly (50ms timeout) before checking whether all work is complete. This design provides natural load balancing — workers that finish fast directories steal work from threads processing slower ones — without requiring explicit work-stealing data structures.
 
-An atomic `in_flight` counter tracks work items that have been dequeued but not yet processed. When the last item completes (counter reaches zero), workers exit. Results flow through an unbounded channel for throughput: the walker should never block on result delivery.
+An atomic `in_flight` counter tracks work items that have been dequeued but not yet processed. When the last item completes (counter reaches zero), workers exit. The work queue is unbounded so workers never deadlock when enqueuing discovered subdirectories, while the result channel is bounded to prevent unbounded memory growth on deep trees.
 
 #### Per-Directory Iteration Cap
 
@@ -2024,7 +2042,8 @@ src/
     scoring.rs              Multi-factor scoring + Bayesian decision framework
     deletion.rs             Circuit-breaker-guarded deletion executor
     protection.rs           .sbh-protect markers + config glob patterns
-    merkle.rs               Incremental Merkle scan index with full-scan fallback
+    index.rs                Candidate index v2 (persisted candidate records + event tracking)
+    merkle.rs               Legacy incremental Merkle index (inactive)
 
   ballast/
     manager.rs              Ballast pool lifecycle (provision, verify, inventory)
@@ -2171,7 +2190,7 @@ For test harness conventions and structured logging registration, see `docs/test
   `sbh service --launchd --scope user restart`.
 
 ### "Dashboard shows DEGRADED"
-- Confirm daemon is running: Linux `systemctl status sbh-daemon`; macOS
+- Confirm daemon is running: Linux `systemctl status sbh`; macOS
   `sbh service --launchd --scope user status`; foreground debugging `sbh daemon`.
 - Check state file path and permissions (default: `/var/lib/sbh/state.json`).
 - Validate config with `sbh config validate`.
@@ -2212,18 +2231,19 @@ For test harness conventions and structured logging registration, see `docs/test
 ### "Memory usage keeps growing"
 - The daemon warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> of RSS and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim -->; the systemd unit caps it at `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->`. Check `sbh status --json | jq '.memory_rss_bytes'`.
 - Systemd's `MemoryMax=256M` provides a hard ceiling.
-- Large Merkle scan indexes on machines with many directories can increase baseline memory. Consider reducing `scanner.root_paths` scope.
+- Large candidate scan indexes on machines with many directories can increase baseline memory. Consider reducing `scanner.root_paths` scope.
 
 ## Limitations
 
 - Process attribution relies on platform-specific process inspection and may be reduced on restricted environments.
 - Extremely bursty workloads may require tighter sample intervals and controller tuning.
 - Network and ephemeral filesystems are intentionally conservative for ballast and cleanup safety.
+- Ballast reserve cannot exceed the reserve floor (`max(orange_min_free_pct, red_min_free_pct + 2%)`); on volumes below the floor, ballast provisioning is deferred and catalog roots serve as the fallback.
 
 ## FAQ
 
 ### Does `sbh` delete source code?
-No. Safety vetoes and protection mechanisms are designed to avoid source directories and protected paths.
+No. Early development incidents on 2026-05-16 and 2026-05-22 led to hardcoded vetoes that cannot be disabled by configuration. Specifically, `HardcodedSourceTree` vetoes any directory with known source structures, and `LooksLikeSourceCode` vetoes directories containing source manifests (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, etc.) lacking build markers. These hardcoded vetoes are checked during pre-flight before any deletion can occur. You can verify safety for any path using `sbh scan <path> --explain` or `sbh explain --why-not <dir>`, which reveals exact factor scores and any vetoes that apply. Additionally, permanent protection can be established via `.sbh-protect` marker files or `scanner.protected_paths` in `config.toml`.
 
 ### Can I force cleanup during an incident?
 Yes. Use `sbh emergency ...` for zero-write recovery, then return to normal policy modes.
@@ -2243,11 +2263,11 @@ Send `SIGHUP` to the daemon process: `kill -HUP $(pidof sbh)`. On systemd, use `
 ### How do I trigger an immediate scan?
 Send `SIGUSR1` to the daemon: `kill -USR1 $(pidof sbh)`. This bypasses the VOI scheduler and runs a full scan on the next iteration, useful for verifying cleanup behavior after a configuration change.
 
-### Does the Merkle index persist across daemon restarts?
-Yes. The index is checkpointed to disk with SHA-256 integrity verification. On restart, the daemon loads the checkpoint and resumes incremental scanning. If the checkpoint is corrupt or missing, it falls back to a full scan.
+### Does the candidate index persist across daemon restarts?
+Yes. The v2 candidate index (`src/scanner/index.rs`, persisted to `scanner-index-v2.json`) records event generations, candidate records, and SHA-256 checksums across restarts under `scanner.engine = "v2"` (default since v0.4.32). If the checkpoint is corrupt or missing, v2 rebuilds through bounded reconciliation. (The legacy `src/scanner/merkle.rs` implementation remains in the repository as reference code but is not active in the live daemon.)
 
 ### How much memory does `sbh` use?
-Under normal operation, 20-60 MB of RSS. The systemd unit's `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->` is the binding cap; the daemon's own self-monitor warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim --> (which only binds without a cgroup cap, as on launchd). Machines with hundreds of thousands of directories in watched paths will use more due to the Merkle scan index.
+Under normal operation, 20-60 MB of RSS. The systemd unit's `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->` is the binding cap; the daemon's own self-monitor warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim --> (which only binds without a cgroup cap, as on launchd). Machines with hundreds of thousands of directories in watched paths will use more due to the candidate scan index.
 
 ### Is this Linux-only?
 No. It is cross-platform, with service integration for `systemd` (Linux) and `launchd` (macOS). Open-file vetoes are platform-specific internally: Linux uses `/proc/*/fd`, while macOS uses PAL/libproc evidence for visible processes. Other safety layers, including age, sacred-path, protected-path, active executable/mmap, and `.git` guards, remain active on both platforms.
