@@ -392,6 +392,19 @@ re-run).
   delivers exactly the designed collapse. Summarized artifact:
   `docs/internal/scanner-ab-2026-09-03-hz3.json`; full artifact
   `.sbh-fleet/hz3.json`.
+- Second fleet host (mmini macOS, 2026-09-05, `sbh scan --ab`): v1 71
+  entries / 201,608 CPU-micros / 2 hard-vetoes; v2 71 entries / 225,686
+  CPU-micros; identical candidate sets, strict blocker
+  `v2_candidates_vetoed_by_v1` empty, `v2_delete_candidates_vetoed_by_v1`
+  empty, cpu_ratio 0.89, entries_ratio 1.0. Full artifact:
+  `docs/internal/scanner-ab-2026-09-05-mmini.json`.
+- Candidate divergence reconciliation (bd-pwid): the workstation strict blocker
+  `/data/projects/mcp_agent_mail_rust/.codex-target` is a Review-action
+  candidate (score 0.805) that never auto-deletes. The scan diff exposes
+  both `v2_candidates_vetoed_by_v1` (all actions) and
+  `v2_delete_candidates_vetoed_by_v1` (auto-deletable subset). Across all three
+  fleet hosts (workstation, hz3, mmini), `v2_delete_candidates_vetoed_by_v1` is
+  consistently empty.
 
 Live A/B capture procedure (one command):
 
@@ -401,8 +414,8 @@ same cache state — and emits the comparison artifact (schema version 1): per
 engine `scanned_entries`, `opaque_pruned_dirs`, `elapsed_seconds`,
 `process_cpu_micros`, the candidate list (`path`, `score`, `action`) and the
 hard-veto list (`path`, `reason`), plus the diff `only_in_v1`, `only_in_v2`,
-`v2_candidates_vetoed_by_v1`, `cpu_ratio_v1_over_v2`, and
-`entries_ratio_v1_over_v2`.
+`v2_candidates_vetoed_by_v1`, `v2_delete_candidates_vetoed_by_v1`,
+`cpu_ratio_v1_over_v2`, and `entries_ratio_v1_over_v2`.
 
 ```bash
 sbh scan --ab /data/projects --top 200                  # human summary
@@ -413,7 +426,7 @@ Archive the artifact beside the daemon `scan_complete` activity events from
 the same window; `sbh stats --json` aggregates those events into the
 `scanner` block (`cpu_seconds_by_day`, `passes`, `entries_scanned`,
 `opaque_pruned_dirs`) using the `process_cpu_micros=` key in the event
-`details`. Promotion remains blocked unless `v2_candidates_vetoed_by_v1` is
-empty, event-overflow or backend-loss windows force reconciliation instead of
-stale index reuse, and the live CPU-seconds/pass reduction supports the >= 50x
-target.
+`details`. Promotion remains blocked unless `v2_delete_candidates_vetoed_by_v1`
+is empty (the auto-deletable candidate subset), event-overflow or backend-loss
+windows force reconciliation instead of stale index reuse, and the live
+CPU-seconds/pass reduction supports the >= 50x target.
