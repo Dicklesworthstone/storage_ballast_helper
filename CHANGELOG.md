@@ -6,7 +6,7 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ---
 
-## Unreleased
+## v0.6.0
 
 Compare: [`v0.5.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.5.1...HEAD)
 

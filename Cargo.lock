@@ -1700,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "storage_ballast_helper"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "bincode",
  "chrono",
