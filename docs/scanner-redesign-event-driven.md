@@ -1,9 +1,6 @@
 # Design: Event-Driven, Pressure-Gated Scanner (v2)
 
-**Status:** Implemented and the default engine since v0.4.32 (`scanner.engine`
-defaults to `"v2"`; `"v1"` is the opt-out rollback). The A/B evidence
-measured on 2026-09-02 (section 7) does not yet meet the promotion
-criteria · **Author:**
+**Status:** Implemented and default engine (`scanner.engine = "v2"`; `"v1"` is the opt-out rollback preserved for safety). Fleet A/B capture verified across three hosts (workstation, Linux worker hz3, macOS mmini); delete-action blocker subset is zero everywhere (section 7) · **Author:**
 fleet-maintenance investigation, 2026-05-25
 **Supersedes the steady-state behavior of:** `src/scanner/walker.rs`, the open-file
 path in `OpenPathCache`, and the periodic full-walk model.
