@@ -1701,7 +1701,7 @@ can connect). One JSON line in, one JSON line out:
 
 ```text
 {"cmd": "ping", "args": {}, "token": "<32 hex characters>"}
-{"ok": true, "result": {"pid": 4242, "started_at": "...", "version": "0.5.1", "uptime_secs": 91, "policy_mode": "enforce"}}
+{"ok": true, "result": {"pid": 4242, "started_at": "...", "version": "0.6.0", "uptime_secs": 91, "policy_mode": "enforce"}}
 {"ok": false, "result": null, "error": {"code": "unauthorized", "message": "token does not match the running daemon's lock file"}}
 ```
 
