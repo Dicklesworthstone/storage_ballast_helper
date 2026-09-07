@@ -596,65 +596,104 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-fn scan_config_and_data_paths(paths: &PathsConfig, footprints: &mut Vec<Footprint>) {
+fn push_footprint_dedup(footprints: &mut Vec<Footprint>, fp: Footprint) {
+    if let Some(existing) = footprints
+        .iter_mut()
+        .find(|f| f.kind == fp.kind && f.path == fp.path)
+    {
+        if !existing.healthy && fp.healthy {
+            *existing = fp;
+        }
+    } else {
+        footprints.push(fp);
+    }
+}
+
+fn scan_config_and_data_paths(
+    paths: &PathsConfig,
+    is_shadowed: bool,
+    footprints: &mut Vec<Footprint>,
+) {
     let cfg = &paths.config_file;
     if cfg.exists() {
         let (healthy, issue, detail) = check_config_health(cfg);
-        footprints.push(Footprint {
-            kind: FootprintKind::ConfigFile,
-            path: cfg.clone(),
-            healthy,
-            issue,
-            detail,
-        });
+        push_footprint_dedup(
+            footprints,
+            Footprint {
+                kind: FootprintKind::ConfigFile,
+                path: cfg.clone(),
+                healthy,
+                issue,
+                detail: if is_shadowed && detail.is_none() {
+                    Some("shadowed by active system configuration".to_string())
+                } else {
+                    detail
+                },
+            },
+        );
     }
 
     let data = data_dir_for_paths(paths);
     if data.exists() {
-        footprints.push(Footprint {
-            kind: FootprintKind::DataDirectory,
-            path: data,
-            healthy: true,
-            issue: None,
-            detail: None,
-        });
-
-        if paths.state_file.exists() {
-            footprints.push(Footprint {
-                kind: FootprintKind::StateFile,
-                path: paths.state_file.clone(),
+        push_footprint_dedup(
+            footprints,
+            Footprint {
+                kind: FootprintKind::DataDirectory,
+                path: data,
                 healthy: true,
                 issue: None,
                 detail: None,
-            });
-        } else {
-            footprints.push(Footprint {
-                kind: FootprintKind::StateFile,
-                path: paths.state_file.clone(),
-                healthy: false,
-                issue: Some(MigrationReason::MissingStateFile),
-                detail: Some("data directory exists but state.json is missing".into()),
-            });
+            },
+        );
+
+        if paths.state_file.exists() {
+            push_footprint_dedup(
+                footprints,
+                Footprint {
+                    kind: FootprintKind::StateFile,
+                    path: paths.state_file.clone(),
+                    healthy: true,
+                    issue: None,
+                    detail: None,
+                },
+            );
+        } else if !is_shadowed {
+            push_footprint_dedup(
+                footprints,
+                Footprint {
+                    kind: FootprintKind::StateFile,
+                    path: paths.state_file.clone(),
+                    healthy: false,
+                    issue: Some(MigrationReason::MissingStateFile),
+                    detail: Some("data directory exists but state.json is missing".into()),
+                },
+            );
         }
 
         if paths.sqlite_db.exists() {
-            footprints.push(Footprint {
-                kind: FootprintKind::SqliteDb,
-                path: paths.sqlite_db.clone(),
-                healthy: true,
-                issue: None,
-                detail: None,
-            });
+            push_footprint_dedup(
+                footprints,
+                Footprint {
+                    kind: FootprintKind::SqliteDb,
+                    path: paths.sqlite_db.clone(),
+                    healthy: true,
+                    issue: None,
+                    detail: None,
+                },
+            );
         }
 
         if paths.jsonl_log.exists() {
-            footprints.push(Footprint {
-                kind: FootprintKind::JsonlLog,
-                path: paths.jsonl_log.clone(),
-                healthy: true,
-                issue: None,
-                detail: None,
-            });
+            push_footprint_dedup(
+                footprints,
+                Footprint {
+                    kind: FootprintKind::JsonlLog,
+                    path: paths.jsonl_log.clone(),
+                    healthy: true,
+                    issue: None,
+                    detail: None,
+                },
+            );
         }
     }
 }
@@ -672,46 +711,52 @@ fn scan_legacy_path_migrations(footprints: &mut Vec<Footprint>) {
             LegacyPathKind::Config => {
                 if migration.source.exists() {
                     let destination_exists = migration.destination.exists();
-                    footprints.push(Footprint {
-                        kind: FootprintKind::ConfigFile,
-                        path: migration.source.clone(),
-                        healthy: destination_exists,
-                        issue: if destination_exists {
-                            None
-                        } else {
-                            Some(MigrationReason::LegacyConfigPath)
+                    push_footprint_dedup(
+                        footprints,
+                        Footprint {
+                            kind: FootprintKind::ConfigFile,
+                            path: migration.source.clone(),
+                            healthy: destination_exists,
+                            issue: if destination_exists {
+                                None
+                            } else {
+                                Some(MigrationReason::LegacyConfigPath)
+                            },
+                            detail: Some(if destination_exists {
+                                format!(
+                                    "legacy config retained at {}; canonical config already exists at {}, so it will not be overwritten",
+                                    migration.source.display(),
+                                    migration.destination.display()
+                                )
+                            } else {
+                                format!(
+                                    "legacy config at {} should be copied to canonical path {}",
+                                    migration.source.display(),
+                                    migration.destination.display()
+                                )
+                            }),
                         },
-                        detail: Some(if destination_exists {
-                            format!(
-                                "legacy config retained at {}; canonical config already exists at {}, so it will not be overwritten",
-                                migration.source.display(),
-                                migration.destination.display()
-                            )
-                        } else {
-                            format!(
-                                "legacy config at {} should be copied to canonical path {}",
-                                migration.source.display(),
-                                migration.destination.display()
-                            )
-                        }),
-                    });
+                    );
                 }
             }
             LegacyPathKind::Data => {
                 if migration.source.exists()
                     && legacy_data_needs_migration(&migration.source, &migration.destination)
                 {
-                    footprints.push(Footprint {
-                        kind: FootprintKind::DataDirectory,
-                        path: migration.source.clone(),
-                        healthy: false,
-                        issue: Some(MigrationReason::LegacyDataPath),
-                        detail: Some(format!(
-                            "legacy state/log files under {} should be copied to canonical data directory {}",
-                            migration.source.display(),
-                            migration.destination.display()
-                        )),
-                    });
+                    push_footprint_dedup(
+                        footprints,
+                        Footprint {
+                            kind: FootprintKind::DataDirectory,
+                            path: migration.source.clone(),
+                            healthy: false,
+                            issue: Some(MigrationReason::LegacyDataPath),
+                            detail: Some(format!(
+                                "legacy state/log files under {} should be copied to canonical data directory {}",
+                                migration.source.display(),
+                                migration.destination.display()
+                            )),
+                        },
+                    );
                 }
             }
         }
@@ -739,8 +784,38 @@ pub fn scan_footprints() -> Vec<Footprint> {
     }
 
     // -- Config and data files.
+    // System-scope config and data files.
+    let system_paths = PathsConfig::system_default();
+    let effective_system_paths = if system_paths.config_file.exists() {
+        crate::core::config::Config::load(Some(&system_paths.config_file))
+            .map_or_else(|_| system_paths, |c| c.paths)
+    } else {
+        system_paths
+    };
+    let system_present = effective_system_paths.config_file.exists()
+        || data_dir_for_paths(&effective_system_paths).exists();
+    if system_present {
+        scan_config_and_data_paths(&effective_system_paths, false, &mut footprints);
+    }
+
+    // User-scope config and data files.
+    let resolved = crate::core::config::Config::resolve_config_path(None);
+    let user_is_shadowed = resolved.shadowed_user_config.is_some();
     if let Some(home) = home_dir() {
-        scan_config_and_data_paths(&canonical_user_paths_for_home(&home), &mut footprints);
+        let user_paths = canonical_user_paths_for_home(&home);
+        let effective_user_paths = if user_paths.config_file.exists() {
+            crate::core::config::Config::load(Some(&user_paths.config_file))
+                .map_or_else(|_| user_paths, |c| c.paths)
+        } else {
+            user_paths
+        };
+        if !system_present
+            || effective_user_paths.config_file != effective_system_paths.config_file
+            || data_dir_for_paths(&effective_user_paths)
+                != data_dir_for_paths(&effective_system_paths)
+        {
+            scan_config_and_data_paths(&effective_user_paths, user_is_shadowed, &mut footprints);
+        }
     }
     scan_legacy_path_migrations(&mut footprints);
 
@@ -823,6 +898,10 @@ pub fn scan_footprints() -> Vec<Footprint> {
             scan_backups_in(&data, &mut footprints);
         }
     }
+    let system_data = data_dir_for_paths(&effective_system_paths);
+    if system_data.exists() {
+        scan_backups_in(&system_data, &mut footprints);
+    }
 
     footprints
 }
@@ -832,13 +911,16 @@ fn scan_backups_in(dir: &Path, footprints: &mut Vec<Footprint>) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.contains(".sbh-backup-") || name.ends_with(".sbh.bak") {
-                footprints.push(Footprint {
-                    kind: FootprintKind::BackupFile,
-                    path: entry.path(),
-                    healthy: true,
-                    issue: Some(MigrationReason::StaleBackupFile),
-                    detail: Some("stale backup file from previous install/migration".into()),
-                });
+                push_footprint_dedup(
+                    footprints,
+                    Footprint {
+                        kind: FootprintKind::BackupFile,
+                        path: entry.path(),
+                        healthy: true,
+                        issue: Some(MigrationReason::StaleBackupFile),
+                        detail: Some("stale backup file from previous install/migration".into()),
+                    },
+                );
             }
         }
     }
@@ -3209,5 +3291,104 @@ mod tests {
         assert!(!opts.dry_run);
         assert!(opts.backup_dir.is_none());
         assert_eq!(opts.cleanup_backups_older_than, 7 * 24 * 3600);
+    }
+
+    #[test]
+    fn scan_config_and_data_paths_shadowed_skips_missing_state() {
+        let tmp = TempDir::new().unwrap();
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let paths = PathsConfig {
+            config_file: tmp.path().join("config.toml"),
+            state_file: data.join("state.json"),
+            sqlite_db: data.join("activity.sqlite3"),
+            jsonl_log: data.join("activity.jsonl"),
+            ballast_dir: data.join("ballast"),
+        };
+
+        // When shadowed: state.json is missing, but should NOT generate a MissingStateFile issue.
+        let mut footprints = Vec::new();
+        scan_config_and_data_paths(&paths, true, &mut footprints);
+        assert!(
+            !footprints
+                .iter()
+                .any(|f| f.issue == Some(MigrationReason::MissingStateFile)),
+            "shadowed path set must not report MissingStateFile"
+        );
+        assert!(
+            footprints
+                .iter()
+                .any(|f| f.kind == FootprintKind::DataDirectory),
+            "data directory should still be recorded"
+        );
+
+        // When not shadowed: missing state.json MUST generate a MissingStateFile issue.
+        let mut footprints_unshadowed = Vec::new();
+        scan_config_and_data_paths(&paths, false, &mut footprints_unshadowed);
+        assert!(
+            footprints_unshadowed
+                .iter()
+                .any(|f| f.issue == Some(MigrationReason::MissingStateFile)),
+            "unshadowed path set must report MissingStateFile when state.json is missing"
+        );
+    }
+
+    #[test]
+    fn scan_config_and_data_paths_healthy_state_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("state.json"), "{}").unwrap();
+        let paths = PathsConfig {
+            config_file: tmp.path().join("config.toml"),
+            state_file: data.join("state.json"),
+            sqlite_db: data.join("activity.sqlite3"),
+            jsonl_log: data.join("activity.jsonl"),
+            ballast_dir: data.join("ballast"),
+        };
+
+        let mut footprints = Vec::new();
+        scan_config_and_data_paths(&paths, true, &mut footprints);
+        let state_fp = footprints
+            .iter()
+            .find(|f| f.kind == FootprintKind::StateFile);
+        assert!(state_fp.is_some(), "state file should be detected");
+        assert!(
+            state_fp.unwrap().healthy,
+            "existing state file should be healthy"
+        );
+        assert!(state_fp.unwrap().issue.is_none());
+    }
+
+    #[test]
+    fn push_footprint_dedup_prefers_healthy() {
+        let mut footprints = Vec::new();
+        let path = PathBuf::from("/test/path");
+        push_footprint_dedup(
+            &mut footprints,
+            Footprint {
+                kind: FootprintKind::StateFile,
+                path: path.clone(),
+                healthy: false,
+                issue: Some(MigrationReason::MissingStateFile),
+                detail: Some("missing".into()),
+            },
+        );
+        assert_eq!(footprints.len(), 1);
+        assert!(!footprints[0].healthy);
+
+        // Deduplication replaces unhealthy with healthy
+        push_footprint_dedup(
+            &mut footprints,
+            Footprint {
+                kind: FootprintKind::StateFile,
+                path,
+                healthy: true,
+                issue: None,
+                detail: None,
+            },
+        );
+        assert_eq!(footprints.len(), 1);
+        assert!(footprints[0].healthy);
     }
 }
