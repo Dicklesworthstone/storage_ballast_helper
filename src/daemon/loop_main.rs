@@ -3745,6 +3745,7 @@ impl MonitoringDaemon {
         if let Err(error) = self.platform.service_manager().notify_ready() {
             eprintln!("[SBH-DAEMON] sd_notify READY=1 failed: {error}");
         }
+        self.watchdog.notify_now("startup complete");
 
         let mut last_health_check = Instant::now();
         let mut shutdown_result = Ok(());
@@ -3752,6 +3753,7 @@ impl MonitoringDaemon {
         // ──────── main monitoring loop ────────
         loop {
             let tick_start = Instant::now();
+            self.watchdog.maybe_notify("tick start");
 
             // 1. Check shutdown signal.
             if self.signal_handler.should_shutdown() {
@@ -3785,6 +3787,7 @@ impl MonitoringDaemon {
                     continue;
                 }
             };
+            self.watchdog.maybe_notify("pressure checked");
 
             // 4. Log pressure transitions.
             if response.level != self.last_pressure_level {
@@ -3844,10 +3847,12 @@ impl MonitoringDaemon {
                 shutdown_result = Err(self.rss_hard_limit_error(self_monitor_tick));
                 break;
             }
+            self.watchdog.maybe_notify("io and state sampled");
 
             // 5. Handle pressure response per mount; the tick follows the
             //    tightest mount sbh is actually working on.
             let requested_tick = self.handle_pressure(&response, &scan_tx, &scan_rx);
+            self.watchdog.maybe_notify("pressure handled");
 
             // 5b. Policy mode changes since the last tick (the engine runs
             // on the executor thread; this is the only place they are logged).

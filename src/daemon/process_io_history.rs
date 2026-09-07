@@ -14,11 +14,12 @@ use crate::platform::pal::Platform;
 use crate::platform::types::ProcessIo;
 
 const SNAPSHOT_VERSION: u32 = 1;
-const DEFAULT_BUCKET_INTERVAL: Duration = Duration::from_secs(15);
+const DEFAULT_BUCKET_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_HISTORY_WINDOW: Duration = Duration::from_hours(1);
 const DEFAULT_RECENT_WINDOW: Duration = Duration::from_mins(15);
 const DEFAULT_PERSIST_INTERVAL: Duration = Duration::from_mins(5);
-const DEFAULT_MAX_PIDS: usize = 1_000;
+const DEFAULT_MAX_PIDS: usize = 500;
+const SAMPLE_TIME_BUDGET: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessIoHistoryReport {
@@ -156,7 +157,11 @@ impl ProcessIoHistory {
             persisted: false,
         };
 
+        let deadline = Instant::now() + SAMPLE_TIME_BUDGET;
         for process in processes.into_iter().take(self.max_pids) {
+            if Instant::now() >= deadline {
+                break;
+            }
             match platform.process_io(process.pid) {
                 Ok(io) => {
                     let _ = self.record_process_sample_at(

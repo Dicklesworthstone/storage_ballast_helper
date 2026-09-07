@@ -485,7 +485,7 @@ impl ServiceManager for SystemdServiceManager {
 
     fn notify_watchdog(&self, status: &str) -> Result<()> {
         if let Some(socket_path) = systemd_notify_socket() {
-            sd_notify_watchdog(status, &socket_path);
+            sd_notify_watchdog(status, &socket_path)?;
         }
         Ok(())
     }
@@ -556,10 +556,11 @@ pub fn sd_watchdog_message(status: &str) -> String {
     format!("WATCHDOG=1\nSTATUS={status}\n")
 }
 
-fn sd_notify_watchdog(status: &str, socket_path: &str) {
-    // Heartbeats are best-effort: a lost datagram costs one beat, and the
-    // next one lands well within WatchdogSec.
-    let _ = sd_notify_send(&sd_watchdog_message(status), socket_path);
+fn sd_notify_watchdog(status: &str, socket_path: &str) -> Result<()> {
+    sd_notify_send(&sd_watchdog_message(status), socket_path).map_err(|source| SbhError::Io {
+        path: PathBuf::from(socket_path),
+        source,
+    })
 }
 
 /// Send one `sd_notify(3)` datagram to `socket_path`.

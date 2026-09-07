@@ -262,11 +262,18 @@ impl WatchdogHeartbeat {
     /// Create a heartbeat with the given interval.
     ///
     /// `watchdog_sec` is the full watchdog timeout from the service manager.
-    /// The heartbeat will fire at half that interval.
+    /// The heartbeat will fire at one quarter of that interval (recommended
+    /// by systemd best practices: 1/4 to 1/3 of WatchdogSec) to ensure robust
+    /// headroom against scheduling delays or CPU quota throttling.
     #[must_use]
     pub fn new(watchdog_sec: u64, service_manager: Box<dyn ServiceManager>) -> Self {
+        let interval = if watchdog_sec > 0 {
+            Duration::from_secs((watchdog_sec / 4).max(1))
+        } else {
+            Duration::from_secs(30)
+        };
         Self {
-            interval: Duration::from_secs(watchdog_sec / 2),
+            interval,
             last_beat: Instant::now(),
             enabled: service_manager.watchdog_enabled(watchdog_sec),
             service_manager,
@@ -284,10 +291,27 @@ impl WatchdogHeartbeat {
         }
     }
 
-    /// The heartbeat cadence (half the service manager's timeout).
+    /// The heartbeat cadence (one quarter of the service manager's timeout).
     #[must_use]
     pub const fn interval(&self) -> Duration {
         self.interval
+    }
+
+    /// Force an immediate watchdog heartbeat regardless of elapsed interval.
+    ///
+    /// Useful at startup and transition boundaries to ensure the supervisor
+    /// is informed immediately. Returns `true` if a notification was sent.
+    pub fn notify_now(&mut self, status: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        self.last_beat = Instant::now();
+        if let Err(error) = self.service_manager.notify_watchdog(status) {
+            eprintln!("[SBH-WATCHDOG] failed to notify service manager: {error}");
+            return false;
+        }
+        true
     }
 
     /// If enough time has elapsed, send a watchdog notification.
@@ -302,11 +326,7 @@ impl WatchdogHeartbeat {
             return false;
         }
 
-        self.last_beat = Instant::now();
-        if let Err(error) = self.service_manager.notify_watchdog(status) {
-            eprintln!("[SBH-WATCHDOG] failed to notify service manager: {error}");
-        }
-        true
+        self.notify_now(status)
     }
 
     /// Whether the watchdog is enabled.
@@ -524,5 +544,27 @@ mod tests {
         };
         // Interval has elapsed, should fire (service manager handles no-op gracefully).
         assert!(wd.maybe_notify("test"));
+    }
+
+    #[test]
+    fn watchdog_interval_one_quarter_timeout() {
+        let wd = WatchdogHeartbeat::new(60, noop_service_manager());
+        assert_eq!(wd.interval(), Duration::from_secs(15));
+
+        let wd_disabled = WatchdogHeartbeat::new(0, noop_service_manager());
+        assert_eq!(wd_disabled.interval(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn watchdog_notify_now_fires_regardless_of_interval() {
+        let mut wd = WatchdogHeartbeat {
+            interval: Duration::from_mins(10),
+            last_beat: Instant::now(),
+            enabled: true,
+            service_manager: noop_service_manager(),
+        };
+        // maybe_notify would fail due to interval, but notify_now succeeds:
+        assert!(!wd.maybe_notify("test"));
+        assert!(wd.notify_now("forced"));
     }
 }
