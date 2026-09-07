@@ -4,6 +4,14 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and the Release workflow refuses to publish a tag that has no marked heading here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
+## Unreleased
+
+### Fixed — macOS installer and Homebrew tap fixes (#22, #23, #24)
+
+- **bash 3.2 heredoc parse bug (#23, bd-fc94):** `scripts/install.sh` failed to parse under macOS stock bash 3.2.57 due to command-substituted heredocs containing single quotes (`$(cat <<'SKILL_EOF' ... Don't ...)`). Fixed by writing the inline agent skill directly to a temporary file before copying.
+- **Homebrew tap formula audit (#22, bd-xt1e):** Added `depends_on :macos` to `packaging/homebrew/Formula/sbh.rb` so Homebrew's Linux syntax verification during `brew tap Dicklesworthstone/sbh` does not reject the formula for missing Linux URLs.
+- **macOS unsigned/adhoc binary installation escape hatch (#24, bd-58fs):** `scripts/install.sh` now supports `--allow-unsigned` and `SBH_ALLOW_UNSIGNED_MACOS=1`, allowing users to install adhoc-signed macOS binaries with a prominent security notice while preserving strict SHA-256 checksum verification. `scripts/release-manual.sh` also warns when darwin targets are packaged without Developer ID signatures.
+
 ---
 
 ## v0.6.0 **[release]**

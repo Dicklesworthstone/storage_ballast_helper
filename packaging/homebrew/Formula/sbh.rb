@@ -3,6 +3,8 @@ class Sbh < Formula
   homepage "https://github.com/Dicklesworthstone/storage_ballast_helper"
   license "MIT"
 
+  depends_on :macos
+
   # Release automation copies this skeleton into Dicklesworthstone/homebrew-sbh
   # and replaces both placeholder checksums before opening the tap PR.
   on_macos do

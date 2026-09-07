@@ -12,6 +12,7 @@ JSON_MODE=0
 QUIET=0
 NO_COLOR=0
 VERIFY=1
+ALLOW_UNSIGNED_MACOS="${SBH_ALLOW_UNSIGNED_MACOS:-0}"
 TRACE_ID=""
 EVENT_LOG_PATH=""
 CURRENT_PHASE="init"
@@ -210,6 +211,7 @@ Options:
   --dry-run               Print planned actions without changing the system
   --verify                Enforce checksum and macOS trust verification (default)
   --no-verify             Skip artifact verification (unsafe, logged)
+  --allow-unsigned        Allow unsigned/adhoc macOS binaries while keeping checksum verification
   --json                  Emit machine-readable JSON summary
   --trace-id <id>         Set explicit trace id for event correlation
   --event-log <path>      Append per-phase JSONL events to the given file
@@ -268,6 +270,10 @@ parse_args() {
         ;;
       --no-verify)
         VERIFY=0
+        shift
+        ;;
+      --allow-unsigned|--allow-adhoc)
+        ALLOW_UNSIGNED_MACOS=1
         shift
         ;;
       --json)
@@ -582,16 +588,31 @@ verify_macos_binary_trust() {
     die "codesign is required to verify macOS release binaries. Install Xcode Command Line Tools or retry only with --no-verify if you trust the artifact."
   fi
   if ! codesign --verify --strict --verbose=2 "$binary_path"; then
-    die "macOS code signature verification failed for ${ASSET_NAME}. Refusing to install."
+    if [[ "$ALLOW_UNSIGNED_MACOS" -eq 1 ]]; then
+      log_warn "macOS code signature verification reported non-strict signature, but --allow-unsigned was specified"
+    else
+      die "macOS code signature verification failed for ${ASSET_NAME}. Refusing to install."
+    fi
   fi
   if ! codesign_detail="$(codesign --display --verbose=4 "$binary_path" 2>&1)"; then
     die "macOS code signature detail inspection failed for ${ASSET_NAME}. Refusing to install."
   fi
+
+  local developer_id_ok=true
   if ! grep -Fq "Authority=Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)" <<<"$codesign_detail"; then
-    die "macOS release binary was not signed by the expected Developer ID Application identity. Refusing to install."
+    developer_id_ok=false
   fi
   if ! grep -Fq "TeamIdentifier=AU8V2Z6NKY" <<<"$codesign_detail"; then
-    die "macOS release binary was not signed by the expected Apple Developer team. Refusing to install."
+    developer_id_ok=false
+  fi
+
+  if ! $developer_id_ok; then
+    if [[ "$ALLOW_UNSIGNED_MACOS" -eq 1 ]]; then
+      log_warn "SECURITY NOTICE: macOS release binary was not signed by Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)."
+      log_warn "SHA-256 checksum verification succeeded and --allow-unsigned was explicitly requested. Proceeding with installation."
+    else
+      die "macOS release binary was not signed by the expected Developer ID Application identity. Refusing to install. (Set SBH_ALLOW_UNSIGNED_MACOS=1 or pass --allow-unsigned to allow adhoc binaries while keeping checksum verification, or use --no-verify)"
+    fi
   fi
 
   finish_phase "macOS Developer ID signature verified"
@@ -599,7 +620,11 @@ verify_macos_binary_trust() {
 
 verify_mode_label() {
   if [[ "$VERIFY" -eq 1 ]]; then
-    printf 'enforced'
+    if [[ "$ALLOW_UNSIGNED_MACOS" -eq 1 ]]; then
+      printf 'checksum-only'
+    else
+      printf 'enforced'
+    fi
   else
     printf 'bypassed'
   fi
@@ -689,8 +714,8 @@ install_skill() {
   # ── Fallback: create minimal inline skill ──────────────────────────────────
   log_info "Installing bundled inline skill"
 
-  local skill_content
-  skill_content=$(cat << 'SKILL_EOF'
+  local skill_temp_file="${WORKDIR}/SKILL.md"
+  cat << 'SKILL_EOF' > "$skill_temp_file"
 ---
 name: sbh
 description: >-
@@ -819,15 +844,15 @@ sbh tune --apply --yes         # Auto-tune for this system
 
 Full documentation: https://github.com/Dicklesworthstone/storage_ballast_helper
 SKILL_EOF
-)
 
-  printf '%s\n' "$skill_content" > "$claude_dest/SKILL.md"
-  installed_claude=true
-  printf '%s\n' "$skill_content" > "$codex_dest/SKILL.md"
-  installed_codex=true
-
-  log_info "Skill created: $claude_dest/SKILL.md"
-  log_info "Skill created: $codex_dest/SKILL.md"
+  if cp "$skill_temp_file" "$claude_dest/SKILL.md" 2>/dev/null; then
+    installed_claude=true
+    log_info "Skill created: $claude_dest/SKILL.md"
+  fi
+  if cp "$skill_temp_file" "$codex_dest/SKILL.md" 2>/dev/null; then
+    installed_codex=true
+    log_info "Skill created: $codex_dest/SKILL.md"
+  fi
   finish_phase "inline skill installed"
 }
 

@@ -208,6 +208,20 @@ for target in "${TARGETS[@]}"; do
     fi
   fi
 
+  # Warn if packaging darwin targets without Developer ID signature
+  if [[ "$target" == *"-apple-darwin" ]]; then
+    if command -v codesign >/dev/null 2>&1; then
+      codesign_detail="$(codesign --display --verbose=4 "$bin_src" 2>&1 || true)"
+      if ! grep -Fq "Authority=Developer ID Application" <<<"$codesign_detail"; then
+        echo "warning: ${bin_src} is NOT signed with Developer ID Application certificate (adhoc or unsigned)." >&2
+        echo "warning: macOS users running scripts/install.sh will require SBH_ALLOW_UNSIGNED_MACOS=1 or --allow-unsigned." >&2
+      fi
+    else
+      echo "warning: codesign tool not found; ${bin_src} packaged without code signature verification." >&2
+      echo "warning: macOS users running scripts/install.sh will require SBH_ALLOW_UNSIGNED_MACOS=1 or --allow-unsigned." >&2
+    fi
+  fi
+
   # Create temp staging dir to package tarball
   stage_dir="$(mktemp -d)"
   cp "$bin_src" "${stage_dir}/${PROGRAM}"

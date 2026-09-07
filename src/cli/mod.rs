@@ -1944,6 +1944,7 @@ mod tests {
 
         for required in [
             "class Sbh < Formula",
+            "depends_on :macos",
             "on_macos do",
             "on_arm do",
             "on_intel do",
