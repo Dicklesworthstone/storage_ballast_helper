@@ -24,7 +24,7 @@ This document tracks the September 2026 fleet remediation and rollout of `sbh` a
 
 | Host | Architecture / OS | Role | Baseline Version | Target Version | Ballast Status | Status Probe | Rollout State |
 |------|-------------------|------|------------------|----------------|----------------|--------------|---------------|
-| `threadripperje` | x86_64 Linux (64-core) | Operator Workstation | v0.5.1 | v0.6.0 | 10 GiB (`/`) + 10 GiB (`/data`) OK | Green (honest flock probe) | Remediated (awaiting kill-switch removal) |
+| `threadripperje` | x86_64 Linux (64-core) | Operator Workstation | v0.5.1 | v0.6.0 | 10 GiB (`/`) + 10 GiB (`/data`) OK | Green (honest flock probe) | Active (running PID 3839007, kill switch removed) |
 | `hz3` | x86_64 Linux | VPS / Build Worker | v0.5.1 | v0.6.0 | Provisioned | Green | Verified (A/B capture clean) |
 | `mmini` | arm64 / x86_64 macOS | Mac Builder / Dev | v0.4.28 | v0.6.0 | APFS purgeable / ballast OK | Green | Verified (A/B capture clean, 0 delete blockers) |
 | `ts2` | x86_64 Linux | Remote Worker | v0.5.1 | v0.6.0 | Provisioned | Green | Verified (dsr build target) |
@@ -51,6 +51,7 @@ This document tracks the September 2026 fleet remediation and rollout of `sbh` a
 - **Systemd Unit**: Hardened unit regenerated via `sbh service reinstall-unit` (`Type=notify`, `WatchdogSec`, `ProtectSystem`, `MemoryMax`). Preserved `50-CPUQuota.conf` (10%).
 - **Doctor**: `sbh doctor --system --json` reports 100% PASS (reserve coverage ratio: 2.50).
 - **Foreground Dry Run**: 15s dry run verified mount `/` at `Green (urgency=0.00 surface=catalog idle_reason=none)` with 0 back-off warnings.
+- **Service Activation (2026-09-06 22:12 EDT)**: `/etc/sbh/HOTLOOP_DISABLED` removed per explicit operator authorization. `sbh.service` started and reached `active (running)` with `Type=notify` (Main PID 3839007). `sbh status --json` confirms `daemon_running: true (daemon_state_reason: lock_held)` and 4/4 threads running (`executor`, `logger`, `monitor`, `scanner`). Steady-state CPU remains under 1%, journal confirms maintenance scan completed with 0 back-off loops.
 
 ---
 
