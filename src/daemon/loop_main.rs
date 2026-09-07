@@ -7360,13 +7360,8 @@ fn scanner_thread_main(
                         if !path.is_dir() {
                             continue;
                         }
-                        if should_skip_protected_daemon_candidate(
-                            &mut protection,
-                            &path,
-                            &sacred_paths,
-                            logger,
-                            "priority pre-scan",
-                        ) {
+                        let _ = protection.discover_ancestor_markers(&path);
+                        if protection.is_protected(&path) {
                             continue;
                         }
                         // Track whether depth-1 dir is a git repo (project root).
@@ -7408,13 +7403,8 @@ fn scanner_thread_main(
                                 }
                                 let sub_path = sub_entry.path();
                                 if sub_path.is_dir() {
-                                    if should_skip_protected_daemon_candidate(
-                                        &mut protection,
-                                        &sub_path,
-                                        &sacred_paths,
-                                        logger,
-                                        "priority pre-scan",
-                                    ) {
+                                    let _ = protection.discover_ancestor_markers(&sub_path);
+                                    if protection.is_protected(&sub_path) {
                                         continue;
                                     }
                                     if known_git_dirs.contains(&sub_path)
@@ -7446,13 +7436,9 @@ fn scanner_thread_main(
                                                 }
                                                 let d3_path = d3_entry.path();
                                                 if d3_path.is_dir() {
-                                                    if should_skip_protected_daemon_candidate(
-                                                        &mut protection,
-                                                        &d3_path,
-                                                        &sacred_paths,
-                                                        logger,
-                                                        "priority pre-scan",
-                                                    ) {
+                                                    let _ = protection
+                                                        .discover_ancestor_markers(&d3_path);
+                                                    if protection.is_protected(&d3_path) {
                                                         continue;
                                                     }
                                                     if known_git_dirs.contains(&d3_path)
@@ -9520,6 +9506,117 @@ mod tests {
             ),
             WorkerReport::DeletionCompleted { .. } => panic!("expected scanner completion report"),
         }
+
+        logger.shutdown();
+        logger_join.join().unwrap();
+    }
+
+    #[test]
+    fn scanner_prescan_discovers_target_in_repo_with_beads_tracker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("scan-root");
+        let repo = root.join("my_beads_project");
+        let beads_dir = repo.join(".beads");
+        let target_dir = repo.join("target");
+        let debug_dir = target_dir.join("debug");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(beads_dir.join("issues.jsonl"), "{}").unwrap();
+        std::fs::create_dir_all(&debug_dir).unwrap();
+        std::fs::write(debug_dir.join("dummy_artifact.o"), b"mock object file").unwrap();
+
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.active_reference_min_size_bytes = u64::MAX;
+
+        let log_path = temp.path().join("activity.jsonl");
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: log_path,
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+            run_id: None,
+        })
+        .unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(1);
+        let (report_tx, report_rx) = bounded::<WorkerReport>(1);
+        let (_index_feedback_tx, index_feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        let cpu_budget = Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0)));
+        let heartbeat = Arc::new(ThreadHeartbeat::new("test-scanner"));
+        let shared_scoring_config = Arc::new(RwLock::new(config.scoring));
+        let shared_scanner_config = Arc::new(RwLock::new(config.scanner));
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let scanner_index_path = temp.path().join("scanner-index-v2.json");
+
+        scan_tx
+            .send(ScanRequest {
+                paths: vec![root],
+                urgency: 0.9,
+                pressure_level: PressureLevel::Orange,
+                free_pct: Some(9.0),
+                max_delete_batch: 10,
+                force_full_scan: false,
+                config_update: None,
+                catalog_roots: Vec::new(),
+                maintenance: false,
+                target_bytes: None,
+            })
+            .unwrap();
+        drop(scan_tx);
+
+        scanner_thread_main(
+            &scan_rx,
+            &del_tx,
+            &logger,
+            &shared_scoring_config,
+            &shared_scanner_config,
+            &platform,
+            &heartbeat,
+            &report_tx,
+            &shutdown,
+            &scanner_index_path,
+            &index_feedback_rx,
+            &cpu_budget,
+            &Arc::new(SharedExecutorConfig::new(
+                false, 10, 0.0, 60, 3600, false, 0,
+            )),
+            &Arc::new(SharedRegret::new(&Config::default())),
+        );
+
+        let report = report_rx
+            .try_recv()
+            .expect("scanner should report completion");
+        match report {
+            WorkerReport::ScanCompleted { candidates, .. } => {
+                assert!(
+                    candidates >= 1,
+                    "target in beads-enabled project must be found as candidate (found {candidates})"
+                );
+            }
+            WorkerReport::DeletionCompleted { .. } => panic!("expected scanner completion report"),
+        }
+
+        // The target candidate was dispatched to the executor channel:
+        let batch = del_rx.try_recv().expect("target should be dispatched");
+        assert!(
+            batch.candidates.iter().any(|c| c.path == target_dir),
+            "batch must contain target_dir"
+        );
+        assert!(
+            !batch
+                .candidates
+                .iter()
+                .any(|c| c.path == repo || c.path == beads_dir),
+            "batch must never contain repo root or .beads dir"
+        );
 
         logger.shutdown();
         logger_join.join().unwrap();
