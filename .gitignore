@@ -86,3 +86,4 @@ windsurf.mcp.json
 .gate_sbh_trj.sh
 # Local daemon/e2e binaries built for the real-daemon scenarios (tests/daemon_e2e.rs).
 .e2e-bin/
+/sbh-release-tui
