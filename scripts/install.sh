@@ -585,6 +585,10 @@ verify_macos_binary_trust() {
   log_header "Verifying macOS binary trust"
 
   if ! command -v codesign >/dev/null 2>&1; then
+    if [[ "$ALLOW_UNSIGNED_MACOS" -eq 1 ]]; then
+      log_warn "codesign tool not found, but --allow-unsigned was specified. Skipping code signature check."
+      return 0
+    fi
     die "codesign is required to verify macOS release binaries. Install Xcode Command Line Tools or retry only with --no-verify if you trust the artifact."
   fi
   if ! codesign --verify --strict --verbose=2 "$binary_path"; then
@@ -595,7 +599,11 @@ verify_macos_binary_trust() {
     fi
   fi
   if ! codesign_detail="$(codesign --display --verbose=4 "$binary_path" 2>&1)"; then
-    die "macOS code signature detail inspection failed for ${ASSET_NAME}. Refusing to install."
+    if [[ "$ALLOW_UNSIGNED_MACOS" -eq 1 ]]; then
+      codesign_detail=""
+    else
+      die "macOS code signature detail inspection failed for ${ASSET_NAME}. Refusing to install."
+    fi
   fi
 
   local developer_id_ok=true
@@ -714,7 +722,13 @@ install_skill() {
   # ── Fallback: create minimal inline skill ──────────────────────────────────
   log_info "Installing bundled inline skill"
 
-  local skill_temp_file="${WORKDIR}/SKILL.md"
+  local temp_dir="${WORKDIR:-}"
+  local cleanup_temp_dir=false
+  if [[ -z "$temp_dir" || ! -d "$temp_dir" ]]; then
+    temp_dir="$(mktemp -d)"
+    cleanup_temp_dir=true
+  fi
+  local skill_temp_file="${temp_dir}/SKILL.md"
   cat << 'SKILL_EOF' > "$skill_temp_file"
 ---
 name: sbh
@@ -852,6 +866,9 @@ SKILL_EOF
   if cp "$skill_temp_file" "$codex_dest/SKILL.md" 2>/dev/null; then
     installed_codex=true
     log_info "Skill created: $codex_dest/SKILL.md"
+  fi
+  if $cleanup_temp_dir; then
+    rm -rf "$temp_dir"
   fi
   finish_phase "inline skill installed"
 }
