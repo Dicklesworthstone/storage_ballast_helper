@@ -3203,6 +3203,10 @@ impl MonitoringDaemon {
                 break;
             }
 
+            // Systemd watchdog heartbeat during long sleeps / throttle stages.
+            self.watchdog
+                .maybe_notify(&format!("pressure={disk_level:?} status=sleeping"));
+
             let wait = remaining.min(MEMORY_PRESSURE_WAKE_INTERVAL);
             // A control-socket command ends the sleep so the next tick runs
             // it at once instead of after the remaining interval.
