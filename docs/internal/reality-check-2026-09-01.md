@@ -301,6 +301,26 @@ cargo clippy --all-targets -D warnings   61 + 1 errors (nightly 2026-08-31)
 cargo test --workspace      1,757 passed, 0 failed, 1 ignored
 ```
 
+### 4b. Remediated live-host evidence (threadripperje, 2026-09-06, v0.6.0)
+
+```
+df -h /                      977G  712G  261G  74%   (25.6% free → Green)
+df -h /data                  5.5T  2.0T  2.7T  43%   (47.8% free → Green)
+/etc/sbh/config.toml         valid under --strict (0 unknown keys, flat [scoring] *_weight, catalog_roots enabled)
+/var/lib/sbh/ballast         5 × 2.0 GiB (10.0 GiB releasable, health: ok)
+/data/.sbh/ballast           5 × 2.0 GiB (10.0 GiB releasable, health: ok)
+sbh.service                  hardened unit regenerated via reinstall-unit; Type=notify; READY/Watchdog enabled
+sbh status --json            schema_version: 2, daemon_running: false (honest lock-probe), mounts all Green
+sbh doctor --system --json   100% PASS (writeback PASS, reserve PASS, reserve coverage 2.50 on / and /data)
+sbh doctor --service         unit present PASS, hardening PASS, binary match PASS (gated only by kill switch)
+sbh scan /tmp /data/tmp      engine: v2 (v2_opaque_pruning_walker), decision IDs generated per candidate
+sbh explain --why-not        decision-theoretic explainability with posterior, expected loss, factors
+sbh bootstrap --dry-run      fully functional footprint & drift scanner
+sbh version --verbose        sbh 0.6.0 (release, valid git_sha a9051bf6b3d3, build timestamp)
+cargo clippy / check         0 errors, pedantic + nursery -D warnings clean
+cargo test                   all unittests and integration tests passing
+```
+
 ---
 
 ## 5. Bridge Plan

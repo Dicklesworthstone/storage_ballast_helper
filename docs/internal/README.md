@@ -20,6 +20,7 @@ the operator records each decision here.
 | `pressure-mapping.md` | memory-pressure level mapping plus the forecast-bound note | current |
 | `reality-check-2026-09-01.md` | parallel reality check (agent OliveIbis), folded into the plan below | historical input |
 | `reality-check-and-bridge-plan-2026-09-02.md` | the reality check and bridge plan the `bd-rc-master-ajg1` bead tree was generated from | current; beads are canonical |
+| `rollout-2026-09.md` | fleet rollout record for v0.5.2 & v0.6.0 | current (bd-rc-master-ajg1.14.2) |
 | `scanner-ab-2026-09-02.md` | scanner v1/v2 A/B evidence | current |
 
 ## Root-level oddities: operator decision list
