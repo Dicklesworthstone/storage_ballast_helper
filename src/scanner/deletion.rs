@@ -3235,6 +3235,33 @@ mod tests {
     }
 
     #[test]
+    fn hardcoded_source_tree_allows_target_debug_and_release_under_projects() {
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/target/debug"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/target/release"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/home/ubuntu/projects/franken_node/target/debug"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/Users/jemanuel/projects/sbh/target/release"
+        )));
+
+        // Standalone debug/release or under non-artifact directories remain vetoed.
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/debug"
+        )));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/src/debug"
+        )));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/home/ubuntu/projects/franken_node/release"
+        )));
+    }
+
+    #[test]
     fn hardcoded_source_tree_still_vetoes_source_basenames_under_protected_root() {
         // The carve-out is narrow — anything NOT on the artifact list is
         // still vetoed. This protects against scorer misclassification.

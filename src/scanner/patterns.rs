@@ -409,11 +409,8 @@ pub(crate) fn has_descriptive_target_suffix(name: &str) -> bool {
 /// for unmatched basenames are unchanged.
 ///
 /// Matching is case-sensitive (real build-artifact dir names are lowercase).
-pub(crate) fn is_obvious_build_artifact_basename(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-
+/// Returns true if the directory name matches an obvious build/cache artifact directory.
+pub(crate) fn is_obvious_artifact_name(name: &str) -> bool {
     // Exact-match basenames (alphabetized for ease of audit). Bare rch
     // target dir names without a job-suffix are included here so the prefix
     // matchers below can safely require a separator (`-` or `_`) — this
@@ -467,6 +464,53 @@ pub(crate) fn is_obvious_build_artifact_basename(path: &Path) -> bool {
     // `target-suffix` (0.88) / `underscore-target-suffix` (0.92) patterns in
     // the artifact registry.
     has_descriptive_target_suffix(name)
+}
+
+/// Returns true if the candidate's basename clearly identifies it as a
+/// disposable build/cache artifact that's safe to delete even when located
+/// inside a protected source-tree root (or, via the `is_system_path`
+/// backstop, directly under a worker's `/root`).
+///
+/// This is the "carve-out" that keeps sbh useful inside `/data/projects/`,
+/// `/home/<user>/projects/`, and `/Users/<user>/projects/`: the broad
+/// hardcoded-source-tree refusal would otherwise block all cleanup there,
+/// including the wizard's main intended use case (clearing `target/`,
+/// `node_modules/`, etc. under operator-configured source roots).
+///
+/// The list is intentionally narrow — only basenames we are confident
+/// represent disposable build/cache directories. Anything not on this list
+/// stays vetoed under protected roots, preserving the carnage-prevention
+/// guarantee for arbitrary unknown names.
+///
+/// If you ever expand this list, the new entries are additive — they only
+/// ever LOOSEN the refusal for the matched basename. Existing protections
+/// for unmatched basenames are unchanged.
+///
+/// Matching is case-sensitive (real build-artifact dir names are lowercase).
+pub(crate) fn is_obvious_build_artifact_basename(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+
+    if is_obvious_artifact_name(name) {
+        return true;
+    }
+
+    // Build-profile subdirectories (`debug`, `release`) produced by cargo or
+    // other build tools are obvious build artifacts when nested under an
+    // obvious build artifact directory (e.g. `target/debug`, `target/release`,
+    // `.cargo-target/debug`, `build/debug`,
+    // `target/x86_64-unknown-linux-gnu/debug`).
+    if matches!(name, "debug" | "release") {
+        return path.ancestors().skip(1).any(|ancestor| {
+            ancestor
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_obvious_artifact_name)
+        });
+    }
+
+    false
 }
 
 /// The broad `target-<x>` / `target_<x>` prefix shapes: the one target-like
@@ -1861,6 +1905,41 @@ mod tests {
             assert!(
                 !is_obvious_build_artifact_basename(Path::new(name)),
                 "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_obvious_build_artifact_basename_recognizes_nested_debug_and_release() {
+        for path in [
+            "target/debug",
+            "target/release",
+            "/data/projects/foo/target/debug",
+            "/data/projects/foo/target/release",
+            "/data/projects/foo/target/x86_64-unknown-linux-gnu/debug",
+            "/data/projects/foo/.cargo-target/debug",
+            "/data/projects/foo/build/debug",
+            "/data/projects/foo/build/release",
+            "/root/target/debug",
+        ] {
+            assert!(
+                is_obvious_build_artifact_basename(Path::new(path)),
+                "expected `{path}` to be recognized as build artifact"
+            );
+        }
+
+        for path in [
+            "debug",
+            "release",
+            "/data/projects/foo/debug",
+            "/data/projects/foo/release",
+            "/data/projects/foo/src/debug",
+            "/data/projects/foo/crates/debug",
+            "/root/debug",
+        ] {
+            assert!(
+                !is_obvious_build_artifact_basename(Path::new(path)),
+                "expected `{path}` to NOT be recognized as build artifact without artifact parent"
             );
         }
     }
