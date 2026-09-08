@@ -290,7 +290,12 @@ impl HorizonRule {
             percent_floor.min(self.absolute_floor_bytes)
         };
         let short_of_room = stats.available_bytes < floor_bytes;
-        let filling_fast = horizon < horizon_limit;
+        let actual_horizon = if rate_bytes_per_sec > 0.0 {
+            stats.available_bytes as f64 / rate_bytes_per_sec
+        } else {
+            f64::INFINITY
+        };
+        let filling_fast = actual_horizon < horizon_limit;
         let severity = if ram_backed {
             SpecialAlert::Critical
         } else {
@@ -303,13 +308,15 @@ impl HorizonRule {
         };
         let urgency = if alert == SpecialAlert::None {
             0.0
+        } else if filling_fast {
+            (1.0 - actual_horizon / horizon_limit).clamp(0.2, 1.0)
         } else {
-            (1.0 - horizon / horizon_limit).clamp(0.2, 1.0)
+            0.2
         };
         let reason = match (short_of_room, filling_fast) {
             (true, true) => format!(
                 "{} free below the {} floor and {:.0}s to exhaustion",
-                stats.available_bytes, floor_bytes, horizon
+                stats.available_bytes, floor_bytes, actual_horizon
             ),
             (true, false) => format!(
                 "{} free below the {} floor",
@@ -317,7 +324,7 @@ impl HorizonRule {
             ),
             (false, true) => format!(
                 "{:.0}s to exhaustion at {:.0} B/s",
-                horizon,
+                actual_horizon,
                 rate_bytes_per_sec.max(0.0)
             ),
             (false, false) => format!(
@@ -505,6 +512,22 @@ mod horizon_tests {
         // 50% free and quiet -> nothing.
         let quiet = rule.assess(&shm, &stats(64 * GIB, 32 * GIB), 0.0, true);
         assert_eq!(quiet.alert, SpecialAlert::None, "{}", quiet.reason);
+
+        // Small RAM-backed location (e.g. 256 MiB /dev/shm with 254 MiB free, quiet)
+        // must NOT alert critical or filling_fast.
+        let small_quiet = rule.assess(
+            &shm,
+            &stats(256 * 1024 * 1024, 254 * 1024 * 1024),
+            0.0,
+            true,
+        );
+        assert_eq!(
+            small_quiet.alert,
+            SpecialAlert::None,
+            "{}",
+            small_quiet.reason
+        );
+        assert_eq!(small_quiet.urgency, 0.0);
     }
 
     #[test]
