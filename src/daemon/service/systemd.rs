@@ -28,7 +28,11 @@ impl SystemdConfig {
     /// `user_scope` controls system vs user service placement.
     pub fn from_env(user_scope: bool) -> Result<Self> {
         let binary_path = resolve_sbh_binary()?;
-        let read_write_paths = default_read_write_paths(user_scope);
+        let read_write_paths =
+            crate::core::config::Config::load_for_service_scope(None, user_scope).map_or_else(
+                |_| default_read_write_paths(user_scope),
+                |config| Self::read_write_paths_for(&config, user_scope),
+            );
         Ok(Self {
             user_scope,
             binary_path,
@@ -275,6 +279,11 @@ impl SystemdServiceManager {
     /// Create a manager from the current environment.
     pub fn from_env(user_scope: bool) -> Result<Self> {
         Ok(Self::new(SystemdConfig::from_env(user_scope)?))
+    }
+
+    /// Create a manager with sandbox derived from a specific config.
+    pub fn from_config(config: &crate::core::config::Config, user_scope: bool) -> Result<Self> {
+        Ok(Self::new(SystemdConfig::from_config(config, user_scope)?))
     }
 
     /// Access the underlying config (for reading unit path, etc.).
@@ -1466,6 +1475,23 @@ mod read_write_paths_tests {
         assert!(line.contains("\"/srv/builds with space\""));
         assert!(!line.contains("/proc/sys"));
         assert!(unit.contains("ProtectSystem=strict\n"));
+    }
+
+    #[test]
+    fn from_config_derives_read_write_paths_for_service_manager() {
+        let config = sample_config();
+        let manager = SystemdServiceManager::from_config(&config, false).expect("valid manager");
+        assert_eq!(
+            manager.config().read_write_paths,
+            SystemdConfig::read_write_paths_for(&config, false)
+        );
+    }
+
+    #[test]
+    fn from_env_populates_read_write_paths() {
+        let config = SystemdConfig::from_env(true).expect("valid config");
+        assert!(!config.read_write_paths.is_empty());
+        assert!(config.read_write_paths.contains(&PathBuf::from("/tmp")));
     }
 }
 
