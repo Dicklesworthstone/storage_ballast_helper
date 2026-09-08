@@ -666,19 +666,25 @@ fn compact_command_output(value: &str) -> String {
 
 fn default_read_write_paths(user_scope: bool) -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
-    if !user_scope {
+    if user_scope {
+        if let Some(home) = env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            paths.push(home.join(".local/share/sbh"));
+            paths.push(home.join(".config/sbh"));
+        }
+    } else {
         paths.push(PathBuf::from("/var/lib/sbh"));
+        let root_home = Path::new("/root");
+        if root_home.is_dir() {
+            paths.push(root_home.join(".local/share/sbh"));
+            paths.push(root_home.join(".config/sbh"));
+        }
     }
     for candidate in ["/data", "/data/tmp"] {
         let p = PathBuf::from(candidate);
         if p.is_dir() {
             paths.push(p);
         }
-    }
-    if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        paths.push(home.join(".local/share/sbh"));
-        paths.push(home.join(".config/sbh"));
     }
     paths
 }
@@ -1492,6 +1498,20 @@ mod read_write_paths_tests {
         let config = SystemdConfig::from_env(true).expect("valid config");
         assert!(!config.read_write_paths.is_empty());
         assert!(config.read_write_paths.contains(&PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn default_read_write_paths_system_scope_does_not_use_caller_home() {
+        let paths = default_read_write_paths(false);
+        if let Some(home) = env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            if home != Path::new("/root") {
+                assert!(
+                    !paths.contains(&home.join(".local/share/sbh")),
+                    "system scope must not inherit non-root caller's home: {paths:?}"
+                );
+            }
+        }
     }
 }
 

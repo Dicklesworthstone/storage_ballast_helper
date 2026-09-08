@@ -1586,6 +1586,10 @@ fn default_update_metadata_cache_file(paths: &PathsConfig) -> PathBuf {
     data_dir_for_paths(paths).join("update-metadata.json")
 }
 
+fn default_notification_file(paths: &PathsConfig) -> PathBuf {
+    data_dir_for_paths(paths).join("notifications.jsonl")
+}
+
 fn data_dir_for_paths(paths: &PathsConfig) -> PathBuf {
     paths
         .state_file
@@ -1619,12 +1623,29 @@ fn raw_paths_contains_key(raw_value: &toml::Value, key: &str) -> bool {
         .is_some_and(|paths| paths.contains_key(key))
 }
 
+fn raw_has_update_metadata_cache_file(raw_value: &toml::Value) -> bool {
+    raw_value
+        .get("update")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|u| u.contains_key("metadata_cache_file"))
+}
+
+fn raw_has_notification_file_path(raw_value: &toml::Value) -> bool {
+    raw_value
+        .get("notifications")
+        .and_then(toml::Value::as_table)
+        .and_then(|n| n.get("file"))
+        .and_then(toml::Value::as_table)
+        .is_some_and(|f| f.contains_key("path"))
+}
+
 impl Config {
     /// Build a default config with an explicit path layout.
     #[must_use]
     pub fn with_paths(paths: PathsConfig) -> Self {
         let mut config = Self::default();
         config.update.metadata_cache_file = default_update_metadata_cache_file(&paths);
+        config.notifications.file.path = default_notification_file(&paths);
         config.paths = paths;
         config
     }
@@ -1713,6 +1734,13 @@ impl Config {
                 &default_paths
             };
             apply_missing_path_defaults(&mut parsed.paths, &raw_value, path_defaults);
+            if !raw_has_update_metadata_cache_file(&raw_value) {
+                parsed.update.metadata_cache_file =
+                    default_update_metadata_cache_file(&parsed.paths);
+            }
+            if !raw_has_notification_file_path(&raw_value) {
+                parsed.notifications.file.path = default_notification_file(&parsed.paths);
+            }
             if announce_system_fallback {
                 eprintln!(
                     "[SBH-CONFIG] Using system config at {}",
@@ -3164,6 +3192,10 @@ mod tests {
             cfg.update.metadata_cache_file,
             PathBuf::from("/tmp/sbh/update-metadata.json")
         );
+        assert_eq!(
+            cfg.notifications.file.path,
+            PathBuf::from("/tmp/sbh/notifications.jsonl")
+        );
     }
 
     #[test]
@@ -3188,6 +3220,40 @@ mod tests {
         assert_eq!(cfg.paths.state_file, scoped_paths.state_file);
         assert_eq!(cfg.paths.sqlite_db, scoped_paths.sqlite_db);
         assert_eq!(cfg.paths.jsonl_log, scoped_paths.jsonl_log);
+        assert_eq!(
+            cfg.update.metadata_cache_file,
+            tmp.path().join("system").join("update-metadata.json")
+        );
+        assert_eq!(
+            cfg.notifications.file.path,
+            tmp.path().join("system").join("notifications.jsonl")
+        );
+    }
+
+    #[test]
+    fn system_config_fallback_derives_metadata_and_notifications_in_system_dir() {
+        let tmp = TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[ballast]\nfile_count = 2\n").expect("write config");
+        let cfg = Config::load_with_default_paths(
+            Some(&config_path),
+            PathsConfig::system_default(),
+            false,
+        )
+        .expect("config should load");
+        let system_data = PathsConfig::system_default()
+            .state_file
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert_eq!(
+            cfg.update.metadata_cache_file,
+            system_data.join("update-metadata.json")
+        );
+        assert_eq!(
+            cfg.notifications.file.path,
+            system_data.join("notifications.jsonl")
+        );
     }
 
     #[test]
