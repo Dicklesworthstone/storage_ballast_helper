@@ -3243,6 +3243,21 @@ mod tests {
             "/data/projects/franken_node/target/release"
         )));
         assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/target/doc"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/target/x86_64-unknown-linux-gnu"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/target/criterion"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/.mypy_cache"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/.astro"
+        )));
+        assert!(!is_hardcoded_source_tree(Path::new(
             "/home/ubuntu/projects/franken_node/target/debug"
         )));
         assert!(!is_hardcoded_source_tree(Path::new(
@@ -3258,6 +3273,12 @@ mod tests {
         )));
         assert!(is_hardcoded_source_tree(Path::new(
             "/home/ubuntu/projects/franken_node/release"
+        )));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/doc"
+        )));
+        assert!(is_hardcoded_source_tree(Path::new(
+            "/data/projects/franken_node/x86_64-unknown-linux-gnu"
         )));
     }
 

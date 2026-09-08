@@ -416,17 +416,25 @@ pub(crate) fn is_obvious_artifact_name(name: &str) -> bool {
     // matchers below can safely require a separator (`-` or `_`) — this
     // prevents `.rch-targetfoo` style false positives.
     let exact_artifacts: &[&str] = &[
+        ".astro",
         ".cargo-target",
+        ".dart_tool",
+        ".docusaurus",
+        ".gradle",
+        ".mypy_cache",
         ".next",
         ".nuxt",
         ".parcel-cache",
         ".pytest_cache",
         ".rch-target",
         ".rch_target",
+        ".ruff_cache",
+        ".svelte-kit",
         ".target",
         ".tox",
         ".turbo",
         ".venv",
+        ".vite",
         "__pycache__",
         "build",
         "dist",
@@ -496,12 +504,17 @@ pub(crate) fn is_obvious_build_artifact_basename(path: &Path) -> bool {
         return true;
     }
 
-    // Build-profile subdirectories (`debug`, `release`) produced by cargo or
+    // Build-profile, output, and target-triple subdirectories produced by cargo or
     // other build tools are obvious build artifacts when nested under an
     // obvious build artifact directory (e.g. `target/debug`, `target/release`,
+    // `target/doc`, `target/package`, `target/criterion`,
     // `.cargo-target/debug`, `build/debug`,
-    // `target/x86_64-unknown-linux-gnu/debug`).
-    if matches!(name, "debug" | "release") {
+    // `target/x86_64-unknown-linux-gnu`, `target/x86_64-unknown-linux-gnu/debug`).
+    if matches!(
+        name,
+        "debug" | "release" | "doc" | "package" | "criterion" | "bench" | "test" | "dev" | "tmp"
+    ) || is_target_triple_basename(name)
+    {
         return path.ancestors().skip(1).any(|ancestor| {
             ancestor
                 .file_name()
@@ -511,6 +524,40 @@ pub(crate) fn is_obvious_build_artifact_basename(path: &Path) -> bool {
     }
 
     false
+}
+
+/// Returns true if `name` matches a standard cross-compilation target triple
+/// (e.g. `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`).
+pub(crate) fn is_target_triple_basename(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('-').collect();
+    if parts.len() < 3 {
+        return false;
+    }
+    let arch = parts[0];
+    let known_arch = matches!(
+        arch,
+        "x86_64"
+            | "aarch64"
+            | "i686"
+            | "i586"
+            | "arm"
+            | "armv7"
+            | "armv7a"
+            | "armv6"
+            | "riscv64"
+            | "riscv64gc"
+            | "wasm32"
+            | "wasm64"
+    );
+    if !known_arch {
+        return false;
+    }
+    parts.iter().skip(1).any(|p| {
+        matches!(
+            *p,
+            "linux" | "darwin" | "apple" | "windows" | "musl" | "gnu" | "msvc" | "wasi" | "unknown"
+        )
+    })
 }
 
 /// The broad `target-<x>` / `target_<x>` prefix shapes: the one target-like
@@ -1171,6 +1218,48 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             category: ArtifactCategory::BuildOutput,
         },
         ArtifactPattern {
+            name: "nuxt-build",
+            kind: MatchKind::Exact(".nuxt"),
+            confidence: 0.90,
+            category: ArtifactCategory::BuildOutput,
+        },
+        ArtifactPattern {
+            name: "astro-build",
+            kind: MatchKind::Exact(".astro"),
+            confidence: 0.88,
+            category: ArtifactCategory::BuildOutput,
+        },
+        ArtifactPattern {
+            name: "svelte-kit-build",
+            kind: MatchKind::Exact(".svelte-kit"),
+            confidence: 0.88,
+            category: ArtifactCategory::BuildOutput,
+        },
+        ArtifactPattern {
+            name: "docusaurus-build",
+            kind: MatchKind::Exact(".docusaurus"),
+            confidence: 0.88,
+            category: ArtifactCategory::BuildOutput,
+        },
+        ArtifactPattern {
+            name: "vite-cache",
+            kind: MatchKind::Exact(".vite"),
+            confidence: 0.86,
+            category: ArtifactCategory::BuildOutput,
+        },
+        ArtifactPattern {
+            name: "dart-tool-cache",
+            kind: MatchKind::Exact(".dart_tool"),
+            confidence: 0.86,
+            category: ArtifactCategory::BuildOutput,
+        },
+        ArtifactPattern {
+            name: "gradle-cache",
+            kind: MatchKind::Exact(".gradle"),
+            confidence: 0.86,
+            category: ArtifactCategory::BuildOutput,
+        },
+        ArtifactPattern {
             name: "python-pycache",
             kind: MatchKind::Exact("__pycache__"),
             confidence: 0.96,
@@ -1185,6 +1274,18 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
         ArtifactPattern {
             name: "pytest-cache",
             kind: MatchKind::Exact(".pytest_cache"),
+            confidence: 0.84,
+            category: ArtifactCategory::PythonCache,
+        },
+        ArtifactPattern {
+            name: "mypy-cache",
+            kind: MatchKind::Exact(".mypy_cache"),
+            confidence: 0.84,
+            category: ArtifactCategory::PythonCache,
+        },
+        ArtifactPattern {
+            name: "ruff-cache",
+            kind: MatchKind::Exact(".ruff_cache"),
             confidence: 0.84,
             category: ArtifactCategory::PythonCache,
         },
@@ -1914,13 +2015,33 @@ mod tests {
         for path in [
             "target/debug",
             "target/release",
+            "target/doc",
+            "target/package",
+            "target/criterion",
+            "target/bench",
+            "target/test",
+            "target/dev",
+            "target/x86_64-unknown-linux-gnu",
+            "target/aarch64-apple-darwin",
             "/data/projects/foo/target/debug",
             "/data/projects/foo/target/release",
+            "/data/projects/foo/target/doc",
+            "/data/projects/foo/target/package",
+            "/data/projects/foo/target/x86_64-unknown-linux-gnu",
             "/data/projects/foo/target/x86_64-unknown-linux-gnu/debug",
             "/data/projects/foo/.cargo-target/debug",
             "/data/projects/foo/build/debug",
             "/data/projects/foo/build/release",
             "/root/target/debug",
+            ".mypy_cache",
+            ".ruff_cache",
+            ".astro",
+            ".svelte-kit",
+            ".docusaurus",
+            ".dart_tool",
+            ".gradle",
+            "/data/projects/foo/.mypy_cache",
+            "/data/projects/foo/.astro",
         ] {
             assert!(
                 is_obvious_build_artifact_basename(Path::new(path)),
@@ -1931,10 +2052,17 @@ mod tests {
         for path in [
             "debug",
             "release",
+            "doc",
+            "package",
+            "criterion",
+            "bench",
+            "x86_64-unknown-linux-gnu",
             "/data/projects/foo/debug",
             "/data/projects/foo/release",
+            "/data/projects/foo/doc",
             "/data/projects/foo/src/debug",
             "/data/projects/foo/crates/debug",
+            "/data/projects/foo/x86_64-unknown-linux-gnu",
             "/root/debug",
         ] {
             assert!(
