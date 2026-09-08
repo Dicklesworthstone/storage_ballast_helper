@@ -4967,11 +4967,23 @@ fn update_check_uses_fresh_cache_when_offline_and_path_disabled() {
         .expect("write cache file");
     }
 
+    let config_path = home.path().join(".config/sbh/config.toml");
+    let config_parent = config_path
+        .parent()
+        .expect("config path should have parent directory");
+    fs::create_dir_all(config_parent).expect("create config parent directory");
+    fs::write(&config_path, "").expect("write isolated config file");
+
     let home_str = home.path().to_string_lossy().to_string();
+    let config_str = config_path.to_string_lossy().to_string();
     let result = common::run_cli_case_with_env(
         "update_check_uses_fresh_cache_when_offline_and_path_disabled",
         &["update", "--check", "--json"],
-        &[("HOME", &home_str), ("PATH", "")],
+        &[
+            ("HOME", &home_str),
+            ("PATH", ""),
+            ("SBH_CONFIG", &config_str),
+        ],
     );
     assert!(
         result.status.success(),
@@ -5181,12 +5193,12 @@ fn update_check_with_offline_bundle_and_pinned_tag_mismatch_fails_json() {
 #[test]
 fn update_check_with_stale_cache_fails_offline_when_network_is_required() {
     let home = tempfile::tempdir().expect("create temp home");
-    let cache_path = home.path().join(".local/share/sbh/update-metadata.json");
-    let cache_parent = cache_path
+    let config_path = home.path().join(".config/sbh/config.toml");
+    let config_parent = config_path
         .parent()
-        .expect("cache path should have parent directory");
-    fs::create_dir_all(cache_parent).expect("create cache parent directory");
-
+        .expect("config path should have parent directory");
+    fs::create_dir_all(config_parent).expect("create config parent directory");
+    fs::write(&config_path, "").expect("write isolated config file");
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after unix epoch")
@@ -5196,17 +5208,33 @@ fn update_check_with_stale_cache_fails_offline_when_network_is_required() {
         "artifact_url": "https://example.invalid/sbh-x86_64-unknown-linux-gnu.tar.xz",
         "fetched_at_unix_secs": now_secs.saturating_sub(7_200),
     });
-    fs::write(
-        &cache_path,
-        serde_json::to_vec_pretty(&stale_cache_entry).expect("serialize stale cache entry"),
-    )
-    .expect("write stale cache file");
+
+    for cache_path in [
+        home.path().join(".local/share/sbh/update-metadata.json"),
+        home.path()
+            .join("Library/Application Support/sbh/update-metadata.json"),
+    ] {
+        let cache_parent = cache_path
+            .parent()
+            .expect("cache path should have parent directory");
+        fs::create_dir_all(cache_parent).expect("create cache parent directory");
+        fs::write(
+            &cache_path,
+            serde_json::to_vec_pretty(&stale_cache_entry).expect("serialize stale cache entry"),
+        )
+        .expect("write stale cache file");
+    }
 
     let home_str = home.path().to_string_lossy().to_string();
+    let config_str = config_path.to_string_lossy().to_string();
     let result = common::run_cli_case_with_env(
         "update_check_with_stale_cache_fails_offline_when_network_is_required",
         &["update", "--check", "--json"],
-        &[("HOME", &home_str), ("PATH", "")],
+        &[
+            ("HOME", &home_str),
+            ("PATH", ""),
+            ("SBH_CONFIG", &config_str),
+        ],
     );
     assert!(
         !result.status.success(),
