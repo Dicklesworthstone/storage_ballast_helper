@@ -1047,7 +1047,8 @@ mod tests {
 
     #[test]
     fn file_or_dir_size_nonexistent() {
-        assert_eq!(file_or_dir_size(Path::new("/nonexistent")), 0);
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(file_or_dir_size(&tmp.path().join("nonexistent")), 0);
     }
 
     #[test]

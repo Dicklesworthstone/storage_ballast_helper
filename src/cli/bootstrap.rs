@@ -1145,6 +1145,9 @@ fn systemd_unit_drift_summary(path: &Path, contents: &str) -> Option<String> {
             gate.source.display()
         ));
     }
+    if parts.is_empty() {
+        return None;
+    }
     Some(parts.join("; "))
 }
 
@@ -2713,6 +2716,23 @@ mod tests {
         let (healthy, issue, _) = check_systemd_health(&unit);
         assert!(!healthy);
         assert_eq!(issue, Some(MigrationReason::SystemdUnitDrift));
+    }
+
+    #[test]
+    fn systemd_health_generated_unit_has_no_drift() {
+        use crate::daemon::service::SystemdServiceManager;
+        let Ok(mgr) = SystemdServiceManager::from_env(true) else {
+            return;
+        };
+        let generated = mgr.generate_unit_file();
+        let tmp = TempDir::new().unwrap();
+        let unit = tmp.path().join("sbh.service");
+        fs::write(&unit, &generated).unwrap();
+        let drift = systemd_unit_drift_summary(&unit, &generated);
+        assert!(
+            drift.is_none(),
+            "generated unit should produce no drift: {drift:?}"
+        );
     }
 
     #[test]
