@@ -4,7 +4,17 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and the Release workflow refuses to publish a tag that has no marked heading here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
-## Unreleased
+## v0.6.1 **[release]**
+
+Compare: [`v0.6.0...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.0...HEAD)
+
+### Fixed — Build artifact recognition, special location monitoring, and test isolation
+
+- **Cargo build-profile artifact recognition (bd-8t1l):** `is_obvious_build_artifact_basename` now recognizes `debug` and `release` subdirectories when nested under an obvious build artifact directory (e.g. `target/debug`, `target/release`, `.cargo-target/debug`, `build/release`), ensuring operator-configured source trees under `/data/projects/` and `/home/*/projects/` have their build profile artifacts safely reclaimed instead of being vetoed as source code.
+- **Special location filling_fast rate check:** `HorizonRule::assess` now checks write rate > 0 before computing seconds-to-exhaustion, preventing quiet small RAM mounts (< 1.8 GiB, e.g. `/dev/shm`) from falsely triggering `SpecialAlert::Critical` and premature emergency ballast releases.
+- **Offline update-check test isolation:** Pinned `SBH_CONFIG` to an isolated configuration inside the temporary fixture and populated metadata cache on both XDG and macOS Application Support paths so host configs and system caches cannot interfere with offline checks.
+- **systemd user-scope path isolation:** Scoped default read-write paths for `HOME` to user service scope, avoiding permission warnings.
+- **Bootstrap drift repair:** Avoid emitting empty drift summary when only foreign drop-ins exist.
 
 ### Fixed — macOS installer and Homebrew tap fixes (#22, #23, #24)
 
