@@ -913,6 +913,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_SCANNER_FOLLOW_SYMLINKS` | config override | `scanner.follow_symlinks` |
 | `SBH_SCANNER_MAX_DEPTH` | config override | `scanner.max_depth` |
 | `SBH_SCANNER_PARALLELISM` | config override | `scanner.parallelism` |
+| `SBH_SCANNER_PRESCAN_TIME_BUDGET_SECS` | config override | `scanner.prescan_time_budget_secs` |
 | `SBH_SCANNER_MAX_DELETE_BATCH` | config override | `scanner.max_delete_batch` |
 | `SBH_SCANNER_MIN_FILE_AGE_MINUTES` | config override | `scanner.min_file_age_minutes` |
 | `SBH_SCANNER_MIN_RESCAN_INTERVAL_SECS` | config override | `scanner.min_rescan_interval_secs` |
@@ -941,6 +942,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_SYSTEM_TUNING_WRITEBACK_BENCHMARK_BYTES` | config override | `system_tuning.writeback.benchmark_bytes` |
 | `SBH_SYSTEM_TUNING_WRITEBACK_POOL_WARN_BYTES` | config override | `system_tuning.writeback.pool_warn_bytes` |
 | `SBH_TELEMETRY_CPU_BUDGET_PCT` | config override | `telemetry.cpu_budget_pct` |
+| `SBH_TELEMETRY_CPU_BUDGET_BURST_SECS` | config override | `telemetry.cpu_budget_burst_secs` |
 | `SBH_TELEMETRY_FS_CACHE_TTL_MS` | config override | `telemetry.fs_cache_ttl_ms` |
 | `SBH_TELEMETRY_EWMA_BASE_ALPHA` | config override | `telemetry.ewma_base_alpha` |
 | `SBH_TELEMETRY_EWMA_MIN_ALPHA` | config override | `telemetry.ewma_min_alpha` |

@@ -2265,6 +2265,23 @@ fn uninstall_dry_run_json_plans_the_user_footprint_and_changes_nothing() {
     );
 }
 
+/// Base directory for a test that wants its fixture on the real system temp
+/// filesystem.
+///
+/// macOS's `/tmp` is a symlink to `/private/tmp` and these tests assert on the
+/// paths sbh reports, so they want the resolved one. Existence is not enough to
+/// pick it: a Linux rch worker can carry a root-owned `/private/tmp` (left
+/// behind by a synced macOS path) that the test user cannot write, which failed
+/// these two tests on hz4 with `PermissionDenied`. Probe for writability.
+#[cfg(target_os = "linux")]
+fn system_temp_base() -> &'static str {
+    let writable = tempfile::Builder::new()
+        .prefix("sbh-tmp-probe-")
+        .tempdir_in("/private/tmp")
+        .is_ok();
+    if writable { "/private/tmp" } else { "/tmp" }
+}
+
 /// `sbh clean --dry-run` records its decisions in the ledger and `sbh explain`
 /// reads them back by `--last`, `--id` (every level) and `--path`; an unknown
 /// id fails with a hint listing recent ids.
@@ -2272,11 +2289,7 @@ fn uninstall_dry_run_json_plans_the_user_footprint_and_changes_nothing() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn clean_plans_the_larger_target_first_and_reports_the_plan() {
-    let base = if Path::new("/private/tmp").is_dir() {
-        "/private/tmp"
-    } else {
-        "/tmp"
-    };
+    let base = system_temp_base();
     let dir = tempfile::Builder::new()
         .prefix("sbh-planner-")
         .tempdir_in(base)
@@ -2422,11 +2435,7 @@ enabled = false
 fn clean_quarantines_at_green_and_undo_restores_the_target() {
     // Outside the hardcoded source-tree roots (a remote worker's temp dir
     // can sit under the project) and canonical, as `clean` reports paths.
-    let base = if Path::new("/private/tmp").is_dir() {
-        "/private/tmp"
-    } else {
-        "/tmp"
-    };
+    let base = system_temp_base();
     let dir = tempfile::Builder::new()
         .prefix("sbh-quarantine-")
         .tempdir_in(base)

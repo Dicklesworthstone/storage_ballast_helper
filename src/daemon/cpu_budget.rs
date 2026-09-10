@@ -6,11 +6,33 @@
 //! priority pre-scan, maintenance passes, index work and the monitor tick.
 //! When the bucket is in deficit the monitor loop stretches its sleep; the
 //! scanner starts a discretionary pass only with at least
-//! [`PASS_MIN_TOKENS`] in the bucket and may then walk only as long as the
-//! bucket has tokens (its wall deadline is capped by
-//! [`CpuBudget::pass_allowance`]). Documented bound: over any window of `w`
-//! seconds the daemon's CPU time is at most `pct/100 * w + BURST_SECS`, plus
+//! [`PASS_MIN_TOKENS`] in the bucket and may then spend only as much CPU as
+//! the bucket holds ([`CpuBudget::pass_cpu_allowance`]), *measured* while the
+//! pass runs by [`PassCpuGuard`]. Documented bound: over any window of `w`
+//! seconds the daemon's CPU time is at most `pct/100 * w + burst`, plus
 //! what the protected operations and the executor cost.
+//!
+//! # Why the allowance is measured and not modelled
+//!
+//! Until 0.6.1 the allowance was converted to a *wall-clock* deadline as
+//! `available_cpu_secs / scanner.parallelism`, i.e. assuming every walker
+//! thread pegs a core for the whole pass. Two things made that catastrophic
+//! in practice:
+//!
+//! * the bucket is clamped to `burst` (5 CPU-seconds by default), so the
+//!   converted wall deadline had a hard ceiling of `burst / parallelism` —
+//!   **0.6-0.7 s on a 14-16 core host** — that no amount of idling could
+//!   raise; and
+//! * a directory walk is I/O- and syscall-bound, and the priority pre-scan
+//!   that the deadline actually killed is *single-threaded*, so dividing by
+//!   the thread count was wrong twice over.
+//!
+//! The observable result was a daemon that logged
+//! `scan complete: 0 entries, 0 candidates, 0.7s (timed out)` on every pass
+//! for months while the disk filled. Charging the pass its *real* rusage
+//! delta keeps the same documented CPU bound, exactly rather than
+//! pessimistically, and lets an I/O-bound walk run to
+//! `scanner.scan_time_budget_secs`.
 //!
 //! Protected operations never wait on the budget: ballast release, the
 //! state write, the service-manager heartbeat and signal handling keep
@@ -25,9 +47,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::monitor::pid::PressureLevel;
 
-/// CPU-seconds the bucket can hold: short bursts (a pre-scan, an index
-/// load) run at full speed; sustained work is paced at the budget rate.
+/// Default CPU-seconds the bucket can hold.
+///
+/// Short bursts (a pre-scan, an index load) run at full speed; sustained
+/// work is paced at the budget rate. Overridable per host with
+/// `telemetry.cpu_budget_burst_secs`.
 pub const BURST_SECS: f64 = 5.0;
+
+/// Floor for a configured burst. Below a CPU-second the bucket could never
+/// satisfy [`PASS_MIN_TOKENS`] and no discretionary pass would ever start.
+pub const MIN_BURST_SECS: f64 = PASS_MIN_TOKENS;
+
+/// Ceiling for a configured burst, so a typo cannot hand the scanner an
+/// effectively unbounded CPU allowance.
+pub const MAX_BURST_SECS: f64 = 600.0;
 
 /// Longest a single monitor tick stretches its sleep for the budget.
 ///
@@ -81,6 +114,7 @@ pub struct BudgetTick {
 #[derive(Debug, Clone)]
 pub struct CpuBudget {
     pct: u8,
+    burst_secs: f64,
     tokens: f64,
     last_wall: Instant,
     last_cpu_secs: f64,
@@ -100,6 +134,7 @@ impl CpuBudget {
     pub fn new(pct: u8, now: Instant, cpu_secs: f64) -> Self {
         Self {
             pct: pct.min(100),
+            burst_secs: BURST_SECS,
             tokens: BURST_SECS,
             last_wall: now,
             last_cpu_secs: cpu_secs,
@@ -122,6 +157,36 @@ impl CpuBudget {
     /// Change the budget (config reload) without losing the accounting.
     pub fn set_pct(&mut self, pct: u8) {
         self.pct = pct.min(100);
+    }
+
+    /// A bucket at `pct` percent of one core holding `burst` CPU-seconds.
+    ///
+    /// `burst` is clamped to `[MIN_BURST_SECS, MAX_BURST_SECS]`: a burst
+    /// under [`PASS_MIN_TOKENS`] would stop every discretionary pass from
+    /// ever starting.
+    #[must_use]
+    pub fn with_burst_secs(mut self, burst_secs: f64) -> Self {
+        self.set_burst_secs(burst_secs);
+        self.tokens = self.burst_secs;
+        self
+    }
+
+    /// Change the burst depth (config reload), keeping the current balance
+    /// but never above the new depth.
+    pub fn set_burst_secs(&mut self, burst_secs: f64) {
+        let burst = if burst_secs.is_finite() {
+            burst_secs.clamp(MIN_BURST_SECS, MAX_BURST_SECS)
+        } else {
+            BURST_SECS
+        };
+        self.burst_secs = burst;
+        self.tokens = self.tokens.min(burst);
+    }
+
+    /// CPU-seconds the bucket can hold.
+    #[must_use]
+    pub const fn burst_secs(&self) -> f64 {
+        self.burst_secs
     }
 
     /// Whether pacing is on (a zero budget only keeps the accounting).
@@ -149,24 +214,25 @@ impl CpuBudget {
         self.tokens.max(0.0)
     }
 
-    /// What a discretionary scan pass may do right now: `None` means no
-    /// limit (budget disabled, or Critical pressure), `Some(ZERO)` means do
-    /// not start (fewer than [`PASS_MIN_TOKENS`] CPU-seconds in the bucket),
-    /// otherwise the wall time the pass may walk: the available CPU-seconds
-    /// spread over `threads` workers, so the pass ends about when the bucket
-    /// does instead of overshooting by a whole pass.
+    /// What a discretionary scan pass may spend right now, in **CPU**-seconds:
+    /// `None` means no limit (budget disabled, or Critical pressure),
+    /// `Some(0.0)` means do not start (fewer than [`PASS_MIN_TOKENS`]
+    /// CPU-seconds in the bucket), otherwise the CPU-seconds in the bucket.
+    ///
+    /// The caller charges the pass its measured rusage delta through
+    /// [`PassCpuGuard`] rather than converting this to a wall deadline; see
+    /// the module docs for why the conversion was the bug that kept the
+    /// scanner to 0.7 s passes.
     #[must_use]
-    pub fn pass_allowance(&self, level: PressureLevel, threads: usize) -> Option<Duration> {
+    pub fn pass_cpu_allowance(&self, level: PressureLevel) -> Option<f64> {
         if !self.enabled() || level >= PressureLevel::Critical {
             return None;
         }
         let available = self.available_secs();
         if available < PASS_MIN_TOKENS {
-            return Some(Duration::ZERO);
+            return Some(0.0);
         }
-        #[allow(clippy::cast_precision_loss)]
-        let wall = available / threads.max(1) as f64;
-        Some(Duration::from_secs_f64(wall))
+        Some(available)
     }
 
     /// Account for the wall time since the last observation and the CPU the
@@ -178,8 +244,8 @@ impl CpuBudget {
         self.last_wall = now;
         self.last_cpu_secs = cpu_secs;
 
-        self.tokens =
-            (wall.mul_add(self.rate(), self.tokens) - used).clamp(-MAX_DEFICIT_SECS, BURST_SECS);
+        self.tokens = (wall.mul_add(self.rate(), self.tokens) - used)
+            .clamp(-MAX_DEFICIT_SECS, self.burst_secs);
 
         self.samples.push_back((now, used));
         while self
@@ -266,6 +332,128 @@ impl CpuBudget {
     }
 }
 
+/// How often [`PassCpuGuard`] re-reads the process's CPU time.
+///
+/// Reading it costs a `/proc` open (Linux) or a Mach call (macOS), and the
+/// scanner asks the guard on every directory entry, so the answer is cached
+/// for this long. The overshoot that permits is bounded by the CPU the
+/// daemon can burn in one interval, far under the burst.
+pub const CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Charges a single scan pass its **measured** CPU time against the
+/// allowance [`CpuBudget::pass_cpu_allowance`] handed out when the pass
+/// started.
+///
+/// The guard latches: once the allowance is spent it keeps reporting
+/// exhausted without re-sampling, so the pass unwinds through its nested
+/// loops with one verdict rather than flapping.
+pub struct PassCpuGuard {
+    allowance_secs: Option<f64>,
+    baseline_secs: Option<f64>,
+    spent_secs: f64,
+    last_sample: Instant,
+    sample_interval: Duration,
+    exhausted: bool,
+    sampler: Box<dyn FnMut() -> Option<f64> + Send>,
+}
+
+impl std::fmt::Debug for PassCpuGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PassCpuGuard")
+            .field("allowance_secs", &self.allowance_secs)
+            .field("spent_secs", &self.spent_secs)
+            .field("exhausted", &self.exhausted)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PassCpuGuard {
+    /// A guard over `allowance_secs` CPU-seconds (`None` = unlimited),
+    /// reading the process's cumulative user+system CPU seconds from
+    /// `sampler`. A sampler that returns `None` (the platform cannot report
+    /// CPU time) makes the guard inert: the pass is then bounded by its wall
+    /// budget alone, which is the safe direction — the old code's failure was
+    /// stopping too early, not too late.
+    pub fn new(
+        allowance_secs: Option<f64>,
+        now: Instant,
+        mut sampler: impl FnMut() -> Option<f64> + Send + 'static,
+    ) -> Self {
+        let baseline_secs = sampler();
+        Self {
+            allowance_secs,
+            baseline_secs,
+            spent_secs: 0.0,
+            last_sample: now,
+            sample_interval: CPU_SAMPLE_INTERVAL,
+            exhausted: false,
+            sampler: Box::new(sampler),
+        }
+    }
+
+    /// An inert guard: no allowance, nothing to sample. Used for operator
+    /// and config-reload scans, which bypass the budget by contract.
+    #[must_use]
+    pub fn unlimited(now: Instant) -> Self {
+        Self::new(None, now, || None)
+    }
+
+    /// Override the sampling interval (tests drive the clock directly).
+    #[must_use]
+    pub const fn with_sample_interval(mut self, interval: Duration) -> Self {
+        self.sample_interval = interval;
+        self
+    }
+
+    /// CPU-seconds this pass may spend in total, if it is limited at all.
+    #[must_use]
+    pub const fn allowance_secs(&self) -> Option<f64> {
+        self.allowance_secs
+    }
+
+    /// CPU-seconds charged to this pass so far (as of the last sample).
+    #[must_use]
+    pub const fn spent_secs(&self) -> f64 {
+        self.spent_secs
+    }
+
+    /// Whether the pass has spent its CPU allowance, re-sampling at most
+    /// once per [`CPU_SAMPLE_INTERVAL`].
+    pub fn exhausted(&mut self, now: Instant) -> bool {
+        if self.exhausted {
+            return true;
+        }
+        let Some(allowance) = self.allowance_secs else {
+            return false;
+        };
+        if self.baseline_secs.is_none() {
+            return false;
+        }
+        if now.saturating_duration_since(self.last_sample) < self.sample_interval {
+            return false;
+        }
+        self.last_sample = now;
+        self.sample();
+        self.exhausted = self.spent_secs >= allowance;
+        self.exhausted
+    }
+
+    /// Read the sampler once and update `spent_secs` (no latching).
+    fn sample(&mut self) {
+        let (Some(baseline), Some(current)) = (self.baseline_secs, (self.sampler)()) else {
+            return;
+        };
+        self.spent_secs = (current - baseline).max(0.0);
+    }
+
+    /// Final accounting for the pass, ignoring the sampling interval. Call
+    /// once when the pass ends so the reported figure is the whole pass.
+    pub fn finish(&mut self) -> f64 {
+        self.sample();
+        self.spent_secs
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,25 +507,125 @@ mod tests {
     }
 
     #[test]
-    fn pass_allowance_spreads_the_tokens_over_the_walker_threads() {
+    fn pass_cpu_allowance_is_the_bucket_balance_not_a_wall_deadline() {
         let (mut b, t0) = budget(25);
-        // A full bucket (5 s) over two threads: 2.5 s of wall.
-        let full = b.pass_allowance(PressureLevel::Green, 2).unwrap();
-        assert!((full.as_secs_f64() - 2.5).abs() < 1e-9, "{full:?}");
+        // A full bucket is 5 CPU-seconds, whatever the walker's thread count.
+        let full = b.pass_cpu_allowance(PressureLevel::Green).unwrap();
+        assert!((full - BURST_SECS).abs() < 1e-9, "{full}");
         // Nearly empty: the pass must not start until a CPU-second is back.
         b.observe(t0 + secs(1.0), 104.5); // 5 + 0.25 - 4.5 = 0.75
         assert!(b.available_secs() < PASS_MIN_TOKENS);
-        assert_eq!(
-            b.pass_allowance(PressureLevel::Orange, 2),
-            Some(Duration::ZERO)
-        );
+        assert_eq!(b.pass_cpu_allowance(PressureLevel::Orange), Some(0.0));
         b.observe(t0 + secs(3.0), 104.5); // +0.5 refill -> 1.25
-        let short = b.pass_allowance(PressureLevel::Orange, 2).unwrap();
-        assert!((short.as_secs_f64() - 0.625).abs() < 1e-9, "{short:?}");
+        let short = b.pass_cpu_allowance(PressureLevel::Orange).unwrap();
+        assert!((short - 1.25).abs() < 1e-9, "{short}");
         // Critical and a disabled budget never limit a pass.
-        assert_eq!(b.pass_allowance(PressureLevel::Critical, 2), None);
+        assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), None);
         let (off, _) = budget(0);
-        assert_eq!(off.pass_allowance(PressureLevel::Green, 2), None);
+        assert_eq!(off.pass_cpu_allowance(PressureLevel::Green), None);
+    }
+
+    /// The regression this whole change exists for: the old allowance was
+    /// `available_cpu_secs / parallelism` **as wall time**, and because the
+    /// bucket is clamped to the burst that gave a hard ceiling of
+    /// `burst / parallelism` seconds — 0.625 s on a 16-core host at the
+    /// default `parallelism = cores / 2`. A pass can now spend the whole
+    /// bucket regardless of how many walker threads there are.
+    #[test]
+    fn allowance_no_longer_shrinks_with_the_thread_count() {
+        let (b, _) = budget(25);
+        let allowance = b.pass_cpu_allowance(PressureLevel::Orange).unwrap();
+        // The value the fleet observed as a 0.7 s wall deadline.
+        let legacy_wall_ceiling = BURST_SECS / 8.0;
+        assert!(
+            legacy_wall_ceiling < 1.0,
+            "the legacy conversion really did produce a sub-second budget: {legacy_wall_ceiling}"
+        );
+        assert!(
+            allowance >= PASS_MIN_TOKENS,
+            "a full bucket must fund a real pass, got {allowance}"
+        );
+        assert!((allowance - BURST_SECS).abs() < 1e-9, "{allowance}");
+    }
+
+    #[test]
+    fn burst_is_configurable_and_clamped() {
+        let now = Instant::now();
+        let wide = CpuBudget::new(25, now, 0.0).with_burst_secs(120.0);
+        assert!((wide.burst_secs() - 120.0).abs() < 1e-9);
+        assert!(
+            (wide.pass_cpu_allowance(PressureLevel::Green).unwrap() - 120.0).abs() < 1e-9,
+            "a wider bucket funds a longer pass"
+        );
+        // Below PASS_MIN_TOKENS no pass could ever start, so it is clamped up.
+        let tiny = CpuBudget::new(25, now, 0.0).with_burst_secs(0.05);
+        assert!((tiny.burst_secs() - MIN_BURST_SECS).abs() < 1e-9);
+        let huge = CpuBudget::new(25, now, 0.0).with_burst_secs(1.0e9);
+        assert!((huge.burst_secs() - MAX_BURST_SECS).abs() < 1e-9);
+        let nan = CpuBudget::new(25, now, 0.0).with_burst_secs(f64::NAN);
+        assert!((nan.burst_secs() - BURST_SECS).abs() < 1e-9);
+        // A reload that narrows the bucket also caps the balance.
+        let mut narrowed = wide;
+        narrowed.set_burst_secs(2.0);
+        assert!(narrowed.available_secs() <= 2.0 + 1e-9);
+    }
+
+    #[test]
+    fn pass_guard_charges_measured_cpu_and_latches() {
+        let t0 = Instant::now();
+        let cpu = std::sync::Arc::new(std::sync::Mutex::new(10.0_f64));
+        let handle = std::sync::Arc::clone(&cpu);
+        let mut guard = PassCpuGuard::new(Some(2.0), t0, move || Some(*handle.lock().unwrap()))
+            .with_sample_interval(Duration::from_millis(100));
+        // Within the sample interval the guard does not even look.
+        *cpu.lock().unwrap() = 99.0;
+        assert!(!guard.exhausted(t0 + Duration::from_millis(50)));
+        // Half the allowance spent: keep going.
+        *cpu.lock().unwrap() = 11.0;
+        assert!(!guard.exhausted(t0 + Duration::from_millis(200)));
+        assert!((guard.spent_secs() - 1.0).abs() < 1e-9);
+        // Over the allowance: exhausted, and it stays exhausted even if the
+        // sampler goes backwards.
+        *cpu.lock().unwrap() = 12.5;
+        assert!(guard.exhausted(t0 + Duration::from_millis(400)));
+        *cpu.lock().unwrap() = 10.0;
+        assert!(guard.exhausted(t0 + Duration::from_millis(4000)));
+    }
+
+    /// An I/O-bound walk burns almost no CPU, so the guard must let it run.
+    /// This is exactly the fleet case: enumerating a 100 GB `/data/projects`
+    /// is syscall- and disk-bound, and the old model charged it as though
+    /// every walker thread pegged a core.
+    #[test]
+    fn pass_guard_lets_an_io_bound_pass_run_long() {
+        let t0 = Instant::now();
+        let cpu = std::sync::Arc::new(std::sync::Mutex::new(0.0_f64));
+        let handle = std::sync::Arc::clone(&cpu);
+        let mut guard = PassCpuGuard::new(Some(5.0), t0, move || Some(*handle.lock().unwrap()))
+            .with_sample_interval(Duration::from_millis(100));
+        // 120 seconds of wall time at 2% of a core.
+        for tick in 1_u64..=120 {
+            #[allow(clippy::cast_precision_loss)]
+            let cpu_secs = tick as f64 * 0.02;
+            *cpu.lock().unwrap() = cpu_secs;
+            assert!(
+                !guard.exhausted(t0 + Duration::from_secs(tick)),
+                "an I/O-bound pass must not be cut at t={tick}s"
+            );
+        }
+        assert!(guard.finish() < 5.0);
+    }
+
+    #[test]
+    fn pass_guard_is_inert_without_an_allowance_or_a_sampler() {
+        let t0 = Instant::now();
+        let mut unlimited = PassCpuGuard::unlimited(t0);
+        assert!(!unlimited.exhausted(t0 + Duration::from_secs(3600)));
+        assert_eq!(unlimited.allowance_secs(), None);
+        // A platform that cannot report CPU time must not stop the pass.
+        let mut blind = PassCpuGuard::new(Some(0.001), t0, || None)
+            .with_sample_interval(Duration::from_millis(1));
+        assert!(!blind.exhausted(t0 + Duration::from_secs(60)));
     }
 
     #[test]

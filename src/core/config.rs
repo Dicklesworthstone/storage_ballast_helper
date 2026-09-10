@@ -529,6 +529,20 @@ pub struct ScannerConfig {
     pub max_scan_duty_cycle_pct: u8,
     /// Maximum wall-clock seconds for a single scan pass. 0 = use built-in default.
     pub scan_time_budget_secs: u64,
+    /// Maximum wall-clock seconds the *priority pre-scan* phase may take
+    /// before the pass moves on to the general walker. 0 = no separate
+    /// limit (the pre-scan may use the whole pass budget).
+    ///
+    /// The pre-scan is the shallow depth-1..3 sweep for the big obvious
+    /// artifact directories. It runs first because it finds multi-GB
+    /// `target/` and `node_modules/` trees in seconds; but on a host with
+    /// hundreds of repositories it cannot finish, and before 0.6.2 that
+    /// aborted the whole pass — the general walker never ran at all, and the
+    /// pre-scan restarted from the same leading directories every time
+    /// (`scan complete: 0 entries, 0 candidates`). Truncating only the
+    /// *phase*, with `scanner.prescan_cursor` resuming where it stopped,
+    /// makes a large tree get covered across passes instead of never.
+    pub prescan_time_budget_secs: u64,
     /// Layer 7: at Green (and for manual `clean`) candidates are moved into
     /// `<mount>/.sbh/quarantine` instead of unlinked, restorable with
     /// `sbh undo <decision-id>`; pressure drains the quarantine oldest-first
@@ -769,6 +783,15 @@ pub struct TelemetryConfig {
     /// yields (never at Critical, never for ballast release, state writes or
     /// heartbeats). 0 disables pacing; accounting still shows in `sbh status`.
     pub cpu_budget_pct: u8,
+    /// Depth of the CPU token bucket in CPU-seconds: the most a single
+    /// discretionary scan pass may spend, and the size of the burst the
+    /// daemon may take above `cpu_budget_pct` before it is paced.
+    ///
+    /// Clamped to `[1.0, 600.0]`. Raise it on a host with a very large tree
+    /// whose passes are genuinely CPU-hungry; the default 5 s is ample for
+    /// the I/O-bound case because the pass is charged its *measured* rusage
+    /// delta, not a worst-case `threads x wall` model.
+    pub cpu_budget_burst_secs: f64,
     /// Write a Prometheus textfile export (`metrics.prom` beside
     /// `state.json`) with every state write, for node_exporter's textfile
     /// collector. Off removes any stale export at startup.
@@ -984,6 +1007,13 @@ impl PathsConfig {
     pub fn scanner_index_file(&self) -> PathBuf {
         data_dir_for_paths(self).join("scanner-index-v2.json")
     }
+
+    /// Durable resume point for the priority pre-scan, so a tree too large to
+    /// enumerate in one pass is covered across passes and across restarts.
+    #[must_use]
+    pub fn prescan_cursor_file(&self) -> PathBuf {
+        data_dir_for_paths(self).join("prescan-cursor.json")
+    }
 }
 
 /// User-managed protection paths kept separate from the generated main config.
@@ -1135,6 +1165,12 @@ impl Default for ScannerConfig {
             // entries. Scans timing out before identifying candidates was the
             // failure mode behind the 2026-04-30 100%-disk incident on ts1.
             scan_time_budget_secs: 900,
+            // 60s of shallow read_dir covers a few thousand depth-1..3
+            // entries. Past that the general walker (which has its own
+            // incremental cursor and computes real recursive sizes) is the
+            // better use of the remaining pass budget; the pre-scan resumes
+            // from its cursor next pass.
+            prescan_time_budget_secs: 60,
             quarantine_enabled: true,
             quarantine_ttl_hours: 24,
             quarantine_max_bytes_pct: 5,
@@ -1214,6 +1250,7 @@ impl Default for TelemetryConfig {
             daemon_rss_warning_bytes: 256 * 1024 * 1024,
             daemon_rss_hard_limit_bytes: 500 * 1024 * 1024,
             cpu_budget_pct: 25,
+            cpu_budget_burst_secs: crate::daemon::cpu_budget::BURST_SECS,
             metrics_enabled: true,
         }
     }
@@ -1844,6 +1881,10 @@ impl Config {
         self.apply_scanner_env_overrides_from(env_var)?;
         set_env_usize("SBH_SCANNER_MAX_DEPTH", &mut self.scanner.max_depth)?;
         set_env_usize("SBH_SCANNER_PARALLELISM", &mut self.scanner.parallelism)?;
+        set_env_u64(
+            "SBH_SCANNER_PRESCAN_TIME_BUDGET_SECS",
+            &mut self.scanner.prescan_time_budget_secs,
+        )?;
         set_env_bool(
             "SBH_SCANNER_FOLLOW_SYMLINKS",
             &mut self.scanner.follow_symlinks,
@@ -1941,6 +1982,10 @@ impl Config {
         set_env_u8(
             "SBH_TELEMETRY_CPU_BUDGET_PCT",
             &mut self.telemetry.cpu_budget_pct,
+        )?;
+        set_env_f64(
+            "SBH_TELEMETRY_CPU_BUDGET_BURST_SECS",
+            &mut self.telemetry.cpu_budget_burst_secs,
         )?;
 
         // update
@@ -2385,6 +2430,28 @@ impl Config {
             return Err(SbhError::InvalidConfig {
                 details: "telemetry.daemon_rss_warning_bytes must be <= telemetry.daemon_rss_hard_limit_bytes"
                     .to_string(),
+            });
+        }
+        if !self.telemetry.cpu_budget_burst_secs.is_finite()
+            || self.telemetry.cpu_budget_burst_secs < crate::daemon::cpu_budget::MIN_BURST_SECS
+            || self.telemetry.cpu_budget_burst_secs > crate::daemon::cpu_budget::MAX_BURST_SECS
+        {
+            return Err(SbhError::InvalidConfig {
+                details: format!(
+                    "telemetry.cpu_budget_burst_secs must be {}..={} CPU-seconds",
+                    crate::daemon::cpu_budget::MIN_BURST_SECS,
+                    crate::daemon::cpu_budget::MAX_BURST_SECS
+                ),
+            });
+        }
+        if self.scanner.prescan_time_budget_secs > 0
+            && self.scanner.scan_time_budget_secs > 0
+            && self.scanner.prescan_time_budget_secs > self.scanner.scan_time_budget_secs
+        {
+            return Err(SbhError::InvalidConfig {
+                details:
+                    "scanner.prescan_time_budget_secs must be <= scanner.scan_time_budget_secs"
+                        .to_string(),
             });
         }
         if self.telemetry.cpu_budget_pct > 100 {

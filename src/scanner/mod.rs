@@ -10,6 +10,7 @@ pub mod log_truncator;
 pub mod merkle;
 pub mod patterns;
 pub mod planner;
+pub mod prescan_cursor;
 pub mod protection;
 pub mod quarantine;
 pub mod regret;

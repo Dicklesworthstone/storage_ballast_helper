@@ -637,6 +637,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | scanner | `min_rescan_interval_secs` | `90` | Shortest gap between scans of one root | `src/core/config.rs` |
 | scanner | `max_scan_duty_cycle_pct` | `25` | Share of wall time the scanner may use | `src/core/config.rs` |
 | scanner | `scan_time_budget_secs` | `900` | Longest single scan | `src/core/config.rs` |
+| scanner | `prescan_time_budget_secs` | `60` | Longest priority pre-scan phase before the walker takes over | `src/core/config.rs` |
 | scanner | `quarantine_ttl_hours` | `24` | Quarantined entries expire after this | `src/core/config.rs` |
 | scanner | `quarantine_max_bytes_pct` | `5` | Quarantine size cap as % of the volume | `src/core/config.rs` |
 | scanner | `active_reference_cache_ttl_secs` | `30` | Active-reference (open file) cache lifetime | `src/core/config.rs` |

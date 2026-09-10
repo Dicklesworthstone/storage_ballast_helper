@@ -4,6 +4,85 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and the Release workflow refuses to publish a tag that has no marked heading here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
+## v0.6.2 **[release]**
+
+Compare: [`v0.6.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.1...HEAD)
+
+### Fixed — the scan pass budget: sbh reclaimed nothing on any host with a large tree
+
+Measured on hz1, vmi1167313 and vmi1156319, every pass of an "active, healthy"
+0.6.x daemon ended:
+
+```
+[SBH-SCANNER] priority pre-scan budget reached (0.7s) — cancelling scan pass
+[SBH-SCANNER] scan complete: 0 entries, 0 candidates, 0.7s (timed out)
+```
+
+Four defects compounded into a scanner that burned its CPU quota and reclaimed
+nothing while the disks filled.
+
+- **The CPU budget was converted into a wall deadline with a worst-case model
+  (`src/daemon/cpu_budget.rs`, `src/daemon/loop_main.rs`).**
+  `CpuBudget::pass_allowance` returned `available_cpu_secs / scanner.parallelism`
+  *as wall time*, i.e. assuming every walker thread pegs a core for the whole
+  pass, and the scanner then took `min(scan_time_budget_secs, that)`. Because
+  the token bucket is clamped to its burst (5 CPU-seconds), that gave every
+  discretionary pass a **hard wall ceiling of `burst / parallelism`** — 0.62 s
+  at the default `parallelism = cores / 2` on a 16-core host, 0.71 s on 14
+  cores — which no amount of idling could raise, and which silently overrode
+  the configured `scan_time_budget_secs = 900`. The model was wrong twice over:
+  a directory walk is I/O- and syscall-bound, and the priority pre-scan that
+  the deadline actually killed is single-threaded. It is now
+  `CpuBudget::pass_cpu_allowance`, a CPU-second allowance charged against the
+  pass's **measured** rusage delta by the new `PassCpuGuard`. The documented
+  bound (`pct/100 * w + burst` over any window `w`) is unchanged and now exact
+  rather than pessimistic; an I/O-bound pass runs to its wall budget.
+- **The priority pre-scan restarted from the first root on every pass
+  (`src/scanner/prescan_cursor.rs`, new).** Truncated at 0.7 s it re-examined
+  the same leading directories forever. The new `PrescanCursor` remembers the
+  root and depth-1 entry the last pass finished, sorts each root's entries so
+  the resume point is stable, resumes strictly after it, wraps to the next root
+  when one is exhausted, and is persisted to `prescan-cursor.json` beside the
+  scanner index so progress survives a restart. A tree needing twenty passes to
+  cover is now covered in twenty passes rather than never.
+- **A pre-scan timeout aborted the whole pass, so the general walker never ran
+  (`src/daemon/loop_main.rs`).** The pre-scan phase now has its own wall budget,
+  `scanner.prescan_time_budget_secs` (default 60 s, `0` = no separate limit);
+  exhausting it hands the pass over to the walker — which has its own
+  incremental cursor and computes real recursive sizes — instead of ending it.
+  Only the pass wall budget and the CPU allowance mark a pass as timed out.
+- **Pressure *shortened* the scan budget (`effective_scan_budget`).** The
+  Orange/Red/Critical extension was `base * 2` clamped with `.min(600)`, so with
+  the shipped default of 900 s the hosts under pressure got 600 s — less than
+  Green. It is now clamped to `[base, 3600]`.
+
+### Fixed — test robustness
+
+- `tests/integration_tests.rs` picked its fixture base with
+  `Path::new("/private/tmp").is_dir()`, meant to resolve macOS's `/tmp`
+  symlink. A Linux build worker can carry a root-owned `/private/tmp` left
+  behind by a synced macOS path, and the two `clean` tests then failed with
+  `PermissionDenied`. The new `system_temp_base()` probes for writability
+  instead of existence.
+
+### Added
+
+- `telemetry.cpu_budget_burst_secs` (default `5.0`, clamped to `[1, 600]`,
+  `SBH_TELEMETRY_CPU_BUDGET_BURST_SECS`): the depth of the CPU token bucket,
+  i.e. the most CPU a single discretionary pass may spend.
+- `scanner.prescan_time_budget_secs` (default `60`,
+  `SBH_SCANNER_PRESCAN_TIME_BUDGET_SECS`): the priority pre-scan phase's own
+  wall budget.
+- **Operator-visible budget reporting.** A truncated pre-scan and a truncated
+  pass now both emit an `ActivityEvent::Warning` with code `SBH-2007`
+  naming which limit stopped it, how many entries it reached, the wall and CPU
+  time spent, and where the next pass resumes — so a budget-starved daemon
+  shows up in `sbh status` and the activity log, not only on stderr. The
+  `scan complete` line now reports the pre-scan's real entry count instead of a
+  hardcoded `0 entries`, and carries the pass's measured CPU.
+
+---
+
 ## v0.6.1 **[release]**
 
 Compare: [`v0.6.0...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.0...HEAD)

@@ -209,6 +209,10 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
     cfg("SBH_SCANNER_FOLLOW_SYMLINKS", "`scanner.follow_symlinks`"),
     cfg("SBH_SCANNER_MAX_DEPTH", "`scanner.max_depth`"),
     cfg("SBH_SCANNER_PARALLELISM", "`scanner.parallelism`"),
+    cfg(
+        "SBH_SCANNER_PRESCAN_TIME_BUDGET_SECS",
+        "`scanner.prescan_time_budget_secs`",
+    ),
     cfg("SBH_SCANNER_MAX_DELETE_BATCH", "`scanner.max_delete_batch`"),
     cfg(
         "SBH_SCANNER_MIN_FILE_AGE_MINUTES",
@@ -297,6 +301,10 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         "`system_tuning.writeback.pool_warn_bytes`",
     ),
     cfg("SBH_TELEMETRY_CPU_BUDGET_PCT", "`telemetry.cpu_budget_pct`"),
+    cfg(
+        "SBH_TELEMETRY_CPU_BUDGET_BURST_SECS",
+        "`telemetry.cpu_budget_burst_secs`",
+    ),
     cfg(
         "SBH_TELEMETRY_FS_CACHE_TTL_MS",
         "`telemetry.fs_cache_ttl_ms`",
@@ -1100,6 +1108,13 @@ pub fn constants() -> Vec<ConstantDoc> {
             "scan_time_budget_secs",
             scanner.scan_time_budget_secs,
             "Longest single scan",
+            CONFIG,
+        ),
+        constant(
+            "scanner",
+            "prescan_time_budget_secs",
+            scanner.prescan_time_budget_secs,
+            "Longest priority pre-scan phase before the walker takes over",
             CONFIG,
         ),
         constant(
