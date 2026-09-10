@@ -316,9 +316,12 @@ if [[ "$mode" == "package" ]]; then
   # Step 4: Generate release-provenance.json if missing
   if [[ ! -f "${artifact_dir}/release-provenance.json" ]]; then
     echo "  Generating release-provenance.json..."
-    commit_sha="$(git rev-parse HEAD)"
-    if git rev-parse "${tag}^{commit}" >/dev/null 2>&1; then
-      commit_sha="$(git rev-parse "${tag}^{commit}")"
+    # `--package` runs with the artifact dir as cwd (line 250), which is not a
+    # git repository: without -C these two calls die under `set -e` and the
+    # provenance document is never written, which then fails the audit.
+    commit_sha="$(git -C "$root_dir" rev-parse HEAD)"
+    if git -C "$root_dir" rev-parse "${tag}^{commit}" >/dev/null 2>&1; then
+      commit_sha="$(git -C "$root_dir" rev-parse "${tag}^{commit}")"
     fi
     rustc_ver="$(rustc --version 2>/dev/null || echo "rustc nightly")"
     cat > "${artifact_dir}/release-provenance.json" <<EOF
