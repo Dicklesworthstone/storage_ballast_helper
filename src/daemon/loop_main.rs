@@ -92,7 +92,7 @@ use crate::scanner::patterns::{
 use crate::scanner::planner::{PlanRequest, RiskBudgetByLevel, plan_batch};
 use crate::scanner::prescan_cursor::PrescanCursor;
 use crate::scanner::protection::{self, ProtectionRegistry};
-use crate::scanner::quarantine::QuarantineStore;
+use crate::scanner::quarantine::{DrainOutcome as QuarantineDrainOutcome, QuarantineStore};
 use crate::scanner::regret::{
     EntryIdentity, Outcome, RegretCalibrator, RegretConfig, RegretDetector, Sighting, Watch,
     certainty_from_name,
@@ -6094,25 +6094,49 @@ impl MonitoringDaemon {
                     store.drain_all().map(|drained| ("pressure", drained))
                 } else {
                     store.drain_expired(now_unix).and_then(|expired| {
-                        let capped = cap_bytes.map_or(Ok((0, 0)), |cap| store.enforce_cap(cap))?;
-                        Ok(if capped.0 > 0 {
-                            ("size cap", (expired.0 + capped.0, expired.1 + capped.1))
+                        let capped = match cap_bytes {
+                            Some(cap) => store.enforce_cap(cap)?,
+                            None => QuarantineDrainOutcome::default(),
+                        };
+                        let why = if capped.entries > 0 {
+                            "size cap"
                         } else {
-                            ("ttl", expired)
-                        })
+                            "ttl"
+                        };
+                        Ok((why, expired.merged(capped)))
                     })
                 };
                 match outcome {
-                    Ok((why, (count, bytes))) if count > 0 => {
-                        let message = format!(
-                            "quarantine under {} drained {count} entr{} ({bytes} bytes) for {why} at {level:?}",
-                            root.display(),
-                            if count == 1 { "y" } else { "ies" }
-                        );
-                        eprintln!("[SBH-QUARANTINE] {message}");
-                        self.logger_handle.send(ActivityEvent::Info { message });
+                    Ok((why, drained)) => {
+                        if drained.entries > 0 {
+                            let count = drained.entries;
+                            let bytes = drained.bytes;
+                            let message = format!(
+                                "quarantine under {} drained {count} entr{} ({bytes} bytes) for {why} at {level:?}",
+                                root.display(),
+                                if count == 1 { "y" } else { "ies" }
+                            );
+                            eprintln!("[SBH-QUARANTINE] {message}");
+                            self.logger_handle.send(ActivityEvent::Info { message });
+                        }
+                        // A stuck entry is reported the first time it sticks,
+                        // then goes quiet for STUCK_RETRY_SECS. Reporting it
+                        // every sweep would be a line a minute, forever.
+                        for failure in drained.new_failures() {
+                            let message = format!(
+                                "quarantine entry {} under {} will not unlink: {} ({})",
+                                failure.decision_id,
+                                root.display(),
+                                failure.error,
+                                failure.path.display()
+                            );
+                            eprintln!("[SBH-QUARANTINE] {message}");
+                            self.logger_handle.send(ActivityEvent::Error {
+                                code: failure.code.clone(),
+                                message,
+                            });
+                        }
                     }
-                    Ok(_) => {}
                     Err(e) => {
                         eprintln!(
                             "[SBH-QUARANTINE] sweep under {} failed: {e}",

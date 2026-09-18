@@ -2282,6 +2282,16 @@ fn system_temp_base() -> &'static str {
     if writable { "/private/tmp" } else { "/tmp" }
 }
 
+/// On macOS `/private/tmp` is the real directory `/tmp` symlinks to, so it is
+/// already the canonical form these tests compare against. Without this arm
+/// the crate's test target does not build on the Mac at all:
+/// `clean_quarantines_at_green_and_undo_restores_the_target` is not gated to
+/// Linux but calls this helper.
+#[cfg(not(target_os = "linux"))]
+fn system_temp_base() -> &'static str {
+    "/private/tmp"
+}
+
 /// `sbh clean --dry-run` records its decisions in the ledger and `sbh explain`
 /// reads them back by `--last`, `--id` (every level) and `--path`; an unknown
 /// id fails with a hint listing recent ids.

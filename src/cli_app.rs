@@ -64,7 +64,7 @@ use storage_ballast_helper::scanner::patterns::{
 };
 use storage_ballast_helper::scanner::planner::{BatchPlan, PlanRequest, plan_batch};
 use storage_ballast_helper::scanner::protection::{self, ProtectionRegistry};
-use storage_ballast_helper::scanner::quarantine::QuarantineStore;
+use storage_ballast_helper::scanner::quarantine::{QuarantineStore, StuckEntry};
 use storage_ballast_helper::scanner::scoring::{
     ActiveReferenceSummary, CandidacyScore, CandidateInput, ScoringEngine,
 };
@@ -6295,8 +6295,10 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
         .filter(|rec| rec.category != TuningCategory::KernelWriteback)
         .collect();
 
-    // Apply config-file recommendations.
-    let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
+    // Apply config-file recommendations. Same write resolver as `config set`:
+    // a tuning run that writes a file the daemon ignores is worse than no
+    // tuning run, because it reports success.
+    let config_path = Config::resolve_config_write_path(cli.config.as_deref()).path;
     if !config_recs.is_empty() {
         let mut toml_value: toml::Value = if config_path.exists() {
             let raw = std::fs::read_to_string(&config_path)
@@ -6583,7 +6585,10 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
         }
         Some(ConfigCommand::Reset) => {
             let defaults = Config::default();
-            let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
+            // As for `set`: reset must rewrite the file that is actually in
+            // effect, or it reports resetting a config it never touched.
+            let resolved = Config::resolve_config_write_path(cli.config.as_deref());
+            let config_path = resolved.path.clone();
 
             if let Some(parent) = config_path.parent() {
                 std::fs::create_dir_all(parent)
@@ -6598,11 +6603,21 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
             match output_mode(cli) {
                 OutputMode::Human => {
                     println!("Reset config to defaults: {}", config_path.display());
+                    println!("  ({})", resolved.reason);
+                    if let Some(shadowed) = &resolved.shadowed_user_config {
+                        println!(
+                            "  note: {} still shadows this file for non-root invocations",
+                            shadowed.display()
+                        );
+                    }
                 }
                 OutputMode::Json => {
                     let payload = json!({
                         "command": "config reset",
                         "path": config_path.to_string_lossy(),
+                        "path_source": resolved.source,
+                        "reason": resolved.reason,
+                        "shadowed_user_config": resolved.shadowed_user_config,
                     });
                     write_json_line(&payload)?;
                 }
@@ -6610,7 +6625,10 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
             Ok(())
         }
         Some(ConfigCommand::Set(set_args)) => {
-            let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
+            // Same resolver the readers use: writing a file the daemon does
+            // not read is silent data loss (bd-config-set-wrong-path-3gp1).
+            let resolved = Config::resolve_config_write_path(cli.config.as_deref());
+            let config_path = resolved.path.clone();
 
             // Read existing TOML or start from empty table.
             let mut toml_value: toml::Value = if config_path.exists() {
@@ -6663,6 +6681,13 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
                         set_args.value,
                         config_path.display()
                     );
+                    println!("  ({})", resolved.reason);
+                    if let Some(shadowed) = &resolved.shadowed_user_config {
+                        println!(
+                            "  note: {} still shadows this file for non-root invocations",
+                            shadowed.display()
+                        );
+                    }
                     if let Some(note) = &unit_update {
                         println!("  {note}");
                     }
@@ -6673,6 +6698,9 @@ fn run_config(cli: &Cli, args: &ConfigArgs) -> Result<(), CliError> {
                         "key": set_args.key,
                         "value": set_args.value,
                         "path": config_path.to_string_lossy(),
+                        "path_source": resolved.source,
+                        "reason": resolved.reason,
+                        "shadowed_user_config": resolved.shadowed_user_config,
                         "valid": true,
                         "systemd_unit": unit_update,
                     });
@@ -7941,6 +7969,7 @@ fn system_doctor_checks(
     let mut checks = vec![
         writeback_doctor_check(platform, config),
         ballast_reserve_doctor_check(config),
+        quarantine_stuck_doctor_check(config),
     ];
     checks.extend(reserve_coverage_doctor_checks(config, bursts, pools));
     checks.push(logging_placement_doctor_check(platform, config, pools));
@@ -8202,6 +8231,74 @@ fn burst_reserve_recommendations(
 /// releasable. A dashboard reading configured totals alone can believe a full
 /// reserve exists after every file has been released or lost — exactly when
 /// the reserve is needed most.
+/// Quarantine entries that a drain cannot unlink.
+///
+/// A stuck entry is not just wasted bytes: because the drains walk the store
+/// oldest-first, a permanently unremovable entry used to abort every sweep and
+/// silently wedge the whole quarantine. The drains are best-effort now, but a
+/// stuck entry still holds space that `held_bytes` counts and the TTL will
+/// never reclaim, so it has to be visible somewhere other than the journal —
+/// a version check is not a liveness check.
+fn quarantine_stuck_doctor_check(config: &Config) -> DoctorCheck {
+    let mut stuck: Vec<StuckEntry> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
+    for root in &config.scanner.root_paths {
+        match QuarantineStore::under(root).stuck_entries() {
+            Ok(entries) => stuck.extend(entries),
+            Err(e) => unreadable.push(format!("{}: {e}", root.display())),
+        }
+    }
+    if !unreadable.is_empty() {
+        return doctor_check(
+            "quarantine.stuck",
+            "Quarantine drain",
+            "WARN",
+            format!("could not read {}", unreadable.join("; ")),
+            Some("Check that the quarantine roots are readable by this user.".to_string()),
+        );
+    }
+    if stuck.is_empty() {
+        return doctor_check(
+            "quarantine.stuck",
+            "Quarantine drain",
+            "PASS",
+            format!(
+                "no stuck entries across {} quarantine root{}",
+                config.scanner.root_paths.len(),
+                if config.scanner.root_paths.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            None,
+        );
+    }
+    stuck.sort_by_key(|entry| std::cmp::Reverse(entry.failures));
+    let worst = &stuck[0];
+    let detail = format!(
+        "{} entr{} will not unlink; worst is {} after {} failed drain{} ({})",
+        stuck.len(),
+        if stuck.len() == 1 { "y" } else { "ies" },
+        worst.path.display(),
+        worst.failures,
+        if worst.failures == 1 { "" } else { "s" },
+        worst.last_error,
+    );
+    doctor_check(
+        "quarantine.stuck",
+        "Quarantine drain",
+        "FAIL",
+        detail,
+        Some(format!(
+            "Inspect {} — a mountpoint, an immutable bit or an open handle under the entry \
+             will block `remove_dir_all`. `sbh undo {}` restores it instead.",
+            worst.path.display(),
+            worst.decision_id,
+        )),
+    )
+}
+
 fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
     let availability = BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
     match availability.health {
@@ -10602,6 +10699,35 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                             println!("  WARNING: {warning}");
                         }
                     }
+                }
+            }
+
+            // Quarantine: reported only when something is wrong. A stuck entry
+            // holds space the TTL will never reclaim, and before the drains
+            // became best-effort it also blocked every later entry behind it,
+            // so it must not be journal-only. Silent in the normal case.
+            let stuck_entries: Vec<StuckEntry> = config
+                .scanner
+                .root_paths
+                .iter()
+                .filter_map(|root| QuarantineStore::under(root).stuck_entries().ok())
+                .flatten()
+                .collect();
+            if !stuck_entries.is_empty() {
+                println!("\nQuarantine:");
+                println!(
+                    "  WARNING: {} stuck entr{} (run `sbh doctor --system`)",
+                    stuck_entries.len(),
+                    if stuck_entries.len() == 1 { "y" } else { "ies" },
+                );
+                for entry in stuck_entries.iter().take(3) {
+                    println!(
+                        "    {} after {} failed drain{}: {}",
+                        entry.path.display(),
+                        entry.failures,
+                        if entry.failures == 1 { "" } else { "s" },
+                        entry.last_error,
+                    );
                 }
             }
 
@@ -14955,13 +15081,27 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     // full disk it goes first, before anything is scanned or scored.
     for root in &root_paths {
         match QuarantineStore::under(root).drain_all() {
-            Ok((count, bytes)) if count > 0 => eprintln!(
-                "[SBH-EMERGENCY] drained {count} quarantined entr{} ({}) under {}",
-                if count == 1 { "y" } else { "ies" },
-                format_bytes(bytes),
-                root.display()
-            ),
-            Ok(_) => {}
+            Ok(drained) => {
+                if drained.entries > 0 {
+                    eprintln!(
+                        "[SBH-EMERGENCY] drained {} quarantined entr{} ({}) under {}",
+                        drained.entries,
+                        if drained.entries == 1 { "y" } else { "ies" },
+                        format_bytes(drained.bytes),
+                        root.display()
+                    );
+                }
+                // In emergency the entries that would not go are exactly the
+                // ones worth naming: the operator is standing at a full disk.
+                for failure in &drained.failures {
+                    eprintln!(
+                        "[SBH-EMERGENCY] quarantine entry {} will not unlink: {} ({})",
+                        failure.decision_id,
+                        failure.error,
+                        failure.path.display()
+                    );
+                }
+            }
             Err(e) => eprintln!(
                 "[SBH-EMERGENCY] quarantine under {} not drained: {e}",
                 root.display()

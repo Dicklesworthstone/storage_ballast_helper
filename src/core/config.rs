@@ -1705,6 +1705,24 @@ impl Config {
         resolve_config_path_with(explicit, &PathsConfig::default(), true)
     }
 
+    /// The config file a *write* must target — `sbh config set`,
+    /// `sbh config reset`, `sbh tune --apply` — and why.
+    ///
+    /// Writes resolve exactly as reads do, and that is the whole point of this
+    /// existing. They did not always: the writers used the raw per-user
+    /// default, so as root on a host carrying `/etc/sbh/config.toml` a
+    /// `sbh config set` wrote `~root/.config/sbh/config.toml` — a file the
+    /// daemon never reads and `sbh config show` never reports — and exited 0.
+    /// A config write that silently goes nowhere is the worst failure mode
+    /// available to a daemon that gets tuned in the middle of an incident.
+    ///
+    /// Reads and writes therefore share one resolver, the same way
+    /// `sbh config path` and [`Config::load`] already do.
+    #[must_use]
+    pub fn resolve_config_write_path(explicit: Option<&Path>) -> ResolvedConfigPath {
+        Self::resolve_config_path(explicit)
+    }
+
     /// Load config from default or explicit path, then apply env overrides.
     ///
     /// Resolution order for config file path:
@@ -3235,6 +3253,66 @@ mod tests {
         let r = resolve_config_path_from(None, None, &user, &system, true, false);
         assert_eq!(r.source, ConfigPathSource::Default);
         assert!(r.shadowed_user_config.is_none());
+    }
+
+    /// bd-config-set-wrong-path-3gp1: a write must land on the file a read
+    /// comes from. `config set`, `config reset` and `tune --apply` used the
+    /// raw per-user default instead of the resolver, so as root on a host
+    /// carrying a system config they wrote `~root/.config/sbh/config.toml`,
+    /// which the daemon never reads, and still exited 0.
+    #[test]
+    fn config_writes_resolve_to_the_same_file_as_reads() {
+        use super::{ConfigPathSource, resolve_config_path_from};
+        use std::path::Path;
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        let system = dir.path().join("system.toml");
+        let explicit = dir.path().join("explicit.toml");
+
+        // (is_root, user exists, system exists) -> the one file both sides use.
+        let cases: &[(bool, bool, bool, ConfigPathSource, &Path)] = &[
+            // The regression: root, both present. Writes went to `user`.
+            (true, true, true, ConfigPathSource::SystemForRoot, &system),
+            (true, false, true, ConfigPathSource::SystemForRoot, &system),
+            (true, true, false, ConfigPathSource::Default, &user),
+            (true, false, false, ConfigPathSource::Default, &user),
+            (
+                false,
+                false,
+                true,
+                ConfigPathSource::SystemFallback,
+                &system,
+            ),
+            (false, true, true, ConfigPathSource::Default, &user),
+            (false, true, false, ConfigPathSource::Default, &user),
+            (false, false, false, ConfigPathSource::Default, &user),
+        ];
+        for &(is_root, user_exists, system_exists, source, expected) in cases {
+            for (path, should_exist) in [(&user, user_exists), (&system, system_exists)] {
+                if should_exist {
+                    std::fs::write(path, "").unwrap();
+                } else {
+                    std::fs::remove_file(path).ok();
+                }
+            }
+            let resolved = resolve_config_path_from(None, None, &user, &system, is_root, true);
+            assert_eq!(
+                (resolved.source, resolved.path.as_path()),
+                (source, expected),
+                "root={is_root} user_exists={user_exists} system_exists={system_exists}"
+            );
+        }
+
+        // The write helper must *be* the read resolver, not a copy that can
+        // drift away from it again.
+        assert_eq!(
+            Config::resolve_config_write_path(Some(&explicit)),
+            Config::resolve_config_path(Some(&explicit)),
+        );
+        assert_eq!(
+            Config::resolve_config_write_path(None),
+            Config::resolve_config_path(None),
+        );
     }
 
     #[test]

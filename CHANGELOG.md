@@ -4,6 +4,68 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and the Release workflow refuses to publish a tag that has no marked heading here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
+## Unreleased
+
+### Fixed — one stuck entry wedged the whole quarantine, permanently (`bd-quarantine-drain-fail-closed-7tun`)
+
+`drain_expired` and `drain_oldest` propagated the first per-entry failure out of
+their loop with `?`:
+
+```rust
+bytes = bytes.saturating_add(self.purge(&record.decision_id)?);
+```
+
+So a single entry that would not unlink — `EACCES`, `EBUSY`, `ENOTEMPTY`, an
+immutable bit, a mountpoint underneath — aborted the entire batch and left every
+remaining expired entry in place. That is not self-healing but self-perpetuating:
+`records()` is sorted oldest-first and `sweep_quarantines` re-enters from the top
+of that same list every 60 s, so the poison entry is always hit first and the
+store never drains again, growing without bound while `sbh status` reads green.
+The same shape made `drain_all`, `enforce_cap` and the Orange+ pressure drain
+brittle — the paths that matter most on a filling disk.
+
+- Drains are **best-effort per entry**. They return a `DrainOutcome`
+  (`entries`, `bytes`, `failures`, `skipped_stuck`) instead of `(usize, u64)`,
+  and `Err` now means only that the store itself is unreadable.
+- A failed purge writes a `<decision-id>.stuck` sidecar next to the record
+  (deliberately not `.json`, so `records()` cannot mistake it for one) carrying
+  the failure count, first/last failure time and the error. The entry is then
+  skipped for `STUCK_RETRY_SECS` (1 h) rather than retried every sweep, and is
+  reported **once** per transition instead of once a minute. `purge` clears the
+  sidecar whenever the entry finally goes, and `stuck_entries()` drops orphans.
+- Pressure and `sbh emergency` use `drain_all`, which **ignores the cooldown**:
+  when the disk is filling, one more `EBUSY` costs less than the space does.
+- Stuck entries are now visible outside the journal: `sbh doctor --system` FAILs
+  the new `quarantine.stuck` check naming the worst offender and its errno, and
+  `sbh status` prints a `Quarantine:` warning block. It stays silent when there
+  is nothing stuck, so normal output is unchanged. A version check is not a
+  liveness check, and neither is a green status.
+
+### Fixed — `config set` wrote a file the daemon never reads (`bd-config-set-wrong-path-3gp1`)
+
+`sbh config set`, `sbh config reset` and `sbh tune --apply` resolved their target
+with the raw per-user default (`Config::default_path`) while every reader —
+`sbh config show`, `sbh config path`, `Config::load` — went through
+`Config::resolve_config_path`, which prefers the system config for root. As root
+on a host carrying `/etc/sbh/config.toml`, a `config set` therefore wrote
+`~root/.config/sbh/config.toml`, reported success, exited 0, and changed nothing;
+`config show` immediately afterwards still returned the old value. `config reset`
+was worse still: it reported resetting a config it had never touched.
+
+Writes now resolve through `Config::resolve_config_write_path`, which *is* the
+read resolver rather than a copy that can drift from it again. `--config` and
+`SBH_CONFIG` continue to win, non-root behaviour is unchanged, and both commands
+now report the chosen file **and why** (`path_source` and `reason` in JSON),
+warning when a shadowed per-user config will keep overriding for non-root runs.
+
+### Fixed — the crate's test target did not build on macOS
+
+`system_temp_base()` was `#[cfg(target_os = "linux")]` but
+`clean_quarantines_at_green_and_undo_restores_the_target` is not gated to Linux
+and calls it, so `cargo check --all-targets` failed on the Mac. Added the
+non-Linux arm (`/private/tmp`, already the canonical form these tests compare
+against) rather than gating the test away.
+
 ## v0.6.2 **[release]**
 
 Compare: [`v0.6.1...HEAD`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.1...HEAD)
