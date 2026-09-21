@@ -1,9 +1,7 @@
 {
   "schema_version": 1,
   "command": "scan_ab",
-  "roots": [
-    "/data/projects/storage_ballast_helper"
-  ],
+  "roots": ["/data/projects/storage_ballast_helper"],
   "min_score": 0.7,
   "warmup": "untimed v2 pass",
   "captured": "2026-09-03",
