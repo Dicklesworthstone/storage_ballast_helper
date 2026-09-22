@@ -23,9 +23,9 @@
 //! Two properties make that safe:
 //!
 //! * **Deterministic order.** `read_dir` order is unspecified and, on some
-//!   filesystems, unstable across calls. The cursor sorts each root's entries
+//!   filesystems, unstable across calls. The cursor selects each root's entries
 //!   by name, so "after X" names the same position on the next pass.
-//!   [`ROOT_ENTRY_CAP`] bounds the sort.
+//!   [`ROOT_ENTRY_CAP`] bounds both selection memory and the returned page.
 //! * **Forgiving resume.** The remembered entry may have been deleted (very
 //!   likely — the scanner deletes things). Resuming is a `>` comparison
 //!   against the sorted names, not a lookup, so a vanished entry costs
@@ -34,19 +34,21 @@
 //! The cursor is persisted next to the scanner index so progress survives a
 //! daemon restart, and a corrupt or unreadable file simply starts over.
 
+use std::collections::BinaryHeap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Most depth-1 entries the cursor hands back for one root in one pass.
+/// Most depth-1 entries the cursor retains and hands back for one root.
 ///
 /// A scan root with more children than this is pathological (`/data/tmp` on
-/// an agent-swarm host is the realistic worst case). The cap is applied
-/// *after* the resume filter, so the cursor still advances through such a
-/// root a prefix at a time; it bounds the work one pass takes on, not the
-/// `read_dir` itself, which must enumerate the whole root to sort it.
+/// an agent-swarm host is the realistic worst case). Selection applies the
+/// resume filter first, then retains only the smallest remaining names in a
+/// bounded max-heap. Unlike collecting and sorting the entire directory before
+/// truncation, memory does not grow with all the root's children. Enumeration
+/// still visits the whole directory: this is a memory bound, not an I/O deadline.
 pub const ROOT_ENTRY_CAP: usize = 200_000;
 
 /// Where the pre-scan stopped, so the next pass can carry on from there.
@@ -134,28 +136,21 @@ impl PrescanCursor {
             .collect()
     }
 
-    /// This root's depth-1 directory entries in deterministic order, with the
-    /// prefix the previous pass already covered skipped.
+    /// This root's next page of depth-1 entries in deterministic order, with
+    /// the prefix the previous pass already covered skipped.
     ///
     /// The resume filter applies only to the cursor's own root: every other
-    /// root starts at its first entry.
+    /// root starts at its first entry. A full page does not prove exhaustion;
+    /// callers must resume after its last entry to retrieve any later names.
+    /// Enumeration errors are returned rather than hidden in a partial page.
     pub fn entries_to_visit(&self, root: &Path) -> io::Result<Vec<PathBuf>> {
-        let mut names: Vec<PathBuf> = fs::read_dir(root)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect();
-        names.sort_unstable();
         let resume_after = if self.root.as_deref() == Some(root) {
             self.after.as_deref()
         } else {
             None
         };
-        if let Some(after) = resume_after {
-            let start = names.partition_point(|path| path.as_path() <= after);
-            names.drain(..start);
-        }
-        names.truncate(ROOT_ENTRY_CAP);
-        Ok(names)
+        let entries = fs::read_dir(root)?.map(|entry| entry.map(|entry| entry.path()));
+        select_page(entries, resume_after, ROOT_ENTRY_CAP)
     }
 
     /// Record that `entry` (a depth-1 child of `root`) was fully examined.
@@ -183,6 +178,32 @@ impl PrescanCursor {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+}
+
+/// Retain the lexicographically smallest `capacity` names after the cursor,
+/// independent of enumeration order. The largest retained name is the heap
+/// root, so a smaller incoming name replaces it without ever growing beyond
+/// the page capacity. Converting the heap to sorted order reuses its allocation.
+fn select_page(
+    entries: impl IntoIterator<Item = io::Result<PathBuf>>,
+    after: Option<&Path>,
+    capacity: usize,
+) -> io::Result<Vec<PathBuf>> {
+    let mut selected = BinaryHeap::with_capacity(capacity);
+    for entry in entries {
+        let path = entry?;
+        if capacity == 0 || after.is_some_and(|after| path.as_path() <= after) {
+            continue;
+        }
+        if selected.len() < capacity {
+            selected.push(path);
+        } else if let Some(mut largest) = selected.peek_mut()
+            && path < *largest
+        {
+            *largest = path;
+        }
+    }
+    Ok(selected.into_sorted_vec())
 }
 
 #[cfg(test)]
@@ -357,5 +378,110 @@ mod tests {
         cursor.reset();
         assert_eq!(cursor, PrescanCursor::new());
         assert_eq!(cursor.describe(), "the first scan root");
+    }
+
+    #[test]
+    fn bounded_selection_matches_a_full_sort_for_adversarial_orders() {
+        let names: Vec<PathBuf> = (0..257)
+            .map(|i| PathBuf::from(format!("/root/item-{i:04}")))
+            .collect();
+        for reverse in [false, true] {
+            // 73 is coprime to 257: every name is visited, in a non-sorted order.
+            let mut shuffled: Vec<PathBuf> = (0..257)
+                .map(|i| names[(i * 73) % 257].clone())
+                .collect();
+            if reverse {
+                shuffled.reverse();
+            }
+            for after in [None, Some(Path::new("/root/item-0128"))] {
+                for cap in [0, 1, 2, 17, 257, 300] {
+                    let expected: Vec<PathBuf> = names
+                        .iter()
+                        .filter(|path| after.is_none_or(|after| path.as_path() > after))
+                        .take(cap)
+                        .cloned()
+                        .collect();
+                    let actual = select_page(shuffled.iter().cloned().map(Ok), after, cap)
+                        .expect("selection");
+                    assert_eq!(actual, expected, "cap={cap} reverse={reverse} after={after:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn entries_discovered_late_can_replace_every_initial_heap_member() {
+        let paths = (0..10_000)
+            .rev()
+            .map(|i| Ok(PathBuf::from(format!("/root/{i:05}"))));
+        let actual = select_page(paths, None, 3).unwrap();
+        assert_eq!(
+            actual,
+            ["/root/00000", "/root/00001", "/root/00002"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn resume_filter_runs_before_the_page_cap() {
+        let paths = (0..10_000).map(|i| Ok(PathBuf::from(format!("/root/{i:05}"))));
+        let actual = select_page(paths, Some(Path::new("/root/09995")), 3).unwrap();
+        assert_eq!(
+            actual,
+            ["/root/09996", "/root/09997", "/root/09998"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn changing_enumeration_order_between_pages_neither_skips_nor_repeats_names() {
+        let mut after: Option<PathBuf> = None;
+        let mut seen = Vec::new();
+        for pass in 0..20 {
+            let mut names: Vec<PathBuf> = (0..41)
+                .map(|i| PathBuf::from(format!("/root/item-{i:04}")))
+                .collect();
+            names.rotate_left((pass * 13) % 41);
+            if pass % 2 == 0 {
+                names.reverse();
+            }
+            let page = select_page(names.into_iter().map(Ok), after.as_deref(), 3).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().cloned();
+            seen.extend(page);
+        }
+        let expected: Vec<PathBuf> = (0..41)
+            .map(|i| PathBuf::from(format!("/root/item-{i:04}")))
+            .collect();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn a_mid_enumeration_error_does_not_return_an_apparently_complete_page() {
+        let entries = [
+            Ok(PathBuf::from("/root/a")),
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "enumeration failed")),
+            Ok(PathBuf::from("/root/b")),
+        ];
+        let error = select_page(entries, None, 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn byte_exact_names_are_ordered_without_lossy_conversion() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        // Synthetic names exercise Unix path ordering without requiring the
+        // host filesystem to admit non-UTF-8 names (APFS need not do so).
+        let names = [b"/root/\xff".as_slice(), b"/root/a", b"/root/\xfe"];
+        let paths = names.map(|bytes| PathBuf::from(OsString::from_vec(bytes.to_vec())));
+        let page = select_page(paths.into_iter().map(Ok), Some(Path::new("/root/a")), 1)
+            .unwrap();
+        assert_eq!(
+            page,
+            vec![PathBuf::from(OsString::from_vec(b"/root/\xfe".to_vec()))]
+        );
     }
 }
