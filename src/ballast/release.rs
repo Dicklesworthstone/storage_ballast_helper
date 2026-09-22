@@ -30,11 +30,11 @@ pub const RELEASE_SETTLE_DURATION: Duration = Duration::from_secs(5);
 /// A pending ballast release awaiting effectiveness measurement after the settle period.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingRelease {
-    /// Bytes released in this batch.
+    /// Total bytes released in this measurement window.
     pub bytes_released: u64,
     /// Free bytes observed immediately before the release.
     pub free_before: u64,
-    /// Timestamp when the release occurred.
+    /// Timestamp of the latest release in the measurement window.
     pub released_at: Instant,
 }
 
@@ -116,55 +116,47 @@ impl BallastReleaseController {
             return 0;
         }
 
-        // Calculate missing files based on physical inventory, robust to restarts.
-        // If files are missing (deleted by us or user), they count as "released".
+        // Emergency release follows actual inventory, including surplus files
+        // left after a configuration change. A zero/shrunken configured pool
+        // must never strand an otherwise releasable reserve under Critical.
+        if response.level == PressureLevel::Critical || response.urgency >= 0.9 {
+            return available;
+        }
+
+        // Missing files count as physically released, including across restarts.
         let already_released = configured_total.saturating_sub(available);
-
-        // Ensure state entry exists for this mount.
-        self.states.entry(mount_path.to_path_buf()).or_default();
-
-        let total_pool = configured_total; // The total capacity is the config target.
-
-        let pid_recommendation = response.release_ballast_files;
-
-        // Graduated fallback based on urgency (cumulative target).
-        let urgency_recommendation = if response.urgency < 0.3 {
-            0
-        } else if response.urgency < 0.6 {
-            1
-        } else if response.urgency < 0.9 {
+        let urgency_recommendation = if response.urgency >= 0.6 {
             3
+        } else if response.urgency >= 0.3 {
+            1
         } else {
-            total_pool // Emergency: release everything
+            0
         };
-
-        // Safety floor based on pressure level (cumulative target).
         let level_floor = match response.level {
-            PressureLevel::Critical => total_pool, // Always release all on Critical
-            PressureLevel::Red => 3,               // Always release at least 3 on Red
-            PressureLevel::Orange => 1,            // Always release at least 1 on Orange
+            PressureLevel::Red => 3,
+            PressureLevel::Orange => 1,
             _ => 0,
         };
-
-        // Take the maximum of all signals to ensure safety.
-        let target_released = pid_recommendation
+        let target_released = response
+            .release_ballast_files
             .max(urgency_recommendation)
             .max(level_floor);
 
-        // Calculate how many MORE files need to be released to reach the target state.
-        let needed = target_released.saturating_sub(already_released);
-
         let state = self.states.entry(mount_path.to_path_buf()).or_default();
-        let eta = state.release_efficiency.clamp(0.05, 1.0);
-        let scaled_needed = if needed > 0 && eta < 1.0 {
+        let eta = state.release_efficiency;
+        // Scale the CUMULATIVE target before subtracting physical releases.
+        // Four files released at eta=0.25 meet an Orange target of one, but
+        // escalating to a target of three still needs eight more files. Scaling
+        // only the deficit would mistakenly return zero after those four files.
+        let scaled_target = if eta < 1.0 {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let count = ((needed as f64) / eta).ceil() as usize;
+            let count = ((target_released as f64) / eta).ceil() as usize;
             count
         } else {
-            needed
+            target_released
         };
 
-        scaled_needed.min(available)
+        scaled_target.saturating_sub(already_released).min(available)
     }
 
     /// Execute a pressure-driven release cycle.
@@ -213,12 +205,26 @@ impl BallastReleaseController {
         free_before: u64,
         now: Instant,
     ) {
+        // A failed/empty release must not erase a real measurement in flight.
+        if bytes_released == 0 {
+            return;
+        }
+
+        // The new pre-release reading can settle an older completed window.
+        // Otherwise combine overlapping releases instead of forgetting the
+        // earlier bytes/baseline; wait five seconds after the LAST release.
+        self.update_effectiveness(mount_path, free_before, now);
         let state = self.states.entry(mount_path.to_path_buf()).or_default();
-        state.pending_release = Some(PendingRelease {
-            bytes_released,
-            free_before,
-            released_at: now,
-        });
+        if let Some(pending) = state.pending_release.as_mut() {
+            pending.bytes_released = pending.bytes_released.saturating_add(bytes_released);
+            pending.released_at = pending.released_at.max(now);
+        } else {
+            state.pending_release = Some(PendingRelease {
+                bytes_released,
+                free_before,
+                released_at: now,
+            });
+        }
     }
 
     /// Update release effectiveness on a tick if at least 5s has elapsed since release.
@@ -230,7 +236,11 @@ impl BallastReleaseController {
         {
             let observed_delta = free_now.saturating_sub(pending.free_before);
             if pending.bytes_released > 0 {
-                let observed_eta = (observed_delta as f64) / (pending.bytes_released as f64);
+                // Unrelated cleanup can free more than the ballast batch.
+                // Bound the observation BEFORE smoothing so one such event
+                // cannot wipe out the mount's low-effectiveness history.
+                let observed_eta =
+                    ((observed_delta as f64) / (pending.bytes_released as f64)).min(1.0);
                 let alpha = 0.3;
                 let new_eta =
                     f64::mul_add(1.0 - alpha, state.release_efficiency, alpha * observed_eta);
@@ -252,7 +262,13 @@ impl BallastReleaseController {
     /// Set release efficiency for `mount_path` (for test setup or persistence restore).
     pub fn set_release_efficiency(&mut self, mount_path: &Path, efficiency: f64) {
         let state = self.states.entry(mount_path.to_path_buf()).or_default();
-        state.release_efficiency = efficiency.clamp(0.05, 1.0);
+        // NaN survives f64::clamp and would turn release counts into zero.
+        // Invalid restored telemetry falls back to the unmeasured prior.
+        state.release_efficiency = if efficiency.is_finite() {
+            efficiency.clamp(0.05, 1.0)
+        } else {
+            1.0
+        };
     }
 
     /// Feed one tick's pressure level for `mount_path`. Runs every tick from
@@ -711,5 +727,150 @@ mod tests {
             ctrl.update_effectiveness(mount, free_at_4s, start + Duration::from_secs(6));
         assert!((eta_settled - 0.775).abs() < 1e-6);
         assert_eq!(ctrl.release_efficiency(mount), eta_settled);
+    }
+
+    #[test]
+    fn ineffective_releases_scale_the_cumulative_target_on_escalation() {
+        let mut ctrl = BallastReleaseController::new(30);
+        let mount = Path::new("/test");
+        ctrl.set_release_efficiency(mount, 0.25);
+        let orange = test_response(PressureLevel::Orange, 0.4, 1);
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+
+        assert_eq!(ctrl.files_to_release(mount, &orange, 20, 20), 4);
+        assert_eq!(ctrl.files_to_release(mount, &orange, 16, 20), 0);
+        assert_eq!(ctrl.files_to_release(mount, &red, 16, 20), 8);
+        assert_eq!(ctrl.files_to_release(mount, &red, 8, 20), 0);
+    }
+
+    #[test]
+    fn settled_ineffectiveness_reopens_an_unmet_release_target() {
+        let mut ctrl = BallastReleaseController::new(30);
+        let mount = Path::new("/test");
+        let orange = test_response(PressureLevel::Orange, 0.4, 1);
+        let now = Instant::now();
+
+        assert_eq!(ctrl.files_to_release(mount, &orange, 10, 10), 1);
+        ctrl.record_release(mount, 100, 1_000, now);
+        assert_eq!(ctrl.files_to_release(mount, &orange, 9, 10), 0);
+        // A snapshot-pinned release freed nothing: the EWMA falls to 0.7.
+        ctrl.update_effectiveness(mount, 1_000, now + RELEASE_SETTLE_DURATION);
+        assert_eq!(ctrl.files_to_release(mount, &orange, 9, 10), 1);
+        assert_eq!(ctrl.files_to_release(mount, &orange, 8, 10), 0);
+    }
+
+    #[test]
+    fn scaled_targets_are_bounded_and_do_not_repeat_at_steady_pressure() {
+        let mount = Path::new("/test");
+        for eta in [0.05, 0.25, 0.5, 0.75, 1.0] {
+            let mut ctrl = BallastReleaseController::new(30);
+            ctrl.set_release_efficiency(mount, eta);
+            for total in 0..=32 {
+                for available in 0..=total {
+                    for target in 0..=8 {
+                        let response = test_response(PressureLevel::Green, 0.0, target);
+                        let count = ctrl.files_to_release(mount, &response, available, total);
+                        assert!(count <= available);
+                        assert_eq!(
+                            ctrl.files_to_release(mount, &response, available - count, total),
+                            0,
+                            "eta={eta}, total={total}, available={available}, target={target}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emergency_releases_actual_inventory_after_config_shrink() {
+        let mut ctrl = BallastReleaseController::new(30);
+        let mount = Path::new("/test");
+        let critical = test_response(PressureLevel::Critical, 0.0, 0);
+        let urgent = test_response(PressureLevel::Red, 0.95, 0);
+        for configured in [0, 1, 3, 5, 10] {
+            assert_eq!(ctrl.files_to_release(mount, &critical, 5, configured), 5);
+            assert_eq!(ctrl.files_to_release(mount, &urgent, 5, configured), 5);
+        }
+    }
+
+    #[test]
+    fn invalid_efficiency_cannot_disable_pressure_release() {
+        let mut ctrl = BallastReleaseController::new(30);
+        let mount = Path::new("/test");
+        let response = test_response(PressureLevel::Orange, 0.4, 1);
+        for efficiency in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            ctrl.set_release_efficiency(mount, efficiency);
+            assert_eq!(ctrl.release_efficiency(mount), 1.0);
+            assert_eq!(ctrl.files_to_release(mount, &response, 10, 10), 1);
+        }
+        // An invalid urgency alone does not fabricate an emergency at Green.
+        let unknown = test_response(PressureLevel::Green, f64::NAN, 0);
+        assert_eq!(ctrl.files_to_release(mount, &unknown, 10, 10), 0);
+    }
+
+    #[test]
+    fn overlapping_releases_preserve_bytes_baseline_and_last_settle_time() {
+        let mut ctrl = BallastReleaseController::new(30);
+        let mount = Path::new("/test");
+        let now = Instant::now();
+        ctrl.record_release(mount, 100, 1_000, now);
+        ctrl.record_release(mount, 300, 1_025, now + Duration::from_secs(3));
+        assert_eq!(
+            ctrl.states[mount].pending_release,
+            Some(PendingRelease {
+                bytes_released: 400,
+                free_before: 1_000,
+                released_at: now + Duration::from_secs(3),
+            })
+        );
+        assert_eq!(
+            ctrl.update_effectiveness(mount, 1_025, now + Duration::from_secs(6)),
+            1.0
+        );
+        // 25 observed bytes out of 400 released: eta = 0.7 + 0.3 * 0.0625.
+        let eta = ctrl.update_effectiveness(mount, 1_025, now + Duration::from_secs(8));
+        assert!((eta - 0.71875).abs() < 1e-6);
+        assert!(ctrl.states[mount].pending_release.is_none());
+        assert_eq!(
+            ctrl.update_effectiveness(mount, 2_000, now + Duration::from_secs(20)),
+            eta
+        );
+    }
+
+    #[test]
+    fn subsequent_release_settles_a_completed_measurement_first() {
+        let mut ctrl = BallastReleaseController::new(30);
+        let mount = Path::new("/test");
+        let now = Instant::now();
+        ctrl.record_release(mount, 100, 1_000, now);
+        ctrl.record_release(mount, 100, 1_025, now + Duration::from_secs(6));
+        assert!((ctrl.release_efficiency(mount) - 0.775).abs() < 1e-6);
+        let eta = ctrl.update_effectiveness(mount, 1_050, now + Duration::from_secs(11));
+        assert!((eta - 0.6175).abs() < 1e-6);
+    }
+
+    #[test]
+    fn empty_release_does_not_replace_pending_measurement() {
+        let mut ctrl = BallastReleaseController::new(30);
+        let mount = Path::new("/test");
+        let now = Instant::now();
+        ctrl.record_release(mount, 100, 1_000, now);
+        ctrl.record_release(mount, 0, 5_000, now + Duration::from_secs(4));
+        let eta = ctrl.update_effectiveness(mount, 1_025, now + RELEASE_SETTLE_DURATION);
+        assert!((eta - 0.775).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unrelated_cleanup_does_not_erase_low_efficiency_history() {
+        let mut ctrl = BallastReleaseController::new(30);
+        let mount = Path::new("/test");
+        let now = Instant::now();
+        ctrl.set_release_efficiency(mount, 0.25);
+        ctrl.record_release(mount, 100, 1_000, now);
+        let eta = ctrl.update_effectiveness(mount, 2_000, now + RELEASE_SETTLE_DURATION);
+        assert!((eta - 0.475).abs() < 1e-6);
+        // Samples for another mount do not contaminate this mount's history.
+        assert_eq!(ctrl.release_efficiency(Path::new("/other")), 1.0);
     }
 }
