@@ -25,7 +25,9 @@ fn invalid(message: &str) -> io::Error {
 pub(super) fn validate_id(id: &str) -> io::Result<()> {
     if id.is_empty()
         || id.len() > 128
-        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
         return Err(invalid("invalid quarantine decision id"));
     }
@@ -82,6 +84,17 @@ fn lock_store(root: &Path) -> io::Result<File> {
 
 fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
+}
+
+// Syncing a new store itself does not persist its name in its parent. The
+// root can be nested beneath newly created `.sbh` directories; persist every
+// ancestor link before the payload can disappear from its original parent.
+fn sync_store_ancestors(root: &Path) -> io::Result<()> {
+    let root = std::path::absolute(root)?;
+    for ancestor in root.ancestors() {
+        sync_directory(ancestor)?;
+    }
+    Ok(())
 }
 
 // An existence check followed by rename is not enough: a rebuild can create
@@ -151,7 +164,11 @@ fn write_new_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
 // symlink. A unique, exclusively-created temporary file also avoids writers
 // sharing/truncating one another's staging file.
 pub(super) fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
-    let tmp = path.with_extension(format!("{}-{}.tmp", std::process::id(), rand::random::<u64>()));
+    let tmp = path.with_extension(format!(
+        "{}-{}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
     write_new_json(&tmp, value)?;
     let result = fs::rename(&tmp, path);
     if result.is_err() {
@@ -165,10 +182,15 @@ fn validate_record(store: &QuarantineStore, id: &str, record: &QuarantineRecord)
     if record.decision_id != id {
         return Err(invalid("quarantine record id does not match its filename"));
     }
-    let name = record.original_path.file_name().ok_or_else(|| invalid("original has no basename"))?;
+    let name = record
+        .original_path
+        .file_name()
+        .ok_or_else(|| invalid("original has no basename"))?;
     let expected = std::path::absolute(store.entry_dir(id).join(name))?;
     if std::path::absolute(&record.quarantine_path)? != expected {
-        return Err(invalid("quarantine payload path escapes its decision directory"));
+        return Err(invalid(
+            "quarantine payload path escapes its decision directory",
+        ));
     }
     if std::path::absolute(&record.original_path)?.starts_with(std::path::absolute(store.root())?) {
         return Err(invalid("quarantine origin is inside the quarantine store"));
@@ -198,12 +220,14 @@ fn payload_metadata(
     if (!metadata.is_file() && !metadata.is_dir())
         || device_of(&record.quarantine_path)? != (record.device_id, record.inode)
     {
-        return Err(invalid("quarantine payload identity changed; refusing to move or purge it"));
+        return Err(invalid(
+            "quarantine payload identity changed; refusing to move or purge it",
+        ));
     }
     Ok(Some(metadata))
 }
 
-pub(super) fn read_record(store: &QuarantineStore, id: &str) -> Result<Option<QuarantineRecord>> {
+fn read_manifest(store: &QuarantineStore, id: &str) -> Result<Option<(QuarantineRecord, bool)>> {
     validate_id(id).map_err(|e| SbhError::io(store.root(), e))?;
     let path = store.record_path(id);
     let (record, pending) = match read_json::<QuarantineRecord>(&path) {
@@ -219,6 +243,13 @@ pub(super) fn read_record(store: &QuarantineStore, id: &str) -> Result<Option<Qu
         Err(e) => return Err(SbhError::io(&path, e)),
     };
     validate_record(store, id, &record).map_err(|e| SbhError::io(&path, e))?;
+    Ok(Some((record, pending)))
+}
+
+pub(super) fn read_record(store: &QuarantineStore, id: &str) -> Result<Option<QuarantineRecord>> {
+    let Some((record, pending)) = read_manifest(store, id)? else {
+        return Ok(None);
+    };
     if pending
         && payload_metadata(store, &record)
             .map_err(|e| SbhError::io(&record.quarantine_path, e))?
@@ -229,6 +260,33 @@ pub(super) fn read_record(store: &QuarantineStore, id: &str) -> Result<Option<Qu
         return Ok(None);
     }
     Ok(Some(record))
+}
+
+// An interrupted reservation may be retried only while its exact original
+// is still present and no payload was moved. Empty-directory removal refuses
+// unknown siblings; neither a rebuilt original nor unrelated bytes are touched.
+fn recover_reservation(store: &QuarantineStore, id: &str, source: &Path) -> io::Result<()> {
+    let pending = pending_path(store, id);
+    if !exists(&pending)? {
+        return Ok(());
+    }
+    let record = read_json::<QuarantineRecord>(&pending)?;
+    validate_record(store, id, &record)?;
+    if std::path::absolute(source)? != std::path::absolute(&record.original_path)?
+        || device_of(source)? != (record.device_id, record.inode)
+        || payload_metadata(store, &record)?.is_some()
+    {
+        return Err(invalid(
+            "pending quarantine belongs to a different or completed move",
+        ));
+    }
+    match fs::remove_dir(store.entry_dir(id)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    remove_file_if_present(&pending)?;
+    sync_directory(store.root())
 }
 
 pub(super) fn quarantine(
@@ -245,18 +303,25 @@ pub(super) fn quarantine(
     let lock = lock_store(store.root()).map_err(unavailable)?;
     let metadata = fs::symlink_metadata(path).map_err(unavailable)?;
     if !metadata.is_file() && !metadata.is_dir() {
-        return Err(unavailable(invalid("candidate is not a regular file or directory")));
+        return Err(unavailable(invalid(
+            "candidate is not a regular file or directory",
+        )));
     }
     let (dev, ino) = device_of(path).map_err(unavailable)?;
     if dev != device_of(store.root()).map_err(unavailable)?.0 {
         return Err(QuarantineUnavailable::CrossDevice);
     }
-    let name = path.file_name().ok_or_else(|| unavailable(invalid("candidate has no file name")))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| unavailable(invalid("candidate has no file name")))?;
     let manifest = store.record_path(id);
     let pending = pending_path(store, id);
-    if exists(&manifest).map_err(unavailable)? || exists(&pending).map_err(unavailable)? {
-        return Err(unavailable(invalid("decision id already has a quarantine record")));
+    if exists(&manifest).map_err(unavailable)? {
+        return Err(unavailable(invalid(
+            "decision id already has a quarantine record",
+        )));
     }
+    recover_reservation(store, id, path).map_err(unavailable)?;
     let dir = store.entry_dir(id);
     let timestamp = now_secs();
     let record = QuarantineRecord {
@@ -274,7 +339,9 @@ pub(super) fn quarantine(
     // Reserving the whole decision directory, not just its basename, stops
     // a reused id from orphaning an earlier payload with a different name.
     fs::create_dir(&dir).map_err(unavailable)?;
-    if let Err(e) = write_new_json(&pending, &record).and_then(|()| lock.sync_all()) {
+    if let Err(e) = write_new_json(&pending, &record)
+        .and_then(|()| sync_store_ancestors(store.root()))
+    {
         let _ = fs::remove_file(&pending);
         let _ = fs::remove_dir(&dir);
         return Err(unavailable(e));
@@ -310,7 +377,7 @@ fn remove_records(store: &QuarantineStore, id: &str) -> io::Result<()> {
 
 pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
     validate_id(id).map_err(|e| SbhError::io(store.root(), e))?;
-    let _lock = match lock_store(store.root()) {
+    let lock = match lock_store(store.root()) {
         Ok(lock) => lock,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(SbhError::io(store.root(), e)),
@@ -319,8 +386,8 @@ pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
         store.clear_stuck(id);
         return Ok(0);
     };
-    let metadata = payload_metadata(store, &record)
-        .map_err(|e| SbhError::io(&record.quarantine_path, e))?;
+    let metadata =
+        payload_metadata(store, &record).map_err(|e| SbhError::io(&record.quarantine_path, e))?;
     let bytes = if let Some(metadata) = metadata {
         // Only the recorded payload is authorized, not arbitrary siblings
         // subsequently placed in the decision directory.
@@ -335,9 +402,54 @@ pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
         // Interrupted cleanup or a prior undo did not free these bytes now.
         0
     };
-    let _ = fs::remove_dir(store.entry_dir(id));
+    // Persist the payload removal before dropping its recovery record. A
+    // crash must not resurrect a payload after its manifest has disappeared.
+    sync_existing_directory(&store.entry_dir(id))
+        .map_err(|e| SbhError::io(store.entry_dir(id), e))?;
     remove_records(store, id).map_err(|e| SbhError::io(store.record_path(id), e))?;
+    let _ = fs::remove_dir(store.entry_dir(id));
+    lock.sync_all().map_err(|e| SbhError::io(store.root(), e))?;
     Ok(bytes)
+}
+
+fn sync_existing_directory(path: &Path) -> io::Result<()> {
+    match sync_directory(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn suffixed_destination(record: &QuarantineRecord) -> PathBuf {
+    let mut destination = record.original_path.clone();
+    let mut name = destination.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".restored-{}", record.decision_id));
+    destination.set_file_name(name);
+    destination
+}
+
+fn restored_destination(record: &QuarantineRecord) -> Option<PathBuf> {
+    [record.original_path.clone(), suffixed_destination(record)]
+        .into_iter()
+        .find(|path| {
+            fs::symlink_metadata(path).is_ok_and(|m| m.is_file() || m.is_dir())
+                && device_of(path).ok() == Some((record.device_id, record.inode))
+        })
+}
+
+fn finish_restore(store: &QuarantineStore, id: &str, destination: &Path, lock: &File) {
+    let finish = || -> io::Result<()> {
+        if let Some(parent) = destination.parent() {
+            sync_directory(parent)?;
+        }
+        sync_existing_directory(&store.entry_dir(id))?;
+        remove_records(store, id)?;
+        let _ = fs::remove_dir(store.entry_dir(id));
+        lock.sync_all()
+    };
+    if let Err(e) = finish() {
+        eprintln!("[SBH-QUARANTINE] {id} restored; metadata cleanup deferred: {e}");
+    }
 }
 
 pub(super) fn restore(
@@ -347,7 +459,10 @@ pub(super) fn restore(
 ) -> Result<RestoreOutcome> {
     validate_id(id).map_err(|e| SbhError::io(store.root(), e))?;
     let lock = lock_store(store.root()).map_err(|e| SbhError::io(store.root(), e))?;
-    let Some(record) = read_record(store, id)? else {
+    // Include pending manifests even without a held payload: explicit undo
+    // can cancel an unmoved reservation or finish an interrupted pending
+    // restore, but only when the exact original inode is already in place.
+    let Some((record, _)) = read_manifest(store, id)? else {
         return Err(SbhError::Runtime {
             details: format!("no quarantined entry for decision {id}"),
         });
@@ -356,8 +471,17 @@ pub(super) fn restore(
         .map_err(|e| SbhError::io(&record.quarantine_path, e))?
         .is_none()
     {
-        return Err(SbhError::Runtime {
+        // Undo may have completed its rename before the process stopped.
+        // Recognize that exact inode, including a force-suffix destination,
+        // rather than moving or overwriting a newly rebuilt original.
+        let destination = restored_destination(&record).ok_or_else(|| SbhError::Runtime {
             details: format!("quarantined entry for {id} is gone"),
+        })?;
+        finish_restore(store, id, &destination, &lock);
+        return Ok(RestoreOutcome {
+            decision_id: id.to_string(),
+            restored_to: destination,
+            size_bytes: record.size_bytes,
         });
     }
     let mut destination = record.original_path.clone();
@@ -375,26 +499,13 @@ pub(super) fn restore(
                     ),
                 });
             }
-            let mut name = destination.file_name().unwrap_or_default().to_os_string();
-            name.push(format!(".restored-{id}"));
-            destination.set_file_name(name);
+            destination = suffixed_destination(&record);
             rename_noreplace(&record.quarantine_path, &destination)
                 .map_err(|e| SbhError::io(&destination, e))?;
         }
         Err(e) => return Err(SbhError::io(&destination, e)),
     }
-    let finish = || -> io::Result<()> {
-        if let Some(parent) = destination.parent() {
-            sync_directory(parent)?;
-        }
-        sync_directory(&store.entry_dir(id))?;
-        remove_records(store, id)?;
-        let _ = fs::remove_dir(store.entry_dir(id));
-        lock.sync_all()
-    };
-    if let Err(e) = finish() {
-        eprintln!("[SBH-QUARANTINE] {id} restored; metadata cleanup deferred: {e}");
-    }
+    finish_restore(store, id, &destination, &lock);
     Ok(RestoreOutcome {
         decision_id: id.to_string(),
         restored_to: destination,
@@ -439,8 +550,10 @@ mod tests {
         assert!(store.record("before").unwrap().is_none());
         assert_eq!(store.held_bytes().unwrap(), 0);
         assert_eq!(store.drain_all().unwrap().bytes, 0);
-        assert!(store.restore("before", false).is_err());
+        let outcome = store.restore("before", false).unwrap();
+        assert_eq!(outcome.restored_to, record.original_path);
         assert_eq!(fs::read(&record.original_path).unwrap(), b"original bytes");
+        assert!(!pending_path(&store, "before").exists());
     }
 
     #[test]
@@ -459,7 +572,11 @@ mod tests {
         let (store, record) = held(dir.path(), "same");
         let second = dir.path().join("different-basename");
         fs::write(&second, b"second payload").unwrap();
-        assert!(store.quarantine(&second, "same", 200, Duration::ZERO, None).is_err());
+        assert!(
+            store
+                .quarantine(&second, "same", 200, Duration::ZERO, None)
+                .is_err()
+        );
         assert_eq!(store.record("same").unwrap(), Some(record.clone()));
         assert_eq!(fs::read(second).unwrap(), b"second payload");
         store.restore("same", false).unwrap();
@@ -473,7 +590,11 @@ mod tests {
         let source = dir.path().join("target");
         fs::write(&source, b"keep").unwrap();
         for id in ["", ".", "..", "../outside", "/absolute", "x/y", "x\\y"] {
-            assert!(store.quarantine(&source, id, 1, Duration::ZERO, None).is_err());
+            assert!(
+                store
+                    .quarantine(&source, id, 1, Duration::ZERO, None)
+                    .is_err()
+            );
             assert!(store.purge(id).is_err());
             assert!(store.restore(id, true).is_err());
             assert!(store.record(id).is_err());
@@ -570,8 +691,12 @@ mod tests {
         let store = QuarantineStore::under(dir.path());
         let source = dir.path().join("target");
         fs::write(&source, b"only copy").unwrap();
-        let oversized = serde_json::Value::String("x".repeat(MAX_RECORD_BYTES as usize));
-        assert!(store.quarantine(&source, "huge", 9, Duration::ZERO, Some(oversized)).is_err());
+        let oversized = serde_json::Value::String("x".repeat(1024 * 1024));
+        assert!(
+            store
+                .quarantine(&source, "huge", 9, Duration::ZERO, Some(oversized))
+                .is_err()
+        );
         assert_eq!(fs::read(source).unwrap(), b"only copy");
         assert!(!pending_path(&store, "huge").exists());
         assert!(!store.entry_dir("huge").exists());
@@ -609,5 +734,147 @@ mod tests {
         assert!(store.restore("dangling", true).is_err());
         assert_eq!(fs::read_link(suffix).unwrap(), Path::new("missing-destination"));
         assert!(record.quarantine_path.exists());
+    }
+
+    #[test]
+    fn retrying_an_interrupted_undo_finishes_metadata_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "retry-undo");
+        fs::rename(&record.quarantine_path, &record.original_path).unwrap();
+        let outcome = store.restore("retry-undo", false).unwrap();
+        assert_eq!(outcome.restored_to, record.original_path);
+        assert_eq!(fs::read(outcome.restored_to).unwrap(), b"original bytes");
+        assert!(store.record("retry-undo").unwrap().is_none());
+    }
+
+    #[test]
+    fn retrying_an_interrupted_suffix_undo_preserves_the_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "retry-suffix");
+        fs::write(&record.original_path, b"new build").unwrap();
+        let destination = suffixed_destination(&record);
+        fs::rename(&record.quarantine_path, &destination).unwrap();
+        let outcome = store.restore("retry-suffix", true).unwrap();
+        assert_eq!(outcome.restored_to, destination);
+        assert_eq!(fs::read(destination).unwrap(), b"original bytes");
+        assert_eq!(fs::read(record.original_path).unwrap(), b"new build");
+        assert!(store.record("retry-suffix").unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_payload_and_a_different_original_are_not_a_completed_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "not-restored");
+        fs::rename(&record.quarantine_path, dir.path().join("saved")).unwrap();
+        fs::write(&record.original_path, b"different inode").unwrap();
+        assert!(store.restore("not-restored", true).is_err());
+        assert!(store.record("not-restored").unwrap().is_some());
+        assert_eq!(fs::read(record.original_path).unwrap(), b"different inode");
+    }
+
+    #[test]
+    fn a_reservation_interrupted_before_the_move_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "retry-reservation");
+        fs::rename(
+            store.record_path("retry-reservation"),
+            pending_path(&store, "retry-reservation"),
+        )
+        .unwrap();
+        fs::rename(&record.quarantine_path, &record.original_path).unwrap();
+        let new_record = store
+            .quarantine(
+                &record.original_path,
+                "retry-reservation",
+                100,
+                Duration::ZERO,
+                None,
+            )
+            .unwrap();
+        assert_eq!(new_record.inode, record.inode);
+        assert!(new_record.quarantine_path.exists());
+        assert!(!new_record.original_path.exists());
+        assert!(!pending_path(&store, "retry-reservation").exists());
+    }
+
+    #[test]
+    fn reservation_recovery_never_discards_unrecognized_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "reserved");
+        fs::rename(store.record_path("reserved"), pending_path(&store, "reserved")).unwrap();
+        fs::rename(&record.quarantine_path, &record.original_path).unwrap();
+        let unknown = store.entry_dir("reserved").join("unrecognized");
+        fs::write(&unknown, b"preserve").unwrap();
+        assert!(
+            store
+                .quarantine(&record.original_path, "reserved", 100, Duration::ZERO, None)
+                .is_err()
+        );
+        assert_eq!(fs::read(unknown).unwrap(), b"preserve");
+        assert_eq!(fs::read(record.original_path).unwrap(), b"original bytes");
+        assert!(pending_path(&store, "reserved").exists());
+    }
+
+    #[test]
+    fn relative_source_paths_remain_findable_after_absolute_recording() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&cwd).unwrap();
+        let store = QuarantineStore::under(dir.path());
+        let source = dir.path().join("relative-target");
+        let relative = source.strip_prefix(&cwd).unwrap();
+        fs::write(&source, b"relative bytes").unwrap();
+        let record = store
+            .quarantine(relative, "relative", 14, Duration::ZERO, None)
+            .unwrap();
+        assert_eq!(record.original_path, source);
+        assert_eq!(store.record_for_path(relative).unwrap(), Some(record));
+        store.restore("relative", false).unwrap();
+        assert_eq!(fs::read(source).unwrap(), b"relative bytes");
+    }
+
+    #[test]
+    fn pending_undo_can_finish_after_the_payload_was_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "pending-undo");
+        fs::rename(
+            store.record_path("pending-undo"),
+            pending_path(&store, "pending-undo"),
+        )
+        .unwrap();
+        fs::write(&record.original_path, b"new build").unwrap();
+        let destination = suffixed_destination(&record);
+        fs::rename(&record.quarantine_path, &destination).unwrap();
+        let outcome = store.restore("pending-undo", true).unwrap();
+        assert_eq!(outcome.restored_to, destination);
+        assert_eq!(fs::read(destination).unwrap(), b"original bytes");
+        assert_eq!(fs::read(record.original_path).unwrap(), b"new build");
+        assert!(!pending_path(&store, "pending-undo").exists());
+    }
+
+    #[test]
+    fn pending_recovery_refuses_a_rebuilt_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "pending-rebuilt");
+        fs::rename(
+            store.record_path("pending-rebuilt"),
+            pending_path(&store, "pending-rebuilt"),
+        )
+        .unwrap();
+        fs::rename(&record.quarantine_path, dir.path().join("saved")).unwrap();
+        fs::write(&record.original_path, b"different inode").unwrap();
+        assert!(store.restore("pending-rebuilt", true).is_err());
+        assert!(
+            store
+                .quarantine(
+                    &record.original_path,
+                    "pending-rebuilt",
+                    100,
+                    Duration::ZERO,
+                    None,
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(record.original_path).unwrap(), b"different inode");
+        assert!(pending_path(&store, "pending-rebuilt").exists());
     }
 }

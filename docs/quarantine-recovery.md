@@ -4,7 +4,7 @@ Quarantine retains the only copy of an approved cleanup candidate until undo,
 expiry, or a pressure drain. Moving it is now a write-ahead transaction:
 
 1. Reserve a previously unused decision directory and write an owner-only
-   `<decision-id>.pending` manifest. Sync the manifest and store directory
+   `<decision-id>.pending` manifest. Sync the manifest, store directory, and its ancestor links
    before moving the candidate.
 2. Move the candidate with an atomic no-replace rename on Linux and macOS.
 3. Sync the source and holding directories, publish `<decision-id>.json`,
@@ -13,8 +13,10 @@ expiry, or a pressure drain. Moving it is now a write-ahead transaction:
 An interrupted move with a payload and a valid pending manifest remains visible
 in quarantine inventory, `sbh undo`, and pressure drains after restarting. A
 pending manifest with no held payload is **not** reclaimable space and never
-authorizes deletion of its original path. Preserve an incomplete pending record
-for investigation rather than inventing a replacement manifest or deleting the
+authorizes deletion of its original path. Retrying quarantine can clear an
+abandoned reservation only when the original path and device/inode still match,
+no payload was moved, and the reserved directory is empty. Otherwise preserve
+the record for investigation; never invent a replacement manifest or delete the
 original. Filesystems that cannot supply atomic no-replace rename are refused;
 there is no overwrite-capable fallback inside quarantine.
 
@@ -28,6 +30,12 @@ Undo never overwrites a rebuilt original, an existing suffixed destination,
 or a dangling symlink, even if the destination appears concurrently. The
 `--force-suffix` option chooses an alternate name; it does not authorize
 clobbering that name. File names are preserved without lossy UTF-8 conversion.
+When undo moved the payload but stopped before removing its manifest, retrying
+undo recognizes the exact inode at the original or suffixed destination and
+finishes bookkeeping without moving it again, including pending-only manifests.
+Explicit undo can also cancel an unmoved reservation by recognizing that the
+original inode is still in place. A rebuilt file with a different identity is not treated as a completed restore. Normal purge also syncs the
+payload removal before discarding the manifest.
 
 Purge and undo validate the manifest's id, containing directory, payload path,
 and recorded device/inode. They refuse substituted payloads and symlinked entry

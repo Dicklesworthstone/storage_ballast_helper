@@ -255,9 +255,7 @@ impl QuarantineStore {
     fn ensure_root(&self) -> std::result::Result<(), QuarantineUnavailable> {
         fs::create_dir_all(&self.root)
             .map_err(|e| QuarantineUnavailable::RootUnavailable(e.to_string()))?;
-        if !fs::symlink_metadata(&self.root)
-            .is_ok_and(|metadata| metadata.file_type().is_dir())
-        {
+        if !fs::symlink_metadata(&self.root).is_ok_and(|metadata| metadata.file_type().is_dir()) {
             return Err(QuarantineUnavailable::RootUnavailable(
                 "not a directory, or is a symlink".to_string(),
             ));
@@ -519,10 +517,11 @@ impl QuarantineStore {
 
     /// The record whose original path is `path`, if held.
     pub fn record_for_path(&self, path: &Path) -> Result<Option<QuarantineRecord>> {
+        let path = std::path::absolute(path).map_err(|e| SbhError::io(path, e))?;
         Ok(self
             .records()?
             .into_iter()
-            .find(|record| record.original_path == path))
+            .find(|record| std::path::absolute(&record.original_path).is_ok_and(|p| p == path)))
     }
 }
 
