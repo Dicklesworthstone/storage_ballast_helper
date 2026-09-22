@@ -23,6 +23,9 @@ use serde::{Deserialize, Serialize};
 use crate::monitor::burst::ReserveMethod;
 use crate::monitor::pid::PressureLevel;
 
+mod idle_wake;
+use idle_wake::IdleWake;
+
 /// Poll interval while a mount is in [`MountState::Recovery`]: fast enough to
 /// notice the volume becoming writable again, slow enough not to hammer it.
 pub const RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -129,7 +132,7 @@ pub enum MountState {
     /// probe write to succeed before reclaiming again.
     Recovery,
     /// A full pass found nothing to reclaim and no ballast to release; rescan
-    /// only on wake signals or after an exponential backoff.
+    /// on new pressure, wake signals, or after an exponential backoff.
     Idle,
 }
 
@@ -295,6 +298,8 @@ pub struct MountController {
     empty_passes: u32,
     /// When an idle mount may be rescanned without a wake signal.
     idle_until: Option<Instant>,
+    /// Pressure already attempted during the current empty-pass incident.
+    idle_wake: IdleWake,
     last_transition: Option<(MountState, MountState)>,
 }
 
@@ -315,6 +320,7 @@ impl MountController {
             clean_ticks: 0,
             empty_passes: 0,
             idle_until: None,
+            idle_wake: IdleWake::default(),
             last_transition: None,
         }
     }
@@ -382,10 +388,17 @@ impl MountController {
 
         let pressured = input.level >= PressureLevel::Yellow;
         let predicted = input.prediction_confident
-            && input
-                .seconds_to_red
-                .is_some_and(|seconds| seconds <= self.config.action_horizon.as_secs_f64());
+            && input.seconds_to_red.is_some_and(|seconds| {
+                seconds.is_finite()
+                    && seconds >= 0.0
+                    && seconds <= self.config.action_horizon.as_secs_f64()
+            });
         let wants_reclaim = pressured || predicted;
+        let pressure_wake = self.idle_wake.observe(
+            input.level,
+            predicted,
+            self.config.recovery_clean_windows,
+        );
 
         // A write failure trumps everything: nothing sbh does on this mount
         // can succeed until a probe write does.
@@ -456,10 +469,19 @@ impl MountController {
                         Some(IdleReason::NoSurface),
                         input.now,
                     );
-                } else if input.wake.any() || backoff_expired || input.releasable_ballast {
+                } else if input.wake.any()
+                    || backoff_expired
+                    || input.releasable_ballast
+                    || (pressure_wake && input.surface.scannable())
+                {
                     if input.wake.forced_scan || input.wake.reload {
                         self.empty_passes = 0;
+                        self.idle_wake.reset();
                     }
+                    // Consume a pressure wake only when there is a surface
+                    // on which it can run. Empty passes retain their count;
+                    // unchanged pressure must still back off after this retry.
+                    self.idle_wake.cover();
                     let next = if wants_reclaim {
                         MountState::Reclaim
                     } else {
@@ -499,12 +521,14 @@ impl MountController {
     ) -> Option<(MountState, MountState)> {
         if dispatchable_candidates > 0 {
             self.empty_passes = 0;
+            self.idle_wake.reset();
             return None;
         }
         if releasable_ballast || !matches!(self.state, MountState::Reclaim | MountState::Maintain) {
             return None;
         }
         self.empty_passes = self.empty_passes.saturating_add(1);
+        self.idle_wake.cover();
         let before = self.state;
         self.enter(MountState::Idle, Some(IdleReason::NothingToReclaim), now);
         self.idle_until = Some(now + self.idle_backoff());
