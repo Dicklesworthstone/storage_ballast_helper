@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use crate::core::errors::{Result, SbhError};
 use crate::scanner::protection::{MARKER_FILENAME, create_marker};
 
+mod safety;
+
 /// Directory under the mount's `.sbh` that holds quarantined entries.
 pub const QUARANTINE_DIR_NAME: &str = "quarantine";
 
@@ -253,9 +255,11 @@ impl QuarantineStore {
     fn ensure_root(&self) -> std::result::Result<(), QuarantineUnavailable> {
         fs::create_dir_all(&self.root)
             .map_err(|e| QuarantineUnavailable::RootUnavailable(e.to_string()))?;
-        if !self.root.is_dir() {
+        if !fs::symlink_metadata(&self.root)
+            .is_ok_and(|metadata| metadata.file_type().is_dir())
+        {
             return Err(QuarantineUnavailable::RootUnavailable(
-                "not a directory".to_string(),
+                "not a directory, or is a symlink".to_string(),
             ));
         }
         if !self.root.join(MARKER_FILENAME).exists() {
@@ -279,8 +283,8 @@ impl QuarantineStore {
 
     /// The stuck marker for `decision_id`, if a drain has failed on it.
     fn stuck(&self, decision_id: &str) -> Option<StuckEntry> {
-        let text = fs::read_to_string(self.stuck_path(decision_id)).ok()?;
-        serde_json::from_str(&text).ok()
+        safety::validate_id(decision_id).ok()?;
+        safety::read_json(&self.stuck_path(decision_id)).ok()
     }
 
     /// Record (or extend) a failed purge. Returns the updated marker so the
@@ -300,9 +304,7 @@ impl QuarantineStore {
         // Best-effort: if the marker cannot be written the drain still
         // continues, it just retries this entry next sweep instead of
         // cooling down. Never fail a drain over bookkeeping.
-        if let Ok(text) = serde_json::to_string_pretty(&marker) {
-            let _ = fs::write(self.stuck_path(&record.decision_id), text);
-        }
+        let _ = safety::write_json(&self.stuck_path(&record.decision_id), &marker);
         marker
     }
 
@@ -330,11 +332,14 @@ impl QuarantineStore {
             if path.extension().and_then(|e| e.to_str()) != Some(STUCK_EXTENSION) {
                 continue;
             }
-            if let Ok(text) = fs::read_to_string(&path)
-                && let Ok(marker) = serde_json::from_str::<StuckEntry>(&text)
+            if let Ok(marker) = safety::read_json::<StuckEntry>(&path)
+                && safety::validate_id(&marker.decision_id).is_ok()
+                && path.file_stem().and_then(|s| s.to_str()) == Some(marker.decision_id.as_str())
             {
                 // An orphan marker (record purged by another path) is noise.
-                if self.record_path(&marker.decision_id).exists() {
+                if self.record_path(&marker.decision_id).exists()
+                    || safety::has_pending_record(self, &marker.decision_id)
+                {
                     stuck.push(marker);
                 } else {
                     let _ = fs::remove_file(&path);
@@ -382,56 +387,11 @@ impl QuarantineStore {
         ttl: Duration,
         decision: Option<serde_json::Value>,
     ) -> std::result::Result<QuarantineRecord, QuarantineUnavailable> {
-        self.ensure_root()?;
-        let (root_dev, _) = device_of(&self.root)
-            .map_err(|e| QuarantineUnavailable::RootUnavailable(e.to_string()))?;
-        let (dev, ino) =
-            device_of(path).map_err(|e| QuarantineUnavailable::RenameFailed(e.to_string()))?;
-        if dev != root_dev {
-            return Err(QuarantineUnavailable::CrossDevice);
-        }
-        let Some(name) = path.file_name() else {
-            return Err(QuarantineUnavailable::RenameFailed(
-                "candidate has no file name".to_string(),
-            ));
-        };
-        let dir = self.entry_dir(decision_id);
-        fs::create_dir_all(&dir).map_err(|e| QuarantineUnavailable::RenameFailed(e.to_string()))?;
-        let target = dir.join(name);
-        if target.exists() {
-            return Err(QuarantineUnavailable::RenameFailed(format!(
-                "{} already holds an entry",
-                target.display()
-            )));
-        }
-        fs::rename(path, &target)
-            .map_err(|e| QuarantineUnavailable::RenameFailed(e.to_string()))?;
-        let quarantined_at = now_secs();
-        let record = QuarantineRecord {
-            decision_id: decision_id.to_string(),
-            original_path: path.to_path_buf(),
-            quarantine_path: target,
-            device_id: dev,
-            inode: ino,
-            size_bytes,
-            quarantined_at,
-            expires_at: quarantined_at.saturating_add(ttl.as_secs()),
-            decision,
-        };
-        // The record is what makes the entry restorable; without it the
-        // entry is just bytes in a hidden directory, so a record write
-        // failure is a quarantine failure and the rename is undone.
-        if let Err(e) = write_record(&self.record_path(decision_id), &record) {
-            let _ = fs::rename(&record.quarantine_path, path);
-            let _ = fs::remove_dir(&dir);
-            return Err(QuarantineUnavailable::RootUnavailable(format!(
-                "record write failed: {e}"
-            )));
-        }
-        Ok(record)
+        safety::quarantine(self, path, decision_id, size_bytes, ttl, decision)
     }
 
-    /// Every record in the store, oldest first.
+    /// Every valid record in the store, oldest first. Completed moves with
+    /// a write-ahead `.pending` record are included after an interruption.
     pub fn records(&self) -> Result<Vec<QuarantineRecord>> {
         let mut records = Vec::new();
         let entries = match fs::read_dir(&self.root) {
@@ -439,13 +399,18 @@ impl QuarantineStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(records),
             Err(e) => return Err(SbhError::io(&self.root, e)),
         };
+        let mut seen = std::collections::BTreeSet::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            if !matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("json" | "pending")
+            ) {
                 continue;
             }
-            if let Ok(text) = fs::read_to_string(&path)
-                && let Ok(record) = serde_json::from_str::<QuarantineRecord>(&text)
+            if let Some(id) = path.file_stem().and_then(|s| s.to_str())
+                && seen.insert(id.to_string())
+                && let Ok(Some(record)) = self.record(id)
             {
                 records.push(record);
             }
@@ -460,12 +425,7 @@ impl QuarantineStore {
 
     /// The record for `decision_id`, if held.
     pub fn record(&self, decision_id: &str) -> Result<Option<QuarantineRecord>> {
-        let path = self.record_path(decision_id);
-        match fs::read_to_string(&path) {
-            Ok(text) => Ok(serde_json::from_str(&text).ok()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(SbhError::io(&path, e)),
-        }
+        safety::read_record(self, decision_id)
     }
 
     /// Bytes held (the decision-time size estimates summed).
@@ -480,19 +440,7 @@ impl QuarantineStore {
     /// Unlink one entry for good (record included). Returns the bytes its
     /// record claimed.
     pub fn purge(&self, decision_id: &str) -> Result<u64> {
-        let Some(record) = self.record(decision_id)? else {
-            // No record: nothing to restore, so any marker is stale.
-            self.clear_stuck(decision_id);
-            return Ok(0);
-        };
-        let dir = self.entry_dir(decision_id);
-        if dir.exists() {
-            fs::remove_dir_all(&dir).map_err(|e| SbhError::io(&dir, e))?;
-        }
-        let record_path = self.record_path(decision_id);
-        fs::remove_file(&record_path).map_err(|e| SbhError::io(&record_path, e))?;
-        self.clear_stuck(decision_id);
-        Ok(record.size_bytes)
+        safety::purge(self, decision_id)
     }
 
     /// Unlink every entry whose TTL has expired.
@@ -566,48 +514,7 @@ impl QuarantineStore {
     /// original path exists again unless `force_suffix`, which restores to
     /// `<original>.restored-<decision-id>` instead.
     pub fn restore(&self, decision_id: &str, force_suffix: bool) -> Result<RestoreOutcome> {
-        let Some(record) = self.record(decision_id)? else {
-            return Err(SbhError::Runtime {
-                details: format!("no quarantined entry for decision {decision_id}"),
-            });
-        };
-        if !record.quarantine_path.exists() {
-            return Err(SbhError::Runtime {
-                details: format!(
-                    "quarantined entry for {decision_id} is gone: {}",
-                    record.quarantine_path.display()
-                ),
-            });
-        }
-        let mut destination = record.original_path.clone();
-        if fs::symlink_metadata(&destination).is_ok() {
-            if !force_suffix {
-                return Err(SbhError::Runtime {
-                    details: format!(
-                        "{} exists again; pass --force-suffix to restore next to it",
-                        destination.display()
-                    ),
-                });
-            }
-            let name = destination
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            destination.set_file_name(format!("{name}.restored-{decision_id}"));
-        }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(|e| SbhError::io(parent, e))?;
-        }
-        fs::rename(&record.quarantine_path, &destination)
-            .map_err(|e| SbhError::io(&record.quarantine_path, e))?;
-        let _ = fs::remove_dir(self.entry_dir(decision_id));
-        let record_path = self.record_path(decision_id);
-        fs::remove_file(&record_path).map_err(|e| SbhError::io(&record_path, e))?;
-        Ok(RestoreOutcome {
-            decision_id: decision_id.to_string(),
-            restored_to: destination,
-            size_bytes: record.size_bytes,
-        })
+        safety::restore(self, decision_id, force_suffix)
     }
 
     /// The record whose original path is `path`, if held.
@@ -619,10 +526,9 @@ impl QuarantineStore {
     }
 }
 
+#[cfg(test)]
 fn write_record(path: &Path, record: &QuarantineRecord) -> io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(record)?)?;
-    fs::rename(&tmp, path)
+    safety::write_json(path, record)
 }
 
 /// The quarantine root for `path`: `<root>/.sbh/quarantine` for the longest
@@ -1040,6 +946,10 @@ mod tests {
     fn stuck_entries_are_listed_and_cleared_when_the_entry_finally_goes() {
         let dir = tempfile::tempdir().unwrap();
         let store = expired_store(dir.path(), 2);
+        // Keep the original inode: repairing permissions or a mount must not
+        // authorize purging an unrelated replacement at the same path.
+        let saved = dir.path().join("saved");
+        fs::rename(store.entry_dir("d0").join("target"), &saved).unwrap();
         poison(&store, "d0");
         store.drain_expired(1_500).unwrap();
 
@@ -1053,7 +963,8 @@ mod tests {
         // with it, or `doctor` reports a phantom forever.
         let entry = store.entry_dir("d0");
         fs::remove_file(&entry).unwrap();
-        fs::create_dir_all(entry.join("target")).unwrap();
+        fs::create_dir(&entry).unwrap();
+        fs::rename(&saved, entry.join("target")).unwrap();
         let out = store.drain_expired(1_500 + STUCK_RETRY_SECS).unwrap();
         assert_eq!(out.entries, 1);
         assert!(out.failures.is_empty());
