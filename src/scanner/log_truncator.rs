@@ -8,25 +8,38 @@
 //!
 //! This module reclaims that space by truncating matching files in place via
 //! `ftruncate(2)` (Rust `File::set_len(0)`):
-//!   - The inode size goes to 0, so the disk blocks are released immediately.
+//!   - The inode size goes to 0, releasing its allocated blocks subject to
+//!     filesystem snapshots and other retention mechanisms.
 //!   - The inode itself survives, so the writer's open fd keeps targeting the
 //!     same file. Subsequent appends continue without disruption (the file
 //!     becomes temporarily sparse if the writer is not in O_APPEND mode).
 //!
 //! Contrast with `unlink`: under an open fd, the inode is orphaned but the
 //! kernel holds its blocks until every fd closes — i.e. **no space is
-//! reclaimed** until the process exits. Truncate-in-place is the only safe
-//! way to free space from an active log without killing the writer.
+//! reclaimed** until the process exits. Truncate-in-place can reclaim an
+//! active log without killing the writer.
 //!
 //! Patterns are matched with a tiny built-in matcher rather than pulling in
 //! `glob`/`globset`. Each `paths` entry is an absolute path; literal `*`
 //! wildcards inside a path segment match direct entries of that segment's parent.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
+use parking_lot::Mutex;
+
 use crate::core::config::LogTruncationConfig;
+
+mod backoff;
+use backoff::{FailureBackoff, FailureKey};
+
+#[cfg(test)]
+mod pressure_tests;
+
+static FAILURE_BACKOFF: OnceLock<Mutex<FailureBackoff>> = OnceLock::new();
 
 /// Report from a single truncation sweep.
 #[derive(Debug, Clone, Default)]
@@ -37,9 +50,9 @@ pub struct LogTruncationReport {
     pub files_would_truncate: usize,
     /// Number of matching paths rejected or failed before truncation.
     pub files_skipped: usize,
-    /// Bytes reclaimed by successful in-place truncation.
+    /// Reclaimed-byte estimate, bounded by both logical and allocated size.
     pub bytes_reclaimed: u64,
-    /// Bytes that would have been reclaimed in dry-run mode.
+    /// Corresponding byte estimate for dry-run mode.
     pub bytes_would_reclaim: u64,
     /// Per-path errors observed while expanding or processing patterns.
     pub errors: Vec<(PathBuf, String)>,
@@ -57,23 +70,49 @@ pub struct LogTruncationReport {
 pub enum SkipReason {
     /// The matched path was not a regular file.
     NotARegularFile,
-    /// The matched file was smaller than the configured minimum size.
+    /// The matched file had fewer reclaimable bytes than the minimum size.
     BelowMinSize,
     /// The matched file was newer than the configured minimum age.
     YoungerThanMinAge,
     /// The matched path was a symlink.
     SymlinkRejected,
+    /// A recent failure, or a saturated failure budget, is cooling down.
+    FailureBackoff,
+    /// The opened object differs from the inspected file, or its identity
+    /// cannot be verified on this platform.
+    IdentityChanged,
 }
 
 /// Execute one truncation pass.
 ///
 /// `free_pct` is the current free-disk percentage. When it is at or below
 /// `config.pressure_free_pct_ceiling`, the `min_age_minutes` gate is bypassed
-/// so the daemon can act decisively under emergency pressure.
+/// so the daemon can act decisively under emergency pressure. Failures still
+/// cool down for a full minute; pressure does not turn them into an I/O loop.
+/// Dry runs neither consult nor change the process-local failure history.
 pub fn truncate_oversized_logs(
     config: &LogTruncationConfig,
     free_pct: f64,
     dry_run: bool,
+) -> LogTruncationReport {
+    let backoff = FAILURE_BACKOFF.get_or_init(|| Mutex::new(FailureBackoff::default()));
+    truncate_with_backoff(
+        config,
+        free_pct,
+        dry_run,
+        backoff,
+        Instant::now,
+        process_candidate,
+    )
+}
+
+fn truncate_with_backoff(
+    config: &LogTruncationConfig,
+    free_pct: f64,
+    dry_run: bool,
+    backoff: &Mutex<FailureBackoff>,
+    clock: impl Fn() -> Instant,
+    mut process: impl FnMut(&Path, &LogTruncationConfig, bool, bool) -> Result<Outcome, String>,
 ) -> LogTruncationReport {
     let start = Instant::now();
     let mut report = LogTruncationReport {
@@ -88,30 +127,56 @@ pub fn truncate_oversized_logs(
 
     let bypass_age_gate =
         free_pct <= f64::from(config.pressure_free_pct_ceiling) || config.min_age_minutes == 0;
+    let mut seen_patterns = HashSet::new();
+    let mut seen_paths = HashSet::new();
 
     for pattern in &config.paths {
+        if !seen_patterns.insert(pattern) {
+            continue;
+        }
+        let key = FailureKey::Pattern(PathBuf::from(pattern));
+        if !dry_run && backoff.lock().blocked(&key, clock()) {
+            record_skip(&mut report, PathBuf::from(pattern), SkipReason::FailureBackoff);
+            continue;
+        }
         let mut matches: Vec<PathBuf> = Vec::new();
         if let Err(err) = expand_pattern(Path::new(pattern), &mut matches) {
+            if !dry_run {
+                backoff.lock().failed(key, clock());
+            }
             report
                 .errors
                 .push((PathBuf::from(pattern), format!("expand failed: {err}")));
+            report.files_skipped += 1;
             continue;
         }
         for path in matches {
-            match process_candidate(&path, config, bypass_age_gate, dry_run) {
+            if !seen_paths.insert(path.clone()) {
+                continue;
+            }
+            let key = FailureKey::Candidate(path.clone());
+            if !dry_run && backoff.lock().blocked(&key, clock()) {
+                record_skip(&mut report, path, SkipReason::FailureBackoff);
+                continue;
+            }
+            // Never hold the shared history lock across filesystem I/O.
+            match process(&path, config, bypass_age_gate, dry_run) {
                 Ok(Outcome::Truncated(bytes)) => {
+                    backoff.lock().succeeded(&key);
                     report.files_truncated += 1;
-                    report.bytes_reclaimed += bytes;
+                    report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(bytes);
                 }
                 Ok(Outcome::WouldTruncate(bytes)) => {
                     report.files_would_truncate += 1;
-                    report.bytes_would_reclaim += bytes;
+                    report.bytes_would_reclaim = report.bytes_would_reclaim.saturating_add(bytes);
                 }
-                Ok(Outcome::Skipped(reason)) => {
-                    report.files_skipped += 1;
-                    report.skipped_with_reason.push((path, reason));
-                }
+                Ok(Outcome::Skipped(reason)) => record_skip(&mut report, path, reason),
                 Err(e) => {
+                    if !dry_run {
+                        // Start the full cooldown after the failing operation,
+                        // not before a potentially slow filesystem call.
+                        backoff.lock().failed(key, clock());
+                    }
                     report.errors.push((path, e));
                     report.files_skipped += 1;
                 }
@@ -121,6 +186,11 @@ pub fn truncate_oversized_logs(
 
     report.duration = start.elapsed();
     report
+}
+
+fn record_skip(report: &mut LogTruncationReport, path: PathBuf, reason: SkipReason) {
+    report.files_skipped += 1;
+    report.skipped_with_reason.push((path, reason));
 }
 
 enum Outcome {
@@ -135,34 +205,104 @@ fn process_candidate(
     bypass_age_gate: bool,
     dry_run: bool,
 ) -> Result<Outcome, String> {
+    process_candidate_with_opener(
+        path,
+        config,
+        bypass_age_gate,
+        dry_run,
+        open_candidate_for_truncate,
+    )
+}
+
+fn process_candidate_with_opener(
+    path: &Path,
+    config: &LogTruncationConfig,
+    bypass_age_gate: bool,
+    dry_run: bool,
+    open: impl FnOnce(&Path) -> Result<fs::File, String>,
+) -> Result<Outcome, String> {
     let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if meta.file_type().is_symlink() {
-        return Ok(Outcome::Skipped(SkipReason::SymlinkRejected));
-    }
-    if !meta.is_file() {
-        return Ok(Outcome::Skipped(SkipReason::NotARegularFile));
-    }
-    let size = meta.len();
-    if size < config.min_size_bytes {
-        return Ok(Outcome::Skipped(SkipReason::BelowMinSize));
-    }
-    if !bypass_age_gate
-        && config.min_age_minutes > 0
-        && let Ok(modified) = meta.modified()
-        && let Ok(elapsed) = SystemTime::now().duration_since(modified)
-        && elapsed < Duration::from_secs(config.min_age_minutes * 60)
-    {
-        return Ok(Outcome::Skipped(SkipReason::YoungerThanMinAge));
+    if let Some(reason) = candidate_skip(&meta, config, bypass_age_gate)? {
+        return Ok(Outcome::Skipped(reason));
     }
     if dry_run {
-        return Ok(Outcome::WouldTruncate(size));
+        return Ok(Outcome::WouldTruncate(reclaimable_bytes(&meta)));
     }
-    let f = open_candidate_for_truncate(path)?;
-    if !f.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("opened path is not a regular file".to_string());
+    let f = open(path)?;
+    let opened_meta = f.metadata().map_err(|e| e.to_string())?;
+    // O_NOFOLLOW refuses leaf symlinks, not a different regular file or a
+    // replaced parent directory. Bind mutation to the inspected inode too.
+    if !same_file(&meta, &opened_meta) {
+        return Ok(Outcome::Skipped(SkipReason::IdentityChanged));
     }
+    // A writer/rotator can shrink or refresh the same inode while it opens.
+    // Reapply the gates to descriptor metadata, then mutate that descriptor.
+    if let Some(reason) = candidate_skip(&opened_meta, config, bypass_age_gate)? {
+        return Ok(Outcome::Skipped(reason));
+    }
+    let bytes = reclaimable_bytes(&opened_meta);
     f.set_len(0).map_err(|e| e.to_string())?;
-    Ok(Outcome::Truncated(size))
+    Ok(Outcome::Truncated(bytes))
+}
+
+fn candidate_skip(
+    meta: &fs::Metadata,
+    config: &LogTruncationConfig,
+    bypass_age_gate: bool,
+) -> Result<Option<SkipReason>, String> {
+    if meta.file_type().is_symlink() {
+        return Ok(Some(SkipReason::SymlinkRejected));
+    }
+    if !meta.is_file() {
+        return Ok(Some(SkipReason::NotARegularFile));
+    }
+    let bytes = reclaimable_bytes(meta);
+    if bytes == 0 || bytes < config.min_size_bytes {
+        return Ok(Some(SkipReason::BelowMinSize));
+    }
+    if !bypass_age_gate && config.min_age_minutes > 0 {
+        let modified = meta.modified().map_err(|e| e.to_string())?;
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or(Duration::ZERO);
+        if age < Duration::from_secs(config.min_age_minutes.saturating_mul(60)) {
+            return Ok(Some(SkipReason::YoungerThanMinAge));
+        }
+    }
+    Ok(None)
+}
+
+/// A non-append writer resumes at its old offset after truncation, creating
+/// holes rather than reallocating its old contents. Do not repeatedly truncate
+/// a huge apparent file that is only consuming a few blocks.
+fn reclaimable_bytes(meta: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.len().min(meta.blocks().saturating_mul(512))
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
+fn same_file(before: &fs::Metadata, opened: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        before.is_file()
+            && opened.is_file()
+            && before.dev() == opened.dev()
+            && before.ino() == opened.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (before, opened);
+        // Size and timestamps cannot establish identity for a destructive
+        // operation. Refuse until this platform supplies stable file IDs.
+        false
+    }
 }
 
 fn open_candidate_for_truncate(path: &Path) -> Result<fs::File, String> {
