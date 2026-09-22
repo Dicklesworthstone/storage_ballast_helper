@@ -333,8 +333,8 @@ pub fn plan_batch(
             .target_bytes
             .is_some_and(|target| planned_bytes >= target);
         let next_risk = risk_used + planned.expected_loss;
-        let over_budget = !next_risk.is_finite()
-            || risk_budget.is_some_and(|budget| next_risk > budget + 1e-9);
+        let over_budget =
+            !next_risk.is_finite() || risk_budget.is_some_and(|budget| next_risk > budget + 1e-9);
         if target_met || chosen_idx.len() >= request.max_items || over_budget {
             continue;
         }
@@ -409,7 +409,9 @@ pub fn plan_batch(
 mod tests {
     use super::*;
     use crate::scanner::patterns::ArtifactClassification;
-    use crate::scanner::scoring::{ArtifactCertainty, DecisionOutcome, EvidenceLedger, ScoreFactors};
+    use crate::scanner::scoring::{
+        ArtifactCertainty, DecisionOutcome, EvidenceLedger, ScoreFactors,
+    };
     use std::path::Path;
     use std::time::Duration;
 
@@ -498,7 +500,10 @@ mod tests {
         assert!(why.contains("posterior 0.85"), "{why}");
         assert!(why.contains("reaches the target"), "{why}");
         assert!(why.contains("50% of the risk"), "{why}");
-        assert!(plan.summary_line().starts_with("level=orange target_bytes="));
+        assert!(
+            plan.summary_line()
+                .starts_with("level=orange target_bytes=")
+        );
     }
 
     #[test]
@@ -690,7 +695,13 @@ mod tests {
         for posterior in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
             for level in [PressureLevel::Green, PressureLevel::Critical] {
                 let candidates = vec![
-                    candidate("/p/invalid", 40 * GIB, posterior, 2.0, DecisionAction::Delete),
+                    candidate(
+                        "/p/invalid",
+                        40 * GIB,
+                        posterior,
+                        2.0,
+                        DecisionAction::Delete,
+                    ),
                     candidate("/p/valid", GIB, 0.9, 1.0, DecisionAction::Delete),
                 ];
                 let mut req = request(level, None, None);
