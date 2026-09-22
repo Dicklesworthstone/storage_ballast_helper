@@ -15,6 +15,9 @@ use super::ActivityEvent;
 pub(super) const WINDOW: Duration = Duration::from_secs(60);
 const PER_TEMPLATE: u8 = 3;
 const PER_SEVERITY: usize = 64;
+/// Conservative JSON string-payload budget, separately for each severity.
+/// Fixed schema fields and the periodic summary are outside this budget.
+const PAYLOAD_BUDGET: usize = 256 * 1024;
 const TEMPLATE_CHARS: usize = 256;
 const INSPECT_CHARS: usize = 1024;
 const CODE_CHARS: usize = 64;
@@ -27,7 +30,7 @@ struct Key {
 }
 
 impl Key {
-    fn for_event(event: &ActivityEvent) -> Option<Self> {
+    fn for_event(event: &ActivityEvent) -> Option<(Self, usize)> {
         let (severity, code, message) = match event {
             ActivityEvent::Info { message } => (0, "", message),
             ActivityEvent::Warning { code, message } => (1, code.as_str(), message),
@@ -36,12 +39,31 @@ impl Key {
             // audit records, not disposable repeated error messages.
             _ => return None,
         };
-        Some(Self {
-            severity,
-            code: code.chars().take(CODE_CHARS).collect(),
-            template: message_template(message),
-        })
+        Some((
+            Self {
+                severity,
+                code: code.chars().take(CODE_CHARS).collect(),
+                template: message_template(message),
+            },
+            payload_cost(code, message),
+        ))
     }
+}
+
+/// Bound serialized string content as well as event counts. JSON escaping
+/// can expand a control byte to six bytes; Unicode UTF-8 stays unchanged.
+/// Oversized input is rejected without scanning its whole message.
+fn payload_cost(code: &str, message: &str) -> usize {
+    if code.len().saturating_add(message.len()) > PAYLOAD_BUDGET {
+        return PAYLOAD_BUDGET + 1;
+    }
+    code.bytes().chain(message.bytes()).fold(0, |cost, byte| {
+        cost + match byte {
+            b'"' | b'\\' => 2,
+            0..=31 => 6,
+            _ => 1,
+        }
+    })
 }
 
 /// Paths and changing numeric observations must not mint a new bucket every
@@ -86,8 +108,10 @@ struct State {
     window_started: Instant,
     last_report: Instant,
     emitted: [usize; 3],
+    payload_bytes: [usize; 3],
     templates: HashMap<Key, u8>,
     pending: [u64; 3],
+    byte_limited: [u64; 3],
     samples: [String; 3],
 }
 
@@ -97,28 +121,39 @@ impl State {
             window_started: now,
             last_report: now,
             emitted: [0; 3],
+            payload_bytes: [0; 3],
             templates: HashMap::new(),
             pending: [0; 3],
+            byte_limited: [0; 3],
             samples: std::array::from_fn(|_| String::new()),
         }
     }
 
-    fn admit(&mut self, key: Key, now: Instant) -> bool {
+    fn admit(&mut self, key: Key, cost: usize, now: Instant) -> bool {
         if now.saturating_duration_since(self.window_started) >= WINDOW {
             self.window_started = now;
             self.emitted = [0; 3];
+            self.payload_bytes = [0; 3];
             self.templates.clear();
             // Pending suppression survives rotation until the consumer writes
             // its summary. A delayed logger must not silently lose counts.
         }
         let severity = key.severity;
         let count = self.templates.get(&key).copied().unwrap_or(0);
-        if self.emitted[severity] < PER_SEVERITY && count < PER_TEMPLATE {
+        let bytes = self.payload_bytes[severity].saturating_add(cost);
+        if self.emitted[severity] < PER_SEVERITY
+            && count < PER_TEMPLATE
+            && bytes <= PAYLOAD_BUDGET
+        {
             self.emitted[severity] += 1;
+            self.payload_bytes[severity] = bytes;
             self.templates.insert(key, count + 1);
             true
         } else {
             self.pending[severity] = self.pending[severity].saturating_add(1);
+            if bytes > PAYLOAD_BUDGET {
+                self.byte_limited[severity] = self.byte_limited[severity].saturating_add(1);
+            }
             if self.samples[severity].is_empty() {
                 self.samples[severity] = format!("{} {}", key.code, key.template);
             }
@@ -145,11 +180,11 @@ impl DiagnosticGate {
     }
 
     pub(super) fn admit(&self, event: &ActivityEvent, now: Instant) -> bool {
-        let Some(key) = Key::for_event(event) else {
+        let Some((key, cost)) = Key::for_event(event) else {
             return true;
         };
         let admitted = if let Some(mut state) = self.state.try_lock() {
-            state.admit(key, now)
+            state.admit(key, cost, now)
         } else {
             self.contended[key.severity].fetch_add(1, Ordering::Relaxed);
             false
@@ -177,9 +212,8 @@ impl DiagnosticGate {
             .contended
             .each_ref()
             .map(|counter| counter.swap(0, Ordering::Relaxed));
-        let counts: [u64; 3] = std::array::from_fn(|i| {
-            state.pending[i].saturating_add(contended[i])
-        });
+        let counts: [u64; 3] =
+            std::array::from_fn(|i| state.pending[i].saturating_add(contended[i]));
         if counts == [0; 3] {
             return None;
         }
@@ -189,11 +223,15 @@ impl DiagnosticGate {
             "suppressed_info": counts[0],
             "suppressed_warning": counts[1],
             "suppressed_error": counts[2],
+            "byte_limited_info": state.byte_limited[0],
+            "byte_limited_warning": state.byte_limited[1],
+            "byte_limited_error": state.byte_limited[2],
             "lock_contention": contended.iter().copied().fold(0u64, u64::saturating_add),
             "sample_templates": state.samples,
         })
         .to_string();
         state.pending = [0; 3];
+        state.byte_limited = [0; 3];
         for sample in &mut state.samples {
             sample.clear();
         }
@@ -232,7 +270,10 @@ mod tests {
             message_template("write failed path=/tmp/agent-7/cache free=12.4% errno=28"),
             message_template("write failed path=/data/other/cache free=9.8% errno=28")
         );
-        assert_ne!(message_template("write failed"), message_template("read failed"));
+        assert_ne!(
+            message_template("write failed"),
+            message_template("read failed")
+        );
         let huge = "磁".repeat(10_000);
         assert!(message_template(&huge).chars().count() <= TEMPLATE_CHARS);
     }
@@ -243,7 +284,10 @@ mod tests {
         let gate = DiagnosticGate::new(now);
         for i in 0..10_000 {
             assert_eq!(
-                gate.admit(&error(format!("write failed path=/tmp/agent-{i} errno=28")), now),
+                gate.admit(
+                    &error(format!("write failed path=/tmp/agent-{i} errno=28")),
+                    now
+                ),
                 i < usize::from(PER_TEMPLATE)
             );
         }
@@ -276,10 +320,18 @@ mod tests {
         let now = Instant::now();
         let gate = DiagnosticGate::new(now);
         for _ in 0..10_000 {
-            gate.admit(&ActivityEvent::Info { message: "retry".to_string() }, now);
+            gate.admit(
+                &ActivityEvent::Info {
+                    message: "retry".to_string(),
+                },
+                now,
+            );
         }
         assert!(gate.admit(
-            &ActivityEvent::Warning { code: "W".to_string(), message: "retry".to_string() },
+            &ActivityEvent::Warning {
+                code: "W".to_string(),
+                message: "retry".to_string(),
+            },
             now
         ));
         assert!(gate.admit(&error("retry"), now));
@@ -311,7 +363,10 @@ mod tests {
             gate.admit(&error("failed"), now);
         }
         assert!(!gate.admit(&error("failed"), now + WINDOW - Duration::from_nanos(1)));
-        assert!(gate.take_report(now + Duration::from_secs(59), false).is_none());
+        assert!(
+            gate.take_report(now + Duration::from_secs(59), false)
+                .is_none()
+        );
         for i in 0..4 {
             assert_eq!(gate.admit(&error("failed"), now + WINDOW), i < 3);
         }
@@ -340,8 +395,13 @@ mod tests {
         for event in [
             ActivityEvent::Shutdown,
             ActivityEvent::MirrorJsonl(true),
-            ActivityEvent::Emergency { details: "full".to_string(), free_pct: 0.0 },
-            ActivityEvent::ConfigReloaded { details: "changed".to_string() },
+            ActivityEvent::Emergency {
+                details: "full".to_string(),
+                free_pct: 0.0,
+            },
+            ActivityEvent::ConfigReloaded {
+                details: "changed".to_string(),
+            },
             ActivityEvent::ArtifactDeletionFailed {
                 path: "/tmp/target".to_string(),
                 error_code: "SBH-IO".to_string(),
@@ -402,7 +462,10 @@ mod tests {
                 error_message: "permission denied".to_string(),
             });
         }
-        handle.send(ActivityEvent::Emergency { details: "full".to_string(), free_pct: 0.0 });
+        handle.send(ActivityEvent::Emergency {
+            details: "full".to_string(),
+            free_pct: 0.0,
+        });
         assert_eq!(handle.suppressed_diagnostics(), 4997);
         assert_eq!(other.suppressed_diagnostics(), 4997);
         assert_eq!(handle.dropped_events(), 0);
@@ -419,26 +482,40 @@ mod tests {
             crate::logger::schema::validate_value(line).unwrap();
             assert_eq!(line["run_id"], "throttle-test");
         }
-        assert_eq!(lines.iter().filter(|line| line["event"] == "artifact_delete").count(), 5);
-        assert_eq!(lines.iter().filter(|line| line["event"] == "emergency").count(), 1);
-        let summary = lines.iter().find(|line| line["error_code"] == "SBH-LOG-THROTTLED").unwrap();
-        let value: serde_json::Value = serde_json::from_str(summary["details"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            lines.iter().filter(|line| line["event"] == "artifact_delete").count(),
+            5
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line["event"] == "emergency").count(),
+            1
+        );
+        let summary = lines
+            .iter()
+            .find(|line| line["error_code"] == "SBH-LOG-THROTTLED")
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(summary["details"].as_str().unwrap()).unwrap();
         assert_eq!(value["suppressed_error"], 4997);
 
         #[cfg(feature = "sqlite")]
         {
             let db = rusqlite::Connection::open(dir.path().join("activity.db")).unwrap();
-            let message: String = db.query_row(
-                "SELECT details FROM activity_log WHERE error_code = 'SBH-LOG-THROTTLED'",
-                [],
-                |row| row.get(0),
-            ).unwrap();
+            let message: String = db
+                .query_row(
+                    "SELECT details FROM activity_log WHERE error_code = 'SBH-LOG-THROTTLED'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert_eq!(serde_json::from_str::<serde_json::Value>(&message).unwrap(), value);
-            let failures: i64 = db.query_row(
-                "SELECT COUNT(*) FROM activity_log WHERE event_type = 'artifact_delete' AND success = 0",
-                [],
-                |row| row.get(0),
-            ).unwrap();
+            let failures: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM activity_log WHERE event_type = 'artifact_delete' AND success = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert_eq!(failures, 5);
         }
     }
@@ -455,9 +532,66 @@ mod tests {
         drop(handle);
         join.join().unwrap();
         let text = std::fs::read_to_string(dir.path().join("activity.jsonl")).unwrap();
-        let lines: Vec<serde_json::Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(lines.len(), 4);
-        let details: serde_json::Value = serde_json::from_str(lines.last().unwrap()["details"].as_str().unwrap()).unwrap();
+        let details: serde_json::Value =
+            serde_json::from_str(lines.last().unwrap()["details"].as_str().unwrap()).unwrap();
         assert_eq!(details["suppressed_error"], 7);
+    }
+
+    #[test]
+    fn an_oversized_message_cannot_consume_the_queue_or_block_a_small_error() {
+        let now = Instant::now();
+        let gate = DiagnosticGate::new(now);
+        assert!(!gate.admit(&error("x".repeat(PAYLOAD_BUDGET + 1)), now));
+        assert!(gate.state.lock().templates.is_empty());
+        assert!(gate.admit(&error("independent small error"), now));
+        let value = report(&gate, now, true);
+        assert_eq!(value["suppressed_error"], 1);
+        assert_eq!(value["byte_limited_error"], 1);
+    }
+
+    #[test]
+    fn escaped_payload_budget_is_separate_per_severity_and_rearms_on_expiry() {
+        let now = Instant::now();
+        let gate = DiagnosticGate::new(now);
+        let event = ActivityEvent::Info {
+            // Each quote takes two bytes inside its JSON string.
+            message: "\"".repeat(PAYLOAD_BUDGET / 2),
+        };
+        assert!(gate.admit(&event, now));
+        assert_eq!(gate.state.lock().payload_bytes[0], PAYLOAD_BUDGET);
+        assert!(!gate.admit(
+            &ActivityEvent::Info {
+                message: "different template, same byte budget".to_string(),
+            },
+            now
+        ));
+        assert!(gate.admit(&error("errors have their own reserve"), now));
+        assert!(gate.admit(&event, now + WINDOW));
+        let value = report(&gate, now + WINDOW, false);
+        assert_eq!(value["byte_limited_info"], 1);
+        assert_eq!(value["suppressed_error"], 0);
+    }
+
+    #[test]
+    fn payload_accounting_bounds_json_escaping_and_does_not_charge_rejected_messages() {
+        assert_eq!(payload_cost("code", "quote=\" slash=\\"), 21);
+        assert_eq!(payload_cost("", "\0"), 6);
+        assert_eq!(payload_cost("", "磁"), "磁".len());
+        let now = Instant::now();
+        let gate = DiagnosticGate::new(now);
+        let event = error("small");
+        for _ in 0..100 {
+            gate.admit(&event, now);
+        }
+        assert_eq!(
+            gate.state.lock().payload_bytes[2],
+            usize::from(PER_TEMPLATE) * payload_cost("SBH-IO", "small")
+        );
+        assert_eq!(report(&gate, now, true)["byte_limited_error"], 0);
     }
 }
