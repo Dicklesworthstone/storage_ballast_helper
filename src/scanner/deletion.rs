@@ -11,6 +11,10 @@
 //! 5. Directory is not a Cargo source root misclassified as a target artifact
 //! 6. Candidate identity still matches the object observed by the scanner
 //! 7. Candidate is not covered by a kernel-held active-target lease
+//! 8. Scoring vetoes, decision eligibility, and numeric evidence are still valid
+//!
+//! Quarantine is a recoverability requirement, not a best-effort hint: a failed
+//! quarantine never falls through to irreversible removal.
 //!
 //! Circuit breaker: `circuit_breaker_threshold` consecutive failures (see
 //! `DeletionConfig::default`) halt the batch; the daemon retries next cycle.
@@ -39,6 +43,8 @@ use crate::scanner::quarantine::{self, QuarantineStore, QuarantineUnavailable};
 use crate::scanner::scoring::{CandidacyScore, DecisionAction, ScoreFactors};
 use crate::scanner::walker;
 
+mod eligibility;
+
 // ──────────────────── configuration ────────────────────
 
 /// What `execute` does to an approved candidate (Layer 7).
@@ -48,9 +54,9 @@ pub enum DeletionMode {
     #[default]
     Unlink,
     /// Rename into `<root>/.sbh/quarantine/<decision-id>/` on the same
-    /// filesystem, restorable with `sbh undo`; when that is impossible
-    /// (cross-device, unusable root) the candidate is removed for good and
-    /// the fallback is logged and counted as `quarantine_unavailable`.
+    /// filesystem, restorable with `sbh undo`. If quarantine is unavailable,
+    /// fail without unlinking the candidate. Irreversible removal requires
+    /// an explicit `Unlink` plan or executor.
     Quarantine,
 }
 
@@ -189,7 +195,8 @@ pub struct DeletionReport {
     /// freed: see `bytes_quarantined`).
     pub items_quarantined: usize,
     pub bytes_quarantined: u64,
-    /// Quarantine-mode candidates that had to be removed for good instead.
+    /// Quarantine-mode mutation attempts that failed without falling back
+    /// to irreversible removal. These also contribute to `items_failed`.
     pub quarantine_unavailable: usize,
 }
 
@@ -415,8 +422,8 @@ impl SkipReason {
             Self::NotWritable => {
                 "parent directory not writable — usually a systemd ReadWritePaths= gap"
             }
-            Self::Vetoed => "scoring vetoed the candidate",
-            Self::BelowThreshold => "score below the configured min_score",
+            Self::Vetoed => "candidate vetoed, suspended, ineligible, or carrying invalid decision evidence",
+            Self::BelowThreshold => "score below min_score, or score/threshold is invalid",
             Self::Symlink => "candidate is a symlink",
             Self::IdentityUnavailable => "filesystem identity could not be re-verified",
             Self::IdentityMismatch => "path now refers to a different inode than when scanned",
@@ -533,16 +540,9 @@ impl DeletionExecutor {
     /// above score threshold), then sorts unambiguous Delete decisions before
     /// Review escalations, by score descending within each group.
     pub fn plan(&self, mut candidates: Vec<CandidacyScore>) -> DeletionPlan {
-        // Filter: only actionable decisions, not vetoed, above threshold.
-        // `Keep` and vetoed candidates are never plannable, in any mode.
-        candidates.retain(|c| {
-            let actionable = match c.decision.action {
-                DecisionAction::Delete => true,
-                DecisionAction::Review => self.config.include_review,
-                DecisionAction::Keep => false,
-            };
-            actionable && !c.vetoed && c.total_score >= self.config.min_score
-        });
+        // Use the same eligibility rule as execution. A public plan is not
+        // a capability to bypass vetoes or the receiving executor's policy.
+        candidates.retain(|candidate| eligibility::check(candidate, &self.config).is_ok());
 
         // Sort: unambiguous Delete decisions first, then Review escalations,
         // score descending within each group (most obvious artifacts first) —
@@ -557,7 +557,10 @@ impl DeletionExecutor {
             })
         });
 
-        let total_reclaimable_bytes: u64 = candidates.iter().map(|c| c.size_bytes).sum();
+        let total_reclaimable_bytes = candidates
+            .iter()
+            .map(|candidate| candidate.size_bytes)
+            .fold(0u64, u64::saturating_add);
         let estimated_items = candidates.len();
 
         DeletionPlan {
@@ -730,16 +733,17 @@ impl DeletionExecutor {
 
             if self.config.dry_run {
                 report.items_would_delete += 1;
-                report.bytes_would_free += candidate.size_bytes;
+                report.bytes_would_free = report.bytes_would_free.saturating_add(candidate.size_bytes);
                 Self::log_dry_run(candidate);
                 continue;
             }
 
-            // Actual deletion, or quarantine (Layer 7).
+            // Actual deletion, or quarantine (Layer 7). Quarantine has no
+            // successful-unlink outcome: failure cannot widen this plan.
             let del_start = Instant::now();
             let outcome = match plan.mode {
                 DeletionMode::Unlink => self.delete_path(candidate).map(|()| false),
-                DeletionMode::Quarantine => self.quarantine_path(candidate),
+                DeletionMode::Quarantine => self.quarantine_path(candidate).map(|()| true),
             };
             match outcome {
                 Ok(quarantined) => {
@@ -749,12 +753,10 @@ impl DeletionExecutor {
                     report.deleted_paths.push(candidate.path.clone());
                     if quarantined {
                         report.items_quarantined += 1;
-                        report.bytes_quarantined += candidate.size_bytes;
+                        report.bytes_quarantined =
+                            report.bytes_quarantined.saturating_add(candidate.size_bytes);
                     } else {
-                        report.bytes_freed += candidate.size_bytes;
-                        if plan.mode == DeletionMode::Quarantine {
-                            report.quarantine_unavailable += 1;
-                        }
+                        report.bytes_freed = report.bytes_freed.saturating_add(candidate.size_bytes);
                     }
                     consecutive_failures = 0;
 
@@ -762,6 +764,9 @@ impl DeletionExecutor {
                 }
                 Err(e) => {
                     report.items_failed += 1;
+                    if plan.mode == DeletionMode::Quarantine {
+                        report.quarantine_unavailable += 1;
+                    }
                     consecutive_failures += 1;
                     match error_recovery_cause(&e) {
                         Some(RecoveryCause::ReadOnly) => {
@@ -806,7 +811,7 @@ impl DeletionExecutor {
 
     /// Delete one candidate through the full batch-mode safety stack: the
     /// complete `preflight_check` veto suite (hardcoded source-tree floor,
-    /// active lease, symlink, identity, .git/manifest/source markers,
+    /// scoring eligibility, active lease, symlink, identity, source markers,
     /// open-file index) followed by `delete_path`'s lease/symlink/identity
     /// rechecks at the mutation point.
     ///
@@ -816,8 +821,9 @@ impl DeletionExecutor {
     /// hard veto still applies to Review-classified candidates, and this is
     /// the method that keeps that promise on the per-item paths.
     ///
-    /// `open_paths` carries a fresh open-file ancestor index for the open-file
-    /// veto; pass `None` only when `check_open_files` is disabled.
+    /// `open_paths` carries a fresh, complete open-file ancestor index for the
+    /// open-file veto. Missing evidence is refused when `check_open_files` is
+    /// enabled; an empty completed scan is `Some(empty)`, not `None`.
     pub fn delete_candidate_checked(
         &self,
         candidate: &CandidacyScore,
@@ -834,15 +840,19 @@ impl DeletionExecutor {
         if let Err(skip) = self.preflight_check(candidate, open_paths, &mut sacred) {
             return Ok(CheckedDeletion::Skipped(skip));
         }
+        if self.config.check_open_files && open_paths.is_none() {
+            return Ok(CheckedDeletion::Skipped(SkipReason::OpenScanIncomplete));
+        }
         match self.config.mode {
             DeletionMode::Quarantine => {
-                if self.quarantine_path(candidate)? {
-                    return Ok(CheckedDeletion::Quarantined);
-                }
+                self.quarantine_path(candidate)?;
+                Ok(CheckedDeletion::Quarantined)
             }
-            DeletionMode::Unlink => self.delete_path(candidate)?,
+            DeletionMode::Unlink => {
+                self.delete_path(candidate)?;
+                Ok(CheckedDeletion::Deleted)
+            }
         }
-        Ok(CheckedDeletion::Deleted)
     }
 
     // ──────────────────── pre-flight checks ────────────────────
@@ -887,6 +897,10 @@ impl DeletionExecutor {
         if active_lease::path_is_actively_leased(path) {
             return Err(SkipReason::ActiveLease);
         }
+
+        // Public plans and per-item callers can bypass `plan()`. Enforce the
+        // receiving executor's policy here, including suspended categories.
+        eligibility::check(candidate, &self.config)?;
 
         // 1. Path still exists (use symlink_metadata to not follow symlinks).
         let Ok(meta) = fs::symlink_metadata(path) else {
@@ -997,9 +1011,13 @@ impl DeletionExecutor {
 
     #[allow(clippy::unused_self)]
     /// The last-moment checks shared by removal and quarantine, run right
-    /// before the mutation: lease, symlink and identity re-checks.
+    /// before the mutation: eligibility, lease, symlink and identity re-checks.
     fn recheck_before_mutation(&self, candidate: &CandidacyScore) -> Result<fs::Metadata> {
         let path = &candidate.path;
+        eligibility::check(candidate, &self.config).map_err(|reason| SbhError::SafetyVeto {
+            path: path.clone(),
+            reason: reason.explanation().to_string(),
+        })?;
         // Recheck immediately before mutation. A lease can begin after the
         // earlier preflight, and deleting despite the newly held lock would
         // recreate the exact scan/reap race this protection exists to close.
@@ -1059,10 +1077,10 @@ impl DeletionExecutor {
     }
 
     /// Layer 7: move the candidate into the quarantine of the scan root it
-    /// lives under (its mount point when no root matches). `Ok(true)` when
-    /// held, `Ok(false)` when quarantine was unavailable and the candidate
-    /// was removed for good instead.
-    fn quarantine_path(&self, candidate: &CandidacyScore) -> Result<bool> {
+    /// lives under (its mount point when no root matches). Failure never
+    /// authorizes an unlink: a busy store or failed recovery record must not
+    /// silently turn a recoverable cleanup into permanent data loss.
+    fn quarantine_path(&self, candidate: &CandidacyScore) -> Result<()> {
         let path = &candidate.path;
         self.recheck_before_mutation(candidate)?;
         let store = QuarantineStore::for_root(&quarantine::quarantine_root_for(
@@ -1087,7 +1105,7 @@ impl DeletionExecutor {
                     path.display(),
                     record.quarantine_path.display()
                 );
-                Ok(true)
+                Ok(())
             }
             Err(reason) => {
                 let detail = match &reason {
@@ -1095,16 +1113,21 @@ impl DeletionExecutor {
                     other => other.to_string(),
                 };
                 eprintln!(
-                    "[SBH-QUARANTINE] quarantine_unavailable for {} ({detail}); removing",
+                    "[SBH-QUARANTINE] quarantine_unavailable for {} ({detail}); candidate retained",
                     path.display()
                 );
                 self.log_event(ActivityEvent::Info {
                     message: format!(
-                        "quarantine_unavailable path={} decision_id={decision_id} reason={detail}",
+                        "quarantine_unavailable path={} decision_id={decision_id} reason={detail} action=retain",
                         path.display()
                     ),
                 });
-                self.delete_path(candidate).map(|()| false)
+                Err(SbhError::Runtime {
+                    details: format!(
+                        "quarantine unavailable for {}: {detail}; candidate retained",
+                        path.display()
+                    ),
+                })
             }
         }
     }
@@ -2195,7 +2218,7 @@ mod tests {
     }
 
     #[test]
-    fn quarantine_mode_removes_for_good_when_the_store_is_unusable() {
+    fn quarantine_mode_retains_the_candidate_when_the_store_is_unusable() {
         let dir = scratch_dir();
         let root = dir.path().join("proj");
         let target = root.join("target");
@@ -2220,11 +2243,15 @@ mod tests {
         );
         let plan = executor.plan(vec![make_identity_candidate(&target, 3, 0.9)]);
         let report = executor.execute(&plan, None);
-        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_failed, 1);
         assert_eq!(report.items_quarantined, 0);
         assert_eq!(report.quarantine_unavailable, 1);
-        assert_eq!(report.bytes_freed, 3);
-        assert!(!target.exists());
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(fs::read(target.join("a.o")).unwrap(), b"obj");
+        assert_eq!(report.backoff_candidates.len(), 1);
+        assert!(report.errors[0].error.contains("candidate retained"));
+        assert!(report.stalled());
     }
 
     #[test]
