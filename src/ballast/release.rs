@@ -156,7 +156,9 @@ impl BallastReleaseController {
             target_released
         };
 
-        scaled_target.saturating_sub(already_released).min(available)
+        scaled_target
+            .saturating_sub(already_released)
+            .min(available)
     }
 
     /// Execute a pressure-driven release cycle.

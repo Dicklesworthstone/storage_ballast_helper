@@ -41,8 +41,7 @@ pub struct RiskBudgetByLevel {
     pub orange: f64,
     /// Red.
     pub red: f64,
-    /// Critical is always unbounded; the field exists so the table reads
-    /// whole in the config and `sbh explain`.
+    /// Critical defaults to unbounded; an explicit value still limits risk.
     pub critical: Option<f64>,
 }
 
@@ -62,14 +61,31 @@ impl RiskBudgetByLevel {
     /// The budget for `level` in loss units, given one false-positive loss.
     #[must_use]
     pub fn budget(&self, level: PressureLevel, false_positive_loss: f64) -> Option<f64> {
+        if !valid_loss_unit(false_positive_loss) {
+            return Some(0.0);
+        }
         let multiple = match level {
-            PressureLevel::Green => self.green,
-            PressureLevel::Yellow => self.yellow,
-            PressureLevel::Orange => self.orange,
-            PressureLevel::Red => self.red,
-            PressureLevel::Critical => return self.critical.map(|m| m * false_positive_loss),
+            PressureLevel::Green => Some(self.green),
+            PressureLevel::Yellow => Some(self.yellow),
+            PressureLevel::Orange => Some(self.orange),
+            PressureLevel::Red => Some(self.red),
+            PressureLevel::Critical => self.critical,
         };
-        Some(multiple * false_positive_loss)
+        multiple.map(|m| finite_budget_or_zero(m * false_positive_loss))
+    }
+}
+
+fn valid_loss_unit(loss: f64) -> bool {
+    loss.is_finite() && loss > 0.0
+}
+
+// An invalid bound must not become an unbounded budget: comparisons with
+// NaN otherwise silently accept every candidate. Overflow also fails closed.
+fn finite_budget_or_zero(budget: f64) -> f64 {
+    if budget.is_finite() && budget >= 0.0 {
+        budget
+    } else {
+        0.0
     }
 }
 
@@ -218,6 +234,9 @@ fn ordinal(n: usize) -> String {
 
 fn plannable(candidate: &CandidacyScore, include_review: bool) -> bool {
     !candidate.vetoed
+        && !candidate.decision.category_suspended
+        && candidate.total_score.is_finite()
+        && (0.0..=1.0).contains(&candidate.decision.posterior_abandoned)
         && match candidate.decision.action {
             DecisionAction::Delete => true,
             DecisionAction::Review => include_review,
@@ -227,7 +246,9 @@ fn plannable(candidate: &CandidacyScore, include_review: bool) -> bool {
 
 #[allow(clippy::cast_precision_loss)]
 fn item(candidate: &CandidacyScore, false_positive_loss: f64) -> PlannedItem {
-    let posterior = candidate.decision.posterior_abandoned.clamp(0.0, 1.0);
+    // The eligibility gate validates this probability; clamping malformed
+    // evidence here would turn infinity into certainty (or NaN into tiny loss).
+    let posterior = candidate.decision.posterior_abandoned;
     // A candidate the model is certain about still carries a floor of loss,
     // so the greedy key stays finite and a huge certain candidate does not
     // drown every other consideration.
@@ -245,18 +266,26 @@ fn item(candidate: &CandidacyScore, false_positive_loss: f64) -> PlannedItem {
 
 /// Plan a batch: the chosen candidates in execution order, plus the plan.
 ///
-/// Candidates that are not plannable (vetoed, `Keep`, `Review` outside
-/// emergency) are dropped silently; the rest are either chosen or listed
-/// under `skipped_for_budget`.
+/// Candidates that are not plannable (vetoed, suspended, invalid evidence,
+/// `Keep`, or `Review` outside Critical) are dropped silently; the rest are
+/// either chosen or listed under `skipped_for_budget`. Invalid loss units
+/// or risk bounds fail closed, even at Critical pressure.
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub fn plan_batch(
     candidates: Vec<CandidacyScore>,
     request: &PlanRequest,
 ) -> (Vec<CandidacyScore>, BatchPlan) {
+    let valid_loss = valid_loss_unit(request.false_positive_loss);
+    let risk_budget = if valid_loss {
+        request.risk_budget.map(finite_budget_or_zero)
+    } else {
+        Some(0.0)
+    };
+    let include_review = request.include_review && request.level == PressureLevel::Critical;
     let mut plannable: Vec<(PlannedItem, CandidacyScore)> = candidates
         .into_iter()
-        .filter(|c| plannable(c, request.include_review))
+        .filter(|c| valid_loss && plannable(c, include_review))
         .map(|c| (item(&c, request.false_positive_loss), c))
         .collect();
 
@@ -277,7 +306,9 @@ pub fn plan_batch(
                 break;
             }
             bytes = bytes.saturating_add(planned.bytes);
-            risk += planned.expected_loss;
+            // Keep the counterfactual diagnostic serializable even when
+            // individually finite losses overflow their aggregate.
+            risk = (risk + planned.expected_loss).min(f64::MAX);
         }
         (bytes, risk)
     };
@@ -301,14 +332,14 @@ pub fn plan_batch(
         let target_met = request
             .target_bytes
             .is_some_and(|target| planned_bytes >= target);
-        let over_budget = request
-            .risk_budget
-            .is_some_and(|budget| risk_used + planned.expected_loss > budget + 1e-9);
+        let next_risk = risk_used + planned.expected_loss;
+        let over_budget = !next_risk.is_finite()
+            || risk_budget.is_some_and(|budget| next_risk > budget + 1e-9);
         if target_met || chosen_idx.len() >= request.max_items || over_budget {
             continue;
         }
         planned_bytes = planned_bytes.saturating_add(planned.bytes);
-        risk_used += planned.expected_loss;
+        risk_used = next_risk;
         chosen_idx.push(index);
     }
     let mut target_met = request
@@ -322,9 +353,7 @@ pub fn plan_batch(
             .iter()
             .enumerate()
             .filter(|(_, (planned, _))| {
-                request
-                    .risk_budget
-                    .is_none_or(|budget| planned.expected_loss <= budget + 1e-9)
+                risk_budget.is_none_or(|budget| planned.expected_loss <= budget + 1e-9)
             })
             .max_by(|(_, (a, _)), (_, (b, _))| {
                 a.bytes.cmp(&b.bytes).then_with(|| b.path.cmp(&a.path))
@@ -365,7 +394,7 @@ pub fn plan_batch(
         level: format!("{:?}", request.level).to_lowercase(),
         target_bytes: request.target_bytes,
         planned_bytes,
-        risk_budget: request.risk_budget,
+        risk_budget,
         risk_used,
         chosen,
         skipped_for_budget: skipped,
@@ -380,9 +409,7 @@ pub fn plan_batch(
 mod tests {
     use super::*;
     use crate::scanner::patterns::ArtifactClassification;
-    use crate::scanner::scoring::{
-        ArtifactCertainty, DecisionOutcome, EvidenceLedger, ScoreFactors,
-    };
+    use crate::scanner::scoring::{ArtifactCertainty, DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::path::Path;
     use std::time::Duration;
 
@@ -471,10 +498,7 @@ mod tests {
         assert!(why.contains("posterior 0.85"), "{why}");
         assert!(why.contains("reaches the target"), "{why}");
         assert!(why.contains("50% of the risk"), "{why}");
-        assert!(
-            plan.summary_line()
-                .starts_with("level=orange target_bytes=")
-        );
+        assert!(plan.summary_line().starts_with("level=orange target_bytes="));
     }
 
     #[test]
@@ -642,5 +666,161 @@ mod tests {
                 "greedy {greedy_bytes} vs optimum {best}: {plan:?}"
             );
         }
+    }
+
+    fn assert_finite_plan(plan: &BatchPlan) {
+        assert!(plan.risk_budget.is_none_or(f64::is_finite));
+        assert!(plan.risk_used.is_finite());
+        assert!(plan.top_n_risk.is_finite());
+        for item in plan.chosen.iter().chain(&plan.skipped_for_budget) {
+            assert!(item.posterior.is_finite());
+            assert!(item.expected_loss.is_finite());
+            assert!(item.value.is_finite());
+        }
+        // Non-finite JSON numbers serialize as null and cannot round-trip
+        // into required f64 fields, so validate the actual persisted shape.
+        let encoded = serde_json::to_string(plan).unwrap();
+        let decoded: BatchPlan = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.chosen.len(), plan.chosen.len());
+        assert_eq!(decoded.risk_budget, plan.risk_budget);
+    }
+
+    #[test]
+    fn malformed_posterior_never_becomes_a_cheap_deletion() {
+        for posterior in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            for level in [PressureLevel::Green, PressureLevel::Critical] {
+                let candidates = vec![
+                    candidate("/p/invalid", 40 * GIB, posterior, 2.0, DecisionAction::Delete),
+                    candidate("/p/valid", GIB, 0.9, 1.0, DecisionAction::Delete),
+                ];
+                let mut req = request(level, None, None);
+                req.include_review = true;
+                let (chosen, plan) = plan_batch(candidates, &req);
+                assert_eq!(chosen.len(), 1, "posterior={posterior}, {plan:?}");
+                assert_eq!(chosen[0].path, Path::new("/p/valid"));
+                assert_eq!(plan.top_n_bytes, GIB);
+                assert!(plan.skipped_for_budget.is_empty());
+                assert_finite_plan(&plan);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_scores_are_not_eligible_for_planning() {
+        for score in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let candidates = vec![candidate("/p/a", GIB, 0.99, score, DecisionAction::Delete)];
+            let (chosen, plan) =
+                plan_batch(candidates, &request(PressureLevel::Critical, None, None));
+            assert!(chosen.is_empty());
+            assert_finite_plan(&plan);
+        }
+    }
+
+    #[test]
+    fn malformed_direct_budgets_fail_closed_even_in_emergency() {
+        for budget in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let candidates = vec![candidate("/p/a", GIB, 1.0, 1.0, DecisionAction::Delete)];
+            let (chosen, plan) = plan_batch(
+                candidates,
+                &request(PressureLevel::Critical, Some(GIB), Some(budget)),
+            );
+            assert!(chosen.is_empty(), "budget={budget}, {plan:?}");
+            assert!(!plan.target_met);
+            assert_eq!(plan.risk_budget, Some(0.0));
+            assert_eq!(plan.risk_used, 0.0);
+            assert_eq!(plan.skipped_for_budget.len(), 1);
+            assert_finite_plan(&plan);
+        }
+    }
+
+    #[test]
+    fn malformed_loss_units_cannot_disable_the_risk_limit() {
+        for loss in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -50.0, 0.0] {
+            for budget in [None, Some(100.0)] {
+                let candidates = vec![candidate("/p/a", GIB, 0.99, 1.0, DecisionAction::Delete)];
+                let mut req = request(PressureLevel::Critical, None, budget);
+                req.false_positive_loss = loss;
+                let (chosen, plan) = plan_batch(candidates, &req);
+                assert!(chosen.is_empty(), "loss={loss}, {plan:?}");
+                assert_eq!(plan.risk_budget, Some(0.0));
+                assert_eq!(plan.risk_used, 0.0);
+                assert_finite_plan(&plan);
+                assert_eq!(
+                    RiskBudgetByLevel::default().budget(PressureLevel::Critical, loss),
+                    Some(0.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_and_overflowing_level_budgets_fail_closed() {
+        for multiple in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, f64::MAX] {
+            let table = RiskBudgetByLevel {
+                green: multiple,
+                yellow: multiple,
+                orange: multiple,
+                red: multiple,
+                critical: Some(multiple),
+            };
+            for level in [
+                PressureLevel::Green,
+                PressureLevel::Yellow,
+                PressureLevel::Orange,
+                PressureLevel::Red,
+                PressureLevel::Critical,
+            ] {
+                assert_eq!(table.budget(level, 50.0), Some(0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn review_opt_in_cannot_bypass_the_emergency_requirement() {
+        for level in [
+            PressureLevel::Green,
+            PressureLevel::Yellow,
+            PressureLevel::Orange,
+            PressureLevel::Red,
+        ] {
+            let candidates = vec![candidate("/p/a", GIB, 0.99, 1.0, DecisionAction::Review)];
+            let mut req = request(level, None, None);
+            req.include_review = true;
+            let (chosen, plan) = plan_batch(candidates, &req);
+            assert!(chosen.is_empty(), "{level:?}: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn suspended_categories_and_vetoes_survive_emergency_planning() {
+        for action in [DecisionAction::Delete, DecisionAction::Review] {
+            let mut suspended = candidate("/p/suspended", GIB, 0.99, 1.0, action);
+            suspended.decision.category_suspended = true;
+            let mut vetoed = candidate("/p/vetoed", GIB, 0.99, 1.0, action);
+            vetoed.vetoed = true;
+            let candidates = vec![suspended, vetoed];
+            let mut req = request(PressureLevel::Critical, None, None);
+            req.include_review = true;
+            let (chosen, plan) = plan_batch(candidates, &req);
+            assert!(chosen.is_empty());
+            assert!(plan.skipped_for_budget.is_empty());
+            assert_finite_plan(&plan);
+        }
+    }
+
+    #[test]
+    fn unbounded_budget_does_not_allow_risk_accounting_to_overflow() {
+        let candidates = vec![
+            candidate("/p/a", GIB, 0.0, 1.0, DecisionAction::Delete),
+            candidate("/p/b", GIB, 0.0, 1.0, DecisionAction::Delete),
+        ];
+        let mut req = request(PressureLevel::Critical, None, None);
+        req.false_positive_loss = f64::MAX;
+        let (chosen, plan) = plan_batch(candidates, &req);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(plan.skipped_for_budget.len(), 1);
+        assert_eq!(plan.risk_used, f64::MAX);
+        assert_eq!(plan.top_n_risk, f64::MAX);
+        assert_finite_plan(&plan);
     }
 }
