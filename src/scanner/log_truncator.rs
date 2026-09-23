@@ -10,9 +10,9 @@
 //! `ftruncate(2)` (Rust `File::set_len(0)`):
 //!   - The inode size goes to 0, releasing its allocated blocks subject to
 //!     filesystem snapshots and other retention mechanisms.
-//!   - The inode itself survives, so the writer's open fd keeps targeting the
-//!     same file. Subsequent appends continue without disruption (the file
-//!     becomes temporarily sparse if the writer is not in O_APPEND mode).
+//!   - The inode survives, so existing writer descriptors still target it.
+//!     Non-append writers retain their old offset and can create zero-filled
+//!     gaps when they resume. Allocation alone does not prove a fresh refill.
 //!
 //! Contrast with `unlink`: under an open fd, the inode is orphaned but the
 //! kernel holds its blocks until every fd closes — i.e. **no space is
@@ -25,6 +25,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
@@ -34,12 +35,17 @@ use parking_lot::Mutex;
 use crate::core::config::LogTruncationConfig;
 
 mod backoff;
+mod repeat;
 use backoff::{FailureBackoff, FailureKey};
+use repeat::RecentTruncations;
 
 #[cfg(test)]
 mod pressure_tests;
+#[cfg(test)]
+mod repeat_tests;
 
 static FAILURE_BACKOFF: OnceLock<Mutex<FailureBackoff>> = OnceLock::new();
+static RECENT_TRUNCATIONS: OnceLock<Mutex<RecentTruncations>> = OnceLock::new();
 
 /// Report from a single truncation sweep.
 #[derive(Debug, Clone, Default)]
@@ -81,15 +87,20 @@ pub enum SkipReason {
     /// The opened object differs from the inspected file, or its identity
     /// cannot be verified on this platform.
     IdentityChanged,
+    /// A recent truncation has ambiguous regrowth, an operation on this file
+    /// is already running, or the bounded identity table is full.
+    RecentTruncation,
 }
 
 /// Execute one truncation pass.
 ///
 /// `free_pct` is the current free-disk percentage. When it is at or below
-/// `config.pressure_free_pct_ceiling`, the `min_age_minutes` gate is bypassed
-/// so the daemon can act decisively under emergency pressure. Failures still
-/// cool down for a full minute; pressure does not turn them into an I/O loop.
-/// Dry runs neither consult nor change the process-local failure history.
+/// `config.pressure_free_pct_ceiling`, the `min_age_minutes` gate is bypassed.
+/// Failures cool down for a full minute. Successful truncations also retain a
+/// one-minute recovery window: a genuine refill remains immediately eligible,
+/// but zero-prefix regrowth with less than a minimum-sized new tail is paced.
+/// Dry runs report potential bytes without consulting or changing either
+/// process-local history. Neither history is held locked across filesystem I/O.
 pub fn truncate_oversized_logs(
     config: &LogTruncationConfig,
     free_pct: f64,
@@ -221,6 +232,27 @@ fn process_candidate_with_opener(
     dry_run: bool,
     open: impl FnOnce(&Path) -> Result<fs::File, String>,
 ) -> Result<Outcome, String> {
+    let recent = RECENT_TRUNCATIONS.get_or_init(|| Mutex::new(RecentTruncations::default()));
+    process_candidate_with_history(
+        path,
+        config,
+        bypass_age_gate,
+        dry_run,
+        open,
+        recent,
+        Instant::now,
+    )
+}
+
+fn process_candidate_with_history(
+    path: &Path,
+    config: &LogTruncationConfig,
+    bypass_age_gate: bool,
+    dry_run: bool,
+    open: impl FnOnce(&Path) -> Result<fs::File, String>,
+    recent: &Mutex<RecentTruncations>,
+    clock: impl Fn() -> Instant,
+) -> Result<Outcome, String> {
     let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if let Some(reason) = candidate_skip(&meta, config, bypass_age_gate)? {
         return Ok(Outcome::Skipped(reason));
@@ -235,14 +267,58 @@ fn process_candidate_with_opener(
     if !same_file(&meta, &opened_meta) {
         return Ok(Outcome::Skipped(SkipReason::IdentityChanged));
     }
-    // A writer/rotator can shrink or refresh the same inode while it opens.
-    // Reapply the gates to descriptor metadata, then mutate that descriptor.
     if let Some(reason) = candidate_skip(&opened_meta, config, bypass_age_gate)? {
         return Ok(Outcome::Skipped(reason));
     }
+    let Some(reservation) = RecentTruncations::acquire(recent, path, &opened_meta, clock()) else {
+        return Ok(Outcome::Skipped(SkipReason::RecentTruncation));
+    };
+    // A competing sweep may have finished between our first stat and this
+    // reservation. Never credit its old size or truncate a now-small refill.
+    let opened_meta = f.metadata().map_err(|e| e.to_string())?;
+    if let Some(reason) = candidate_skip(&opened_meta, config, bypass_age_gate)? {
+        return Ok(Outcome::Skipped(reason));
+    }
+    if let Some(previous_size) = reservation.previous_size()
+        && !has_new_log_data(path, &opened_meta, previous_size, config.min_size_bytes)
+    {
+        // Dropping the reservation preserves the previous completion time.
+        // A skipped attempt never extends the one-minute recovery window.
+        return Ok(Outcome::Skipped(SkipReason::RecentTruncation));
+    }
     let bytes = reclaimable_bytes(&opened_meta);
     f.set_len(0).map_err(|e| e.to_string())?;
+    reservation.commit(opened_meta.len(), clock());
     Ok(Outcome::Truncated(bytes))
+}
+
+/// Distinguish a fresh refill from a writer resuming beyond the old EOF.
+/// This is a bounded recovery heuristic, not proof of append mode. A nonzero
+/// prefix or a minimum-sized new logical tail permits an immediate retry.
+/// Otherwise the size/age gates may retry after the recovery window expires.
+fn has_new_log_data(path: &Path, expected: &fs::Metadata, previous_size: u64, minimum: u64) -> bool {
+    if expected.len().saturating_sub(previous_size) >= minimum.max(1) {
+        return true;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let Ok(mut reader) = options.open(path) else {
+        // Do not add a read-permission requirement to the first truncation.
+        // An unverifiable repeat waits out the bounded recovery window.
+        return false;
+    };
+    if !reader.metadata().is_ok_and(|meta| same_file(expected, &meta)) {
+        return false;
+    }
+    let mut prefix = [0u8; 4096];
+    reader
+        .read(&mut prefix)
+        .is_ok_and(|read| prefix[..read].iter().any(|byte| *byte != 0))
 }
 
 fn candidate_skip(
@@ -272,9 +348,9 @@ fn candidate_skip(
     Ok(None)
 }
 
-/// A non-append writer resumes at its old offset after truncation, creating
-/// holes rather than reallocating its old contents. Do not repeatedly truncate
-/// a huge apparent file that is only consuming a few blocks.
+/// Bound estimates by allocated blocks as well as logical length. Recent
+/// truncations additionally check for ambiguous zero-prefix regrowth: a gap
+/// need not remain unallocated on every filesystem or allocation path.
 fn reclaimable_bytes(meta: &fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
@@ -309,7 +385,6 @@ fn open_candidate_for_truncate(path: &Path) -> Result<fs::File, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-
         fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
@@ -374,9 +449,7 @@ fn expand_recursive(prefix: &Path, segments: &[String], idx: usize, out: &mut Ve
 /// Forward slashes never appear inside a segment.
 fn segment_matches(pattern: &str, name: &str) -> bool {
     // Shell glob convention: hidden entries are only matched when the
-    // pattern explicitly opens with a literal dot. A pattern starting with
-    // `*` does NOT cross the hidden-file boundary, so `*` doesn't match
-    // `.hidden` and `*.log` doesn't match `.hidden.log`.
+    // pattern explicitly opens with a literal dot.
     if let Some(first) = name.as_bytes().first()
         && *first == b'.'
         && !pattern.starts_with('.')
@@ -442,22 +515,18 @@ mod tests {
         let original_inode = fs::metadata(&path).unwrap();
         let original_size = original_inode.len();
         assert_eq!(original_size, 4096);
-
-        // Match the directory's path explicitly.
         let pattern = path.to_string_lossy().into_owned();
         let config = LogTruncationConfig {
             enabled: true,
             paths: vec![pattern],
-            min_size_bytes: 1, // any non-empty file qualifies
+            min_size_bytes: 1,
             pressure_free_pct_ceiling: 100,
             min_age_minutes: 0,
         };
-
         let report = truncate_oversized_logs(&config, 50.0, false);
         assert_eq!(report.files_truncated, 1, "{report:?}");
         assert_eq!(report.bytes_reclaimed, 4096);
         assert_eq!(report.errors.len(), 0);
-
         let new_meta = fs::metadata(&path).unwrap();
         assert_eq!(new_meta.len(), 0);
     }
@@ -467,7 +536,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("small.log");
         File::create(&path).unwrap().write_all(b"tiny").unwrap();
-
         let config = LogTruncationConfig {
             enabled: true,
             paths: vec![path.to_string_lossy().into_owned()],
@@ -475,7 +543,6 @@ mod tests {
             pressure_free_pct_ceiling: 100,
             min_age_minutes: 0,
         };
-
         let report = truncate_oversized_logs(&config, 50.0, false);
         assert_eq!(report.files_truncated, 0);
         assert_eq!(report.files_skipped, 1);
@@ -490,7 +557,6 @@ mod tests {
             .unwrap()
             .write_all(&vec![b'x'; 2048])
             .unwrap();
-
         let config = LogTruncationConfig {
             enabled: true,
             paths: vec![path.to_string_lossy().into_owned()],
@@ -498,7 +564,6 @@ mod tests {
             pressure_free_pct_ceiling: 100,
             min_age_minutes: 0,
         };
-
         let report = truncate_oversized_logs(&config, 50.0, true);
         assert_eq!(report.files_truncated, 0);
         assert_eq!(report.files_would_truncate, 1);
@@ -515,7 +580,6 @@ mod tests {
             .unwrap()
             .write_all(&vec![b'x'; 2048])
             .unwrap();
-
         let config = LogTruncationConfig {
             enabled: false,
             paths: vec![path.to_string_lossy().into_owned()],
@@ -523,7 +587,6 @@ mod tests {
             pressure_free_pct_ceiling: 100,
             min_age_minutes: 0,
         };
-
         let report = truncate_oversized_logs(&config, 50.0, false);
         assert_eq!(report.files_truncated, 0);
         assert_eq!(fs::metadata(&path).unwrap().len(), 2048);
@@ -539,7 +602,6 @@ mod tests {
             .unwrap();
         let link = dir.path().join("alias.log");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-
         let config = LogTruncationConfig {
             enabled: true,
             paths: vec![link.to_string_lossy().into_owned()],
@@ -547,11 +609,9 @@ mod tests {
             pressure_free_pct_ceiling: 100,
             min_age_minutes: 0,
         };
-
         let report = truncate_oversized_logs(&config, 50.0, false);
         assert_eq!(report.files_truncated, 0);
         assert_eq!(report.files_skipped, 1);
-        // Target file unchanged.
         assert_eq!(fs::metadata(&target).unwrap().len(), 2048);
     }
 
@@ -563,21 +623,16 @@ mod tests {
             .unwrap()
             .write_all(&vec![b'x'; 2048])
             .unwrap();
-
         let config = LogTruncationConfig {
             enabled: true,
             paths: vec![path.to_string_lossy().into_owned()],
             min_size_bytes: 1024,
             pressure_free_pct_ceiling: 15,
-            min_age_minutes: 60, // very fresh file
+            min_age_minutes: 60,
         };
-
-        // free_pct 50.0 (healthy) -> gate engaged, skip
         let report = truncate_oversized_logs(&config, 50.0, false);
         assert_eq!(report.files_truncated, 0);
         assert_eq!(report.files_skipped, 1);
-
-        // free_pct 5.0 (pressure) -> gate bypassed
         let report = truncate_oversized_logs(&config, 5.0, false);
         assert_eq!(report.files_truncated, 1);
         assert_eq!(report.bytes_reclaimed, 2048);
@@ -600,7 +655,6 @@ mod tests {
             .unwrap()
             .write_all(&vec![b'b'; 2048])
             .unwrap();
-
         let pattern = format!("{}/*/.codex/log/codex-tui.log", dir.path().display());
         let config = LogTruncationConfig {
             enabled: true,
@@ -609,7 +663,6 @@ mod tests {
             pressure_free_pct_ceiling: 100,
             min_age_minutes: 0,
         };
-
         let report = truncate_oversized_logs(&config, 50.0, false);
         assert_eq!(report.files_truncated, 2);
         assert_eq!(report.bytes_reclaimed, 4096);
@@ -617,16 +670,12 @@ mod tests {
         assert_eq!(fs::metadata(&file_b).unwrap().len(), 0);
     }
 
-    // Linux-only: APFS/HFS+ reject non-UTF-8 byte sequences in filenames, so the
-    // `\xFF` test fixture can't be created on macOS. The behavior under test
-    // (wildcard expansion preserving exotic OsString bytes) is reachable only
-    // on filesystems that admit such names — which on this codebase means Linux.
+    // Linux-only: the fixture requires a filesystem admitting non-UTF-8 names.
     #[cfg(target_os = "linux")]
     #[test]
     fn wildcard_expansion_preserves_non_utf8_file_names() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
-
         let dir = tempfile::tempdir().unwrap();
         let file_name = OsString::from_vec(b"codex-\xFF.log".to_vec());
         let path = dir.path().join(&file_name);
@@ -634,7 +683,6 @@ mod tests {
             .unwrap()
             .write_all(&vec![b'x'; 2048])
             .unwrap();
-
         let pattern = format!("{}/*.log", dir.path().display());
         let config = LogTruncationConfig {
             enabled: true,
@@ -643,7 +691,6 @@ mod tests {
             pressure_free_pct_ceiling: 100,
             min_age_minutes: 0,
         };
-
         let report = truncate_oversized_logs(&config, 50.0, false);
         assert_eq!(report.files_truncated, 1, "{report:?}");
         assert!(report.errors.is_empty(), "{report:?}");
