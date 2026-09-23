@@ -37,7 +37,7 @@ pub(super) fn check(candidate: &CandidacyScore, config: &DeletionConfig) -> Resu
     {
         return Err(SkipReason::Vetoed);
     }
-    check_path(&candidate.path, config)
+    check_path(candidate, config)
 }
 
 /// Check protection that does not require a recursive directory walk.
@@ -47,7 +47,8 @@ pub(super) fn check(candidate: &CandidacyScore, config: &DeletionConfig) -> Resu
 /// operator-protected file patterns. Ancestor markers also live OUTSIDE a
 /// candidate's subtree and must be checked separately, including after a
 /// plan has already been built. Do not cache an unprotected verdict here.
-fn check_path(path: &Path, config: &DeletionConfig) -> Result<(), SkipReason> {
+fn check_path(candidate: &CandidacyScore, config: &DeletionConfig) -> Result<(), SkipReason> {
+    let path = &candidate.path;
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         // Planning may describe a disappeared candidate; the existing
@@ -79,6 +80,11 @@ fn check_path(path: &Path, config: &DeletionConfig) -> Result<(), SkipReason> {
             Err(_) => return Err(SkipReason::SacredStowaway),
         }
     }
+    if metadata.is_dir()
+        && candidate.classification.category == crate::scanner::patterns::ArtifactCategory::GoCache
+    {
+        check_go_cache(&normalized)?;
+    }
     if metadata.is_file() {
         let overlaps = protection::find_sacred_overlaps_with_config(
             &normalized,
@@ -92,6 +98,52 @@ fn check_path(path: &Path, config: &DeletionConfig) -> Result<(), SkipReason> {
     }
     // Recursive directory containment remains in the existing preflight,
     // preserving its bounded walk, per-batch reuse, and accounting.
+    Ok(())
+}
+
+/// A cache label grants unusually destructive privileges: the executor can
+/// bypass its source check and make read-only trees writable. The label in a
+/// public or queued candidate is not authority for either privilege. Recheck
+/// the actual cache root at every admission, including the final mutation
+/// boundary, without descending through its potentially huge module trees.
+fn check_go_cache(path: &Path) -> Result<(), SkipReason> {
+    use crate::scanner::patterns::{
+        ArtifactCategory, OpaqueTreeContext, OpaqueTreeDisposition, classify_opaque_tree,
+    };
+
+    // A real module cache contains module source BELOW its root, not a
+    // project manifest or source files AT its root. Never exempt the latter
+    // just because stale evidence still calls the directory a Go cache.
+    if super::looks_like_source_code(path) {
+        return Err(SkipReason::LooksLikeSourceCode);
+    }
+    let Some(tree) = classify_opaque_tree(path, OpaqueTreeContext::default()) else {
+        return Err(SkipReason::Vetoed);
+    };
+    if tree.disposition != OpaqueTreeDisposition::CandidateOpaque
+        || tree.classification.category != ArtifactCategory::GoCache
+    {
+        return Err(SkipReason::Vetoed);
+    }
+
+    // The scanner's cheap structural probe may follow cache/download or
+    // merely see an entry named trim.txt. Such aliases and special files
+    // cannot authorize permission widening. Inspect marker types without
+    // following symlinks; the build-cache shard proof above is also no-follow.
+    let marker_verified = match tree.classification.pattern_name.as_ref() {
+        "opaque-go-build-cache" => fs::symlink_metadata(path.join("trim.txt"))
+            .is_ok_and(|metadata| metadata.file_type().is_file()),
+        "opaque-go-mod-cache" => {
+            fs::symlink_metadata(path.join("cache"))
+                .is_ok_and(|metadata| metadata.file_type().is_dir())
+                && fs::symlink_metadata(path.join("cache/download"))
+                    .is_ok_and(|metadata| metadata.file_type().is_dir())
+        }
+        _ => false,
+    };
+    if !marker_verified {
+        return Err(SkipReason::Vetoed);
+    }
     Ok(())
 }
 
@@ -110,14 +162,10 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::time::Duration;
 
-    use crate::scanner::deletion::{
-        CheckedDeletion, DeletionExecutor, DeletionMode, DeletionPlan,
-    };
+    use crate::scanner::deletion::{CheckedDeletion, DeletionExecutor, DeletionMode, DeletionPlan};
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::quarantine::QuarantineStore;
-    use crate::scanner::scoring::{
-        ArtifactCertainty, DecisionOutcome, EvidenceLedger, ScoreFactors,
-    };
+    use crate::scanner::scoring::{ArtifactCertainty, DecisionOutcome, EvidenceLedger, ScoreFactors};
     use crate::scanner::walker::identity_for_path;
 
     const PAYLOAD: &[u8] = b"preserve these bytes";
@@ -234,9 +282,10 @@ mod tests {
                     path.clone()
                 };
                 let mut cfg = config(dir.path(), mode);
-                cfg.sacred_paths.extend(protection::sacred_paths_from_protected_patterns(&[
-                    pattern.to_string_lossy().into_owned(),
-                ]));
+                cfg.sacred_paths
+                    .extend(protection::sacred_paths_from_protected_patterns(&[
+                        pattern.to_string_lossy().into_owned(),
+                    ]));
                 let executor = DeletionExecutor::new(cfg, None);
                 assert_refused(&executor, &candidate(&path), mode);
                 assert_eq!(fs::read(path).unwrap(), PAYLOAD);
@@ -304,7 +353,10 @@ mod tests {
         let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
         assert_refused(&executor, &candidate(&path), DeletionMode::Unlink);
         assert_eq!(fs::read(path).unwrap(), PAYLOAD);
-        assert_eq!(fs::read_link(marker).unwrap(), Path::new("nonexistent-marker-target"));
+        assert_eq!(
+            fs::read_link(marker).unwrap(),
+            Path::new("nonexistent-marker-target")
+        );
     }
 
     #[test]
@@ -331,9 +383,10 @@ mod tests {
         let path = parent.join("artifact.bin");
         fs::write(&path, PAYLOAD).unwrap();
         let mut cfg = config(dir.path(), DeletionMode::Unlink);
-        cfg.sacred_paths.extend(protection::sacred_paths_from_protected_patterns(&[
-            dir.path().join("keep").to_string_lossy().into_owned(),
-        ]));
+        cfg.sacred_paths
+            .extend(protection::sacred_paths_from_protected_patterns(&[
+                dir.path().join("keep").to_string_lossy().into_owned(),
+            ]));
         let executor = DeletionExecutor::new(cfg, None);
         assert_refused(&executor, &candidate(&path), DeletionMode::Unlink);
         assert_eq!(fs::read(path).unwrap(), PAYLOAD);
@@ -367,6 +420,196 @@ mod tests {
                 assert_eq!(fs::read(path).unwrap(), PAYLOAD);
             } else {
                 assert_eq!(report.bytes_freed, item.size_bytes);
+            }
+        }
+    }
+
+    fn go_candidate(path: &Path) -> CandidacyScore {
+        let mut item = candidate(path);
+        item.classification.category = ArtifactCategory::GoCache;
+        item.classification.pattern_name = Cow::Borrowed("opaque-go-build-cache");
+        item
+    }
+
+    fn go_cache(path: &Path, module_cache: bool) -> std::path::PathBuf {
+        let payload = if module_cache {
+            fs::create_dir_all(path.join("cache/download")).unwrap();
+            let module = path.join("example.org/library@v1.0.0");
+            fs::create_dir_all(&module).unwrap();
+            fs::write(module.join("go.mod"), b"module example.org/library\n").unwrap();
+            module.join("library.go")
+        } else {
+            fs::create_dir_all(path.join("00")).unwrap();
+            fs::write(path.join("trim.txt"), b"0\n").unwrap();
+            path.join("00/artifact-d")
+        };
+        fs::write(&payload, PAYLOAD).unwrap();
+        payload
+    }
+
+    fn assert_checked_refusal(
+        executor: &DeletionExecutor,
+        item: &CandidacyScore,
+        mode: DeletionMode,
+        reason: SkipReason,
+    ) {
+        assert!(executor.plan(vec![item.clone()]).candidates.is_empty());
+        let report = executor.execute(&raw_plan(item, mode), None);
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(report.bytes_quarantined, 0);
+        assert_eq!(
+            executor.delete_candidate_checked(item, None).unwrap(),
+            CheckedDeletion::Skipped(reason)
+        );
+        // Direct entry after a previously successful preflight must not
+        // avoid the same live evidence requirements in either backend.
+        assert!(executor.delete_path(item).is_err());
+        assert!(executor.quarantine_path(item).is_err());
+        assert!(item.path.exists());
+    }
+
+    #[test]
+    fn forged_go_cache_labels_do_not_grant_source_or_force_removal_privileges() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for name in ["main.go", "artifact.bin"] {
+                let dir = scratch();
+                let path = dir.path().join("go-cache");
+                fs::create_dir(&path).unwrap();
+                let payload = path.join(name);
+                fs::write(&payload, PAYLOAD).unwrap();
+                fs::set_permissions(&payload, fs::Permissions::from_mode(0o444)).unwrap();
+                let mut item = go_candidate(&path);
+                // Emergency Review admission must not widen the safety rails.
+                item.decision.action = DecisionAction::Review;
+                let mut cfg = config(dir.path(), mode);
+                cfg.include_review = true;
+                let executor = DeletionExecutor::new(cfg, None);
+                let reason = if name == "main.go" {
+                    SkipReason::LooksLikeSourceCode
+                } else {
+                    SkipReason::Vetoed
+                };
+                assert_checked_refusal(&executor, &item, mode, reason);
+                assert_eq!(fs::read(&payload).unwrap(), PAYLOAD);
+                assert_eq!(
+                    fs::metadata(payload).unwrap().permissions().mode() & 0o777,
+                    0o444
+                );
+                assert!(!QuarantineStore::under(dir.path()).root().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn go_cache_layout_disappearing_after_preflight_blocks_both_mutations() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let dir = scratch();
+            let path = dir.path().join("go-build-cache");
+            let payload = go_cache(&path, false);
+            let item = go_candidate(&path);
+            let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+            assert!(executor.explain_preflight(&item, None).is_ok());
+            fs::rename(path.join("trim.txt"), path.join("trim.saved")).unwrap();
+            assert_checked_refusal(&executor, &item, mode, SkipReason::Vetoed);
+            assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
+            assert!(!QuarantineStore::under(dir.path()).root().exists());
+        }
+    }
+
+    #[test]
+    fn source_appearing_in_a_go_cache_after_preflight_is_not_removed() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for name in ["go.mod", "main.go", "package.json", "lib.rs"] {
+                let dir = scratch();
+                let path = dir.path().join("go-module-cache");
+                let payload = go_cache(&path, true);
+                let item = go_candidate(&path);
+                let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+                assert!(executor.explain_preflight(&item, None).is_ok());
+                let source = path.join(name);
+                fs::write(&source, PAYLOAD).unwrap();
+                assert_checked_refusal(&executor, &item, mode, SkipReason::LooksLikeSourceCode);
+                assert_eq!(fs::read(source).unwrap(), PAYLOAD);
+                assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
+                assert!(!QuarantineStore::under(dir.path()).root().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn symlinked_or_non_file_go_cache_markers_do_not_authorize_removal() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for variant in 0..5 {
+                let dir = scratch();
+                let path = dir.path().join("go-cache");
+                let external = dir.path().join("external");
+                fs::create_dir_all(external.join("download")).unwrap();
+                fs::write(external.join("marker"), PAYLOAD).unwrap();
+                fs::create_dir(&path).unwrap();
+                if variant != 4 {
+                    fs::create_dir(path.join("00")).unwrap();
+                }
+                let payload = path.join("artifact-d");
+                fs::write(&payload, PAYLOAD).unwrap();
+                match variant {
+                    0 => symlink(&external, path.join("cache")).unwrap(),
+                    1 => {
+                        fs::create_dir(path.join("cache")).unwrap();
+                        symlink(external.join("download"), path.join("cache/download")).unwrap();
+                    }
+                    2 => symlink(external.join("marker"), path.join("trim.txt")).unwrap(),
+                    3 => fs::create_dir(path.join("trim.txt")).unwrap(),
+                    _ => {
+                        // A valid trim.txt without a shard must not vouch
+                        // for a DIFFERENT, symlinked module-cache signature.
+                        fs::write(path.join("trim.txt"), b"0\n").unwrap();
+                        symlink(&external, path.join("cache")).unwrap();
+                    }
+                }
+                let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+                assert_checked_refusal(&executor, &go_candidate(&path), mode, SkipReason::Vetoed);
+                assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
+                assert_eq!(fs::read(external.join("marker")).unwrap(), PAYLOAD);
+                assert!(!QuarantineStore::under(dir.path()).root().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn genuine_go_caches_still_reclaim_or_restore_with_nested_module_source() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for module_cache in [false, true] {
+                let dir = scratch();
+                let path = dir.path().join("go-cache");
+                let payload = go_cache(&path, module_cache);
+                let item = go_candidate(&path);
+                let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+                let plan = executor.plan(vec![item.clone()]);
+                assert_eq!(plan.estimated_items, 1);
+                let report = executor.execute(&plan, None);
+                assert_eq!(report.items_deleted, 1);
+                assert_eq!(report.items_failed, 0);
+                assert_eq!(report.items_skipped, 0);
+                assert!(!path.exists());
+                if mode == DeletionMode::Quarantine {
+                    assert_eq!(report.bytes_freed, 0);
+                    assert_eq!(report.items_quarantined, 1);
+                    let id = crate::scanner::decision_record::stable_decision_id(
+                        &path,
+                        item.identity,
+                        item.size_bytes,
+                    );
+                    QuarantineStore::under(dir.path())
+                        .restore(&id, false)
+                        .unwrap();
+                    assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
+                } else {
+                    assert_eq!(report.bytes_freed, item.size_bytes);
+                }
             }
         }
     }
