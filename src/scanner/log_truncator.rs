@@ -25,7 +25,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
@@ -415,46 +415,125 @@ fn open_candidate_for_truncate(path: &Path) -> Result<fs::File, String> {
     }
 }
 
-/// Expand a pattern with literal `*` wildcards by walking the filesystem from
-/// the longest non-wildcard prefix.
+// Expansion runs on the reclamation path, before any matched log is processed.
+// Bound both its scratch memory and traversal work, independently of matches:
+// a directory containing only nonmatching names is work too. Time is cooperative;
+// these checks cannot interrupt an individual blocked filesystem call.
+const MAX_PATTERN_STEPS: usize = 50_000;
+const MAX_PATTERN_SEGMENTS: usize = 128;
+const PATTERN_TIME_BUDGET: Duration = Duration::from_secs(2);
+
+struct ExpansionBudget {
+    remaining_steps: usize,
+    deadline: Instant,
+}
+
+impl ExpansionBudget {
+    fn charge(&mut self) -> Result<(), String> {
+        if Instant::now() >= self.deadline {
+            return Err("pattern expansion timed out; narrow the configured glob".to_string());
+        }
+        if self.remaining_steps == 0 {
+            return Err(
+                "pattern expansion work limit reached; narrow the configured glob".to_string(),
+            );
+        }
+        self.remaining_steps -= 1;
+        Ok(())
+    }
+}
+
+/// Expand an absolute pattern without returning a silently incomplete plan.
+/// An over-budget or unreadable pattern enters the caller's failure cooldown;
+/// other configured patterns remain eligible for reclamation.
 fn expand_pattern(pattern: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let mut budget = ExpansionBudget {
+        remaining_steps: MAX_PATTERN_STEPS,
+        deadline: Instant::now() + PATTERN_TIME_BUDGET,
+    };
+    expand_pattern_with_budget(pattern, out, &mut budget)
+}
+
+fn expand_pattern_with_budget(
+    pattern: &Path,
+    out: &mut Vec<PathBuf>,
+    budget: &mut ExpansionBudget,
+) -> Result<(), String> {
     if !pattern.is_absolute() {
         return Err("only absolute patterns are supported".to_string());
+    }
+    // Check depth before allocating segments or recursing, including for paths
+    // whose first literal component does not exist.
+    if pattern.components().take(MAX_PATTERN_SEGMENTS + 1).count() > MAX_PATTERN_SEGMENTS {
+        return Err("pattern has too many path segments; narrow the configured glob".to_string());
     }
     let segments: Vec<String> = pattern
         .iter()
         .map(|s| s.to_string_lossy().into_owned())
         .collect();
     // segments[0] is "/" on Unix when the path is absolute.
-    expand_recursive(Path::new("/"), &segments, 1, out);
-    Ok(())
+    let checkpoint = out.len();
+    let result = expand_recursive(Path::new("/"), &segments, 1, out, budget);
+    if result.is_err() {
+        out.truncate(checkpoint);
+    }
+    result
 }
 
-fn expand_recursive(prefix: &Path, segments: &[String], idx: usize, out: &mut Vec<PathBuf>) {
+fn expand_recursive(
+    prefix: &Path,
+    segments: &[String],
+    idx: usize,
+    out: &mut Vec<PathBuf>,
+    budget: &mut ExpansionBudget,
+) -> Result<(), String> {
+    budget.charge()?;
     if idx == segments.len() {
         out.push(prefix.to_path_buf());
-        return;
+        return Ok(());
     }
     let seg = &segments[idx];
     if seg.contains('*') {
-        let Ok(entries) = fs::read_dir(prefix) else {
-            return;
+        let mut entries = match fs::read_dir(prefix) {
+            Ok(entries) => entries,
+            Err(error) if absent_glob_branch(&error) => return Ok(()),
+            Err(error) => {
+                return Err(format!("read directory {}: {error}", prefix.display()));
+            }
         };
-        for entry in entries.flatten() {
+        loop {
+            // Charge before advancing ReadDir, not just for matching entries.
+            budget.charge()?;
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            let entry =
+                entry.map_err(|error| format!("read entry in {}: {error}", prefix.display()))?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if segment_matches(seg, &name_str) {
                 let next = prefix.join(&name);
-                expand_recursive(&next, segments, idx + 1, out);
+                expand_recursive(&next, segments, idx + 1, out, budget)?;
             }
         }
     } else {
         let next = prefix.join(seg);
-        // Only descend if it exists, to avoid spurious not-found entries.
-        if next.symlink_metadata().is_ok() {
-            expand_recursive(&next, segments, idx + 1, out);
+        match next.symlink_metadata() {
+            Ok(_) => expand_recursive(&next, segments, idx + 1, out, budget)?,
+            Err(error) if absent_glob_branch(&error) => {}
+            Err(error) => return Err(format!("inspect {}: {error}", next.display())),
         }
     }
+    Ok(())
+}
+
+fn absent_glob_branch(error: &io::Error) -> bool {
+    // A vanished path, or a regular file where the remaining pattern expects a
+    // directory, is an ordinary nonmatch. Permission/I/O errors are not.
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
 }
 
 /// Match a single path segment against a pattern that may contain `*`.
@@ -810,6 +889,145 @@ mod tests {
         assert_eq!(report.bytes_reclaimed, 4096);
         assert_eq!(fs::metadata(&file_a).unwrap().len(), 0);
         assert_eq!(fs::metadata(&file_b).unwrap().len(), 0);
+    }
+
+    fn expansion_budget(steps: usize) -> ExpansionBudget {
+        ExpansionBudget {
+            remaining_steps: steps,
+            deadline: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn exhausted_expansion_discards_partial_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["one.log", "two.log", "three.log"] {
+            fs::write(dir.path().join(name), b"preserve").unwrap();
+        }
+        let pattern = dir.path().join("*.log");
+        let previous = PathBuf::from("already-collected");
+        let mut paths = vec![previous.clone()];
+        // The literal prefix and first matching child fit; the next entry
+        // exceeds the budget. No partial expansion may escape to the caller.
+        let mut budget = expansion_budget(dir.path().components().count() + 2);
+        let error = expand_pattern_with_budget(&pattern, &mut paths, &mut budget).unwrap_err();
+        assert!(error.contains("work limit"), "{error}");
+        assert_eq!(paths, vec![previous]);
+        for name in ["one.log", "two.log", "three.log"] {
+            assert_eq!(fs::read(dir.path().join(name)).unwrap(), b"preserve");
+        }
+    }
+
+    #[test]
+    fn expansion_charges_nonmatching_directory_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..8 {
+            fs::write(dir.path().join(format!("{index}.data")), b"preserve").unwrap();
+        }
+        let mut paths = Vec::new();
+        let mut budget = expansion_budget(dir.path().components().count() + 2);
+        let error =
+            expand_pattern_with_budget(&dir.path().join("*.log"), &mut paths, &mut budget)
+                .unwrap_err();
+        assert!(error.contains("work limit"), "{error}");
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn expired_expansion_deadline_fails_without_a_partial_plan() {
+        let mut budget = ExpansionBudget {
+            remaining_steps: MAX_PATTERN_STEPS,
+            deadline: Instant::now(),
+        };
+        let mut paths = Vec::new();
+        let error =
+            expand_pattern_with_budget(Path::new("/*"), &mut paths, &mut budget).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn excessive_pattern_depth_is_rejected_before_filesystem_access() {
+        let pattern = PathBuf::from(format!("/{}*.log", "missing/".repeat(MAX_PATTERN_SEGMENTS)));
+        let mut paths = Vec::new();
+        let error = expand_pattern(&pattern, &mut paths).unwrap_err();
+        assert!(error.contains("too many path segments"), "{error}");
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn bounded_expansion_still_returns_all_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.log");
+        let second = dir.path().join("second.log");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        fs::write(dir.path().join("not-a-log.data"), b"data").unwrap();
+        let mut paths = Vec::new();
+        expand_pattern_with_budget(
+            &dir.path().join("*.log"),
+            &mut paths,
+            &mut expansion_budget(1000),
+        )
+        .unwrap();
+        paths.sort();
+        assert_eq!(paths, vec![first.clone(), second]);
+        let mut literal = Vec::new();
+        expand_pattern(&first, &mut literal).unwrap();
+        assert_eq!(literal, vec![first]);
+    }
+
+    #[test]
+    fn absent_and_nondirectory_branches_remain_normal_nonmatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("regular");
+        fs::write(&regular, b"not a directory").unwrap();
+        for pattern in [dir.path().join("absent/*.log"), regular.join("*.log")] {
+            let mut paths = Vec::new();
+            expand_pattern(&pattern, &mut paths).unwrap();
+            assert!(paths.is_empty());
+        }
+        assert!(!absent_glob_branch(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(!absent_glob_branch(&io::Error::from(io::ErrorKind::Other)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_read_errors_back_off_without_blocking_independent_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let cycle = dir.path().join("cycle");
+        // A symlink loop forces read_dir to fail even when the tests run as
+        // root, unlike a chmod-based permission fixture.
+        std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+        let bad = cycle.join("*.log");
+        let mut matches = Vec::new();
+        let error = expand_pattern(&bad, &mut matches).unwrap_err();
+        assert!(error.contains("read directory"), "{error}");
+        assert!(matches.is_empty());
+
+        let good = dir.path().join("good.log");
+        fs::write(&good, vec![b'x'; 4096]).unwrap();
+        let mut config = active_log_config(&bad);
+        config.paths.push(good.to_string_lossy().into_owned());
+        let backoff = Mutex::new(FailureBackoff::default());
+        let now = Instant::now();
+        let first = truncate_with_backoff(&config, 0.0, false, &backoff, || now, process_candidate);
+        assert_eq!(first.errors.len(), 1, "{first:?}");
+        assert_eq!(first.errors[0].0, bad);
+        assert_eq!(first.files_truncated, 1, "{first:?}");
+        assert_eq!(first.bytes_reclaimed, 4096);
+
+        fs::write(&good, vec![b'y'; 4096]).unwrap();
+        let second =
+            truncate_with_backoff(&config, 0.0, false, &backoff, || now, process_candidate);
+        assert!(second.errors.is_empty(), "{second:?}");
+        assert_eq!(second.files_truncated, 1, "{second:?}");
+        assert_eq!(
+            second.skipped_with_reason,
+            vec![(bad, SkipReason::FailureBackoff)]
+        );
     }
 
     // Linux-only: the fixture requires a filesystem admitting non-UTF-8 names.
