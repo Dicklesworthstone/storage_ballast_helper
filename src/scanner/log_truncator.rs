@@ -82,6 +82,9 @@ pub enum SkipReason {
     YoungerThanMinAge,
     /// The matched path was a symlink.
     SymlinkRejected,
+    /// The inode has multiple directory entries, or was unlinked while being
+    /// inspected. Truncation must not mutate data through another name.
+    UnsafeLinkCount,
     /// A recent failure, or a saturated failure budget, is cooling down.
     FailureBackoff,
     /// The opened object differs from the inspected file, or its identity
@@ -332,6 +335,18 @@ fn candidate_skip(
     if !meta.is_file() {
         return Ok(Some(SkipReason::NotARegularFile));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Unlike unlinking a name, truncation mutates every hard-link alias.
+        // Neither O_NOFOLLOW nor device/inode equality protects other names.
+        // This gate runs for dry runs, after open, and after reservation, so
+        // a link added between those observations cannot authorize truncation.
+        // It is not an atomic exclusion against a concurrent link(2).
+        if meta.nlink() != 1 {
+            return Ok(Some(SkipReason::UnsafeLinkCount));
+        }
+    }
     let bytes = reclaimable_bytes(meta);
     if bytes == 0 || bytes < config.min_size_bytes {
         return Ok(Some(SkipReason::BelowMinSize));
@@ -490,6 +505,133 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
+
+    #[cfg(unix)]
+    fn active_log_config(path: &Path) -> LogTruncationConfig {
+        LogTruncationConfig {
+            enabled: true,
+            paths: vec![path.to_string_lossy().into_owned()],
+            min_size_bytes: 1024,
+            pressure_free_pct_ceiling: 15,
+            min_age_minutes: 60,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_inodes_are_kept_without_blocking_independent_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let protected = dir.path().join("important.data");
+        let alias = dir.path().join("codex-tui.log");
+        let ordinary = dir.path().join("ordinary.log");
+        let contents = vec![b'x'; 4096];
+        fs::write(&protected, &contents).unwrap();
+        fs::hard_link(&protected, &alias).unwrap();
+        fs::write(&ordinary, &contents).unwrap();
+        let mut config = active_log_config(&alias);
+        config.paths.push(ordinary.to_string_lossy().into_owned());
+
+        for dry_run in [true, false] {
+            // Even a completely full disk may bypass only the age gate.
+            let report = truncate_oversized_logs(&config, 0.0, dry_run);
+            assert_eq!(report.files_skipped, 1, "{report:?}");
+            assert_eq!(
+                report.skipped_with_reason,
+                vec![(alias.clone(), SkipReason::UnsafeLinkCount)]
+            );
+            assert!(report.errors.is_empty(), "{report:?}");
+            assert_eq!(fs::read(&protected).unwrap(), contents);
+            assert_eq!(fs::read(&alias).unwrap(), contents);
+            if dry_run {
+                assert_eq!(report.files_would_truncate, 1, "{report:?}");
+                assert_eq!(report.bytes_would_reclaim, 4096);
+                assert_eq!(report.files_truncated, 0);
+                assert_eq!(report.bytes_reclaimed, 0);
+                assert_eq!(fs::read(&ordinary).unwrap(), contents);
+            } else {
+                assert_eq!(report.files_truncated, 1, "{report:?}");
+                assert_eq!(report.bytes_reclaimed, 4096);
+                assert_eq!(report.files_would_truncate, 0);
+                assert_eq!(report.bytes_would_reclaim, 0);
+                assert_eq!(fs::metadata(&ordinary).unwrap().len(), 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_added_between_inspection_and_open_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active.log");
+        let alias = dir.path().join("preserve.data");
+        let contents = vec![b'x'; 4096];
+        fs::write(&path, &contents).unwrap();
+        let config = active_log_config(&path);
+        let result = process_candidate_with_opener(&path, &config, true, false, |path| {
+            fs::hard_link(path, &alias).unwrap();
+            open_candidate_for_truncate(path)
+        })
+        .unwrap();
+        assert!(matches!(
+            result,
+            Outcome::Skipped(SkipReason::UnsafeLinkCount)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), contents);
+        assert_eq!(fs::read(&alias).unwrap(), contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_added_after_open_is_rechecked_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active.log");
+        let alias = dir.path().join("preserve.data");
+        let contents = vec![b'x'; 4096];
+        fs::write(&path, &contents).unwrap();
+        let config = active_log_config(&path);
+        let recent = Mutex::new(RecentTruncations::default());
+        let linked = std::cell::Cell::new(false);
+        let now = Instant::now();
+        let result = process_candidate_with_history(
+            &path,
+            &config,
+            true,
+            false,
+            open_candidate_for_truncate,
+            &recent,
+            || {
+                // The reservation clock is read after the opened-fd gate.
+                if !linked.replace(true) {
+                    fs::hard_link(&path, &alias).unwrap();
+                }
+                now
+            },
+        )
+        .unwrap();
+        assert!(linked.get());
+        assert!(matches!(
+            result,
+            Outcome::Skipped(SkipReason::UnsafeLinkCount)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), contents);
+        assert_eq!(fs::read(&alias).unwrap(), contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_open_append_writer_does_not_make_a_single_link_log_unsafe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active.log");
+        fs::write(&path, vec![b'x'; 4096]).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let config = active_log_config(&path);
+        let result = process_candidate(&path, &config, true, false).unwrap();
+        assert!(matches!(result, Outcome::Truncated(4096)));
+        assert!(same_file(&before, &fs::metadata(&path).unwrap()));
+        writer.write_all(b"writer survives\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"writer survives\n");
+    }
 
     #[test]
     fn glob_segment_handles_star_and_literal() {
