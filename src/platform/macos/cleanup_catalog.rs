@@ -43,22 +43,17 @@ pub const ELECTRON_CACHE_ROOT: CleanupRule = cleanup_rule(
     CleanupConfidence::Likely,
 );
 
-pub const ELECTRON_SERVICE_WORKER_CACHE: CleanupRule = cleanup_rule(
+// CacheStorage belongs to the application, not the HTTP cache. It can hold
+// offline-only content; age and absence of open handles do not prove that it
+// can be downloaded again. Keep the existing labels for scan/explain output.
+pub const ELECTRON_SERVICE_WORKER_CACHE: CleanupRule = application_storage_rule(
     "electron-service-worker-cache",
     "~/Library/Application Support/*/Service Worker/CacheStorage/*",
-    AgeThreshold::from_hours(1),
-    CheckRequirement::Required,
-    ReclaimCommand::RemoveTree,
-    CleanupConfidence::Likely,
 );
 
-pub const ELECTRON_SERVICE_WORKER_CACHE_ROOT: CleanupRule = cleanup_rule(
+pub const ELECTRON_SERVICE_WORKER_CACHE_ROOT: CleanupRule = application_storage_rule(
     "electron-service-worker-cache-root",
     "~/Library/Application Support/*/Service Worker/CacheStorage",
-    AgeThreshold::from_hours(1),
-    CheckRequirement::Required,
-    ReclaimCommand::RemoveTree,
-    CleanupConfidence::Likely,
 );
 
 pub const ELECTRON_CODE_CACHE: CleanupRule = cleanup_rule(
@@ -97,40 +92,29 @@ pub const ELECTRON_GPU_CACHE_ROOT: CleanupRule = cleanup_rule(
     CleanupConfidence::Likely,
 );
 
-pub const ELECTRON_INDEXED_DB: CleanupRule = cleanup_rule(
+// IndexedDB is a persistent transactional database, not disposable cache.
+// Its LevelDB files need not have a .db suffix or an active process owner.
+pub const ELECTRON_INDEXED_DB: CleanupRule = application_storage_rule(
     "electron-indexed-db",
     "~/Library/Application Support/*/IndexedDB/*",
-    AgeThreshold::from_hours(1),
-    CheckRequirement::Required,
-    ReclaimCommand::RemoveTree,
-    CleanupConfidence::Likely,
 );
 
-pub const ELECTRON_INDEXED_DB_ROOT: CleanupRule = cleanup_rule(
+pub const ELECTRON_INDEXED_DB_ROOT: CleanupRule = application_storage_rule(
     "electron-indexed-db-root",
     "~/Library/Application Support/*/IndexedDB",
-    AgeThreshold::from_hours(1),
-    CheckRequirement::Required,
-    ReclaimCommand::RemoveTree,
-    CleanupConfidence::Likely,
 );
 
-pub const ELECTRON_VM_BUNDLES: CleanupRule = cleanup_rule(
+// A generic vm_bundles directory does not establish that a guest disk is a
+// pristine, recoverable image. Reclamation needs an application-specific
+// lifecycle contract before any such bundle may become actionable.
+pub const ELECTRON_VM_BUNDLES: CleanupRule = application_storage_rule(
     "electron-vm-bundles",
     "~/Library/Application Support/*/vm_bundles/*",
-    AgeThreshold::from_hours(24),
-    CheckRequirement::Required,
-    ReclaimCommand::RemoveTree,
-    CleanupConfidence::Likely,
 );
 
-pub const ELECTRON_VM_BUNDLES_ROOT: CleanupRule = cleanup_rule(
+pub const ELECTRON_VM_BUNDLES_ROOT: CleanupRule = application_storage_rule(
     "electron-vm-bundles-root",
     "~/Library/Application Support/*/vm_bundles",
-    AgeThreshold::from_hours(24),
-    CheckRequirement::Required,
-    ReclaimCommand::RemoveTree,
-    CleanupConfidence::Likely,
 );
 
 pub const TMP_DASH_TARGET: CleanupRule = cleanup_rule(
@@ -327,6 +311,17 @@ pub fn match_path_scanner_rule(path: &std::path::Path) -> Option<&'static Cleanu
     cleanup_catalog::match_path_scanner_rule(path, MAC_CLEANUP_RULES)
 }
 
+const fn application_storage_rule(name: &'static str, path_glob: &'static str) -> CleanupRule {
+    cleanup_rule(
+        name,
+        path_glob,
+        AgeThreshold::NONE,
+        CheckRequirement::NotRequired,
+        ReclaimCommand::ReportOnly,
+        CleanupConfidence::ReportOnly,
+    )
+}
+
 const fn cleanup_rule(
     name: &'static str,
     path_glob: &'static str,
@@ -426,10 +421,62 @@ mod tests {
             HOME_TRASH_REPORT,
             ICLOUD_TRASH_REPORT,
             SPOTLIGHT_INDEX_REPORT,
+            ELECTRON_INDEXED_DB,
+            super::ELECTRON_INDEXED_DB_ROOT,
+            ELECTRON_SERVICE_WORKER_CACHE,
+            super::ELECTRON_SERVICE_WORKER_CACHE_ROOT,
+            ELECTRON_VM_BUNDLES,
+            super::ELECTRON_VM_BUNDLES_ROOT,
         ] {
             assert_eq!(rule.reclaim_command, ReclaimCommand::ReportOnly);
             assert_eq!(rule.confidence, CleanupConfidence::ReportOnly);
             assert!(!rule.is_destructive());
+            assert!(!rule.is_path_scanner_candidate());
+            assert!(rule.is_scan_visible_candidate());
+        }
+    }
+
+    #[test]
+    fn persistent_application_storage_is_visible_but_never_actionable() {
+        use crate::core::config::ScoringConfig;
+        use crate::scanner::patterns::{ArtifactPatternRegistry, StructuralSignals};
+        use crate::scanner::scoring::{
+            ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine,
+        };
+
+        let registry = ArtifactPatternRegistry::default();
+        let engine = ScoringEngine::from_config(&ScoringConfig::default(), 4);
+        for suffix in [
+            "IndexedDB",
+            "IndexedDB/https_example.test_0.indexeddb.leveldb",
+            "Service Worker/CacheStorage",
+            "Service Worker/CacheStorage/offline-documents",
+            "vm_bundles",
+            "vm_bundles/user-workspace.bundle",
+        ] {
+            let path = Path::new("/Users/operator/Library/Application Support/Example").join(suffix);
+            let rule = match_rule(&path).expect("application storage remains visible");
+            assert_eq!(rule.reclaim_command, ReclaimCommand::ReportOnly);
+            assert!(match_path_scanner_rule(&path).is_none());
+            let signals = StructuralSignals::default();
+            let classification =
+                registry.classify_with_cleanup_rules(&path, signals, cleanup_rules());
+            assert_eq!(classification.pattern_name.as_ref(), rule.scanner_label());
+            let input = CandidateInput {
+                path,
+                size_bytes: 100 * 1_073_741_824,
+                age: Duration::from_hours(24 * 365),
+                classification,
+                signals,
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            };
+            for pressure in [0.0, 0.5, 0.95, 1.0] {
+                let score = engine.score_candidate(&input, pressure);
+                assert_eq!(score.decision.action, DecisionAction::Keep);
+                assert!(score.veto_reason.is_some(), "report-only must be a hard veto");
+            }
         }
     }
 
@@ -501,11 +548,6 @@ mod tests {
                 "electron-cache",
             ),
             (
-                ELECTRON_SERVICE_WORKER_CACHE,
-                "~/Library/Application Support/*/Service Worker/CacheStorage/*",
-                "electron-service-worker-cache",
-            ),
-            (
                 ELECTRON_CODE_CACHE,
                 "~/Library/Application Support/*/Code Cache/*",
                 "electron-code-cache",
@@ -514,16 +556,6 @@ mod tests {
                 ELECTRON_GPU_CACHE,
                 "~/Library/Application Support/*/GPUCache/*",
                 "electron-gpu-cache",
-            ),
-            (
-                ELECTRON_INDEXED_DB,
-                "~/Library/Application Support/*/IndexedDB/*",
-                "electron-indexed-db",
-            ),
-            (
-                ELECTRON_VM_BUNDLES,
-                "~/Library/Application Support/*/vm_bundles/*",
-                "electron-vm-bundles",
             ),
         ];
 
@@ -534,11 +566,7 @@ mod tests {
                 path_glob,
                 CleanupConfidence::Likely,
                 ReclaimCommand::RemoveTree,
-                if rule == ELECTRON_VM_BUNDLES {
-                    AgeThreshold::from_hours(24)
-                } else {
-                    AgeThreshold::from_hours(1)
-                },
+                AgeThreshold::from_hours(1),
             );
             assert_eq!(rule.fd_check, CheckRequirement::Required);
         }
