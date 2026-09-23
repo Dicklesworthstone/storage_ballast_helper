@@ -64,6 +64,13 @@ fn check_path(candidate: &CandidacyScore, config: &DeletionConfig) -> Result<(),
     // hide the protected ancestors of the actual object. Failure to resolve
     // is missing safety evidence, never proof that the object is unprotected.
     let normalized = fs::canonicalize(path).map_err(|_| SkipReason::SacredStowaway)?;
+    // The immutable source-tree floor applies to the actual object, too.
+    // A relative path or a parent symlink must not hide .git or a protected
+    // project location. Re-resolve on every call: a parent alias can move
+    // after preflight without changing the candidate's device/inode.
+    if super::is_hardcoded_source_tree(&normalized) {
+        return Err(SkipReason::HardcodedSourceTree);
+    }
     let marker_root = if metadata.is_dir() {
         normalized.as_path()
     } else {
@@ -85,16 +92,22 @@ fn check_path(candidate: &CandidacyScore, config: &DeletionConfig) -> Result<(),
     {
         check_go_cache(&normalized)?;
     }
-    if metadata.is_file() {
-        let overlaps = protection::find_sacred_overlaps_with_config(
-            &normalized,
-            &config.sacred_paths,
-            config.stowaway_scan,
-        )
-        .map_err(|_| SkipReason::SacredStowaway)?;
-        if !overlaps.is_empty() {
-            return Err(SkipReason::SacredStowaway);
-        }
+    // Recheck direct/ancestor catalog rules for directories as well as
+    // files at the mutation boundary. The protection module resolves exact
+    // paths and literal glob prefixes, including operator-configured aliases.
+    // Depth zero deliberately leaves recursive containment to preflight:
+    // this must not multiply large-tree walks during planning and mutation.
+    let overlaps = protection::find_sacred_overlaps_with_config(
+        &normalized,
+        &config.sacred_paths,
+        protection::StowawayScanConfig {
+            max_depth: 0,
+            ..config.stowaway_scan
+        },
+    )
+    .map_err(|_| SkipReason::SacredStowaway)?;
+    if !overlaps.is_empty() {
+        return Err(SkipReason::SacredStowaway);
     }
     // Recursive directory containment remains in the existing preflight,
     // preserving its bounded walk, per-batch reuse, and accounting.
@@ -610,6 +623,157 @@ mod tests {
                 } else {
                     assert_eq!(report.bytes_freed, item.size_bytes);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn aliases_cannot_hide_git_ancestry_even_with_an_empty_catalog() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for directory in [false, true] {
+                let dir = scratch();
+                let git = dir.path().join(".git/objects");
+                fs::create_dir_all(&git).unwrap();
+                // An artifact-like name does not grant a .git carve-out.
+                let real = git.join("target");
+                let payload = if directory {
+                    fs::create_dir(&real).unwrap();
+                    real.join("artifact.o")
+                } else {
+                    real.clone()
+                };
+                fs::write(&payload, PAYLOAD).unwrap();
+                let alias = dir.path().join("alias");
+                symlink(&git, &alias).unwrap();
+                let item = candidate(&alias.join("target"));
+                let mut cfg = config(dir.path(), mode);
+                cfg.sacred_paths.clear();
+                let executor = DeletionExecutor::new(cfg, None);
+                assert_checked_refusal(&executor, &item, mode, SkipReason::HardcodedSourceTree);
+                assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
+                assert!(!QuarantineStore::under(dir.path()).root().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn moving_the_same_inode_behind_a_git_alias_revokes_admission() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let dir = scratch();
+            let real = dir.path().join("real");
+            fs::create_dir_all(real.join("target")).unwrap();
+            fs::write(real.join("target/artifact.o"), PAYLOAD).unwrap();
+            let alias = dir.path().join("alias");
+            symlink(&real, &alias).unwrap();
+            let item = candidate(&alias.join("target"));
+            let mut cfg = config(dir.path(), mode);
+            cfg.sacred_paths.clear();
+            let executor = DeletionExecutor::new(cfg, None);
+            assert!(executor.explain_preflight(&item, None).is_ok());
+
+            let git = dir.path().join(".git");
+            fs::rename(&real, &git).unwrap();
+            fs::rename(&alias, dir.path().join("old-alias")).unwrap();
+            symlink(&git, &alias).unwrap();
+            assert_eq!(
+                item.identity,
+                Some(identity_for_path(&item.path, false).unwrap())
+            );
+            // Exercise the actual boundary, not only a fresh preflight.
+            assert!(executor.delete_path(&item).is_err());
+            assert!(executor.quarantine_path(&item).is_err());
+            assert_checked_refusal(&executor, &item, mode, SkipReason::HardcodedSourceTree);
+            assert_eq!(fs::read(git.join("target/artifact.o")).unwrap(), PAYLOAD);
+        }
+    }
+
+    #[test]
+    fn directory_protection_is_rechecked_after_parent_alias_relocation() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for glob in [false, true] {
+                let dir = scratch();
+                let real = dir.path().join("real");
+                fs::create_dir_all(real.join("target")).unwrap();
+                fs::write(real.join("target/artifact.o"), PAYLOAD).unwrap();
+                let alias = dir.path().join("alias");
+                symlink(&real, &alias).unwrap();
+                let protected = dir.path().join("protected");
+                let pattern = if glob {
+                    protected.join("*")
+                } else {
+                    protected.clone()
+                };
+                let mut cfg = config(dir.path(), mode);
+                cfg.sacred_paths
+                    .extend(protection::sacred_paths_from_protected_patterns(&[
+                        pattern.to_string_lossy().into_owned(),
+                    ]));
+                let item = candidate(&alias.join("target"));
+                let executor = DeletionExecutor::new(cfg, None);
+                assert!(executor.explain_preflight(&item, None).is_ok());
+
+                fs::rename(&real, &protected).unwrap();
+                fs::rename(&alias, dir.path().join("old-alias")).unwrap();
+                symlink(&protected, &alias).unwrap();
+                assert_eq!(
+                    item.identity,
+                    Some(identity_for_path(&item.path, false).unwrap())
+                );
+                assert!(executor.delete_path(&item).is_err());
+                assert!(executor.quarantine_path(&item).is_err());
+                assert_checked_refusal(&executor, &item, mode, SkipReason::SacredStowaway);
+                assert_eq!(
+                    fs::read(protected.join("target/artifact.o")).unwrap(),
+                    PAYLOAD
+                );
+                assert!(!QuarantineStore::under(dir.path()).root().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn direct_protection_rechecks_do_not_repeat_recursive_containment() {
+        let dir = scratch();
+        let path = dir.path().join("target");
+        fs::create_dir_all(path.join("nested")).unwrap();
+        fs::write(path.join("nested/.sbh-protect"), b"").unwrap();
+        let mut cfg = config(dir.path(), DeletionMode::Unlink);
+        cfg.stowaway_scan.max_entries = 1;
+        cfg.stowaway_scan.max_dirs = 1;
+        let item = candidate(&path);
+        // Only direct rules and ancestors belong in admission. The existing
+        // bounded preflight owns descendant discovery and its cost counters.
+        assert!(check(&item, &cfg).is_ok());
+        let executor = DeletionExecutor::new(cfg, None);
+        assert_eq!(
+            executor.explain_preflight(&item, None),
+            Err(SkipReason::SacredStowaway)
+        );
+        assert!(path.join("nested/.sbh-protect").exists());
+    }
+
+    #[test]
+    fn unprotected_parent_aliases_remain_eligible_in_both_modes() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let dir = scratch();
+            let real = dir.path().join("real");
+            fs::create_dir_all(real.join("target")).unwrap();
+            fs::write(real.join("target/artifact.o"), PAYLOAD).unwrap();
+            let alias = dir.path().join("alias");
+            symlink(&real, &alias).unwrap();
+            let item = candidate(&alias.join("target"));
+            let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+            assert!(executor.explain_preflight(&item, None).is_ok());
+            let plan = executor.plan(vec![item]);
+            assert_eq!(plan.estimated_items, 1);
+            let report = executor.execute(&plan, None);
+            assert_eq!(report.items_deleted, 1);
+            assert_eq!(report.items_failed, 0);
+            assert_eq!(report.items_skipped, 0);
+            assert!(!real.join("target").exists());
+            if mode == DeletionMode::Quarantine {
+                assert_eq!(report.bytes_freed, 0);
+                assert_eq!(report.items_quarantined, 1);
             }
         }
     }
