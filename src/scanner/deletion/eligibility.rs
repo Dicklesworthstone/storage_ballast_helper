@@ -87,10 +87,11 @@ fn check_path(candidate: &CandidacyScore, config: &DeletionConfig) -> Result<(),
             Err(_) => return Err(SkipReason::SacredStowaway),
         }
     }
-    if metadata.is_dir()
-        && candidate.classification.category == crate::scanner::patterns::ArtifactCategory::GoCache
-    {
-        check_go_cache(&normalized)?;
+    if metadata.is_dir() {
+        check_directory_root(&normalized)?;
+        if candidate.classification.category == crate::scanner::patterns::ArtifactCategory::GoCache {
+            check_go_cache(&normalized)?;
+        }
     }
     // Recheck direct/ancestor catalog rules for directories as well as
     // files at the mutation boundary. The protection module resolves exact
@@ -114,6 +115,31 @@ fn check_path(candidate: &CandidacyScore, config: &DeletionConfig) -> Result<(),
     Ok(())
 }
 
+/// Source or Git metadata can appear inside an approved directory without
+/// changing its device/inode. Repeat the existing root-level source guards
+/// at every admission, including the final mutation boundary. Descendant
+/// Git discovery remains in bounded preflight; no recursive scan is added.
+fn check_directory_root(path: &Path) -> Result<(), SkipReason> {
+    match fs::symlink_metadata(path.join(".git")) {
+        // Git worktrees use a regular .git file, and any other entry with
+        // this reserved name must also protect without reading its contents.
+        Ok(_) => return Err(SkipReason::ContainsGit),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(_) => return Err(SkipReason::SacredStowaway),
+    }
+    if super::contains_cargo_manifest_without_artifact_markers(path) {
+        return Err(SkipReason::ContainsCargoManifest);
+    }
+    // A real module cache contains module source BELOW its root, not a
+    // project manifest or source files AT its root. Cache classifications
+    // must not exempt the latter, nor may an ordinary target be repurposed
+    // into source between preflight and unlink/quarantine.
+    if super::looks_like_source_code(path) {
+        return Err(SkipReason::LooksLikeSourceCode);
+    }
+    Ok(())
+}
+
 /// A cache label grants unusually destructive privileges: the executor can
 /// bypass its source check and make read-only trees writable. The label in a
 /// public or queued candidate is not authority for either privilege. Recheck
@@ -124,12 +150,6 @@ fn check_go_cache(path: &Path) -> Result<(), SkipReason> {
         ArtifactCategory, OpaqueTreeContext, OpaqueTreeDisposition, classify_opaque_tree,
     };
 
-    // A real module cache contains module source BELOW its root, not a
-    // project manifest or source files AT its root. Never exempt the latter
-    // just because stale evidence still calls the directory a Go cache.
-    if super::looks_like_source_code(path) {
-        return Err(SkipReason::LooksLikeSourceCode);
-    }
     let Some(tree) = classify_opaque_tree(path, OpaqueTreeContext::default()) else {
         return Err(SkipReason::Vetoed);
     };
@@ -774,6 +794,112 @@ mod tests {
             if mode == DeletionMode::Quarantine {
                 assert_eq!(report.bytes_freed, 0);
                 assert_eq!(report.items_quarantined, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn source_added_after_preflight_revokes_ordinary_directory_admission() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for name in ["main.rs", "app.py", "package.json", "go.mod"] {
+                let dir = scratch();
+                let path = dir.path().join("target");
+                fs::create_dir(&path).unwrap();
+                let payload = path.join("artifact.o");
+                fs::write(&payload, PAYLOAD).unwrap();
+                let item = candidate(&path);
+                let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+                let plan = executor.plan(vec![item.clone()]);
+                assert_eq!(plan.estimated_items, 1);
+                assert!(executor.explain_preflight(&item, None).is_ok());
+
+                let source = path.join(name);
+                fs::write(&source, PAYLOAD).unwrap();
+                assert_eq!(
+                    item.identity,
+                    Some(identity_for_path(&path, false).unwrap())
+                );
+                // Enter the mutation helpers FIRST so this proves the
+                // safety check is not merely a new planning filter.
+                assert!(executor.delete_path(&item).is_err());
+                assert!(executor.quarantine_path(&item).is_err());
+                let report = executor.execute(&plan, None);
+                assert_eq!(report.items_deleted, 0);
+                assert_eq!(report.items_failed, 0);
+                assert_eq!(
+                    report.skipped_by_reason.get("looks_like_source_code"),
+                    Some(&1)
+                );
+                assert_checked_refusal(&executor, &item, mode, SkipReason::LooksLikeSourceCode);
+                assert_eq!(fs::read(source).unwrap(), PAYLOAD);
+                assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
+                assert!(!QuarantineStore::under(dir.path()).root().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_manifest_added_after_preflight_keeps_the_cargo_veto_attribution() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            let dir = scratch();
+            let path = dir.path().join("target");
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("artifact.o"), PAYLOAD).unwrap();
+            let item = candidate(&path);
+            let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+            assert!(executor.explain_preflight(&item, None).is_ok());
+            fs::write(path.join("Cargo.toml"), b"[package]\nname = \"keep-me\"\n").unwrap();
+            assert!(executor.delete_path(&item).is_err());
+            assert!(executor.quarantine_path(&item).is_err());
+            assert_checked_refusal(&executor, &item, mode, SkipReason::ContainsCargoManifest);
+            assert!(path.join("Cargo.toml").exists());
+            assert_eq!(fs::read(path.join("artifact.o")).unwrap(), PAYLOAD);
+        }
+    }
+
+    #[test]
+    fn git_metadata_added_after_preflight_blocks_both_mutation_backends() {
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for variant in 0..4 {
+                let dir = scratch();
+                let path = dir.path().join("target");
+                fs::create_dir(&path).unwrap();
+                let payload = path.join("artifact.o");
+                fs::write(&payload, PAYLOAD).unwrap();
+                let item = candidate(&path);
+                let mut cfg = config(dir.path(), mode);
+                cfg.sacred_paths.clear();
+                let executor = DeletionExecutor::new(cfg, None);
+                assert!(executor.explain_preflight(&item, None).is_ok());
+
+                let git = path.join(".git");
+                let socket = match variant {
+                    0 => {
+                        fs::create_dir(&git).unwrap();
+                        fs::write(git.join("config"), PAYLOAD).unwrap();
+                        None
+                    }
+                    1 => {
+                        fs::write(&git, b"gitdir: ../worktree-metadata\n").unwrap();
+                        None
+                    }
+                    2 => {
+                        symlink("missing-git-metadata", &git).unwrap();
+                        None
+                    }
+                    _ => Some(std::os::unix::net::UnixListener::bind(&git).unwrap()),
+                };
+                assert_eq!(
+                    item.identity,
+                    Some(identity_for_path(&path, false).unwrap())
+                );
+                assert!(executor.delete_path(&item).is_err());
+                assert!(executor.quarantine_path(&item).is_err());
+                assert_checked_refusal(&executor, &item, mode, SkipReason::ContainsGit);
+                assert!(fs::symlink_metadata(&git).is_ok());
+                assert_eq!(fs::read(payload).unwrap(), PAYLOAD);
+                assert!(!QuarantineStore::under(dir.path()).root().exists());
+                drop(socket);
             }
         }
     }
