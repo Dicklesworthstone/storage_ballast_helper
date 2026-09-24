@@ -2175,6 +2175,7 @@ For test harness conventions and structured logging registration, see `docs/test
 ## Troubleshooting
 
 ### "No candidates found, but disk is full"
+- The daemon says where the bytes are: at Red or Critical with nothing reclaimable, it logs an `SBH-2007` warning (journal and activity log, at most hourly per mount) naming the largest directories on that filesystem, with containers such as `/home` and `/data` broken down one level (`/home/ubuntu 278.1 GiB, /data/projects >=235.0 GiB, ...`; `>=` marks a size probe that hit its budget).
 - Ask the scorer directly: `sbh explain --why-not <dir>` scores that directory now, runs the deletion preflight, and prints the first thing standing in the way (a `.sbh-protect` marker or protected pattern, an exclusion, a scoring veto, a preflight refusal such as a source tree or an active lease, or a score below `scoring.min_score`) followed by the full factor table. Add `--counterfactual` to see the smallest change of age, size, or pressure that would flip it to Delete, and `--json` for the same report as data.
 - `sbh scan <path> --min-score 0.0` lists everything the scorer saw; each line ends with an id for `sbh explain --id`.
 - Check protections via `sbh protect --list`.

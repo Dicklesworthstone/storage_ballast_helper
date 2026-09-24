@@ -298,7 +298,7 @@ fn note_opaque_signal(
 /// The probe also collects the structural signals found anywhere under the
 /// root: the evidence the walker scores an opaque root with. The scanner
 /// index persists those signals so a replay does not repeat this walk.
-fn opaque_tree_probe(
+pub(crate) fn opaque_tree_probe(
     root: &Path,
     cross_devices: bool,
     root_dev: u64,
@@ -1265,7 +1265,7 @@ pub fn identity_for_path(path: &Path, follow_symlinks: bool) -> std::io::Result<
 }
 
 /// Get device ID from metadata (for cross-device detection).
-fn device_id(meta: &fs::Metadata) -> u64 {
+pub(crate) fn device_id(meta: &fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
