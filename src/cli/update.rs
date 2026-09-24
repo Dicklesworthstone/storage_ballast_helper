@@ -13,6 +13,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rand::random;
 use serde::Serialize;
 
+mod backup_snapshot;
+mod binary_install;
+mod execution_probe;
+#[cfg(test)]
+mod backup_tests;
+#[cfg(all(test, unix))]
+mod transactional_tests;
+
 #[cfg(test)]
 use crate::core::hex_lower;
 use crate::core::update_cache::{CachedUpdateMetadata, UpdateMetadataCache};
@@ -316,44 +324,7 @@ impl BackupStore {
         install_path: &Path,
         version: &str,
     ) -> std::result::Result<BackupSnapshot, String> {
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|e| format!("failed to create backup dir: {e}"))?;
-
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let id = format!("{ts}");
-
-        let entry_dir = self.dir.join(&id);
-        std::fs::create_dir_all(&entry_dir)
-            .map_err(|e| format!("failed to create backup entry dir: {e}"))?;
-
-        let dest = entry_dir.join("sbh");
-        std::fs::copy(install_path, &dest)
-            .map_err(|e| format!("failed to copy binary for backup: {e}"))?;
-
-        let binary_size = std::fs::metadata(&dest).map_or(0, |m| m.len());
-
-        let meta = serde_json::json!({
-            "version": version,
-            "timestamp": ts,
-            "binary_size": binary_size,
-        });
-        let meta_path = entry_dir.join("backup.json");
-        std::fs::write(
-            &meta_path,
-            serde_json::to_string_pretty(&meta).unwrap_or_default(),
-        )
-        .map_err(|e| format!("failed to write backup metadata: {e}"))?;
-
-        Ok(BackupSnapshot {
-            id,
-            version: version.to_string(),
-            timestamp: ts,
-            binary_size,
-            path: dest,
-        })
+        backup_snapshot::create(&self.dir, install_path, version)
     }
 
     /// List all backup entries, sorted newest-first.
@@ -415,7 +386,12 @@ impl BackupStore {
             });
         }
 
-        entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
+        entries.sort_by(|left, right| {
+            right
+                .timestamp
+                .cmp(&left.timestamp)
+                .then_with(|| right.id.cmp(&left.id))
+        });
         entries
     }
 
@@ -457,19 +433,8 @@ impl BackupStore {
             });
         }
 
-        if let Some(parent) = install_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create install dir: {e}"))?;
-        }
-
-        std::fs::copy(&snap.path, install_path)
-            .map_err(|e| format!("failed to restore backup: {e}"))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(install_path, std::fs::Permissions::from_mode(0o755));
-        }
+        binary_install::install_with_validation(&snap.path, install_path, |_| Ok(()))
+            .map_err(|error| format!("failed to restore backup: {error}"))?;
 
         Ok(RollbackResult {
             success: true,
@@ -927,10 +892,11 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
             Ok(snap) => {
                 report.backup_id = Some(snap.id.clone());
                 report.step_ok(format!("Backed up v{} as {}", current, snap.id));
-                let _ = store.prune(opts.max_backups);
             }
             Err(e) => {
                 report.step_fail("Backup current binary", e);
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return report;
             }
         }
     }
@@ -950,6 +916,15 @@ pub fn run_update_sequence(opts: &UpdateOptions) -> UpdateReport {
         Ok(()) => {
             report.step_ok(format!("Installed to {}", install_path.display()));
             report.applied = true;
+            // A failed validation/install must not consume rollback history.
+            // Retention applies only after the new executable is in place.
+            if report.backup_id.is_some()
+                && let Err(error) = BackupStore::open_default().prune(opts.max_backups)
+            {
+                report.follow_up.push(format!(
+                    "Update installed, but backup retention failed: {error}; review the backup inventory."
+                ));
+            }
         }
         Err(e) => {
             report.step_fail("Install binary", e);
@@ -1382,87 +1357,15 @@ fn extract_and_install(
         archive_path.to_path_buf()
     };
 
-    if let Some(parent) = install_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create install dir: {e}"))?;
-    }
-
-    // Keep a `.old` safety net in addition to the backup store snapshot.
-    // Use a unique name to avoid collisions and allow Windows self-update
-    // (renaming a running binary is allowed, but overwriting/renaming-over is not).
-    let nonce = random::<u32>();
-    let backup_path = install_path.with_extension(format!("old.{nonce}"));
-
-    if install_path.exists() {
-        // Must rename (move) the current binary. Copying leaves the locked binary
-        // in place on Windows, causing the subsequent install rename to fail.
-        std::fs::rename(install_path, &backup_path)
-            .map_err(|e| format!("failed to move current binary to backup location: {e}"))?;
-    }
-
-    // Atomic install: copy to .new alongside target, then rename.
-    // This ensures we are on the same filesystem for the final rename.
-    let temp_install_path = install_path.with_extension("new");
-    if let Err(e) = std::fs::copy(&new_binary, &temp_install_path) {
-        let _ = std::fs::remove_dir_all(&extract_dir);
-        // Try to restore backup if we moved it.
-        if backup_path.exists() {
-            let _ = std::fs::rename(&backup_path, install_path);
-        }
-        return Err(format!("failed to copy new binary to temp location: {e}"));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ =
-            std::fs::set_permissions(&temp_install_path, std::fs::Permissions::from_mode(0o755));
-    }
-
-    // Verify the new binary works *before* moving it into place (check noexec, library linkage).
-    if let Err(e) = verify_binary_execution(&temp_install_path) {
-        let _ = std::fs::remove_file(&temp_install_path);
-        let _ = std::fs::remove_dir_all(&extract_dir);
-        // Restore backup if we moved it.
-        if backup_path.exists() {
-            let _ = std::fs::rename(&backup_path, install_path);
-        }
-        return Err(format!("new binary failed self-test: {e}"));
-    }
-
-    if let Err(e) = verify_binary_trust(&temp_install_path, binary_trust_policy) {
-        let _ = std::fs::remove_file(&temp_install_path);
-        let _ = std::fs::remove_dir_all(&extract_dir);
-        if backup_path.exists() {
-            let _ = std::fs::rename(&backup_path, install_path);
-        }
-        return Err(format!("new binary failed trust verification: {e}"));
-    }
-
-    if let Err(e) = std::fs::rename(&temp_install_path, install_path) {
-        // Rollback: restore from backup if it exists.
-        if backup_path.exists() {
-            let _ = std::fs::rename(&backup_path, install_path);
-        }
-        let _ = std::fs::remove_file(&temp_install_path);
-        let _ = std::fs::remove_dir_all(&extract_dir);
-        return Err(format!(
-            "failed to atomically replace binary (rolled back): {e}"
-        ));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(install_path, std::fs::Permissions::from_mode(0o755));
-    }
-
-    // Best-effort cleanup of the running-binary backup.
-    // On Windows this will fail because the process is still running from this file.
-    // That's acceptable; it's a temp file in the bin dir.
-    let _ = std::fs::remove_file(&backup_path);
+    let result = binary_install::install_with_validation(&new_binary, install_path, |candidate| {
+        // Never execute a candidate that has not passed the selected trust policy.
+        verify_binary_trust(candidate, binary_trust_policy)
+            .map_err(|error| format!("new binary failed trust verification: {error}"))?;
+        verify_binary_execution(candidate)
+            .map_err(|error| format!("new binary failed self-test: {error}"))
+    });
     let _ = std::fs::remove_dir_all(&extract_dir);
-    Ok(())
+    result
 }
 
 #[cfg_attr(
@@ -1573,15 +1476,7 @@ fn binary_trust_command_detail(output: &BinaryTrustCommandOutput) -> String {
 }
 
 fn verify_binary_execution(path: &Path) -> std::result::Result<(), String> {
-    let output = Command::new(path)
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("failed to execute binary: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!("binary exited with status {}", output.status));
-    }
-    Ok(())
+    execution_probe::verify(path, Duration::from_secs(30))
 }
 
 fn tempdir_for_update() -> std::result::Result<PathBuf, String> {
