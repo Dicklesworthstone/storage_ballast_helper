@@ -620,6 +620,13 @@ impl ScoringEngine {
         if let Some(reason) = rch_target_veto_reason(&input.path, urgency) {
             return Some(reason);
         }
+        // The executor refuses symlinks (removal would follow them out of the
+        // tree) and unlinking one frees nothing, so a symlink nominated by
+        // name (a pnpm-style `node_modules` link) was re-proposed and refused
+        // every pass (ts2: 612 executor skips of five links in three days).
+        if std::fs::symlink_metadata(&input.path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Some(Cow::Borrowed("symlink: removing it frees nothing"));
+        }
         if input.signals.has_cargo_toml
             && !input.signals.has_strong_signal()
             && !cleanup_rule_allows_embedded_manifest(&input.classification)
@@ -1756,6 +1763,43 @@ mod tests {
             structural_confidence: confidence,
             combined_confidence: confidence,
         }
+    }
+
+    /// A symlinked `node_modules` is vetoed at scoring, so it is never
+    /// nominated for an executor that must refuse it; the real directory it
+    /// points at still scores normally.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_candidate_is_vetoed_but_its_target_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("store/node_modules");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("app/node_modules");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let engine = default_engine();
+        let input = |path: &Path| CandidateInput {
+            path: path.to_path_buf(),
+            size_bytes: 2 * 1024 * 1024 * 1024,
+            age: Duration::from_hours(48),
+            classification: classification(0.9, ArtifactCategory::NodeModules),
+            signals: StructuralSignals::default(),
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+        let linked = engine.score_candidate(&input(&link), 0.9);
+        assert!(linked.vetoed);
+        assert_eq!(
+            linked.veto_reason.as_deref(),
+            Some("symlink: removing it frees nothing")
+        );
+        let target = engine.score_candidate(&input(&real), 0.9);
+        assert_ne!(
+            target.veto_reason.as_deref(),
+            Some("symlink: removing it frees nothing")
+        );
     }
 
     #[test]
