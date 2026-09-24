@@ -1692,7 +1692,7 @@ Before any candidate is scored for deletion, the walker collects active-referenc
 
 | Budget | Limit | Purpose |
 | --- | --- | --- |
-| Time | 5 seconds | Prevents hanging on machines with many processes |
+| Time | 30 seconds | Bounds the sweep while leaving a CPU-capped (`CPUQuota=10%`) daemon room to finish on a loaded host |
 | PIDs | 50,000 | Caps scan even if individual PIDs are fast |
 
 If either budget is exhausted, the scan returns a partial set. The system fails conservative: a partial open-file set means some open files might be missed, but the pre-flight safety checks provide a second layer of defense.

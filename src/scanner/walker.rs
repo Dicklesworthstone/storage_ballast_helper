@@ -1349,11 +1349,17 @@ fn collect_open_files_linux() -> HashSet<(u64, u64)> {
 /// entries cause permanent blind spots.
 pub const MAX_ENTRIES_PER_DIR: u32 = 65_536;
 
-/// Maximum time to spend scanning /proc for open file ancestors.
-/// On agent swarms with many processes, /proc scanning can take minutes.
-/// A 5-second budget captures enough data for reliable veto decisions.
+/// Maximum wall time to spend scanning /proc for open file ancestors.
+///
+/// The budget is wall time, but the daemon runs at `Nice=19` under the
+/// unit's `CPUQuota=10%`: it gets at most 0.1 CPU-second per wall second,
+/// less on a loaded host. At 5 s the sweep had ~0.5 CPU-s, which a busy agent
+/// host (1,600 processes, 40k fds, load 64) could not fit, so every deletion
+/// batch failed closed with SBH-3003 while the disk sat at 100% (css,
+/// 2026-09-24). 30 s keeps the sweep bounded and fail-closed with room to
+/// finish under the quota.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub const OPEN_FILES_SCAN_BUDGET: Duration = Duration::from_secs(5);
+pub const OPEN_FILES_SCAN_BUDGET: Duration = Duration::from_secs(30);
 
 /// Maximum number of PIDs to scan before bailing out.
 /// Increased to 50,000 to handle busy swarm machines without false-negative open checks.

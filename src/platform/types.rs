@@ -374,8 +374,10 @@ pub struct OpenFile {
     pub mode: OpenFileMode,
 }
 
-/// Maximum time to spend scanning processes for open files or executables (5 s).
-pub const OPEN_FILES_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// Maximum wall time to spend scanning processes for open files or
+/// executables (30 s): a CPU-capped daemon on a loaded host needs the room
+/// (see `scanner::walker::OPEN_FILES_SCAN_BUDGET`).
+pub const OPEN_FILES_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Maximum number of PIDs to scan before bailing out (50,000).
 pub const OPEN_FILES_MAX_PIDS: usize = 50_000;
