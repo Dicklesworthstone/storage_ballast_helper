@@ -170,7 +170,9 @@ impl PrescanCursor {
     }
 
     fn page_proof(&self) -> MutexGuard<'_, Option<PageProof>> {
-        self.page.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.page
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn resume_after(&self, root: &Path) -> Option<&Path> {
@@ -236,7 +238,10 @@ impl PrescanCursor {
         let retain = proof.as_ref().is_some_and(|page| {
             page.root == root
                 && (!page.exhausted
-                    || page.last.as_deref().is_some_and(|last| self.resume_after(root) != Some(last)))
+                    || page
+                        .last
+                        .as_deref()
+                        .is_some_and(|last| self.resume_after(root) != Some(last)))
         });
         self.remember_current();
         if !retain {
@@ -472,9 +477,8 @@ mod tests {
             .map(|i| PathBuf::from(format!("/root/item-{i:04}")))
             .collect();
         for reverse in [false, true] {
-            let mut shuffled: Vec<PathBuf> = (0..257)
-                .map(|i| names[(i * 73) % 257].clone())
-                .collect();
+            let mut shuffled: Vec<PathBuf> =
+                (0..257).map(|i| names[(i * 73) % 257].clone()).collect();
             if reverse {
                 shuffled.reverse();
             }
@@ -488,7 +492,10 @@ mod tests {
                         .collect();
                     let actual = select_page(shuffled.iter().cloned().map(Ok), after, cap)
                         .expect("selection");
-                    assert_eq!(actual, expected, "cap={cap} reverse={reverse} after={after:?}");
+                    assert_eq!(
+                        actual, expected,
+                        "cap={cap} reverse={reverse} after={after:?}"
+                    );
                 }
             }
         }

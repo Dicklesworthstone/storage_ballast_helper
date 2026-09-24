@@ -454,7 +454,8 @@ mod tests {
             "vm_bundles",
             "vm_bundles/user-workspace.bundle",
         ] {
-            let path = Path::new("/Users/operator/Library/Application Support/Example").join(suffix);
+            let path =
+                Path::new("/Users/operator/Library/Application Support/Example").join(suffix);
             let rule = match_rule(&path).expect("application storage remains visible");
             assert_eq!(rule.reclaim_command, ReclaimCommand::ReportOnly);
             assert!(match_path_scanner_rule(&path).is_none());
@@ -475,7 +476,10 @@ mod tests {
             for pressure in [0.0, 0.5, 0.95, 1.0] {
                 let score = engine.score_candidate(&input, pressure);
                 assert_eq!(score.decision.action, DecisionAction::Keep);
-                assert!(score.veto_reason.is_some(), "report-only must be a hard veto");
+                assert!(
+                    score.veto_reason.is_some(),
+                    "report-only must be a hard veto"
+                );
             }
         }
     }

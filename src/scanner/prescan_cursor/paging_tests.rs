@@ -52,7 +52,10 @@ fn capped_roots_rotate_fairly_without_discarding_each_others_continuations() {
     assert_eq!(page(&mut cursor, &roots, &a, 2), expected(&a, 0, 2));
     assert_eq!(cursor.position().0, Some(b.as_path()));
     assert_eq!(page(&mut cursor, &roots, &b, 2), expected(&b, 0, 2));
-    assert_eq!(cursor.position(), (Some(a.as_path()), Some(a.join("item-001").as_path())));
+    assert_eq!(
+        cursor.position(),
+        (Some(a.as_path()), Some(a.join("item-001").as_path()))
+    );
     assert_eq!(page(&mut cursor, &roots, &a, 2), expected(&a, 2, 4));
     assert_eq!(page(&mut cursor, &roots, &b, 2), expected(&b, 2, 4));
     assert!(cursor.continuations.is_empty());
@@ -65,10 +68,22 @@ fn alternating_per_mount_requests_keep_the_other_mounts_position() {
     let a = make_root(dir.path(), "mount-a", 5);
     let b = make_root(dir.path(), "mount-b", 5);
     let mut cursor = PrescanCursor::new();
-    assert_eq!(page(&mut cursor, std::slice::from_ref(&a), &a, 2), expected(&a, 0, 2));
-    assert_eq!(page(&mut cursor, std::slice::from_ref(&b), &b, 2), expected(&b, 0, 2));
-    assert_eq!(page(&mut cursor, std::slice::from_ref(&a), &a, 2), expected(&a, 2, 4));
-    assert_eq!(page(&mut cursor, std::slice::from_ref(&b), &b, 2), expected(&b, 2, 4));
+    assert_eq!(
+        page(&mut cursor, std::slice::from_ref(&a), &a, 2),
+        expected(&a, 0, 2)
+    );
+    assert_eq!(
+        page(&mut cursor, std::slice::from_ref(&b), &b, 2),
+        expected(&b, 0, 2)
+    );
+    assert_eq!(
+        page(&mut cursor, std::slice::from_ref(&a), &a, 2),
+        expected(&a, 2, 4)
+    );
+    assert_eq!(
+        page(&mut cursor, std::slice::from_ref(&b), &b, 2),
+        expected(&b, 2, 4)
+    );
 }
 
 #[test]
@@ -167,10 +182,19 @@ fn legacy_checkpoints_upgrade_without_forgetting_the_old_resume_point() {
     let mut cursor: PrescanCursor = serde_json::from_value(old).unwrap();
     // Switch requests before returning to the old checkpoint's root.
     page(&mut cursor, std::slice::from_ref(&b), &b, 2);
-    assert_eq!(page(&mut cursor, std::slice::from_ref(&a), &a, 2), expected(&a, 2, 4));
+    assert_eq!(
+        page(&mut cursor, std::slice::from_ref(&a), &a, 2),
+        expected(&a, 2, 4)
+    );
     let encoded = serde_json::to_value(&cursor).unwrap();
-    assert!(encoded.get("page").is_none(), "enumeration is not completed work");
-    assert_eq!(serde_json::from_value::<PrescanCursor>(encoded).unwrap(), cursor);
+    assert!(
+        encoded.get("page").is_none(),
+        "enumeration is not completed work"
+    );
+    assert_eq!(
+        serde_json::from_value::<PrescanCursor>(encoded).unwrap(),
+        cursor
+    );
 }
 
 #[test]
@@ -223,7 +247,8 @@ fn tail_evidence_matches_eligible_cardinality_in_every_enumeration_order() {
                 let after = Path::new("/root/005");
                 let eligible = paths.iter().filter(|path| path.as_path() > after).count();
                 let (selected, more) =
-                    select_page_with_tail(paths.into_iter().map(Ok), Some(after), capacity).unwrap();
+                    select_page_with_tail(paths.into_iter().map(Ok), Some(after), capacity)
+                        .unwrap();
                 assert_eq!(selected.len(), eligible.min(capacity));
                 assert_eq!(more, eligible > capacity);
             }

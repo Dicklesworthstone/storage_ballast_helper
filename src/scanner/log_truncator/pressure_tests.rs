@@ -187,17 +187,11 @@ fn overlapping_patterns_visit_each_path_once_including_dry_run_and_failure() {
     assert_eq!(dry.bytes_would_reclaim, 4096);
     let backoff = Mutex::new(FailureBackoff::default());
     let calls = Cell::new(0);
-    let report = truncate_with_backoff(
-        &config,
-        0.0,
-        false,
-        &backoff,
-        Instant::now,
-        |_, _, _, _| {
+    let report =
+        truncate_with_backoff(&config, 0.0, false, &backoff, Instant::now, |_, _, _, _| {
             calls.set(calls.get() + 1);
             Err("injected failure".to_string())
-        },
-    );
+        });
     assert_eq!(calls.get(), 1);
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.files_skipped, 1);
@@ -216,7 +210,10 @@ fn replaced_regular_file_is_never_truncated() {
         open_candidate_for_truncate(path)
     })
     .unwrap();
-    assert!(matches!(outcome, Outcome::Skipped(SkipReason::IdentityChanged)));
+    assert!(matches!(
+        outcome,
+        Outcome::Skipped(SkipReason::IdentityChanged)
+    ));
     assert_eq!(fs::read(&path).unwrap(), b"replacement data must survive");
     assert_eq!(fs::metadata(&old).unwrap().len(), 4096);
 }
@@ -237,7 +234,10 @@ fn a_replaced_parent_directory_cannot_redirect_the_open_to_another_inode() {
         open_candidate_for_truncate(path)
     })
     .unwrap();
-    assert!(matches!(outcome, Outcome::Skipped(SkipReason::IdentityChanged)));
+    assert!(matches!(
+        outcome,
+        Outcome::Skipped(SkipReason::IdentityChanged)
+    ));
     assert_eq!(fs::metadata(&path).unwrap().len(), 4096);
     assert_eq!(fs::metadata(moved.join("active.log")).unwrap().len(), 4096);
 }
@@ -254,7 +254,10 @@ fn a_log_that_shrinks_while_opening_is_rechecked_before_truncation() {
         Ok(file)
     })
     .unwrap();
-    assert!(matches!(outcome, Outcome::Skipped(SkipReason::BelowMinSize)));
+    assert!(matches!(
+        outcome,
+        Outcome::Skipped(SkipReason::BelowMinSize)
+    ));
     assert_eq!(fs::read(&path).unwrap(), b"xxxxxxxx");
 }
 
@@ -273,7 +276,10 @@ fn the_age_gate_is_rechecked_on_the_opened_inode() {
         open_candidate_for_truncate(path)
     })
     .unwrap();
-    assert!(matches!(outcome, Outcome::Skipped(SkipReason::YoungerThanMinAge)));
+    assert!(matches!(
+        outcome,
+        Outcome::Skipped(SkipReason::YoungerThanMinAge)
+    ));
     assert_eq!(fs::metadata(&path).unwrap().len(), 4096);
 }
 
@@ -357,14 +363,9 @@ fn byte_estimates_saturate_instead_of_overflowing_the_report() {
     log(&b);
     let config = config(&[a, b]);
     let backoff = Mutex::new(FailureBackoff::default());
-    let report = truncate_with_backoff(
-        &config,
-        0.0,
-        true,
-        &backoff,
-        Instant::now,
-        |_, _, _, _| Ok(Outcome::WouldTruncate(u64::MAX)),
-    );
+    let report = truncate_with_backoff(&config, 0.0, true, &backoff, Instant::now, |_, _, _, _| {
+        Ok(Outcome::WouldTruncate(u64::MAX))
+    });
     assert_eq!(report.files_would_truncate, 2);
     assert_eq!(report.bytes_would_reclaim, u64::MAX);
 }

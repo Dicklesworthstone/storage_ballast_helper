@@ -23,7 +23,10 @@ where
     }
     match fs::symlink_metadata(dest) {
         Ok(meta) if !meta.is_file() && !meta.file_type().is_symlink() => {
-            return Err(format!("binary destination is not a file: {}", dest.display()));
+            return Err(format!(
+                "binary destination is not a file: {}",
+                dest.display()
+            ));
         }
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -72,7 +75,10 @@ fn open_regular_source(path: &Path) -> Result<File, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("failed to inspect candidate binary: {error}"))?;
     if !metadata.is_file() {
-        return Err(format!("candidate is not a regular file: {}", path.display()));
+        return Err(format!(
+            "candidate is not a regular file: {}",
+            path.display()
+        ));
     }
     let mut options = OpenOptions::new();
     options.read(true);
@@ -91,7 +97,10 @@ fn open_regular_source(path: &Path) -> Result<File, String> {
         .map_err(|error| format!("failed to inspect open candidate: {error}"))?
         .is_file()
     {
-        return Err(format!("candidate is not a regular file: {}", path.display()));
+        return Err(format!(
+            "candidate is not a regular file: {}",
+            path.display()
+        ));
     }
     Ok(input)
 }
@@ -160,7 +169,9 @@ impl StagingDir {
                     ));
                 }
             }
-            return Err(format!("failed to install binary: {error}; previous state restored"));
+            return Err(format!(
+                "failed to install binary: {error}; previous state restored"
+            ));
         }
         Ok(())
     }
@@ -217,8 +228,8 @@ mod tests {
     #[test]
     fn failed_validation_preserves_installed_binary_and_cleans_staging() {
         let (_temp, source, dest) = fixture();
-        let error = install_with_validation(&source, &dest, |_| Err("rejected".to_string()))
-            .unwrap_err();
+        let error =
+            install_with_validation(&source, &dest, |_| Err("rejected".to_string())).unwrap_err();
         assert_eq!(error, "rejected");
         assert_eq!(fs::read(&dest).unwrap(), b"old binary");
         assert_no_staging(&dest);
@@ -330,8 +341,16 @@ mod tests {
         let (_temp, source, dest) = fixture();
         fs::write(&source, b"#!/bin/sh\nexit 0\n").unwrap();
         install_with_validation(&source, &dest, |candidate| {
-            assert_eq!(fs::metadata(candidate).unwrap().permissions().mode() & 0o777, 0o755);
-            assert!(std::process::Command::new(candidate).status().unwrap().success());
+            assert_eq!(
+                fs::metadata(candidate).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert!(
+                std::process::Command::new(candidate)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
             Ok(())
         })
         .unwrap();

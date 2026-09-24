@@ -255,7 +255,8 @@ impl Fsevents {
                     "FSEvents requires absolute UTF-8 paths without NUL bytes",
                 ));
             }
-            let length = isize::try_from(bytes.len()).map_err(|_| io::Error::other("path too long"))?;
+            let length =
+                isize::try_from(bytes.len()).map_err(|_| io::Error::other("path too long"))?;
             // SAFETY: bytes is live for length bytes. CF copies the string;
             // UTF-8 was validated above. Null uses the default allocator.
             strings.push(CfOwned::checked(
@@ -264,7 +265,8 @@ impl Fsevents {
             )?);
         }
         let values: Vec<NativeRef> = strings.iter().map(CfOwned::raw).collect();
-        let count = isize::try_from(values.len()).map_err(|_| io::Error::other("too many roots"))?;
+        let count =
+            isize::try_from(values.len()).map_err(|_| io::Error::other("too many roots"))?;
         // SAFETY: every value is a live CFString. Type callbacks retain the
         // strings, so both the array and any stream-retained copy own them.
         let paths = CfOwned::checked(
@@ -519,7 +521,14 @@ mod tests {
     fn oversized_callback_does_not_dereference_its_arrays() {
         let inbox = Inbox::default();
         // SAFETY: the oversized-count path rejects before reading arrays.
-        unsafe { receive_inner(&inbox, MAX_CALLBACK_EVENTS + 1, ptr::null_mut(), ptr::null()) };
+        unsafe {
+            receive_inner(
+                &inbox,
+                MAX_CALLBACK_EVENTS + 1,
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        };
         assert!(inbox.drain().must_rescan);
     }
 

@@ -150,7 +150,11 @@ fn truncate_with_backoff(
         }
         let key = FailureKey::Pattern(PathBuf::from(pattern));
         if !dry_run && backoff.lock().blocked(&key, clock()) {
-            record_skip(&mut report, PathBuf::from(pattern), SkipReason::FailureBackoff);
+            record_skip(
+                &mut report,
+                PathBuf::from(pattern),
+                SkipReason::FailureBackoff,
+            );
             continue;
         }
         let mut matches: Vec<PathBuf> = Vec::new();
@@ -299,7 +303,12 @@ fn process_candidate_with_history(
 /// This is a bounded recovery heuristic, not proof of append mode. A nonzero
 /// prefix or a minimum-sized new logical tail permits an immediate retry.
 /// Otherwise the size/age gates may retry after the recovery window expires.
-fn has_new_log_data(path: &Path, expected: &fs::Metadata, previous_size: u64, minimum: u64) -> bool {
+fn has_new_log_data(
+    path: &Path,
+    expected: &fs::Metadata,
+    previous_size: u64,
+    minimum: u64,
+) -> bool {
     if expected.len().saturating_sub(previous_size) >= minimum.max(1) {
         return true;
     }
@@ -315,7 +324,10 @@ fn has_new_log_data(path: &Path, expected: &fs::Metadata, previous_size: u64, mi
         // An unverifiable repeat waits out the bounded recovery window.
         return false;
     };
-    if !reader.metadata().is_ok_and(|meta| same_file(expected, &meta)) {
+    if !reader
+        .metadata()
+        .is_ok_and(|meta| same_file(expected, &meta))
+    {
         return false;
     }
     let mut prefix = [0u8; 4096];
@@ -926,9 +938,8 @@ mod tests {
         }
         let mut paths = Vec::new();
         let mut budget = expansion_budget(dir.path().components().count() + 2);
-        let error =
-            expand_pattern_with_budget(&dir.path().join("*.log"), &mut paths, &mut budget)
-                .unwrap_err();
+        let error = expand_pattern_with_budget(&dir.path().join("*.log"), &mut paths, &mut budget)
+            .unwrap_err();
         assert!(error.contains("work limit"), "{error}");
         assert!(paths.is_empty());
     }

@@ -84,7 +84,11 @@ mod tests {
     #[test]
     fn reports_nonzero_exit() {
         let (_temp, path) = script("exit 7");
-        assert!(verify(&path, Duration::from_secs(2)).unwrap_err().contains("status"));
+        assert!(
+            verify(&path, Duration::from_secs(2))
+                .unwrap_err()
+                .contains("status")
+        );
     }
 
     #[test]

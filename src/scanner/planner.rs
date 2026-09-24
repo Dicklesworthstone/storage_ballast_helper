@@ -254,12 +254,15 @@ struct SelectedPaths {
 impl SelectedPaths {
     fn overlaps(&self, path: &Path) -> bool {
         self.ancestors.contains(path)
-            || path.ancestors().any(|ancestor| self.paths.contains(ancestor))
+            || path
+                .ancestors()
+                .any(|ancestor| self.paths.contains(ancestor))
     }
 
     fn insert(&mut self, path: &Path) {
         self.paths.insert(path.to_path_buf());
-        self.ancestors.extend(path.ancestors().map(Path::to_path_buf));
+        self.ancestors
+            .extend(path.ancestors().map(Path::to_path_buf));
     }
 }
 
@@ -549,7 +552,10 @@ mod tests {
         // The counterfactual must also skip overlaps BEFORE its slot limit.
         assert_eq!(plan.top_n_bytes, 10 * GIB);
         assert_eq!(plan.skipped_for_overlap.len(), 1);
-        assert_eq!(plan.skipped_for_overlap[0].path, Path::new("/p/target/debug"));
+        assert_eq!(
+            plan.skipped_for_overlap[0].path,
+            Path::new("/p/target/debug")
+        );
         assert!(plan.skipped_for_budget.is_empty());
         assert_finite_plan(&plan);
     }
@@ -558,7 +564,13 @@ mod tests {
     fn a_safer_child_excludes_its_parent_without_excluding_other_roots() {
         let candidates = vec![
             candidate("/p/target", 6 * GIB, 0.8, 3.0, DecisionAction::Delete),
-            candidate("/p/target/debug", 5 * GIB, 0.99, 2.0, DecisionAction::Delete),
+            candidate(
+                "/p/target/debug",
+                5 * GIB,
+                0.99,
+                2.0,
+                DecisionAction::Delete,
+            ),
             candidate("/p/cache", GIB, 0.9, 1.0, DecisionAction::Delete),
         ];
         let (chosen, plan) = plan_batch(
@@ -598,8 +610,7 @@ mod tests {
             candidate("/p/target/a", GIB, 0.9, 1.0, DecisionAction::Delete),
             candidate("/p/target/b", GIB, 0.9, 1.0, DecisionAction::Delete),
         ];
-        let (chosen, plan) =
-            plan_batch(candidates, &request(PressureLevel::Orange, None, None));
+        let (chosen, plan) = plan_batch(candidates, &request(PressureLevel::Orange, None, None));
         assert_eq!(chosen.len(), 4);
         assert_eq!(plan.planned_bytes, 13 * GIB);
         assert!(plan.skipped_for_overlap.is_empty());
@@ -629,7 +640,13 @@ mod tests {
         let candidates = vec![
             candidate("/p/a", 12 * GIB, 0.85, 1.0, DecisionAction::Delete),
             candidate("/p/a/target", 8 * GIB, 0.95, 1.0, DecisionAction::Delete),
-            candidate("/p/a/target/debug", 7 * GIB, 0.99, 1.0, DecisionAction::Delete),
+            candidate(
+                "/p/a/target/debug",
+                7 * GIB,
+                0.99,
+                1.0,
+                DecisionAction::Delete,
+            ),
             candidate("/p/a/cache", 3 * GIB, 0.95, 1.0, DecisionAction::Delete),
             candidate("/p/b", 4 * GIB, 0.95, 1.0, DecisionAction::Delete),
         ];

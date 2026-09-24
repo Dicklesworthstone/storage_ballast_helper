@@ -14,10 +14,10 @@ use rand::random;
 use serde::Serialize;
 
 mod backup_snapshot;
-mod binary_install;
-mod execution_probe;
 #[cfg(test)]
 mod backup_tests;
+mod binary_install;
+mod execution_probe;
 #[cfg(all(test, unix))]
 mod transactional_tests;
 

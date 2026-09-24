@@ -31,8 +31,8 @@ test -f "$bin_dir/sbh""#,
 #[test]
 fn update_self_test_failure_keeps_the_installed_binary() {
     let (_temp, source, dest) = fixture("exit 7");
-    let error = extract_and_install(&source, &dest, BinaryTrustPolicy::BypassNoVerify, false)
-        .unwrap_err();
+    let error =
+        extract_and_install(&source, &dest, BinaryTrustPolicy::BypassNoVerify, false).unwrap_err();
     assert!(error.contains("self-test"));
     assert_eq!(fs::read(&dest).unwrap(), b"old installed binary");
     assert!(!source.with_extension("extract").exists());

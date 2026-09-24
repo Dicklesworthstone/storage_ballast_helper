@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use super::EventSourceBackend;
 use super::{
-    EventBackendKind, EventInvalidation, EventRateTracker, EventSourceCapability, EventSourceConfig,
-    EventSourcePlan, OverflowBackoff, OverflowDecision, ScannerEventSourceMode,
+    EventBackendKind, EventInvalidation, EventRateTracker, EventSourceCapability,
+    EventSourceConfig, EventSourcePlan, OverflowBackoff, OverflowDecision, ScannerEventSourceMode,
 };
 #[cfg(target_os = "macos")]
 use sbh_mach::fsevents::{Fsevents, MAX_ROOTS};
@@ -112,7 +112,8 @@ fn resolve_roots(
     }
     let complete = dirty.is_empty() && !watched.is_empty();
     let reason = if complete {
-        "FSEvents recursively covers all configured roots; periodic reconciliation remains required".to_string()
+        "FSEvents recursively covers all configured roots; periodic reconciliation remains required"
+            .to_string()
     } else {
         format!(
             "FSEvents coverage incomplete: {} roots require reconciliation{}",
@@ -149,7 +150,11 @@ pub(super) fn retry_due(
         && now.saturating_duration_since(planned_at) >= RETRY_INTERVAL
 }
 
-fn record_loss(roots: &[PathBuf], backoff: &mut OverflowBackoff, now: Instant) -> EventInvalidation {
+fn record_loss(
+    roots: &[PathBuf],
+    backoff: &mut OverflowBackoff,
+    now: Instant,
+) -> EventInvalidation {
     let mut invalidation = EventInvalidation::empty();
     // Pace the expensive rescan, never the revocation of stale candidates.
     invalidation.generation_bump = true;
@@ -324,7 +329,8 @@ fn install_plan(
                 capability.watched_dirs = 0;
                 capability.frontier_dirs = config.root_paths().len();
                 capability.dirty_roots = config.root_paths().to_vec();
-                capability.reason = format!("FSEvents startup failed; reconciliation fallback: {err}");
+                capability.reason =
+                    format!("FSEvents startup failed; reconciliation fallback: {err}");
                 EventSourceBackend::ReconciliationOnly
             }
         }
@@ -524,7 +530,10 @@ mod tests {
         let disabled = resolve_roots(&cfg, |_| {
             panic!("disabled plans must not touch the filesystem")
         });
-        assert_eq!(disabled.summary.backend, EventBackendKind::ReconciliationOnly);
+        assert_eq!(
+            disabled.summary.backend,
+            EventBackendKind::ReconciliationOnly
+        );
     }
 
     #[test]

@@ -339,8 +339,8 @@ pub(super) fn quarantine(
     // Reserving the whole decision directory, not just its basename, stops
     // a reused id from orphaning an earlier payload with a different name.
     fs::create_dir(&dir).map_err(unavailable)?;
-    if let Err(e) = write_new_json(&pending, &record)
-        .and_then(|()| sync_store_ancestors(store.root()))
+    if let Err(e) =
+        write_new_json(&pending, &record).and_then(|()| sync_store_ancestors(store.root()))
     {
         let _ = fs::remove_file(&pending);
         let _ = fs::remove_dir(&dir);
@@ -532,7 +532,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store, record) = held(dir.path(), "pending");
         // Crash immediately after moving the payload, before publishing JSON.
-        fs::rename(store.record_path("pending"), pending_path(&store, "pending")).unwrap();
+        fs::rename(
+            store.record_path("pending"),
+            pending_path(&store, "pending"),
+        )
+        .unwrap();
         let reopened = QuarantineStore::at(store.root().to_path_buf());
         assert_eq!(reopened.records().unwrap(), vec![record.clone()]);
         assert_eq!(reopened.held_bytes().unwrap(), 100);
@@ -560,7 +564,11 @@ mod tests {
     fn pressure_can_drain_a_completed_pending_move() {
         let dir = tempfile::tempdir().unwrap();
         let (store, record) = held(dir.path(), "pressure");
-        fs::rename(store.record_path("pressure"), pending_path(&store, "pressure")).unwrap();
+        fs::rename(
+            store.record_path("pressure"),
+            pending_path(&store, "pressure"),
+        )
+        .unwrap();
         assert_eq!(store.drain_all().unwrap().bytes, 100);
         assert!(!record.quarantine_path.exists());
         assert!(!pending_path(&store, "pressure").exists());
@@ -629,7 +637,10 @@ mod tests {
         let out = store.drain_all().unwrap();
         assert_eq!(out.bytes, 0);
         assert_eq!(out.failures.len(), 1);
-        assert_eq!(fs::read(record.quarantine_path).unwrap(), b"unrelated replacement");
+        assert_eq!(
+            fs::read(record.quarantine_path).unwrap(),
+            b"unrelated replacement"
+        );
         assert_eq!(fs::read(saved).unwrap(), b"original bytes");
     }
 
@@ -713,7 +724,10 @@ mod tests {
         symlink(&saved, store.entry_dir("symlink")).unwrap();
         assert!(store.restore("symlink", false).is_err());
         assert!(store.purge("symlink").is_err());
-        assert_eq!(fs::read(saved.join("target-symlink")).unwrap(), b"original bytes");
+        assert_eq!(
+            fs::read(saved.join("target-symlink")).unwrap(),
+            b"original bytes"
+        );
         let manifest = store.record_path("symlink");
         let saved_manifest = dir.path().join("saved-manifest");
         fs::rename(&manifest, &saved_manifest).unwrap();
@@ -732,7 +746,10 @@ mod tests {
         let suffix = dir.path().join("target-dangling.restored-dangling");
         symlink("missing-destination", &suffix).unwrap();
         assert!(store.restore("dangling", true).is_err());
-        assert_eq!(fs::read_link(suffix).unwrap(), Path::new("missing-destination"));
+        assert_eq!(
+            fs::read_link(suffix).unwrap(),
+            Path::new("missing-destination")
+        );
         assert!(record.quarantine_path.exists());
     }
 
@@ -801,7 +818,11 @@ mod tests {
     fn reservation_recovery_never_discards_unrecognized_siblings() {
         let dir = tempfile::tempdir().unwrap();
         let (store, record) = held(dir.path(), "reserved");
-        fs::rename(store.record_path("reserved"), pending_path(&store, "reserved")).unwrap();
+        fs::rename(
+            store.record_path("reserved"),
+            pending_path(&store, "reserved"),
+        )
+        .unwrap();
         fs::rename(&record.quarantine_path, &record.original_path).unwrap();
         let unknown = store.entry_dir("reserved").join("unrecognized");
         fs::write(&unknown, b"preserve").unwrap();

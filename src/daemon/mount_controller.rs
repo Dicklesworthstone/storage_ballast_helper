@@ -394,11 +394,9 @@ impl MountController {
                     && seconds <= self.config.action_horizon.as_secs_f64()
             });
         let wants_reclaim = pressured || predicted;
-        let pressure_wake = self.idle_wake.observe(
-            input.level,
-            predicted,
-            self.config.recovery_clean_windows,
-        );
+        let pressure_wake =
+            self.idle_wake
+                .observe(input.level, predicted, self.config.recovery_clean_windows);
 
         // A write failure trumps everything: nothing sbh does on this mount
         // can succeed until a probe write does.

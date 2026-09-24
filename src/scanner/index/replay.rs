@@ -44,8 +44,12 @@ fn eligible(record: &CandidateIndexRecord, generation: u64, now_nanos: u128) -> 
             record.safety_state,
             CandidateSafetyState::Safe | CandidateSafetyState::Failed
         )
-        && record.score.is_some_and(|score| score.is_finite() && score > 0.0)
-        && record.cooldown_until_nanos.is_none_or(|until| now_nanos >= until)
+        && record
+            .score
+            .is_some_and(|score| score.is_finite() && score > 0.0)
+        && record
+            .cooldown_until_nanos
+            .is_none_or(|until| now_nanos >= until)
 }
 
 pub(super) fn ranked_records<'a>(
@@ -153,7 +157,13 @@ mod tests {
     #[test]
     fn invalid_scores_and_safety_vetoes_do_not_consume_replay_slots() {
         let mut records = Vec::new();
-        for score in [None, Some(f64::NAN), Some(f64::INFINITY), Some(-1.0), Some(0.0)] {
+        for score in [
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(-1.0),
+            Some(0.0),
+        ] {
             let mut bad = record(1);
             bad.score = score;
             records.push(bad);
@@ -230,7 +240,11 @@ mod tests {
             current.safety_state = state;
             index.upsert(current.clone());
             assert_eq!(index.get(current.identity).unwrap().safety_state, state);
-            assert!(index.ranked_records(UNIX_EPOCH + Duration::from_secs(2), 1).is_empty());
+            assert!(
+                index
+                    .ranked_records(UNIX_EPOCH + Duration::from_secs(2), 1)
+                    .is_empty()
+            );
         }
     }
 
@@ -264,7 +278,11 @@ mod tests {
             Duration::from_secs(10),
         );
         index.upsert(current);
-        assert!(index.ranked_records(UNIX_EPOCH + Duration::from_secs(9), 1).is_empty());
+        assert!(
+            index
+                .ranked_records(UNIX_EPOCH + Duration::from_secs(9), 1)
+                .is_empty()
+        );
         let ranked = index.ranked_records(UNIX_EPOCH + Duration::from_secs(10), 1);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].safety_state, CandidateSafetyState::Failed);

@@ -38,7 +38,11 @@ fn incomplete_binary_is_not_visible_to_inventory_or_rollback() {
     let entry = store.dir().join("123-000000001-test");
     fs::create_dir_all(&entry).unwrap();
     fs::write(entry.join("sbh.partial"), b"incomplete").unwrap();
-    fs::write(entry.join("backup.json"), br#"{"version":"test","timestamp":123}"#).unwrap();
+    fs::write(
+        entry.join("backup.json"),
+        br#"{"version":"test","timestamp":123}"#,
+    )
+    .unwrap();
     assert!(store.list().is_empty());
     assert!(store.rollback(&temp.path().join("restored"), None).is_err());
     fs::rename(entry.join("sbh.partial"), entry.join("sbh")).unwrap();
@@ -53,7 +57,11 @@ fn equal_second_timestamps_are_ordered_by_subsecond_snapshot_id() {
         let entry = store.dir().join(id);
         fs::create_dir_all(&entry).unwrap();
         fs::write(entry.join("sbh"), id).unwrap();
-        fs::write(entry.join("backup.json"), br#"{"version":"test","timestamp":123}"#).unwrap();
+        fs::write(
+            entry.join("backup.json"),
+            br#"{"version":"test","timestamp":123}"#,
+        )
+        .unwrap();
     }
     let entries = store.list();
     assert_eq!(entries[0].id, "123-000000002-second");

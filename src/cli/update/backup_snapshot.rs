@@ -1,8 +1,8 @@
 //! Publish complete, collision-resistant rollback snapshots.
 
-use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,7 +15,9 @@ pub(super) fn create(
     version: &str,
 ) -> Result<BackupSnapshot, String> {
     fs::create_dir_all(store).map_err(|error| format!("failed to create backup dir: {error}"))?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let (id, entry) = allocate_entry(store, now)?;
     let result = write_snapshot(&entry, install_path, version, &id, now.as_secs());
     if result.is_err() {

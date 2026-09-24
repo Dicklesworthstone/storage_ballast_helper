@@ -37,7 +37,10 @@ fn await_paths(source: &mut ScannerEventSource, paths: &[PathBuf]) -> EventInval
     let mut observed = EventInvalidation::empty();
     while Instant::now() < deadline {
         observed.merge(source.drain());
-        if paths.iter().all(|path| observed.dirty_paths().contains(path)) {
+        if paths
+            .iter()
+            .all(|path| observed.dirty_paths().contains(path))
+        {
             return observed;
         }
         thread::sleep(Duration::from_millis(25));
@@ -115,7 +118,8 @@ fn missing_roots_retry_without_events_and_unchanged_gaps_do_not_rescan() {
     let missing = temp.path().join("missing");
     fs::create_dir(&healthy).unwrap();
     let now = Instant::now();
-    let mut source = ScannerEventSource::start_at(config(&[healthy.clone(), missing.clone()], 2), now);
+    let mut source =
+        ScannerEventSource::start_at(config(&[healthy.clone(), missing.clone()], 2), now);
     assert_native(&source);
     assert!(!source.capability().complete);
     assert!(source.drain_at(now).dirty_roots().contains(&missing));

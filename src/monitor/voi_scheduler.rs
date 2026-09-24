@@ -494,9 +494,9 @@ impl VoiScheduler {
         let mut next: Option<&PathBuf> = None;
         for path in paths {
             let overdue = self.path_stats.get(path).is_some_and(|stats| {
-                stats.last_scanned.is_none_or(|last| {
-                    now.saturating_duration_since(last) >= MAX_REVISIT_INTERVAL
-                })
+                stats
+                    .last_scanned
+                    .is_none_or(|last| now.saturating_duration_since(last) >= MAX_REVISIT_INTERVAL)
             });
             if !overdue {
                 continue;
@@ -504,7 +504,10 @@ impl VoiScheduler {
             if first.is_none_or(|previous| path < previous) {
                 first = Some(path);
             }
-            if self.exploration_after.as_ref().is_none_or(|after| path > after)
+            if self
+                .exploration_after
+                .as_ref()
+                .is_none_or(|after| path > after)
                 && next.is_none_or(|previous| path < previous)
             {
                 next = Some(path);
@@ -541,7 +544,11 @@ impl VoiScheduler {
         });
         let exploration_index = exploration
             .as_ref()
-            .and_then(|path| scored.iter().position(|(_, _, candidate)| *candidate == path))
+            .and_then(|path| {
+                scored
+                    .iter()
+                    .position(|(_, _, candidate)| *candidate == path)
+            })
             .filter(|&index| budget > 1 || !self.last_plan_explored || index == 0);
         if let Some(index) = exploration_index {
             // Put the reserved opportunity first without disturbing relative
@@ -1072,7 +1079,10 @@ mod tests {
         assert_eq!(plan.paths.len(), 1);
         assert_eq!(plan.paths[0].path, Path::new("/cold"));
         assert!(plan.paths[0].is_exploration);
-        assert!(plan.paths[0].utility < 0.0, "keep the real, poor utility visible");
+        assert!(
+            plan.paths[0].utility < 0.0,
+            "keep the real, poor utility visible"
+        );
         assert!(!plan.fallback_active);
         assert_eq!(plan.budget_used, 1);
         assert_eq!(plan.budget_total, 1);
@@ -1186,8 +1196,18 @@ mod tests {
         right.config.scan_budget_per_interval = 2;
         let now = Instant::now();
         for _ in 0..12 {
-            let l: Vec<_> = left.schedule(now).paths.into_iter().map(|e| e.path).collect();
-            let r: Vec<_> = right.schedule(now).paths.into_iter().map(|e| e.path).collect();
+            let l: Vec<_> = left
+                .schedule(now)
+                .paths
+                .into_iter()
+                .map(|e| e.path)
+                .collect();
+            let r: Vec<_> = right
+                .schedule(now)
+                .paths
+                .into_iter()
+                .map(|e| e.path)
+                .collect();
             assert_eq!(l, r);
         }
     }
