@@ -19,6 +19,7 @@ use crate::core::config::BallastConfig;
 use crate::core::errors::Result;
 use crate::platform::pal::{MountPoint, Platform};
 
+mod provision;
 mod stranded;
 use stranded::StrandedReserve;
 
@@ -547,7 +548,7 @@ impl BallastPoolCoordinator {
                     .map_or(0.0, |s| s.free_pct())
             };
 
-            match pool.manager.provision(Some(&free_check)) {
+            match provision::provision(pool, Some(&free_check)) {
                 Ok(report) => per_volume.push((mount_path.clone(), report)),
                 Err(e) => {
                     skipped_volumes.push((mount_path.clone(), format!("provision failed: {e}")));
@@ -614,7 +615,7 @@ impl BallastPoolCoordinator {
             return Ok(None);
         };
 
-        let report = pool.manager.replenish_one(free_pct_check)?;
+        let report = provision::replenish_one(pool, free_pct_check)?;
         Ok(Some(report))
     }
 

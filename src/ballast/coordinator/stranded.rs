@@ -262,6 +262,38 @@ mod unix {
             self.files.iter().map(|(_, size)| *size).fold(0, u64::saturating_add)
         }
 
+        /// Revalidate before crediting reserve against new allocation. Known
+        /// losses revoke stale inventory; unreadable or busy entries defer
+        /// growth instead of silently treating an unknown reserve as empty.
+        /// This never adopts a replacement under an old snapshot's authority.
+        pub(in super::super) fn refresh(&mut self) -> Vec<String> {
+            let mut errors = Vec::new();
+            let mut kept = Vec::new();
+            for (path, size) in std::mem::take(&mut self.files) {
+                let Some(snapshot) = self.snapshots.get(&path) else {
+                    continue;
+                };
+                match with_validated_candidate(&path, snapshot, |_, _| Ok(())) {
+                    Ok(()) => kept.push((path, size)),
+                    Err(error) if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                    ) => {
+                        self.snapshots.remove(&path);
+                    }
+                    Err(error) => {
+                        errors.push(format!(
+                            "cannot determine adopted reserve at {}: {error}",
+                            path.display()
+                        ));
+                        kept.push((path, size));
+                    }
+                }
+            }
+            self.files = kept;
+            errors
+        }
+
         /// Missing/replaced entries revoke the cached authority and do not
         /// consume the quota. A busy directory cannot block a healthy sibling.
         pub(in super::super) fn release(&mut self, count: usize) -> ReleaseReport {
@@ -302,7 +334,11 @@ mod unix {
         }
     }
 
-    fn release_one(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
+    fn with_validated_candidate(
+        path: &Path,
+        snapshot: &Snapshot,
+        action: impl FnOnce(&File, &OsStr) -> io::Result<()>,
+    ) -> io::Result<()> {
         let parent = path.parent().ok_or_else(|| invalid("ballast has no parent"))?;
         let directory = open_directory(parent)?;
         if Identity::of(&directory.metadata()?) != snapshot.directory {
@@ -312,7 +348,7 @@ mod unix {
         // a provisioner. Legacy pools produced by the manager already have it.
         let lock = open_regular(&directory, OsStr::new(".lock")).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
-                io::Error::other("existing ballast lock is missing; refusing unlocked release")
+                io::Error::other("existing ballast lock is missing; refusing unlocked access")
             } else {
                 error
             }
@@ -323,10 +359,17 @@ mod unix {
         if current != snapshot.file {
             return Err(invalid("ballast file was replaced or modified since adoption"));
         }
-        // Cooperating CLI/daemon writers hold .lock; anchoring the unlink to
-        // the open directory also prevents an ancestor rename redirecting it.
-        unlinkat(&directory, name, AtFlags::empty())?;
-        Ok(())
+        // Keep directory, payload and manager lock alive throughout the action.
+        action(&directory, name)
+    }
+
+    fn release_one(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
+        with_validated_candidate(path, snapshot, |directory, name| {
+            // Cooperating CLI/daemon writers hold .lock; anchoring the unlink to
+            // the open directory also prevents an ancestor rename redirecting it.
+            unlinkat(directory, name, AtFlags::empty())?;
+            Ok(())
+        })
     }
 }
 
@@ -348,6 +391,9 @@ impl StrandedReserve {
     }
     pub(super) fn bytes(&self) -> u64 {
         0
+    }
+    pub(super) fn refresh(&mut self) -> Vec<String> {
+        Vec::new()
     }
     pub(super) fn release(&mut self, _count: usize) -> ReleaseReport {
         empty_report()
@@ -602,5 +648,38 @@ mod release_tests {
         );
         assert!(reserve.files().is_empty());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn refresh_revokes_missing_and_replaced_files_without_adopting_the_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("legacy");
+        let first = ballast(&dir, 1);
+        let second = ballast(&dir, 2);
+        let third = ballast(&dir, 3);
+        let mut reserve = discover(temp.path(), &[dir]);
+        fs::remove_file(first).unwrap();
+        let replacement = ballast(&temp.path().join("replacement"), 2);
+        fs::rename(replacement, &second).unwrap();
+        assert!(reserve.refresh().is_empty());
+        assert_eq!(reserve.files().len(), 1);
+        assert_eq!(reserve.files()[0].0, fs::canonicalize(third).unwrap());
+        assert!(second.exists());
+        assert_eq!(reserve.bytes(), 2 * HEADER_SIZE as u64);
+    }
+
+    #[test]
+    fn refresh_reports_unknown_reserve_instead_of_authorizing_replacement_allocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("legacy");
+        ballast(&dir, 1);
+        let mut reserve = discover(temp.path(), &[dir.clone()]);
+        let lock = File::open(dir.join(".lock")).unwrap();
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+        assert_eq!(reserve.refresh().len(), 1);
+        assert_eq!(reserve.files().len(), 1);
+        drop(lock);
+        assert!(reserve.refresh().is_empty());
+        assert_eq!(reserve.files().len(), 1);
     }
 }
