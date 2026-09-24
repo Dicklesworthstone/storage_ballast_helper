@@ -189,16 +189,23 @@ mod unix {
             || meta.len() < HEADER_SIZE as u64
             || meta.blocks().saturating_mul(512) < meta.len()
         {
-            return Err(invalid("ballast is linked, truncated, or not fully allocated"));
+            return Err(invalid(
+                "ballast is linked, truncated, or not fully allocated",
+            ));
         }
         let identity = FileIdentity::of(&meta);
         let mut bytes = [0u8; HEADER_SIZE];
         file.read_exact(&mut bytes)?;
-        let end = bytes.iter().position(|&byte| byte == 0).unwrap_or(HEADER_SIZE);
+        let end = bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(HEADER_SIZE);
         let header: BallastHeader = serde_json::from_slice(&bytes[..end])
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if header.magic != MAGIC || header.file_index != index || header.file_size != meta.len() {
-            return Err(invalid("ballast header does not match its filename and actual size"));
+            return Err(invalid(
+                "ballast header does not match its filename and actual size",
+            ));
         }
         if FileIdentity::of(&file.metadata()?) != identity {
             return Err(invalid("ballast changed while reading its header"));
@@ -246,10 +253,18 @@ mod unix {
                     };
                     let path = dir.join(name);
                     files.push((index, path.clone(), file.size));
-                    reserve.snapshots.insert(path, Snapshot { directory: identity, file });
+                    reserve.snapshots.insert(
+                        path,
+                        Snapshot {
+                            directory: identity,
+                            file,
+                        },
+                    );
                 }
                 files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-                reserve.files.extend(files.into_iter().map(|(_, path, size)| (path, size)));
+                reserve
+                    .files
+                    .extend(files.into_iter().map(|(_, path, size)| (path, size)));
             }
             reserve
         }
@@ -259,7 +274,10 @@ mod unix {
         }
 
         pub(in super::super) fn bytes(&self) -> u64 {
-            self.files.iter().map(|(_, size)| *size).fold(0, u64::saturating_add)
+            self.files
+                .iter()
+                .map(|(_, size)| *size)
+                .fold(0, u64::saturating_add)
         }
 
         /// Revalidate before crediting reserve against new allocation. Known
@@ -275,10 +293,12 @@ mod unix {
                 };
                 match with_validated_candidate(&path, snapshot, |_, _| Ok(())) {
                     Ok(()) => kept.push((path, size)),
-                    Err(error) if matches!(
-                        error.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::InvalidData
-                    ) => {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                        ) =>
+                    {
                         self.snapshots.remove(&path);
                     }
                     Err(error) => {
@@ -339,7 +359,9 @@ mod unix {
         snapshot: &Snapshot,
         action: impl FnOnce(&File, &OsStr) -> io::Result<()>,
     ) -> io::Result<()> {
-        let parent = path.parent().ok_or_else(|| invalid("ballast has no parent"))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("ballast has no parent"))?;
         let directory = open_directory(parent)?;
         if Identity::of(&directory.metadata()?) != snapshot.directory {
             return Err(invalid("ballast directory was replaced"));
@@ -354,10 +376,14 @@ mod unix {
             }
         })?;
         flock(&lock, FlockOperation::NonBlockingLockExclusive)?;
-        let name = path.file_name().ok_or_else(|| invalid("ballast has no filename"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| invalid("ballast has no filename"))?;
         let (_file, current) = read_candidate(&directory, name)?;
         if current != snapshot.file {
-            return Err(invalid("ballast file was replaced or modified since adoption"));
+            return Err(invalid(
+                "ballast file was replaced or modified since adoption",
+            ));
         }
         // Keep directory, payload and manager lock alive throughout the action.
         action(&directory, name)
@@ -407,7 +433,10 @@ mod tests {
     #[test]
     fn legacy_locations_include_only_known_homes_and_conventional_paths() {
         let dirs = legacy_dirs_with_homes(
-            &[PathBuf::from("/home/alice/projects"), PathBuf::from("/data/projects")],
+            &[
+                PathBuf::from("/home/alice/projects"),
+                PathBuf::from("/data/projects"),
+            ],
             Some(Path::new("/Users/bob/new-reserve")),
             Some(Path::new("/root")),
             Vec::new(),
@@ -433,16 +462,33 @@ mod tests {
         let homes = conventional_homes(&[temp.path().to_path_buf()]);
         let dirs = legacy_dirs_with_homes(&[], None, None, homes);
         assert!(dirs.contains(&home.join(".local/share/sbh/ballast")));
-        assert!(!dirs.iter().any(|path| path.starts_with(home.join("projects"))));
-        assert!(!dirs.iter().any(|path| path.starts_with(temp.path().join("not-a-directory"))));
+        assert!(
+            !dirs
+                .iter()
+                .any(|path| path.starts_with(home.join("projects")))
+        );
+        assert!(
+            !dirs
+                .iter()
+                .any(|path| path.starts_with(temp.path().join("not-a-directory")))
+        );
     }
 
     #[test]
     fn reserve_health_counts_retired_bytes_but_preserves_unknown_managed_state() {
         assert_eq!(health(100, BallastHealth::Empty, 100), BallastHealth::Ok);
-        assert_eq!(health(100, BallastHealth::Empty, 30), BallastHealth::Degraded);
-        assert_eq!(health(100, BallastHealth::Indeterminate, 100), BallastHealth::Indeterminate);
-        assert_eq!(health(0, BallastHealth::Unconfigured, 100), BallastHealth::Unconfigured);
+        assert_eq!(
+            health(100, BallastHealth::Empty, 30),
+            BallastHealth::Degraded
+        );
+        assert_eq!(
+            health(100, BallastHealth::Indeterminate, 100),
+            BallastHealth::Indeterminate
+        );
+        assert_eq!(
+            health(0, BallastHealth::Unconfigured, 100),
+            BallastHealth::Unconfigured
+        );
     }
 }
 
@@ -450,9 +496,9 @@ mod tests {
 mod release_tests {
     use super::*;
     use crate::ballast::manager::{BallastHeader, HEADER_SIZE, MAGIC};
+    use rustix::fs::{FlockOperation, flock};
     use std::fs::{self, File};
     use std::os::unix::fs::symlink;
-    use rustix::fs::{FlockOperation, flock};
 
     fn ballast(dir: &Path, index: u32) -> PathBuf {
         fs::create_dir_all(dir).unwrap();
@@ -504,9 +550,13 @@ mod release_tests {
         ballast(&dir, 1);
         let alias = temp.path().join("alias");
         symlink(&dir, &alias).unwrap();
-        let dirs = [dir.clone(), alias.clone(), dir.clone()];
+        let dirs = [dir.clone(), alias.clone(), dir];
         assert_eq!(discover(temp.path(), &dirs).files().len(), 1);
-        assert!(StrandedReserve::discover(&dirs, &alias, temp.path()).files().is_empty());
+        assert!(
+            StrandedReserve::discover(&dirs, &alias, temp.path())
+                .files()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -518,7 +568,11 @@ mod release_tests {
         fs::hard_link(&linked, temp.path().join("keep-link")).unwrap();
         symlink(&good, dir.join("SBH_BALLAST_FILE_00003.dat")).unwrap();
         fs::copy(&good, dir.join("SBH_BALLAST_FILE_00004.dat")).unwrap();
-        fs::write(dir.join("SBH_BALLAST_FILE_00005.dat"), vec![b'x'; HEADER_SIZE * 2]).unwrap();
+        fs::write(
+            dir.join("SBH_BALLAST_FILE_00005.dat"),
+            vec![b'x'; HEADER_SIZE * 2],
+        )
+        .unwrap();
         let reserve = discover(temp.path(), &[dir]);
         assert_eq!(reserve.files().len(), 1);
         assert_eq!(reserve.files()[0].0, fs::canonicalize(good).unwrap());
@@ -536,7 +590,10 @@ mod release_tests {
         assert_eq!(report.files_released, 0);
         assert_eq!(report.errors.len(), 1);
         assert!(path.exists());
-        assert!(reserve.files().is_empty(), "changed identity revokes cached authority");
+        assert!(
+            reserve.files().is_empty(),
+            "changed identity revokes cached authority"
+        );
     }
 
     #[test]
@@ -557,7 +614,7 @@ mod release_tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("legacy");
         ballast(&dir, 1);
-        let mut reserve = discover(temp.path(), &[dir.clone()]);
+        let mut reserve = discover(temp.path(), std::slice::from_ref(&dir));
         fs::rename(&dir, temp.path().join("old")).unwrap();
         let replacement = ballast(&dir, 1);
         let report = reserve.release(1);
@@ -590,7 +647,7 @@ mod release_tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("legacy");
         let path = ballast(&dir, 1);
-        let mut reserve = discover(temp.path(), &[dir.clone()]);
+        let mut reserve = discover(temp.path(), std::slice::from_ref(&dir));
         fs::remove_file(dir.join(".lock")).unwrap();
         let report = reserve.release(1);
         assert_eq!(report.files_released, 0);
@@ -604,7 +661,7 @@ mod release_tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("legacy");
         let path = ballast(&dir, 1);
-        let mut reserve = discover(temp.path(), &[dir.clone()]);
+        let mut reserve = discover(temp.path(), std::slice::from_ref(&dir));
         let other = temp.path().join("unrelated");
         fs::write(&other, b"keep").unwrap();
         fs::remove_file(dir.join(".lock")).unwrap();
@@ -643,9 +700,8 @@ mod release_tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("legacy");
         let path = ballast(&dir, 1);
-        let reserve = StrandedReserve::discover(
-            &[dir], &temp.path().join("managed"), Path::new("/proc"),
-        );
+        let reserve =
+            StrandedReserve::discover(&[dir], &temp.path().join("managed"), Path::new("/proc"));
         assert!(reserve.files().is_empty());
         assert!(path.exists());
     }
@@ -673,7 +729,7 @@ mod release_tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("legacy");
         ballast(&dir, 1);
-        let mut reserve = discover(temp.path(), &[dir.clone()]);
+        let mut reserve = discover(temp.path(), std::slice::from_ref(&dir));
         let lock = File::open(dir.join(".lock")).unwrap();
         flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
         assert_eq!(reserve.refresh().len(), 1);

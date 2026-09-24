@@ -77,7 +77,12 @@ fn grow(
     // range, platform, allocation strategy, or configured headroom floor.
     let config = pool.manager.config().clone();
     pool.manager.update_config(config);
-    report.files_skipped = pool.manager.inventory().iter().filter(|file| file.integrity_ok).count();
+    report.files_skipped = pool
+        .manager
+        .inventory()
+        .iter()
+        .filter(|file| file.integrity_ok)
+        .count();
     let target = pool.manager.configured_pool_bytes();
     let adopted = pool.stranded.bytes();
 
@@ -91,19 +96,23 @@ fn grow(
         let step = match pool.manager.replenish_one(free_pct_check) {
             Ok(step) => step,
             Err(error) => {
-                report.errors.push(format!("reserve growth failed: {error}"));
+                report
+                    .errors
+                    .push(format!("reserve growth failed: {error}"));
                 break;
             }
         };
         let made_progress = step.files_created > 0;
-        let stop = !made_progress || !step.errors.is_empty() || step.skipped_for_floor > 0;
+        let halt = !made_progress || !step.errors.is_empty() || step.skipped_for_floor > 0;
         report.files_created = report.files_created.saturating_add(step.files_created);
         report.total_bytes = report.total_bytes.saturating_add(step.total_bytes);
-        report.skipped_for_floor = report.skipped_for_floor.saturating_add(step.skipped_for_floor);
+        report.skipped_for_floor = report
+            .skipped_for_floor
+            .saturating_add(step.skipped_for_floor);
         report.free_pct_after = step.free_pct_after.or(report.free_pct_after);
         report.errors.extend(step.errors);
         report.created.extend(step.created);
-        if stop {
+        if halt {
             break;
         }
         if valid_managed_bytes(&pool.manager) <= before {
@@ -121,10 +130,10 @@ mod tests {
     use super::*;
     use crate::ballast::coordinator::{ProvisionStrategy, stranded::StrandedReserve};
     use crate::core::config::BallastConfig;
+    use rustix::fs::{FlockOperation, flock};
     use std::collections::BTreeMap;
     use std::fs::{self, File};
     use std::path::{Path, PathBuf};
-    use rustix::fs::{FlockOperation, flock};
 
     const UNIT: u64 = 8192;
 
@@ -147,7 +156,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let active = temp.path().join("active");
         let retired = temp.path().join("retired");
-        let mut legacy = BallastManager::new(retired.clone(), config(retired_count, retired_size)).unwrap();
+        let mut legacy =
+            BallastManager::new(retired.clone(), config(retired_count, retired_size)).unwrap();
         let report = legacy.provision(None).unwrap();
         assert_eq!(report.files_created, retired_count, "{report:?}");
         let stranded = StrandedReserve::discover(&[retired], &active, temp.path());
@@ -203,7 +213,10 @@ mod tests {
     fn many_small_legacy_files_do_not_satisfy_a_larger_byte_target() {
         let (_temp, mut pool) = fixture(3, 2 * UNIT, 4, UNIT);
         let report = provision(&mut pool, None).unwrap();
-        assert_eq!(report.files_created, 1, "four old files cover only two new slots");
+        assert_eq!(
+            report.files_created, 1,
+            "four old files cover only two new slots"
+        );
         assert_eq!(report.total_bytes, 2 * UNIT);
         assert_eq!(pool.releasable_bytes(), 6 * UNIT);
     }
