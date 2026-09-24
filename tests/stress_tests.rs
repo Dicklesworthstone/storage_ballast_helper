@@ -779,6 +779,9 @@ fn stress_guard_integrity_failure() {
             .collect();
         let scored = scoring.score_batch(&candidates, 0.8);
         let decision = engine.evaluate(&scored, Some(&guard.diagnostics()));
+        // The executor carries out approvals and reports them; the canary
+        // budget is charged for executed deletions.
+        engine.note_executed_deletions(decision.approved_for_deletion.len());
         total_approved += decision.approved_for_deletion.len();
         total_evaluated += scored.len();
         report.steps += 1;

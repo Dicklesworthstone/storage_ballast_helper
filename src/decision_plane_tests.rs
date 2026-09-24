@@ -1010,13 +1010,23 @@ impl ReplayEngine {
                     self.policy.observe_window(guard_diag);
                 }
                 PolicyOp::Evaluate => {
-                    last_decision = Some(self.policy.evaluate(&scored, Some(&diag)));
+                    let decision = self.policy.evaluate(&scored, Some(&diag));
+                    // The replay executes every approval, as the daemon's
+                    // executor reports its deletions back to the engine.
+                    self.policy
+                        .note_executed_deletions(decision.approved_for_deletion.len());
+                    last_decision = Some(decision);
                 }
             }
         }
 
         // If no explicit Evaluate op, do one anyway for trace completeness.
-        let decision = last_decision.unwrap_or_else(|| self.policy.evaluate(&scored, Some(&diag)));
+        let decision = last_decision.unwrap_or_else(|| {
+            let decision = self.policy.evaluate(&scored, Some(&diag));
+            self.policy
+                .note_executed_deletions(decision.approved_for_deletion.len());
+            decision
+        });
 
         let mode_after = self.policy.mode();
 

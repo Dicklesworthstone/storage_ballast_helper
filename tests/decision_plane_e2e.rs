@@ -421,6 +421,9 @@ fn e2e_canary_bounded_impact() {
     step.assertions
         .push("all approved paths have complete evidence records".to_string());
     trace.steps.push(step);
+    // The executor performs the approved deletions and reports them back;
+    // the canary budget is charged for executed deletions only.
+    engine.note_executed_deletions(decision.approved_for_deletion.len());
 
     // Step 3: Exhaust budget with another batch.
     let inputs2: Vec<CandidateInput> = (0..10)

@@ -1065,6 +1065,16 @@ const STARTUP_CALIBRATION_GRACE_SECS: u64 = 10 * 60;
 /// This floor ensures guard statistics remain valid regardless of tick rate.
 const MIN_OBSERVE_INTERVAL_SECS: u64 = 10;
 
+/// How long an automatically entered Canary must run without a new fallback
+/// before the engine returns to the operator's intended mode.
+///
+/// "Automatically entered" means recovery or emergency escalation from
+/// FallbackSafe. Without this the canary gate was a one-way door: every
+/// automatic recovery of an Enforce fleet landed in Canary and only a manual
+/// `sbh policy promote` ever left it (fleet audit 2026-09-24: 15 of 20 hosts
+/// held at 10 deletions/hour for days while their disks filled).
+pub const CANARY_REPROVE_SECS: u64 = 30 * 60;
+
 /// The shadow-mode policy engine with progressive delivery gates.
 pub struct PolicyEngine {
     config: PolicyConfig,
@@ -1109,6 +1119,19 @@ pub struct PolicyEngine {
     last_observe_time: Option<Instant>,
     /// When the current mode was entered.
     mode_since: Instant,
+    /// The mode the operator chose (`initial_mode`, or the last manual
+    /// promote/demote). Automatic transitions never change it; an
+    /// automatically entered Canary re-proves itself and then returns here.
+    intended_mode: ActiveMode,
+    /// Set while the current Canary was entered automatically and has not
+    /// yet re-proved itself for `CANARY_REPROVE_SECS`.
+    reproving_canary: bool,
+    /// Canary approvals handed out in the current `evaluate` call. The hourly
+    /// budget is charged only for deletions the executor actually performed
+    /// (`note_executed_deletions`); this bounds a single batch meanwhile.
+    canary_approved_this_eval: usize,
+    /// Last time an advisory (non-demoting) guard drift alarm was logged.
+    last_drift_advisory_log: Option<Instant>,
     /// The most recent fallback reason, kept after recovery for `sbh status`.
     last_fallback_reason: Option<String>,
     /// State-file write failures reported by the daemon.
@@ -1157,6 +1180,14 @@ impl PolicyEngine {
             last_suppression_log: None,
             last_observe_time: None,
             mode_since: Instant::now(),
+            intended_mode: if intended == ActiveMode::FallbackSafe {
+                ActiveMode::Observe
+            } else {
+                intended
+            },
+            reproving_canary: false,
+            canary_approved_this_eval: 0,
+            last_drift_advisory_log: None,
             last_fallback_reason: None,
             serialization_failures: 0,
         };
@@ -1241,6 +1272,7 @@ impl PolicyEngine {
 
         let budget = self.config.max_candidates_per_loop.min(candidates.len());
         let policy_mode = self.mode.to_policy_mode();
+        self.canary_approved_this_eval = 0;
 
         let mut records = Vec::with_capacity(budget);
         let mut approved = Vec::new();
@@ -1325,6 +1357,8 @@ impl PolicyEngine {
             }
             self.last_observe_time = Some(Instant::now());
         }
+
+        self.check_canary_reproved();
 
         let pressure_is_green = self.pressure_level == PressureLevel::Green;
         // A window is "clean" when the guard passes normally, OR when pressure
@@ -1460,6 +1494,8 @@ impl PolicyEngine {
             Some("fallback_safe deadlock: pressure sustained at Yellow+".to_string()),
         );
         self.mode = target;
+        self.reproving_canary =
+            target == ActiveMode::Canary && self.intended_mode == ActiveMode::Enforce;
         true
     }
 
@@ -1472,10 +1508,12 @@ impl PolicyEngine {
         match self.mode {
             ActiveMode::Observe => {
                 self.apply_transition(ActiveMode::Canary, "promote");
+                self.intended_mode = ActiveMode::Canary;
                 true
             }
             ActiveMode::Canary => {
                 self.apply_transition(ActiveMode::Enforce, "promote");
+                self.intended_mode = ActiveMode::Enforce;
                 true
             }
             // The operator's way out of FallbackSafe (the only way when
@@ -1492,6 +1530,10 @@ impl PolicyEngine {
                 self.fallback_reason = None;
                 self.fallback_entered_at = None;
                 self.apply_transition(target, "promote");
+                // The operator asked out of FallbackSafe: the capped Canary
+                // re-proves itself and returns to the intended mode.
+                self.reproving_canary =
+                    target == ActiveMode::Canary && self.intended_mode == ActiveMode::Enforce;
                 true
             }
             ActiveMode::Enforce => false,
@@ -1505,10 +1547,14 @@ impl PolicyEngine {
         match self.mode {
             ActiveMode::Enforce => {
                 self.apply_transition(ActiveMode::Canary, "demote");
+                self.intended_mode = ActiveMode::Canary;
+                self.reproving_canary = false;
                 true
             }
             ActiveMode::Canary => {
                 self.apply_transition(ActiveMode::Observe, "demote");
+                self.intended_mode = ActiveMode::Observe;
+                self.reproving_canary = false;
                 true
             }
             _ => false,
@@ -1575,7 +1621,15 @@ impl PolicyEngine {
             }
 
             let from = self.mode;
-            self.pre_fallback_mode = self.mode;
+            // An automatically entered Canary is a waypoint, not a mode the
+            // operator chose: remember the intended mode so a later recovery
+            // does not ratchet Enforce down to Canary one fallback at a time.
+            self.pre_fallback_mode = if self.reproving_canary {
+                self.intended_mode
+            } else {
+                self.mode
+            };
+            self.reproving_canary = false;
             let reason_str = reason.to_string();
             self.last_fallback_reason = Some(reason_str.clone());
             self.fallback_reason = Some(reason);
@@ -1699,9 +1753,17 @@ impl PolicyEngine {
         // Canary mode: check hourly budget. The decision that hits the cap is
         // Keep either way; `canary_budget_action` decides whether the canary
         // also pauses in FallbackSafe until clean windows recover it.
+        // The hourly count holds executed deletions only
+        // (`note_executed_deletions`): approvals the executor later drops
+        // (dampening, certainty gate, planner, preflight skips) must not
+        // spend the budget, or the canary re-approves the same skipped paths
+        // every hour and deletes nothing (vmi1167313: 1,165 approvals, 15
+        // deletions). Approvals within one batch count against what is left.
         if self.mode == ActiveMode::Canary {
             self.rotate_canary_hour();
-            if self.canary_deletes_this_hour >= self.config.max_canary_deletes_per_hour {
+            if self.canary_deletes_this_hour + self.canary_approved_this_eval
+                >= self.config.max_canary_deletes_per_hour
+            {
                 match self.config.canary_budget_action {
                     CanaryBudgetAction::Demote => {
                         self.enter_fallback(FallbackReason::CanaryBudgetExhausted);
@@ -1710,7 +1772,7 @@ impl PolicyEngine {
                 }
                 return DecisionAction::Keep;
             }
-            self.canary_deletes_this_hour += 1;
+            self.canary_approved_this_eval += 1;
         }
 
         DecisionAction::Delete
@@ -1734,12 +1796,74 @@ impl PolicyEngine {
         // - Already in FallbackSafe (no-op)
         // - Guard has too few observations (< 30) — freshly started guard
         //   with unreliable EWMA should not trigger FallbackSafe
+        //
+        // The drift alarm is a statement about the *forecaster* (predicted vs
+        // observed fill rate), the same evidence a calibration breach rests
+        // on, so it honors the same `calibration_breach_action`: an Enforce
+        // fleet keeps deleting (deletion safety lives in scoring, vetoes and
+        // regret calibration, none of which the forecast feeds). Ignoring the
+        // setting here demoted every Enforce host at the first bursty Orange.
         if diag.e_process_alarm
             && self.mode != ActiveMode::FallbackSafe
             && self.pressure_level >= PressureLevel::Orange
             && diag.observation_count >= 30
         {
-            self.enter_fallback(FallbackReason::GuardrailDrift);
+            match self.config.resolved_calibration_breach_action() {
+                FallbackAction::Demote => self.enter_fallback(FallbackReason::GuardrailDrift),
+                FallbackAction::Advisory => {
+                    if self
+                        .last_drift_advisory_log
+                        .is_none_or(|t| t.elapsed() >= Duration::from_mins(30))
+                    {
+                        eprintln!(
+                            "[SBH-POLICY] guardrail drift alarm — continuing in {} \
+                             (calibration_breach_action = advisory)",
+                            self.mode
+                        );
+                        self.last_drift_advisory_log = Some(Instant::now());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pretend the current mode was entered `secs` ago (tests of time gates).
+    #[cfg(test)]
+    fn backdate_mode_since(&mut self, secs: u64) {
+        self.mode_since = Instant::now()
+            .checked_sub(Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// Return an automatically entered Canary to the intended mode once it
+    /// has run `CANARY_REPROVE_SECS` without falling back.
+    fn check_canary_reproved(&mut self) {
+        if self.reproving_canary
+            && self.mode == ActiveMode::Canary
+            && self.mode_since.elapsed() >= Duration::from_secs(CANARY_REPROVE_SECS)
+        {
+            let target = self.intended_mode;
+            self.reproving_canary = false;
+            self.log_transition(
+                "reproved",
+                ActiveMode::Canary,
+                target,
+                Some(format!(
+                    "canary ran {}m without a fallback",
+                    CANARY_REPROVE_SECS / 60
+                )),
+            );
+            self.mode = target;
+            eprintln!("[SBH-POLICY] canary → {target} (re-proved)");
+        }
+    }
+
+    /// Charge the canary hourly budget with deletions the executor actually
+    /// performed. No-op outside Canary.
+    pub fn note_executed_deletions(&mut self, deleted: usize) {
+        if self.mode == ActiveMode::Canary && deleted > 0 {
+            self.rotate_canary_hour();
+            self.canary_deletes_this_hour = self.canary_deletes_this_hour.saturating_add(deleted);
         }
     }
 
@@ -1792,6 +1916,8 @@ impl PolicyEngine {
         self.fallback_entered_at = None;
         self.log_transition("recover", from, target, None);
         self.mode = target;
+        self.reproving_canary =
+            target == ActiveMode::Canary && self.intended_mode == ActiveMode::Enforce;
         eprintln!("[SBH-POLICY] {from} → {target} (recovered)");
     }
 
@@ -1801,7 +1927,14 @@ impl PolicyEngine {
     /// FallbackSafe; `advisory` only counts and logs.
     pub fn note_serialization_failure(&mut self) {
         self.serialization_failures = self.serialization_failures.saturating_add(1);
-        match self.config.serialization_failure_action {
+        // At Red and Critical the failed write is almost always the full disk
+        // itself; demoting then would stop the only thing that can fix it.
+        let action = if self.pressure_level >= PressureLevel::Red {
+            FallbackAction::Advisory
+        } else {
+            self.config.serialization_failure_action
+        };
+        match action {
             FallbackAction::Demote => {
                 if self.mode != ActiveMode::FallbackSafe {
                     self.enter_fallback(FallbackReason::SerializationFailure);
@@ -2660,6 +2793,140 @@ mod tests {
         assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
         assert!(engine.promote());
         assert_ne!(engine.mode(), ActiveMode::FallbackSafe);
+    }
+
+    /// The drift alarm is forecaster evidence and follows
+    /// `calibration_breach_action`: an Enforce fleet (advisory by default)
+    /// keeps deleting at Orange+; an explicit `demote` still falls back.
+    #[test]
+    fn drift_alarm_honors_calibration_breach_action() {
+        let enforce = PolicyConfig {
+            initial_mode: ActiveMode::Enforce,
+            observe_min_interval_secs: 0,
+            ..PolicyConfig::default()
+        };
+        let mut engine = PolicyEngine::new(enforce.clone());
+        engine.set_pressure_level(PressureLevel::Red);
+        let decision = engine.evaluate(
+            &[sample_candidate(DecisionAction::Delete, 2.5)],
+            Some(&failing_guard()),
+        );
+        assert_eq!(engine.mode(), ActiveMode::Enforce);
+        assert_eq!(decision.approved_for_deletion.len(), 1);
+
+        let mut engine = PolicyEngine::new(PolicyConfig {
+            calibration_breach_action: Some(FallbackAction::Demote),
+            ..enforce
+        });
+        engine.set_pressure_level(PressureLevel::Red);
+        let decision = engine.evaluate(
+            &[sample_candidate(DecisionAction::Delete, 2.5)],
+            Some(&failing_guard()),
+        );
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
+        assert!(decision.approved_for_deletion.is_empty());
+    }
+
+    /// Regression (fleet audit 2026-09-24): Enforce → fallback → Canary →
+    /// fallback used to record Canary as the pre-fallback mode, so every
+    /// later recovery landed in Canary. The automatic Canary now remembers
+    /// the intended mode, and returns to it after `CANARY_REPROVE_SECS`.
+    #[test]
+    fn automatic_canary_does_not_ratchet_and_reproves_to_enforce() {
+        let mut engine = PolicyEngine::new(PolicyConfig {
+            initial_mode: ActiveMode::Enforce,
+            auto_recover_to: AutoRecoverTo::Canary,
+            recovery_clean_windows: 1,
+            min_fallback_secs: 0,
+            observe_min_interval_secs: 0,
+            ..PolicyConfig::default()
+        });
+        for _ in 0..3 {
+            engine.enter_fallback(FallbackReason::SerializationFailure);
+            engine.observe_window(&passing_guard());
+            assert_eq!(engine.mode(), ActiveMode::Canary);
+        }
+        // Not yet re-proved.
+        engine.observe_window(&passing_guard());
+        assert_eq!(engine.mode(), ActiveMode::Canary);
+        engine.backdate_mode_since(CANARY_REPROVE_SECS);
+        engine.observe_window(&passing_guard());
+        assert_eq!(engine.mode(), ActiveMode::Enforce);
+        assert_eq!(
+            engine
+                .transition_log()
+                .last()
+                .map(|t| t.transition.as_str()),
+            Some("reproved")
+        );
+    }
+
+    /// An operator-chosen Canary is not auto-promoted.
+    #[test]
+    fn operator_canary_stays_canary() {
+        let mut engine = PolicyEngine::new(PolicyConfig {
+            initial_mode: ActiveMode::Enforce,
+            observe_min_interval_secs: 0,
+            ..PolicyConfig::default()
+        });
+        assert!(engine.demote());
+        engine.backdate_mode_since(CANARY_REPROVE_SECS * 4);
+        engine.observe_window(&passing_guard());
+        assert_eq!(engine.mode(), ActiveMode::Canary);
+    }
+
+    /// The canary hourly budget counts executed deletions: approvals the
+    /// executor dropped do not spend it, executed ones do.
+    #[test]
+    fn canary_budget_counts_executed_deletions_not_approvals() {
+        let mut config = default_config();
+        config.max_canary_deletes_per_hour = 2;
+        let mut engine = PolicyEngine::new(config);
+        engine.promote(); // canary
+        let candidates = vec![
+            sample_candidate(DecisionAction::Delete, 2.5),
+            sample_candidate(DecisionAction::Delete, 2.4),
+            sample_candidate(DecisionAction::Delete, 2.3),
+        ];
+        // One batch is still bounded by the budget.
+        assert_eq!(
+            engine
+                .evaluate(&candidates, Some(&passing_guard()))
+                .approved_for_deletion
+                .len(),
+            2
+        );
+        // Nothing executed: the next batch gets the full budget again.
+        assert_eq!(
+            engine
+                .evaluate(&candidates, Some(&passing_guard()))
+                .approved_for_deletion
+                .len(),
+            2
+        );
+        engine.note_executed_deletions(2);
+        assert!(
+            engine
+                .evaluate(&candidates, Some(&passing_guard()))
+                .approved_for_deletion
+                .is_empty()
+        );
+    }
+
+    /// A failed state write at Red+ is the full disk itself: it must not
+    /// stop cleanup. Below Red the configured action still applies.
+    #[test]
+    fn serialization_failure_does_not_demote_at_red() {
+        let mut engine = PolicyEngine::new(PolicyConfig {
+            initial_mode: ActiveMode::Enforce,
+            ..PolicyConfig::default()
+        });
+        engine.set_pressure_level(PressureLevel::Critical);
+        engine.note_serialization_failure();
+        assert_eq!(engine.mode(), ActiveMode::Enforce);
+        engine.set_pressure_level(PressureLevel::Yellow);
+        engine.note_serialization_failure();
+        assert_eq!(engine.mode(), ActiveMode::FallbackSafe);
     }
 
     #[test]

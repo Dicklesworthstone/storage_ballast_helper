@@ -4505,8 +4505,10 @@ impl MonitoringDaemon {
             if let Some(ref response) = worst_response {
                 let pressure_is_critical = response.level >= PressureLevel::Yellow;
                 if policy.check_emergency_escalation(pressure_is_critical) {
+                    let landed = policy.mode();
+                    drop(policy);
                     eprintln!(
-                        "[SBH-DAEMON] emergency escalation: fallback_safe → enforce \
+                        "[SBH-DAEMON] emergency escalation: fallback_safe → {landed} \
                          (pressure deadlock broken after sustained Yellow+)"
                     );
                 }
@@ -9180,6 +9182,13 @@ fn executor_thread_main(
                     ),
                 });
             }
+        }
+
+        // Canary budget counts executed deletions, not approvals.
+        if !report.dry_run {
+            policy_engine
+                .lock()
+                .note_executed_deletions(report.deleted_paths.len());
         }
 
         // Record deletions for repeat-deletion dampening.
