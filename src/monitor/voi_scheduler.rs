@@ -19,10 +19,17 @@
 //! where `R_i` is the expected reclaim (EWMA of bytes reclaimed per scan),
 //! `C_i` the visit cost (EWMA of IO per scan), `lambda_i` the EWMA of dirty
 //! transitions per hour reported by the v2 event source (prior: once a day,
-//! also the floor), and `dt_i` the hours since the last visit. Roots with a
-//! pending dirty transition always go first; then the top of the index within
-//! the budget. The hazard term is what keeps an idle root from being starved:
-//! it climbs on its own as time passes, so no exploration quota is needed.
+//! also the floor), and `dt_i` the hours since the last visit.
+//!
+//! The index is bounded and cannot prevent starvation by itself: a root
+//! with a zero reclaim forecast never gains utility, however long it waits.
+//! Each plan therefore reserves one of its existing budget slots for a
+//! never-scanned or day-overdue root, rotating by path. The remaining slots
+//! retain dirty-first, highest-index ordering. For a fixed set of N roots,
+//! every continuously eligible root gets an opportunity within at most N
+//! positive-budget VOI plans, even if scan feedback is missing. This is a
+//! scheduling guarantee, not a claim that a scan finished or that an entry
+//! is safe to delete.
 //!
 //! # Fallback Guarantee
 //!
@@ -35,11 +42,16 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub use crate::core::config::VoiConfig;
 
 // ──────────────────── configuration ────────────────────
+
+/// Age at which a completed scan no longer excludes a root from the
+/// maintenance exploration rotation. Actual revisit latency also includes
+/// the finite number of scheduling opportunities needed to reach that root.
+pub const MAX_REVISIT_INTERVAL: Duration = Duration::from_hours(24);
 
 // ──────────────────── per-path statistics ────────────────────
 
@@ -71,8 +83,8 @@ pub struct PathStats {
     pub dirty_rate_per_hour: f64,
     /// When the dirty rate was last observed.
     last_dirty_observation: Option<Instant>,
-    /// A dirty transition was reported since the last scan: the root goes
-    /// first in the next plan regardless of its index.
+    /// A dirty transition was reported since the last scan: the root has
+    /// priority in the hazard-ranked portion of the next plan.
     pub dirty_pending: bool,
 }
 
@@ -118,10 +130,9 @@ impl PathStats {
     /// since its last visit, minus the weighted visit cost.
     ///
     /// `I = R * (1 - exp(-lambda * dt)) - w_c * C`, with `lambda` floored at
-    /// the daily prior so a quiet root is still revisited about once a day,
-    /// and `dt` the hours since the last visit. A never-visited root's state
-    /// is unknown, which is the maximal hazard: it ranks on its full prior
-    /// reclaim until its first scan, so nothing is starved.
+    /// the daily prior and `dt` the hours since the last visit. A never-visited
+    /// root uses its full prior reclaim. The separate maintenance rotation
+    /// guarantees opportunities when zero yield or high cost keeps this index low.
     fn hazard_index(&self, expected_reclaim: f64, io_cost_weight: f64, now: Instant) -> f64 {
         let hazard = self.last_scanned.map_or(1.0, |t| {
             let dt_hours = now.saturating_duration_since(t).as_secs_f64() / 3600.0;
@@ -184,7 +195,8 @@ impl PathStats {
 /// A prioritized scan plan produced by the scheduler.
 #[derive(Debug, Clone)]
 pub struct ScanPlan {
-    /// Ordered list of paths to scan (highest utility first).
+    /// Ordered list of paths to scan: the reserved maintenance opportunity,
+    /// when needed, followed by dirty-first, highest-utility roots.
     pub paths: Vec<ScanPlanEntry>,
     /// Whether the scheduler is in fallback (round-robin) mode.
     pub fallback_active: bool,
@@ -271,8 +283,11 @@ pub struct VoiScheduler {
     calibration: CalibrationState,
     /// Errors observed in the current window (for calibration).
     pending_errors: Vec<f64>,
-    /// Round-robin cursor for exploration and fallback.
+    /// Round-robin cursor for fallback.
     rr_cursor: usize,
+    /// Last root given the reserved maintenance slot. A path key remains
+    /// stable when roots become ineligible or new roots are registered.
+    exploration_after: Option<PathBuf>,
 }
 
 impl VoiScheduler {
@@ -284,6 +299,7 @@ impl VoiScheduler {
             calibration: CalibrationState::new(),
             pending_errors: Vec::new(),
             rr_cursor: 0,
+            exploration_after: None,
         }
     }
 
@@ -429,7 +445,7 @@ impl VoiScheduler {
             return self.schedule_round_robin(&paths, budget);
         }
 
-        let paths: Vec<&PathBuf> = self.path_stats.keys().collect();
+        let paths: Vec<PathBuf> = self.path_stats.keys().cloned().collect();
         self.schedule_voi(&paths, budget, now)
     }
 
@@ -466,17 +482,42 @@ impl VoiScheduler {
         }
     }
 
-    /// VOI-prioritized scheduler with exploration quota.
-    /// Q6: rank every root by its hazard index (dirty roots first) and take
-    /// the top of the list within the budget. The exploit/explore split is
-    /// gone: the hazard term already grows with time since the last visit,
-    /// so an unvisited or long-idle root climbs the list on its own.
-    fn schedule_voi(&self, paths: &[&PathBuf], budget: usize, now: Instant) -> ScanPlan {
+    /// Next continuously overdue root in a path-key rotation. Do not use
+    /// last-scanned order alone: a failed or cancelled scan would then win
+    /// the same slot forever and prevent every later root from being tried.
+    fn next_exploration(&self, paths: &[PathBuf], now: Instant) -> Option<PathBuf> {
+        let mut first: Option<&PathBuf> = None;
+        let mut next: Option<&PathBuf> = None;
+        for path in paths {
+            let overdue = self.path_stats.get(path).is_some_and(|stats| {
+                stats.last_scanned.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= MAX_REVISIT_INTERVAL
+                })
+            });
+            if !overdue {
+                continue;
+            }
+            if first.is_none_or(|previous| path < previous) {
+                first = Some(path);
+            }
+            if self.exploration_after.as_ref().is_none_or(|after| path > after)
+                && next.is_none_or(|previous| path < previous)
+            {
+                next = Some(path);
+            }
+        }
+        next.or(first).cloned()
+    }
+
+    /// Reserve one existing slot for bounded maintenance exploration, then
+    /// spend the remaining budget using the dirty-first hazard index.
+    fn schedule_voi(&mut self, paths: &[PathBuf], budget: usize, now: Instant) -> ScanPlan {
         let prior = self.unscanned_reclaim_prior();
-        let mut scored: Vec<(bool, f64, &PathBuf)> = paths
+        let exploration = self.next_exploration(paths, now);
+        let mut scored: Vec<(bool, bool, f64, &PathBuf)> = paths
             .iter()
-            .map(|p| {
-                let stats = self.path_stats.get(*p);
+            .map(|path| {
+                let stats = self.path_stats.get(path);
                 let dirty = stats.is_some_and(|s| s.dirty_pending);
                 let index = stats.map_or(0.0, |s| {
                     s.hazard_index(
@@ -485,31 +526,39 @@ impl VoiScheduler {
                         now,
                     )
                 });
-                (dirty, index, *p)
+                (exploration.as_ref() == Some(path), dirty, index, path)
             })
             .collect();
 
-        // Dirty first, then by index, then by path for determinism.
+        // The reserved opportunity comes first so a bounded pass does not
+        // always run out of work budget before reaching the exploration root.
+        // Every other slot retains the ordinary dirty/index/path ordering.
         scored.sort_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-                .then_with(|| a.2.cmp(b.2))
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.3.cmp(b.3))
         });
 
         let selected: Vec<ScanPlanEntry> = scored
             .iter()
             .take(budget)
-            .map(|(_, index, path)| {
+            .map(|(reserved, _, index, path)| {
                 let stats = self.path_stats.get(*path);
                 ScanPlanEntry {
                     path: (*path).clone(),
                     utility: *index,
-                    is_exploration: stats.is_none_or(|s| s.scan_count == 0),
+                    is_exploration: *reserved || stats.is_none_or(|s| s.scan_count == 0),
                     forecast_reclaim_bytes: stats.map_or(0.0, |s| s.forecast_reclaim),
                 }
             })
             .collect();
 
+        if !selected.is_empty() && exploration.is_some() {
+            self.exploration_after = exploration;
+        }
+        // A plan is not completion evidence. Only record_scan_result changes
+        // last_scanned, dirty_pending, forecasts or scan counts.
         let used = selected.len();
         ScanPlan {
             paths: selected,
@@ -627,9 +676,8 @@ mod tests {
         }
     }
 
-    /// Q6: unvisited roots are not starved by a quota; the hazard term does
-    /// the work. A root scanned a minute ago has almost no chance of having
-    /// changed, so the never-visited roots (a day of prior hazard) outrank it.
+    /// Unvisited roots have the full prior hazard. The bounded exploration
+    /// rotation additionally protects them when utility alone is insufficient.
     #[test]
     fn unvisited_roots_outrank_a_just_scanned_root_by_hazard() {
         let mut s = VoiScheduler::new(VoiConfig {
@@ -690,7 +738,7 @@ mod tests {
     }
 
     /// Dirty roots (v2 events) go first regardless of index, and the flag
-    /// clears once the root is scanned.
+    /// clears once the root is scanned. Neither root is overdue here.
     #[test]
     fn dirty_roots_go_first_until_scanned() {
         let mut s = scheduler_with_paths(&["/big", "/small"]);
@@ -993,5 +1041,192 @@ mod tests {
             "EWMA should converge near 1M, got {}",
             stats.ewma_reclaim_per_scan
         );
+    }
+
+    #[test]
+    fn zero_yield_root_gets_a_slot_despite_a_continuously_dirty_profitable_root() {
+        let mut s = scheduler_with_paths(&["/cold", "/hot"]);
+        s.config.scan_budget_per_interval = 1;
+        let start = Instant::now();
+        let now = start + MAX_REVISIT_INTERVAL;
+        s.record_scan_result(&PathBuf::from("/cold"), 0, 0, 0, 1_000_000.0, start);
+        s.record_scan_result(&PathBuf::from("/hot"), 1_000_000_000, 10, 0, 1.0, now);
+        s.record_dirty(&PathBuf::from("/hot"), true, now);
+
+        let plan = s.schedule(now);
+        assert_eq!(plan.paths.len(), 1);
+        assert_eq!(plan.paths[0].path, Path::new("/cold"));
+        assert!(plan.paths[0].is_exploration);
+        assert!(plan.paths[0].utility < 0.0, "keep the real, poor utility visible");
+        assert!(!plan.fallback_active);
+        assert_eq!(plan.budget_used, 1);
+        assert_eq!(plan.budget_total, 1);
+        assert!(s.path_stats(&PathBuf::from("/hot")).unwrap().dirty_pending);
+    }
+
+    #[test]
+    fn continuous_dirty_load_leaves_one_slot_for_each_overdue_root() {
+        let mut s = scheduler_with_paths(&["/cold-a", "/cold-b", "/cold-c", "/hot"]);
+        s.config.scan_budget_per_interval = 2;
+        let start = Instant::now();
+        let now = start + MAX_REVISIT_INTERVAL;
+        for path in ["/cold-a", "/cold-b", "/cold-c"] {
+            s.record_scan_result(&PathBuf::from(path), 0, 0, 0, 1_000_000.0, start);
+        }
+        s.record_scan_result(&PathBuf::from("/hot"), 1_000_000_000, 10, 0, 1.0, now);
+        for expected in ["/cold-a", "/cold-b", "/cold-c", "/cold-a"] {
+            s.record_dirty(&PathBuf::from("/hot"), true, now);
+            let plan = s.schedule(now);
+            assert_eq!(plan.paths.len(), 2);
+            assert_eq!(plan.paths[0].path, Path::new(expected));
+            assert!(plan.paths[0].is_exploration);
+            assert_eq!(plan.paths[1].path, Path::new("/hot"));
+            assert!(!plan.paths[1].is_exploration);
+        }
+    }
+
+    #[test]
+    fn startup_exploration_rotates_without_fabricating_completion_feedback() {
+        let mut s = scheduler_with_paths(&["/c", "/a", "/b"]);
+        s.config.scan_budget_per_interval = 1;
+        let now = Instant::now();
+        for expected in ["/a", "/b", "/c", "/a"] {
+            let plan = s.schedule(now);
+            assert_eq!(plan.paths[0].path, Path::new(expected));
+            assert!(plan.paths[0].is_exploration);
+        }
+        for stats in s.path_stats.values() {
+            assert_eq!(stats.scan_count, 0);
+            assert!(stats.last_scanned.is_none());
+        }
+    }
+
+    #[test]
+    fn maintenance_deadline_is_exact_and_recent_roots_keep_hazard_ordering() {
+        let mut s = scheduler_with_paths(&["/cold", "/hot"]);
+        s.config.scan_budget_per_interval = 1;
+        let start = Instant::now();
+        s.record_scan_result(&PathBuf::from("/cold"), 0, 0, 0, 1_000.0, start);
+        s.record_scan_result(
+            &PathBuf::from("/hot"),
+            1_000_000_000,
+            10,
+            0,
+            1.0,
+            start + Duration::from_secs(1),
+        );
+        let deadline = start + MAX_REVISIT_INTERVAL;
+        let before = s.schedule(deadline - Duration::from_nanos(1));
+        assert_eq!(before.paths[0].path, Path::new("/hot"));
+        assert!(!before.paths[0].is_exploration);
+        assert_eq!(s.schedule(deadline).paths[0].path, Path::new("/cold"));
+    }
+
+    #[test]
+    fn only_completed_scans_reset_the_exploration_deadline() {
+        let mut s = scheduler_with_paths(&["/cold", "/hot"]);
+        s.config.scan_budget_per_interval = 1;
+        let start = Instant::now();
+        let now = start + MAX_REVISIT_INTERVAL;
+        let cold = PathBuf::from("/cold");
+        let hot = PathBuf::from("/hot");
+        s.record_scan_result(&cold, 0, 0, 0, 1000.0, start);
+        s.record_scan_result(&hot, 1_000_000_000, 10, 0, 1.0, now);
+        s.record_dirty(&cold, true, now);
+        s.record_dirty(&hot, true, now);
+        assert_eq!(s.schedule(now).paths[0].path, cold);
+        let stats = s.path_stats(&cold).unwrap();
+        assert_eq!(stats.last_scanned, Some(start));
+        assert_eq!(stats.scan_count, 1);
+        assert!(stats.dirty_pending);
+        s.record_scan_result(&cold, 0, 0, 0, 1000.0, now);
+        assert_eq!(s.schedule(now + Duration::from_secs(1)).paths[0].path, hot);
+        assert_eq!(s.path_stats(&cold).unwrap().last_scanned, Some(now));
+        assert!(!s.path_stats(&cold).unwrap().dirty_pending);
+    }
+
+    #[test]
+    fn zero_budget_does_not_advance_exploration_and_large_budgets_do_not_duplicate() {
+        let mut s = scheduler_with_paths(&["/a", "/b"]);
+        let now = Instant::now();
+        s.config.scan_budget_per_interval = 0;
+        assert!(s.schedule(now).paths.is_empty());
+        assert!(s.exploration_after.is_none());
+        s.config.scan_budget_per_interval = 1;
+        assert_eq!(s.schedule(now).paths[0].path, Path::new("/a"));
+        s.config.scan_budget_per_interval = 0;
+        assert!(s.schedule(now).paths.is_empty());
+        s.config.scan_budget_per_interval = usize::MAX;
+        let plan = s.schedule(now);
+        assert_eq!(plan.budget_used, 2);
+        assert_eq!(plan.paths[0].path, Path::new("/b"));
+        assert_eq!(plan.paths[1].path, Path::new("/a"));
+    }
+
+    #[test]
+    fn exploration_order_is_independent_of_registration_and_hash_iteration_order() {
+        let mut left = scheduler_with_paths(&["/d", "/a", "/c", "/b"]);
+        let mut right = scheduler_with_paths(&["/b", "/c", "/a", "/d"]);
+        left.config.scan_budget_per_interval = 2;
+        right.config.scan_budget_per_interval = 2;
+        let now = Instant::now();
+        for _ in 0..12 {
+            let l: Vec<_> = left.schedule(now).paths.into_iter().map(|e| e.path).collect();
+            let r: Vec<_> = right.schedule(now).paths.into_iter().map(|e| e.path).collect();
+            assert_eq!(l, r);
+        }
+    }
+
+    #[test]
+    fn path_cursor_keeps_progress_when_a_root_completes_and_another_is_registered() {
+        let mut s = scheduler_with_paths(&["/a", "/b", "/c"]);
+        s.config.scan_budget_per_interval = 1;
+        let now = Instant::now();
+        assert_eq!(s.schedule(now).paths[0].path, Path::new("/a"));
+        s.record_scan_result(&PathBuf::from("/a"), 0, 0, 0, 1000.0, now);
+        s.register_path(PathBuf::from("/aa"));
+        for expected in ["/aa", "/b", "/c"] {
+            assert_eq!(s.schedule(now).paths[0].path, Path::new(expected));
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(200))]
+
+        #[test]
+        fn every_unknown_root_is_offered_within_a_bounded_number_of_plans(
+            inputs in proptest::collection::vec((0u32..1_000_000, proptest::bool::ANY), 1..40),
+            budget in 1usize..45,
+        ) {
+            let mut s = VoiScheduler::new(VoiConfig {
+                scan_budget_per_interval: budget,
+                ..Default::default()
+            });
+            let now = Instant::now();
+            let mut expected = std::collections::BTreeSet::new();
+            for (index, &(cost, dirty)) in inputs.iter().enumerate() {
+                let path = PathBuf::from(format!("/root/{index:03}"));
+                s.register_path(path.clone());
+                s.path_stats.get_mut(&path).unwrap().ewma_io_cost_per_scan = f64::from(cost);
+                s.record_dirty(&path, dirty, now);
+                expected.insert(path);
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..inputs.len() {
+                // No completion reports: failures or a cancelled pass must
+                // not pin exploration to the same lexicographic prefix.
+                let plan = s.schedule(now);
+                proptest::prop_assert!(!plan.fallback_active);
+                proptest::prop_assert_eq!(plan.budget_used, budget.min(inputs.len()));
+                let unique: std::collections::BTreeSet<_> =
+                    plan.paths.iter().map(|entry| entry.path.clone()).collect();
+                proptest::prop_assert_eq!(unique.len(), plan.paths.len());
+                seen.extend(unique);
+            }
+            proptest::prop_assert_eq!(seen, expected);
+            proptest::prop_assert!(s.path_stats.values().all(|stats| {
+                stats.scan_count == 0 && stats.last_scanned.is_none()
+            }));
+        }
     }
 }
