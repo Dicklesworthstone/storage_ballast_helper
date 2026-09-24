@@ -265,12 +265,9 @@ impl PredictiveActionPolicy {
         // trigger "disk full in 1m" because the median rate shows it's transient.
         let bs = &estimate.burst_state;
         if bs.calibrated && bs.burst_probability > 0.5 {
-            // Use median rate for time projection instead of burst-inflated EWMA.
-            let median_minutes = if bs.median_rate > 0.0 {
-                estimate.seconds_to_exhaustion * (estimate.bytes_per_second / bs.median_rate) / 60.0
-            } else {
-                f64::INFINITY
-            };
+            // Remove burst acceleration as well as the burst-inflated rate
+            // when projecting the historical baseline's runway.
+            let median_minutes = median_runway_minutes(estimate);
 
             // If median-rate projection shows no danger, return Clear.
             if median_minutes > self.config.warning_horizon_minutes {
@@ -402,8 +399,7 @@ impl PredictiveActionPolicy {
             if rate_divergence > 3.0 {
                 // EWMA is >3× the robust median — likely spike-inflated.
                 // Re-project using median rate: if median says no danger, gate it.
-                let median_seconds = estimate.seconds_to_exhaustion * rate_divergence;
-                let median_minutes = median_seconds / 60.0;
+                let median_minutes = median_runway_minutes(estimate);
                 if median_minutes > self.config.warning_horizon_minutes {
                     return PredictiveAction::Clear;
                 }
@@ -487,6 +483,30 @@ impl PredictiveActionPolicy {
         } else {
             PredictiveAction::Clear
         }
+    }
+}
+
+/// Project the forecast's implied free space at the historical median rate.
+///
+/// EWMA exhaustion time includes acceleration: distance = v*t + a*t*t/2.
+/// Scaling time by v/median alone discards the acceleration contribution and
+/// can turn a safe historical baseline into a false cleanup recommendation.
+/// For deceleration, retain the longer constant-rate bound rather than making
+/// an existing median cross-check more aggressive. Callers validate inputs;
+/// arithmetic overflow still fails closed instead of authorizing cleanup.
+fn median_runway_minutes(estimate: &RateEstimate) -> f64 {
+    let median_rate = estimate.burst_state.median_rate;
+    if median_rate <= 0.0 {
+        return f64::INFINITY;
+    }
+    let seconds = estimate.seconds_to_exhaustion;
+    let mean_rate =
+        (0.5 * estimate.acceleration.max(0.0)).mul_add(seconds, estimate.bytes_per_second);
+    let minutes = mean_rate * seconds / median_rate / 60.0;
+    if minutes.is_finite() && minutes >= 0.0 {
+        minutes
+    } else {
+        f64::INFINITY
     }
 }
 
@@ -1067,8 +1087,7 @@ mod tests {
     #[test]
     fn burst_with_dangerous_median_can_release_ballast() {
         let policy = default_policy();
-        let est =
-            make_burst_estimate(500_000_000.0, 60.0, 0.99, Trend::Stable, 0.6, 400_000_000.0);
+        let est = make_burst_estimate(500_000_000.0, 60.0, 0.99, Trend::Stable, 0.6, 400_000_000.0);
         // Both forecasts show danger: 60s EWMA, 75s at the historical median.
         // Raw 0.99 clears the burst bar; adjusted 0.8118 clears the normal bar.
         let action = policy.evaluate(&est, 10.0, PathBuf::from("/data"));
@@ -1359,3 +1378,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "predictive/runway_tests.rs"]
+mod runway_tests;
