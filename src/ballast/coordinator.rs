@@ -13,11 +13,14 @@ use std::sync::Arc;
 
 use crate::ballast::manager::{
     BallastAvailability, BallastHealth, BallastManager, ProvisionReport, ReleaseReport,
-    VerifyReport, orphan_ballast_files, stranded_ballast_files,
+    VerifyReport, orphan_ballast_files,
 };
 use crate::core::config::BallastConfig;
 use crate::core::errors::Result;
 use crate::platform::pal::{MountPoint, Platform};
+
+mod stranded;
+use stranded::StrandedReserve;
 
 // ──────────────────── constants ────────────────────
 
@@ -66,30 +69,29 @@ pub struct BallastPool {
     pub fs_type: String,
     pub strategy: ProvisionStrategy,
     manager: BallastManager,
-    /// sbh ballast files on this filesystem outside the managed dir, highest
-    /// index first (see [`stranded_ballast_files`]). They reserve space like
-    /// the pool's own files and are released after them; never replenished.
-    stranded: Vec<(PathBuf, u64)>,
+    /// Verified, identity-bound reserve outside the managed directory. Release
+    /// retired files first; never provision into a former installation's pool.
+    stranded: StrandedReserve,
 }
 
 impl BallastPool {
     /// How many bytes can be released from this pool.
     pub fn releasable_bytes(&self) -> u64 {
-        self.manager.releasable_bytes() + self.stranded.iter().map(|(_, size)| size).sum::<u64>()
+        self.manager.releasable_bytes().saturating_add(self.stranded.bytes())
     }
 
     /// Number of ballast files currently available (not released),
     /// stranded files on the same filesystem included.
     pub fn available_count(&self) -> usize {
-        self.manager.available_count() + self.stranded.len()
+        self.manager.available_count().saturating_add(self.stranded.files().len())
     }
 
     /// sbh ballast files adopted from stranded dirs on this filesystem.
     pub fn stranded_files(&self) -> &[(PathBuf, u64)] {
-        &self.stranded
+        self.stranded.files()
     }
 
-    /// Number of files currently on disk in this pool.
+    /// Number of files currently on disk in the managed directory.
     pub fn actual_count(&self) -> usize {
         self.manager.inventory().len()
     }
@@ -129,9 +131,8 @@ struct PlannedPool {
     fs_type: String,
     strategy: ProvisionStrategy,
     config: BallastConfig,
-    /// Default pool dirs on the same filesystem that are not `ballast_dir`
-    /// (the mount's own `.sbh/ballast` when the dir is configured elsewhere,
-    /// and those of folded bind-mount entries).
+    /// Default and conventional legacy pool directories on this filesystem,
+    /// excluding the active managed directory.
     stranded_dirs: Vec<PathBuf>,
 }
 
@@ -279,7 +280,11 @@ impl BallastPoolCoordinator {
             if plan.strategy == ProvisionStrategy::RandomData {
                 manager.set_skip_fallocate(true);
             }
-
+            let stranded = StrandedReserve::discover(
+                &plan.stranded_dirs,
+                &plan.ballast_dir,
+                &plan.mount_point,
+            );
             pools.insert(
                 plan.mount_point.clone(),
                 BallastPool {
@@ -288,11 +293,7 @@ impl BallastPoolCoordinator {
                     fs_type: plan.fs_type,
                     strategy: plan.strategy,
                     manager,
-                    stranded: plan
-                        .stranded_dirs
-                        .iter()
-                        .flat_map(|dir| stranded_ballast_files(dir))
-                        .collect(),
+                    stranded,
                 },
             );
         }
@@ -329,23 +330,27 @@ impl BallastPoolCoordinator {
             .into_iter()
             .map(|plan| {
                 let observed = BallastAvailability::observe(&plan.ballast_dir, &plan.config);
-                let stranded: Vec<(PathBuf, u64)> = plan
-                    .stranded_dirs
-                    .iter()
-                    .flat_map(|dir| stranded_ballast_files(dir))
-                    .collect();
-                let stranded_bytes: u64 = stranded.iter().map(|(_, size)| size).sum();
+                let stranded = StrandedReserve::discover(
+                    &plan.stranded_dirs,
+                    &plan.ballast_dir,
+                    &plan.mount_point,
+                );
+                let releasable_bytes = observed.releasable_bytes.saturating_add(stranded.bytes());
                 PoolInventory {
                     orphans: orphan_ballast_files(&plan.ballast_dir, plan.config.file_count),
                     mount_point: plan.mount_point,
                     ballast_dir: plan.ballast_dir,
                     fs_type: plan.fs_type,
                     strategy: plan.strategy,
-                    files_available: observed.available_count + stranded.len(),
+                    files_available: observed.available_count.saturating_add(stranded.files().len()),
                     files_total: observed.configured_count,
-                    releasable_bytes: observed.releasable_bytes + stranded_bytes,
+                    releasable_bytes,
                     configured_bytes: observed.configured_pool_bytes,
-                    health: observed.health,
+                    health: stranded::health(
+                        observed.configured_pool_bytes,
+                        observed.health,
+                        releasable_bytes,
+                    ),
                     skipped: false,
                     skip_reason: None,
                 }
@@ -373,8 +378,8 @@ impl BallastPoolCoordinator {
         Ok(inventory)
     }
 
-    /// Decide which mounts get a pool (and why the others do not) without
-    /// touching the filesystem beyond `fs_stats`.
+    /// Decide which mounts get a pool (and why the others do not), observing
+    /// conventional legacy locations without creating or changing anything.
     fn plan_pools(
         config: &BallastConfig,
         watched_paths: &[PathBuf],
@@ -384,6 +389,8 @@ impl BallastPoolCoordinator {
         let mounts = platform.mount_points()?;
         let mut planned = Vec::new();
         let mut skipped_pools = HashMap::new();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let legacy_dirs = stranded::legacy_dirs(watched_paths, configured_ballast_dir, home.as_deref());
 
         // Deduplicate watched paths by mount point.
         let mut seen_mounts = HashMap::<PathBuf, MountPoint>::new();
@@ -489,7 +496,9 @@ impl BallastPoolCoordinator {
 
             // Configured ballast_dir on this mount is honored verbatim;
             // otherwise fall back to the per-volume subdirectory.
-            let stranded_dirs = stranded_pool_dirs(mount_path, &aliases, &resolved_dir);
+            let stranded_dirs = stranded_pool_dirs(
+                mount_path, &aliases, &resolved_dir, &legacy_dirs, platform, &mounts,
+            );
             planned.push(PlannedPool {
                 mount_point: mount_path.clone(),
                 ballast_dir: resolved_dir,
@@ -554,7 +563,10 @@ impl BallastPoolCoordinator {
 
     /// Release ballast files on a SPECIFIC mount point under pressure.
     ///
-    /// Returns None if the mount has no pool or no available files.
+    /// Retired reserves go first so release does not depend on opening or
+    /// allocating anything in the managed directory. Preserve partial progress
+    /// if that directory subsequently fails; each error remains in the report.
+    /// Returns None if there is no pool, no inventory, or no release requested.
     pub fn release_for_mount(
         &mut self,
         mount_path: &Path,
@@ -564,48 +576,28 @@ impl BallastPoolCoordinator {
         let Some(pool) = self.pools.get_mut(&key) else {
             return Ok(None);
         };
-
-        if pool.available_count() == 0 {
+        if count == 0 || pool.available_count() == 0 {
             return Ok(None);
         }
 
-        let mut report = if pool.manager.available_count() > 0 {
-            pool.manager.release(count)?
-        } else {
-            ReleaseReport {
-                files_released: 0,
-                bytes_freed: 0,
-                warnings: Vec::new(),
-                errors: Vec::new(),
-                released: Vec::new(),
-            }
-        };
+        let mut report = pool.stranded.release(count);
         let wanted = count.saturating_sub(report.files_released);
-        let mut from_stranded = 0;
-        let mut kept = Vec::new();
-        for (path, size) in pool.stranded.drain(..) {
-            if from_stranded >= wanted {
-                kept.push((path, size));
-                continue;
-            }
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    from_stranded += 1;
-                    report.files_released += 1;
-                    report.bytes_freed += size;
-                    report.released.push((path, size));
+        if wanted > 0 && pool.manager.available_count() > 0 {
+            match pool.manager.release(wanted) {
+                Ok(managed) => {
+                    report.files_released = report.files_released.saturating_add(managed.files_released);
+                    report.bytes_freed = report.bytes_freed.saturating_add(managed.bytes_freed);
+                    report.warnings.extend(managed.warnings);
+                    report.errors.extend(managed.errors);
+                    report.released.extend(managed.released);
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    report.errors.push(format!(
-                        "failed to release stranded ballast {}: {err}",
-                        path.display()
-                    ));
-                    kept.push((path, size));
+                Err(error) => {
+                    let message = format!("managed ballast {}: {error}", pool.ballast_dir.display());
+                    report.warnings.push(message.clone());
+                    report.errors.push(message);
                 }
             }
         }
-        pool.stranded = kept;
         Ok(Some(report))
     }
 
@@ -664,7 +656,11 @@ impl BallastPoolCoordinator {
                     .config()
                     .file_size_bytes
                     .saturating_mul(u64::try_from(pool.expected_count()).unwrap_or(u64::MAX)),
-                health: pool.manager.health(),
+                health: stranded::health(
+                    pool.manager.configured_pool_bytes(),
+                    pool.manager.health(),
+                    pool.releasable_bytes(),
+                ),
                 orphans: pool.manager.orphans(),
                 skipped: false,
                 skip_reason: None,
@@ -696,7 +692,7 @@ impl BallastPoolCoordinator {
 
     /// Total releasable bytes across all pools.
     pub fn total_releasable(&self) -> u64 {
-        self.pools.values().map(BallastPool::releasable_bytes).sum()
+        self.pools.values().map(BallastPool::releasable_bytes).fold(0, u64::saturating_add)
     }
 
     /// Number of pools.
@@ -786,13 +782,16 @@ fn configured_owner_mount(
     }
 }
 
-/// Default pool dirs on `mount_path`'s filesystem other than the pool's own
-/// `resolved_dir`: the mount's `.sbh/ballast` and those of mounts folded into
-/// it. Files there are adopted as stranded reserve.
+/// Conventional reserve locations that are actually on this pool's writable
+/// filesystem. Discovery subsequently deduplicates directory inode aliases and
+/// excludes any alias of the managed directory itself.
 fn stranded_pool_dirs(
     mount_path: &Path,
     aliases: &HashMap<PathBuf, PathBuf>,
     resolved_dir: &Path,
+    legacy_dirs: &[PathBuf],
+    platform: &dyn Platform,
+    mounts: &[MountPoint],
 ) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::iter::once(mount_path)
         .chain(
@@ -802,11 +801,40 @@ fn stranded_pool_dirs(
                 .map(|(alias, _)| alias.as_path()),
         )
         .map(|root| root.join(BALLAST_SUBDIR))
+        .chain(legacy_dirs.iter().cloned())
         .filter(|dir| dir != resolved_dir)
+        .filter(|dir| same_pool_filesystem(dir, mount_path, aliases, platform, mounts))
         .collect();
     dirs.sort();
     dirs.dedup();
     dirs
+}
+
+fn same_pool_filesystem(
+    dir: &Path,
+    mount_path: &Path,
+    aliases: &HashMap<PathBuf, PathBuf>,
+    platform: &dyn Platform,
+    mounts: &[MountPoint],
+) -> bool {
+    let Ok(stats) = platform.fs_stats(dir) else {
+        return false;
+    };
+    if stats.is_readonly {
+        return false;
+    }
+    if stats.mount_point == mount_path
+        || aliases.get(&stats.mount_point).is_some_and(|keeper| keeper == mount_path)
+    {
+        return true;
+    }
+    // An old user-scope pool can be behind a bind mount that is not itself
+    // watched. As in folding, only actual block-device sources may alias.
+    let owner = mounts.iter().find(|mount| mount.path == mount_path);
+    let legacy = mounts.iter().find(|mount| mount.path == stats.mount_point);
+    owner.zip(legacy).is_some_and(|(owner, legacy)| {
+        owner.device.starts_with("/dev/") && owner.device == legacy.device
+    })
 }
 
 /// The mount entry that holds `path`, as the kernel reports it.
@@ -1837,11 +1865,8 @@ mod tests {
         );
     }
 
-    /// sbh ballast left in the mount's default `.sbh/ballast` when the pool
-    /// was configured elsewhere counts as reserve and is released after the
-    /// pool's own files; a same-named file without the sbh header is never
-    /// touched (fleet audit: ~126 GB of stranded ballast, every emergency
-    /// "released 0 ballast file(s)").
+    /// Retired default pools are reserve, without changing the managed dir.
+    /// A same-named file without the ballast header is never touched.
     #[test]
     fn stranded_default_pool_is_adopted_and_released() {
         let mount = tempfile::tempdir().unwrap();
@@ -1872,6 +1897,13 @@ mod tests {
         assert_eq!(pool.ballast_dir, configured);
         assert_eq!(pool.stranded_files().len(), 3, "impostor excluded");
         assert_eq!(pool.available_count(), 3);
+        assert_eq!(coordinator.inventory()[0].health, BallastHealth::Ok);
+        let observed = BallastPoolCoordinator::inventory_for_config(
+            &tiny_ballast_config(), &[mount.path().to_path_buf()], &platform, Some(&configured),
+        ).unwrap();
+        assert_eq!(observed[0].health, BallastHealth::Ok);
+        assert_eq!(observed[0].releasable_bytes, 3 * tiny_ballast_config().file_size_bytes);
+        assert!(!configured.exists());
 
         let report = coordinator
             .release_for_mount(mount.path(), 2)
@@ -2033,5 +2065,70 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("read-only"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_directory_alias_does_not_double_count_managed_reserve() {
+        let mount = tempfile::tempdir().unwrap();
+        let original = mount.path().join(BALLAST_SUBDIR);
+        let mut manager = BallastManager::new(original.clone(), tiny_ballast_config()).unwrap();
+        manager.provision(None).unwrap();
+        let alias = mount.path().join("alias");
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let platform = MockPlatform::new(
+            vec![mock_mount(mount.path(), "/dev/sda1")],
+            HashMap::from([(mount.path().to_path_buf(), mock_stats(mount.path(), false))]),
+            mock_memory(), PlatformPaths::default(),
+        );
+        let coordinator = BallastPoolCoordinator::discover_with_configured_dir(
+            &tiny_ballast_config(), &[mount.path().to_path_buf()], &platform, Some(&alias),
+        ).unwrap();
+        let pool = coordinator.pool_for_mount(mount.path()).unwrap();
+        assert_eq!(pool.available_count(), 3);
+        assert!(pool.stranded_files().is_empty());
+        let observed = BallastPoolCoordinator::inventory_for_config(
+            &tiny_ballast_config(), &[mount.path().to_path_buf()], &platform, Some(&alias),
+        ).unwrap();
+        assert_eq!(observed[0].files_available, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_release_progress_survives_failure_to_open_the_managed_pool_lock() {
+        let mount = tempfile::tempdir().unwrap();
+        let retired = mount.path().join(BALLAST_SUBDIR);
+        let configured = mount.path().join("active");
+        for dir in [&retired, &configured] {
+            BallastManager::new(dir.clone(), tiny_ballast_config()).unwrap().provision(None).unwrap();
+        }
+        let platform = MockPlatform::new(
+            vec![mock_mount(mount.path(), "/dev/sda1")],
+            HashMap::from([(mount.path().to_path_buf(), mock_stats(mount.path(), false))]),
+            mock_memory(), PlatformPaths::default(),
+        );
+        let mut coordinator = BallastPoolCoordinator::discover_with_configured_dir(
+            &tiny_ballast_config(), &[mount.path().to_path_buf()], &platform, Some(&configured),
+        ).unwrap();
+        fs::remove_file(configured.join(".lock")).unwrap();
+        fs::create_dir(configured.join(".lock")).unwrap();
+        let report = coordinator.release_for_mount(mount.path(), 4).unwrap().unwrap();
+        assert_eq!(report.files_released, 3);
+        assert_eq!(report.bytes_freed, 3 * tiny_ballast_config().file_size_bytes);
+        assert!(!report.errors.is_empty());
+        assert!(report.released.iter().all(|(path, _)| path.starts_with(fs::canonicalize(&retired).unwrap())));
+        assert!(configured.join("SBH_BALLAST_FILE_00001.dat").exists());
+    }
+
+    #[test]
+    fn legacy_binding_must_be_writable_and_on_the_same_device() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let platform = mock_platform_two_volumes(first.path(), second.path());
+        let mounts = platform.mount_points().unwrap();
+        let aliases = HashMap::new();
+        assert!(same_pool_filesystem(first.path(), first.path(), &aliases, &platform, &mounts));
+        assert!(!same_pool_filesystem(second.path(), first.path(), &aliases, &platform, &mounts));
+        assert!(!same_pool_filesystem(Path::new("/unknown"), first.path(), &aliases, &platform, &mounts));
     }
 }
