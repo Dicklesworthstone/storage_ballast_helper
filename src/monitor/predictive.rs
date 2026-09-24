@@ -41,8 +41,8 @@ pub struct PredictiveConfig {
     pub imminent_danger_minutes: f64,
     /// Minutes-remaining threshold below which `ImminentDanger` is critical (release ALL ballast).
     pub critical_danger_minutes: f64,
-    /// Minimum confidence required during detected bursts. Higher than normal
-    /// `min_confidence` because burst-inflated predictions are inherently less reliable.
+    /// Minimum unpenalized confidence required during detected bursts. The
+    /// burst-adjusted confidence must also clear `min_confidence`.
     pub burst_min_confidence: f64,
 }
 
@@ -183,9 +183,10 @@ impl PredictiveActionPolicy {
     /// Confidence gating prevents false alarms:
     /// - Disabled → always `Clear`
     /// - Fallback active (insufficient data) → `Clear`
+    /// - Invalid numerical evidence → `Clear`
     /// - Low confidence → `Clear`
     /// - Insufficient samples → `Clear`
-    /// - Recovering/Decelerating trend → `Clear`
+    /// - Recovering trend or no finite exhaustion forecast → `Clear`
     /// - Not consuming space (rate ≤ 0) → `Clear`
     #[must_use]
     pub fn evaluate(
@@ -220,6 +221,12 @@ impl PredictiveActionPolicy {
         if estimate.fallback_active {
             return PredictiveAction::Clear;
         }
+        // Comparisons with NaN are false, so threshold checks alone would let
+        // invalid evidence authorize cleanup. Infinity is a valid estimator
+        // result for "never fills", but cannot authorize a predictive action.
+        if !valid_prediction_evidence(estimate, current_free_pct) {
+            return PredictiveAction::Clear;
+        }
         if estimate.confidence < self.config.min_confidence {
             return PredictiveAction::Clear;
         }
@@ -231,10 +238,11 @@ impl PredictiveActionPolicy {
             return PredictiveAction::Clear;
         }
 
-        // Trend gating: only act on consumption, not recovery.
-        match estimate.trend {
-            Trend::Recovering | Trend::Decelerating => return PredictiveAction::Clear,
-            Trend::Stable | Trend::Accelerating => {}
+        // Slowing consumption is not recovery. The estimator already returns
+        // infinity when deceleration stops writes before exhaustion; a finite
+        // forecast means the disk still fills before the rate reaches zero.
+        if estimate.trend == Trend::Recovering {
+            return PredictiveAction::Clear;
         }
 
         // Not consuming space — no prediction needed.
@@ -281,13 +289,17 @@ impl PredictiveActionPolicy {
             let effective_confidence =
                 estimate.confidence * 0.3f64.mul_add(-bs.burst_probability, 1.0);
 
-            // Require higher confidence during bursts — use the configured burst
-            // threshold, but never lower than the normal min_confidence.
+            // Require stronger raw evidence AND enough confidence after the
+            // burst penalty. Comparing adjusted confidence to 0.85 instead
+            // makes every default-config burst impossible to act on:
+            // p > 0.5 implies adjusted confidence < 0.85 even at confidence 1.
             let burst_min_confidence = self
                 .config
                 .min_confidence
                 .max(self.config.burst_min_confidence);
-            if effective_confidence < burst_min_confidence {
+            if estimate.confidence < burst_min_confidence
+                || effective_confidence < self.config.min_confidence
+            {
                 return PredictiveAction::Clear;
             }
 
@@ -379,9 +391,8 @@ impl PredictiveActionPolicy {
         //
         // Production evidence: trj at 32% free predicted "disk full on /data
         // in 37m at 74% confidence" — burst_probability was only 0.3 (below
-        // the 0.5 threshold for the burst-aware path), but the EWMA was
-        // inflated by a rustc compilation burst. The median rate (which is
-        // robust to outliers) showed no danger.
+        // the 0.5 threshold), but the EWMA was inflated by a rustc compilation
+        // burst. The median rate (which is robust to outliers) showed no danger.
         if bs.calibrated
             && bs.median_rate > 0.0
             && current_free_pct > 25.0
@@ -477,6 +488,21 @@ impl PredictiveActionPolicy {
             PredictiveAction::Clear
         }
     }
+}
+
+/// Only finite, physically meaningful evidence may authorize a prediction.
+fn valid_prediction_evidence(estimate: &RateEstimate, current_free_pct: f64) -> bool {
+    let burst = &estimate.burst_state;
+    (0.0..=1.0).contains(&estimate.confidence)
+        && estimate.bytes_per_second.is_finite()
+        && estimate.acceleration.is_finite()
+        && estimate.seconds_to_exhaustion.is_finite()
+        && estimate.seconds_to_exhaustion >= 0.0
+        && (0.0..=100.0).contains(&current_free_pct)
+        && (!burst.calibrated
+            || ((0.0..=1.0).contains(&burst.burst_probability)
+                && burst.median_rate.is_finite()
+                && burst.median_rate >= 0.0))
 }
 
 /// Linear interpolation between two values.
@@ -587,13 +613,14 @@ mod tests {
     }
 
     #[test]
-    fn decelerating_trend_returns_clear() {
+    fn decelerating_consumption_with_finite_runway_remains_actionable() {
         let policy = default_policy();
-        let est = make_estimate(500_000_000.0, 900.0, 0.95, Trend::Decelerating, false);
-        assert_eq!(
-            policy.evaluate(&est, 80.0, PathBuf::from("/data")),
-            PredictiveAction::Clear
-        );
+        let mut est = make_estimate(500_000_000.0, 900.0, 0.95, Trend::Decelerating, false);
+        est.acceleration = -100_000.0;
+        assert!(matches!(
+            policy.evaluate(&est, 20.0, PathBuf::from("/data")),
+            PredictiveAction::PreemptiveCleanup { .. }
+        ));
     }
 
     #[test]
@@ -1038,27 +1065,26 @@ mod tests {
     }
 
     #[test]
-    fn burst_gating_is_conservative_even_with_dangerous_median() {
+    fn burst_with_dangerous_median_can_release_ballast() {
         let policy = default_policy();
-        // During a detected burst (bp > 0.5), the confidence penalty makes it
-        // nearly impossible to pass the raised 0.85 confidence bar. This is
-        // intentional: "false alarms are just as bad as misses."
-        // The system will act once the burst subsides and bp drops below 0.5.
-        let est = make_burst_estimate(
-            500_000_000.0, // burst-inflated EWMA rate
-            60.0,          // 1 minute to exhaustion per EWMA
-            0.99,          // very high confidence
-            Trend::Stable,
-            0.6,           // moderate burst probability
-            400_000_000.0, // median rate is also dangerous
-        );
-        // effective_confidence = 0.99 * (1 - 0.3 * 0.6) = 0.99 * 0.82 = 0.812 < 0.85
+        let est =
+            make_burst_estimate(500_000_000.0, 60.0, 0.99, Trend::Stable, 0.6, 400_000_000.0);
+        // Both forecasts show danger: 60s EWMA, 75s at the historical median.
+        // Raw 0.99 clears the burst bar; adjusted 0.8118 clears the normal bar.
         let action = policy.evaluate(&est, 10.0, PathBuf::from("/data"));
-        assert_eq!(
-            action,
-            PredictiveAction::Clear,
-            "burst gating should be conservative — returns Clear during detected bursts"
-        );
+        assert!(action.should_cleanup());
+        assert!(action.should_release_ballast());
+        match action {
+            PredictiveAction::ImminentDanger {
+                minutes_remaining,
+                critical,
+                ..
+            } => {
+                assert!(critical);
+                assert!((minutes_remaining - 1.25).abs() < 1e-9);
+            }
+            other => panic!("expected burst rescue, got {other:?}"),
+        }
 
         // Without burst detection, the same rate triggers action.
         let est_no_burst = make_estimate(500_000_000.0, 60.0, 0.95, Trend::Stable, false);
@@ -1210,5 +1236,126 @@ mod tests {
             action.severity() >= 2,
             "low free space should bypass median cross-check: got {action:?}"
         );
+    }
+
+    #[test]
+    fn deceleration_that_stops_before_exhaustion_stays_clear() {
+        let mut est = make_estimate(1_000_000.0, f64::INFINITY, 0.99, Trend::Decelerating, false);
+        est.acceleration = -100_000.0;
+        assert_eq!(
+            default_policy().evaluate(&est, 10.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+    }
+
+    #[test]
+    fn burst_cleanup_uses_conservative_runway_and_adjusted_confidence() {
+        let est = make_burst_estimate(1000.0, 600.0, 0.95, Trend::Accelerating, 0.6, 500.0);
+        let action = default_policy().evaluate(&est, 20.0, PathBuf::from("/data"));
+        match action {
+            PredictiveAction::PreemptiveCleanup {
+                minutes_remaining,
+                confidence,
+                ..
+            } => {
+                assert!((minutes_remaining - 20.0).abs() < 1e-9);
+                assert!((confidence - 0.779).abs() < 1e-9);
+            }
+            other => panic!("expected preemptive burst cleanup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn burst_cleanup_requires_raw_and_adjusted_confidence_gates() {
+        for (confidence, probability) in [(0.84, 0.51), (0.86, 0.9)] {
+            let est =
+                make_burst_estimate(1000.0, 60.0, confidence, Trend::Stable, probability, 800.0);
+            assert_eq!(
+                default_policy().evaluate(&est, 10.0, PathBuf::from("/data")),
+                PredictiveAction::Clear,
+                "confidence={confidence}, probability={probability}"
+            );
+        }
+        let policy = PredictiveActionPolicy::new(PredictiveConfig {
+            burst_min_confidence: 0.98,
+            ..Default::default()
+        });
+        let est = make_burst_estimate(1000.0, 60.0, 0.97, Trend::Stable, 0.6, 800.0);
+        assert_eq!(
+            policy.evaluate(&est, 10.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+    }
+
+    #[test]
+    fn insufficient_samples_still_block_dangerous_bursts() {
+        let mut est = make_burst_estimate(1000.0, 60.0, 0.99, Trend::Stable, 0.6, 800.0);
+        est.sample_count = 4;
+        assert_eq!(
+            default_policy().evaluate(&est, 10.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+    }
+
+    #[test]
+    fn invalid_forecast_evidence_never_authorizes_cleanup() {
+        let policy = default_policy();
+        let base = make_estimate(1000.0, 60.0, 0.99, Trend::Stable, false);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            let mut est = base.clone();
+            est.confidence = invalid;
+            assert_eq!(
+                policy.evaluate(&est, 10.0, PathBuf::from("/data")),
+                PredictiveAction::Clear,
+                "invalid confidence {invalid}"
+            );
+        }
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut est = base.clone();
+            est.bytes_per_second = invalid;
+            assert_eq!(
+                policy.evaluate(&est, 10.0, PathBuf::from("/data")),
+                PredictiveAction::Clear,
+                "invalid rate {invalid}"
+            );
+            est = base.clone();
+            est.acceleration = invalid;
+            assert_eq!(
+                policy.evaluate(&est, 10.0, PathBuf::from("/data")),
+                PredictiveAction::Clear,
+                "invalid acceleration {invalid}"
+            );
+        }
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 101.0] {
+            assert_eq!(
+                policy.evaluate(&base, invalid, PathBuf::from("/data")),
+                PredictiveAction::Clear,
+                "invalid free percent {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_calibrated_burst_evidence_never_authorizes_cleanup() {
+        let policy = default_policy();
+        let base = make_burst_estimate(1000.0, 60.0, 0.99, Trend::Stable, 0.6, 800.0);
+        for invalid in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            let mut est = base.clone();
+            est.burst_state.burst_probability = invalid;
+            assert_eq!(
+                policy.evaluate(&est, 10.0, PathBuf::from("/data")),
+                PredictiveAction::Clear,
+                "invalid burst probability {invalid}"
+            );
+        }
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            let mut est = base.clone();
+            est.burst_state.median_rate = invalid;
+            assert_eq!(
+                policy.evaluate(&est, 10.0, PathBuf::from("/data")),
+                PredictiveAction::Clear,
+                "invalid median rate {invalid}"
+            );
+        }
     }
 }
