@@ -512,7 +512,7 @@ pub struct ScanRequest {
     /// engine walks them even without dirty event roots.
     pub maintenance: bool,
     /// W1 planner: the bytes this pass should reclaim to bring the pressured
-    /// mount back to Yellow; `None` while the mount is not pressured.
+    /// mount back to Green; `None` while the mount is not pressured.
     pub target_bytes: Option<u64>,
 }
 
@@ -5242,14 +5242,17 @@ impl MonitoringDaemon {
         }
 
         // W1 planner: the bytes that bring the pressured mount back to
-        // Yellow, so the executor can plan the set that reaches them with
-        // the least expected loss.
+        // Green, so the executor can plan the set that reaches them with the
+        // least expected loss. Aiming only at Yellow parked hosts at the
+        // Orange/Yellow edge: v2 does not walk at Yellow without dirty
+        // roots, so the next build burst found them at Orange again with no
+        // margin (fleet audit 2026-09-24: most hosts lived at 80-94% used).
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let target_bytes = (response.level >= PressureLevel::Orange)
             .then(|| self.fs_collector.collect(&response.causing_mount).ok())
             .flatten()
             .map(|stats| {
-                let wanted = (stats.total_bytes as f64 * self.config.pressure.yellow_min_free_pct
+                let wanted = (stats.total_bytes as f64 * self.config.pressure.green_min_free_pct
                     / 100.0) as u64;
                 wanted.saturating_sub(stats.available_bytes)
             })

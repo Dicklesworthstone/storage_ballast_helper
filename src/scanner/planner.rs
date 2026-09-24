@@ -2,7 +2,7 @@
 //!
 //! The executor used to take the top-N candidates by composite score. When
 //! a byte target is known (`clean --target-free`, the bytes a pressured
-//! mount needs to return to Yellow), "highest score first" is not "least
+//! mount needs to return to Green), "highest score first" is not "least
 //! risk for the bytes we need": a large candidate at posterior 0.85 is
 //! often a better first choice than a small one at 0.95. The decision
 //! layer already prices every candidate's loss; this module chooses the
