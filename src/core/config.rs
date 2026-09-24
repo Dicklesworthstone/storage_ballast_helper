@@ -1454,6 +1454,9 @@ pub enum ConfigPathSource {
     SystemFallback,
     /// Running as root with a system config present.
     SystemForRoot,
+    /// The installed sbh service starts the daemon with `--config PATH`
+    /// (or `SBH_CONFIG_PATH`), and this process can read that file.
+    Service,
 }
 
 impl ConfigPathSource {
@@ -1478,6 +1481,7 @@ impl std::fmt::Display for ConfigPathSource {
             Self::Default => "default",
             Self::SystemFallback => "system fallback",
             Self::SystemForRoot => "system (root)",
+            Self::Service => "installed service",
         })
     }
 }
@@ -1581,6 +1585,22 @@ fn resolve_config_path_with(
     } else {
         None
     };
+    if explicit.is_none()
+        && env_config.is_none()
+        && allow_system_fallback
+        && let Some(path) = installed_service_config()
+    {
+        return ResolvedConfigPath {
+            reason: format!(
+                "the installed sbh service runs the daemon with --config {}",
+                path.display()
+            ),
+            path,
+            source: ConfigPathSource::Service,
+            exists: true,
+            shadowed_user_config: None,
+        };
+    }
     resolve_config_path_from(
         explicit,
         env_config.as_deref(),
@@ -1600,6 +1620,110 @@ fn effective_uid_is_root() -> bool {
     {
         false
     }
+}
+
+/// The config file the installed sbh service starts the daemon with, when
+/// this process can read it.
+///
+/// Without this, an invocation with no `--config` resolved by user and
+/// privilege alone, while fleet units start the daemon with an explicit
+/// `--config /root/.config/sbh/config.toml`: `sudo sbh status` then read a
+/// stale `/etc/sbh/config.toml`, reported the daemon as not running and
+/// zero deletions on most hosts, and `sbh config set` edited a file the
+/// daemon never loads (fleet audit 2026-09-24). The service definition is
+/// the one place that names the daemon's file. Root checks the system
+/// service first; other users check their own user service first. Ignored
+/// under `SBH_TEST_MODE` and in unit tests, which must not read the host's
+/// units.
+fn installed_service_config() -> Option<PathBuf> {
+    if cfg!(test) || env::var_os("SBH_TEST_MODE").is_some() {
+        return None;
+    }
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let system_units = PathBuf::from("/etc/systemd/system");
+    let user_units = home.as_ref().map(|h| h.join(".config/systemd/user"));
+    let system_plist = PathBuf::from("/Library/LaunchDaemons/com.sbh.daemon.plist");
+    let user_plist = home
+        .as_ref()
+        .map(|h| h.join("Library/LaunchAgents/com.sbh.daemon.plist"));
+
+    let from_unit = |dir: &Path| config_from_systemd_unit_dir(dir);
+    let from_plist = |plist: &Path| {
+        fs::read_to_string(plist)
+            .ok()
+            .and_then(|text| config_from_launchd_plist(&text))
+    };
+    let system = || from_unit(&system_units).or_else(|| from_plist(&system_plist));
+    let user = || {
+        user_units
+            .as_deref()
+            .and_then(from_unit)
+            .or_else(|| user_plist.as_deref().and_then(from_plist))
+    };
+    let candidate = if effective_uid_is_root() {
+        system().or_else(user)
+    } else {
+        user().or_else(system)
+    };
+    candidate.filter(|path| fs::File::open(path).is_ok())
+}
+
+/// `--config` of the effective `ExecStart=` in `<dir>/sbh.service` and its
+/// `sbh.service.d/*.conf` drop-ins (the last assignment wins, as in systemd).
+fn config_from_systemd_unit_dir(dir: &Path) -> Option<PathBuf> {
+    let unit = fs::read_to_string(dir.join("sbh.service")).ok()?;
+    let mut texts = vec![unit];
+    if let Ok(entries) = fs::read_dir(dir.join("sbh.service.d")) {
+        let mut dropins: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "conf"))
+            .collect();
+        dropins.sort();
+        texts.extend(dropins.iter().filter_map(|p| fs::read_to_string(p).ok()));
+    }
+    config_from_systemd_texts(&texts)
+}
+
+fn config_from_systemd_texts(texts: &[String]) -> Option<PathBuf> {
+    let exec_start = texts
+        .iter()
+        .rev()
+        .flat_map(|text| text.lines().rev())
+        .filter_map(|line| line.trim().strip_prefix("ExecStart="))
+        .find(|value| !value.trim().is_empty())?;
+    config_flag_value(exec_start.split_whitespace())
+}
+
+fn config_flag_value<'a>(mut args: impl Iterator<Item = &'a str>) -> Option<PathBuf> {
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            return args.next().map(PathBuf::from);
+        }
+        if let Some(value) = arg.strip_prefix("--config=") {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
+}
+
+/// `--config` in `ProgramArguments`, else `SBH_CONFIG_PATH` in
+/// `EnvironmentVariables`, of a launchd plist.
+fn config_from_launchd_plist(text: &str) -> Option<PathBuf> {
+    let strings: Vec<&str> = text
+        .split("<string>")
+        .skip(1)
+        .filter_map(|chunk| chunk.split("</string>").next())
+        .collect();
+    if let Some(path) = config_flag_value(strings.iter().copied()) {
+        return Some(path);
+    }
+    let after_key = text.split("<key>SBH_CONFIG_PATH</key>").nth(1)?;
+    let value = after_key
+        .split("<string>")
+        .nth(1)?
+        .split("</string>")
+        .next()?;
+    Some(PathBuf::from(value.trim()))
 }
 
 /// Platform data directory of a system-scope service.
@@ -2854,6 +2978,53 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    /// The service definition names the daemon's config: the last
+    /// `ExecStart=` across unit and drop-ins wins, both flag spellings parse,
+    /// and a unit without `--config` names nothing.
+    #[test]
+    fn service_config_comes_from_the_effective_exec_start() {
+        use super::config_from_systemd_texts;
+        let unit = "[Service]\nExecStart=/usr/local/bin/sbh daemon --config /etc/sbh/config.toml\n"
+            .to_string();
+        assert_eq!(
+            config_from_systemd_texts(std::slice::from_ref(&unit)),
+            Some(PathBuf::from("/etc/sbh/config.toml"))
+        );
+        let dropin =
+            "[Service]\nExecStart=\nExecStart=/usr/local/bin/sbh daemon --config=/root/.config/sbh/config.toml\n"
+                .to_string();
+        assert_eq!(
+            config_from_systemd_texts(&[unit, dropin]),
+            Some(PathBuf::from("/root/.config/sbh/config.toml"))
+        );
+        let bare = "[Service]\nExecStart=/usr/local/bin/sbh daemon\n".to_string();
+        assert_eq!(config_from_systemd_texts(&[bare]), None);
+    }
+
+    #[test]
+    fn launchd_plist_names_the_config_by_argument_or_environment() {
+        use super::config_from_launchd_plist;
+        let by_argument = "<key>ProgramArguments</key><array><string>/usr/local/bin/sbh</string>\
+            <string>daemon</string><string>--config</string><string>/Users/op/sbh.toml</string></array>";
+        assert_eq!(
+            config_from_launchd_plist(by_argument),
+            Some(PathBuf::from("/Users/op/sbh.toml"))
+        );
+        let by_env = "<key>ProgramArguments</key><array><string>sbh</string><string>daemon</string>\
+            </array><key>EnvironmentVariables</key><dict><key>SBH_CONFIG_PATH</key>\
+            <string>/Users/op/Library/Application Support/sbh/config.toml</string></dict>";
+        assert_eq!(
+            config_from_launchd_plist(by_env),
+            Some(PathBuf::from(
+                "/Users/op/Library/Application Support/sbh/config.toml"
+            ))
+        );
+        assert_eq!(
+            config_from_launchd_plist("<array><string>sbh</string></array>"),
+            None
+        );
+    }
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
