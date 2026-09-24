@@ -600,8 +600,10 @@ mod tests {
         assert_eq!(device_score.decision.action, DecisionAction::Keep);
     }
 
+    /// Service-worker CacheStorage is application storage (offline-only
+    /// content), report-only since a6b0a61: labeled and sized, never deleted.
     #[test]
-    fn electron_service_worker_cache_is_actionable_cache_dir() {
+    fn electron_service_worker_cache_is_report_only_cache_dir() {
         let registry = ArtifactPatternRegistry::default();
         let engine = default_engine();
         let path = PathBuf::from(
@@ -627,8 +629,11 @@ mod tests {
             0.8,
         );
 
-        assert!(!score.vetoed);
-        assert_eq!(score.decision.action, DecisionAction::Delete);
+        assert!(
+            score.vetoed,
+            "report-only application storage must be vetoed"
+        );
+        assert_ne!(score.decision.action, DecisionAction::Delete);
     }
 
     #[test]

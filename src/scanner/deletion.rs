@@ -144,6 +144,11 @@ pub struct DeletionPlan {
     pub estimated_items: usize,
     /// What executing this plan does to each candidate.
     pub mode: DeletionMode,
+    /// Candidates `plan()` refused at admission, with the reason. `execute`
+    /// records each as a skip and backs it off, so a refusal is attributed
+    /// in the report and the scanner index instead of being dropped silently
+    /// and re-proposed every cycle.
+    pub refused: Vec<(CandidacyScore, SkipReason)>,
 }
 
 /// Summary after a deletion batch completes.
@@ -422,7 +427,9 @@ impl SkipReason {
             Self::NotWritable => {
                 "parent directory not writable — usually a systemd ReadWritePaths= gap"
             }
-            Self::Vetoed => "candidate vetoed, suspended, ineligible, or carrying invalid decision evidence",
+            Self::Vetoed => {
+                "candidate vetoed, suspended, ineligible, or carrying invalid decision evidence"
+            }
             Self::BelowThreshold => "score below min_score, or score/threshold is invalid",
             Self::Symlink => "candidate is a symlink",
             Self::IdentityUnavailable => "filesystem identity could not be re-verified",
@@ -539,10 +546,22 @@ impl DeletionExecutor {
     /// when `include_review` is set for emergency escalation — not vetoed,
     /// above score threshold), then sorts unambiguous Delete decisions before
     /// Review escalations, by score descending within each group.
-    pub fn plan(&self, mut candidates: Vec<CandidacyScore>) -> DeletionPlan {
+    pub fn plan(&self, candidates: Vec<CandidacyScore>) -> DeletionPlan {
         // Use the same eligibility rule as execution. A public plan is not
         // a capability to bypass vetoes or the receiving executor's policy.
-        candidates.retain(|candidate| eligibility::check(candidate, &self.config).is_ok());
+        let mut refused = Vec::new();
+        let mut candidates: Vec<CandidacyScore> = candidates
+            .into_iter()
+            .filter_map(
+                |candidate| match eligibility::check(&candidate, &self.config) {
+                    Ok(()) => Some(candidate),
+                    Err(reason) => {
+                        refused.push((candidate, reason));
+                        None
+                    }
+                },
+            )
+            .collect();
 
         // Sort: unambiguous Delete decisions first, then Review escalations,
         // score descending within each group (most obvious artifacts first) —
@@ -568,6 +587,7 @@ impl DeletionExecutor {
             total_reclaimable_bytes,
             estimated_items,
             mode: self.config.mode,
+            refused,
         }
     }
 
@@ -605,6 +625,13 @@ impl DeletionExecutor {
             bytes_quarantined: 0,
             quarantine_unavailable: 0,
         };
+
+        for (candidate, reason) in &plan.refused {
+            report.record_skip(*reason);
+            if should_backoff_skip(*reason) {
+                report.backoff_candidates.push(candidate.clone());
+            }
+        }
 
         let mut consecutive_failures: u32 = 0;
         let mut sacred = SacredScanStats::default();
@@ -733,7 +760,8 @@ impl DeletionExecutor {
 
             if self.config.dry_run {
                 report.items_would_delete += 1;
-                report.bytes_would_free = report.bytes_would_free.saturating_add(candidate.size_bytes);
+                report.bytes_would_free =
+                    report.bytes_would_free.saturating_add(candidate.size_bytes);
                 Self::log_dry_run(candidate);
                 continue;
             }
@@ -753,10 +781,12 @@ impl DeletionExecutor {
                     report.deleted_paths.push(candidate.path.clone());
                     if quarantined {
                         report.items_quarantined += 1;
-                        report.bytes_quarantined =
-                            report.bytes_quarantined.saturating_add(candidate.size_bytes);
+                        report.bytes_quarantined = report
+                            .bytes_quarantined
+                            .saturating_add(candidate.size_bytes);
                     } else {
-                        report.bytes_freed = report.bytes_freed.saturating_add(candidate.size_bytes);
+                        report.bytes_freed =
+                            report.bytes_freed.saturating_add(candidate.size_bytes);
                     }
                     consecutive_failures = 0;
 
@@ -3432,16 +3462,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn go_cache_candidate_is_not_vetoed_as_source_despite_go_mod() {
-        // The candidate IS a module dir whose direct child is go.mod — exactly
-        // what `looks_like_source_code` vetoes. With the GoCache carve-out it
-        // must delete; with any other category it must be source-vetoed.
+        // A real GOMODCACHE root holds module source (go.mod, *.go) BELOW
+        // its root, which the source veto must not treat as a source tree.
         let dir = scratch_dir();
 
-        // Positive case: GoCache classification deletes through the veto.
-        let go_dir = dir.path().join("m@v1.0.0");
-        fs::create_dir_all(&go_dir).unwrap();
-        fs::write(go_dir.join("go.mod"), "module m\n").unwrap();
-        fs::write(go_dir.join("lib.go"), "package m\n").unwrap();
+        // Positive case: a structurally verified module cache deletes.
+        let go_dir = dir.path().join("gomodcache");
+        fs::create_dir_all(go_dir.join("cache/download/example.com/m/@v")).unwrap();
+        let module = go_dir.join("example.com/m@v1.0.0");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("go.mod"), "module m\n").unwrap();
+        fs::write(module.join("lib.go"), "package m\n").unwrap();
         let mut go_candidate = make_candidate(&go_dir, 4096, 0.93);
         go_candidate.classification = go_cache_classification();
 
@@ -3458,6 +3489,19 @@ mod tests {
             "go cache must not be source-vetoed"
         );
         assert!(!go_dir.exists());
+
+        // A GoCache label on a directory with go.mod AT its root is not a
+        // module cache: the label grants no exemption (source stays put).
+        let labeled = dir.path().join("m@v1.0.0");
+        fs::create_dir_all(&labeled).unwrap();
+        fs::write(labeled.join("go.mod"), "module m\n").unwrap();
+        fs::write(labeled.join("lib.go"), "package m\n").unwrap();
+        let mut labeled_candidate = make_candidate(&labeled, 4096, 0.93);
+        labeled_candidate.classification = go_cache_classification();
+        let report = executor.execute(&executor.plan(vec![labeled_candidate]), None);
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert!(labeled.join("go.mod").exists());
 
         // Control: same shape, non-GoCache category → vetoed as source.
         let src_dir = dir.path().join("real_src");

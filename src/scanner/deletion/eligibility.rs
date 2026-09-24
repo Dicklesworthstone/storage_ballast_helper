@@ -80,16 +80,17 @@ fn check_path(candidate: &CandidacyScore, config: &DeletionConfig) -> Result<(),
     };
     for ancestor in marker_root.ancestors() {
         match fs::symlink_metadata(ancestor.join(protection::MARKER_FILENAME)) {
-            // Any marker entry protects, even a dangling symlink. Reading
-            // marker metadata is unnecessary and could block on a FIFO.
-            Ok(_) => return Err(SkipReason::SacredStowaway),
             Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(_) => return Err(SkipReason::SacredStowaway),
+            // Any marker entry protects, even a dangling symlink, and so does
+            // an unreadable one. Reading marker metadata is unnecessary and
+            // could block on a FIFO.
+            _ => return Err(SkipReason::SacredStowaway),
         }
     }
     if metadata.is_dir() {
         check_directory_root(&normalized)?;
-        if candidate.classification.category == crate::scanner::patterns::ArtifactCategory::GoCache {
+        if candidate.classification.category == crate::scanner::patterns::ArtifactCategory::GoCache
+        {
             check_go_cache(&normalized)?;
         }
     }
@@ -198,7 +199,9 @@ mod tests {
     use crate::scanner::deletion::{CheckedDeletion, DeletionExecutor, DeletionMode, DeletionPlan};
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::quarantine::QuarantineStore;
-    use crate::scanner::scoring::{ArtifactCertainty, DecisionOutcome, EvidenceLedger, ScoreFactors};
+    use crate::scanner::scoring::{
+        ArtifactCertainty, DecisionOutcome, EvidenceLedger, ScoreFactors,
+    };
     use crate::scanner::walker::identity_for_path;
 
     const PAYLOAD: &[u8] = b"preserve these bytes";
@@ -267,6 +270,7 @@ mod tests {
             total_reclaimable_bytes: item.size_bytes,
             estimated_items: 1,
             mode,
+            refused: Vec::new(),
         }
     }
 
@@ -316,9 +320,9 @@ mod tests {
                 };
                 let mut cfg = config(dir.path(), mode);
                 cfg.sacred_paths
-                    .extend(protection::sacred_paths_from_protected_patterns(&[
-                        pattern.to_string_lossy().into_owned(),
-                    ]));
+                    .extend(protection::sacred_paths_from_protected_patterns(&[pattern
+                        .to_string_lossy()
+                        .into_owned()]));
                 let executor = DeletionExecutor::new(cfg, None);
                 assert_refused(&executor, &candidate(&path), mode);
                 assert_eq!(fs::read(path).unwrap(), PAYLOAD);
@@ -417,9 +421,11 @@ mod tests {
         fs::write(&path, PAYLOAD).unwrap();
         let mut cfg = config(dir.path(), DeletionMode::Unlink);
         cfg.sacred_paths
-            .extend(protection::sacred_paths_from_protected_patterns(&[
-                dir.path().join("keep").to_string_lossy().into_owned(),
-            ]));
+            .extend(protection::sacred_paths_from_protected_patterns(&[dir
+                .path()
+                .join("keep")
+                .to_string_lossy()
+                .into_owned()]));
         let executor = DeletionExecutor::new(cfg, None);
         assert_refused(&executor, &candidate(&path), DeletionMode::Unlink);
         assert_eq!(fs::read(path).unwrap(), PAYLOAD);
@@ -725,9 +731,9 @@ mod tests {
                 };
                 let mut cfg = config(dir.path(), mode);
                 cfg.sacred_paths
-                    .extend(protection::sacred_paths_from_protected_patterns(&[
-                        pattern.to_string_lossy().into_owned(),
-                    ]));
+                    .extend(protection::sacred_paths_from_protected_patterns(&[pattern
+                        .to_string_lossy()
+                        .into_owned()]));
                 let item = candidate(&alias.join("target"));
                 let executor = DeletionExecutor::new(cfg, None);
                 assert!(executor.explain_preflight(&item, None).is_ok());

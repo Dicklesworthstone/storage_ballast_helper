@@ -12,13 +12,13 @@ use std::time::Duration;
 
 use storage_ballast_helper::scanner::decision_record::stable_decision_id;
 use storage_ballast_helper::scanner::deletion::{
-    CheckedDeletion, DeletionConfig, DeletionExecutor, DeletionPlan, SkipReason,
-    DeletionMode,
+    CheckedDeletion, DeletionConfig, DeletionExecutor, DeletionMode, DeletionPlan, SkipReason,
 };
 use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactClassification};
 use storage_ballast_helper::scanner::quarantine::QuarantineStore;
 use storage_ballast_helper::scanner::scoring::{
-    ArtifactCertainty, CandidacyScore, DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors,
+    ArtifactCertainty, CandidacyScore, DecisionAction, DecisionOutcome, EvidenceLedger,
+    ScoreFactors,
 };
 use storage_ballast_helper::scanner::walker::identity_for_path;
 
@@ -97,6 +97,7 @@ fn raw_plan(candidates: Vec<CandidacyScore>, mode: DeletionMode) -> DeletionPlan
             .fold(0, u64::saturating_add),
         candidates,
         mode,
+        refused: Vec::new(),
     }
 }
 
@@ -116,19 +117,67 @@ fn public_plans_and_direct_calls_cannot_bypass_decision_refusals() {
             |c| c.decision.category_suspended = true,
             SkipReason::Vetoed,
         ),
-        ("keep", |c| c.decision.action = DecisionAction::Keep, SkipReason::Vetoed),
-        ("review", |c| c.decision.action = DecisionAction::Review, SkipReason::Vetoed),
+        (
+            "keep",
+            |c| c.decision.action = DecisionAction::Keep,
+            SkipReason::Vetoed,
+        ),
+        (
+            "review",
+            |c| c.decision.action = DecisionAction::Review,
+            SkipReason::Vetoed,
+        ),
         ("weak", |c| c.total_score = 0.1, SkipReason::BelowThreshold),
-        ("nan-score", |c| c.total_score = f64::NAN, SkipReason::BelowThreshold),
-        ("infinite-score", |c| c.total_score = f64::INFINITY, SkipReason::BelowThreshold),
-        ("negative-score", |c| c.total_score = -1.0, SkipReason::BelowThreshold),
-        ("nan-posterior", |c| c.decision.posterior_abandoned = f64::NAN, SkipReason::Vetoed),
-        ("large-posterior", |c| c.decision.posterior_abandoned = 1.1, SkipReason::Vetoed),
-        ("negative-posterior", |c| c.decision.posterior_abandoned = -0.1, SkipReason::Vetoed),
-        ("negative-loss", |c| c.decision.expected_loss_delete = -1.0, SkipReason::Vetoed),
-        ("infinite-loss", |c| c.decision.expected_loss_keep = f64::INFINITY, SkipReason::Vetoed),
-        ("nan-calibration", |c| c.decision.calibration_score = f64::NAN, SkipReason::Vetoed),
-        ("nan-regret", |c| c.decision.regret_calibration = f64::NAN, SkipReason::Vetoed),
+        (
+            "nan-score",
+            |c| c.total_score = f64::NAN,
+            SkipReason::BelowThreshold,
+        ),
+        (
+            "infinite-score",
+            |c| c.total_score = f64::INFINITY,
+            SkipReason::BelowThreshold,
+        ),
+        (
+            "negative-score",
+            |c| c.total_score = -1.0,
+            SkipReason::BelowThreshold,
+        ),
+        (
+            "nan-posterior",
+            |c| c.decision.posterior_abandoned = f64::NAN,
+            SkipReason::Vetoed,
+        ),
+        (
+            "large-posterior",
+            |c| c.decision.posterior_abandoned = 1.1,
+            SkipReason::Vetoed,
+        ),
+        (
+            "negative-posterior",
+            |c| c.decision.posterior_abandoned = -0.1,
+            SkipReason::Vetoed,
+        ),
+        (
+            "negative-loss",
+            |c| c.decision.expected_loss_delete = -1.0,
+            SkipReason::Vetoed,
+        ),
+        (
+            "infinite-loss",
+            |c| c.decision.expected_loss_keep = f64::INFINITY,
+            SkipReason::Vetoed,
+        ),
+        (
+            "nan-calibration",
+            |c| c.decision.calibration_score = f64::NAN,
+            SkipReason::Vetoed,
+        ),
+        (
+            "nan-regret",
+            |c| c.decision.regret_calibration = f64::NAN,
+            SkipReason::Vetoed,
+        ),
     ];
     for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
         let dir = scratch();
@@ -136,12 +185,19 @@ fn public_plans_and_direct_calls_cannot_bypass_decision_refusals() {
         for &(name, corrupt, expected) in cases {
             let mut item = artifact(dir.path(), name);
             corrupt(&mut item);
-            assert!(executor.plan(vec![item.clone()]).candidates.is_empty(), "{name}");
+            assert!(
+                executor.plan(vec![item.clone()]).candidates.is_empty(),
+                "{name}"
+            );
             // Deliberately bypass plan() and supply an otherwise plausible plan.
             let report = executor.execute(&raw_plan(vec![item.clone()], mode), None);
             assert_eq!(report.items_deleted, 0, "{name} {mode:?}");
             assert_eq!(report.items_skipped, 1, "{name} {mode:?}");
-            assert_eq!(report.skipped_by_reason.get(expected.as_str()), Some(&1), "{name}");
+            assert_eq!(
+                report.skipped_by_reason.get(expected.as_str()),
+                Some(&1),
+                "{name}"
+            );
             assert_eq!(report.bytes_freed, 0, "{name}");
             assert_eq!(
                 executor.delete_candidate_checked(&item, None).unwrap(),
@@ -285,7 +341,9 @@ fn a_known_open_path_remains_a_veto_with_explicit_review_consent() {
     let handle = fs::File::open(&item.path).unwrap();
     let open = HashSet::from([fs::canonicalize(&item.path).unwrap()]);
     assert_eq!(
-        executor.delete_candidate_checked(&item, Some(&open)).unwrap(),
+        executor
+            .delete_candidate_checked(&item, Some(&open))
+            .unwrap(),
         CheckedDeletion::Skipped(SkipReason::FileOpen)
     );
     assert_eq!(fs::read(&item.path).unwrap(), PAYLOAD);
@@ -341,7 +399,10 @@ fn duplicate_recovery_ids_never_delete_the_rebuilt_original() {
     );
     let rebuilt = b"rebuilt bytes";
     fs::write(&item.path, rebuilt).unwrap();
-    let report = executor.execute(&raw_plan(vec![item.clone()], DeletionMode::Quarantine), None);
+    let report = executor.execute(
+        &raw_plan(vec![item.clone()], DeletionMode::Quarantine),
+        None,
+    );
     assert_eq!(report.items_deleted, 0);
     assert_eq!(report.quarantine_unavailable, 1);
     assert!(executor.delete_candidate_checked(&item, None).is_err());
@@ -424,7 +485,10 @@ fn one_unavailable_store_does_not_prevent_an_independent_quarantine() {
     cfg.quarantine_roots = vec![first_root, second_root.clone()];
     let executor = DeletionExecutor::new(cfg, None);
     let report = executor.execute(
-        &raw_plan(vec![first.clone(), second.clone()], DeletionMode::Quarantine),
+        &raw_plan(
+            vec![first.clone(), second.clone()],
+            DeletionMode::Quarantine,
+        ),
         None,
     );
     assert_eq!(report.items_failed, 1);

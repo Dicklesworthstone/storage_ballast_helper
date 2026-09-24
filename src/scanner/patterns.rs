@@ -2231,7 +2231,19 @@ mod tests {
                 "unexpected pattern for {path}"
             );
             assert_eq!(classification.category, ArtifactCategory::CacheDir);
-            assert!(classification.combined_confidence > 0.70);
+            // IndexedDB, CacheStorage and vm_bundles keep their labels but are
+            // report-only application storage (a6b0a61; covered by the
+            // catalog's `report_only_rules_never_delete`), so only the
+            // regenerable HTTP/code/GPU caches carry actionable confidence.
+            let report_only = matches!(
+                expected_pattern,
+                "electron-service-worker-cache" | "electron-indexed-db" | "electron-vm-bundles"
+            );
+            assert_eq!(
+                classification.combined_confidence > 0.70,
+                !report_only,
+                "confidence for {path}"
+            );
             assert_eq!(extract_macos_pattern_label(path), expected_pattern);
         }
     }
