@@ -167,6 +167,18 @@ impl MultiProvisionReport {
 pub struct BallastPoolCoordinator {
     pools: HashMap<PathBuf, BallastPool>,
     skipped_pools: HashMap<PathBuf, SkippedPoolInfo>,
+    /// Mount entries that are the same filesystem as a pooled mount (bind
+    /// mounts, e.g. the `ReadWritePaths=` binds a sandboxed systemd unit
+    /// sees), mapped to the mount that holds that filesystem's pool.
+    aliases: HashMap<PathBuf, PathBuf>,
+}
+
+/// The mount planning decided on: pools to build, mounts skipped with a
+/// reason, and duplicate mounts aliased to the mount holding their pool.
+struct PoolPlan {
+    planned: Vec<PlannedPool>,
+    skipped: HashMap<PathBuf, SkippedPoolInfo>,
+    aliases: HashMap<PathBuf, PathBuf>,
 }
 
 impl BallastPoolCoordinator {
@@ -221,10 +233,12 @@ impl BallastPoolCoordinator {
         manager_platform: &Arc<dyn Platform>,
         configured_ballast_dir: Option<&Path>,
     ) -> Result<Self> {
-        let (planned, skipped_pools) =
-            Self::plan_pools(config, watched_paths, platform, configured_ballast_dir)?;
+        let PoolPlan {
+            planned,
+            skipped: mut skipped_pools,
+            aliases,
+        } = Self::plan_pools(config, watched_paths, platform, configured_ballast_dir)?;
         let mut pools = HashMap::new();
-        let mut skipped_pools = skipped_pools;
         for plan in planned {
             let mut manager = match BallastManager::with_platform(
                 plan.ballast_dir.clone(),
@@ -267,7 +281,16 @@ impl BallastPoolCoordinator {
         Ok(Self {
             pools,
             skipped_pools,
+            aliases,
         })
+    }
+
+    /// The mount whose pool serves `mount_path` (itself unless it is an
+    /// alias of another mount on the same filesystem).
+    fn pool_key<'a>(&'a self, mount_path: &'a Path) -> &'a Path {
+        self.aliases
+            .get(mount_path)
+            .map_or(mount_path, PathBuf::as_path)
     }
 
     /// Read-only view of every pool the coordinator would manage for this
@@ -280,8 +303,9 @@ impl BallastPoolCoordinator {
         platform: &dyn Platform,
         configured_ballast_dir: Option<&Path>,
     ) -> Result<Vec<PoolInventory>> {
-        let (planned, skipped) =
-            Self::plan_pools(config, watched_paths, platform, configured_ballast_dir)?;
+        let PoolPlan {
+            planned, skipped, ..
+        } = Self::plan_pools(config, watched_paths, platform, configured_ballast_dir)?;
         let mut inventory: Vec<PoolInventory> = planned
             .into_iter()
             .map(|plan| {
@@ -331,7 +355,7 @@ impl BallastPoolCoordinator {
         watched_paths: &[PathBuf],
         platform: &dyn Platform,
         configured_ballast_dir: Option<&Path>,
-    ) -> Result<(Vec<PlannedPool>, HashMap<PathBuf, SkippedPoolInfo>)> {
+    ) -> Result<PoolPlan> {
         let mounts = platform.mount_points()?;
         let mut planned = Vec::new();
         let mut skipped_pools = HashMap::new();
@@ -339,7 +363,7 @@ impl BallastPoolCoordinator {
         // Deduplicate watched paths by mount point.
         let mut seen_mounts = HashMap::<PathBuf, MountPoint>::new();
         for path in watched_paths {
-            if let Some(mount) = find_mount(path, &mounts) {
+            if let Some(mount) = owning_mount(path, platform, &mounts) {
                 seen_mounts
                     .entry(mount.path.clone())
                     .or_insert_with(|| mount.clone());
@@ -350,7 +374,30 @@ impl BallastPoolCoordinator {
         // ballast dir, so only that single pool is redirected to the configured
         // path (not every ancestor mount, e.g. `/` of `/data/...`).
         let configured_owner_mount =
-            configured_owner_mount(configured_ballast_dir, &mounts, &seen_mounts);
+            configured_owner_mount(configured_ballast_dir, platform, &mounts, &seen_mounts);
+
+        // One pool per filesystem: fold mount entries of the same device.
+        let aliases = fold_same_filesystem_mounts(
+            &mut seen_mounts,
+            platform,
+            configured_owner_mount.as_deref(),
+        );
+        for (alias, keeper) in &aliases {
+            if let Some(mount) = mounts.iter().find(|m| &m.path == alias) {
+                skipped_pools.insert(
+                    alias.clone(),
+                    SkippedPoolInfo {
+                        ballast_dir: keeper.join(BALLAST_SUBDIR),
+                        fs_type: mount.fs_type.clone(),
+                        strategy: provision_strategy(&mount.fs_type),
+                        reason: format!(
+                            "same filesystem as {} (its pool serves this mount)",
+                            keeper.display()
+                        ),
+                    },
+                );
+            }
+        }
 
         for (mount_path, mount) in &seen_mounts {
             let mount_str = mount_path.to_string_lossy();
@@ -426,7 +473,11 @@ impl BallastPoolCoordinator {
             });
         }
 
-        Ok((planned, skipped_pools))
+        Ok(PoolPlan {
+            planned,
+            skipped: skipped_pools,
+            aliases,
+        })
     }
 
     /// Apply one headroom floor to every pool (percent free that must remain
@@ -482,7 +533,8 @@ impl BallastPoolCoordinator {
         mount_path: &Path,
         count: usize,
     ) -> Result<Option<ReleaseReport>> {
-        let Some(pool) = self.pools.get_mut(mount_path) else {
+        let key = self.pool_key(mount_path).to_path_buf();
+        let Some(pool) = self.pools.get_mut(&key) else {
             return Ok(None);
         };
 
@@ -502,7 +554,8 @@ impl BallastPoolCoordinator {
         mount_path: &Path,
         free_pct_check: Option<&dyn Fn() -> f64>,
     ) -> Result<Option<ProvisionReport>> {
-        let Some(pool) = self.pools.get_mut(mount_path) else {
+        let key = self.pool_key(mount_path).to_path_buf();
+        let Some(pool) = self.pools.get_mut(&key) else {
             return Ok(None);
         };
 
@@ -590,12 +643,12 @@ impl BallastPoolCoordinator {
 
     /// Check if a specific mount point has a pool.
     pub fn has_pool(&self, mount_path: &Path) -> bool {
-        self.pools.contains_key(mount_path)
+        self.pools.contains_key(self.pool_key(mount_path))
     }
 
     /// Get the pool for a specific mount point (immutable).
     pub fn pool_for_mount(&self, mount_path: &Path) -> Option<&BallastPool> {
-        self.pools.get(mount_path)
+        self.pools.get(self.pool_key(mount_path))
     }
 
     /// Resolve a path to its mount point and return the associated pool.
@@ -605,10 +658,10 @@ impl BallastPoolCoordinator {
         platform: &dyn Platform,
     ) -> Result<Option<&BallastPool>> {
         let mounts = platform.mount_points()?;
-        let Some(mount) = find_mount(path, &mounts) else {
+        let Some(mount) = owning_mount(path, platform, &mounts) else {
             return Ok(None);
         };
-        Ok(self.pools.get(&mount.path))
+        Ok(self.pools.get(self.pool_key(&mount.path)))
     }
 
     /// Release ballast for a path (resolves to mount point first).
@@ -619,10 +672,11 @@ impl BallastPoolCoordinator {
         platform: &dyn Platform,
     ) -> Result<Option<ReleaseReport>> {
         let mounts = platform.mount_points()?;
-        let Some(mount) = find_mount(path, &mounts) else {
+        let Some(mount) = owning_mount(path, platform, &mounts) else {
             return Ok(None);
         };
-        self.release_for_mount(&mount.path, count)
+        let mount_path = mount.path.clone();
+        self.release_for_mount(&mount_path, count)
     }
 
     /// Propagate configuration updates to all pools.
@@ -656,11 +710,12 @@ fn per_volume_config(config: &BallastConfig, mount_str: &str) -> BallastConfig {
 /// `/` is never redirected away from its `.sbh/ballast` default.
 fn configured_owner_mount(
     configured_ballast_dir: Option<&Path>,
+    platform: &dyn Platform,
     mounts: &[MountPoint],
     seen_mounts: &HashMap<PathBuf, MountPoint>,
 ) -> Option<PathBuf> {
     let dir = configured_ballast_dir?;
-    let mount = find_mount(dir, mounts)?;
+    let mount = owning_mount(dir, platform, mounts)?;
     if seen_mounts.contains_key(&mount.path) {
         Some(mount.path.clone())
     } else {
@@ -668,21 +723,91 @@ fn configured_owner_mount(
     }
 }
 
-/// Resolve the ballast directory for a single volume.
+/// The mount entry that holds `path`, as the kernel reports it.
 ///
-/// When the operator configured an explicit `[paths] ballast_dir` and that
-/// directory lives on this `mount_path`, the configured directory is used
-/// verbatim (honoring issue #14). Otherwise the per-volume `.sbh/ballast`
-/// subdirectory is used so that ballast still lands on the right filesystem.
-pub(crate) fn resolve_ballast_dir(mount_path: &Path, configured: Option<&Path>) -> PathBuf {
-    if let Some(configured) = configured {
-        // Only honor the configured dir for the mount that actually contains
-        // it; other discovered volumes keep their own subdirectory pool.
-        if configured.starts_with(mount_path) {
-            return configured.to_path_buf();
+/// A path-prefix match is wrong where the namespace is stitched together:
+/// on macOS `/Users/...` lives on `/System/Volumes/Data` through a firmlink,
+/// so the prefix match picked the sealed, read-only `/` and every macOS pool
+/// was skipped as "read-only filesystem". The platform's `fs_stats` answers
+/// from `statfs`; the nearest existing ancestor stands in for a path that
+/// does not exist yet (an unprovisioned ballast dir). The prefix match
+/// remains the fallback when the platform cannot say.
+fn owning_mount<'a>(
+    path: &Path,
+    platform: &dyn Platform,
+    mounts: &'a [MountPoint],
+) -> Option<&'a MountPoint> {
+    let reported = path
+        .ancestors()
+        .find_map(|candidate| platform.fs_stats(candidate).ok())
+        .map(|stats| stats.mount_point);
+    reported
+        .and_then(|mount_point| mounts.iter().find(|mount| mount.path == mount_point))
+        .or_else(|| find_mount(path, mounts))
+}
+
+/// Fold mount entries that are the same filesystem into one pool, returning
+/// each folded entry mapped to the mount that keeps the pool.
+///
+/// A sandboxed systemd unit (`ProtectSystem=strict`) sees every
+/// `ReadWritePaths=` entry as its own bind mount of the root filesystem;
+/// planning one pool per entry built several pools on one disk and released
+/// none of them when the pressured entry was not the one holding files
+/// (vmi1227854: Critical with 10 GiB of ballast, 0 released). The keeper is
+/// the mount that owns the configured ballast dir, else the first writable
+/// entry (the read-only bind of `/` under `ProtectSystem=strict` cannot hold
+/// files), else the first entry, in path order.
+///
+/// Identity is the mount's source block device as the platform reports it:
+/// a bind mount repeats its source's device. Only real `/dev/` devices fold;
+/// pseudo sources (`tmpfs`, `overlay`, `none`) are shared by unrelated
+/// filesystems.
+fn fold_same_filesystem_mounts(
+    seen_mounts: &mut HashMap<PathBuf, MountPoint>,
+    platform: &dyn Platform,
+    configured_owner: Option<&Path>,
+) -> HashMap<PathBuf, PathBuf> {
+    let mut by_device: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for (mount_path, mount) in seen_mounts.iter() {
+        if mount.device.starts_with("/dev/") {
+            by_device
+                .entry(mount.device.clone())
+                .or_default()
+                .push(mount_path.clone());
         }
     }
-    mount_path.join(BALLAST_SUBDIR)
+    let mut aliases = HashMap::new();
+    for mut group in by_device.into_values().filter(|group| group.len() > 1) {
+        group.sort();
+        let writable = |path: &PathBuf| {
+            platform
+                .fs_stats(path)
+                .is_ok_and(|stats| !stats.is_readonly)
+        };
+        let keeper = configured_owner
+            .and_then(|owner| group.iter().find(|path| path.as_path() == owner))
+            .or_else(|| group.iter().find(|path| writable(path)))
+            .unwrap_or(&group[0])
+            .clone();
+        for path in group {
+            if path != keeper {
+                seen_mounts.remove(&path);
+                aliases.insert(path, keeper.clone());
+            }
+        }
+    }
+    aliases
+}
+
+/// Resolve the ballast directory for a single volume.
+///
+/// `configured` is the operator's `[paths] ballast_dir`, passed only for
+/// the mount that owns it (ownership comes from the kernel's answer, see
+/// `owning_mount`, not from a path prefix, which a firmlink breaks); it is
+/// used verbatim (issue #14). Otherwise the per-volume `.sbh/ballast`
+/// subdirectory is used so that ballast still lands on the right filesystem.
+pub(crate) fn resolve_ballast_dir(mount_path: &Path, configured: Option<&Path>) -> PathBuf {
+    configured.map_or_else(|| mount_path.join(BALLAST_SUBDIR), Path::to_path_buf)
 }
 
 /// Provisioning strategy for a given filesystem type.
@@ -723,6 +848,7 @@ mod tests {
     use crate::platform::pal::{FsStats, MemoryInfo, MockPlatform, PlatformPaths};
     use crate::platform::types::PalError;
     use std::collections::HashMap;
+    use std::fs;
 
     fn tiny_ballast_config() -> BallastConfig {
         BallastConfig {
@@ -1379,6 +1505,165 @@ mod tests {
             provision_strategy("foobarfs"),
             ProvisionStrategy::RandomData
         );
+    }
+
+    fn mock_mount(path: &Path, device: &str) -> MountPoint {
+        MountPoint {
+            path: path.to_path_buf(),
+            device: device.to_string(),
+            fs_type: "ext4".to_string(),
+            is_ram_backed: false,
+        }
+    }
+
+    fn mock_stats(mount_point: &Path, is_readonly: bool) -> FsStats {
+        FsStats {
+            total_bytes: 100_000_000_000,
+            free_bytes: 50_000_000_000,
+            available_bytes: 50_000_000_000,
+            fs_type: "ext4".to_string(),
+            mount_point: mount_point.to_path_buf(),
+            is_readonly,
+        }
+    }
+
+    fn mock_memory() -> MemoryInfo {
+        MemoryInfo {
+            total_bytes: 32_000_000_000,
+            available_bytes: 16_000_000_000,
+            swap_total_bytes: 0,
+            swap_free_bytes: 0,
+        }
+    }
+
+    /// A sandboxed systemd unit sees each `ReadWritePaths=` entry as a bind
+    /// mount of the same device (read-only bind of `/` plus writable binds).
+    /// One pool serves them all, on a writable entry, and a release asked of
+    /// any of them reaches it.
+    #[test]
+    fn bind_mounts_of_one_device_share_one_writable_pool() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let home = root.path().join("home");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let platform = MockPlatform::new(
+            vec![
+                mock_mount(root.path(), "/dev/sda1"),
+                mock_mount(&data, "/dev/sda1"),
+                mock_mount(&home, "/dev/sda1"),
+            ],
+            HashMap::from([
+                (root.path().to_path_buf(), mock_stats(root.path(), true)),
+                (data.clone(), mock_stats(&data, false)),
+                (home.clone(), mock_stats(&home, false)),
+            ]),
+            mock_memory(),
+            PlatformPaths::default(),
+        );
+        let watched = vec![root.path().to_path_buf(), home.clone(), data.clone()];
+        let mut coordinator =
+            BallastPoolCoordinator::discover(&tiny_ballast_config(), &watched, &platform).unwrap();
+
+        assert_eq!(coordinator.pool_count(), 1);
+        // Path order picks the first writable entry: `data` < `home`.
+        let pool = coordinator.pool_for_mount(&home).unwrap();
+        assert_eq!(pool.mount_point, data);
+        assert!(coordinator.has_pool(root.path()));
+
+        coordinator.provision_all(&platform).unwrap();
+        let released = coordinator.release_for_mount(&home, 1).unwrap();
+        assert_eq!(released.map(|r| r.files_released), Some(1));
+
+        let inventory = BallastPoolCoordinator::inventory_for_config(
+            &tiny_ballast_config(),
+            &watched,
+            &platform,
+            None,
+        )
+        .unwrap();
+        let folded: Vec<_> = inventory
+            .iter()
+            .filter(|v| {
+                v.skip_reason
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("same filesystem as"))
+            })
+            .map(|v| v.mount_point.clone())
+            .collect();
+        assert_eq!(folded.len(), 2, "{inventory:?}");
+    }
+
+    /// Distinct devices keep distinct pools even when one is mounted inside
+    /// the other.
+    #[test]
+    fn distinct_devices_are_not_folded() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let platform = MockPlatform::new(
+            vec![
+                mock_mount(root.path(), "/dev/sda1"),
+                mock_mount(&data, "/dev/sdb1"),
+            ],
+            HashMap::from([
+                (root.path().to_path_buf(), mock_stats(root.path(), false)),
+                (data.clone(), mock_stats(&data, false)),
+            ]),
+            mock_memory(),
+            PlatformPaths::default(),
+        );
+        let watched = vec![root.path().to_path_buf(), data];
+        let coordinator =
+            BallastPoolCoordinator::discover(&tiny_ballast_config(), &watched, &platform).unwrap();
+        assert_eq!(coordinator.pool_count(), 2);
+    }
+
+    /// macOS firmlinks: `/Users/...` is string-prefixed by the sealed,
+    /// read-only `/` but lives on `/System/Volumes/Data`. The mount comes
+    /// from the platform's `statfs` answer, so the pool lands on the Data
+    /// volume at the configured directory instead of being skipped as
+    /// read-only. (The mock reports stats per prefix-matched mount, so the
+    /// "/" entry's stats carry the Data volume as the owning mount point,
+    /// the way `statfs` answers for a firmlinked path.)
+    #[test]
+    fn firmlinked_ballast_dir_resolves_to_the_owning_data_volume() {
+        let system = tempfile::tempdir().unwrap();
+        let data_volume = tempfile::tempdir().unwrap();
+        let user_dir = system
+            .path()
+            .join("Users/op/Library/Application Support/sbh");
+        fs::create_dir_all(&user_dir).unwrap();
+        let configured = user_dir.join("ballast.bin");
+        let platform = MockPlatform::new(
+            vec![
+                mock_mount(system.path(), "/dev/disk3s1"),
+                mock_mount(data_volume.path(), "/dev/disk3s5"),
+            ],
+            HashMap::from([
+                (
+                    system.path().to_path_buf(),
+                    mock_stats(data_volume.path(), true),
+                ),
+                (
+                    data_volume.path().to_path_buf(),
+                    mock_stats(data_volume.path(), false),
+                ),
+            ]),
+            mock_memory(),
+            PlatformPaths::default(),
+        );
+        let coordinator = BallastPoolCoordinator::discover_with_configured_dir(
+            &tiny_ballast_config(),
+            std::slice::from_ref(&configured),
+            &platform,
+            Some(&configured),
+        )
+        .unwrap();
+        let pool = coordinator
+            .pool_for_mount(data_volume.path())
+            .expect("pool on the Data volume");
+        assert_eq!(pool.ballast_dir, configured);
     }
 
     #[test]
