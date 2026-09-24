@@ -209,6 +209,11 @@ struct CachedSacredVerdict {
     root_mtime: Option<SystemTime>,
 }
 
+/// Protected verdicts carried from one registry to the next
+/// ([`ProtectionRegistry::adopt_verdict_cache`]).
+#[derive(Debug, Clone, Default)]
+pub struct SacredVerdictCache(HashMap<PathBuf, CachedSacredVerdict>);
+
 /// Registry of protected paths from marker files and config-level glob patterns.
 ///
 /// The registry supports two modes:
@@ -261,6 +266,27 @@ impl ProtectionRegistry {
             config_patterns: Vec::new(),
             sacred_verdict_cache: HashMap::new(),
         }
+    }
+
+    /// Install protected verdicts proved by an earlier registry.
+    ///
+    /// The daemon builds a fresh registry for every scan pass (so config and
+    /// marker changes take effect), which used to discard the B7 cache every
+    /// pass: the priority pre-scan re-proved the same protected trees each
+    /// time, spending its CPU budget on them and logging a skip line per tree
+    /// per pass (fleet audit 2026-09-24: ~30k skips of one /tmp cache on
+    /// trj, pre-scans stopping after a few hundred entries). Carried entries
+    /// keep the same TTL and root-mtime revalidation, and only protected
+    /// verdicts are ever cached, so carrying them is fail-safe.
+    pub fn adopt_verdict_cache(&mut self, carried: SacredVerdictCache) {
+        self.sacred_verdict_cache = carried.0;
+    }
+
+    /// A copy of the protected verdicts proved so far, to carry into the
+    /// next pass's registry.
+    #[must_use]
+    pub fn verdict_cache_snapshot(&self) -> SacredVerdictCache {
+        SacredVerdictCache(self.sacred_verdict_cache.clone())
     }
 
     /// B7: look up a memoized *protected* verdict for `path`.
@@ -2286,6 +2312,35 @@ protected_at = "2026-05-07T03:50:00Z"
         assert_eq!(
             reg.cached_protected_verdict(&candidate).as_deref(),
             Some("contains sacred marker")
+        );
+    }
+
+    /// The daemon builds a new registry every pass; a verdict proved by one
+    /// pass must be honored by the next, with the same revalidation.
+    #[test]
+    fn protected_verdicts_carry_into_the_next_registry_and_still_revalidate() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("protected-tree");
+        fs::create_dir_all(&candidate).unwrap();
+
+        let mut first_pass = ProtectionRegistry::marker_only();
+        first_pass.cache_protected_verdict(&candidate, "sacred overlap".to_string());
+
+        let mut next_pass = ProtectionRegistry::marker_only();
+        assert!(next_pass.cached_protected_verdict(&candidate).is_none());
+        next_pass.adopt_verdict_cache(first_pass.verdict_cache_snapshot());
+        assert_eq!(
+            next_pass.cached_protected_verdict(&candidate).as_deref(),
+            Some("sacred overlap")
+        );
+
+        let bumped = SystemTime::now() + Duration::from_secs(5);
+        filetime::set_file_mtime(&candidate, filetime::FileTime::from_system_time(bumped)).unwrap();
+        let mut third_pass = ProtectionRegistry::marker_only();
+        third_pass.adopt_verdict_cache(next_pass.verdict_cache_snapshot());
+        assert!(
+            third_pass.cached_protected_verdict(&candidate).is_none(),
+            "a carried verdict is re-proved once the tree changes"
         );
     }
 

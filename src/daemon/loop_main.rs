@@ -6621,6 +6621,11 @@ fn should_skip_protected_daemon_candidate(
     logger: &ActivityLoggerHandle,
     context: &str,
 ) -> bool {
+    // Proved protected (and logged) on an earlier pass and still fresh:
+    // skip quietly. Only protected verdicts are cached, so this is fail-safe.
+    if protection.cached_protected_verdict(path).is_some() {
+        return true;
+    }
     match daemon_protection_reason(protection, path, sacred_paths) {
         Ok(Some(reason)) => {
             eprintln!(
@@ -6860,6 +6865,9 @@ fn scanner_thread_main(
     // afterwards, capping scanner CPU regardless of pressure level.
     let mut last_pass_finished_at: Option<Instant> = None;
     let mut last_pass_duration = Duration::ZERO;
+    // Protected verdicts outlive the per-pass registries (see
+    // `ProtectionRegistry::adopt_verdict_cache`).
+    let mut carried_verdicts = protection::SacredVerdictCache::default();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -7329,6 +7337,7 @@ fn scanner_thread_main(
                             continue;
                         }
                     };
+                replay_protection.adopt_verdict_cache(carried_verdicts.clone());
                 let mut replay_sacred = platform.sacred_paths();
                 replay_sacred.extend(protection::sacred_paths_from_protected_patterns(
                     &current_scanner_config.protected_paths,
@@ -7399,6 +7408,7 @@ fn scanner_thread_main(
                         }
                     }
                 }
+                carried_verdicts = replay_protection.verdict_cache_snapshot();
             }
             replay_counts.set((records.len(), revetoed));
             let indexed_bytes = indexed_candidates
@@ -7494,6 +7504,7 @@ fn scanner_thread_main(
                     continue;
                 }
             };
+        protection.adopt_verdict_cache(carried_verdicts.clone());
 
         // ── Priority pre-scan pass ──
         // Before the general walker, do a shallow (depth 1-3) scan of each root
@@ -8113,6 +8124,8 @@ fn scanner_thread_main(
                 excluded
             },
         };
+
+        carried_verdicts = protection.verdict_cache_snapshot();
 
         // Catalog-only requests do not walk: each derived root is one opaque
         // candidate unit, sized and dated by a bounded probe, and flows
