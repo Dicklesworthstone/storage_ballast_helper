@@ -49,8 +49,10 @@ pub use crate::core::config::VoiConfig;
 // ──────────────────── configuration ────────────────────
 
 /// Age at which a completed scan no longer excludes a root from the
-/// maintenance exploration rotation. Actual revisit latency also includes
-/// the finite number of scheduling opportunities needed to reach that root.
+/// maintenance exploration rotation.
+///
+/// Actual revisit latency also includes the finite number of scheduling
+/// opportunities needed to reach that root.
 pub const MAX_REVISIT_INTERVAL: Duration = Duration::from_hours(24);
 
 // ──────────────────── per-path statistics ────────────────────
@@ -1141,7 +1143,7 @@ mod tests {
             start + Duration::from_secs(1),
         );
         let deadline = start + MAX_REVISIT_INTERVAL;
-        let before = s.schedule(deadline - Duration::from_nanos(1));
+        let before = s.schedule(deadline.checked_sub(Duration::from_nanos(1)).unwrap());
         assert_eq!(before.paths[0].path, Path::new("/hot"));
         assert!(!before.paths[0].is_exploration);
         assert_eq!(s.schedule(deadline).paths[0].path, Path::new("/cold"));
@@ -1303,9 +1305,13 @@ mod tests {
                 seen.extend(unique);
             }
             proptest::prop_assert_eq!(seen, expected);
-            proptest::prop_assert!(s.path_stats.values().all(|stats| {
-                stats.scan_count == 0 && stats.last_scanned.is_none()
-            }));
+            // Bound first: prop_assert! turns its expression into a format
+            // string, and a braced closure body is not one.
+            let untouched = s
+                .path_stats
+                .values()
+                .all(|stats| stats.scan_count == 0 && stats.last_scanned.is_none());
+            proptest::prop_assert!(untouched);
         }
     }
 }

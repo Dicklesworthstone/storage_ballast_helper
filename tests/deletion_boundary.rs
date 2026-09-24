@@ -104,6 +104,7 @@ fn raw_plan(candidates: Vec<CandidacyScore>, mode: DeletionMode) -> DeletionPlan
 type RefusalCase = (&'static str, fn(&mut CandidacyScore), SkipReason);
 
 #[test]
+#[allow(clippy::too_many_lines)] // one table of refusal cases
 fn public_plans_and_direct_calls_cannot_bypass_decision_refusals() {
     let cases: &[RefusalCase] = &[
         ("veto", |c| c.vetoed = true, SkipReason::Vetoed),

@@ -1582,16 +1582,15 @@ mod tests {
             None,
         )
         .unwrap();
-        let folded: Vec<_> = inventory
+        let folded = inventory
             .iter()
             .filter(|v| {
                 v.skip_reason
                     .as_deref()
                     .is_some_and(|r| r.starts_with("same filesystem as"))
             })
-            .map(|v| v.mount_point.clone())
-            .collect();
-        assert_eq!(folded.len(), 2, "{inventory:?}");
+            .count();
+        assert_eq!(folded, 2, "{inventory:?}");
     }
 
     /// Distinct devices keep distinct pools even when one is mounted inside

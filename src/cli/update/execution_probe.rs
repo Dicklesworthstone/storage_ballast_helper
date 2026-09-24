@@ -41,7 +41,11 @@ fn wait_for_child(child: Child, timeout: Duration) -> Result<(), String> {
                 timeout.as_millis()
             ));
         }
-        std::thread::sleep((timeout - elapsed).min(Duration::from_millis(10)));
+        std::thread::sleep(
+            timeout
+                .saturating_sub(elapsed)
+                .min(Duration::from_millis(10)),
+        );
     }
 }
 

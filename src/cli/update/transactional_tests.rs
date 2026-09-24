@@ -87,8 +87,18 @@ fn rollback_works_while_the_destination_binary_is_executing() {
     let (temp, source, dest) = fixture("exit 0");
     let store = BackupStore::open(temp.path().join("backups"));
     let snapshot = store.create(&source, "previous").unwrap();
-    fs::copy("/bin/sleep", &dest).unwrap();
-    let mut running = Running(std::process::Command::new(&dest).arg("30").spawn().unwrap());
+    // A shell, not /bin/sleep: multicall coreutils (uutils, Ubuntu's default)
+    // dispatch on the executable's file name, so a renamed copy of sleep
+    // exits at once as an unknown program. The shell blocks reading a pipe
+    // the child handle keeps open; the executing image is `dest`.
+    fs::copy("/bin/sh", &dest).unwrap();
+    let mut running = Running(
+        std::process::Command::new(&dest)
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     assert!(running.0.try_wait().unwrap().is_none());
     let result = store.rollback(&dest, Some(&snapshot.id)).unwrap();
     assert!(result.success);
