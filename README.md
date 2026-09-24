@@ -1234,15 +1234,17 @@ Promotion between modes (`observe -> canary -> enforce`) is explicit. The system
 
 Demotion to FallbackSafe is automatic and triggered by any of:
 
-- **Calibration breach**: 3 consecutive observation windows where the guardrail status is Fail (prediction accuracy has degraded).
-- **Guardrail drift**: The e-process alarm fires, indicating systematic miscalibration.
-- **Canary budget exhaustion**: More than 10 deletions in a single hour while in Canary mode.
-- **Serialization failure**: The daemon can't write its state file (possible disk-full condition).
+- **Calibration breach**: 3 consecutive observation windows where the guardrail status is Fail (prediction accuracy has degraded), when `calibration_breach_action = "demote"` (the default below Enforce).
+- **Guardrail drift**: The e-process alarm fires at Orange or worse, under the same `calibration_breach_action` rule.
+- **Canary budget exhaustion**: More than 10 deletions in a single hour while in Canary mode, when `canary_budget_action = "demote"`.
+- **Serialization failure**: The daemon can't write its state file, below Red pressure (at Red and Critical the failed write is the full disk itself and cleanup continues).
 - **Kill switch**: An environment variable or config flag forces immediate fallback.
 
 #### Recovery with Mandatory Canary Gate
 
-Recovery from FallbackSafe requires the guardrails to report <!-- claim:constants.guardrails.recovery_clean_windows -->3<!-- /claim --> consecutive clean observation windows (configurable via `recovery_clean_windows`). When recovery occurs, the system does *not* return directly to its pre-fallback mode if that mode was Enforce. Instead, it recovers to Canary, requiring an explicit re-promotion to Enforce. This mandatory canary gate ensures the system re-proves itself under limited-deletion conditions before resuming full enforcement.
+Recovery from FallbackSafe requires the guardrails to report <!-- claim:constants.guardrails.recovery_clean_windows -->3<!-- /claim --> consecutive clean observation windows (configurable via `recovery_clean_windows`). With the default `auto_recover_to = "canary"`, an Enforce fleet does *not* return directly to Enforce: it recovers to Canary and re-proves itself there. The canary gate is temporary: an automatically entered Canary that runs 30 minutes without a new fallback returns to the operator's intended mode (the `initial_mode` or the last `sbh policy promote`/`demote`), and a later fallback remembers that intended mode rather than the waypoint Canary. A Canary the operator chose stays Canary. `auto_recover_to = "previous"` skips the gate; `"none"` leaves recovery to `sbh policy promote`.
+
+The drift alarm (e-process) and the calibration breach are both statements about the forecaster, so both follow `calibration_breach_action`, which defaults to `advisory` for Enforce fleets: forecast drift is logged, and deletion keeps running on the scoring, veto and regret evidence that actually governs it. The canary hourly budget counts deletions the executor performed, not approvals it later dropped.
 
 #### Guard Penalty
 
@@ -1313,6 +1315,10 @@ As described above, the progressive delivery system (observe/canary/enforce) ens
 #### Layer 5: Guardrails and Drift Detection
 
 The guardrail system continuously validates that the forecasting and scoring pipeline is well-calibrated. If predictions drift from reality, the system automatically falls back to safe mode. See the Guardrails section below for details.
+
+#### rch Build Pools
+
+rch's remote `CARGO_TARGET_DIR`s (`.rch-target-<worker>-{pool,job,pid}-<key>`) are warm caches shared by later builds, so their age is the newest write anywhere in the tree, never the directory's birth time. Normally sbh honors rch's own floors: a pooled dir must be idle for 168 hours and a per-job dir for 12. Pools in daily use never reach 168 idle hours and grew without bound on the fleet, so once the controller's urgency reaches 0.7 (from roughly mid-Orange, always at Red) the floors drop to 60 minutes for pools and 30 for per-job dirs, and the idle probe may walk up to 2 million entries. A pool written inside the floor is vetoed at every pressure, and the open-file and active-lease rails still apply at deletion time.
 
 #### Layer 6: Repeat-Deletion Dampening
 

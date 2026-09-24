@@ -446,7 +446,7 @@ impl ScoringEngine {
         urgency: f64,
         sacred_overlaps: &[SacredOverlap],
     ) -> CandidacyScore {
-        if let Some(reason) = self.veto_reason(input, sacred_overlaps) {
+        if let Some(reason) = self.veto_reason(input, urgency, sacred_overlaps) {
             return self.vetoed(input, reason);
         }
 
@@ -600,6 +600,7 @@ impl ScoringEngine {
     fn veto_reason(
         &self,
         input: &CandidateInput,
+        urgency: f64,
         sacred_overlaps: &[SacredOverlap],
     ) -> Option<Cow<'static, str>> {
         if has_git_component(&input.path) || input.signals.has_git {
@@ -616,7 +617,7 @@ impl ScoringEngine {
                 "inside a cargo registry/git store: crate source, not build output",
             ));
         }
-        if let Some(reason) = rch_target_veto_reason(&input.path) {
+        if let Some(reason) = rch_target_veto_reason(&input.path, urgency) {
             return Some(reason);
         }
         if input.signals.has_cargo_toml
@@ -730,6 +731,27 @@ impl RchTargetKind {
         }
     }
 
+    /// Idle floor at this urgency: rch's own floor normally, and a short
+    /// least-recently-used floor once urgency reaches `RCH_PRESSURE_URGENCY`.
+    ///
+    /// rch's floors optimize warm-cache reuse, not disk survival: a pool in
+    /// daily use is never idle for 7 days, so pools grew without bound while
+    /// the host filled (fleet audit 2026-09-24: 85-133 GB single pools, ~400
+    /// GB fleet-wide, no reaper covering `/data/tmp/rch`). On a disk that
+    /// pressured, a pool nobody has written for an hour is the cheapest large reclaim
+    /// there is: the cost is one cold rebuild, against a full disk that fails
+    /// every build. A pool written within the floor stays vetoed at every
+    /// urgency, and the open-file and active-lease rails still apply.
+    fn idle_floor(self, urgency: f64) -> Duration {
+        if urgency < RCH_PRESSURE_URGENCY {
+            return self.required_idle();
+        }
+        match self {
+            Self::PerJob => Duration::from_mins(30),
+            Self::Pooled => Duration::from_hours(1),
+        }
+    }
+
     const fn label(self) -> &'static str {
         match self {
             Self::PerJob => "per-job",
@@ -737,6 +759,15 @@ impl RchTargetKind {
         }
     }
 }
+
+/// Urgency at which rch target dirs switch from rch's warm-cache idle floors
+/// to the short pressure floors.
+///
+/// With the default controller gains this is reached from roughly the middle
+/// of Orange (about 12% free on a 1 TiB volume) and always at Red. It is
+/// still stricter than the `rch-pool-janitor` the fleet already runs safely
+/// (usage >= 80% and 60 minutes idle).
+const RCH_PRESSURE_URGENCY: f64 = 0.7;
 
 /// Classify a path as an rch-managed target dir by its basename.
 ///
@@ -774,11 +805,15 @@ pub fn classify_rch_target(path: &Path) -> Option<RchTargetKind> {
 /// everything. The cap only stops a pathological tree from stalling a scan; a
 /// real cargo target dir is comfortably inside it.
 ///
-/// Exceeding it yields [`TreeActivity::Unknown`], which vetoes. That is the
-/// right division of labour rather than a lost reclaim: rch runs its own reaper
-/// over these dirs with the same idle floors, so deferring costs nothing but a
-/// later sweep, whereas guessing costs a cold rebuild of the whole crate graph.
+/// Exceeding it yields [`TreeActivity::Unknown`], which vetoes: guessing
+/// costs a cold rebuild of the whole crate graph. Under pressure the
+/// budget is [`RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE`], because the pools
+/// that matter most then are the biggest ones (a 130 GB pool holds well over
+/// 400k entries) and no rch reaper was found covering them on the fleet.
 const RCH_IDLE_PROBE_MAX_ENTRIES: usize = 400_000;
+
+/// Idle-probe budget once urgency reaches [`RCH_PRESSURE_URGENCY`].
+const RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE: usize = 2_000_000;
 
 /// Outcome of asking "has anything in this tree been written recently?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -800,7 +835,7 @@ enum TreeActivity {
 /// maximally abandoned while a build is actively writing to it. rch's own
 /// reaper instead asks whether the *tree* has seen file activity, and that is
 /// the question we have to answer too.
-fn rch_tree_activity(root: &Path, window: Duration) -> TreeActivity {
+fn rch_tree_activity(root: &Path, window: Duration, max_entries: usize) -> TreeActivity {
     let Some(cutoff) = std::time::SystemTime::now().checked_sub(window) else {
         return TreeActivity::Unknown;
     };
@@ -816,7 +851,7 @@ fn rch_tree_activity(root: &Path, window: Duration) -> TreeActivity {
                 return TreeActivity::Unknown;
             };
             seen += 1;
-            if seen > RCH_IDLE_PROBE_MAX_ENTRIES {
+            if seen > max_entries {
                 return TreeActivity::Unknown;
             }
             // Symlinks are not followed: only real files in this tree count as
@@ -840,20 +875,26 @@ fn rch_tree_activity(root: &Path, window: Duration) -> TreeActivity {
     TreeActivity::IdleThroughout
 }
 
-/// Hard-veto rch target dirs unless they are idle past rch's own floor.
+/// Hard-veto rch target dirs unless they are idle past the floor for this
+/// urgency (see [`RchTargetKind::idle_floor`]).
 ///
 /// Deleting a live pool dir does not reclaim reusable space — it forces every
 /// subsequent dispatch sharing those build dimensions to rebuild the whole
 /// crate graph from cold, and can clip a build already in flight.
-fn rch_target_veto_reason(path: &Path) -> Option<Cow<'static, str>> {
+fn rch_target_veto_reason(path: &Path, urgency: f64) -> Option<Cow<'static, str>> {
     let kind = classify_rch_target(path)?;
-    let required = kind.required_idle();
-    match rch_tree_activity(path, required) {
+    let required = kind.idle_floor(urgency);
+    let max_entries = if urgency < RCH_PRESSURE_URGENCY {
+        RCH_IDLE_PROBE_MAX_ENTRIES
+    } else {
+        RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE
+    };
+    match rch_tree_activity(path, required, max_entries) {
         TreeActivity::IdleThroughout => None,
         TreeActivity::Active => Some(Cow::Owned(format!(
-            "rch {} target dir has file activity within rch's {}h idle floor",
+            "rch {} target dir has file activity within the {}m idle floor",
             kind.label(),
-            required.as_secs() / 3600
+            required.as_secs() / 60
         ))),
         TreeActivity::Unknown => Some(Cow::Owned(format!(
             "rch {} target dir idleness could not be established",
@@ -1558,10 +1599,12 @@ mod tests {
             // behind mid-build, and what a top-level mtime/birth-time check misses.
             std::fs::write(pool.join("debug/deps/libfoo.rlib"), b"x").unwrap();
 
-            assert!(
-                rch_target_veto_reason(&pool).is_some(),
-                "active pool dir must be vetoed"
-            );
+            for urgency in [0.0, 1.0] {
+                assert!(
+                    rch_target_veto_reason(&pool, urgency).is_some(),
+                    "active pool dir must be vetoed at urgency {urgency}"
+                );
+            }
 
             let engine = default_engine();
             let score = engine.score_candidate(
@@ -1611,16 +1654,64 @@ mod tests {
             filetime::set_file_mtime(pool.join("debug"), ft).unwrap();
 
             assert!(
-                rch_target_veto_reason(&pool).is_none(),
+                rch_target_veto_reason(&pool, 0.0).is_none(),
                 "a pool dir idle beyond rch's floor must remain reclaimable"
             );
+        }
+
+        /// At pressure urgency a pool nobody has written for longer than the
+        /// short floor becomes reclaimable; below it the same pool keeps
+        /// rch's 168h warm-cache floor; a pool written inside the short floor
+        /// stays vetoed even at maximum urgency.
+        #[test]
+        fn pressure_shortens_the_pool_idle_floor_but_never_to_active_pools() {
+            let tmp = tempfile::tempdir().unwrap();
+            let set_age = |pool: &Path, age: Duration| {
+                let stamp =
+                    filetime::FileTime::from_system_time(std::time::SystemTime::now() - age);
+                filetime::set_file_mtime(pool.join("debug/old.rlib"), stamp).unwrap();
+                filetime::set_file_mtime(pool.join("debug"), stamp).unwrap();
+            };
+            let make = |name: &str, age: Duration| {
+                let pool = tmp.path().join(name);
+                std::fs::create_dir_all(pool.join("debug")).unwrap();
+                std::fs::write(pool.join("debug/old.rlib"), b"x").unwrap();
+                set_age(&pool, age);
+                pool
+            };
+
+            // Idle two hours: past the 1h pressure floor, inside rch's 168h.
+            let idle = make(".rch-target-hz1-pool-idle2h", Duration::from_hours(2));
+            assert!(
+                rch_target_veto_reason(&idle, 0.5).is_some(),
+                "below pressure urgency keeps 168h"
+            );
+            assert!(
+                rch_target_veto_reason(&idle, 0.7).is_none(),
+                "pressure urgency uses 1h"
+            );
+            assert!(
+                rch_target_veto_reason(&idle, 1.0).is_none(),
+                "maximum urgency uses 1h"
+            );
+
+            // Written 10 minutes ago: in use, whatever the pressure.
+            let busy = make(".rch-target-hz1-pool-busy", Duration::from_mins(10));
+            assert!(rch_target_veto_reason(&busy, 1.0).is_some());
+
+            // Per-job dirs: 30 minutes under pressure, 12h otherwise.
+            let job = make(".rch-target-hz1-job-7-1-1", Duration::from_mins(45));
+            assert!(rch_target_veto_reason(&job, 0.0).is_some());
+            assert!(rch_target_veto_reason(&job, 0.9).is_none());
         }
 
         #[test]
         fn unreadable_tree_fails_safe() {
             // If we cannot establish idleness we must refuse to delete.
             let missing = Path::new("/nonexistent-rch-root/.rch-target-hz1-pool-abc");
-            assert!(rch_target_veto_reason(missing).is_some());
+            for urgency in [0.0, 1.0] {
+                assert!(rch_target_veto_reason(missing, urgency).is_some());
+            }
         }
 
         #[test]
@@ -1651,7 +1742,7 @@ mod tests {
             // Everything is fresh, so this must be a definite Active, reached
             // via early exit rather than by exhausting the guard.
             assert_eq!(
-                rch_tree_activity(&pool, Duration::from_hours(168)),
+                rch_tree_activity(&pool, Duration::from_hours(168), RCH_IDLE_PROBE_MAX_ENTRIES),
                 TreeActivity::Active
             );
         }
