@@ -24,6 +24,8 @@ struct Identity {
 }
 
 impl Identity {
+    // `None` is the non-unix answer; on unix the wrap is always `Some`.
+    #[cfg_attr(unix, allow(clippy::unnecessary_wraps))]
     fn for_file(path: &Path, meta: &fs::Metadata) -> Option<Self> {
         #[cfg(unix)]
         {
@@ -134,7 +136,9 @@ impl Drop for Reservation<'_> {
         }
         let mut table = self.history.lock();
         if let Some(previous) = self.previous {
-            table.entries.insert(self.key.clone(), Entry::Completed(previous));
+            table
+                .entries
+                .insert(self.key.clone(), Entry::Completed(previous));
         } else {
             table.entries.remove(&self.key);
         }
@@ -177,7 +181,9 @@ mod tests {
         let cooling = RecentTruncations::reserve(
             &history,
             identity(1),
-            finished + WINDOW - Duration::from_nanos(1),
+            (finished + WINDOW)
+                .checked_sub(Duration::from_nanos(1))
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(cooling.previous_size(), Some(4096));
@@ -190,7 +196,9 @@ mod tests {
     fn rejected_retries_do_not_slide_the_recovery_window() {
         let history = Mutex::new(RecentTruncations::default());
         let now = Instant::now();
-        RecentTruncations::reserve(&history, identity(1), now).unwrap().commit(4096, now);
+        RecentTruncations::reserve(&history, identity(1), now)
+            .unwrap()
+            .commit(4096, now);
         for second in 1..60 {
             let retry = RecentTruncations::reserve(
                 &history,
@@ -240,7 +248,9 @@ mod tests {
         let history = Mutex::new(RecentTruncations::default());
         let now = Instant::now();
         let old = identity(7);
-        RecentTruncations::reserve(&history, old.clone(), now).unwrap().commit(4096, now);
+        RecentTruncations::reserve(&history, old.clone(), now)
+            .unwrap()
+            .commit(4096, now);
         let mut new = old;
         new.created = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
         let replacement = RecentTruncations::reserve(&history, new, now).unwrap();

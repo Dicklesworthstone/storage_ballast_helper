@@ -68,7 +68,10 @@ fn a_critical_mount_does_not_wait_out_an_hour_old_healthy_empty_pass() {
     assert_eq!(record.rescan_in_secs, None);
     let base = Duration::from_secs(60);
     let urgent = Duration::from_secs(5);
-    assert_eq!(global_tick([controller.cadence(base, urgent)], base), urgent);
+    assert_eq!(
+        global_tick([controller.cadence(base, urgent)], base),
+        urgent
+    );
 }
 
 #[test]
@@ -142,7 +145,11 @@ fn invalid_distant_or_low_confidence_predictions_do_not_trigger_reclamation() {
             prediction_confident: true,
             ..tick(PressureLevel::Green, now)
         });
-        assert_eq!(decision.state, MountState::Idle, "invalid/distant {seconds}");
+        assert_eq!(
+            decision.state,
+            MountState::Idle,
+            "invalid/distant {seconds}"
+        );
         assert!(!decision.scan);
     }
     let mut controller = idle_at(PressureLevel::Green, now);
@@ -202,13 +209,27 @@ fn a_persistent_prediction_prevents_false_recovery_rearming() {
 fn expired_backoff_still_retries_a_steady_critical_mount() {
     let now = Instant::now();
     let mut controller = idle_at(PressureLevel::Critical, now);
-    let before_deadline = now + IDLE_BACKOFF_CAP - Duration::from_secs(1);
+    let before_deadline = (now + IDLE_BACKOFF_CAP)
+        .checked_sub(Duration::from_secs(1))
+        .unwrap();
     let deadline = now + IDLE_BACKOFF_CAP;
-    assert!(!controller.observe(tick(PressureLevel::Critical, before_deadline)).scan);
-    assert!(controller.observe(tick(PressureLevel::Critical, deadline)).scan);
+    assert!(
+        !controller
+            .observe(tick(PressureLevel::Critical, before_deadline))
+            .scan
+    );
+    assert!(
+        controller
+            .observe(tick(PressureLevel::Critical, deadline))
+            .scan
+    );
     controller.note_pass(0, false, deadline);
     assert_eq!(controller.empty_passes(), 2);
-    assert!(!controller.observe(tick(PressureLevel::Critical, deadline)).scan);
+    assert!(
+        !controller
+            .observe(tick(PressureLevel::Critical, deadline))
+            .scan
+    );
 }
 
 #[test]

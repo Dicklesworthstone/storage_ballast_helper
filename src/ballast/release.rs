@@ -127,10 +127,8 @@ impl BallastReleaseController {
         let already_released = configured_total.saturating_sub(available);
         let urgency_recommendation = if response.urgency >= 0.6 {
             3
-        } else if response.urgency >= 0.3 {
-            1
         } else {
-            0
+            usize::from(response.urgency >= 0.3)
         };
         let level_floor = match response.level {
             PressureLevel::Red => 3,

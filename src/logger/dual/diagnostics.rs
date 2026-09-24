@@ -141,9 +141,7 @@ impl State {
         let severity = key.severity;
         let count = self.templates.get(&key).copied().unwrap_or(0);
         let bytes = self.payload_bytes[severity].saturating_add(cost);
-        if self.emitted[severity] < PER_SEVERITY
-            && count < PER_TEMPLATE
-            && bytes <= PAYLOAD_BUDGET
+        if self.emitted[severity] < PER_SEVERITY && count < PER_TEMPLATE && bytes <= PAYLOAD_BUDGET
         {
             self.emitted[severity] += 1;
             self.payload_bytes[severity] = bytes;
@@ -236,6 +234,7 @@ impl DiagnosticGate {
             sample.clear();
         }
         state.last_report = now;
+        drop(state);
         Some(ActivityEvent::Warning {
             code: "SBH-LOG-THROTTLED".to_string(),
             message,
@@ -362,7 +361,8 @@ mod tests {
         for _ in 0..4 {
             gate.admit(&error("failed"), now);
         }
-        assert!(!gate.admit(&error("failed"), now + WINDOW - Duration::from_nanos(1)));
+        let just_inside = (now + WINDOW).checked_sub(Duration::from_nanos(1)).unwrap();
+        assert!(!gate.admit(&error("failed"), just_inside));
         assert!(
             gate.take_report(now + Duration::from_secs(59), false)
                 .is_none()
@@ -483,11 +483,17 @@ mod tests {
             assert_eq!(line["run_id"], "throttle-test");
         }
         assert_eq!(
-            lines.iter().filter(|line| line["event"] == "artifact_delete").count(),
+            lines
+                .iter()
+                .filter(|line| line["event"] == "artifact_delete")
+                .count(),
             5
         );
         assert_eq!(
-            lines.iter().filter(|line| line["event"] == "emergency").count(),
+            lines
+                .iter()
+                .filter(|line| line["event"] == "emergency")
+                .count(),
             1
         );
         let summary = lines
@@ -508,7 +514,10 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(serde_json::from_str::<serde_json::Value>(&message).unwrap(), value);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&message).unwrap(),
+                value
+            );
             let failures: i64 = db
                 .query_row(
                     "SELECT COUNT(*) FROM activity_log WHERE event_type = 'artifact_delete' AND success = 0",
