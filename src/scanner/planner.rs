@@ -11,15 +11,18 @@
 //! The planner is the fractional-knapsack greedy: order candidates by
 //! expected reclaim per unit of expected loss, take them while the level's
 //! batch size, the risk budget and the byte target allow, and stop as soon
-//! as the target is met. For the shapes that occur here (a handful of
-//! candidates, one budget) that is within a constant factor of the 0/1
-//! optimum, and every choice is explainable with two numbers.
+//! as the target is met. A best-single fallback also considers large items
+//! crowded out by the greedy prefix. Overlapping paths are alternatives,
+//! never additive space: selecting a directory consumes its descendants.
+//! The approximation bound for ordinary knapsack does not extend to these
+//! overlap and batch-size constraints.
 //!
 //! Determinism: ties break on bytes descending, then path ascending, so
 //! identical inputs plan identically whatever order the walker found them
 //! in (design principle 3).
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -143,6 +146,11 @@ pub struct BatchPlan {
     pub chosen: Vec<PlannedItem>,
     /// Plannable candidates the budget or batch size left out.
     pub skipped_for_budget: Vec<PlannedItem>,
+    /// Alternatives overlapping a chosen path (including duplicate paths).
+    /// Their bytes are not additional reclaimable space. Older persisted
+    /// plans did not distinguish these from budget skips.
+    #[serde(default)]
+    pub skipped_for_overlap: Vec<PlannedItem>,
     /// Expected loss the top-N-by-score set for the same target would have
     /// carried; what the explanation compares against.
     pub top_n_risk: f64,
@@ -158,7 +166,7 @@ impl BatchPlan {
     #[must_use]
     pub fn summary_line(&self) -> String {
         format!(
-            "level={} target_bytes={} planned_bytes={} risk_budget={} risk_used={:.2} chosen={} skipped_for_budget={} top_n_risk={:.2}",
+            "level={} target_bytes={} planned_bytes={} risk_budget={} risk_used={:.2} chosen={} skipped_for_budget={} top_n_risk={:.2} skipped_for_overlap={}",
             self.level,
             self.target_bytes
                 .map_or_else(|| "none".to_string(), |b| b.to_string()),
@@ -168,7 +176,8 @@ impl BatchPlan {
             self.risk_used,
             self.chosen.len(),
             self.skipped_for_budget.len(),
-            self.top_n_risk
+            self.top_n_risk,
+            self.skipped_for_overlap.len()
         )
     }
 
@@ -232,6 +241,28 @@ fn ordinal(n: usize) -> String {
     format!("{n}{suffix}")
 }
 
+/// A lexical antichain: no selected path contains another selected path.
+/// Remembering ancestors makes both directions of containment checks depend
+/// on path depth rather than the number of candidates in a scan. These are
+/// planning checks, not a replacement for executor identity/lease preflight.
+#[derive(Default)]
+struct SelectedPaths {
+    paths: BTreeSet<PathBuf>,
+    ancestors: BTreeSet<PathBuf>,
+}
+
+impl SelectedPaths {
+    fn overlaps(&self, path: &Path) -> bool {
+        self.ancestors.contains(path)
+            || path.ancestors().any(|ancestor| self.paths.contains(ancestor))
+    }
+
+    fn insert(&mut self, path: &Path) {
+        self.paths.insert(path.to_path_buf());
+        self.ancestors.extend(path.ancestors().map(Path::to_path_buf));
+    }
+}
+
 fn plannable(candidate: &CandidacyScore, include_review: bool) -> bool {
     !candidate.vetoed
         && !candidate.decision.category_suspended
@@ -268,8 +299,9 @@ fn item(candidate: &CandidacyScore, false_positive_loss: f64) -> PlannedItem {
 ///
 /// Candidates that are not plannable (vetoed, suspended, invalid evidence,
 /// `Keep`, or `Review` outside Critical) are dropped silently; the rest are
-/// either chosen or listed under `skipped_for_budget`. Invalid loss units
-/// or risk bounds fail closed, even at Critical pressure.
+/// either chosen or listed under `skipped_for_budget`/`skipped_for_overlap`.
+/// Byte totals count only disjoint chosen paths. Invalid loss units or risk
+/// bounds fail closed, even at Critical pressure.
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub fn plan_batch(
@@ -298,13 +330,23 @@ pub fn plan_batch(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.0.bytes.cmp(&a.0.bytes))
                 .then_with(|| a.0.path.cmp(&b.0.path))
+                .then_with(|| a.0.decision_id.cmp(&b.0.decision_id))
         });
         let mut bytes = 0u64;
         let mut risk = 0.0;
-        for (planned, _) in by_score.into_iter().take(request.max_items) {
-            if request.target_bytes.is_some_and(|target| bytes >= target) {
+        let mut selected = SelectedPaths::default();
+        for (planned, _) in by_score {
+            if selected.paths.len() >= request.max_items
+                || request.target_bytes.is_some_and(|target| bytes >= target)
+            {
                 break;
             }
+            // A duplicate or descendant must not consume a comparison slot
+            // or count the same bytes toward the target twice.
+            if selected.overlaps(&planned.path) {
+                continue;
+            }
+            selected.insert(&planned.path);
             bytes = bytes.saturating_add(planned.bytes);
             // Keep the counterfactual diagnostic serializable even when
             // individually finite losses overflow their aggregate.
@@ -320,6 +362,7 @@ pub fn plan_batch(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.0.bytes.cmp(&a.0.bytes))
             .then_with(|| a.0.path.cmp(&b.0.path))
+            .then_with(|| a.0.decision_id.cmp(&b.0.decision_id))
     });
 
     // Greedy pass: take in value order whatever the budget, batch size and
@@ -328,6 +371,7 @@ pub fn plan_batch(
     let mut chosen_idx: Vec<usize> = Vec::new();
     let mut planned_bytes = 0u64;
     let mut risk_used = 0.0f64;
+    let mut selected = SelectedPaths::default();
     for (index, (planned, _)) in plannable.iter().enumerate() {
         let target_met = request
             .target_bytes
@@ -335,9 +379,14 @@ pub fn plan_batch(
         let next_risk = risk_used + planned.expected_loss;
         let over_budget =
             !next_risk.is_finite() || risk_budget.is_some_and(|budget| next_risk > budget + 1e-9);
-        if target_met || chosen_idx.len() >= request.max_items || over_budget {
+        if target_met
+            || chosen_idx.len() >= request.max_items
+            || over_budget
+            || selected.overlaps(&planned.path)
+        {
             continue;
         }
+        selected.insert(&planned.path);
         planned_bytes = planned_bytes.saturating_add(planned.bytes);
         risk_used = next_risk;
         chosen_idx.push(index);
@@ -345,7 +394,7 @@ pub fn plan_batch(
     let mut target_met = request
         .target_bytes
         .is_some_and(|target| planned_bytes >= target);
-    // The 2-approximation: when the greedy set falls short of the target
+    // Best-single fallback: when the greedy set falls short of the target
     // (or has none), the single largest candidate that fits the budget on
     // its own beats a bundle of small safe ones if it reclaims more.
     if !target_met && request.max_items >= 1 {
@@ -370,9 +419,16 @@ pub fn plan_batch(
         }
     }
 
+    // Rebuild from the final set: best-single may have replaced the greedy
+    // set, so overlap explanations must not retain its discarded choices.
+    let mut selected = SelectedPaths::default();
+    for &index in &chosen_idx {
+        selected.insert(&plannable[index].0.path);
+    }
     let mut chosen = Vec::with_capacity(chosen_idx.len());
     let mut chosen_scores = Vec::with_capacity(chosen_idx.len());
     let mut skipped = Vec::new();
+    let mut overlapping = Vec::new();
     for (index, (mut planned, score)) in plannable.into_iter().enumerate() {
         if let Some(rank) = chosen_idx
             .iter()
@@ -381,6 +437,8 @@ pub fn plan_batch(
             planned.rank = rank + 1;
             chosen.push(planned);
             chosen_scores.push(score);
+        } else if selected.overlaps(&planned.path) {
+            overlapping.push(planned);
         } else {
             skipped.push(planned);
         }
@@ -398,6 +456,7 @@ pub fn plan_batch(
         risk_used,
         chosen,
         skipped_for_budget: skipped,
+        skipped_for_overlap: overlapping,
         top_n_risk,
         top_n_bytes,
         target_met,
@@ -412,7 +471,6 @@ mod tests {
     use crate::scanner::scoring::{
         ArtifactCertainty, DecisionOutcome, EvidenceLedger, ScoreFactors,
     };
-    use std::path::Path;
     use std::time::Duration;
 
     fn candidate(
@@ -471,6 +529,146 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn a_parent_and_child_cannot_satisfy_a_target_with_the_same_bytes() {
+        let candidates = vec![
+            candidate("/p/target", 6 * GIB, 0.9, 3.0, DecisionAction::Delete),
+            candidate("/p/target/debug", 5 * GIB, 0.9, 2.0, DecisionAction::Delete),
+            candidate("/p/cache", 4 * GIB, 0.9, 1.0, DecisionAction::Delete),
+        ];
+        let mut req = request(PressureLevel::Orange, Some(10 * GIB), None);
+        req.max_items = 2;
+        let (chosen, plan) = plan_batch(candidates, &req);
+        assert_eq!(
+            chosen.iter().map(|c| c.path.as_path()).collect::<Vec<_>>(),
+            vec![Path::new("/p/target"), Path::new("/p/cache")]
+        );
+        assert!(plan.target_met);
+        assert_eq!(plan.planned_bytes, 10 * GIB);
+        // The counterfactual must also skip overlaps BEFORE its slot limit.
+        assert_eq!(plan.top_n_bytes, 10 * GIB);
+        assert_eq!(plan.skipped_for_overlap.len(), 1);
+        assert_eq!(plan.skipped_for_overlap[0].path, Path::new("/p/target/debug"));
+        assert!(plan.skipped_for_budget.is_empty());
+        assert_finite_plan(&plan);
+    }
+
+    #[test]
+    fn a_safer_child_excludes_its_parent_without_excluding_other_roots() {
+        let candidates = vec![
+            candidate("/p/target", 6 * GIB, 0.8, 3.0, DecisionAction::Delete),
+            candidate("/p/target/debug", 5 * GIB, 0.99, 2.0, DecisionAction::Delete),
+            candidate("/p/cache", GIB, 0.9, 1.0, DecisionAction::Delete),
+        ];
+        let (chosen, plan) = plan_batch(
+            candidates,
+            &request(PressureLevel::Orange, Some(6 * GIB), None),
+        );
+        assert_eq!(
+            chosen.iter().map(|c| c.path.as_path()).collect::<Vec<_>>(),
+            vec![Path::new("/p/target/debug"), Path::new("/p/cache")]
+        );
+        assert_eq!(plan.planned_bytes, 6 * GIB);
+        assert!(plan.target_met);
+        assert_eq!(plan.skipped_for_overlap[0].path, Path::new("/p/target"));
+    }
+
+    #[test]
+    fn duplicate_paths_are_one_cleanup_unit_not_extra_capacity() {
+        let item = candidate("/p/target", 5 * GIB, 0.9, 1.0, DecisionAction::Delete);
+        let (chosen, plan) = plan_batch(
+            vec![item.clone(), item.clone(), item],
+            &request(PressureLevel::Critical, Some(8 * GIB), None),
+        );
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(plan.planned_bytes, 5 * GIB);
+        assert_eq!(plan.top_n_bytes, 5 * GIB);
+        assert!(!plan.target_met);
+        assert_eq!(plan.skipped_for_overlap.len(), 2);
+        assert!(plan.skipped_for_budget.is_empty());
+        assert!(plan.summary_line().contains("skipped_for_overlap=2"));
+    }
+
+    #[test]
+    fn path_components_not_string_prefixes_determine_overlap() {
+        let candidates = vec![
+            candidate("/p/cache", 6 * GIB, 0.9, 1.0, DecisionAction::Delete),
+            candidate("/p/cache-other", 5 * GIB, 0.9, 1.0, DecisionAction::Delete),
+            candidate("/p/target/a", GIB, 0.9, 1.0, DecisionAction::Delete),
+            candidate("/p/target/b", GIB, 0.9, 1.0, DecisionAction::Delete),
+        ];
+        let (chosen, plan) =
+            plan_batch(candidates, &request(PressureLevel::Orange, None, None));
+        assert_eq!(chosen.len(), 4);
+        assert_eq!(plan.planned_bytes, 13 * GIB);
+        assert!(plan.skipped_for_overlap.is_empty());
+    }
+
+    #[test]
+    fn overlap_explanations_follow_the_final_single_item_replacement() {
+        let candidates = vec![
+            candidate("/p/target", 100 * GIB, 0.0, 1.0, DecisionAction::Delete),
+            candidate("/p/target/a", 40 * GIB, 0.99, 1.0, DecisionAction::Delete),
+            candidate("/p/target/b", 40 * GIB, 0.99, 1.0, DecisionAction::Delete),
+        ];
+        let (chosen, plan) = plan_batch(
+            candidates,
+            &request(PressureLevel::Orange, None, Some(50.0)),
+        );
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/p/target"));
+        assert_eq!(plan.planned_bytes, 100 * GIB);
+        assert_eq!(plan.skipped_for_overlap.len(), 2);
+        assert!(plan.skipped_for_budget.is_empty());
+        assert!(plan.skipped_for_overlap.iter().all(|item| item.rank == 0));
+    }
+
+    #[test]
+    fn overlap_plans_are_disjoint_and_deterministic_under_permutation() {
+        let candidates = vec![
+            candidate("/p/a", 12 * GIB, 0.85, 1.0, DecisionAction::Delete),
+            candidate("/p/a/target", 8 * GIB, 0.95, 1.0, DecisionAction::Delete),
+            candidate("/p/a/target/debug", 7 * GIB, 0.99, 1.0, DecisionAction::Delete),
+            candidate("/p/a/cache", 3 * GIB, 0.95, 1.0, DecisionAction::Delete),
+            candidate("/p/b", 4 * GIB, 0.95, 1.0, DecisionAction::Delete),
+        ];
+        let req = request(PressureLevel::Orange, Some(15 * GIB), Some(20.0));
+        let (_, reference) = plan_batch(candidates.clone(), &req);
+        let mut seed = 0x1234_5678u64;
+        for _ in 0..100 {
+            let mut shuffled = candidates.clone();
+            for i in (1..shuffled.len()).rev() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let j = usize::try_from(seed % (i as u64 + 1)).unwrap();
+                shuffled.swap(i, j);
+            }
+            let (chosen, plan) = plan_batch(shuffled, &req);
+            assert_eq!(plan, reference);
+            for (i, first) in chosen.iter().enumerate() {
+                for second in chosen.iter().skip(i + 1) {
+                    assert!(!first.path.starts_with(&second.path));
+                    assert!(!second.path.starts_with(&first.path));
+                }
+            }
+            assert_eq!(
+                plan.planned_bytes,
+                chosen.iter().map(|c| c.size_bytes).sum::<u64>()
+            );
+            assert_finite_plan(&plan);
+        }
+    }
+
+    #[test]
+    fn old_persisted_plans_default_to_no_overlap_explanations() {
+        let (_, plan) = plan_batch(Vec::new(), &request(PressureLevel::Green, None, None));
+        let mut value = serde_json::to_value(&plan).unwrap();
+        value.as_object_mut().unwrap().remove("skipped_for_overlap");
+        let decoded: BatchPlan = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, plan);
+    }
 
     #[test]
     fn the_large_mid_posterior_candidate_goes_first_for_a_byte_target() {
@@ -677,7 +875,12 @@ mod tests {
         assert!(plan.risk_budget.is_none_or(f64::is_finite));
         assert!(plan.risk_used.is_finite());
         assert!(plan.top_n_risk.is_finite());
-        for item in plan.chosen.iter().chain(&plan.skipped_for_budget) {
+        for item in plan
+            .chosen
+            .iter()
+            .chain(&plan.skipped_for_budget)
+            .chain(&plan.skipped_for_overlap)
+        {
             assert!(item.posterior.is_finite());
             assert!(item.expected_loss.is_finite());
             assert!(item.value.is_finite());
