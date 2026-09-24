@@ -3,10 +3,12 @@
 //!
 //! The reserve on a mount has one job: absorb what lands on the mount between
 //! the moment pressure is observed and the moment the first reclaim
-//! completes, the *reaction window*. Every window's peak used-bytes growth is
-//! one sample. The reserve target is the 0.99 quantile of those samples: read
-//! from a t-digest once enough windows exist, extrapolated from a generalized
-//! Pareto fit to the tail before that, and never below two ballast files.
+//! completes, the *reaction window*. Every window's largest chronological
+//! used-bytes increase is one sample, including writes after cleanup lowered
+//! usage below the first reading. The reserve target is the 0.99 quantile of
+//! those samples: read from a t-digest once enough windows exist, extrapolated
+//! from a generalized Pareto fit to the tail before that, and never below two
+//! ballast files.
 //!
 //! The samples come from the mount's own `statfs` readings, not from
 //! per-process I/O counters: used-bytes growth is exactly what the reserve
@@ -470,8 +472,22 @@ pub struct MountBurstTracker {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct OpenWindow {
     started: Instant,
-    used_at_start: u64,
-    peak_used: u64,
+    last_observed: Instant,
+    /// Lowest usage seen so far, not the minimum over future readings.
+    lowest_used: u64,
+    /// Largest increase from an earlier reading in this window.
+    peak_growth: u64,
+}
+
+impl OpenWindow {
+    fn new(now: Instant, used_bytes: u64) -> Self {
+        Self {
+            started: now,
+            last_observed: now,
+            lowest_used: used_bytes,
+            peak_growth: 0,
+        }
+    }
 }
 
 impl Default for MountBurstTracker {
@@ -487,29 +503,32 @@ impl Default for MountBurstTracker {
 
 impl MountBurstTracker {
     /// Feed one `statfs` reading. A window closes after `window_secs`; its
-    /// sample is the peak used-bytes growth inside it, so a burst that is
-    /// reclaimed before the window ends still counts.
+    /// sample is the largest increase between chronologically ordered readings.
+    /// Cleanup may lower the baseline for a later burst, but cannot erase an
+    /// earlier peak or make an earlier high followed by a low count as growth.
+    /// This measures peak headroom demand, not the sum of positive I/O deltas.
     pub fn observe(&mut self, now: Instant, used_bytes: u64, window_secs: f64) {
         let Some(open) = self.window.as_mut() else {
-            self.window = Some(OpenWindow {
-                started: now,
-                used_at_start: used_bytes,
-                peak_used: used_bytes,
-            });
+            self.window = Some(OpenWindow::new(now, used_bytes));
             return;
         };
-        open.peak_used = open.peak_used.max(used_bytes);
+        // Replayed or delayed telemetry must not turn a past low reading into
+        // a new baseline, nor move the active window backwards.
+        if now < open.last_observed {
+            return;
+        }
+        open.last_observed = now;
+        open.peak_growth = open
+            .peak_growth
+            .max(used_bytes.saturating_sub(open.lowest_used));
+        open.lowest_used = open.lowest_used.min(used_bytes);
         if now.duration_since(open.started).as_secs_f64() < window_secs.max(1.0) {
             return;
         }
         #[allow(clippy::cast_precision_loss)]
-        let growth = open.peak_used.saturating_sub(open.used_at_start) as f64;
+        let growth = open.peak_growth as f64;
         self.push_sample(growth);
-        self.window = Some(OpenWindow {
-            started: now,
-            used_at_start: used_bytes,
-            peak_used: used_bytes,
-        });
+        self.window = Some(OpenWindow::new(now, used_bytes));
     }
 
     /// Record a closed window's growth directly (tests and replays).
@@ -805,6 +824,119 @@ mod tests {
         assert_eq!(estimate.horizon_minutes(8192), None);
     }
 
+    fn window_sample(readings: &[u64]) -> f64 {
+        let mut tracker = MountBurstTracker::default();
+        let now = Instant::now();
+        let count = u64::try_from(readings.len()).unwrap();
+        #[allow(clippy::cast_precision_loss)]
+        let window_secs = (count + 1) as f64;
+        for (index, &used) in readings.iter().enumerate() {
+            tracker.observe(
+                now + Duration::from_secs(u64::try_from(index).unwrap()),
+                used,
+                window_secs,
+            );
+        }
+        tracker.observe(
+            now + Duration::from_secs(count + 1),
+            *readings.last().unwrap(),
+            window_secs,
+        );
+        assert_eq!(tracker.windows(), 1);
+        tracker.raw.back().copied().unwrap()
+    }
+
+    #[test]
+    fn regrowth_after_cleanup_is_a_nonzero_window_sample() {
+        // A mount starts at 100 GiB used, releases 12 GiB, then receives
+        // 8 GiB of writes. All later readings are below the initial usage.
+        let gib = 1u64 << 30;
+        assert_eq!(
+            window_sample(&[100 * gib, 88 * gib, 96 * gib]),
+            8.0 * 1_073_741_824.0
+        );
+    }
+
+    #[test]
+    fn growth_preserves_chronology_instead_of_using_the_global_range() {
+        assert_eq!(window_sample(&[1_000, 5_000, 0, 2_000]), 4_000.0);
+        assert_eq!(window_sample(&[9_000, 8_000, 2_000, 0]), 0.0);
+    }
+
+    #[test]
+    fn repeated_cleanup_cycles_measure_peak_headroom_not_total_io() {
+        assert_eq!(window_sample(&[10, 20, 10, 20]), 10.0);
+        assert_eq!(window_sample(&[9_000, 1_000, 3_000, 500, 4_000]), 3_500.0);
+    }
+
+    #[test]
+    fn window_rotation_does_not_reuse_the_previous_low_water_mark() {
+        let mut tracker = MountBurstTracker::default();
+        let now = Instant::now();
+        tracker.observe(now, 100, 60.0);
+        tracker.observe(now + Duration::from_secs(10), 10, 60.0);
+        tracker.observe(now + Duration::from_secs(60), 80, 60.0);
+        assert_eq!(tracker.raw.back().copied(), Some(70.0));
+        tracker.observe(now + Duration::from_secs(120), 85, 60.0);
+        assert_eq!(tracker.raw.back().copied(), Some(5.0));
+    }
+
+    #[test]
+    fn stale_readings_do_not_create_bursts_or_delay_completion() {
+        let mut tracker = MountBurstTracker::default();
+        let now = Instant::now();
+        tracker.observe(now, 100, 60.0);
+        tracker.observe(now + Duration::from_secs(20), 110, 60.0);
+        tracker.observe(now + Duration::from_secs(10), 0, 60.0);
+        tracker.observe(now + Duration::from_secs(60), 120, 60.0);
+        assert_eq!(tracker.raw.back().copied(), Some(20.0));
+        tracker.observe(now + Duration::from_secs(30), 0, 60.0);
+        tracker.observe(now + Duration::from_secs(120), 125, 60.0);
+        assert_eq!(tracker.raw.back().copied(), Some(5.0));
+        assert_eq!(tracker.windows(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn growth_handles_u64_extremes_without_wrapping() {
+        assert_eq!(window_sample(&[u64::MAX, 0]), 0.0);
+        assert_eq!(window_sample(&[u64::MAX, 0, u64::MAX]), u64::MAX as f64);
+    }
+
+    #[test]
+    fn repeated_readings_do_not_manufacture_reserve_demand() {
+        assert_eq!(window_sample(&[100, 100, 100, 100]), 0.0);
+        assert_eq!(window_sample(&[100, 20, 20, 60, 60]), 40.0);
+    }
+
+    #[test]
+    fn reclaimed_then_refilled_mount_rebuilds_and_persists_its_measured_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SNAPSHOT_FILE_NAME);
+        let mut stats = BurstStats::new(path.clone());
+        stats.record_cycle(Duration::from_secs(60));
+        let mount = Path::new("/data");
+        let now = Instant::now();
+        let gib = 1u64 << 30;
+        stats.observe(mount, now, 100 * gib);
+        for window in 0..QUANTILE_WINDOWS {
+            let start = now + Duration::from_secs(window * 60);
+            stats.observe(mount, start + Duration::from_secs(10), 88 * gib);
+            stats.observe(mount, start + Duration::from_secs(20), 96 * gib);
+            stats.observe(mount, start + Duration::from_secs(60), 100 * gib);
+        }
+        let estimate = stats.estimate(mount, gib).unwrap();
+        assert_eq!(estimate.method, ReserveMethod::Quantile);
+        assert_eq!(estimate.windows, QUANTILE_WINDOWS);
+        assert_eq!(estimate.burst_q99_bytes, 12 * gib);
+        assert_eq!(estimate.bytes, 12 * gib);
+        assert_eq!(estimate.file_count(gib), 12);
+        stats.persist();
+        let loaded = BurstStats::load_or_new(path);
+        assert_eq!(loaded.estimate(mount, gib), Some(estimate));
+        assert!(loaded.mount(mount).unwrap().window.is_none());
+    }
+
     #[test]
     #[allow(clippy::cast_precision_loss)]
     fn estimate_uses_the_tail_then_the_quantile() {
@@ -893,6 +1025,26 @@ mod tests {
 
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(200))]
+
+        /// Compare the streaming measurement against every ordered pair,
+        /// not another implementation of the running-minimum recurrence.
+        #[test]
+        fn window_growth_matches_the_chronological_all_pairs_reference(
+            readings in proptest::collection::vec(0u32..1_000_000, 1..80),
+        ) {
+            let mut expected = 0u32;
+            for (index, &earlier) in readings.iter().enumerate() {
+                for &later in &readings[index..] {
+                    expected = expected.max(later.saturating_sub(earlier));
+                }
+            }
+            let values: Vec<u64> = readings.iter().map(|&value| u64::from(value)).collect();
+            proptest::prop_assert_eq!(window_sample(&values), f64::from(expected));
+            // Demand does not depend on how much unrelated data was already
+            // present when the window began.
+            let shifted: Vec<u64> = values.iter().map(|value| value + (1u64 << 40)).collect();
+            proptest::prop_assert_eq!(window_sample(&shifted), f64::from(expected));
+        }
 
         /// Quantiles are monotone in `q`, bounded by the sample range, and
         /// with enough samples the median stays within 10% of the range of
