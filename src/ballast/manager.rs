@@ -289,6 +289,58 @@ fn ballast_file_name(index: u32) -> String {
     format!("SBH_BALLAST_FILE_{index:05}.dat")
 }
 
+/// sbh ballast files in a stranded pool dir, highest index first, with sizes.
+///
+/// A stranded pool is one the daemon no longer manages: the
+/// `<mount>/.sbh/ballast` default left behind when `ballast_dir` was
+/// configured elsewhere, or the pool of a bind-mount entry folded into
+/// another. Only files named `SBH_BALLAST_FILE_*.dat` whose header carries
+/// [`MAGIC`] count, so nothing sbh did not create is ever listed. Read-only.
+#[must_use]
+pub fn stranded_ballast_files(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(u32, PathBuf, u64)> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            let index: u32 = name
+                .to_str()?
+                .strip_prefix("SBH_BALLAST_FILE_")?
+                .strip_suffix(".dat")?
+                .parse()
+                .ok()?;
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() || !has_ballast_magic(&entry.path()) {
+                return None;
+            }
+            Some((index, entry.path(), meta.len()))
+        })
+        .collect();
+    files.sort_by_key(|file| std::cmp::Reverse(file.0));
+    files
+        .into_iter()
+        .map(|(_, path, size)| (path, size))
+        .collect()
+}
+
+/// Whether `path` starts with an sbh ballast header.
+fn has_ballast_magic(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut header = vec![0u8; HEADER_SIZE];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    let end = header.iter().position(|&b| b == 0).unwrap_or(HEADER_SIZE);
+    std::str::from_utf8(&header[..end])
+        .ok()
+        .and_then(|text| serde_json::from_str::<BallastHeader>(text).ok())
+        .is_some_and(|parsed| parsed.validate())
+}
+
 /// Ballast files in `dir` whose index is outside `1..=file_count`: leftovers
 /// of a larger pool, or files sbh did not create. Read-only.
 #[must_use]
