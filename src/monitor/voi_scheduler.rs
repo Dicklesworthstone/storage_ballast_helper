@@ -23,13 +23,13 @@
 //!
 //! The index is bounded and cannot prevent starvation by itself: a root
 //! with a zero reclaim forecast never gains utility, however long it waits.
-//! Each plan therefore reserves one of its existing budget slots for a
-//! never-scanned or day-overdue root, rotating by path. The remaining slots
-//! retain dirty-first, highest-index ordering. For a fixed set of N roots,
-//! every continuously eligible root gets an opportunity within at most N
-//! positive-budget VOI plans, even if scan feedback is missing. This is a
-//! scheduling guarantee, not a claim that a scan finished or that an entry
-//! is safe to delete.
+//! Plans reserve one existing budget slot for a never-scanned or day-overdue
+//! root, rotating by path. With a one-root budget, contending exploration and
+//! ordinary dirty/index-ranked work alternate, so neither monopolizes the
+//! only slot. For a fixed set of N roots, every continuously eligible root
+//! gets an opportunity within at most 2N positive-budget VOI plans (N with
+//! at least two slots), even if scan feedback is missing. This is a scheduling
+//! guarantee, not a claim that a scan finished or an entry is safe to delete.
 //!
 //! # Fallback Guarantee
 //!
@@ -196,7 +196,7 @@ impl PathStats {
 #[derive(Debug, Clone)]
 pub struct ScanPlan {
     /// Ordered list of paths to scan: the reserved maintenance opportunity,
-    /// when needed, followed by dirty-first, highest-utility roots.
+    /// when selected, followed by dirty-first, highest-utility roots.
     pub paths: Vec<ScanPlanEntry>,
     /// Whether the scheduler is in fallback (round-robin) mode.
     pub fallback_active: bool,
@@ -288,6 +288,9 @@ pub struct VoiScheduler {
     /// Last root given the reserved maintenance slot. A path key remains
     /// stable when roots become ineligible or new roots are registered.
     exploration_after: Option<PathBuf>,
+    /// A one-slot budget alternates contending exploration and ordinary
+    /// work. This records an opportunity, never a completed scan.
+    last_plan_explored: bool,
 }
 
 impl VoiScheduler {
@@ -300,6 +303,7 @@ impl VoiScheduler {
             pending_errors: Vec::new(),
             rr_cursor: 0,
             exploration_after: None,
+            last_plan_explored: false,
         }
     }
 
@@ -509,12 +513,12 @@ impl VoiScheduler {
         next.or(first).cloned()
     }
 
-    /// Reserve one existing slot for bounded maintenance exploration, then
-    /// spend the remaining budget using the dirty-first hazard index.
+    /// Reserve an existing slot for bounded maintenance exploration, sharing
+    /// a one-slot budget with ordinary work when the two choices contend.
     fn schedule_voi(&mut self, paths: &[PathBuf], budget: usize, now: Instant) -> ScanPlan {
         let prior = self.unscanned_reclaim_prior();
         let exploration = self.next_exploration(paths, now);
-        let mut scored: Vec<(bool, bool, f64, &PathBuf)> = paths
+        let mut scored: Vec<(bool, f64, &PathBuf)> = paths
             .iter()
             .map(|path| {
                 let stats = self.path_stats.get(path);
@@ -526,36 +530,47 @@ impl VoiScheduler {
                         now,
                     )
                 });
-                (exploration.as_ref() == Some(path), dirty, index, path)
+                (dirty, index, path)
             })
             .collect();
 
-        // The reserved opportunity comes first so a bounded pass does not
-        // always run out of work budget before reaching the exploration root.
-        // Every other slot retains the ordinary dirty/index/path ordering.
         scored.sort_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| b.1.cmp(&a.1))
-                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-                .then_with(|| a.3.cmp(b.3))
+                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.2.cmp(b.2))
         });
+        let exploration_index = exploration
+            .as_ref()
+            .and_then(|path| scored.iter().position(|(_, _, candidate)| *candidate == path))
+            .filter(|&index| budget > 1 || !self.last_plan_explored || index == 0);
+        if let Some(index) = exploration_index {
+            // Put the reserved opportunity first without disturbing relative
+            // dirty/index ordering among every other root. Under a one-slot
+            // budget, a contending ordinary winner gets every second plan.
+            scored[..=index].rotate_right(1);
+        }
 
         let selected: Vec<ScanPlanEntry> = scored
             .iter()
+            .enumerate()
             .take(budget)
-            .map(|(reserved, _, index, path)| {
+            .map(|(position, (_, index, path))| {
                 let stats = self.path_stats.get(*path);
                 ScanPlanEntry {
                     path: (*path).clone(),
                     utility: *index,
-                    is_exploration: *reserved || stats.is_none_or(|s| s.scan_count == 0),
+                    is_exploration: (exploration_index.is_some() && position == 0)
+                        || stats.is_none_or(|s| s.scan_count == 0),
                     forecast_reclaim_bytes: stats.map_or(0.0, |s| s.forecast_reclaim),
                 }
             })
             .collect();
 
-        if !selected.is_empty() && exploration.is_some() {
-            self.exploration_after = exploration;
+        if !selected.is_empty() {
+            self.last_plan_explored = exploration_index.is_some();
+            if self.last_plan_explored {
+                self.exploration_after = exploration;
+            }
         }
         // A plan is not completion evidence. Only record_scan_result changes
         // last_scanned, dirty_pending, forecasts or scan counts.
@@ -1090,7 +1105,7 @@ mod tests {
         let mut s = scheduler_with_paths(&["/c", "/a", "/b"]);
         s.config.scan_budget_per_interval = 1;
         let now = Instant::now();
-        for expected in ["/a", "/b", "/c", "/a"] {
+        for expected in ["/a", "/a", "/b", "/a", "/c", "/a"] {
             let plan = s.schedule(now);
             assert_eq!(plan.paths[0].path, Path::new(expected));
             assert!(plan.paths[0].is_exploration);
@@ -1186,7 +1201,50 @@ mod tests {
         s.record_scan_result(&PathBuf::from("/a"), 0, 0, 0, 1000.0, now);
         s.register_path(PathBuf::from("/aa"));
         for expected in ["/aa", "/b", "/c"] {
+            let path = PathBuf::from(expected);
+            assert_eq!(s.schedule(now).paths[0].path, path);
+            s.record_scan_result(&path, 0, 0, 0, 1000.0, now);
+        }
+    }
+
+    #[test]
+    fn an_unresponsive_overdue_root_cannot_monopolize_a_single_slot() {
+        let mut s = scheduler_with_paths(&["/cold", "/hot"]);
+        s.config.scan_budget_per_interval = 1;
+        let start = Instant::now();
+        let now = start + MAX_REVISIT_INTERVAL;
+        let cold = PathBuf::from("/cold");
+        let hot = PathBuf::from("/hot");
+        s.record_scan_result(&cold, 0, 0, 0, 1_000_000.0, start);
+        s.record_scan_result(&hot, 1_000_000_000, 10, 0, 1.0, now);
+        s.record_dirty(&hot, true, now);
+        for _ in 0..3 {
+            let exploration = s.schedule(now);
+            assert_eq!(exploration.paths[0].path, cold);
+            assert!(exploration.paths[0].is_exploration);
+            let ordinary = s.schedule(now);
+            assert_eq!(ordinary.paths[0].path, hot);
+            assert!(!ordinary.paths[0].is_exploration);
+        }
+        assert_eq!(s.path_stats(&cold).unwrap().last_scanned, Some(start));
+        assert!(s.path_stats(&hot).unwrap().dirty_pending);
+    }
+
+    #[test]
+    fn one_slot_keeps_serving_dirty_work_while_rotating_multiple_overdue_roots() {
+        let mut s = scheduler_with_paths(&["/cold-a", "/cold-b", "/cold-c", "/hot"]);
+        s.config.scan_budget_per_interval = 1;
+        let start = Instant::now();
+        let now = start + MAX_REVISIT_INTERVAL;
+        for path in ["/cold-a", "/cold-b", "/cold-c"] {
+            s.record_scan_result(&PathBuf::from(path), 0, 0, 0, 1_000_000.0, start);
+        }
+        let hot = PathBuf::from("/hot");
+        s.record_scan_result(&hot, 1_000_000_000, 10, 0, 1.0, now);
+        s.record_dirty(&hot, true, now);
+        for expected in ["/cold-a", "/cold-b", "/cold-c"] {
             assert_eq!(s.schedule(now).paths[0].path, Path::new(expected));
+            assert_eq!(s.schedule(now).paths[0].path, hot);
         }
     }
 
@@ -1212,7 +1270,8 @@ mod tests {
                 expected.insert(path);
             }
             let mut seen = std::collections::BTreeSet::new();
-            for _ in 0..inputs.len() {
+            let opportunities = if budget == 1 { 2 * inputs.len() } else { inputs.len() };
+            for _ in 0..opportunities {
                 // No completion reports: failures or a cancelled pass must
                 // not pin exploration to the same lexicographic prefix.
                 let plan = s.schedule(now);
