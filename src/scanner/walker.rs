@@ -209,10 +209,12 @@ pub const OPAQUE_SIZE_PROBE_BUDGET: usize = 200_000;
 /// Iterative (no recursion depth risk), never follows symlinks, stays on the
 /// starting device unless `cross_devices`, honours `cancel`, and stops after
 /// `budget` entries. Returns the bytes counted and whether the walk completed.
-/// A partial result is still the best available LOWER BOUND, so the call site
-/// floors it at [`OPAQUE_CANDIDATE_SIZE_FLOOR`] rather than discarding it: a
-/// budget-truncated walk of a huge tree keeps its large partial total, while a
-/// walk that saw almost nothing cannot make that tree look trivial.
+/// A partial result is still the best available LOWER BOUND. The call site
+/// floors it at [`OPAQUE_CANDIDATE_SIZE_FLOOR`] only when the walk was
+/// truncated (budget or cancel): a budget-truncated walk of a huge tree keeps
+/// its large partial total, and a walk cut off after seeing almost nothing
+/// cannot make that tree look trivial. A walk that only skipped unreadable
+/// entries keeps its measured total.
 ///
 /// Production code uses [`opaque_tree_probe`] (same walk, plus the newest
 /// mtime); this size-only view is kept for the size-accounting tests.
@@ -239,6 +241,11 @@ pub struct OpaqueTreeProbe {
     /// short: `allocated_bytes` is then a lower bound and `newest_mtime` may
     /// miss fresher files.
     pub complete: bool,
+    /// True only when the entry budget or a cancel stopped the walk: the
+    /// unvisited remainder may be any size. An incomplete walk that merely
+    /// skipped unreadable entries is not truncated; its total is a close
+    /// lower bound, not a guess.
+    pub truncated: bool,
     /// Newest `mtime` among the entries visited (symlinks excluded).
     pub newest_mtime: Option<SystemTime>,
     /// Structural markers seen at the root (validated `CACHEDIR.TAG`,
@@ -315,6 +322,7 @@ fn opaque_tree_probe(
             return OpaqueTreeProbe {
                 allocated_bytes: total,
                 complete: false,
+                truncated: true,
                 newest_mtime: newest,
                 signals,
             };
@@ -332,6 +340,7 @@ fn opaque_tree_probe(
                 return OpaqueTreeProbe {
                     allocated_bytes: total,
                     complete: false,
+                    truncated: true,
                     newest_mtime: newest,
                     signals,
                 };
@@ -347,6 +356,7 @@ fn opaque_tree_probe(
                 return OpaqueTreeProbe {
                     allocated_bytes: total,
                     complete: false,
+                    truncated: true,
                     newest_mtime: newest,
                     signals,
                 };
@@ -396,6 +406,7 @@ fn opaque_tree_probe(
     OpaqueTreeProbe {
         allocated_bytes: total,
         complete,
+        truncated: false,
         newest_mtime: newest,
         signals,
     }
@@ -440,6 +451,7 @@ pub fn tree_newest_mtime(root: &Path, max_entries: usize, max_depth: usize) -> O
                 return OpaqueTreeProbe {
                     allocated_bytes: allocated,
                     complete: false,
+                    truncated: true,
                     newest_mtime: newest,
                     signals: StructuralSignals::default(),
                 };
@@ -463,6 +475,7 @@ pub fn tree_newest_mtime(root: &Path, max_entries: usize, max_depth: usize) -> O
     OpaqueTreeProbe {
         allocated_bytes: allocated,
         complete,
+        truncated: false,
         newest_mtime: newest,
         signals: StructuralSignals::default(),
     }
@@ -963,7 +976,12 @@ fn process_directory(
                         // The tree is pruned from the main walk, so measure it
                         // here: without this every opaque candidate reported
                         // exactly the floor and nothing could be ranked by size.
-                        // A truncated/failed probe keeps the floor semantics.
+                        // Only a truncated probe (budget or cancel: the rest
+                        // could be any size) keeps the floor. A probe that
+                        // merely skipped unreadable entries measured nearly
+                        // everything; flooring it inflated small fixture dirs
+                        // to exactly 100 MiB each (vmi1264463: 1,076 of 1,117
+                        // logged deletions, `bytes_freed` pure fiction).
                         let probe = opaque_tree_probe(
                             &child_path,
                             config.cross_devices,
@@ -971,18 +989,16 @@ fn process_directory(
                             OPAQUE_SIZE_PROBE_BUDGET,
                             cancel,
                         );
-                        let (measured, complete) = (probe.allocated_bytes, probe.complete);
+                        let (measured, truncated) = (probe.allocated_bytes, probe.truncated);
                         // Same pass, no extra syscalls: the newest mtime inside
                         // the tree is what "age" means for a build cache.
                         emeta.tree_last_modified = probe.newest_mtime;
                         probe_signals = probe.signals;
-                        emeta.content_size_bytes = if complete {
-                            emeta.content_size_bytes.saturating_add(measured)
+                        let measured = emeta.content_size_bytes.saturating_add(measured);
+                        emeta.content_size_bytes = if truncated {
+                            measured.max(OPAQUE_CANDIDATE_SIZE_FLOOR)
                         } else {
-                            emeta
-                                .content_size_bytes
-                                .saturating_add(measured)
-                                .max(OPAQUE_CANDIDATE_SIZE_FLOOR)
+                            measured
                         };
                     }
                     let walk_entry = WalkEntry {
@@ -2938,6 +2954,42 @@ mod tests {
             !complete,
             "exceeding the entry budget must report incomplete"
         );
+        let probe = opaque_tree_probe(&tree, false, root_dev, 4, &cancel);
+        assert!(probe.truncated, "a budget stop is a truncation");
+    }
+
+    /// Skipping an unreadable entry leaves the probe incomplete but NOT
+    /// truncated: the measured total stands, it is not replaced by the
+    /// 100 MiB floor that only a truncated walk deserves.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_entries_are_incomplete_but_not_truncated() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let tree = tmp.path().join("small-fixture");
+        let blocked = tree.join("blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::write(tree.join("f"), b"x").unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        let root_dev = device_id(&fs::metadata(&tree).unwrap());
+        let cancel = AtomicBool::new(false);
+
+        let probe = opaque_tree_probe(&tree, false, root_dev, OPAQUE_SIZE_PROBE_BUDGET, &cancel);
+        let _ = fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755));
+
+        assert!(!probe.truncated);
+        if probe.complete {
+            assert!(crate::platform::running_as_root());
+            eprintln!(
+                "SKIP: running as root (unreadable_entries_are_incomplete_but_not_truncated)"
+            );
+            return;
+        }
+        assert!(
+            probe.allocated_bytes < OPAQUE_CANDIDATE_SIZE_FLOOR,
+            "a tiny tree measures tiny: {}",
+            probe.allocated_bytes
+        );
     }
 
     /// Cancellation during a probe must stop promptly and report incomplete.
@@ -2954,6 +3006,8 @@ mod tests {
             opaque_tree_allocated_size(&tree, false, root_dev, OPAQUE_SIZE_PROBE_BUDGET, &cancel);
         assert!(!complete);
         assert_eq!(bytes, 0);
+        let probe = opaque_tree_probe(&tree, false, root_dev, OPAQUE_SIZE_PROBE_BUDGET, &cancel);
+        assert!(probe.truncated, "a cancel is a truncation");
     }
 
     fn walk_fixture(root: &Path, opaque_pruning: bool) -> Vec<WalkEntry> {
