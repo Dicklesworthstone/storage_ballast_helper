@@ -27,6 +27,8 @@ use crate::scanner::scoring::{
 };
 use crate::scanner::walker::{FsEntryKind, FsIdentity};
 
+mod replay;
+
 /// Bumped to 2 when records gained `structural_signals`; a version-1
 /// checkpoint is rejected and the next pass walks the roots once.
 const CHECKPOINT_VERSION: u32 = 2;
@@ -186,6 +188,11 @@ impl CandidateIndexRecord {
         };
         let metadata =
             fs::symlink_metadata(&score.path).map_err(|e| SbhError::io(&score.path, e))?;
+        // Never attach a replacement's metadata to the old scanner identity.
+        // The next walk may index the replacement with its own evidence.
+        if identity_from_metadata(&metadata) != IndexedIdentity::from(identity) {
+            return Ok(None);
+        }
         let (parent_identity, parent_mtime_nanos) = parent_snapshot(&score.path);
 
         Ok(Some(Self {
@@ -250,6 +257,7 @@ impl CandidateIndexRecord {
             && self.candidate_ctime_nanos == other.candidate_ctime_nanos
             && self.size_estimate_bytes == other.size_estimate_bytes
             && self.prune_decision == other.prune_decision
+            && self.structural_signals == other.structural_signals
     }
 
     /// A `CandidacyScore` fabricated from the persisted total score (every
@@ -377,7 +385,11 @@ impl ScannerCandidateIndex {
         {
             record.fail_count = existing.fail_count;
             record.cooldown_until_nanos = existing.cooldown_until_nanos;
-            if existing.safety_state == CandidateSafetyState::Failed {
+            // A failed attempt is retryable, not permission to overwrite a
+            // newly observed active-reference or safety veto with Failed.
+            if existing.safety_state == CandidateSafetyState::Failed
+                && record.safety_state == CandidateSafetyState::Safe
+            {
                 record.safety_state = CandidateSafetyState::Failed;
             }
         }
@@ -391,30 +403,20 @@ impl ScannerCandidateIndex {
         })
     }
 
-    /// The `limit` best persisted candidates (safe or previously failed, scored,
-    /// not cooling down), best score then largest first. These are hints: the
-    /// daemon re-stats and re-scores each one with fresh vetoes before it may
-    /// be dispatched (`replay_indexed_record`).
+    /// The `limit` best current-generation candidates (safe or previously
+    /// failed, finite positive scores, not cooling down), best score then
+    /// largest first. Ties break by path and identity, not discovery order.
+    /// Uses O(limit) ranking storage rather than sorting the entire index.
+    /// These remain hints: the daemon re-stats and re-scores each result
+    /// with fresh vetoes before dispatch (`replay_indexed_record`).
     #[must_use]
     pub fn ranked_records(&self, now: SystemTime, limit: usize) -> Vec<CandidateIndexRecord> {
-        let mut records = self
-            .records
-            .values()
-            .filter(|record| {
-                matches!(
-                    record.safety_state,
-                    CandidateSafetyState::Safe | CandidateSafetyState::Failed
-                ) && record.score.is_some()
-                    && !self.in_cooldown(record.identity, now)
-            })
-            .collect::<Vec<_>>();
-        records.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.size_estimate_bytes.cmp(&a.size_estimate_bytes))
-        });
-        records.into_iter().take(limit).cloned().collect()
+        replay::ranked_records(
+            self.records.values(),
+            self.event_generation,
+            system_time_nanos(now),
+            limit,
+        )
     }
 
     /// Persisted scores turned straight into dispatchable candidates. Kept
@@ -432,7 +434,14 @@ impl ScannerCandidateIndex {
     }
 
     pub fn mark_event_overflow(&mut self) {
-        self.event_generation = self.event_generation.saturating_add(1);
+        if let Some(next) = self.event_generation.checked_add(1) {
+            self.event_generation = next;
+        } else {
+            // Saturation would make a subsequent overflow leave every record
+            // apparently fresh. Reset only after revoking all old records.
+            self.records.clear();
+            self.event_generation = 0;
+        }
     }
 
     pub fn record_failure(
