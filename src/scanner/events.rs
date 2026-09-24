@@ -23,10 +23,14 @@ use crate::scanner::index::ScannerCandidateIndex;
 use crate::scanner::patterns::classify_opaque_tree;
 use crate::scanner::walker::opaque_context_for_path;
 
+#[cfg(any(target_os = "macos", test))]
+mod fsevents;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EventBackendKind {
     Fanotify,
     RecursiveInotify,
+    Fsevents,
     ReconciliationOnly,
 }
 
@@ -35,6 +39,7 @@ impl fmt::Display for EventBackendKind {
         match self {
             Self::Fanotify => f.write_str("fanotify"),
             Self::RecursiveInotify => f.write_str("recursive-inotify"),
+            Self::Fsevents => f.write_str("fsevents"),
             Self::ReconciliationOnly => f.write_str("reconciliation-only"),
         }
     }
@@ -149,7 +154,12 @@ impl EventSourcePlan {
             );
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            fsevents::root_plan(config).summary
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             Self::reconciliation_only(
                 &config.root_paths,
@@ -795,7 +805,7 @@ pub struct ScannerEventSource {
     pending: EventInvalidation,
     rates: EventRateTracker,
     backoff: OverflowBackoff,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     planned_at: Instant,
     replans: u64,
 }
@@ -818,6 +828,16 @@ impl ScannerEventSource {
         pending.mark_plan_gaps(&plan);
 
         let backend = match plan.backend {
+            EventBackendKind::Fsevents => {
+                #[cfg(target_os = "macos")]
+                {
+                    fsevents::start_backend(&config, &mut capability, &mut pending, now)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    EventSourceBackend::ReconciliationOnly
+                }
+            }
             EventBackendKind::RecursiveInotify => {
                 #[cfg(target_os = "linux")]
                 {
@@ -890,6 +910,16 @@ impl ScannerEventSource {
     pub fn drain_at(&mut self, now: Instant) -> EventInvalidation {
         let mut invalidation = std::mem::replace(&mut self.pending, EventInvalidation::empty());
         match &mut self.backend {
+            #[cfg(target_os = "macos")]
+            EventSourceBackend::Fsevents(backend) => {
+                invalidation.merge(backend.drain(
+                    &self.config,
+                    &mut self.rates,
+                    &mut self.backoff,
+                    &mut self.capability,
+                    now,
+                ));
+            }
             #[cfg(target_os = "linux")]
             EventSourceBackend::RecursiveInotify(backend) => {
                 invalidation.merge(backend.drain(
@@ -936,7 +966,11 @@ impl ScannerEventSource {
     }
 
     fn should_replan(&self, now: Instant) -> bool {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            fsevents::retry_due(&self.config, &self.capability, self.planned_at, now)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = now;
             false
@@ -950,9 +984,27 @@ impl ScannerEventSource {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn replan(&mut self, _now: Instant) -> EventInvalidation {
         EventInvalidation::empty()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn replan(&mut self, now: Instant) -> EventInvalidation {
+        self.planned_at = now;
+        self.replans = self.replans.saturating_add(1);
+        let mut invalidation = EventInvalidation::empty();
+        // The replacement starts before the old stream is dropped. A full
+        // reconciliation closes the SinceNow gap and removes stale aliases.
+        fsevents::refresh_backend(
+            &self.config,
+            &mut self.backend,
+            &mut self.capability,
+            &mut invalidation,
+            now,
+        );
+        self.rates.retain_watched(self.config.root_paths());
+        invalidation
     }
 
     /// Re-spend the watch budget by observed event rate. The new backend is
@@ -1000,6 +1052,8 @@ impl ScannerEventSource {
 
 #[derive(Debug)]
 enum EventSourceBackend {
+    #[cfg(target_os = "macos")]
+    Fsevents(fsevents::MacOsFseventsBackend),
     #[cfg(target_os = "linux")]
     RecursiveInotify(LinuxInotifyBackend),
     ReconciliationOnly,
@@ -1902,8 +1956,8 @@ mod tests {
 
     /// bd-rc-master-ajg1.8.5: the capability report must say what the event
     /// source really is on this platform. Linux plans recursive inotify and
-    /// reports fanotify as deferred; every other platform reconciles only,
-    /// with every root dirty, and says why.
+    /// reports fanotify as deferred; macOS plans recursive FSEvents streams;
+    /// other platforms reconcile only, with every root dirty, and say why.
     #[test]
     fn capability_report_is_honest_about_the_platform() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1931,6 +1985,12 @@ mod tests {
             );
             assert!(capability.recursive_inotify.available, "{capability:?}");
             assert!(capability.complete, "{capability:?}");
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(capability.selected_backend, EventBackendKind::Fsevents);
+            assert!(!capability.recursive_inotify.available, "{capability:?}");
+            assert!(capability.complete, "{capability:?}");
+            assert_eq!(capability.watched_dirs, 1);
+            assert!(capability.dirty_roots.is_empty());
         } else {
             assert_eq!(
                 capability.selected_backend,

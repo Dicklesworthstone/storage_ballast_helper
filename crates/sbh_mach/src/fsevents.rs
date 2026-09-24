@@ -92,14 +92,8 @@ impl Inbox {
 }
 
 type NativeRef = *const c_void;
-type Callback = unsafe extern "C" fn(
-    NativeRef,
-    *mut c_void,
-    usize,
-    *mut c_void,
-    *const u32,
-    *const u64,
-);
+type Callback =
+    unsafe extern "C" fn(NativeRef, *mut c_void, usize, *mut c_void, *const u32, *const u64);
 
 #[repr(C)]
 struct StreamContext {
@@ -265,15 +259,12 @@ impl Fsevents {
             // SAFETY: bytes is live for length bytes. CF copies the string;
             // UTF-8 was validated above. Null uses the default allocator.
             strings.push(CfOwned::checked(
-                unsafe {
-                    CFStringCreateWithBytes(ptr::null(), bytes.as_ptr(), length, UTF8, 0)
-                },
+                unsafe { CFStringCreateWithBytes(ptr::null(), bytes.as_ptr(), length, UTF8, 0) },
                 "CFStringCreateWithBytes",
             )?);
         }
         let values: Vec<NativeRef> = strings.iter().map(CfOwned::raw).collect();
-        let count =
-            isize::try_from(values.len()).map_err(|_| io::Error::other("too many roots"))?;
+        let count = isize::try_from(values.len()).map_err(|_| io::Error::other("too many roots"))?;
         // SAFETY: every value is a live CFString. Type callbacks retain the
         // strings, so both the array and any stream-retained copy own them.
         let paths = CfOwned::checked(
@@ -340,17 +331,16 @@ impl Fsevents {
     pub fn drain(&mut self) -> EventBatch {
         self.inbox.drain()
     }
-
 }
 
-unsafe extern "C" fn retain_context(info: NativeRef) -> NativeRef {
+extern "C" fn retain_context(info: NativeRef) -> NativeRef {
     // SAFETY: context.info was made from Arc::as_ptr; creation keeps the
     // original alive and each native retain is paired with release_context.
     unsafe { Arc::increment_strong_count(info.cast::<Inbox>()) };
     info
 }
 
-unsafe extern "C" fn release_context(info: NativeRef) {
+extern "C" fn release_context(info: NativeRef) {
     // SAFETY: consumes precisely the reference acquired by retain_context.
     drop(unsafe { Arc::from_raw(info.cast::<Inbox>()) });
 }
@@ -529,14 +519,7 @@ mod tests {
     fn oversized_callback_does_not_dereference_its_arrays() {
         let inbox = Inbox::default();
         // SAFETY: the oversized-count path rejects before reading arrays.
-        unsafe {
-            receive_inner(
-                &inbox,
-                MAX_CALLBACK_EVENTS + 1,
-                ptr::null_mut(),
-                ptr::null(),
-            )
-        };
+        unsafe { receive_inner(&inbox, MAX_CALLBACK_EVENTS + 1, ptr::null_mut(), ptr::null()) };
         assert!(inbox.drain().must_rescan);
     }
 
