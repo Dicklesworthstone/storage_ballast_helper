@@ -662,19 +662,15 @@ impl DeletionExecutor {
                             .to_string(),
                 });
                 // Fail safe: abort the entire batch because we cannot guarantee
-                // that any candidate is safe to delete.
+                // that any candidate is safe to delete. Every candidate is a
+                // skip, not a failure, and is not backed off: the missing
+                // evidence is the host's load, not the path's fault. Counting
+                // aborts as failures raised the deletion-failure alarm
+                // (SBH-2005 "delete_error") on busy hosts that had deleted
+                // nothing wrong (css, 2026-09-24).
                 report.duration = start.elapsed();
-                // Mark all candidates as skipped/failed due to safety check.
-                report.items_failed = limit;
-                for candidate in plan.candidates.iter().take(limit) {
+                for _ in plan.candidates.iter().take(limit) {
                     report.record_skip(SkipReason::OpenScanIncomplete);
-                    report.errors.push(DeletionError {
-                        path: candidate.path.clone(),
-                        error: "safety check incomplete".to_string(),
-                        error_code: "SBH-3003".to_string(),
-                        recoverable: true,
-                    });
-                    report.backoff_candidates.push(candidate.clone());
                 }
                 return report;
             }
@@ -3539,18 +3535,18 @@ mod tests {
         let plan = executor.plan(vec![candidate]);
         let report = executor.execute(&plan, None);
 
-        // Entire batch must be vetoed / skipped safely
+        // Entire batch must be vetoed / skipped safely. An abort is a skip,
+        // not a deletion failure (it must not feed the failure alarm), and
+        // the candidate is not backed off for the host's load.
         assert_eq!(report.items_deleted, 0);
         assert_eq!(report.items_skipped, 1);
-        assert_eq!(report.items_failed, 1);
+        assert_eq!(report.items_failed, 0);
+        assert!(report.errors.is_empty());
+        assert!(report.backoff_candidates.is_empty());
         assert_eq!(
             report.skipped_by_reason.get("open_scan_incomplete"),
             Some(&1),
             "candidate must be attributed to SkipReason::OpenScanIncomplete"
-        );
-        assert!(
-            report.errors.iter().any(|err| err.error_code == "SBH-3003"),
-            "safety check incomplete error must be recorded"
         );
         assert!(target_dir.exists(), "candidate must not be deleted");
     }
