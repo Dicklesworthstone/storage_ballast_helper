@@ -27,6 +27,8 @@ use crate::core::config::BallastConfig;
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::Platform;
 
+mod emergency;
+
 // ──────────────────── constants ────────────────────
 
 pub const HEADER_SIZE: usize = 4096;
@@ -547,7 +549,7 @@ impl BallastManager {
     // ──────────────────── locking ────────────────────
 
     #[cfg(unix)]
-    fn acquire_lock(&self) -> Result<nix::fcntl::Flock<File>> {
+    fn acquire_lock(&self, nonblocking: bool) -> Result<nix::fcntl::Flock<File>> {
         // Mutating paths own directory creation; opening a manager does not.
         fs::create_dir_all(&self.ballast_dir).map_err(|e| SbhError::io(&self.ballast_dir, e))?;
         let lock_path = self.ballast_dir.join(".lock");
@@ -557,19 +559,27 @@ impl BallastManager {
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&lock_path)
             .map_err(|e| SbhError::io(&lock_path, e))?;
-
+        if !file.metadata().map_err(|e| SbhError::io(&lock_path, e))?.is_file() {
+            return Err(SbhError::Runtime {
+                details: format!("ballast lock is not a regular file: {}", lock_path.display()),
+            });
+        }
+        let operation = if nonblocking {
+            nix::fcntl::FlockArg::LockExclusiveNonblock
+        } else {
+            nix::fcntl::FlockArg::LockExclusive
+        };
         #[allow(deprecated)]
-        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive).map_err(|(_file, e)| {
-            SbhError::Runtime {
-                details: format!("failed to lock ballast dir: {e}"),
-            }
+        nix::fcntl::Flock::lock(file, operation).map_err(|(_file, e)| SbhError::Runtime {
+            details: format!("failed to lock ballast dir: {e}"),
         })
     }
 
     #[cfg(not(unix))]
-    fn acquire_lock(&self) -> Result<()> {
+    fn acquire_lock(&self, _nonblocking: bool) -> Result<()> {
         Ok(())
     }
 
@@ -583,7 +593,7 @@ impl BallastManager {
         &mut self,
         free_pct_check: Option<&dyn Fn() -> f64>,
     ) -> Result<ProvisionReport> {
-        let _lock = self.acquire_lock()?;
+        let _lock = self.acquire_lock(false)?;
         let mut report = ProvisionReport {
             files_created: 0,
             files_skipped: 0,
@@ -654,45 +664,12 @@ impl BallastManager {
     // ──────────────────── release ────────────────────
 
     /// Release N ballast files (delete highest-index first).
+    ///
+    /// On Unix, use the existing pool lock without allocating or waiting for a
+    /// provisioner. Inventory is refreshed under that lock and only successful
+    /// removals consume the quota. A busy pool can be retried on a later tick.
     pub fn release(&mut self, count: usize) -> Result<ReleaseReport> {
-        let _lock = self.acquire_lock()?;
-        let mut report = ReleaseReport {
-            files_released: 0,
-            bytes_freed: 0,
-            warnings: Vec::new(),
-            errors: Vec::new(),
-            released: Vec::new(),
-        };
-
-        // Collect indices of available files in descending order.
-        let mut available: Vec<u32> = self.inventory.iter().map(|f| f.index).collect();
-        available.sort_unstable_by(|a, b| b.cmp(a));
-
-        for &index in available.iter().take(count) {
-            let path = self.file_path(index);
-            let actual_size = fs::metadata(&path).map_or(0, |m| m.len());
-            match fs::remove_file(&path) {
-                Ok(()) => {
-                    report.files_released += 1;
-                    report.bytes_freed += actual_size;
-                    report.released.push((path.clone(), actual_size));
-                }
-                Err(e) => {
-                    report
-                        .errors
-                        .push(format!("failed to release file {index}: {e}"));
-                }
-            }
-        }
-
-        if report.files_released > 0 {
-            report
-                .warnings
-                .extend(self.local_snapshot_release_warnings());
-        }
-
-        self.scan_existing();
-        Ok(report)
+        emergency::release(self, count)
     }
 
     fn local_snapshot_release_warnings(&self) -> Vec<String> {
@@ -723,7 +700,7 @@ impl BallastManager {
         // release cannot be observed half-written. A pool that does not
         // exist yet is reported as all-missing without creating anything.
         let _lock = if self.ballast_dir.is_dir() {
-            Some(self.acquire_lock()?)
+            Some(self.acquire_lock(false)?)
         } else {
             None
         };
@@ -770,11 +747,12 @@ impl BallastManager {
     }
 
     /// Recreate at most one missing ballast file (for gradual replenishment).
+    /// A busy pool returns an error immediately so a daemon tick can continue.
     pub fn replenish_one(
         &mut self,
         free_pct_check: Option<&dyn Fn() -> f64>,
     ) -> Result<ProvisionReport> {
-        let _lock = self.acquire_lock()?;
+        let _lock = self.acquire_lock(true)?;
         let mut report = ProvisionReport {
             files_created: 0,
             files_skipped: 0,
