@@ -1516,6 +1516,32 @@ fn prescan_age(path: &Path) -> Duration {
     newest.elapsed().unwrap_or(Duration::ZERO)
 }
 
+/// Recursive allocated size of a pre-scan directory candidate.
+///
+/// The pre-scan used to plan every directory at a flat 100 MiB, so a 2 MiB
+/// `.ruff_cache` was planned and logged as 100 MiB (css 2026-09-25,
+/// `freed=104857600B observed_freed=2195456B`). This uses the walker's
+/// bounded probe and, like the walker, keeps the floor only when the probe
+/// was cut short and the remainder could be any size.
+fn prescan_dir_size(path: &Path, cross_devices: bool, cancel: &AtomicBool) -> u64 {
+    use crate::scanner::walker::{OPAQUE_CANDIDATE_SIZE_FLOOR, OPAQUE_SIZE_PROBE_BUDGET};
+    let Ok(meta) = path.symlink_metadata() else {
+        return OPAQUE_CANDIDATE_SIZE_FLOOR;
+    };
+    let probe = crate::scanner::walker::opaque_tree_probe(
+        path,
+        cross_devices,
+        crate::scanner::walker::device_id(&meta),
+        OPAQUE_SIZE_PROBE_BUDGET,
+        cancel,
+    );
+    if probe.truncated {
+        probe.allocated_bytes.max(OPAQUE_CANDIDATE_SIZE_FLOOR)
+    } else {
+        probe.allocated_bytes
+    }
+}
+
 /// Probe write used to leave `MountState::Recovery`: 4 KiB into the mount's
 /// ballast directory (or `<mount>/.sbh`), removed again on success.
 fn probe_mount_writable(mount: &Path, ballast_dir: Option<&Path>) -> bool {
@@ -6501,13 +6527,24 @@ fn daemon_protection_reason(
     }
 
     let overlaps = protection::find_sacred_overlaps(path, sacred_paths)?;
-    let reason = overlaps
-        .first()
-        .map(|overlap| format!("sacred path overlap: {}", overlap.summary()));
-    if let Some(reason) = reason.as_ref() {
-        protection.cache_protected_verdict(path, reason.clone());
+    let Some(first) = overlaps.first() else {
+        return Ok(None);
+    };
+    let reason = format!("sacred path overlap: {}", first.summary());
+    // A real find is a witness: the verdict then survives the churn of a busy
+    // protected tree (an agent's temp dir with a live `.db` or `.beads/`)
+    // instead of being re-walked on every pass. A truncated sub-walk proved
+    // nothing and keeps the mtime/TTL rule.
+    match overlaps
+        .iter()
+        .find(|overlap| overlap.pattern != protection::TRUNCATED_OVERLAP_PATTERN)
+    {
+        Some(found) => {
+            protection.cache_witnessed_verdict(path, reason.clone(), found.matched_path.clone());
+        }
+        None => protection.cache_protected_verdict(path, reason.clone()),
     }
-    Ok(reason)
+    Ok(Some(reason))
 }
 
 /// Why a replayed index record was not dispatched.
@@ -7840,6 +7877,21 @@ fn scanner_thread_main(
                             excluded: false,
                         };
                         let mut score = prescan_engine.score_candidate(&input, request.urgency);
+                        // Nomination keeps the floor in the size factor; only a
+                        // directory that would be deleted pays for a real size
+                        // probe, and that measured size is what the planner
+                        // ranks and the executor reports.
+                        let measured_size = (score.decision.action
+                            == crate::scanner::scoring::DecisionAction::Delete
+                            && !score.vetoed
+                            && candidate_path.is_dir())
+                        .then(|| {
+                            prescan_dir_size(
+                                &candidate_path,
+                                current_scanner_config.cross_devices,
+                                shutdown,
+                            )
+                        });
                         if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
                             && !score.vetoed
                             && active_reference_scan.should_probe(size)
@@ -7947,6 +7999,9 @@ fn scanner_thread_main(
                                     held_by_certainty += 1;
                                 }
                             } else if !scanner_index_backoff_active {
+                                if let Some(measured) = measured_size {
+                                    score.size_bytes = measured;
+                                }
                                 priority_candidates.push(score);
                             }
                         }
@@ -9726,6 +9781,72 @@ mod tests {
         assert!(clear.stage_changed);
     }
 
+    /// A small complete tree is planned at its measured size, not the 100 MiB
+    /// floor the pre-scan used to apply to every directory.
+    #[test]
+    fn prescan_measures_small_directory_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join(".ruff_cache");
+        std::fs::create_dir_all(cache.join("0.6")).unwrap();
+        std::fs::write(cache.join("0.6").join("blob"), vec![7u8; 2 * 1_048_576]).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        let size = prescan_dir_size(&cache, false, &cancel);
+
+        assert!(size >= 2 * 1_048_576, "{size}");
+        assert!(
+            size < crate::scanner::walker::OPAQUE_CANDIDATE_SIZE_FLOOR,
+            "a complete 2 MiB tree must not be floored to 100 MiB: {size}"
+        );
+    }
+
+    /// css 2026-09-25: busy agent temp dirs holding a live `.db` were re-walked
+    /// on every pass because each pass changed their mtime. The daemon now
+    /// caches the find itself as the witness, so churn does not force a
+    /// re-walk while the `.db` is still there.
+    #[test]
+    fn found_sacred_path_keeps_a_busy_tree_protected_without_rewalking() {
+        let temp = tempfile::tempdir().unwrap();
+        let candidate = temp.path().join("claude-1000");
+        let db = candidate.join("lh").join("router").join("actions.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"db").unwrap();
+        // The built-in `*.db` stowaway marker, as in the css log.
+        let sacred = vec![crate::platform::types::SacredPath {
+            pattern: "*.db".to_string(),
+            kind: crate::platform::types::SacredPathKind::StowawayMarker,
+            reason: "Database files commonly hold application or project state.".to_string(),
+            source: crate::platform::types::SacredPathSource::Builtin,
+        }];
+        let mut registry = ProtectionRegistry::marker_only();
+
+        let reason = daemon_protection_reason(&mut registry, &candidate, &sacred)
+            .unwrap()
+            .expect("a *.db inside must protect the tree");
+        assert!(reason.contains("actions.db"), "{reason}");
+
+        std::fs::create_dir(candidate.join("new-session")).unwrap();
+        let later =
+            std::fs::metadata(&candidate).unwrap().modified().unwrap() + Duration::from_secs(1);
+        std::fs::File::open(&candidate)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(
+            registry.cached_protected_verdict(&candidate).as_deref(),
+            Some(reason.as_str()),
+            "churn must not drop a verdict whose witness still exists"
+        );
+
+        std::fs::remove_file(&db).unwrap();
+        assert!(registry.cached_protected_verdict(&candidate).is_none());
+        assert_eq!(
+            daemon_protection_reason(&mut registry, &candidate, &sacred).unwrap(),
+            None,
+            "with the .db gone the tree is re-proved and is no longer protected"
+        );
+    }
+
     /// A candidate whose protection cannot be proved is skipped, and stays
     /// skipped on later passes without being re-probed and re-logged.
     #[test]
@@ -10391,6 +10512,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one end-to-end scanner pass
     fn scanner_prescan_discovers_target_in_repo_with_beads_tracker() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("scan-root");
@@ -10496,6 +10618,17 @@ mod tests {
                 .iter()
                 .any(|c| c.path == repo || c.path == beads_dir),
             "batch must never contain repo root or .beads dir"
+        );
+        // The dispatched size is measured, not the 100 MiB nomination floor.
+        let target = batch
+            .candidates
+            .iter()
+            .find(|c| c.path == target_dir)
+            .unwrap();
+        assert!(
+            target.size_bytes < crate::scanner::walker::OPAQUE_CANDIDATE_SIZE_FLOOR,
+            "a near-empty target must be planned at its real size: {}",
+            target.size_bytes
         );
 
         logger.shutdown();
