@@ -562,9 +562,16 @@ impl BallastManager {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&lock_path)
             .map_err(|e| SbhError::io(&lock_path, e))?;
-        if !file.metadata().map_err(|e| SbhError::io(&lock_path, e))?.is_file() {
+        if !file
+            .metadata()
+            .map_err(|e| SbhError::io(&lock_path, e))?
+            .is_file()
+        {
             return Err(SbhError::Runtime {
-                details: format!("ballast lock is not a regular file: {}", lock_path.display()),
+                details: format!(
+                    "ballast lock is not a regular file: {}",
+                    lock_path.display()
+                ),
             });
         }
         let operation = if nonblocking {

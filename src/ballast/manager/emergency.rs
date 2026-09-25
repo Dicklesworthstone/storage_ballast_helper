@@ -90,7 +90,8 @@ mod unix {
                     // invent another locking protocol on a full filesystem.
                     for index in 1..=configured_count {
                         let name = ballast_file_name(
-                            u32::try_from(index).map_err(|_| invalid("ballast index exceeds u32"))?,
+                            u32::try_from(index)
+                                .map_err(|_| invalid("ballast index exceeds u32"))?,
                         );
                         match open_regular(&directory, OsStr::new(&name)) {
                             Err(missing) if missing.kind() == io::ErrorKind::NotFound => {}
@@ -262,7 +263,7 @@ mod unix {
                 file_size_bytes: 12_288,
                 replenish_cooldown_minutes: 0,
                 auto_provision: true,
-                overrides: Default::default(),
+                overrides: std::collections::BTreeMap::default(),
             }
         }
 
@@ -568,7 +569,9 @@ pub(super) fn release(manager: &mut BallastManager, count: usize) -> Result<Rele
                 report.released.push((path, size));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => report.errors.push(format!("failed to release file {index}: {error}")),
+            Err(error) => report
+                .errors
+                .push(format!("failed to release file {index}: {error}")),
         }
     }
     manager.scan_existing();
