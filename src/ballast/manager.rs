@@ -1302,6 +1302,22 @@ mod tests {
         BallastManager::new_unfloored(dir, config)
     }
 
+    /// A manager whose volume reports half its space free, whatever the build
+    /// host's disk looks like, so floor tests exercise the floor and the
+    /// caller's probe rather than the host (they failed on a 99%-full Mac).
+    /// Pool files are written for real and seeded with their allocation.
+    fn roomy(dir: &Path, config: BallastConfig) -> BallastManager {
+        let blocks = config.file_size_bytes.div_ceil(512);
+        let mut platform = MockPlatform::healthy();
+        for index in 1..=u32::try_from(config.file_count).unwrap() {
+            platform = platform.with_block_count(dir.join(ballast_file_name(index)), blocks);
+        }
+        let mut manager =
+            BallastManager::with_platform(dir.to_path_buf(), config, Arc::new(platform)).unwrap();
+        manager.set_skip_fallocate(true);
+        manager
+    }
+
     fn small_config() -> BallastConfig {
         BallastConfig {
             file_count: 3,
@@ -1585,7 +1601,7 @@ mod tests {
     #[test]
     fn provision_refuses_files_that_would_breach_the_floor() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = roomy(dir.path(), small_config());
         mgr.set_provision_floor(10.0);
 
         let report = mgr.provision(Some(&|| 9.0)).unwrap();
@@ -1614,7 +1630,7 @@ mod tests {
     #[test]
     fn provision_admits_a_full_reserve_when_the_volume_stays_above_the_floor() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = roomy(dir.path(), small_config());
         mgr.set_provision_floor(10.0);
 
         let report = mgr.provision(Some(&|| 12.0)).unwrap();
@@ -1634,7 +1650,7 @@ mod tests {
     #[test]
     fn provision_stops_at_the_file_that_would_cross_the_floor() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = roomy(dir.path(), small_config());
         mgr.set_provision_floor(10.0);
 
         // Free space as the caller's probe would see it before each file:
@@ -1655,7 +1671,7 @@ mod tests {
     #[test]
     fn default_floor_refuses_a_volume_that_config_would_admit() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = roomy(dir.path(), small_config());
         assert!((mgr.provision_floor_pct() - DEFAULT_PROVISION_FLOOR_PCT).abs() < f64::EPSILON);
 
         let report = mgr.provision(Some(&|| 12.0)).unwrap();
@@ -1673,7 +1689,7 @@ mod tests {
     #[test]
     fn replenish_one_honors_the_floor() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = roomy(dir.path(), small_config());
         mgr.set_provision_floor(10.0);
         assert_eq!(mgr.provision(None).unwrap().files_created, 3);
         assert_eq!(mgr.release(1).unwrap().files_released, 1);

@@ -2034,9 +2034,32 @@ mod tests {
         assert!(blocks > 0);
     }
 
+    /// sbh never preallocates on a volume below its provisioning floor, and
+    /// APFS honours `F_PREALLOCATE` only partly when nearly full (a 99%-full
+    /// Mac allocated 128 KiB of 64 MiB, 2026-09-25; a fresh APFS image passes).
+    /// There the preallocation tests prove nothing about sbh, so they say so.
+    fn temp_volume_below_provisioning_floor(dir: &Path) -> bool {
+        let stats = MacOsPal::new()
+            .fs_stats(dir)
+            .expect("temp volume stats should be readable");
+        #[allow(clippy::cast_precision_loss)]
+        let free_pct = stats.available_bytes as f64 / stats.total_bytes.max(1) as f64 * 100.0;
+        let below = free_pct < 10.0;
+        if below {
+            eprintln!(
+                "SKIP: temp volume {} is {free_pct:.1}% free, below the 10% provisioning floor",
+                stats.mount_point.display()
+            );
+        }
+        below
+    }
+
     #[test]
     fn preallocate_file_reserves_blocks_on_macos() {
         let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        if temp_volume_below_provisioning_floor(dir.path()) {
+            return;
+        }
         let path = dir.path().join("preallocated-macos.bin");
         let size = 1024 * 1024;
         let platform = MacOsPal::new();
@@ -2057,6 +2080,9 @@ mod tests {
     #[test]
     fn preallocate_64mib_ballast_file_in_under_one_second() {
         let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        if temp_volume_below_provisioning_floor(dir.path()) {
+            return;
+        }
         let path = dir.path().join("ballast-64mib.bin");
         let size = 64 * 1024 * 1024;
         let platform = MacOsPal::new();

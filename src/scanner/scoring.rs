@@ -1023,6 +1023,7 @@ fn factor_location(path: &Path) -> f64 {
         || text.starts_with("/var/tmp")
         || text.starts_with("/data/tmp")
         || text.starts_with("/dev/shm")
+        || crate::scanner::patterns::is_darwin_user_temp_path(path)
     {
         0.95
     } else if text.contains("/data/projects/") && text.contains("/.tmp_") {
@@ -1084,6 +1085,7 @@ pub fn is_volatile_temp_path(path: &Path) -> bool {
         || path.starts_with("/var/tmp")
         || path.starts_with("/data/tmp")
         || path.starts_with("/dev/shm")
+        || crate::scanner::patterns::is_darwin_user_temp_path(path)
 }
 
 fn factor_name(path: &Path, classification: &ArtifactClassification) -> f64 {

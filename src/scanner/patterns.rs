@@ -633,6 +633,33 @@ fn is_tmp_like_path(path: &Path) -> bool {
             let root = Path::new(root);
             path == root || path.starts_with(root)
         })
+        || is_darwin_user_temp_path(path)
+}
+
+/// Anything inside a macOS per-user temp dir, `$TMPDIR` =
+/// `/var/folders/<xx>/<hash>/T` (or its `/private/var/...` spelling).
+///
+/// It is the Mac equivalent of `/tmp` for everything that honours `TMPDIR`
+/// (cargo test fixtures, build scratch), yet no temp-root list knew it, so a
+/// target there scored `Review` where the same target in `/tmp` scored
+/// `Delete` (first native macOS test run, 2026-09-25). Only `T` counts: `C`
+/// is the per-user cache dir and `0` belongs to the system.
+#[must_use]
+pub fn is_darwin_user_temp_path(path: &Path) -> bool {
+    let mut parts = path.components().filter_map(|part| match part {
+        std::path::Component::Normal(name) => name.to_str(),
+        _ => None,
+    });
+    let mut first = parts.next();
+    if first == Some("private") {
+        first = parts.next();
+    }
+    first == Some("var")
+        && parts.next() == Some("folders")
+        && parts.next().is_some()
+        && parts.next().is_some()
+        && parts.next() == Some("T")
+        && parts.next().is_some()
 }
 
 fn is_cargo_cache_root(path: &Path) -> bool {
@@ -1614,6 +1641,32 @@ mod tests {
     };
     use crate::platform::{linux, macos};
     use std::path::Path;
+
+    #[test]
+    fn darwin_user_temp_dir_is_a_temp_root() {
+        use super::is_darwin_user_temp_path as temp;
+        for inside in [
+            "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/.tmp6ktZ0Q/proj/target",
+            "/private/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/build",
+        ] {
+            assert!(temp(Path::new(inside)), "{inside}");
+        }
+        for outside in [
+            // $TMPDIR itself is never a candidate.
+            "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T",
+            // The per-user cache dir and the system-owned dir are not temp.
+            "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/C/com.apple.x",
+            "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/0/state",
+            "/var/folders/vt/T/short",
+            "/Users/op/var/folders/vt/hash/T/lookalike",
+        ] {
+            assert!(!temp(Path::new(outside)), "{outside}");
+        }
+        // The scoring side agrees: a target there is in a volatile temp root.
+        assert!(crate::scanner::scoring::is_volatile_temp_path(Path::new(
+            "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/proj/target"
+        )));
+    }
 
     fn classify_macos(
         registry: &ArtifactPatternRegistry,

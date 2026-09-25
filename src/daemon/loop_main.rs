@@ -1945,6 +1945,7 @@ fn is_tmp_like_path(path: &Path) -> bool {
         || text.starts_with("/data/tmp/")
         || text == "/private/tmp"
         || text.starts_with("/private/tmp/")
+        || crate::scanner::patterns::is_darwin_user_temp_path(path)
 }
 
 /// rch's bare in-tree target dirs (`.rch-target/`, `rch-target/`, plus
@@ -9567,6 +9568,41 @@ mod tests {
     /// The two on-disk scanner checkpoints a `scanner_thread_main` test
     /// needs: the v2 candidate index and the priority pre-scan's resume
     /// cursor.
+    /// A scratch dir outside every temp root. Inside one every recognized
+    /// artifact is `definite` by rule, which changes what a scanner test
+    /// sees; `tempfile::tempdir()` is a temp root on a Mac (`$TMPDIR`) and a
+    /// plain tempdir only on the rch workers (their `TMPDIR` is `.rch-tmp`).
+    /// The cargo target directory is neither temp nor source, unless the
+    /// build itself runs from a temp root, in which case the user cache
+    /// directory stands in.
+    fn non_temp_scratch_dir() -> tempfile::TempDir {
+        let scratch_base = [
+            std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")),
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".cache").join("sbh-test-scratch")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|base| !crate::scanner::scoring::is_volatile_temp_path(base))
+        .expect("a scratch base outside every temp root");
+        std::fs::create_dir_all(&scratch_base).unwrap();
+        tempfile::tempdir_in(&scratch_base).unwrap()
+    }
+
+    /// The `CACHEDIR.TAG` cargo writes into every target dir. Without it a
+    /// fixture target has no structural evidence, and whether it scores
+    /// `Delete` or `Review` then depends on where the test runs (it passed on
+    /// the rch workers and failed natively on Linux and macOS, 2026-09-25).
+    fn write_cargo_cachedir_tag(target: &Path) {
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n\
+             # This file is a cache directory tag created by cargo.\n",
+        )
+        .unwrap();
+    }
+
     fn scanner_state_paths(dir: &Path) -> (PathBuf, PathBuf) {
         (
             dir.join("scanner-index-v2.json"),
@@ -10287,6 +10323,7 @@ mod tests {
             let debug = repo.join("target").join("debug");
             std::fs::create_dir_all(debug.join("deps")).unwrap();
             std::fs::write(debug.join("artifact.o"), b"mock object file").unwrap();
+            write_cargo_cachedir_tag(&repo.join("target"));
         }
 
         let mut config = Config::default();
@@ -10361,10 +10398,14 @@ mod tests {
             &Arc::new(SharedRegret::new(&Config::default())),
         );
 
-        let mut prescan_paths: Vec<PathBuf> = Vec::new();
-        while let Ok(batch) = del_rx.try_recv() {
-            prescan_paths.extend(batch.candidates.into_iter().map(|c| c.path));
-        }
+        // The pre-scan's batch is dispatched first. The walk may follow with
+        // its own: on macOS the FSEvents startup replan marks the roots dirty
+        // and the walk reconciles everything, the cursor's prefix included.
+        let prescan_paths: Vec<PathBuf> = del_rx
+            .try_recv()
+            .map(|batch| batch.candidates.into_iter().map(|c| c.path).collect())
+            .unwrap_or_default();
+        while del_rx.try_recv().is_ok() {}
         assert!(
             !prescan_paths.is_empty(),
             "the resumed pre-scan must still find the targets after the cursor"
@@ -10411,6 +10452,7 @@ mod tests {
             let debug = repo.join("target").join("debug");
             std::fs::create_dir_all(debug.join("deps")).unwrap();
             std::fs::write(debug.join("artifact.o"), b"mock object file").unwrap();
+            write_cargo_cachedir_tag(&repo.join("target"));
         }
 
         let mut config = Config::default();
@@ -10539,8 +10581,12 @@ mod tests {
             (root_after, None) => {
                 // Pass 1 covered the whole root: it must have found every
                 // target, and the cursor wrapped back to the root's start.
+                // On macOS the FSEvents startup replan marks the root dirty,
+                // so the walk reconciles after the pre-scan and counts each
+                // target again (README "What feeds the index").
+                let expected = if cfg!(target_os = "macos") { 1200 } else { 600 };
                 assert_eq!(
-                    first_candidates, 600,
+                    first_candidates, expected,
                     "a completed pre-scan finds every target"
                 );
                 assert_eq!(root_after, Some(root.as_path()));
@@ -11004,23 +11050,7 @@ mod tests {
             }
         }
 
-        // Not under a temp root: inside one every recognized artifact is
-        // `definite` by rule, which is the opposite of what this test needs.
-        // The cargo target directory is neither temp nor source, unless the
-        // build itself runs from a temp root (a scratch worktree, a remote
-        // worker), in which case the user cache directory stands in.
-        let scratch_base = [
-            std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
-            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")),
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".cache").join("sbh-test-scratch")),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|base| !crate::scanner::scoring::is_volatile_temp_path(base))
-        .expect("a scratch base outside every temp root");
-        std::fs::create_dir_all(&scratch_base).unwrap();
-        let temp = tempfile::tempdir_in(&scratch_base).unwrap();
+        let temp = non_temp_scratch_dir();
         let root = temp.path().join("scan-root");
         // `node_modules` beside a package manifest is an opaque candidate whose
         // certainty is `unclear` outside a temp root: no structural marker can
@@ -11143,11 +11173,17 @@ mod tests {
             1,
             "index-cargo.json",
         );
-        assert!(
-            replayed_target.log.contains("replayed_records=1"),
-            "the second pass replays the persisted record: {}",
-            replayed_target.log
-        );
+        // On macOS the FSEvents backend's startup replan marks the roots
+        // dirty, so a fresh daemon reconciles instead of replaying (by
+        // design, see README "What feeds the index"); the certainty
+        // assertions below hold either way.
+        if cfg!(target_os = "linux") {
+            assert!(
+                replayed_target.log.contains("replayed_records=1"),
+                "the second pass replays the persisted record: {}",
+                replayed_target.log
+            );
+        }
         assert!(
             replayed_target.dispatched,
             "the replayed target keeps its definite certainty and is dispatched again: {}",

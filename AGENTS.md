@@ -90,7 +90,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Toolchain:** Nightly (see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml only
-- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` in both `lib.rs` and `main.rs`). The one exception is the workspace member `crates/sbh_mach`, which holds the macOS Mach/libproc/dispatch FFI behind safe wrappers with `unsafe_op_in_unsafe_fn = "deny"`; it compiles to nothing off macOS, and rch workers are Linux, so `cargo test -p sbh_mach` only exercises it on a Mac. There is currently no venue for that: rch workers are Linux and the Macs set `RCH_REQUIRE_REMOTE=1` (no local builds), so changes to `crates/sbh_mach` go untested until a macOS rch worker or an explicit exception exists
+- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` in both `lib.rs` and `main.rs`). The one exception is the workspace member `crates/sbh_mach`, which holds the macOS Mach/libproc/dispatch FFI behind safe wrappers with `unsafe_op_in_unsafe_fn = "deny"`; it compiles to nothing off macOS, and rch workers are Linux, so its tests, and every `#[cfg(target_os = "macos")]` path in the main crate, only run on a Mac. rch workers are Linux, so the owner approved one exception (2026-09-25): run them natively on mac-mini-old from a `git archive` of the tree in a scratch dir, `RCH_CARGO_WRAPPER_BYPASS=1 RCH_REQUIRE_REMOTE=0 cargo test -p sbh_mach` and `... cargo test --lib`, whenever macOS code or scanner behaviour changes (the first run found a macOS temp-root gap and 10 host-dependent tests)
 
 ### Key Dependencies
 
