@@ -11,6 +11,13 @@
 //! Two scenarios need a real filesystem whose free space and write mode the
 //! test controls (a loop-mounted ext4 image): they are `#[ignore]`d and run
 //! with `--ignored` where passwordless sudo is available.
+//!
+//! Run serially (`-- --test-threads=1`). Each scenario is a real daemon with
+//! wall-clock deadlines and a CPU-share budget (an idle daemon must stay
+//! under 2% of a CPU); scenarios running side by side, on a build host at
+//! load 200, blew those budgets (2026-09-24: `special_locations_stay_quiet`
+//! and `green_quarantine_holds...` failed in parallel runs on hz3 and passed
+//! 2/2 serially on vmi1153651).
 #![allow(missing_docs)]
 
 mod common;

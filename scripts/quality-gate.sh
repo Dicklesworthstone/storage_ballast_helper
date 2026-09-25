@@ -127,7 +127,7 @@ STAGES=(
   "fuzz|SOFT|test|Stress & Performance|parser-robustness|cargo test --test fuzz_smoke|A harness in src/fuzzing.rs panicked: reproduce with 'cargo test --test fuzz_smoke', add the input as a seed under fuzz/corpus/<target>/ and fix the parser"
   "stress-harness|SOFT|test|Stress & Performance|concurrency-safety|cargo test --test stress_harness -- --test-threads=2|Stress harness failure — may indicate timing sensitivity (check thread count)"
   "tui-stress|SOFT|test|Stress & Performance|dashboard-endurance|cargo test --lib --features tui tui::test_stress -- --test-threads=4|TUI stress failure — long-run dashboard stability or memory growth issue"
-  "daemon-e2e|SOFT|test|E2E & Installer|daemon-lifecycle|cargo test --test daemon_e2e -- --test-threads=2|Real daemon runs (start/stop, injected pressure, reclaim, events); the idle-CPU case is load-sensitive on a busy host — rerun quiet before treating as a regression"
+  "daemon-e2e|SOFT|test|E2E & Installer|daemon-lifecycle|cargo test --test daemon_e2e -- --test-threads=1|Real daemon runs (start/stop, injected pressure, reclaim, events); the idle-CPU case is load-sensitive on a busy host — rerun quiet before treating as a regression"
   "installer|HARD|test|E2E & Installer|install-safety|cargo test --test installer_e2e -- --test-threads=4|Installer test failure — check install/uninstall/rollback logic"
   "e2e|HARD|e2e|E2E & Installer|user-experience|./scripts/e2e_test.sh|E2E failure — check the e2e/ artifact dir for per-case logs and summary.json"
 )

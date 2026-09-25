@@ -261,7 +261,7 @@ clippy) have no tests.
 | 25 | `fuzz` | SOFT | test | Stress & Performance | parser-robustness | `cargo test --test fuzz_smoke` |
 | 26 | `stress-harness` | SOFT | test | Stress & Performance | concurrency-safety | `cargo test --test stress_harness -- --test-threads=2` |
 | 27 | `tui-stress` | SOFT | test | Stress & Performance | dashboard-endurance | `cargo test --lib --features tui tui::test_stress -- --test-threads=4` |
-| 28 | `daemon-e2e` | SOFT | test | E2E & Installer | daemon-lifecycle | `cargo test --test daemon_e2e -- --test-threads=2` |
+| 28 | `daemon-e2e` | SOFT | test | E2E & Installer | daemon-lifecycle | `cargo test --test daemon_e2e -- --test-threads=1` |
 | 29 | `installer` | HARD | test | E2E & Installer | install-safety | `cargo test --test installer_e2e -- --test-threads=4` |
 | 30 | `e2e` | HARD | e2e | E2E & Installer | user-experience | `./scripts/e2e_test.sh` |
 
