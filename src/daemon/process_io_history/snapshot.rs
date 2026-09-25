@@ -13,9 +13,7 @@ use std::path::Path;
 use serde::de::{self, DeserializeOwned, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::{
-    DEFAULT_MAX_PIDS, MAX_SAMPLES_PER_PROCESS, ProcessIoHistoryEntry, ProcessIoSample,
-};
+use super::{DEFAULT_MAX_PIDS, MAX_SAMPLES_PER_PROCESS, ProcessIoHistoryEntry, ProcessIoSample};
 use crate::core::errors::{Result, SbhError};
 
 const MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -107,12 +105,13 @@ pub(super) fn read<T: DeserializeOwned>(path: &Path) -> Option<T> {
 }
 
 pub(super) fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard()).map_err(|error| {
-        SbhError::Serialization {
-            context: "bincode",
-            details: error.to_string(),
-        }
-    })?;
+    let bytes =
+        bincode::serde::encode_to_vec(value, bincode::config::standard()).map_err(|error| {
+            SbhError::Serialization {
+                context: "bincode",
+                details: error.to_string(),
+            }
+        })?;
     if bytes.len() > MAX_BYTES {
         return Err(SbhError::Serialization {
             context: "bincode",
@@ -222,8 +221,8 @@ mod tests {
     fn truncated_and_trailing_payloads_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history");
-        let bytes = bincode::serde::encode_to_vec(&vec![1_u64, 2, 3], bincode::config::standard())
-            .unwrap();
+        let bytes =
+            bincode::serde::encode_to_vec(vec![1_u64, 2, 3], bincode::config::standard()).unwrap();
         fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
         assert!(read::<Vec<u64>>(&path).is_none());
         let mut trailing = bytes;
@@ -239,14 +238,14 @@ mod tests {
         // The tuple has exactly the wire prefix of a snapshot, but claims an
         // enormous entries vector without supplying any entries.
         let bytes = bincode::serde::encode_to_vec(
-            &(SNAPSHOT_VERSION, 0_i64, u64::MAX),
+            (SNAPSHOT_VERSION, 0_i64, u64::MAX),
             bincode::config::standard(),
         )
         .unwrap();
         fs::write(&path, bytes).unwrap();
         assert!(read::<ProcessIoHistorySnapshot>(&path).is_none());
         let bytes = bincode::serde::encode_to_vec(
-            &(42_i32, Some(0_i64), u64::MAX),
+            (42_i32, Some(0_i64), u64::MAX),
             bincode::config::standard(),
         )
         .unwrap();

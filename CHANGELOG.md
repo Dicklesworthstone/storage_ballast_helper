@@ -6,7 +6,7 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
-## v0.6.5
+## v0.6.5 **[release]**
 
 Compare: [`v0.6.4...v0.6.5`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.4...v0.6.5)
 
@@ -24,6 +24,14 @@ Compare: [`v0.6.4...v0.6.5`](https://github.com/Dicklesworthstone/storage_ballas
   reserve by a process running with another config (a CLI, a second scope, a
   test daemon). A test daemon running as root on a build worker had counted,
   and could release from, the production daemon's live 10 GiB pool (`56f6271`).
+- **A tree is dispatched for deletion at most once per scan pass.** The
+  pre-scan and the walk could both nominate it; the second batch arrived right
+  after the first deletion, and a build that recreated the tree in between got
+  the freed inode back, so the identity check passed and the rebuilt target was
+  deleted too (`a219521`).
+- Process I/O attribution history is bounded, persisted atomically and
+  survives counter and clock resets; busy hosts are sampled fairly
+  (`dec4a3e`, `e0741fc`).
 
 ### Changed — releases no longer involve GitHub Actions
 
