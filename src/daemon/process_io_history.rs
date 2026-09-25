@@ -91,6 +91,8 @@ pub struct ProcessIoHistory {
     // A PID boundary, not a vector offset: process-list ordering and membership
     // can change between passes. Advance only after actually attempting I/O.
     last_sampled_pid: Option<i32>,
+    // New PIDs join the next sweep rather than extending this one forever.
+    sweep_upper_pid: Option<i32>,
     bucket_interval: Duration,
     history_window: Duration,
     recent_window: Duration,
@@ -115,6 +117,7 @@ impl ProcessIoHistory {
             last_sample_at: None,
             last_persist_at: None,
             last_sampled_pid: None,
+            sweep_upper_pid: None,
             bucket_interval: DEFAULT_BUCKET_INTERVAL,
             history_window: DEFAULT_HISTORY_WINDOW,
             recent_window: DEFAULT_RECENT_WINDOW,
@@ -200,21 +203,34 @@ impl ProcessIoHistory {
             persisted: false,
         };
         processes.sort_unstable_by_key(|process| process.pid);
-        let start = self.last_sampled_pid.map_or(0, |pid| {
+        let mut start = self.last_sampled_pid.map_or(0, |pid| {
             processes.partition_point(|process| process.pid <= pid)
         });
-        // Wrap at most once; a small inventory must not be sampled repeatedly
-        // in one tick. Errors consume work and advance the cursor too, so one
-        // inaccessible PID cannot starve every PID behind it.
-        for process in processes
+        let mut end = self.sweep_upper_pid.map_or(0, |pid| {
+            processes.partition_point(|process| process.pid <= pid)
+        });
+        let upper_pid = if self.sweep_upper_pid.is_none() || start >= end {
+            // A fixed upper boundary makes the sweep finite even when new
+            // higher PIDs arrive faster than we can sample. Also restart when
+            // the old boundary PID (and all remaining peers) has exited.
+            start = 0;
+            end = processes.len();
+            processes.last().map(|process| process.pid)
+        } else {
+            self.sweep_upper_pid
+        };
+        // Do not wrap within a pass or sample a small inventory repeatedly.
+        // Failed probes advance too; an inaccessible PID cannot hold the sweep.
+        for process in processes[start..end]
             .iter()
-            .skip(start)
-            .chain(processes.iter().take(start))
             .take(self.max_samples_per_pass)
         {
             if Instant::now() >= deadline {
                 break;
             }
+            // Publish a new sweep boundary only when a probe actually starts.
+            // An expired deadline at rollover must not skip its lowest PIDs.
+            self.sweep_upper_pid = upper_pid;
             self.last_sampled_pid = Some(process.pid);
             match platform.process_io(process.pid) {
                 Ok(io) => {
@@ -716,6 +732,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut history = ProcessIoHistory::new(dir.path().join("history"));
         history.last_sampled_pid = Some(10);
+        history.sweep_upper_pid = Some(20);
         let report = history.sample_processes(
             &MockPlatform::healthy(),
             vec![process(10), process(20)],
@@ -911,5 +928,61 @@ mod tests {
             history.load_snapshot_at(4_000_000);
             assert!(history.samples_by_process.is_empty());
         }
+    }
+
+    #[test]
+    fn continuous_new_pids_cannot_extend_a_sweep_and_starve_existing_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = ProcessIoHistory::new(dir.path().join("history"));
+        history.max_samples_per_pass = 1;
+        sample_pass(&mut history, &[10, 20], 100, 0);
+        assert_eq!(history.sweep_upper_pid, Some(20));
+        sample_pass(&mut history, &[10, 20, 30], 200, 1_000);
+        assert_eq!(history.last_sampled_pid, Some(20));
+        sample_pass(&mut history, &[10, 20, 30, 40], 900, 2_000);
+        // The previous sweep ended at 20: revisit the old writer rather than
+        // chasing 30, then 40, then every newly born PID indefinitely.
+        assert_eq!(history.last_sampled_pid, Some(10));
+        assert_eq!(history.sweep_upper_pid, Some(40));
+        let recent = history
+            .recent_totals_for_process(&io(10, 0, 900), None, 2_001, Duration::from_mins(15))
+            .unwrap();
+        assert_eq!(recent.bytes_written, 800);
+        sample_pass(&mut history, &[10, 20, 30, 40, 50], 900, 3_000);
+        sample_pass(&mut history, &[10, 20, 30, 40, 50, 60], 900, 4_000);
+        assert_eq!(history.last_sampled_pid, Some(30));
+        assert_eq!(history.sweep_upper_pid, Some(40));
+    }
+
+    #[test]
+    fn an_exited_sweep_boundary_does_not_trap_the_sampler() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = ProcessIoHistory::new(dir.path().join("history"));
+        history.max_samples_per_pass = 1;
+        sample_pass(&mut history, &[10, 20], 100, 0);
+        sample_pass(&mut history, &[10, 30, 40], 200, 1_000);
+        assert_eq!(history.last_sampled_pid, Some(10));
+        assert_eq!(history.sweep_upper_pid, Some(40));
+        sample_pass(&mut history, &[10, 30, 40], 300, 2_000);
+        assert_eq!(history.last_sampled_pid, Some(30));
+    }
+
+    #[test]
+    fn an_expired_deadline_at_rollover_cannot_skip_the_next_sweeps_first_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = ProcessIoHistory::new(dir.path().join("history"));
+        history.max_samples_per_pass = 1;
+        sample_pass(&mut history, &[10], 100, 0);
+        let report = history.sample_processes(
+            &MockPlatform::healthy(),
+            vec![process(10), process(20)],
+            1_000,
+            Instant::now(),
+        );
+        assert_eq!(report.pids_recorded, 0);
+        assert_eq!(history.sweep_upper_pid, Some(10));
+        sample_pass(&mut history, &[10, 20], 200, 2_000);
+        assert_eq!(history.last_sampled_pid, Some(10));
+        assert_eq!(history.sweep_upper_pid, Some(20));
     }
 }
