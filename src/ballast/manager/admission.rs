@@ -103,12 +103,12 @@ mod tests {
         }
     }
 
-    fn platform(reading: Option<FsStats>) -> Arc<dyn Platform> {
+    fn platform(root: &Path, reading: Option<FsStats>) -> Arc<dyn Platform> {
         let mut readings = HashMap::new();
         if let Some(reading) = reading {
             readings.insert(PathBuf::from("/"), reading);
         }
-        Arc::new(MockPlatform::new(
+        let mut platform = MockPlatform::new(
             vec![MountPoint {
                 path: PathBuf::from("/"),
                 device: "mockdev".to_string(),
@@ -123,7 +123,17 @@ mod tests {
                 swap_free_bytes: 0,
             },
             PlatformPaths::default(),
-        ))
+        );
+        // MockPlatform does not inspect the real filesystem for block counts.
+        // Each 8192-byte test file has 16 blocks; without these explicit values
+        // every otherwise-valid file is classified as sparse and rebuilt again.
+        for index in 1..=3 {
+            platform = platform.with_block_count(
+                root.join(format!("SBH_BALLAST_FILE_{index:05}.dat")),
+                16,
+            );
+        }
+        Arc::new(platform)
     }
 
     fn manager(root: &Path, reading: Option<FsStats>) -> BallastManager {
@@ -136,7 +146,7 @@ mod tests {
                 auto_provision: true,
                 overrides: BTreeMap::new(),
             },
-            platform(reading),
+            platform(root, reading),
         )
         .unwrap();
         manager.set_provision_floor(10.0);
@@ -275,6 +285,71 @@ mod tests {
         assert!(repaired.errors.is_empty());
         assert!(manager.verify_single_file(&manager.file_path(1), 1).is_ok());
         assert!(!manager.file_path(2).exists());
+    }
+
+    #[test]
+    fn gradual_refill_advances_past_valid_files_without_rewriting_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = manager(temp.path(), Some(stats(1_000_000, 800_000)));
+        assert_eq!(manager.replenish_one(None).unwrap().files_created, 1);
+        let first = fs::read(manager.file_path(1)).unwrap();
+        for expected_count in [2, 3] {
+            let report = manager.replenish_one(None).unwrap();
+            assert_eq!(report.files_created, 1);
+            assert_eq!(report.files_skipped, expected_count - 1);
+            assert_eq!(manager.available_count(), expected_count);
+            assert_eq!(fs::read(manager.file_path(1)).unwrap(), first);
+        }
+        let complete = manager.replenish_one(None).unwrap();
+        assert_eq!(complete.files_created, 0);
+        assert_eq!(complete.files_skipped, 3);
+    }
+
+    #[test]
+    fn a_complete_valid_pool_needs_no_capacity_probe_to_remain_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = manager(temp.path(), Some(stats(1_000_000, 800_000)));
+        assert_eq!(manager.provision(None).unwrap().files_created, 3);
+        let original = fs::read(manager.file_path(1)).unwrap();
+        manager.platform = platform(temp.path(), None);
+        let report = manager.provision(None).unwrap();
+        assert_eq!(report.files_created, 0);
+        assert_eq!(report.files_skipped, 3);
+        assert!(report.errors.is_empty());
+        assert_eq!(fs::read(manager.file_path(1)).unwrap(), original);
+    }
+
+    #[test]
+    fn invalid_second_sample_preserves_the_completed_prefix_of_a_bulk_refill() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = manager(temp.path(), Some(stats(1_000_000, 800_000)));
+        let calls = std::cell::Cell::new(0);
+        let probe = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 { 80.0 } else { f64::NAN }
+        };
+        let report = manager.provision(Some(&probe)).unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(report.files_created, 1);
+        assert_eq!(report.total_bytes, 8192);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.skipped_for_floor, 0);
+        assert!(manager.verify_single_file(&manager.file_path(1), 1).is_ok());
+        assert!(!manager.file_path(2).exists());
+        assert!(!manager.file_path(3).exists());
+    }
+
+    #[test]
+    fn actual_file_cost_is_checked_even_when_the_caller_reports_full_headroom() {
+        let temp = tempfile::tempdir().unwrap();
+        // One byte short after paying for an 8192-byte file above the 10% floor.
+        let mut manager = manager(temp.path(), Some(stats(1_000_000, 108_191)));
+        let report = manager.replenish_one(Some(&|| 100.0)).unwrap();
+        assert_eq!(report.files_created, 0);
+        assert!(report.skipped_for_floor > 0);
+        assert!(!manager.file_path(1).exists());
+        manager.platform = platform(temp.path(), Some(stats(1_000_000, 108_192)));
+        assert_eq!(manager.replenish_one(Some(&|| 100.0)).unwrap().files_created, 1);
     }
 
     #[test]
