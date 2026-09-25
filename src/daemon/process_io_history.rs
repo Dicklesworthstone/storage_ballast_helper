@@ -472,8 +472,7 @@ fn current_delta_since(
         return None;
     }
     let baseline = samples.iter().find(|sample| {
-        sample.collected_at_unix_ms >= cutoff_unix_ms
-            && sample.collected_at_unix_ms < now_unix_ms
+        sample.collected_at_unix_ms >= cutoff_unix_ms && sample.collected_at_unix_ms < now_unix_ms
     })?;
     // A first observation is unknown, not a measured zero. A valid earlier
     // sample gives a conservative delta over the observed part of the window.
