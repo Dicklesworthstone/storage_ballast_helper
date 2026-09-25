@@ -6,6 +6,41 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.4 **[release]**
+
+Compare: [`v0.6.3...v0.6.4`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.3...v0.6.4)
+
+### Fixed
+
+- **Agent session histories and cass data are built-in sacred** (`a446e2a`):
+  `~/.claude`, `~/.codex`, `~/.gemini`, `~/.cass-memory`,
+  `~/.local/share/coding-agent-search*` and the macOS cass Application Support /
+  `Library/Caches/cass-*` trees are protected under any home, not only when an
+  operator remembers to add them.
+- **Executor reports the space deletions actually free** (`2df3347`): each
+  unlink is measured with `statvfs` before and after; `bytes_freed` stays the
+  estimate and `bytes_freed_observed` feeds the controller and the
+  `observed_freed=` summary. Quarantine renames count as zero freed.
+- **Emergency ballast release no longer blocks on pool locks** (`d556cc4`):
+  release uses a nonblocking flock, refreshes slots under it and unlinks by
+  directory handle after an identity check; gradual refill defers on
+  contention instead of stalling the daemon.
+- **Ballast provisioning fails closed on unknown headroom** (`c30a376`):
+  every new file needs a fresh capacity reading; unknown, nonfinite or
+  read-only readings stop allocation, and damaged reserves are kept when the
+  replacement would cross the floor.
+- FIFO release regressions are portable to macOS (`6d884a5`); emergency
+  manager lint cleanup (`2c490aa`).
+- An explicit `SBH_BUILD_GIT_SHA` wins over the enclosing checkout, so
+  worktree/dsr builds embed the right sha (`a23f07a`).
+- Real-daemon e2e scenarios run serially to stop timing flakes (`a32294f`).
+- `sbh update` retries its staged-binary self-test while exec reports
+  `Text file busy` (a descriptor briefly inherited by another thread's
+  child) instead of aborting a good update (`003cd43`).
+- Ballast tests no longer depend on how full the build host is; the rch
+  pressure floors and the canary re-prove window are documented constants
+  checked against the code (`53dca2e`, `ecab55c`).
+
 ## v0.6.3 **[release]**
 
 Compare: [`v0.6.2...v0.6.3`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.2...v0.6.3)
