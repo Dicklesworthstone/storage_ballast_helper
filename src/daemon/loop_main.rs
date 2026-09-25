@@ -6716,6 +6716,12 @@ fn should_skip_protected_daemon_candidate(
         }
         Ok(None) => false,
         Err(err) => {
+            // A path whose protection cannot be proved is treated as
+            // protected until the verdict TTL lapses or the directory
+            // changes. Skipping is always safe; re-probing it every pass was
+            // not free (fleet 2026-09-25: a dead FUSE mount inside an rch
+            // temp dir failed with ENOTCONN and was logged on every pass).
+            protection.cache_protected_verdict(path, format!("protection check failed: {err}"));
             eprintln!(
                 "[SBH-SAFETY] {context}: protection check failed for {}; skipping candidate: {err}",
                 path.display()
@@ -9718,6 +9724,58 @@ mod tests {
         assert_eq!(clear.interval, requested);
         assert_eq!(clear.reason, None);
         assert!(clear.stage_changed);
+    }
+
+    /// A candidate whose protection cannot be proved is skipped, and stays
+    /// skipped on later passes without being re-probed and re-logged.
+    #[test]
+    fn unprovable_candidate_is_remembered_as_protected() {
+        let temp = tempfile::tempdir().unwrap();
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: temp.path().join("activity.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+            run_id: None,
+        })
+        .unwrap();
+        // A path through a regular file: the marker probe fails with ENOTDIR,
+        // which is neither "absent" nor "protected".
+        let file = temp.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let candidate = file.join("target");
+        let mut registry = ProtectionRegistry::marker_only();
+
+        assert!(daemon_protection_reason(&mut registry, &candidate, &[]).is_err());
+        assert!(should_skip_protected_daemon_candidate(
+            &mut registry,
+            &candidate,
+            &[],
+            &logger,
+            "test"
+        ));
+        let cached = registry.cached_protected_verdict(&candidate);
+        assert!(
+            cached
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("protection check failed")),
+            "{cached:?}"
+        );
+        assert!(should_skip_protected_daemon_candidate(
+            &mut registry,
+            &candidate,
+            &[],
+            &logger,
+            "test"
+        ));
+
+        logger.shutdown();
+        logger_join.join().unwrap();
     }
 
     #[test]
