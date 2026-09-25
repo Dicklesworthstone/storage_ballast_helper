@@ -3,15 +3,16 @@
 #![allow(missing_docs)]
 
 use std::collections::{HashMap, VecDeque};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::errors::{Result, SbhError};
+use crate::core::errors::Result;
 use crate::platform::pal::Platform;
 use crate::platform::types::{ProcessInfo, ProcessIo};
+
+mod snapshot;
 
 const SNAPSHOT_VERSION: u32 = 1;
 const DEFAULT_BUCKET_INTERVAL: Duration = Duration::from_secs(30);
@@ -22,6 +23,7 @@ const DEFAULT_PERSIST_INTERVAL: Duration = Duration::from_mins(5);
 // the previous sweep's baselines before a busy host can be sampled again.
 const DEFAULT_MAX_PIDS: usize = 4096;
 const DEFAULT_MAX_SAMPLES_PER_PASS: usize = 500;
+const MAX_SAMPLES_PER_PROCESS: usize = 121;
 const SAMPLE_TIME_BUDGET: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +70,7 @@ struct ProcessIoHistoryKey {
 struct ProcessIoHistoryEntry {
     pid: i32,
     start_time_unix_ms: Option<i64>,
+    #[serde(deserialize_with = "snapshot::deserialize_samples")]
     samples: Vec<ProcessIoSample>,
 }
 
@@ -75,6 +78,7 @@ struct ProcessIoHistoryEntry {
 struct ProcessIoHistorySnapshot {
     version: u32,
     saved_at_unix_ms: i64,
+    #[serde(deserialize_with = "snapshot::deserialize_entries")]
     entries: Vec<ProcessIoHistoryEntry>,
 }
 
@@ -262,8 +266,9 @@ impl ProcessIoHistory {
         };
         let window_ms = duration_ms_i64(self.history_window);
         let samples = self.samples_by_process.entry(key).or_default();
-        samples.push_back(sample);
+        append_sample(samples, sample);
         prune_samples(samples, collected_at_unix_ms.saturating_sub(window_ms));
+        self.enforce_pid_limit();
         self.io_with_recent_for_process_at(io, start_time_unix_ms, collected_at_unix_ms)
     }
 
@@ -308,6 +313,9 @@ impl ProcessIoHistory {
         window: Duration,
     ) -> Option<ProcessIoRecentTotals> {
         let cutoff = collected_at_unix_ms.saturating_sub(duration_ms_i64(window));
+        if start_time_unix_ms.is_some_and(|start| start < 0 || start > collected_at_unix_ms) {
+            return None;
+        }
         if start_time_unix_ms.is_some_and(|start| start >= cutoff) {
             return Some(ProcessIoRecentTotals {
                 bytes_read: io.bytes_read_total,
@@ -320,7 +328,8 @@ impl ProcessIoHistory {
             start_time_unix_ms,
         };
         if let Some(samples) = self.samples_by_process.get(&key)
-            && let Some((read_recent, written_recent)) = current_delta_since(samples, io, cutoff)
+            && let Some((read_recent, written_recent)) =
+                current_delta_since(samples, io, cutoff, collected_at_unix_ms)
         {
             return Some(ProcessIoRecentTotals {
                 bytes_read: read_recent,
@@ -331,34 +340,50 @@ impl ProcessIoHistory {
     }
 
     fn load_snapshot(&mut self) {
-        let Ok(raw) = fs::read(&self.snapshot_path) else {
+        self.load_snapshot_at(unix_time_ms());
+    }
+
+    fn load_snapshot_at(&mut self, now_unix_ms: i64) {
+        let Some(snapshot) = snapshot::read::<ProcessIoHistorySnapshot>(&self.snapshot_path) else {
             return;
         };
-        let Ok((snapshot, _bytes_read)) = bincode::serde::decode_from_slice::<
-            ProcessIoHistorySnapshot,
-            _,
-        >(&raw, bincode::config::standard()) else {
-            return;
-        };
-        if snapshot.version != SNAPSHOT_VERSION {
+        let cutoff = now_unix_ms.saturating_sub(duration_ms_i64(self.history_window));
+        if snapshot.version != SNAPSHOT_VERSION
+            || snapshot.saved_at_unix_ms > now_unix_ms
+            || snapshot.saved_at_unix_ms < cutoff
+        {
             return;
         }
 
-        let cutoff = unix_time_ms().saturating_sub(duration_ms_i64(self.history_window));
         for entry in snapshot.entries {
-            let mut samples: Vec<_> = entry
+            // A PID alone is not a restart-stable identity. Reusing an old
+            // baseline for an unrelated process can falsely accuse it of I/O.
+            let Some(start) = entry.start_time_unix_ms else {
+                continue;
+            };
+            if entry.pid <= 0 || start < 0 || start > now_unix_ms {
+                continue;
+            }
+            let mut ordered: Vec<_> = entry
                 .samples
                 .into_iter()
-                .filter(|sample| sample.collected_at_unix_ms >= cutoff)
+                .filter(|sample| {
+                    sample.collected_at_unix_ms >= cutoff.max(start)
+                        && sample.collected_at_unix_ms <= snapshot.saved_at_unix_ms
+                })
                 .collect();
-            samples.sort_by_key(|sample| sample.collected_at_unix_ms);
+            ordered.sort_by_key(|sample| sample.collected_at_unix_ms);
+            let mut samples = VecDeque::new();
+            for sample in ordered {
+                append_sample(&mut samples, sample);
+            }
             if !samples.is_empty() {
                 self.samples_by_process.insert(
                     ProcessIoHistoryKey {
                         pid: entry.pid,
                         start_time_unix_ms: entry.start_time_unix_ms,
                     },
-                    VecDeque::from(samples),
+                    samples,
                 );
             }
         }
@@ -366,10 +391,6 @@ impl ProcessIoHistory {
     }
 
     fn persist_snapshot(&self) -> Result<()> {
-        if let Some(parent) = self.snapshot_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| SbhError::io(parent, error))?;
-        }
-
         let mut entries: Vec<_> = self
             .samples_by_process
             .iter()
@@ -386,14 +407,7 @@ impl ProcessIoHistory {
             saved_at_unix_ms: unix_time_ms(),
             entries,
         };
-        let bytes = bincode::serde::encode_to_vec(&snapshot, bincode::config::standard()).map_err(
-            |error| SbhError::Serialization {
-                context: "bincode",
-                details: error.to_string(),
-            },
-        )?;
-        fs::write(&self.snapshot_path, bytes)
-            .map_err(|error| SbhError::io(&self.snapshot_path, error))
+        snapshot::write(&self.snapshot_path, &snapshot)
     }
 
     fn enforce_pid_limit(&mut self) {
@@ -421,20 +435,52 @@ impl ProcessIoHistory {
     }
 }
 
+fn append_sample(samples: &mut VecDeque<ProcessIoSample>, sample: ProcessIoSample) {
+    if samples.back().is_some_and(|last| {
+        sample.collected_at_unix_ms < last.collected_at_unix_ms
+            || sample.bytes_read_total < last.bytes_read_total
+            || sample.bytes_written_total < last.bytes_written_total
+    }) {
+        // A counter reset/PID reuse or wall-clock rollback starts a new
+        // observation segment. Saturating subtraction would misreport it as
+        // zero activity until the new counter caught up to the old one.
+        samples.clear();
+    }
+    if samples
+        .back()
+        .is_some_and(|last| last.collected_at_unix_ms == sample.collected_at_unix_ms)
+    {
+        samples.pop_back();
+    }
+    samples.push_back(sample);
+    while samples.len() > MAX_SAMPLES_PER_PROCESS {
+        samples.pop_front();
+    }
+}
+
 fn current_delta_since(
     samples: &VecDeque<ProcessIoSample>,
     io: &ProcessIo,
     cutoff_unix_ms: i64,
+    now_unix_ms: i64,
 ) -> Option<(u64, u64)> {
-    let baseline = samples
-        .iter()
-        .find(|sample| sample.collected_at_unix_ms >= cutoff_unix_ms)?;
-
+    let latest = samples.back()?;
+    if latest.collected_at_unix_ms > now_unix_ms
+        || latest.bytes_read_total > io.bytes_read_total
+        || latest.bytes_written_total > io.bytes_written_total
+    {
+        return None;
+    }
+    let baseline = samples.iter().find(|sample| {
+        sample.collected_at_unix_ms >= cutoff_unix_ms
+            && sample.collected_at_unix_ms < now_unix_ms
+    })?;
+    // A first observation is unknown, not a measured zero. A valid earlier
+    // sample gives a conservative delta over the observed part of the window.
     Some((
-        io.bytes_read_total
-            .saturating_sub(baseline.bytes_read_total),
+        io.bytes_read_total.checked_sub(baseline.bytes_read_total)?,
         io.bytes_written_total
-            .saturating_sub(baseline.bytes_written_total),
+            .checked_sub(baseline.bytes_written_total)?,
     ))
 }
 
@@ -728,5 +774,143 @@ mod tests {
         history.prune_history(3_600_001);
         assert_eq!(history.samples_by_process.len(), 1);
         assert_eq!(history.samples_by_process.keys().next().unwrap().pid, 20);
+    }
+
+    #[test]
+    fn first_observation_is_unknown_but_a_later_quiet_sample_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = ProcessIoHistory::new(dir.path().join("history"));
+        let first = history.record_sample_at(io(42, 100, 200), 1_000);
+        assert_eq!(first.bytes_read_recent_15m, None);
+        assert_eq!(first.bytes_written_recent_15m, None);
+        let second = history.record_sample_at(io(42, 100, 200), 2_000);
+        assert_eq!(second.bytes_read_recent_15m, Some(0));
+        assert_eq!(second.bytes_written_recent_15m, Some(0));
+    }
+
+    #[test]
+    fn counter_reset_starts_a_new_segment_instead_of_hiding_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = ProcessIoHistory::new(dir.path().join("history"));
+        let _ = history.record_sample_at(io(42, 10_000, 20_000), 1_000);
+        let reset = history.record_sample_at(io(42, 10, 20), 2_000);
+        assert_eq!(reset.bytes_written_recent_15m, None);
+        let current = history.record_sample_at(io(42, 30, 900), 3_000);
+        assert_eq!(current.bytes_read_recent_15m, Some(20));
+        assert_eq!(current.bytes_written_recent_15m, Some(880));
+    }
+
+    #[test]
+    fn queries_reject_counter_resets_and_future_samples_before_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = ProcessIoHistory::new(dir.path().join("history"));
+        let _ = history.record_sample_at(io(42, 100, 200), 2_000);
+        let window = Duration::from_mins(15);
+        assert!(
+            history
+                .recent_totals_for_process(&io(42, 10, 20), None, 3_000, window)
+                .is_none()
+        );
+        assert!(
+            history
+                .recent_totals_for_process(&io(42, 300, 400), None, 1_000, window)
+                .is_none()
+        );
+        assert!(
+            history
+                .recent_totals_for_process(&io(42, 300, 400), Some(4_000), 3_000, window)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn clock_rollback_recovers_without_comparing_across_the_discontinuity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = ProcessIoHistory::new(dir.path().join("history"));
+        let _ = history.record_sample_at(io(42, 100, 200), 5_000);
+        let rollback = history.record_sample_at(io(42, 200, 300), 1_000);
+        assert_eq!(rollback.bytes_written_recent_15m, None);
+        let current = history.record_sample_at(io(42, 250, 400), 2_000);
+        assert_eq!(current.bytes_written_recent_15m, Some(100));
+    }
+
+    #[test]
+    fn duplicate_timestamps_and_rapid_samples_have_bounded_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = ProcessIoHistory::new(dir.path().join("history"));
+        let _ = history.record_sample_at(io(42, 0, 1), 0);
+        let _ = history.record_sample_at(io(42, 0, 2), 0);
+        assert_eq!(history.samples_by_process.values().next().unwrap().len(), 1);
+        for index in 1..=1_000 {
+            let _ = history.record_sample_at(io(42, 0, 2), index);
+        }
+        assert_eq!(
+            history.samples_by_process.values().next().unwrap().len(),
+            MAX_SAMPLES_PER_PROCESS
+        );
+    }
+
+    fn write_snapshot_fixture(path: &Path, saved_at: i64, entries: Vec<ProcessIoHistoryEntry>) {
+        snapshot::write(
+            path,
+            &ProcessIoHistorySnapshot {
+                version: SNAPSHOT_VERSION,
+                saved_at_unix_ms: saved_at,
+                entries,
+            },
+        )
+        .unwrap();
+    }
+
+    fn snapshot_entry(pid: i32, start: Option<i64>, timestamp: i64) -> ProcessIoHistoryEntry {
+        ProcessIoHistoryEntry {
+            pid,
+            start_time_unix_ms: start,
+            samples: vec![ProcessIoSample {
+                collected_at_unix_ms: timestamp,
+                bytes_read_total: 100,
+                bytes_written_total: 200,
+            }],
+        }
+    }
+
+    #[test]
+    fn restart_only_reuses_identified_processes_and_nonfuture_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        write_snapshot_fixture(
+            &path,
+            1_100_000,
+            vec![
+                snapshot_entry(10, Some(0), 1_000_000),
+                snapshot_entry(20, None, 1_000_000),
+                snapshot_entry(30, Some(0), 1_200_000),
+                snapshot_entry(40, Some(1_050_000), 1_000_000),
+            ],
+        );
+        let mut history = ProcessIoHistory::new(path);
+        history.load_snapshot_at(1_200_000);
+        assert_eq!(history.samples_by_process.len(), 1);
+        let recent = history
+            .recent_totals_for_process(
+                &io(10, 150, 900),
+                Some(0),
+                1_200_000,
+                Duration::from_mins(15),
+            )
+            .unwrap();
+        assert_eq!(recent.bytes_written, 700);
+    }
+
+    #[test]
+    fn stale_and_future_snapshots_do_not_repopulate_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        for saved_at in [0, 4_000_001] {
+            write_snapshot_fixture(&path, saved_at, vec![snapshot_entry(10, Some(0), 0)]);
+            let mut history = ProcessIoHistory::new(path.clone());
+            history.load_snapshot_at(4_000_000);
+            assert!(history.samples_by_process.is_empty());
+        }
     }
 }
