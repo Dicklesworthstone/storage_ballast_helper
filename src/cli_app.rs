@@ -513,9 +513,9 @@ struct DoctorArgs {
     /// Probe the Platform Abstraction Layer implementation.
     #[arg(long)]
     pal: bool,
-    /// Probe release readiness: macOS signing, notarization, Homebrew CI, and
-    /// drift (latest assets per target, tap version, workflows enabled,
-    /// cert-expiration run).
+    /// Probe release readiness for `scripts/dsr_release.sh`: Developer ID
+    /// signing identity, notary profile, Homebrew tap, and drift (latest
+    /// assets per target, tap version).
     #[arg(long)]
     release: bool,
     /// With --release: audit a published asset set instead of the host's
@@ -7698,7 +7698,6 @@ struct ReleaseDoctorReport {
     failed: usize,
     repository: &'static str,
     notary_profile: &'static str,
-    required_github_secrets: Vec<&'static str>,
     checks: Vec<DoctorCheck>,
     setup_steps: Vec<ReleaseDoctorSetupStep>,
 }
@@ -8524,10 +8523,6 @@ fn print_release_doctor_report(report: &ReleaseDoctorReport) {
         report.failed
     );
     println!("  notary_profile={}", report.notary_profile);
-    println!(
-        "  required_github_secrets={}",
-        report.required_github_secrets.join(", ")
-    );
     println!("\nRelease checks:");
     print_doctor_checks(&report.checks);
     println!("\nCredential setup plan:");
@@ -8564,17 +8559,6 @@ fn release_readiness_label(report: &ReleaseDoctorReport) -> &'static str {
 
 const RELEASE_DOCTOR_NOTARY_PROFILE: &str = "sbh-notary";
 const RELEASE_HOMEBREW_TAP_REPOSITORY: &str = "Dicklesworthstone/homebrew-sbh";
-const RELEASE_SECRET_PRESENT_ENV_PREFIX: &str = "SBH_RELEASE_SECRET_";
-const RELEASE_SECRET_PRESENT_ENV_SUFFIX: &str = "_PRESENT";
-const RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS: &[&str] = &[
-    "APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
-    "APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
-    "APPLE_DEVELOPER_ID_IDENTITY",
-    "APPLE_NOTARY_KEY_P8_BASE64",
-    "APPLE_NOTARY_KEY_ID",
-    "APPLE_NOTARY_ISSUER_ID",
-    "HOMEBREW_TAP_SSH_KEY",
-];
 
 fn release_doctor_report() -> ReleaseDoctorReport {
     release_doctor_report_with_command_runner_and_env(&run_doctor_command, &release_doctor_env_var)
@@ -8600,12 +8584,9 @@ where
     let checks = vec![
         release_developer_id_identity_check(run_command, read_env),
         release_notary_profile_check(run_command),
-        release_github_secrets_check(run_command, read_env),
         release_homebrew_tap_check(run_command),
         release_latest_assets_check(&latest),
         release_tap_version_check(run_command, &latest),
-        release_workflows_enabled_check(run_command),
-        release_cert_expiration_run_check(run_command),
     ];
     let failed = doctor_check_status_count(&checks, "FAIL");
     let warnings = doctor_check_status_count(&checks, "WARN");
@@ -8617,7 +8598,6 @@ where
         failed,
         repository: RELEASE_REPOSITORY,
         notary_profile: RELEASE_DOCTOR_NOTARY_PROFILE,
-        required_github_secrets: RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS.to_vec(),
         setup_steps: release_doctor_setup_steps(),
         checks,
     }
@@ -8686,7 +8666,7 @@ where
                     "no Developer ID Application signing identity is available: {}",
                     command_detail(&outcome)
                 ),
-                Some("Create a Developer ID Application certificate in the Apple Developer portal, export it as a password-protected .p12 with the private key, and set the release workflow secrets documented in docs/macos.md.".to_string()),
+                Some("Create a Developer ID Application certificate in the Apple Developer portal, and install it in the login keychain of the Mac that runs `scripts/dsr_release.sh sign` (docs/macos.md).".to_string()),
             )
         }
         Ok(outcome) => doctor_check(
@@ -8697,7 +8677,7 @@ where
                 "no Developer ID Application signing identity is available: {}",
                 command_detail(&outcome)
             ),
-            Some("Create a Developer ID Application certificate in the Apple Developer portal, export it as a password-protected .p12 with the private key, and set the release workflow secrets documented in docs/macos.md.".to_string()),
+            Some("Create a Developer ID Application certificate in the Apple Developer portal, and install it in the login keychain of the Mac that runs `scripts/dsr_release.sh sign` (docs/macos.md).".to_string()),
         ),
         Err(error) => doctor_check(
             "release.developer_id_identity",
@@ -8753,155 +8733,6 @@ where
                     .to_string(),
             ),
         ),
-    }
-}
-
-fn release_github_secrets_check<F, E>(run_command: &F, read_env: &E) -> DoctorCheck
-where
-    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
-    E: Fn(&str) -> Option<String>,
-{
-    match release_secret_names_from_presence_env(read_env) {
-        Ok(Some(secret_names)) => {
-            return release_secret_names_check(
-                &secret_names,
-                "CI secret presence flags reported all required release secrets are configured",
-                "CI secret presence flags reported missing required secrets",
-                "Set the missing secrets on the release repository, then rerun CI and sbh doctor --release.",
-            );
-        }
-        Ok(None) => {}
-        Err(error) => {
-            return doctor_check(
-                "release.github_secrets",
-                "GitHub release secrets",
-                "FAIL",
-                format!("CI release secret presence flags are invalid: {error}"),
-                Some(
-                    "Fix the SBH_RELEASE_SECRET_*_PRESENT environment values in the CI release doctor diagnostic step."
-                        .to_string(),
-                ),
-            );
-        }
-    }
-
-    let args = vec![
-        "secret".to_string(),
-        "list".to_string(),
-        "-R".to_string(),
-        RELEASE_REPOSITORY.to_string(),
-        "--json".to_string(),
-        "name".to_string(),
-    ];
-
-    match run_command("gh", &args) {
-        Ok(outcome) if outcome.success => {
-            let secret_names = match parse_github_secret_names(&outcome.stdout) {
-                Ok(names) => names,
-                Err(error) => {
-                    return doctor_check(
-                        "release.github_secrets",
-                        "GitHub release secrets",
-                        "FAIL",
-                        format!("could not parse gh secret list output: {error}"),
-                        Some("Re-run `gh secret list --json name` and check GitHub CLI authentication.".to_string()),
-                    );
-                }
-            };
-            let secret_names = secret_names.iter().map(String::as_str).collect::<Vec<_>>();
-            release_secret_names_check(
-                &secret_names,
-                "all required release secrets are configured",
-                "missing required secrets",
-                &format!(
-                    "Set the missing secrets on {RELEASE_REPOSITORY} with the commands documented in docs/macos.md."
-                ),
-            )
-        }
-        Ok(outcome) => doctor_check(
-            "release.github_secrets",
-            "GitHub release secrets",
-            "FAIL",
-            format!("gh secret list failed: {}", command_detail(&outcome)),
-            Some("Authenticate GitHub CLI with secret-read access to the repository, then re-run sbh doctor --release.".to_string()),
-        ),
-        Err(error) => doctor_check(
-            "release.github_secrets",
-            "GitHub release secrets",
-            "FAIL",
-            format!("failed to run gh secret list: {error}"),
-            Some("Install GitHub CLI and authenticate before checking release secrets.".to_string()),
-        ),
-    }
-}
-
-fn release_secret_names_from_presence_env<E>(
-    read_env: &E,
-) -> Result<Option<Vec<&'static str>>, String>
-where
-    E: Fn(&str) -> Option<String>,
-{
-    let mut observed_any = false;
-    let mut present = Vec::new();
-
-    for secret in RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS {
-        let env_key = release_secret_presence_env_key(secret);
-        let Some(value) = read_env(&env_key) else {
-            continue;
-        };
-        observed_any = true;
-        match parse_release_secret_presence_flag(&value) {
-            Some(true) => present.push(*secret),
-            Some(false) => {}
-            None => {
-                return Err(format!("{env_key} must be true or false, got {value:?}"));
-            }
-        }
-    }
-
-    Ok(observed_any.then_some(present))
-}
-
-fn release_secret_presence_env_key(secret: &str) -> String {
-    format!("{RELEASE_SECRET_PRESENT_ENV_PREFIX}{secret}{RELEASE_SECRET_PRESENT_ENV_SUFFIX}")
-}
-
-fn parse_release_secret_presence_flag(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" => Some(true),
-        "0" | "false" | "no" | "" => Some(false),
-        _ => None,
-    }
-}
-
-fn release_secret_names_check(
-    secret_names: &[&str],
-    pass_message: &str,
-    missing_prefix: &str,
-    remediation: &str,
-) -> DoctorCheck {
-    let missing = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
-        .iter()
-        .copied()
-        .filter(|secret| !secret_names.iter().any(|name| name == secret))
-        .collect::<Vec<_>>();
-
-    if missing.is_empty() {
-        doctor_check(
-            "release.github_secrets",
-            "GitHub release secrets",
-            "PASS",
-            pass_message,
-            None,
-        )
-    } else {
-        doctor_check(
-            "release.github_secrets",
-            "GitHub release secrets",
-            "FAIL",
-            format!("{missing_prefix}: {}", missing.join(", ")),
-            Some(remediation.to_string()),
-        )
     }
 }
 
@@ -8980,7 +8811,7 @@ where
                     format!(
                         "{RELEASE_HOMEBREW_TAP_REPOSITORY} is reachable, but Formula/sbh.rb could not be checked: {error}"
                     ),
-                    Some("Re-run with GitHub CLI network access, then verify the release workflow's Homebrew tap update.".to_string()),
+                    Some("Re-run with GitHub CLI network access, then run `scripts/dsr_release.sh tap VERSION`.".to_string()),
                 ),
             }
         }
@@ -9027,34 +8858,15 @@ fn parse_homebrew_tap_default_branch(raw: &str) -> std::result::Result<String, S
         })
 }
 
-fn parse_github_secret_names(raw: &str) -> std::result::Result<HashSet<String>, String> {
-    let value = serde_json::from_str::<Value>(raw).map_err(|error| error.to_string())?;
-    let entries = value
-        .as_array()
-        .ok_or_else(|| "expected top-level JSON array".to_string())?;
-    let mut names = HashSet::with_capacity(entries.len());
-    for entry in entries {
-        let name = entry
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "secret entry missing string field 'name'".to_string())?;
-        names.insert(name.to_string());
-    }
-    Ok(names)
-}
-
 /// The latest published release as `gh release view` reports it.
 struct LatestRelease {
     tag: String,
     assets: Vec<String>,
 }
 
-/// The provenance document the Release workflow attaches to every release.
+/// The provenance document `scripts/release_gate_and_package.sh` attaches to
+/// every release.
 const RELEASE_PROVENANCE_ASSET: &str = "release-provenance.json";
-
-/// The workflows that must stay enabled for releases to be trustworthy
-/// (bd-rc-master-ajg1.1.7 is the operator action that enables them).
-const RELEASE_WORKFLOW_FILES: [&str; 3] = ["ci.yml", "release.yml", "cert-expiration.yml"];
 
 fn release_latest_release<F>(run_command: &F) -> std::result::Result<LatestRelease, String>
 where
@@ -9141,7 +8953,7 @@ fn release_latest_assets_check(latest: &std::result::Result<LatestRelease, Strin
         });
         match contract {
             Ok(contract) => {
-                // The workflow publishes the archive and its checksum (plus
+                // A release publishes the archive and its checksum (plus
                 // the aggregate SHA256SUMS.txt); sigstore bundles are an
                 // optional layer the updater tolerates being absent, so
                 // they are not required here either.
@@ -9182,7 +8994,7 @@ fn release_latest_assets_check(latest: &std::result::Result<LatestRelease, Strin
         "FAIL",
         format!("{}: {}", latest.tag, problems.join("; ")),
         Some(format!(
-            "Publish the missing assets for {} through the Release workflow (`gh workflow run release.yml`) and re-run `sbh doctor --release`; until then `sbh update` cannot resolve that release on those hosts.",
+            "Publish the missing assets for {} with `scripts/dsr_release.sh publish` (after `dsr build`) and re-run `sbh doctor --release`; until then `sbh update` cannot resolve that release on those hosts.",
             latest.tag
         )),
     )
@@ -9242,8 +9054,8 @@ where
             ID,
             TITLE,
             "FAIL",
-            "Formula/sbh.rb has no `version \"…\"` line",
-            Some("Regenerate the formula through the Release workflow's tap update.".to_string()),
+            "Formula/sbh.rb names no version (no `version \"…\"` line or releases/download/vX.Y.Z URL)",
+            Some("Regenerate the formula with `scripts/dsr_release.sh tap VERSION`.".to_string()),
         );
     };
     let expected = latest.tag.trim_start_matches('v');
@@ -9267,190 +9079,34 @@ where
                 "Formula/sbh.rb version {formula_version} lags the latest release {}",
                 latest.tag
             ),
-            Some("Re-run the Release workflow's tap update job (or update Formula/sbh.rb by hand) so `brew upgrade sbh` serves the latest release.".to_string()),
+            Some("Run `scripts/dsr_release.sh tap VERSION` so `brew upgrade sbh` serves the latest release.".to_string()),
         )
     }
 }
 
 /// The `version "x.y.z"` of a Homebrew formula.
+/// The version a formula installs: an explicit `version "…"` line, or else
+/// the tag in its `releases/download/vX.Y.Z/` URL (Homebrew infers the
+/// version from the URL, and the rendered sbh formula carries no version
+/// line).
 fn formula_version(formula: &str) -> Option<String> {
-    formula.lines().find_map(|line| {
+    let explicit = formula.lines().find_map(|line| {
         let rest = line.trim().strip_prefix("version ")?;
         let rest = rest.trim().strip_prefix('"')?;
         let end = rest.find('"')?;
         Some(rest[..end].trim_start_matches('v').to_string())
+    });
+    explicit.or_else(|| {
+        let marker = "/releases/download/v";
+        let start = formula.find(marker)? + marker.len();
+        let rest = &formula[start..];
+        let end = rest.find('/')?;
+        let version = &rest[..end];
+        version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| version.to_string())
     })
-}
-
-/// ci.yml, release.yml and cert-expiration.yml exist and are active.
-fn release_workflows_enabled_check<F>(run_command: &F) -> DoctorCheck
-where
-    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
-{
-    const ID: &str = "release.workflows_enabled";
-    const TITLE: &str = "GitHub workflows enabled";
-    let args = vec![
-        "workflow".to_string(),
-        "list".to_string(),
-        "--repo".to_string(),
-        RELEASE_REPOSITORY.to_string(),
-        "--all".to_string(),
-        "--json".to_string(),
-        "name,state,path".to_string(),
-    ];
-    let outcome = match run_command("gh", &args) {
-        Ok(outcome) if outcome.success => outcome,
-        Ok(outcome) => {
-            return doctor_check(
-                ID,
-                TITLE,
-                "WARN",
-                format!("workflow list could not be read: {}", command_detail(&outcome)),
-                Some("Authenticate GitHub CLI with actions read access, then re-run sbh doctor --release.".to_string()),
-            );
-        }
-        Err(error) => {
-            return doctor_check(
-                ID,
-                TITLE,
-                "WARN",
-                format!("workflow list could not be read: {error}"),
-                Some("Re-run with GitHub CLI network access.".to_string()),
-            );
-        }
-    };
-    let Ok(serde_json::Value::Array(workflows)) =
-        serde_json::from_str::<serde_json::Value>(&outcome.stdout)
-    else {
-        return doctor_check(
-            ID,
-            TITLE,
-            "WARN",
-            "gh workflow list returned something other than a JSON array",
-            Some("Re-run `gh workflow list --all --json name,state,path` and check the GitHub CLI version.".to_string()),
-        );
-    };
-    let mut problems = Vec::new();
-    for file in RELEASE_WORKFLOW_FILES {
-        let entry = workflows.iter().find(|workflow| {
-            workflow
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|path| path.ends_with(&format!("/{file}")) || path == file)
-        });
-        match entry.and_then(|workflow| workflow.get("state").and_then(serde_json::Value::as_str)) {
-            Some("active") => {}
-            Some(state) => problems.push(format!("{file} is {state}")),
-            None => problems.push(format!("{file} is not registered")),
-        }
-    }
-    if problems.is_empty() {
-        doctor_check(
-            ID,
-            TITLE,
-            "PASS",
-            format!("{} are active", RELEASE_WORKFLOW_FILES.join(", ")),
-            None,
-        )
-    } else {
-        doctor_check(
-            ID,
-            TITLE,
-            "FAIL",
-            problems.join("; "),
-            Some(format!(
-                "Enable them with `gh workflow enable <file> --repo {RELEASE_REPOSITORY}` (operator action, bd-rc-master-ajg1.1.7); a disabled release or cert-expiration workflow means no release and no expiry warning."
-            )),
-        )
-    }
-}
-
-/// The last cert-expiration run concluded successfully.
-fn release_cert_expiration_run_check<F>(run_command: &F) -> DoctorCheck
-where
-    F: Fn(&str, &[String]) -> std::io::Result<DoctorCommandOutcome>,
-{
-    const ID: &str = "release.cert_expiration_run";
-    const TITLE: &str = "Certificate expiration check";
-    let args = vec![
-        "run".to_string(),
-        "list".to_string(),
-        "--repo".to_string(),
-        RELEASE_REPOSITORY.to_string(),
-        "--workflow".to_string(),
-        "cert-expiration.yml".to_string(),
-        "--limit".to_string(),
-        "1".to_string(),
-        "--json".to_string(),
-        "conclusion,status,createdAt".to_string(),
-    ];
-    let outcome = match run_command("gh", &args) {
-        Ok(outcome) if outcome.success => outcome,
-        Ok(outcome) => {
-            return doctor_check(
-                ID,
-                TITLE,
-                "WARN",
-                format!("run list could not be read: {}", command_detail(&outcome)),
-                Some("Authenticate GitHub CLI with actions read access, then re-run sbh doctor --release.".to_string()),
-            );
-        }
-        Err(error) => {
-            return doctor_check(
-                ID,
-                TITLE,
-                "WARN",
-                format!("run list could not be read: {error}"),
-                Some("Re-run with GitHub CLI network access.".to_string()),
-            );
-        }
-    };
-    let runs: Vec<serde_json::Value> = serde_json::from_str(&outcome.stdout).unwrap_or_default();
-    let Some(run) = runs.first() else {
-        return doctor_check(
-            ID,
-            TITLE,
-            "WARN",
-            "cert-expiration.yml has never run",
-            Some(
-                "Enable the workflow and trigger it once (`gh workflow run cert-expiration.yml`)."
-                    .to_string(),
-            ),
-        );
-    };
-    let field = |name: &str| {
-        run.get(name)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
-    let (status, conclusion, created) = (field("status"), field("conclusion"), field("createdAt"));
-    if status != "completed" {
-        return doctor_check(
-            ID,
-            TITLE,
-            "WARN",
-            format!("the last cert-expiration run ({created}) is {status}"),
-            None,
-        );
-    }
-    if conclusion == "success" {
-        doctor_check(
-            ID,
-            TITLE,
-            "PASS",
-            format!("the last cert-expiration run ({created}) succeeded"),
-            None,
-        )
-    } else {
-        doctor_check(
-            ID,
-            TITLE,
-            "FAIL",
-            format!("the last cert-expiration run ({created}) concluded {conclusion}"),
-            Some("Open the failed run: it names the Developer ID certificate or notary credential that is expiring; renew it and re-run the workflow.".to_string()),
-        )
-    }
 }
 
 fn release_doctor_setup_steps() -> Vec<ReleaseDoctorSetupStep> {
@@ -9470,53 +9126,26 @@ fn release_doctor_setup_steps() -> Vec<ReleaseDoctorSetupStep> {
         ReleaseDoctorSetupStep {
             id: "developer_id_certificate",
             title: "Developer ID certificate",
-            reason: "Install/export the issued Developer ID Application identity and store the signing secrets for tagged macOS releases.",
+            reason: "Install the issued Developer ID Application identity in the login keychain of the Mac that runs `scripts/dsr_release.sh sign`.",
             docs: "docs/macos.md#code-signing-and-hardened-runtime",
-            commands: vec![
-                "security find-identity -v -p codesigning".to_string(),
-                format!(
-                    "base64 < \"$P12_PATH\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 -R {RELEASE_REPOSITORY}",
-                ),
-                format!(
-                    "printf '%s' \"$P12_PASSWORD\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD -R {RELEASE_REPOSITORY}",
-                ),
-                format!(
-                    "printf '%s' \"$DEVELOPER_ID_IDENTITY\" | gh secret set APPLE_DEVELOPER_ID_IDENTITY -R {RELEASE_REPOSITORY}",
-                ),
-            ],
+            commands: vec!["security find-identity -v -p codesigning".to_string()],
         },
         ReleaseDoctorSetupStep {
             id: "notary_credentials",
             title: "Notary credentials",
-            reason: "Create the local notarytool profile used by release readiness checks and store App Store Connect API key secrets for CI notarization.",
+            reason: "Create the local notarytool profile that `scripts/dsr_release.sh notarize` and this check use.",
             docs: "docs/macos.md#release-readiness-diagnostics",
-            commands: vec![
-                format!(
-                    "xcrun notarytool store-credentials {RELEASE_DOCTOR_NOTARY_PROFILE} --key \"$APPLE_NOTARY_KEY_PATH\" --key-id \"$APPLE_NOTARY_KEY_ID\" --issuer \"$APPLE_NOTARY_ISSUER_ID\"",
-                ),
-                format!(
-                    "base64 < \"$APPLE_NOTARY_KEY_PATH\" | gh secret set APPLE_NOTARY_KEY_P8_BASE64 -R {RELEASE_REPOSITORY}",
-                ),
-                format!(
-                    "printf '%s' \"$APPLE_NOTARY_KEY_ID\" | gh secret set APPLE_NOTARY_KEY_ID -R {RELEASE_REPOSITORY}",
-                ),
-                format!(
-                    "printf '%s' \"$APPLE_NOTARY_ISSUER_ID\" | gh secret set APPLE_NOTARY_ISSUER_ID -R {RELEASE_REPOSITORY}",
-                ),
-            ],
+            commands: vec![format!(
+                "xcrun notarytool store-credentials {RELEASE_DOCTOR_NOTARY_PROFILE} --key \"$APPLE_NOTARY_KEY_PATH\" --key-id \"$APPLE_NOTARY_KEY_ID\" --issuer \"$APPLE_NOTARY_ISSUER_ID\"",
+            )],
         },
         ReleaseDoctorSetupStep {
-            id: "homebrew_tap_deploy_key",
-            title: "Homebrew tap deploy key",
-            reason: "Store the repository-scoped deploy key that lets the release workflow publish formula updates to the Homebrew tap.",
+            id: "homebrew_tap_access",
+            title: "Homebrew tap access",
+            reason: "`scripts/dsr_release.sh tap` pushes the rendered formula with your GitHub CLI login, which needs push access to the tap.",
             docs: "docs/macos.md#homebrew-and-install-paths",
             commands: vec![
-                "ssh-keygen -t ed25519 -C \"sbh Homebrew tap release\" -f \"$HOME/.ssh/sbh-homebrew-tap-release\" -N \"\"".to_string(),
-                "gh api -X POST repos/Dicklesworthstone/homebrew-sbh/keys -f title=\"sbh release workflow\" -f key=\"$(cat \"$HOME/.ssh/sbh-homebrew-tap-release.pub\")\" -F read_only=false".to_string(),
-                format!(
-                    "gh secret set HOMEBREW_TAP_SSH_KEY -R {RELEASE_REPOSITORY} < \"$HOME/.ssh/sbh-homebrew-tap-release\"",
-                ),
-                format!("gh secret list -R {RELEASE_REPOSITORY} --json name,updatedAt,visibility",),
+                format!("gh api repos/{RELEASE_HOMEBREW_TAP_REPOSITORY} --jq .permissions.push"),
                 "sbh doctor --release --json".to_string(),
             ],
         },
@@ -16908,7 +16537,7 @@ mod tests {
         hex
     }
 
-    /// A release directory shaped exactly like the workflow's upload for
+    /// A release directory shaped exactly like the packager's upload for
     /// `tag`: per target the versioned archive, its sidecar, the legacy
     /// mirror and its sidecar; `SHA256SUMS.txt`; `release-provenance.json`.
     /// `binary_for` picks which target's binary goes into each archive, so a
@@ -16971,7 +16600,7 @@ mod tests {
         .unwrap();
     }
 
-    /// A workflow-shaped asset set passes the audit; one tarball carrying
+    /// A packager-shaped asset set passes the audit; one tarball carrying
     /// another target's binary (the v0.4.23 incident shape), a wrong
     /// sidecar, a missing legacy mirror and a provenance tag mismatch each
     /// fail with a finding that names the file.
@@ -17089,8 +16718,8 @@ mod tests {
     }
 
     /// `gh release view --json tagName,assets` for a release shaped like the
-    /// workflow's output: per target the versioned archive and its checksum
-    /// (no sigstore bundle, the workflow publishes none), plus the aggregate
+    /// packager's output: per target the versioned archive and its checksum
+    /// (no sigstore bundle, the packager publishes none), plus the aggregate
     /// manifest and the provenance document.
     fn fixture_latest_release_json(tag: &str) -> String {
         use storage_ballast_helper::cli::{
@@ -17112,20 +16741,6 @@ mod tests {
             "tagName": tag,
             "assets": names.iter().map(|name| json!({ "name": name })).collect::<Vec<_>>(),
         })
-        .to_string()
-    }
-
-    fn fixture_workflows_json(active: bool) -> String {
-        json!(
-            RELEASE_WORKFLOW_FILES
-                .iter()
-                .map(|file| json!({
-                    "name": file,
-                    "state": if active { "active" } else { "disabled_manually" },
-                    "path": format!(".github/workflows/{file}"),
-                }))
-                .collect::<Vec<_>>()
-        )
         .to_string()
     }
 
@@ -17212,13 +16827,7 @@ mod tests {
 
     #[test]
     fn release_doctor_report_passes_when_credentials_are_present() {
-        let secrets = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
-            .iter()
-            .map(|name| json!({ "name": name }))
-            .collect::<Vec<_>>();
-        let secrets_json = serde_json::to_string(&secrets).unwrap();
-        let command = |program: &str, args: &[String]| {
-            match program {
+        let command = |program: &str, args: &[String]| match program {
             "security" => Ok(DoctorCommandOutcome {
                 success: true,
                 exit_code: Some(0),
@@ -17229,12 +16838,6 @@ mod tests {
                 success: true,
                 exit_code: Some(0),
                 stdout: "{\"history\":[]}".to_string(),
-                stderr: String::new(),
-            }),
-            "gh" if args_start_with(args, &["secret", "list"]) => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: secrets_json.clone(),
                 stderr: String::new(),
             }),
             "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
@@ -17250,13 +16853,6 @@ mod tests {
             "gh" if args_start_with(args, &["release", "view"]) => {
                 Ok(fixture_ok(fixture_latest_release_json("v0.5.1")))
             }
-            "gh" if args_start_with(args, &["workflow", "list"]) => {
-                Ok(fixture_ok(fixture_workflows_json(true)))
-            }
-            "gh" if args_start_with(args, &["run", "list"]) => Ok(fixture_ok(
-                r#"[{"conclusion":"success","status":"completed","createdAt":"2026-09-01T00:00:00Z"}]"#
-                    .to_string(),
-            )),
             "gh" if args.iter().any(|arg| arg == ".content|@base64d") => {
                 Ok(fixture_ok(fixture_formula_text("0.5.1")))
             }
@@ -17267,13 +16863,12 @@ mod tests {
                 stderr: String::new(),
             }),
             other => panic!("unexpected release doctor command: {other}"),
-        }
         };
 
         let report = release_doctor_report_with_command_runner(&command);
 
         assert!(report.ok);
-        assert_eq!(report.passed, 8, "4 credential checks + 4 drift checks");
+        assert_eq!(report.passed, 5, "3 credential checks + 2 drift checks");
         assert_eq!(report.warnings, 0);
         assert_eq!(report.failed, 0);
         assert_eq!(release_readiness_label(&report), "ready");
@@ -17291,15 +16886,14 @@ mod tests {
                 "developer_id_csr",
                 "developer_id_certificate",
                 "notary_credentials",
-                "homebrew_tap_deploy_key"
+                "homebrew_tap_access"
             ]
         );
     }
 
     #[test]
     fn release_doctor_report_flags_missing_external_credentials() {
-        let command = |program: &str, args: &[String]| {
-            match program {
+        let command = |program: &str, args: &[String]| match program {
             "security" => Ok(DoctorCommandOutcome {
                 success: true,
                 exit_code: Some(0),
@@ -17311,12 +16905,6 @@ mod tests {
                 exit_code: Some(1),
                 stdout: String::new(),
                 stderr: "No Keychain password item found for profile: sbh-notary".to_string(),
-            }),
-            "gh" if args_start_with(args, &["secret", "list"]) => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: "[]".to_string(),
-                stderr: String::new(),
             }),
             "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
                 success: true,
@@ -17331,13 +16919,6 @@ mod tests {
             "gh" if args_start_with(args, &["release", "view"]) => {
                 Ok(fixture_ok(fixture_latest_release_json("v0.5.1")))
             }
-            "gh" if args_start_with(args, &["workflow", "list"]) => {
-                Ok(fixture_ok(fixture_workflows_json(true)))
-            }
-            "gh" if args_start_with(args, &["run", "list"]) => Ok(fixture_ok(
-                r#"[{"conclusion":"success","status":"completed","createdAt":"2026-09-01T00:00:00Z"}]"#
-                    .to_string(),
-            )),
             "gh" if args.iter().any(|arg| arg == ".content|@base64d") => {
                 Ok(fixture_ok(fixture_formula_text("0.5.1")))
             }
@@ -17348,15 +16929,14 @@ mod tests {
                 stderr: "Not Found".to_string(),
             }),
             other => panic!("unexpected release doctor command: {other}"),
-        }
         };
 
         let report = release_doctor_report_with_command_runner(&command);
 
         assert!(!report.ok);
-        assert_eq!(report.passed, 4, "only the 4 drift checks pass");
+        assert_eq!(report.passed, 2, "only the 2 drift checks pass");
         assert_eq!(report.warnings, 1);
-        assert_eq!(report.failed, 3);
+        assert_eq!(report.failed, 2);
         assert_eq!(release_readiness_label(&report), "blocked");
         assert_eq!(
             release_check_by_id(&report, "release.developer_id_identity").status,
@@ -17376,15 +16956,6 @@ mod tests {
                 .message
                 .contains("No Keychain password item")
         );
-        let secrets = release_check_by_id(&report, "release.github_secrets");
-        assert_eq!(secrets.status, "FAIL");
-        assert!(
-            secrets
-                .message
-                .contains("APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64")
-        );
-        assert!(secrets.message.contains("APPLE_NOTARY_KEY_P8_BASE64"));
-        assert!(secrets.message.contains("HOMEBREW_TAP_SSH_KEY"));
         let tap = release_check_by_id(&report, "release.homebrew_tap");
         assert_eq!(tap.status, "WARN");
         assert!(
@@ -17396,13 +16967,7 @@ mod tests {
 
     #[test]
     fn release_doctor_report_fails_when_configured_developer_id_identity_is_absent() {
-        let secrets = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
-            .iter()
-            .map(|name| json!({ "name": name }))
-            .collect::<Vec<_>>();
-        let secrets_json = serde_json::to_string(&secrets).unwrap();
-        let command = |program: &str, args: &[String]| {
-            match program {
+        let command = |program: &str, args: &[String]| match program {
             "security" => Ok(DoctorCommandOutcome {
                 success: true,
                 exit_code: Some(0),
@@ -17413,12 +16978,6 @@ mod tests {
                 success: true,
                 exit_code: Some(0),
                 stdout: "{\"history\":[]}".to_string(),
-                stderr: String::new(),
-            }),
-            "gh" if args_start_with(args, &["secret", "list"]) => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: secrets_json.clone(),
                 stderr: String::new(),
             }),
             "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
@@ -17434,13 +16993,6 @@ mod tests {
             "gh" if args_start_with(args, &["release", "view"]) => {
                 Ok(fixture_ok(fixture_latest_release_json("v0.5.1")))
             }
-            "gh" if args_start_with(args, &["workflow", "list"]) => {
-                Ok(fixture_ok(fixture_workflows_json(true)))
-            }
-            "gh" if args_start_with(args, &["run", "list"]) => Ok(fixture_ok(
-                r#"[{"conclusion":"success","status":"completed","createdAt":"2026-09-01T00:00:00Z"}]"#
-                    .to_string(),
-            )),
             "gh" if args.iter().any(|arg| arg == ".content|@base64d") => {
                 Ok(fixture_ok(fixture_formula_text("0.5.1")))
             }
@@ -17451,7 +17003,6 @@ mod tests {
                 stderr: String::new(),
             }),
             other => panic!("unexpected release doctor command: {other}"),
-        }
         };
 
         let report = release_doctor_report_with_command_runner_and_env(&command, &|key| {
@@ -17460,7 +17011,7 @@ mod tests {
         });
 
         assert!(!report.ok);
-        assert_eq!(report.passed, 7, "3 credential checks + 4 drift checks");
+        assert_eq!(report.passed, 4, "2 credential checks + 2 drift checks");
         assert_eq!(report.warnings, 0);
         assert_eq!(report.failed, 1);
         assert_eq!(release_readiness_label(&report), "blocked");
@@ -17476,157 +17027,8 @@ mod tests {
     }
 
     #[test]
-    fn release_doctor_report_uses_ci_secret_presence_flags_before_gh_secret_list() {
-        let mut env = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
-            .iter()
-            .map(|secret| (release_secret_presence_env_key(secret), "true".to_string()))
-            .collect::<HashMap<_, _>>();
-        env.insert(
-            release_secret_presence_env_key("HOMEBREW_TAP_SSH_KEY"),
-            "false".to_string(),
-        );
-
-        let command = |program: &str, args: &[String]| {
-            match program {
-            "security" => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: "1) ABCDEF \"Developer ID Application: Example LLC (TEAMID)\"".to_string(),
-                stderr: String::new(),
-            }),
-            "xcrun" => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: "{\"history\":[]}".to_string(),
-                stderr: String::new(),
-            }),
-            "gh" if args_start_with(args, &["secret", "list"]) => {
-                panic!("CI secret presence flags should avoid gh secret list")
-            }
-            "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: json!({
-                    "nameWithOwner": RELEASE_HOMEBREW_TAP_REPOSITORY,
-                    "defaultBranchRef": { "name": "main" }
-                })
-                .to_string(),
-                stderr: String::new(),
-            }),
-            "gh" if args_start_with(args, &["release", "view"]) => {
-                Ok(fixture_ok(fixture_latest_release_json("v0.5.1")))
-            }
-            "gh" if args_start_with(args, &["workflow", "list"]) => {
-                Ok(fixture_ok(fixture_workflows_json(true)))
-            }
-            "gh" if args_start_with(args, &["run", "list"]) => Ok(fixture_ok(
-                r#"[{"conclusion":"success","status":"completed","createdAt":"2026-09-01T00:00:00Z"}]"#
-                    .to_string(),
-            )),
-            "gh" if args.iter().any(|arg| arg == ".content|@base64d") => {
-                Ok(fixture_ok(fixture_formula_text("0.5.1")))
-            }
-            "gh" if args_start_with(args, &["api"]) => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: "sbh.rb\n".to_string(),
-                stderr: String::new(),
-            }),
-            other => panic!("unexpected release doctor command: {other}"),
-        }
-        };
-
-        let report = release_doctor_report_with_command_runner_and_env(&command, &|key| {
-            env.get(key).cloned()
-        });
-
-        assert!(!report.ok);
-        assert_eq!(report.passed, 7, "3 credential checks + 4 drift checks");
-        assert_eq!(report.warnings, 0);
-        assert_eq!(report.failed, 1);
-        let secrets = release_check_by_id(&report, "release.github_secrets");
-        assert_eq!(secrets.status, "FAIL");
-        assert!(secrets.message.contains("CI secret presence flags"));
-        assert!(secrets.message.contains("HOMEBREW_TAP_SSH_KEY"));
-    }
-
-    #[test]
-    fn release_doctor_report_rejects_invalid_ci_secret_presence_flags() {
-        let env = std::iter::once((
-            release_secret_presence_env_key("HOMEBREW_TAP_SSH_KEY"),
-            "maybe".to_string(),
-        ))
-        .collect::<HashMap<_, _>>();
-
-        let command = |program: &str, args: &[String]| {
-            match program {
-            "security" => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: "1) ABCDEF \"Developer ID Application: Example LLC (TEAMID)\"".to_string(),
-                stderr: String::new(),
-            }),
-            "xcrun" => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: "{\"history\":[]}".to_string(),
-                stderr: String::new(),
-            }),
-            "gh" if args_start_with(args, &["secret", "list"]) => {
-                panic!("invalid CI secret presence flags should avoid gh secret list")
-            }
-            "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: json!({
-                    "nameWithOwner": RELEASE_HOMEBREW_TAP_REPOSITORY,
-                    "defaultBranchRef": { "name": "main" }
-                })
-                .to_string(),
-                stderr: String::new(),
-            }),
-            "gh" if args_start_with(args, &["release", "view"]) => {
-                Ok(fixture_ok(fixture_latest_release_json("v0.5.1")))
-            }
-            "gh" if args_start_with(args, &["workflow", "list"]) => {
-                Ok(fixture_ok(fixture_workflows_json(true)))
-            }
-            "gh" if args_start_with(args, &["run", "list"]) => Ok(fixture_ok(
-                r#"[{"conclusion":"success","status":"completed","createdAt":"2026-09-01T00:00:00Z"}]"#
-                    .to_string(),
-            )),
-            "gh" if args.iter().any(|arg| arg == ".content|@base64d") => {
-                Ok(fixture_ok(fixture_formula_text("0.5.1")))
-            }
-            "gh" if args_start_with(args, &["api"]) => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: "sbh.rb\n".to_string(),
-                stderr: String::new(),
-            }),
-            other => panic!("unexpected release doctor command: {other}"),
-        }
-        };
-
-        let report = release_doctor_report_with_command_runner_and_env(&command, &|key| {
-            env.get(key).cloned()
-        });
-
-        assert!(!report.ok);
-        let secrets = release_check_by_id(&report, "release.github_secrets");
-        assert_eq!(secrets.status, "FAIL");
-        assert!(secrets.message.contains("must be true or false"));
-    }
-
-    #[test]
     fn release_doctor_report_marks_missing_homebrew_formula_as_attention() {
-        let secrets = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
-            .iter()
-            .map(|name| json!({ "name": name }))
-            .collect::<Vec<_>>();
-        let secrets_json = serde_json::to_string(&secrets).unwrap();
-        let command = |program: &str, args: &[String]| {
-            match program {
+        let command = |program: &str, args: &[String]| match program {
             "security" => Ok(DoctorCommandOutcome {
                 success: true,
                 exit_code: Some(0),
@@ -17637,12 +17039,6 @@ mod tests {
                 success: true,
                 exit_code: Some(0),
                 stdout: "{\"history\":[]}".to_string(),
-                stderr: String::new(),
-            }),
-            "gh" if args_start_with(args, &["secret", "list"]) => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: secrets_json.clone(),
                 stderr: String::new(),
             }),
             "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
@@ -17658,13 +17054,6 @@ mod tests {
             "gh" if args_start_with(args, &["release", "view"]) => {
                 Ok(fixture_ok(fixture_latest_release_json("v0.5.1")))
             }
-            "gh" if args_start_with(args, &["workflow", "list"]) => {
-                Ok(fixture_ok(fixture_workflows_json(true)))
-            }
-            "gh" if args_start_with(args, &["run", "list"]) => Ok(fixture_ok(
-                r#"[{"conclusion":"success","status":"completed","createdAt":"2026-09-01T00:00:00Z"}]"#
-                    .to_string(),
-            )),
             "gh" if args.iter().any(|arg| arg == ".content|@base64d") => {
                 Ok(fixture_ok(fixture_formula_text("0.5.1")))
             }
@@ -17675,13 +17064,12 @@ mod tests {
                 stderr: "Not Found".to_string(),
             }),
             other => panic!("unexpected release doctor command: {other}"),
-        }
         };
 
         let report = release_doctor_report_with_command_runner(&command);
 
         assert!(!report.ok);
-        assert_eq!(report.passed, 7, "3 credential checks + 4 drift checks");
+        assert_eq!(report.passed, 4, "2 credential checks + 2 drift checks");
         assert_eq!(report.warnings, 1);
         assert_eq!(report.failed, 0);
         assert_eq!(release_readiness_label(&report), "attention");
@@ -17696,13 +17084,7 @@ mod tests {
 
     #[test]
     fn release_doctor_report_fails_when_homebrew_tap_default_branch_is_not_main() {
-        let secrets = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
-            .iter()
-            .map(|name| json!({ "name": name }))
-            .collect::<Vec<_>>();
-        let secrets_json = serde_json::to_string(&secrets).unwrap();
-        let command = |program: &str, args: &[String]| {
-            match program {
+        let command = |program: &str, args: &[String]| match program {
             "security" => Ok(DoctorCommandOutcome {
                 success: true,
                 exit_code: Some(0),
@@ -17713,12 +17095,6 @@ mod tests {
                 success: true,
                 exit_code: Some(0),
                 stdout: "{\"history\":[]}".to_string(),
-                stderr: String::new(),
-            }),
-            "gh" if args_start_with(args, &["secret", "list"]) => Ok(DoctorCommandOutcome {
-                success: true,
-                exit_code: Some(0),
-                stdout: secrets_json.clone(),
                 stderr: String::new(),
             }),
             "gh" if args_start_with(args, &["repo", "view"]) => Ok(DoctorCommandOutcome {
@@ -17734,13 +17110,6 @@ mod tests {
             "gh" if args_start_with(args, &["release", "view"]) => {
                 Ok(fixture_ok(fixture_latest_release_json("v0.5.1")))
             }
-            "gh" if args_start_with(args, &["workflow", "list"]) => {
-                Ok(fixture_ok(fixture_workflows_json(true)))
-            }
-            "gh" if args_start_with(args, &["run", "list"]) => Ok(fixture_ok(
-                r#"[{"conclusion":"success","status":"completed","createdAt":"2026-09-01T00:00:00Z"}]"#
-                    .to_string(),
-            )),
             "gh" if args.iter().any(|arg| arg == ".content|@base64d") => {
                 Ok(fixture_ok(fixture_formula_text("0.5.1")))
             }
@@ -17748,13 +17117,12 @@ mod tests {
                 panic!("formula check should not run after a default-branch failure")
             }
             other => panic!("unexpected release doctor command: {other}"),
-        }
         };
 
         let report = release_doctor_report_with_command_runner(&command);
 
         assert!(!report.ok);
-        assert_eq!(report.passed, 7, "3 credential checks + 4 drift checks");
+        assert_eq!(report.passed, 4, "2 credential checks + 2 drift checks");
         assert_eq!(report.warnings, 0);
         assert_eq!(report.failed, 1);
         assert_eq!(release_readiness_label(&report), "blocked");
@@ -17784,16 +17152,10 @@ mod tests {
     }
 
     /// Drift checks (bd-rc-master-ajg1.5.6): a release missing one target's
-    /// archive and the provenance document, a formula that lags the tag, a
-    /// disabled release workflow and a failed cert-expiration run each fail
-    /// their own check with a message that names the problem.
+    /// archive and the provenance document, and a formula that lags the tag,
+    /// each fail their own check with a message that names the problem.
     #[test]
     fn release_doctor_flags_release_drift() {
-        let secrets = RELEASE_DOCTOR_REQUIRED_GITHUB_SECRETS
-            .iter()
-            .map(|name| json!({ "name": name }))
-            .collect::<Vec<_>>();
-        let secrets_json = serde_json::to_string(&secrets).unwrap();
         // Drop the aarch64 darwin archive and the provenance document.
         let mut release: serde_json::Value =
             serde_json::from_str(&fixture_latest_release_json("v0.5.1")).unwrap();
@@ -17803,20 +17165,12 @@ mod tests {
             name != RELEASE_PROVENANCE_ASSET && name != "sbh-v0.5.1-aarch64-apple-darwin.tar.xz"
         });
         let release_json = release.to_string();
-        let mut workflows: Vec<serde_json::Value> =
-            serde_json::from_str(&fixture_workflows_json(true)).unwrap();
-        workflows[1]["state"] = json!("disabled_manually");
-        let workflows_json = serde_json::to_string(&workflows).unwrap();
 
-        let command = |program: &str, args: &[String]| {
-            match program {
+        let command = |program: &str, args: &[String]| match program {
             "security" => Ok(fixture_ok(
                 "1) ABCDEF \"Developer ID Application: Example LLC (TEAMID)\"".to_string(),
             )),
             "xcrun" => Ok(fixture_ok("{\"history\":[]}".to_string())),
-            "gh" if args_start_with(args, &["secret", "list"]) => {
-                Ok(fixture_ok(secrets_json.clone()))
-            }
             "gh" if args_start_with(args, &["repo", "view"]) => Ok(fixture_ok(
                 json!({
                     "nameWithOwner": RELEASE_HOMEBREW_TAP_REPOSITORY,
@@ -17827,24 +17181,16 @@ mod tests {
             "gh" if args_start_with(args, &["release", "view"]) => {
                 Ok(fixture_ok(release_json.clone()))
             }
-            "gh" if args_start_with(args, &["workflow", "list"]) => {
-                Ok(fixture_ok(workflows_json.clone()))
-            }
-            "gh" if args_start_with(args, &["run", "list"]) => Ok(fixture_ok(
-                r#"[{"conclusion":"failure","status":"completed","createdAt":"2026-08-30T00:00:00Z"}]"#
-                    .to_string(),
-            )),
             "gh" if args.iter().any(|arg| arg == ".content|@base64d") => {
                 Ok(fixture_ok(fixture_formula_text("0.5.0")))
             }
             "gh" if args_start_with(args, &["api"]) => Ok(fixture_ok("sbh.rb\n".to_string())),
             other => panic!("unexpected release doctor command: {other}"),
-        }
         };
 
         let report = release_doctor_report_with_command_runner(&command);
         assert!(!report.ok);
-        assert_eq!(report.failed, 4, "{:#?}", report.checks);
+        assert_eq!(report.failed, 2, "{:#?}", report.checks);
 
         let assets = release_check_by_id(&report, "release.latest_assets");
         assert_eq!(assets.status, "FAIL");
@@ -17876,19 +17222,6 @@ mod tests {
             "{}",
             tap.message
         );
-
-        let workflows = release_check_by_id(&report, "release.workflows_enabled");
-        assert_eq!(workflows.status, "FAIL");
-        assert_eq!(workflows.message, "release.yml is disabled_manually");
-
-        let cert = release_check_by_id(&report, "release.cert_expiration_run");
-        assert_eq!(cert.status, "FAIL");
-        assert!(
-            cert.message.contains("concluded failure"),
-            "{}",
-            cert.message
-        );
-        assert!(cert.message.contains("2026-08-30"));
     }
 
     /// Without GitHub access the drift checks warn instead of failing, and
@@ -17900,7 +17233,6 @@ mod tests {
                 "1) ABCDEF \"Developer ID Application: Example LLC (TEAMID)\"".to_string(),
             )),
             "xcrun" => Ok(fixture_ok("{\"history\":[]}".to_string())),
-            "gh" if args_start_with(args, &["secret", "list"]) => Ok(fixture_ok("[]".to_string())),
             "gh" if args_start_with(args, &["repo", "view"]) => Ok(fixture_ok(
                 json!({
                     "nameWithOwner": RELEASE_HOMEBREW_TAP_REPOSITORY,
@@ -17911,13 +17243,6 @@ mod tests {
             "gh" if args_start_with(args, &["release", "view"]) => {
                 Err(std::io::Error::other("gh: not logged in"))
             }
-            "gh" if args_start_with(args, &["workflow", "list"]) => Ok(DoctorCommandOutcome {
-                success: false,
-                exit_code: Some(4),
-                stdout: String::new(),
-                stderr: "HTTP 401".to_string(),
-            }),
-            "gh" if args_start_with(args, &["run", "list"]) => Ok(fixture_ok("[]".to_string())),
             "gh" if args.iter().any(|arg| arg == ".content|@base64d") => {
                 panic!("the tap version is not compared without a latest tag")
             }
@@ -17926,12 +17251,7 @@ mod tests {
         };
 
         let report = release_doctor_report_with_command_runner(&command);
-        for id in [
-            "release.latest_assets",
-            "release.tap_version",
-            "release.workflows_enabled",
-            "release.cert_expiration_run",
-        ] {
+        for id in ["release.latest_assets", "release.tap_version"] {
             assert_eq!(release_check_by_id(&report, id).status, "WARN", "{id}");
         }
         assert!(
@@ -17939,17 +17259,19 @@ mod tests {
                 .message
                 .contains("not logged in")
         );
-        assert!(
-            release_check_by_id(&report, "release.cert_expiration_run")
-                .message
-                .contains("never run")
-        );
 
         assert_eq!(
             formula_version("  version \"v0.5.1\"\n").as_deref(),
             Some("0.5.1")
         );
         assert_eq!(formula_version("class Sbh < Formula\nend\n"), None);
+        // The rendered tap formula has no version line; the URL carries it.
+        let rendered = include_str!("../packaging/homebrew/Formula/sbh.rb");
+        assert_eq!(formula_version(rendered).as_deref(), Some("0.4.8"));
+        assert_eq!(
+            formula_version("url \"https://x/releases/download/vlatest/sbh.tar.xz\"\n"),
+            None
+        );
         for triple in storage_ballast_helper::cli::CI_RELEASE_TARGETS {
             assert!(host_parts_for_triple(triple).is_some(), "{triple}");
         }
@@ -17957,7 +17279,7 @@ mod tests {
     }
 
     #[test]
-    fn release_doctor_setup_plan_uses_stdin_secrets_and_rechecks() {
+    fn release_doctor_setup_plan_is_local_and_rechecks() {
         let steps = release_doctor_setup_steps();
         let all_commands = steps
             .iter()
@@ -17972,24 +17294,21 @@ mod tests {
             "certtool V \"$CSR_PATH\"",
             "open https://developer.apple.com/account/resources/certificates/add",
             "security find-identity -v -p codesigning",
-            "base64 < \"$P12_PATH\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
-            "printf '%s' \"$P12_PASSWORD\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
-            "printf '%s' \"$DEVELOPER_ID_IDENTITY\" | gh secret set APPLE_DEVELOPER_ID_IDENTITY",
             "xcrun notarytool store-credentials sbh-notary",
-            "base64 < \"$APPLE_NOTARY_KEY_PATH\" | gh secret set APPLE_NOTARY_KEY_P8_BASE64",
-            "printf '%s' \"$APPLE_NOTARY_KEY_ID\" | gh secret set APPLE_NOTARY_KEY_ID",
-            "printf '%s' \"$APPLE_NOTARY_ISSUER_ID\" | gh secret set APPLE_NOTARY_ISSUER_ID",
-            "ssh-keygen -t ed25519 -C \"sbh Homebrew tap release\"",
-            "gh api -X POST repos/Dicklesworthstone/homebrew-sbh/keys",
-            "gh secret set HOMEBREW_TAP_SSH_KEY",
-            "gh secret list -R Dicklesworthstone/storage_ballast_helper --json name,updatedAt,visibility",
+            "gh api repos/Dicklesworthstone/homebrew-sbh --jq .permissions.push",
             "sbh doctor --release --json",
         ] {
             assert!(
                 all_commands.contains(required),
-                "release doctor setup plan must include safe handoff command fragment: {required}"
+                "release doctor setup plan must include command fragment: {required}"
             );
         }
+        // Releases never go through GitHub Actions, so nothing is stored as
+        // a repository secret.
+        assert!(
+            !all_commands.contains("gh secret"),
+            "the setup plan must not route credentials into GitHub secrets"
+        );
 
         assert!(
             steps

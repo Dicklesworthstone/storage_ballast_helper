@@ -71,11 +71,14 @@ fn test_mode_base_override(var: &str) -> Option<String> {
     (!base.is_empty()).then(|| base.to_string())
 }
 
-/// CI/CD target triples built and published in release workflows.
+/// Target triples built by `dsr build` and published with every release.
 ///
-/// The release.yml matrix MUST match this list exactly. Tests in this module
-/// validate the contract: every CI target resolves to a valid artifact, and
-/// the naming scheme matches what the installer expects.
+/// `scripts/release_gate_and_package.sh` packages exactly these four targets
+/// (its `TARGETS` array MUST match this list), and `scripts/dsr_release.sh`
+/// signs and notarizes the two `apple-darwin` entries. Tests in this module
+/// validate the contract: the packager lists exactly these triples, every
+/// target resolves to a valid artifact, and the naming scheme matches what the
+/// installer expects.
 pub const CI_RELEASE_TARGETS: &[&str] = &[
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -1478,7 +1481,7 @@ mod tests {
 
     #[test]
     fn macos_hardened_runtime_entitlements_are_minimal() {
-        let entitlements = include_str!("../../.github/macos/sbh.entitlements.plist");
+        let entitlements = include_str!("../../packaging/macos/sbh.entitlements.plist");
         assert!(entitlements.contains("<dict/>"));
 
         for forbidden in [
@@ -1495,137 +1498,194 @@ mod tests {
         }
     }
 
-    #[test]
-    fn workflows_sign_macos_binaries_with_hardened_runtime_entitlements() {
-        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
-        let release_workflow = include_str!("../../.github/workflows/release.yml");
+    /// Body of the shell function `name` in `script`, from its `name() {`
+    /// line up to (not including) the next top-level function or loop.
+    fn shell_function<'a>(script: &'a str, name: &str) -> &'a str {
+        let start_marker = format!("\n{name}() {{\n");
+        let start = script
+            .find(&start_marker)
+            .unwrap_or_else(|| panic!("script missing function {name}"));
+        let rest = &script[start + 1..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("function {name} has no closing brace"));
+        &rest[..end + 2]
+    }
 
-        for (name, workflow) in [("ci", ci_workflow), ("release", release_workflow)] {
-            assert!(
-                workflow.contains("entitlements=\".github/macos/sbh.entitlements.plist\""),
-                "{name} workflow must use the canonical sbh entitlements file"
-            );
-            assert!(
-                workflow.contains("--options runtime"),
-                "{name} workflow must enable Hardened Runtime during codesign"
-            );
-            assert!(
-                workflow.contains("--entitlements \"${entitlements}\""),
-                "{name} workflow must pass the canonical entitlements file to codesign"
-            );
-            assert!(
-                workflow.contains("codesign --display --entitlements :-"),
-                "{name} workflow must inspect the entitlements that were embedded"
-            );
-            assert!(
-                workflow.contains("com\\.apple\\.security\\."),
-                "{name} workflow must reject forbidden entitlement keys"
-            );
+    fn assert_in_order(haystack: &str, context: &str, fragments: &[&str]) {
+        let mut cursor = 0;
+        for fragment in fragments {
+            let offset = haystack[cursor..].find(fragment).unwrap_or_else(|| {
+                panic!("{context}: missing (or out of order) fragment: {fragment}")
+            });
+            cursor += offset + fragment.len();
         }
+    }
+
+    #[test]
+    fn dsr_release_signs_macos_binaries_with_developer_id_hardened_runtime() {
+        let script = include_str!("../../scripts/dsr_release.sh");
+        let installer = include_str!("../../scripts/install.sh");
 
         assert!(
-            release_workflow.contains("if: contains(matrix.target, 'apple-darwin')"),
-            "release workflow must restrict codesign to macOS target triples"
+            script.contains("ENTITLEMENTS=\"${ROOT}/packaging/macos/sbh.entitlements.plist\""),
+            "dsr release must sign with the canonical minimal entitlements file"
+        );
+        assert!(
+            script.contains("darwin_triples=(aarch64-apple-darwin x86_64-apple-darwin)"),
+            "dsr release must sign both (and only the) apple-darwin targets"
+        );
+
+        // The default signing identity must be the exact authority the
+        // installer and updater accept, or every signed release is refused.
+        let identity = "Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)";
+        assert!(
+            script.contains(&format!("IDENTITY=\"${{SBH_SIGN_IDENTITY:-{identity}}}\"")),
+            "dsr release default signing identity must be {identity}"
+        );
+        assert!(
+            installer.contains(&format!("Authority={identity}")),
+            "installer must require the same Developer ID authority dsr signs with"
+        );
+
+        let signed_by = shell_function(script, "signed_by_identity");
+        assert!(
+            signed_by.contains("codesign -dvv \"$1\"")
+                && signed_by.contains("*\"Authority=${IDENTITY}\"*"),
+            "signed_by_identity must check the Developer ID authority, got:\n{signed_by}"
+        );
+
+        let sign = shell_function(script, "step_sign");
+        assert_in_order(
+            sign,
+            "step_sign must lint the entitlements, sign with Hardened Runtime and a secure timestamp, verify, and check the authority before repacking",
+            &[
+                "plutil -lint \"${ENTITLEMENTS}\"",
+                "for triple in \"${darwin_triples[@]}\"; do",
+                "codesign --force --options runtime --timestamp --entitlements \"${ENTITLEMENTS}\"",
+                "-s \"${IDENTITY}\" \"${raw}\"",
+                "codesign --verify --strict \"${raw}\"",
+                "signed_by_identity \"${raw}\" || die",
+                "tar -cJf \"${DIR}/${versioned}\"",
+                "write_sidecar \"${versioned}\"",
+                "write_sidecar \"${legacy}\"",
+            ],
+        );
+        assert!(
+            sign.contains("artifact[\"sha256\"] = hashlib.sha256(f.read()).hexdigest()"),
+            "step_sign must rewrite the dsr manifest hashes of the re-signed darwin archives"
         );
     }
 
     #[test]
-    fn ci_workflow_ad_hoc_signs_macos_pr_builds() {
-        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+    fn dsr_release_notarizes_signed_macos_binaries_and_requires_accepted() {
+        let script = include_str!("../../scripts/dsr_release.sh");
 
-        for required in [
-            "pull_request:",
-            "macOS Platform Tests (${{ matrix.runner }})",
-            "Ad-hoc sign and verify release binary",
-            "codesign --force --sign -",
-            "codesign --verify --strict --verbose=2 \"${bin}\"",
-            "codesign -dv \"${bin}\"",
-            "codesign --display --verbose=4 \"${bin}\"",
-            "macos-codesign-output.txt",
-        ] {
-            assert!(
-                ci_workflow.contains(required),
-                "CI workflow must include PR ad-hoc signing contract fragment: {required}"
-            );
-        }
+        assert!(
+            script.contains("NOTARY_PROFILE=\"${SBH_NOTARY_PROFILE:-sbh-notary}\""),
+            "dsr release must default to the sbh-notary keychain profile that sbh doctor --release checks"
+        );
+
+        let notarize = shell_function(script, "step_notarize");
+        assert_in_order(
+            notarize,
+            "step_notarize must refuse unsigned binaries, zip, submit with notarytool, and require Accepted",
+            &[
+                "for triple in \"${darwin_triples[@]}\"; do",
+                "signed_by_identity \"${raw}\" || die",
+                "ditto -c -k --keepParent \"${raw}\" \"${zip}\"",
+                "xcrun notarytool submit \"${zip}\" --keychain-profile \"${NOTARY_PROFILE}\"",
+                "--wait",
+                "[ \"${status}\" = \"Accepted\" ] || die",
+            ],
+        );
     }
 
     #[test]
-    fn ci_workflow_ignores_beads_only_branch_and_pr_updates() {
-        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+    fn dsr_release_runs_steps_in_signing_before_publication_order() {
+        let script = include_str!("../../scripts/dsr_release.sh");
 
-        for required in [
-            "push:\n    branches: [main]\n    paths-ignore:\n      - '.beads/**'",
-            "pull_request:\n    branches: [main]\n    paths-ignore:\n      - '.beads/**'",
-        ] {
-            assert!(
-                ci_workflow.contains(required),
-                "CI workflow must avoid restarting expensive platform gates for tracker-only updates: {required}"
-            );
-        }
+        // Package hashes the signed binaries, and the tap must point at what
+        // publish uploaded, so this order is load-bearing.
+        assert!(
+            script.contains(
+                "all) for s in sign notarize package minisign publish tap; do \"step_${s}\"; done ;;"
+            ),
+            "`all` must run sign, notarize, package, minisign, publish, tap in that order"
+        );
+        assert!(
+            script.contains("set -euo pipefail"),
+            "dsr release must stop at the first failing command"
+        );
     }
 
     #[test]
-    fn release_workflow_imports_developer_id_certificate_before_signing() {
-        let release_workflow = include_str!("../../.github/workflows/release.yml");
+    fn dsr_release_publishes_full_asset_set_and_verifies_release() {
+        let script = include_str!("../../scripts/dsr_release.sh");
+
+        let package = shell_function(script, "step_package");
+        assert!(
+            package.contains(
+                "scripts/release_gate_and_package.sh\" --package --dir \"${DIR}\" --tag \"${TAG}\""
+            ),
+            "step_package must build the canonical asset set with the release packager"
+        );
+
+        let minisign = shell_function(script, "step_minisign");
+        assert!(
+            minisign.contains("dsr signing sign /tmp/${base} && dsr signing verify /tmp/${base}")
+                && minisign.contains("${base}.minisig"),
+            "step_minisign must sign and verify the manifest and fetch its .minisig"
+        );
+
+        let publish = shell_function(script, "step_publish");
+        assert_in_order(
+            publish,
+            "step_publish must upload the complete asset set and then verify the published release",
+            &[
+                "gh release upload \"${TAG}\" --repo \"${REPO}\" --clobber",
+                "release-provenance.json SHA256SUMS SHA256SUMS.txt",
+                "sbh_darwin_amd64 sbh_darwin_arm64 sbh_linux_amd64 sbh_linux_arm64",
+                "sbh-*.tar.xz sbh-*.tar.xz.sha256",
+                "\"$(basename \"${MANIFEST}\")\" \"$(basename \"${MANIFEST}\").minisig\"",
+                "scripts/release_gate_and_package.sh\" --verify-release \"${TAG}\"",
+            ],
+        );
+        assert!(
+            publish.contains("--verify-tag"),
+            "step_publish must only create a release for an existing tag"
+        );
+    }
+
+    #[test]
+    fn macos_guide_documents_dsr_release_credentials_and_doctor() {
         let macos_guide = include_str!("../../docs/macos.md");
 
         for required in [
-            "Import Developer ID certificate",
-            "APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}",
-            "APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}",
-            "APPLE_DEVELOPER_ID_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_IDENTITY }}",
-            "security create-keychain",
-            "security import \"${cert_path}\"",
-            "security set-key-partition-list",
-            "security find-identity -v -p codesigning",
-            "identity_list=\"sbh-${{ matrix.target }}-identity-list.txt\"",
-            "grep -Fq \"${APPLE_DEVELOPER_ID_IDENTITY}\" \"${identity_list}\"",
-            "APPLE_DEVELOPER_ID_IDENTITY was not found in the imported Developer ID keychain",
-            "Sign macOS release binary with Developer ID and hardened runtime",
-            "--sign \"${APPLE_DEVELOPER_ID_IDENTITY}\"",
-            "--timestamp",
-            "Authority=Developer ID Application",
-        ] {
-            assert!(
-                release_workflow.contains(required),
-                "release workflow must import and use Developer ID certificate fragment: {required}"
-            );
-        }
-
-        for required in [
-            "APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
-            "APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
-            "APPLE_DEVELOPER_ID_IDENTITY",
+            "sbh does not use GitHub Actions or any hosted CI for releases",
+            "scripts/dsr_release.sh all X.Y.Z",
+            "packaging/macos/sbh.entitlements.plist",
+            "codesign --force --options runtime --timestamp",
+            "codesign --verify --strict",
+            "Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)",
+            "xcrun notarytool submit --keychain-profile sbh-notary --wait",
+            "`Accepted`",
+            "login keychain",
+            "xcrun notarytool store-credentials sbh-notary",
             "Apple Developer Program enrollment is confirmed",
             "already-enrolled Apple Developer account or team",
-            "Organization and Individual memberships both use",
-            "the same secret names",
             "App Store Connect API key",
             "security find-identity -v -p codesigning",
             "When `APPLE_DEVELOPER_ID_IDENTITY` is exported",
             "exact configured identity must appear",
-            "base64 < \"$P12_PATH\" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
-            "gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD",
-            "gh secret set APPLE_NOTARY_KEY_P8_BASE64",
-            "gh secret set APPLE_NOTARY_KEY_ID",
-            "gh secret set APPLE_NOTARY_ISSUER_ID",
-            "gh secret set HOMEBREW_TAP_SSH_KEY",
-            "gh secret list -R Dicklesworthstone/storage_ballast_helper",
             "gh repo view Dicklesworthstone/homebrew-sbh --json nameWithOwner,defaultBranchRef",
             "`defaultBranchRef.name`",
-            "Formula/sbh.rb",
             "reports a warning, not a hard failure",
             "Rotate the Developer ID certificate and App Store Connect API key every 12",
-            "`Developer ID Certificate Expiration` workflow manually",
-            "base64-encoded Developer ID Application certificate",
-            "temporary keychain",
+            "openssl x509 -noout -enddate",
             "Developer ID Application: Example LLC",
             "non-secret credential setup plan",
-            "`$P12_PATH`",
             "`$APPLE_NOTARY_KEY_PATH`",
-            "`$HOME/.ssh/sbh-homebrew-tap-release`",
-            "redirected stdin instead of storing values in shell history",
             "Treat `WARN` as an attention state",
             "remains false until every release check passes",
             "aggregate `ok` boolean",
@@ -1635,273 +1695,28 @@ mod tests {
         ] {
             assert!(
                 macos_guide.contains(required),
-                "macOS guide must document Developer ID release secret fragment: {required}"
-            );
-        }
-    }
-
-    #[test]
-    fn developer_id_certificate_expiration_workflow_monitors_nightly() {
-        let workflow = include_str!("../../.github/workflows/cert-expiration.yml");
-        let macos_guide = include_str!("../../docs/macos.md");
-
-        for required in [
-            "name: Developer ID Certificate Expiration",
-            "schedule:",
-            "cron: \"17 9 * * *\"",
-            "workflow_dispatch:",
-            "APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}",
-            "APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}",
-            "Developer ID certificate secrets are not configured; expiration monitoring is inactive",
-            "openssl pkcs12",
-            "openssl x509 -in \"${pem_path}\" -noout -enddate",
-            "warning_seconds=$((30 * 24 * 60 * 60))",
-            "openssl x509 -in \"${pem_path}\" -checkend 0 -noout",
-            "Developer ID certificate has expired",
-            "openssl x509 -in \"${pem_path}\" -checkend \"${warning_seconds}\" -noout",
-            "Developer ID certificate expires within 30 days",
-        ] {
-            assert!(
-                workflow.contains(required),
-                "certificate expiration workflow must include fragment: {required}"
+                "macOS guide must document the dsr release credential fragment: {required}"
             );
         }
 
-        for required in [
+        for retired in [
+            "gh secret set",
+            "gh workflow run",
+            "HOMEBREW_TAP_SSH_KEY",
+            "APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64",
             "Developer ID Certificate Expiration",
-            "runs nightly",
-            "openssl pkcs12",
-            "notAfter",
-            "expires within 30 days",
-            "expiration monitoring is inactive",
         ] {
             assert!(
-                macos_guide.contains(required),
-                "macOS guide must document certificate expiration monitoring: {required}"
+                !macos_guide.contains(retired),
+                "macOS guide must not document the retired GitHub Actions release path: {retired}"
             );
         }
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn ci_workflow_spot_checks_macos_release_builds_without_notarization() {
-        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
-        let release_workflow = include_str!("../../.github/workflows/release.yml");
-
-        for required in [
-            "pull_request:",
-            "macOS Platform Tests (${{ matrix.runner }})",
-            "Build release binary",
-            "cargo build $CI_FEATURES --release 2>&1 | tee macos-release-build-output.txt",
-            "Capture release doctor diagnostics",
-            "GH_TOKEN: ${{ github.token }}",
-            "SBH_RELEASE_SECRET_APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64_PRESENT: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 != '' }}",
-            "SBH_RELEASE_SECRET_APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD_PRESENT: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD != '' }}",
-            "SBH_RELEASE_SECRET_APPLE_DEVELOPER_ID_IDENTITY_PRESENT: ${{ secrets.APPLE_DEVELOPER_ID_IDENTITY != '' }}",
-            "SBH_RELEASE_SECRET_APPLE_NOTARY_KEY_P8_BASE64_PRESENT: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 != '' }}",
-            "SBH_RELEASE_SECRET_APPLE_NOTARY_KEY_ID_PRESENT: ${{ secrets.APPLE_NOTARY_KEY_ID != '' }}",
-            "SBH_RELEASE_SECRET_APPLE_NOTARY_ISSUER_ID_PRESENT: ${{ secrets.APPLE_NOTARY_ISSUER_ID != '' }}",
-            "SBH_RELEASE_SECRET_HOMEBREW_TAP_SSH_KEY_PRESENT: ${{ secrets.HOMEBREW_TAP_SSH_KEY != '' }}",
-            "\"${bin}\" --json doctor --release > macos-release-doctor-output.json",
-            "DOCTOR_STATUS=\"${doctor_status}\" python3",
-            "import os",
-            "doctor_status = int(os.environ[\"DOCTOR_STATUS\"])",
-            "\"ok\"",
-            "\"passed\"",
-            "\"warnings\"",
-            "\"failed\"",
-            "ok must be a boolean",
-            "must be a non-negative integer",
-            "repository",
-            "notary_profile",
-            "required_github_secrets must be a string array",
-            "setup_steps must be an array",
-            "checks must be an array",
-            "duplicate_check_ids",
-            "has invalid id",
-            "has invalid status",
-            "allowed_statuses = {\"PASS\", \"WARN\", \"FAIL\"}",
-            "unknown_statuses",
-            "expected_counts = {",
-            "statuses.count(\"WARN\")",
-            "report.get(\"ok\") != expected_ok",
-            "expected_status = 1 if expected_counts[\"failed\"] > 0 else 0",
-            "does not match failed-check count",
-            "\"release.homebrew_tap\"",
-            "macos-release-doctor-summary.txt",
-            "ok={report['ok']}",
-            "warnings={report['warnings']}",
-            "Prepare macOS binary diagnostic artifact",
-            "macos-release-artifact/sbh-${{ matrix.runner }}",
-            "Upload macOS binary diagnostic artifact",
-            "macos-release-binary-${{ matrix.os }}",
-            "macos-release-build-output.txt",
-        ] {
-            assert!(
-                ci_workflow.contains(required),
-                "CI workflow must spot-check macOS release builds on PRs: {required}"
-            );
-        }
-
-        for forbidden in [
-            "notarytool",
-            "APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}",
-            "Notarize macOS release binary",
-        ] {
-            assert!(
-                !ci_workflow.contains(forbidden),
-                "PR CI must not run release-only notarization behavior: {forbidden}"
-            );
-        }
-
-        assert!(
-            release_workflow.contains("tags:") && release_workflow.contains("- 'v*'"),
-            "full release workflow must remain tag-triggered"
-        );
-        let quality_gate = workflow_block(
-            release_workflow,
-            "  quality-gate:\n",
-            "\n  homebrew-tap-deploy-key-preflight:",
-        );
-        assert!(
-            quality_gate.contains("uses: ./.github/workflows/ci.yml")
-                && quality_gate.contains("secrets: inherit"),
-            "release workflow quality gate must inherit release secrets for hosted macOS release-doctor diagnostics"
-        );
-        assert!(
-            !release_workflow.contains("pull_request:"),
-            "full release workflow must not run on PRs"
-        );
-        assert!(
-            release_workflow.contains("needs: [quality-gate, homebrew-tap-deploy-key-preflight]"),
-            "release artifact builds must depend on the reusable CI quality gate and tap deploy-key preflight"
-        );
-        assert!(
-            !release_workflow.contains("if: always() && !cancelled()"),
-            "release artifact builds must not continue after quality-gate failure"
-        );
-        assert!(
-            !release_workflow
-                .contains("Quality gate failures should not block release artifact production"),
-            "release workflow must not document non-blocking quality gates"
-        );
-
-        for required in [
-            "Generate release checksum manifest",
-            "checksum_files=(sbh-*.sha256)",
-            "no release checksum sidecars were downloaded",
-            "missing archive for checksum sidecar",
-            "sha256sum -c \"${checksum_file}\"",
-            "shasum -a 256 -c \"${checksum_file}\"",
-            "SHA256SUMS.txt",
-            "Collect provenance",
-            "dtolnay/rust-toolchain@master",
-            "toolchain: ${{ env.TOOLCHAIN }}",
-            "rustc --version",
-            "release-provenance.json",
-        ] {
-            assert!(
-                release_workflow.contains(required),
-                "release workflow must publish release artifacts with deterministic provenance: {required}"
-            );
-        }
-
-        let publish_release = workflow_block(release_workflow, "  release:\n", "\n  homebrew-tap:");
-        let toolchain_setup = publish_release
-            .find("dtolnay/rust-toolchain@master")
-            .expect("publish release job must install the Rust toolchain");
-        let provenance = publish_release
-            .find("Collect provenance")
-            .expect("publish release job must collect provenance");
-        assert!(
-            toolchain_setup < provenance,
-            "release provenance must not rely on ambient runner rustc"
-        );
-    }
-
-    #[test]
-    fn workflows_use_node24_ready_github_actions() {
-        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
-        let release_workflow = include_str!("../../.github/workflows/release.yml");
-        let workflows = [ci_workflow, release_workflow].join("\n");
-
-        for required in [
-            "actions/checkout@v6.0.2",
-            "actions/upload-artifact@v7.0.1",
-            "actions/download-artifact@v8.0.1",
-            "softprops/action-gh-release@v3.0.0",
-        ] {
-            assert!(
-                workflows.contains(required),
-                "workflows must use Node 24-ready GitHub action release: {required}"
-            );
-        }
-
-        for deprecated in [
-            "actions/checkout@v4",
-            "actions/upload-artifact@v4",
-            "actions/download-artifact@v4",
-            "softprops/action-gh-release@v2",
-        ] {
-            assert!(
-                !workflows.contains(deprecated),
-                "workflows must not use deprecated Node 20 action release: {deprecated}"
-            );
-        }
-    }
-
-    #[test]
-    fn ci_runs_macos_validation_lanes_independently_from_linux_check() {
-        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
-        let testing_guide = include_str!("../../docs/testing-and-logging.md");
-
-        for (job, end_marker) in [
-            ("  macos-platform:\n", "\n  macos-coverage:\n"),
-            ("  macos-coverage:\n", "\n  macos-benchmarks:\n"),
-            ("  macos-benchmarks:\n", "\n  stress:\n"),
-        ] {
-            let block = workflow_block(ci_workflow, job, end_marker);
-            assert!(
-                block.contains("runs-on: macos") || block.contains("runs-on: ${{ matrix.os }}"),
-                "macOS validation job must run on a macOS hosted runner: {job}"
-            );
-            assert!(
-                !block.contains("needs: check"),
-                "macOS validation job must not wait behind the Ubuntu check job: {job}"
-            );
-        }
-
-        for required in [
-            "macOS validation independence",
-            "`macos-platform`, `macos-coverage`, and",
-            "`macos-benchmarks` jobs intentionally",
-            "do not declare `needs: check`",
-            "a queued Ubuntu runner cannot hide missing macOS proof",
-        ] {
-            assert!(
-                testing_guide.contains(required),
-                "testing guide must document independent macOS validation: {required}"
-            );
-        }
-    }
-
-    #[test]
-    fn ci_requires_docs_updates_for_user_facing_changes() {
-        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+    fn docs_update_lint_requires_companion_docs_for_user_facing_changes() {
         let docs_lint = include_str!("../../scripts/ci_docs_update_check.sh");
         let testing_guide = include_str!("../../docs/testing-and-logging.md");
-
-        for required in [
-            "fetch-depth: 0",
-            "Require docs updates for user-facing changes",
-            "github.event_name == 'pull_request'",
-            "bash scripts/ci_docs_update_check.sh",
-        ] {
-            assert!(
-                ci_workflow.contains(required),
-                "CI workflow must run docs update lint on PRs: {required}"
-            );
-        }
 
         for required in [
             "src/(main|cli_app)\\.rs",
@@ -2005,89 +1820,120 @@ mod tests {
     }
 
     #[test]
-    fn ci_preflights_homebrew_tap_deploy_key_on_mainline_pushes() {
-        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
+    fn dsr_release_renders_homebrew_tap_formula_with_both_checksums() {
+        let script = include_str!("../../scripts/dsr_release.sh");
 
+        let render = shell_function(script, "render_formula");
         for required in [
-            "homebrew-tap-deploy-key-preflight:",
-            "Homebrew Tap Deploy Key Preflight",
-            "if: github.event_name == 'push' && github.ref == 'refs/heads/main'",
-            "Validate tap deploy key before mainline release readiness",
-            "HOMEBREW_TAP_REPOSITORY: git@github.com:Dicklesworthstone/homebrew-sbh.git",
-            "HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}",
-            "HOMEBREW_TAP_SSH_KEY is required before macOS release readiness can pass",
-            "ssh-keygen -y -f \"${key_path}\" > homebrew-tap-deploy-key.pub",
-            "git ls-remote --symref \"${HOMEBREW_TAP_REPOSITORY}\" HEAD",
-            "ref: refs/heads/main\\tHEAD",
-            "git push --dry-run \"${HOMEBREW_TAP_REPOSITORY}\" HEAD:refs/heads/sbh-deploy-key-preflight-${GITHUB_RUN_ID}",
+            "s/version \"[^\"]+\"/version \"$ENV{VERSION}\"/;",
+            "releases\\/download\\/v$ENV{VERSION}\\/",
+            "sbh-v$ENV{VERSION}-",
+            "# REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256\\n( *)sha256 \"[0-9a-f]{64}\"/$1sha256 \"$ENV{ARM_SHA}\"/g;",
+            "# REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256\\n( *)sha256 \"[0-9a-f]{64}\"/$1sha256 \"$ENV{INTEL_SHA}\"/g;",
+            "! grep -q 'REPLACE_WITH_' \"${out}\" || die",
+            "grep -q \"releases/download/${TAG}/\" \"${out}\" || die",
+            "grep -q \"sha256 \\\"${arm_sha}\\\"\" \"${out}\" || die",
+            "grep -q \"sha256 \\\"${intel_sha}\\\"\" \"${out}\" || die",
+            "ruby -c \"${out}\"",
         ] {
             assert!(
-                ci_workflow.contains(required),
-                "CI workflow must preflight Homebrew tap deploy key quality on mainline pushes: {required}"
+                render.contains(required),
+                "render_formula must include tap rendering fragment: {required}"
             );
         }
     }
 
+    /// Runs the real `render_formula` from `scripts/dsr_release.sh` against
+    /// the checked-in formula skeleton. `ruby -c` is stubbed only when the
+    /// host has no ruby; the text test above pins that the script runs it.
     #[test]
-    fn release_workflow_updates_homebrew_tap_with_deploy_key() {
-        let release_workflow = include_str!("../../.github/workflows/release.yml");
-        let readme = include_str!("../../README.md");
+    fn dsr_release_render_formula_output_pins_version_and_checksums() {
+        let script = include_str!("../../scripts/dsr_release.sh");
+        let render = shell_function(script, "render_formula");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("sbh.rb");
+        let arm_sha = "0".repeat(64);
+        let intel_sha = "1".repeat(64);
+
+        let program = format!(
+            "set -euo pipefail\n\
+             die() {{ echo \"render: $*\" >&2; exit 1; }}\n\
+             command -v ruby >/dev/null || ruby() {{ :; }}\n\
+             VERSION=9.8.7\nTAG=v9.8.7\n{render}\n\
+             render_formula \"$1\" \"$2\" \"$3\" \"$4\"\n"
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&program)
+            .arg("render")
+            .arg(root.join("packaging/homebrew/Formula/sbh.rb"))
+            .arg(&out)
+            .arg(&arm_sha)
+            .arg(&intel_sha)
+            .output()
+            .expect("bash must be available to run render_formula");
+        assert!(
+            output.status.success(),
+            "render_formula failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let rendered = std::fs::read_to_string(&out).unwrap();
+        assert!(!rendered.contains("REPLACE_WITH_"), "{rendered}");
+        assert!(!rendered.contains("0.4.8"), "{rendered}");
+        assert_eq!(
+            rendered.matches("releases/download/v9.8.7/").count(),
+            2,
+            "both archive URLs must point at the rendered tag:\n{rendered}"
+        );
+        assert_in_order(
+            &rendered,
+            "rendered formula must pair each archive with its own checksum",
+            &[
+                "\"sbh-v9.8.7-aarch64-apple-darwin.tar.xz\"",
+                &format!("sha256 \"{arm_sha}\""),
+                "\"sbh-v9.8.7-x86_64-apple-darwin.tar.xz\"",
+                &format!("sha256 \"{intel_sha}\""),
+            ],
+        );
+    }
+
+    #[test]
+    fn dsr_release_tap_refuses_checksums_that_differ_from_published() {
+        let script = include_str!("../../scripts/dsr_release.sh");
         let macos_guide = include_str!("../../docs/macos.md");
 
+        assert!(
+            script.contains("TAP_REPO=\"${SBH_TAP_REPO:-Dicklesworthstone/homebrew-sbh}\""),
+            "dsr release must default to the Dicklesworthstone/homebrew-sbh tap"
+        );
+
+        let tap_step = shell_function(script, "step_tap");
+        assert_in_order(
+            tap_step,
+            "step_tap must compare local and published checksums before cloning, rendering and pushing the tap",
+            &[
+                "for triple in \"${darwin_triples[@]}\"; do",
+                "gh release download \"${TAG}\" --repo \"${REPO}\"",
+                "[ \"${want}\" = \"${published}\" ] || die",
+                "gh repo clone \"${TAP_REPO}\"",
+                "render_formula \"${ROOT}/packaging/homebrew/Formula/sbh.rb\" \"${tap}/Formula/sbh.rb\" \"${arm_sha}\" \"${intel_sha}\"",
+                "git push -q origin HEAD:main",
+            ],
+        );
+
         for required in [
-            "homebrew-tap-deploy-key-preflight:",
-            "Homebrew Tap Deploy Key Preflight",
-            "Validate tap deploy key before release work",
-            "HOMEBREW_TAP_SSH_KEY is required before release artifacts are built",
-            "needs: [quality-gate, homebrew-tap-deploy-key-preflight]",
-            "homebrew-tap:",
-            "Update Homebrew Tap",
-            "HOMEBREW_TAP_REPOSITORY: git@github.com:Dicklesworthstone/homebrew-sbh.git",
-            "HOMEBREW_TAP_SLUG: Dicklesworthstone/homebrew-sbh",
-            "HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}",
-            "ssh-keygen -y -f \"${key_path}\" > homebrew-tap-deploy-key.pub",
-            "git ls-remote --symref \"${HOMEBREW_TAP_REPOSITORY}\" HEAD",
-            "git push --dry-run \"${HOMEBREW_TAP_REPOSITORY}\" HEAD:refs/heads/sbh-deploy-key-preflight-${GITHUB_RUN_ID}",
-            "repository: ${{ env.HOMEBREW_TAP_SLUG }}",
-            "ssh-key: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}",
-            "sbh-source/packaging/homebrew/Formula/sbh.rb",
-            "homebrew-sbh/Formula/sbh.rb",
-            "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256",
-            "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256",
-            "releases\\/download\\/v$ENV{VERSION}",
-            "sbh-v$ENV{VERSION}-",
-            "sha256 \"[0-9a-f]{64}\"",
-            "grep -q 'REPLACE_WITH_' homebrew-sbh/Formula/sbh.rb",
-            "grep -q \"releases/download/v${version}/\" homebrew-sbh/Formula/sbh.rb",
-            "grep -q \"sbh-v${version}-aarch64-apple-darwin.tar.xz\" homebrew-sbh/Formula/sbh.rb",
-            "grep -q \"sbh-v${version}-x86_64-apple-darwin.tar.xz\" homebrew-sbh/Formula/sbh.rb",
-            "grep -q \"sha256 \\\"${arm_sha}\\\"\" homebrew-sbh/Formula/sbh.rb",
-            "grep -q \"sha256 \\\"${intel_sha}\\\"\" homebrew-sbh/Formula/sbh.rb",
-            "ruby -c homebrew-sbh/Formula/sbh.rb",
-            "Publish Homebrew formula update",
-            "git checkout -B main origin/main",
-            "git push origin HEAD:main",
+            "Dicklesworthstone/homebrew-sbh",
+            "packaging/homebrew/Formula/sbh.rb",
+            "scripts/dsr_release.sh tap",
+            "tap update",
+            "published checksums",
         ] {
             assert!(
-                release_workflow.contains(required),
-                "release workflow must automate Homebrew tap updates: {required}"
+                macos_guide.contains(required),
+                "macOS guide must explain the dsr tap update fragment: {required}"
             );
-        }
-
-        for doc in [readme, macos_guide] {
-            for required in [
-                "Dicklesworthstone/homebrew-sbh",
-                "packaging/homebrew/Formula/sbh.rb",
-                "HOMEBREW_TAP_SSH_KEY",
-                "deploy key",
-                "dry-runs a branch push",
-                "tap update",
-            ] {
-                assert!(
-                    doc.contains(required),
-                    "Homebrew tap docs must explain release automation fragment: {required}"
-                );
-            }
         }
     }
 
@@ -2097,7 +1943,8 @@ mod tests {
 
         for required in [
             "Manual Release Fallback",
-            "operator has explicitly approved publishing outside the workflow",
+            "operator has explicitly approved publishing outside the dsr path",
+            "`scripts/dsr_release.sh publish` runs the same",
             "publish from chat notes",
             "historical provenance",
             "missing `/tmp` directory",
@@ -2313,172 +2160,6 @@ mod tests {
     }
 
     #[test]
-    fn ci_macos_platform_smoke_exercises_safe_operational_commands() {
-        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
-
-        for required in [
-            "macos-smoke-root",
-            "macos-smoke-state",
-            "smoke_config=\"${smoke_state}/config.toml\"",
-            "sample_target/debug/object.o",
-            "protected_paths = [\"${smoke_root}/config-protected\"]",
-            "case=smoke-config-validate",
-            "--config \"${smoke_config}\" config validate",
-            "case=json-status-sacred",
-            "--json status --sacred",
-            "case=json-check",
-            "--json check \"${smoke_root}\" --need 1M --target-free 0",
-            "case=json-scan",
-            "--json scan \"${smoke_root}\" --top 5 --min-score 0.1 --explain",
-            "case=json-clean-dry-run",
-            "--json clean \"${smoke_root}\" --dry-run --yes --max-items 2 --min-score 0.1",
-            "case=json-blame",
-            "--json blame --top 3 --since 1m",
-            "case=json-ballast-status",
-            "--json ballast status",
-            "case=json-tune",
-            "--json tune",
-            "case=json-setup-verify-dry-run",
-            "--json setup --verify --dry-run --bin-dir",
-            "case=json-protect-create",
-            "--json protect \"${smoke_root}/protected\"",
-            "case=json-protect-list",
-            "--json protect --list",
-            "macos-e2e-smoke-output.txt",
-        ] {
-            assert!(
-                ci_workflow.contains(required),
-                "macOS platform smoke must cover safe operational command fragment: {required}"
-            );
-        }
-
-        for forbidden in [
-            "case=emergency",
-            "--json emergency",
-            "case=unprotect",
-            "--json unprotect",
-            "case=uninstall",
-            "--json uninstall",
-        ] {
-            assert!(
-                !ci_workflow.contains(forbidden),
-                "macOS platform smoke must not exercise destructive or cleanup command fragment: {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn ci_validates_homebrew_formula_generation() {
-        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
-        let testing_guide = include_str!("../../docs/testing-and-logging.md");
-
-        for required in [
-            "homebrew-formula:",
-            "Homebrew Formula Validation",
-            "runs-on: macos-latest",
-            "Check formula syntax",
-            "ruby -c packaging/homebrew/Formula/sbh.rb",
-            "brew style packaging/homebrew/Formula/sbh.rb",
-            "generated-homebrew/Formula/sbh.rb",
-            "REPLACE_WITH_AARCH64_APPLE_DARWIN_SHA256",
-            "REPLACE_WITH_X86_64_APPLE_DARWIN_SHA256",
-            "releases\\/download\\/v$ENV{VERSION}",
-            "sbh-v$ENV{VERSION}-",
-            "generated Homebrew formula retained checksum markers",
-            "grep -q \"releases/download/v${version}/\" generated-homebrew/Formula/sbh.rb",
-            "grep -q \"sbh-v${version}-aarch64-apple-darwin.tar.xz\" generated-homebrew/Formula/sbh.rb",
-            "grep -q \"sbh-v${version}-x86_64-apple-darwin.tar.xz\" generated-homebrew/Formula/sbh.rb",
-            "ruby -c generated-homebrew/Formula/sbh.rb",
-            "brew style generated-homebrew/Formula/sbh.rb",
-            "homebrew-formula-syntax-output.txt",
-            "homebrew-formula-style-output.txt",
-            "homebrew-generated-formula-syntax-output.txt",
-            "homebrew-generated-formula-style-output.txt",
-            "generated-homebrew/Formula/sbh.rb",
-            "Exercise Homebrew formula install from current signed binary",
-            "macos-homebrew-archive",
-            "class SbhCi < Formula",
-            "ci_formula_version=\"$(grep '^version = ' Cargo.toml | head -n 1 | sed 's/version = \"\\(.*\\)\"/\\1/')\"",
-            "export CI_FORMULA_VERSION=\"${ci_formula_version}\"",
-            "version \\\"#{ENV.fetch('CI_FORMULA_VERSION')}\\\"",
-            "releases/download/v[^/]+/",
-            "sbh-v[^\"]+-(?:aarch64|x86_64)-apple-darwin\\.tar\\.xz",
-            "formula_path=\"${PWD}/macos-homebrew-formula/Formula/sbh-ci.rb\"",
-            "tap_name=\"sbh/local-ci\"",
-            "brew tap-new --no-git \"${tap_name}\"",
-            "tap_formula_path=\"${tap_root}/Formula/sbh-ci.rb\"",
-            "cp \"${formula_path}\" \"${tap_formula_path}\"",
-            "ruby -c \"${formula_path}\"",
-            "ruby -c \"${tap_formula_path}\"",
-            "brew install --formula --build-from-source --skip-link \"${tap_name}/sbh-ci\"",
-            "brew test --force \"${tap_name}/sbh-ci\"",
-            "macos-homebrew-tap-new-output.txt",
-            "macos-homebrew-install-output.txt",
-            "macos-homebrew-test-output.txt",
-            "macos-homebrew-formula/Formula/sbh-ci.rb",
-            "needs: [homebrew-formula, unit, integration, linux-arm64, decision-plane, dashboard, e2e, macos-platform, macos-coverage, macos-benchmarks, stress, artifact-contract]",
-        ] {
-            assert!(
-                ci_workflow.contains(required),
-                "CI must validate Homebrew formula generation fragment: {required}"
-            );
-        }
-
-        for required in [
-            "homebrew-formula",
-            "brew style",
-            "packaging/homebrew/Formula/sbh.rb",
-            ".github/workflows/release.yml",
-            "REPLACE_WITH_",
-            "normal PR/push CI",
-            "homebrew-generated-formula-style-output.txt",
-        ] {
-            assert!(
-                testing_guide.contains(required),
-                "testing guide must document Homebrew formula CI validation: {required}"
-            );
-        }
-    }
-
-    #[test]
-    fn ci_workflow_cancels_superseded_push_and_pr_runs() {
-        let ci_workflow = include_str!("../../.github/workflows/ci.yml");
-        let testing_guide = include_str!("../../docs/testing-and-logging.md");
-
-        for required in [
-            "concurrency:",
-            "group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
-            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
-            "workflow_call:",
-        ] {
-            assert!(
-                ci_workflow.contains(required),
-                "CI workflow must cancel superseded PR runs, let main runs queue and complete, and keep workflow_call: {required}"
-            );
-        }
-        assert!(
-            !ci_workflow.contains(
-                "github.ref == 'refs/heads/main') || github.event_name == 'pull_request'"
-            ),
-            "pushes to main must not cancel each other: agents push every few minutes and no run ever finished"
-        );
-
-        for required in [
-            "Superseded CI cancellation",
-            "`cancel-in-progress` enabled only for `pull_request` events",
-            "a main run that is in progress is never cancelled",
-            "a newer push replaces the waiting run",
-            "Tag-triggered release workflow calls are not cancelable",
-            "release quality gates",
-        ] {
-            assert!(
-                testing_guide.contains(required),
-                "testing guide must document CI supersession behavior: {required}"
-            );
-        }
-    }
-
-    #[test]
     fn macos_completion_audit_maps_goal_to_evidence() {
         let audit = include_str!("../../docs/internal/macos-parity-completion-audit.md");
 
@@ -2489,7 +2170,9 @@ mod tests {
             "bd-r7m7.16",
             "bd-ykwh",
             "bd-ykwh.20",
-            "release CI now verifies Apple notary log ticketContents",
+            "release CI verified Apple notary log",
+            "`scripts/dsr_release.sh notarize` now",
+            "requires notarytool status `Accepted`",
             "avoids pinning exact commit hashes",
             "GitHub Actions run ids",
             "git rev-parse HEAD",
@@ -2857,58 +2540,32 @@ mod tests {
     }
 
     #[test]
-    fn release_workflow_notarizes_macos_binaries_asynchronously() {
-        let release_workflow = include_str!("../../.github/workflows/release.yml");
+    fn release_packager_packages_exactly_the_release_targets() {
+        let packager = include_str!("../../scripts/release_gate_and_package.sh");
+        let block = workflow_block(packager, "\nTARGETS=(\n", "\n)\n");
+        let listed_targets: Vec<&str> = block
+            .lines()
+            .skip(2)
+            .map(|line| line.trim().trim_matches('"'))
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            listed_targets, CI_RELEASE_TARGETS,
+            "scripts/release_gate_and_package.sh TARGETS must match CI_RELEASE_TARGETS exactly"
+        );
 
-        for required in [
-            "Notarize macOS release binary",
-            "if: contains(matrix.target, 'apple-darwin')",
-            "APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}",
-            "APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}",
-            "APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}",
-            "base64.b64decode(os.environ[\"APPLE_NOTARY_KEY_P8_BASE64\"])",
-            "chmod 600 \"${notary_key}\"",
-            "APPLE_NOTARY_KEY_P8_BASE64 did not decode to an App Store Connect private key",
-            "notary_args=(",
-            "--key \"${notary_key}\"",
-            "--key-id \"${APPLE_NOTARY_KEY_ID}\"",
-            "--issuer \"${APPLE_NOTARY_ISSUER_ID}\"",
-            "Authority=Developer ID Application",
-            "ditto -c -k --keepParent \"${bin}\" \"${upload}\"",
-            "xcrun notarytool submit \"${upload}\"",
-            "plutil -extract id raw -o - \"${submit_plist}\"",
-            "xcrun notarytool info \"${submission_id}\"",
-            "plutil -extract status raw -o - \"${info_plist}\"",
-            "sleep 30",
-            "xcrun notarytool log \"${submission_id}\"",
-            "EXPECTED_CDHASH=\"${expected_cdhash}\" EXPECTED_ARCH=\"${expected_arch}\" NOTARY_LOG_JSON=\"${log_json}\" python3 - <<'PY'",
-            "notary log did not contain the signed binary ticket",
-            "notarization timed out after 30 minutes",
-            "sbh-*-notary-*.plist",
-            "sbh-*-notary-*.json",
-            "sbh-*-codesign-authority.txt",
-        ] {
+        let script = include_str!("../../scripts/dsr_release.sh");
+        let darwin: Vec<&str> = CI_RELEASE_TARGETS
+            .iter()
+            .copied()
+            .filter(|triple| triple.ends_with("-apple-darwin"))
+            .collect();
+        for triple in darwin {
             assert!(
-                release_workflow.contains(required),
-                "release workflow must include notarization contract fragment: {required}"
+                script.contains(&format!("{triple})")),
+                "dsr release must map {triple} to its raw darwin binary for signing"
             );
         }
-
-        let notary_ticket_verification = release_workflow
-            .find("notary log did not contain the signed binary ticket")
-            .expect("release workflow must verify notary ticket contents");
-        let package_archive = release_workflow
-            .find("- name: Package archive")
-            .expect("release workflow must package archives after verification");
-        assert!(
-            notary_ticket_verification < package_archive,
-            "release workflow must verify the accepted notary ticket before packaging"
-        );
-
-        assert!(
-            !release_workflow.contains("notarytool submit \"${upload}\" --wait"),
-            "release workflow must keep submit and polling as separate audited phases"
-        );
     }
 
     #[test]

@@ -10,14 +10,14 @@
 # --tag T            Check the heading for tag T. Without --expect-release or
 #                    --assets the asset count is looked up with `gh` (a tag
 #                    with no GitHub Release counts as 0 assets).
-# --expect-release   The tag is being published right now (release workflow):
+# --expect-release   The tag is being published right now (release path):
 #                    the heading must exist and carry the marker.
 # --assets N         Use N as the asset count instead of asking GitHub (tests).
 # --all              Audit every tag GitHub lists as a release (needs `gh`).
 #
 # Exit 0 when every checked heading matches, 1 on any mismatch, 2 on usage or
-# lookup errors. Lines are prefixed `changelog-check:`; failures also use the
-# GitHub Actions `::error::` form so they surface in a workflow summary.
+# lookup errors. Lines are prefixed `changelog-check:`; failures carry an
+# `::error::` prefix so they are easy to grep in release logs.
 set -euo pipefail
 
 REPOSITORY="Dicklesworthstone/storage_ballast_helper"

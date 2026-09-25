@@ -262,7 +262,7 @@ Grouped by file. Each item is a concrete edit target.
 - `internal/macos-parity-completion-audit.md`: 786-line diary with contradictory stale literals; conclusion (v0.4.22 closeout) never propagated to beads.
 - `testing-and-logging.md` L45-62: coverage map names `platform.rs`, `monitoring/ewma.rs`, `monitoring/pid_controller.rs`, `monitoring/predictive_action.rs`, `scanner/pattern_registry.rs`, `scanner/deletion_executor.rs` — none exist. L92-99 test counts (836/1,776/33/183) vs ~1,600/2,576/122/265. L121 lists `repro_issue.rs`, `repro_glob.rs` as regression tests. L165-186 says 20 stages (21). Per-case harness logs under `$TMPDIR/sbh-test-logs/` are undocumented.
 - `post-rollout-monitoring-and-handoff.md` L49: "quality-gate.sh in CI — every PR, nightly on main" — never referenced by `ci.yml`, which has no `schedule:` trigger.
-- `.github/workflows/ci.yml` L24-25, L39-43 and `release.yml` L82-88: "Strip local-only TUI path deps" step `sed`s `/dp/frankentui` path deps that no longer exist (git tags since 2026-06-13).
+- CI workflow `ci.yml` L24-25, L39-43 and `release.yml` L82-88 (both deleted on 2026-09-25 when sbh retired GitHub Actions): "Strip local-only TUI path deps" step `sed`s `/dp/frankentui` path deps that no longer exist (git tags since 2026-06-13).
 - `CHANGELOG.md`: header promises `[release]` markers; `v0.5.1` (published 2026-08-26) lacks one; 13 published versions (v0.4.40, .39, .38, .36, .33, .32, .27, .24, .23, .22, .14, .8, .4, .3, .2, v0.3.17) have no entry at all.
 - `SESSION_REPORT_EXPLORATION.md` (root): claims a swap-thrash constant rename that never landed; 3 of 4 claimed fixes exist.
 

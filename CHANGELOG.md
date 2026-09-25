@@ -2,9 +2,33 @@
 
 All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
-Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and the Release workflow refuses to publish a tag that has no marked heading here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
+Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
 ## Unreleased
+
+### Changed — releases no longer involve GitHub Actions
+
+- The GitHub workflows (`ci.yml`, `release.yml`, `cert-expiration.yml`) are
+  deleted. Releases are `dsr build` from a clean tag worktree followed by
+  `scripts/dsr_release.sh all X.Y.Z`: Developer ID signing with hardened
+  runtime, notarization (must be `Accepted`), packaging and audit, manifest
+  minisign, GitHub release upload and verification, and the Homebrew tap. The
+  sign step refuses an expired certificate and warns 30 days ahead.
+- **The Homebrew tap had been stuck at v0.6.0**: only the disabled Release
+  workflow updated it, so v0.6.1–v0.6.3 never reached `brew`. It now serves
+  v0.6.4, and the v0.6.4 darwin binaries are notarized
+  (`spctl`: `accepted, source=Notarized Developer ID`).
+- `sbh doctor --release` no longer checks GitHub secrets, workflow state or the
+  cert-expiration workflow, and its setup plan no longer stores credentials as
+  GitHub secrets; the JSON report drops `required_github_secrets`. The tap
+  version check reads the version from the formula URL (the rendered formula
+  has no `version` line, which made the check fail).
+
+### Fixed
+
+- A candidate whose protection check errors (for example a dead FUSE mount
+  inside it) is remembered as protected until its verdict expires, instead of
+  being re-probed and logged on every pass.
 
 ## v0.6.4 **[release]**
 

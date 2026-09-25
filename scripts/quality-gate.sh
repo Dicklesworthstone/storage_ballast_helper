@@ -48,7 +48,7 @@
 # Reference:
 #   docs/tui-acceptance-gates-and-budgets.md (gate definitions)
 #   docs/quality-gate-runbook.md (embeds `--print-stages --markdown`)
-#   .github/workflows/ci.yml (CI pipeline alignment)
+# There is no hosted CI: run this through rch before pushing.
 
 set -euo pipefail
 

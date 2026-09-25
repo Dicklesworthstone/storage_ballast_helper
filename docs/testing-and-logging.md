@@ -274,11 +274,16 @@ clippy) have no tests.
 - `e2e/` — nested e2e suite artifacts (when stage `e2e` runs)
 
 **Remote compilation:** CPU-intensive stages use `rch exec` by default.
-Use `--local` to skip rch. CI workflows run locally (no rch available).
+Use `--local` to skip rch.
 
-**Docs update lint:** PR CI runs `scripts/ci_docs_update_check.sh` in the
-Format + Lint job before Cargo setup. The guard compares the pull request
-against the base branch and fails when user-facing source, installer,
+**No hosted CI:** sbh does not use GitHub Actions or any other hosted CI, for
+tests or for releases. The gates above, `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, and the test suites are run by
+whoever changes the code, through rch, before pushing. Releases go through
+`dsr build` and `scripts/dsr_release.sh` (see `docs/macos.md`).
+
+**Docs update lint:** `scripts/ci_docs_update_check.sh` compares a head
+revision against a base and fails when user-facing source, installer,
 packaging, cleanup-policy, or config-schema files change without a companion
 update to README, `docs/`, CHANGELOG, CLI help text in `src/cli_app.rs`, or the
 Homebrew formula. It also checks two high-risk cases directly:
@@ -288,89 +293,36 @@ Homebrew formula. It also checks two high-risk cases directly:
 - New public config fields in `src/core/config.rs` must update config docs or
   sample configs.
 
-Local dry run:
+Nothing runs the lint automatically, and without `DOCS_UPDATE_BASE` (or an
+explicit `DOCS_UPDATE_CHANGED_FILES` list) it skips outside a pull-request
+event. Run it before pushing user-facing changes:
 ```bash
 DOCS_UPDATE_BASE=origin/main DOCS_UPDATE_HEAD=HEAD bash scripts/ci_docs_update_check.sh
 ```
 
-**Superseded CI cancellation:** Branch and pull-request CI runs use workflow
-concurrency group `github.workflow` plus the PR number or ref, with
-`cancel-in-progress` enabled only for `pull_request` events;
-a main run that is in progress is never cancelled. Several
-agents push to main every few minutes, and cancelling in progress meant no
-main run ever finished (four in a row were cancelled on 2026-09-02).
-GitHub still keeps at most one main run waiting behind the active one, and
-a newer push replaces the waiting run, so the group holder has to start: on
-2026-09-02 a run stuck in `queued` for 78 minutes held the group and every
-later push was cancelled while pending until that run was cancelled by hand
-(`gh run cancel <id>`). Check `gh run list --status queued` before blaming
-the concurrency policy.
-Tag-triggered release workflow calls are not cancelable through this CI
-policy either, which preserves `workflow_call` behavior for the
-release quality gates.
+**Homebrew formula rendering:** `scripts/dsr_release.sh tap` renders
+`packaging/homebrew/Formula/sbh.rb` for each release in its `render_formula`
+function: it substitutes the tag and both macOS SHA-256 checksums, fails if any
+`REPLACE_WITH_` marker remains, and runs `ruby -c` on the result before pushing
+the tap. The unit test
+`dsr_release_render_formula_output_pins_version_and_checksums` runs that same
+function against the checked-in skeleton, so a skeleton edit that breaks
+rendering fails `cargo test` long before a release.
 
-**macOS validation independence:** The `macos-platform`, `macos-coverage`, and
-`macos-benchmarks` jobs intentionally do not declare `needs: check`. They still
-run their own checkout, toolchain setup, build, tests, and artifact upload, but
-a queued Ubuntu runner cannot hide missing macOS proof. The final provenance job
-continues to require all Linux and macOS validation lanes before a CI run is
-trusted.
-
-**CI artifact retention** (`.github/workflows/ci.yml`):
-
-| CI Job | Artifacts | Retention |
-| --- | --- | --- |
-| homebrew-formula | `homebrew-formula-style-output.txt`, `homebrew-generated-formula-style-output.txt`, generated `Formula/sbh.rb` | 14 days |
-| unit | `unit-test-output.txt`, `bin-test-output.txt` | 14 days |
-| integration | `integration-output.txt` | 14 days |
-| decision-plane | `proof-harness-output.txt`, `decision-plane-e2e-output.txt` | 30 days |
-| e2e | `e2e-output.txt`, per-case logs | 14 days |
-| macos-platform | `macos-*-output.txt`, `macos-runner-info.txt`, `macos-toolchain-output.txt`, `macos-codesign-output.txt`, `macos-codesign-entitlements.plist`, `sbh-completions.zsh` | 14 days |
-| macos-coverage | `current-coverage.json`, `current-lcov.info`, `coverage-summary.json`, optional PR `base-coverage.json` | 30 days |
-| macos-benchmarks | `current-summary.json`, `current-output.txt`, `benchmark-summary.json`, optional PR `base-summary.json` | 30 days |
-| stress | `stress-output.txt` | 14 days |
-| dashboard | TUI test stage outputs | 14 days |
-| provenance | `ci-metadata.json`, `dependency-tree.txt` | 90 days |
-
-**macOS CI runners:** As of May 2026, GitHub's standard hosted runner labels
-for this project are `macos-latest` for Apple Silicon (`arm64`) and
-`macos-15-intel` for Intel (`x86_64`). The retired `macos-13` label is not used
-in active workflows. The `macos-platform` job asserts `uname -m` so runner-label
-drift is caught before release artifacts are trusted.
-
-**Homebrew formula validation:** The `homebrew-formula` job runs on
-`macos-latest` before release credentials are needed. It runs `brew style` on
-the checked-in `packaging/homebrew/Formula/sbh.rb`, then copies the formula,
-substitutes a synthetic tag and both macOS SHA-256 checksums with the same Perl
-expression used by `.github/workflows/release.yml`, fails if any
-`REPLACE_WITH_` marker remains, and runs `brew style` on the generated formula.
-The tagged release workflow repeats the checksum substitution against the real
-release artifacts and runs `ruby -c homebrew-sbh/Formula/sbh.rb` before pushing
-the tap update with the repository-scoped deploy key. This keeps the tap formula
-generation path covered on normal PR/push CI and still catches malformed
-generated Ruby during a signed release.
-
-**macOS coverage tracking:** The `macos-coverage` job runs on `macos-latest`
-and installs `cargo-llvm-cov` with `taiki-e/install-action@cargo-llvm-cov`, the
-upstream GitHub Actions install path for prebuilt cargo-llvm-cov binaries. It
-generates JSON and LCOV coverage for the CI-supported non-TUI library, binary,
-and `integration_tests` targets. On pull requests it also checks out the base
-SHA, computes the same macOS line-coverage summary, and fails if current
-coverage is more than 2.0 percentage points below the base branch. The rendered
-step summary and `coverage-summary.json` show current, base, and delta values.
-
-**macOS performance budgets:** The `macos-benchmarks` job runs on
-`macos-latest` and executes the Criterion bench target
-`macos_performance`. The bench records two hard budget summaries:
+**macOS performance budgets:** On a Mac, `cargo bench --bench macos_performance`
+runs the Criterion bench target `macos_performance`, which asserts these
+budgets:
 
 - `daemon_poll_tick_avg_ms` must stay at or below 200 ms for a representative
   synthetic monitoring tick.
 - `pal_surface_avg_ms` must stay at or below 5 ms for the PAL filesystem and
   memory calls exercised by a tick.
+- the `sbh status` cold-start p50 must stay at or below 250 ms (checked only
+  when the bench finds an `sbh` binary and `SBH_BENCH_BUDGET_SCALE` is unset
+  or 1).
 
-On pull requests, CI also runs the same bench target at the base SHA when that
-target exists there. `benchmark-summary.json` reports current, base, and delta
-values, and the job fails if either metric regresses by more than 20 percent.
+`SBH_BENCH_BUDGET_SCALE` (at least 1) widens the first two budgets on slower
+hardware.
 The harness uses the native PAL when platform detection is available and falls
 back to a deterministic synthetic PAL while a platform implementation is still
 being wired in.
@@ -455,8 +407,8 @@ Stable event IDs follow `<component>.<action>` pattern:
 | Decision plane proof fails | Scoring/ranking invariant violated | Check scoring weights, RRF fusion, or veto logic |
 | Clippy lint | New lint in toolchain update | Add targeted `#[allow]` with justification, or fix |
 | Feature gate error | Missing `--features tui` | TUI tests require explicit feature flag |
-| A `chmod`-based test fails only as root | Root bypasses permission bits, so the provoked `EACCES` never happens | Guard the test with `crate::platform::running_as_root()` and print `SKIP: running as root (<test>)`; the CI job `unit-as-root` counts those lines |
-| `from_source` cargo/rustc probes fail under `sudo` | `sudo` reset `PATH`/`HOME`, so rustup cannot find a toolchain | Run as `sudo -E env "PATH=$PATH" cargo test --lib` (what CI does); this is an environment problem, not a permission one |
+| A `chmod`-based test fails only as root | Root bypasses permission bits, so the provoked `EACCES` never happens | Guard the test with `crate::platform::running_as_root()` and print `SKIP: running as root (<test>)` so a root run shows what it skipped |
+| `from_source` cargo/rustc probes fail under `sudo` | `sudo` reset `PATH`/`HOME`, so rustup cannot find a toolchain | Run as `sudo -E env "PATH=$PATH" cargo test --lib`; this is an environment problem, not a permission one |
 
 ### Isolating TUI Failures
 

@@ -802,9 +802,11 @@ A crash found by `cargo fuzz` becomes a seed file under `fuzz/corpus/<target>/` 
 
 The E2E script runs real CLI invocations with per-case logging.
 
-### What CI gates
+### No hosted CI; releases go through dsr
 
-`.github/workflows/ci.yml` runs `cargo clippy --all-targets -- -D warnings` twice (shipped features, which include `tui`, then with the off-by-default `legacy-crossterm-dashboard` added), the unit suite as root (`unit-as-root`, chmod-based tests must print `SKIP: running as root`), a `unit-tui` lane that must execute at least 950 library tests, and actionlint over the workflows. Anything that only compiles with the TUI still has to pass clippy, so keep `--features tui` building.
+sbh never uses GitHub Actions (owner's rule; the workflows were deleted 2026-09-25). Before pushing, run the gates yourself through rch: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (shipped features, which include `tui`) and again with `--features legacy-crossterm-dashboard`, `cargo test --lib`, `cargo test --bin sbh`, the integration targets, and `tests/daemon_e2e.rs` with `--test-threads=1` on a host whose disk is not IO-starved. `scripts/quality-gate.sh` runs the staged gate. Keep `--features tui` building.
+
+Release: `scripts/changelog_check.sh --tag vX.Y.Z --expect-release`, tag and push, `dsr build storage_ballast_helper --version X.Y.Z` from a clean worktree at the tag, then `scripts/dsr_release.sh all X.Y.Z` (Developer ID signing, notarization, packaging and audit, manifest minisign, GitHub release upload and verification, Homebrew tap). `sbh doctor --release` checks the credentials and release drift.
 
 ### Test Conventions
 

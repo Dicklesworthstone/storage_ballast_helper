@@ -165,14 +165,13 @@ sudo sbh doctor --pal
 ```
 
 Homebrew is supported by the packaged formula skeleton and the
-`Dicklesworthstone/homebrew-sbh` tap. Tagged releases copy
-`packaging/homebrew/Formula/sbh.rb` into the tap, replace the per-architecture
-SHA-256 placeholders from the release artifacts, and publish the formula
-update to the tap using the `HOMEBREW_TAP_SSH_KEY` release secret. That secret is
-the private half of a write-enabled deploy key scoped only to the tap repository;
-the release workflow verifies the key can see `main` and dry-runs a branch push
-before building release artifacts. After the tap update lands, the operator path
-is:
+`Dicklesworthstone/homebrew-sbh` tap. Every release runs
+`scripts/dsr_release.sh tap VERSION`, which renders
+`packaging/homebrew/Formula/sbh.rb` with the version and the per-architecture
+SHA-256s of the published darwin archives (refusing if the published checksums
+differ from the local build) and pushes it to the tap with the releasing
+operator's `gh` login. `sbh doctor --release` fails when the tap lags the latest
+release. With the tap current, the operator path is:
 
 ```bash
 brew tap Dicklesworthstone/sbh
