@@ -9251,8 +9251,23 @@ fn executor_thread_main(
         if plan.candidates.is_empty() {
             eprintln!(
                 "[SBH-EXECUTOR] plan() filtered all {pre_plan_count} approved candidates \
-                 (min_score={min_score:.2}, dry_run={dry_run})",
+                 (min_score={min_score:.2}, dry_run={dry_run}; refused: {})",
+                plan.refusal_summary(),
             );
+            // `execute` is skipped, so hand the scanner its backoff here;
+            // without it the same refusals were re-proposed every pass (css
+            // 2026-09-25: 10 of 27 batches refused whole).
+            if shared_scanner_config.read().engine == ScannerEngineMode::V2 {
+                for candidate in plan.refusals_to_back_off() {
+                    let Some(identity) = candidate.identity else {
+                        continue;
+                    };
+                    let _ = index_feedback_tx.try_send(ScannerIndexFeedback {
+                        identity: IndexedIdentity::from(identity),
+                        path: candidate.path.clone(),
+                    });
+                }
+            }
             continue;
         }
 

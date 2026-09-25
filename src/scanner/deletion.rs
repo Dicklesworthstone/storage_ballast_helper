@@ -151,6 +151,42 @@ pub struct DeletionPlan {
     pub refused: Vec<(CandidacyScore, SkipReason)>,
 }
 
+impl DeletionPlan {
+    /// Refused candidates that must be backed off, by the same rule
+    /// `execute` applies. A caller that skips `execute` because nothing was
+    /// admitted still owes the scanner this feedback; otherwise the same
+    /// refusals come back every pass.
+    #[must_use]
+    pub fn refusals_to_back_off(&self) -> Vec<&CandidacyScore> {
+        self.refused
+            .iter()
+            .filter(|(_, reason)| should_backoff_skip(*reason))
+            .map(|(candidate, _)| candidate)
+            .collect()
+    }
+
+    /// Refusal counts by reason, most frequent first: `vetoed×7, below_threshold×2`.
+    #[must_use]
+    pub fn refusal_summary(&self) -> String {
+        let mut counts: Vec<(&'static str, usize)> = Vec::new();
+        for (_, reason) in &self.refused {
+            match counts
+                .iter_mut()
+                .find(|(label, _)| *label == reason.as_str())
+            {
+                Some((_, n)) => *n += 1,
+                None => counts.push((reason.as_str(), 1)),
+            }
+        }
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        counts
+            .iter()
+            .map(|(label, n)| format!("{label}\u{00d7}{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// Summary after a deletion batch completes.
 #[derive(Debug, Clone)]
 pub struct DeletionReport {
@@ -1763,6 +1799,35 @@ mod tests {
             "clean/daemon planning must keep holding Review candidates for a human"
         );
         assert_eq!(plan.total_reclaimable_bytes, 0);
+    }
+
+    /// An all-refused plan never reaches `execute`, so the caller reads the
+    /// backoff and the reasons from the plan itself.
+    #[test]
+    fn refused_plan_names_its_reasons_and_what_to_back_off() {
+        let dir = scratch_dir();
+        let review = make_review_candidate(&dir.path().join("ambiguous"), 4096, 0.85);
+        let mut low = make_candidate(&dir.path().join("low"), 4096, 0.10);
+        low.decision.action = DecisionAction::Delete;
+        let mut vetoed = make_candidate(&dir.path().join("vetoed"), 4096, 0.90);
+        vetoed.vetoed = true;
+
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let plan = executor.plan(vec![review, low, vetoed]);
+
+        assert!(plan.candidates.is_empty());
+        assert_eq!(
+            plan.refusal_summary(),
+            "vetoed\u{00d7}2, below_threshold\u{00d7}1"
+        );
+        let backed_off: Vec<_> = plan
+            .refusals_to_back_off()
+            .iter()
+            .map(|c| c.path.file_name().unwrap().to_owned())
+            .collect();
+        // A below-threshold score can rise with pressure: it is not backed off.
+        assert_eq!(backed_off.len(), 2, "{backed_off:?}");
+        assert!(!backed_off.iter().any(|name| name == "low"));
     }
 
     #[test]
