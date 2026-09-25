@@ -708,9 +708,11 @@ pub fn constants() -> Vec<ConstantDoc> {
     };
     use crate::daemon::self_monitor;
     use crate::monitor::{ewma, guardrails, pid};
+    use crate::scanner::scoring as rch;
     use crate::scanner::{deletion, planner, quarantine, walker};
 
     const CONFIG: &str = "src/core/config.rs";
+    const RCH_SOURCE: &str = "src/scanner/scoring.rs";
     let pressure = PressureConfig::default();
     let controller = &pressure.controller;
     let prediction = &pressure.prediction;
@@ -1546,6 +1548,48 @@ pub fn constants() -> Vec<ConstantDoc> {
             "Paths the VOI scheduler scans per cycle",
             CONFIG,
         ),
+        constant(
+            "rch",
+            "RCH_POOLED_IDLE_HOURS",
+            rch::RCH_POOLED_IDLE_HOURS,
+            "rch's own idle floor (hours) for a pooled target dir",
+            RCH_SOURCE,
+        ),
+        constant(
+            "rch",
+            "RCH_PER_JOB_IDLE_HOURS",
+            rch::RCH_PER_JOB_IDLE_HOURS,
+            "rch's own idle floor (hours) for a per-job target dir",
+            RCH_SOURCE,
+        ),
+        constant(
+            "rch",
+            "RCH_PRESSURE_URGENCY",
+            rch::RCH_PRESSURE_URGENCY,
+            "Urgency at which the short pressure floors apply",
+            RCH_SOURCE,
+        ),
+        constant(
+            "rch",
+            "RCH_PRESSURE_POOLED_IDLE_MINUTES",
+            rch::RCH_PRESSURE_POOLED_IDLE_MINUTES,
+            "Pooled idle floor (minutes) under pressure",
+            RCH_SOURCE,
+        ),
+        constant(
+            "rch",
+            "RCH_PRESSURE_PER_JOB_IDLE_MINUTES",
+            rch::RCH_PRESSURE_PER_JOB_IDLE_MINUTES,
+            "Per-job idle floor (minutes) under pressure",
+            RCH_SOURCE,
+        ),
+        constant(
+            "rch",
+            "RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE",
+            rch::RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE,
+            "Entries the idle probe may walk under pressure",
+            RCH_SOURCE,
+        ),
     ];
     rows.extend(daemon_constants());
     rows
@@ -1632,6 +1676,13 @@ fn daemon_constants() -> Vec<ConstantDoc> {
             daemon::CATALOG_PROBE_MAX_DEPTH,
             "Depth of a catalog freshness probe",
             SOURCE,
+        ),
+        constant(
+            "daemon",
+            "CANARY_REPROVE_MINUTES",
+            crate::daemon::policy::CANARY_REPROVE_SECS / 60,
+            "Clean minutes an automatic Canary needs to return to the intended mode",
+            "src/daemon/policy.rs",
         ),
     ]
 }

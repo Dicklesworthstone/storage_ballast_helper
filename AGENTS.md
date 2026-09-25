@@ -725,6 +725,12 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | control | `MAX_SOCKET_PATH_BYTES` | `100` | Longest socket path a Unix address can carry | `src/daemon/control.rs` |
 | voi | `ewma_alpha` | `0.3` | Smoothing of the scheduler's expected-reclaim estimates | `src/core/config.rs` |
 | voi | `scan_budget_per_interval` | `5` | Paths the VOI scheduler scans per cycle | `src/core/config.rs` |
+| rch | `RCH_POOLED_IDLE_HOURS` | `168` | rch's own idle floor (hours) for a pooled target dir | `src/scanner/scoring.rs` |
+| rch | `RCH_PER_JOB_IDLE_HOURS` | `12` | rch's own idle floor (hours) for a per-job target dir | `src/scanner/scoring.rs` |
+| rch | `RCH_PRESSURE_URGENCY` | `0.7` | Urgency at which the short pressure floors apply | `src/scanner/scoring.rs` |
+| rch | `RCH_PRESSURE_POOLED_IDLE_MINUTES` | `60` | Pooled idle floor (minutes) under pressure | `src/scanner/scoring.rs` |
+| rch | `RCH_PRESSURE_PER_JOB_IDLE_MINUTES` | `30` | Per-job idle floor (minutes) under pressure | `src/scanner/scoring.rs` |
+| rch | `RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE` | `2000000` | Entries the idle probe may walk under pressure | `src/scanner/scoring.rs` |
 | daemon | `SCANNER_CHANNEL_CAP` | `2` | Monitor → scanner requests in flight | `src/daemon/loop_main.rs` |
 | daemon | `EXECUTOR_CHANNEL_CAP` | `64` | Scanner → executor batches in flight | `src/daemon/loop_main.rs` |
 | daemon | `MEMORY_PRESSURE_CHANNEL_CAP` | `16` | Memory-pressure samples buffered | `src/daemon/loop_main.rs` |
@@ -736,6 +742,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | daemon | `THREAD_STALL_THRESHOLD` | `60 s` | Heartbeat age that counts as a stall | `src/daemon/loop_main.rs` |
 | daemon | `CATALOG_PROBE_MAX_ENTRIES` | `50000` | Entries a catalog freshness probe may visit | `src/daemon/loop_main.rs` |
 | daemon | `CATALOG_PROBE_MAX_DEPTH` | `5` | Depth of a catalog freshness probe | `src/daemon/loop_main.rs` |
+| daemon | `CANARY_REPROVE_MINUTES` | `30` | Clean minutes an automatic Canary needs to return to the intended mode | `src/daemon/policy.rs` |
 <!-- sbh-docs:end -->
 
 ---
