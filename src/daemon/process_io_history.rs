@@ -221,10 +221,7 @@ impl ProcessIoHistory {
         };
         // Do not wrap within a pass or sample a small inventory repeatedly.
         // Failed probes advance too; an inaccessible PID cannot hold the sweep.
-        for process in processes[start..end]
-            .iter()
-            .take(self.max_samples_per_pass)
-        {
+        for process in processes[start..end].iter().take(self.max_samples_per_pass) {
             if Instant::now() >= deadline {
                 break;
             }
