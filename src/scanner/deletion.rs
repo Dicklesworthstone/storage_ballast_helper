@@ -187,6 +187,77 @@ impl DeletionPlan {
     }
 }
 
+/// How long one complete open-file sweep may serve later batches, measured
+/// from when it *started*.
+///
+/// The sweep walks every process's `/proc/*/fd` and does not depend on the
+/// batch's candidates; on a host with thousands of agent processes under
+/// `CPUQuota=10%` it took most of each batch's 12-25 s, and 74% of batches
+/// start the moment the previous one ends (css, 2026-09-25). A single sweep
+/// already takes over 10 s there, so a 20 s window roughly doubles the
+/// staleness a batch already accepted, and a batch whose candidate root
+/// changed after the sweep started always gets a fresh sweep.
+pub const OPEN_SWEEP_REUSE_WINDOW: Duration = Duration::from_secs(20);
+
+/// Whether a complete sweep that started `age` ago (wall clock
+/// `started_wall`) may serve a batch whose candidate roots have the given
+/// mtimes. A root that changed after the sweep began, or whose mtime cannot
+/// be read, forces a fresh sweep: a rebuild writing into a target shows up
+/// there first.
+#[cfg(any(target_os = "linux", test))]
+fn open_sweep_reusable(
+    age: Duration,
+    started_wall: std::time::SystemTime,
+    mut root_mtimes: impl Iterator<Item = Option<std::time::SystemTime>>,
+) -> bool {
+    age < OPEN_SWEEP_REUSE_WINDOW
+        && root_mtimes.all(|mtime| mtime.is_some_and(|mtime| mtime < started_wall))
+}
+
+#[cfg(target_os = "linux")]
+struct OpenSweep {
+    started: Instant,
+    started_wall: std::time::SystemTime,
+    targets: Arc<Vec<PathBuf>>,
+}
+
+/// The last complete sweep; one executor thread uses it per process.
+#[cfg(target_os = "linux")]
+static LAST_OPEN_SWEEP: std::sync::Mutex<Option<OpenSweep>> = std::sync::Mutex::new(None);
+
+/// Open file targets for a batch over `roots`: the last complete sweep when
+/// [`open_sweep_reusable`] allows it, otherwise a fresh one.
+#[cfg(target_os = "linux")]
+fn open_targets_for_batch(roots: &[PathBuf]) -> (Arc<Vec<PathBuf>>, bool) {
+    let lock = || {
+        LAST_OPEN_SWEEP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let reusable = lock().as_ref().and_then(|sweep| {
+        let mtimes = roots.iter().map(|root| {
+            fs::symlink_metadata(root)
+                .and_then(|meta| meta.modified())
+                .ok()
+        });
+        open_sweep_reusable(sweep.started.elapsed(), sweep.started_wall, mtimes)
+            .then(|| Arc::clone(&sweep.targets))
+    });
+    if let Some(targets) = reusable {
+        return (targets, true);
+    }
+    let started = Instant::now();
+    let started_wall = std::time::SystemTime::now();
+    let (targets, complete) = walker::collect_open_file_targets_linux();
+    let targets = Arc::new(targets);
+    *lock() = complete.then(|| OpenSweep {
+        started,
+        started_wall,
+        targets: Arc::clone(&targets),
+    });
+    (targets, complete)
+}
+
 /// Summary after a deletion batch completes.
 #[derive(Debug, Clone)]
 pub struct DeletionReport {
@@ -692,7 +763,20 @@ impl DeletionExecutor {
                 .map(|candidate| candidate.path.clone())
                 .collect::<Vec<_>>();
             let (paths, complete) = self.platform.as_ref().map_or_else(
-                || walker::collect_open_path_ancestors(&roots),
+                || {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let (targets, complete) = open_targets_for_batch(&roots);
+                        (
+                            walker::open_path_ancestors_for_roots(&targets, &roots),
+                            complete,
+                        )
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        walker::collect_open_path_ancestors(&roots)
+                    }
+                },
                 |platform| {
                     walker::collect_open_path_ancestors_with_platform(platform.as_ref(), &roots)
                 },
@@ -3712,6 +3796,87 @@ mod tests {
             "candidate must be attributed to SkipReason::OpenScanIncomplete"
         );
         assert!(target_dir.exists(), "candidate must not be deleted");
+    }
+
+    #[test]
+    fn open_sweep_reuse_needs_a_young_sweep_and_unchanged_roots() {
+        use std::time::SystemTime;
+        let started = SystemTime::now();
+        let before = started - Duration::from_secs(60);
+        let after = started + Duration::from_secs(1);
+        let young = Duration::from_secs(5);
+
+        assert!(open_sweep_reusable(
+            young,
+            started,
+            [Some(before)].into_iter()
+        ));
+        assert!(!open_sweep_reusable(
+            OPEN_SWEEP_REUSE_WINDOW,
+            started,
+            [Some(before)].into_iter()
+        ));
+        // A root that changed after the sweep began, or whose mtime cannot
+        // be read, forces a fresh sweep.
+        assert!(!open_sweep_reusable(
+            young,
+            started,
+            [Some(before), Some(after)].into_iter()
+        ));
+        assert!(!open_sweep_reusable(
+            young,
+            started,
+            [Some(before), None].into_iter()
+        ));
+    }
+
+    /// A sweep taken for one batch is not reused for a candidate whose root
+    /// changed afterwards: a file opened there after the sweep still vetoes
+    /// the deletion.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_opened_after_the_last_sweep_still_blocks_deletion() {
+        let dir = scratch_dir();
+        let first = dir.path().join("first").join("target");
+        let second = dir.path().join("second").join("target");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("a.o"), b"object").unwrap();
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: true,
+                dry_run: false,
+                ..Default::default()
+            },
+            None,
+        );
+
+        // Batch 1 takes (or reuses) a sweep and deletes `first`.
+        let report = executor.execute(&executor.plan(vec![make_candidate(&first, 6, 0.95)]), None);
+        assert_eq!(report.items_deleted, 1, "{report:?}");
+
+        // A build starts in `second` after that sweep: its root changes and
+        // a file under it is held open by this process.
+        std::thread::sleep(Duration::from_millis(20));
+        let live = second.join("build.lock");
+        fs::write(&live, b"lock").unwrap();
+        let handle = fs::File::open(&live).unwrap();
+        let (visible, _) = walker::collect_open_path_ancestors(std::slice::from_ref(&second));
+        if !visible.contains(&live) {
+            // /proc hides our own fds here (hidepid, containers): nothing to prove.
+            drop(handle);
+            return;
+        }
+
+        let report = executor.execute(&executor.plan(vec![make_candidate(&second, 4, 0.95)]), None);
+        assert_eq!(report.items_deleted, 0, "{report:?}");
+        assert_eq!(
+            report.skipped_by_reason.get("file_open"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert!(second.exists());
+        drop(handle);
     }
 
     #[test]

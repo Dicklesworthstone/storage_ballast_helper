@@ -1498,15 +1498,28 @@ fn add_open_path_ancestor_chain(
 
 #[cfg(target_os = "linux")]
 fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
+    let (targets, complete) = collect_open_file_targets_linux();
+    (
+        open_path_ancestors_for_roots(&targets, root_paths),
+        complete,
+    )
+}
+
+/// Every absolute path some process holds open, from one walk of
+/// `/proc/*/fd`, plus whether the walk finished within its budget.
+///
+/// This is the expensive part of an open-file check and does not depend on
+/// which candidates are being checked, so one walk can serve several batches
+/// (see `deletion::OPEN_SWEEP_REUSE_WINDOW`).
+#[cfg(target_os = "linux")]
+pub(crate) fn collect_open_file_targets_linux() -> (Vec<PathBuf>, bool) {
     use std::os::unix::ffi::OsStrExt;
     use std::time::Instant;
 
-    let mut ancestors = HashSet::with_capacity(4096);
+    let mut targets: HashSet<PathBuf> = HashSet::with_capacity(4096);
     let Ok(proc_dir) = fs::read_dir("/proc") else {
-        return (ancestors, true);
+        return (Vec::new(), true);
     };
-
-    let normalized_roots = normalized_open_roots(root_paths);
 
     let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
     let mut pids_scanned: usize = 0;
@@ -1541,11 +1554,29 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf
             if let Some(stripped) = target.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
                 target = PathBuf::from(stripped);
             }
-            add_open_path_ancestor_chain(&mut ancestors, &target, &normalized_roots);
+            targets.insert(target);
         }
     }
 
-    (ancestors, !incomplete)
+    (targets.into_iter().collect(), !incomplete)
+}
+
+/// The open-path ancestor index for `root_paths`, built from a list of open
+/// file targets (see [`collect_open_file_targets_linux`]).
+#[cfg(target_os = "linux")]
+pub(crate) fn open_path_ancestors_for_roots(
+    targets: &[PathBuf],
+    root_paths: &[PathBuf],
+) -> HashSet<PathBuf> {
+    let normalized_roots = normalized_open_roots(root_paths);
+    let mut ancestors = HashSet::with_capacity(4096);
+    if normalized_roots.is_empty() {
+        return ancestors;
+    }
+    for target in targets {
+        add_open_path_ancestor_chain(&mut ancestors, target, &normalized_roots);
+    }
+    ancestors
 }
 
 /// Collect open path ancestors using a specific platform implementation.
