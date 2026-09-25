@@ -6402,12 +6402,32 @@ fn join_worker_with_timeout(name: &str, handle: thread::JoinHandle<()>, timeout:
 
 // ──────────────────── scanner thread ────────────────────
 
+/// What one scan pass has handed to the executor.
+#[derive(Debug, Default)]
+struct PassDispatch {
+    /// Candidates dispatched this pass (the inter-pass cooldown's signal).
+    count: usize,
+    /// Their paths. The pre-scan and the walk can nominate the same tree in
+    /// one pass; a second batch for it arrives right after the first one
+    /// deleted it, and a tree recreated in between can reuse the freed inode
+    /// and pass the identity check (e2e 2026-09-25: a rebuilt target under a
+    /// live process was deleted twice). A path, or anything under it, is
+    /// dispatched at most once per pass.
+    paths: HashSet<PathBuf>,
+}
+
 fn dispatch_top_candidates(
     scored: &mut Vec<CandidacyScore>,
     request: &ScanRequest,
     del_tx: &Sender<DeletionBatch>,
-    dispatched: &mut usize,
+    dispatched: &mut PassDispatch,
 ) -> bool {
+    scored.retain(|candidate| {
+        !dispatched
+            .paths
+            .iter()
+            .any(|sent| candidate.path.starts_with(sent))
+    });
     if scored.is_empty() {
         return true;
     }
@@ -6435,6 +6455,7 @@ fn dispatch_top_candidates(
         target_bytes: request.target_bytes,
     };
     let batch_len = batch.candidates.len();
+    let batch_paths: Vec<PathBuf> = batch.candidates.iter().map(|c| c.path.clone()).collect();
 
     // Non-blocking send preserves scanner progress and avoids deadlock when
     // executor is slow. If channel is full, re-queue candidates locally so the
@@ -6445,7 +6466,8 @@ fn dispatch_top_candidates(
             // reclaim work was started this pass. Counted so the inter-pass
             // cooldown (B6) distinguishes a *productive* pass from one that
             // surfaced candidates but dispatched none (all protected/dampened).
-            *dispatched += batch_len;
+            dispatched.count += batch_len;
+            dispatched.paths.extend(batch_paths);
             true
         }
         Err(TrySendError::Full(mut deferred)) => {
@@ -7406,7 +7428,7 @@ fn scanner_thread_main(
         // pass — the signal for whether the pass made reclaim progress (drives
         // the B6 empty-pass cooldown). A pass can surface many candidates yet
         // dispatch zero when they are all protected/dampened.
-        let mut dispatched_this_pass: usize = 0;
+        let mut dispatched_this_pass = PassDispatch::default();
         let reclaim_at_pass_start = executor_config.reclaim_events();
         let mut scanner_should_exit = false;
         let mut scan_timed_out = false;
@@ -8803,7 +8825,7 @@ fn scanner_thread_main(
                 ),
             });
         }
-        if dispatched_this_pass == 0 {
+        if dispatched_this_pass.count == 0 {
             if !scan_timed_out {
                 consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
             }
@@ -11745,7 +11767,7 @@ mod tests {
             &mut scored,
             &request,
             &del_tx,
-            &mut 0usize
+            &mut PassDispatch::default()
         ));
         assert!(
             scored.is_empty(),
@@ -13079,7 +13101,7 @@ mod tests {
             &mut scored,
             &request,
             &del_tx,
-            &mut 0usize
+            &mut PassDispatch::default()
         ));
         let batch = del_rx.recv().expect("batch should be dispatched");
         assert_eq!(batch.candidates.len(), 1);
@@ -13119,7 +13141,7 @@ mod tests {
             &mut scored,
             &request,
             &del_tx,
-            &mut 0usize
+            &mut PassDispatch::default()
         ));
 
         // Channel remained full, so scanner should still retain all candidates.
@@ -13130,6 +13152,57 @@ mod tests {
         // Existing queued batch should still be the one currently in the channel.
         let queued = del_rx.recv().expect("prefilled batch still queued");
         assert_eq!(queued.candidates[0].path, Path::new("/tmp/already-queued"));
+    }
+
+    /// The pre-scan and the walk nominated the same target in one pass; the
+    /// second batch deleted the tree a build had just recreated (the freed
+    /// inode was reused, so the identity check passed). A path, or anything
+    /// under it, is dispatched at most once per pass.
+    #[test]
+    fn a_pass_never_dispatches_the_same_tree_twice() {
+        let request = ScanRequest {
+            paths: vec![PathBuf::from("/tmp")],
+            urgency: 0.9,
+            pressure_level: PressureLevel::Orange,
+            free_pct: None,
+            max_delete_batch: 10,
+            force_full_scan: false,
+            config_update: None,
+            catalog_roots: Vec::new(),
+            maintenance: false,
+            target_bytes: None,
+        };
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(4);
+        let mut pass = PassDispatch::default();
+
+        let mut prescan = vec![test_candidate("/tmp/proj/target", 0.9)];
+        assert!(dispatch_top_candidates(
+            &mut prescan,
+            &request,
+            &del_tx,
+            &mut pass
+        ));
+        assert_eq!(del_rx.try_recv().unwrap().candidates.len(), 1);
+
+        let mut walk = vec![
+            test_candidate("/tmp/proj/target", 0.9),
+            test_candidate("/tmp/proj/target/debug", 0.8),
+            test_candidate("/tmp/other/target", 0.7),
+        ];
+        assert!(dispatch_top_candidates(
+            &mut walk, &request, &del_tx, &mut pass
+        ));
+        let second = del_rx.try_recv().unwrap();
+        let paths: Vec<_> = second.candidates.iter().map(|c| c.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("/tmp/other/target")]);
+        assert_eq!(pass.count, 2);
+
+        // Nothing new: no batch at all.
+        let mut again = vec![test_candidate("/tmp/proj/target", 0.9)];
+        assert!(dispatch_top_candidates(
+            &mut again, &request, &del_tx, &mut pass
+        ));
+        assert!(del_rx.try_recv().is_err());
     }
 
     #[test]
