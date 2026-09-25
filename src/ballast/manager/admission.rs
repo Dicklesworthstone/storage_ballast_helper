@@ -128,10 +128,8 @@ mod tests {
         // Each 8192-byte test file has 16 blocks; without these explicit values
         // every otherwise-valid file is classified as sparse and rebuilt again.
         for index in 1..=3 {
-            platform = platform.with_block_count(
-                root.join(format!("SBH_BALLAST_FILE_{index:05}.dat")),
-                16,
-            );
+            platform = platform
+                .with_block_count(root.join(format!("SBH_BALLAST_FILE_{index:05}.dat")), 16);
         }
         Arc::new(platform)
     }
@@ -283,10 +281,7 @@ mod tests {
         let repaired = manager.replenish_one(None).unwrap();
         assert_eq!(repaired.files_created, 1);
         assert!(repaired.errors.is_empty());
-        // The mock reports no allocated blocks; verify on the real platform.
-        let on_disk =
-            BallastManager::new(temp.path().to_path_buf(), manager.config().clone()).unwrap();
-        let verified = on_disk.verify_single_file(&manager.file_path(1), 1);
+        let verified = manager.verify_single_file(&manager.file_path(1), 1);
         assert!(verified.is_ok(), "{verified:?}");
         assert!(!manager.file_path(2).exists());
     }
@@ -353,7 +348,13 @@ mod tests {
         assert!(report.skipped_for_floor > 0);
         assert!(!manager.file_path(1).exists());
         manager.platform = platform(temp.path(), Some(stats(1_000_000, 108_192)));
-        assert_eq!(manager.replenish_one(Some(&|| 100.0)).unwrap().files_created, 1);
+        assert_eq!(
+            manager
+                .replenish_one(Some(&|| 100.0))
+                .unwrap()
+                .files_created,
+            1
+        );
     }
 
     #[test]
