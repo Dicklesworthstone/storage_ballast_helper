@@ -160,8 +160,15 @@ pub struct DeletionReport {
     pub items_skipped: usize,
     /// Paths that passed all safety checks and would have been removed in dry-run mode.
     pub items_would_delete: usize,
-    /// Bytes actually reclaimed from the filesystem.
+    /// Sum of the removed candidates' sizes as the scanner estimated them
+    /// (a lower bound where a size probe was truncated).
     pub bytes_freed: u64,
+    /// Free space the filesystem actually gained across the unlinks, each
+    /// measured (`statvfs` on the parent) just before and after its removal.
+    /// Concurrent writers make it approximate, and on APFS a local snapshot
+    /// holding the blocks correctly shows 0. `None` when any removal could
+    /// not be measured, so a partial sum never poses as the whole.
+    pub bytes_freed_observed: Option<u64>,
     /// Bytes that would have been reclaimed in dry-run mode.
     pub bytes_would_free: u64,
     pub duration: Duration,
@@ -608,6 +615,7 @@ impl DeletionExecutor {
             items_skipped: 0,
             items_would_delete: 0,
             bytes_freed: 0,
+            bytes_freed_observed: Some(0),
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -765,6 +773,9 @@ impl DeletionExecutor {
             // Actual deletion, or quarantine (Layer 7). Quarantine has no
             // successful-unlink outcome: failure cannot widen this plan.
             let del_start = Instant::now();
+            let free_before = (plan.mode == DeletionMode::Unlink)
+                .then(|| available_bytes_beside(&candidate.path))
+                .flatten();
             let outcome = match plan.mode {
                 DeletionMode::Unlink => self.delete_path(candidate).map(|()| false),
                 DeletionMode::Quarantine => self.quarantine_path(candidate).map(|()| true),
@@ -783,6 +794,13 @@ impl DeletionExecutor {
                     } else {
                         report.bytes_freed =
                             report.bytes_freed.saturating_add(candidate.size_bytes);
+                        let gained = free_before
+                            .zip(available_bytes_beside(&candidate.path))
+                            .map(|(before, after)| after.saturating_sub(before));
+                        report.bytes_freed_observed = report
+                            .bytes_freed_observed
+                            .zip(gained)
+                            .map(|(sum, bytes)| sum.saturating_add(bytes));
                     }
                     consecutive_failures = 0;
 
@@ -1301,6 +1319,20 @@ fn classification_allows_force_remove(c: &ArtifactClassification) -> bool {
             | "tmp-cargo-home"
             | "dot-cargo-prefix"
     )
+}
+
+/// Bytes available to unprivileged users on the filesystem holding `path`,
+/// read from its parent (which outlives the removal). `None` when it cannot
+/// be read.
+fn available_bytes_beside(path: &Path) -> Option<u64> {
+    let stat = nix::sys::statvfs::statvfs(path.parent()?).ok()?;
+    // The field types differ by platform (u32 or u64); widen losslessly.
+    #[allow(clippy::useless_conversion)]
+    let (blocks, fragment) = (
+        u64::from(stat.blocks_available()),
+        u64::from(stat.fragment_size()),
+    );
+    Some(blocks.saturating_mul(fragment))
 }
 
 /// `fs::remove_dir_all` that defeats read-only directory/file permission bits.
@@ -1912,6 +1944,7 @@ mod tests {
             items_skipped: 0,
             items_would_delete: 0,
             bytes_freed: 0,
+            bytes_freed_observed: None,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -1987,6 +2020,7 @@ mod tests {
             items_skipped: 0,
             items_would_delete: 0,
             bytes_freed: 0,
+            bytes_freed_observed: None,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -2067,6 +2101,70 @@ mod tests {
         assert_eq!(report.items_failed, 0);
         assert!(!file_path.exists());
         assert!(!dir_path.exists());
+    }
+
+    /// `bytes_freed` stays the scanner's estimate; `bytes_freed_observed` is
+    /// what the filesystem actually gained. A 64 MiB file under a fictional
+    /// 100 MiB estimate (the old truncated-probe floor) must be measured, not
+    /// echoed. The bound is loose because other writers share the volume.
+    #[test]
+    fn observed_freed_bytes_are_measured_not_estimated() {
+        let dir = scratch_dir();
+        let blob = dir.path().join("blob.bin");
+        let mut file = fs::File::create(&blob).unwrap();
+        std::io::Write::write_all(&mut file, &vec![0x5a_u8; 64 * 1024 * 1024]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let estimate = 100 * 1024 * 1024;
+        let report = executor.execute(
+            &executor.plan(vec![make_candidate(&blob, estimate, 0.9)]),
+            None,
+        );
+        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.bytes_freed, estimate);
+        let observed = report
+            .bytes_freed_observed
+            .expect("an unlink on a local volume is measured");
+        assert!(
+            observed >= 16 * 1024 * 1024,
+            "removing 64 MiB should free most of it, observed {observed}"
+        );
+        assert_ne!(observed, estimate);
+    }
+
+    /// A quarantine rename frees nothing, and is not counted as freed.
+    #[test]
+    fn quarantine_rename_is_not_observed_as_freed() {
+        let dir = scratch_dir();
+        let root = dir.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(target.join("debug")).unwrap();
+        fs::write(target.join("debug/lib.rlib"), vec![1u8; 1024 * 1024]).unwrap();
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                require_identity: true,
+                check_open_files: false,
+                mode: DeletionMode::Quarantine,
+                quarantine_roots: vec![root],
+                ..Default::default()
+            },
+            None,
+        );
+        let report = executor.execute(
+            &executor.plan(vec![make_identity_candidate(&target, 1024 * 1024, 0.9)]),
+            None,
+        );
+        assert_eq!(report.items_quarantined, 1);
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(report.bytes_freed_observed, Some(0));
     }
 
     #[test]

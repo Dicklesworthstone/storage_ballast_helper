@@ -9331,11 +9331,14 @@ fn executor_thread_main(
             }
         } else if report.items_deleted > 0 || report.items_failed > 0 {
             eprintln!(
-                "[SBH-EXECUTOR] deleted={} failed={} skipped={} freed={}B sacred_scans={} sacred_ms={} ({:?})",
+                "[SBH-EXECUTOR] deleted={} failed={} skipped={} freed={}B observed_freed={} sacred_scans={} sacred_ms={} ({:?})",
                 report.items_deleted,
                 report.items_failed,
                 report.items_skipped,
                 report.bytes_freed,
+                report
+                    .bytes_freed_observed
+                    .map_or_else(|| "unknown".to_string(), |bytes| format!("{bytes}B")),
                 report.sacred_scans,
                 report.sacred_scan_ms,
                 report.duration,
@@ -9405,7 +9408,10 @@ fn executor_thread_main(
         // Report deletion stats back to main loop for SelfMonitor counters.
         let _ = report_tx.try_send(WorkerReport::DeletionCompleted {
             deleted: report.items_deleted as u64,
-            bytes_freed: report.bytes_freed,
+            // What the filesystem gained when every removal was measured;
+            // the scanner's estimate (a lower bound for truncated probes, or
+            // a 100 MiB floor) only when some removal could not be.
+            bytes_freed: report.bytes_freed_observed.unwrap_or(report.bytes_freed),
             failed: report.items_failed as u64,
             recovery_paths: report.recovery_paths().cloned().collect(),
             failure_alarm,
