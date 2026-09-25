@@ -6,6 +6,21 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.5
+
+Compare: [`v0.6.4...v0.6.5`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.4...v0.6.5)
+
+### Fixed — pressured hosts spent their scan budget re-proving the same trees
+
+- A protected verdict proved by a real find (a `.db`, `.beads/`, WAL sidecar
+  inside the tree) is kept while that find still exists, instead of being
+  dropped whenever the busy tree's mtime changes. On css every pass re-walked
+  ~8 active agent temp trees, hit the daemon CPU budget, and never reached the
+  main walk (`245fc18`).
+- The priority pre-scan plans and reports a directory at its measured size;
+  it used a flat 100 MiB, so a 2 MiB cache was logged as 100 MiB freed
+  (`245fc18`).
+
 ### Changed — releases no longer involve GitHub Actions
 
 - The GitHub workflows (`ci.yml`, `release.yml`, `cert-expiration.yml`) are
