@@ -6,6 +6,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.3 **[release]**
+
+Compare: [`v0.6.2...v0.6.3`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.2...v0.6.3)
+
 ### Fixed — the fleet kept filling while sbh held itself back (fleet audit 2026-09-24)
 
 An audit of all 20 deployed hosts (sbh 0.6.2) found disks at 84–100% with the
@@ -32,6 +36,18 @@ daemon running but throttled or blind. Fixes, each with tests:
   100 MiB deletions), **protected verdicts carried across passes** (`21dbe9a`,
   pre-scans no longer burn their CPU budget re-proving the same trees), and the
   **CLI reads the config the installed service runs** (`f2d3eeb`).
+- **Open-file safety sweep** (`b2895d7`, `f8c8d53`): its 5 s wall-clock budget
+  could not fit under the unit's `CPUQuota=10%` on a busy host, so every batch
+  failed closed (css at 100%, SBH-3003 on every batch). The budget is 30 s, and
+  an aborted batch now counts as skips, not deletion failures (no false
+  SBH-2005 alarm, no index backoff for the host's load).
+- **Growth attribution** (`03a401a`, `28e0865`): a mount at Red or worse for
+  10 minutes gets an `SBH-2007` warning naming its largest directories, at
+  most hourly.
+- **Former user-scope reserves** (`ccf445e`, `aa75d80`): ballast left by an
+  earlier user-scope install is adopted and credited before the active pool
+  grows.
+- `sbh config set` accepts arrays and inline tables (`95730d2`).
 
 ### Fixed — one stuck entry wedged the whole quarantine, permanently (`bd-quarantine-drain-fail-closed-7tun`)
 
