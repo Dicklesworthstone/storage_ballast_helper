@@ -20,6 +20,10 @@ Compare: [`v0.6.4...v0.6.5`](https://github.com/Dicklesworthstone/storage_ballas
 - The priority pre-scan plans and reports a directory at its measured size;
   it used a flat 100 MiB, so a 2 MiB cache was logged as 100 MiB freed
   (`245fc18`).
+- The installed service's own ballast pool is never adopted as a "stranded"
+  reserve by a process running with another config (a CLI, a second scope, a
+  test daemon). A test daemon running as root on a build worker had counted,
+  and could release from, the production daemon's live 10 GiB pool (`56f6271`).
 
 ### Changed — releases no longer involve GitHub Actions
 
