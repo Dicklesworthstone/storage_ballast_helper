@@ -62,6 +62,9 @@ These rules are embedded in `src/platform/sacred.toml`.
 | `~/.config/age` | `ExactMatch` | age identity files are encryption keys. |
 | `~/.config/age/*` | `GlobMatch` | Everything under the age config directory may be needed to decrypt user data. |
 | `.config/age/` | `ContainsAny` | A nested age config directory inside a candidate is credential state. |
+| `{~,/home/*,/Users/*}/.claude`, `.codex`, `.gemini` | `GlobMatch` | Agent session histories are operator-sacred memory (indexed by cass); never reclaimed, even under disk pressure. Listed for every home form because the fleet daemon runs as root while agents run as other users. |
+| `{~,/home/*,/Users/*}/.cass-memory`, `.local/share/coding-agent-search*` | `GlobMatch` | cass memory, index, databases and recovery copies. |
+| `{~,/Users/*}/Library/Application Support/com.coding-agent-search.coding-agent-search`, `Library/Caches/cass-*` | `GlobMatch` | cass data and index work directories on macOS. |
 
 ## macOS Built-ins
 

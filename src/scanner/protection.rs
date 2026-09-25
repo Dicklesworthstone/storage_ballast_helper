@@ -2236,6 +2236,44 @@ protected_at = "2026-05-07T03:50:00Z"
         assert_eq!(overlaps[0].pattern, ".beads/");
     }
 
+    /// Agent session histories and cass data are sacred wherever the agents'
+    /// home is (the fleet daemon runs as root, the agents as other users),
+    /// down to their deepest descendants; ordinary caches beside them are not.
+    #[test]
+    fn agent_session_and_cass_data_are_sacred_under_any_home() {
+        let catalog = cross_platform_sacred_paths();
+        for path in [
+            "/home/ubuntu/.claude/projects/-data-projects-x/abc.jsonl",
+            "/home/ubuntu/.codex/sessions/2026/09/24",
+            "/home/ubuntu/.gemini/tmp",
+            "/home/ubuntu/.cass-memory",
+            "/home/ubuntu/.local/share/coding-agent-search/index",
+            "/home/ubuntu/.local/share/coding-agent-search-recovered-20260325T2115",
+            "/Users/op/.claude",
+            "/Users/op/Library/Application Support/com.coding-agent-search.coding-agent-search/agent_search.db",
+            "/Users/op/Library/Caches/cass-fold3/segments",
+        ] {
+            assert!(
+                !find_sacred_overlaps(Path::new(path), catalog)
+                    .unwrap()
+                    .is_empty(),
+                "{path} must be sacred"
+            );
+        }
+        for path in [
+            "/home/ubuntu/.cache/mtdt-amt-build",
+            "/Users/op/Library/Caches/dsr",
+            "/home/ubuntu/.local/share/sbh",
+        ] {
+            assert!(
+                find_sacred_overlaps(Path::new(path), catalog)
+                    .unwrap()
+                    .is_empty(),
+                "{path} must stay reclaimable"
+            );
+        }
+    }
+
     #[test]
     fn absolute_root_guards_fire_independent_of_home() {
         let catalog = cross_platform_sacred_paths();

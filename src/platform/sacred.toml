@@ -196,3 +196,123 @@ pattern = "/root/.cargo/credentials*"
 kind = "GlobMatch"
 reason = "Cargo credentials (crates.io publish tokens) are security-sensitive and must never be reclaimed."
 source = "Builtin"
+
+# Agent session histories and cass data are operator-sacred (never reclaim,
+# even under disk pressure). The daemon runs as root on the fleet while the
+# agents' data lives under /home/<user>, so each root is listed as `~`,
+# `/home/*` and `/Users/*`; a GlobMatch protects the directory and everything
+# below it.
+
+[[paths]]
+pattern = "~/.claude"
+kind = "GlobMatch"
+reason = "Claude Code session histories are agent memory (indexed by cass) and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "/home/*/.claude"
+kind = "GlobMatch"
+reason = "Claude Code session histories are agent memory (indexed by cass) and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "/Users/*/.claude"
+kind = "GlobMatch"
+reason = "Claude Code session histories are agent memory (indexed by cass) and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/.codex"
+kind = "GlobMatch"
+reason = "Codex session histories are agent memory (indexed by cass) and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "/home/*/.codex"
+kind = "GlobMatch"
+reason = "Codex session histories are agent memory (indexed by cass) and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "/Users/*/.codex"
+kind = "GlobMatch"
+reason = "Codex session histories are agent memory (indexed by cass) and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/.gemini"
+kind = "GlobMatch"
+reason = "Gemini CLI session histories are agent memory (indexed by cass) and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "/home/*/.gemini"
+kind = "GlobMatch"
+reason = "Gemini CLI session histories are agent memory (indexed by cass) and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "/Users/*/.gemini"
+kind = "GlobMatch"
+reason = "Gemini CLI session histories are agent memory (indexed by cass) and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/.cass-memory"
+kind = "GlobMatch"
+reason = "cass memory data is agent memory and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "/home/*/.cass-memory"
+kind = "GlobMatch"
+reason = "cass memory data is agent memory and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "/Users/*/.cass-memory"
+kind = "GlobMatch"
+reason = "cass memory data is agent memory and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/.local/share/coding-agent-search*"
+kind = "GlobMatch"
+reason = "cass session-search data (index, databases, recovery copies) must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "/home/*/.local/share/coding-agent-search*"
+kind = "GlobMatch"
+reason = "cass session-search data (index, databases, recovery copies) must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "/Users/*/.local/share/coding-agent-search*"
+kind = "GlobMatch"
+reason = "cass session-search data (index, databases, recovery copies) must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Application Support/com.coding-agent-search.coding-agent-search"
+kind = "GlobMatch"
+reason = "cass session-search data on macOS must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "/Users/*/Library/Application Support/com.coding-agent-search.coding-agent-search"
+kind = "GlobMatch"
+reason = "cass session-search data on macOS must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "~/Library/Caches/cass-*"
+kind = "GlobMatch"
+reason = "cass index work directories hold session-search data and must never be reclaimed."
+source = "Builtin"
+
+[[paths]]
+pattern = "/Users/*/Library/Caches/cass-*"
+kind = "GlobMatch"
+reason = "cass index work directories hold session-search data and must never be reclaimed."
+source = "Builtin"
