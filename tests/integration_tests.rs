@@ -1296,6 +1296,9 @@ fn macos_apfs_ballast_preallocates_and_releases_space() {
         },
     )
     .expect("create ballast manager");
+    // The byte check above gates this test; the percentage floor would make
+    // it depend on how full the volume is.
+    manager.set_provision_floor(0.0);
     let provision = manager
         .provision(None)
         .expect("provision 1 GiB APFS ballast");
@@ -5493,6 +5496,8 @@ fn ballast_lifecycle() {
     };
 
     let mut manager = BallastManager::new(ballast_dir, config).expect("create manager");
+    // Not a floor test: do not depend on how full the host running it is.
+    manager.set_provision_floor(0.0);
 
     // Provision.
     let prov = manager.provision(None).expect("provision");
