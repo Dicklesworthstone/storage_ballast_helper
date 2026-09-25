@@ -2260,10 +2260,12 @@ protected_at = "2026-05-07T03:50:00Z"
                 "{path} must be sacred"
             );
         }
+        // Nonexistent homes: a real directory would be sub-walked for sacred
+        // markers, which makes the verdict depend on the test host.
         for path in [
-            "/home/ubuntu/.cache/mtdt-amt-build",
-            "/Users/op/Library/Caches/dsr",
-            "/home/ubuntu/.local/share/sbh",
+            "/home/sbh-no-such-user/.cache/mtdt-amt-build",
+            "/Users/sbh-no-such-user/Library/Caches/dsr",
+            "/home/sbh-no-such-user/.local/share/sbh",
         ] {
             assert!(
                 find_sacred_overlaps(Path::new(path), catalog)

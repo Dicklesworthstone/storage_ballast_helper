@@ -157,7 +157,8 @@ mod tests {
         let active = temp.path().join("active");
         let retired = temp.path().join("retired");
         let mut legacy =
-            BallastManager::new(retired.clone(), config(retired_count, retired_size)).unwrap();
+            BallastManager::new_unfloored(retired.clone(), config(retired_count, retired_size))
+                .unwrap();
         let report = legacy.provision(None).unwrap();
         assert_eq!(report.files_created, retired_count, "{report:?}");
         let stranded = StrandedReserve::discover(&[retired], &active, temp.path());

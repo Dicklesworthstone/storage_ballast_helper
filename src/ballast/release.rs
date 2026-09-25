@@ -519,7 +519,8 @@ mod tests {
     #[test]
     fn maybe_release_deletes_files() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), test_config()).unwrap();
+        let mut mgr =
+            BallastManager::new_unfloored(dir.path().to_path_buf(), test_config()).unwrap();
         mgr.provision(None).unwrap();
         assert_eq!(mgr.available_count(), 5);
 
@@ -538,7 +539,8 @@ mod tests {
     #[test]
     fn replenish_requires_green_cooldown() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), test_config()).unwrap();
+        let mut mgr =
+            BallastManager::new_unfloored(dir.path().to_path_buf(), test_config()).unwrap();
         mgr.provision(None).unwrap();
         let mount = dir.path();
 
@@ -569,7 +571,8 @@ mod tests {
     #[test]
     fn replenish_pauses_when_pressure_rises() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), test_config()).unwrap();
+        let mut mgr =
+            BallastManager::new_unfloored(dir.path().to_path_buf(), test_config()).unwrap();
         mgr.provision(None).unwrap();
         let mount = dir.path();
 
@@ -612,7 +615,8 @@ mod tests {
     #[test]
     fn replenish_detects_externally_deleted_files() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), test_config()).unwrap();
+        let mut mgr =
+            BallastManager::new_unfloored(dir.path().to_path_buf(), test_config()).unwrap();
         mgr.provision(None).unwrap();
         let mount = dir.path();
 
@@ -632,7 +636,8 @@ mod tests {
             std::fs::remove_file(f.path()).unwrap();
         }
 
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), test_config()).unwrap();
+        let mut mgr =
+            BallastManager::new_unfloored(dir.path().to_path_buf(), test_config()).unwrap();
         assert_eq!(mgr.available_count(), 2);
 
         let mut ctrl = BallastReleaseController::new(0);
@@ -662,7 +667,8 @@ mod tests {
     #[test]
     fn continuous_pressure_does_not_drain_pool_if_target_reached() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), test_config()).unwrap();
+        let mut mgr =
+            BallastManager::new_unfloored(dir.path().to_path_buf(), test_config()).unwrap();
         mgr.provision(None).unwrap();
         assert_eq!(mgr.available_count(), 5);
 

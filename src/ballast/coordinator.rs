@@ -1442,6 +1442,7 @@ mod tests {
 
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
 
         // Release 2 files from volume A only.
@@ -1488,6 +1489,7 @@ mod tests {
 
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
 
         // 3 files per volume * 2 volumes * (4096 + 4096) bytes each
@@ -1515,6 +1517,7 @@ mod tests {
         let watched = vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()];
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
 
         // Volume A: 2 files, Volume B: 3 files (default)
@@ -1536,6 +1539,7 @@ mod tests {
 
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
 
         let reports = coordinator.verify_all();
@@ -1557,6 +1561,7 @@ mod tests {
 
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
 
         // Release all from volume A.
@@ -1599,6 +1604,7 @@ mod tests {
 
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
 
         let inv = coordinator.inventory();
@@ -1715,6 +1721,7 @@ mod tests {
         assert_eq!(pool.mount_point, data);
         assert!(coordinator.has_pool(root.path()));
 
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
         let released = coordinator.release_for_mount(&home, 1).unwrap();
         assert_eq!(released.map(|r| r.files_released), Some(1));
@@ -2109,7 +2116,8 @@ mod tests {
     fn configured_directory_alias_does_not_double_count_managed_reserve() {
         let mount = tempfile::tempdir().unwrap();
         let original = mount.path().join(BALLAST_SUBDIR);
-        let mut manager = BallastManager::new(original.clone(), tiny_ballast_config()).unwrap();
+        let mut manager =
+            BallastManager::new_unfloored(original.clone(), tiny_ballast_config()).unwrap();
         manager.provision(None).unwrap();
         let alias = mount.path().join("alias");
         std::os::unix::fs::symlink(&original, &alias).unwrap();
@@ -2146,7 +2154,7 @@ mod tests {
         let retired = mount.path().join(BALLAST_SUBDIR);
         let configured = mount.path().join("active");
         for dir in [&retired, &configured] {
-            BallastManager::new(dir.clone(), tiny_ballast_config())
+            BallastManager::new_unfloored(dir.clone(), tiny_ballast_config())
                 .unwrap()
                 .provision(None)
                 .unwrap();

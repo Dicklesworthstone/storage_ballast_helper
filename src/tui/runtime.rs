@@ -1153,7 +1153,7 @@ mod tests {
             file_size_bytes: 4096,
             ..BallastConfig::default()
         };
-        let mut manager = BallastManager::new(dir.clone(), config.clone()).unwrap();
+        let mut manager = BallastManager::new_unfloored(dir.clone(), config.clone()).unwrap();
         manager.provision(None).unwrap();
         assert_eq!(manager.available_count(), 2);
         drop(manager);

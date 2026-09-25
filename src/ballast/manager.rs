@@ -633,9 +633,9 @@ impl BallastManager {
                     Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
                     Err(error) => {
-                        report
-                            .errors
-                            .push(format!("file {index}: cannot replace existing reserve: {error}"));
+                        report.errors.push(format!(
+                            "file {index}: cannot replace existing reserve: {error}"
+                        ));
                         break;
                     }
                 }
@@ -804,9 +804,9 @@ impl BallastManager {
                     Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
                     Err(error) => {
-                        report
-                            .errors
-                            .push(format!("file {index}: cannot replace existing reserve: {error}"));
+                        report.errors.push(format!(
+                            "file {index}: cannot replace existing reserve: {error}"
+                        ));
                         break;
                     }
                 }
@@ -1171,6 +1171,18 @@ fn shell_quote_for_warning(value: &str) -> String {
 // ──────────────────── tests ────────────────────
 
 #[cfg(test)]
+impl BallastManager {
+    /// A manager on the real platform with no percentage floor, so tests that
+    /// are not about the floor do not depend on how full the build host is.
+    /// The live capacity probe, read-only refusal and size check still apply.
+    pub(crate) fn new_unfloored(ballast_dir: PathBuf, config: BallastConfig) -> Result<Self> {
+        let mut manager = Self::new(ballast_dir, config)?;
+        manager.set_provision_floor(0.0);
+        Ok(manager)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -1286,6 +1298,10 @@ mod tests {
     use crate::platform::types::LocalSnapshotInfo;
     use crate::platform::types::PalError;
 
+    fn unfloored(dir: PathBuf, config: BallastConfig) -> Result<BallastManager> {
+        BallastManager::new_unfloored(dir, config)
+    }
+
     fn small_config() -> BallastConfig {
         BallastConfig {
             file_count: 3,
@@ -1315,7 +1331,7 @@ mod tests {
         std::fs::write(&orphan_hi, b"stale").unwrap();
         std::fs::write(&orphan_zero, b"stale").unwrap();
         std::fs::write(pool.join("unrelated.dat"), b"keep").unwrap();
-        let mut mgr = BallastManager::new(pool.clone(), small_config()).unwrap();
+        let mut mgr = unfloored(pool.clone(), small_config()).unwrap();
         mgr.set_skip_fallocate(true);
         assert_eq!(mgr.orphans(), vec![orphan_zero.clone(), orphan_hi.clone()]);
         assert!(
@@ -1353,7 +1369,7 @@ mod tests {
     #[test]
     fn provision_creates_files() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
         let report = mgr.provision(None).unwrap();
 
         assert_eq!(report.files_created, 3);
@@ -1379,7 +1395,7 @@ mod tests {
     #[test]
     fn provision_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
 
         let r1 = mgr.provision(None).unwrap();
         assert_eq!(r1.files_created, 3);
@@ -1392,7 +1408,7 @@ mod tests {
     #[test]
     fn verify_detects_good_files() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
         mgr.provision(None).unwrap();
 
         let report = mgr.verify().unwrap();
@@ -1405,7 +1421,7 @@ mod tests {
     #[test]
     fn verify_detects_missing_files() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
         // Don't provision — all files are missing.
 
         let report = mgr.verify().unwrap();
@@ -1415,7 +1431,7 @@ mod tests {
     #[test]
     fn verify_detects_corrupted_header() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
         mgr.provision(None).unwrap();
 
         // Corrupt file 2's header.
@@ -1468,7 +1484,7 @@ mod tests {
     #[test]
     fn provisioned_files_have_allocated_blocks() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
         mgr.provision(None).unwrap();
         let platform = crate::platform::current();
 
@@ -1487,7 +1503,7 @@ mod tests {
     #[test]
     fn release_deletes_highest_index_first() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
         mgr.provision(None).unwrap();
 
         let report = mgr.release(2).unwrap();
@@ -1537,7 +1553,7 @@ mod tests {
     #[test]
     fn replenish_recreates_released_files() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
         mgr.provision(None).unwrap();
         mgr.release(2).unwrap();
         assert_eq!(mgr.available_count(), 1);
@@ -1552,7 +1568,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = small_config();
         let expected = config.file_size_bytes * 3;
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), config).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), config).unwrap();
         mgr.provision(None).unwrap();
 
         assert_eq!(mgr.releasable_bytes(), expected);
@@ -1569,7 +1585,7 @@ mod tests {
     #[test]
     fn provision_refuses_files_that_would_breach_the_floor() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
         mgr.set_provision_floor(10.0);
 
         let report = mgr.provision(Some(&|| 9.0)).unwrap();
@@ -1598,7 +1614,7 @@ mod tests {
     #[test]
     fn provision_admits_a_full_reserve_when_the_volume_stays_above_the_floor() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
         mgr.set_provision_floor(10.0);
 
         let report = mgr.provision(Some(&|| 12.0)).unwrap();
@@ -1618,7 +1634,7 @@ mod tests {
     #[test]
     fn provision_stops_at_the_file_that_would_cross_the_floor() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
         mgr.set_provision_floor(10.0);
 
         // Free space as the caller's probe would see it before each file:
@@ -1657,7 +1673,7 @@ mod tests {
     #[test]
     fn replenish_one_honors_the_floor() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
         mgr.set_provision_floor(10.0);
         assert_eq!(mgr.provision(None).unwrap().files_created, 3);
         assert_eq!(mgr.release(1).unwrap().files_released, 1);
@@ -1714,7 +1730,7 @@ mod tests {
     #[test]
     fn full_lifecycle_provision_verify_release_replenish() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
 
         // 1. Provision
         let p = mgr.provision(None).unwrap();
@@ -1759,7 +1775,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), small_config()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), small_config()).unwrap();
         mgr.provision(None).unwrap();
 
         let path = dir.path().join("SBH_BALLAST_FILE_00001.dat");
@@ -1773,7 +1789,7 @@ mod tests {
         // Start with 5 files
         let mut config = small_config();
         config.file_count = 5;
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), config.clone()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), config.clone()).unwrap();
         mgr.provision(None).unwrap();
 
         assert_eq!(mgr.available_count(), 5);
@@ -1843,7 +1859,7 @@ mod tests {
     fn availability_observe_reports_full_pool_and_never_mutates() {
         let dir = tempfile::tempdir().unwrap();
         let config = small_config();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), config.clone()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), config.clone()).unwrap();
         mgr.provision(None).unwrap();
 
         let availability = BallastAvailability::observe(dir.path(), &config);
@@ -1863,7 +1879,7 @@ mod tests {
     fn availability_observe_flags_empty_reserve_after_release() {
         let dir = tempfile::tempdir().unwrap();
         let config = small_config();
-        let mut mgr = BallastManager::new(dir.path().to_path_buf(), config.clone()).unwrap();
+        let mut mgr = unfloored(dir.path().to_path_buf(), config.clone()).unwrap();
         mgr.provision(None).unwrap();
 
         // Release one file → degraded.

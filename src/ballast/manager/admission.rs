@@ -283,7 +283,11 @@ mod tests {
         let repaired = manager.replenish_one(None).unwrap();
         assert_eq!(repaired.files_created, 1);
         assert!(repaired.errors.is_empty());
-        assert!(manager.verify_single_file(&manager.file_path(1), 1).is_ok());
+        // The mock reports no allocated blocks; verify on the real platform.
+        let on_disk =
+            BallastManager::new(temp.path().to_path_buf(), manager.config().clone()).unwrap();
+        let verified = on_disk.verify_single_file(&manager.file_path(1), 1);
+        assert!(verified.is_ok(), "{verified:?}");
         assert!(!manager.file_path(2).exists());
     }
 

@@ -269,7 +269,8 @@ mod unix {
 
         fn fixture() -> (tempfile::TempDir, BallastManager) {
             let root = tempfile::tempdir().unwrap();
-            let mut manager = BallastManager::new(root.path().join("pool"), config()).unwrap();
+            let mut manager =
+                BallastManager::new_unfloored(root.path().join("pool"), config()).unwrap();
             assert_eq!(manager.provision(None).unwrap().files_created, 3);
             (root, manager)
         }
@@ -363,7 +364,7 @@ mod unix {
             let root = tempfile::tempdir().unwrap();
             let pool = root.path().join("pool");
             let mut stale = BallastManager::new(pool.clone(), config()).unwrap();
-            let mut writer = BallastManager::new(pool, config()).unwrap();
+            let mut writer = BallastManager::new_unfloored(pool, config()).unwrap();
             writer.provision(None).unwrap();
             assert_eq!(stale.available_count(), 0);
             assert_eq!(stale.release(2).unwrap().files_released, 2);
