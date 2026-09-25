@@ -58,10 +58,6 @@ success** — one line, revert, next lever, no retraction narrative.
 - **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
 - **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
   ```bash
-  git push origin main:master
-  ```
-- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
-  ```bash
   git push origin main main:master
   ```
 
@@ -94,7 +90,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Toolchain:** Nightly (see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml only
-- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` in both `lib.rs` and `main.rs`). The one exception is the workspace member `crates/sbh_mach`, which holds the macOS Mach/libproc/dispatch FFI behind safe wrappers with `unsafe_op_in_unsafe_fn = "deny"`; it compiles to nothing off macOS and its tests run in the macOS CI lanes (`cargo test -p sbh_mach`)
+- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` in both `lib.rs` and `main.rs`). The one exception is the workspace member `crates/sbh_mach`, which holds the macOS Mach/libproc/dispatch FFI behind safe wrappers with `unsafe_op_in_unsafe_fn = "deny"`; it compiles to nothing off macOS, and rch workers are Linux, so `cargo test -p sbh_mach` only exercises it on a Mac. There is currently no venue for that: rch workers are Linux and the Macs set `RCH_REQUIRE_REMOTE=1` (no local builds), so changes to `crates/sbh_mach` go untested until a macOS rch worker or an explicit exception exists
 
 ### Key Dependencies
 
@@ -601,7 +597,7 @@ Layer 7, quarantine-first deletion: at Green (and for `sbh clean` without `--no-
 
 ## Runtime Constants
 
-Every tunable default and hard-coded limit the daemon runs with, read from the code by `sbh docs` (`sbh docs --section constants` prints it; `sbh docs --check AGENTS.md` fails CI when this table is stale). Change the constant, run `sbh docs --render README.md AGENTS.md`, commit both.
+Every tunable default and hard-coded limit the daemon runs with, read from the code by `sbh docs` (`sbh docs --section constants` prints it; `sbh docs --check AGENTS.md` fails when this table is stale, and so does `cargo test --bin sbh`). Change the constant, run `sbh docs --render README.md AGENTS.md`, commit both.
 
 <!-- sbh-docs:begin constants -->
 | Area | Constant | Value | Meaning | Where |
