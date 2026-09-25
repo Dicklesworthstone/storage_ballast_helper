@@ -27,6 +27,7 @@ use crate::core::config::BallastConfig;
 use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::Platform;
 
+mod admission;
 mod emergency;
 
 // ──────────────────── constants ────────────────────
@@ -398,8 +399,7 @@ pub struct BallastManager {
 /// Outcome of the per-file headroom check.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Admission {
-    /// The next file fits: free space after creating it stays above the floor
-    /// (`None` when the caller opted out of headroom planning).
+    /// The next file fits: free space after creating it stays above the floor.
     Admit { free_pct_after: Option<f64> },
     /// Creating the next file would take the volume below the floor.
     Refuse { free_pct_after: f64 },
@@ -499,7 +499,11 @@ impl BallastManager {
     /// built incrementally on a low-but-not-critical volume instead of being
     /// refused wholesale.
     pub fn set_provision_floor(&mut self, floor_pct: f64) {
-        self.provision_floor_pct = floor_pct.clamp(0.0, 100.0);
+        self.provision_floor_pct = if floor_pct.is_finite() {
+            floor_pct.clamp(0.0, 100.0)
+        } else {
+            100.0
+        };
     }
 
     /// The headroom floor in effect.
@@ -510,36 +514,12 @@ impl BallastManager {
 
     /// Decide whether the next ballast file fits above the floor.
     ///
-    /// `free_pct_check` is the caller's live free-space probe for the volume
-    /// (the CLI and the coordinator both pass one that re-reads fs stats, so
-    /// it shrinks as files land). `None` means the caller opted out of
-    /// headroom planning entirely; every file is admitted and only the create
-    /// itself fails closed on ENOSPC. The file's share of the volume comes
-    /// from the platform's total bytes.
-    fn admit_next_file(&self, free_pct_check: Option<&dyn Fn() -> f64>) -> Admission {
-        let Some(check) = free_pct_check else {
-            return Admission::Admit {
-                free_pct_after: None,
-            };
-        };
-        let free_pct = check();
-        #[allow(clippy::cast_precision_loss)]
-        let file_share_pct = self
-            .platform
-            .fs_stats(&self.ballast_dir)
-            .ok()
-            .filter(|s| s.total_bytes > 0)
-            .map_or(0.0, |s| {
-                self.config.file_size_bytes as f64 / s.total_bytes as f64 * 100.0
-            });
-        let free_pct_after = free_pct - file_share_pct;
-        if free_pct_after >= self.provision_floor_pct {
-            Admission::Admit {
-                free_pct_after: Some(free_pct_after),
-            }
-        } else {
-            Admission::Refuse { free_pct_after }
-        }
+    /// Always use a fresh platform capacity reading. The optional caller probe
+    /// may tighten that bound, never override it with a more optimistic value.
+    /// Unknown, contradictory or read-only capacity stops growth; absence of a
+    /// callback does not disable headroom protection.
+    fn admit_next_file(&self, free_pct_check: Option<&dyn Fn() -> f64>) -> Result<Admission> {
+        admission::check(self, free_pct_check)
     }
 
     pub fn set_skip_fallocate(&mut self, skip: bool) {
@@ -594,8 +574,8 @@ impl BallastManager {
 
     /// Create all ballast files (idempotent: skips existing valid files).
     ///
-    /// If `free_pct_check` is provided, it's called before creating each file
-    /// to ensure we don't go below the minimum free space threshold.
+    /// A fresh capacity reading enforces the headroom floor before each file.
+    /// An optional caller probe can impose a stricter free-space bound.
     pub fn provision(
         &mut self,
         free_pct_check: Option<&dyn Fn() -> f64>,
@@ -619,25 +599,19 @@ impl BallastManager {
             let index = i as u32;
             let path = self.file_path(index);
 
-            // Skip if already exists and valid.
-            if path.exists() {
-                if self.verify_single_file(&path, index).is_ok() {
-                    report.files_skipped += 1;
-                    continue;
-                }
-                // Corrupted: remove and recreate.
-                let _ = fs::remove_file(&path);
+            // A damaged reserve is still emergency space. Do not remove it
+            // until the replacement has passed the live headroom check.
+            let replace_existing = path.exists();
+            if replace_existing && self.verify_single_file(&path, index).is_ok() {
+                report.files_skipped += 1;
+                continue;
             }
 
-            // Headroom admission: create this file only if the volume stays at
-            // or above the floor afterwards. A refusal ends the pass (later
-            // files would be refused too) and is reported as a plan outcome,
-            // not an error; the pool grows on later passes as space frees.
             match self.admit_next_file(free_pct_check) {
-                Admission::Admit { free_pct_after } => {
+                Ok(Admission::Admit { free_pct_after }) => {
                     report.free_pct_after = free_pct_after;
                 }
-                Admission::Refuse { free_pct_after } => {
+                Ok(Admission::Refuse { free_pct_after }) => {
                     report.free_pct_after = Some(free_pct_after);
                     report.skipped_for_floor = self
                         .config
@@ -645,6 +619,25 @@ impl BallastManager {
                         .saturating_sub(index as usize)
                         .saturating_add(1);
                     break;
+                }
+                Err(error) => {
+                    report
+                        .errors
+                        .push(format!("file {index}: headroom probe failed: {error}"));
+                    break;
+                }
+            }
+
+            if replace_existing {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        report
+                            .errors
+                            .push(format!("file {index}: cannot replace existing reserve: {error}"));
+                        break;
+                    }
                 }
             }
 
@@ -778,23 +771,18 @@ impl BallastManager {
             let index = i as u32;
             let path = self.file_path(index);
 
-            if path.exists() {
-                if self.verify_single_file(&path, index).is_ok() {
-                    report.files_skipped += 1;
-                    continue;
-                }
-                let _ = fs::remove_file(&path);
+            // Keep the existing reserve when no replacement can safely fit.
+            let replace_existing = path.exists();
+            if replace_existing && self.verify_single_file(&path, index).is_ok() {
+                report.files_skipped += 1;
+                continue;
             }
 
-            // Headroom admission: create this file only if the volume stays at
-            // or above the floor afterwards. A refusal ends the pass (later
-            // files would be refused too) and is reported as a plan outcome,
-            // not an error; the pool grows on later passes as space frees.
             match self.admit_next_file(free_pct_check) {
-                Admission::Admit { free_pct_after } => {
+                Ok(Admission::Admit { free_pct_after }) => {
                     report.free_pct_after = free_pct_after;
                 }
-                Admission::Refuse { free_pct_after } => {
+                Ok(Admission::Refuse { free_pct_after }) => {
                     report.free_pct_after = Some(free_pct_after);
                     report.skipped_for_floor = self
                         .config
@@ -802,6 +790,25 @@ impl BallastManager {
                         .saturating_sub(index as usize)
                         .saturating_add(1);
                     break;
+                }
+                Err(error) => {
+                    report
+                        .errors
+                        .push(format!("file {index}: headroom probe failed: {error}"));
+                    break;
+                }
+            }
+
+            if replace_existing {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        report
+                            .errors
+                            .push(format!("file {index}: cannot replace existing reserve: {error}"));
+                        break;
+                    }
                 }
             }
 
