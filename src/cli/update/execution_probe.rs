@@ -5,14 +5,29 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub(super) fn verify(path: &Path, timeout: Duration) -> Result<(), String> {
-    let child = Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("failed to execute binary: {error}"))?;
-    wait_for_child(child, timeout)
+    let started = Instant::now();
+    let child = loop {
+        match Command::new(path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => break child,
+            // A child forked by another thread can briefly inherit the
+            // staging file's write descriptor; exec then fails with ETXTBSY
+            // until that child execs or exits.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && started.elapsed() < timeout =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("failed to execute binary: {error}")),
+        }
+    };
+    wait_for_child(child, timeout.saturating_sub(started.elapsed()))
 }
 
 fn wait_for_child(child: Child, timeout: Duration) -> Result<(), String> {
