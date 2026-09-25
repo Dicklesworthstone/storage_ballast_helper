@@ -1,9 +1,9 @@
 //! Build metadata for `sbh version --verbose` and the Prometheus `sbh_info`
 //! line (bd-rc-master-ajg1.5.4).
 //!
-//! Every build path gets real values: a checkout (git answers), a tarball or
-//! remote build without `.git` (the `SBH_BUILD_GIT_SHA` environment variable
-//! the packager sets), and a reproducible timestamp (`SOURCE_DATE_EPOCH`,
+//! Every build path gets real values: the commit the packager names in
+//! `SBH_BUILD_GIT_SHA` when set (it wins over git), else what the enclosing
+//! checkout's git answers, and a reproducible timestamp (`SOURCE_DATE_EPOCH`,
 //! else the commit time, else the build time). The crate reads them with
 //! `option_env!`, so a build with none of these still compiles and says
 //! "unknown" rather than lying.
@@ -22,17 +22,25 @@ fn git(args: &[&str]) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// The commit the binary was built from: git's answer with a `-dirty`
-/// suffix when the tree has uncommitted changes, else what the packager set.
+/// The commit the binary was built from: what the packager set, else git's
+/// answer with a `-dirty` suffix when the tree has uncommitted changes.
+///
+/// An explicit `SBH_BUILD_GIT_SHA` wins because the packager knows which
+/// commit it shipped, while git answers for whatever repository encloses
+/// the build dir: on a remote build host that is a synced tree inside a
+/// stale checkout, and 0.6.3 fleet binaries reported that checkout's
+/// `d7320ef655b3-dirty` while containing later commits (2026-09-24).
 fn git_sha() -> Option<String> {
-    if let Some(sha) = git(&["rev-parse", "--short=12", "HEAD"]) {
-        let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_some();
-        return Some(if dirty { format!("{sha}-dirty") } else { sha });
-    }
-    env::var("SBH_BUILD_GIT_SHA")
+    if let Some(sha) = env::var("SBH_BUILD_GIT_SHA")
         .ok()
         .map(|sha| sha.trim().to_string())
         .filter(|sha| !sha.is_empty())
+    {
+        return Some(sha);
+    }
+    let sha = git(&["rev-parse", "--short=12", "HEAD"])?;
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_some();
+    Some(if dirty { format!("{sha}-dirty") } else { sha })
 }
 
 /// RFC 3339 UTC from a unix timestamp, without a date crate.

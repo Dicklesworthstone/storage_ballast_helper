@@ -141,6 +141,11 @@ const MAX_SCAN_TIME_BUDGET_SECS: u64 = 3600;
 const SWAP_THRASH_WARNING_COOLDOWN: Duration = Duration::from_mins(15);
 /// B5: minimum interval between "pressured device has no root_path" warnings.
 const DEVICE_AFFINITY_WARN_INTERVAL: Duration = Duration::from_mins(15);
+/// Minimum interval between growth-attribution reports (SBH-2007) per mount:
+/// the probe walks up to `attribution::PROBE_BUDGET_ENTRIES` per directory.
+const ATTRIBUTION_REPORT_INTERVAL: Duration = Duration::from_hours(1);
+/// How long a mount must stay at Red or worse before it is attributed.
+const ATTRIBUTION_SUSTAINED_PRESSURE: Duration = Duration::from_mins(10);
 /// Swap usage threshold that indicates probable paging thrash.
 const SWAP_THRASH_USED_PCT_THRESHOLD: f64 = 70.0;
 /// Minimum free RAM for high swap use to indicate thrash (anomalous paging
@@ -1802,6 +1807,10 @@ pub struct MonitoringDaemon {
     /// Rate-limit for the B5 "pressured device has no root_path" warning so the
     /// back-off path does not spam logs on every tick.
     last_device_affinity_warn: Option<Instant>,
+    /// When each mount last got a growth-attribution report (SBH-2007).
+    attribution_reported: HashMap<PathBuf, Instant>,
+    /// Since when each mount has been continuously at Red or worse.
+    attribution_pressured_since: HashMap<PathBuf, Instant>,
     last_summary_report: Instant,
     summary_scans: u64,
     summary_scan_timeouts: u64,
@@ -2973,6 +2982,8 @@ impl MonitoringDaemon {
             last_scan_channel_warn: None,
             scan_channel_warn_suppressed: 0,
             last_device_affinity_warn: None,
+            attribution_reported: HashMap::new(),
+            attribution_pressured_since: HashMap::new(),
             last_summary_report: Instant::now(),
             summary_scans: 0,
             summary_scan_timeouts: 0,
@@ -4924,8 +4935,74 @@ impl MonitoringDaemon {
             }
         }
         self.emit_reclaim_unavailable(&unprotected_mounts, now);
+        self.report_unreclaimable_growth(now);
 
         global_tick(cadence, base_poll)
+    }
+
+    /// For a mount that has stayed at Red or worse for
+    /// `ATTRIBUTION_SUSTAINED_PRESSURE` (reclaim is not keeping up, whether
+    /// its scans find nothing or only crumbs), name the directories that hold
+    /// its bytes (SBH-2007), at most once per `ATTRIBUTION_REPORT_INTERVAL`.
+    /// The bounded size probe runs on its own low-priority thread so the
+    /// monitor tick never waits on it.
+    fn report_unreclaimable_growth(&mut self, now: Instant) {
+        let levels: Vec<(PathBuf, String)> = self
+            .mount_controllers
+            .iter()
+            .map(|(mount, controller)| (mount.clone(), controller.record(now).level))
+            .collect();
+        let mut due = Vec::new();
+        for (mount, level) in levels {
+            if !matches!(level.as_str(), "red" | "critical") {
+                self.attribution_pressured_since.remove(&mount);
+                continue;
+            }
+            let since = *self
+                .attribution_pressured_since
+                .entry(mount.clone())
+                .or_insert(now);
+            let sustained = now.duration_since(since) >= ATTRIBUTION_SUSTAINED_PRESSURE;
+            let not_recent = self
+                .attribution_reported
+                .get(&mount)
+                .is_none_or(|last| now.duration_since(*last) >= ATTRIBUTION_REPORT_INTERVAL);
+            if sustained && not_recent {
+                due.push((mount, level));
+            }
+        }
+        for (mount, level) in due {
+            self.attribution_reported.insert(mount.clone(), now);
+            let logger = self.logger_handle.clone();
+            let spawned = std::thread::Builder::new()
+                .name("sbh-attribution".to_string())
+                .spawn(move || {
+                    let consumers = crate::daemon::attribution::top_consumers(
+                        &mount,
+                        crate::daemon::attribution::PROBE_BUDGET_ENTRIES,
+                        crate::daemon::attribution::REPORT_TOP,
+                    );
+                    if consumers.is_empty() {
+                        return;
+                    }
+                    let message = format!(
+                        "pressure {level} on {} for over {} min and reclaim is not keeping \
+                         up; largest directories: {}. Next: move or clean one of these, or \
+                         add a scanner.root_path covering disposable data in it",
+                        mount.display(),
+                        ATTRIBUTION_SUSTAINED_PRESSURE.as_secs() / 60,
+                        crate::daemon::attribution::describe(&consumers)
+                    );
+                    eprintln!("[SBH-DAEMON] {message}");
+                    logger.send(ActivityEvent::Warning {
+                        code: "SBH-2007".to_string(),
+                        message,
+                    });
+                });
+            if let Err(err) = spawned {
+                eprintln!("[SBH-DAEMON] growth attribution thread failed to start: {err}");
+            }
+        }
     }
 
     /// The loud version of "observing only": a notification and a warning

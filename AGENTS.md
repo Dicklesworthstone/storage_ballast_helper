@@ -672,7 +672,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | walker | `WORK_RECV_TIMEOUT` | `50 ms` | Idle wait before a worker re-checks shutdown | `src/scanner/walker.rs` |
 | walker | `SEND_TIMEOUT` | `100 ms` | Wait on a full channel before dropping the entry | `src/scanner/walker.rs` |
 | walker | `MAX_ENTRIES_PER_DIR` | `65536` | Entries read per directory before it is cut off | `src/scanner/walker.rs` |
-| walker | `OPEN_FILES_SCAN_BUDGET` | `5 s` | Time budget of one /proc open-file sweep | `src/scanner/walker.rs` |
+| walker | `OPEN_FILES_SCAN_BUDGET` | `30 s` | Time budget of one /proc open-file sweep | `src/scanner/walker.rs` |
 | walker | `OPEN_FILES_MAX_PIDS` | `50000` | Processes inspected per open-file sweep | `src/scanner/walker.rs` |
 | walker | `OPAQUE_CANDIDATE_SIZE_FLOOR` | `100 MiB` | Opaque trees smaller than this are not sized | `src/scanner/walker.rs` |
 | walker | `OPAQUE_SIZE_PROBE_BUDGET` | `200000` | Entries an opaque-tree size probe may visit | `src/scanner/walker.rs` |

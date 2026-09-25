@@ -6799,6 +6799,11 @@ fn set_toml_value(root: &mut toml::Value, dot_path: &str, raw_value: &str) -> Re
 }
 
 /// Parse a raw string into a TOML value, guessing the type.
+///
+/// A value written as a TOML array or inline table (`["/tmp", "/data"]`,
+/// `{ file_count = 5 }`) is parsed as one; before, it was stored as a string
+/// and the write was refused, so list keys such as `scanner.root_paths`
+/// could not be set from the CLI at all.
 fn parse_toml_value(raw: &str) -> toml::Value {
     if let Ok(b) = raw.parse::<bool>() {
         return toml::Value::Boolean(b);
@@ -6808,6 +6813,13 @@ fn parse_toml_value(raw: &str) -> toml::Value {
     }
     if let Ok(f) = raw.parse::<f64>() {
         return toml::Value::Float(f);
+    }
+    let trimmed = raw.trim_start();
+    if (trimmed.starts_with('[') || trimmed.starts_with('{'))
+        && let Ok(mut table) = toml::from_str::<toml::Table>(&format!("value = {raw}"))
+        && let Some(value) = table.remove("value")
+    {
+        return value;
     }
     toml::Value::String(raw.to_string())
 }
@@ -16513,6 +16525,34 @@ mod tests {
             bytes_read_recent_15m: None,
             bytes_written_recent_15m: None,
         }
+    }
+
+    /// `sbh config set scanner.root_paths '["/tmp", "/data/tmp"]'` sets a
+    /// list; scalars keep their inferred types and anything else is a string.
+    #[test]
+    fn config_set_parses_arrays_and_inline_tables() {
+        let mut root = toml::Value::Table(toml::map::Map::new());
+        set_toml_value(&mut root, "scanner.root_paths", r#"["/tmp", "/data/tmp"]"#).unwrap();
+        set_toml_value(
+            &mut root,
+            "ballast.overrides",
+            r#"{ "/data" = { file_count = 5 } }"#,
+        )
+        .unwrap();
+        set_toml_value(&mut root, "scanner.dry_run", "false").unwrap();
+        set_toml_value(&mut root, "paths.ballast_dir", "[not toml").unwrap();
+        let text = toml::to_string(&root).unwrap();
+        let parsed: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(
+            parsed["scanner"]["root_paths"],
+            toml::Value::Array(vec!["/tmp".into(), "/data/tmp".into()])
+        );
+        assert_eq!(
+            parsed["ballast"]["overrides"]["/data"]["file_count"],
+            5.into()
+        );
+        assert_eq!(parsed["scanner"]["dry_run"], false.into());
+        assert_eq!(parsed["paths"]["ballast_dir"], "[not toml".into());
     }
 
     #[test]
