@@ -1635,6 +1635,20 @@ fn effective_uid_is_root() -> bool {
 /// service first; other users check their own user service first. Ignored
 /// under `SBH_TEST_MODE` and in unit tests, which must not read the host's
 /// units.
+/// The ballast pool the installed sbh service manages, if one is installed
+/// and its config loads.
+///
+/// That pool is live: another process (a CLI or test daemon with a different
+/// config, or the other service scope) must not adopt it as a stranded
+/// reserve, count it as its own, or release from it.
+#[must_use]
+pub fn installed_service_ballast_dir() -> Option<PathBuf> {
+    let path = installed_service_config()?;
+    Config::load(Some(&path))
+        .ok()
+        .map(|config| config.paths.ballast_dir)
+}
+
 fn installed_service_config() -> Option<PathBuf> {
     if cfg!(test) || env::var_os("SBH_TEST_MODE").is_some() {
         return None;

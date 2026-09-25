@@ -399,6 +399,7 @@ impl BallastPoolCoordinator {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let legacy_dirs =
             stranded::legacy_dirs(watched_paths, configured_ballast_dir, home.as_deref());
+        let service_dir = crate::core::config::installed_service_ballast_dir();
 
         // Deduplicate watched paths by mount point.
         let mut seen_mounts = HashMap::<PathBuf, MountPoint>::new();
@@ -493,6 +494,7 @@ impl BallastPoolCoordinator {
                 mount_path,
                 &aliases,
                 &resolved_dir,
+                service_dir.as_deref(),
                 &legacy_dirs,
                 platform,
                 &mounts,
@@ -813,14 +815,24 @@ fn record_folded_mounts(
 /// Conventional reserve locations that are actually on this pool's writable
 /// filesystem. Discovery subsequently deduplicates directory inode aliases and
 /// excludes any alias of the managed directory itself.
+/// `service_dir` is the installed service's configured pool: it is live, so
+/// it is never stranded, even when this process runs with another config.
 fn stranded_pool_dirs(
     mount_path: &Path,
     aliases: &HashMap<PathBuf, PathBuf>,
     resolved_dir: &Path,
+    service_dir: Option<&Path>,
     legacy_dirs: &[PathBuf],
     platform: &dyn Platform,
     mounts: &[MountPoint],
 ) -> Vec<PathBuf> {
+    let same_dir = |a: &Path, b: &Path| {
+        a == b
+            || matches!(
+                (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+                (Ok(a), Ok(b)) if a == b
+            )
+    };
     let mut dirs: Vec<PathBuf> = std::iter::once(mount_path)
         .chain(
             aliases
@@ -831,6 +843,7 @@ fn stranded_pool_dirs(
         .map(|root| root.join(BALLAST_SUBDIR))
         .chain(legacy_dirs.iter().cloned())
         .filter(|dir| dir != resolved_dir)
+        .filter(|dir| !service_dir.is_some_and(|live| same_dir(dir, live)))
         .filter(|dir| same_pool_filesystem(dir, mount_path, aliases, platform, mounts))
         .collect();
     dirs.sort();
@@ -1683,6 +1696,52 @@ mod tests {
             available_bytes: 16_000_000_000,
             swap_total_bytes: 0,
             swap_free_bytes: 0,
+        }
+    }
+
+    /// The installed service's own pool is live: a process with another
+    /// config (CLI, test daemon, the other scope) must not adopt it as a
+    /// stranded reserve, by its literal path or a symlinked spelling. Other
+    /// legacy pools are still adopted. (rch worker 2026-09-25: a test daemon
+    /// running as root adopted the production daemon's 10 GiB pool.)
+    #[cfg(unix)]
+    #[test]
+    fn the_installed_services_pool_is_never_stranded() {
+        let mount = tempfile::tempdir().unwrap();
+        let live = mount.path().join("root-home/.local/share/sbh/ballast");
+        let former = mount.path().join("old-user/.local/share/sbh/ballast");
+        fs::create_dir_all(&live).unwrap();
+        fs::create_dir_all(&former).unwrap();
+        let live_alias = mount.path().join("live-link");
+        std::os::unix::fs::symlink(&live, &live_alias).unwrap();
+        let resolved = mount.path().join("test-daemon/ballast");
+        let platform = MockPlatform::new(
+            vec![mock_mount(mount.path(), "/dev/sda1")],
+            HashMap::from([(mount.path().to_path_buf(), mock_stats(mount.path(), false))]),
+            mock_memory(),
+            PlatformPaths::default(),
+        );
+        let mounts = platform.mount_points().unwrap();
+        let legacy = vec![live.clone(), former.clone()];
+        let stranded = |service: Option<&Path>| {
+            stranded_pool_dirs(
+                mount.path(),
+                &HashMap::new(),
+                &resolved,
+                service,
+                &legacy,
+                &platform,
+                &mounts,
+            )
+        };
+
+        let without_service = stranded(None);
+        assert!(without_service.contains(&live) && without_service.contains(&former));
+
+        for service in [live.as_path(), live_alias.as_path()] {
+            let dirs = stranded(Some(service));
+            assert!(!dirs.contains(&live), "{service:?}: {dirs:?}");
+            assert!(dirs.contains(&former), "{service:?}: {dirs:?}");
         }
     }
 
