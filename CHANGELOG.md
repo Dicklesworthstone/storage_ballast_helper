@@ -6,6 +6,35 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.6 **[release]**
+
+Compare: [`v0.6.5...v0.6.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.5...v0.6.6)
+
+### Changed — the executor spends its time deleting, not re-listing open files
+
+- A complete open-file sweep is reused by the next batch while it started
+  less than 20 s ago; a batch whose candidate root changed after the sweep
+  began gets a fresh one. On css the sweep over thousands of agent
+  processes took most of each 12-25 s batch, and 74% of batches start the
+  moment the previous one ends (`4c834f2`).
+- A plan the executor refuses entirely now backs its candidates off and names
+  the reasons, instead of being re-proposed every pass (css: 10 of 27 batches)
+  (`b3747eb`).
+
+### Fixed — macOS
+
+- The per-user temp dir `$TMPDIR` (`/var/folders/<xx>/<hash>/T`) is a temp
+  root: build artifacts there are scored like those in `/tmp` instead of
+  being held for review (`d74ed6d`).
+- The library suite now passes natively on macOS (3028/3028, plus `sbh_mach`
+  19/19); it had never run there. Host-dependent tests were made hermetic and
+  README now describes the FSEvents backend that shipped in `864066f`.
+
+### Changed — process I/O attribution
+
+- Bounded sampling sweeps finish despite continuous PID churn (`f9a5d5e`), and
+  I/O history snapshots persist across daemon restarts (`c5b5dd5`).
+
 ## v0.6.5 **[release]**
 
 Compare: [`v0.6.4...v0.6.5`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.4...v0.6.5)
