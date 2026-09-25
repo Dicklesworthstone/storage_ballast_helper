@@ -6,6 +6,33 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Fixed — the fleet kept filling while sbh held itself back (fleet audit 2026-09-24)
+
+An audit of all 20 deployed hosts (sbh 0.6.2) found disks at 84–100% with the
+daemon running but throttled or blind. Fixes, each with tests:
+
+- **Policy ratchet** (`c825b75`): the drift alarm ignored
+  `calibration_breach_action` and demoted Enforce fleets at every bursty Orange;
+  recovery landed in Canary and a later fallback remembered Canary, so hosts sat
+  at 10 deletions/hour for days (15/20 hosts). Drift now follows the breach
+  action, the engine tracks the operator's intended mode, an automatic Canary
+  re-proves itself back to it after 30 minutes, the canary budget counts executed
+  deletions, and a failed state write at Red+ no longer demotes.
+- **Ballast never helped** (`a1190e4`, `b5de9ce`): macOS pools resolved to the
+  sealed read-only `/` and were always skipped; `ReadWritePaths=` bind mounts of
+  one disk became separate pools that released nothing when the pressured entry
+  was not the one holding files; ~126 GB of sbh's own ballast sat stranded in
+  unmanaged `.sbh/ballast` dirs. Pools now follow `statfs`, fold per device, and
+  adopt header-validated stranded files as reserve.
+- **rch pools** (`c8af305`): active pools were vetoed until idle 168 h (never);
+  from urgency 0.7 the idle floor is 60 min (pooled) / 30 min (per-job).
+- **Reclaim to Green** (`09eccc2`), **symlink candidates vetoed at scoring**
+  (`3ecc3e0`), **plan-time refusals attributed and backed off** (`2097add`),
+  **opaque sizes floored only when truncated** (`90fc109`, no more fictional
+  100 MiB deletions), **protected verdicts carried across passes** (`21dbe9a`,
+  pre-scans no longer burn their CPU budget re-proving the same trees), and the
+  **CLI reads the config the installed service runs** (`f2d3eeb`).
+
 ### Fixed — one stuck entry wedged the whole quarantine, permanently (`bd-quarantine-drain-fail-closed-7tun`)
 
 `drain_expired` and `drain_oldest` propagated the first per-entry failure out of
