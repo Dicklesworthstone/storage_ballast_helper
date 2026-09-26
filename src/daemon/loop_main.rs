@@ -10567,19 +10567,35 @@ mod tests {
         assert!(second_candidates > 0, "the second pass must also find work");
         match after_first.position() {
             (_, Some(resume_point)) => {
-                // Pass 1 was truncated: pass 2 picks up strictly after it.
-                assert!(
-                    second_dispatched
-                        .iter()
-                        .all(|path| path.as_path() > resume_point),
-                    "pass 2 must not re-examine ground pass 1 already covered \
-                     (resume point {}): {second_dispatched:?}",
-                    resume_point.display()
-                );
-                assert_ne!(
-                    after_first, after_second,
-                    "two consecutive passes must make progress"
-                );
+                // Pass 1 was truncated: pass 2's pre-scan picks up strictly
+                // after it, so its own cursor ends further on (or wraps once
+                // the root is done). A pre-scan restarting from the first
+                // entry would stop at or before the old resume point again.
+                // Pass 2 may still dispatch earlier targets: pass 1's walk
+                // indexed the whole root, and the index replay re-offers the
+                // targets nothing has deleted, ahead of the pre-scan's batch.
+                // The exact no-restart contract is pinned deterministically by
+                // `prescan_resumes_from_the_persisted_cursor_instead_of_restarting`.
+                let resume_point = resume_point.to_path_buf();
+                match after_second.position() {
+                    (_, Some(second_point)) => assert!(
+                        second_point > resume_point.as_path(),
+                        "pass 2 must resume after pass 1 ({}), not restart: stopped at {}",
+                        resume_point.display(),
+                        second_point.display()
+                    ),
+                    (second_root, None) => assert_eq!(second_root, Some(root.as_path())),
+                }
+                if resume_point.as_path() < root.join("repo-0599").as_path() {
+                    assert!(
+                        second_dispatched
+                            .iter()
+                            .any(|path| path.as_path() > resume_point.as_path()),
+                        "pass 2 must dispatch targets beyond pass 1's resume point ({}): \
+                         {second_dispatched:?}",
+                        resume_point.display()
+                    );
+                }
             }
             (root_after, None) => {
                 // Pass 1 covered the whole root: it must have found every
