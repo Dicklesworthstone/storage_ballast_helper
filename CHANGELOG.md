@@ -6,6 +6,20 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.10 **[release]**
+
+Compare: [`v0.6.9...v0.6.10`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.9...v0.6.10)
+
+### Fixed — macOS scans no longer stall in the memory-map probe
+
+- The active-reference memory-map check walks only file-backed regions
+  (`PROC_PIDREGIONPATHINFO2`) instead of every region of every process. On
+  a Mac with ~900 processes the old walk took 9-12 s per scan root, often
+  timed out (reporting "incomplete" anyway), and ran once per root, so a
+  pass could spend its whole CPU budget before scanning anything ("scan
+  budget reached (1 entries, 0 candidates, 54.2s)"). Now 0.2-0.4 s per root
+  with identical results (`ebf65ee`). No change on Linux.
+
 ## v0.6.9 **[release]**
 
 Compare: [`v0.6.8...v0.6.9`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.8...v0.6.9)
