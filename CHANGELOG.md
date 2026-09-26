@@ -6,6 +6,25 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.9 **[release]**
+
+Compare: [`v0.6.8...v0.6.9`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.8...v0.6.9)
+
+### Added — macOS scans the per-user temp dir
+
+- The daemon also scans `$TMPDIR` (`/var/folders/<x>/<y>/T`), where cargo
+  test tempdirs and most tools write. The default roots `/tmp` and
+  `/var/tmp` resolve to `/private/...` on macOS and never reached it, so a
+  full Mac reported nothing to reclaim while that directory went unvisited.
+  It is added at load unless a configured root already is, contains, or lies
+  inside it; `scanner.include_user_temp_dir = false` opts out. No effect on
+  other platforms (`95cc829`).
+
+### Changed
+
+- `clippy -D warnings` passes on macOS; macOS-only code had never been
+  linted. No behavior change (`1312548`).
+
 ## v0.6.8 **[release]**
 
 Compare: [`v0.6.7...v0.6.8`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.7...v0.6.8)
