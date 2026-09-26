@@ -6412,8 +6412,8 @@ struct PassDispatch {
     /// one pass; a second batch for it arrives right after the first one
     /// deleted it, and a tree recreated in between can reuse the freed inode
     /// and pass the identity check (e2e 2026-09-25: a rebuilt target under a
-    /// live process was deleted twice). A path, or anything under it, is
-    /// dispatched at most once per pass.
+    /// live process was deleted twice). Within a pass, no candidate at, under
+    /// or above an already dispatched path is dispatched again.
     paths: HashSet<PathBuf>,
 }
 
@@ -6423,11 +6423,14 @@ fn dispatch_top_candidates(
     del_tx: &Sender<DeletionBatch>,
     dispatched: &mut PassDispatch,
 ) -> bool {
+    // Neither a path under a dispatched tree nor one containing it: deleting
+    // an ancestor would take a subtree rebuilt since its own deletion. The
+    // ancestor waits for the next pass.
     scored.retain(|candidate| {
         !dispatched
             .paths
             .iter()
-            .any(|sent| candidate.path.starts_with(sent))
+            .any(|sent| candidate.path.starts_with(sent) || sent.starts_with(&candidate.path))
     });
     if scored.is_empty() {
         return true;
@@ -13246,6 +13249,17 @@ mod tests {
         let second = del_rx.try_recv().unwrap();
         let paths: Vec<_> = second.candidates.iter().map(|c| c.path.clone()).collect();
         assert_eq!(paths, vec![PathBuf::from("/tmp/other/target")]);
+
+        // Nor an ancestor of a dispatched tree: deleting `/tmp/other` would
+        // take whatever was rebuilt in `/tmp/other/target` since.
+        let mut ancestor = vec![test_candidate("/tmp/other", 0.9)];
+        assert!(dispatch_top_candidates(
+            &mut ancestor,
+            &request,
+            &del_tx,
+            &mut pass
+        ));
+        assert!(del_rx.try_recv().is_err());
         assert_eq!(pass.count, 2);
 
         // Nothing new: no batch at all.

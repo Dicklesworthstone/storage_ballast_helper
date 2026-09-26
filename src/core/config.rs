@@ -1639,8 +1639,13 @@ fn effective_uid_is_root() -> bool {
 /// and its config loads.
 ///
 /// That pool is live: another process (a CLI or test daemon with a different
-/// config, or the other service scope) must not adopt it as a stranded
-/// reserve, count it as its own, or release from it.
+/// config) must not adopt it as a stranded reserve, count it as its own, or
+/// release from it. "Installed service" is the one [`installed_service_config`]
+/// finds: root sees the system service first and then its own user service;
+/// another user's user-scope service is not discovered. The config is loaded
+/// with this process's default paths, which is what the daemon itself does,
+/// so a default-located pool resolves correctly when the caller runs as the
+/// service's user.
 #[must_use]
 pub fn installed_service_ballast_dir() -> Option<PathBuf> {
     let path = installed_service_config()?;

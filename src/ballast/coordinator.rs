@@ -815,8 +815,9 @@ fn record_folded_mounts(
 /// Conventional reserve locations that are actually on this pool's writable
 /// filesystem. Discovery subsequently deduplicates directory inode aliases and
 /// excludes any alias of the managed directory itself.
-/// `service_dir` is the installed service's configured pool: it is live, so
-/// it is never stranded, even when this process runs with another config.
+/// `service_dir` is the installed service's configured pool (see
+/// `installed_service_ballast_dir` for which service that is): it is live,
+/// so it is never stranded, even when this process runs with another config.
 fn stranded_pool_dirs(
     mount_path: &Path,
     aliases: &HashMap<PathBuf, PathBuf>,
@@ -1700,7 +1701,7 @@ mod tests {
     }
 
     /// The installed service's own pool is live: a process with another
-    /// config (CLI, test daemon, the other scope) must not adopt it as a
+    /// config (a CLI or a test daemon) must not adopt it as a
     /// stranded reserve, by its literal path or a symlinked spelling. Other
     /// legacy pools are still adopted. (rch worker 2026-09-25: a test daemon
     /// running as root adopted the production daemon's 10 GiB pool.)

@@ -144,15 +144,20 @@ step_notarize() {
     done
 }
 
-step_package() {
-    # The packager audits with `sbh doctor`; use this release's own binary.
-    local bin="${WORK}/bin"
-    mkdir -p "${bin}"
+# Put this release's own darwin binary for this Mac first on PATH (in $1):
+# the packager's audit and --verify-release both run `sbh doctor`.
+release_sbh_on_path() {
+    mkdir -p "$1"
     case "$(uname -s)-$(uname -m)" in
-        Darwin-arm64) cp "${DIR}/sbh_darwin_arm64" "${bin}/sbh" ;;
-        Darwin-x86_64) cp "${DIR}/sbh_darwin_amd64" "${bin}/sbh" ;;
-        *) die "run package on a Mac (it needs this release's darwin binary)" ;;
+        Darwin-arm64) cp "${DIR}/sbh_darwin_arm64" "$1/sbh" ;;
+        Darwin-x86_64) cp "${DIR}/sbh_darwin_amd64" "$1/sbh" ;;
+        *) die "run this step on a Mac (it needs this release's darwin binary)" ;;
     esac
+}
+
+step_package() {
+    local bin="${WORK}/bin"
+    release_sbh_on_path "${bin}"
     PATH="${bin}:${PATH}" "${ROOT}/scripts/release_gate_and_package.sh" --package --dir "${DIR}" --tag "${TAG}"
 }
 
@@ -183,8 +188,7 @@ step_publish() {
             "$(basename "${MANIFEST}")" "$(basename "${MANIFEST}").minisig"
     )
     local bin="${WORK}/verify-bin"
-    mkdir -p "${bin}"
-    cp "${DIR}/sbh_darwin_arm64" "${bin}/sbh" 2>/dev/null || true
+    release_sbh_on_path "${bin}"
     PATH="${bin}:${PATH}" "${ROOT}/scripts/release_gate_and_package.sh" --verify-release "${TAG}"
 }
 

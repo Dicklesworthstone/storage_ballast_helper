@@ -646,10 +646,23 @@ fn is_tmp_like_path(path: &Path) -> bool {
 /// is the per-user cache dir and `0` belongs to the system.
 #[must_use]
 pub fn is_darwin_user_temp_path(path: &Path) -> bool {
-    let mut parts = path.components().filter_map(|part| match part {
-        std::path::Component::Normal(name) => name.to_str(),
-        _ => None,
-    });
+    use std::path::Component;
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return false;
+    }
+    // Only plain names after the root: a `.` or `..` could step out of the
+    // temp dir while still matching the pattern textually.
+    let names: Option<Vec<&str>> = components
+        .map(|part| match part {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect();
+    let Some(names) = names else {
+        return false;
+    };
+    let mut parts = names.into_iter();
     let mut first = parts.next();
     if first == Some("private") {
         first = parts.next();
@@ -1659,6 +1672,9 @@ mod tests {
             "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/0/state",
             "/var/folders/vt/T/short",
             "/Users/op/var/folders/vt/hash/T/lookalike",
+            // Relative, or stepping out with `..`: never a temp root.
+            "var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/rel",
+            "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/../../../../etc",
         ] {
             assert!(!temp(Path::new(outside)), "{outside}");
         }
