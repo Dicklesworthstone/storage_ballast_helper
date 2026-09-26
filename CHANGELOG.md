@@ -6,6 +6,22 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.7 **[release]**
+
+Compare: [`v0.6.6...v0.6.7`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.6...v0.6.7)
+
+### Fixed
+
+- Within one scan pass, no candidate *containing* an already dispatched tree
+  is dispatched either. Only candidates inside a dispatched tree were dropped,
+  so a pre-scan batch for `proj/target/debug` followed by a walk batch for
+  `proj/target` could delete a `debug/` rebuilt in between; the containing
+  tree now waits for the next pass (`405a15f`).
+- The macOS temp-root check requires an absolute path of plain names; it
+  accepted relative paths and skipped `..` components (`405a15f`).
+- `scripts/dsr_release.sh` verifies a release with the binary for the release
+  Mac's own architecture (`405a15f`).
+
 ## v0.6.6 **[release]**
 
 Compare: [`v0.6.5...v0.6.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.5...v0.6.6)
