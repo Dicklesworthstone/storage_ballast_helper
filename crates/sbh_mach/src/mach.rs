@@ -94,7 +94,12 @@ const HOST_VM_INFO64_REV0_COUNT: mach_msg_type_number_t =
     (size_of::<VmStatistics64Rev0>() / size_of::<integer_t>()) as mach_msg_type_number_t;
 
 const PROC_ALL_PIDS: u32 = 1;
-const PROC_PIDREGIONPATHINFO: i32 = 8;
+/// `PROC_PIDREGIONPATHINFO2`: like `PROC_PIDREGIONPATHINFO` (8), same
+/// `proc_regionwithpathinfo` result, but the kernel skips to the next
+/// vnode-backed region. Flavor 8 returns every anonymous region too, one
+/// call each: walking all processes that way took ~12 s on a Mac with ~900
+/// processes, and only vnode-backed regions can ever carry a path.
+const PROC_PIDREGIONPATHINFO2: i32 = 22;
 const RUSAGE_INFO_V4: i32 = 4;
 
 #[repr(C)]
@@ -639,17 +644,19 @@ pub fn proc_pid_rusage_v4(pid: i32) -> io::Result<RUsageInfoV4> {
     Ok(unsafe { usage.assume_init() })
 }
 
-/// Return mapped-region path information for a process address.
+/// Return path information for the first vnode-backed (file-mapped) region
+/// of a process at or after `address`; anonymous memory is skipped.
 #[allow(unsafe_code)]
 pub fn proc_pid_region_path(pid: i32, address: u64) -> io::Result<ProcRegionWithPathInfo> {
     let mut info = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
     let buffer_size = i32::try_from(size_of::<ProcRegionWithPathInfo>())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "region buffer too large"))?;
-    // SAFETY: proc_pidinfo called with valid PROC_PIDREGIONPATHINFO flavor and buffer size.
+    // SAFETY: proc_pidinfo called with the PROC_PIDREGIONPATHINFO2 flavor,
+    // whose result is the same proc_regionwithpathinfo, and its buffer size.
     let returned_bytes = unsafe {
         libc::proc_pidinfo(
             pid,
-            PROC_PIDREGIONPATHINFO,
+            PROC_PIDREGIONPATHINFO2,
             address,
             info.as_mut_ptr().cast::<c_void>(),
             buffer_size,
