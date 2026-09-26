@@ -346,6 +346,11 @@ For non-interactive environments (CI, automation), `sbh install --auto` applies 
 - **Service control:** use `sbh service --launchd --scope user status` and
   `sbh service --launchd --scope user restart` for user installs; replace
   `--scope user` with `--scope system` for LaunchDaemons.
+- **Per-user temp dir:** the daemon also scans `$TMPDIR`
+  (`/var/folders/<x>/<y>/T`), where cargo test tempdirs and most tools write;
+  `/tmp` and `/var/tmp` resolve to `/private/...` and never reach it. It is
+  added at load unless a configured root already is, contains, or lies inside
+  it. Set `scanner.include_user_temp_dir = false` to opt out.
 - **Homebrew paths:** Apple Silicon installs normally live under
   `/opt/homebrew`, Intel installs under `/usr/local`; bootstrap and doctor
   checks inspect both families and repair stale launchd plist paths.
@@ -745,6 +750,7 @@ engine = "v2"  # default since v0.4.32; set "v1" to opt back into the legacy ful
 event_source = "auto"
 event_watch_budget = 8192
 root_paths = ["/data/projects", "/tmp", "/dev/shm"]
+include_user_temp_dir = true  # macOS: also scan $TMPDIR (/var/folders/<x>/<y>/T); no-op elsewhere
 cross_devices = false
 protected_paths = ["/data/projects/production-*", "/home/*/critical-builds"]
 

@@ -566,6 +566,12 @@ pub struct ScannerConfig {
     /// Every veto and the executor pre-flight still apply. Turn off on shared
     /// multi-user hosts where other users' caches must stay untouched.
     pub catalog_roots_on_pressured_device: bool,
+    /// macOS: also scan the per-user temp dir (`$TMPDIR`,
+    /// `/var/folders/<x>/<y>/T`), where cargo test tempdirs and most tools
+    /// write. The default roots (`/tmp`, `/var/tmp`) resolve to
+    /// `/private/...` there and never reach it. Added at load unless a root
+    /// already covers it. No effect on other platforms.
+    pub include_user_temp_dir: bool,
     /// How often (seconds) a catalog scan may repeat on the same mount at the
     /// same pressure level; a rising level re-arms it immediately.
     pub catalog_rescan_interval_secs: u64,
@@ -1155,6 +1161,7 @@ impl Default for ScannerConfig {
             repeat_deletion_max_cooldown_secs: 3600,
             min_rescan_interval_secs: 90,
             catalog_roots_on_pressured_device: true,
+            include_user_temp_dir: true,
             catalog_rescan_interval_secs: 900,
             // 25% => after a pass of T seconds, wait 3T before the next
             // pressure-driven pass. Keeps reclaim continuous on a full
@@ -1958,6 +1965,11 @@ impl Config {
         cfg.apply_env_overrides()?;
         cfg.merge_sacred_config()?;
         cfg.normalize_paths();
+        if cfg.scanner.include_user_temp_dir
+            && let Some(dir) = darwin_user_temp_dir()
+        {
+            add_root_unless_covered(&mut cfg.scanner.root_paths, dir);
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -2988,12 +3000,128 @@ fn strip_trailing_separator(s: &str) -> &str {
         .unwrap_or(s)
 }
 
+/// macOS per-user temp dir, when it exists: `$TMPDIR` if it is one
+/// (`/var/folders/<x>/<y>/T`), else `getconf DARWIN_USER_TEMP_DIR` (launchd
+/// jobs do not always inherit `$TMPDIR`).
+#[cfg(target_os = "macos")]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    // `is_darwin_user_temp_path` matches entries *inside* `T`.
+    let is_temp_dir = |dir: &Path| {
+        dir.file_name().is_some_and(|name| name == "T")
+            && crate::scanner::patterns::is_darwin_user_temp_path(&dir.join("entry"))
+    };
+    let from_env = std::env::var("TMPDIR").ok();
+    let text = match from_env {
+        Some(dir) if is_temp_dir(Path::new(strip_trailing_separator(&dir))) => dir,
+        _ => {
+            let out = std::process::Command::new("/usr/bin/getconf")
+                .arg("DARWIN_USER_TEMP_DIR")
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            String::from_utf8(out.stdout).ok()?.trim().to_string()
+        }
+    };
+    let dir = PathBuf::from(strip_trailing_separator(&text));
+    (is_temp_dir(&dir) && dir.is_dir()).then_some(dir)
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn darwin_user_temp_dir() -> Option<PathBuf> {
+    None
+}
+
+/// Append `dir` to `roots` unless a root already is, contains, or lies
+/// inside it: a root inside it means the operator (or a test's tempdir
+/// config) already chose how much of it to scan. macOS's `/var` and `/tmp`
+/// are links into `/private`, so both spellings match.
+fn add_root_unless_covered(roots: &mut Vec<PathBuf>, dir: PathBuf) {
+    fn without_private(path: &Path) -> PathBuf {
+        path.strip_prefix("/private")
+            .map_or_else(|_| path.to_path_buf(), |rest| Path::new("/").join(rest))
+    }
+    let wanted = without_private(&dir);
+    if !roots.iter().any(|root| {
+        let root = without_private(root);
+        wanted.starts_with(&root) || root.starts_with(&wanted)
+    }) {
+        roots.push(dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BehaviorPreset, Config, PathsConfig, SacredConfig, SbhError, ScannerEngineMode,
-        load_sacred_config, sacred_config_path_for, write_sacred_config,
+        add_root_unless_covered, load_sacred_config, sacred_config_path_for, write_sacred_config,
     };
+
+    #[test]
+    fn the_user_temp_dir_is_added_once_and_only_when_uncovered() {
+        use std::path::PathBuf;
+        let temp = PathBuf::from("/var/folders/vt/n2xy/T");
+        let mut roots = vec![PathBuf::from("/private/tmp"), PathBuf::from("/var/tmp")];
+        add_root_unless_covered(&mut roots, temp.clone());
+        assert_eq!(roots.last(), Some(&temp));
+        add_root_unless_covered(&mut roots, temp.clone());
+        assert_eq!(roots.len(), 3, "already a root: {roots:?}");
+        // A containing root covers it, through the /private link as well.
+        for covering in [
+            "/",
+            "/var",
+            "/private/var/folders",
+            "/var/folders/vt/n2xy/T",
+        ] {
+            let mut roots = vec![PathBuf::from(covering)];
+            add_root_unless_covered(&mut roots, temp.clone());
+            assert_eq!(roots.len(), 1, "{covering} covers it");
+        }
+        let mut roots = vec![PathBuf::from("/var/folders/vt/n2xy/T")];
+        add_root_unless_covered(&mut roots, PathBuf::from("/private/var/folders/vt/n2xy/T"));
+        assert_eq!(roots.len(), 1, "the /private spelling is the same dir");
+        // A root inside it is a deliberate narrower scope (a test's tempdir).
+        let mut roots = vec![PathBuf::from("/private/var/folders/vt/n2xy/T/.tmpAbc")];
+        add_root_unless_covered(&mut roots, temp.clone());
+        assert_eq!(roots.len(), 1, "a scoped root inside it wins");
+        // A sibling does not cover it.
+        for other in [
+            "/var/folders/vt/n2xy/C",
+            "/var/folders/vt/n2xy/Tx",
+            "/var/tmp",
+        ] {
+            let mut roots = vec![PathBuf::from(other)];
+            add_root_unless_covered(&mut roots, temp.clone());
+            assert_eq!(roots.len(), 2, "{other} does not cover it");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_loaded_config_scans_the_user_temp_dir_unless_opted_out() {
+        let temp = super::darwin_user_temp_dir().expect("macOS has a per-user temp dir");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[scanner]\nroot_paths = [\"/private/tmp\"]\n").unwrap();
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert!(
+            cfg.scanner.root_paths.contains(&temp),
+            "{:?}",
+            cfg.scanner.root_paths
+        );
+        std::fs::write(
+            &path,
+            "[scanner]\nroot_paths = [\"/private/tmp\"]\ninclude_user_temp_dir = false\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert!(
+            !cfg.scanner.root_paths.contains(&temp),
+            "{:?}",
+            cfg.scanner.root_paths
+        );
+    }
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
