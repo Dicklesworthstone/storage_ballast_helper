@@ -211,21 +211,21 @@ impl Platform for MacOsPal {
         let root_variants = macos_process_path_variants(&root);
         let mut processes: Vec<ProcessInfo> = Vec::new();
         let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
-        let mut pids_scanned: usize = 0;
         let mut incomplete = false;
 
-        for pid in process_pids_current_first()
+        for (pids_scanned, pid) in process_pids_current_first()
             .map_err(|error| macos_method_error("executables_under", &error))?
+            .into_iter()
+            .enumerate()
         {
             if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
                 incomplete = true;
                 break;
             }
-            pids_scanned += 1;
-            if let Some(process) = process_info_for_pid_without_command_line(pid) {
-                if executable_is_under(&process, &root_variants) {
-                    processes.push(process);
-                }
+            if let Some(process) = process_info_for_pid_without_command_line(pid)
+                && executable_is_under(&process, &root_variants)
+            {
+                processes.push(process);
             }
         }
         processes.sort_by(|left, right| {
@@ -867,22 +867,19 @@ fn estimate_reclaimable_by_snapshot_thinning(
 ) -> Option<SnapshotThinningEstimate> {
     let query_foundation = std::env::var("SBH_MACOS_QUERY_FOUNDATION_PURGEABLE")
         .ok()
-        .map_or(true, |val| {
+        .is_none_or(|val| {
             !matches!(
                 val.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "no" | "off"
             )
         });
 
-    if query_foundation {
-        if let Ok(Some(important_available)) = sys::important_usage_available_bytes(mount_point) {
-            if let Some(bytes) = purgeable_bytes_from_important_available(
-                important_available,
-                counted_available_bytes,
-            ) {
-                return Some(SnapshotThinningEstimate::new(bytes, "foundation"));
-            }
-        }
+    if query_foundation
+        && let Ok(Some(important_available)) = sys::important_usage_available_bytes(mount_point)
+        && let Some(bytes) =
+            purgeable_bytes_from_important_available(important_available, counted_available_bytes)
+    {
+        return Some(SnapshotThinningEstimate::new(bytes, "foundation"));
     }
 
     purgeable_bytes_from_apfs_inventory(inventory, container_id)

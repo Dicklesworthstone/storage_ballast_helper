@@ -600,6 +600,7 @@ fn sd_notify_watchdog(status: &str, socket_path: &str) -> Result<()> {
 /// values starting with `@`, which systemd uses for some user managers).
 /// Non-Linux platforms have no notify socket and report success without
 /// sending anything.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 pub fn sd_notify_send(message: &str, socket_path: &str) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {

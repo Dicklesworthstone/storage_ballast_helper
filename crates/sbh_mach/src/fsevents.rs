@@ -1,4 +1,4 @@
-//! Owned, bounded FSEvents delivery for the scanner.
+//! Owned, bounded `FSEvents` delivery for the scanner.
 //!
 //! The callback only copies paths into a bounded inbox. It never invokes user
 //! code, scans a directory, or authorizes deletion. Lost events invalidate the
@@ -78,11 +78,21 @@ impl Inbox {
     }
 
     fn drain(&self) -> EventBatch {
-        let mut pending = self.pending.lock().unwrap_or_else(|err| err.into_inner());
-        let restart_required = self.restart.swap(false, Ordering::AcqRel);
-        let must_rescan = self.rescan.swap(false, Ordering::AcqRel) || restart_required;
-        let paths = std::mem::take(&mut pending.paths).into_iter().collect();
-        pending.bytes = 0;
+        let (pending_paths, restart_required, must_rescan) = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let restart_required = self.restart.swap(false, Ordering::AcqRel);
+            let must_rescan = self.rescan.swap(false, Ordering::AcqRel) || restart_required;
+            pending.bytes = 0;
+            (
+                std::mem::take(&mut pending.paths),
+                restart_required,
+                must_rescan,
+            )
+        };
+        let paths = pending_paths.into_iter().collect();
         EventBatch {
             paths,
             must_rescan,
@@ -218,11 +228,13 @@ impl Drop for NativeStream {
 // SAFETY: the unique owner may move between threads. Native callbacks use
 // only the retained synchronized Inbox; stream lifetime operations remain
 // serialized by &mut/self ownership and the private dispatch queue barrier.
+// The queue is a libdispatch object, which is safe to use from any thread.
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for NativeStream {}
 
 /// A recursively watched set of absolute, canonical directory paths.
 ///
-/// FSEvents uses one stream, not one descriptor per descendant directory.
+/// `FSEvents` uses one stream, not one descriptor per descendant directory.
 /// Drains are nonblocking with respect to filesystem I/O; delivery is bounded
 /// in count and bytes. Drop stops callbacks and releases native resources.
 #[derive(Debug)]

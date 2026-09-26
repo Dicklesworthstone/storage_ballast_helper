@@ -1548,6 +1548,7 @@ fn sigusr1_forces_a_green_scan_within_two_seconds() {
 }
 
 /// `key=<n>` from a `scan_complete` event's details.
+#[cfg(target_os = "linux")]
 fn scan_detail(event: &Value, key: &str) -> Option<u64> {
     event
         .get("details")?

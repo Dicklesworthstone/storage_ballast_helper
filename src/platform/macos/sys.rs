@@ -640,9 +640,7 @@ fn parse_mount_command_output(raw: &str) -> Vec<MountCommandEntry> {
 }
 
 fn diskutil_cli_cache_path() -> PathBuf {
-    let tmp = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let tmp = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     let uid = nix::unistd::getuid().as_raw();
     tmp.join(format!("sbh-diskutil-{uid}.plist"))
 }
