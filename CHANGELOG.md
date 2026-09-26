@@ -6,6 +6,32 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.8 **[release]**
+
+Compare: [`v0.6.7...v0.6.8`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.7...v0.6.8)
+
+### Fixed — service repairs keep the unit's config and never run a dev build
+
+- `sbh service reinstall-unit`, `sbh bootstrap` and the install-time repair
+  keep the unit's `--config` (and other `ExecStart` arguments). They reset
+  the command to plain `daemon`, so a fleet unit running with
+  `--config /root/.config/sbh/config.toml` fell back to a stale
+  `/etc/sbh/config.toml` after a repair (`84ea6f2`).
+- A service repair refuses to point the unit at a binary outside an install
+  location (`/usr/local/bin`, `/usr/bin`, Homebrew, `~/.local/bin`,
+  `~/.cargo/bin`). A test run as root on a build worker had rewritten that
+  host's production unit to run the worker's debug build (`84ea6f2`).
+- `sbh bootstrap` honors the `SBH_TEST_MODE` + `SBH_SYSTEMD_UNIT_DIR` fixture
+  override when it scans for units, as `doctor --service` already did
+  (`84ea6f2`).
+
+### Tests
+
+- Two load-sensitive tests no longer fail on busy build workers: the pre-scan
+  resume test asserts on the cursor (an index replay batch legitimately
+  precedes the pre-scan's), and the `proof_harness` micro-benchmarks bound
+  the median rather than the single slowest sample (`ad390fd`, `5bb5416`).
+
 ## v0.6.7 **[release]**
 
 Compare: [`v0.6.6...v0.6.7`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.6...v0.6.7)
