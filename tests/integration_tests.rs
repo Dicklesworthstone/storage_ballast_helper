@@ -1938,10 +1938,17 @@ fn bootstrap_repairs_an_isolated_home_footprint_with_backups() {
         .join("share")
         .to_string_lossy()
         .to_string();
+    // Units live in the fixture too: run as root on a build worker, bootstrap
+    // otherwise found and "repaired" the host's real system unit.
+    let unit_dir = home_path.join("systemd-units");
+    fs::create_dir_all(&unit_dir).expect("create fixture unit dir");
+    let unit_dir_env = unit_dir.to_string_lossy().to_string();
     let env = [
         ("HOME", home_env.as_str()),
         ("XDG_CONFIG_HOME", config_env.as_str()),
         ("XDG_DATA_HOME", data_env.as_str()),
+        ("SBH_TEST_MODE", "1"),
+        ("SBH_SYSTEMD_UNIT_DIR", unit_dir_env.as_str()),
     ];
     let planted = [
         "stale-path-entry",
@@ -3313,6 +3320,10 @@ fn doctor_service_reports_unit_drift_and_reinstall_unit_repairs_it() {
     let rewritten = fs::read_to_string(&unit_path).unwrap();
     assert!(rewritten.contains("NoNewPrivileges=true"), "{rewritten}");
     assert!(rewritten.contains("Nice=19"), "{rewritten}");
+    assert!(
+        rewritten.contains(" daemon --config /etc/sbh/config.toml\n"),
+        "the unit's --config survives the repair: {rewritten}"
+    );
     assert_eq!(
         payload["dropins_kept"].as_array().unwrap().len(),
         2,

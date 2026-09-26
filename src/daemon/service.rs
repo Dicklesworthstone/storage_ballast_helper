@@ -21,6 +21,7 @@ use crate::platform::types::ServiceKind;
 
 pub use launchctl::{LaunchctlDomain, LaunchctlServiceTarget};
 pub use launchd::{LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport};
+pub(crate) use systemd::test_unit_dir_override;
 pub use systemd::{
     ConditionGate, DirectiveChange, DriftSeverity, ForeignDropIn, ReinstallReport, SystemdConfig,
     SystemdServiceManager, UnitDrift, parse_unit_directives,

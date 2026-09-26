@@ -539,6 +539,13 @@ fn candidate_profile_paths() -> Vec<PathBuf> {
 
 /// Known systemd unit locations.
 fn candidate_systemd_paths() -> Vec<PathBuf> {
+    // Under SBH_TEST_MODE with SBH_SYSTEMD_UNIT_DIR, only the fixture unit:
+    // a test running as root on a build worker otherwise "repaired" the
+    // host's real /etc/systemd/system/sbh.service to run the test binary
+    // (vmi1152480, 2026-09-25).
+    if let Some(dir) = crate::daemon::service::test_unit_dir_override() {
+        return vec![dir.join("sbh.service")];
+    }
     let mut paths = vec![PathBuf::from("/etc/systemd/system/sbh.service")];
     if let Some(home) = home_dir() {
         paths.push(
@@ -1151,11 +1158,55 @@ fn systemd_unit_drift_summary(path: &Path, contents: &str) -> Option<String> {
     Some(parts.join("; "))
 }
 
+/// Whether `binary` sits where an installed sbh lives: the system bin
+/// directories, Homebrew, or a `.local/bin` / `.cargo/bin` install. A repair
+/// run from anywhere else (a cargo `target/`, an rch build dir, a temp dir)
+/// would point the service at that build: a test on a build worker turned a
+/// production unit into one running a debug binary (vmi1152480, 2026-09-25).
+fn is_installed_binary_location(binary: &Path) -> bool {
+    if binary.file_name().is_none_or(|name| name != "sbh") {
+        return false;
+    }
+    let Some(dir) = binary.parent() else {
+        return false;
+    };
+    let system = [
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/bin",
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+    ];
+    system.iter().any(|root| dir == Path::new(root))
+        || dir.ends_with(".local/bin")
+        || dir.ends_with(".cargo/bin")
+        || (dir.ends_with("bin")
+            && ["/opt/homebrew/Cellar/sbh", "/usr/local/Cellar/sbh"]
+                .iter()
+                .any(|cellar| dir.starts_with(cellar)))
+}
+
+/// Refuse a service repair that would run `binary` unless it is an installed
+/// sbh. A fixture unit dir (`SBH_TEST_MODE` + `SBH_SYSTEMD_UNIT_DIR`) is
+/// exempt: nothing real runs from it.
+fn refuse_non_installed_service_binary(binary: &Path) -> std::io::Result<()> {
+    if is_installed_binary_location(binary)
+        || crate::daemon::service::test_unit_dir_override().is_some()
+    {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "refusing to point the service at {}: not an installed sbh; rerun bootstrap from the installed binary",
+        binary.display()
+    )))
+}
+
 fn apply_reinstall_service_unit(action: &mut MigrationAction) -> std::io::Result<()> {
     use crate::daemon::service::SystemdServiceManager;
 
     let manager = SystemdServiceManager::from_env(systemd_unit_is_user_scope(&action.target))
         .map_err(|e| std::io::Error::other(e.to_string()))?;
+    refuse_non_installed_service_binary(&manager.config().binary_path)?;
     let report = manager
         .reinstall_unit(false)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -1752,16 +1803,17 @@ fn apply_update_service_path(
     if action.reason == MigrationReason::SystemdUnitStalePaths {
         return apply_update_read_write_paths(action, backup_dir);
     }
-    let backup = create_backup(&action.target, backup_dir)?;
-    action.backup_path = Some(backup);
-
-    let contents = fs::read_to_string(&action.target)?;
     let Some(current_exe) = current_binary_path() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "cannot determine current binary path",
         ));
     };
+    refuse_non_installed_service_binary(&current_exe)?;
+    let backup = create_backup(&action.target, backup_dir)?;
+    action.backup_path = Some(backup);
+
+    let contents = fs::read_to_string(&action.target)?;
     let exe_str = current_exe.to_string_lossy().to_string();
 
     // Track whether we are inside the ProgramArguments array to scope
@@ -1773,7 +1825,7 @@ fn apply_update_service_path(
         .map(|line| {
             let trimmed = line.trim();
             if trimmed.starts_with("ExecStart=") {
-                format!("ExecStart={exe_str} daemon")
+                exec_start_with_binary(trimmed, &exe_str)
             } else if trimmed == "<key>ProgramArguments</key>" {
                 in_program_args = true;
                 binary_replaced = false;
@@ -1802,6 +1854,21 @@ fn apply_update_service_path(
         .collect();
     fs::write(&action.target, updated.join("\n") + "\n")?;
     Ok(())
+}
+
+/// Swap the binary in an `ExecStart=` line, keeping its arguments (a
+/// `--config` the operator set must survive the repair).
+fn exec_start_with_binary(line: &str, binary: &str) -> String {
+    let args = line
+        .trim()
+        .trim_start_matches("ExecStart=")
+        .split_once(char::is_whitespace)
+        .map_or("", |(_, rest)| rest.trim());
+    if args.is_empty() {
+        format!("ExecStart={binary} daemon")
+    } else {
+        format!("ExecStart={binary} {args}")
+    }
 }
 
 fn copy_file_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<bool> {
@@ -2945,6 +3012,48 @@ mod tests {
         let actions = plan_actions(&footprints, &opts);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].kind, ActionKind::UpdateServicePath);
+    }
+
+    #[test]
+    fn only_installed_binaries_may_back_a_service() {
+        for installed in [
+            "/usr/local/bin/sbh",
+            "/usr/bin/sbh",
+            "/opt/homebrew/bin/sbh",
+            "/opt/homebrew/Cellar/sbh/0.6.7/bin/sbh",
+            "/root/.local/bin/sbh",
+            "/home/ubuntu/.cargo/bin/sbh",
+        ] {
+            assert!(
+                is_installed_binary_location(Path::new(installed)),
+                "{installed}"
+            );
+        }
+        for dev in [
+            "/data/projects/sbh/target/debug/sbh",
+            "/tmp/rch/.rch-target/debug/sbh",
+            "/tmp/sbh",
+            "/usr/local/bin/sbh-dev",
+            "/usr/local/bin/other/sbh",
+            "/opt/homebrew/Cellar/other/1.0/bin/sbh",
+        ] {
+            assert!(!is_installed_binary_location(Path::new(dev)), "{dev}");
+        }
+    }
+
+    #[test]
+    fn exec_start_repair_keeps_the_operators_arguments() {
+        assert_eq!(
+            exec_start_with_binary(
+                "ExecStart=/old/sbh daemon --config /root/.config/sbh/config.toml",
+                "/usr/local/bin/sbh"
+            ),
+            "ExecStart=/usr/local/bin/sbh daemon --config /root/.config/sbh/config.toml"
+        );
+        assert_eq!(
+            exec_start_with_binary("ExecStart=/old/sbh", "/usr/local/bin/sbh"),
+            "ExecStart=/usr/local/bin/sbh daemon"
+        );
     }
 
     #[test]

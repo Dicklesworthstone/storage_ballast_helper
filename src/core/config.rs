@@ -1689,7 +1689,7 @@ fn installed_service_config() -> Option<PathBuf> {
 
 /// `--config` of the effective `ExecStart=` in `<dir>/sbh.service` and its
 /// `sbh.service.d/*.conf` drop-ins (the last assignment wins, as in systemd).
-fn config_from_systemd_unit_dir(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn config_from_systemd_unit_dir(dir: &Path) -> Option<PathBuf> {
     let unit = fs::read_to_string(dir.join("sbh.service")).ok()?;
     let mut texts = vec![unit];
     if let Ok(entries) = fs::read_dir(dir.join("sbh.service.d")) {
