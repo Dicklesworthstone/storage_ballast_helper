@@ -297,12 +297,23 @@ impl Platform for MacOsPal {
             .open(path)
             .map_err(|error| crate::core::errors::SbhError::io(path, error))?;
 
-        fallocate(&file, FallocateFlags::empty(), 0, size).map_err(|error| {
-            PalError::method_failed("macos", "preallocate_file", error.to_string())
-        })?;
+        let preallocated = fallocate(&file, FallocateFlags::empty(), 0, size).is_ok();
         file.sync_all()
             .map_err(|error| crate::core::errors::SbhError::io(path, error))?;
+        if preallocated
+            && verify_preallocated_blocks("macos", path, size, self.file_block_count(path)?).is_ok()
+        {
+            return Ok(());
+        }
 
+        // APFS does not reliably turn F_PREALLOCATE into allocated blocks:
+        // it fails outright on some volumes and on others leaves the
+        // ftruncate-extended file sparse (5 of 64 MiB on mac-mini-old, 2026-
+        // 09-27), so a ballast pool could never be provisioned. Writing the
+        // bytes allocates them.
+        write_zeros(&file, size).map_err(|error| crate::core::errors::SbhError::io(path, error))?;
+        file.sync_all()
+            .map_err(|error| crate::core::errors::SbhError::io(path, error))?;
         let blocks = self.file_block_count(path)?;
         verify_preallocated_blocks("macos", path, size, blocks)
     }
@@ -331,6 +342,22 @@ impl Platform for MacOsPal {
     fn service_kind(&self) -> ServiceKind {
         ServiceKind::Launchd
     }
+}
+
+/// Overwrite `file` from offset 0 with `size` zero bytes.
+fn write_zeros(file: &File, size: u64) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    const CHUNK: usize = 1 << 20;
+    let zeros = vec![0u8; CHUNK];
+    let mut file = file;
+    file.seek(SeekFrom::Start(0))?;
+    let mut remaining = size;
+    while remaining > 0 {
+        let n = usize::try_from(remaining).map_or(CHUNK, |left| left.min(CHUNK));
+        file.write_all(&zeros[..n])?;
+        remaining = remaining.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
+    }
+    Ok(())
 }
 
 fn cached_open_files_under(root: &Path) -> Result<OpenFilesResult> {
