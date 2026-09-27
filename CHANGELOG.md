@@ -6,6 +6,18 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.14 **[release]**
+
+Compare: [`v0.6.13...v0.6.14`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.13...v0.6.14)
+
+### Fixed — macOS ballast
+
+- Ballast files on macOS really reserve their space. APFS does not reliably
+  turn a preallocation into allocated blocks (it fails outright on some
+  volumes and leaves the file mostly sparse on others), so a Mac's ballast
+  pool could never be provisioned. The file is now filled with zeros when
+  preallocation falls short (`d295843`). No change on Linux.
+
 ## v0.6.13 **[release]**
 
 Compare: [`v0.6.12...v0.6.13`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.12...v0.6.13)
