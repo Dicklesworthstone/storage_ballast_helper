@@ -602,6 +602,22 @@ fn has_cargo_target_root_markers(path: &Path) -> bool {
     false
 }
 
+/// A directory the Claude Code harness itself runs out of.
+///
+/// That is the per-user session root `claude-<uid>` (every live session's
+/// scratchpads and background-task output) and the
+/// `claude-mcp-browser-bridge-*` bridge. The broad `claude-` prefix rule
+/// nominated both whole; on a Mac the daemon
+/// deleted the bridge and tried the session root three times (2026-09-27),
+/// stopped only by the open-file check. Artifacts inside stay reclaimable.
+#[must_use]
+pub fn is_agent_harness_dir_name(lowercase_name: &str) -> bool {
+    lowercase_name.strip_prefix("claude-").is_some_and(|rest| {
+        (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+            || rest.starts_with("mcp-browser-bridge")
+    })
+}
+
 /// True when `path` lies strictly inside one of cargo's home stores.
 ///
 /// The stores are `registry/src`, `registry/cache`, `registry/index`,
@@ -901,6 +917,9 @@ impl ArtifactPatternRegistry {
             return ArtifactClassification::unknown();
         }
         let normalized = name_os.to_string_lossy().to_lowercase();
+        if is_agent_harness_dir_name(&normalized) {
+            return ArtifactClassification::unknown();
+        }
 
         let catalog_classification = cleanup_catalog_path_classification(path, cleanup_rules, home);
         let mut best = catalog_classification
@@ -1995,6 +2014,36 @@ mod tests {
         assert!(!is_cargo_cache_store(Path::new(
             "/root/.cargo/registry/other"
         )));
+    }
+
+    #[test]
+    fn claude_harness_dirs_are_never_artifacts_but_their_contents_can_be() {
+        let registry = ArtifactPatternRegistry::default();
+        for path in [
+            "/tmp/claude-501",
+            "/private/tmp/claude-501",
+            "/data/tmp/claude-1000",
+            "/tmp/claude-mcp-browser-bridge-jemanuel",
+        ] {
+            let class = registry.classify(Path::new(path), StructuralSignals::default());
+            assert_eq!(
+                class.category,
+                ArtifactCategory::Unknown,
+                "{path}: {class:?}"
+            );
+        }
+        // Agent-made scratch under the same prefix is still a cache.
+        let scratch = registry.classify(
+            Path::new("/data/tmp/claude-idprobe.7k5d0J"),
+            StructuralSignals::default(),
+        );
+        assert_eq!(scratch.pattern_name, "claude-session-cache");
+        // An artifact inside a session scratchpad is still reclaimable.
+        let pycache = registry.classify(
+            Path::new("/tmp/claude-501/-Users-x-proj/0f2c/scratchpad/__pycache__"),
+            StructuralSignals::default(),
+        );
+        assert_eq!(pycache.category, ArtifactCategory::PythonCache);
     }
 
     #[test]

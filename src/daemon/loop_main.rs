@@ -8531,9 +8531,18 @@ fn scanner_thread_main(
                     score.veto_reason.as_deref().unwrap_or("-"),
                 );
             }
+            // A walked (not opaque-measured) directory carries only its
+            // immediate files' size, a lower bound: a 36 GB target dir read as
+            // ~3 KB and skipped the running-executable / mmap / open-file
+            // probes, the only guard for a binary a process is running.
+            let probe_size = if entry.metadata.is_dir && entry.opaque_tree.is_none() {
+                u64::MAX
+            } else {
+                entry.metadata.content_size_bytes
+            };
             if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
                 && !score.vetoed
-                && active_reference_scan.should_probe(entry.metadata.content_size_bytes)
+                && active_reference_scan.should_probe(probe_size)
             {
                 if has_active_reference_scan_budget(scan_deadline, active_reference_probe_budget) {
                     let open_files = open_files_joined.get_or_insert_with(|| {
