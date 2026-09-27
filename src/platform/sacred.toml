@@ -177,8 +177,8 @@ reason = "Root ~/.local binaries and data (installed rch/rchd/sbh tooling) must 
 source = "Builtin"
 
 # .cargo is protected SURGICALLY: the security-sensitive config + credential
-# files are hard-guarded, but the regenerable `.cargo/registry` and
-# `.cargo/git` caches (classified `opaque-cargo-cache`) stay reclaimable.
+# files are hard-guarded, and the regenerable stores inside `.cargo/registry`
+# and `.cargo/git` (classified `opaque-cargo-cache`) stay reclaimable.
 [[paths]]
 pattern = "/root/.cargo/config.toml"
 kind = "ExactMatch"
