@@ -6,6 +6,44 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.12 **[release]**
+
+Compare: [`v0.6.11...v0.6.12`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.11...v0.6.12)
+
+### Fixed — safety
+
+- Claude Code's own directories are never reclaimed whole: the per-user
+  session root `claude-<uid>` (every live session's scratchpads and task
+  output) and `claude-mcp-browser-bridge-*`. The broad `claude-` rule
+  nominated them; a Mac deleted the bridge directory and tried the session
+  root three times, stopped only by the open-file check. Agent scratch dirs
+  and artifacts inside a scratchpad stay reclaimable (`f04a9b0`).
+- A walked directory about to be deleted is always checked for running
+  executables, memory maps and open files. Its recorded size was only its
+  immediate files, so a large build directory looked tiny and skipped those
+  checks, the only guard for a binary a process is running (`f04a9b0`).
+- `state.json` is written world-readable whatever the daemon's umask, so
+  non-root `sbh status` can always read it (`00b858a`).
+
+## v0.6.11 **[release]**
+
+Compare: [`v0.6.10...v0.6.11`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.10...v0.6.11)
+
+### Fixed
+
+- `~/.cargo/registry` and `~/.cargo/git` are never reclaimed as a whole;
+  the stores inside them (`registry/{cache,src,index}`, `git/{checkouts,db}`)
+  are. rch's per-job cargo home symlinks those roots, so removing one broke
+  every crates.io download on that worker (hz4: a release lost 33 minutes)
+  (`6417f0b`).
+- The executor's open-file refusal now matches candidates spelled through a
+  symlink. It compared the spelled path against resolved open-file paths, so
+  on macOS nothing under `/var/tmp` or `$TMPDIR` could ever be refused as
+  open (`94e2fb3`).
+- A configured root that is itself a symlink is walked. On macOS the default
+  `/tmp` (a link to `/private/tmp`) was skipped silently, so the daemon never
+  saw stale build output there (`94e2fb3`).
+
 ## v0.6.10 **[release]**
 
 Compare: [`v0.6.9...v0.6.10`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.9...v0.6.10)
