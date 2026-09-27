@@ -6,6 +6,19 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.13 **[release]**
+
+Compare: [`v0.6.12...v0.6.13`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.12...v0.6.13)
+
+### Fixed — safety
+
+- Name rules for agent scratch directories (`cass_*`, `frankenterm-*`,
+  `frankentui-*`, `pi_agent_*`, `claude-*`, ...) apply only to a directory
+  created directly in a temp root. Matching a name anywhere had removed a
+  backup folder, checked-in fuzz corpora inside git clones and rch run
+  mirrors. Build-artifact rules (targets, `node_modules`, caches) are
+  unchanged (`8b1b728`).
+
 ## v0.6.12 **[release]**
 
 Compare: [`v0.6.11...v0.6.12`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.11...v0.6.12)
