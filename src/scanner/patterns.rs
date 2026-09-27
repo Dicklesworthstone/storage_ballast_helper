@@ -651,6 +651,31 @@ pub fn is_cargo_registry_internal_path(path: &Path) -> bool {
     })
 }
 
+/// Name-only rules for agent scratch (`cass_*`, `frankenterm-*`, `pi_agent_*`,
+/// `claude-*`, ...) describe directories an agent creates directly in a temp
+/// root. Deeper, the same names are someone's data: the fleet deleted
+/// checked-in fuzz corpora (`<clone>/fuzz/corpus/cass_import_jsonl`), backups
+/// (`/tmp/backup_repo_files/frankentui_untracked`) and rch run mirrors
+/// (`/tmp/rch-run/frankenterm-<hash>`) on name alone (2026-09-15..27).
+fn is_temp_root_scoped(pattern: &ArtifactPattern) -> bool {
+    pattern.category == ArtifactCategory::AgentWorkspace || pattern.name == "claude-session-cache"
+}
+
+/// A temp root itself (not a path inside one).
+fn is_temp_root_dir(path: &Path) -> bool {
+    [
+        "/tmp",
+        "/var/tmp",
+        "/data/tmp",
+        "/private/tmp",
+        "/private/var/tmp",
+    ]
+    .iter()
+    .any(|root| path == Path::new(root))
+        || (path.file_name().is_some_and(|name| name == "T")
+            && is_darwin_user_temp_path(&path.join("entry")))
+}
+
 fn is_tmp_like_path(path: &Path) -> bool {
     ["/tmp", "/var/tmp", "/data/tmp", "/private/tmp"]
         .iter()
@@ -925,9 +950,11 @@ impl ArtifactPatternRegistry {
         let mut best = catalog_classification
             .clone()
             .unwrap_or_else(ArtifactClassification::unknown);
+        let in_temp_root = path.parent().is_some_and(is_temp_root_dir);
         for pattern in &self.builtins {
             if matches_builtin(pattern.kind, &normalized)
                 && pattern.confidence > best.name_confidence
+                && (in_temp_root || !is_temp_root_scoped(pattern))
             {
                 best = ArtifactClassification {
                     pattern_name: Cow::Borrowed(pattern.name),
@@ -2017,6 +2044,51 @@ mod tests {
     }
 
     #[test]
+    fn agent_scratch_name_rules_apply_only_directly_under_a_temp_root() {
+        let registry = ArtifactPatternRegistry::default();
+        // Real fleet deletions (2026-09-15..27) that were someone's data.
+        for path in [
+            "/data/tmp/ee_triage0924/fuzz/corpus/cass_import_jsonl",
+            "/tmp/backup_repo_files/frankentui_untracked",
+            "/tmp/backup_repo_files/cass_untracked",
+            "/tmp/rch-run/frankenterm-9bf541b87e260846",
+            "/tmp/rch-run/pi_agent_rust-61c0a642eeb896ae",
+            "/home/ubuntu/.cache/claude-cli-nodejs",
+            "/data/projects/pi_agent_rust",
+        ] {
+            let class = registry.classify(Path::new(path), StructuralSignals::default());
+            assert_eq!(
+                class.category,
+                ArtifactCategory::Unknown,
+                "{path}: {class:?}"
+            );
+        }
+        // Agent scratch created directly in a temp root is still reclaimable.
+        for (path, pattern) in [
+            ("/data/tmp/cass-self-update.lQLsJD", "cass-prefix-hyphen"),
+            (
+                "/tmp/frankenterm-guardian-socket-authority-sPJzLf",
+                "frankenterm-prefix",
+            ),
+            ("/data/tmp/pi_agent_rust_cargo", "pi-agent"),
+            ("/private/tmp/claude-idprobe.7k5d0J", "claude-session-cache"),
+            (
+                "/var/folders/vt/n2xy/T/frankentui-snapshot-1",
+                "frankentui-prefix-hyphen",
+            ),
+        ] {
+            let class = registry.classify(Path::new(path), StructuralSignals::default());
+            assert_eq!(class.pattern_name, pattern, "{path}");
+        }
+        // Artifact rules are not scoped: a cargo target deep in a clone stays one.
+        let nested_target = registry.classify(
+            Path::new("/data/tmp/some-clone/crates/cass_core_target"),
+            StructuralSignals::default(),
+        );
+        assert_eq!(nested_target.category, ArtifactCategory::RustTarget);
+    }
+
+    #[test]
     fn claude_harness_dirs_are_never_artifacts_but_their_contents_can_be() {
         let registry = ArtifactPatternRegistry::default();
         for path in [
@@ -2727,8 +2799,10 @@ mod tests {
             ("work-target", ArtifactCategory::RustTarget),
         ];
 
+        // Observed directly under /tmp; agent-scratch rules are scoped there.
         for (name, expected) in cases {
-            let classification = registry.classify(Path::new(name), StructuralSignals::default());
+            let path = Path::new("/tmp").join(name);
+            let classification = registry.classify(&path, StructuralSignals::default());
             assert_eq!(
                 classification.category, expected,
                 "unexpected classification for {name}"
@@ -2812,7 +2886,8 @@ mod tests {
         ];
 
         for name in cases {
-            let classification = registry.classify(Path::new(name), StructuralSignals::default());
+            let path = Path::new("/tmp").join(name);
+            let classification = registry.classify(&path, StructuralSignals::default());
             assert_ne!(
                 classification.category,
                 ArtifactCategory::Unknown,
@@ -2888,7 +2963,8 @@ mod tests {
         ];
 
         for name in cases {
-            let classification = registry.classify(Path::new(name), StructuralSignals::default());
+            let path = Path::new("/tmp").join(name);
+            let classification = registry.classify(&path, StructuralSignals::default());
             assert_eq!(
                 classification.category,
                 ArtifactCategory::AgentWorkspace,
@@ -2908,12 +2984,12 @@ mod tests {
         // names; the new `frankentui-` does not steal them.
         let registry = ArtifactPatternRegistry::default();
         let frankenterm = registry.classify(
-            Path::new("frankenterm-build-1234"),
+            Path::new("/tmp/frankenterm-build-1234"),
             StructuralSignals::default(),
         );
         assert_eq!(frankenterm.category, ArtifactCategory::AgentWorkspace);
         let frankentui = registry.classify(
-            Path::new("frankentui-codex-bd-2vr05-4"),
+            Path::new("/tmp/frankentui-codex-bd-2vr05-4"),
             StructuralSignals::default(),
         );
         assert_eq!(frankentui.category, ArtifactCategory::AgentWorkspace);
