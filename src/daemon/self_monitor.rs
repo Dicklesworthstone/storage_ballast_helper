@@ -1479,6 +1479,14 @@ fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
                 opts.mode(0o644);
             }
             let mut file = opts.open(&tmp_path)?;
+            // `mode()` is masked by the process umask; a daemon started
+            // under 077 wrote a 0600 state.json that non-root `sbh status`
+            // could not read. Set the bits explicitly.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(fs::Permissions::from_mode(0o644))?;
+            }
             file.write_all(json.as_bytes())?;
             file.sync_all()?;
         }
