@@ -6,6 +6,25 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.11 **[release]**
+
+Compare: [`v0.6.10...v0.6.11`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.10...v0.6.11)
+
+### Fixed
+
+- `~/.cargo/registry` and `~/.cargo/git` are never reclaimed as a whole;
+  the stores inside them (`registry/{cache,src,index}`, `git/{checkouts,db}`)
+  are. rch's per-job cargo home symlinks those roots, so removing one broke
+  every crates.io download on that worker (hz4: a release lost 33 minutes)
+  (`6417f0b`).
+- The executor's open-file refusal now matches candidates spelled through a
+  symlink. It compared the spelled path against resolved open-file paths, so
+  on macOS nothing under `/var/tmp` or `$TMPDIR` could ever be refused as
+  open (`94e2fb3`).
+- A configured root that is itself a symlink is walked. On macOS the default
+  `/tmp` (a link to `/private/tmp`) was skipped silently, so the daemon never
+  saw stale build output there (`94e2fb3`).
+
 ## v0.6.10 **[release]**
 
 Compare: [`v0.6.9...v0.6.10`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.9...v0.6.10)
