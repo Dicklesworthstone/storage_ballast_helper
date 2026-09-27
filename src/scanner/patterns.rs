@@ -217,9 +217,9 @@ pub fn classify_opaque_tree(
     // crates such as `target-triple-1.0.0` / `target-lexicon-0.13.5` unpack to
     // directories whose names satisfy the broad `target-` prefix, and a store
     // that lives under a temp-like `CARGO_HOME` would otherwise be promoted to
-    // a 0.93 `opaque-cargo-target` candidate purely on that name. The store
-    // roots themselves are excluded here so `.cargo/registry` / `.cargo/git`
-    // remain the opaque reclaim unit handled below.
+    // a 0.93 `opaque-cargo-target` candidate purely on that name. The stores
+    // themselves are excluded here: they are the opaque reclaim unit handled
+    // below (the `.cargo/registry` / `.cargo/git` roots above them are kept).
     if is_cargo_registry_internal_path(path) {
         return Some(OpaqueTreeClassification::protected(
             "cargo registry/git store content is crate source, never a build target",
@@ -313,9 +313,18 @@ pub fn classify_opaque_tree(
         ));
     }
 
-    if is_cargo_cache_root(path) {
+    // `.cargo/registry` and `.cargo/git` themselves must survive: rch's per-job
+    // CARGO_HOME symlinks them, and a removed root leaves the link dangling so
+    // every crates.io download fails with EEXIST (hz4, 2026-09-26: a release
+    // lost 33 min). Descend and reclaim the stores inside instead.
+    if is_cargo_home_store_root(path) {
+        return Some(OpaqueTreeClassification::signal_only(
+            "cargo registry/git root is kept; its stores are the reclaim unit",
+        ));
+    }
+    if is_cargo_cache_store(path) {
         return Some(OpaqueTreeClassification::candidate(
-            "cargo registry/cache root",
+            "cargo registry/git store",
             "opaque-cargo-cache",
             ArtifactCategory::CacheDir,
             0.92,
@@ -600,10 +609,10 @@ fn has_cargo_target_root_markers(path: &Path) -> bool {
 /// Everything below those directories is cargo-managed content: unpacked
 /// crate source, `.crate` archives, index clones, git checkouts. None of it
 /// is a build output, so no name pattern may nominate it and the deletion
-/// scorer vetoes it outright. The store directories themselves (and the
-/// `registry` / `git` roots above them) are deliberately NOT matched: those
-/// remain the opaque, whole-store reclaim unit (`opaque-cargo-cache` / the
-/// cleanup catalog).
+/// scorer vetoes it outright. The store directories themselves are
+/// deliberately NOT matched: they are the opaque, whole-store reclaim unit
+/// (`opaque-cargo-cache` / the cleanup catalog). The `registry` / `git`
+/// roots above them are never reclaimed (rch symlinks them).
 #[must_use]
 pub fn is_cargo_registry_internal_path(path: &Path) -> bool {
     // `ancestors()` yields `path` first; the store dir must be a STRICT
@@ -675,17 +684,32 @@ pub fn is_darwin_user_temp_path(path: &Path) -> bool {
         && parts.next().is_some()
 }
 
-fn is_cargo_cache_root(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+/// `.cargo/registry` or `.cargo/git`.
+fn is_cargo_home_store_root(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "registry" | "git"))
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|parent| parent == ".cargo")
+}
+
+/// A regenerable store directly inside a cargo-home root:
+/// `.cargo/registry/{cache,src,index}` or `.cargo/git/{checkouts,db}`.
+fn is_cargo_cache_store(path: &Path) -> bool {
+    let (Some(name), Some(root)) = (
+        path.file_name().and_then(|name| name.to_str()),
+        path.parent(),
+    ) else {
         return false;
     };
-    if !matches!(name, "registry" | "git") {
-        return false;
-    }
-    path.parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .is_some_and(|parent| parent == ".cargo")
+    is_cargo_home_store_root(root)
+        && match root.file_name().and_then(|name| name.to_str()) {
+            Some("registry") => matches!(name, "cache" | "src" | "index"),
+            Some("git") => matches!(name, "checkouts" | "db"),
+            _ => false,
+        }
 }
 
 /// On-disk kind of a detected Go toolchain cache.
@@ -1649,7 +1673,7 @@ mod tests {
         ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, CustomPattern,
         OpaqueTreeContext, OpaqueTreeDisposition, StructuralSignals, classify_opaque_tree,
         extract_pattern_label, extract_pattern_label_with_cleanup_rules,
-        has_descriptive_target_suffix, is_cargo_registry_internal_path,
+        has_descriptive_target_suffix, is_cargo_cache_store, is_cargo_registry_internal_path,
         is_obvious_build_artifact_basename, structural_score,
     };
     use crate::platform::{linux, macos};
@@ -1927,14 +1951,50 @@ mod tests {
             assert_eq!(opaque.classification.category, ArtifactCategory::Unknown);
         }
 
-        // The store root is still the whole-store cache candidate.
-        let root = classify_opaque_tree(
-            Path::new("/root/.cargo/registry"),
-            OpaqueTreeContext::default(),
-        )
-        .expect("registry root should be classified");
-        assert_eq!(root.disposition, OpaqueTreeDisposition::CandidateOpaque);
-        assert_eq!(root.classification.pattern_name, "opaque-cargo-cache");
+        // The roots are kept (rch symlinks them); the stores inside are the
+        // whole-store cache candidates.
+        for root in ["/root/.cargo/registry", "/home/ubuntu/.cargo/git"] {
+            let opaque = classify_opaque_tree(Path::new(root), OpaqueTreeContext::default())
+                .expect("cargo root should be classified");
+            assert_eq!(
+                opaque.disposition,
+                OpaqueTreeDisposition::SignalOnly,
+                "{root}"
+            );
+        }
+        for store in [
+            "/root/.cargo/registry/cache",
+            "/root/.cargo/registry/src",
+            "/root/.cargo/registry/index",
+            "/home/ubuntu/.cargo/git/checkouts",
+            "/home/ubuntu/.cargo/git/db",
+        ] {
+            let opaque = classify_opaque_tree(Path::new(store), OpaqueTreeContext::default())
+                .expect("cargo store should be classified");
+            assert_eq!(
+                opaque.disposition,
+                OpaqueTreeDisposition::CandidateOpaque,
+                "{store}"
+            );
+            assert_eq!(opaque.classification.pattern_name, "opaque-cargo-cache");
+        }
+        // Nor may the name classifier (the daemon pre-scan) nominate a root.
+        let names = ArtifactPatternRegistry::default();
+        for root in ["/home/ubuntu/.cargo/registry", "/home/ubuntu/.cargo/git"] {
+            let class = names.classify(Path::new(root), StructuralSignals::default());
+            assert_eq!(
+                class.category,
+                ArtifactCategory::Unknown,
+                "{root}: {class:?}"
+            );
+        }
+        // A same-named dir outside a cargo home is not a cargo store.
+        assert!(!is_cargo_cache_store(Path::new(
+            "/data/proj/registry/cache"
+        )));
+        assert!(!is_cargo_cache_store(Path::new(
+            "/root/.cargo/registry/other"
+        )));
     }
 
     #[test]
