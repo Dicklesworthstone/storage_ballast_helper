@@ -6,6 +6,19 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.16 **[release]**
+
+Compare: [`v0.6.15...v0.6.16`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.15...v0.6.16)
+
+### Fixed — a scan pass can no longer run away inside one directory
+
+- Sacred-pattern regexes are compiled once and reused. Every protection
+  check recompiled the whole catalog's patterns, for every candidate.
+- The priority pre-scan checks its CPU and time limits before each
+  candidate. One directory with dozens of candidates, each taking seconds
+  to prove protected, held a pass at most of a core for 16+ minutes past
+  its budget (`d55310b`).
+
 ## v0.6.15 **[release]**
 
 Compare: [`v0.6.14...v0.6.15`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.14...v0.6.15)
