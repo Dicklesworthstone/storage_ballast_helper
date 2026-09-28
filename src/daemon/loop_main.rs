@@ -7847,6 +7847,20 @@ fn scanner_thread_main(
                     }
 
                     for candidate_path in to_score {
+                        // Each candidate's protection check can walk its tree
+                        // for sacred markers; one entry with dozens of
+                        // candidates (a repo's `.rch-tmp/.tmp*` dirs on fmd,
+                        // 2026-09-28) held a pass for 16+ minutes past its
+                        // budget. Stop like the sub-entry loops do: the entry
+                        // is retried next pass (unless it is the first), and
+                        // candidates already proved protected are cached.
+                        if let Some(stop) = limits.prescan_stop() {
+                            prescan_stop = Some(stop);
+                            if prescan_entries > 1 {
+                                *cursor = cursor_before_entry.clone();
+                            }
+                            break 'priority_roots;
+                        }
                         if should_skip_protected_daemon_candidate(
                             &mut protection,
                             &candidate_path,

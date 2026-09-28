@@ -965,13 +965,40 @@ pub fn validate_glob_pattern(pattern: &str) -> Result<()> {
     glob_to_regex(pattern).map(|_| ())
 }
 
+/// Most distinct glob patterns memoized; the set comes from the sacred
+/// catalog and operator config, so this is only a guard against growth.
+const GLOB_REGEX_CACHE_MAX: usize = 4096;
+
+/// [`compile_glob_regex`], memoized by pattern. Every sacred-overlap check
+/// compiled the whole catalog's globs (27+ regexes) again, once per
+/// candidate and per replayed index record: on fmd (2026-09-28) the scanner
+/// thread spent minutes of CPU in regex compilation without finishing a
+/// pass. A compiled `Regex` clones cheaply (it is reference-counted).
+fn glob_to_regex(pattern: &str) -> Result<Regex> {
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, Regex>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    if let Some(regex) = cache.lock().get(pattern) {
+        return Ok(regex.clone());
+    }
+    let regex = compile_glob_regex(pattern)?;
+    {
+        let mut cache = cache.lock();
+        if cache.len() >= GLOB_REGEX_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(pattern.to_string(), regex.clone());
+    }
+    Ok(regex)
+}
+
 /// Convert a shell-style glob pattern to a regex.
 ///
 /// Supports:
 /// - `**` → matches any path (including separators)
 /// - `*`  → matches anything except `/`
 /// - `?`  → matches a single character except `/`
-fn glob_to_regex(pattern: &str) -> Result<Regex> {
+fn compile_glob_regex(pattern: &str) -> Result<Regex> {
     let normalized_pattern = pattern.replace('\\', "/");
     let mut regex_str = String::with_capacity(pattern.len() * 2);
     regex_str.push('^');
