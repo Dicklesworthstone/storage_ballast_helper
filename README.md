@@ -1890,7 +1890,8 @@ This keeps `sbh` at background priority. System-scope systemd units also add a c
 
 **Resource limits:**
 - `MemoryMax=256M` — hard memory ceiling enforced by the cgroup controller
-- `CPUQuota=10%` — limits CPU usage to 10% of one core
+- `CPUQuota=100%` — caps CPU at one core as a runaway backstop
+- `CPUWeight=1` — the lowest CPU share, so builds win whenever cores are busy
 
 **Lifecycle:**
 - `Type=notify` (system scope) with `WatchdogSec=60` for automatic restart on stall

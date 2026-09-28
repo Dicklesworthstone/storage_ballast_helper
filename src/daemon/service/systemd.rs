@@ -380,7 +380,11 @@ impl SystemdServiceManager {
 
         writeln!(unit, "# Resource limits").ok();
         writeln!(unit, "MemoryMax=256M").ok();
-        writeln!(unit, "CPUQuota=10%").ok();
+        // One core as the runaway backstop; the weight (plus Nice/IO idle)
+        // keeps it out of the way of builds. 10% of one core starved every
+        // host: throttled in up to 100% of periods, scans timing out at Critical.
+        writeln!(unit, "CPUQuota=100%").ok();
+        writeln!(unit, "CPUWeight=1").ok();
         writeln!(unit).ok();
 
         if !self.config.user_scope {
@@ -744,6 +748,7 @@ const HARDENING_DIRECTIVES: &[&str] = &[
     "Service/RestrictSUIDSGID",
     "Service/MemoryMax",
     "Service/CPUQuota",
+    "Service/CPUWeight",
 ];
 
 /// Directives that legitimately differ between hosts (paths, wording) and
@@ -1244,7 +1249,11 @@ mod unit_drift_tests {
             ),
             (
                 PathBuf::from("/etc/systemd/system.control/sbh.service.d/50-CPUQuota.conf"),
-                "# created via systemctl set-property\n[Service]\nCPUQuota=10.00%\n".to_string(),
+                "# created via systemctl set-property\n[Service]\nCPUQuota=100.00%\n".to_string(),
+            ),
+            (
+                PathBuf::from("/etc/systemd/system.control/sbh.service.d/50-CPUWeight.conf"),
+                "# created via systemctl set-property\n[Service]\nCPUWeight=1\n".to_string(),
             ),
         ]
     }
@@ -1318,8 +1327,10 @@ mod unit_drift_tests {
                 "{expected} missing from {gaps:?}"
             );
         }
-        // CPUQuota is supplied by the set-property drop-in, so it is not a gap.
+        // CPUQuota and CPUWeight are supplied by set-property drop-ins, so
+        // they are not gaps.
         assert!(!gaps.contains(&"Service/CPUQuota".to_string()), "{gaps:?}");
+        assert!(!gaps.contains(&"Service/CPUWeight".to_string()), "{gaps:?}");
         let type_change = drift
             .changed_directives
             .iter()
@@ -1332,7 +1343,7 @@ mod unit_drift_tests {
                 .extra_directives
                 .contains(&"Service/UMask".to_string())
         );
-        assert_eq!(drift.foreign_dropins.len(), 3);
+        assert_eq!(drift.foreign_dropins.len(), 4);
         assert!(
             drift.foreign_dropins.iter().any(|d| d.overrides_hardening),
             "CPUQuota drop-in"

@@ -506,7 +506,8 @@ mod legacy_inline {
                 crate::daemon::service::SYSTEMD_MEMORY_MAX
             )
             .ok();
-            writeln!(unit, "CPUQuota=10%").ok();
+            writeln!(unit, "CPUQuota=100%").ok();
+            writeln!(unit, "CPUWeight=1").ok();
             writeln!(unit).ok();
 
             // -- Logging -------------------------------------------------------
@@ -1215,7 +1216,8 @@ mod tests {
         let unit = mgr.generate_unit_file();
 
         assert!(unit.contains("MemoryMax=256M"));
-        assert!(unit.contains("CPUQuota=10%"));
+        assert!(unit.contains("CPUQuota=100%"));
+        assert!(unit.contains("CPUWeight=1"));
     }
 
     #[test]
