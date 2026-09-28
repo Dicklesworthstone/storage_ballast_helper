@@ -39,6 +39,8 @@ mod tests {
     fn restart_under_pressure_does_not_over_release() {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = BallastManager::new(dir.path().to_path_buf(), test_config()).unwrap();
+        // Not a floor test: do not depend on how full the host running it is.
+        mgr.set_provision_floor(0.0);
         mgr.provision(None).unwrap();
         let mount = dir.path();
 

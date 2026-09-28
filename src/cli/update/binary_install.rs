@@ -345,12 +345,21 @@ mod tests {
                 fs::metadata(candidate).unwrap().permissions().mode() & 0o777,
                 0o755
             );
-            assert!(
-                std::process::Command::new(candidate)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            // As in execution_probe::verify: a child forked by another test
+            // thread can briefly inherit a write descriptor (ETXTBSY).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let status = loop {
+                match std::process::Command::new(candidate).status() {
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    other => break other.unwrap(),
+                }
+            };
+            assert!(status.success());
             Ok(())
         })
         .unwrap();

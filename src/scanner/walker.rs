@@ -605,7 +605,13 @@ impl DirectoryWalker {
 
         // Seed work queue with root paths.
         for root in &self.config.root_paths {
-            let meta = match metadata_for_path(root, self.config.follow_symlinks) {
+            // A configured root is followed even when it is a symlink: on
+            // macOS the default `/tmp` is a link to `/private/tmp`, and the
+            // no-follow stat skipped it silently, so the daemon never walked
+            // it (a Mac at 95% with 160 GB of stale target dirs there). Paths
+            // keep the configured spelling; links inside the tree still obey
+            // `follow_symlinks`.
+            let meta = match fs::metadata(root) {
                 Ok(m) => m,
                 Err(err) if err.kind() == ErrorKind::NotFound => continue,
                 Err(err) if err.kind() == ErrorKind::PermissionDenied => continue,
@@ -1498,15 +1504,28 @@ fn add_open_path_ancestor_chain(
 
 #[cfg(target_os = "linux")]
 fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
+    let (targets, complete) = collect_open_file_targets_linux();
+    (
+        open_path_ancestors_for_roots(&targets, root_paths),
+        complete,
+    )
+}
+
+/// Every absolute path some process holds open, from one walk of
+/// `/proc/*/fd`, plus whether the walk finished within its budget.
+///
+/// This is the expensive part of an open-file check and does not depend on
+/// which candidates are being checked, so one walk can serve several batches
+/// (see `deletion::OPEN_SWEEP_REUSE_WINDOW`).
+#[cfg(target_os = "linux")]
+pub(crate) fn collect_open_file_targets_linux() -> (Vec<PathBuf>, bool) {
     use std::os::unix::ffi::OsStrExt;
     use std::time::Instant;
 
-    let mut ancestors = HashSet::with_capacity(4096);
+    let mut targets: HashSet<PathBuf> = HashSet::with_capacity(4096);
     let Ok(proc_dir) = fs::read_dir("/proc") else {
-        return (ancestors, true);
+        return (Vec::new(), true);
     };
-
-    let normalized_roots = normalized_open_roots(root_paths);
 
     let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
     let mut pids_scanned: usize = 0;
@@ -1541,11 +1560,29 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf
             if let Some(stripped) = target.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
                 target = PathBuf::from(stripped);
             }
-            add_open_path_ancestor_chain(&mut ancestors, &target, &normalized_roots);
+            targets.insert(target);
         }
     }
 
-    (ancestors, !incomplete)
+    (targets.into_iter().collect(), !incomplete)
+}
+
+/// The open-path ancestor index for `root_paths`, built from a list of open
+/// file targets (see [`collect_open_file_targets_linux`]).
+#[cfg(target_os = "linux")]
+pub(crate) fn open_path_ancestors_for_roots(
+    targets: &[PathBuf],
+    root_paths: &[PathBuf],
+) -> HashSet<PathBuf> {
+    let normalized_roots = normalized_open_roots(root_paths);
+    let mut ancestors = HashSet::with_capacity(4096);
+    if normalized_roots.is_empty() {
+        return ancestors;
+    }
+    for target in targets {
+        add_open_path_ancestor_chain(&mut ancestors, target, &normalized_roots);
+    }
+    ancestors
 }
 
 /// Collect open path ancestors using a specific platform implementation.
@@ -1863,7 +1900,15 @@ pub fn is_path_open_by_ancestor<S: std::hash::BuildHasher>(
     path: &Path,
     open_ancestors: &HashSet<PathBuf, S>,
 ) -> bool {
-    open_ancestors.contains(path)
+    // The set holds resolved paths (`add_open_path_ancestor_chain`), but a
+    // candidate keeps the spelling of its scan root. Through a symlinked
+    // component (macOS `/tmp`, `/var` -> `/private/...`) the plain lookup can
+    // never match, which silently disabled the executor's open-file refusal
+    // for every candidate under `/var/tmp` or `$TMPDIR` on a Mac.
+    open_ancestors.contains(path) || {
+        let resolved = crate::core::paths::resolve_absolute_path(path);
+        resolved != path && open_ancestors.contains(&resolved)
+    }
 }
 
 /// Memoized open-file detector for repeated path checks during one scan pass.
@@ -2420,6 +2465,55 @@ mod tests {
         assert!(paths.contains(&tmp.path().join("a")));
         assert!(paths.contains(&tmp.path().join("a").join("b")));
         assert!(paths.contains(&tmp.path().join("c")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_open_file_protects_a_candidate_spelled_through_a_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("private-tmp");
+        let open_file = real.join("target").join("debug").join("lib.rlib");
+        fs::create_dir_all(open_file.parent().unwrap()).unwrap();
+        fs::write(&open_file, b"x").unwrap();
+        let alias = tmp.path().join("tmp");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        // Ancestors are recorded under the resolved path, as the platform
+        // reports open files; the candidate keeps its root's spelling.
+        let roots = normalized_open_roots(std::slice::from_ref(&alias));
+        let mut ancestors = HashSet::new();
+        add_open_path_ancestor_chain(&mut ancestors, &open_file, &roots);
+
+        assert!(is_path_open_by_ancestor(&alias.join("target"), &ancestors));
+        assert!(is_path_open_by_ancestor(&real.join("target"), &ancestors));
+        fs::create_dir_all(real.join("idle")).unwrap();
+        assert!(!is_path_open_by_ancestor(&alias.join("idle"), &ancestors));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_walked_under_its_configured_spelling() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("private-tmp");
+        fs::create_dir_all(real.join("build").join("cache")).unwrap();
+        let link = tmp.path().join("tmp");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // A link inside the tree is still not followed.
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir_all(elsewhere.join("secret")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, real.join("escape")).unwrap();
+
+        let walker = DirectoryWalker::new(test_config(&link), ProtectionRegistry::marker_only());
+        let paths: Vec<_> = walker.walk().unwrap().into_iter().map(|e| e.path).collect();
+        assert!(paths.contains(&link.join("build")), "{paths:?}");
+        assert!(
+            paths.contains(&link.join("build").join("cache")),
+            "{paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.ends_with("secret")),
+            "a link inside the tree was followed: {paths:?}"
+        );
     }
 
     #[test]

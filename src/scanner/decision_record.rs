@@ -1326,6 +1326,10 @@ mod tests {
         // Retention: rows younger than the cutoff survive, older ones go.
         assert_eq!(db.prune_decision_log(30).unwrap(), 0);
         assert_eq!(db.recent_decisions(10).unwrap().len(), 3);
+        // The cutoff has millisecond resolution and the prune is strict
+        // (`timestamp < cutoff`): a row written in the same millisecond
+        // survives, which made this flaky on a fast machine.
+        std::thread::sleep(std::time::Duration::from_millis(5));
         assert_eq!(
             db.prune_decision_log(0).unwrap(),
             3,

@@ -190,6 +190,18 @@ struct GlobPattern {
 /// protected forever by a stale cache entry.
 pub const SACRED_VERDICT_CACHE_TTL: Duration = Duration::from_secs(600);
 
+/// Lifetime of a verdict backed by a witness.
+///
+/// The witness is the sacred path the sub-walk found. Every lookup re-checks
+/// that it still exists, so this bounds how long an entry lives, not how
+/// stale it can be.
+pub const WITNESSED_VERDICT_CACHE_TTL: Duration = Duration::from_hours(6);
+
+/// Pattern of the overlap synthesized when the containment sub-walk ran out
+/// of budget. Its `matched_path` is the candidate itself, so it proves
+/// nothing and must never serve as a witness.
+pub const TRUNCATED_OVERLAP_PATTERN: &str = "<containment-scan-truncated>";
+
 /// B7: cap on memoized protected verdicts. `/data/tmp` on a busy agent host
 /// holds a few hundred protected candidates; 4096 covers that with headroom
 /// while bounding the daemon's steady-state memory.
@@ -207,6 +219,10 @@ struct CachedSacredVerdict {
     /// Root mtime observed when the verdict was proved. A change means the
     /// directory was touched, so the verdict is re-proved rather than reused.
     root_mtime: Option<SystemTime>,
+    /// The sacred path whose presence made the candidate protected. While it
+    /// still exists the verdict holds whatever else changed in the tree, so
+    /// a busy protected directory is not re-walked on every pass.
+    witness: Option<PathBuf>,
 }
 
 /// Protected verdicts carried from one registry to the next
@@ -298,6 +314,16 @@ impl ProtectionRegistry {
     #[must_use]
     pub fn cached_protected_verdict(&mut self, path: &Path) -> Option<String> {
         let entry = self.sacred_verdict_cache.get(path)?;
+        if let Some(witness) = &entry.witness {
+            // Witnessed: valid exactly while the sacred path is still there.
+            if entry.cached_at.elapsed() < WITNESSED_VERDICT_CACHE_TTL
+                && fs::symlink_metadata(witness).is_ok()
+            {
+                return Some(entry.reason.clone());
+            }
+            self.sacred_verdict_cache.remove(path);
+            return None;
+        }
         if entry.cached_at.elapsed() >= SACRED_VERDICT_CACHE_TTL {
             self.sacred_verdict_cache.remove(path);
             return None;
@@ -324,6 +350,19 @@ impl ProtectionRegistry {
     /// [`find_sacred_overlaps_with_config`] exists to prevent, so the clean
     /// verdict is deliberately re-proved on every pass.
     pub fn cache_protected_verdict(&mut self, path: &Path, reason: String) {
+        self.insert_verdict(path, reason, None);
+    }
+
+    /// Memoize a protected verdict proved by `witness`, a sacred path the
+    /// containment check found at or under `path` (or the sacred ancestor
+    /// `path` sits in). The verdict is reused while the witness exists,
+    /// however often the rest of the tree changes. A truncated sub-walk has
+    /// no witness and must use [`Self::cache_protected_verdict`].
+    pub fn cache_witnessed_verdict(&mut self, path: &Path, reason: String, witness: PathBuf) {
+        self.insert_verdict(path, reason, Some(witness));
+    }
+
+    fn insert_verdict(&mut self, path: &Path, reason: String, witness: Option<PathBuf>) {
         if self.sacred_verdict_cache.len() >= SACRED_VERDICT_CACHE_CAPACITY
             && !self.sacred_verdict_cache.contains_key(path)
         {
@@ -335,6 +374,7 @@ impl ProtectionRegistry {
                 reason,
                 cached_at: Instant::now(),
                 root_mtime: root_mtime(path),
+                witness,
             },
         );
     }
@@ -685,7 +725,7 @@ pub fn find_sacred_overlaps_with_config(
         overlaps.push(SacredOverlap {
             candidate_path: candidate_path.clone(),
             matched_path: candidate_path,
-            pattern: "<containment-scan-truncated>".to_string(),
+            pattern: TRUNCATED_OVERLAP_PATTERN.to_string(),
             kind: SacredOverlapKind::ContainsSacred,
             source: SacredPathSource::Builtin,
             reason,
@@ -925,13 +965,40 @@ pub fn validate_glob_pattern(pattern: &str) -> Result<()> {
     glob_to_regex(pattern).map(|_| ())
 }
 
+/// Most distinct glob patterns memoized; the set comes from the sacred
+/// catalog and operator config, so this is only a guard against growth.
+const GLOB_REGEX_CACHE_MAX: usize = 4096;
+
+/// [`compile_glob_regex`], memoized by pattern. Every sacred-overlap check
+/// compiled the whole catalog's globs (27+ regexes) again, once per
+/// candidate and per replayed index record: on fmd (2026-09-28) the scanner
+/// thread spent minutes of CPU in regex compilation without finishing a
+/// pass. A compiled `Regex` clones cheaply (it is reference-counted).
+fn glob_to_regex(pattern: &str) -> Result<Regex> {
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, Regex>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    if let Some(regex) = cache.lock().get(pattern) {
+        return Ok(regex.clone());
+    }
+    let regex = compile_glob_regex(pattern)?;
+    {
+        let mut cache = cache.lock();
+        if cache.len() >= GLOB_REGEX_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(pattern.to_string(), regex.clone());
+    }
+    Ok(regex)
+}
+
 /// Convert a shell-style glob pattern to a regex.
 ///
 /// Supports:
 /// - `**` → matches any path (including separators)
 /// - `*`  → matches anything except `/`
 /// - `?`  → matches a single character except `/`
-fn glob_to_regex(pattern: &str) -> Result<Regex> {
+fn compile_glob_regex(pattern: &str) -> Result<Regex> {
     let normalized_pattern = pattern.replace('\\', "/");
     let mut regex_str = String::with_capacity(pattern.len() * 2);
     regex_str.push('^');
@@ -2236,6 +2303,46 @@ protected_at = "2026-05-07T03:50:00Z"
         assert_eq!(overlaps[0].pattern, ".beads/");
     }
 
+    /// Agent session histories and cass data are sacred wherever the agents'
+    /// home is (the fleet daemon runs as root, the agents as other users),
+    /// down to their deepest descendants; ordinary caches beside them are not.
+    #[test]
+    fn agent_session_and_cass_data_are_sacred_under_any_home() {
+        let catalog = cross_platform_sacred_paths();
+        for path in [
+            "/home/ubuntu/.claude/projects/-data-projects-x/abc.jsonl",
+            "/home/ubuntu/.codex/sessions/2026/09/24",
+            "/home/ubuntu/.gemini/tmp",
+            "/home/ubuntu/.cass-memory",
+            "/home/ubuntu/.local/share/coding-agent-search/index",
+            "/home/ubuntu/.local/share/coding-agent-search-recovered-20260325T2115",
+            "/Users/op/.claude",
+            "/Users/op/Library/Application Support/com.coding-agent-search.coding-agent-search/agent_search.db",
+            "/Users/op/Library/Caches/cass-fold3/segments",
+        ] {
+            assert!(
+                !find_sacred_overlaps(Path::new(path), catalog)
+                    .unwrap()
+                    .is_empty(),
+                "{path} must be sacred"
+            );
+        }
+        // Nonexistent homes: a real directory would be sub-walked for sacred
+        // markers, which makes the verdict depend on the test host.
+        for path in [
+            "/home/sbh-no-such-user/.cache/mtdt-amt-build",
+            "/Users/sbh-no-such-user/Library/Caches/dsr",
+            "/home/sbh-no-such-user/.local/share/sbh",
+        ] {
+            assert!(
+                find_sacred_overlaps(Path::new(path), catalog)
+                    .unwrap()
+                    .is_empty(),
+                "{path} must stay reclaimable"
+            );
+        }
+    }
+
     #[test]
     fn absolute_root_guards_fire_independent_of_home() {
         let catalog = cross_platform_sacred_paths();
@@ -2313,6 +2420,61 @@ protected_at = "2026-05-07T03:50:00Z"
             reg.cached_protected_verdict(&candidate).as_deref(),
             Some("contains sacred marker")
         );
+    }
+
+    /// A busy protected tree (an agent temp dir whose mtime changes every
+    /// pass) keeps its verdict while the sacred path that proved it exists,
+    /// and loses it the moment that path is gone.
+    #[test]
+    fn witnessed_verdict_survives_tree_churn_until_the_witness_disappears() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("claude-1000");
+        let witness = candidate.join("session").join("actions.db");
+        fs::create_dir_all(witness.parent().unwrap()).unwrap();
+        fs::write(&witness, b"db").unwrap();
+
+        let mut reg = ProtectionRegistry::marker_only();
+        reg.cache_witnessed_verdict(&candidate, "contains *.db".to_string(), witness.clone());
+
+        // Churn: a new entry bumps the root mtime. An unwitnessed verdict
+        // would be dropped here; this one still holds.
+        std::thread::sleep(Duration::from_millis(20));
+        fs::create_dir(candidate.join("new-session")).unwrap();
+        filetime_bump(&candidate);
+        assert_eq!(
+            reg.cached_protected_verdict(&candidate).as_deref(),
+            Some("contains *.db")
+        );
+
+        fs::remove_file(&witness).unwrap();
+        assert!(
+            reg.cached_protected_verdict(&candidate).is_none(),
+            "a verdict whose witness is gone must be re-proved"
+        );
+        assert_eq!(reg.cached_verdict_count(), 0);
+    }
+
+    /// The unwitnessed rule is unchanged: churn forces a re-proof.
+    #[test]
+    fn unwitnessed_verdict_is_still_dropped_on_tree_churn() {
+        let tmp = TempDir::new().unwrap();
+        let candidate = tmp.path().join("truncated-tree");
+        fs::create_dir_all(&candidate).unwrap();
+        let mut reg = ProtectionRegistry::marker_only();
+        reg.cache_protected_verdict(&candidate, TRUNCATED_OVERLAP_PATTERN.to_string());
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs::create_dir(candidate.join("child")).unwrap();
+        filetime_bump(&candidate);
+        assert!(reg.cached_protected_verdict(&candidate).is_none());
+    }
+
+    /// Move a directory's mtime a second forward so the churn is visible
+    /// even on filesystems with coarse timestamps.
+    fn filetime_bump(dir: &Path) {
+        let later = fs::metadata(dir).unwrap().modified().unwrap() + Duration::from_secs(1);
+        let file = fs::File::open(dir).unwrap();
+        file.set_modified(later).unwrap();
     }
 
     /// The daemon builds a new registry every pass; a verdict proved by one

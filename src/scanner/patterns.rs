@@ -217,9 +217,9 @@ pub fn classify_opaque_tree(
     // crates such as `target-triple-1.0.0` / `target-lexicon-0.13.5` unpack to
     // directories whose names satisfy the broad `target-` prefix, and a store
     // that lives under a temp-like `CARGO_HOME` would otherwise be promoted to
-    // a 0.93 `opaque-cargo-target` candidate purely on that name. The store
-    // roots themselves are excluded here so `.cargo/registry` / `.cargo/git`
-    // remain the opaque reclaim unit handled below.
+    // a 0.93 `opaque-cargo-target` candidate purely on that name. The stores
+    // themselves are excluded here: they are the opaque reclaim unit handled
+    // below (the `.cargo/registry` / `.cargo/git` roots above them are kept).
     if is_cargo_registry_internal_path(path) {
         return Some(OpaqueTreeClassification::protected(
             "cargo registry/git store content is crate source, never a build target",
@@ -313,9 +313,18 @@ pub fn classify_opaque_tree(
         ));
     }
 
-    if is_cargo_cache_root(path) {
+    // `.cargo/registry` and `.cargo/git` themselves must survive: rch's per-job
+    // CARGO_HOME symlinks them, and a removed root leaves the link dangling so
+    // every crates.io download fails with EEXIST (hz4, 2026-09-26: a release
+    // lost 33 min). Descend and reclaim the stores inside instead.
+    if is_cargo_home_store_root(path) {
+        return Some(OpaqueTreeClassification::signal_only(
+            "cargo registry/git root is kept; its stores are the reclaim unit",
+        ));
+    }
+    if is_cargo_cache_store(path) {
         return Some(OpaqueTreeClassification::candidate(
-            "cargo registry/cache root",
+            "cargo registry/git store",
             "opaque-cargo-cache",
             ArtifactCategory::CacheDir,
             0.92,
@@ -593,6 +602,22 @@ fn has_cargo_target_root_markers(path: &Path) -> bool {
     false
 }
 
+/// A directory the Claude Code harness itself runs out of.
+///
+/// That is the per-user session root `claude-<uid>` (every live session's
+/// scratchpads and background-task output) and the
+/// `claude-mcp-browser-bridge-*` bridge. The broad `claude-` prefix rule
+/// nominated both whole; on a Mac the daemon
+/// deleted the bridge and tried the session root three times (2026-09-27),
+/// stopped only by the open-file check. Artifacts inside stay reclaimable.
+#[must_use]
+pub fn is_agent_harness_dir_name(lowercase_name: &str) -> bool {
+    lowercase_name.strip_prefix("claude-").is_some_and(|rest| {
+        (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+            || rest.starts_with("mcp-browser-bridge")
+    })
+}
+
 /// True when `path` lies strictly inside one of cargo's home stores.
 ///
 /// The stores are `registry/src`, `registry/cache`, `registry/index`,
@@ -600,10 +625,10 @@ fn has_cargo_target_root_markers(path: &Path) -> bool {
 /// Everything below those directories is cargo-managed content: unpacked
 /// crate source, `.crate` archives, index clones, git checkouts. None of it
 /// is a build output, so no name pattern may nominate it and the deletion
-/// scorer vetoes it outright. The store directories themselves (and the
-/// `registry` / `git` roots above them) are deliberately NOT matched: those
-/// remain the opaque, whole-store reclaim unit (`opaque-cargo-cache` / the
-/// cleanup catalog).
+/// scorer vetoes it outright. The store directories themselves are
+/// deliberately NOT matched: they are the opaque, whole-store reclaim unit
+/// (`opaque-cargo-cache` / the cleanup catalog). The `registry` / `git`
+/// roots above them are never reclaimed (rch symlinks them).
 #[must_use]
 pub fn is_cargo_registry_internal_path(path: &Path) -> bool {
     // `ancestors()` yields `path` first; the store dir must be a STRICT
@@ -626,6 +651,31 @@ pub fn is_cargo_registry_internal_path(path: &Path) -> bool {
     })
 }
 
+/// Name-only rules for agent scratch (`cass_*`, `frankenterm-*`, `pi_agent_*`,
+/// `claude-*`, ...) describe directories an agent creates directly in a temp
+/// root. Deeper, the same names are someone's data: the fleet deleted
+/// checked-in fuzz corpora (`<clone>/fuzz/corpus/cass_import_jsonl`), backups
+/// (`/tmp/backup_repo_files/frankentui_untracked`) and rch run mirrors
+/// (`/tmp/rch-run/frankenterm-<hash>`) on name alone (2026-09-15..27).
+fn is_temp_root_scoped(pattern: &ArtifactPattern) -> bool {
+    pattern.category == ArtifactCategory::AgentWorkspace || pattern.name == "claude-session-cache"
+}
+
+/// A temp root itself (not a path inside one).
+fn is_temp_root_dir(path: &Path) -> bool {
+    [
+        "/tmp",
+        "/var/tmp",
+        "/data/tmp",
+        "/private/tmp",
+        "/private/var/tmp",
+    ]
+    .iter()
+    .any(|root| path == Path::new(root))
+        || (path.file_name().is_some_and(|name| name == "T")
+            && is_darwin_user_temp_path(&path.join("entry")))
+}
+
 fn is_tmp_like_path(path: &Path) -> bool {
     ["/tmp", "/var/tmp", "/data/tmp", "/private/tmp"]
         .iter()
@@ -633,19 +683,74 @@ fn is_tmp_like_path(path: &Path) -> bool {
             let root = Path::new(root);
             path == root || path.starts_with(root)
         })
+        || is_darwin_user_temp_path(path)
 }
 
-fn is_cargo_cache_root(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    if !matches!(name, "registry" | "git") {
+/// Anything inside a macOS per-user temp dir, `$TMPDIR` =
+/// `/var/folders/<xx>/<hash>/T` (or its `/private/var/...` spelling).
+///
+/// It is the Mac equivalent of `/tmp` for everything that honours `TMPDIR`
+/// (cargo test fixtures, build scratch), yet no temp-root list knew it, so a
+/// target there scored `Review` where the same target in `/tmp` scored
+/// `Delete` (first native macOS test run, 2026-09-25). Only `T` counts: `C`
+/// is the per-user cache dir and `0` belongs to the system.
+#[must_use]
+pub fn is_darwin_user_temp_path(path: &Path) -> bool {
+    use std::path::Component;
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
         return false;
     }
-    path.parent()
-        .and_then(Path::file_name)
+    // Only plain names after the root: a `.` or `..` could step out of the
+    // temp dir while still matching the pattern textually.
+    let names: Option<Vec<&str>> = components
+        .map(|part| match part {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect();
+    let Some(names) = names else {
+        return false;
+    };
+    let mut parts = names.into_iter();
+    let mut first = parts.next();
+    if first == Some("private") {
+        first = parts.next();
+    }
+    first == Some("var")
+        && parts.next() == Some("folders")
+        && parts.next().is_some()
+        && parts.next().is_some()
+        && parts.next() == Some("T")
+        && parts.next().is_some()
+}
+
+/// `.cargo/registry` or `.cargo/git`.
+fn is_cargo_home_store_root(path: &Path) -> bool {
+    path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|parent| parent == ".cargo")
+        .is_some_and(|name| matches!(name, "registry" | "git"))
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|parent| parent == ".cargo")
+}
+
+/// A regenerable store directly inside a cargo-home root:
+/// `.cargo/registry/{cache,src,index}` or `.cargo/git/{checkouts,db}`.
+fn is_cargo_cache_store(path: &Path) -> bool {
+    let (Some(name), Some(root)) = (
+        path.file_name().and_then(|name| name.to_str()),
+        path.parent(),
+    ) else {
+        return false;
+    };
+    is_cargo_home_store_root(root)
+        && match root.file_name().and_then(|name| name.to_str()) {
+            Some("registry") => matches!(name, "cache" | "src" | "index"),
+            Some("git") => matches!(name, "checkouts" | "db"),
+            _ => false,
+        }
 }
 
 /// On-disk kind of a detected Go toolchain cache.
@@ -837,14 +942,19 @@ impl ArtifactPatternRegistry {
             return ArtifactClassification::unknown();
         }
         let normalized = name_os.to_string_lossy().to_lowercase();
+        if is_agent_harness_dir_name(&normalized) {
+            return ArtifactClassification::unknown();
+        }
 
         let catalog_classification = cleanup_catalog_path_classification(path, cleanup_rules, home);
         let mut best = catalog_classification
             .clone()
             .unwrap_or_else(ArtifactClassification::unknown);
+        let in_temp_root = path.parent().is_some_and(is_temp_root_dir);
         for pattern in &self.builtins {
             if matches_builtin(pattern.kind, &normalized)
                 && pattern.confidence > best.name_confidence
+                && (in_temp_root || !is_temp_root_scoped(pattern))
             {
                 best = ArtifactClassification {
                     pattern_name: Cow::Borrowed(pattern.name),
@@ -1609,11 +1719,40 @@ mod tests {
         ArtifactCategory, ArtifactClassification, ArtifactPatternRegistry, CustomPattern,
         OpaqueTreeContext, OpaqueTreeDisposition, StructuralSignals, classify_opaque_tree,
         extract_pattern_label, extract_pattern_label_with_cleanup_rules,
-        has_descriptive_target_suffix, is_cargo_registry_internal_path,
+        has_descriptive_target_suffix, is_cargo_cache_store, is_cargo_registry_internal_path,
         is_obvious_build_artifact_basename, structural_score,
     };
     use crate::platform::{linux, macos};
     use std::path::Path;
+
+    #[test]
+    fn darwin_user_temp_dir_is_a_temp_root() {
+        use super::is_darwin_user_temp_path as temp;
+        for inside in [
+            "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/.tmp6ktZ0Q/proj/target",
+            "/private/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/build",
+        ] {
+            assert!(temp(Path::new(inside)), "{inside}");
+        }
+        for outside in [
+            // $TMPDIR itself is never a candidate.
+            "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T",
+            // The per-user cache dir and the system-owned dir are not temp.
+            "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/C/com.apple.x",
+            "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/0/state",
+            "/var/folders/vt/T/short",
+            "/Users/op/var/folders/vt/hash/T/lookalike",
+            // Relative, or stepping out with `..`: never a temp root.
+            "var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/rel",
+            "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/../../../../etc",
+        ] {
+            assert!(!temp(Path::new(outside)), "{outside}");
+        }
+        // The scoring side agrees: a target there is in a volatile temp root.
+        assert!(crate::scanner::scoring::is_volatile_temp_path(Path::new(
+            "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/proj/target"
+        )));
+    }
 
     fn classify_macos(
         registry: &ArtifactPatternRegistry,
@@ -1858,14 +1997,125 @@ mod tests {
             assert_eq!(opaque.classification.category, ArtifactCategory::Unknown);
         }
 
-        // The store root is still the whole-store cache candidate.
-        let root = classify_opaque_tree(
-            Path::new("/root/.cargo/registry"),
-            OpaqueTreeContext::default(),
-        )
-        .expect("registry root should be classified");
-        assert_eq!(root.disposition, OpaqueTreeDisposition::CandidateOpaque);
-        assert_eq!(root.classification.pattern_name, "opaque-cargo-cache");
+        // The roots are kept (rch symlinks them); the stores inside are the
+        // whole-store cache candidates.
+        for root in ["/root/.cargo/registry", "/home/ubuntu/.cargo/git"] {
+            let opaque = classify_opaque_tree(Path::new(root), OpaqueTreeContext::default())
+                .expect("cargo root should be classified");
+            assert_eq!(
+                opaque.disposition,
+                OpaqueTreeDisposition::SignalOnly,
+                "{root}"
+            );
+        }
+        for store in [
+            "/root/.cargo/registry/cache",
+            "/root/.cargo/registry/src",
+            "/root/.cargo/registry/index",
+            "/home/ubuntu/.cargo/git/checkouts",
+            "/home/ubuntu/.cargo/git/db",
+        ] {
+            let opaque = classify_opaque_tree(Path::new(store), OpaqueTreeContext::default())
+                .expect("cargo store should be classified");
+            assert_eq!(
+                opaque.disposition,
+                OpaqueTreeDisposition::CandidateOpaque,
+                "{store}"
+            );
+            assert_eq!(opaque.classification.pattern_name, "opaque-cargo-cache");
+        }
+        // Nor may the name classifier (the daemon pre-scan) nominate a root.
+        let names = ArtifactPatternRegistry::default();
+        for root in ["/home/ubuntu/.cargo/registry", "/home/ubuntu/.cargo/git"] {
+            let class = names.classify(Path::new(root), StructuralSignals::default());
+            assert_eq!(
+                class.category,
+                ArtifactCategory::Unknown,
+                "{root}: {class:?}"
+            );
+        }
+        // A same-named dir outside a cargo home is not a cargo store.
+        assert!(!is_cargo_cache_store(Path::new(
+            "/data/proj/registry/cache"
+        )));
+        assert!(!is_cargo_cache_store(Path::new(
+            "/root/.cargo/registry/other"
+        )));
+    }
+
+    #[test]
+    fn agent_scratch_name_rules_apply_only_directly_under_a_temp_root() {
+        let registry = ArtifactPatternRegistry::default();
+        // Real fleet deletions (2026-09-15..27) that were someone's data.
+        for path in [
+            "/data/tmp/ee_triage0924/fuzz/corpus/cass_import_jsonl",
+            "/tmp/backup_repo_files/frankentui_untracked",
+            "/tmp/backup_repo_files/cass_untracked",
+            "/tmp/rch-run/frankenterm-9bf541b87e260846",
+            "/tmp/rch-run/pi_agent_rust-61c0a642eeb896ae",
+            "/home/ubuntu/.cache/claude-cli-nodejs",
+            "/data/projects/pi_agent_rust",
+        ] {
+            let class = registry.classify(Path::new(path), StructuralSignals::default());
+            assert_eq!(
+                class.category,
+                ArtifactCategory::Unknown,
+                "{path}: {class:?}"
+            );
+        }
+        // Agent scratch created directly in a temp root is still reclaimable.
+        for (path, pattern) in [
+            ("/data/tmp/cass-self-update.lQLsJD", "cass-prefix-hyphen"),
+            (
+                "/tmp/frankenterm-guardian-socket-authority-sPJzLf",
+                "frankenterm-prefix",
+            ),
+            ("/data/tmp/pi_agent_rust_cargo", "pi-agent"),
+            ("/private/tmp/claude-idprobe.7k5d0J", "claude-session-cache"),
+            (
+                "/var/folders/vt/n2xy/T/frankentui-snapshot-1",
+                "frankentui-prefix-hyphen",
+            ),
+        ] {
+            let class = registry.classify(Path::new(path), StructuralSignals::default());
+            assert_eq!(class.pattern_name, pattern, "{path}");
+        }
+        // Artifact rules are not scoped: a cargo target deep in a clone stays one.
+        let nested_target = registry.classify(
+            Path::new("/data/tmp/some-clone/crates/cass_core_target"),
+            StructuralSignals::default(),
+        );
+        assert_eq!(nested_target.category, ArtifactCategory::RustTarget);
+    }
+
+    #[test]
+    fn claude_harness_dirs_are_never_artifacts_but_their_contents_can_be() {
+        let registry = ArtifactPatternRegistry::default();
+        for path in [
+            "/tmp/claude-501",
+            "/private/tmp/claude-501",
+            "/data/tmp/claude-1000",
+            "/tmp/claude-mcp-browser-bridge-jemanuel",
+        ] {
+            let class = registry.classify(Path::new(path), StructuralSignals::default());
+            assert_eq!(
+                class.category,
+                ArtifactCategory::Unknown,
+                "{path}: {class:?}"
+            );
+        }
+        // Agent-made scratch under the same prefix is still a cache.
+        let scratch = registry.classify(
+            Path::new("/data/tmp/claude-idprobe.7k5d0J"),
+            StructuralSignals::default(),
+        );
+        assert_eq!(scratch.pattern_name, "claude-session-cache");
+        // An artifact inside a session scratchpad is still reclaimable.
+        let pycache = registry.classify(
+            Path::new("/tmp/claude-501/-Users-x-proj/0f2c/scratchpad/__pycache__"),
+            StructuralSignals::default(),
+        );
+        assert_eq!(pycache.category, ArtifactCategory::PythonCache);
     }
 
     #[test]
@@ -2549,8 +2799,10 @@ mod tests {
             ("work-target", ArtifactCategory::RustTarget),
         ];
 
+        // Observed directly under /tmp; agent-scratch rules are scoped there.
         for (name, expected) in cases {
-            let classification = registry.classify(Path::new(name), StructuralSignals::default());
+            let path = Path::new("/tmp").join(name);
+            let classification = registry.classify(&path, StructuralSignals::default());
             assert_eq!(
                 classification.category, expected,
                 "unexpected classification for {name}"
@@ -2634,7 +2886,8 @@ mod tests {
         ];
 
         for name in cases {
-            let classification = registry.classify(Path::new(name), StructuralSignals::default());
+            let path = Path::new("/tmp").join(name);
+            let classification = registry.classify(&path, StructuralSignals::default());
             assert_ne!(
                 classification.category,
                 ArtifactCategory::Unknown,
@@ -2710,7 +2963,8 @@ mod tests {
         ];
 
         for name in cases {
-            let classification = registry.classify(Path::new(name), StructuralSignals::default());
+            let path = Path::new("/tmp").join(name);
+            let classification = registry.classify(&path, StructuralSignals::default());
             assert_eq!(
                 classification.category,
                 ArtifactCategory::AgentWorkspace,
@@ -2730,12 +2984,12 @@ mod tests {
         // names; the new `frankentui-` does not steal them.
         let registry = ArtifactPatternRegistry::default();
         let frankenterm = registry.classify(
-            Path::new("frankenterm-build-1234"),
+            Path::new("/tmp/frankenterm-build-1234"),
             StructuralSignals::default(),
         );
         assert_eq!(frankenterm.category, ArtifactCategory::AgentWorkspace);
         let frankentui = registry.classify(
-            Path::new("frankentui-codex-bd-2vr05-4"),
+            Path::new("/tmp/frankentui-codex-bd-2vr05-4"),
             StructuralSignals::default(),
         );
         assert_eq!(frankentui.category, ArtifactCategory::AgentWorkspace);

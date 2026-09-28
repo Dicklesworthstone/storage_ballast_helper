@@ -1145,6 +1145,8 @@ fn stress_ballast_lifecycle() {
     };
 
     let mut manager = BallastManager::new(ballast_dir, config).unwrap();
+    // Not a floor test: do not depend on how full the host running it is.
+    manager.set_provision_floor(0.0);
     let mut report = StressReport::new("ballast_lifecycle");
 
     // Phase 1: Provision.

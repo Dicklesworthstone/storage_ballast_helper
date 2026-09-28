@@ -733,8 +733,8 @@ impl RchTargetKind {
     /// "pooled dirs are warm caches, not short-TTL targets".
     const fn required_idle(self) -> Duration {
         match self {
-            Self::PerJob => Duration::from_hours(12),
-            Self::Pooled => Duration::from_hours(168),
+            Self::PerJob => Duration::from_hours(RCH_PER_JOB_IDLE_HOURS),
+            Self::Pooled => Duration::from_hours(RCH_POOLED_IDLE_HOURS),
         }
     }
 
@@ -754,8 +754,8 @@ impl RchTargetKind {
             return self.required_idle();
         }
         match self {
-            Self::PerJob => Duration::from_mins(30),
-            Self::Pooled => Duration::from_hours(1),
+            Self::PerJob => Duration::from_mins(RCH_PRESSURE_PER_JOB_IDLE_MINUTES),
+            Self::Pooled => Duration::from_mins(RCH_PRESSURE_POOLED_IDLE_MINUTES),
         }
     }
 
@@ -774,7 +774,19 @@ impl RchTargetKind {
 /// of Orange (about 12% free on a 1 TiB volume) and always at Red. It is
 /// still stricter than the `rch-pool-janitor` the fleet already runs safely
 /// (usage >= 80% and 60 minutes idle).
-const RCH_PRESSURE_URGENCY: f64 = 0.7;
+pub(crate) const RCH_PRESSURE_URGENCY: f64 = 0.7;
+
+/// rch's own idle floor for a per-job target dir.
+pub(crate) const RCH_PER_JOB_IDLE_HOURS: u64 = 12;
+
+/// rch's own idle floor for a pooled (warm-cache) target dir.
+pub(crate) const RCH_POOLED_IDLE_HOURS: u64 = 168;
+
+/// Per-job idle floor once urgency reaches [`RCH_PRESSURE_URGENCY`].
+pub(crate) const RCH_PRESSURE_PER_JOB_IDLE_MINUTES: u64 = 30;
+
+/// Pooled idle floor once urgency reaches [`RCH_PRESSURE_URGENCY`].
+pub(crate) const RCH_PRESSURE_POOLED_IDLE_MINUTES: u64 = 60;
 
 /// Classify a path as an rch-managed target dir by its basename.
 ///
@@ -820,7 +832,7 @@ pub fn classify_rch_target(path: &Path) -> Option<RchTargetKind> {
 const RCH_IDLE_PROBE_MAX_ENTRIES: usize = 400_000;
 
 /// Idle-probe budget once urgency reaches [`RCH_PRESSURE_URGENCY`].
-const RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE: usize = 2_000_000;
+pub(crate) const RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE: usize = 2_000_000;
 
 /// Outcome of asking "has anything in this tree been written recently?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1011,6 +1023,7 @@ fn factor_location(path: &Path) -> f64 {
         || text.starts_with("/var/tmp")
         || text.starts_with("/data/tmp")
         || text.starts_with("/dev/shm")
+        || crate::scanner::patterns::is_darwin_user_temp_path(path)
     {
         0.95
     } else if text.contains("/data/projects/") && text.contains("/.tmp_") {
@@ -1072,6 +1085,7 @@ pub fn is_volatile_temp_path(path: &Path) -> bool {
         || path.starts_with("/var/tmp")
         || path.starts_with("/data/tmp")
         || path.starts_with("/dev/shm")
+        || crate::scanner::patterns::is_darwin_user_temp_path(path)
 }
 
 fn factor_name(path: &Path, classification: &ArtifactClassification) -> f64 {

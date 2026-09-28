@@ -5,8 +5,8 @@ class Sbh < Formula
 
   depends_on :macos
 
-  # Release automation copies this skeleton into Dicklesworthstone/homebrew-sbh
-  # and replaces both placeholder checksums before opening the tap PR.
+  # `scripts/dsr_release.sh tap VERSION` renders this skeleton (version in the
+  # URLs, both placeholder checksums) and pushes it to Dicklesworthstone/homebrew-sbh.
   on_macos do
     on_arm do
       url "https://github.com/Dicklesworthstone/storage_ballast_helper/releases/download/v0.4.8/" \

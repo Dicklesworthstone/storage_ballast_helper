@@ -1516,6 +1516,32 @@ fn prescan_age(path: &Path) -> Duration {
     newest.elapsed().unwrap_or(Duration::ZERO)
 }
 
+/// Recursive allocated size of a pre-scan directory candidate.
+///
+/// The pre-scan used to plan every directory at a flat 100 MiB, so a 2 MiB
+/// `.ruff_cache` was planned and logged as 100 MiB (css 2026-09-25,
+/// `freed=104857600B observed_freed=2195456B`). This uses the walker's
+/// bounded probe and, like the walker, keeps the floor only when the probe
+/// was cut short and the remainder could be any size.
+fn prescan_dir_size(path: &Path, cross_devices: bool, cancel: &AtomicBool) -> u64 {
+    use crate::scanner::walker::{OPAQUE_CANDIDATE_SIZE_FLOOR, OPAQUE_SIZE_PROBE_BUDGET};
+    let Ok(meta) = path.symlink_metadata() else {
+        return OPAQUE_CANDIDATE_SIZE_FLOOR;
+    };
+    let probe = crate::scanner::walker::opaque_tree_probe(
+        path,
+        cross_devices,
+        crate::scanner::walker::device_id(&meta),
+        OPAQUE_SIZE_PROBE_BUDGET,
+        cancel,
+    );
+    if probe.truncated {
+        probe.allocated_bytes.max(OPAQUE_CANDIDATE_SIZE_FLOOR)
+    } else {
+        probe.allocated_bytes
+    }
+}
+
 /// Probe write used to leave `MountState::Recovery`: 4 KiB into the mount's
 /// ballast directory (or `<mount>/.sbh`), removed again on success.
 fn probe_mount_writable(mount: &Path, ballast_dir: Option<&Path>) -> bool {
@@ -1919,6 +1945,7 @@ fn is_tmp_like_path(path: &Path) -> bool {
         || text.starts_with("/data/tmp/")
         || text == "/private/tmp"
         || text.starts_with("/private/tmp/")
+        || crate::scanner::patterns::is_darwin_user_temp_path(path)
 }
 
 /// rch's bare in-tree target dirs (`.rch-target/`, `rch-target/`, plus
@@ -6376,12 +6403,35 @@ fn join_worker_with_timeout(name: &str, handle: thread::JoinHandle<()>, timeout:
 
 // ──────────────────── scanner thread ────────────────────
 
+/// What one scan pass has handed to the executor.
+#[derive(Debug, Default)]
+struct PassDispatch {
+    /// Candidates dispatched this pass (the inter-pass cooldown's signal).
+    count: usize,
+    /// Their paths. The pre-scan and the walk can nominate the same tree in
+    /// one pass; a second batch for it arrives right after the first one
+    /// deleted it, and a tree recreated in between can reuse the freed inode
+    /// and pass the identity check (e2e 2026-09-25: a rebuilt target under a
+    /// live process was deleted twice). Within a pass, no candidate at, under
+    /// or above an already dispatched path is dispatched again.
+    paths: HashSet<PathBuf>,
+}
+
 fn dispatch_top_candidates(
     scored: &mut Vec<CandidacyScore>,
     request: &ScanRequest,
     del_tx: &Sender<DeletionBatch>,
-    dispatched: &mut usize,
+    dispatched: &mut PassDispatch,
 ) -> bool {
+    // Neither a path under a dispatched tree nor one containing it: deleting
+    // an ancestor would take a subtree rebuilt since its own deletion. The
+    // ancestor waits for the next pass.
+    scored.retain(|candidate| {
+        !dispatched
+            .paths
+            .iter()
+            .any(|sent| candidate.path.starts_with(sent) || sent.starts_with(&candidate.path))
+    });
     if scored.is_empty() {
         return true;
     }
@@ -6409,6 +6459,7 @@ fn dispatch_top_candidates(
         target_bytes: request.target_bytes,
     };
     let batch_len = batch.candidates.len();
+    let batch_paths: Vec<PathBuf> = batch.candidates.iter().map(|c| c.path.clone()).collect();
 
     // Non-blocking send preserves scanner progress and avoids deadlock when
     // executor is slow. If channel is full, re-queue candidates locally so the
@@ -6419,7 +6470,8 @@ fn dispatch_top_candidates(
             // reclaim work was started this pass. Counted so the inter-pass
             // cooldown (B6) distinguishes a *productive* pass from one that
             // surfaced candidates but dispatched none (all protected/dampened).
-            *dispatched += batch_len;
+            dispatched.count += batch_len;
+            dispatched.paths.extend(batch_paths);
             true
         }
         Err(TrySendError::Full(mut deferred)) => {
@@ -6501,13 +6553,24 @@ fn daemon_protection_reason(
     }
 
     let overlaps = protection::find_sacred_overlaps(path, sacred_paths)?;
-    let reason = overlaps
-        .first()
-        .map(|overlap| format!("sacred path overlap: {}", overlap.summary()));
-    if let Some(reason) = reason.as_ref() {
-        protection.cache_protected_verdict(path, reason.clone());
+    let Some(first) = overlaps.first() else {
+        return Ok(None);
+    };
+    let reason = format!("sacred path overlap: {}", first.summary());
+    // A real find is a witness: the verdict then survives the churn of a busy
+    // protected tree (an agent's temp dir with a live `.db` or `.beads/`)
+    // instead of being re-walked on every pass. A truncated sub-walk proved
+    // nothing and keeps the mtime/TTL rule.
+    match overlaps
+        .iter()
+        .find(|overlap| overlap.pattern != protection::TRUNCATED_OVERLAP_PATTERN)
+    {
+        Some(found) => {
+            protection.cache_witnessed_verdict(path, reason.clone(), found.matched_path.clone());
+        }
+        None => protection.cache_protected_verdict(path, reason.clone()),
     }
-    Ok(reason)
+    Ok(Some(reason))
 }
 
 /// Why a replayed index record was not dispatched.
@@ -6716,6 +6779,12 @@ fn should_skip_protected_daemon_candidate(
         }
         Ok(None) => false,
         Err(err) => {
+            // A path whose protection cannot be proved is treated as
+            // protected until the verdict TTL lapses or the directory
+            // changes. Skipping is always safe; re-probing it every pass was
+            // not free (fleet 2026-09-25: a dead FUSE mount inside an rch
+            // temp dir failed with ENOTCONN and was logged on every pass).
+            protection.cache_protected_verdict(path, format!("protection check failed: {err}"));
             eprintln!(
                 "[SBH-SAFETY] {context}: protection check failed for {}; skipping candidate: {err}",
                 path.display()
@@ -7363,7 +7432,7 @@ fn scanner_thread_main(
         // pass — the signal for whether the pass made reclaim progress (drives
         // the B6 empty-pass cooldown). A pass can surface many candidates yet
         // dispatch zero when they are all protected/dampened.
-        let mut dispatched_this_pass: usize = 0;
+        let mut dispatched_this_pass = PassDispatch::default();
         let reclaim_at_pass_start = executor_config.reclaim_events();
         let mut scanner_should_exit = false;
         let mut scan_timed_out = false;
@@ -7778,6 +7847,20 @@ fn scanner_thread_main(
                     }
 
                     for candidate_path in to_score {
+                        // Each candidate's protection check can walk its tree
+                        // for sacred markers; one entry with dozens of
+                        // candidates (a repo's `.rch-tmp/.tmp*` dirs on fmd,
+                        // 2026-09-28) held a pass for 16+ minutes past its
+                        // budget. Stop like the sub-entry loops do: the entry
+                        // is retried next pass (unless it is the first), and
+                        // candidates already proved protected are cached.
+                        if let Some(stop) = limits.prescan_stop() {
+                            prescan_stop = Some(stop);
+                            if prescan_entries > 1 {
+                                *cursor = cursor_before_entry.clone();
+                            }
+                            break 'priority_roots;
+                        }
                         if should_skip_protected_daemon_candidate(
                             &mut protection,
                             &candidate_path,
@@ -7834,6 +7917,21 @@ fn scanner_thread_main(
                             excluded: false,
                         };
                         let mut score = prescan_engine.score_candidate(&input, request.urgency);
+                        // Nomination keeps the floor in the size factor; only a
+                        // directory that would be deleted pays for a real size
+                        // probe, and that measured size is what the planner
+                        // ranks and the executor reports.
+                        let measured_size = (score.decision.action
+                            == crate::scanner::scoring::DecisionAction::Delete
+                            && !score.vetoed
+                            && candidate_path.is_dir())
+                        .then(|| {
+                            prescan_dir_size(
+                                &candidate_path,
+                                current_scanner_config.cross_devices,
+                                shutdown,
+                            )
+                        });
                         if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
                             && !score.vetoed
                             && active_reference_scan.should_probe(size)
@@ -7941,6 +8039,9 @@ fn scanner_thread_main(
                                     held_by_certainty += 1;
                                 }
                             } else if !scanner_index_backoff_active {
+                                if let Some(measured) = measured_size {
+                                    score.size_bytes = measured;
+                                }
                                 priority_candidates.push(score);
                             }
                         }
@@ -8444,9 +8545,18 @@ fn scanner_thread_main(
                     score.veto_reason.as_deref().unwrap_or("-"),
                 );
             }
+            // A walked (not opaque-measured) directory carries only its
+            // immediate files' size, a lower bound: a 36 GB target dir read as
+            // ~3 KB and skipped the running-executable / mmap / open-file
+            // probes, the only guard for a binary a process is running.
+            let probe_size = if entry.metadata.is_dir && entry.opaque_tree.is_none() {
+                u64::MAX
+            } else {
+                entry.metadata.content_size_bytes
+            };
             if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
                 && !score.vetoed
-                && active_reference_scan.should_probe(entry.metadata.content_size_bytes)
+                && active_reference_scan.should_probe(probe_size)
             {
                 if has_active_reference_scan_budget(scan_deadline, active_reference_probe_budget) {
                     let open_files = open_files_joined.get_or_insert_with(|| {
@@ -8742,7 +8852,7 @@ fn scanner_thread_main(
                 ),
             });
         }
-        if dispatched_this_pass == 0 {
+        if dispatched_this_pass.count == 0 {
             if !scan_timed_out {
                 consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
             }
@@ -9168,8 +9278,23 @@ fn executor_thread_main(
         if plan.candidates.is_empty() {
             eprintln!(
                 "[SBH-EXECUTOR] plan() filtered all {pre_plan_count} approved candidates \
-                 (min_score={min_score:.2}, dry_run={dry_run})",
+                 (min_score={min_score:.2}, dry_run={dry_run}; refused: {})",
+                plan.refusal_summary(),
             );
+            // `execute` is skipped, so hand the scanner its backoff here;
+            // without it the same refusals were re-proposed every pass (css
+            // 2026-09-25: 10 of 27 batches refused whole).
+            if shared_scanner_config.read().engine == ScannerEngineMode::V2 {
+                for candidate in plan.refusals_to_back_off() {
+                    let Some(identity) = candidate.identity else {
+                        continue;
+                    };
+                    let _ = index_feedback_tx.try_send(ScannerIndexFeedback {
+                        identity: IndexedIdentity::from(identity),
+                        path: candidate.path.clone(),
+                    });
+                }
+            }
             continue;
         }
 
@@ -9331,11 +9456,14 @@ fn executor_thread_main(
             }
         } else if report.items_deleted > 0 || report.items_failed > 0 {
             eprintln!(
-                "[SBH-EXECUTOR] deleted={} failed={} skipped={} freed={}B sacred_scans={} sacred_ms={} ({:?})",
+                "[SBH-EXECUTOR] deleted={} failed={} skipped={} freed={}B observed_freed={} sacred_scans={} sacred_ms={} ({:?})",
                 report.items_deleted,
                 report.items_failed,
                 report.items_skipped,
                 report.bytes_freed,
+                report
+                    .bytes_freed_observed
+                    .map_or_else(|| "unknown".to_string(), |bytes| format!("{bytes}B")),
                 report.sacred_scans,
                 report.sacred_scan_ms,
                 report.duration,
@@ -9405,7 +9533,10 @@ fn executor_thread_main(
         // Report deletion stats back to main loop for SelfMonitor counters.
         let _ = report_tx.try_send(WorkerReport::DeletionCompleted {
             deleted: report.items_deleted as u64,
-            bytes_freed: report.bytes_freed,
+            // What the filesystem gained when every removal was measured;
+            // the scanner's estimate (a lower bound for truncated probes, or
+            // a 100 MiB floor) only when some removal could not be.
+            bytes_freed: report.bytes_freed_observed.unwrap_or(report.bytes_freed),
             failed: report.items_failed as u64,
             recovery_paths: report.recovery_paths().cloned().collect(),
             failure_alarm,
@@ -9463,6 +9594,41 @@ mod tests {
     /// The two on-disk scanner checkpoints a `scanner_thread_main` test
     /// needs: the v2 candidate index and the priority pre-scan's resume
     /// cursor.
+    /// A scratch dir outside every temp root. Inside one every recognized
+    /// artifact is `definite` by rule, which changes what a scanner test
+    /// sees; `tempfile::tempdir()` is a temp root on a Mac (`$TMPDIR`) and a
+    /// plain tempdir only on the rch workers (their `TMPDIR` is `.rch-tmp`).
+    /// The cargo target directory is neither temp nor source, unless the
+    /// build itself runs from a temp root, in which case the user cache
+    /// directory stands in.
+    fn non_temp_scratch_dir() -> tempfile::TempDir {
+        let scratch_base = [
+            std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")),
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".cache").join("sbh-test-scratch")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|base| !crate::scanner::scoring::is_volatile_temp_path(base))
+        .expect("a scratch base outside every temp root");
+        std::fs::create_dir_all(&scratch_base).unwrap();
+        tempfile::tempdir_in(&scratch_base).unwrap()
+    }
+
+    /// The `CACHEDIR.TAG` cargo writes into every target dir. Without it a
+    /// fixture target has no structural evidence, and whether it scores
+    /// `Delete` or `Review` then depends on where the test runs (it passed on
+    /// the rch workers and failed natively on Linux and macOS, 2026-09-25).
+    fn write_cargo_cachedir_tag(target: &Path) {
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n\
+             # This file is a cache directory tag created by cargo.\n",
+        )
+        .unwrap();
+    }
+
     fn scanner_state_paths(dir: &Path) -> (PathBuf, PathBuf) {
         (
             dir.join("scanner-index-v2.json"),
@@ -9712,6 +9878,124 @@ mod tests {
         assert_eq!(clear.interval, requested);
         assert_eq!(clear.reason, None);
         assert!(clear.stage_changed);
+    }
+
+    /// A small complete tree is planned at its measured size, not the 100 MiB
+    /// floor the pre-scan used to apply to every directory.
+    #[test]
+    fn prescan_measures_small_directory_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join(".ruff_cache");
+        std::fs::create_dir_all(cache.join("0.6")).unwrap();
+        std::fs::write(cache.join("0.6").join("blob"), vec![7u8; 2 * 1_048_576]).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        let size = prescan_dir_size(&cache, false, &cancel);
+
+        assert!(size >= 2 * 1_048_576, "{size}");
+        assert!(
+            size < crate::scanner::walker::OPAQUE_CANDIDATE_SIZE_FLOOR,
+            "a complete 2 MiB tree must not be floored to 100 MiB: {size}"
+        );
+    }
+
+    /// css 2026-09-25: busy agent temp dirs holding a live `.db` were re-walked
+    /// on every pass because each pass changed their mtime. The daemon now
+    /// caches the find itself as the witness, so churn does not force a
+    /// re-walk while the `.db` is still there.
+    #[test]
+    fn found_sacred_path_keeps_a_busy_tree_protected_without_rewalking() {
+        let temp = tempfile::tempdir().unwrap();
+        let candidate = temp.path().join("claude-1000");
+        let db = candidate.join("lh").join("router").join("actions.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"db").unwrap();
+        // The built-in `*.db` stowaway marker, as in the css log.
+        let sacred = vec![crate::platform::types::SacredPath {
+            pattern: "*.db".to_string(),
+            kind: crate::platform::types::SacredPathKind::StowawayMarker,
+            reason: "Database files commonly hold application or project state.".to_string(),
+            source: crate::platform::types::SacredPathSource::Builtin,
+        }];
+        let mut registry = ProtectionRegistry::marker_only();
+
+        let reason = daemon_protection_reason(&mut registry, &candidate, &sacred)
+            .unwrap()
+            .expect("a *.db inside must protect the tree");
+        assert!(reason.contains("actions.db"), "{reason}");
+
+        std::fs::create_dir(candidate.join("new-session")).unwrap();
+        let later =
+            std::fs::metadata(&candidate).unwrap().modified().unwrap() + Duration::from_secs(1);
+        std::fs::File::open(&candidate)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(
+            registry.cached_protected_verdict(&candidate).as_deref(),
+            Some(reason.as_str()),
+            "churn must not drop a verdict whose witness still exists"
+        );
+
+        std::fs::remove_file(&db).unwrap();
+        assert!(registry.cached_protected_verdict(&candidate).is_none());
+        assert_eq!(
+            daemon_protection_reason(&mut registry, &candidate, &sacred).unwrap(),
+            None,
+            "with the .db gone the tree is re-proved and is no longer protected"
+        );
+    }
+
+    /// A candidate whose protection cannot be proved is skipped, and stays
+    /// skipped on later passes without being re-probed and re-logged.
+    #[test]
+    fn unprovable_candidate_is_remembered_as_protected() {
+        let temp = tempfile::tempdir().unwrap();
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: temp.path().join("activity.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 64,
+            run_id: None,
+        })
+        .unwrap();
+        // A path through a regular file: the marker probe fails with ENOTDIR,
+        // which is neither "absent" nor "protected".
+        let file = temp.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let candidate = file.join("target");
+        let mut registry = ProtectionRegistry::marker_only();
+
+        assert!(daemon_protection_reason(&mut registry, &candidate, &[]).is_err());
+        assert!(should_skip_protected_daemon_candidate(
+            &mut registry,
+            &candidate,
+            &[],
+            &logger,
+            "test"
+        ));
+        let cached = registry.cached_protected_verdict(&candidate);
+        assert!(
+            cached
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("protection check failed")),
+            "{cached:?}"
+        );
+        assert!(should_skip_protected_daemon_candidate(
+            &mut registry,
+            &candidate,
+            &[],
+            &logger,
+            "test"
+        ));
+
+        logger.shutdown();
+        logger_join.join().unwrap();
     }
 
     #[test]
@@ -10065,6 +10349,7 @@ mod tests {
             let debug = repo.join("target").join("debug");
             std::fs::create_dir_all(debug.join("deps")).unwrap();
             std::fs::write(debug.join("artifact.o"), b"mock object file").unwrap();
+            write_cargo_cachedir_tag(&repo.join("target"));
         }
 
         let mut config = Config::default();
@@ -10139,10 +10424,14 @@ mod tests {
             &Arc::new(SharedRegret::new(&Config::default())),
         );
 
-        let mut prescan_paths: Vec<PathBuf> = Vec::new();
-        while let Ok(batch) = del_rx.try_recv() {
-            prescan_paths.extend(batch.candidates.into_iter().map(|c| c.path));
-        }
+        // The pre-scan's batch is dispatched first. The walk may follow with
+        // its own: on macOS the FSEvents startup replan marks the roots dirty
+        // and the walk reconciles everything, the cursor's prefix included.
+        let prescan_paths: Vec<PathBuf> = del_rx
+            .try_recv()
+            .map(|batch| batch.candidates.into_iter().map(|c| c.path).collect())
+            .unwrap_or_default();
+        while del_rx.try_recv().is_ok() {}
         assert!(
             !prescan_paths.is_empty(),
             "the resumed pre-scan must still find the targets after the cursor"
@@ -10189,6 +10478,7 @@ mod tests {
             let debug = repo.join("target").join("debug");
             std::fs::create_dir_all(debug.join("deps")).unwrap();
             std::fs::write(debug.join("artifact.o"), b"mock object file").unwrap();
+            write_cargo_cachedir_tag(&repo.join("target"));
         }
 
         let mut config = Config::default();
@@ -10300,25 +10590,45 @@ mod tests {
         assert!(second_candidates > 0, "the second pass must also find work");
         match after_first.position() {
             (_, Some(resume_point)) => {
-                // Pass 1 was truncated: pass 2 picks up strictly after it.
-                assert!(
-                    second_dispatched
-                        .iter()
-                        .all(|path| path.as_path() > resume_point),
-                    "pass 2 must not re-examine ground pass 1 already covered \
-                     (resume point {}): {second_dispatched:?}",
-                    resume_point.display()
-                );
-                assert_ne!(
-                    after_first, after_second,
-                    "two consecutive passes must make progress"
-                );
+                // Pass 1 was truncated: pass 2's pre-scan picks up strictly
+                // after it, so its own cursor ends further on (or wraps once
+                // the root is done). A pre-scan restarting from the first
+                // entry would stop at or before the old resume point again.
+                // Pass 2 may still dispatch earlier targets: pass 1's walk
+                // indexed the whole root, and the index replay re-offers the
+                // targets nothing has deleted, ahead of the pre-scan's batch.
+                // The exact no-restart contract is pinned deterministically by
+                // `prescan_resumes_from_the_persisted_cursor_instead_of_restarting`.
+                let resume_point = resume_point.to_path_buf();
+                match after_second.position() {
+                    (_, Some(second_point)) => assert!(
+                        second_point > resume_point.as_path(),
+                        "pass 2 must resume after pass 1 ({}), not restart: stopped at {}",
+                        resume_point.display(),
+                        second_point.display()
+                    ),
+                    (second_root, None) => assert_eq!(second_root, Some(root.as_path())),
+                }
+                if resume_point.as_path() < root.join("repo-0599").as_path() {
+                    assert!(
+                        second_dispatched
+                            .iter()
+                            .any(|path| path.as_path() > resume_point.as_path()),
+                        "pass 2 must dispatch targets beyond pass 1's resume point ({}): \
+                         {second_dispatched:?}",
+                        resume_point.display()
+                    );
+                }
             }
             (root_after, None) => {
                 // Pass 1 covered the whole root: it must have found every
                 // target, and the cursor wrapped back to the root's start.
+                // On macOS the FSEvents startup replan marks the root dirty,
+                // so the walk reconciles after the pre-scan and counts each
+                // target again (README "What feeds the index").
+                let expected = if cfg!(target_os = "macos") { 1200 } else { 600 };
                 assert_eq!(
-                    first_candidates, 600,
+                    first_candidates, expected,
                     "a completed pre-scan finds every target"
                 );
                 assert_eq!(root_after, Some(root.as_path()));
@@ -10327,6 +10637,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one end-to-end scanner pass
     fn scanner_prescan_discovers_target_in_repo_with_beads_tracker() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("scan-root");
@@ -10432,6 +10743,17 @@ mod tests {
                 .iter()
                 .any(|c| c.path == repo || c.path == beads_dir),
             "batch must never contain repo root or .beads dir"
+        );
+        // The dispatched size is measured, not the 100 MiB nomination floor.
+        let target = batch
+            .candidates
+            .iter()
+            .find(|c| c.path == target_dir)
+            .unwrap();
+        assert!(
+            target.size_bytes < crate::scanner::walker::OPAQUE_CANDIDATE_SIZE_FLOOR,
+            "a near-empty target must be planned at its real size: {}",
+            target.size_bytes
         );
 
         logger.shutdown();
@@ -10770,23 +11092,7 @@ mod tests {
             }
         }
 
-        // Not under a temp root: inside one every recognized artifact is
-        // `definite` by rule, which is the opposite of what this test needs.
-        // The cargo target directory is neither temp nor source, unless the
-        // build itself runs from a temp root (a scratch worktree, a remote
-        // worker), in which case the user cache directory stands in.
-        let scratch_base = [
-            std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
-            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")),
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".cache").join("sbh-test-scratch")),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|base| !crate::scanner::scoring::is_volatile_temp_path(base))
-        .expect("a scratch base outside every temp root");
-        std::fs::create_dir_all(&scratch_base).unwrap();
-        let temp = tempfile::tempdir_in(&scratch_base).unwrap();
+        let temp = non_temp_scratch_dir();
         let root = temp.path().join("scan-root");
         // `node_modules` beside a package manifest is an opaque candidate whose
         // certainty is `unclear` outside a temp root: no structural marker can
@@ -10909,11 +11215,17 @@ mod tests {
             1,
             "index-cargo.json",
         );
-        assert!(
-            replayed_target.log.contains("replayed_records=1"),
-            "the second pass replays the persisted record: {}",
-            replayed_target.log
-        );
+        // On macOS the FSEvents backend's startup replan marks the roots
+        // dirty, so a fresh daemon reconciles instead of replaying (by
+        // design, see README "What feeds the index"); the certainty
+        // assertions below hold either way.
+        if cfg!(target_os = "linux") {
+            assert!(
+                replayed_target.log.contains("replayed_records=1"),
+                "the second pass replays the persisted record: {}",
+                replayed_target.log
+            );
+        }
         assert!(
             replayed_target.dispatched,
             "the replayed target keeps its definite certainty and is dispatched again: {}",
@@ -11548,7 +11860,7 @@ mod tests {
             &mut scored,
             &request,
             &del_tx,
-            &mut 0usize
+            &mut PassDispatch::default()
         ));
         assert!(
             scored.is_empty(),
@@ -12882,7 +13194,7 @@ mod tests {
             &mut scored,
             &request,
             &del_tx,
-            &mut 0usize
+            &mut PassDispatch::default()
         ));
         let batch = del_rx.recv().expect("batch should be dispatched");
         assert_eq!(batch.candidates.len(), 1);
@@ -12922,7 +13234,7 @@ mod tests {
             &mut scored,
             &request,
             &del_tx,
-            &mut 0usize
+            &mut PassDispatch::default()
         ));
 
         // Channel remained full, so scanner should still retain all candidates.
@@ -12933,6 +13245,68 @@ mod tests {
         // Existing queued batch should still be the one currently in the channel.
         let queued = del_rx.recv().expect("prefilled batch still queued");
         assert_eq!(queued.candidates[0].path, Path::new("/tmp/already-queued"));
+    }
+
+    /// The pre-scan and the walk nominated the same target in one pass; the
+    /// second batch deleted the tree a build had just recreated (the freed
+    /// inode was reused, so the identity check passed). A path, or anything
+    /// under it, is dispatched at most once per pass.
+    #[test]
+    fn a_pass_never_dispatches_the_same_tree_twice() {
+        let request = ScanRequest {
+            paths: vec![PathBuf::from("/tmp")],
+            urgency: 0.9,
+            pressure_level: PressureLevel::Orange,
+            free_pct: None,
+            max_delete_batch: 10,
+            force_full_scan: false,
+            config_update: None,
+            catalog_roots: Vec::new(),
+            maintenance: false,
+            target_bytes: None,
+        };
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(4);
+        let mut pass = PassDispatch::default();
+
+        let mut prescan = vec![test_candidate("/tmp/proj/target", 0.9)];
+        assert!(dispatch_top_candidates(
+            &mut prescan,
+            &request,
+            &del_tx,
+            &mut pass
+        ));
+        assert_eq!(del_rx.try_recv().unwrap().candidates.len(), 1);
+
+        let mut walk = vec![
+            test_candidate("/tmp/proj/target", 0.9),
+            test_candidate("/tmp/proj/target/debug", 0.8),
+            test_candidate("/tmp/other/target", 0.7),
+        ];
+        assert!(dispatch_top_candidates(
+            &mut walk, &request, &del_tx, &mut pass
+        ));
+        let second = del_rx.try_recv().unwrap();
+        let paths: Vec<_> = second.candidates.iter().map(|c| c.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("/tmp/other/target")]);
+
+        // Nor an ancestor of a dispatched tree: deleting `/tmp/other` would
+        // take whatever was rebuilt in `/tmp/other/target` since.
+        let mut ancestor = vec![test_candidate("/tmp/other", 0.9)];
+        assert!(dispatch_top_candidates(
+            &mut ancestor,
+            &request,
+            &del_tx,
+            &mut pass
+        ));
+        assert!(del_rx.try_recv().is_err());
+        assert_eq!(pass.count, 2);
+
+        // Nothing new: no batch at all.
+        let mut again = vec![test_candidate("/tmp/proj/target", 0.9)];
+        assert!(dispatch_top_candidates(
+            &mut again, &request, &del_tx, &mut pass
+        ));
+        assert!(del_rx.try_recv().is_err());
     }
 
     #[test]

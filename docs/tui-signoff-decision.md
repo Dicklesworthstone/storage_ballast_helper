@@ -156,7 +156,7 @@ All rollback paths verified. Kill switch takes priority at all levels.
 
 | Item | Status | Evidence |
 | --- | --- | --- |
-| CI pipeline updated | DONE | `.github/workflows/ci.yml` includes `dashboard` job |
+| CI pipeline updated | DONE | the CI workflow included a `dashboard` job (sbh retired GitHub Actions on 2026-09-25; `scripts/quality-gate.sh` runs the dashboard stages) |
 | Quality-gate script | DONE | `scripts/quality-gate.sh` (20 stages, JSON reporting) |
 | Runbook documented | DONE | `docs/quality-gate-runbook.md` |
 | README updated | DONE | Dashboard section, keybindings, incident triage (dc53984) |

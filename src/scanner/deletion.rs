@@ -151,6 +151,113 @@ pub struct DeletionPlan {
     pub refused: Vec<(CandidacyScore, SkipReason)>,
 }
 
+impl DeletionPlan {
+    /// Refused candidates that must be backed off, by the same rule
+    /// `execute` applies. A caller that skips `execute` because nothing was
+    /// admitted still owes the scanner this feedback; otherwise the same
+    /// refusals come back every pass.
+    #[must_use]
+    pub fn refusals_to_back_off(&self) -> Vec<&CandidacyScore> {
+        self.refused
+            .iter()
+            .filter(|(_, reason)| should_backoff_skip(*reason))
+            .map(|(candidate, _)| candidate)
+            .collect()
+    }
+
+    /// Refusal counts by reason, most frequent first: `vetoed×7, below_threshold×2`.
+    #[must_use]
+    pub fn refusal_summary(&self) -> String {
+        let mut counts: Vec<(&'static str, usize)> = Vec::new();
+        for (_, reason) in &self.refused {
+            match counts
+                .iter_mut()
+                .find(|(label, _)| *label == reason.as_str())
+            {
+                Some((_, n)) => *n += 1,
+                None => counts.push((reason.as_str(), 1)),
+            }
+        }
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        counts
+            .iter()
+            .map(|(label, n)| format!("{label}\u{00d7}{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// How long one complete open-file sweep may serve later batches, measured
+/// from when it *started*.
+///
+/// The sweep walks every process's `/proc/*/fd` and does not depend on the
+/// batch's candidates; on a host with thousands of agent processes under
+/// `CPUQuota=10%` it took most of each batch's 12-25 s, and 74% of batches
+/// start the moment the previous one ends (css, 2026-09-25). A single sweep
+/// already takes over 10 s there, so a 20 s window roughly doubles the
+/// staleness a batch already accepted, and a batch whose candidate root
+/// changed after the sweep started always gets a fresh sweep.
+pub const OPEN_SWEEP_REUSE_WINDOW: Duration = Duration::from_secs(20);
+
+/// Whether a complete sweep that started `age` ago (wall clock
+/// `started_wall`) may serve a batch whose candidate roots have the given
+/// mtimes. A root that changed after the sweep began, or whose mtime cannot
+/// be read, forces a fresh sweep: a rebuild writing into a target shows up
+/// there first.
+#[cfg(any(target_os = "linux", test))]
+fn open_sweep_reusable(
+    age: Duration,
+    started_wall: std::time::SystemTime,
+    mut root_mtimes: impl Iterator<Item = Option<std::time::SystemTime>>,
+) -> bool {
+    age < OPEN_SWEEP_REUSE_WINDOW
+        && root_mtimes.all(|mtime| mtime.is_some_and(|mtime| mtime < started_wall))
+}
+
+#[cfg(target_os = "linux")]
+struct OpenSweep {
+    started: Instant,
+    started_wall: std::time::SystemTime,
+    targets: Arc<Vec<PathBuf>>,
+}
+
+/// The last complete sweep; one executor thread uses it per process.
+#[cfg(target_os = "linux")]
+static LAST_OPEN_SWEEP: std::sync::Mutex<Option<OpenSweep>> = std::sync::Mutex::new(None);
+
+/// Open file targets for a batch over `roots`: the last complete sweep when
+/// [`open_sweep_reusable`] allows it, otherwise a fresh one.
+#[cfg(target_os = "linux")]
+fn open_targets_for_batch(roots: &[PathBuf]) -> (Arc<Vec<PathBuf>>, bool) {
+    let lock = || {
+        LAST_OPEN_SWEEP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let reusable = lock().as_ref().and_then(|sweep| {
+        let mtimes = roots.iter().map(|root| {
+            fs::symlink_metadata(root)
+                .and_then(|meta| meta.modified())
+                .ok()
+        });
+        open_sweep_reusable(sweep.started.elapsed(), sweep.started_wall, mtimes)
+            .then(|| Arc::clone(&sweep.targets))
+    });
+    if let Some(targets) = reusable {
+        return (targets, true);
+    }
+    let started = Instant::now();
+    let started_wall = std::time::SystemTime::now();
+    let (targets, complete) = walker::collect_open_file_targets_linux();
+    let targets = Arc::new(targets);
+    *lock() = complete.then(|| OpenSweep {
+        started,
+        started_wall,
+        targets: Arc::clone(&targets),
+    });
+    (targets, complete)
+}
+
 /// Summary after a deletion batch completes.
 #[derive(Debug, Clone)]
 pub struct DeletionReport {
@@ -160,8 +267,15 @@ pub struct DeletionReport {
     pub items_skipped: usize,
     /// Paths that passed all safety checks and would have been removed in dry-run mode.
     pub items_would_delete: usize,
-    /// Bytes actually reclaimed from the filesystem.
+    /// Sum of the removed candidates' sizes as the scanner estimated them
+    /// (a lower bound where a size probe was truncated).
     pub bytes_freed: u64,
+    /// Free space the filesystem actually gained across the unlinks, each
+    /// measured (`statvfs` on the parent) just before and after its removal.
+    /// Concurrent writers make it approximate, and on APFS a local snapshot
+    /// holding the blocks correctly shows 0. `None` when any removal could
+    /// not be measured, so a partial sum never poses as the whole.
+    pub bytes_freed_observed: Option<u64>,
     /// Bytes that would have been reclaimed in dry-run mode.
     pub bytes_would_free: u64,
     pub duration: Duration,
@@ -608,6 +722,7 @@ impl DeletionExecutor {
             items_skipped: 0,
             items_would_delete: 0,
             bytes_freed: 0,
+            bytes_freed_observed: Some(0),
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -648,7 +763,20 @@ impl DeletionExecutor {
                 .map(|candidate| candidate.path.clone())
                 .collect::<Vec<_>>();
             let (paths, complete) = self.platform.as_ref().map_or_else(
-                || walker::collect_open_path_ancestors(&roots),
+                || {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let (targets, complete) = open_targets_for_batch(&roots);
+                        (
+                            walker::open_path_ancestors_for_roots(&targets, &roots),
+                            complete,
+                        )
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        walker::collect_open_path_ancestors(&roots)
+                    }
+                },
                 |platform| {
                     walker::collect_open_path_ancestors_with_platform(platform.as_ref(), &roots)
                 },
@@ -765,6 +893,9 @@ impl DeletionExecutor {
             // Actual deletion, or quarantine (Layer 7). Quarantine has no
             // successful-unlink outcome: failure cannot widen this plan.
             let del_start = Instant::now();
+            let free_before = (plan.mode == DeletionMode::Unlink)
+                .then(|| available_bytes_beside(&candidate.path))
+                .flatten();
             let outcome = match plan.mode {
                 DeletionMode::Unlink => self.delete_path(candidate).map(|()| false),
                 DeletionMode::Quarantine => self.quarantine_path(candidate).map(|()| true),
@@ -783,6 +914,13 @@ impl DeletionExecutor {
                     } else {
                         report.bytes_freed =
                             report.bytes_freed.saturating_add(candidate.size_bytes);
+                        let gained = free_before
+                            .zip(available_bytes_beside(&candidate.path))
+                            .map(|(before, after)| after.saturating_sub(before));
+                        report.bytes_freed_observed = report
+                            .bytes_freed_observed
+                            .zip(gained)
+                            .map(|(sum, bytes)| sum.saturating_add(bytes));
                     }
                     consecutive_failures = 0;
 
@@ -1303,6 +1441,20 @@ fn classification_allows_force_remove(c: &ArtifactClassification) -> bool {
     )
 }
 
+/// Bytes available to unprivileged users on the filesystem holding `path`,
+/// read from its parent (which outlives the removal). `None` when it cannot
+/// be read.
+fn available_bytes_beside(path: &Path) -> Option<u64> {
+    let stat = nix::sys::statvfs::statvfs(path.parent()?).ok()?;
+    // The field types differ by platform (u32 or u64); widen losslessly.
+    #[allow(clippy::useless_conversion)]
+    let (blocks, fragment) = (
+        u64::from(stat.blocks_available()),
+        u64::from(stat.fragment_size()),
+    );
+    Some(blocks.saturating_mul(fragment))
+}
+
 /// `fs::remove_dir_all` that defeats read-only directory/file permission bits.
 ///
 /// Standard `remove_dir_all` cannot unlink an entry inside a `0555` directory —
@@ -1733,6 +1885,35 @@ mod tests {
         assert_eq!(plan.total_reclaimable_bytes, 0);
     }
 
+    /// An all-refused plan never reaches `execute`, so the caller reads the
+    /// backoff and the reasons from the plan itself.
+    #[test]
+    fn refused_plan_names_its_reasons_and_what_to_back_off() {
+        let dir = scratch_dir();
+        let review = make_review_candidate(&dir.path().join("ambiguous"), 4096, 0.85);
+        let mut low = make_candidate(&dir.path().join("low"), 4096, 0.10);
+        low.decision.action = DecisionAction::Delete;
+        let mut vetoed = make_candidate(&dir.path().join("vetoed"), 4096, 0.90);
+        vetoed.vetoed = true;
+
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let plan = executor.plan(vec![review, low, vetoed]);
+
+        assert!(plan.candidates.is_empty());
+        assert_eq!(
+            plan.refusal_summary(),
+            "vetoed\u{00d7}2, below_threshold\u{00d7}1"
+        );
+        let backed_off: Vec<_> = plan
+            .refusals_to_back_off()
+            .iter()
+            .map(|c| c.path.file_name().unwrap().to_owned())
+            .collect();
+        // A below-threshold score can rise with pressure: it is not backed off.
+        assert_eq!(backed_off.len(), 2, "{backed_off:?}");
+        assert!(!backed_off.iter().any(|name| name == "low"));
+    }
+
     #[test]
     fn emergency_plan_includes_review_and_orders_delete_first() {
         let dir = scratch_dir();
@@ -1912,6 +2093,7 @@ mod tests {
             items_skipped: 0,
             items_would_delete: 0,
             bytes_freed: 0,
+            bytes_freed_observed: None,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -1987,6 +2169,7 @@ mod tests {
             items_skipped: 0,
             items_would_delete: 0,
             bytes_freed: 0,
+            bytes_freed_observed: None,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -2067,6 +2250,70 @@ mod tests {
         assert_eq!(report.items_failed, 0);
         assert!(!file_path.exists());
         assert!(!dir_path.exists());
+    }
+
+    /// `bytes_freed` stays the scanner's estimate; `bytes_freed_observed` is
+    /// what the filesystem actually gained. A 64 MiB file under a fictional
+    /// 100 MiB estimate (the old truncated-probe floor) must be measured, not
+    /// echoed. The bound is loose because other writers share the volume.
+    #[test]
+    fn observed_freed_bytes_are_measured_not_estimated() {
+        let dir = scratch_dir();
+        let blob = dir.path().join("blob.bin");
+        let mut file = fs::File::create(&blob).unwrap();
+        std::io::Write::write_all(&mut file, &vec![0x5a_u8; 64 * 1024 * 1024]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let estimate = 100 * 1024 * 1024;
+        let report = executor.execute(
+            &executor.plan(vec![make_candidate(&blob, estimate, 0.9)]),
+            None,
+        );
+        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.bytes_freed, estimate);
+        let observed = report
+            .bytes_freed_observed
+            .expect("an unlink on a local volume is measured");
+        assert!(
+            observed >= 16 * 1024 * 1024,
+            "removing 64 MiB should free most of it, observed {observed}"
+        );
+        assert_ne!(observed, estimate);
+    }
+
+    /// A quarantine rename frees nothing, and is not counted as freed.
+    #[test]
+    fn quarantine_rename_is_not_observed_as_freed() {
+        let dir = scratch_dir();
+        let root = dir.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(target.join("debug")).unwrap();
+        fs::write(target.join("debug/lib.rlib"), vec![1u8; 1024 * 1024]).unwrap();
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                require_identity: true,
+                check_open_files: false,
+                mode: DeletionMode::Quarantine,
+                quarantine_roots: vec![root],
+                ..Default::default()
+            },
+            None,
+        );
+        let report = executor.execute(
+            &executor.plan(vec![make_identity_candidate(&target, 1024 * 1024, 0.9)]),
+            None,
+        );
+        assert_eq!(report.items_quarantined, 1);
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(report.bytes_freed_observed, Some(0));
     }
 
     #[test]
@@ -3549,6 +3796,87 @@ mod tests {
             "candidate must be attributed to SkipReason::OpenScanIncomplete"
         );
         assert!(target_dir.exists(), "candidate must not be deleted");
+    }
+
+    #[test]
+    fn open_sweep_reuse_needs_a_young_sweep_and_unchanged_roots() {
+        use std::time::SystemTime;
+        let started = SystemTime::now();
+        let before = started - Duration::from_secs(60);
+        let after = started + Duration::from_secs(1);
+        let young = Duration::from_secs(5);
+
+        assert!(open_sweep_reusable(
+            young,
+            started,
+            [Some(before)].into_iter()
+        ));
+        assert!(!open_sweep_reusable(
+            OPEN_SWEEP_REUSE_WINDOW,
+            started,
+            [Some(before)].into_iter()
+        ));
+        // A root that changed after the sweep began, or whose mtime cannot
+        // be read, forces a fresh sweep.
+        assert!(!open_sweep_reusable(
+            young,
+            started,
+            [Some(before), Some(after)].into_iter()
+        ));
+        assert!(!open_sweep_reusable(
+            young,
+            started,
+            [Some(before), None].into_iter()
+        ));
+    }
+
+    /// A sweep taken for one batch is not reused for a candidate whose root
+    /// changed afterwards: a file opened there after the sweep still vetoes
+    /// the deletion.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_opened_after_the_last_sweep_still_blocks_deletion() {
+        let dir = scratch_dir();
+        let first = dir.path().join("first").join("target");
+        let second = dir.path().join("second").join("target");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("a.o"), b"object").unwrap();
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: true,
+                dry_run: false,
+                ..Default::default()
+            },
+            None,
+        );
+
+        // Batch 1 takes (or reuses) a sweep and deletes `first`.
+        let report = executor.execute(&executor.plan(vec![make_candidate(&first, 6, 0.95)]), None);
+        assert_eq!(report.items_deleted, 1, "{report:?}");
+
+        // A build starts in `second` after that sweep: its root changes and
+        // a file under it is held open by this process.
+        std::thread::sleep(Duration::from_millis(20));
+        let live = second.join("build.lock");
+        fs::write(&live, b"lock").unwrap();
+        let handle = fs::File::open(&live).unwrap();
+        let (visible, _) = walker::collect_open_path_ancestors(std::slice::from_ref(&second));
+        if !visible.contains(&live) {
+            // /proc hides our own fds here (hidepid, containers): nothing to prove.
+            drop(handle);
+            return;
+        }
+
+        let report = executor.execute(&executor.plan(vec![make_candidate(&second, 4, 0.95)]), None);
+        assert_eq!(report.items_deleted, 0, "{report:?}");
+        assert_eq!(
+            report.skipped_by_reason.get("file_open"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert!(second.exists());
+        drop(handle);
     }
 
     #[test]

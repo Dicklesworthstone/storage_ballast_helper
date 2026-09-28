@@ -399,6 +399,7 @@ impl BallastPoolCoordinator {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let legacy_dirs =
             stranded::legacy_dirs(watched_paths, configured_ballast_dir, home.as_deref());
+        let service_dir = crate::core::config::installed_service_ballast_dir();
 
         // Deduplicate watched paths by mount point.
         let mut seen_mounts = HashMap::<PathBuf, MountPoint>::new();
@@ -493,6 +494,7 @@ impl BallastPoolCoordinator {
                 mount_path,
                 &aliases,
                 &resolved_dir,
+                service_dir.as_deref(),
                 &legacy_dirs,
                 platform,
                 &mounts,
@@ -813,14 +815,25 @@ fn record_folded_mounts(
 /// Conventional reserve locations that are actually on this pool's writable
 /// filesystem. Discovery subsequently deduplicates directory inode aliases and
 /// excludes any alias of the managed directory itself.
+/// `service_dir` is the installed service's configured pool (see
+/// `installed_service_ballast_dir` for which service that is): it is live,
+/// so it is never stranded, even when this process runs with another config.
 fn stranded_pool_dirs(
     mount_path: &Path,
     aliases: &HashMap<PathBuf, PathBuf>,
     resolved_dir: &Path,
+    service_dir: Option<&Path>,
     legacy_dirs: &[PathBuf],
     platform: &dyn Platform,
     mounts: &[MountPoint],
 ) -> Vec<PathBuf> {
+    let same_dir = |a: &Path, b: &Path| {
+        a == b
+            || matches!(
+                (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+                (Ok(a), Ok(b)) if a == b
+            )
+    };
     let mut dirs: Vec<PathBuf> = std::iter::once(mount_path)
         .chain(
             aliases
@@ -831,6 +844,7 @@ fn stranded_pool_dirs(
         .map(|root| root.join(BALLAST_SUBDIR))
         .chain(legacy_dirs.iter().cloned())
         .filter(|dir| dir != resolved_dir)
+        .filter(|dir| !service_dir.is_some_and(|live| same_dir(dir, live)))
         .filter(|dir| same_pool_filesystem(dir, mount_path, aliases, platform, mounts))
         .collect();
     dirs.sort();
@@ -1442,6 +1456,7 @@ mod tests {
 
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
 
         // Release 2 files from volume A only.
@@ -1488,6 +1503,7 @@ mod tests {
 
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
 
         // 3 files per volume * 2 volumes * (4096 + 4096) bytes each
@@ -1515,6 +1531,7 @@ mod tests {
         let watched = vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()];
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
 
         // Volume A: 2 files, Volume B: 3 files (default)
@@ -1536,6 +1553,7 @@ mod tests {
 
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
 
         let reports = coordinator.verify_all();
@@ -1557,6 +1575,7 @@ mod tests {
 
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
 
         // Release all from volume A.
@@ -1599,6 +1618,7 @@ mod tests {
 
         let mut coordinator =
             BallastPoolCoordinator::discover(&config, &watched, &platform).unwrap();
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
 
         let inv = coordinator.inventory();
@@ -1680,6 +1700,52 @@ mod tests {
         }
     }
 
+    /// The installed service's own pool is live: a process with another
+    /// config (a CLI or a test daemon) must not adopt it as a
+    /// stranded reserve, by its literal path or a symlinked spelling. Other
+    /// legacy pools are still adopted. (rch worker 2026-09-25: a test daemon
+    /// running as root adopted the production daemon's 10 GiB pool.)
+    #[cfg(unix)]
+    #[test]
+    fn the_installed_services_pool_is_never_stranded() {
+        let mount = tempfile::tempdir().unwrap();
+        let live = mount.path().join("root-home/.local/share/sbh/ballast");
+        let former = mount.path().join("old-user/.local/share/sbh/ballast");
+        fs::create_dir_all(&live).unwrap();
+        fs::create_dir_all(&former).unwrap();
+        let live_alias = mount.path().join("live-link");
+        std::os::unix::fs::symlink(&live, &live_alias).unwrap();
+        let resolved = mount.path().join("test-daemon/ballast");
+        let platform = MockPlatform::new(
+            vec![mock_mount(mount.path(), "/dev/sda1")],
+            HashMap::from([(mount.path().to_path_buf(), mock_stats(mount.path(), false))]),
+            mock_memory(),
+            PlatformPaths::default(),
+        );
+        let mounts = platform.mount_points().unwrap();
+        let legacy = vec![live.clone(), former.clone()];
+        let stranded = |service: Option<&Path>| {
+            stranded_pool_dirs(
+                mount.path(),
+                &HashMap::new(),
+                &resolved,
+                service,
+                &legacy,
+                &platform,
+                &mounts,
+            )
+        };
+
+        let without_service = stranded(None);
+        assert!(without_service.contains(&live) && without_service.contains(&former));
+
+        for service in [live.as_path(), live_alias.as_path()] {
+            let dirs = stranded(Some(service));
+            assert!(!dirs.contains(&live), "{service:?}: {dirs:?}");
+            assert!(dirs.contains(&former), "{service:?}: {dirs:?}");
+        }
+    }
+
     /// A sandboxed systemd unit sees each `ReadWritePaths=` entry as a bind
     /// mount of the same device (read-only bind of `/` plus writable binds).
     /// One pool serves them all, on a writable entry, and a release asked of
@@ -1715,6 +1781,7 @@ mod tests {
         assert_eq!(pool.mount_point, data);
         assert!(coordinator.has_pool(root.path()));
 
+        coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
         let released = coordinator.release_for_mount(&home, 1).unwrap();
         assert_eq!(released.map(|r| r.files_released), Some(1));
@@ -2109,7 +2176,8 @@ mod tests {
     fn configured_directory_alias_does_not_double_count_managed_reserve() {
         let mount = tempfile::tempdir().unwrap();
         let original = mount.path().join(BALLAST_SUBDIR);
-        let mut manager = BallastManager::new(original.clone(), tiny_ballast_config()).unwrap();
+        let mut manager =
+            BallastManager::new_unfloored(original.clone(), tiny_ballast_config()).unwrap();
         manager.provision(None).unwrap();
         let alias = mount.path().join("alias");
         std::os::unix::fs::symlink(&original, &alias).unwrap();
@@ -2146,7 +2214,7 @@ mod tests {
         let retired = mount.path().join(BALLAST_SUBDIR);
         let configured = mount.path().join("active");
         for dir in [&retired, &configured] {
-            BallastManager::new(dir.clone(), tiny_ballast_config())
+            BallastManager::new_unfloored(dir.clone(), tiny_ballast_config())
                 .unwrap()
                 .provision(None)
                 .unwrap();

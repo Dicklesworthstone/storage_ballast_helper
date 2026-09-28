@@ -211,21 +211,21 @@ impl Platform for MacOsPal {
         let root_variants = macos_process_path_variants(&root);
         let mut processes: Vec<ProcessInfo> = Vec::new();
         let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
-        let mut pids_scanned: usize = 0;
         let mut incomplete = false;
 
-        for pid in process_pids_current_first()
+        for (pids_scanned, pid) in process_pids_current_first()
             .map_err(|error| macos_method_error("executables_under", &error))?
+            .into_iter()
+            .enumerate()
         {
             if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
                 incomplete = true;
                 break;
             }
-            pids_scanned += 1;
-            if let Some(process) = process_info_for_pid_without_command_line(pid) {
-                if executable_is_under(&process, &root_variants) {
-                    processes.push(process);
-                }
+            if let Some(process) = process_info_for_pid_without_command_line(pid)
+                && executable_is_under(&process, &root_variants)
+            {
+                processes.push(process);
             }
         }
         processes.sort_by(|left, right| {
@@ -297,12 +297,23 @@ impl Platform for MacOsPal {
             .open(path)
             .map_err(|error| crate::core::errors::SbhError::io(path, error))?;
 
-        fallocate(&file, FallocateFlags::empty(), 0, size).map_err(|error| {
-            PalError::method_failed("macos", "preallocate_file", error.to_string())
-        })?;
+        let preallocated = fallocate(&file, FallocateFlags::empty(), 0, size).is_ok();
         file.sync_all()
             .map_err(|error| crate::core::errors::SbhError::io(path, error))?;
+        if preallocated
+            && verify_preallocated_blocks("macos", path, size, self.file_block_count(path)?).is_ok()
+        {
+            return Ok(());
+        }
 
+        // APFS does not reliably turn F_PREALLOCATE into allocated blocks:
+        // it fails outright on some volumes and on others leaves the
+        // ftruncate-extended file sparse (5 of 64 MiB on mac-mini-old, 2026-
+        // 09-27), so a ballast pool could never be provisioned. Writing the
+        // bytes allocates them.
+        write_zeros(&file, size).map_err(|error| crate::core::errors::SbhError::io(path, error))?;
+        file.sync_all()
+            .map_err(|error| crate::core::errors::SbhError::io(path, error))?;
         let blocks = self.file_block_count(path)?;
         verify_preallocated_blocks("macos", path, size, blocks)
     }
@@ -331,6 +342,22 @@ impl Platform for MacOsPal {
     fn service_kind(&self) -> ServiceKind {
         ServiceKind::Launchd
     }
+}
+
+/// Overwrite `file` from offset 0 with `size` zero bytes.
+fn write_zeros(file: &File, size: u64) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    const CHUNK: usize = 1 << 20;
+    let zeros = vec![0u8; CHUNK];
+    let mut file = file;
+    file.seek(SeekFrom::Start(0))?;
+    let mut remaining = size;
+    while remaining > 0 {
+        let n = usize::try_from(remaining).map_or(CHUNK, |left| left.min(CHUNK));
+        file.write_all(&zeros[..n])?;
+        remaining = remaining.saturating_sub(u64::try_from(n).unwrap_or(u64::MAX));
+    }
+    Ok(())
 }
 
 fn cached_open_files_under(root: &Path) -> Result<OpenFilesResult> {
@@ -867,22 +894,19 @@ fn estimate_reclaimable_by_snapshot_thinning(
 ) -> Option<SnapshotThinningEstimate> {
     let query_foundation = std::env::var("SBH_MACOS_QUERY_FOUNDATION_PURGEABLE")
         .ok()
-        .map_or(true, |val| {
+        .is_none_or(|val| {
             !matches!(
                 val.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "no" | "off"
             )
         });
 
-    if query_foundation {
-        if let Ok(Some(important_available)) = sys::important_usage_available_bytes(mount_point) {
-            if let Some(bytes) = purgeable_bytes_from_important_available(
-                important_available,
-                counted_available_bytes,
-            ) {
-                return Some(SnapshotThinningEstimate::new(bytes, "foundation"));
-            }
-        }
+    if query_foundation
+        && let Ok(Some(important_available)) = sys::important_usage_available_bytes(mount_point)
+        && let Some(bytes) =
+            purgeable_bytes_from_important_available(important_available, counted_available_bytes)
+    {
+        return Some(SnapshotThinningEstimate::new(bytes, "foundation"));
     }
 
     purgeable_bytes_from_apfs_inventory(inventory, container_id)
@@ -2034,9 +2058,32 @@ mod tests {
         assert!(blocks > 0);
     }
 
+    /// sbh never preallocates on a volume below its provisioning floor, and
+    /// APFS honours `F_PREALLOCATE` only partly when nearly full (a 99%-full
+    /// Mac allocated 128 KiB of 64 MiB, 2026-09-25; a fresh APFS image passes).
+    /// There the preallocation tests prove nothing about sbh, so they say so.
+    fn temp_volume_below_provisioning_floor(dir: &Path) -> bool {
+        let stats = MacOsPal::new()
+            .fs_stats(dir)
+            .expect("temp volume stats should be readable");
+        #[allow(clippy::cast_precision_loss)]
+        let free_pct = stats.available_bytes as f64 / stats.total_bytes.max(1) as f64 * 100.0;
+        let below = free_pct < 10.0;
+        if below {
+            eprintln!(
+                "SKIP: temp volume {} is {free_pct:.1}% free, below the 10% provisioning floor",
+                stats.mount_point.display()
+            );
+        }
+        below
+    }
+
     #[test]
     fn preallocate_file_reserves_blocks_on_macos() {
         let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        if temp_volume_below_provisioning_floor(dir.path()) {
+            return;
+        }
         let path = dir.path().join("preallocated-macos.bin");
         let size = 1024 * 1024;
         let platform = MacOsPal::new();
@@ -2057,6 +2104,9 @@ mod tests {
     #[test]
     fn preallocate_64mib_ballast_file_in_under_one_second() {
         let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        if temp_volume_below_provisioning_floor(dir.path()) {
+            return;
+        }
         let path = dir.path().join("ballast-64mib.bin");
         let size = 64 * 1024 * 1024;
         let platform = MacOsPal::new();

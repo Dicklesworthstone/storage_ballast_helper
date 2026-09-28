@@ -295,6 +295,14 @@ impl SystemdServiceManager {
     /// Generate the full systemd unit file content.
     #[must_use]
     pub fn generate_unit_file(&self) -> String {
+        self.generate_unit_file_with_config(None)
+    }
+
+    /// The unit with `--config <path>` on `ExecStart=` when `config` is set.
+    /// `reinstall_unit` passes the config the existing unit runs with, so a
+    /// repair does not silently switch the daemon to another config file.
+    #[must_use]
+    pub fn generate_unit_file_with_config(&self, config: Option<&Path>) -> String {
         let binary = self.config.binary_path.display();
         let rw_paths = SystemdConfig::render_read_write_paths(&self.config.read_write_paths);
 
@@ -328,7 +336,21 @@ impl SystemdServiceManager {
             writeln!(unit, "WatchdogSec=60").ok();
         }
 
-        writeln!(unit, "ExecStart={binary} daemon").ok();
+        match config {
+            Some(path) if path.to_string_lossy().contains(char::is_whitespace) => writeln!(
+                unit,
+                "ExecStart={binary} daemon --config \"{}\"",
+                path.display()
+            )
+            .ok(),
+            Some(path) => writeln!(
+                unit,
+                "ExecStart={binary} daemon --config {}",
+                path.display()
+            )
+            .ok(),
+            None => writeln!(unit, "ExecStart={binary} daemon").ok(),
+        };
         writeln!(unit, "ExecReload=/bin/kill -HUP $MAINPID").ok();
         writeln!(unit, "Restart=on-failure").ok();
         writeln!(unit, "RestartSec=10").ok();
@@ -358,7 +380,11 @@ impl SystemdServiceManager {
 
         writeln!(unit, "# Resource limits").ok();
         writeln!(unit, "MemoryMax=256M").ok();
-        writeln!(unit, "CPUQuota=10%").ok();
+        // One core as the runaway backstop; the weight (plus Nice/IO idle)
+        // keeps it out of the way of builds. 10% of one core starved every
+        // host: throttled in up to 100% of periods, scans timing out at Critical.
+        writeln!(unit, "CPUQuota=100%").ok();
+        writeln!(unit, "CPUWeight=1").ok();
         writeln!(unit).ok();
 
         if !self.config.user_scope {
@@ -578,6 +604,7 @@ fn sd_notify_watchdog(status: &str, socket_path: &str) -> Result<()> {
 /// values starting with `@`, which systemd uses for some user managers).
 /// Non-Linux platforms have no notify socket and report success without
 /// sending anything.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 pub fn sd_notify_send(message: &str, socket_path: &str) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -690,7 +717,7 @@ fn default_read_write_paths(user_scope: bool) -> Vec<PathBuf> {
 }
 
 /// `SBH_SYSTEMD_UNIT_DIR`, honored only under `SBH_TEST_MODE=1`.
-fn test_unit_dir_override() -> Option<PathBuf> {
+pub fn test_unit_dir_override() -> Option<PathBuf> {
     if !crate::platform::test_overlay::test_mode_requested() {
         return None;
     }
@@ -721,6 +748,7 @@ const HARDENING_DIRECTIVES: &[&str] = &[
     "Service/RestrictSUIDSGID",
     "Service/MemoryMax",
     "Service/CPUQuota",
+    "Service/CPUWeight",
 ];
 
 /// Directives that legitimately differ between hosts (paths, wording) and
@@ -1110,7 +1138,15 @@ impl SystemdServiceManager {
         let unit_path = self.config.unit_path();
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
         let backup_path = unit_path.with_file_name(format!("{SYSTEMD_UNIT_NAME}.bak-{stamp}"));
-        let generated = self.generate_unit_file();
+        // Keep the config the unit runs with: a fleet unit's
+        // `--config /root/.config/sbh/config.toml` dropped by a repair made the
+        // daemon load /etc/sbh/config.toml instead (vmi1152480, 2026-09-25).
+        // A quoted path is not split back out whole, so it is not carried.
+        let preserved_config = unit_path
+            .parent()
+            .and_then(crate::core::config::config_from_systemd_unit_dir)
+            .filter(|path| !path.to_string_lossy().contains('"'));
+        let generated = self.generate_unit_file_with_config(preserved_config.as_deref());
 
         let previous = fs::read_to_string(&unit_path).ok();
         let backup_path = if previous.is_some() {
@@ -1213,7 +1249,11 @@ mod unit_drift_tests {
             ),
             (
                 PathBuf::from("/etc/systemd/system.control/sbh.service.d/50-CPUQuota.conf"),
-                "# created via systemctl set-property\n[Service]\nCPUQuota=10.00%\n".to_string(),
+                "# created via systemctl set-property\n[Service]\nCPUQuota=100.00%\n".to_string(),
+            ),
+            (
+                PathBuf::from("/etc/systemd/system.control/sbh.service.d/50-CPUWeight.conf"),
+                "# created via systemctl set-property\n[Service]\nCPUWeight=1\n".to_string(),
             ),
         ]
     }
@@ -1287,8 +1327,10 @@ mod unit_drift_tests {
                 "{expected} missing from {gaps:?}"
             );
         }
-        // CPUQuota is supplied by the set-property drop-in, so it is not a gap.
+        // CPUQuota and CPUWeight are supplied by set-property drop-ins, so
+        // they are not gaps.
         assert!(!gaps.contains(&"Service/CPUQuota".to_string()), "{gaps:?}");
+        assert!(!gaps.contains(&"Service/CPUWeight".to_string()), "{gaps:?}");
         let type_change = drift
             .changed_directives
             .iter()
@@ -1301,7 +1343,7 @@ mod unit_drift_tests {
                 .extra_directives
                 .contains(&"Service/UMask".to_string())
         );
-        assert_eq!(drift.foreign_dropins.len(), 3);
+        assert_eq!(drift.foreign_dropins.len(), 4);
         assert!(
             drift.foreign_dropins.iter().any(|d| d.overrides_hardening),
             "CPUQuota drop-in"

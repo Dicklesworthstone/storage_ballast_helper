@@ -7,6 +7,13 @@
 > counted as complete were closed without their deliverable shipping (see the
 > notes on `bd-izu.2`, `bd-2j5.21`, `bd-2s9`, `bd-xzt.5.3`, `bd-xzt.5.6`).
 > The bridge plan and its beads are the current record.
+>
+> **GitHub Actions retired (2026-09-25).** sbh no longer has CI or release
+> workflows: the CI, Release and Developer ID Certificate Expiration workflow
+> files were deleted, and releases go through `dsr build` plus
+> `scripts/dsr_release.sh` (see `docs/macos.md`). Everything below about CI
+> jobs, hosted runs, workflow secrets and `gh run` commands describes the
+> pipeline as it was, not a process that still exists.
 
 Bead: `bd-r7m7.11` (parent `bd-r7m7`); refresh beads `bd-r7m7.12`,
 `bd-r7m7.13`, `bd-r7m7.15`, `bd-r7m7.16`, `bd-r7m7.17`.
@@ -52,7 +59,7 @@ What the 2026-09-02 reality check changed:
   - W9.1 (`bd-rc-master-ajg1.10.1`): Replaced `/sbin/mount` with `sbh_mach::getfsstat()`,
     eliminating subprocess forks on the hot path (zero child spawns verified by test),
     cached `diskutil apfs` (5-min TTL), and budgeted cold-start `sbh status` at 250 ms
-    in `benches/macos_performance.rs` and `.github/workflows/ci.yml`.
+    in `benches/macos_performance.rs` and the (since deleted) CI workflow.
   - W9.2 (`bd-rc-master-ajg1.10.2`): Added deadlines and pid caps to `open_files_under`
     and `executables_under` (fail-closed like Linux).
   - W9.3 (`bd-rc-master-ajg1.10.3`): Unified APFS snapshot reporting into
@@ -77,9 +84,10 @@ still maps each goal to its proof):
   Gatekeeper gate) and `bd-r7m7.16` (no volatile head/run pins); `bd-ykwh`
   (release engineering) with `bd-ykwh.20` (Gatekeeper acceptance before
   packaging). `bd-ykwh.20` is closed;
-  release CI now verifies Apple notary log ticketContents
-  (`.github/workflows/release.yml` fails when the notary log ticketContents
-  is not an array).
+  until GitHub Actions was retired, release CI verified Apple notary log
+  ticketContents (the since-deleted release workflow failed when the
+  notary log ticketContents was not an array); `scripts/dsr_release.sh notarize` now
+  requires notarytool status `Accepted` instead.
 - Pinning policy: the audit avoids pinning exact commit hashes or
   GitHub Actions run ids as durable proof; refresh with `git rev-parse HEAD`,
   `gh run list --repo Dicklesworthstone/storage_ballast_helper` and

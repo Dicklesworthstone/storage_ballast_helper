@@ -540,6 +540,7 @@ mod tests {
         // Canonical form of `deep`, for identifying its ancestor chain in the
         // cache below (keys are canonicalized, tmp may traverse symlinks).
         let canonical_deep = resolve_uncached(&deep);
+        let canonical_tmp = resolve_uncached(tmp.path());
 
         let ancestors_after = |count: usize| -> usize {
             clear_resolve_cache();
@@ -547,13 +548,14 @@ mod tests {
                 let _ = resolve_absolute_path(&deep.join(format!("sibling-{i}")));
             }
             let cache = resolve_cache().lock();
-            // Count only ancestors of OUR path: the cache is process-global and
-            // other tests running in parallel insert their own ancestor chains
-            // between our two measurements, so counting everything is flaky.
+            // Count only ancestors of OUR path inside OUR temp dir: the cache
+            // is process-global, and parallel tests insert shared system
+            // ancestors (`/private/var/folders`, ...) between our two
+            // measurements, so counting those is flaky.
             cache
                 .entries
                 .keys()
-                .filter(|k| canonical_deep.starts_with(k))
+                .filter(|k| k.starts_with(&canonical_tmp) && canonical_deep.starts_with(k))
                 .count()
         };
 
