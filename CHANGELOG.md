@@ -6,6 +6,21 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.15 **[release]**
+
+Compare: [`v0.6.14...v0.6.15`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.14...v0.6.15)
+
+### Changed — the daemon gets enough CPU to finish a scan
+
+- The generated systemd unit caps sbh at one core (`CPUQuota=100%`) with the
+  lowest CPU weight (`CPUWeight=1`) instead of 10% of one core. The 10% cap
+  throttled the fleet in nearly every scheduling period, so on a full host
+  every scan timed out; builds still win whenever cores are busy
+  (`0ce785a`).
+- A routine scan waits until the daemon's CPU budget is nearly full before
+  starting, so each pass gets a real slice instead of stopping after a
+  handful of entries. Average CPU use is unchanged (`9987a36`).
+
 ## v0.6.14 **[release]**
 
 Compare: [`v0.6.13...v0.6.14`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.13...v0.6.14)
