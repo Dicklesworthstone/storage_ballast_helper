@@ -92,13 +92,25 @@ fn rollback_works_while_the_destination_binary_is_executing() {
     // exits at once as an unknown program. The shell blocks reading a pipe
     // the child handle keeps open; the executing image is `dest`.
     fs::copy("/bin/sh", &dest).unwrap();
-    let mut running = Running(
-        std::process::Command::new(&dest)
+    // A child forked by another test thread can briefly inherit the copy's
+    // write descriptor (ETXTBSY); retry like execution_probe::verify does.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let child = loop {
+        match std::process::Command::new(&dest)
             .args(["-c", "read line"])
             .stdin(std::process::Stdio::piped())
             .spawn()
-            .unwrap(),
-    );
+        {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other => break other.unwrap(),
+        }
+    };
+    let mut running = Running(child);
     assert!(running.0.try_wait().unwrap().is_none());
     let result = store.rollback(&dest, Some(&snapshot.id)).unwrap();
     assert!(result.success);
