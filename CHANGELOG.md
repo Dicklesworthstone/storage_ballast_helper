@@ -6,6 +6,17 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.17 **[release]**
+
+Compare: [`v0.6.16...v0.6.17`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.16...v0.6.17)
+
+### Fixed — Linux: the memory-map check no longer burns a core on big hosts
+
+- Every process's `/proc/<pid>/maps` is read once per 30 seconds and shared
+  by all scan roots, instead of once per root on almost every pass. On a
+  host with ~2,400 processes one sweep costs ~6 CPU-seconds, and the
+  scanner was running at a full core (`b5587bf`).
+
 ## v0.6.16 **[release]**
 
 Compare: [`v0.6.15...v0.6.16`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.15...v0.6.16)
