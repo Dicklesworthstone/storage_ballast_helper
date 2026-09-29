@@ -6,6 +6,19 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.18 **[release]**
+
+Compare: [`v0.6.17...v0.6.18`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.17...v0.6.18)
+
+### Fixed — reported and planned sizes are measured, not a 100 MiB placeholder
+
+- The priority pre-scan recorded candidates in its index at the 100 MiB
+  nomination placeholder, so every later replay dispatched and reported
+  that size: a host logged 73 GB "freed" in 12 hours for a few megabytes of
+  tiny `node_modules`, and the reclaim byte target counted it as progress.
+  The index now records the measured size, and records written by earlier
+  versions are re-measured when replayed (`e4c33d4`).
+
 ## v0.6.17 **[release]**
 
 Compare: [`v0.6.16...v0.6.17`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.16...v0.6.17)
