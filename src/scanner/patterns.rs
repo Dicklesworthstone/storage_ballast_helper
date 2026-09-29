@@ -980,6 +980,20 @@ impl ArtifactPatternRegistry {
             }
         }
 
+        if best.category == ArtifactCategory::Unknown
+            && is_tmp_like_path(path)
+            && is_mktemp_scratch_name(&name_os.to_string_lossy())
+            && !inside_project_tree(path)
+        {
+            best = ArtifactClassification {
+                pattern_name: Cow::Borrowed("mktemp-scratch"),
+                category: ArtifactCategory::TempDir,
+                name_confidence: 0.70,
+                structural_confidence: 0.0,
+                combined_confidence: 0.70,
+            };
+        }
+
         if let Some(classification) = catalog_classification {
             best = classification;
         }
@@ -1059,6 +1073,48 @@ pub fn platform_cleanup_rules() -> &'static [CleanupRule] {
     {
         &[]
     }
+}
+
+/// A `mktemp -d -t <prefix>.XXXXXXXX` name: a prefix, a dot, and 6-16 random
+/// alphanumerics that mix upper and lower case (`fsfs-quickstart.ZH7Q3npF`,
+/// plain `mktemp -d`'s `tmp.AbC123xyz`). No name pattern knew them, so test
+/// scratch made this way was never nominated: 14 of them held 53 GB in
+/// ts1's `/data/tmp/bl` at Critical pressure (2026-09-29). Requiring both
+/// cases keeps words and extensions (`archive.backup1`, `site.config`) out;
+/// it misses the ~3% of random suffixes that happen to lack one case.
+fn is_mktemp_scratch_name(name: &str) -> bool {
+    let Some((prefix, suffix)) = name.rsplit_once('.') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && (6..=16).contains(&suffix.len())
+        && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+        && suffix.bytes().any(|b| b.is_ascii_uppercase())
+        && suffix.bytes().any(|b| b.is_ascii_lowercase())
+}
+
+/// True when a directory between `path` and its temp root is a project:
+/// clones and build copies live in temp trees too (dsr's `/var/tmp/dsr-build-*`),
+/// and a repo's checked-in fixtures can carry mktemp-shaped names (beads_rust's
+/// `sample_beads_db_files/repro_beadsrust_import_write.M6eaGY`). Only reached
+/// for names that already look like mktemp scratch.
+fn inside_project_tree(path: &Path) -> bool {
+    const MARKERS: &[&str] = &[
+        ".git",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+    ];
+    path.ancestors()
+        .skip(1)
+        .take(8)
+        .take_while(|dir| !is_temp_root_dir(dir))
+        .any(|dir| {
+            MARKERS
+                .iter()
+                .any(|marker| dir.join(marker).symlink_metadata().is_ok())
+        })
 }
 
 fn matches_builtin(kind: MatchKind, normalized: &str) -> bool {
@@ -2086,6 +2142,90 @@ mod tests {
             StructuralSignals::default(),
         );
         assert_eq!(nested_target.category, ArtifactCategory::RustTarget);
+    }
+
+    #[test]
+    fn mktemp_scratch_in_temp_trees_is_a_temp_dir() {
+        let registry = ArtifactPatternRegistry::default();
+        for path in [
+            "/data/tmp/bl/fsfs-quickstart.ZH7Q3npF",
+            "/tmp/tmp.AbC123xyzQ",
+            "/var/tmp/build.Xy9kLmNo",
+        ] {
+            let class = registry.classify(Path::new(path), StructuralSignals::default());
+            assert_eq!(class.pattern_name, "mktemp-scratch", "{path}");
+            assert_eq!(class.category, ArtifactCategory::TempDir, "{path}");
+        }
+        for path in [
+            // Outside a temp tree the same name is someone's data.
+            "/data/projects/app/fsfs-quickstart.ZH7Q3npF",
+            // Words and extensions are not random suffixes.
+            "/tmp/archive.backup1",
+            "/tmp/site.config",
+            "/tmp/notes.ABCDEFG",
+            "/tmp/x.Ab1",
+        ] {
+            let class = registry.classify(Path::new(path), StructuralSignals::default());
+            assert_eq!(class.category, ArtifactCategory::Unknown, "{path}");
+        }
+        // Named rules keep precedence: tempfile's `.tmpXXXXXX` stays dot-tmp.
+        let dot_tmp = registry.classify(
+            Path::new("/data/tmp/bl/.tmpETepM0"),
+            StructuralSignals::default(),
+        );
+        assert_eq!(dot_tmp.pattern_name, "dot-tmp");
+        // A repository checked out into mktemp scratch is not reclaimable.
+        let with_git = registry.classify(
+            Path::new("/tmp/tmp.AbC123xyzQ"),
+            StructuralSignals {
+                has_git: true,
+                ..StructuralSignals::default()
+            },
+        );
+        assert!(with_git.combined_confidence < 0.1);
+    }
+
+    #[test]
+    fn mktemp_shaped_fixtures_inside_a_project_are_not_scratch() {
+        let registry = ArtifactPatternRegistry::default();
+        let base = tempfile::tempdir_in("/tmp").expect("tempdir under /tmp");
+        let clone = base.path().join("clone");
+        let fixture = clone.join("fixtures/repro_import_write.M6eaGY");
+        std::fs::create_dir_all(&fixture).unwrap();
+        std::fs::write(clone.join("Cargo.toml"), "[package]\n").unwrap();
+        let scratch = base.path().join("bl/fsfs-quickstart.ZH7Q3npF");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let class = registry.classify(&fixture, StructuralSignals::default());
+        assert_eq!(class.category, ArtifactCategory::Unknown);
+        let class = registry.classify(&scratch, StructuralSignals::default());
+        assert_eq!(class.pattern_name, "mktemp-scratch");
+    }
+
+    #[test]
+    fn stale_mktemp_scratch_is_reclaimed_but_fresh_scratch_is_kept() {
+        use crate::core::config::ScoringConfig;
+        use crate::scanner::scoring::{
+            ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine,
+        };
+        use std::time::Duration;
+        let registry = ArtifactPatternRegistry::default();
+        let engine = ScoringEngine::from_config(&ScoringConfig::default(), 30);
+        let path = Path::new("/data/tmp/bl/fsfs-quickstart.ZH7Q3npF");
+        let candidate = |age| CandidateInput {
+            path: path.to_path_buf(),
+            size_bytes: 3_900_000_000,
+            age,
+            classification: registry.classify(path, StructuralSignals::default()),
+            signals: StructuralSignals::default(),
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+        let stale = engine.score_candidate(&candidate(Duration::from_hours(48)), 0.95);
+        assert_eq!(stale.decision.action, DecisionAction::Delete, "{stale:?}");
+        let fresh = engine.score_candidate(&candidate(Duration::from_mins(10)), 0.95);
+        assert_eq!(fresh.decision.action, DecisionAction::Keep, "{fresh:?}");
     }
 
     #[test]
