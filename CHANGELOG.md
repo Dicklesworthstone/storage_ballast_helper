@@ -14,8 +14,11 @@ Compare: [`v0.6.17...v0.6.18`](https://github.com/Dicklesworthstone/storage_ball
 
 - The priority pre-scan recorded candidates in its index at the 100 MiB
   nomination placeholder, so every later replay dispatched and reported
-  that size: a host logged 73 GB "freed" in 12 hours for a few megabytes of
-  tiny `node_modules`, and the reclaim byte target counted it as progress.
+  that size: in 12 hours one host logged 361 deletions and 17.9 GB "freed",
+  all of it the placeholder (171 deletions at exactly 100 MiB) for a few
+  megabytes of tiny `node_modules`, and the reclaim byte target counted it
+  as progress. (The release commit's "73 GB in 12 hours" came from a query
+  whose time filter matched a much longer window.)
   The index now records the measured size, and records written by earlier
   versions are re-measured when replayed (`e4c33d4`).
 
