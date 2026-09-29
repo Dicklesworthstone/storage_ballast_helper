@@ -1080,17 +1080,26 @@ pub fn platform_cleanup_rules() -> &'static [CleanupRule] {
 /// plain `mktemp -d`'s `tmp.AbC123xyz`). No name pattern knew them, so test
 /// scratch made this way was never nominated: 14 of them held 53 GB in
 /// ts1's `/data/tmp/bl` at Critical pressure (2026-09-29). Requiring both
-/// cases keeps words and extensions (`archive.backup1`, `site.config`) out;
-/// it misses the ~3% of random suffixes that happen to lack one case.
+/// cases keeps words and extensions (`archive.backup1`, `site.config`) out,
+/// and rejecting digit-free suffixes with a run of 4+ lowercase letters keeps
+/// out the CamelCase app dirs in a macOS `$TMPDIR` (`com.apple.WindowManager`,
+/// `com.openai.sky.CUAService`). A few random suffixes fail one of these and
+/// stay unnominated, which is the safe direction.
 fn is_mktemp_scratch_name(name: &str) -> bool {
     let Some((prefix, suffix)) = name.rsplit_once('.') else {
         return false;
     };
+    let longest_lowercase_run = suffix
+        .split(|c: char| !c.is_ascii_lowercase())
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
     !prefix.is_empty()
         && (6..=16).contains(&suffix.len())
         && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
         && suffix.bytes().any(|b| b.is_ascii_uppercase())
         && suffix.bytes().any(|b| b.is_ascii_lowercase())
+        && (suffix.bytes().any(|b| b.is_ascii_digit()) || longest_lowercase_run < 4)
 }
 
 /// True when a directory between `path` and its temp root is a project:
@@ -2151,6 +2160,9 @@ mod tests {
             "/data/tmp/bl/fsfs-quickstart.ZH7Q3npF",
             "/tmp/tmp.AbC123xyzQ",
             "/var/tmp/build.Xy9kLmNo",
+            "/tmp/com.google.Chrome.LiO3XR",
+            "/private/tmp/TemporaryDirectory.QLWPkT",
+            "/tmp/com.openai.codex.RdtJFb",
         ] {
             let class = registry.classify(Path::new(path), StructuralSignals::default());
             assert_eq!(class.pattern_name, "mktemp-scratch", "{path}");
@@ -2164,6 +2176,11 @@ mod tests {
             "/tmp/site.config",
             "/tmp/notes.ABCDEFG",
             "/tmp/x.Ab1",
+            // CamelCase app dirs in a macOS $TMPDIR are words, not random.
+            "/tmp/com.apple.WindowManager",
+            "/tmp/com.apple.AppSSOAgent",
+            "/tmp/com.openai.sky.CUAService",
+            "/tmp/com.dicklesworthstone.frankenterm.savedState",
         ] {
             let class = registry.classify(Path::new(path), StructuralSignals::default());
             assert_eq!(class.category, ArtifactCategory::Unknown, "{path}");
