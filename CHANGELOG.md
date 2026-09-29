@@ -6,6 +6,24 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.19 **[release]**
+
+Compare: [`v0.6.18...v0.6.19`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.18...v0.6.19)
+
+### Added — abandoned `mktemp` scratch in temp trees is reclaimable
+
+- Directories made by `mktemp -d -t <prefix>.XXXXXXXX` matched no name
+  pattern, so sbh never nominated them: one host at Critical pressure
+  reported "nothing to reclaim" while 14 idle `fsfs-quickstart.*` test
+  dirs held 53 GB. A directory under a temp tree named
+  `<prefix>.<6-16 random alphanumerics mixing upper and lower case>` is
+  now temp scratch, unless a directory between it and the temp root is a
+  project (`.git`, `Cargo.toml`, `package.json`, `pyproject.toml`,
+  `go.mod`). Digit-free suffixes with a run of four or more lowercase
+  letters are words (`com.apple.WindowManager` in a macOS `$TMPDIR`) and
+  do not count. The whole-tree idle age and open-file checks still apply
+  (`4cb4c54`, `8136b30`).
+
 ## v0.6.18 **[release]**
 
 Compare: [`v0.6.17...v0.6.18`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.17...v0.6.18)
