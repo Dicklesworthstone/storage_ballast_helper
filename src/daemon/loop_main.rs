@@ -6717,9 +6717,19 @@ fn replay_indexed_record(
     };
     #[cfg(not(unix))]
     let allocated = meta.len();
+    // Records written before 0.6.18 could carry the pre-scan's nomination
+    // floor instead of a measured size; exactly the floor means "never
+    // measured", so measure it now rather than dispatch and report 100 MiB.
+    let size_estimate = if meta.is_dir()
+        && record.size_estimate_bytes == crate::scanner::walker::OPAQUE_CANDIDATE_SIZE_FLOOR
+    {
+        prescan_dir_size(path, scanner_config.cross_devices, &AtomicBool::new(false))
+    } else {
+        record.size_estimate_bytes
+    };
     let input = CandidateInput {
         path: path.clone(),
-        size_bytes: record.size_estimate_bytes.max(allocated),
+        size_bytes: size_estimate.max(allocated),
         age: adjusted_candidate_age(
             age,
             scanner_config.min_file_age_minutes,
@@ -8005,6 +8015,15 @@ fn scanner_thread_main(
                                 current_scanner_config.follow_symlinks,
                             )
                             .ok();
+                            // Before the index record is made: the record's
+                            // size is what every later replay dispatches and
+                            // reports. Recording the 100 MiB nomination floor
+                            // made fmd log 73 GB "freed" for a few MB of tiny
+                            // node_modules (2026-09-29), and the byte target
+                            // counted that fiction as progress.
+                            if let Some(measured) = measured_size {
+                                score.size_bytes = measured;
+                            }
                             let mut scanner_index_backoff_active = false;
                             if scanner_index_enabled {
                                 match CandidateIndexRecord::from_candidate_score(
@@ -10636,6 +10655,23 @@ mod tests {
         }
     }
 
+    /// `size_estimate_bytes` of the scanner-index record for `path`,
+    /// wherever it sits in the persisted JSON.
+    fn recorded_size(value: &serde_json::Value, path: &str) -> Option<u64> {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("path").and_then(serde_json::Value::as_str) == Some(path) {
+                    return map
+                        .get("size_estimate_bytes")
+                        .and_then(serde_json::Value::as_u64);
+                }
+                map.values().find_map(|v| recorded_size(v, path))
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(|v| recorded_size(v, path)),
+            _ => None,
+        }
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)] // one end-to-end scanner pass
     fn scanner_prescan_discovers_target_in_repo_with_beads_tracker() {
@@ -10754,6 +10790,16 @@ mod tests {
             target.size_bytes < crate::scanner::walker::OPAQUE_CANDIDATE_SIZE_FLOOR,
             "a near-empty target must be planned at its real size: {}",
             target.size_bytes
+        );
+        // So is the index record every later replay dispatches from: it was
+        // written with the floor, and fmd reported 73 GB freed for a few MB.
+        let index: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&scanner_index_path).unwrap()).unwrap();
+        let recorded = recorded_size(&index, &target_dir.to_string_lossy())
+            .expect("the target is recorded in the scanner index");
+        assert!(
+            recorded < crate::scanner::walker::OPAQUE_CANDIDATE_SIZE_FLOOR,
+            "the index must record the measured size, not the nomination floor: {recorded}"
         );
 
         logger.shutdown();
