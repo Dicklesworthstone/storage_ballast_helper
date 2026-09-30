@@ -620,9 +620,6 @@ impl ScoringEngine {
         if let Some(reason) = rch_target_veto_reason(&input.path, urgency) {
             return Some(reason);
         }
-        if let Some(reason) = rch_job_tmpdir_veto_reason(&input.path, urgency) {
-            return Some(reason);
-        }
         // The executor refuses symlinks (removal would follow them out of the
         // tree) and unlinking one frees nothing, so a symlink nominated by
         // name (a pnpm-style `node_modules` link) was re-proposed and refused
@@ -925,33 +922,6 @@ fn rch_target_veto_reason(path: &Path, urgency: f64) -> Option<Cow<'static, str>
     }
 }
 
-/// rch's own prune floor for its job TMPDIR (`WORKER_TMP_PRUNE_MAX_AGE_MINS`).
-pub(crate) const RCH_JOB_TMPDIR_IDLE_HOURS: u64 = 24;
-
-/// Hard-veto an rch job TMPDIR (`<project>/.rch-tmp`) unless nothing in it
-/// has been written for [`RCH_JOB_TMPDIR_IDLE_HOURS`]: a running job's tests
-/// keep their tempdirs there, and rch itself only prunes past that age.
-fn rch_job_tmpdir_veto_reason(path: &Path, urgency: f64) -> Option<Cow<'static, str>> {
-    if path.file_name()? != std::ffi::OsStr::new(".rch-tmp") {
-        return None;
-    }
-    let max_entries = if urgency < RCH_PRESSURE_URGENCY {
-        RCH_IDLE_PROBE_MAX_ENTRIES
-    } else {
-        RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE
-    };
-    let window = Duration::from_hours(RCH_JOB_TMPDIR_IDLE_HOURS);
-    match rch_tree_activity(path, window, max_entries) {
-        TreeActivity::IdleThroughout => None,
-        TreeActivity::Active => Some(Cow::Borrowed(
-            "rch job TMPDIR has file activity within rch's 24h prune floor",
-        )),
-        TreeActivity::Unknown => Some(Cow::Borrowed(
-            "rch job TMPDIR idleness could not be established",
-        )),
-    }
-}
-
 fn cleanup_rule_veto_reason(input: &CandidateInput) -> Option<Cow<'static, str>> {
     let rule = cleanup_rule_for_classification(&input.classification)?;
     match rule.reclaim_command {
@@ -1054,7 +1024,6 @@ fn factor_location(path: &Path) -> f64 {
         || text.starts_with("/data/tmp")
         || text.starts_with("/dev/shm")
         || crate::scanner::patterns::is_darwin_user_temp_path(path)
-        || crate::scanner::patterns::is_rch_job_tmpdir_path(path)
     {
         0.95
     } else if text.contains("/data/projects/") && text.contains("/.tmp_") {

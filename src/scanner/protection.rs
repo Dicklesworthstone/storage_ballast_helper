@@ -649,60 +649,7 @@ pub fn find_sacred_overlaps(
     candidate: &Path,
     catalog: &[SacredPath],
 ) -> Result<Vec<SacredOverlap>> {
-    if candidate.file_name().is_some_and(|name| name == ".rch-tmp") {
-        return find_rch_job_tmpdir_overlaps(candidate, catalog);
-    }
     find_sacred_overlaps_with_config(candidate, catalog, StowawayScanConfig::default())
-}
-
-/// Built-in markers that tests routinely leave in a TMPDIR: repositories,
-/// beads trackers and SQLite files.
-const TEST_FIXTURE_BUILTIN_MARKERS: &[&str] = &[
-    ".git/",
-    ".beads/",
-    "beads.db",
-    "beads.db-wal",
-    "beads.db-shm",
-    "*.db",
-    "*.db-wal",
-    "*.db-shm",
-    "*.sqlite",
-    "*.sqlite-wal",
-    "*.sqlite-shm",
-    "*.sqlite3",
-    "*.sqlite3-wal",
-    "*.sqlite3-shm",
-];
-
-/// Sacred overlaps for an rch job TMPDIR (`<project>/.rch-tmp`).
-///
-/// rch sets every job's TMPDIR there and `rm -rf`s its children after 24 h
-/// unconditionally; the scorer only nominates the dir after proving nothing
-/// in it was written for that long. Every one on the fleet was protected by
-/// test fixtures inside (a test's `git init`, its SQLite file), so v0.6.21's
-/// rule reclaimed nothing (2026-09-30). Those built-in fixture markers are
-/// therefore not consulted here. Everything else still is: `.sbh-protect`
-/// markers, user `protected_paths` / `sacred.toml`, and the built-in secret
-/// stores (`.ssh/`, `.gnupg/`, `.config/age/`). The walk may cover the
-/// whole entry budget instead of stopping at the directory bound (the
-/// biggest held 65k directories), and a truncated walk still fails closed.
-fn find_rch_job_tmpdir_overlaps(
-    candidate: &Path,
-    catalog: &[SacredPath],
-) -> Result<Vec<SacredOverlap>> {
-    let consulted: Vec<SacredPath> = catalog
-        .iter()
-        .filter(|entry| {
-            entry.source != SacredPathSource::Builtin
-                || !TEST_FIXTURE_BUILTIN_MARKERS.contains(&entry.pattern.as_str())
-        })
-        .cloned()
-        .collect();
-    let config = StowawayScanConfig {
-        max_dirs: DEFAULT_STOWAWAY_SCAN_MAX_ENTRIES,
-        ..StowawayScanConfig::default()
-    };
-    find_sacred_overlaps_with_config(candidate, &consulted, config)
 }
 
 #[must_use]
@@ -1379,60 +1326,6 @@ mod tests {
     use crate::platform::types::{SacredPath, SacredPathKind, SacredPathSource};
     use std::fs;
     use tempfile::TempDir;
-
-    #[test]
-    fn rch_job_tmpdir_ignores_test_fixture_markers_but_not_user_or_secret_ones() {
-        let catalog = cross_platform_sacred_paths();
-        let tmp = TempDir::new().unwrap();
-        let job_tmpdir = |project: &str| {
-            let dir = tmp.path().join(project).join(".rch-tmp");
-            fs::create_dir_all(dir.join(".tmpA1b2C3/repo/.git")).unwrap();
-            fs::create_dir_all(dir.join(".tmpD4e5F6")).unwrap();
-            fs::write(dir.join(".tmpD4e5F6/index.sqlite"), b"x").unwrap();
-            fs::write(dir.join(".tmpD4e5F6/state.db-wal"), b"x").unwrap();
-            dir
-        };
-
-        // fmd 2026-09-30: leaked `git init` repos and SQLite files only.
-        let fixtures_only = job_tmpdir("fixtures");
-        let overlaps = find_sacred_overlaps(&fixtures_only, catalog).unwrap();
-        assert!(overlaps.is_empty(), "{overlaps:?}");
-
-        // The same fixtures anywhere else stay protected.
-        let elsewhere = tmp.path().join("fixtures/scratch");
-        fs::create_dir_all(&elsewhere).unwrap();
-        fs::write(elsewhere.join("state.db"), b"x").unwrap();
-        assert!(
-            !find_sacred_overlaps(&elsewhere, catalog)
-                .unwrap()
-                .is_empty()
-        );
-
-        // An operator's marker still protects the job TMPDIR.
-        let marked = job_tmpdir("marked");
-        fs::create_dir_all(marked.join(".tmpG7h8I9")).unwrap();
-        fs::write(marked.join(".tmpG7h8I9").join(MARKER_FILENAME), b"").unwrap();
-        assert!(!find_sacred_overlaps(&marked, catalog).unwrap().is_empty());
-
-        // Built-in secret stores are not test fixtures.
-        let secrets = job_tmpdir("secrets");
-        fs::create_dir_all(secrets.join(".tmpJ1k2L3/.ssh")).unwrap();
-        assert!(!find_sacred_overlaps(&secrets, catalog).unwrap().is_empty());
-
-        // User-configured protection still applies.
-        let user = job_tmpdir("user");
-        let user_catalog = [SacredPath {
-            pattern: user.to_string_lossy().into_owned(),
-            kind: SacredPathKind::ExactMatch,
-            reason: "operator".to_string(),
-            source: SacredPathSource::UserConfig,
-        }];
-        assert!(
-            !find_sacred_overlaps(&user, &user_catalog)
-                .unwrap()
-                .is_empty()
-        );
-    }
 
     #[test]
     fn marker_only_registry_starts_empty() {

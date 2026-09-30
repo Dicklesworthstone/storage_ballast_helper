@@ -661,20 +661,6 @@ fn is_temp_root_scoped(pattern: &ArtifactPattern) -> bool {
     pattern.category == ArtifactCategory::AgentWorkspace || pattern.name == "claude-session-cache"
 }
 
-/// An rch job TMPDIR, `<project>/.rch-tmp`, or anything inside one.
-///
-/// rch points every job's TMPDIR there (`mkdir -p` + `chmod 1700` per job)
-/// and prunes children idle 24 h only when the next job for that project
-/// arrives, so a project that stops getting jobs keeps its leaked test
-/// tempdirs: fmd held ~13 GB in such dirs (2026-09-30), one with 315k
-/// entries idle since 2026-09-25. Scored as project files (location 0.4)
-/// they were all kept, and the pre-scan re-scored them every cycle.
-#[must_use]
-pub fn is_rch_job_tmpdir_path(path: &Path) -> bool {
-    path.ancestors()
-        .any(|dir| dir.file_name().is_some_and(|name| name == ".rch-tmp"))
-}
-
 /// A temp root itself (not a path inside one).
 fn is_temp_root_dir(path: &Path) -> bool {
     [
@@ -1526,15 +1512,6 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {
             confidence: 0.60,
             category: ArtifactCategory::TempDir,
         },
-        // rch's per-project job TMPDIR as one unit (rch recreates it for the
-        // next job); the scorer vetoes it until the whole tree has been idle
-        // for rch's own 24 h prune floor.
-        ArtifactPattern {
-            name: "rch-job-tmpdir",
-            kind: MatchKind::Exact(".rch-tmp"),
-            confidence: 0.90,
-            category: ArtifactCategory::TempDir,
-        },
         // rch (remote compilation helper) build artifacts — can be 70+ GB.
         ArtifactPattern {
             name: "rch-target-underscore",
@@ -2223,67 +2200,6 @@ mod tests {
             },
         );
         assert!(with_git.combined_confidence < 0.1);
-    }
-
-    #[test]
-    fn an_idle_rch_job_tmpdir_is_reclaimed_whole_and_a_busy_one_kept() {
-        use crate::core::config::ScoringConfig;
-        use crate::scanner::scoring::{
-            ActiveReferenceSummary, CandidateInput, DecisionAction, ScoringEngine,
-        };
-        use std::time::{Duration, SystemTime};
-        let registry = ArtifactPatternRegistry::default();
-        let engine = ScoringEngine::from_config(&ScoringConfig::default(), 30);
-        let base = tempfile::tempdir().unwrap();
-        // fmd, 2026-09-30: `<project>/.rch-tmp` full of leaked `.tmpXXXXXX`
-        // test dirs, idle for days, 1.3 GB in one project.
-        let make = |project: &str, idle: Duration| {
-            let tmpdir = base.path().join(project).join(".rch-tmp");
-            let leaked = tmpdir.join(".tmpyNGqGi");
-            std::fs::create_dir_all(&leaked).unwrap();
-            std::fs::write(leaked.join("fixture.db"), b"x").unwrap();
-            let stamp = filetime::FileTime::from_system_time(SystemTime::now() - idle);
-            for path in [leaked.join("fixture.db"), leaked, tmpdir.clone()] {
-                filetime::set_file_mtime(path, stamp).unwrap();
-            }
-            tmpdir
-        };
-        let score = |tmpdir: &Path, idle: Duration| {
-            let class = registry.classify(tmpdir, StructuralSignals::default());
-            assert_eq!(class.pattern_name, "rch-job-tmpdir");
-            engine.score_candidate(
-                &CandidateInput {
-                    path: tmpdir.to_path_buf(),
-                    // The daemon's pre-scan nominates directories at its
-                    // 100 MiB floor and measures only what it would delete.
-                    size_bytes: 100 * 1024 * 1024,
-                    age: idle,
-                    classification: class,
-                    signals: StructuralSignals::default(),
-                    active_references: ActiveReferenceSummary::default(),
-                    is_open: false,
-                    excluded: false,
-                },
-                0.5,
-            )
-        };
-
-        let idle = make("abandoned", Duration::from_hours(120));
-        let stale = score(&idle, Duration::from_hours(120));
-        assert_eq!(stale.decision.action, DecisionAction::Delete, "{stale:?}");
-
-        // Idle 6 h: past sbh's own age curve, inside rch's 24 h floor.
-        let recent = make("paused", Duration::from_hours(6));
-        let kept = score(&recent, Duration::from_hours(6));
-        assert!(kept.vetoed, "{kept:?}");
-        assert_eq!(kept.decision.action, DecisionAction::Keep);
-
-        // The children are not candidates on their own: the unit is the dir.
-        let child = registry.classify(
-            &idle.join("rch-cargo-cache-abc"),
-            StructuralSignals::default(),
-        );
-        assert_ne!(child.pattern_name, "rch-job-tmpdir");
     }
 
     #[test]
