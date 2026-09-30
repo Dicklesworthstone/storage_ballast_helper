@@ -6,6 +6,21 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.20 **[release]**
+
+Compare: [`v0.6.19...v0.6.20`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.19...v0.6.20)
+
+### Changed — the behavior matrix's scan posture sets the scanner's CPU pace
+
+- The matrix's scan posture was only a label (just `skip` was honoured), so
+  at Yellow through Red with healthy memory the "aggressive" scanner ran
+  exactly like a Green one; at Orange one host's priority pre-scan stopped
+  on the CPU budget ~150 times an hour. `aggressive` now paces at twice
+  `telemetry.cpu_budget_pct` (at most one core), `light` and
+  `definite_only` (memory pressure) at half. Critical disk pressure stays
+  unpaced; `definite_only` does not yet restrict which paths are walked
+  (`6ebd3a3`).
+
 ## v0.6.19 **[release]**
 
 Compare: [`v0.6.18...v0.6.19`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.18...v0.6.19)
