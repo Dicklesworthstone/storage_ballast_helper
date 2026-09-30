@@ -6,6 +6,22 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.23 **[release]**
+
+Compare: [`v0.6.22...v0.6.23`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.22...v0.6.23)
+
+### Reverted — the rch job TMPDIR rule (v0.6.21, v0.6.22)
+
+- Neither release reclaimed a single `.rch-tmp`. With the scorer and the
+  sacred layer past, the executor still refused every one: its source-tree
+  floor, nested-`.git`, Cargo-manifest and source-file checks all match the
+  test fixtures that live in a job TMPDIR, and those fail-closed layers
+  exist because sbh once destroyed real working trees. Meanwhile each pass
+  spent large idle probes and containment walks on candidates that could
+  never be deleted. The code is back to v0.6.20's (`d1db715`). rch, which
+  owns that directory and already prunes children idle >24 h, is the right
+  place to sweep projects that stop receiving jobs.
+
 ## v0.6.22 **[release]**
 
 Compare: [`v0.6.21...v0.6.22`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.21...v0.6.22)
@@ -22,6 +38,8 @@ Compare: [`v0.6.21...v0.6.22`](https://github.com/Dicklesworthstone/storage_ball
   `protected_paths` / `sacred.toml` and the built-in secret stores
   (`.ssh/`, `.gnupg/`, `.config/age/`) still protect it, and a walk that
   cannot finish still fails closed (`95724d8`).
+- **Did not reclaim anything either:** the executor's source-tree and
+  nested-`.git` checks refused every `.rch-tmp`; reverted in v0.6.23.
 
 ## v0.6.21 **[release]**
 
