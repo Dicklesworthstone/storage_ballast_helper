@@ -6,6 +6,21 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.21 **[release]**
+
+Compare: [`v0.6.20...v0.6.21`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.20...v0.6.21)
+
+### Added — idle rch job TMPDIRs are reclaimed
+
+- rch points every job's TMPDIR at `<project>/.rch-tmp` and prunes it only
+  when the next job for that project arrives, so projects that stop getting
+  jobs keep every leaked test tempdir: one host held ~13 GB in idle
+  `.rch-tmp` dirs, one with 315k entries idle for five days. sbh kept each
+  tiny child and re-scored all of them on every pre-scan cycle (a full CPU
+  slice per project). The whole `.rch-tmp` is now the reclaim unit (rch
+  recreates it per job), vetoed until nothing in it has been written for
+  rch's own 24 h prune floor (`d8d5e42`).
+
 ## v0.6.20 **[release]**
 
 Compare: [`v0.6.19...v0.6.20`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.19...v0.6.20)
