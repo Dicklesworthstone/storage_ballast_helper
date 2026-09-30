@@ -501,7 +501,8 @@ pub struct DaemonState {
     pub threads: ThreadsState,
     /// CPU time (user + system) the daemon has consumed, seconds.
     pub cpu_secs_total: f64,
-    /// The CPU budget (Q7): configured percent, last-minute use, deficit.
+    /// The CPU budget (Q7): the percent being paced at (the configured one
+    /// scaled by the behavior mode), last-minute use, deficit.
     #[serde(default)]
     pub cpu_budget: CpuBudgetState,
     /// Why the whole daemon is idle, when every mount is observe-only or

@@ -33,7 +33,7 @@ use crate::daemon::control::{
     BallastAction as ControlBallastAction, ControlBackend, ControlCommand, ControlResponse,
     ControlServer, Peer, PolicyAction, persist_policy_mode,
 };
-use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD, PassCpuGuard};
+use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD, PassCpuGuard, paced_pct};
 use crate::daemon::mount_controller::{
     IdleReason, MountController, MountControllerConfig, MountState, MountStateRecord, MountSurface,
     MountTickInput, ReserveBurst, ReserveState, WakeSignals, global_tick,
@@ -2943,7 +2943,10 @@ impl MonitoringDaemon {
         // (config load, ballast discovery) is not charged to the first tick.
         let cpu_budget = Arc::new(Mutex::new(
             CpuBudget::new(
-                config.telemetry.cpu_budget_pct,
+                paced_pct(
+                    config.telemetry.cpu_budget_pct,
+                    behavior_state.mode.scan_aggressiveness,
+                ),
                 Instant::now(),
                 self_monitor.current_cpu_secs(),
             )
@@ -3218,6 +3221,10 @@ impl MonitoringDaemon {
             BehaviorUpdate::Applied(transition) => {
                 self.shared_executor_config
                     .set_min_certainty(min_certainty_for(transition.to_mode.cleanup_action));
+                self.cpu_budget.lock().set_pct(paced_pct(
+                    self.config.telemetry.cpu_budget_pct,
+                    transition.to_mode.scan_aggressiveness,
+                ));
                 let message = format!(
                     "behavior mode changed source={source} latency_ms={} memory={:?}->{:?} \
                      disk={:?}->{:?} mode=({}) -> ({})",
@@ -6022,7 +6029,10 @@ impl MonitoringDaemon {
                         .update_config(&new_config.notifications);
                     {
                         let mut budget = self.cpu_budget.lock();
-                        budget.set_pct(new_config.telemetry.cpu_budget_pct);
+                        budget.set_pct(paced_pct(
+                            new_config.telemetry.cpu_budget_pct,
+                            self.behavior_state.mode.scan_aggressiveness,
+                        ));
                         budget.set_burst_secs(new_config.telemetry.cpu_budget_burst_secs);
                     }
 

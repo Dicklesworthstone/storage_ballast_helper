@@ -45,7 +45,27 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::daemon::policy::ScanAggressiveness;
 use crate::monitor::pid::PressureLevel;
+
+/// The budget percent to pace at while the behavior matrix selects `scan`.
+///
+/// `Aggressive` (disk Yellow..Red with healthy memory) doubles the
+/// configured pace, capped at one core: at Orange the priority pre-scan on
+/// fmd stopped on the budget ~150 times an hour (2026-09-30) while the
+/// matrix asked for "increased scanner budget" and nothing read it.
+/// `Light` and `DefiniteOnly` (memory Warn/Critical) halve it, so the walk
+/// allocates at half the rate while memory is short; `DefiniteOnly` does not
+/// yet restrict which paths are walked. A configured 0 stays disabled.
+#[must_use]
+pub fn paced_pct(configured: u8, scan: ScanAggressiveness) -> u8 {
+    match scan {
+        _ if configured == 0 => 0,
+        ScanAggressiveness::Aggressive => configured.saturating_mul(2).min(100),
+        ScanAggressiveness::Light | ScanAggressiveness::DefiniteOnly => (configured / 2).max(1),
+        ScanAggressiveness::Normal | ScanAggressiveness::Skip => configured,
+    }
+}
 
 /// Default CPU-seconds the bucket can hold.
 ///
@@ -475,6 +495,21 @@ mod tests {
 
     fn secs(s: f64) -> Duration {
         Duration::from_secs_f64(s)
+    }
+
+    #[test]
+    fn behavior_mode_scales_the_configured_pace() {
+        use ScanAggressiveness::{Aggressive, DefiniteOnly, Light, Normal, Skip};
+        assert_eq!(paced_pct(25, Normal), 25);
+        assert_eq!(paced_pct(25, Skip), 25);
+        assert_eq!(paced_pct(25, Aggressive), 50);
+        assert_eq!(paced_pct(80, Aggressive), 100);
+        assert_eq!(paced_pct(25, Light), 12);
+        assert_eq!(paced_pct(25, DefiniteOnly), 12);
+        assert_eq!(paced_pct(1, Light), 1, "halving never disables pacing");
+        for scan in [Normal, Skip, Aggressive, Light, DefiniteOnly] {
+            assert_eq!(paced_pct(0, scan), 0, "a disabled budget stays disabled");
+        }
     }
 
     #[test]

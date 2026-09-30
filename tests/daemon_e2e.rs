@@ -821,6 +821,26 @@ fn injected_orange_mount_reclaims_only_the_stale_target() {
     assert_eq!(fixture_state["surface"], "configured", "{fixture_state}");
     assert_ne!(fixture_state["state"], "observe_only", "{fixture_state}");
 
+    // Orange selects Aggressive scanning with healthy memory (twice the
+    // configured 25%) and Light/DefiniteOnly under memory pressure (half):
+    // either way the daemon no longer paces at the configured value.
+    let paced = run
+        .wait_for_state(
+            "the behavior mode's CPU pace",
+            Duration::from_secs(120),
+            |state| {
+                state["cpu_budget"]["pct"]
+                    .as_u64()
+                    .is_some_and(|pct| pct != 25)
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        matches!(paced["cpu_budget"]["pct"].as_u64(), Some(50 | 12)),
+        "{}",
+        paced["cpu_budget"]
+    );
+
     // Loud degradation: the pressured mount with nothing to reclaim is
     // reported as such everywhere an operator or a script would look.
     assert_eq!(
@@ -2623,8 +2643,10 @@ fn cpu_budget_bounds_an_expensive_scanner_at_green() {
         .expect("run sbh status");
     let payload: Value = serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim())
         .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&status.stdout)));
-    assert_eq!(
-        payload["daemon"]["cpu_budget"]["pct"], 5,
+    // Green paces at the configured 5% with healthy memory and at half
+    // (Light) while the test host's memory is under pressure.
+    assert!(
+        matches!(payload["daemon"]["cpu_budget"]["pct"].as_u64(), Some(5 | 2)),
         "{}",
         payload["daemon"]
     );
