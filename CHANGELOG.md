@@ -20,6 +20,12 @@ Compare: [`v0.6.20...v0.6.21`](https://github.com/Dicklesworthstone/storage_ball
   slice per project). The whole `.rch-tmp` is now the reclaim unit (rch
   recreates it per job), vetoed until nothing in it has been written for
   rch's own 24 h prune floor (`d8d5e42`).
+- **Not effective yet:** after rollout no host reclaimed a `.rch-tmp`. The
+  sacred-path layer still protects every one observed, because leaked test
+  fixtures inside match the built-in `*.db`, `*.sqlite` and `.git/` markers,
+  and the largest exceed the containment scan's 50k-directory bound (which
+  fails closed). Whether idle rch job TMPDIRs may override those built-in
+  markers is an open policy decision.
 
 ## v0.6.20 **[release]**
 
