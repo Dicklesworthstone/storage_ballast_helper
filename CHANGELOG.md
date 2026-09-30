@@ -6,6 +6,23 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.22 **[release]**
+
+Compare: [`v0.6.21...v0.6.22`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.21...v0.6.22)
+
+### Fixed — idle rch job TMPDIRs are no longer protected by test fixtures
+
+- v0.6.21's `.rch-tmp` rule reclaimed nothing: tests leave `git init`
+  repos and SQLite files in their TMPDIR, which matched the built-in
+  sacred markers, and the largest dirs exceeded the containment walk's
+  directory bound. For a `.rch-tmp` (which rch itself prunes after 24 h,
+  and which sbh only nominates once its whole tree is that idle) the
+  built-in test-fixture markers (`.git/`, `.beads/`, `beads.db*`, `*.db*`,
+  `*.sqlite*`) are no longer consulted. `.sbh-protect` markers, user
+  `protected_paths` / `sacred.toml` and the built-in secret stores
+  (`.ssh/`, `.gnupg/`, `.config/age/`) still protect it, and a walk that
+  cannot finish still fails closed (`95724d8`).
+
 ## v0.6.21 **[release]**
 
 Compare: [`v0.6.20...v0.6.21`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.20...v0.6.21)
