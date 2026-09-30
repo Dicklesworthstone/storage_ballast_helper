@@ -2254,7 +2254,9 @@ mod tests {
             engine.score_candidate(
                 &CandidateInput {
                     path: tmpdir.to_path_buf(),
-                    size_bytes: 1_300_000_000,
+                    // The daemon's pre-scan nominates directories at its
+                    // 100 MiB floor and measures only what it would delete.
+                    size_bytes: 100 * 1024 * 1024,
                     age: idle,
                     classification: class,
                     signals: StructuralSignals::default(),
