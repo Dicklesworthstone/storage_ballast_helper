@@ -6259,7 +6259,9 @@ fn e2e_scenario_4_index_corruption_full_scan() {
     // Simulate a full scan by scoring candidates directly (no incremental index).
     let candidates: Vec<CandidateInput> = vec![
         e2e_candidate("/data/projects/p1/target", 3, 48, 0.9),
-        e2e_candidate("/data/projects/p2/.target_agent", 2, 72, 0.85),
+        // A name the executor's source-tree floor accepts under
+        // /data/projects (it refuses `.target_agent`, so the scorer vetoes it).
+        e2e_candidate("/data/projects/p2/target-agent", 2, 72, 0.85),
         e2e_candidate("/data/projects/p3/build", 1, 24, 0.3),
     ];
 

@@ -1572,7 +1572,7 @@ fn contains_nested_git(path: &Path, max_depth: usize) -> bool {
 /// canonical case so this is acceptable. Windows-native paths
 /// (`C:\Users\...`) are not currently covered — sbh's target deployments
 /// are Linux and macOS only.
-fn is_hardcoded_source_tree(path: &Path) -> bool {
+pub(crate) fn is_hardcoded_source_tree(path: &Path) -> bool {
     let s = path.to_string_lossy();
 
     // Determine whether the candidate sits under a protected source-tree root.
@@ -1637,6 +1637,16 @@ fn is_under_user_projects(path_str: &str, root: &str) -> bool {
 /// positives only mean keeping a few bytes of disk; false negatives mean
 /// destroying source.
 fn looks_like_source_code(path: &Path) -> bool {
+    source_marker_within(path, usize::MAX)
+}
+
+/// [`looks_like_source_code`] over at most `max_entries` direct children.
+///
+/// The scorer's early copy of the executor check uses a bound: it runs on
+/// every candidate each pass, and a flat directory can hold hundreds of
+/// thousands of entries. Missing a marker there only costs a dispatch the
+/// executor's unbounded check then refuses.
+pub(crate) fn source_marker_within(path: &Path, max_entries: usize) -> bool {
     // Manifest filenames — any one is a hard veto.
     const MANIFEST_FILES: &[&str] = &[
         "Cargo.toml",
@@ -1667,7 +1677,7 @@ fn looks_like_source_code(path: &Path) -> bool {
         return false;
     };
 
-    for entry in entries.flatten() {
+    for entry in entries.flatten().take(max_entries) {
         let name_os = entry.file_name();
         let name = name_os.to_string_lossy();
 

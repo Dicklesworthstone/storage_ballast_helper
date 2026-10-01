@@ -667,6 +667,22 @@ impl ScoringEngine {
         if input.is_open {
             return Some(Cow::Borrowed("currently open by another process"));
         }
+        // Last, so every more specific reason wins: the executor's two
+        // source-tree refusals, applied at nomination. A candidate either
+        // would fail is never deleted, but approving it cost a dispatch, a
+        // re-dispatch from the index every pass and an "empty pass" back-off
+        // (fmd: 902 refused plans an hour, hz1: 58 back-offs at Critical,
+        // 2026-09-30). The executor keeps its own checks.
+        if crate::scanner::deletion::is_hardcoded_source_tree(&input.path) {
+            return Some(Cow::Borrowed(
+                "inside a project source tree and not an obvious build-artifact name",
+            ));
+        }
+        if input.classification.category != ArtifactCategory::GoCache
+            && crate::scanner::deletion::source_marker_within(&input.path, 4096)
+        {
+            return Some(Cow::Borrowed("contains source-code marker files"));
+        }
         None
     }
 
@@ -2905,6 +2921,45 @@ mod tests {
     /// at Critical pressure. This is the absolute minimum bar for the scoring
     /// engine to be useful in production.
     #[test]
+    fn candidates_the_executor_always_refuses_are_vetoed_at_nomination() {
+        let engine = default_engine();
+        let candidate = |path: PathBuf| CandidateInput {
+            path,
+            size_bytes: 1_073_741_824,
+            age: Duration::from_hours(48),
+            classification: classification(0.9, ArtifactCategory::TempDir),
+            signals: StructuralSignals::default(),
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+
+        // hz1 2026-09-30: dispatched and refused (hardcoded_source_tree) on
+        // every pass at Critical.
+        let in_project = PathBuf::from(
+            "/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-server/data/tmp/.tmpJ2e45Z",
+        );
+        let score = engine.score_candidate(&candidate(in_project), 0.95);
+        assert!(score.vetoed, "{score:?}");
+
+        // fmd 2026-09-30: 902 plans an hour refused as looks_like_source_code.
+        // In /tmp: rch runs tests with TMPDIR under /data/projects, where the
+        // source-tree floor alone would veto it.
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
+        let scratch_crate = tmp.path().join(".tmpAb3dEf");
+        std::fs::create_dir_all(&scratch_crate).unwrap();
+        std::fs::write(scratch_crate.join("Cargo.toml"), "[package]\n").unwrap();
+        let score = engine.score_candidate(&candidate(scratch_crate.clone()), 0.95);
+        assert!(score.vetoed, "{score:?}");
+
+        // Without the source marker the same scratch dir stays deletable.
+        std::fs::remove_file(scratch_crate.join("Cargo.toml")).unwrap();
+        let score = engine.score_candidate(&candidate(scratch_crate), 0.95);
+        assert!(!score.vetoed, "{score:?}");
+        assert_eq!(score.decision.action, DecisionAction::Delete);
+    }
+
+    #[test]
     fn swarm_artifacts_delete_at_critical_pressure() {
         let engine = default_engine();
         let urgency = 0.95; // Critical pressure
@@ -2919,7 +2974,7 @@ mod tests {
             ),
             // Rust target in /data/projects
             (
-                "/data/projects/foo/.target_opus_42",
+                "/data/projects/foo/target-opus-42",
                 3 * 1_073_741_824,
                 3 * 3600,
                 0.80,
@@ -2933,12 +2988,36 @@ mod tests {
             ),
             // Hidden target dir
             (
-                "/data/projects/baz/.tmp_target_rch",
+                "/data/projects/baz/.rch_target_rch",
                 2 * 1_073_741_824,
                 6 * 3600,
                 0.85,
             ),
         ];
+
+        // Under a project tree the executor only removes obvious artifact
+        // names, so the scorer now vetoes the rest instead of approving
+        // candidates that are refused on every pass.
+        for path in [
+            "/data/projects/foo/.target_opus_42",
+            "/data/projects/baz/.tmp_target_rch",
+        ] {
+            let input = CandidateInput {
+                path: PathBuf::from(path),
+                size_bytes: 1_073_741_824,
+                age: Duration::from_hours(6),
+                classification: classification(0.85, ArtifactCategory::RustTarget),
+                signals: StructuralSignals {
+                    has_fingerprint: true,
+                    ..StructuralSignals::default()
+                },
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            };
+            let score = engine.score_candidate(&input, urgency);
+            assert!(score.vetoed, "{path}: the executor would refuse it");
+        }
 
         for (path, size, age_secs, confidence) in &artifacts {
             let input = CandidateInput {
