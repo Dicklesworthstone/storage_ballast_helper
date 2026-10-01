@@ -6,6 +6,21 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.24 **[release]**
+
+Compare: [`v0.6.23...v0.6.24`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.23...v0.6.24)
+
+### Fixed — no more dispatching candidates the executor always refuses
+
+- The scorer approved directories that the executor's source-tree floor and
+  source-file check refuse every time: one host logged 902 refused plans in
+  an hour, another backed off 58 times at Critical pressure because those
+  passes "reclaimed nothing", and the scan index re-dispatched them on every
+  pass. Both checks now also run at the end of the scorer's veto chain (the
+  source-file check bounded to 4096 entries there); the executor keeps its
+  own unbounded checks, so nothing becomes deletable that was not before
+  (`75ad60a`).
+
 ## v0.6.23 **[release]**
 
 Compare: [`v0.6.22...v0.6.23`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.22...v0.6.23)
