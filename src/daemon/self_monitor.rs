@@ -501,7 +501,8 @@ pub struct DaemonState {
     pub threads: ThreadsState,
     /// CPU time (user + system) the daemon has consumed, seconds.
     pub cpu_secs_total: f64,
-    /// The CPU budget (Q7): configured percent, last-minute use, deficit.
+    /// The CPU budget (Q7): the percent being paced at (the configured one
+    /// scaled by the behavior mode), last-minute use, deficit.
     #[serde(default)]
     pub cpu_budget: CpuBudgetState,
     /// Why the whole daemon is idle, when every mount is observe-only or
@@ -1479,6 +1480,14 @@ fn write_state_atomic(path: &Path, state: &DaemonState) -> std::io::Result<()> {
                 opts.mode(0o644);
             }
             let mut file = opts.open(&tmp_path)?;
+            // `mode()` is masked by the process umask; a daemon started
+            // under 077 wrote a 0600 state.json that non-root `sbh status`
+            // could not read. Set the bits explicitly.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(fs::Permissions::from_mode(0o644))?;
+            }
             file.write_all(json.as_bytes())?;
             file.sync_all()?;
         }

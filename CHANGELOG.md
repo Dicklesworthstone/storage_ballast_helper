@@ -2,9 +2,406 @@
 
 All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
-Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and the Release workflow refuses to publish a tag that has no marked heading here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
+Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
 ## Unreleased
+
+## v0.6.23 **[release]**
+
+Compare: [`v0.6.22...v0.6.23`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.22...v0.6.23)
+
+### Reverted — the rch job TMPDIR rule (v0.6.21, v0.6.22)
+
+- Neither release reclaimed a single `.rch-tmp`. With the scorer and the
+  sacred layer past, the executor still refused every one: its source-tree
+  floor, nested-`.git`, Cargo-manifest and source-file checks all match the
+  test fixtures that live in a job TMPDIR, and those fail-closed layers
+  exist because sbh once destroyed real working trees. Meanwhile each pass
+  spent large idle probes and containment walks on candidates that could
+  never be deleted. The code is back to v0.6.20's (`d1db715`). rch, which
+  owns that directory and already prunes children idle >24 h, is the right
+  place to sweep projects that stop receiving jobs.
+
+## v0.6.22 **[release]**
+
+Compare: [`v0.6.21...v0.6.22`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.21...v0.6.22)
+
+### Fixed — idle rch job TMPDIRs are no longer protected by test fixtures
+
+- v0.6.21's `.rch-tmp` rule reclaimed nothing: tests leave `git init`
+  repos and SQLite files in their TMPDIR, which matched the built-in
+  sacred markers, and the largest dirs exceeded the containment walk's
+  directory bound. For a `.rch-tmp` (which rch itself prunes after 24 h,
+  and which sbh only nominates once its whole tree is that idle) the
+  built-in test-fixture markers (`.git/`, `.beads/`, `beads.db*`, `*.db*`,
+  `*.sqlite*`) are no longer consulted. `.sbh-protect` markers, user
+  `protected_paths` / `sacred.toml` and the built-in secret stores
+  (`.ssh/`, `.gnupg/`, `.config/age/`) still protect it, and a walk that
+  cannot finish still fails closed (`95724d8`).
+- **Did not reclaim anything either:** the executor's source-tree and
+  nested-`.git` checks refused every `.rch-tmp`; reverted in v0.6.23.
+
+## v0.6.21 **[release]**
+
+Compare: [`v0.6.20...v0.6.21`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.20...v0.6.21)
+
+### Added — idle rch job TMPDIRs are reclaimed
+
+- rch points every job's TMPDIR at `<project>/.rch-tmp` and prunes it only
+  when the next job for that project arrives, so projects that stop getting
+  jobs keep every leaked test tempdir: one host held ~13 GB in idle
+  `.rch-tmp` dirs, one with 315k entries idle for five days. sbh kept each
+  tiny child and re-scored all of them on every pre-scan cycle (a full CPU
+  slice per project). The whole `.rch-tmp` is now the reclaim unit (rch
+  recreates it per job), vetoed until nothing in it has been written for
+  rch's own 24 h prune floor (`d8d5e42`).
+- **Not effective yet:** after rollout no host reclaimed a `.rch-tmp`. The
+  sacred-path layer still protects every one observed, because leaked test
+  fixtures inside match the built-in `*.db`, `*.sqlite` and `.git/` markers,
+  and the largest exceed the containment scan's 50k-directory bound (which
+  fails closed). Whether idle rch job TMPDIRs may override those built-in
+  markers is an open policy decision.
+
+## v0.6.20 **[release]**
+
+Compare: [`v0.6.19...v0.6.20`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.19...v0.6.20)
+
+### Changed — the behavior matrix's scan posture sets the scanner's CPU pace
+
+- The matrix's scan posture was only a label (just `skip` was honoured), so
+  at Yellow through Red with healthy memory the "aggressive" scanner ran
+  exactly like a Green one; at Orange one host's priority pre-scan stopped
+  on the CPU budget ~150 times an hour. `aggressive` now paces at twice
+  `telemetry.cpu_budget_pct` (at most one core), `light` and
+  `definite_only` (memory pressure) at half. Critical disk pressure stays
+  unpaced; `definite_only` does not yet restrict which paths are walked
+  (`6ebd3a3`).
+
+## v0.6.19 **[release]**
+
+Compare: [`v0.6.18...v0.6.19`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.18...v0.6.19)
+
+### Added — abandoned `mktemp` scratch in temp trees is reclaimable
+
+- Directories made by `mktemp -d -t <prefix>.XXXXXXXX` matched no name
+  pattern, so sbh never nominated them: one host at Critical pressure
+  reported "nothing to reclaim" while 14 idle `fsfs-quickstart.*` test
+  dirs held 53 GB. A directory under a temp tree named
+  `<prefix>.<6-16 random alphanumerics mixing upper and lower case>` is
+  now temp scratch, unless a directory between it and the temp root is a
+  project (`.git`, `Cargo.toml`, `package.json`, `pyproject.toml`,
+  `go.mod`). Digit-free suffixes with a run of four or more lowercase
+  letters are words (`com.apple.WindowManager` in a macOS `$TMPDIR`) and
+  do not count. The whole-tree idle age and open-file checks still apply
+  (`4cb4c54`, `8136b30`).
+
+## v0.6.18 **[release]**
+
+Compare: [`v0.6.17...v0.6.18`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.17...v0.6.18)
+
+### Fixed — reported and planned sizes are measured, not a 100 MiB placeholder
+
+- The priority pre-scan recorded candidates in its index at the 100 MiB
+  nomination placeholder, so every later replay dispatched and reported
+  that size: in 12 hours one host logged 361 deletions and 17.9 GB "freed",
+  all of it the placeholder (171 deletions at exactly 100 MiB) for a few
+  megabytes of tiny `node_modules`, and the reclaim byte target counted it
+  as progress. (The release commit's "73 GB in 12 hours" came from a query
+  whose time filter matched a much longer window.)
+  The index now records the measured size, and records written by earlier
+  versions are re-measured when replayed (`e4c33d4`).
+
+## v0.6.17 **[release]**
+
+Compare: [`v0.6.16...v0.6.17`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.16...v0.6.17)
+
+### Fixed — Linux: the memory-map check no longer burns a core on big hosts
+
+- Every process's `/proc/<pid>/maps` is read once per 30 seconds and shared
+  by all scan roots, instead of once per root on almost every pass. On a
+  host with ~2,400 processes one sweep costs ~6 CPU-seconds, and the
+  scanner was running at a full core (`b5587bf`).
+
+## v0.6.16 **[release]**
+
+Compare: [`v0.6.15...v0.6.16`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.15...v0.6.16)
+
+### Fixed — a scan pass can no longer run away inside one directory
+
+- Sacred-pattern regexes are compiled once and reused. Every protection
+  check recompiled the whole catalog's patterns, for every candidate.
+- The priority pre-scan checks its CPU and time limits before each
+  candidate. One directory with dozens of candidates, each taking seconds
+  to prove protected, held a pass at most of a core for 16+ minutes past
+  its budget (`d55310b`).
+
+## v0.6.15 **[release]**
+
+Compare: [`v0.6.14...v0.6.15`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.14...v0.6.15)
+
+### Changed — the daemon gets enough CPU to finish a scan
+
+- The generated systemd unit caps sbh at one core (`CPUQuota=100%`) with the
+  lowest CPU weight (`CPUWeight=1`) instead of 10% of one core. The 10% cap
+  throttled the fleet in nearly every scheduling period, so on a full host
+  every scan timed out; builds still win whenever cores are busy
+  (`0ce785a`).
+- A routine scan waits until the daemon's CPU budget is nearly full before
+  starting, so each pass gets a real slice instead of stopping after a
+  handful of entries. Average CPU use is unchanged (`9987a36`).
+
+## v0.6.14 **[release]**
+
+Compare: [`v0.6.13...v0.6.14`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.13...v0.6.14)
+
+### Fixed — macOS ballast
+
+- Ballast files on macOS really reserve their space. APFS does not reliably
+  turn a preallocation into allocated blocks (it fails outright on some
+  volumes and leaves the file mostly sparse on others), so a Mac's ballast
+  pool could never be provisioned. The file is now filled with zeros when
+  preallocation falls short (`d295843`). No change on Linux.
+
+## v0.6.13 **[release]**
+
+Compare: [`v0.6.12...v0.6.13`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.12...v0.6.13)
+
+### Fixed — safety
+
+- Name rules for agent scratch directories (`cass_*`, `frankenterm-*`,
+  `frankentui-*`, `pi_agent_*`, `claude-*`, ...) apply only to a directory
+  created directly in a temp root. Matching a name anywhere had removed a
+  backup folder, checked-in fuzz corpora inside git clones and rch run
+  mirrors. Build-artifact rules (targets, `node_modules`, caches) are
+  unchanged (`8b1b728`).
+
+## v0.6.12 **[release]**
+
+Compare: [`v0.6.11...v0.6.12`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.11...v0.6.12)
+
+### Fixed — safety
+
+- Claude Code's own directories are never reclaimed whole: the per-user
+  session root `claude-<uid>` (every live session's scratchpads and task
+  output) and `claude-mcp-browser-bridge-*`. The broad `claude-` rule
+  nominated them; a Mac deleted the bridge directory and tried the session
+  root three times, stopped only by the open-file check. Agent scratch dirs
+  and artifacts inside a scratchpad stay reclaimable (`f04a9b0`).
+- A walked directory about to be deleted is always checked for running
+  executables, memory maps and open files. Its recorded size was only its
+  immediate files, so a large build directory looked tiny and skipped those
+  checks, the only guard for a binary a process is running (`f04a9b0`).
+- `state.json` is written world-readable whatever the daemon's umask, so
+  non-root `sbh status` can always read it (`00b858a`).
+
+## v0.6.11 **[release]**
+
+Compare: [`v0.6.10...v0.6.11`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.10...v0.6.11)
+
+### Fixed
+
+- `~/.cargo/registry` and `~/.cargo/git` are never reclaimed as a whole;
+  the stores inside them (`registry/{cache,src,index}`, `git/{checkouts,db}`)
+  are. rch's per-job cargo home symlinks those roots, so removing one broke
+  every crates.io download on that worker (hz4: a release lost 33 minutes)
+  (`6417f0b`).
+- The executor's open-file refusal now matches candidates spelled through a
+  symlink. It compared the spelled path against resolved open-file paths, so
+  on macOS nothing under `/var/tmp` or `$TMPDIR` could ever be refused as
+  open (`94e2fb3`).
+- A configured root that is itself a symlink is walked. On macOS the default
+  `/tmp` (a link to `/private/tmp`) was skipped silently, so the daemon never
+  saw stale build output there (`94e2fb3`).
+
+## v0.6.10 **[release]**
+
+Compare: [`v0.6.9...v0.6.10`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.9...v0.6.10)
+
+### Fixed — macOS scans no longer stall in the memory-map probe
+
+- The active-reference memory-map check walks only file-backed regions
+  (`PROC_PIDREGIONPATHINFO2`) instead of every region of every process. On
+  a Mac with ~900 processes the old walk took 9-12 s per scan root, often
+  timed out (reporting "incomplete" anyway), and ran once per root, so a
+  pass could spend its whole CPU budget before scanning anything ("scan
+  budget reached (1 entries, 0 candidates, 54.2s)"). Now 0.2-0.4 s per root
+  with identical results (`ebf65ee`). No change on Linux.
+
+## v0.6.9 **[release]**
+
+Compare: [`v0.6.8...v0.6.9`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.8...v0.6.9)
+
+### Added — macOS scans the per-user temp dir
+
+- The daemon also scans `$TMPDIR` (`/var/folders/<x>/<y>/T`), where cargo
+  test tempdirs and most tools write. The default roots `/tmp` and
+  `/var/tmp` resolve to `/private/...` on macOS and never reached it, so a
+  full Mac reported nothing to reclaim while that directory went unvisited.
+  It is added at load unless a configured root already is, contains, or lies
+  inside it; `scanner.include_user_temp_dir = false` opts out. No effect on
+  other platforms (`95cc829`).
+
+### Changed
+
+- `clippy -D warnings` passes on macOS; macOS-only code had never been
+  linted. No behavior change (`1312548`).
+
+## v0.6.8 **[release]**
+
+Compare: [`v0.6.7...v0.6.8`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.7...v0.6.8)
+
+### Fixed — service repairs keep the unit's config and never run a dev build
+
+- `sbh service reinstall-unit`, `sbh bootstrap` and the install-time repair
+  keep the unit's `--config` (and other `ExecStart` arguments). They reset
+  the command to plain `daemon`, so a fleet unit running with
+  `--config /root/.config/sbh/config.toml` fell back to a stale
+  `/etc/sbh/config.toml` after a repair (`84ea6f2`).
+- A service repair refuses to point the unit at a binary outside an install
+  location (`/usr/local/bin`, `/usr/bin`, Homebrew, `~/.local/bin`,
+  `~/.cargo/bin`). A test run as root on a build worker had rewritten that
+  host's production unit to run the worker's debug build (`84ea6f2`).
+- `sbh bootstrap` honors the `SBH_TEST_MODE` + `SBH_SYSTEMD_UNIT_DIR` fixture
+  override when it scans for units, as `doctor --service` already did
+  (`84ea6f2`).
+
+### Tests
+
+- Two load-sensitive tests no longer fail on busy build workers: the pre-scan
+  resume test asserts on the cursor (an index replay batch legitimately
+  precedes the pre-scan's), and the `proof_harness` micro-benchmarks bound
+  the median rather than the single slowest sample (`ad390fd`, `5bb5416`).
+
+## v0.6.7 **[release]**
+
+Compare: [`v0.6.6...v0.6.7`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.6...v0.6.7)
+
+### Fixed
+
+- Within one scan pass, no candidate *containing* an already dispatched tree
+  is dispatched either. Only candidates inside a dispatched tree were dropped,
+  so a pre-scan batch for `proj/target/debug` followed by a walk batch for
+  `proj/target` could delete a `debug/` rebuilt in between; the containing
+  tree now waits for the next pass (`405a15f`).
+- The macOS temp-root check requires an absolute path of plain names; it
+  accepted relative paths and skipped `..` components (`405a15f`).
+- `scripts/dsr_release.sh` verifies a release with the binary for the release
+  Mac's own architecture (`405a15f`).
+
+## v0.6.6 **[release]**
+
+Compare: [`v0.6.5...v0.6.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.5...v0.6.6)
+
+### Changed — the executor spends its time deleting, not re-listing open files
+
+- A complete open-file sweep is reused by the next batch while it started
+  less than 20 s ago; a batch whose candidate root changed after the sweep
+  began gets a fresh one. On css the sweep over thousands of agent
+  processes took most of each 12-25 s batch, and 74% of batches start the
+  moment the previous one ends (`4c834f2`).
+- A plan the executor refuses entirely now backs its candidates off and names
+  the reasons, instead of being re-proposed every pass (css: 10 of 27 batches)
+  (`b3747eb`).
+
+### Fixed — macOS
+
+- The per-user temp dir `$TMPDIR` (`/var/folders/<xx>/<hash>/T`) is a temp
+  root: build artifacts there are scored like those in `/tmp` instead of
+  being held for review (`d74ed6d`).
+- The library suite now passes natively on macOS (3028/3028, plus `sbh_mach`
+  19/19); it had never run there. Host-dependent tests were made hermetic and
+  README now describes the FSEvents backend that shipped in `864066f`.
+
+### Changed — process I/O attribution
+
+- Bounded sampling sweeps finish despite continuous PID churn (`f9a5d5e`), and
+  I/O history snapshots persist across daemon restarts (`c5b5dd5`).
+
+## v0.6.5 **[release]**
+
+Compare: [`v0.6.4...v0.6.5`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.4...v0.6.5)
+
+### Fixed — pressured hosts spent their scan budget re-proving the same trees
+
+- A protected verdict proved by a real find (a `.db`, `.beads/`, WAL sidecar
+  inside the tree) is kept while that find still exists, instead of being
+  dropped whenever the busy tree's mtime changes. On css every pass re-walked
+  ~8 active agent temp trees, hit the daemon CPU budget, and never reached the
+  main walk (`245fc18`).
+- The priority pre-scan plans and reports a directory at its measured size;
+  it used a flat 100 MiB, so a 2 MiB cache was logged as 100 MiB freed
+  (`245fc18`).
+- The installed service's own ballast pool is never adopted as a "stranded"
+  reserve by a process running with another config (a CLI or a test daemon).
+  A test daemon running as root on a build worker had counted,
+  and could release from, the production daemon's live 10 GiB pool (`56f6271`).
+- **A tree is dispatched for deletion at most once per scan pass.** The
+  pre-scan and the walk could both nominate it; the second batch arrived right
+  after the first deletion, and a build that recreated the tree in between got
+  the freed inode back, so the identity check passed and the rebuilt target was
+  deleted too (`a219521`).
+- Process I/O attribution history is bounded, persisted atomically and
+  survives counter and clock resets; busy hosts are sampled fairly
+  (`dec4a3e`, `e0741fc`).
+
+### Changed — releases no longer involve GitHub Actions
+
+- The GitHub workflows (`ci.yml`, `release.yml`, `cert-expiration.yml`) are
+  deleted. Releases are `dsr build` from a clean tag worktree followed by
+  `scripts/dsr_release.sh all X.Y.Z`: Developer ID signing with hardened
+  runtime, notarization (must be `Accepted`), packaging and audit, manifest
+  minisign, GitHub release upload and verification, and the Homebrew tap. The
+  sign step refuses an expired certificate and warns 30 days ahead.
+- **The Homebrew tap had been stuck at v0.6.0**: only the disabled Release
+  workflow updated it, so v0.6.1–v0.6.3 never reached `brew`. It now serves
+  v0.6.4, and the v0.6.4 darwin binaries are notarized
+  (`spctl`: `accepted, source=Notarized Developer ID`).
+- `sbh doctor --release` no longer checks GitHub secrets, workflow state or the
+  cert-expiration workflow, and its setup plan no longer stores credentials as
+  GitHub secrets; the JSON report drops `required_github_secrets`. The tap
+  version check reads the version from the formula URL (the rendered formula
+  has no `version` line, which made the check fail).
+
+### Fixed
+
+- A candidate whose protection check errors (for example a dead FUSE mount
+  inside it) is remembered as protected until its verdict expires, instead of
+  being re-probed and logged on every pass.
+
+## v0.6.4 **[release]**
+
+Compare: [`v0.6.3...v0.6.4`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.3...v0.6.4)
+
+### Fixed
+
+- **Agent session histories and cass data are built-in sacred** (`a446e2a`):
+  `~/.claude`, `~/.codex`, `~/.gemini`, `~/.cass-memory`,
+  `~/.local/share/coding-agent-search*` and the macOS cass Application Support /
+  `Library/Caches/cass-*` trees are protected under any home, not only when an
+  operator remembers to add them.
+- **Executor reports the space deletions actually free** (`2df3347`): each
+  unlink is measured with `statvfs` before and after; `bytes_freed` stays the
+  estimate and `bytes_freed_observed` feeds the controller and the
+  `observed_freed=` summary. Quarantine renames count as zero freed.
+- **Emergency ballast release no longer blocks on pool locks** (`d556cc4`):
+  release uses a nonblocking flock, refreshes slots under it and unlinks by
+  directory handle after an identity check; gradual refill defers on
+  contention instead of stalling the daemon.
+- **Ballast provisioning fails closed on unknown headroom** (`c30a376`):
+  every new file needs a fresh capacity reading; unknown, nonfinite or
+  read-only readings stop allocation, and damaged reserves are kept when the
+  replacement would cross the floor.
+- FIFO release regressions are portable to macOS (`6d884a5`); emergency
+  manager lint cleanup (`2c490aa`).
+- An explicit `SBH_BUILD_GIT_SHA` wins over the enclosing checkout, so
+  worktree/dsr builds embed the right sha (`a23f07a`).
+- Real-daemon e2e scenarios run serially to stop timing flakes (`a32294f`).
+- `sbh update` retries its staged-binary self-test while exec reports
+  `Text file busy` (a descriptor briefly inherited by another thread's
+  child) instead of aborting a good update (`003cd43`).
+- Ballast tests no longer depend on how full the build host is; the rch
+  pressure floors and the canary re-prove window are documented constants
+  checked against the code (`53dca2e`, `ecab55c`).
 
 ## v0.6.3 **[release]**
 

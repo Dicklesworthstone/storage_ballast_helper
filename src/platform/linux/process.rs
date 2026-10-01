@@ -128,12 +128,39 @@ pub(super) fn read_executables_under(root: &Path) -> Result<ExecutablesResult> {
     })
 }
 
+/// How long one sweep of every process's `maps` serves all roots and callers.
+const MMAP_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(super) fn read_mmap_regions_under(root: &Path) -> Result<Vec<MappedRegion>> {
     let root = resolve_absolute_path(root);
+    Ok(mmap_snapshot()?
+        .iter()
+        .filter(|region| region.path.starts_with(&root))
+        .cloned()
+        .collect())
+}
+
+/// Every file-backed mapping of every process, shared for
+/// [`MMAP_SNAPSHOT_TTL`]. Reading `/proc/*/maps` is kernel-heavy (one sweep
+/// of trj's ~2,400 processes cost ~6 CPU-seconds) and was done once per scan
+/// root on every active-reference index build, which ran almost every pass:
+/// trj's scanner sat at a full core (2026-09-28).
+fn mmap_snapshot() -> Result<std::sync::Arc<Vec<MappedRegion>>> {
+    type Snapshot = Option<(Instant, std::sync::Arc<Vec<MappedRegion>>)>;
+    static SNAPSHOT: std::sync::OnceLock<parking_lot::Mutex<Snapshot>> = std::sync::OnceLock::new();
+    let slot = SNAPSHOT.get_or_init(|| parking_lot::Mutex::new(None));
+    if let Some((at, snapshot)) = slot.lock().as_ref()
+        && at.elapsed() < MMAP_SNAPSHOT_TTL
+    {
+        return Ok(std::sync::Arc::clone(snapshot));
+    }
+    // Resolve each distinct mapped path once per sweep: ~100k maps lines are
+    // mostly the same few shared libraries.
+    let mut resolved = std::collections::HashMap::<String, PathBuf>::new();
     let mut regions = Vec::new();
     for pid in proc_pids()? {
         if pid > 0 {
-            regions.extend(mapped_regions_for_pid_under(pid, &root));
+            collect_mapped_regions_for_pid(pid, &mut resolved, &mut regions);
         }
     }
     regions.sort_by(|left, right| {
@@ -142,7 +169,9 @@ pub(super) fn read_mmap_regions_under(root: &Path) -> Result<Vec<MappedRegion>> 
             .then_with(|| left.start_address.cmp(&right.start_address))
             .then_with(|| left.path.cmp(&right.path))
     });
-    Ok(regions)
+    let snapshot = std::sync::Arc::new(regions);
+    *slot.lock() = Some((Instant::now(), std::sync::Arc::clone(&snapshot)));
+    Ok(snapshot)
 }
 
 pub(super) fn read_process_io(pid: i32) -> Result<ProcessIo> {
@@ -358,17 +387,41 @@ fn parse_fdinfo_flags(raw: &str) -> Option<u64> {
     })
 }
 
-fn mapped_regions_for_pid_under(pid: i32, root: &Path) -> Vec<MappedRegion> {
+fn collect_mapped_regions_for_pid(
+    pid: i32,
+    resolved: &mut std::collections::HashMap<String, PathBuf>,
+    regions: &mut Vec<MappedRegion>,
+) {
     let maps_path = pid_proc_path(pid).join("maps");
     let Ok(raw) = fs::read_to_string(maps_path) else {
-        return Vec::new();
+        return;
     };
-    raw.lines()
-        .filter_map(|line| mapped_region_from_maps_line(pid, line, root))
-        .collect()
+    for line in raw.lines() {
+        if let Some(region) = parse_maps_line(pid, line, |raw_path| {
+            resolved
+                .entry(raw_path.to_string())
+                .or_insert_with(|| resolve_absolute_path(Path::new(raw_path)))
+                .clone()
+        }) {
+            regions.push(region);
+        }
+    }
 }
 
+#[cfg(test)]
 fn mapped_region_from_maps_line(pid: i32, line: &str, root: &Path) -> Option<MappedRegion> {
+    parse_maps_line(pid, line, |raw_path| {
+        resolve_absolute_path(Path::new(raw_path))
+    })
+    .filter(|region| region.path.starts_with(root))
+}
+
+/// A file-backed `maps` line as a region, its path resolved by `resolve`.
+fn parse_maps_line(
+    pid: i32,
+    line: &str,
+    resolve: impl FnOnce(&str) -> PathBuf,
+) -> Option<MappedRegion> {
     let (range, rest) = take_whitespace_field(line)?;
     let (perms, rest) = take_whitespace_field(rest)?;
     let (_, rest) = take_whitespace_field(rest)?;
@@ -379,13 +432,9 @@ fn mapped_region_from_maps_line(pid: i32, line: &str, root: &Path) -> Option<Map
         return None;
     }
     let (start, end) = parse_maps_address_range(range)?;
-    let path = resolve_absolute_path(Path::new(raw_path));
-    if !path.starts_with(root) {
-        return None;
-    }
     Some(MappedRegion {
         pid,
-        path,
+        path: resolve(raw_path),
         start_address: Some(start),
         end_address: Some(end),
         protection: Some(maps_protection(perms)),

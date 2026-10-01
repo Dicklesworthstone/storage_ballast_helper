@@ -254,56 +254,64 @@ The tap skeleton lives in:
 packaging/homebrew/Formula/sbh.rb
 ```
 
-Tagged releases copy that file into
-`Dicklesworthstone/homebrew-sbh/Formula/sbh.rb`, replace the placeholder SHA-256
-values with the per-architecture checksums for the released
-`sbh-v<version>-<target>.tar.xz` archives, and push the tap update containing
-the formula. The release workflow requires a `HOMEBREW_TAP_SSH_KEY` secret
-containing the private half of a write-enabled deploy key scoped only to
-`Dicklesworthstone/homebrew-sbh`. Before release artifacts are built, the
-workflow derives the public key, verifies the tap's default branch is `main`,
-and dry-runs a branch push over SSH so a read-only or wrong-repository deploy key
-fails early. The formula installs the prebuilt `sbh` binary, runs
+For each release, `scripts/dsr_release.sh tap X.Y.Z` renders that file into
+`Dicklesworthstone/homebrew-sbh/Formula/sbh.rb`: it points both archive URLs at
+`releases/download/vX.Y.Z`, replaces the placeholder SHA-256 values with the
+per-architecture checksums for the released `sbh-v<version>-<target>.tar.xz`
+archives, fails if any `REPLACE_WITH_` marker remains, runs `ruby -c` on the
+result, and pushes the tap update to the tap's `main` branch. Before rendering,
+it downloads the published checksum sidecars for both macOS archives and
+refuses to touch the tap when the published checksums differ from the local
+ones, so the tap always points at what the release actually serves. The clone
+and push use the operator's GitHub CLI login, which therefore needs push access
+to `Dicklesworthstone/homebrew-sbh`; no deploy key or repository secret is
+involved. The formula installs the prebuilt `sbh` binary, runs
 `sbh setup --verify --bin-dir <keg>/bin` as a post-install sanity check, defines
 a `brew services` daemon entry, and prints the Full Disk Access reminder in its
 caveats.
 
-Until the external tap is published, a manually installed or from-source binary
-can still live in one of the standard Homebrew prefixes as long as the launchd
-plist points at the actual binary path.
+A manually installed or from-source binary can also live in one of the
+standard Homebrew prefixes as long as the launchd plist points at the actual
+binary path.
 
 ## Code Signing And Hardened Runtime
 
-macOS CI and release builds sign `sbh` with Hardened Runtime enabled. The
+Released macOS `sbh` binaries are signed with Hardened Runtime enabled. The
 entitlements file is intentionally minimal:
 
 ```text
-.github/macos/sbh.entitlements.plist
+packaging/macos/sbh.entitlements.plist
 ```
 
 That file contains an empty entitlement dictionary. `sbh` does not need JIT,
 library-validation bypasses, camera, microphone, or network-server entitlements.
-Pull-request CI signs the release-style binary ad hoc with:
+
+sbh does not use GitHub Actions or any hosted CI for releases. A release is
+`dsr build storage_ballast_helper --version X.Y.Z` run from a clean worktree at
+the release tag, which leaves the four target archives and raw binaries in the
+dsr artifact directory, followed on the release Mac by:
 
 ```bash
-codesign --force --sign - --options runtime --timestamp=none \
-  --entitlements .github/macos/sbh.entitlements.plist target/release/sbh
+scripts/dsr_release.sh all X.Y.Z
 ```
 
-The ad-hoc identity used in PR CI is only for build validation. Tagged macOS
-releases import the Developer ID Application certificate from Actions secrets
-into a temporary keychain and sign the same binary with:
+`all` runs the steps `sign`, `notarize`, `package`, `minisign`, `publish`, and
+`tap` in that order, and stops at the first failure; each step can also be run
+on its own, for example `scripts/dsr_release.sh notarize X.Y.Z`. The `sign`
+step signs both darwin raw binaries with:
 
 ```bash
-codesign --force --sign "${APPLE_DEVELOPER_ID_IDENTITY}" --options runtime \
-  --timestamp --entitlements .github/macos/sbh.entitlements.plist target/release/sbh
+codesign --force --options runtime --timestamp \
+  --entitlements packaging/macos/sbh.entitlements.plist \
+  -s "Developer ID Application: Jeffrey Emanuel (AU8V2Z6NKY)" sbh_darwin_arm64
 ```
 
-CI runs the ad-hoc signing check on both `push` and `pull_request` events so
-PRs exercise the macOS codesign path without requiring a Developer ID
-certificate. Tagged releases fail before packaging if the Developer ID
-certificate secrets are absent or the resulting binary is not signed by a
-`Developer ID Application` authority.
+It then runs `codesign --verify --strict` and fails unless `codesign -dvv`
+reports that exact Developer ID authority, repacks the signed binary into the
+versioned and legacy archives, rewrites their `.sha256` sidecars, and updates
+the darwin hashes in the dsr manifest. `SBH_SIGN_IDENTITY` overrides the
+signing identity (for example `Developer ID Application: Example LLC (TEAMID)`),
+but the installer and `sbh update` accept only the default identity.
 
 The Unix one-liner installer keeps checksum verification enabled by default.
 On macOS, that same `--verify` path also runs
@@ -315,30 +323,31 @@ and `TeamIdentifier=AU8V2Z6NKY`. The explicit `sbh install --no-verify` or
 `sbh update --no-verify` flags bypass these installer trust checks and should
 only be used for deliberate recovery from a trusted local artifact.
 
-Tagged macOS releases also run an explicit notarization phase. Apple accepts
-notary uploads as ZIP archives, disk images, or signed flat packages, while the
-existing release artifact remains `sbh-{tag}-{target}.tar.xz`; the workflow
-therefore creates a temporary ZIP around the signed `sbh` binary for Apple's
-scanner and keeps the tarball naming contract unchanged.
+The `notarize` step refuses a binary that lacks the Developer ID authority.
+Apple accepts notary uploads as ZIP archives, disk images, or signed flat
+packages, while the release artifact remains `sbh-{tag}-{target}.tar.xz`, so the
+step wraps each signed `sbh` binary in a temporary ZIP for Apple's scanner and
+keeps the tarball naming contract unchanged. It submits with
+`xcrun notarytool submit --keychain-profile sbh-notary --wait --timeout 30m`
+and fails the release, printing the notary response, unless the status is
+`Accepted`. A bare Mach-O cannot be stapled; Gatekeeper finds the ticket online
+by code hash, so notarizing also works for a release that is already published.
 
-The release workflow uses these GitHub secrets:
+Release credentials live on the release Mac, never in a repository:
 
-```text
-APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64
-APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD
-APPLE_DEVELOPER_ID_IDENTITY
-APPLE_NOTARY_KEY_P8_BASE64
-APPLE_NOTARY_KEY_ID
-APPLE_NOTARY_ISSUER_ID
-HOMEBREW_TAP_SSH_KEY
-```
+- the Developer ID Application identity (certificate plus private key) in the
+  login keychain;
+- the `sbh-notary` notarytool keychain profile, created from an App Store
+  Connect API key;
+- the operator's `gh` login, which creates the GitHub release, uploads the
+  assets, and pushes the tap update;
+- ssh access to the host that holds the dsr minisign key
+  (`SBH_MINISIGN_HOST`, default `css`) for the `minisign` step.
 
 Apple Developer Program enrollment is confirmed for this project. Use the
 already-enrolled Apple Developer account or team that owns the Developer ID
-Application certificate and notarization credentials. The repository workflow is
-intentionally team-agnostic: Organization and Individual memberships both use
-the same secret names, and notarization uses an App Store Connect API key rather
-than branching release logic around Apple ID account passwords.
+Application certificate and notarization credentials. Notarization uses an App
+Store Connect API key rather than Apple ID account passwords.
 
 Developer ID certificate setup is intentionally outside the repository because
 it handles private key material:
@@ -360,39 +369,10 @@ it handles private key material:
    that created the CSR/private key pair and verify that
    `security find-identity -v -p codesigning` lists a `Developer ID
    Application` identity for the selected Team ID.
-4. Export that identity, including the private key, as an encrypted P12 file.
-   Keep the P12 outside the repository and protect it with a unique password.
-5. Set the release secrets from stdin so the values do not appear in shell
-   history:
-
-   ```bash
-   base64 < "$P12_PATH" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 \
-     -R Dicklesworthstone/storage_ballast_helper
-   printf '%s' "$P12_PASSWORD" | gh secret set APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD \
-     -R Dicklesworthstone/storage_ballast_helper
-   printf '%s' "$DEVELOPER_ID_IDENTITY" | gh secret set APPLE_DEVELOPER_ID_IDENTITY \
-     -R Dicklesworthstone/storage_ballast_helper
-   base64 < "$APPLE_NOTARY_KEY_PATH" | gh secret set APPLE_NOTARY_KEY_P8_BASE64 \
-     -R Dicklesworthstone/storage_ballast_helper
-   printf '%s' "$APPLE_NOTARY_KEY_ID" | gh secret set APPLE_NOTARY_KEY_ID \
-     -R Dicklesworthstone/storage_ballast_helper
-   printf '%s' "$APPLE_NOTARY_ISSUER_ID" | gh secret set APPLE_NOTARY_ISSUER_ID \
-     -R Dicklesworthstone/storage_ballast_helper
-   ssh-keygen -t ed25519 -C "sbh Homebrew tap release" \
-     -f "$HOME/.ssh/sbh-homebrew-tap-release" -N ""
-   gh api -X POST repos/Dicklesworthstone/homebrew-sbh/keys \
-     -f title="sbh release workflow" \
-     -f key="$(cat "$HOME/.ssh/sbh-homebrew-tap-release.pub")" \
-     -F read_only=false
-   gh secret set HOMEBREW_TAP_SSH_KEY \
-     -R Dicklesworthstone/storage_ballast_helper \
-     < "$HOME/.ssh/sbh-homebrew-tap-release"
-   gh secret list -R Dicklesworthstone/storage_ballast_helper
-   ```
-
-   The notary key path should point at the `.p8` App Store Connect API key
-   downloaded from Apple. Store the same key in the local keychain profile used
-   by release readiness diagnostics:
+4. Create the `sbh-notary` keychain profile that `scripts/dsr_release.sh
+   notarize` and the release doctor use. `$APPLE_NOTARY_KEY_PATH` is the `.p8`
+   App Store Connect API key downloaded from Apple; `notarytool` stores it in
+   the keychain, so the file can be moved offline afterwards:
 
    ```bash
    xcrun notarytool store-credentials sbh-notary \
@@ -401,39 +381,26 @@ it handles private key material:
      --issuer "$APPLE_NOTARY_ISSUER_ID"
    ```
 
+5. Confirm the GitHub CLI login can push to the tap:
+
+   ```bash
+   gh api repos/Dicklesworthstone/homebrew-sbh --jq .permissions.push
+   ```
+
 Rotate the Developer ID certificate and App Store Connect API key every 12
-months, or immediately after any maintainer, runner, or secret exposure
-incident. During rotation, create and store the replacement secrets first, run the
-`Developer ID Certificate Expiration` workflow manually, then publish the next
-tagged release only after the release workflow signs, notarizes, and verifies
-the binary with the new identity.
+months, or immediately after any maintainer, release-host, or credential
+exposure incident. During rotation, install the replacement identity and
+re-create the `sbh-notary` profile first, run `sbh doctor --release`, then
+publish the next release only after `scripts/dsr_release.sh sign` and
+`notarize` succeed with the new identity.
 
-If any secret is missing, the macOS release job fails before packaging. The P12
-secret is the base64-encoded Developer ID Application certificate plus private
-key exported from Keychain Access, and `APPLE_DEVELOPER_ID_IDENTITY` is the full
-codesigning identity string, for example `Developer ID Application: Example LLC
-(TEAMID)`. When all credentials are present, the workflow imports the P12 into a
-temporary keychain, signs with Hardened Runtime, verifies that the binary was
-signed by a `Developer ID Application` authority, then submits the temporary ZIP
-with `xcrun notarytool submit --key "$APPLE_NOTARY_KEY_PATH" --key-id
-"$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID"`, extracts the
-submission id, polls `xcrun notarytool info` every 30 seconds for up to 30
-minutes, and downloads `xcrun notarytool log` output on both success and failure.
-After Apple accepts the submission, the workflow parses the downloaded notary
-log and verifies that `ticketContents` contains the signed binary CDHash and
-architecture before packaging the tarball. Raw CLI executables distributed in
-tarballs do not produce a useful `spctl -t execute` assessment on all supported
-macOS versions even when the notary service accepts the submission, so the
-release gate verifies Apple's accepted notary ticket directly. `Invalid`,
-`Rejected`, and timeout states fail the release with the notary log printed into
-the Actions output.
+Nothing monitors the certificate's expiry automatically. Check its `notAfter`
+date on the release Mac before cutting a release:
 
-The `Developer ID Certificate Expiration` workflow runs nightly and on manual
-dispatch. It decodes `APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64`, extracts the
-leaf certificate with `openssl pkcs12`, reports the `notAfter` timestamp, fails
-if the certificate is already expired, and emits a GitHub Actions warning when
-the certificate expires within 30 days. Until the Developer ID certificate
-secrets are configured, the workflow emits a warning that certificate expiration monitoring is inactive and exits successfully.
+```bash
+security find-certificate -c "Developer ID Application: Jeffrey Emanuel" -p \
+  | openssl x509 -noout -enddate
+```
 
 ## Release Readiness Diagnostics
 
@@ -451,18 +418,14 @@ signals:
    exact configured identity must appear in the available signing identities.
 2. `xcrun notarytool history --keychain-profile sbh-notary --output-format json`
    must authenticate successfully with the configured keychain profile.
-3. `gh secret list -R Dicklesworthstone/storage_ballast_helper --json name` must
-   report every release secret used by the GitHub Actions workflow, including
-   `HOMEBREW_TAP_SSH_KEY`.
-4. `gh repo view Dicklesworthstone/homebrew-sbh --json nameWithOwner,defaultBranchRef`
+3. `gh repo view Dicklesworthstone/homebrew-sbh --json nameWithOwner,defaultBranchRef`
    must be able to see the Homebrew tap repository and report `main` as
-   `defaultBranchRef.name`. The release workflow additionally validates the
-   `HOMEBREW_TAP_SSH_KEY` secret with Git over SSH in an early preflight before
-   release builds start, and again before tap checkout: the key must authenticate
-   to `Dicklesworthstone/homebrew-sbh`, see `main` as the default branch, and
-   pass a dry-run branch push so read-only deploy keys fail before packaging.
+   `defaultBranchRef.name`, the branch `scripts/dsr_release.sh tap` pushes to.
    The doctor also probes `Formula/sbh.rb` and reports a warning, not a hard failure,
    when the tap exists but the initial formula has not been published yet.
+4. Drift checks compare the latest published release with what users get: the
+   release must carry the archive and checksum for every release target, and
+   the tap formula's version must match the latest release tag.
 
 For automation or handoff checks, use:
 
@@ -474,9 +437,8 @@ Treat any `FAIL` result as a release blocker. Treat `WARN` as an attention state
 it does not make the doctor command fail by itself, but the aggregate `ok`
 boolean remains false until every release check passes. The command
 intentionally reports missing local signing identity, missing notary profile,
-and missing GitHub Actions secrets or tap access as explicit diagnostics so the
-external Apple/GitHub credential setup can be finished without inspecting
-workflow internals.
+and missing tap access as explicit diagnostics so the Apple and GitHub
+credential setup can be finished without reading `scripts/dsr_release.sh`.
 The JSON report includes an aggregate `ok` boolean plus `passed`, `warnings`, and
 `failed` counts so automation can gate on a stable summary before drilling into
 individual `checks`.
@@ -487,10 +449,8 @@ without scraping terminal text.
 The release doctor also prints a non-secret credential setup plan. The plan
 starts with the CSR/keychain request step now that Apple Developer Program
 enrollment is confirmed, then uses placeholder environment variables such as
-`$P12_PATH`, `$P12_PASSWORD`, `$APPLE_NOTARY_KEY_PATH`,
-`$APPLE_NOTARY_KEY_ID`, `$APPLE_NOTARY_ISSUER_ID`, and the generated
-`$HOME/.ssh/sbh-homebrew-tap-release` deploy key path; it never prints secret
-values. The GitHub secret commands use redirected stdin instead of storing values in shell history.
+`$APPLE_NOTARY_KEY_PATH`, `$APPLE_NOTARY_KEY_ID`, and
+`$APPLE_NOTARY_ISSUER_ID`; it never prints secret values.
 After completing the plan, rerun:
 
 ```bash
@@ -498,28 +458,30 @@ sbh doctor --release --json
 ```
 
 The JSON `setup_steps` field is stable enough for handoff automation that wants
-to display the same Developer ID, notary, Homebrew token, and final recheck
-commands without scraping this document.
+to display the same Developer ID, notary, Homebrew tap access, and final
+recheck commands without scraping this document.
 
 The current CLI tarball flow does not staple a ticket because `stapler` supports
-app bundles, disk images, and signed flat packages rather than the `.tar.xz`
-artifact. The release workflow keeps the accepted notary log with ticket
-contents for the signed binary. A future `.pkg` or `.dmg` distribution path
-should staple and validate that package after notarization.
+app bundles, disk images, and signed flat packages rather than bare binaries or
+the `.tar.xz` artifact. A future `.pkg` or `.dmg` distribution path should
+staple and validate that package after notarization.
 
 ## Manual Release Fallback
 
-The normal release path is the tagged GitHub Actions workflow. Use a manual
-fallback only when the hosted release run is stuck before runner assignment and
-the operator has explicitly approved publishing outside the workflow. Do not
+The normal release path is `dsr build` followed by
+`scripts/dsr_release.sh all X.Y.Z` (see
+[Code Signing And Hardened Runtime](#code-signing-and-hardened-runtime)). Use a
+manual fallback only when `dsr build` cannot produce a target and the
+operator has explicitly approved publishing outside the dsr path. Do not
 publish from chat notes, historical provenance, or a missing `/tmp` directory:
 the complete artifact set must exist on disk and pass verification immediately
 before upload. The verification is `sbh doctor --release --assets "$ARTIFACT_DIR"`
 (a locally built `sbh` is fine): it fails on any missing archive or sidecar,
 checksum or `SHA256SUMS.txt` mismatch, missing or differing legacy mirror,
 a tarball whose binary is not the labelled architecture, or a provenance
-document with the wrong tag. The hosted workflow runs the same audit against
-the published release in its `asset-audit` job before the tap update.
+document with the wrong tag. `scripts/dsr_release.sh publish` runs the same
+audit against the published release
+(`scripts/release_gate_and_package.sh --verify-release`) before the tap update.
 
 The entire fallback build, packaging, and pre-upload audit can be run directly using `scripts/release-manual.sh --tag $TAG` (or previewed with `--dry-run`).
 
@@ -535,7 +497,9 @@ mkdir -p "$ARTIFACT_DIR"
 ```
 
 Build fallback artifacts with the same nightly Rust toolchain and feature set as
-the hosted release workflow. The repository `rust-toolchain.toml` pins nightly;
+`dsr build`, whose sbh config builds with
+`--no-default-features --features cli,daemon,sqlite`. The repository
+`rust-toolchain.toml` pins nightly;
 keep `+nightly` in manual release commands so shell-level overrides cannot
 accidentally publish stable-built binaries:
 
@@ -564,8 +528,8 @@ For macOS artifacts, build the exact tag, sign with the Developer ID Application
 identity, verify the hardened-runtime signature, submit the signed binary to
 notarytool, download the accepted notary log, and verify the log's
 `ticketContents` contains the binary architecture and CDHash before packaging.
-For Linux artifacts, use the same no-default-feature release profile as the
-workflow and verify each extracted binary reports the expected `sbh --version`.
+For Linux artifacts, use the same no-default-feature release profile as
+`dsr build` and verify each extracted binary reports the expected `sbh --version`.
 
 After all four archives and sidecars are present, regenerate the aggregate
 manifest from the sidecars and verify it from inside the artifact directory:
@@ -687,7 +651,7 @@ the bound on how stale the candidate index can be, and the daemon logs
 `scanner_events: backend=reconciliation-only ... reason=safe kernel scanner
 event backend is unavailable on this platform` at startup so nobody has to
 guess. Adding FSEvents through a safe crate is tracked on
-bd-rc-master-ajg1.8.5; it needs the macOS CI lane to prove it, not a Linux
+bd-rc-master-ajg1.8.5; it needs a test run on a Mac to prove it, not a Linux
 host.
 
 ## Migrating From Visual Cleanup Tools
@@ -740,7 +704,7 @@ the `Platform` trait in `src/platform/pal.rs`:
 - `LinuxPal`: The production Linux implementation (`src/platform/linux/mod.rs`) using
   `statvfs`, `/proc/mounts`, `/proc/<pid>/fd`, and systemd.
 - `MockPlatform`: The in-memory test implementation (`src/platform/pal.rs`) providing
-  fully deterministic filesystem, capacity, and process listings for CI and unit tests.
+  fully deterministic filesystem, capacity, and process listings for tests.
 
 ## Security Model
 

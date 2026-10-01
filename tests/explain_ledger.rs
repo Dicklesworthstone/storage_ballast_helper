@@ -230,7 +230,13 @@ enabled = false
                     .collect::<Vec<_>>(),
                 self.stderr_tail()
             );
-            if !nudged && started.elapsed() > Duration::from_secs(20) {
+            // Only once the daemon logged `daemon_start` (its signal handlers
+            // are installed by then): SIGUSR1 before that is the default
+            // action, which kills it. An IO-starved host (hz3) took >20 s.
+            if !nudged
+                && started.elapsed() > Duration::from_secs(20)
+                && !self.events_of("daemon_start").is_empty()
+            {
                 self.signal("-USR1");
                 nudged = true;
             }

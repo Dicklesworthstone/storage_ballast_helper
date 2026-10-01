@@ -165,14 +165,13 @@ sudo sbh doctor --pal
 ```
 
 Homebrew is supported by the packaged formula skeleton and the
-`Dicklesworthstone/homebrew-sbh` tap. Tagged releases copy
-`packaging/homebrew/Formula/sbh.rb` into the tap, replace the per-architecture
-SHA-256 placeholders from the release artifacts, and publish the formula
-update to the tap using the `HOMEBREW_TAP_SSH_KEY` release secret. That secret is
-the private half of a write-enabled deploy key scoped only to the tap repository;
-the release workflow verifies the key can see `main` and dry-runs a branch push
-before building release artifacts. After the tap update lands, the operator path
-is:
+`Dicklesworthstone/homebrew-sbh` tap. Every release runs
+`scripts/dsr_release.sh tap VERSION`, which renders
+`packaging/homebrew/Formula/sbh.rb` with the version and the per-architecture
+SHA-256s of the published darwin archives (refusing if the published checksums
+differ from the local build) and pushes it to the tap with the releasing
+operator's `gh` login. `sbh doctor --release` fails when the tap lags the latest
+release. With the tap current, the operator path is:
 
 ```bash
 brew tap Dicklesworthstone/sbh
@@ -347,6 +346,11 @@ For non-interactive environments (CI, automation), `sbh install --auto` applies 
 - **Service control:** use `sbh service --launchd --scope user status` and
   `sbh service --launchd --scope user restart` for user installs; replace
   `--scope user` with `--scope system` for LaunchDaemons.
+- **Per-user temp dir:** the daemon also scans `$TMPDIR`
+  (`/var/folders/<x>/<y>/T`), where cargo test tempdirs and most tools write;
+  `/tmp` and `/var/tmp` resolve to `/private/...` and never reach it. It is
+  added at load unless a configured root already is, contains, or lies inside
+  it. Set `scanner.include_user_temp_dir = false` to opt out.
 - **Homebrew paths:** Apple Silicon installs normally live under
   `/opt/homebrew`, Intel installs under `/usr/local`; bootstrap and doctor
   checks inspect both families and repair stale launchd plist paths.
@@ -746,6 +750,7 @@ engine = "v2"  # default since v0.4.32; set "v1" to opt back into the legacy ful
 event_source = "auto"
 event_watch_budget = 8192
 root_paths = ["/data/projects", "/tmp", "/dev/shm"]
+include_user_temp_dir = true  # macOS: also scan $TMPDIR (/var/folders/<x>/<y>/T); no-op elsewhere
 cross_devices = false
 protected_paths = ["/data/projects/production-*", "/home/*/critical-builds"]
 
@@ -1242,7 +1247,7 @@ Demotion to FallbackSafe is automatic and triggered by any of:
 
 #### Recovery with Mandatory Canary Gate
 
-Recovery from FallbackSafe requires the guardrails to report <!-- claim:constants.guardrails.recovery_clean_windows -->3<!-- /claim --> consecutive clean observation windows (configurable via `recovery_clean_windows`). With the default `auto_recover_to = "canary"`, an Enforce fleet does *not* return directly to Enforce: it recovers to Canary and re-proves itself there. The canary gate is temporary: an automatically entered Canary that runs 30 minutes without a new fallback returns to the operator's intended mode (the `initial_mode` or the last `sbh policy promote`/`demote`), and a later fallback remembers that intended mode rather than the waypoint Canary. A Canary the operator chose stays Canary. `auto_recover_to = "previous"` skips the gate; `"none"` leaves recovery to `sbh policy promote`.
+Recovery from FallbackSafe requires the guardrails to report <!-- claim:constants.guardrails.recovery_clean_windows -->3<!-- /claim --> consecutive clean observation windows (configurable via `recovery_clean_windows`). With the default `auto_recover_to = "canary"`, an Enforce fleet does *not* return directly to Enforce: it recovers to Canary and re-proves itself there. The canary gate is temporary: an automatically entered Canary that runs <!-- claim:constants.daemon.CANARY_REPROVE_MINUTES -->30<!-- /claim --> minutes without a new fallback returns to the operator's intended mode (the `initial_mode` or the last `sbh policy promote`/`demote`), and a later fallback remembers that intended mode rather than the waypoint Canary. A Canary the operator chose stays Canary. `auto_recover_to = "previous"` skips the gate; `"none"` leaves recovery to `sbh policy promote`.
 
 The drift alarm (e-process) and the calibration breach are both statements about the forecaster, so both follow `calibration_breach_action`, which defaults to `advisory` for Enforce fleets: forecast drift is logged, and deletion keeps running on the scoring, veto and regret evidence that actually governs it. The canary hourly budget counts deletions the executor performed, not approvals it later dropped.
 
@@ -1253,6 +1258,8 @@ When guardrails report a non-Pass status, a penalty (default 50.0) is added to t
 #### Behavior Matrix
 
 What actually runs at a given pressure is the behavior matrix: memory pressure (rows) crossed with disk pressure (columns) selects a scanner posture, a cleanup posture, a ballast action and a notification severity. `[behavior] preset` (or `SBH_BEHAVIOR_PRESET`) picks `v0.6` (the default: reclaim before the cliff), `v0.5` (the matrix shipped through v0.5.x, for rollback) or `custom` (`v0.6` plus `[behavior.cells.<memory>_<disk>]` overrides, which go through the never-reduce rule in `src/daemon/policy.rs`). The tables are generated from the code by `sbh docs --render README.md`.
+
+The scan posture sets the CPU pace: `aggressive` paces the scanner at twice `telemetry.cpu_budget_pct` (at most one core), `light` and `definite_only` at half, `normal` at the configured value, and `skip` starts no new scans. Critical disk pressure is unpaced regardless. `definite_only` does not yet restrict which paths are walked.
 
 <!-- sbh-docs:begin behavior-matrix -->
 **Preset `v0.6` (default)** (cell = scan / cleanup / ballast / notify):
@@ -1318,7 +1325,7 @@ The guardrail system continuously validates that the forecasting and scoring pip
 
 #### rch Build Pools
 
-rch's remote `CARGO_TARGET_DIR`s (`.rch-target-<worker>-{pool,job,pid}-<key>`) are warm caches shared by later builds, so their age is the newest write anywhere in the tree, never the directory's birth time. Normally sbh honors rch's own floors: a pooled dir must be idle for 168 hours and a per-job dir for 12. Pools in daily use never reach 168 idle hours and grew without bound on the fleet, so once the controller's urgency reaches 0.7 (from roughly mid-Orange, always at Red) the floors drop to 60 minutes for pools and 30 for per-job dirs, and the idle probe may walk up to 2 million entries. A pool written inside the floor is vetoed at every pressure, and the open-file and active-lease rails still apply at deletion time.
+rch's remote `CARGO_TARGET_DIR`s (`.rch-target-<worker>-{pool,job,pid}-<key>`) are warm caches shared by later builds, so their age is the newest write anywhere in the tree, never the directory's birth time. Normally sbh honors rch's own floors: a pooled dir must be idle for <!-- claim:constants.rch.RCH_POOLED_IDLE_HOURS -->168<!-- /claim --> hours and a per-job dir for <!-- claim:constants.rch.RCH_PER_JOB_IDLE_HOURS -->12<!-- /claim -->. Pools in daily use never go that long without a write and grew without bound on the fleet, so once the controller's urgency reaches <!-- claim:constants.rch.RCH_PRESSURE_URGENCY -->0.7<!-- /claim --> (from roughly mid-Orange, always at Red) the floors drop to <!-- claim:constants.rch.RCH_PRESSURE_POOLED_IDLE_MINUTES -->60<!-- /claim --> minutes for pools and <!-- claim:constants.rch.RCH_PRESSURE_PER_JOB_IDLE_MINUTES -->30<!-- /claim --> for per-job dirs, and the idle probe may walk up to <!-- claim:constants.rch.RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE -->2000000<!-- /claim --> entries. A pool written inside the floor is vetoed at every pressure, and the open-file and active-lease rails still apply at deletion time.
 
 #### Layer 6: Repeat-Deletion Dampening
 
@@ -1653,7 +1660,8 @@ v2 uses the candidate index to avoid cold full walks under pressure. At Green or
 What feeds the index is platform-specific, and the daemon says which at startup (`scanner_events: backend=... complete=... reason=...` in the activity log, `sbh scan --json` capability fields):
 
 - **Linux:** recursive `inotify` watches over the configured roots, planned against `scanner.event_watch_budget` (<!-- claim:constants.scanner.event_watch_budget -->8192<!-- /claim --> by default). Every root and every depth-1 directory always gets a watch; the rest of the budget goes to the most active directories, ranked by a per-directory event-rate EWMA with a directory-mtime prior for subtrees that have never been watched. Directories left without a watch under a watched parent form the *frontier*: they are reconciled as their own scan paths (never the whole root, unless a root has more than 256 of them) and afterwards rely on the maintenance pass. While the plan is incomplete the daemon re-plans every 15 minutes from the observed rates, restarting the watches without losing events. A change under a project resolves to that project directory (the depth-1 directory below the configured root) as the scan path; the root itself is used when the change is at the root, when that directory is an artifact tree, or when more than 64 projects are dirty at once. The scanner polls the event source every 2 seconds while idle and runs the scoped pass itself at Green or Yellow (`reason=event` in `scan_complete`), paced by the base `min_rescan_interval_secs` only, so a new `target/` is seen within seconds instead of at the next maintenance walk. An inotify queue overflow reconciles everything once and then backs off: overflows inside the backoff window (30 s, doubling per consecutive overflow up to 30 min) are coalesced into one deferred reconciliation. The activity log carries `frontier_dirs`, `overflows`, `backoff_secs` and `replans`, and `scan_complete` details carry `event_overflows` and `event_watch_replans`. `fanotify` is **not implemented**: the crate forbids `unsafe`, the safe wrapper available to it does not report file handles (`FAN_REPORT_FID`), and filesystem-wide marks need `CAP_SYS_ADMIN`, which a user-scope service does not have. The capability probe reports it as deferred.
-- **macOS and everything else:** reconciliation only. There is no FSEvents backend; the bound on staleness is the maintenance cadence (`pressure.maintenance_interval_secs`) plus the pressure-driven passes. An FSEvents backend through a safe crate is a decision recorded on bd-rc-master-ajg1.8.5 and needs the macOS CI lane to prove it before it ships.
+- **macOS:** a recursive FSEvents stream over the configured roots (`crates/sbh_mach` owns the native stream behind safe wrappers; `src/scanner/events/fsevents.rs` translates paths and invalidates the scanner view). Startup and every replan mark the roots dirty, so the first pass after a daemon start reconciles instead of replaying the candidate index; a dropped or overflowing stream forces a full reconciliation. `scanner.event_source = "reconciliation-only"` turns it off.
+- **Everything else:** reconciliation only; the bound on staleness is the maintenance cadence (`pressure.maintenance_interval_secs`) plus the pressure-driven passes.
 
 For validation and A/B artifacts, `sbh scan --json` reports `scanner_engine`, `scanner_dispatch`, `opaque_pruning`, `opaque_pruned_dirs`, `scanned_entries`, and nullable `process_cpu_micros` alongside the existing candidate totals. Daemon `scan_complete` activity events also include the selected dispatch, pruning state, dirty event-root count, index generation, indexed-record count, candidate bytes seen, and timeout state in their `details` payload, plus `process_cpu_micros=` when the pass measured its CPU. `sbh stats --json` aggregates those events into a `scanner` block (`cpu_seconds_by_day`, `passes`, `entries_scanned`, `opaque_pruned_dirs`), and human `sbh stats` prints the scanner's 7-day CPU-seconds/day average. These fields are intended to make v1/v2 scan captures auditable without scraping human output.
 
@@ -1884,7 +1892,8 @@ This keeps `sbh` at background priority. System-scope systemd units also add a c
 
 **Resource limits:**
 - `MemoryMax=256M` — hard memory ceiling enforced by the cgroup controller
-- `CPUQuota=10%` — limits CPU usage to 10% of one core
+- `CPUQuota=100%` — caps CPU at one core as a runaway backstop
+- `CPUWeight=1` — the lowest CPU share, so builds win whenever cores are busy
 
 **Lifecycle:**
 - `Type=notify` (system scope) with `WatchdogSec=60` for automatic restart on stall

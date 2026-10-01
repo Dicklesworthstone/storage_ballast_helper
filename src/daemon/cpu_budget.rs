@@ -45,7 +45,27 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::daemon::policy::ScanAggressiveness;
 use crate::monitor::pid::PressureLevel;
+
+/// The budget percent to pace at while the behavior matrix selects `scan`.
+///
+/// `Aggressive` (disk Yellow..Red with healthy memory) doubles the
+/// configured pace, capped at one core: at Orange the priority pre-scan on
+/// fmd stopped on the budget ~150 times an hour (2026-09-30) while the
+/// matrix asked for "increased scanner budget" and nothing read it.
+/// `Light` and `DefiniteOnly` (memory Warn/Critical) halve it, so the walk
+/// allocates at half the rate while memory is short; `DefiniteOnly` does not
+/// yet restrict which paths are walked. A configured 0 stays disabled.
+#[must_use]
+pub fn paced_pct(configured: u8, scan: ScanAggressiveness) -> u8 {
+    match scan {
+        _ if configured == 0 => 0,
+        ScanAggressiveness::Aggressive => configured.saturating_mul(2).min(100),
+        ScanAggressiveness::Light | ScanAggressiveness::DefiniteOnly => (configured / 2).max(1),
+        ScanAggressiveness::Normal | ScanAggressiveness::Skip => configured,
+    }
+}
 
 /// Default CPU-seconds the bucket can hold.
 ///
@@ -76,6 +96,10 @@ pub const MAX_DEFICIT_SECS: f64 = 60.0;
 /// start; below this the scanner waits for the refill instead of running a
 /// pass that would be cut short at once.
 pub const PASS_MIN_TOKENS: f64 = 1.0;
+
+/// Fraction of the burst the bucket must hold before a discretionary pass
+/// starts, so each pass gets a real slice rather than the first CPU-second.
+pub const PASS_START_FILL: f64 = 0.95;
 
 /// The "budget exceeded" line is logged at most this often.
 pub const EXCEEDED_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -228,8 +252,14 @@ impl CpuBudget {
         if !self.enabled() || level >= PressureLevel::Critical {
             return None;
         }
+        // Wait for a nearly full bucket, not merely PASS_MIN_TOKENS: a pass
+        // started on one CPU-second spends it on per-pass setup and stops
+        // after a handful of entries. Once the fleet's 10% systemd quota
+        // was lifted (2026-09-28), fmd ran 98 such passes in 9 minutes,
+        // every one cut after ~1 s and 1-80 entries. The average CPU is the
+        // same either way; fewer, fuller passes make progress.
         let available = self.available_secs();
-        if available < PASS_MIN_TOKENS {
+        if available < (self.burst_secs * PASS_START_FILL).max(PASS_MIN_TOKENS) {
             return Some(0.0);
         }
         Some(available)
@@ -468,6 +498,21 @@ mod tests {
     }
 
     #[test]
+    fn behavior_mode_scales_the_configured_pace() {
+        use ScanAggressiveness::{Aggressive, DefiniteOnly, Light, Normal, Skip};
+        assert_eq!(paced_pct(25, Normal), 25);
+        assert_eq!(paced_pct(25, Skip), 25);
+        assert_eq!(paced_pct(25, Aggressive), 50);
+        assert_eq!(paced_pct(80, Aggressive), 100);
+        assert_eq!(paced_pct(25, Light), 12);
+        assert_eq!(paced_pct(25, DefiniteOnly), 12);
+        assert_eq!(paced_pct(1, Light), 1, "halving never disables pacing");
+        for scan in [Normal, Skip, Aggressive, Light, DefiniteOnly] {
+            assert_eq!(paced_pct(0, scan), 0, "a disabled budget stays disabled");
+        }
+    }
+
+    #[test]
     fn refills_from_wall_time_and_drains_by_cpu_deltas() {
         let (mut b, t0) = budget(25);
         // 5 s burst, 4 s of wall refill 1 s, 2 s of CPU used: 5 + 1 - 2 = 4.
@@ -517,8 +562,12 @@ mod tests {
         assert!(b.available_secs() < PASS_MIN_TOKENS);
         assert_eq!(b.pass_cpu_allowance(PressureLevel::Orange), Some(0.0));
         b.observe(t0 + secs(3.0), 104.5); // +0.5 refill -> 1.25
-        let short = b.pass_cpu_allowance(PressureLevel::Orange).unwrap();
-        assert!((short - 1.25).abs() < 1e-9, "{short}");
+        // A CPU-second is not enough any more: the pass waits for a nearly
+        // full bucket so it does not spend its slice on setup alone.
+        assert_eq!(b.pass_cpu_allowance(PressureLevel::Orange), Some(0.0));
+        b.observe(t0 + secs(17.0), 104.5); // +3.5 refill -> 4.75 = 95% of 5
+        let refilled = b.pass_cpu_allowance(PressureLevel::Orange).unwrap();
+        assert!((refilled - 4.75).abs() < 1e-9, "{refilled}");
         // Critical and a disabled budget never limit a pass.
         assert_eq!(b.pass_cpu_allowance(PressureLevel::Critical), None);
         let (off, _) = budget(0);

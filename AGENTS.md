@@ -58,10 +58,6 @@ success** — one line, revert, next lever, no retraction narrative.
 - **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
 - **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
   ```bash
-  git push origin main:master
-  ```
-- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
-  ```bash
   git push origin main main:master
   ```
 
@@ -94,7 +90,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Toolchain:** Nightly (see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml only
-- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` in both `lib.rs` and `main.rs`). The one exception is the workspace member `crates/sbh_mach`, which holds the macOS Mach/libproc/dispatch FFI behind safe wrappers with `unsafe_op_in_unsafe_fn = "deny"`; it compiles to nothing off macOS and its tests run in the macOS CI lanes (`cargo test -p sbh_mach`)
+- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` in both `lib.rs` and `main.rs`). The one exception is the workspace member `crates/sbh_mach`, which holds the macOS Mach/libproc/dispatch FFI behind safe wrappers with `unsafe_op_in_unsafe_fn = "deny"`; it compiles to nothing off macOS, and rch workers are Linux, so its tests, and every `#[cfg(target_os = "macos")]` path in the main crate, only run on a Mac. rch workers are Linux, so the owner approved one exception (2026-09-25): run them natively on mac-mini-old from a `git archive` of the tree in a scratch dir, `RCH_CARGO_WRAPPER_BYPASS=1 RCH_REQUIRE_REMOTE=0 cargo test -p sbh_mach` and `... cargo test --lib`, whenever macOS code or scanner behaviour changes (the first run found a macOS temp-root gap and 10 host-dependent tests)
 
 ### Key Dependencies
 
@@ -601,7 +597,7 @@ Layer 7, quarantine-first deletion: at Green (and for `sbh clean` without `--no-
 
 ## Runtime Constants
 
-Every tunable default and hard-coded limit the daemon runs with, read from the code by `sbh docs` (`sbh docs --section constants` prints it; `sbh docs --check AGENTS.md` fails CI when this table is stale). Change the constant, run `sbh docs --render README.md AGENTS.md`, commit both.
+Every tunable default and hard-coded limit the daemon runs with, read from the code by `sbh docs` (`sbh docs --section constants` prints it; `sbh docs --check AGENTS.md` fails when this table is stale, and so does `cargo test --bin sbh`). Change the constant, run `sbh docs --render README.md AGENTS.md`, commit both.
 
 <!-- sbh-docs:begin constants -->
 | Area | Constant | Value | Meaning | Where |
@@ -725,6 +721,12 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | control | `MAX_SOCKET_PATH_BYTES` | `100` | Longest socket path a Unix address can carry | `src/daemon/control.rs` |
 | voi | `ewma_alpha` | `0.3` | Smoothing of the scheduler's expected-reclaim estimates | `src/core/config.rs` |
 | voi | `scan_budget_per_interval` | `5` | Paths the VOI scheduler scans per cycle | `src/core/config.rs` |
+| rch | `RCH_POOLED_IDLE_HOURS` | `168` | rch's own idle floor (hours) for a pooled target dir | `src/scanner/scoring.rs` |
+| rch | `RCH_PER_JOB_IDLE_HOURS` | `12` | rch's own idle floor (hours) for a per-job target dir | `src/scanner/scoring.rs` |
+| rch | `RCH_PRESSURE_URGENCY` | `0.7` | Urgency at which the short pressure floors apply | `src/scanner/scoring.rs` |
+| rch | `RCH_PRESSURE_POOLED_IDLE_MINUTES` | `60` | Pooled idle floor (minutes) under pressure | `src/scanner/scoring.rs` |
+| rch | `RCH_PRESSURE_PER_JOB_IDLE_MINUTES` | `30` | Per-job idle floor (minutes) under pressure | `src/scanner/scoring.rs` |
+| rch | `RCH_IDLE_PROBE_MAX_ENTRIES_UNDER_PRESSURE` | `2000000` | Entries the idle probe may walk under pressure | `src/scanner/scoring.rs` |
 | daemon | `SCANNER_CHANNEL_CAP` | `2` | Monitor → scanner requests in flight | `src/daemon/loop_main.rs` |
 | daemon | `EXECUTOR_CHANNEL_CAP` | `64` | Scanner → executor batches in flight | `src/daemon/loop_main.rs` |
 | daemon | `MEMORY_PRESSURE_CHANNEL_CAP` | `16` | Memory-pressure samples buffered | `src/daemon/loop_main.rs` |
@@ -736,6 +738,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | daemon | `THREAD_STALL_THRESHOLD` | `60 s` | Heartbeat age that counts as a stall | `src/daemon/loop_main.rs` |
 | daemon | `CATALOG_PROBE_MAX_ENTRIES` | `50000` | Entries a catalog freshness probe may visit | `src/daemon/loop_main.rs` |
 | daemon | `CATALOG_PROBE_MAX_DEPTH` | `5` | Depth of a catalog freshness probe | `src/daemon/loop_main.rs` |
+| daemon | `CANARY_REPROVE_MINUTES` | `30` | Clean minutes an automatic Canary needs to return to the intended mode | `src/daemon/policy.rs` |
 <!-- sbh-docs:end -->
 
 ---
@@ -795,9 +798,11 @@ A crash found by `cargo fuzz` becomes a seed file under `fuzz/corpus/<target>/` 
 
 The E2E script runs real CLI invocations with per-case logging.
 
-### What CI gates
+### No hosted CI; releases go through dsr
 
-`.github/workflows/ci.yml` runs `cargo clippy --all-targets -- -D warnings` twice (shipped features, which include `tui`, then with the off-by-default `legacy-crossterm-dashboard` added), the unit suite as root (`unit-as-root`, chmod-based tests must print `SKIP: running as root`), a `unit-tui` lane that must execute at least 950 library tests, and actionlint over the workflows. Anything that only compiles with the TUI still has to pass clippy, so keep `--features tui` building.
+sbh never uses GitHub Actions (owner's rule; the workflows were deleted 2026-09-25). Before pushing, run the gates yourself through rch: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (shipped features, which include `tui`) and again with `--features legacy-crossterm-dashboard`, `cargo test --lib`, `cargo test --bin sbh`, the integration targets, and `tests/daemon_e2e.rs` with `--test-threads=1` on a host whose disk is not IO-starved. `scripts/quality-gate.sh` runs the staged gate. Keep `--features tui` building.
+
+Release: `scripts/changelog_check.sh --tag vX.Y.Z --expect-release`, tag and push, `dsr build storage_ballast_helper --version X.Y.Z` from a clean worktree at the tag, then `scripts/dsr_release.sh all X.Y.Z` (Developer ID signing, notarization, packaging and audit, manifest minisign, GitHub release upload and verification, Homebrew tap). `sbh doctor --release` checks the credentials and release drift.
 
 ### Test Conventions
 

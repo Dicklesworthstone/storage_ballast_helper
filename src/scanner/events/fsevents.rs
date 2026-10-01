@@ -314,14 +314,14 @@ impl MacOsFseventsBackend {
 #[cfg(target_os = "macos")]
 fn install_plan(
     config: &EventSourceConfig,
-    plan: RootPlan,
+    plan: &RootPlan,
     capability: &mut EventSourceCapability,
     pending: &mut EventInvalidation,
     now: Instant,
 ) -> EventSourceBackend {
     *capability = EventSourceCapability::from_plan(&plan.summary);
     let backend = if plan.summary.backend == EventBackendKind::Fsevents {
-        match MacOsFseventsBackend::start(&plan, now) {
+        match MacOsFseventsBackend::start(plan, now) {
             Ok(backend) => EventSourceBackend::Fsevents(backend),
             Err(err) => {
                 capability.selected_backend = EventBackendKind::ReconciliationOnly;
@@ -354,7 +354,7 @@ pub(super) fn start_backend(
     pending: &mut EventInvalidation,
     now: Instant,
 ) -> EventSourceBackend {
-    install_plan(config, root_plan(config), capability, pending, now)
+    install_plan(config, &root_plan(config), capability, pending, now)
 }
 
 #[cfg(target_os = "macos")]
@@ -384,7 +384,7 @@ pub(super) fn refresh_backend(
         *capability = EventSourceCapability::from_plan(&plan.summary);
         return;
     }
-    *backend = install_plan(config, plan, capability, pending, now);
+    *backend = install_plan(config, &plan, capability, pending, now);
 }
 
 #[cfg(test)]

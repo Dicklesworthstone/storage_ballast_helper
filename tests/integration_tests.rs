@@ -498,12 +498,11 @@ fn release_doctor_json_failure_exits_nonzero_after_parseable_report() {
     assert_eq!(payload["notary_profile"].as_str(), Some("sbh-notary"));
     assert_eq!(payload["ok"].as_bool(), Some(false));
     assert_eq!(payload["passed"].as_u64(), Some(0));
-    // The four tool-availability checks fail under an empty PATH on every
-    // platform. The four drift checks (latest assets, tap version, workflow
-    // enablement, cert-expiration run) warn when gh is reachable through the
-    // runner's fallback PATH (macOS) and fail when it is not (Linux); either
-    // way the doctor must not report ok, and exactly the four tool checks
-    // must fail.
+    // The three tool-availability checks fail under an empty PATH on every
+    // platform. The two drift checks (latest assets, tap version) warn when
+    // gh is reachable through the fallback PATH (macOS) and fail when it is
+    // not (Linux); either way the doctor must not report ok, and exactly the
+    // three tool checks must fail.
     let warnings = payload["warnings"].as_u64().unwrap_or_else(|| {
         panic!(
             "release doctor JSON missing warnings count: {payload}; log={}",
@@ -511,11 +510,11 @@ fn release_doctor_json_failure_exits_nonzero_after_parseable_report() {
         )
     });
     assert!(
-        warnings <= 4,
+        warnings <= 2,
         "unexpected warning count {warnings}; payload={payload}; log={}",
         result.log_path.display()
     );
-    assert_eq!(payload["failed"].as_u64(), Some(4));
+    assert_eq!(payload["failed"].as_u64(), Some(3));
 
     let checks = payload["checks"].as_array().unwrap_or_else(|| {
         panic!(
@@ -526,7 +525,6 @@ fn release_doctor_json_failure_exits_nonzero_after_parseable_report() {
     for check_id in [
         "release.developer_id_identity",
         "release.notary_profile",
-        "release.github_secrets",
         "release.homebrew_tap",
     ] {
         let status = checks
@@ -541,19 +539,10 @@ fn release_doctor_json_failure_exits_nonzero_after_parseable_report() {
         );
     }
 
-    let required_secrets = payload["required_github_secrets"]
-        .as_array()
-        .unwrap_or_else(|| {
-            panic!(
-                "release doctor JSON missing required secrets: {payload}; log={}",
-                result.log_path.display()
-            )
-        });
+    // Releases never use GitHub Actions: no repository secrets are required.
     assert!(
-        required_secrets
-            .iter()
-            .any(|secret| secret.as_str() == Some("HOMEBREW_TAP_SSH_KEY")),
-        "release doctor should include Homebrew tap secret requirement; payload={payload}; log={}",
+        payload.get("required_github_secrets").is_none(),
+        "release doctor must not ask for GitHub secrets; payload={payload}; log={}",
         result.log_path.display()
     );
     assert!(
@@ -1296,6 +1285,9 @@ fn macos_apfs_ballast_preallocates_and_releases_space() {
         },
     )
     .expect("create ballast manager");
+    // The byte check above gates this test; the percentage floor would make
+    // it depend on how full the volume is.
+    manager.set_provision_floor(0.0);
     let provision = manager
         .provision(None)
         .expect("provision 1 GiB APFS ballast");
@@ -1946,10 +1938,17 @@ fn bootstrap_repairs_an_isolated_home_footprint_with_backups() {
         .join("share")
         .to_string_lossy()
         .to_string();
+    // Units live in the fixture too: run as root on a build worker, bootstrap
+    // otherwise found and "repaired" the host's real system unit.
+    let unit_dir = home_path.join("systemd-units");
+    fs::create_dir_all(&unit_dir).expect("create fixture unit dir");
+    let unit_dir_env = unit_dir.to_string_lossy().to_string();
     let env = [
         ("HOME", home_env.as_str()),
         ("XDG_CONFIG_HOME", config_env.as_str()),
         ("XDG_DATA_HOME", data_env.as_str()),
+        ("SBH_TEST_MODE", "1"),
+        ("SBH_SYSTEMD_UNIT_DIR", unit_dir_env.as_str()),
     ];
     let planted = [
         "stale-path-entry",
@@ -3321,6 +3320,10 @@ fn doctor_service_reports_unit_drift_and_reinstall_unit_repairs_it() {
     let rewritten = fs::read_to_string(&unit_path).unwrap();
     assert!(rewritten.contains("NoNewPrivileges=true"), "{rewritten}");
     assert!(rewritten.contains("Nice=19"), "{rewritten}");
+    assert!(
+        rewritten.contains(" daemon --config /etc/sbh/config.toml\n"),
+        "the unit's --config survives the repair: {rewritten}"
+    );
     assert_eq!(
         payload["dropins_kept"].as_array().unwrap().len(),
         2,
@@ -5493,6 +5496,8 @@ fn ballast_lifecycle() {
     };
 
     let mut manager = BallastManager::new(ballast_dir, config).expect("create manager");
+    // Not a floor test: do not depend on how full the host running it is.
+    manager.set_provision_floor(0.0);
 
     // Provision.
     let prov = manager.provision(None).expect("provision");

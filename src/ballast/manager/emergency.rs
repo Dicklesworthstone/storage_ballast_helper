@@ -90,7 +90,8 @@ mod unix {
                     // invent another locking protocol on a full filesystem.
                     for index in 1..=configured_count {
                         let name = ballast_file_name(
-                            u32::try_from(index).map_err(|_| invalid("ballast index exceeds u32"))?,
+                            u32::try_from(index)
+                                .map_err(|_| invalid("ballast index exceeds u32"))?,
                         );
                         match open_regular(&directory, OsStr::new(&name)) {
                             Err(missing) if missing.kind() == io::ErrorKind::NotFound => {}
@@ -262,13 +263,14 @@ mod unix {
                 file_size_bytes: 12_288,
                 replenish_cooldown_minutes: 0,
                 auto_provision: true,
-                overrides: Default::default(),
+                overrides: std::collections::BTreeMap::default(),
             }
         }
 
         fn fixture() -> (tempfile::TempDir, BallastManager) {
             let root = tempfile::tempdir().unwrap();
-            let mut manager = BallastManager::new(root.path().join("pool"), config()).unwrap();
+            let mut manager =
+                BallastManager::new_unfloored(root.path().join("pool"), config()).unwrap();
             assert_eq!(manager.provision(None).unwrap().files_created, 3);
             (root, manager)
         }
@@ -362,7 +364,7 @@ mod unix {
             let root = tempfile::tempdir().unwrap();
             let pool = root.path().join("pool");
             let mut stale = BallastManager::new(pool.clone(), config()).unwrap();
-            let mut writer = BallastManager::new(pool, config()).unwrap();
+            let mut writer = BallastManager::new_unfloored(pool, config()).unwrap();
             writer.provision(None).unwrap();
             assert_eq!(stale.available_count(), 0);
             assert_eq!(stale.release(2).unwrap().files_released, 2);
@@ -402,10 +404,11 @@ mod unix {
 
         #[test]
         fn fifo_slot_does_not_block_release_or_inventory_refresh() {
-            use rustix::fs::{CWD, mkfifoat};
+            use nix::sys::stat::Mode as FifoMode;
+            use nix::unistd::mkfifo;
             let (_root, mut manager) = fixture();
             fs::remove_file(manager.file_path(3)).unwrap();
-            mkfifoat(CWD, manager.file_path(3), Mode::RUSR | Mode::WUSR).unwrap();
+            mkfifo(&manager.file_path(3), FifoMode::S_IRUSR | FifoMode::S_IWUSR).unwrap();
             let report = manager.release(1).unwrap();
             assert_eq!(report.files_released, 1);
             assert!(!report.errors.is_empty());
@@ -488,11 +491,12 @@ mod unix {
 
         #[test]
         fn release_rejects_a_fifo_pool_lock_without_waiting() {
-            use rustix::fs::{CWD, mkfifoat};
+            use nix::sys::stat::Mode as FifoMode;
+            use nix::unistd::mkfifo;
             let (_root, mut manager) = fixture();
             let lock = manager.ballast_dir.join(".lock");
             fs::rename(&lock, manager.ballast_dir.join("saved-lock")).unwrap();
-            mkfifoat(CWD, &lock, Mode::RUSR | Mode::WUSR).unwrap();
+            mkfifo(&lock, FifoMode::S_IRUSR | FifoMode::S_IWUSR).unwrap();
             assert!(manager.release(1).is_err());
             assert!(manager.file_path(3).exists());
         }
@@ -566,7 +570,9 @@ pub(super) fn release(manager: &mut BallastManager, count: usize) -> Result<Rele
                 report.released.push((path, size));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => report.errors.push(format!("failed to release file {index}: {error}")),
+            Err(error) => report
+                .errors
+                .push(format!("failed to release file {index}: {error}")),
         }
     }
     manager.scan_existing();

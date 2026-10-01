@@ -11,6 +11,13 @@
 //! Two scenarios need a real filesystem whose free space and write mode the
 //! test controls (a loop-mounted ext4 image): they are `#[ignore]`d and run
 //! with `--ignored` where passwordless sudo is available.
+//!
+//! Run serially (`-- --test-threads=1`). Each scenario is a real daemon with
+//! wall-clock deadlines and a CPU-share budget (an idle daemon must stay
+//! under 2% of a CPU); scenarios running side by side, on a build host at
+//! load 200, blew those budgets (2026-09-24: `special_locations_stay_quiet`
+//! and `green_quarantine_holds...` failed in parallel runs on hz3 and passed
+//! 2/2 serially on vmi1153651).
 #![allow(missing_docs)]
 
 mod common;
@@ -814,6 +821,26 @@ fn injected_orange_mount_reclaims_only_the_stale_target() {
     assert_eq!(fixture_state["surface"], "configured", "{fixture_state}");
     assert_ne!(fixture_state["state"], "observe_only", "{fixture_state}");
 
+    // Orange selects Aggressive scanning with healthy memory (twice the
+    // configured 25%) and Light/DefiniteOnly under memory pressure (half):
+    // either way the daemon no longer paces at the configured value.
+    let paced = run
+        .wait_for_state(
+            "the behavior mode's CPU pace",
+            Duration::from_secs(120),
+            |state| {
+                state["cpu_budget"]["pct"]
+                    .as_u64()
+                    .is_some_and(|pct| pct != 25)
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        matches!(paced["cpu_budget"]["pct"].as_u64(), Some(50 | 12)),
+        "{}",
+        paced["cpu_budget"]
+    );
+
     // Loud degradation: the pressured mount with nothing to reclaim is
     // reported as such everywhere an operator or a script would look.
     assert_eq!(
@@ -1541,6 +1568,7 @@ fn sigusr1_forces_a_green_scan_within_two_seconds() {
 }
 
 /// `key=<n>` from a `scan_complete` event's details.
+#[cfg(target_os = "linux")]
 fn scan_detail(event: &Value, key: &str) -> Option<u64> {
     event
         .get("details")?
@@ -2568,13 +2596,21 @@ fn cpu_budget_bounds_an_expensive_scanner_at_green() {
         .filter(|e| e["error_code"] == "SBH-3004" && e["severity"] == "warning")
         .count();
     let shortened = cut_short(&run);
+    // Since 0.6.15 a discretionary pass also waits for a nearly full bucket
+    // before it starts, so the budget can act by holding passes back
+    // without ever cutting one short: once sacred globs were cached (0.6.16)
+    // a pass on this fixture fits in one slice.
+    let passes = run.events_of("scan_complete").len();
+    let free_passes = free_run.events_of("scan_complete").len();
     let _ = writeln!(
         std::io::stderr(),
-        "cpu budget 5%: {shortened} passes cut short, {deficit_warnings} deficit warnings"
+        "cpu budget 5%: {shortened} passes cut short, {deficit_warnings} deficit warnings, \
+         {passes} passes vs {free_passes} unbudgeted"
     );
     assert!(
-        shortened >= 1 || deficit_warnings >= 1,
-        "the budget never acted: no pass cut short and no deficit reported"
+        shortened >= 1 || deficit_warnings >= 1 || passes < free_passes,
+        "the budget never acted: no pass cut short, no deficit reported and as many \
+         passes as without a budget ({passes} vs {free_passes})"
     );
     // A deficit is reported at most once a minute, on stderr and as an
     // activity warning; a daemon that never runs dry reports nothing.
@@ -2607,8 +2643,10 @@ fn cpu_budget_bounds_an_expensive_scanner_at_green() {
         .expect("run sbh status");
     let payload: Value = serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim())
         .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&status.stdout)));
-    assert_eq!(
-        payload["daemon"]["cpu_budget"]["pct"], 5,
+    // Green paces at the configured 5% with healthy memory and at half
+    // (Light) while the test host's memory is under pressure.
+    assert!(
+        matches!(payload["daemon"]["cpu_budget"]["pct"].as_u64(), Some(5 | 2)),
         "{}",
         payload["daemon"]
     );
