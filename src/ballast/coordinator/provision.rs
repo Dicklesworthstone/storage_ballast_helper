@@ -129,7 +129,9 @@ fn grow(
 mod tests {
     use super::*;
     use crate::ballast::coordinator::{ProvisionStrategy, stranded::StrandedReserve};
+    use crate::ballast::release::BallastReleaseController;
     use crate::core::config::BallastConfig;
+    use crate::monitor::pid::PressureLevel;
     use rustix::fs::{FlockOperation, flock};
     use std::collections::BTreeMap;
     use std::fs::{self, File};
@@ -351,5 +353,144 @@ mod tests {
         assert_eq!(missing_bytes(u64::MAX, 1, 1), u64::MAX - 2);
         assert_eq!(missing_bytes(100, 40, 20), 40);
         assert_eq!(missing_bytes(100, 120, 0), 0);
+    }
+
+    /// The monitor observes pressure, admits one attempt, invokes the same
+    /// provisioner as replenish_for_mount, and acknowledges actual creations.
+    /// Keep the controller in the test: direct provisioner tests alone cannot
+    /// catch a scheduler that never lets a byte-deficient pool reach it.
+    fn maintenance_tick(
+        pool: &mut BallastPool,
+        controller: &mut BallastReleaseController,
+        level: PressureLevel,
+        free_pct_check: Option<&dyn Fn() -> f64>,
+    ) -> Option<ProvisionReport> {
+        controller.observe_level(&pool.mount_point, level);
+        if !controller.is_ready_for_replenish(
+            &pool.mount_point,
+            level,
+            pool.available_count(),
+            pool.expected_count(),
+        ) {
+            return None;
+        }
+        let report = replenish_one(pool, free_pct_check).unwrap();
+        if report.files_created > 0 {
+            controller.on_replenished(&pool.mount_point, report.files_created);
+        }
+        Some(report)
+    }
+
+    #[test]
+    fn scheduled_maintenance_rebuilds_bytes_despite_a_surplus_legacy_count() {
+        let (_temp, mut pool) = fixture(3, 2 * UNIT, 4, UNIT);
+        let mut controller = BallastReleaseController::new(0);
+        assert_eq!(pool.available_count(), 4);
+        assert_eq!(pool.expected_count(), 3);
+        assert_eq!(pool.releasable_bytes(), 4 * UNIT);
+        let retired = pool.stranded.files()[0].0.clone();
+        let retained = fs::read(&retired).unwrap();
+
+        let report =
+            maintenance_tick(&mut pool, &mut controller, PressureLevel::Green, None).unwrap();
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.files_created, 1);
+        assert_eq!(report.total_bytes, 2 * UNIT);
+        assert_eq!(pool.releasable_bytes(), 6 * UNIT);
+        assert_eq!(pool.actual_count(), 1);
+        assert_eq!(pool.expected_count(), 3);
+        assert_eq!(fs::read(retired).unwrap(), retained);
+        assert!(maintenance_tick(&mut pool, &mut controller, PressureLevel::Green, None).is_none());
+    }
+
+    #[test]
+    fn scheduled_full_adopted_pool_is_a_paced_noop_not_a_duplicate_allocation() {
+        let (_temp, mut pool) = fixture(3, UNIT, 1, 3 * UNIT);
+        let mut controller = BallastReleaseController::new(0);
+        let report =
+            maintenance_tick(&mut pool, &mut controller, PressureLevel::Green, None).unwrap();
+        assert_eq!(report.files_created, 0);
+        assert_eq!(report.total_bytes, 0);
+        assert!(report.errors.is_empty());
+        assert!(!pool.ballast_dir.exists());
+        assert_eq!(pool.releasable_bytes(), 3 * UNIT);
+        // No successful-creation callback was sent, but the probe is paced.
+        assert!(maintenance_tick(&mut pool, &mut controller, PressureLevel::Green, None).is_none());
+        assert!(!pool.ballast_dir.exists());
+    }
+
+    #[test]
+    fn scheduled_rebuild_still_obeys_headroom_and_paces_floor_refusals() {
+        let (_temp, mut pool) = fixture(3, 2 * UNIT, 4, UNIT);
+        pool.manager.set_provision_floor(20.0);
+        let mut controller = BallastReleaseController::new(0);
+        let report = maintenance_tick(
+            &mut pool,
+            &mut controller,
+            PressureLevel::Green,
+            Some(&|| 0.0),
+        )
+        .unwrap();
+        assert_eq!(report.files_created, 0);
+        assert!(report.skipped_for_floor > 0);
+        assert!(report.errors.is_empty());
+        assert_eq!(pool.stranded.bytes(), 4 * UNIT);
+        assert!(!file(&pool.ballast_dir, 1).exists());
+        // Better headroom does not turn a single monitor tick into a busy retry.
+        assert!(
+            maintenance_tick(
+                &mut pool,
+                &mut controller,
+                PressureLevel::Green,
+                Some(&|| 100.0),
+            )
+            .is_none()
+        );
+        assert!(!file(&pool.ballast_dir, 1).exists());
+    }
+
+    #[test]
+    fn scheduled_busy_legacy_pool_is_preserved_and_the_failed_probe_is_paced() {
+        let (_temp, mut pool) = fixture(3, 2 * UNIT, 4, UNIT);
+        let mut controller = BallastReleaseController::new(0);
+        let retired = pool.stranded.files()[0].0.clone();
+        let lock = File::open(retired.parent().unwrap().join(".lock")).unwrap();
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+        let report =
+            maintenance_tick(&mut pool, &mut controller, PressureLevel::Green, None).unwrap();
+        assert_eq!(report.files_created, 0);
+        assert!(!report.errors.is_empty());
+        assert!(retired.exists());
+        assert!(!pool.ballast_dir.exists());
+        drop(lock);
+        assert!(maintenance_tick(&mut pool, &mut controller, PressureLevel::Green, None).is_none());
+        assert!(!pool.ballast_dir.exists());
+    }
+
+    #[test]
+    fn scheduled_validation_replaces_missing_coverage_hidden_by_a_full_legacy_count() {
+        let (_temp, mut pool) = fixture(3, UNIT, 3, UNIT);
+        let retired = pool.stranded.files()[0].0.clone();
+        fs::write(&retired, b"not a valid reserve").unwrap();
+        assert_eq!(pool.available_count(), 3, "cached inventory still looks full");
+        let mut controller = BallastReleaseController::new(0);
+        let report =
+            maintenance_tick(&mut pool, &mut controller, PressureLevel::Green, None).unwrap();
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.files_created, 1);
+        assert_eq!(pool.stranded.files().len(), 2);
+        assert_eq!(pool.releasable_bytes(), 3 * UNIT);
+        // Rebuild in the managed pool, never overwrite an invalid legacy file.
+        assert_eq!(fs::read(retired).unwrap(), b"not a valid reserve");
+        assert_eq!(pool.actual_count(), 1);
+    }
+
+    #[test]
+    fn scheduled_disabled_pool_never_creates_an_active_reserve() {
+        let (_temp, mut pool) = fixture(0, UNIT, 2, UNIT);
+        let mut controller = BallastReleaseController::new(0);
+        assert!(maintenance_tick(&mut pool, &mut controller, PressureLevel::Green, None).is_none());
+        assert!(!pool.ballast_dir.exists());
+        assert_eq!(pool.stranded.files().len(), 2);
     }
 }
