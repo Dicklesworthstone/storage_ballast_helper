@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::errors::{Result, SbhError};
 use crate::scanner::protection::{MARKER_FILENAME, create_marker};
 
+mod placement;
 mod safety;
 
 /// Directory under the mount's `.sbh` that holds quarantined entries.
@@ -163,7 +164,7 @@ pub struct QuarantineRecord {
     pub decision: Option<serde_json::Value>,
 }
 
-/// Why an entry could not be quarantined and had to be unlinked instead.
+/// Why a recoverable move was refused. This does not authorize an unlink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuarantineUnavailable {
     /// The quarantine root could not be created or is not a directory.
@@ -376,7 +377,7 @@ impl QuarantineStore {
     }
 
     /// Move `path` into quarantine under `decision_id`. Same filesystem
-    /// only; the caller unlinks instead when this returns `Err`.
+    /// only. Failure does not authorize permanently deleting the candidate.
     pub fn quarantine(
         &self,
         path: &Path,
@@ -385,6 +386,8 @@ impl QuarantineStore {
         ttl: Duration,
         decision: Option<serde_json::Value>,
     ) -> std::result::Result<QuarantineRecord, QuarantineUnavailable> {
+        placement::validate(path, self.root())
+            .map_err(|error| QuarantineUnavailable::RootUnavailable(error.to_string()))?;
         safety::quarantine(self, path, decision_id, size_bytes, ttl, decision)
     }
 
@@ -530,17 +533,12 @@ fn write_record(path: &Path, record: &QuarantineRecord) -> io::Result<()> {
     safety::write_json(path, record)
 }
 
-/// The quarantine root for `path`: `<root>/.sbh/quarantine` for the longest
-/// of `roots` that contains it, else the same under its mount point.
+/// Place quarantine beneath the deepest same-filesystem configured ancestor,
+/// excluding the candidate itself, or beneath its own mount when none qualifies.
+/// Aliases are resolved for comparison without changing the store's spelling.
 #[must_use]
 pub fn quarantine_root_for(path: &Path, roots: &[PathBuf]) -> PathBuf {
-    let base = roots
-        .iter()
-        .filter(|root| path.starts_with(root))
-        .max_by_key(|root| root.as_os_str().len())
-        .cloned()
-        .unwrap_or_else(|| mount_point_of(path));
-    base.join(".sbh").join(QUARANTINE_DIR_NAME)
+    placement::root_for(path, roots)
 }
 
 /// The highest ancestor of `path` on the same device: its mount point
