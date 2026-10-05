@@ -129,7 +129,7 @@ pub enum MountState {
     /// PID cadence.
     Reclaim,
     /// The executor could not write on this mount (EROFS/ENOSPC); wait for a
-    /// probe write to succeed before reclaiming again.
+    /// successful probe, then resume the work needed to restore headroom.
     Recovery,
     /// A full pass found nothing to reclaim and no ballast to release; rescan
     /// on new pressure, wake signals, or after an exponential backoff.
@@ -263,8 +263,9 @@ pub struct MountControllerConfig {
     /// First idle backoff; doubles on each empty pass, capped at
     /// [`IDLE_BACKOFF_CAP`].
     pub min_rescan_interval: Duration,
-    /// Free percent below which a recovering mount stays in `Recovery` even
-    /// when the probe write succeeds.
+    /// Configured Red threshold, retained for caller compatibility. Recovery
+    /// does not wait to reach this floor: successful cleanup must create that
+    /// headroom after a probe establishes that the filesystem is writable.
     pub red_min_free_pct: f64,
 }
 
@@ -398,8 +399,9 @@ impl MountController {
             self.idle_wake
                 .observe(input.level, predicted, self.config.recovery_clean_windows);
 
-        // A write failure trumps everything: nothing sbh does on this mount
-        // can succeed until a probe write does.
+        // A new executor failure dominates even a successful probe reported
+        // on this tick: their relative order is unknown. Require a later
+        // successful probe before resuming work on this mount.
         if input.recovery_needed && self.state != MountState::Recovery {
             self.enter(
                 MountState::Recovery,
@@ -447,13 +449,22 @@ impl MountController {
                 }
             }
             MountState::Recovery => {
-                if input.recovery_probe_ok == Some(true)
-                    && input.free_pct >= self.config.red_min_free_pct
+                // Writability and healthy capacity are different conditions.
+                // Waiting for free_pct >= red_min deadlocks recovery: scanning
+                // is paused here, yet cleanup is what must restore headroom.
+                // The write probe is necessary, but invalid capacity evidence
+                // or another executor failure must never authorize a retry.
+                if !input.recovery_needed
+                    && input.recovery_probe_ok == Some(true)
+                    && input.free_pct.is_finite()
+                    && (0.0..=100.0).contains(&input.free_pct)
                 {
-                    let next = if input.surface.actionable() {
+                    let next = if !input.surface.actionable() {
+                        MountState::ObserveOnly
+                    } else if wants_reclaim {
                         MountState::Reclaim
                     } else {
-                        MountState::ObserveOnly
+                        MountState::Maintain
                     };
                     let reason = (next == MountState::ObserveOnly).then_some(IdleReason::NoSurface);
                     self.enter(next, reason, input.now);
@@ -957,7 +968,7 @@ mod tests {
                 reason: Some(IdleReason::WriteFailure),
             },
             Case {
-                name: "recovery stays while free is below red even if the probe works",
+                name: "recovery resumes below red once the probe works",
                 setup: |c, now| {
                     c.observe(MountTickInput {
                         recovery_needed: true,
@@ -968,8 +979,8 @@ mod tests {
                     recovery_probe_ok: Some(true),
                     ..input(PressureLevel::Red, configured(), now)
                 },
-                expect: MountState::Recovery,
-                reason: Some(IdleReason::WriteFailure),
+                expect: MountState::Reclaim,
+                reason: None,
             },
             Case {
                 name: "recovery -> reclaim once the probe writes above red",
@@ -1364,5 +1375,235 @@ mod tests {
         .unwrap();
         assert_eq!(old.reclaim_capability, ReclaimCapability::None);
         assert!(old.reserve_state.is_none());
+    }
+
+    #[test]
+    fn writable_low_space_mount_resumes_cleanup_and_ballast_release() {
+        let now = Instant::now();
+        let surface = MountSurface {
+            ballast_pool: true,
+            ..configured()
+        };
+        for free_pct in [0.0, 0.01, 1.0, 5.99] {
+            let mut controller = fresh();
+            let mut tick = MountTickInput {
+                free_pct,
+                recovery_needed: true,
+                releasable_ballast: true,
+                ..input(PressureLevel::Critical, surface, now)
+            };
+            assert_eq!(controller.observe(tick).state, MountState::Recovery);
+            tick.recovery_needed = false;
+            tick.recovery_probe_ok = Some(true);
+            tick.now += RECOVERY_POLL_INTERVAL;
+            let decision = controller.observe(tick);
+            assert_eq!(decision.state, MountState::Reclaim, "free_pct={free_pct}");
+            assert!(decision.scan && decision.release_ballast && !decision.probe_write);
+            assert_eq!(controller.idle_reason(), None);
+            assert_eq!(
+                decision.transition,
+                Some((MountState::Recovery, MountState::Reclaim))
+            );
+        }
+    }
+
+    #[test]
+    fn new_failure_dominates_a_simultaneous_successful_probe() {
+        let now = Instant::now();
+        for state in [
+            MountState::ObserveOnly,
+            MountState::Maintain,
+            MountState::Reclaim,
+            MountState::Idle,
+            MountState::Recovery,
+        ] {
+            let mut controller = fresh();
+            controller.state = state;
+            let mut tick = MountTickInput {
+                recovery_needed: true,
+                recovery_probe_ok: Some(true),
+                ..input(PressureLevel::Orange, configured(), now)
+            };
+            let decision = controller.observe(tick);
+            assert_eq!(decision.state, MountState::Recovery, "from {state:?}");
+            assert!(!decision.scan && !decision.release_ballast && decision.probe_write);
+            tick.recovery_needed = false;
+            tick.recovery_probe_ok = None;
+            tick.now += RECOVERY_POLL_INTERVAL;
+            assert_eq!(controller.observe(tick).state, MountState::Recovery);
+            tick.recovery_probe_ok = Some(true);
+            tick.now += RECOVERY_POLL_INTERVAL;
+            assert_eq!(controller.observe(tick).state, MountState::Reclaim);
+        }
+    }
+
+    #[test]
+    fn recovery_requires_a_successful_probe_and_valid_capacity() {
+        let now = Instant::now();
+        for free_pct in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 100.1] {
+            let mut controller = fresh();
+            controller.observe(MountTickInput {
+                recovery_needed: true,
+                ..input(PressureLevel::Critical, configured(), now)
+            });
+            let decision = controller.observe(MountTickInput {
+                free_pct,
+                recovery_probe_ok: Some(true),
+                ..input(PressureLevel::Critical, configured(), now)
+            });
+            assert_eq!(decision.state, MountState::Recovery);
+            assert!(!decision.scan && !decision.release_ballast);
+        }
+        for probe in [None, Some(false)] {
+            let mut controller = fresh();
+            controller.observe(MountTickInput {
+                recovery_needed: true,
+                ..input(PressureLevel::Critical, configured(), now)
+            });
+            let decision = controller.observe(MountTickInput {
+                recovery_probe_ok: probe,
+                wake: WakeSignals {
+                    dirty_roots: true,
+                    forced_scan: true,
+                    reload: true,
+                },
+                ..input(PressureLevel::Green, configured(), now)
+            });
+            assert_eq!(decision.state, MountState::Recovery);
+            assert!(!decision.scan && !decision.release_ballast);
+        }
+    }
+
+    #[test]
+    fn repeated_enospc_cycles_can_recover_without_manual_headroom() {
+        let now = Instant::now();
+        let mut controller = fresh();
+        let mut tick = input(PressureLevel::Critical, configured(), now);
+        for _ in 0..4 {
+            tick.recovery_needed = true;
+            tick.recovery_probe_ok = None;
+            assert_eq!(controller.observe(tick).state, MountState::Recovery);
+            tick.recovery_needed = false;
+            for probe in [None, Some(false), Some(false)] {
+                tick.recovery_probe_ok = probe;
+                tick.now += RECOVERY_POLL_INTERVAL;
+                assert_eq!(controller.observe(tick).state, MountState::Recovery);
+            }
+            tick.recovery_probe_ok = Some(true);
+            tick.now += RECOVERY_POLL_INTERVAL;
+            assert!(controller.observe(tick).scan);
+            assert!(tick.free_pct < controller.config.red_min_free_pct);
+        }
+        controller.note_pass(1, false, tick.now);
+        tick.level = PressureLevel::Green;
+        tick.free_pct = 40.0;
+        tick.recovery_probe_ok = None;
+        for _ in 0..DEFAULT_RECOVERY_CLEAN_WINDOWS {
+            controller.observe(tick);
+        }
+        assert_eq!(controller.state(), MountState::Maintain);
+    }
+
+    #[test]
+    fn recovery_preserves_the_capabilities_of_each_surface() {
+        let now = Instant::now();
+        for surface in [
+            configured(),
+            MountSurface {
+                catalog_roots: 1,
+                ..MountSurface::default()
+            },
+            MountSurface {
+                cross_device_fallback: true,
+                ..MountSurface::default()
+            },
+            MountSurface {
+                ballast_pool: true,
+                ..MountSurface::default()
+            },
+            MountSurface::default(),
+        ] {
+            let mut controller = fresh();
+            controller.observe(MountTickInput {
+                recovery_needed: true,
+                ..input(PressureLevel::Critical, surface, now)
+            });
+            let decision = controller.observe(MountTickInput {
+                recovery_probe_ok: Some(true),
+                releasable_ballast: true,
+                ..input(PressureLevel::Critical, surface, now + RECOVERY_POLL_INTERVAL)
+            });
+            assert_eq!(decision.scan, surface.scannable());
+            assert_eq!(decision.release_ballast, surface.ballast_pool);
+            assert_eq!(
+                decision.state,
+                if surface.actionable() {
+                    MountState::Reclaim
+                } else {
+                    MountState::ObserveOnly
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn recovered_healthy_mount_maintains_unless_prediction_requires_action() {
+        let now = Instant::now();
+        for predicted in [false, true] {
+            let mut controller = fresh();
+            controller.observe(MountTickInput {
+                recovery_needed: true,
+                ..input(PressureLevel::Critical, configured(), now)
+            });
+            let decision = controller.observe(MountTickInput {
+                recovery_probe_ok: Some(true),
+                prediction_confident: predicted,
+                seconds_to_red: Some(60.0),
+                ..input(PressureLevel::Green, configured(), now + RECOVERY_POLL_INTERVAL)
+            });
+            assert_eq!(decision.scan, predicted);
+            assert_eq!(
+                decision.state,
+                if predicted { MountState::Reclaim } else { MountState::Maintain }
+            );
+        }
+    }
+
+    #[test]
+    fn failed_mount_does_not_block_an_independent_recovered_mount() {
+        let now = Instant::now();
+        let mut readonly = fresh();
+        let mut writable = MountController::new(
+            PathBuf::from("/other"),
+            MountControllerConfig::default(),
+        );
+        let failed = MountTickInput {
+            recovery_needed: true,
+            ..input(PressureLevel::Critical, configured(), now)
+        };
+        readonly.observe(failed);
+        writable.observe(failed);
+        assert!(!readonly.observe(MountTickInput {
+            recovery_needed: false,
+            recovery_probe_ok: Some(false),
+            ..failed
+        }).scan);
+        assert!(writable.observe(MountTickInput {
+            recovery_needed: false,
+            recovery_probe_ok: Some(true),
+            ..failed
+        }).scan);
+        assert_eq!(readonly.state(), MountState::Recovery);
+        assert_eq!(writable.state(), MountState::Reclaim);
+        assert_eq!(
+            global_tick(
+                [
+                    readonly.cadence(Duration::from_secs(5), Duration::from_secs(1)),
+                    writable.cadence(Duration::from_secs(5), Duration::from_secs(1)),
+                ],
+                Duration::from_secs(5),
+            ),
+            Duration::from_secs(1)
+        );
     }
 }
