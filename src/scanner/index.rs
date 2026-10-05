@@ -8,8 +8,7 @@
 #![allow(missing_docs)]
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::{BufReader, BufWriter, Write as IoWrite};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +26,7 @@ use crate::scanner::scoring::{
 };
 use crate::scanner::walker::{FsEntryKind, FsIdentity};
 
+mod checkpoint;
 mod replay;
 
 /// Bumped to 2 when records gained `structural_signals`; a version-1
@@ -327,15 +327,6 @@ fn safety_state_from_score(score: &CandidacyScore) -> CandidateSafetyState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ScannerIndexCheckpoint {
-    version: u32,
-    context: ScannerIndexContext,
-    event_generation: u64,
-    records: Vec<CandidateIndexRecord>,
-    integrity_hash: [u8; 32],
-}
-
 #[derive(Debug, Clone)]
 pub struct ScannerCandidateIndex {
     context: ScannerIndexContext,
@@ -473,146 +464,21 @@ impl ScannerCandidateIndex {
             .is_some_and(|until| system_time_nanos(now) < until)
     }
 
+    /// Publish a complete, synced checkpoint without cloning the record map.
+    /// Failure before publication leaves the previous checkpoint intact.
     pub fn save_checkpoint(&self, path: &Path) -> Result<()> {
-        let records = self.records.values().cloned().collect::<Vec<_>>();
-        let integrity_hash =
-            checkpoint_integrity_hash(&self.context, self.event_generation, &records)?;
-        let checkpoint = ScannerIndexCheckpoint {
-            version: CHECKPOINT_VERSION,
-            context: self.context.clone(),
-            event_generation: self.event_generation,
-            records,
-            integrity_hash,
-        };
-
-        let temp_path = path.with_extension("tmp");
-        if let Some(parent) = temp_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| SbhError::io(parent, e))?;
-        }
-
-        let file = {
-            let mut opts = OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                opts.mode(0o600);
-            }
-            opts.open(&temp_path)
-                .map_err(|e| SbhError::io(&temp_path, e))?
-        };
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &checkpoint).map_err(|e| SbhError::Serialization {
-            context: "scanner_candidate_index_write",
-            details: e.to_string(),
-        })?;
-        writer.flush().map_err(|e| SbhError::io(&temp_path, e))?;
-        fs::rename(&temp_path, path).map_err(|e| SbhError::io(path, e))?;
-        Ok(())
+        checkpoint::save(self, path)
     }
 
+    /// Load a bounded regular-file snapshot; unusable caches yield an empty
+    /// index so the scanner can rediscover candidates instead of failing boot.
     #[must_use]
     pub fn load_checkpoint(
         path: &Path,
         expected_context: ScannerIndexContext,
     ) -> (Self, ScannerIndexLoadStatus) {
-        let missing = || {
-            (
-                Self::new(expected_context.clone()),
-                ScannerIndexLoadStatus::Missing,
-            )
-        };
-        let file = match fs::File::open(path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return missing(),
-            Err(err) => {
-                return (
-                    Self::new(expected_context),
-                    ScannerIndexLoadStatus::Corrupt(err.to_string()),
-                );
-            }
-        };
-        let reader = BufReader::new(file);
-        let checkpoint: ScannerIndexCheckpoint = match serde_json::from_reader(reader) {
-            Ok(checkpoint) => checkpoint,
-            Err(err) => {
-                return (
-                    Self::new(expected_context),
-                    ScannerIndexLoadStatus::Corrupt(err.to_string()),
-                );
-            }
-        };
-
-        if checkpoint.version != CHECKPOINT_VERSION {
-            return (
-                Self::new(expected_context),
-                ScannerIndexLoadStatus::Stale(format!(
-                    "unsupported scanner index version {} (expected {CHECKPOINT_VERSION})",
-                    checkpoint.version
-                )),
-            );
-        }
-        if checkpoint.context != expected_context {
-            return (
-                Self::new(expected_context),
-                ScannerIndexLoadStatus::Stale(
-                    "root or scanner config fingerprint changed".to_string(),
-                ),
-            );
-        }
-        match checkpoint_integrity_hash(
-            &checkpoint.context,
-            checkpoint.event_generation,
-            &checkpoint.records,
-        ) {
-            Ok(computed) if computed == checkpoint.integrity_hash => {}
-            Ok(_) => {
-                return (
-                    Self::new(expected_context),
-                    ScannerIndexLoadStatus::Corrupt("integrity hash mismatch".to_string()),
-                );
-            }
-            Err(err) => {
-                return (
-                    Self::new(expected_context),
-                    ScannerIndexLoadStatus::Corrupt(err.to_string()),
-                );
-            }
-        }
-
-        let mut records = BTreeMap::new();
-        for record in checkpoint.records {
-            records.insert(record.identity, record);
-        }
-        (
-            Self {
-                context: checkpoint.context,
-                event_generation: checkpoint.event_generation,
-                records,
-            },
-            ScannerIndexLoadStatus::Loaded,
-        )
+        checkpoint::load(path, expected_context)
     }
-}
-
-fn checkpoint_integrity_hash(
-    context: &ScannerIndexContext,
-    event_generation: u64,
-    records: &[CandidateIndexRecord],
-) -> Result<[u8; 32]> {
-    let mut hasher = Sha256::new();
-    let context_bytes = serde_json::to_vec(context).map_err(|e| SbhError::Serialization {
-        context: "scanner_candidate_index_integrity",
-        details: e.to_string(),
-    })?;
-    let records_bytes = serde_json::to_vec(records).map_err(|e| SbhError::Serialization {
-        context: "scanner_candidate_index_integrity",
-        details: e.to_string(),
-    })?;
-    hasher.update(context_bytes);
-    hasher.update(event_generation.to_le_bytes());
-    hasher.update(records_bytes);
-    Ok(hasher.finalize().into())
 }
 
 fn root_fingerprint(root_paths: &[PathBuf]) -> String {
