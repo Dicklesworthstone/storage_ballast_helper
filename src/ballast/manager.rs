@@ -164,8 +164,10 @@ impl BallastHealth {
     /// Evaluate pool health from the configured pool size and the bytes that
     /// releasing every inventoried file would actually free.
     ///
-    /// Integrity-corrupt files still count toward `releasable_bytes`:
-    /// deleting a file frees its on-disk bytes regardless of header state.
+    /// Integrity-corrupt configured slots still count toward `releasable_bytes`:
+    /// deleting them frees their on-disk bytes regardless of header state.
+    /// Surplus files outside the configured slots require a valid header before
+    /// inventory may treat them as ballast at all.
     #[must_use]
     pub fn evaluate(configured_pool_bytes: u64, releasable_bytes: u64) -> Self {
         if configured_pool_bytes == 0 {
@@ -200,10 +202,9 @@ impl std::fmt::Display for BallastHealth {
 
 /// Read-only snapshot of a ballast pool's actual availability (#16).
 ///
-/// Unlike [`BallastManager::new`], observing never creates the pool
-/// directory and never prunes orphans, so it is safe to call from read-only
-/// surfaces (`sbh status`, `sbh check`, `sbh doctor`) even on a full or
-/// read-only filesystem.
+/// Like [`BallastManager::new`], observing never creates the pool directory and
+/// never prunes orphans, so it is safe to call from read-only surfaces (`sbh
+/// status`, `sbh check`, `sbh doctor`) even on a full or read-only filesystem.
 #[derive(Debug, Clone)]
 pub struct BallastAvailability {
     /// Configured number of ballast files.
@@ -213,16 +214,19 @@ pub struct BallastAvailability {
     /// Configured total pool size (`count × size`, saturating).
     pub configured_pool_bytes: u64,
     /// Independently releasable regular ballast files currently present.
+    /// On Unix this includes verified surplus beyond the configured slots.
     pub available_count: usize,
     /// Configured slots confirmed absent or unusable by managed release.
     ///
     /// Includes links, non-regular files and foreign-device slots. Files that
     /// could not be inspected are counted in `unreadable_count` instead, so a
-    /// permission failure is never reported as a missing reserve.
+    /// permission failure is never reported as a missing reserve. Surplus does
+    /// not erase a missing configured slot from this count.
     pub missing_count: usize,
-    /// Configured files whose presence could not be determined, because `stat`
-    /// failed for a reason other than "not found" (permission denied, I/O
-    /// error). Non-zero means this snapshot is not authoritative.
+    /// Configured or surplus files whose state could not be determined because
+    /// inspection failed (permission denied, I/O error, concurrent replacement).
+    /// At least one is recorded when directory enumeration fails and the exact
+    /// number is unknown. Non-zero means this snapshot is not authoritative.
     pub unreadable_count: usize,
     /// Conservative allocation estimate, capped by logical length. Snapshots
     /// may retain blocks after unlink; this is not a guaranteed free-space delta.
@@ -238,9 +242,9 @@ impl BallastAvailability {
         observation::observe(ballast_dir, config)
     }
 
-    /// Whether this snapshot is authoritative (every configured slot was
-    /// successfully inspected). Callers should avoid asserting that the reserve
-    /// is gone when this is `false`.
+    /// Whether configured slots and surplus discovery were successfully
+    /// inspected. Callers should avoid asserting that the reserve is gone when
+    /// this is `false`; unknown surplus is not proof of an empty pool.
     #[must_use]
     pub const fn is_authoritative(&self) -> bool {
         self.unreadable_count == 0
@@ -395,10 +399,10 @@ impl BallastManager {
         Ok(mgr)
     }
 
-    /// Ballast files in the pool directory whose index is outside
-    /// `1..=file_count` (left behind by a smaller `file_count`, or foreign).
-    /// Reported by `status`; removed only by `provision`/`replenish` under
-    /// the lock.
+    /// Files in the pool directory whose index is outside `1..=file_count`
+    /// (left behind by a smaller `file_count`, or foreign). Reported by status
+    /// and pruned by provisioning under the lock. On Unix, verified surplus
+    /// ballast is also inventoried and may be used for emergency release.
     #[must_use]
     pub fn orphans(&self) -> Vec<PathBuf> {
         orphan_ballast_files(&self.ballast_dir, self.config.file_count)
@@ -414,7 +418,7 @@ impl BallastManager {
         &self.config
     }
 
-    /// Current inventory of ballast files.
+    /// Current inventory of releasable files, including verified Unix surplus.
     pub fn inventory(&self) -> &[BallastFile] {
         &self.inventory
     }
@@ -427,7 +431,7 @@ impl BallastManager {
             .fold(0_u64, u64::saturating_add)
     }
 
-    /// Number of ballast files currently available.
+    /// Number of ballast files currently available, not configured capacity.
     pub fn available_count(&self) -> usize {
         self.inventory.len()
     }
@@ -442,14 +446,14 @@ impl BallastManager {
         BallastHealth::evaluate(self.configured_pool_bytes(), self.releasable_bytes())
     }
 
-    /// Update configuration at runtime.
+    /// Update configuration at runtime without creating or deleting files.
     ///
-    /// Files above a lowered `file_count` become orphans; they are reported
-    /// by `orphans()` and removed by the next provision/replenish under the
-    /// lock, never here (this runs unlocked on config reload).
+    /// On Unix, verified files above a lowered `file_count` remain physical
+    /// reserve in the inventory even though they are also reported as orphans.
+    /// Lowering or disabling future provisioning must not hide emergency space.
     pub fn update_config(&mut self, config: BallastConfig) {
         self.config = config;
-        // Re-scan inventory to reflect new file count limits.
+        // Revalidate configured slots and any independently verified surplus.
         self.scan_existing();
     }
 
@@ -630,7 +634,8 @@ impl BallastManager {
     ///
     /// On Unix, use the existing pool lock without allocating or waiting for a
     /// provisioner. Inventory is refreshed under that lock and only successful
-    /// removals consume the quota. A busy pool can be retried on a later tick.
+    /// removals consume the quota, including verified surplus after a target
+    /// change. A busy pool can be retried on a later tick.
     pub fn release(&mut self, count: usize) -> Result<ReleaseReport> {
         emergency::release(self, count)
     }
@@ -1699,12 +1704,21 @@ mod tests {
             );
         }
 
-        // Reduce to 3 files
+        // Reduce the target, not the physical reserve that emergency release
+        // can use. The portable non-Unix backend still inventories slots only.
         config.file_count = 3;
         mgr.update_config(config);
-
-        // Inventory should show 3
-        assert_eq!(mgr.available_count(), 3);
+        let expected_available = if cfg!(unix) { 5 } else { 3 };
+        assert_eq!(mgr.available_count(), expected_available);
+        assert_eq!(mgr.config().file_count, 3);
+        assert_eq!(
+            mgr.releasable_bytes(),
+            expected_available as u64 * small_config().file_size_bytes
+        );
+        let observed = BallastAvailability::observe(dir.path(), mgr.config());
+        assert_eq!(observed.available_count, expected_available);
+        assert_eq!(observed.configured_count, 3);
+        assert_eq!(observed.releasable_bytes, mgr.releasable_bytes());
 
         // Files 4 and 5 are orphans now: reported, not removed (config
         // reload runs unlocked; only provision/replenish prune).
@@ -1727,6 +1741,7 @@ mod tests {
             "Orphaned file 5 should be removed by provision"
         );
         assert_eq!(mgr.orphans(), Vec::<PathBuf>::new());
+        assert_eq!(mgr.available_count(), 3);
     }
 
     // ──── #16: health / availability ────

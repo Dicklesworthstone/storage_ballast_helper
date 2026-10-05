@@ -4,6 +4,8 @@
 //! regular files on the pool's filesystem, bounded by their allocated blocks.
 //! These are allocation estimates, not guaranteed free-space deltas: snapshots
 //! may retain extents after unlink. No observation creates a directory or lock.
+//! On Unix, verified surplus files remain visible after a target is reduced or
+//! disabled, so the pressure controller can still release that physical reserve.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -146,6 +148,110 @@ impl PoolReader {
     }
 }
 
+#[cfg(unix)]
+#[derive(Default)]
+struct SurplusSnapshot {
+    files: Vec<BallastFile>,
+    unreadable: usize,
+}
+
+/// Preserve the same ownership boundary as emergency release: outside the
+/// configured slots, a familiar filename alone proves nothing. Verify the
+/// original header/size/allocation through the opened directory, not against a
+/// newly configured file size. No lock acquisition or mutation belongs here.
+#[cfg(unix)]
+fn read_surplus(pool: &PoolReader, index: u32) -> std::io::Result<Option<BallastFile>> {
+    let name = ballast_file_name(index);
+    let mut file = match pool.open_slot(OsStr::new(&name)) {
+        Ok(file) => file,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    if !independently_releasable(&meta, &pool.meta)
+        || meta.len() < HEADER_SIZE as u64
+        || allocated_bytes(&meta) < meta.len()
+    {
+        return Ok(None);
+    }
+    let mut bytes = [0u8; HEADER_SIZE];
+    match file.read_exact(&mut bytes) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let end = bytes.iter().position(|&byte| byte == 0).unwrap_or(HEADER_SIZE);
+    let Ok(header) = serde_json::from_slice::<BallastHeader>(&bytes[..end]) else {
+        return Ok(None);
+    };
+    if !header.validate() || header.file_index != index || header.file_size != meta.len() {
+        return Ok(None);
+    }
+    let after = file.metadata()?;
+    let current = pool.open_slot(OsStr::new(&name))?;
+    if !same_file(&meta, &after) || !same_file(&meta, &current.metadata()?) || !pool.is_current() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "surplus ballast or its pool changed during observation",
+        ));
+    }
+    let created_at = meta
+        .created()
+        .ok()
+        .map(|time| {
+            let time: chrono::DateTime<chrono::Utc> = time.into();
+            time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        })
+        .unwrap_or_default();
+    Ok(Some(BallastFile {
+        path: pool.path.join(name),
+        index,
+        size: allocated_bytes(&meta),
+        created_at,
+        integrity_ok: true,
+    }))
+}
+
+#[cfg(unix)]
+fn verified_surplus(
+    path: &Path,
+    configured_count: usize,
+    expected_pool: &Metadata,
+) -> std::io::Result<SurplusSnapshot> {
+    let pool = PoolReader::open(path)?;
+    if !same_identity(expected_pool, &pool.meta) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ballast pool changed before surplus observation",
+        ));
+    }
+    let mut snapshot = SurplusSnapshot::default();
+    for index in super::emergency::existing_indices(path, &pool.meta)? {
+        if usize::try_from(index).is_ok_and(|index| index <= configured_count) {
+            continue;
+        }
+        match read_surplus(&pool, index) {
+            Ok(Some(file)) => snapshot.files.push(file),
+            Ok(None) => {}
+            // Keep independently verified neighbors visible. Unknown is not
+            // missing, and the status snapshot must advertise its uncertainty.
+            Err(_) => snapshot.unreadable = snapshot.unreadable.saturating_add(1),
+        }
+    }
+    if !pool.is_current() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ballast pool changed during surplus observation",
+        ));
+    }
+    Ok(snapshot)
+}
+
 pub(super) fn observe(ballast_dir: &Path, config: &BallastConfig) -> BallastAvailability {
     let configured_pool_bytes =
         (config.file_count as u64).saturating_mul(config.file_size_bytes);
@@ -159,9 +265,6 @@ pub(super) fn observe(ballast_dir: &Path, config: &BallastConfig) -> BallastAvai
         releasable_bytes: 0,
         health: BallastHealth::evaluate(configured_pool_bytes, 0),
     };
-    if config.file_count == 0 {
-        return result;
-    }
     match pool_metadata(ballast_dir) {
         Ok(pool) => {
             for i in 1..=config.file_count {
@@ -186,19 +289,36 @@ pub(super) fn observe(ballast_dir: &Path, config: &BallastConfig) -> BallastAvai
                     Err(_) => result.unreadable_count += 1,
                 }
             }
+            #[cfg(unix)]
+            match verified_surplus(ballast_dir, config.file_count, &pool) {
+                Ok(surplus) => {
+                    result.available_count = result
+                        .available_count
+                        .saturating_add(surplus.files.len());
+                    for file in surplus.files {
+                        result.releasable_bytes = result.releasable_bytes.saturating_add(file.size);
+                    }
+                    result.unreadable_count = result
+                        .unreadable_count
+                        .saturating_add(surplus.unreadable);
+                }
+                // Directory enumeration failed: we cannot claim that there is
+                // no surplus. Preserve any already counted unreadable slots.
+                Err(_) => result.unreadable_count = result.unreadable_count.max(1),
+            }
             // Do not combine slots observed through two different pool paths.
             // This is a best-effort read-only snapshot, not a release lease.
             if !pool_metadata(ballast_dir).is_ok_and(|after| same_identity(&pool, &after)) {
                 result.available_count = 0;
                 result.missing_count = 0;
                 result.releasable_bytes = 0;
-                result.unreadable_count = config.file_count;
+                result.unreadable_count = config.file_count.max(1);
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             result.missing_count = config.file_count;
         }
-        Err(_) => result.unreadable_count = config.file_count,
+        Err(_) => result.unreadable_count = config.file_count.max(1),
     }
     result.health = if configured_pool_bytes == 0 {
         BallastHealth::Unconfigured
@@ -247,6 +367,10 @@ pub(super) fn inventory(manager: &BallastManager) -> Vec<BallastFile> {
             created_at,
             integrity_ok,
         });
+    }
+    #[cfg(unix)]
+    if let Ok(surplus) = verified_surplus(&manager.ballast_dir, manager.config.file_count, &pool) {
+        inventory.extend(surplus.files);
     }
     if !pool_metadata(&manager.ballast_dir).is_ok_and(|after| same_identity(&pool, &after)) {
         inventory.clear();
@@ -662,5 +786,270 @@ mod tests {
             })
             .collect();
         assert_eq!(manager.releasable_bytes(), u64::MAX);
+    }
+
+    #[cfg(unix)]
+    fn provisioned_fixture() -> (tempfile::TempDir, BallastManager) {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager =
+            BallastManager::new_unfloored(root.path().join("pool"), config()).unwrap();
+        assert_eq!(manager.provision(None).unwrap().files_created, 3);
+        (root, manager)
+    }
+
+    #[cfg(unix)]
+    fn pressure(mount: &Path, level: crate::monitor::pid::PressureLevel) -> crate::monitor::pid::PressureResponse {
+        crate::monitor::pid::PressureResponse {
+            level,
+            urgency: if level == crate::monitor::pid::PressureLevel::Critical { 1.0 } else { 0.4 },
+            scan_interval: std::time::Duration::from_secs(1),
+            release_ballast_files: 0,
+            max_delete_batch: 10,
+            fallback_active: false,
+            causing_mount: mount.to_path_buf(),
+            free_pct: 1.0,
+            predicted_seconds: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reloaded_and_reopened_pools_keep_surplus_visible_to_pressure_release() {
+        use crate::ballast::release::BallastReleaseController;
+        use crate::monitor::pid::PressureLevel;
+
+        for target in [0, 1, 2] {
+            for restart in [false, true] {
+                let (root, mut manager) = provisioned_fixture();
+                let mut changed = config();
+                changed.file_count = target;
+                changed.file_size_bytes *= 2;
+                if restart {
+                    manager = BallastManager::new(manager.ballast_dir.clone(), changed.clone()).unwrap();
+                } else {
+                    manager.update_config(changed.clone());
+                }
+                assert_eq!(manager.available_count(), 3);
+                assert_eq!(manager.releasable_bytes(), 3 * config().file_size_bytes);
+                let observed = BallastAvailability::observe(&manager.ballast_dir, &changed);
+                assert_eq!(observed.available_count, 3);
+                assert_eq!(observed.configured_count, target);
+                assert_eq!(observed.releasable_bytes, manager.releasable_bytes());
+                assert!(observed.is_authoritative());
+                assert_eq!(observed.health, manager.health());
+                let mut controller = BallastReleaseController::new(0);
+                let report = controller
+                    .maybe_release(root.path(), &mut manager, &pressure(root.path(), PressureLevel::Critical))
+                    .unwrap()
+                    .expect("physical reserve must reach the pressure-driven release path");
+                assert_eq!(report.files_released, 3);
+                assert_eq!(report.bytes_freed, 3 * config().file_size_bytes);
+                assert!(report.errors.is_empty(), "{report:?}");
+                assert_eq!(manager.config().file_count, target);
+                let after = BallastAvailability::observe(&manager.ballast_dir, &changed);
+                assert_eq!(after.available_count, 0);
+                assert_eq!(after.releasable_bytes, 0);
+                assert_eq!(after.missing_count, target);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surplus_is_used_by_graduated_release_without_reenabling_growth() {
+        use crate::ballast::release::BallastReleaseController;
+        use crate::monitor::pid::PressureLevel;
+
+        let (root, mut manager) = provisioned_fixture();
+        let mut disabled = config();
+        disabled.file_count = 0;
+        manager.update_config(disabled);
+        assert_eq!(manager.health(), BallastHealth::Unconfigured);
+        let mut controller = BallastReleaseController::new(0);
+        assert!(!controller
+            .maybe_replenish(root.path(), &mut manager, PressureLevel::Green, &|| 100.0)
+            .unwrap());
+        assert_eq!(manager.available_count(), 3);
+        let orange = pressure(root.path(), PressureLevel::Orange);
+        let first = controller.maybe_release(root.path(), &mut manager, &orange).unwrap().unwrap();
+        assert_eq!(first.files_released, 1);
+        assert!(controller.maybe_release(root.path(), &mut manager, &orange).unwrap().is_none());
+        let remaining = controller
+            .maybe_release(root.path(), &mut manager, &pressure(root.path(), PressureLevel::Critical))
+            .unwrap()
+            .unwrap();
+        assert_eq!(remaining.files_released, 2);
+        assert_eq!(manager.available_count(), 0);
+        assert!(!controller
+            .maybe_replenish(root.path(), &mut manager, PressureLevel::Green, &|| 100.0)
+            .unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_surplus_observation_does_not_create_a_missing_lock() {
+        let (_root, mut manager) = verified_fixture();
+        let retained = fs::read(manager.file_path(1)).unwrap();
+        let mut disabled = config();
+        disabled.file_count = 0;
+        manager.update_config(disabled.clone());
+        let observed = BallastAvailability::observe(&manager.ballast_dir, &disabled);
+        assert_eq!(manager.available_count(), 1);
+        assert_eq!(observed.available_count, 1);
+        assert_eq!(observed.releasable_bytes, config().file_size_bytes);
+        assert_eq!(observed.health, BallastHealth::Unconfigured);
+        assert_eq!(observed.missing_count, 0);
+        assert!(observed.is_authoritative());
+        assert!(!manager.ballast_dir.join(".lock").exists());
+        assert_eq!(fs::read(manager.file_path(1)).unwrap(), retained);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_surplus_is_neither_capacity_nor_deletion_authority() {
+        use crate::ballast::release::BallastReleaseController;
+        use crate::monitor::pid::PressureLevel;
+
+        let (root, mut manager) = provisioned_fixture();
+        let invalid = manager.file_path(3);
+        fs::write(&invalid, b"foreign or corrupt surplus").unwrap();
+        let wrong_index = manager.file_path(4);
+        fs::copy(manager.file_path(2), &wrong_index).unwrap();
+        let copied = fs::read(&wrong_index).unwrap();
+        let mut changed = config();
+        changed.file_count = 1;
+        manager.update_config(changed.clone());
+        let observed = BallastAvailability::observe(&manager.ballast_dir, &changed);
+        assert_eq!(observed.available_count, 2);
+        assert_eq!(observed.releasable_bytes, 2 * config().file_size_bytes);
+        assert_eq!(manager.available_count(), 2);
+        let mut controller = BallastReleaseController::new(0);
+        let report = controller
+            .maybe_release(root.path(), &mut manager, &pressure(root.path(), PressureLevel::Critical))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.files_released, 2);
+        assert!(!report.errors.is_empty());
+        assert_eq!(fs::read(invalid).unwrap(), b"foreign or corrupt surplus");
+        assert_eq!(fs::read(wrong_index).unwrap(), copied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surplus_links_and_nonregular_entries_are_not_reserved_capacity() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+        use std::os::unix::fs::symlink;
+
+        let (root, mut manager) = verified_fixture();
+        let external = root.path().join("external");
+        fs::rename(manager.file_path(1), &external).unwrap();
+        let retained = fs::read(&external).unwrap();
+        symlink(&external, manager.file_path(1)).unwrap();
+        fs::hard_link(&external, manager.file_path(2)).unwrap();
+        mkfifo(&manager.file_path(3), Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        fs::create_dir(manager.file_path(4)).unwrap();
+        let mut disabled = config();
+        disabled.file_count = 0;
+        manager.update_config(disabled.clone());
+        let observed = BallastAvailability::observe(&manager.ballast_dir, &disabled);
+        assert_eq!(observed.available_count, 0);
+        assert_eq!(observed.releasable_bytes, 0);
+        assert_eq!(observed.missing_count, 0);
+        assert!(observed.is_authoritative());
+        assert_eq!(manager.available_count(), 0);
+        assert_eq!(fs::read(external).unwrap(), retained);
+        assert!(!manager.ballast_dir.join(".lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surplus_does_not_hide_missing_configured_slots() {
+        let (_root, mut manager) = provisioned_fixture();
+        fs::remove_file(manager.file_path(1)).unwrap();
+        let mut changed = config();
+        changed.file_count = 1;
+        manager.update_config(changed.clone());
+        let observed = BallastAvailability::observe(&manager.ballast_dir, &changed);
+        assert_eq!(observed.configured_count, 1);
+        assert_eq!(observed.available_count, 2);
+        assert_eq!(observed.missing_count, 1);
+        assert_eq!(observed.releasable_bytes, 2 * config().file_size_bytes);
+        assert_eq!(observed.health, BallastHealth::Ok);
+        assert_eq!(manager.available_count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surplus_discovery_is_bound_to_the_original_directory_identity() {
+        let (root, manager) = verified_fixture();
+        let expected = pool_metadata(&manager.ballast_dir).unwrap();
+        let retained = fs::read(manager.file_path(1)).unwrap();
+        fs::rename(&manager.ballast_dir, root.path().join("old-pool")).unwrap();
+        fs::create_dir(&manager.ballast_dir).unwrap();
+        fs::write(manager.file_path(1), &retained).unwrap();
+        assert!(verified_surplus(&manager.ballast_dir, 0, &expected).is_err());
+        assert_eq!(fs::read(manager.file_path(1)).unwrap(), retained);
+        assert!(!manager.ballast_dir.join(".lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_surplus_is_revalidated_at_release_after_external_damage() {
+        use crate::ballast::release::BallastReleaseController;
+        use crate::monitor::pid::PressureLevel;
+
+        let (root, mut manager) = provisioned_fixture();
+        let mut disabled = config();
+        disabled.file_count = 0;
+        manager.update_config(disabled.clone());
+        assert_eq!(manager.available_count(), 3);
+        let changed = manager.file_path(3);
+        fs::write(&changed, b"replacement data").unwrap();
+        assert_eq!(manager.available_count(), 3, "the cached observation predates the write");
+        assert_eq!(BallastAvailability::observe(&manager.ballast_dir, &disabled).available_count, 2);
+        let mut controller = BallastReleaseController::new(0);
+        let report = controller
+            .maybe_release(root.path(), &mut manager, &pressure(root.path(), PressureLevel::Critical))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.files_released, 2);
+        assert_eq!(report.bytes_freed, 2 * config().file_size_bytes);
+        assert_eq!(fs::read(changed).unwrap(), b"replacement data");
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn very_high_surplus_index_does_not_imply_billions_of_missing_slots() {
+        let (_root, mut manager) = verified_fixture();
+        let mut bytes = fs::read(manager.file_path(1)).unwrap();
+        let header = super::super::ballast_header_buffer(u32::MAX, config().file_size_bytes).unwrap();
+        bytes[..HEADER_SIZE].copy_from_slice(&header);
+        fs::write(manager.file_path(u32::MAX), bytes).unwrap();
+        let mut disabled = config();
+        disabled.file_count = 0;
+        manager.update_config(disabled.clone());
+        let observed = BallastAvailability::observe(&manager.ballast_dir, &disabled);
+        assert_eq!(observed.available_count, 2);
+        assert_eq!(observed.missing_count, 0);
+        assert_eq!(observed.releasable_bytes, 2 * config().file_size_bytes);
+        assert_eq!(manager.available_count(), 2);
+        assert_eq!(manager.inventory()[1].index, u32::MAX);
+    }
+
+    #[test]
+    fn disabled_target_does_not_turn_an_unknown_pool_into_proven_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("not-a-directory");
+        fs::write(&path, b"keep").unwrap();
+        let mut disabled = config();
+        disabled.file_count = 0;
+        let observed = BallastAvailability::observe(&path, &disabled);
+        assert_eq!(observed.health, BallastHealth::Unconfigured);
+        assert_eq!(observed.available_count, 0);
+        assert_eq!(observed.missing_count, 0);
+        assert!(!observed.is_authoritative());
+        assert_eq!(fs::read(path).unwrap(), b"keep");
     }
 }
