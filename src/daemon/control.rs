@@ -118,6 +118,7 @@ pub fn read_endpoint(state_file: &Path) -> Option<ControlEndpoint> {
 
 /// One request line.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlRequest {
     /// Command name: `ping`, `status`, `scan-now`, `reload`, `policy`,
     /// `explain`, `ballast` or `shutdown`.
@@ -257,6 +258,28 @@ impl ControlCommand {
             code: "bad_request".to_string(),
             message,
         };
+        // A misspelled scope must not become the default (all mounts/roots),
+        // and scalar args must not make a mutating command silently ignore
+        // its intended options. Null remains the wire spelling of no args.
+        let fields: Option<&[&str]> = match request.cmd.as_str() {
+            "ping" | "status" | "reload" | "shutdown" => Some(&[]),
+            "scan-now" | "scan_now" => Some(&["paths", "force"]),
+            "policy" => Some(&["action"]),
+            "explain" => Some(&["id"]),
+            "ballast" => Some(&["mount", "release", "replenish"]),
+            _ => None,
+        };
+        if let Some(fields) = fields {
+            match args {
+                Value::Null => {}
+                Value::Object(args) => {
+                    if let Some(key) = args.keys().find(|key| !fields.contains(&key.as_str())) {
+                        return Err(bad(format!("{}: unknown argument {key:?}", request.cmd)));
+                    }
+                }
+                _ => return Err(bad(format!("{}: args must be an object or null", request.cmd))),
+            }
+        }
         match request.cmd.as_str() {
             "ping" => Ok(Self::Ping),
             "status" => Ok(Self::Status),
@@ -266,9 +289,12 @@ impl ControlCommand {
                     Some(Value::Array(items)) => items
                         .iter()
                         .map(|item| {
-                            item.as_str().map(PathBuf::from).ok_or_else(|| {
-                                bad("scan-now: every path must be a string".to_string())
-                            })
+                            item.as_str()
+                                .filter(|path| !path.trim().is_empty() && !path.contains('\0'))
+                                .map(PathBuf::from)
+                                .ok_or_else(|| {
+                                    bad("scan-now: every path must be a nonempty string without NUL".to_string())
+                                })
                         })
                         .collect::<std::result::Result<Vec<_>, _>>()?,
                     Some(other) => {
@@ -277,7 +303,12 @@ impl ControlCommand {
                         )));
                     }
                 };
-                let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+                let force = match args.get("force") {
+                    None => false,
+                    Some(value) => value.as_bool().ok_or_else(|| {
+                        bad("scan-now: force must be a boolean".to_string())
+                    })?,
+                };
                 Ok(Self::ScanNow { paths, force })
             }
             "reload" => Ok(Self::Reload),
@@ -303,23 +334,7 @@ impl ControlCommand {
                     .ok_or_else(|| bad("explain: args.id is required".to_string()))?;
                 Ok(Self::Explain { id: id.to_string() })
             }
-            "ballast" => {
-                let mount = args.get("mount").and_then(Value::as_str).map(PathBuf::from);
-                if let Some(count) = args.get("release") {
-                    let count = count.as_u64().filter(|count| *count > 0).ok_or_else(|| {
-                        bad("ballast: release must be a positive integer".to_string())
-                    })?;
-                    let count = usize::try_from(count)
-                        .map_err(|_| bad("ballast: release count is too large".to_string()))?;
-                    return Ok(Self::Ballast(BallastAction::Release { count, mount }));
-                }
-                if args.get("replenish").and_then(Value::as_bool) == Some(true) {
-                    return Ok(Self::Ballast(BallastAction::Replenish { mount }));
-                }
-                Err(bad(
-                    "ballast: give release = <count> or replenish = true".to_string()
-                ))
-            }
+            "ballast" => Self::parse_ballast(args),
             "shutdown" => Ok(Self::Shutdown),
             other => Err(ControlError {
                 code: "unknown_command".to_string(),
@@ -328,6 +343,46 @@ impl ControlCommand {
                 ),
             }),
         }
+    }
+
+    fn parse_ballast(args: &Value) -> std::result::Result<Self, ControlError> {
+        let bad = |message: &str| ControlError {
+            code: "bad_request".to_string(),
+            message: message.to_string(),
+        };
+        let mount = match args.get("mount") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(path))
+                if Path::new(path).is_absolute() && !path.contains('\0') =>
+            {
+                Some(PathBuf::from(path))
+            }
+            Some(_) => {
+                return Err(bad("ballast: mount must be an absolute path string or null"));
+            }
+        };
+        let replenish = match args.get("replenish") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| bad("ballast: replenish must be a boolean"))?,
+        };
+        if args.get("release").is_some() && replenish {
+            return Err(bad("ballast: release and replenish are mutually exclusive"));
+        }
+        if let Some(count) = args.get("release") {
+            let count = count
+                .as_u64()
+                .filter(|count| *count > 0)
+                .ok_or_else(|| bad("ballast: release must be a positive integer"))?;
+            let count = usize::try_from(count)
+                .map_err(|_| bad("ballast: release count is too large"))?;
+            return Ok(Self::Ballast(BallastAction::Release { count, mount }));
+        }
+        if replenish {
+            return Ok(Self::Ballast(BallastAction::Replenish { mount }));
+        }
+        Err(bad("ballast: give release = <count> or replenish = true"))
     }
 
     /// The wire name of the command.
