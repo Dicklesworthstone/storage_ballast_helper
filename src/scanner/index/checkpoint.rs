@@ -401,11 +401,20 @@ fn load_with_limit(
         return Err(corrupt(invalid("integrity hash mismatch")));
     }
     let mut records = BTreeMap::new();
+    let mut paths = BTreeMap::new();
     for record in checkpoint.records {
         if record.event_generation > checkpoint.event_generation {
             return Err(corrupt(invalid(
                 "candidate generation exceeds checkpoint generation",
             )));
+        }
+        if paths.insert(record.path.clone(), record.identity).is_some() {
+            // Older checkpoints could retain multiple incarnations of one
+            // path. Their ordering cannot identify the current one without a
+            // fresh walk, so rediscover instead of reviving an obsolete hint.
+            return Err(ScannerIndexLoadStatus::Stale(
+                "multiple candidate identities for one path; rediscovery required".to_string(),
+            ));
         }
         match records.entry(record.identity) {
             Entry::Vacant(entry) => {
@@ -422,6 +431,7 @@ fn load_with_limit(
         context: checkpoint.context,
         event_generation: checkpoint.event_generation,
         records,
+        paths,
     })
 }
 
@@ -676,7 +686,9 @@ mod tests {
         for duplicate in [true, false] {
             let mut checkpoint = legacy(&index);
             if duplicate {
-                checkpoint.records.push(checkpoint.records[0].clone());
+                let mut duplicate = checkpoint.records[0].clone();
+                duplicate.path = PathBuf::from("/cache/same-identity-other-path");
+                checkpoint.records.push(duplicate);
             } else {
                 checkpoint.records[0].event_generation = 1;
             }
@@ -706,5 +718,28 @@ mod tests {
         assert_eq!(loaded.event_generation(), 1);
         assert_eq!(loaded.len(), 3);
         assert!(loaded.ranked_records(UNIX_EPOCH, 3).is_empty());
+    }
+
+    #[test]
+    fn old_checkpoint_with_multiple_incarnations_of_one_path_requires_rediscovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("checkpoint.json");
+        let index = fixture("old-incarnations");
+        let mut checkpoint = legacy(&index);
+        checkpoint.records[1].path = checkpoint.records[0].path.clone();
+        checkpoint.integrity_hash = integrity_hash(
+            &checkpoint.context,
+            checkpoint.event_generation,
+            &checkpoint.records,
+            MAX_CHECKPOINT_BYTES,
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&checkpoint).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let (loaded, status) = load(&path, index.context);
+        assert!(matches!(status, ScannerIndexLoadStatus::Stale(_)), "{status:?}");
+        assert!(loaded.is_empty());
+        assert!(loaded.paths.is_empty());
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 }

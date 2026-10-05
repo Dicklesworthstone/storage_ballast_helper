@@ -332,6 +332,10 @@ pub struct ScannerCandidateIndex {
     context: ScannerIndexContext,
     event_generation: u64,
     records: BTreeMap<IndexedIdentity, CandidateIndexRecord>,
+    /// One current identity per observed path. A rebuilt artifact must retire
+    /// its old inode's replay hint rather than leave both in the ranked queue.
+    /// Derived from records on load, never independently persisted.
+    paths: BTreeMap<PathBuf, IndexedIdentity>,
 }
 
 impl ScannerCandidateIndex {
@@ -341,6 +345,7 @@ impl ScannerCandidateIndex {
             context,
             event_generation: 0,
             records: BTreeMap::new(),
+            paths: BTreeMap::new(),
         }
     }
 
@@ -371,19 +376,33 @@ impl ScannerCandidateIndex {
 
     pub fn upsert(&mut self, mut record: CandidateIndexRecord) {
         record.event_generation = self.event_generation;
-        if let Some(existing) = self.records.get(&record.identity)
-            && existing.evidence_matches(&record)
+        // A fresh observation of this path supersedes every earlier identity
+        // at that path, even when the new candidate is vetoed or has no score.
+        // Otherwise an obsolete high score can monopolize a bounded replay.
+        if let Some(previous) = self.paths.get(&record.path).copied()
+            && previous != record.identity
         {
-            record.fail_count = existing.fail_count;
-            record.cooldown_until_nanos = existing.cooldown_until_nanos;
-            // A failed attempt is retryable, not permission to overwrite a
-            // newly observed active-reference or safety veto with Failed.
-            if existing.safety_state == CandidateSafetyState::Failed
-                && record.safety_state == CandidateSafetyState::Safe
-            {
-                record.safety_state = CandidateSafetyState::Failed;
+            self.records.remove(&previous);
+        }
+        if let Some(existing) = self.records.get(&record.identity) {
+            if existing.path != record.path {
+                // Rename or a newly observed alias of the same identity:
+                // reusing its old path later must not retire this new binding.
+                self.paths.remove(&existing.path);
+            }
+            if existing.evidence_matches(&record) {
+                record.fail_count = existing.fail_count;
+                record.cooldown_until_nanos = existing.cooldown_until_nanos;
+                // A failed attempt is retryable, not permission to overwrite
+                // a newly observed active-reference or safety veto with Failed.
+                if existing.safety_state == CandidateSafetyState::Failed
+                    && record.safety_state == CandidateSafetyState::Safe
+                {
+                    record.safety_state = CandidateSafetyState::Failed;
+                }
             }
         }
+        self.paths.insert(record.path.clone(), record.identity);
         self.records.insert(record.identity, record);
     }
 
@@ -431,6 +450,7 @@ impl ScannerCandidateIndex {
             // Saturation would make a subsequent overflow leave every record
             // apparently fresh. Reset only after revoking all old records.
             self.records.clear();
+            self.paths.clear();
             self.event_generation = 0;
         }
     }
@@ -891,5 +911,178 @@ mod tests {
         let v2 = ScannerIndexContext::from_roots_and_config(&roots, &v2_config);
 
         assert_ne!(v1.config_fingerprint, v2.config_fingerprint);
+    }
+
+    fn assert_path_index_consistent(index: &ScannerCandidateIndex) {
+        assert_eq!(index.paths.len(), index.records.len());
+        for (identity, record) in &index.records {
+            assert_eq!(index.paths.get(&record.path), Some(identity));
+        }
+    }
+
+    #[test]
+    fn rebuilding_one_path_does_not_accumulate_replayable_old_inodes() {
+        let mut index = ScannerCandidateIndex::new(context("rebuild"));
+        for inode in 1..=1000 {
+            let mut current = record(identity(inode), identity(99));
+            current.path = PathBuf::from("/cache/rebuilt/target");
+            current.score = Some(if inode == 1 { 0.99 } else { 0.6 });
+            index.upsert(current.clone());
+            assert_eq!(index.len(), 1);
+            assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![current]);
+            assert_path_index_consistent(&index);
+        }
+    }
+
+    #[test]
+    fn a_vetoed_replacement_retires_the_old_high_score_without_starving_other_work() {
+        for state in [CandidateSafetyState::Vetoed, CandidateSafetyState::ActiveReference] {
+            let mut index = ScannerCandidateIndex::new(context("veto"));
+            let mut old = record(identity(1), identity(99));
+            old.score = Some(0.99);
+            let useful = record(identity(2), identity(99));
+            index.upsert(old.clone());
+            index.upsert(useful.clone());
+            let mut replacement = old.clone();
+            replacement.identity = identity(3);
+            replacement.safety_state = state;
+            index.upsert(replacement);
+            assert!(index.get(old.identity).is_none());
+            assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![useful]);
+            assert_path_index_consistent(&index);
+        }
+    }
+
+    #[test]
+    fn late_failure_for_a_retired_inode_does_not_cool_down_its_replacement() {
+        let mut index = ScannerCandidateIndex::new(context("late-failure"));
+        let old = record(identity(1), identity(99));
+        index.upsert(old.clone());
+        index.record_failure(old.identity, UNIX_EPOCH, Duration::from_secs(60), Duration::from_secs(60));
+        let mut replacement = old.clone();
+        replacement.identity = identity(2);
+        index.upsert(replacement.clone());
+        index.record_failure(old.identity, UNIX_EPOCH, Duration::from_secs(60), Duration::from_secs(60));
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![replacement]);
+        assert!(index.get(old.identity).is_none());
+        assert_path_index_consistent(&index);
+    }
+
+    #[test]
+    fn reusing_an_old_path_after_a_rename_preserves_the_renamed_candidate() {
+        let mut index = ScannerCandidateIndex::new(context("rename"));
+        let original = record(identity(1), identity(99));
+        let mut renamed = original.clone();
+        renamed.path = PathBuf::from("/cache/new-name");
+        index.upsert(original.clone());
+        index.upsert(renamed.clone());
+        let mut replacement = original;
+        replacement.identity = identity(2);
+        index.upsert(replacement.clone());
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.get(renamed.identity), Some(&renamed));
+        assert_eq!(index.get(replacement.identity), Some(&replacement));
+        assert_path_index_consistent(&index);
+    }
+
+    #[test]
+    fn rename_over_an_indexed_path_retires_only_the_displaced_identity() {
+        let mut index = ScannerCandidateIndex::new(context("replace-rename"));
+        let first = record(identity(1), identity(99));
+        let second = record(identity(2), identity(99));
+        index.upsert(first.clone());
+        index.upsert(second.clone());
+        let mut renamed = first.clone();
+        renamed.path = second.path;
+        index.upsert(renamed.clone());
+        assert!(index.get(second.identity).is_none());
+        assert_eq!(index.get(first.identity), Some(&renamed));
+        let mut third = first;
+        third.identity = identity(3);
+        index.upsert(third);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.get(renamed.identity), Some(&renamed));
+        assert_path_index_consistent(&index);
+    }
+
+    #[test]
+    fn replacement_lookup_is_rebuilt_after_checkpoint_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("checkpoint.json");
+        let mut index = ScannerCandidateIndex::new(context("restart"));
+        let old = record(identity(1), identity(99));
+        index.upsert(old.clone());
+        index.save_checkpoint(&path).unwrap();
+        let (mut restarted, status) = ScannerCandidateIndex::load_checkpoint(&path, index.context);
+        assert_eq!(status, ScannerIndexLoadStatus::Loaded);
+        assert_path_index_consistent(&restarted);
+        let mut current = old.clone();
+        current.identity = identity(2);
+        restarted.upsert(current.clone());
+        assert!(restarted.get(old.identity).is_none());
+        assert_eq!(restarted.ranked_records(UNIX_EPOCH, 1), vec![current]);
+        assert_path_index_consistent(&restarted);
+    }
+
+    #[test]
+    fn overflow_clears_path_bindings_before_generation_reuse() {
+        let mut index = ScannerCandidateIndex::new(context("overflow"));
+        index.event_generation = u64::MAX;
+        index.upsert(record(identity(1), identity(99)));
+        index.mark_event_overflow();
+        assert!(index.paths.is_empty());
+        let mut current = record(identity(2), identity(99));
+        current.path = record(identity(1), identity(99)).path;
+        index.upsert(current.clone());
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![current]);
+        assert_path_index_consistent(&index);
+    }
+
+    #[test]
+    fn identical_inode_numbers_on_different_devices_remain_independent() {
+        let mut index = ScannerCandidateIndex::new(context("devices"));
+        let first = record(identity(1), identity(99));
+        let mut second = first.clone();
+        second.identity.device_id += 1;
+        second.path = PathBuf::from("/other-device/target");
+        index.upsert(first.clone());
+        index.upsert(second.clone());
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.get(first.identity), Some(&first));
+        assert_eq!(index.get(second.identity), Some(&second));
+        assert_path_index_consistent(&index);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_real_directory_replacement_revokes_the_old_replay_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("target");
+        fs::create_dir(&path).unwrap();
+        let old_identity = identity_from_metadata(&fs::symlink_metadata(&path).unwrap());
+        let old_score = score(path.clone(), old_identity.into());
+        let old = CandidateIndexRecord::from_candidate_score(
+            &old_score, None, StructuralSignals::default(), 0,
+        ).unwrap().unwrap();
+        let mut index = ScannerCandidateIndex::new(context("filesystem"));
+        index.upsert(old);
+        // Preserve the original inode so this is deterministic even on a
+        // filesystem that immediately recycles deleted directory identities.
+        let retired = temp.path().join("retired-original");
+        fs::rename(&path, &retired).unwrap();
+        fs::create_dir(&path).unwrap();
+        let new_identity = identity_from_metadata(&fs::symlink_metadata(&path).unwrap());
+        assert_ne!(new_identity, old_identity);
+        let mut fresh_score = score(path, new_identity.into());
+        fresh_score.vetoed = true;
+        fresh_score.veto_reason = Some("currently open".to_string());
+        let fresh = CandidateIndexRecord::from_candidate_score(
+            &fresh_score, None, StructuralSignals::default(), 0,
+        ).unwrap().unwrap();
+        index.upsert(fresh);
+        assert!(index.get(old_identity).is_none());
+        assert!(index.ranked_records(SystemTime::now(), 10).is_empty());
+        assert!(retired.is_dir(), "retiring an index hint never deletes its artifact");
+        assert_path_index_consistent(&index);
     }
 }
