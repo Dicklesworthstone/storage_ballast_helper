@@ -452,5 +452,231 @@ mod unix {
                 assert!(inspect(&parent, OsStr::new(name)).is_err(), "{name:?}");
             }
         }
+
+        #[cfg(target_os = "linux")]
+        mod mount_tests {
+            use super::*;
+            use std::os::unix::fs::MetadataExt;
+            use std::path::PathBuf;
+
+            use crate::core::errors::SbhError;
+            use nix::errno::Errno as NixErrno;
+            use nix::mount::{MntFlags, MsFlags, mount, umount, umount2};
+
+            #[derive(Clone, Copy)]
+            enum BoundAt {
+                Subtree,
+                Payload,
+                DecisionDirectory,
+                File,
+            }
+
+            struct Mounted {
+                scratch: Option<tempfile::TempDir>,
+                store: QuarantineStore,
+                record: QuarantineRecord,
+                target: PathBuf,
+                retained: PathBuf,
+                before: Vec<u8>,
+                attached: bool,
+            }
+
+            impl Mounted {
+                fn bind(at: BoundAt) -> Option<Self> {
+                    let scratch = tempfile::tempdir().unwrap();
+                    let (store, record) = held_tree(scratch.path(), "mounted");
+                    let foreign = scratch.path().join("foreign");
+                    fs::create_dir(&foreign).unwrap();
+                    fs::write(foreign.join("precious"), b"not quarantine data").unwrap();
+                    let (source, target, retained) = match at {
+                        BoundAt::Subtree => {
+                            let target = record.quarantine_path.join("nested/bound");
+                            fs::create_dir(&target).unwrap();
+                            (foreign.clone(), target, foreign.join("precious"))
+                        }
+                        BoundAt::Payload => (
+                            record.quarantine_path.clone(),
+                            record.quarantine_path.clone(),
+                            record.quarantine_path.join("nested/leaf"),
+                        ),
+                        BoundAt::DecisionDirectory => {
+                            let target = record.quarantine_path.parent().unwrap().to_path_buf();
+                            (target.clone(), target, record.quarantine_path.join("nested/leaf"))
+                        }
+                        BoundAt::File => {
+                            let target = record.quarantine_path.join("nested/bound-file");
+                            fs::write(&target, b"covered file").unwrap();
+                            (foreign.join("precious"), target, foreign.join("precious"))
+                        }
+                    };
+                    let before = fs::read(&retained).unwrap();
+                    match mount(
+                        Some(source.as_path()),
+                        target.as_path(),
+                        None::<&str>,
+                        MsFlags::MS_BIND,
+                        None::<&str>,
+                    ) {
+                        Ok(()) => {}
+                        Err(NixErrno::EPERM | NixErrno::EACCES | NixErrno::ENOSYS) => {
+                            eprintln!("TEST SKIP: bind-mount fixture requires mount capability");
+                            return None;
+                        }
+                        Err(error) => panic!("bind-mount fixture failed: {error}"),
+                    }
+                    // Install the cleanup guard immediately after mount succeeds.
+                    Some(Self {
+                        scratch: Some(scratch),
+                        store,
+                        record,
+                        target,
+                        retained,
+                        before,
+                        attached: true,
+                    })
+                }
+
+                fn detach(&mut self) {
+                    umount(self.target.as_path()).unwrap();
+                    self.attached = false;
+                }
+
+                fn assert_preserved(&self) {
+                    assert_eq!(fs::read(&self.retained).unwrap(), self.before);
+                    assert!(self.store.record("mounted").unwrap().is_some());
+                }
+            }
+
+            impl Drop for Mounted {
+                fn drop(&mut self) {
+                    if self.attached
+                        && let Err(error) = umount2(self.target.as_path(), MntFlags::MNT_DETACH)
+                    {
+                        // Never let TempDir's unrestricted recursive cleanup
+                        // traverse a fixture mount that could not be detached.
+                        if let Some(scratch) = self.scratch.take() {
+                            let preserved = scratch.keep();
+                            eprintln!(
+                                "fixture unmount failed ({error}); retained {}",
+                                preserved.display()
+                            );
+                        }
+                    }
+                }
+            }
+
+            fn assert_errno(error: SbhError, code: i32) {
+                match error {
+                    SbhError::Io { source, .. } => {
+                        assert_eq!(source.raw_os_error(), Some(code), "{source}");
+                    }
+                    other => panic!("expected a filesystem boundary error, got {other}"),
+                }
+            }
+
+            #[test]
+            fn same_device_bind_subtree_is_preserved_and_other_entries_drain() {
+                let Some(mut fixture) = Mounted::bind(BoundAt::Subtree) else {
+                    return;
+                };
+                assert_eq!(fs::metadata(&fixture.target).unwrap().dev(), fixture.record.device_id);
+                assert_errno(fixture.store.purge("mounted").unwrap_err(), libc::EXDEV);
+                fixture.assert_preserved();
+                let (_, healthy) = held_tree(fixture.scratch.as_ref().unwrap().path(), "healthy");
+                let drained = fixture.store.drain_all().unwrap();
+                assert_eq!(drained.entries, 1);
+                assert_eq!(drained.bytes, 100);
+                assert_eq!(drained.failures.len(), 1);
+                assert!(!healthy.quarantine_path.exists());
+                fixture.assert_preserved();
+                fixture.detach();
+                assert_eq!(fixture.store.purge("mounted").unwrap(), 100);
+                assert_eq!(fs::read(&fixture.retained).unwrap(), fixture.before);
+                assert!(fixture.store.stuck_entries().unwrap().is_empty());
+            }
+
+            #[test]
+            fn self_bound_payload_is_refused_even_when_record_identity_still_matches() {
+                let Some(fixture) = Mounted::bind(BoundAt::Payload) else {
+                    return;
+                };
+                let metadata = fs::metadata(&fixture.target).unwrap();
+                assert_eq!(metadata.dev(), fixture.record.device_id);
+                assert_eq!(metadata.ino(), fixture.record.inode);
+                assert_errno(fixture.store.purge("mounted").unwrap_err(), libc::EXDEV);
+                fixture.assert_preserved();
+            }
+
+            #[test]
+            fn self_bound_decision_directory_is_refused_before_payload_traversal() {
+                let Some(fixture) = Mounted::bind(BoundAt::DecisionDirectory) else {
+                    return;
+                };
+                assert_errno(fixture.store.purge("mounted").unwrap_err(), libc::EXDEV);
+                fixture.assert_preserved();
+            }
+
+            #[test]
+            fn mounted_file_is_not_unlinked_or_modified() {
+                let Some(fixture) = Mounted::bind(BoundAt::File) else {
+                    return;
+                };
+                assert_errno(fixture.store.purge("mounted").unwrap_err(), libc::EBUSY);
+                fixture.assert_preserved();
+                assert_eq!(fs::read(&fixture.target).unwrap(), fixture.before);
+            }
+
+            #[test]
+            fn pending_manifest_survives_mount_refusal_and_drains_after_unmount() {
+                let Some(mut fixture) = Mounted::bind(BoundAt::Subtree) else {
+                    return;
+                };
+                let manifest = fixture.store.root().join("mounted.json");
+                let pending = fixture.store.root().join("mounted.pending");
+                fs::rename(&manifest, &pending).unwrap();
+                assert_errno(fixture.store.purge("mounted").unwrap_err(), libc::EXDEV);
+                assert!(pending.exists());
+                assert!(!manifest.exists());
+                fixture.assert_preserved();
+                fixture.detach();
+                assert_eq!(fixture.store.purge("mounted").unwrap(), 100);
+                assert!(!pending.exists());
+                assert!(!fixture.record.quarantine_path.exists());
+                assert_eq!(fs::read(&fixture.retained).unwrap(), fixture.before);
+            }
+
+            #[test]
+            fn existing_kernel_mount_boundaries_can_be_checked_without_mount_privileges() {
+                let Ok(mounts) = fs::read_to_string("/proc/self/mountinfo") else {
+                    eprintln!("TEST SKIP: Linux mount inventory is unavailable");
+                    return;
+                };
+                let mut checked = 0;
+                // Read-only opens, never purge these system directories.
+                // Container /proc/bus is often a same-device bind mount.
+                for (parent_path, name, full_path) in [
+                    ("/dev", "shm", "/dev/shm"),
+                    ("/proc", "bus", "/proc/bus"),
+                ] {
+                    if !mounts.lines().any(|line| {
+                        line.split_whitespace().nth(4) == Some(full_path)
+                    }) {
+                        continue;
+                    }
+                    let Ok(parent) = File::open(parent_path) else {
+                        continue;
+                    };
+                    let Ok(Some(identity)) = inspect(&parent, OsStr::new(name)) else {
+                        continue;
+                    };
+                    let error = open_directory(&parent, OsStr::new(name), identity).unwrap_err();
+                    assert_eq!(error.raw_os_error(), Some(libc::EXDEV), "{full_path}: {error}");
+                    checked += 1;
+                }
+                if checked == 0 {
+                    eprintln!("TEST SKIP: no readable fixture-free mount boundaries found");
+                }
+            }
+        }
     }
 }
