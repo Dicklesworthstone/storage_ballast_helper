@@ -45,7 +45,8 @@ struct MountReleaseState {
     last_release_time: Option<Instant>,
     /// When pressure first returned to Green (for replenishment cooldown).
     green_since: Option<Instant>,
-    /// Last time a file was replenished.
+    /// Most recent replenishment attempt or successful completion. Failed and
+    /// no-op probes must be paced too; a slow success extends the interval.
     last_replenish_time: Option<Instant>,
     /// Count of non-green ticks since green_since was set. Allows brief
     /// pressure spikes (e.g. compilation bursts) without resetting the
@@ -116,7 +117,7 @@ pub struct BallastReleaseController {
     states: HashMap<PathBuf, MountReleaseState>,
     /// Cooldown before replenishment begins after returning to green.
     replenish_cooldown: Duration,
-    /// Minimum interval between individual file replenishments.
+    /// Minimum interval between reserve validation/growth attempts.
     replenish_interval: Duration,
 }
 
@@ -126,7 +127,7 @@ impl BallastReleaseController {
         Self {
             states: HashMap::new(),
             replenish_cooldown: Duration::from_secs(replenish_cooldown_minutes * 60),
-            replenish_interval: Duration::from_mins(5), // 5 min between files
+            replenish_interval: Duration::from_mins(5), // 5 min between attempts
         }
     }
 
@@ -365,44 +366,64 @@ impl BallastReleaseController {
         Ok(false)
     }
 
-    /// Whether a mount may replenish one file now: Green, Green for the full
-    /// cooldown (as fed by [`Self::observe_level`] every tick), short of its
-    /// configured files, and past the per-file rate limit. Pure with
-    /// respect to the cooldown: the observation happens in `observe_level`.
+    /// Admit one reserve validation/growth attempt after the Green cooldown.
+    ///
+    /// A physical file count cannot prove byte coverage or integrity: legacy
+    /// files can be smaller than configured slots, and cached inventory can
+    /// conceal external removal or damage. The provisioner must revalidate
+    /// coverage and enforce headroom before repairing/growing at most one file.
+    /// `current_files` is retained for caller compatibility, not admission.
+    /// A zero configured target disables maintenance.
+    ///
+    /// Returning true consumes the per-mount attempt slot BEFORE I/O. Call
+    /// once immediately before provisioning; no-op, refused, and failed probes
+    /// are rate-limited too. [`Self::on_replenished`] records a successful
+    /// completion, extending the interval if allocation itself took time.
     pub fn is_ready_for_replenish(
         &mut self,
         mount_path: &Path,
         current_level: PressureLevel,
-        current_files: usize,
+        _current_files: usize,
         target_files: usize,
     ) -> bool {
-        if current_level != PressureLevel::Green {
+        self.is_ready_for_replenish_at(mount_path, current_level, target_files, Instant::now())
+    }
+
+    fn is_ready_for_replenish_at(
+        &mut self,
+        mount_path: &Path,
+        current_level: PressureLevel,
+        target_files: usize,
+        now: Instant,
+    ) -> bool {
+        if current_level != PressureLevel::Green || target_files == 0 {
             return false;
         }
         let state = self.states.entry(mount_path.to_path_buf()).or_default();
 
-        // Cooldown: must be green for the full cooldown period. An observer
-        // that never saw Green (no observe_level call yet) is not ready.
-        let now = Instant::now();
+        // An observer that never saw Green is not ready. Do not let an
+        // out-of-order instant satisfy a zero-duration cooldown either.
         let Some(green_since) = state.green_since else {
             return false;
         };
-        if now.duration_since(green_since) < self.replenish_cooldown {
-            return false;
-        }
-
-        // Nothing to replenish if all configured files are present.
-        if current_files >= target_files {
-            return false;
-        }
-
-        // Rate limit: one file every replenish_interval.
-        if let Some(last) = state.last_replenish_time
-            && now.duration_since(last) < self.replenish_interval
+        if now
+            .checked_duration_since(green_since)
+            .is_none_or(|elapsed| elapsed < self.replenish_cooldown)
         {
             return false;
         }
 
+        if let Some(last) = state.last_replenish_time
+            && now
+                .checked_duration_since(last)
+                .is_none_or(|elapsed| elapsed < self.replenish_interval)
+        {
+            return false;
+        }
+
+        // Consume the slot even when the caller discovers a full pool, an
+        // unknown inventory, a busy lock, or insufficient safe headroom.
+        state.last_replenish_time = Some(now);
         true
     }
 
@@ -474,11 +495,12 @@ mod tests {
         // Never observed: not ready even at Green with files missing.
         assert!(!ctrl.is_ready_for_replenish(mount, PressureLevel::Green, 3, 5));
 
-        // Green long enough: ready.
+        // Green long enough: ready, even if a cached count looks full.
         ctrl.observe_level(mount, PressureLevel::Green);
         std::thread::sleep(Duration::from_millis(50));
         assert!(ctrl.is_ready_for_replenish(mount, PressureLevel::Green, 3, 5));
-        assert!(!ctrl.is_ready_for_replenish(mount, PressureLevel::Green, 5, 5));
+        assert!(ctrl.is_ready_for_replenish(mount, PressureLevel::Green, 5, 5));
+        assert!(!ctrl.is_ready_for_replenish(mount, PressureLevel::Green, 5, 0));
 
         // Three Yellow ticks are forgiven: the cooldown keeps its start.
         for _ in 0..TOLERATED_INTERRUPTIONS {
@@ -1045,5 +1067,179 @@ mod tests {
         assert_eq!(mgr.available_count(), 1);
         let rebuilt = ctrl.maybe_release(dir.path(), &mut mgr, &red).unwrap().unwrap();
         assert_eq!(rebuilt.files_released, 1);
+    }
+
+    #[test]
+    fn maintenance_does_not_confuse_physical_count_with_byte_coverage() {
+        let mount = Path::new("/mixed-size-reserve");
+        for available in [0, 1, 2, 3, 4, usize::MAX] {
+            let mut ctrl = BallastReleaseController::new(0);
+            ctrl.observe_level(mount, PressureLevel::Green);
+            // Four small adopted files may cover fewer than three new slots.
+            // Only the provisioner can establish actual verified byte coverage.
+            assert!(ctrl.is_ready_for_replenish(mount, PressureLevel::Green, available, 3));
+            assert!(!ctrl.is_ready_for_replenish(mount, PressureLevel::Green, available, 3));
+        }
+    }
+
+    #[test]
+    fn unsuccessful_or_noop_attempts_are_paced_without_success_callbacks() {
+        let mount = Path::new("/test");
+        let mut ctrl = BallastReleaseController::new(0);
+        let start = Instant::now();
+        ctrl.states.entry(mount.to_path_buf()).or_default().green_since = Some(start);
+        assert!(ctrl.is_ready_for_replenish_at(mount, PressureLevel::Green, 3, start));
+        // No on_replenished callback: a full pool, floor refusal, or error.
+        for seconds in 0..300 {
+            assert!(!ctrl.is_ready_for_replenish_at(
+                mount,
+                PressureLevel::Green,
+                3,
+                start + Duration::from_secs(seconds),
+            ));
+        }
+        assert!(ctrl.is_ready_for_replenish_at(
+            mount,
+            PressureLevel::Green,
+            3,
+            start + Duration::from_secs(300),
+        ));
+        assert!(!ctrl.is_ready_for_replenish_at(
+            mount,
+            PressureLevel::Green,
+            3,
+            start + Duration::from_secs(301),
+        ));
+        assert_eq!(ctrl.released_since_green(mount), 0);
+    }
+
+    #[test]
+    fn validation_keeps_green_cooldown_and_disabled_pool_vetoes() {
+        let mount = Path::new("/test");
+        let mut ctrl = BallastReleaseController::new(1);
+        let start = Instant::now();
+        assert!(!ctrl.is_ready_for_replenish_at(mount, PressureLevel::Green, 3, start));
+        ctrl.states.entry(mount.to_path_buf()).or_default().green_since = Some(start);
+        assert!(!ctrl.is_ready_for_replenish_at(
+            mount,
+            PressureLevel::Green,
+            3,
+            start + Duration::from_secs(59),
+        ));
+        let ready = start + Duration::from_secs(60);
+        for level in [
+            PressureLevel::Yellow,
+            PressureLevel::Orange,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
+            assert!(!ctrl.is_ready_for_replenish_at(mount, level, 3, ready));
+        }
+        assert!(!ctrl.is_ready_for_replenish_at(mount, PressureLevel::Green, 0, ready));
+        // Rejections did not consume a maintenance attempt.
+        assert!(ctrl.states[mount].last_replenish_time.is_none());
+        assert!(ctrl.is_ready_for_replenish_at(mount, PressureLevel::Green, 3, ready));
+    }
+
+    #[test]
+    fn maintenance_attempt_budgets_are_independent_per_mount() {
+        let first = Path::new("/first");
+        let second = Path::new("/second");
+        let mut ctrl = BallastReleaseController::new(0);
+        let now = Instant::now();
+        for mount in [first, second] {
+            ctrl.states.entry(mount.to_path_buf()).or_default().green_since = Some(now);
+            assert!(ctrl.is_ready_for_replenish_at(mount, PressureLevel::Green, 3, now));
+        }
+        for mount in [first, second] {
+            assert!(!ctrl.is_ready_for_replenish_at(mount, PressureLevel::Green, 3, now));
+        }
+    }
+
+    #[test]
+    fn successful_completion_extends_the_interval_after_a_slow_attempt() {
+        let mount = Path::new("/test");
+        let mut ctrl = BallastReleaseController::new(0);
+        let start = Instant::now();
+        ctrl.states.entry(mount.to_path_buf()).or_default().green_since = Some(start);
+        assert!(ctrl.is_ready_for_replenish_at(mount, PressureLevel::Green, 3, start));
+        ctrl.on_replenished(mount, 1);
+        // Inject the completion time without sleeping for a slow allocation.
+        ctrl.states.get_mut(mount).unwrap().last_replenish_time =
+            Some(start + Duration::from_secs(120));
+        assert!(!ctrl.is_ready_for_replenish_at(
+            mount,
+            PressureLevel::Green,
+            3,
+            start + Duration::from_secs(300),
+        ));
+        assert!(!ctrl.is_ready_for_replenish_at(
+            mount,
+            PressureLevel::Green,
+            3,
+            start + Duration::from_secs(419),
+        ));
+        assert!(ctrl.is_ready_for_replenish_at(
+            mount,
+            PressureLevel::Green,
+            3,
+            start + Duration::from_secs(420),
+        ));
+    }
+
+    #[test]
+    fn stale_full_inventory_cannot_disable_reserve_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr =
+            BallastManager::new_unfloored(dir.path().to_path_buf(), test_config()).unwrap();
+        assert_eq!(mgr.provision(None).unwrap().files_created, 5);
+        let missing = dir.path().join("SBH_BALLAST_FILE_00001.dat");
+        std::fs::remove_file(&missing).unwrap();
+        // The long-lived daemon's manager has not been reopened or rescanned.
+        assert_eq!(mgr.available_count(), 5);
+        let mut ctrl = BallastReleaseController::new(0);
+        assert!(
+            ctrl.maybe_replenish(dir.path(), &mut mgr, PressureLevel::Green, &|| 50.0)
+                .unwrap()
+        );
+        assert_eq!(std::fs::metadata(missing).unwrap().len(), 8192);
+        assert_eq!(mgr.available_count(), 5);
+    }
+
+    #[test]
+    fn damaged_full_inventory_can_be_repaired_without_waiting_for_a_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr =
+            BallastManager::new_unfloored(dir.path().to_path_buf(), test_config()).unwrap();
+        assert_eq!(mgr.provision(None).unwrap().files_created, 5);
+        let damaged = dir.path().join("SBH_BALLAST_FILE_00001.dat");
+        std::fs::write(&damaged, b"incomplete reserve").unwrap();
+        assert_eq!(mgr.available_count(), 5);
+        let mut ctrl = BallastReleaseController::new(0);
+        assert!(
+            ctrl.maybe_replenish(dir.path(), &mut mgr, PressureLevel::Green, &|| 50.0)
+                .unwrap()
+        );
+        assert_eq!(std::fs::metadata(damaged).unwrap().len(), 8192);
+        assert!(mgr.inventory().iter().all(|file| file.integrity_ok));
+    }
+
+    #[test]
+    fn healthy_full_pool_validation_is_a_paced_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr =
+            BallastManager::new_unfloored(dir.path().to_path_buf(), test_config()).unwrap();
+        assert_eq!(mgr.provision(None).unwrap().files_created, 5);
+        let retained = dir.path().join("SBH_BALLAST_FILE_00001.dat");
+        let before = std::fs::read(&retained).unwrap();
+        let mut ctrl = BallastReleaseController::new(0);
+        assert!(
+            !ctrl.maybe_replenish(dir.path(), &mut mgr, PressureLevel::Green, &|| 50.0)
+                .unwrap()
+        );
+        assert!(ctrl.states[dir.path()].last_replenish_time.is_some());
+        assert!(!ctrl.is_ready_for_replenish(dir.path(), PressureLevel::Green, 5, 5));
+        assert_eq!(std::fs::read(retained).unwrap(), before);
+        assert_eq!(mgr.available_count(), 5);
     }
 }
