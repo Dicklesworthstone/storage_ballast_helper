@@ -30,6 +30,7 @@ use crate::platform::pal::Platform;
 mod admission;
 mod emergency;
 mod observation;
+mod repair;
 
 // ──────────────────── constants ────────────────────
 
@@ -566,10 +567,9 @@ impl BallastManager {
             let index = i as u32;
             let path = self.file_path(index);
 
-            // A damaged reserve is still emergency space. Do not remove it
-            // until the replacement has passed the live headroom check.
-            let replace_existing = path.exists();
-            if replace_existing && self.verify_single_file(&path, index).is_ok() {
+            // A damaged reserve is still emergency space. Repair it in place
+            // only after the full replacement allocation passes headroom.
+            if path.exists() && self.verify_single_file(&path, index).is_ok() {
                 report.files_skipped += 1;
                 continue;
             }
@@ -592,19 +592,6 @@ impl BallastManager {
                         .errors
                         .push(format!("file {index}: headroom probe failed: {error}"));
                     break;
-                }
-            }
-
-            if replace_existing {
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => {
-                        report.errors.push(format!(
-                            "file {index}: cannot replace existing reserve: {error}"
-                        ));
-                        break;
-                    }
                 }
             }
 
@@ -739,9 +726,8 @@ impl BallastManager {
             let index = i as u32;
             let path = self.file_path(index);
 
-            // Keep the existing reserve when no replacement can safely fit.
-            let replace_existing = path.exists();
-            if replace_existing && self.verify_single_file(&path, index).is_ok() {
+            // Keep the existing reserve linked throughout an admitted repair.
+            if path.exists() && self.verify_single_file(&path, index).is_ok() {
                 report.files_skipped += 1;
                 continue;
             }
@@ -764,19 +750,6 @@ impl BallastManager {
                         .errors
                         .push(format!("file {index}: headroom probe failed: {error}"));
                     break;
-                }
-            }
-
-            if replace_existing {
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => {
-                        report.errors.push(format!(
-                            "file {index}: cannot replace existing reserve: {error}"
-                        ));
-                        break;
-                    }
                 }
             }
 
@@ -836,6 +809,13 @@ impl BallastManager {
             return Err(SbhError::InvalidConfig {
                 details: format!("file_size_bytes ({size}) must be >= HEADER_SIZE ({HEADER_SIZE})"),
             });
+        }
+
+        // Existing allocations never enter the new-file cleanup path. Even
+        // a failed/partial repair leaves the configured reserve available for
+        // emergency release; symlinks and shared inodes are refused untouched.
+        if repair::existing(self, index)? {
+            return Ok(());
         }
 
         let result = self.write_ballast_file_inner(index, &path, size);
