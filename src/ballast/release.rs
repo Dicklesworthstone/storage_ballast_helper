@@ -56,6 +56,11 @@ struct MountReleaseState {
     /// is rebuilding, not a cap on replenishment (a reserve short for any
     /// other reason is rebuilt too).
     released_since_green: usize,
+    /// Last physical inventory supplied by the pool, not configured capacity.
+    last_available_count: Option<usize>,
+    /// Net observed inventory depletion, used for the cumulative release
+    /// target. Files never provisioned do not count as releases.
+    release_credit: usize,
     /// Observed release effectiveness EWMA (eta_m): delta_free / bytes_released.
     /// Prior 1.0, EWMA alpha 0.3, clamp [0.05, 1.0].
     release_efficiency: f64,
@@ -71,9 +76,32 @@ impl Default for MountReleaseState {
             last_replenish_time: None,
             non_green_interruptions: 0,
             released_since_green: 0,
+            last_available_count: None,
+            release_credit: 0,
             release_efficiency: 1.0,
             pending_release: None,
         }
+    }
+}
+
+impl MountReleaseState {
+    /// Reconcile fresh pool inventory before making a release recommendation.
+    /// Callbacks maintain the operator-facing count, but must not also spend
+    /// this budget: the next inventory sample already includes their effects.
+    fn observe_inventory(&mut self, available: usize) -> usize {
+        if let Some(previous) = self.last_available_count {
+            self.release_credit = self
+                .release_credit
+                .saturating_add(previous.saturating_sub(available))
+                .saturating_sub(available.saturating_sub(previous));
+        } else {
+            // An operator/emergency release may precede the first pressure
+            // recommendation. Only confirmed events in this controller's
+            // lifetime are evidence; a short startup pool proves no release.
+            self.release_credit = self.released_since_green;
+        }
+        self.last_available_count = Some(available);
+        self.release_credit
     }
 }
 
@@ -104,14 +132,23 @@ impl BallastReleaseController {
 
     /// Determine how many ballast files to release based on PID urgency.
     ///
+    /// `available` must be the pool's fresh physical inventory. The configured
+    /// total is retained for API compatibility, but cannot prove that absent
+    /// files were ever provisioned or released. After startup/reset, begin a
+    /// new observed release window instead of stranding a partial reserve.
     /// Returns 0 if no release is needed (Green/Yellow with low urgency).
     pub fn files_to_release(
         &mut self,
         mount_path: &Path,
         response: &PressureResponse,
         available: usize,
-        configured_total: usize,
+        _configured_total: usize,
     ) -> usize {
+        let state = self.states.entry(mount_path.to_path_buf()).or_default();
+        // Record even an empty pool: a later refill must retire old credit.
+        // A recommendation with unchanged inventory consumes no budget, so a
+        // failed or dry-run release remains retryable on the next request.
+        let already_released = state.observe_inventory(available);
         if available == 0 {
             return 0;
         }
@@ -123,8 +160,6 @@ impl BallastReleaseController {
             return available;
         }
 
-        // Missing files count as physically released, including across restarts.
-        let already_released = configured_total.saturating_sub(available);
         let urgency_recommendation = if response.urgency >= 0.6 {
             3
         } else {
@@ -140,7 +175,6 @@ impl BallastReleaseController {
             .max(urgency_recommendation)
             .max(level_floor);
 
-        let state = self.states.entry(mount_path.to_path_buf()).or_default();
         let eta = state.release_efficiency;
         // Scale the CUMULATIVE target before subtracting physical releases.
         // Four files released at eta=0.25 meet an Orange target of one, but
@@ -708,8 +742,10 @@ mod tests {
         // With 10 available, 1 / 0.25 = 4 files requested
         assert_eq!(ctrl.files_to_release(mount, &r, 10, 10), 4);
 
-        // When only 3 files are available in a 3-file pool, capped at available count
-        assert_eq!(ctrl.files_to_release(mount, &r, 3, 3), 3);
+        // A separate three-file pool has its own inventory history.
+        let small = Path::new("/small");
+        ctrl.set_release_efficiency(small, 0.25);
+        assert_eq!(ctrl.files_to_release(small, &r, 3, 3), 3);
     }
 
     #[test]
@@ -769,11 +805,13 @@ mod tests {
     fn scaled_targets_are_bounded_and_do_not_repeat_at_steady_pressure() {
         let mount = Path::new("/test");
         for eta in [0.05, 0.25, 0.5, 0.75, 1.0] {
-            let mut ctrl = BallastReleaseController::new(30);
-            ctrl.set_release_efficiency(mount, eta);
             for total in 0..=32 {
                 for available in 0..=total {
                     for target in 0..=8 {
+                        // Each case is a distinct startup inventory, not an
+                        // unexplained loss from the previous case's pool.
+                        let mut ctrl = BallastReleaseController::new(30);
+                        ctrl.set_release_efficiency(mount, eta);
                         let response = test_response(PressureLevel::Green, 0.0, target);
                         let count = ctrl.files_to_release(mount, &response, available, total);
                         assert!(count <= available);
@@ -878,5 +916,134 @@ mod tests {
         assert!((eta - 0.475).abs() < 1e-6);
         // Samples for another mount do not contaminate this mount's history.
         assert_eq!(ctrl.release_efficiency(Path::new("/other")), 1.0);
+    }
+
+    #[test]
+    fn partial_startup_pool_is_released_before_critical_pressure() {
+        let mount = Path::new("/partial");
+        let orange = test_response(PressureLevel::Orange, 0.4, 1);
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        for configured in [3, 10, 100, usize::MAX] {
+            let mut ctrl = BallastReleaseController::new(30);
+            assert_eq!(ctrl.files_to_release(mount, &orange, 3, configured), 1);
+            assert_eq!(ctrl.files_to_release(mount, &orange, 2, configured), 0);
+            assert_eq!(ctrl.files_to_release(mount, &red, 2, configured), 2);
+            assert_eq!(ctrl.files_to_release(mount, &red, 0, configured), 0);
+        }
+    }
+
+    #[test]
+    fn partial_pool_release_failures_remain_retryable_without_spending_credit() {
+        let mount = Path::new("/partial");
+        let mut ctrl = BallastReleaseController::new(30);
+        let orange = test_response(PressureLevel::Orange, 0.4, 1);
+        for _ in 0..10 {
+            // Recommendation only: no file actually disappeared.
+            assert_eq!(ctrl.files_to_release(mount, &orange, 2, 20), 1);
+        }
+        ctrl.on_released(mount, 1);
+        assert_eq!(ctrl.files_to_release(mount, &orange, 1, 20), 0);
+        assert_eq!(ctrl.states[mount].release_credit, 1);
+    }
+
+    #[test]
+    fn configured_capacity_changes_neither_fabricate_nor_forget_releases() {
+        let mount = Path::new("/partial");
+        let mut ctrl = BallastReleaseController::new(30);
+        let orange = test_response(PressureLevel::Orange, 0.4, 1);
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        assert_eq!(ctrl.files_to_release(mount, &orange, 3, 20), 1);
+        assert_eq!(ctrl.files_to_release(mount, &orange, 2, 20), 0);
+        for configured in [0, 1, 2, 20, usize::MAX] {
+            assert_eq!(ctrl.files_to_release(mount, &orange, 2, configured), 0);
+            assert_eq!(ctrl.files_to_release(mount, &red, 2, configured), 2);
+        }
+    }
+
+    #[test]
+    fn external_depletion_and_refill_adjust_only_the_observed_mount() {
+        let mount = Path::new("/partial");
+        let other = Path::new("/other");
+        let mut ctrl = BallastReleaseController::new(30);
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        assert_eq!(ctrl.files_to_release(mount, &red, 5, 20), 3);
+        // An external release removed two files. No callback is necessary.
+        assert_eq!(ctrl.files_to_release(mount, &red, 3, 20), 1);
+        assert_eq!(ctrl.files_to_release(other, &red, 3, 20), 3);
+        // Refilling one file consumes the space that release had provided.
+        assert_eq!(ctrl.files_to_release(mount, &red, 4, 20), 2);
+        assert_eq!(ctrl.files_to_release(mount, &red, 2, 20), 0);
+        // Growing past the original inventory never creates negative credit.
+        assert_eq!(ctrl.files_to_release(mount, &red, 8, 20), 3);
+        assert_eq!(ctrl.states[mount].release_credit, 0);
+    }
+
+    #[test]
+    fn release_and_replenish_callbacks_are_not_double_counted() {
+        let mount = Path::new("/partial");
+        let mut ctrl = BallastReleaseController::new(30);
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        assert_eq!(ctrl.files_to_release(mount, &red, 5, 20), 3);
+        ctrl.on_released(mount, 2);
+        assert_eq!(ctrl.files_to_release(mount, &red, 3, 20), 1);
+        ctrl.on_replenished(mount, 1);
+        assert_eq!(ctrl.files_to_release(mount, &red, 4, 20), 2);
+        assert_eq!(ctrl.states[mount].release_credit, 1);
+        assert_eq!(ctrl.released_since_green(mount), 1);
+    }
+
+    #[test]
+    fn confirmed_release_before_first_sample_is_not_lost() {
+        let mount = Path::new("/partial");
+        let mut ctrl = BallastReleaseController::new(30);
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        ctrl.on_released(mount, 2);
+        assert_eq!(ctrl.files_to_release(mount, &red, 3, 20), 1);
+        ctrl.on_released(mount, 1);
+        assert_eq!(ctrl.files_to_release(mount, &red, 2, 20), 0);
+        assert_eq!(ctrl.states[mount].release_credit, 3);
+    }
+
+    #[test]
+    fn empty_inventory_then_refill_does_not_strand_the_new_reserve() {
+        let mount = Path::new("/partial");
+        let mut ctrl = BallastReleaseController::new(30);
+        let orange = test_response(PressureLevel::Orange, 0.4, 1);
+        assert_eq!(ctrl.files_to_release(mount, &orange, 0, 20), 0);
+        assert_eq!(ctrl.files_to_release(mount, &orange, 2, 20), 1);
+        assert_eq!(ctrl.files_to_release(mount, &orange, 1, 20), 0);
+        assert_eq!(ctrl.files_to_release(mount, &orange, 0, 20), 0);
+        assert_eq!(ctrl.files_to_release(mount, &orange, 2, 20), 1);
+    }
+
+    #[test]
+    fn real_partial_pool_can_release_escalate_and_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr =
+            BallastManager::new_unfloored(dir.path().to_path_buf(), test_config()).unwrap();
+        // Provision only three of the configured five files.
+        for _ in 0..3 {
+            let report = mgr.replenish_one(None).unwrap();
+            assert_eq!(report.files_created, 1);
+        }
+        assert_eq!(mgr.available_count(), 3);
+        assert_eq!(mgr.config().file_count, 5);
+        let mut ctrl = BallastReleaseController::new(0);
+        ctrl.replenish_interval = Duration::ZERO;
+        let orange = test_response(PressureLevel::Orange, 0.4, 1);
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        let first = ctrl.maybe_release(dir.path(), &mut mgr, &orange).unwrap().unwrap();
+        assert_eq!(first.files_released, 1);
+        assert!(first.bytes_freed > 0);
+        assert_eq!(mgr.available_count(), 2);
+        assert!(ctrl.maybe_release(dir.path(), &mut mgr, &orange).unwrap().is_none());
+        let next = ctrl.maybe_release(dir.path(), &mut mgr, &red).unwrap().unwrap();
+        assert_eq!(next.files_released, 2);
+        assert_eq!(mgr.available_count(), 0);
+        assert!(ctrl.maybe_release(dir.path(), &mut mgr, &red).unwrap().is_none());
+        assert!(ctrl.maybe_replenish(dir.path(), &mut mgr, PressureLevel::Green, &|| 50.0).unwrap());
+        assert_eq!(mgr.available_count(), 1);
+        let rebuilt = ctrl.maybe_release(dir.path(), &mut mgr, &red).unwrap().unwrap();
+        assert_eq!(rebuilt.files_released, 1);
     }
 }
