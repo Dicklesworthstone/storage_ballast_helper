@@ -13,6 +13,8 @@
 //! | < 5 min | `ImminentDanger` — release ballast + aggressive cleanup |
 //!
 //! Confidence gating prevents false alarms from brief spikes or insufficient data.
+//! A calibrated historical baseline can corroborate imminent exhaustion even
+//! when a percentage-only plausibility heuristic would otherwise suppress it.
 
 #![allow(missing_docs)]
 #![allow(clippy::cast_precision_loss)]
@@ -250,11 +252,16 @@ impl PredictiveActionPolicy {
             return PredictiveAction::Clear;
         }
 
-        // Hard gate: if more than half the disk is free, no prediction can be
-        // credible unless confidence is very high (>0.95). Consuming 50%+ of a
-        // disk in minutes is physically implausible for normal workloads.
-        // This is checked early so it also covers the burst-aware path below.
-        if current_free_pct > 50.0 && estimate.confidence < 0.95 {
+        // A percentage is not a time budget: a small volume can be mostly
+        // empty and still fill within minutes at its ordinary historical rate.
+        // Only agreement with a calibrated median can bypass percentage-only
+        // plausibility gates; all evidence/confidence gates above still apply.
+        let corroborated_imminent =
+            corroborated_imminent_runway(estimate, self.config.imminent_danger_minutes);
+        if current_free_pct > 50.0
+            && estimate.confidence < 0.95
+            && corroborated_imminent.is_none()
+        {
             return PredictiveAction::Clear;
         }
 
@@ -303,6 +310,21 @@ impl PredictiveActionPolicy {
             return self.classify(
                 minutes_remaining,
                 effective_confidence,
+                estimate.bytes_per_second,
+                estimate.trend,
+                current_free_pct,
+                mount,
+            );
+        }
+
+        // A non-burst forecast corroborated by the historical baseline does
+        // not need another percentage-based veto. Use the longer runway so
+        // corroboration can never turn a non-critical forecast into a critical
+        // one. Detected bursts have already passed their stricter path above.
+        if let Some(minutes_remaining) = corroborated_imminent {
+            return self.classify(
+                minutes_remaining,
+                estimate.confidence,
                 estimate.bytes_per_second,
                 estimate.trend,
                 current_free_pct,
@@ -484,6 +506,33 @@ impl PredictiveActionPolicy {
             PredictiveAction::Clear
         }
     }
+}
+
+/// A narrow escape from percentage-only plausibility gates: both the EWMA
+/// and the calibrated historical baseline must project imminent exhaustion.
+/// The median uses the acceleration-aware implied free bytes, not just a
+/// ratio of current rates. Missing, invalid or overflowing baseline evidence
+/// cannot corroborate a rescue. This is not independent deletion authority.
+fn corroborated_imminent_runway(estimate: &RateEstimate, horizon_minutes: f64) -> Option<f64> {
+    if !estimate.burst_state.calibrated
+        || estimate.burst_state.median_rate <= 0.0
+        || !horizon_minutes.is_finite()
+        || horizon_minutes <= 0.0
+    {
+        return None;
+    }
+    let ewma_minutes = estimate.seconds_to_exhaustion / 60.0;
+    let median_minutes = median_runway_minutes(estimate);
+    // Check both before max: f64::max deliberately ignores one NaN operand.
+    if !ewma_minutes.is_finite()
+        || ewma_minutes < 0.0
+        || !median_minutes.is_finite()
+        || median_minutes < 0.0
+    {
+        return None;
+    }
+    let conservative_minutes = ewma_minutes.max(median_minutes);
+    (conservative_minutes <= horizon_minutes).then_some(conservative_minutes)
 }
 
 /// Project the forecast's implied free space at the historical median rate.
@@ -1192,8 +1241,8 @@ mod tests {
     #[test]
     fn median_rate_crosscheck_gates_spike_inflated_ewma() {
         let policy = default_policy();
-        // Production scenario: trj at 32% free, "disk full in 37m at 74%
-        // confidence". EWMA rate is spike-inflated (10× median rate) from a
+        // Production scenario: trj at 32% free, "disk full in 37m at 74%"
+        // confidence. EWMA rate is spike-inflated (10× median rate) from a
         // rustc burst, but burst_probability is only 0.3 (below 0.5 threshold).
         // The median rate (100 bytes/sec) projects hours of runway.
         let ewma_rate = 1000.0; // 10× the median
@@ -1375,6 +1424,213 @@ mod tests {
                 PredictiveAction::Clear,
                 "invalid median rate {invalid}"
             );
+        }
+    }
+
+    #[test]
+    fn corroborated_imminence_survives_percentage_plausibility_gates() {
+        let policy = default_policy();
+        for probability in [0.0, 0.3, 0.5] {
+            let est = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, probability, 800.0);
+            for free_pct in [20.0, 25.0, 31.0, 50.0, 50.01, 80.0, 100.0] {
+                let action = policy.evaluate(&est, free_pct, PathBuf::from("/data"));
+                match action {
+                    PredictiveAction::ImminentDanger {
+                        mount,
+                        minutes_remaining,
+                        critical,
+                    } => {
+                        assert_eq!(mount, PathBuf::from("/data"));
+                        assert!((minutes_remaining - 1.25).abs() < 1e-9);
+                        assert!(critical);
+                    }
+                    other => panic!("corroborated rescue lost at {free_pct}%: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn corroboration_uses_the_longer_runway_at_severity_boundaries() {
+        let policy = default_policy();
+        for (seconds, median, expected_minutes, expected_critical) in [
+            (60.0, 500.0, 2.0, true),
+            (60.0, 200.0, 5.0, false),
+            (180.0, 2000.0, 3.0, false),
+        ] {
+            let est = make_burst_estimate(1000.0, seconds, 0.9, Trend::Stable, 0.3, median);
+            match policy.evaluate(&est, 80.0, PathBuf::from("/data")) {
+                PredictiveAction::ImminentDanger {
+                    minutes_remaining,
+                    critical,
+                    ..
+                } => {
+                    assert!((minutes_remaining - expected_minutes).abs() < 1e-9);
+                    assert_eq!(critical, expected_critical);
+                }
+                other => panic!("expected corroborated imminent action, got {other:?}"),
+            }
+        }
+        // A 5.01-minute baseline is outside the escape path, even though the
+        // EWMA predicts only one minute. Preserve the existing high-free gate.
+        let est = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, 0.3, 1000.0 / 5.01);
+        assert_eq!(
+            policy.evaluate(&est, 80.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+    }
+
+    #[test]
+    fn corroborated_burst_rescue_keeps_both_confidence_gates() {
+        for (confidence, probability, should_release) in [
+            (0.9, 0.6, true),
+            (0.84, 0.51, false),
+            (0.86, 0.9, false),
+        ] {
+            let est = make_burst_estimate(1000.0, 60.0, confidence, Trend::Stable, probability, 800.0);
+            let action = default_policy().evaluate(&est, 80.0, PathBuf::from("/data"));
+            assert_eq!(action.should_release_ballast(), should_release);
+            assert_eq!(action.should_cleanup(), should_release);
+        }
+        let policy = PredictiveActionPolicy::new(PredictiveConfig {
+            burst_min_confidence: 0.98,
+            ..Default::default()
+        });
+        let est = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, 0.6, 800.0);
+        assert_eq!(
+            policy.evaluate(&est, 80.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+    }
+
+    #[test]
+    fn corroboration_does_not_bypass_forecast_evidence_gates() {
+        let policy = default_policy();
+        let base = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, 0.3, 800.0);
+        let mut rejected = Vec::new();
+        let mut est = base.clone();
+        est.confidence = 0.69;
+        rejected.push(est);
+        let mut est = base.clone();
+        est.fallback_active = true;
+        rejected.push(est);
+        let mut est = base.clone();
+        est.sample_count = 4;
+        rejected.push(est);
+        let mut est = base.clone();
+        est.trend = Trend::Recovering;
+        rejected.push(est);
+        let mut est = base.clone();
+        est.bytes_per_second = 0.0;
+        rejected.push(est);
+        let mut est = base.clone();
+        est.acceleration = f64::NAN;
+        rejected.push(est);
+        for est in rejected {
+            assert_eq!(
+                policy.evaluate(&est, 80.0, PathBuf::from("/data")),
+                PredictiveAction::Clear,
+                "invalid rescue evidence: {est:?}"
+            );
+        }
+        for config in [
+            PredictiveConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            PredictiveConfig {
+                min_confidence: 0.91,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                PredictiveActionPolicy::new(config).evaluate(&base, 80.0, PathBuf::from("/data")),
+                PredictiveAction::Clear
+            );
+        }
+    }
+
+    #[test]
+    fn safe_or_unavailable_baselines_do_not_authorize_high_free_rescue() {
+        for probability in [0.0, 0.3, 0.5, 0.6, 0.9] {
+            for median in [0.0, 1.0, f64::NAN, f64::INFINITY, -1.0] {
+                let est = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, probability, median);
+                assert_eq!(
+                    default_policy().evaluate(&est, 80.0, PathBuf::from("/data")),
+                    PredictiveAction::Clear
+                );
+            }
+        }
+        let mut est = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, 0.3, 800.0);
+        est.burst_state.calibrated = false;
+        assert_eq!(
+            default_policy().evaluate(&est, 80.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+    }
+
+    #[test]
+    fn corroboration_includes_acceleration_in_the_baseline_distance() {
+        let mut est = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Accelerating, 0.3, 1000.0);
+        est.acceleration = 100.0;
+        // Implied free bytes = 1000*60 + 100*60*60/2 = 240000;
+        // the historical median has four minutes left, not one.
+        assert_eq!(corroborated_imminent_runway(&est, 5.0), Some(4.0));
+        match default_policy().evaluate(&est, 80.0, PathBuf::from("/data")) {
+            PredictiveAction::ImminentDanger {
+                minutes_remaining,
+                critical,
+                ..
+            } => {
+                assert!((minutes_remaining - 4.0).abs() < 1e-9);
+                assert!(!critical);
+            }
+            other => panic!("expected conservative accelerating rescue, got {other:?}"),
+        }
+        for acceleration in [200.0, f64::MAX] {
+            est.acceleration = acceleration;
+            assert_eq!(corroborated_imminent_runway(&est, 5.0), None);
+            assert_eq!(
+                default_policy().evaluate(&est, 80.0, PathBuf::from("/data")),
+                PredictiveAction::Clear
+            );
+        }
+    }
+
+    #[test]
+    fn corroborated_rescue_respects_custom_horizons() {
+        let policy = PredictiveActionPolicy::new(PredictiveConfig {
+            imminent_danger_minutes: 3.0,
+            critical_danger_minutes: 1.0,
+            ..Default::default()
+        });
+        let est = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, 0.3, 500.0);
+        assert!(matches!(
+            policy.evaluate(&est, 80.0, PathBuf::from("/data")),
+            PredictiveAction::ImminentDanger { critical: false, .. }
+        ));
+        let outside = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, 0.3, 300.0);
+        assert_eq!(
+            policy.evaluate(&outside, 80.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+    }
+
+    #[test]
+    fn neither_a_safe_ewma_nor_invalid_horizon_can_corroborate_imminence() {
+        let mut est = make_burst_estimate(1000.0, 360.0, 0.9, Trend::Stable, 0.3, 10000.0);
+        assert_eq!(corroborated_imminent_runway(&est, 5.0), None);
+        assert_eq!(
+            default_policy().evaluate(&est, 80.0, PathBuf::from("/data")),
+            PredictiveAction::Clear
+        );
+        est.seconds_to_exhaustion = 60.0;
+        for horizon in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(corroborated_imminent_runway(&est, horizon), None);
+        }
+        for seconds in [f64::NAN, f64::INFINITY, -1.0] {
+            est.seconds_to_exhaustion = seconds;
+            assert_eq!(corroborated_imminent_runway(&est, 5.0), None);
         }
     }
 }
