@@ -1,8 +1,10 @@
 //! Managed-pool release without allocating a lock file or waiting for a writer.
 //!
 //! The configured pool's canonical slots are the managed deletion surface,
-//! including damaged ballast. Retired pools have the stricter adoption contract
-//! in `coordinator::stranded`. Unix operations below stay relative to an opened
+//! including damaged ballast. Canonical files beyond the configured range are
+//! releasable only with a valid, unchanged ballast header and full allocation.
+//! A smaller or disabled target changes future provisioning, not the existence
+//! of an already allocated reserve. Unix operations stay relative to an opened
 //! pool directory and hold the existing provisioner's flock for the whole pass.
 
 use super::{BallastManager, ReleaseReport};
@@ -18,6 +20,59 @@ fn empty_report() -> ReleaseReport {
     }
 }
 
+/// A name alone identifies a slot, never authority to delete surplus payloads.
+#[cfg(unix)]
+pub(super) fn canonical_index(name: &std::ffi::OsStr) -> Option<u32> {
+    let name = name.to_str()?;
+    let index = name
+        .strip_prefix("SBH_BALLAST_FILE_")?
+        .strip_suffix(".dat")?
+        .parse::<u32>()
+        .ok()?;
+    (index > 0 && name == super::ballast_file_name(index)).then_some(index)
+}
+
+/// Enumerate names from the same directory the caller opened. A remembered
+/// path must not redirect either release or read-only surplus discovery.
+/// Work is proportional to actual directory entries, not configured capacity
+/// or the largest index found in a sparse sequence of filenames.
+#[cfg(unix)]
+pub(super) fn existing_indices(
+    path: &std::path::Path,
+    expected: &std::fs::Metadata,
+) -> std::io::Result<Vec<u32>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let is_current = || {
+        std::fs::symlink_metadata(path).is_ok_and(|current| {
+            current.is_dir()
+                && current.dev() == expected.dev()
+                && current.ino() == expected.ino()
+        })
+    };
+    if !is_current() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ballast pool changed before directory enumeration",
+        ));
+    }
+    let mut indices = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        if let Some(index) = canonical_index(&entry?.file_name()) {
+            indices.push(index);
+        }
+    }
+    if !is_current() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ballast pool changed during directory enumeration",
+        ));
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    Ok(indices)
+}
+
 #[cfg(unix)]
 mod unix {
     use std::ffi::OsStr;
@@ -29,7 +84,7 @@ mod unix {
     use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags, flock, openat, unlinkat};
 
     use super::super::{BallastFile, BallastHeader, HEADER_SIZE, ballast_file_name};
-    use super::{BallastManager, ReleaseReport, Result, empty_report};
+    use super::{BallastManager, ReleaseReport, Result, empty_report, existing_indices};
     use crate::core::errors::SbhError;
 
     fn invalid(message: &str) -> io::Error {
@@ -59,6 +114,7 @@ mod unix {
             && left.ino() == right.ino()
             && left.len() == right.len()
             && left.nlink() == right.nlink()
+            && left.blocks() == right.blocks()
             && left.mtime() == right.mtime()
             && left.mtime_nsec() == right.mtime_nsec()
             && left.ctime() == right.ctime()
@@ -72,7 +128,7 @@ mod unix {
     }
 
     impl PoolLock {
-        fn open(path: &Path, configured_count: usize) -> io::Result<Option<Self>> {
+        fn open(path: &Path) -> io::Result<Option<Self>> {
             let directory = match OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -86,17 +142,10 @@ mod unix {
                 Ok(lock) => lock,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     // A never-provisioned empty directory needs no mutation.
-                    // Existing payloads without their lock are not authority to
-                    // invent another locking protocol on a full filesystem.
-                    for index in 1..=configured_count {
-                        let name = ballast_file_name(
-                            u32::try_from(index)
-                                .map_err(|_| invalid("ballast index exceeds u32"))?,
-                        );
-                        match open_regular(&directory, OsStr::new(&name)) {
-                            Err(missing) if missing.kind() == io::ErrorKind::NotFound => {}
-                            _ => return Err(invalid("existing ballast pool lock is missing")),
-                        }
+                    // Check actual names, including a surplus-only/disabled
+                    // pool, rather than assuming configured slots cover it.
+                    if !existing_indices(path, &directory.metadata()?)?.is_empty() {
+                        return Err(invalid("existing ballast pool lock is missing"));
                     }
                     return Ok(None);
                 }
@@ -158,23 +207,31 @@ mod unix {
         count: usize,
     ) -> Result<ReleaseReport> {
         let mut report = empty_report();
-        if count == 0 || manager.config.file_count == 0 {
+        if count == 0 {
             return Ok(report);
         }
-        let last_index =
+        let last_managed_index =
             u32::try_from(manager.config.file_count).map_err(|_| SbhError::InvalidConfig {
                 details: "ballast file_count exceeds the supported index range".to_string(),
             })?;
-        let Some(guard) = PoolLock::open(&manager.ballast_dir, manager.config.file_count)
+        let Some(guard) = PoolLock::open(&manager.ballast_dir)
             .map_err(|error| SbhError::io(&manager.ballast_dir, error))?
         else {
             manager.inventory.clear();
             return Ok(report);
         };
+        let indices = existing_indices(
+            &manager.ballast_dir,
+            &guard
+                .directory
+                .metadata()
+                .map_err(|error| SbhError::io(&manager.ballast_dir, error))?,
+        )
+        .map_err(|error| SbhError::io(&manager.ballast_dir, error))?;
         let mut inventory = Vec::new();
-        // Snapshot the real slots under the lock, not the manager's startup
-        // cache: another CLI may have provisioned or released files meanwhile.
-        for index in (1..=last_index).rev() {
+        // Snapshot actual slots under the lock, not startup inventory or the
+        // configured range: reloads and external CLI operations change both.
+        for index in indices.into_iter().rev() {
             let name = ballast_file_name(index);
             let path = manager.ballast_dir.join(&name);
             let opened = open_regular(&guard.directory, OsStr::new(&name));
@@ -197,6 +254,17 @@ mod unix {
                     continue;
                 }
             };
+            let surplus = index > last_managed_index;
+            // Configured slots retain their damaged-reserve recovery contract.
+            // Outside that range a filename is insufficient authority: prove
+            // this is fully allocated ballast, using its original size rather
+            // than a newly configured size. Invalid surplus is left untouched.
+            if surplus && !verify_open_file(&mut file, &meta, index, meta.len()) {
+                let message = format!("surplus ballast file {index} failed verification; retained");
+                report.warnings.push(message.clone());
+                report.errors.push(message);
+                continue;
+            }
             // Logical length is not freed space for a sparse/truncated reserve.
             // This is a conservative allocation estimate, not an observed free
             // delta: CoW snapshots can still retain blocks after unlink.
@@ -217,8 +285,8 @@ mod unix {
                     }
                 }
             }
-            let integrity_ok =
-                verify_open_file(&mut file, &meta, index, manager.config.file_size_bytes);
+            let integrity_ok = surplus
+                || verify_open_file(&mut file, &meta, index, manager.config.file_size_bytes);
             let created_at = meta
                 .created()
                 .ok()
@@ -514,9 +582,7 @@ mod unix {
         #[test]
         fn payload_replacement_revokes_an_in_flight_unlink() {
             let (_root, manager) = fixture();
-            let guard = PoolLock::open(&manager.ballast_dir, config().file_count)
-                .unwrap()
-                .unwrap();
+            let guard = PoolLock::open(&manager.ballast_dir).unwrap().unwrap();
             let path = manager.file_path(3);
             let meta = fs::metadata(&path).unwrap();
             fs::rename(&path, manager.ballast_dir.join("previous")).unwrap();
@@ -529,9 +595,7 @@ mod unix {
         #[test]
         fn renamed_parent_does_not_redirect_unlink_into_its_replacement() {
             let (root, manager) = fixture();
-            let guard = PoolLock::open(&manager.ballast_dir, config().file_count)
-                .unwrap()
-                .unwrap();
+            let guard = PoolLock::open(&manager.ballast_dir).unwrap().unwrap();
             let path = manager.file_path(3);
             let meta = fs::metadata(&path).unwrap();
             let moved = root.path().join("moved-pool");
@@ -541,6 +605,173 @@ mod unix {
             guard.remove(path.file_name().unwrap(), &meta).unwrap();
             assert_eq!(fs::read(path).unwrap(), b"new directory's contents");
             assert!(!moved.join(ballast_file_name(3)).exists());
+        }
+
+        #[test]
+        fn release_survives_a_smaller_or_disabled_reserve_target() {
+            for target in [0, 1, 2] {
+                let (_root, mut manager) = fixture();
+                let mut changed = config();
+                changed.file_count = target;
+                changed.file_size_bytes *= 2;
+                manager.update_config(changed);
+                let report = manager.release(usize::MAX).unwrap();
+                assert_eq!(report.files_released, 3, "target={target}: {report:?}");
+                assert_eq!(report.bytes_freed, 3 * config().file_size_bytes);
+                assert!(report.errors.is_empty(), "{report:?}");
+                assert_eq!(manager.available_count(), 0);
+                assert_eq!(manager.config.file_count, target);
+                assert!(manager.ballast_dir.join(".lock").exists());
+                for index in 1..=3 {
+                    assert!(!manager.file_path(index).exists());
+                }
+            }
+        }
+
+        #[test]
+        fn surplus_release_is_highest_first_and_retains_the_remaining_inventory() {
+            let (_root, mut manager) = fixture();
+            let mut changed = config();
+            changed.file_count = 0;
+            manager.update_config(changed);
+            let first = manager.release(1).unwrap();
+            assert_eq!(first.files_released, 1);
+            assert_eq!(first.released[0].0, manager.file_path(3));
+            assert_eq!(manager.available_count(), 2);
+            assert!(manager.inventory.iter().all(|file| file.integrity_ok));
+            let second = manager.release(1).unwrap();
+            assert_eq!(second.released[0].0, manager.file_path(2));
+            assert_eq!(manager.available_count(), 1);
+            assert!(manager.file_path(1).exists());
+        }
+
+        #[test]
+        fn unverified_surplus_never_consumes_the_release_quota_or_gets_unlinked() {
+            let (_root, mut manager) = fixture();
+            let foreign = manager.file_path(4);
+            fs::write(&foreign, b"user data with a ballast-like name").unwrap();
+            let mut changed = config();
+            changed.file_count = 1;
+            manager.update_config(changed);
+            let report = manager.release(2).unwrap();
+            assert_eq!(report.files_released, 2);
+            assert_eq!(report.released[0].0, manager.file_path(3));
+            assert_eq!(report.released[1].0, manager.file_path(2));
+            assert!(!report.errors.is_empty());
+            assert_eq!(fs::read(foreign).unwrap(), b"user data with a ballast-like name");
+            assert!(manager.file_path(1).exists());
+        }
+
+        #[test]
+        fn surplus_header_must_match_both_name_and_size() {
+            use std::io::Write;
+            let (_root, mut manager) = fixture();
+            // A valid header copied to another canonical index is not authority.
+            fs::copy(manager.file_path(3), manager.file_path(4)).unwrap();
+            // Nor is a valid header whose allocation has since been truncated.
+            let damaged = OpenOptions::new().write(true).open(manager.file_path(3)).unwrap();
+            damaged.set_len(HEADER_SIZE as u64).unwrap();
+            drop(damaged);
+            let mut changed = config();
+            changed.file_count = 1;
+            manager.update_config(changed);
+            let report = manager.release(usize::MAX).unwrap();
+            assert_eq!(report.files_released, 2);
+            assert!(manager.file_path(3).exists());
+            assert!(manager.file_path(4).exists());
+            // Restore a correctly indexed, fully written surplus file.
+            let header = super::super::super::ballast_header_buffer(4, config().file_size_bytes)
+                .unwrap();
+            let mut file = File::create(manager.file_path(4)).unwrap();
+            file.write_all(&header).unwrap();
+            file.write_all(&vec![7u8; config().file_size_bytes as usize - HEADER_SIZE]).unwrap();
+            file.sync_all().unwrap();
+            assert_eq!(manager.release(1).unwrap().files_released, 1);
+        }
+
+        #[test]
+        fn surplus_only_pool_without_a_lock_is_not_mistaken_for_empty() {
+            let (_root, mut manager) = fixture();
+            let mut changed = config();
+            changed.file_count = 0;
+            manager.update_config(changed);
+            fs::rename(
+                manager.ballast_dir.join(".lock"),
+                manager.ballast_dir.join("saved-lock"),
+            )
+            .unwrap();
+            assert!(manager.release(1).unwrap_err().to_string().contains("lock is missing"));
+            assert!(manager.file_path(3).exists());
+            assert!(!manager.ballast_dir.join(".lock").exists());
+        }
+
+        #[test]
+        fn disabled_pool_still_obeys_the_existing_nonblocking_lock() {
+            let (_root, mut manager) = fixture();
+            manager.config.file_count = 0;
+            let lock = File::open(manager.ballast_dir.join(".lock")).unwrap();
+            flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+            assert!(manager.release(1).unwrap_err().to_string().contains("busy"));
+            assert!(manager.file_path(3).exists());
+            drop(lock);
+            assert_eq!(manager.release(1).unwrap().files_released, 1);
+        }
+
+        #[test]
+        fn directory_enumeration_rejects_a_replaced_pool() {
+            let (root, manager) = fixture();
+            let before = fs::metadata(&manager.ballast_dir).unwrap();
+            fs::rename(&manager.ballast_dir, root.path().join("saved-pool")).unwrap();
+            fs::create_dir(&manager.ballast_dir).unwrap();
+            fs::write(manager.file_path(1), b"replacement contents").unwrap();
+            assert!(existing_indices(&manager.ballast_dir, &before).is_err());
+            assert_eq!(fs::read(manager.file_path(1)).unwrap(), b"replacement contents");
+        }
+
+        #[test]
+        fn sparse_indices_do_not_require_visiting_missing_slots() {
+            use std::io::Write;
+            let (_root, mut manager) = fixture();
+            let index = u32::MAX;
+            let path = manager.file_path(index);
+            let header = super::super::super::ballast_header_buffer(index, config().file_size_bytes)
+                .unwrap();
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&header).unwrap();
+            file.write_all(&vec![11u8; config().file_size_bytes as usize - HEADER_SIZE]).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            let indices = existing_indices(
+                &manager.ballast_dir,
+                &fs::metadata(&manager.ballast_dir).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(indices, vec![1, 2, 3, u32::MAX]);
+            let report = manager.release(1).unwrap();
+            assert_eq!(report.files_released, 1);
+            assert_eq!(report.released[0].0, path);
+            assert!(manager.file_path(3).exists());
+        }
+
+        #[test]
+        fn noncanonical_names_are_never_release_candidates() {
+            let (_root, mut manager) = fixture();
+            for name in [
+                "SBH_BALLAST_FILE_0.dat",
+                "SBH_BALLAST_FILE_00000.dat",
+                "SBH_BALLAST_FILE_4.dat",
+                "SBH_BALLAST_FILE_000004.dat",
+                "SBH_BALLAST_FILE_00004.DAT",
+                "SBH_BALLAST_FILE_4294967296.dat",
+            ] {
+                fs::write(manager.ballast_dir.join(name), b"keep").unwrap();
+            }
+            assert_eq!(manager.release(usize::MAX).unwrap().files_released, 3);
+            for entry in fs::read_dir(&manager.ballast_dir).unwrap().flatten() {
+                if entry.file_name() != ".lock" {
+                    assert_eq!(fs::read(entry.path()).unwrap(), b"keep");
+                }
+            }
         }
     }
 }
