@@ -29,6 +29,7 @@ use crate::platform::pal::Platform;
 
 mod admission;
 mod emergency;
+mod observation;
 
 // ──────────────────── constants ────────────────────
 
@@ -211,19 +212,20 @@ pub struct BallastAvailability {
     pub configured_file_size_bytes: u64,
     /// Configured total pool size (`count × size`, saturating).
     pub configured_pool_bytes: u64,
-    /// Ballast files currently present on disk.
+    /// Independently releasable regular ballast files currently present.
     pub available_count: usize,
-    /// Configured files confirmed absent (released or lost).
+    /// Configured slots confirmed absent or unusable by managed release.
     ///
-    /// Only counts files whose `stat` returned `NotFound`. Files that could not
-    /// be inspected at all are counted in `unreadable_count` instead, so a
+    /// Includes links, non-regular files and foreign-device slots. Files that
+    /// could not be inspected are counted in `unreadable_count` instead, so a
     /// permission failure is never reported as a missing reserve.
     pub missing_count: usize,
     /// Configured files whose presence could not be determined, because `stat`
     /// failed for a reason other than "not found" (permission denied, I/O
     /// error). Non-zero means this snapshot is not authoritative.
     pub unreadable_count: usize,
-    /// Bytes that releasing every present file would free.
+    /// Conservative allocation estimate, capped by logical length. Snapshots
+    /// may retain blocks after unlink; this is not a guaranteed free-space delta.
     pub releasable_bytes: u64,
     /// Overall pool health derived from the fields above.
     pub health: BallastHealth,
@@ -233,49 +235,7 @@ impl BallastAvailability {
     /// Observe the pool at `ballast_dir` without mutating anything.
     #[must_use]
     pub fn observe(ballast_dir: &Path, config: &BallastConfig) -> Self {
-        let configured_pool_bytes =
-            (config.file_count as u64).saturating_mul(config.file_size_bytes);
-        let mut available_count = 0usize;
-        let mut missing_count = 0usize;
-        let mut unreadable_count = 0usize;
-        let mut releasable_bytes = 0u64;
-        for i in 1..=config.file_count {
-            let path = ballast_dir.join(ballast_file_name(i as u32));
-            match fs::metadata(&path) {
-                Ok(meta) if meta.is_file() => {
-                    available_count += 1;
-                    releasable_bytes = releasable_bytes.saturating_add(meta.len());
-                }
-                // Path exists but is not a regular file: the reserve slot is
-                // genuinely unusable, which is a real absence.
-                Ok(_) => missing_count += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing_count += 1,
-                // Permission denied, I/O error, and friends: we simply do not
-                // know. Never fold this into `missing`.
-                Err(_) => unreadable_count += 1,
-            }
-        }
-        let health = if configured_pool_bytes == 0 {
-            // No reserve is configured, so readability of the directory is
-            // irrelevant — reporting `Indeterminate` here would send an operator
-            // off to sudo-inspect a pool that is absent by design.
-            // `Unconfigured` outranks `Indeterminate`.
-            BallastHealth::Unconfigured
-        } else if unreadable_count > 0 {
-            BallastHealth::Indeterminate
-        } else {
-            BallastHealth::evaluate(configured_pool_bytes, releasable_bytes)
-        };
-        Self {
-            configured_count: config.file_count,
-            configured_file_size_bytes: config.file_size_bytes,
-            configured_pool_bytes,
-            available_count,
-            missing_count,
-            unreadable_count,
-            releasable_bytes,
-            health,
-        }
+        observation::observe(ballast_dir, config)
     }
 
     /// Whether this snapshot is authoritative (every configured slot was
@@ -461,7 +421,10 @@ impl BallastManager {
 
     /// How many bytes can be released (sum of all inventoried files).
     pub fn releasable_bytes(&self) -> u64 {
-        self.inventory.iter().map(|f| f.size).sum()
+        self.inventory
+            .iter()
+            .map(|file| file.size)
+            .fold(0_u64, u64::saturating_add)
     }
 
     /// Number of ballast files currently available.
@@ -849,32 +812,7 @@ impl BallastManager {
     }
 
     fn scan_existing(&mut self) {
-        self.inventory.clear();
-        for i in 1..=self.config.file_count {
-            let index = i as u32;
-            let path = self.file_path(index);
-            if path.exists() {
-                let integrity_ok = self.verify_single_file(&path, index).is_ok();
-                let size = fs::metadata(&path).map_or(0, |m| m.len());
-                let created_at = fs::metadata(&path)
-                    .ok()
-                    .and_then(|m| m.created().ok())
-                    .map(|t| {
-                        let dt: chrono::DateTime<chrono::Utc> = t.into();
-                        dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                    })
-                    .unwrap_or_default();
-
-                self.inventory.push(BallastFile {
-                    path: path.clone(),
-                    index,
-                    size,
-                    created_at,
-                    integrity_ok,
-                });
-            }
-            // If the file doesn't exist, it's been released (not added to inventory).
-        }
+        self.inventory = observation::inventory(self);
     }
 
     fn verify_single_file(
@@ -882,63 +820,7 @@ impl BallastManager {
         path: &Path,
         expected_index: u32,
     ) -> std::result::Result<(), String> {
-        // Check file size.
-        let meta = fs::metadata(path).map_err(|e| format!("metadata: {e}"))?;
-        if meta.len() != self.config.file_size_bytes {
-            return Err(format!(
-                "size mismatch: expected {} got {}",
-                self.config.file_size_bytes,
-                meta.len()
-            ));
-        }
-
-        // Read and validate header.
-        let mut file = File::open(path).map_err(|e| format!("open: {e}"))?;
-        let mut header_buf = vec![0u8; HEADER_SIZE];
-        file.read_exact(&mut header_buf)
-            .map_err(|e| format!("read header: {e}"))?;
-
-        // Find the end of JSON (null-padded).
-        let json_end = header_buf
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(HEADER_SIZE);
-        let header_str = std::str::from_utf8(&header_buf[..json_end])
-            .map_err(|e| format!("header not UTF-8: {e}"))?;
-        let header: BallastHeader =
-            serde_json::from_str(header_str).map_err(|e| format!("header parse: {e}"))?;
-
-        if !header.validate() {
-            return Err(format!("bad magic: {}", header.magic));
-        }
-        if header.file_index != expected_index {
-            return Err(format!(
-                "index mismatch: expected {expected_index} got {}",
-                header.file_index
-            ));
-        }
-        if header.file_size != self.config.file_size_bytes {
-            return Err(format!(
-                "header size mismatch: {} vs {}",
-                header.file_size, self.config.file_size_bytes
-            ));
-        }
-
-        let blocks = self
-            .platform
-            .file_block_count(path)
-            .map_err(|e| format!("block count: {e}"))?;
-        let allocated_bytes = blocks
-            .checked_mul(512)
-            .ok_or_else(|| "allocated block count overflow".to_string())?;
-        if allocated_bytes < self.config.file_size_bytes {
-            return Err(format!(
-                "allocated bytes mismatch: expected at least {} got {allocated_bytes}",
-                self.config.file_size_bytes
-            ));
-        }
-
-        Ok(())
+        observation::verify(self, path, expected_index)
     }
 
     fn create_ballast_file(&self, index: u32) -> Result<()> {
