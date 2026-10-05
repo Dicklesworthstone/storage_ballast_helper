@@ -16,6 +16,9 @@ use super::{
 };
 use crate::core::errors::{Result, SbhError};
 
+#[path = "purge.rs"]
+mod confined_purge;
+
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 
 fn invalid(message: &str) -> io::Error {
@@ -386,26 +389,20 @@ pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
         store.clear_stuck(id);
         return Ok(0);
     };
-    let metadata =
-        payload_metadata(store, &record).map_err(|e| SbhError::io(&record.quarantine_path, e))?;
-    let bytes = if let Some(metadata) = metadata {
-        // Only the recorded payload is authorized, not arbitrary siblings
-        // subsequently placed in the decision directory.
-        let result = if metadata.is_dir() {
-            fs::remove_dir_all(&record.quarantine_path)
-        } else {
-            fs::remove_file(&record.quarantine_path)
-        };
-        result.map_err(|e| SbhError::io(&record.quarantine_path, e))?;
+    // Resolve the payload from the locked store descriptor, not a pathname
+    // checked earlier. Nested mounts are not part of a quarantined artifact.
+    // On refusal keep its manifest so later drains/undo can recover what
+    // remains; never fall back to unrestricted recursive removal.
+    let removed = confined_purge::remove_payload(&lock, &record)
+        .map_err(|e| SbhError::io(&record.quarantine_path, e))?;
+    let bytes = if removed {
         record.size_bytes
     } else {
         // Interrupted cleanup or a prior undo did not free these bytes now.
         0
     };
-    // Persist the payload removal before dropping its recovery record. A
-    // crash must not resurrect a payload after its manifest has disappeared.
-    sync_existing_directory(&store.entry_dir(id))
-        .map_err(|e| SbhError::io(store.entry_dir(id), e))?;
+    // The confined remover synced the opened payload parent before this
+    // point, including an already-absent payload from an interrupted purge.
     remove_records(store, id).map_err(|e| SbhError::io(store.record_path(id), e))?;
     let _ = fs::remove_dir(store.entry_dir(id));
     lock.sync_all().map_err(|e| SbhError::io(store.root(), e))?;
