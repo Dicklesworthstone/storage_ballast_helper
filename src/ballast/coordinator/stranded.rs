@@ -354,6 +354,47 @@ mod unix {
         }
     }
 
+    struct ExistingPoolLock {
+        file: File,
+        owner_pid: u32,
+    }
+
+    impl std::ops::Deref for ExistingPoolLock {
+        type Target = File;
+
+        fn deref(&self) -> &Self::Target {
+            &self.file
+        }
+    }
+
+    impl Drop for ExistingPoolLock {
+        fn drop(&mut self) {
+            // Closing our descriptor alone leaves the flock live if a child
+            // inherited its open-file description. Only the acquiring process
+            // ends this ownership; a forked guard must not unlock its parent.
+            if self.owner_pid == std::process::id() {
+                let _ = flock(&self.file, FlockOperation::Unlock);
+            }
+        }
+    }
+
+    fn lock_existing_pool(directory: &File) -> io::Result<ExistingPoolLock> {
+        // The same lock as BallastManager, but never create it or wait behind
+        // a provisioner. Legacy pools produced by the manager already have it.
+        let lock = open_regular(directory, OsStr::new(".lock")).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                io::Error::other("existing ballast lock is missing; refusing unlocked access")
+            } else {
+                error
+            }
+        })?;
+        flock(&lock, FlockOperation::NonBlockingLockExclusive)?;
+        Ok(ExistingPoolLock {
+            file: lock,
+            owner_pid: std::process::id(),
+        })
+    }
+
     fn with_validated_candidate(
         path: &Path,
         snapshot: &Snapshot,
@@ -366,16 +407,7 @@ mod unix {
         if Identity::of(&directory.metadata()?) != snapshot.directory {
             return Err(invalid("ballast directory was replaced"));
         }
-        // The same lock as BallastManager, but never create it or wait behind
-        // a provisioner. Legacy pools produced by the manager already have it.
-        let lock = open_regular(&directory, OsStr::new(".lock")).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                io::Error::other("existing ballast lock is missing; refusing unlocked access")
-            } else {
-                error
-            }
-        })?;
-        flock(&lock, FlockOperation::NonBlockingLockExclusive)?;
+        let _lock = lock_existing_pool(&directory)?;
         let name = path
             .file_name()
             .ok_or_else(|| invalid("ballast has no filename"))?;
@@ -396,6 +428,90 @@ mod unix {
             unlinkat(directory, name, AtFlags::empty())?;
             Ok(())
         })
+    }
+
+    #[cfg(test)]
+    mod lock_tests {
+        use super::*;
+        use crate::ballast::manager::BallastManager;
+        use crate::core::config::BallastConfig;
+        use std::process::{Child, Command, Stdio};
+        use std::time::Duration;
+
+        struct ChildHolder(Child);
+
+        impl Drop for ChildHolder {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        #[test]
+        fn completed_adoption_guard_releases_while_a_child_retains_its_descriptor() {
+            let temp = tempfile::tempdir().unwrap();
+            let retired = temp.path().join("retired");
+            let mut manager = BallastManager::new_unfloored(
+                retired.clone(),
+                BallastConfig {
+                    file_count: 1,
+                    file_size_bytes: 8192,
+                    ..BallastConfig::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(manager.provision(None).unwrap().files_created, 1);
+            let mut reserve = StrandedReserve::discover(
+                std::slice::from_ref(&retired),
+                &temp.path().join("active"),
+                temp.path(),
+            );
+            assert_eq!(reserve.files().len(), 1);
+            let path = reserve.files()[0].0.clone();
+            let before = std::fs::read(&path).unwrap();
+            let directory = open_directory(&retired).unwrap();
+            let lock = lock_existing_pool(&directory).unwrap();
+            let mut child = ChildHolder(
+                Command::new("/bin/sh")
+                    .args(["-c", "printf ready; exec /bin/sleep 60"])
+                    .stdin(Stdio::from(lock.try_clone().unwrap()))
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut stdout = child.0.stdout.take().unwrap();
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let reader = std::thread::spawn(move || {
+                let mut ready = [0u8; 5];
+                ready_tx
+                    .send(stdout.read_exact(&mut ready).map(|()| ready))
+                    .unwrap();
+            });
+            assert_eq!(
+                ready_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap(),
+                *b"ready"
+            );
+            reader.join().unwrap();
+            assert_eq!(
+                reserve.refresh().len(),
+                1,
+                "active parent still excludes a competitor"
+            );
+            drop(lock);
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "child still holds the descriptor"
+            );
+            assert!(
+                reserve.refresh().is_empty(),
+                "a completed parent action no longer owns the lock"
+            );
+            assert_eq!(reserve.files().len(), 1);
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
     }
 }
 
