@@ -25,6 +25,10 @@ fn fixture(count: usize) -> (tempfile::TempDir, Vec<PathBuf>) {
         .collect();
     for root in &roots {
         fs::create_dir(root).unwrap();
+        // The walker emits directories below its configured roots, not the
+        // roots themselves or individual files. Supply a real child result
+        // so cancellation exercises the scheduler's selected root.
+        fs::create_dir(root.join("candidate-tree")).unwrap();
         fs::write(root.join("candidate.bin"), b"retained fixture data").unwrap();
     }
     (temp, roots)
@@ -68,7 +72,10 @@ fn owner(entry: &WalkEntry, roots: &[PathBuf]) -> PathBuf {
 
 fn assert_retained(roots: &[PathBuf]) {
     for root in roots {
-        assert_eq!(fs::read(root.join("candidate.bin")).unwrap(), b"retained fixture data");
+        assert_eq!(
+            fs::read(root.join("candidate.bin")).unwrap(),
+            b"retained fixture data"
+        );
     }
 }
 
@@ -93,7 +100,11 @@ fn disabled_voi_rotates_actual_walk_results_after_one_entry_passes() {
     }
     assert_eq!(seen, roots.iter().cloned().collect());
     assert!(scheduler.path_stats(&roots[2]).unwrap().dirty_pending);
-    assert!(roots.iter().all(|root| scheduler.path_stats(root).unwrap().scan_count == 0));
+    assert!(
+        roots
+            .iter()
+            .all(|root| scheduler.path_stats(root).unwrap().scan_count == 0)
+    );
     assert_retained(&roots);
 }
 
@@ -167,7 +178,10 @@ fn forecast_failure_and_recovery_change_the_live_pressure_order() {
 #[test]
 fn remembered_roots_do_not_expand_a_later_scoped_walk() {
     let (_temp, roots) = fixture(3);
-    let mut scheduler = VoiScheduler::new(VoiConfig { enabled: false, ..VoiConfig::default() });
+    let mut scheduler = VoiScheduler::new(VoiConfig {
+        enabled: false,
+        ..VoiConfig::default()
+    });
     let now = Instant::now();
     for root in &roots {
         scheduler.register_path(root.clone());
@@ -185,7 +199,10 @@ fn remembered_roots_do_not_expand_a_later_scoped_walk() {
 #[test]
 fn a_leading_opportunity_never_overrides_walker_exclusions() {
     let (_temp, roots) = fixture(2);
-    let mut scheduler = VoiScheduler::new(VoiConfig { enabled: false, ..VoiConfig::default() });
+    let mut scheduler = VoiScheduler::new(VoiConfig {
+        enabled: false,
+        ..VoiConfig::default()
+    });
     let ranked = scheduler.rank_paths(&roots, Instant::now());
     assert_eq!(ranked[0], roots[0]);
     let excluded = HashSet::from([roots[0].clone()]);
@@ -198,7 +215,10 @@ fn a_leading_opportunity_never_overrides_walker_exclusions() {
 fn interleaved_scopes_each_rotate_their_actual_first_results() {
     let (_left_temp, left) = fixture(2);
     let (_right_temp, right) = fixture(4);
-    let mut scheduler = VoiScheduler::new(VoiConfig { enabled: false, ..VoiConfig::default() });
+    let mut scheduler = VoiScheduler::new(VoiConfig {
+        enabled: false,
+        ..VoiConfig::default()
+    });
     let now = Instant::now();
     let mut left_seen = BTreeSet::new();
     let mut right_seen = BTreeSet::new();
