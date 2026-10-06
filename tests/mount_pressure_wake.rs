@@ -75,6 +75,97 @@ fn a_critical_mount_does_not_wait_out_an_hour_old_healthy_empty_pass() {
 }
 
 #[test]
+fn a_late_green_empty_pass_cannot_park_the_new_orange_scan() {
+    let now = Instant::now();
+    let mut controller = MountController::new(
+        PathBuf::from("/pressured"),
+        MountControllerConfig::default(),
+    );
+    controller.observe(tick(PressureLevel::Green, now));
+    assert_eq!(controller.state(), MountState::Maintain);
+
+    // The Green pass finished while the next tick was dispatching Orange.
+    let at = now + Duration::from_millis(500);
+    assert!(controller.observe(tick(PressureLevel::Orange, at)).scan);
+    assert_eq!(
+        controller.note_pass_at_level(PressureLevel::Green, 0, false, at),
+        None,
+        "Green did not examine the conditions that triggered Orange"
+    );
+    assert_eq!(controller.state(), MountState::Reclaim);
+    assert_eq!(controller.empty_passes(), 0);
+    assert_eq!(controller.idle_until(), None);
+    assert!(controller.observe(tick(PressureLevel::Orange, at)).scan);
+
+    // Once Orange actually finishes empty, unchanged pressure must back off.
+    assert_eq!(
+        controller.note_pass_at_level(PressureLevel::Orange, 0, false, at),
+        Some((MountState::Reclaim, MountState::Idle))
+    );
+    let deadline = controller.idle_until();
+    assert!(!controller.observe(tick(PressureLevel::Orange, at)).scan);
+    assert_eq!(controller.idle_until(), deadline);
+    assert_eq!(controller.empty_passes(), 1);
+}
+
+#[test]
+fn a_late_yellow_empty_pass_does_not_consume_a_critical_wake() {
+    let now = Instant::now();
+    let mut controller = idle_at(PressureLevel::Yellow, now);
+    let prior_empty_passes = controller.empty_passes();
+    assert!(controller.observe(tick(PressureLevel::Critical, now)).scan);
+    assert_eq!(
+        controller.note_pass_at_level(PressureLevel::Yellow, 0, false, now),
+        None
+    );
+    assert_eq!(controller.empty_passes(), prior_empty_passes);
+    assert_eq!(controller.idle_until(), None);
+    assert!(controller.observe(tick(PressureLevel::Critical, now)).scan);
+    controller.note_pass_at_level(PressureLevel::Critical, 0, false, now);
+    assert!(!controller.observe(tick(PressureLevel::Critical, now)).scan);
+    assert_eq!(controller.empty_passes(), prior_empty_passes + 1);
+}
+
+#[test]
+fn attributed_scan_results_retain_positive_ballast_and_recovery_boundaries() {
+    let now = Instant::now();
+    let mut controller = idle_at(PressureLevel::Green, now);
+    controller.observe(tick(PressureLevel::Orange, now));
+    // An older positive result is still useful work, rather than an empty
+    // verdict on a severity the pass never examined.
+    assert_eq!(
+        controller.note_pass_at_level(PressureLevel::Green, 2, false, now),
+        None
+    );
+    assert_eq!(controller.empty_passes(), 0);
+    assert_eq!(controller.state(), MountState::Reclaim);
+    assert_eq!(
+        controller.note_pass_at_level(PressureLevel::Orange, 0, true, now),
+        None
+    );
+    assert_eq!(controller.state(), MountState::Reclaim);
+
+    let mut recovery = tick(PressureLevel::Critical, now);
+    recovery.recovery_needed = true;
+    controller.observe(recovery);
+    assert_eq!(
+        controller.note_pass_at_level(PressureLevel::Orange, 0, false, now),
+        None
+    );
+    assert_eq!(controller.state(), MountState::Recovery);
+    assert_eq!(controller.idle_reason(), Some(IdleReason::WriteFailure));
+
+    let mut recovered = tick(PressureLevel::Orange, now);
+    recovered.recovery_probe_ok = Some(true);
+    assert!(controller.observe(recovered).scan);
+    // A pass completed at greater severity is usable after pressure falls.
+    assert_eq!(
+        controller.note_pass_at_level(PressureLevel::Critical, 0, false, now),
+        Some((MountState::Reclaim, MountState::Idle))
+    );
+}
+
+#[test]
 fn ascending_pressure_retries_once_per_level_and_keeps_empty_pass_backoff() {
     let now = Instant::now();
     let mut controller = idle_at(PressureLevel::Green, now);

@@ -517,11 +517,31 @@ impl MountController {
         }
     }
 
+    /// Record a full scan outcome together with the pressure it examined.
+    ///
+    /// An empty result from before an escalation cannot prove that the new
+    /// pressure has nothing reclaimable. Keep that retry live; positive
+    /// results still reset the streak, and same-level empty passes still pace.
+    pub fn note_pass_at_level(
+        &mut self,
+        pass_level: PressureLevel,
+        dispatchable_candidates: usize,
+        releasable_ballast: bool,
+        now: Instant,
+    ) -> Option<(MountState, MountState)> {
+        if dispatchable_candidates == 0 && pass_level < self.level {
+            return None;
+        }
+        self.note_pass(dispatchable_candidates, releasable_ballast, now)
+    }
+
     /// Record the outcome of a full scan pass over this mount's roots.
     ///
     /// A pass with nothing dispatchable and no ballast left to release parks
     /// the mount in `Idle` with an exponential rescan backoff; anything found
     /// resets the backoff. Returns the transition, if any.
+    /// Asynchronous callers should use [`Self::note_pass_at_level`] so a
+    /// delayed result cannot consume a newer pressure wake.
     pub fn note_pass(
         &mut self,
         dispatchable_candidates: usize,

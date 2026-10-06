@@ -793,6 +793,8 @@ enum WorkerReport {
         duration: Duration,
         root_stats: Vec<RootScanResult>,
         timed_out: bool,
+        /// Pressure examined by this pass, before any newer monitor tick.
+        pressure_level: PressureLevel,
     },
     /// Executor completed a deletion batch.
     DeletionCompleted {
@@ -4076,6 +4078,7 @@ impl MonitoringDaemon {
                         duration,
                         root_stats,
                         timed_out,
+                        pressure_level,
                     } => {
                         self.summary_scans += 1;
                         if timed_out {
@@ -4101,7 +4104,7 @@ impl MonitoringDaemon {
                         // A completed (not timed-out) pass with nothing found
                         // on a mount parks that mount's controller in Idle.
                         if !timed_out {
-                            self.note_scan_pass_per_mount(&root_stats, now);
+                            self.note_scan_pass_per_mount(&root_stats, pressure_level, now);
                         }
                     }
                     WorkerReport::DeletionCompleted {
@@ -4686,6 +4689,7 @@ impl MonitoringDaemon {
         let cross_device_fallback = self.config.scanner.cross_devices && !root_paths.is_empty();
 
         let responses = std::mem::take(&mut self.mount_responses);
+        let mut pending_scans = Vec::new();
         let mut cadence = Vec::with_capacity(responses.len());
         let mut replenished_this_tick = false;
         let mut pressured_without_surface: Option<(PathBuf, PressureLevel)> = None;
@@ -4789,13 +4793,7 @@ impl MonitoringDaemon {
                             if catalog_epoch_due(previous, tick.response.level, now, rescan) {
                                 self.catalog_epochs
                                     .insert(mount.clone(), (tick.response.level, now));
-                                self.send_catalog_scan_request(
-                                    scan_tx,
-                                    scan_rx,
-                                    &tick.response,
-                                    catalog,
-                                );
-                                self.last_tick_cleanup_ran = true;
+                                pending_scans.push((&tick.response, Vec::new(), Some(catalog)));
                             }
                         } else {
                             // A mount with no root of its own only gets here
@@ -4810,8 +4808,7 @@ impl MonitoringDaemon {
                             // level's; the scheduler only orders the roots
                             // (dirty first, then by hazard index).
                             let paths = self.voi_scheduler.rank_paths(&paths, now);
-                            self.send_scan_request(scan_tx, scan_rx, &tick.response, paths);
-                            self.last_tick_cleanup_ran = true;
+                            pending_scans.push((&tick.response, paths, None));
                         }
                     }
                 }
@@ -4861,9 +4858,19 @@ impl MonitoringDaemon {
             }
         }
 
-        // Layer 7: the quarantine is already-decided space. Pressure drains
-        // it before any new deletion; calm ticks expire and cap it.
+        // Release ballast with its existing priority, then drain already-
+        // decided quarantine space before enqueuing any new pressure scan.
+        // The scanner runs concurrently with this tick, so draining after
+        // enqueue would race both its completion and its deletion batches.
         self.sweep_quarantines(&responses, &root_mounts, now);
+        for (response, paths, catalog) in pending_scans {
+            if let Some(catalog) = catalog {
+                self.send_catalog_scan_request(scan_tx, scan_rx, response, catalog);
+            } else {
+                self.send_scan_request(scan_tx, scan_rx, response, paths);
+            }
+            self.last_tick_cleanup_ran = true;
+        }
         self.resolve_regrets(now);
 
         // Green maintenance (Q6): once per maintenance interval, a routine
@@ -5221,7 +5228,12 @@ impl MonitoringDaemon {
     /// Feed a completed scan pass to the per-mount controllers: a mount whose
     /// roots all came back empty, with nothing left to release, goes idle
     /// with an exponential rescan backoff.
-    fn note_scan_pass_per_mount(&mut self, root_stats: &[RootScanResult], now: Instant) {
+    fn note_scan_pass_per_mount(
+        &mut self,
+        root_stats: &[RootScanResult],
+        pressure_level: PressureLevel,
+        now: Instant,
+    ) {
         let mut found_by_mount: HashMap<PathBuf, usize> = HashMap::new();
         for stat in root_stats {
             let Ok(stats) = self.fs_collector.collect(&stat.path) else {
@@ -5237,7 +5249,9 @@ impl MonitoringDaemon {
             let Some(controller) = self.mount_controllers.get_mut(&mount) else {
                 continue;
             };
-            if let Some((from, to)) = controller.note_pass(found, releasable, now) {
+            if let Some((from, to)) =
+                controller.note_pass_at_level(pressure_level, found, releasable, now)
+            {
                 let message = format!(
                     "mount {} {from} -> {to} (empty_passes={} rescan_in={}s idle_reason={})",
                     mount.display(),
@@ -7404,6 +7418,7 @@ fn scanner_thread_main(
                 duration: Duration::ZERO,
                 root_stats,
                 timed_out: false,
+                pressure_level: request.pressure_level,
             });
             continue;
         }
@@ -7666,6 +7681,7 @@ fn scanner_thread_main(
                         duration: Duration::ZERO,
                         root_stats,
                         timed_out: false,
+                        pressure_level: request.pressure_level,
                     });
                     if held_by_certainty > 0 {
                         logger.send(ActivityEvent::Info {
@@ -8243,6 +8259,7 @@ fn scanner_thread_main(
                 duration,
                 root_stats,
                 timed_out: true,
+                pressure_level: request.pressure_level,
             });
             eprintln!(
                 "[SBH-SCANNER] scan complete: {prescan_entries} entries, \
@@ -8322,6 +8339,7 @@ fn scanner_thread_main(
                 duration,
                 root_stats,
                 timed_out: false,
+                pressure_level: request.pressure_level,
             });
             if held_by_certainty > 0 {
                 logger.send(ActivityEvent::Info {
@@ -8849,6 +8867,7 @@ fn scanner_thread_main(
             duration: total_scan_duration,
             root_stats: root_stats_map.into_values().collect(),
             timed_out: scan_timed_out,
+            pressure_level: request.pressure_level,
         });
 
         // Flush remaining candidates in bounded batches.
@@ -11503,12 +11522,14 @@ mod tests {
         let report = report_rx
             .try_recv()
             .expect("forced v2 scan should report completion");
-        match report {
-            WorkerReport::ScanCompleted { root_stats, .. } => {
-                assert_eq!(root_stats.len(), 1);
-            }
-            WorkerReport::DeletionCompleted { .. } => panic!("expected scanner completion report"),
-        }
+        assert!(
+            matches!(&report, WorkerReport::ScanCompleted {
+                root_stats,
+                pressure_level: PressureLevel::Green,
+                ..
+            } if root_stats.len() == 1),
+            "forced Green scan reports one root at Green: {report:?}"
+        );
 
         logger.shutdown();
         logger_join.join().unwrap();
