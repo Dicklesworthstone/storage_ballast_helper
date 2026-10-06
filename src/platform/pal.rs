@@ -176,6 +176,38 @@ pub(crate) fn verify_preallocated_blocks(
     Ok(())
 }
 
+/// Reserve storage through an already-owned descriptor, never through `path`.
+/// The pathname is diagnostic only. Neither an existing larger file nor its
+/// contents are truncated; callers retain responsibility for CoW policy.
+fn preallocate_descriptor(file: &fs::File, path: &Path, size: u64) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use rustix::fs::{FallocateFlags, fallocate};
+        use std::os::unix::fs::MetadataExt as _;
+
+        if !file.metadata().map_err(|error| SbhError::io(path, error))?.is_file() {
+            return Err(SbhError::io(
+                path,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "allocation requires a regular file"),
+            ));
+        }
+        fallocate(file, FallocateFlags::empty(), 0, size)
+            .map_err(|error| SbhError::io(path, error.into()))?;
+        let metadata = file.metadata().map_err(|error| SbhError::io(path, error))?;
+        if metadata.len() < size {
+            file.set_len(size).map_err(|error| SbhError::io(path, error))?;
+        }
+        file.sync_all().map_err(|error| SbhError::io(path, error))?;
+        let metadata = file.metadata().map_err(|error| SbhError::io(path, error))?;
+        verify_preallocated_blocks("descriptor", path, size, metadata.blocks())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (file, path, size);
+        pal_not_implemented("unknown", "preallocate_open_file")
+    }
+}
+
 /// Service control surface (systemd, launchd, etc.).
 pub trait ServiceManager: Send + Sync {
     fn install(&self) -> Result<()>;
@@ -288,6 +320,14 @@ pub trait Platform: Send + Sync {
 
     fn preallocate_file(&self, _path: &Path, _size: u64) -> Result<()> {
         pal_not_implemented(self.name(), "preallocate_file")
+    }
+
+    /// Allocate through the caller's file without reopening its pathname.
+    /// Implementations must not truncate, replace, or unlink the file; `path`
+    /// is only a diagnostic/injection key. Unsupported or sparse allocation
+    /// is an error so the caller may write data through the same descriptor.
+    fn preallocate_open_file(&self, file: &fs::File, path: &Path, size: u64) -> Result<()> {
+        preallocate_descriptor(file, path, size)
     }
 
     fn file_block_count(&self, path: &Path) -> Result<u64> {
@@ -767,6 +807,34 @@ impl Platform for MockPlatform {
         Ok(())
     }
 
+    fn preallocate_open_file(&self, file: &fs::File, path: &Path, size: u64) -> Result<()> {
+        if let Some(failure) = self.preallocate_failures.get(path) {
+            return Err(SbhError::Pal { source: failure.clone() });
+        }
+        if !self.preallocated.is_empty()
+            && !self.preallocated.iter().any(|(expected, bytes)| expected == path && *bytes == size)
+        {
+            return Err(PalError::method_failed(
+                self.name(),
+                "preallocate_open_file",
+                format!("unexpected mock descriptor allocation for {}", path.display()),
+            ).into());
+        }
+        // Preserve the mock's deliberately sparse allocation behavior. The
+        // manager must check the descriptor and write real blocks when needed;
+        // injected block-count metadata is not proof of physical allocation.
+        let metadata = file.metadata().map_err(|error| SbhError::io(path, error))?;
+        if !metadata.is_file() {
+            return Err(SbhError::io(path, std::io::Error::new(
+                std::io::ErrorKind::InvalidInput, "allocation requires a regular file",
+            )));
+        }
+        if metadata.len() < size {
+            file.set_len(size).map_err(|error| SbhError::io(path, error))?;
+        }
+        file.sync_all().map_err(|error| SbhError::io(path, error))
+    }
+
     fn file_block_count(&self, path: &Path) -> Result<u64> {
         Ok(self.block_counts.get(path).copied().unwrap_or(0))
     }
@@ -992,5 +1060,62 @@ mod tests {
         assert_eq!(process.open_file_descriptors, 1);
         assert!(process.running_executable);
         assert_eq!(process.mmap_regions, 1);
+    }
+
+    #[test]
+    fn descriptor_allocation_does_not_open_the_diagnostic_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let owned = temp.path().join("owned");
+        let unrelated = temp.path().join("unrelated");
+        std::fs::write(&owned, b"preserved").unwrap();
+        std::fs::write(&unrelated, b"do not touch").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&owned).unwrap();
+        let platform = MockPlatform::healthy();
+        platform.preallocate_open_file(&file, &unrelated, 8192).unwrap();
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"do not touch");
+        assert_eq!(file.metadata().unwrap().len(), 8192);
+        assert!(std::fs::read(&owned).unwrap().starts_with(b"preserved"));
+        platform.preallocate_open_file(&file, &unrelated, 4096).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 8192, "never shrink old allocation");
+    }
+
+    #[test]
+    fn descriptor_mock_retains_failure_and_expected_request_checks() {
+        use crate::platform::types::PalError;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reserve");
+        std::fs::write(&path, b"preserve").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let failing = MockPlatform::healthy().with_preallocate_failure(
+            &path, PalError::method_failed("mock", "preallocate_file", "ENOSPC"),
+        );
+        assert!(failing.preallocate_open_file(&file, &path, 8192).unwrap_err().to_string().contains("ENOSPC"));
+        let expected = MockPlatform::healthy().with_preallocated_file(&path, 4096);
+        assert!(expected.preallocate_open_file(&file, &path, 8192).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn native_descriptor_allocation_never_resolves_a_replaced_name() {
+        use std::os::unix::fs::MetadataExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reserve");
+        let moved = temp.path().join("owned-inode");
+        std::fs::write(&path, b"old reserve").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let inode = file.metadata().unwrap().ino();
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, b"replacement is not ours").unwrap();
+        let result = super::preallocate_descriptor(&file, &path, 65536);
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement is not ours");
+        assert_eq!(file.metadata().unwrap().ino(), inode);
+        assert!(std::fs::read(moved).unwrap().starts_with(b"old reserve"));
+        if result.is_ok() {
+            assert!(file.metadata().unwrap().blocks() * 512 >= 65536);
+            assert!(file.metadata().unwrap().len() >= 65536);
+        } else {
+            eprintln!("native allocation refused on this filesystem: {result:?}");
+        }
     }
 }

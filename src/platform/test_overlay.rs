@@ -357,6 +357,10 @@ impl Platform for TestOverlayPlatform {
         self.inner.preallocate_file(path, size)
     }
 
+    fn preallocate_open_file(&self, file: &std::fs::File, path: &Path, size: u64) -> Result<()> {
+        self.inner.preallocate_open_file(file, path, size)
+    }
+
     fn file_block_count(&self, path: &Path) -> Result<u64> {
         self.inner.file_block_count(path)
     }
@@ -488,5 +492,21 @@ mod tests {
     fn service_manager_refusal_only_applies_in_test_mode() {
         // Not in test mode: never refuses, whatever else is set.
         assert!(refuse_under_service_manager().is_ok());
+    }
+
+    #[test]
+    fn descriptor_preallocation_delegates_failure_without_touching_the_file() {
+        use crate::platform::types::PalError;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ballast");
+        std::fs::write(&path, b"preserve").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let inner = MockPlatform::healthy().with_preallocate_failure(
+            &path, PalError::method_failed("mock", "preallocate_file", "ENOSPC"),
+        );
+        let overlay = TestOverlayPlatform::new(Arc::new(inner), InjectedFsTable::default());
+        let error = overlay.preallocate_open_file(&file, &path, 8192).unwrap_err();
+        assert!(error.to_string().contains("ENOSPC"));
+        assert_eq!(std::fs::read(path).unwrap(), b"preserve");
     }
 }
