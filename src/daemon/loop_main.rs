@@ -10531,6 +10531,14 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn prescan_over_a_large_tree_yields_candidates_and_moves_the_cursor() {
+        struct PassObservation {
+            dispatched: Vec<PathBuf>,
+            candidates: usize,
+            indexed: std::collections::BTreeSet<PathBuf>,
+            walker_entries: usize,
+            walker_targets: usize,
+            replayed: usize,
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("scan-root");
         // 600 repositories, each with a nested `target/debug` the pre-scan
@@ -10557,8 +10565,7 @@ mod tests {
         let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        // (dispatched candidate paths, candidates the pass found, timed out)
-        let run_pass = |pass: usize| -> (Vec<PathBuf>, usize, bool) {
+        let run_pass = |pass: usize| -> PassObservation {
             let (logger, logger_join) = spawn_logger(DualLoggerConfig {
                 sqlite_path: None,
                 jsonl_config: crate::logger::jsonl::JsonlConfig {
@@ -10629,16 +10636,52 @@ mod tests {
             }
             logger.shutdown();
             logger_join.join().unwrap();
-            (dispatched, candidates_found, timed_out)
+            let checkpoint: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&scanner_index_path).unwrap()).unwrap();
+            let completion_log =
+                std::fs::read_to_string(temp.path().join(format!("activity-{pass}.jsonl")))
+                    .unwrap();
+            let completions: Vec<serde_json::Value> = completion_log
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .filter(|event: &serde_json::Value| event["event"] == "scan_complete")
+                .collect();
+            assert_eq!(completions.len(), 1, "one request completes exactly once");
+            let details = completions[0]["details"].as_str().unwrap();
+            let field = |name: &str| {
+                details
+                    .split_whitespace()
+                    .find_map(|part| part.split_once('=').filter(|(key, _)| *key == name))
+                    .unwrap()
+                    .1
+            };
+            assert_eq!(
+                field("candidates").parse::<usize>().unwrap(),
+                candidates_found
+            );
+            assert_eq!(field("timed_out").parse::<bool>().unwrap(), timed_out);
+            let records: Vec<CandidateIndexRecord> =
+                serde_json::from_value(checkpoint["records"].clone()).unwrap();
+            let indexed: std::collections::BTreeSet<_> =
+                records.iter().map(|record| record.path.clone()).collect();
+            assert_eq!(indexed.len(), records.len(), "no duplicate indexed paths");
+            PassObservation {
+                dispatched,
+                candidates: candidates_found,
+                indexed,
+                walker_entries: field("paths_scanned").parse().unwrap(),
+                walker_targets: field("opaque_pruned_dirs").parse().unwrap(),
+                replayed: field("replayed_records").parse().unwrap(),
+            }
         };
 
-        let (first_dispatched, first_candidates, _) = run_pass(1);
+        let first = run_pass(1);
         assert!(
-            !first_dispatched.is_empty(),
+            !first.dispatched.is_empty(),
             "a pre-scan must dispatch what it found, never an empty set"
         );
         assert!(
-            first_candidates > 0,
+            first.candidates > 0,
             "a pre-scan must report the candidates it reached, timed out or not"
         );
         let after_first = PrescanCursor::load(&prescan_cursor_path);
@@ -10648,9 +10691,9 @@ mod tests {
             "the pre-scan must record where it stopped"
         );
 
-        let (second_dispatched, second_candidates, _) = run_pass(2);
+        let second = run_pass(2);
         let after_second = PrescanCursor::load(&prescan_cursor_path);
-        assert!(second_candidates > 0, "the second pass must also find work");
+        assert!(second.candidates > 0, "the second pass must also find work");
         match after_first.position() {
             (_, Some(resume_point)) => {
                 // Pass 1 was truncated: pass 2's pre-scan picks up strictly
@@ -10674,25 +10717,50 @@ mod tests {
                 }
                 if resume_point.as_path() < root.join("repo-0599").as_path() {
                     assert!(
-                        second_dispatched
+                        second
+                            .dispatched
                             .iter()
                             .any(|path| path.as_path() > resume_point.as_path()),
                         "pass 2 must dispatch targets beyond pass 1's resume point ({}): \
-                         {second_dispatched:?}",
-                        resume_point.display()
+                         {:?}",
+                        resume_point.display(),
+                        second.dispatched
                     );
                 }
             }
             (root_after, None) => {
                 // Pass 1 covered the whole root: it must have found every
                 // target, and the cursor wrapped back to the root's start.
-                // On macOS the FSEvents startup replan marks the root dirty,
-                // so the walk reconciles after the pre-scan and counts each
-                // target again (README "What feeds the index").
-                let expected = if cfg!(target_os = "macos") { 1200 } else { 600 };
+                let expected_paths: std::collections::BTreeSet<_> = (0..600)
+                    .map(|index| root.join(format!("repo-{index:04}/target")))
+                    .collect();
                 assert_eq!(
-                    first_candidates, expected,
-                    "a completed pre-scan finds every target"
+                    first.indexed, expected_paths,
+                    "every distinct target is indexed"
+                );
+                assert_eq!(
+                    first.replayed, 0,
+                    "a fresh index cannot replay prior records"
+                );
+                // Reconciliation is a runtime decision on either OS. With
+                // this fixture a walk visits one repo and one opaque target
+                // per repository, and counts the same targets a second time.
+                if first.walker_entries == 0 {
+                    assert_eq!(first.walker_targets, 0);
+                } else {
+                    assert_eq!(
+                        first.walker_entries, 1200,
+                        "the walk covers the entire fixture"
+                    );
+                    assert_eq!(
+                        first.walker_targets, 600,
+                        "the walk sees every opaque target"
+                    );
+                }
+                assert_eq!(
+                    first.candidates,
+                    600 + first.walker_targets,
+                    "candidate observations equal the pre-scan plus the actual walk"
                 );
                 assert_eq!(root_after, Some(root.as_path()));
             }
