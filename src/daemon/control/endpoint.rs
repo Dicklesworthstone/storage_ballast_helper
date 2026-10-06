@@ -33,9 +33,14 @@ struct Identity {
 
 impl Identity {
     fn of(stat: &Stat) -> Self {
+        // Preserve Darwin's signed dev_t widening without a sign-loss cast.
+        #[cfg(target_vendor = "apple")]
+        let device = u64::from_ne_bytes(i64::from(stat.st_dev).to_ne_bytes());
+        #[cfg(not(target_vendor = "apple"))]
+        let device = stat.st_dev;
         #[allow(clippy::unnecessary_cast)]
         Self {
-            device: stat.st_dev as u64,
+            device,
             inode: stat.st_ino as u64,
             kind: FileType::from_raw_mode(stat.st_mode),
             uid: stat.st_uid,

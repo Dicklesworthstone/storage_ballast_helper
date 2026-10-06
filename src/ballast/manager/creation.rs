@@ -110,8 +110,13 @@ mod unix {
                 Err(rustix::io::Errno::NOENT) => return Ok(false),
                 Err(error) => return Err(error.into()),
             };
+            // Preserve Darwin's signed dev_t widening used by MetadataExt::dev.
+            #[cfg(target_vendor = "apple")]
+            let device = u64::from_ne_bytes(i64::from(named.st_dev).to_ne_bytes());
+            #[cfg(not(target_vendor = "apple"))]
+            let device = named.st_dev;
             #[allow(clippy::unnecessary_cast)]
-            Ok(named.st_dev as u64 == self.identity.dev()
+            Ok(device == self.identity.dev()
                 && named.st_ino as u64 == self.identity.ino()
                 && rustix::fs::FileType::from_raw_mode(named.st_mode)
                     == rustix::fs::FileType::RegularFile
