@@ -162,11 +162,12 @@ mod unix {
             entry.sync_all()?;
             return Ok(false);
         };
-        if payload.device != record.device_id
-            || payload.inode != record.inode
+        if (payload.device, payload.inode) != (record.device_id, record.inode)
             || !matches!(payload.kind, FileType::RegularFile | FileType::Directory)
         {
-            return Err(invalid("quarantine payload identity changed; refusing purge"));
+            return Err(invalid(
+                "quarantine payload identity changed; refusing purge",
+            ));
         }
         let removed = remove_child(&entry, name, payload, 0, hook)?;
         // Sync the SAME opened parent before the caller drops recovery data.
@@ -424,7 +425,7 @@ mod unix {
         fn excessive_depth_retains_recovery_metadata_and_other_entries_still_drain() {
             let temp = tempfile::tempdir().unwrap();
             let (store, record) = held_tree(temp.path(), "deep");
-            let mut deepest = record.quarantine_path.clone();
+            let mut deepest = record.quarantine_path;
             for _ in 0..MAX_DIRECTORY_DEPTH {
                 deepest.push("d");
                 fs::create_dir(&deepest).unwrap();
@@ -501,7 +502,11 @@ mod unix {
                         ),
                         BoundAt::DecisionDirectory => {
                             let target = record.quarantine_path.parent().unwrap().to_path_buf();
-                            (target.clone(), target, record.quarantine_path.join("nested/leaf"))
+                            (
+                                target.clone(),
+                                target,
+                                record.quarantine_path.join("nested/leaf"),
+                            )
                         }
                         BoundAt::File => {
                             let target = record.quarantine_path.join("nested/bound-file");
@@ -579,7 +584,10 @@ mod unix {
                 let Some(mut fixture) = Mounted::bind(BoundAt::Subtree) else {
                     return;
                 };
-                assert_eq!(fs::metadata(&fixture.target).unwrap().dev(), fixture.record.device_id);
+                assert_eq!(
+                    fs::metadata(&fixture.target).unwrap().dev(),
+                    fixture.record.device_id
+                );
                 assert_errno(fixture.store.purge("mounted").unwrap_err(), libc::EXDEV);
                 fixture.assert_preserved();
                 let (_, healthy) = held_tree(fixture.scratch.as_ref().unwrap().path(), "healthy");
@@ -654,13 +662,13 @@ mod unix {
                 let mut checked = 0;
                 // Read-only opens, never purge these system directories.
                 // Container /proc/bus is often a same-device bind mount.
-                for (parent_path, name, full_path) in [
-                    ("/dev", "shm", "/dev/shm"),
-                    ("/proc", "bus", "/proc/bus"),
-                ] {
-                    if !mounts.lines().any(|line| {
-                        line.split_whitespace().nth(4) == Some(full_path)
-                    }) {
+                for (parent_path, name, full_path) in
+                    [("/dev", "shm", "/dev/shm"), ("/proc", "bus", "/proc/bus")]
+                {
+                    if !mounts
+                        .lines()
+                        .any(|line| line.split_whitespace().nth(4) == Some(full_path))
+                    {
                         continue;
                     }
                     let Ok(parent) = File::open(parent_path) else {
@@ -670,7 +678,11 @@ mod unix {
                         continue;
                     };
                     let error = open_directory(&parent, OsStr::new(name), identity).unwrap_err();
-                    assert_eq!(error.raw_os_error(), Some(libc::EXDEV), "{full_path}: {error}");
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(libc::EXDEV),
+                        "{full_path}: {error}"
+                    );
                     checked += 1;
                 }
                 if checked == 0 {

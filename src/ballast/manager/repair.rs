@@ -34,7 +34,7 @@ pub(super) fn existing(manager: &BallastManager, index: u32) -> Result<bool> {
 
 #[cfg(unix)]
 mod unix {
-    use super::*;
+    use super::{BallastManager, Result, SbhError};
     use std::fs::{self, File, Metadata, OpenOptions};
     use std::io::{self, Seek, SeekFrom, Write};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};

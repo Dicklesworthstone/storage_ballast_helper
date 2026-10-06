@@ -533,8 +533,9 @@ fn write_record(path: &Path, record: &QuarantineRecord) -> io::Result<()> {
     safety::write_json(path, record)
 }
 
-/// Place quarantine beneath the deepest same-filesystem configured ancestor,
-/// excluding the candidate itself, or beneath its own mount when none qualifies.
+/// Place quarantine beneath a same-filesystem configured ancestor or mount.
+///
+/// Select the deepest ancestor, excluding the candidate itself.
 /// Aliases are resolved for comparison without changing the store's spelling.
 #[must_use]
 pub fn quarantine_root_for(path: &Path, roots: &[PathBuf]) -> PathBuf {

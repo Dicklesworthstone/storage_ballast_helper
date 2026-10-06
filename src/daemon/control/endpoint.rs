@@ -12,13 +12,15 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use nix::errno::Errno as NixErrno;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
-use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, Stat, flock, fstat, openat, statat, unlinkat};
+use rustix::fs::{
+    AtFlags, FileType, FlockOperation, Mode, OFlags, Stat, flock, fstat, openat, statat, unlinkat,
+};
 use rustix::io::Errno;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +73,11 @@ pub(super) struct EndpointGuard {
 
 impl EndpointGuard {
     fn check_location(&self) -> io::Result<()> {
-        let named_parent = statat(rustix::fs::CWD, &self.parent_path, AtFlags::SYMLINK_NOFOLLOW)?;
+        let named_parent = statat(
+            rustix::fs::CWD,
+            &self.parent_path,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?;
         if Identity::of(&named_parent) != Identity::of(&fstat(&self.parent)?) {
             return Err(occupied("control socket parent changed during startup"));
         }
@@ -88,7 +94,9 @@ impl EndpointGuard {
             return Ok(());
         };
         if Identity::of(&current) != expected || expected.kind != FileType::Socket {
-            return Err(occupied("control socket changed; leaving replacement untouched"));
+            return Err(occupied(
+                "control socket changed; leaving replacement untouched",
+            ));
         }
         match unlinkat(&self.parent, &self.name, AtFlags::empty()) {
             Ok(()) | Err(Errno::NOENT) => Ok(()),
@@ -111,7 +119,10 @@ impl Drop for EndpointGuard {
 pub(super) fn bind(path: &Path) -> io::Result<(UnixListener, EndpointGuard)> {
     let absolute = std::path::absolute(path)?;
     let name = absolute.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "control socket has no filename")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "control socket has no filename",
+        )
     })?;
     let parent_path = absolute.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "control socket has no parent")
@@ -139,7 +150,9 @@ pub(super) fn bind(path: &Path) -> io::Result<(UnixListener, EndpointGuard)> {
         || metadata.st_mode & 0o077 != 0
         || metadata.st_dev != fstat(&parent)?.st_dev
     {
-        return Err(occupied("control socket lease is not a private owned regular file"));
+        return Err(occupied(
+            "control socket lease is not a private owned regular file",
+        ));
     }
     flock(&lease, FlockOperation::NonBlockingLockExclusive)?;
     let mut guard = EndpointGuard {
@@ -157,10 +170,14 @@ pub(super) fn bind(path: &Path) -> io::Result<(UnixListener, EndpointGuard)> {
             || identity.uid != nix::unistd::geteuid().as_raw()
             || existing.st_nlink != 1
         {
-            return Err(occupied("control endpoint exists but is not an owned socket"));
+            return Err(occupied(
+                "control endpoint exists but is not an owned socket",
+            ));
         }
         if !connection_refused(&resolved)? {
-            return Err(occupied("control socket is active or its liveness is uncertain"));
+            return Err(occupied(
+                "control socket is active or its liveness is uncertain",
+            ));
         }
         guard.check_location()?;
         guard.remove_same_socket(identity)?;
@@ -177,10 +194,13 @@ pub(super) fn bind(path: &Path) -> io::Result<(UnixListener, EndpointGuard)> {
     guard.check_location()?;
     // Only after ownership is established. The server does not accept until
     // this mode change and its own nonblocking setup have both succeeded.
-    use std::os::unix::fs::PermissionsExt as _;
     fs::set_permissions(&resolved, fs::Permissions::from_mode(0o600))?;
     guard.check_location()?;
-    if inspect(&guard.parent, &guard.name)?.as_ref().map(Identity::of) != guard.bound {
+    if inspect(&guard.parent, &guard.name)?
+        .as_ref()
+        .map(Identity::of)
+        != guard.bound
+    {
         return Err(occupied("control socket changed while setting permissions"));
     }
     listener.set_nonblocking(true)?;
@@ -215,7 +235,9 @@ mod tests {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
     use std::sync::Arc;
 
-    use super::super::{ControlBackend, ControlCommand, ControlResponse, ControlServer, Peer, request};
+    use super::super::{
+        ControlBackend, ControlCommand, ControlResponse, ControlServer, Peer, request,
+    };
 
     struct Echo;
 
@@ -260,10 +282,18 @@ mod tests {
         let inode = fs::symlink_metadata(&path).unwrap().ino();
         assert!(ControlServer::start(&path, "second", Arc::new(Echo)).is_err());
         assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
-        assert!(request(&path, "first", "ping", &serde_json::json!({})).unwrap().ok);
+        assert!(
+            request(&path, "first", "ping", &serde_json::json!({}))
+                .unwrap()
+                .ok
+        );
         first.stop();
         let replacement = ControlServer::start(&path, "second", Arc::new(Echo)).unwrap();
-        assert!(request(&path, "second", "ping", &serde_json::json!({})).unwrap().ok);
+        assert!(
+            request(&path, "second", "ping", &serde_json::json!({}))
+                .unwrap()
+                .ok
+        );
         replacement.stop();
     }
 
@@ -290,7 +320,10 @@ mod tests {
         drop(UnixListener::bind(&path).unwrap());
         assert!(connection_refused(&path).unwrap());
         let (listener, guard) = bind(&path).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(!connection_refused(&path).unwrap());
         drop(listener);
         drop(guard);
@@ -304,7 +337,10 @@ mod tests {
         let lease = temp.path().join("control.sock.lock");
         let (listener, guard) = bind(&path).unwrap();
         let inode = fs::metadata(&lease).unwrap().ino();
-        assert_eq!(fs::metadata(&lease).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&lease).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         drop(listener);
         drop(guard);
         assert_eq!(fs::metadata(&lease).unwrap().ino(), inode);
@@ -390,7 +426,10 @@ mod tests {
             assert!(bind(&path).is_err(), "{kind}");
             assert!(!path.exists());
             assert_eq!(fs::read(&target).unwrap(), b"not lock contents");
-            assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 
@@ -398,7 +437,11 @@ mod tests {
     fn fifo_endpoint_is_refused_without_opening_it() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("control.sock");
-        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
         assert!(bind(&path).is_err());
         assert!(fs::symlink_metadata(path).unwrap().file_type().is_fifo());
     }

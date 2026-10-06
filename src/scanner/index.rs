@@ -936,7 +936,10 @@ mod tests {
 
     #[test]
     fn a_vetoed_replacement_retires_the_old_high_score_without_starving_other_work() {
-        for state in [CandidateSafetyState::Vetoed, CandidateSafetyState::ActiveReference] {
+        for state in [
+            CandidateSafetyState::Vetoed,
+            CandidateSafetyState::ActiveReference,
+        ] {
             let mut index = ScannerCandidateIndex::new(context("veto"));
             let mut old = record(identity(1), identity(99));
             old.score = Some(0.99);
@@ -958,11 +961,21 @@ mod tests {
         let mut index = ScannerCandidateIndex::new(context("late-failure"));
         let old = record(identity(1), identity(99));
         index.upsert(old.clone());
-        index.record_failure(old.identity, UNIX_EPOCH, Duration::from_secs(60), Duration::from_secs(60));
+        index.record_failure(
+            old.identity,
+            UNIX_EPOCH,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
         let mut replacement = old.clone();
         replacement.identity = identity(2);
         index.upsert(replacement.clone());
-        index.record_failure(old.identity, UNIX_EPOCH, Duration::from_secs(60), Duration::from_secs(60));
+        index.record_failure(
+            old.identity,
+            UNIX_EPOCH,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
         assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![replacement]);
         assert!(index.get(old.identity).is_none());
         assert_path_index_consistent(&index);
@@ -1062,8 +1075,13 @@ mod tests {
         let old_identity = identity_from_metadata(&fs::symlink_metadata(&path).unwrap());
         let old_score = score(path.clone(), old_identity.into());
         let old = CandidateIndexRecord::from_candidate_score(
-            &old_score, None, StructuralSignals::default(), 0,
-        ).unwrap().unwrap();
+            &old_score,
+            None,
+            StructuralSignals::default(),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         let mut index = ScannerCandidateIndex::new(context("filesystem"));
         index.upsert(old);
         // Preserve the original inode so this is deterministic even on a
@@ -1075,14 +1093,22 @@ mod tests {
         assert_ne!(new_identity, old_identity);
         let mut fresh_score = score(path, new_identity.into());
         fresh_score.vetoed = true;
-        fresh_score.veto_reason = Some("currently open".to_string());
+        fresh_score.veto_reason = Some("currently open".into());
         let fresh = CandidateIndexRecord::from_candidate_score(
-            &fresh_score, None, StructuralSignals::default(), 0,
-        ).unwrap().unwrap();
+            &fresh_score,
+            None,
+            StructuralSignals::default(),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         index.upsert(fresh);
         assert!(index.get(old_identity).is_none());
         assert!(index.ranked_records(SystemTime::now(), 10).is_empty());
-        assert!(retired.is_dir(), "retiring an index hint never deletes its artifact");
+        assert!(
+            retired.is_dir(),
+            "retiring an index hint never deletes its artifact"
+        );
         assert_path_index_consistent(&index);
     }
 }

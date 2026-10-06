@@ -1,7 +1,7 @@
 //! Exercise admission and I/O through the actual connection entry point.
 
 use super::*;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::net::Shutdown;
 
 struct CountingBackend(AtomicUsize);
@@ -23,13 +23,12 @@ fn shared(backend: Arc<dyn ControlBackend>) -> Shared {
 }
 
 fn ping() -> Vec<u8> {
-    transport::encode_frame(&json!({"cmd": "ping", "token": "secret"}), MAX_LINE_BYTES)
-        .unwrap()
+    transport::encode_frame(&json!({"cmd": "ping", "token": "secret"}), MAX_LINE_BYTES).unwrap()
 }
 
 fn reply(stream: &UnixStream) -> ControlResponse {
-    let frame = transport::read_frame(stream, MAX_RESPONSE_BYTES, Instant::now(), IO_TIMEOUT)
-        .unwrap();
+    let frame =
+        transport::read_frame(stream, MAX_RESPONSE_BYTES, Instant::now(), IO_TIMEOUT).unwrap();
     serde_json::from_slice(&frame).unwrap()
 }
 
@@ -44,7 +43,10 @@ fn admission_reserves_capacity_before_any_worker_can_run() {
     for _ in 0..100 {
         let refusal = admit_connection(&shared, now).err().unwrap();
         assert_eq!(refusal.error.unwrap().code, "busy");
-        assert_eq!(shared.active.load(Ordering::Acquire), MAX_CONCURRENT_CONNECTIONS);
+        assert_eq!(
+            shared.active.load(Ordering::Acquire),
+            MAX_CONCURRENT_CONNECTIONS
+        );
     }
     assert_eq!(backend.0.load(Ordering::SeqCst), 0);
     // This is also what happens when spawning the owning closure fails.
@@ -87,7 +89,9 @@ fn unauthorized_requests_release_their_slot_without_dispatching() {
     let shared = shared(backend.clone());
     let slot = admit_connection(&shared, Instant::now()).unwrap();
     let (mut client, server) = UnixStream::pair().unwrap();
-    client.write_all(b"{\"cmd\":\"shutdown\",\"token\":\"wrong\"}\n").unwrap();
+    client
+        .write_all(b"{\"cmd\":\"shutdown\",\"token\":\"wrong\"}\n")
+        .unwrap();
     serve_connection(&server, &shared, slot, Instant::now());
     assert_eq!(reply(&client).error.unwrap().code, "unauthorized");
     assert_eq!(backend.0.load(Ordering::SeqCst), 0);
@@ -142,8 +146,13 @@ fn oversized_requests_do_not_dispatch_and_do_not_poison_the_next_connection() {
     let worker = thread::spawn(move || {
         serve_connection(&server, &worker_shared, slot, Instant::now());
     });
-    transport::write_frame(&client, &vec![b'x'; MAX_LINE_BYTES + 1], Instant::now(), IO_TIMEOUT)
-        .unwrap();
+    transport::write_frame(
+        &client,
+        &vec![b'x'; MAX_LINE_BYTES + 1],
+        Instant::now(),
+        IO_TIMEOUT,
+    )
+    .unwrap();
     let rejected = reply(&client);
     worker.join().unwrap();
     assert_eq!(rejected.error.unwrap().code, "bad_request");
@@ -163,7 +172,12 @@ fn oversized_requests_do_not_dispatch_and_do_not_poison_the_next_connection() {
 fn oversized_client_requests_fail_before_connecting() {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("no-daemon.sock");
-    let result = request(&socket, "secret", "explain", &json!({"id": "x".repeat(MAX_LINE_BYTES)}));
+    let result = request(
+        &socket,
+        "secret",
+        "explain",
+        &json!({"id": "x".repeat(MAX_LINE_BYTES)}),
+    );
     match result.unwrap_err() {
         SbhError::Io { source, .. } => assert_eq!(source.kind(), std::io::ErrorKind::InvalidData),
         error => panic!("expected the frame bound, not a connection failure: {error}"),
@@ -197,8 +211,14 @@ fn parse_command(cmd: &str, args: Value) -> std::result::Result<ControlCommand, 
 #[test]
 fn malformed_mounts_never_expand_a_ballast_action_to_all_pools() {
     for mount in [
-        json!(false), json!(1), json!([]), json!({}), json!(""),
-        json!(" "), json!("relative"), json!("/data\u{0}other"),
+        json!(false),
+        json!(1),
+        json!([]),
+        json!({}),
+        json!(""),
+        json!(" "),
+        json!("relative"),
+        json!("/data\u{0}other"),
     ] {
         for operation in [json!({"release": 2}), json!({"replenish": true})] {
             let mut args = operation;
@@ -224,12 +244,17 @@ fn explicit_valid_ballast_scope_is_preserved_exactly() {
     for args in [json!({"release": 2}), json!({"release": 2, "mount": null})] {
         assert_eq!(
             parse_command("ballast", args).unwrap(),
-            ControlCommand::Ballast(BallastAction::Release { count: 2, mount: None })
+            ControlCommand::Ballast(BallastAction::Release {
+                count: 2,
+                mount: None
+            })
         );
     }
     assert_eq!(
         parse_command("ballast", json!({"replenish": true, "mount": "/data"})).unwrap(),
-        ControlCommand::Ballast(BallastAction::Replenish { mount: Some(PathBuf::from("/data")) })
+        ControlCommand::Ballast(BallastAction::Replenish {
+            mount: Some(PathBuf::from("/data"))
+        })
     );
 }
 
@@ -243,19 +268,27 @@ fn ambiguous_operations_and_mistyped_flags_are_not_coerced() {
         json!({"replenish": "true"}),
         json!({"replenish": false}),
     ] {
-        assert_eq!(parse_command("ballast", args).unwrap_err().code, "bad_request");
+        assert_eq!(
+            parse_command("ballast", args).unwrap_err().code,
+            "bad_request"
+        );
     }
     assert!(parse_command("ballast", json!({"release": 1, "replenish": false})).is_ok());
     for force in [json!(1), json!("true"), json!(null), json!([])] {
         assert_eq!(
-            parse_command("scan-now", json!({"force": force})).unwrap_err().code,
+            parse_command("scan-now", json!({"force": force}))
+                .unwrap_err()
+                .code,
             "bad_request"
         );
     }
     for force in [false, true] {
         assert_eq!(
             parse_command("scan-now", json!({"force": force})).unwrap(),
-            ControlCommand::ScanNow { paths: Vec::new(), force }
+            ControlCommand::ScanNow {
+                paths: Vec::new(),
+                force
+            }
         );
     }
 }
@@ -263,8 +296,12 @@ fn ambiguous_operations_and_mistyped_flags_are_not_coerced() {
 #[test]
 fn argument_shape_and_typo_checks_cover_every_documented_command() {
     for (cmd, valid) in [
-        ("ping", json!({})), ("status", json!({})), ("shutdown", json!({})),
-        ("reload", json!({})), ("scan-now", json!({})), ("scan_now", json!({})),
+        ("ping", json!({})),
+        ("status", json!({})),
+        ("shutdown", json!({})),
+        ("reload", json!({})),
+        ("scan-now", json!({})),
+        ("scan_now", json!({})),
         ("policy", json!({"action": "promote"})),
         ("explain", json!({"id": "41d4fafc918d"})),
         ("ballast", json!({"release": 1})),
@@ -272,19 +309,32 @@ fn argument_shape_and_typo_checks_cover_every_documented_command() {
         assert!(parse_command(cmd, valid.clone()).is_ok(), "{cmd}");
         let mut typo = valid;
         typo["mounts"] = json!(["/data"]);
-        assert_eq!(parse_command(cmd, typo).unwrap_err().code, "bad_request", "{cmd}");
+        assert_eq!(
+            parse_command(cmd, typo).unwrap_err().code,
+            "bad_request",
+            "{cmd}"
+        );
         for scalar in [json!(true), json!(1), json!("/data"), json!([])] {
-            assert_eq!(parse_command(cmd, scalar).unwrap_err().code, "bad_request", "{cmd}");
+            assert_eq!(
+                parse_command(cmd, scalar).unwrap_err().code,
+                "bad_request",
+                "{cmd}"
+            );
         }
     }
-    assert_eq!(parse_command("unknown", json!({})).unwrap_err().code, "unknown_command");
+    assert_eq!(
+        parse_command("unknown", json!({})).unwrap_err().code,
+        "unknown_command"
+    );
 }
 
 #[test]
 fn empty_or_nul_scan_paths_are_rejected_instead_of_becoming_daemon_working_directory() {
     for path in ["", "  ", "a\u{0}b"] {
         assert_eq!(
-            parse_command("scan-now", json!({"paths": [path]})).unwrap_err().code,
+            parse_command("scan-now", json!({"paths": [path]}))
+                .unwrap_err()
+                .code,
             "bad_request"
         );
     }
@@ -310,21 +360,29 @@ fn authenticated_malformed_mutations_never_reach_the_backend() {
         json!({"cmd": "scan-now", "args": {"path": "/data"}, "token": "secret"}),
     ] {
         let (mut client, server) = UnixStream::pair().unwrap();
-        client.write_all(&transport::encode_frame(&request, MAX_LINE_BYTES).unwrap()).unwrap();
+        client
+            .write_all(&transport::encode_frame(&request, MAX_LINE_BYTES).unwrap())
+            .unwrap();
         let slot = admit_connection(&shared, Instant::now()).unwrap();
         serve_connection(&server, &shared, slot, Instant::now());
         assert_eq!(reply(&client).error.unwrap().code, "bad_request");
         assert!(backend.0.lock().is_empty());
         assert_eq!(shared.active.load(Ordering::Acquire), 0);
     }
-    let request = json!({"cmd": "ballast", "args": {"release": 1, "mount": "/data"}, "token": "secret"});
+    let request =
+        json!({"cmd": "ballast", "args": {"release": 1, "mount": "/data"}, "token": "secret"});
     let (mut client, server) = UnixStream::pair().unwrap();
-    client.write_all(&transport::encode_frame(&request, MAX_LINE_BYTES).unwrap()).unwrap();
+    client
+        .write_all(&transport::encode_frame(&request, MAX_LINE_BYTES).unwrap())
+        .unwrap();
     let slot = admit_connection(&shared, Instant::now()).unwrap();
     serve_connection(&server, &shared, slot, Instant::now());
     assert!(reply(&client).ok);
     assert_eq!(
         backend.0.lock().as_slice(),
-        &[ControlCommand::Ballast(BallastAction::Release { count: 1, mount: Some(PathBuf::from("/data")) })]
+        &[ControlCommand::Ballast(BallastAction::Release {
+            count: 1,
+            mount: Some(PathBuf::from("/data"))
+        })]
     );
 }

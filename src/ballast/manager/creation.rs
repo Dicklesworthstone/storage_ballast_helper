@@ -22,14 +22,16 @@ pub(super) fn create(manager: &BallastManager, index: u32) -> Result<()> {
     {
         let _ = (manager, index);
         Err(SbhError::UnsupportedPlatform {
-            details: "safe ballast creation requires Unix descriptor-relative filesystem operations".to_string(),
+            details:
+                "safe ballast creation requires Unix descriptor-relative filesystem operations"
+                    .to_string(),
         })
     }
 }
 
 #[cfg(unix)]
 mod unix {
-    use super::*;
+    use super::{BallastManager, Result, SbhError};
     use std::fs::{self, File, Metadata, OpenOptions};
     use std::io::{self, Seek, SeekFrom, Write};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -37,7 +39,9 @@ mod unix {
 
     use rustix::fs::{AtFlags, Mode, OFlags, openat, statat, unlinkat};
 
-    use super::super::{HEADER_SIZE, ballast_file_name, ballast_header_buffer, is_storage_exhausted_error};
+    use super::super::{
+        HEADER_SIZE, ballast_file_name, ballast_header_buffer, is_storage_exhausted_error,
+    };
     use crate::platform::types::PalError;
 
     fn invalid(message: &str) -> io::Error {
@@ -51,7 +55,10 @@ mod unix {
     fn allocated(metadata: &Metadata, size: u64) -> bool {
         metadata.is_file()
             && metadata.len() >= size
-            && metadata.blocks().checked_mul(512).is_some_and(|bytes| bytes >= size)
+            && metadata
+                .blocks()
+                .checked_mul(512)
+                .is_some_and(|bytes| bytes >= size)
     }
 
     struct NewSlot {
@@ -76,8 +83,12 @@ mod unix {
             let file = File::from(openat(
                 &pool,
                 name.as_str(),
-                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW
-                    | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                OFlags::RDWR
+                    | OFlags::CREATE
+                    | OFlags::EXCL
+                    | OFlags::NOFOLLOW
+                    | OFlags::NONBLOCK
+                    | OFlags::CLOEXEC,
                 Mode::RUSR | Mode::WUSR,
             )?);
             let identity = file.metadata()?;
@@ -102,7 +113,8 @@ mod unix {
             #[allow(clippy::unnecessary_cast)]
             Ok(named.st_dev as u64 == self.identity.dev()
                 && named.st_ino as u64 == self.identity.ino()
-                && rustix::fs::FileType::from_raw_mode(named.st_mode) == rustix::fs::FileType::RegularFile
+                && rustix::fs::FileType::from_raw_mode(named.st_mode)
+                    == rustix::fs::FileType::RegularFile
                 && named.st_nlink == 1)
         }
 
@@ -176,15 +188,26 @@ mod unix {
             return false;
         }
         match error {
-            SbhError::Io { source, .. } => source.kind() == io::ErrorKind::Unsupported
-                || source.raw_os_error().is_some_and(|code| {
-                    code == libc::ENOSYS || code == libc::EOPNOTSUPP || code == libc::EINVAL
-                }),
-            SbhError::Pal { source: PalError::NotImplemented { .. } } => true,
+            SbhError::Io { source, .. } => {
+                source.kind() == io::ErrorKind::Unsupported
+                    || source.raw_os_error().is_some_and(|code| {
+                        code == libc::ENOSYS || code == libc::EOPNOTSUPP || code == libc::EINVAL
+                    })
+            }
+            SbhError::Pal {
+                source: PalError::NotImplemented { .. },
+            } => true,
             // The PAL's block verifier reports underallocation distinctly from
             // native errno failures. APFS may accept preallocation yet leave
             // holes; refill those through this same descriptor, not a reopen.
-            SbhError::Pal { source: PalError::MethodFailed { method_name, details, .. } } => {
+            SbhError::Pal {
+                source:
+                    PalError::MethodFailed {
+                        method_name,
+                        details,
+                        ..
+                    },
+            } => {
                 method_name == "preallocate_file"
                     && details.contains("allocated bytes after preallocation; expected at least")
             }
@@ -201,7 +224,10 @@ mod unix {
         if !manager.skip_fallocate {
             match manager.platform.preallocate_open_file(file, path, size) {
                 Ok(()) => {
-                    if allocated(&file.metadata().map_err(|error| SbhError::io(path, error))?, size) {
+                    if allocated(
+                        &file.metadata().map_err(|error| SbhError::io(path, error))?,
+                        size,
+                    ) {
                         return Ok(());
                     }
                     // A nominal success (including a mock) does not establish
@@ -221,8 +247,8 @@ mod unix {
         use super::*;
         use crate::core::config::BallastConfig;
         use crate::platform::pal::MockPlatform;
-        use std::sync::Arc;
         use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::sync::Arc;
 
         const SIZE: u64 = 32768;
 
@@ -266,7 +292,12 @@ mod unix {
             let path = manager.file_path(1);
             fs::write(&path, b"another creator owns this").unwrap();
             let inode = fs::metadata(&path).unwrap().ino();
-            assert!(create_with(&manager, 1, |_, _, _, _| panic!("collision must not allocate")).is_err());
+            assert!(
+                create_with(&manager, 1, |_, _, _, _| panic!(
+                    "collision must not allocate"
+                ))
+                .is_err()
+            );
             assert_eq!(fs::read(&path).unwrap(), b"another creator owns this");
             assert_eq!(fs::metadata(path).unwrap().ino(), inode);
         }
@@ -284,7 +315,9 @@ mod unix {
                     2 => fs::hard_link(&external, &path).unwrap(),
                     _ => fs::create_dir(&path).unwrap(),
                 }
-                assert!(create_with(&manager, 1, |_, _, _, _| panic!("must not allocate")).is_err());
+                assert!(
+                    create_with(&manager, 1, |_, _, _, _| panic!("must not allocate")).is_err()
+                );
                 assert!(fs::symlink_metadata(path).is_ok());
                 assert_eq!(fs::read(external).unwrap(), b"keep external");
             }
@@ -294,7 +327,11 @@ mod unix {
         fn a_fifo_collision_returns_without_opening_it_for_io() {
             let (_temp, manager) = fixture();
             let path = manager.file_path(1);
-            nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+            nix::unistd::mkfifo(
+                &path,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )
+            .unwrap();
             assert!(create_with(&manager, 1, |_, _, _, _| panic!("must not allocate")).is_err());
             assert!(fs::symlink_metadata(path).is_ok());
         }
@@ -305,8 +342,12 @@ mod unix {
             let path = manager.file_path(1);
             let error = create_with(&manager, 1, |_, file, path, _| {
                 file.write_all(b"partial").unwrap();
-                Err(SbhError::io(path, io::Error::from_raw_os_error(libc::ENOSPC)))
-            }).unwrap_err();
+                Err(SbhError::io(
+                    path,
+                    io::Error::from_raw_os_error(libc::ENOSPC),
+                ))
+            })
+            .unwrap_err();
             assert!(is_storage_exhausted_error(&error));
             assert!(fs::symlink_metadata(&path).is_err());
             create_with(&manager, 1, prepare).unwrap();
@@ -334,12 +375,15 @@ mod unix {
             let (temp, manager) = fixture();
             let path = manager.file_path(1);
             let ours = temp.path().join("retired");
-            assert!(create_with(&manager, 1, |manager, file, path, size| {
-                prepare(manager, file, path, size)?;
-                fs::rename(path, &ours).unwrap();
-                fs::write(path, b"do not finalize this").unwrap();
-                Ok(())
-            }).is_err());
+            assert!(
+                create_with(&manager, 1, |manager, file, path, size| {
+                    prepare(manager, file, path, size)?;
+                    fs::rename(path, &ours).unwrap();
+                    fs::write(path, b"do not finalize this").unwrap();
+                    Ok(())
+                })
+                .is_err()
+            );
             assert_eq!(fs::read(path).unwrap(), b"do not finalize this");
             assert!(ours.exists());
         }
@@ -350,14 +394,22 @@ mod unix {
             let outside = temp.path().join("external");
             let ours = temp.path().join("ours");
             fs::write(&outside, b"external stays intact").unwrap();
-            assert!(create_with(&manager, 1, |_, file, path, _| {
-                fs::rename(path, &ours).unwrap();
-                symlink(&outside, path).unwrap();
-                file.write_all(b"our partial write").unwrap();
-                Ok(())
-            }).is_err());
+            assert!(
+                create_with(&manager, 1, |_, file, path, _| {
+                    fs::rename(path, &ours).unwrap();
+                    symlink(&outside, path).unwrap();
+                    file.write_all(b"our partial write").unwrap();
+                    Ok(())
+                })
+                .is_err()
+            );
             assert_eq!(fs::read(outside).unwrap(), b"external stays intact");
-            assert!(fs::symlink_metadata(manager.file_path(1)).unwrap().file_type().is_symlink());
+            assert!(
+                fs::symlink_metadata(manager.file_path(1))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
             assert_eq!(fs::read(ours).unwrap(), b"our partial write");
         }
 
@@ -366,12 +418,15 @@ mod unix {
             let (temp, manager) = fixture();
             let retired = temp.path().join("retired-pool");
             let replacement = manager.file_path(1);
-            assert!(create_with(&manager, 1, |_, _, path, _| {
-                fs::rename(&manager.ballast_dir, &retired).unwrap();
-                fs::create_dir(&manager.ballast_dir).unwrap();
-                fs::write(&replacement, b"new pool file").unwrap();
-                Err(SbhError::io(path, io::Error::from_raw_os_error(libc::EIO)))
-            }).is_err());
+            assert!(
+                create_with(&manager, 1, |_, _, path, _| {
+                    fs::rename(&manager.ballast_dir, &retired).unwrap();
+                    fs::create_dir(&manager.ballast_dir).unwrap();
+                    fs::write(&replacement, b"new pool file").unwrap();
+                    Err(SbhError::io(path, io::Error::from_raw_os_error(libc::EIO)))
+                })
+                .is_err()
+            );
             assert_eq!(fs::read(replacement).unwrap(), b"new pool file");
             assert!(!retired.join(ballast_file_name(1)).exists());
         }
@@ -380,11 +435,14 @@ mod unix {
         fn new_hard_link_prevents_success_and_destructive_cleanup() {
             let (temp, manager) = fixture();
             let linked = temp.path().join("second-link");
-            assert!(create_with(&manager, 1, |_, file, path, _| {
-                file.write_all(b"shared inode").unwrap();
-                fs::hard_link(path, &linked).unwrap();
-                Ok(())
-            }).is_err());
+            assert!(
+                create_with(&manager, 1, |_, file, path, _| {
+                    file.write_all(b"shared inode").unwrap();
+                    fs::hard_link(path, &linked).unwrap();
+                    Ok(())
+                })
+                .is_err()
+            );
             assert_eq!(fs::read(manager.file_path(1)).unwrap(), b"shared inode");
             assert_eq!(fs::read(linked).unwrap(), b"shared inode");
         }
@@ -395,7 +453,9 @@ mod unix {
             let path = manager.file_path(1);
             let config = manager.config.clone();
             let platform = MockPlatform::healthy().with_block_count(&path, SIZE / 512);
-            let mut manager = BallastManager::with_platform(manager.ballast_dir.clone(), config, Arc::new(platform)).unwrap();
+            let mut manager =
+                BallastManager::with_platform(manager.ballast_dir, config, Arc::new(platform))
+                    .unwrap();
             let report = manager.provision(None).unwrap();
             assert_eq!(report.files_created, 1, "{report:?}");
             assert!(allocated(&fs::metadata(path).unwrap(), SIZE));
@@ -414,8 +474,11 @@ mod unix {
                     PalError::method_failed("mock", "preallocate_file", message),
                 );
                 let mut manager = BallastManager::with_platform(
-                    manager.ballast_dir.clone(), config, Arc::new(platform),
-                ).unwrap();
+                    manager.ballast_dir.clone(),
+                    config,
+                    Arc::new(platform),
+                )
+                .unwrap();
                 let report = manager.provision(None).unwrap();
                 assert_eq!(report.files_created, 0);
                 assert_eq!(report.errors.len(), 1, "{report:?}");
@@ -432,10 +495,14 @@ mod unix {
             let path = Path::new("/test/ballast");
             let sparse = verify_preallocated_blocks("descriptor", path, SIZE, 0).unwrap_err();
             assert!(fallback_allowed(&sparse));
-            let overflow = verify_preallocated_blocks("descriptor", path, SIZE, u64::MAX)
-                .unwrap_err();
+            let overflow =
+                verify_preallocated_blocks("descriptor", path, SIZE, u64::MAX).unwrap_err();
             assert!(!fallback_allowed(&overflow));
-            for details in ["I/O error", "EDQUOT", "unexpected mock preallocation request"] {
+            for details in [
+                "I/O error",
+                "EDQUOT",
+                "unexpected mock preallocation request",
+            ] {
                 let error = SbhError::Pal {
                     source: PalError::method_failed("descriptor", "preallocate_file", details),
                 };
@@ -446,11 +513,23 @@ mod unix {
         #[test]
         fn native_io_and_quota_failures_are_not_retried_as_random_writes() {
             let path = Path::new("/test/ballast");
-            for code in [libc::ENOSPC, libc::EDQUOT, libc::EIO, libc::EACCES, libc::EROFS] {
-                assert!(!fallback_allowed(&SbhError::io(path, io::Error::from_raw_os_error(code))));
+            for code in [
+                libc::ENOSPC,
+                libc::EDQUOT,
+                libc::EIO,
+                libc::EACCES,
+                libc::EROFS,
+            ] {
+                assert!(!fallback_allowed(&SbhError::io(
+                    path,
+                    io::Error::from_raw_os_error(code)
+                )));
             }
             for code in [libc::ENOSYS, libc::EOPNOTSUPP, libc::EINVAL] {
-                assert!(fallback_allowed(&SbhError::io(path, io::Error::from_raw_os_error(code))));
+                assert!(fallback_allowed(&SbhError::io(
+                    path,
+                    io::Error::from_raw_os_error(code)
+                )));
             }
         }
 
