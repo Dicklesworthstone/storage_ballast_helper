@@ -506,7 +506,26 @@ fn read_current_memory_pressure(method: &'static str) -> Result<MemoryPressure> 
     let total_bytes = macos_total_memory_bytes(method)?;
     let stats = sys::read_vm_stats().map_err(|error| macos_method_error(method, &error))?;
     let swap = sys::vm_swapusage().map_err(|error| macos_method_error(method, &error))?;
-    Ok(memory_pressure_from_vm_stats(total_bytes, stats, &swap))
+    Ok(memory_pressure_with_kernel_level(
+        memory_pressure_from_vm_stats(total_bytes, stats, &swap),
+        sys::sysctl::read::<i32>("kern.memorystatus_vm_pressure_level").ok(),
+    ))
+}
+
+fn memory_pressure_with_kernel_level(
+    mut pressure: MemoryPressure,
+    kernel_level: Option<i32>,
+) -> MemoryPressure {
+    // XNU exports dispatch masks here, rather than its internal 0-based enum.
+    // Sparse free pages and old swap usage do not imply current pressure.
+    // Unknown/unavailable native evidence keeps the conservative VM fallback.
+    pressure.level = match kernel_level {
+        Some(1) => MemoryPressureLevel::Normal,
+        Some(2) => MemoryPressureLevel::Warn,
+        Some(4) => MemoryPressureLevel::Critical,
+        _ => pressure.level,
+    };
+    pressure
 }
 
 fn spawn_native_memory_pressure_subscription(
@@ -611,11 +630,9 @@ fn infer_macos_memory_pressure_level(
     let compressor_pct = pages_pct(stats.compressor_page_count, total_pages);
     let swap_is_active = swap_used_bytes.is_some_and(|bytes| bytes > 0);
 
-    // Apple exposes dispatch memory-pressure levels but not the exact numeric
-    // thresholds. Until bd-hqu2.5 wires event notifications, keep the mapping
-    // conservative: warn only when free pages are scarce and the compressor is
-    // doing meaningful work; critical requires near-exhausted free pages plus
-    // evidence that memory pressure has spilled into swap.
+    // Conservative fallback when the current native level is unavailable:
+    // warn when free pages are scarce and the compressor is doing meaningful
+    // work; critical also requires evidence that pressure spilled into swap.
     if free_pct < 2.0 && swap_is_active {
         MemoryPressureLevel::Critical
     } else if free_pct < 5.0 && (compressor_pct >= 10.0 || swap_is_active) {
@@ -1384,6 +1401,52 @@ mod tests {
         assert_eq!(pressure.level, MemoryPressureLevel::Unknown);
         assert_eq!(pressure.swap_total_bytes, None);
         assert_eq!(pressure.swap_used_bytes, None);
+    }
+
+    #[test]
+    fn current_kernel_level_overrides_stale_vm_pressure_without_losing_counters() {
+        for inferred in [
+            MemoryPressureLevel::Normal,
+            MemoryPressureLevel::Warn,
+            MemoryPressureLevel::Critical,
+            MemoryPressureLevel::Unknown,
+        ] {
+            let observed = MemoryPressure {
+                compressor_used_bytes: Some(12 * 1_073_741_824),
+                swap_total_bytes: Some(26 * 1_073_741_824),
+                swap_used_bytes: Some(25 * 1_073_741_824),
+                ..test_memory_pressure(inferred)
+            };
+            for (raw, expected) in [
+                (1, MemoryPressureLevel::Normal),
+                (2, MemoryPressureLevel::Warn),
+                (4, MemoryPressureLevel::Critical),
+            ] {
+                let actual = super::memory_pressure_with_kernel_level(observed.clone(), Some(raw));
+                let mut preserved = observed.clone();
+                preserved.level = expected;
+                assert_eq!(actual, preserved, "kernel={raw}, inferred={inferred:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_or_unknown_kernel_pressure_retains_the_vm_fallback() {
+        for inferred in [
+            MemoryPressureLevel::Normal,
+            MemoryPressureLevel::Warn,
+            MemoryPressureLevel::Critical,
+            MemoryPressureLevel::Unknown,
+        ] {
+            let observed = test_memory_pressure(inferred);
+            for raw in [None, Some(-1), Some(0), Some(3), Some(8), Some(i32::MAX)] {
+                assert_eq!(
+                    super::memory_pressure_with_kernel_level(observed.clone(), raw),
+                    observed,
+                    "kernel={raw:?}, inferred={inferred:?}"
+                );
+            }
+        }
     }
 
     #[test]
