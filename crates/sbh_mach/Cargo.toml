@@ -5,7 +5,9 @@ edition = "2024"
 license = "MIT"
 description = "Safe macOS Mach task-info adapter for storage_ballast_helper"
 
-[dependencies]
+# macOS-only: off macOS the crate compiles to nothing, so `cargo check
+# --workspace` on a Linux host must not build Apple-only crates.
+[target.'cfg(target_os = "macos")'.dependencies]
 dispatch2 = { version = "0.3.1", default-features = false, features = ["std", "objc2"] }
 libc = "0.2"
 mach2 = "0.7.0"
