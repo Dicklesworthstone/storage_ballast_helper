@@ -52,7 +52,17 @@ impl Fixtures {
         let stale_target = definite_target(&root.join("stale-proj"), stale_age, rlib_bytes);
         let fresh_target = definite_target(&root.join("fresh-proj"), Duration::ZERO, 1024);
         let project = root.join("src-proj");
-        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let git = Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .arg(&project)
+            .output()
+            .expect("initialize real source repository");
+        assert!(
+            git.status.success(),
+            "{}",
+            String::from_utf8_lossy(&git.stderr)
+        );
         let project_target = definite_target(&project, stale_age, 1024);
         Self {
             root,
