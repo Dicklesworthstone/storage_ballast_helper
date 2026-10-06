@@ -2,9 +2,8 @@
 //!
 //! Ballast files are named `SBH_BALLAST_FILE_NNNNN.dat` and contain a 4096-byte
 //! JSON header followed by reserved data blocks. On platforms with native
-//! preallocation, provisioning uses the PAL for instant allocation; on CoW
-//! filesystems (btrfs, zfs), random data is written in 4 MB chunks to defeat
-//! deduplication.
+//! preallocation, provisioning uses the PAL through an exclusively owned file
+//! descriptor; on CoW filesystems, random data is written in 4 MB chunks.
 //!
 //! Access to the ballast directory is serialized via `flock()` on a lockfile so
 //! concurrent daemon + CLI operations don't race.
@@ -28,6 +27,7 @@ use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::Platform;
 
 mod admission;
+mod creation;
 mod emergency;
 mod observation;
 mod repair;
@@ -802,9 +802,7 @@ impl BallastManager {
     }
 
     fn create_ballast_file(&self, index: u32) -> Result<()> {
-        let path = self.file_path(index);
         let size = self.config.file_size_bytes;
-
         if size < HEADER_SIZE as u64 {
             return Err(SbhError::InvalidConfig {
                 details: format!("file_size_bytes ({size}) must be >= HEADER_SIZE ({HEADER_SIZE})"),
@@ -817,50 +815,9 @@ impl BallastManager {
         if repair::existing(self, index)? {
             return Ok(());
         }
-
-        let result = self.write_ballast_file_inner(index, &path, size);
-        if result.is_err() {
-            // Clean up partial file on write error.
-            let _ = fs::remove_file(&path);
-        }
-        result
-    }
-
-    fn write_ballast_file_inner(&self, index: u32, path: &Path, size: u64) -> Result<()> {
-        let header_buf = ballast_header_buffer(index, size)?;
-
-        if !self.skip_fallocate {
-            match self.platform.preallocate_file(path, size) {
-                Ok(()) => {
-                    Self::write_header_to_preallocated_file(path, size, &header_buf)?;
-                    return Ok(());
-                }
-                Err(error) if is_storage_exhausted_error(&error) => return Err(error),
-                Err(_) => {}
-            }
-        }
-
-        let data_size = size - HEADER_SIZE as u64;
-        let mut file = create_truncated_ballast_file(path)?;
-        file.write_all(&header_buf)
-            .map_err(|e| SbhError::io(path, e))?;
-        self.write_random_data(&mut file, data_size, path)?;
-        file.sync_all().map_err(|e| SbhError::io(path, e))?;
-        Ok(())
-    }
-
-    fn write_header_to_preallocated_file(path: &Path, size: u64, header_buf: &[u8]) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(false)
-            .truncate(false)
-            .open(path)
-            .map_err(|e| SbhError::io(path, e))?;
-        file.set_len(size).map_err(|e| SbhError::io(path, e))?;
-        file.write_all(header_buf)
-            .map_err(|e| SbhError::io(path, e))?;
-        file.sync_all().map_err(|e| SbhError::io(path, e))?;
-        Ok(())
+        // The absent check above is advisory: creation itself must be
+        // exclusive, and only its owned inode may be removed on failure.
+        creation::create(self, index)
     }
 
     #[allow(clippy::unused_self)]
@@ -910,17 +867,6 @@ fn ballast_header_buffer(index: u32, size: u64) -> Result<Vec<u8>> {
     Ok(header_buf)
 }
 
-fn create_truncated_ballast_file(path: &Path) -> Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    opts.open(path).map_err(|e| SbhError::io(path, e))
-}
-
 fn record_create_error(
     report: &mut ProvisionReport,
     index: u32,
@@ -949,7 +895,7 @@ fn is_storage_exhausted_error(error: &SbhError) -> bool {
                     method_name,
                     ..
                 },
-        } if method_name == "preallocate_file" => message_mentions_storage_full(details),
+        } if method_name == "preallocate_file" || method_name == "preallocate_open_file" => message_mentions_storage_full(details),
         SbhError::Runtime { details } => message_mentions_storage_full(details),
         _ => false,
     }
@@ -964,7 +910,7 @@ fn io_error_is_storage_full(error: &std::io::Error) -> bool {
 
 #[cfg(unix)]
 fn raw_os_error_is_storage_full(code: i32) -> bool {
-    code == libc::ENOSPC
+    code == libc::ENOSPC || code == libc::EDQUOT
 }
 
 #[cfg(windows)]
@@ -984,6 +930,8 @@ fn message_mentions_storage_full(message: &str) -> bool {
         || message.contains("storage full")
         || message.contains("disk full")
         || message.contains("not enough space")
+        || message.contains("disk quota exceeded")
+        || message.contains("edquot")
 }
 
 fn time_machine_snapshot_release_warning(

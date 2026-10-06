@@ -185,10 +185,25 @@ fn preallocate_descriptor(file: &fs::File, path: &Path, size: u64) -> Result<()>
         use rustix::fs::{FallocateFlags, fallocate};
         use std::os::unix::fs::MetadataExt as _;
 
-        if !file.metadata().map_err(|error| SbhError::io(path, error))?.is_file() {
+        let before = file.metadata().map_err(|error| SbhError::io(path, error))?;
+        if !before.is_file() {
             return Err(SbhError::io(
                 path,
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "allocation requires a regular file"),
+            ));
+        }
+        // rustix 1.1.4 emulates macOS fallocate with F_PREALLOCATE followed
+        // by ftruncate(offset + len). Refuse a smaller request before that
+        // call can discard an existing tail. Fresh exclusive slots are empty;
+        // existing-file repair has its own non-truncating preparation path.
+        #[cfg(target_os = "macos")]
+        if before.len() > size {
+            return Err(SbhError::io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "macOS descriptor preallocation would shrink an existing file",
+                ),
             ));
         }
         fallocate(file, FallocateFlags::empty(), 0, size)
@@ -1116,6 +1131,26 @@ mod tests {
             assert!(file.metadata().unwrap().len() >= 65536);
         } else {
             eprintln!("native allocation refused on this filesystem: {result:?}");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn native_descriptor_request_preserves_an_existing_larger_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("larger-reserve");
+        let contents = vec![0xa5u8; 65536];
+        std::fs::write(&path, &contents).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let result = super::preallocate_descriptor(&file, &path, 8192);
+        assert_eq!(file.metadata().unwrap().len(), 65536);
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+        if cfg!(target_os = "macos") {
+            assert!(matches!(
+                result,
+                Err(crate::core::errors::SbhError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::Unsupported
+            ));
         }
     }
 }
