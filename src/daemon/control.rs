@@ -37,6 +37,7 @@ use serde_json::{Value, json};
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::self_monitor::{DaemonLockProbe, probe_daemon_lock};
 
+mod endpoint;
 mod transport;
 
 #[cfg(test)]
@@ -524,50 +525,25 @@ struct Shared {
     active: Arc<AtomicUsize>,
 }
 
-/// The running listener. Dropping it (or calling [`Self::stop`]) unlinks
-/// the socket.
+/// The running listener. Dropping it (or calling [`Self::stop`]) removes
+/// only the socket it bound, then releases its persistent sidecar lease.
 pub struct ControlServer {
     path: PathBuf,
     shutdown: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
+    endpoint: Option<endpoint::EndpointGuard>,
 }
 
 impl ControlServer {
-    /// Bind `path` (a stale socket file is unlinked first), restrict it to
-    /// the owner, and start serving. `token` is the per-boot secret every
-    /// request must carry.
+    /// Lease `path`, reclaim only a confirmed stale owned socket, restrict
+    /// the new endpoint to its owner, and start serving. Regular files,
+    /// symlinks, live listeners and uncertain liveness are never overwritten.
+    /// `token` is the per-boot secret every request must carry.
     pub fn start(path: &Path, token: &str, backend: Arc<dyn ControlBackend>) -> Result<Self> {
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|source| SbhError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| SbhError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let listener = UnixListener::bind(path).map_err(|source| SbhError::Io {
+        let (listener, endpoint) = endpoint::bind(path).map_err(|source| SbhError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |source| SbhError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                },
-            )?;
-        }
-        listener
-            .set_nonblocking(true)
-            .map_err(|source| SbhError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
@@ -587,6 +563,7 @@ impl ControlServer {
             path: path.to_path_buf(),
             shutdown,
             join: Some(join),
+            endpoint: Some(endpoint),
         })
     }
 
@@ -596,13 +573,13 @@ impl ControlServer {
         &self.path
     }
 
-    /// Stop accepting, join the listener, unlink the socket.
+    /// Stop accepting, join the listener, then clean up the owned endpoint.
     pub fn stop(mut self) {
         self.shutdown.store(true, Ordering::Release);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
-        let _ = std::fs::remove_file(&self.path);
+        drop(self.endpoint.take());
     }
 }
 
@@ -612,7 +589,7 @@ impl Drop for ControlServer {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
-        let _ = std::fs::remove_file(&self.path);
+        drop(self.endpoint.take());
     }
 }
 
@@ -1002,7 +979,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state.json");
         let socket = control_socket_path(&state);
-        std::fs::write(&socket, b"stale").unwrap();
+        // A closed listener leaves a real stale socket, not a regular file
+        // which startup has no authority to delete.
+        drop(UnixListener::bind(&socket).unwrap());
 
         let server = ControlServer::start(&socket, "secret", Arc::new(EchoBackend)).unwrap();
         {
