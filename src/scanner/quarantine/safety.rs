@@ -64,7 +64,33 @@ fn remove_file_if_present(path: &Path) -> io::Result<()> {
 // Lock the directory itself: this needs no lock-file allocation at ENOSPC,
 // works across daemon/CLI processes, and disappears on process death. Never
 // unlink a lock inode or wait indefinitely behind a slow pressure drain.
-fn lock_store(root: &Path) -> io::Result<File> {
+struct StoreLock {
+    file: File,
+    owner_pid: u32,
+}
+
+impl std::ops::Deref for StoreLock {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.owner_pid == std::process::id() {
+            // Closing alone leaves the flock held by any inherited copy of
+            // the open file description. End THIS process's lock scope even
+            // if a child is still between fork and exec. An inherited guard
+            // in a different PID must not unlock its parent's active scope.
+            let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+        }
+    }
+}
+
+fn lock_store(root: &Path) -> io::Result<StoreLock> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -73,7 +99,10 @@ fn lock_store(root: &Path) -> io::Result<File> {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(root)?;
         rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
-        Ok(file)
+        Ok(StoreLock {
+            file,
+            owner_pid: std::process::id(),
+        })
     }
     #[cfg(not(unix))]
     {
@@ -691,6 +720,62 @@ mod tests {
         drop(lock);
         store.restore("locked", false).unwrap();
         assert!(record.original_path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_the_guard_releases_its_lock_while_an_inherited_child_fd_stays_open() {
+        struct Holder(std::process::Child);
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "inherited");
+        let lock = lock_store(store.root()).unwrap();
+        // stdin deliberately retains this same open file description across
+        // exec. The real holder process outlives the parent's lock scope.
+        let mut child = Holder(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "printf ready; exec /bin/sleep 60"])
+                .stdin(std::process::Stdio::from(lock.try_clone().unwrap()))
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut stdout = child.0.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut ready = [0u8; 5];
+            let result = stdout.read_exact(&mut ready).map(|()| ready);
+            let _ = ready_tx.send(result);
+        });
+        assert_eq!(
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            *b"ready"
+        );
+        reader.join().unwrap();
+        assert_eq!(
+            lock_store(store.root()).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock,
+            "the active guard still excludes a competing operation"
+        );
+        assert!(record.quarantine_path.exists());
+        drop(lock);
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "holder is still alive"
+        );
+        store.restore("inherited", false).unwrap();
+        assert_eq!(fs::read(&record.original_path).unwrap(), b"original bytes");
+        assert!(!record.quarantine_path.exists());
+        assert!(store.record("inherited").unwrap().is_none());
+        assert!(child.0.try_wait().unwrap().is_none());
     }
 
     #[test]
