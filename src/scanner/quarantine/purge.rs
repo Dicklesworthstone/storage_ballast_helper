@@ -286,15 +286,57 @@ mod unix {
         }
 
         #[test]
-        fn non_utf8_names_are_removed_without_lossy_path_conversion() {
+        fn native_filename_admission_and_purge_preserve_exact_paths() {
             let temp = tempfile::tempdir().unwrap();
             let (store, record) = held_tree(temp.path(), "bytes");
             let name = OsStr::from_bytes(b"non-utf8-\xff");
             let nested = record.quarantine_path.join(name);
-            fs::create_dir(&nested).unwrap();
-            fs::write(nested.join(name), b"opaque name").unwrap();
+            match fs::create_dir(&nested) {
+                Ok(()) => {
+                    // Retain the arbitrary-byte directory and child proof on
+                    // Linux and any native filesystem admitting these bytes.
+                    fs::write(nested.join(name), b"opaque name").unwrap();
+                    assert_eq!(fs::read(nested.join(name)).unwrap(), b"opaque name");
+                }
+                Err(error) => {
+                    // APFS refuses this fixture before the executor runs. Do
+                    // not replace its bytes with the Unicode replacement
+                    // character or claim that rejection proves byte purge.
+                    #[cfg(not(target_os = "macos"))]
+                    panic!("the raw-byte fixture must be admitted: {error}");
+                    #[cfg(target_os = "macos")]
+                    {
+                        assert_eq!(error.raw_os_error(), Some(libc::EILSEQ));
+                        assert!(!nested.exists());
+                        assert!(
+                            !record
+                                .quarantine_path
+                                .join(name.to_string_lossy().as_ref())
+                                .exists()
+                        );
+                        assert_eq!(
+                            fs::read(record.quarantine_path.join("nested/leaf")).unwrap(),
+                            b"held bytes"
+                        );
+                    }
+                }
+            }
+            // Exercise the actual confined purge on both platforms, with
+            // supported non-ASCII directory and child names, plus a survivor.
+            let supported = OsStr::from_bytes("native-雪-🦀".as_bytes());
+            let supported_dir = record.quarantine_path.join(supported);
+            fs::create_dir(&supported_dir).unwrap();
+            fs::write(supported_dir.join(supported), b"native path").unwrap();
+            assert_eq!(
+                fs::read(supported_dir.join(supported)).unwrap(),
+                b"native path"
+            );
+            let outside = temp.path().join(supported);
+            fs::write(&outside, b"outside survives").unwrap();
             assert_eq!(store.purge("bytes").unwrap(), 100);
             assert!(!record.quarantine_path.exists());
+            assert_eq!(fs::read(outside).unwrap(), b"outside survives");
+            assert!(store.record("bytes").unwrap().is_none());
         }
 
         #[test]
