@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,16 +14,59 @@ use crate::platform::pal::{FsStats, MountPoint, Platform};
 
 #[derive(Debug, Clone)]
 struct CachedStats {
+    binding: MountBinding,
     stats: FsStats,
     collected_at: Instant,
 }
 
+/// The PAL's ownership evidence, including the resolved mount spelling.
+/// A reused pathname alone is not a cache identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountBinding {
+    path: PathBuf,
+    resolved: PathBuf,
+    device: String,
+    fs_type: String,
+    is_ram_backed: bool,
+}
+
+impl MountBinding {
+    fn of(mount: &MountPoint) -> Self {
+        Self {
+            path: mount.path.clone(),
+            resolved: crate::core::paths::resolve_absolute_path(&mount.path),
+            device: mount.device.clone(),
+            fs_type: mount.fs_type.clone(),
+            is_ram_backed: mount.is_ram_backed,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MountSnapshot {
+    bindings: Vec<MountBinding>,
+    collected_at: Instant,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct CollectorState {
+    cache: HashMap<PathBuf, CachedStats>,
+    mounts: Option<MountSnapshot>,
+    generation: u64,
+}
+
 /// Cache-aware, mount-deduplicating filesystem statistics collector.
+///
+/// Readings belong to a discovered mount binding, not merely its path. A
+/// topology refresh invalidates changed bindings, and an in-flight read from
+/// an older discovery cannot publish into the new snapshot. This is a cache
+/// consistency contract, not an atomic kernel mount-namespace snapshot: the
+/// PAL and configured discovery TTL still bound detection of mount changes.
 pub struct FsStatsCollector {
     platform: Arc<dyn Platform>,
     cache_ttl: Duration,
-    cache: RwLock<HashMap<PathBuf, CachedStats>>,
-    mount_cache: RwLock<Option<(Vec<MountPoint>, Instant)>>,
+    state: RwLock<CollectorState>,
 }
 
 impl FsStatsCollector {
@@ -32,19 +75,18 @@ impl FsStatsCollector {
         Self {
             platform,
             cache_ttl,
-            cache: RwLock::new(HashMap::new()),
-            mount_cache: RwLock::new(None),
+            state: RwLock::new(CollectorState::default()),
         }
     }
 
     pub fn collect(&self, path: &Path) -> Result<FsStats> {
         let mounts = self.cached_mounts()?;
         let lookup_path = crate::core::paths::resolve_absolute_path(path);
-        let mount = find_mount(&lookup_path, &mounts).ok_or_else(|| SbhError::FsStats {
+        let mount = find_mount(&lookup_path, &mounts.bindings).ok_or_else(|| SbhError::FsStats {
             path: path.to_path_buf(),
             details: "path does not belong to known mount".to_string(),
         })?;
-        self.collect_for_mount(&mount.path)
+        self.collect_for_mount(mount, mounts.generation)
     }
 
     pub fn collect_many(&self, paths: &[PathBuf]) -> Result<HashMap<PathBuf, FsStats>> {
@@ -56,29 +98,30 @@ impl FsStatsCollector {
             .iter()
             .map(|path| crate::core::paths::resolve_absolute_path(path))
             .collect();
-        let mut mounts_needed = HashSet::<PathBuf>::new();
+        let mut mounts_needed = BTreeMap::new();
+        let mut owners = Vec::with_capacity(paths.len());
         for (path, resolved_path) in paths.iter().zip(&resolved_paths) {
-            let Some(mount) = find_mount(resolved_path, &mounts) else {
+            let Some(mount) = find_mount(resolved_path, &mounts.bindings) else {
                 return Err(SbhError::FsStats {
                     path: path.clone(),
                     details: "path does not belong to known mount".to_string(),
                 });
             };
-            mounts_needed.insert(mount.path.clone());
+            mounts_needed.insert(mount.path.clone(), mount);
+            owners.push((path, mount));
         }
 
         let mut per_mount = HashMap::<PathBuf, FsStats>::new();
-        for mount_path in mounts_needed {
-            let stats = self.collect_for_mount(&mount_path)?;
+        for (mount_path, mount) in mounts_needed {
+            let stats = self.collect_for_mount(mount, mounts.generation)?;
             per_mount.insert(mount_path, stats);
         }
 
+        // Do not assemble a batch across different topology generations.
+        let state = self.state.read();
+        ensure_generation(&state, mounts.generation, &paths[0])?;
         let mut out = HashMap::with_capacity(paths.len());
-        for (path, resolved_path) in paths.iter().zip(&resolved_paths) {
-            let mount = find_mount(resolved_path, &mounts).ok_or_else(|| SbhError::FsStats {
-                path: path.clone(),
-                details: "path does not belong to known mount".to_string(),
-            })?;
+        for (path, mount) in owners {
             let stats = per_mount
                 .get(&mount.path)
                 .cloned()
@@ -95,80 +138,181 @@ impl FsStatsCollector {
     pub fn prune_expired_cache(&self) {
         let now = Instant::now();
         let ttl = self.cache_ttl;
-        self.cache
-            .write()
+        let mut state = self.state.write();
+        state
+            .cache
             .retain(|_, entry| now.duration_since(entry.collected_at) <= ttl);
 
-        // Also clear mount cache if expired.
-        let mut mc = self.mount_cache.write();
-        if let Some((_, cached_at)) = mc.as_ref()
-            && now.duration_since(*cached_at) > ttl
+        if state
+            .mounts
+            .as_ref()
+            .is_some_and(|snapshot| now.duration_since(snapshot.collected_at) > ttl)
         {
-            *mc = None;
+            state.mounts = None;
         }
     }
 
     pub fn set_ttl(&mut self, ttl: Duration) {
+        if self.cache_ttl == ttl {
+            return;
+        }
         self.cache_ttl = ttl;
+        // Increasing a TTL must not resurrect evidence that already expired.
+        let state = self.state.get_mut();
+        state.cache.clear();
+        state.mounts = None;
     }
 
-    fn cached_mounts(&self) -> Result<Vec<MountPoint>> {
+    fn cached_mounts(&self) -> Result<MountSnapshot> {
         {
-            let mc = self.mount_cache.read();
-            if let Some((ref mounts, cached_at)) = *mc
-                && cached_at.elapsed() <= self.cache_ttl
+            let state = self.state.read();
+            if let Some(snapshot) = &state.mounts
+                && snapshot.collected_at.elapsed() <= self.cache_ttl
             {
-                return Ok(mounts.clone());
+                return Ok(snapshot.clone());
             }
         }
-        let fresh = self.platform.mount_points()?;
-        *self.mount_cache.write() = Some((fresh.clone(), Instant::now()));
-        Ok(fresh)
+        // Serialize discoveries, not capacity probes. An older slow discovery
+        // cannot overwrite a newer topology, and concurrent misses share it.
+        let mut state = self.state.write();
+        if let Some(snapshot) = &state.mounts
+            && snapshot.collected_at.elapsed() <= self.cache_ttl
+        {
+            return Ok(snapshot.clone());
+        }
+        state.mounts = None;
+        let collected_at = Instant::now();
+        let bindings: Vec<_> = self
+            .platform
+            .mount_points()?
+            .iter()
+            .map(MountBinding::of)
+            .collect();
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| SbhError::FsStats {
+                path: PathBuf::from("/"),
+                details: "mount discovery generation exhausted".to_string(),
+            })?;
+        let snapshot = MountSnapshot {
+            bindings,
+            collected_at,
+            generation: state.generation,
+        };
+        state
+            .cache
+            .retain(|_, entry| snapshot.bindings.contains(&entry.binding));
+        state.mounts = Some(snapshot.clone());
+        Ok(snapshot)
     }
 
-    fn collect_for_mount(&self, mount_path: &Path) -> Result<FsStats> {
-        if let Some(hit) = self.cache_hit(mount_path) {
-            return Ok(hit);
+    fn collect_for_mount(&self, mount: &MountBinding, generation: u64) -> Result<FsStats> {
+        let collected_at = Instant::now();
+        if crate::core::paths::resolve_absolute_path(&mount.path) != mount.resolved {
+            self.invalidate(mount, generation, collected_at);
+            return Err(changed_mount(&mount.path));
+        }
+        {
+            let state = self.state.read();
+            ensure_generation(&state, generation, &mount.path)?;
+            if let Some(hit) = state.cache.get(&mount.path)
+                && hit.binding == *mount
+                && hit.collected_at.elapsed() <= self.cache_ttl
+            {
+                return Ok(hit.stats.clone());
+            }
         }
 
-        let fresh = self.platform.fs_stats(mount_path)?;
-        self.cache.write().insert(
-            mount_path.to_path_buf(),
+        let fresh = match self.platform.fs_stats(&mount.path) {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                self.invalidate(mount, generation, collected_at);
+                return Err(error);
+            }
+        };
+        if crate::core::paths::resolve_absolute_path(&mount.path) != mount.resolved
+            || crate::core::paths::resolve_absolute_path(&fresh.mount_point) != mount.resolved
+            || fresh.fs_type != mount.fs_type
+        {
+            self.invalidate(mount, generation, collected_at);
+            return Err(changed_mount(&mount.path));
+        }
+        let mut state = self.state.write();
+        ensure_generation(&state, generation, &mount.path)?;
+        if state
+            .cache
+            .get(&mount.path)
+            .is_some_and(|entry| entry.collected_at > collected_at)
+        {
+            // Capacity probes need not finish in the order they started.
+            // Never replace a later observation with this older result.
+            return Err(SbhError::FsStats {
+                path: mount.path.clone(),
+                details: "filesystem reading superseded by a newer observation".to_string(),
+            });
+        }
+        state.cache.insert(
+            mount.path.clone(),
             CachedStats {
+                binding: mount.clone(),
                 stats: fresh.clone(),
-                collected_at: Instant::now(),
+                collected_at,
             },
         );
         Ok(fresh)
     }
 
-    fn cache_hit(&self, mount_path: &Path) -> Option<FsStats> {
-        let cache = self.cache.read();
-        let entry = cache.get(mount_path)?;
-        if entry.collected_at.elapsed() > self.cache_ttl {
-            return None;
+    fn invalidate(&self, mount: &MountBinding, generation: u64, started: Instant) {
+        let mut state = self.state.write();
+        // A late error from an obsolete probe must not evict a newer reading.
+        if state
+            .cache
+            .get(&mount.path)
+            .is_some_and(|entry| entry.collected_at > started)
+        {
+            return;
         }
-        let stats = entry.stats.clone();
-        drop(cache);
-        Some(stats)
+        if state
+            .mounts
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.generation == generation)
+        {
+            state.cache.remove(&mount.path);
+            state.mounts = None;
+        }
     }
 }
 
-fn find_mount<'a>(path: &Path, mounts: &'a [MountPoint]) -> Option<&'a MountPoint> {
+fn changed_mount(path: &Path) -> SbhError {
+    SbhError::FsStats {
+        path: path.to_path_buf(),
+        details: "mount ownership changed during collection; rediscovery required".to_string(),
+    }
+}
+
+fn ensure_generation(state: &CollectorState, generation: u64, path: &Path) -> Result<()> {
+    if state
+        .mounts
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.generation == generation)
+    {
+        Ok(())
+    } else {
+        Err(changed_mount(path))
+    }
+}
+
+fn find_mount<'a>(path: &Path, mounts: &'a [MountBinding]) -> Option<&'a MountBinding> {
     mounts
         .iter()
-        .filter(|mount| path_matches_mount(path, &mount.path))
-        .max_by_key(|mount| mount.path.as_os_str().len())
+        .filter(|mount| path.starts_with(&mount.resolved))
+        // Compare the prefix that matched, not the length of a symlink alias.
+        .max_by_key(|mount| mount.resolved.components().count())
 }
 
-fn path_matches_mount(path: &Path, mount_path: &Path) -> bool {
-    if path.starts_with(mount_path) {
-        return true;
-    }
-
-    let resolved_mount = crate::core::paths::resolve_absolute_path(mount_path);
-    resolved_mount != mount_path && path.starts_with(resolved_mount)
-}
+#[cfg(test)]
+mod topology_tests;
 
 #[cfg(test)]
 mod tests {
