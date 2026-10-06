@@ -7,7 +7,7 @@
 //! 1. Path still exists (may have been cleaned by another process)
 //! 2. Path is not currently open by any process (Linux: /proc/*/fd; macOS: PAL/libproc)
 //! 3. Parent directory is writable
-//! 4. Directory does not contain .git/ (final safety net)
+//! 4. Candidate does not contain Git metadata or tracked repository content
 //! 5. Directory is not a Cargo source root misclassified as a target artifact
 //! 6. Candidate identity still matches the object observed by the scanner
 //! 7. Candidate is not covered by a kernel-held active-target lease
@@ -537,7 +537,7 @@ impl SkipReason {
             Self::TargetFreeReached => "target free space already reached — stopped early",
             Self::PathGone => "path disappeared between scan and delete",
             Self::FileOpen => "a running process holds the path open",
-            Self::ContainsGit => "contains a .git directory (source tree)",
+            Self::ContainsGit => "contains Git metadata or tracked repository content",
             Self::NotWritable => {
                 "parent directory not writable — usually a systemd ReadWritePaths= gap"
             }
@@ -1097,6 +1097,13 @@ impl DeletionExecutor {
             return Err(SkipReason::ContainsGit);
         }
 
+        // A deep source subtree need not contain its repository's .git marker.
+        // This also covers linked worktrees, whose marker is an ancestor file.
+        // Keep tracked content even when its name resembles a build artifact.
+        if contains_tracked_git_content(path) {
+            return Err(SkipReason::ContainsGit);
+        }
+
         // 6. Does not look like a Cargo source root that a target-name
         //    heuristic misclassified. This final guard is intentionally
         //    independent of scoring so stale/buggy candidates cannot reach
@@ -1546,6 +1553,57 @@ fn contains_nested_git(path: &Path, max_depth: usize) -> bool {
     false
 }
 
+/// Veto tracked subtrees independently of source extensions and artifact names.
+/// Untracked build outputs inside a valid repository remain reclaimable. If a
+/// repository marker exists but its index cannot be queried, keep the candidate:
+/// unavailable evidence is never permission to delete possible source.
+fn contains_tracked_git_content(path: &Path) -> bool {
+    let Ok(path) = fs::canonicalize(path) else {
+        return true;
+    };
+    for root in path.ancestors().skip(1) {
+        match fs::symlink_metadata(root.join(".git")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return true,
+            Ok(marker) if marker.file_type().is_symlink() => return true,
+            Ok(_) => {}
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            return true;
+        };
+        let status = std::process::Command::new("git")
+            .args([
+                "--no-optional-locks",
+                "--literal-pathspecs",
+                "-c",
+                "core.fsmonitor=false",
+                "-C",
+            ])
+            .arg(root)
+            .args(["ls-files", "--cached", "--error-unmatch", "--"])
+            .arg(relative)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_NAMESPACE")
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match status.map(|status| status.code()) {
+            // Only Git's explicit unmatched-path result permits continuing.
+            Ok(Some(1)) => {}
+            _ => return true,
+        }
+    }
+    false
+}
+
 /// Hardcoded refusal: paths inside well-known source-tree locations must
 /// never be deleted, regardless of operator config — UNLESS the candidate's
 /// basename clearly identifies it as a build/cache artifact (see
@@ -1670,7 +1728,7 @@ pub(crate) fn source_marker_within(path: &Path, max_entries: usize) -> bool {
     // Source-file extensions — any one direct-child source file vetos.
     const SOURCE_EXTS: &[&str] = &[
         "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "kt", "rb", "ex", "exs", "ml", "hs",
-        "cpp", "cc", "c", "h", "hpp", "swift", "scala", "clj", "cljs", "lua", "jl",
+        "cpp", "cc", "c", "h", "hpp", "swift", "scala", "clj", "cljs", "lua", "jl", "lean",
     ];
 
     let Ok(entries) = fs::read_dir(path) else {
@@ -3305,6 +3363,120 @@ mod tests {
         let dir = scratch_dir();
         fs::write(dir.path().join("main.go"), "package main").unwrap();
         assert!(looks_like_source_code(dir.path()));
+    }
+
+    #[test]
+    fn preflight_keeps_lean_sources_outside_a_repository() {
+        let dir = scratch_dir();
+        fs::write(dir.path().join("Build.LEAN"), "def kept : Nat := 7").unwrap();
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        assert_eq!(
+            executor.explain_preflight(&make_candidate(dir.path(), 1, 1.0), None),
+            Err(SkipReason::LooksLikeSourceCode)
+        );
+    }
+
+    #[test]
+    fn preflight_keeps_tracked_worktree_subtrees_but_allows_untracked_artifacts() {
+        let dir = scratch_dir();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("vendor/lean4-src/src/lake/Lake/Build")).unwrap();
+        fs::create_dir_all(repo.join("vendor/assets/build")).unwrap();
+        fs::write(
+            repo.join("vendor/lean4-src/src/lake/Lake/Build/Job.lean"),
+            "def job := 7",
+        )
+        .unwrap();
+        // Protection must not rely on a known language extension.
+        fs::write(
+            repo.join("vendor/assets/build/spec.payload"),
+            "useful source",
+        )
+        .unwrap();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["add", "vendor"]);
+        git(&[
+            "-c",
+            "user.name=SBH regression",
+            "-c",
+            "user.email=sbh-regression@example.invalid",
+            "commit",
+            "-m",
+            "tracked source control",
+        ]);
+        let worktree = dir.path().join("worktree");
+        git(&[
+            "worktree",
+            "add",
+            "--detach",
+            worktree.to_str().unwrap(),
+            "HEAD",
+        ]);
+        assert!(worktree.join(".git").is_file());
+        let artifact = worktree.join("target/debug/build");
+        fs::create_dir_all(&artifact).unwrap();
+        fs::write(artifact.join("generated.o"), "object bytes").unwrap();
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        for (relative, first_veto) in [
+            (
+                "vendor/lean4-src/src/lake/Lake/Build",
+                SkipReason::LooksLikeSourceCode,
+            ),
+            ("vendor/assets/build", SkipReason::ContainsGit),
+        ] {
+            let path = worktree.join(relative);
+            assert!(
+                contains_tracked_git_content(&path),
+                "tracked subtree {relative}"
+            );
+            assert_eq!(
+                executor.explain_preflight(&make_candidate(&path, 1, 1.0), None),
+                Err(first_veto),
+                "tracked subtree {relative}"
+            );
+        }
+        assert_eq!(
+            executor.explain_preflight(&make_candidate(&artifact, 1, 1.0), None),
+            Ok(())
+        );
+        assert_eq!(
+            executor.explain_preflight(
+                &make_candidate(&repo.join("vendor/assets/build/spec.payload"), 1, 1.0),
+                None
+            ),
+            Err(SkipReason::ContainsGit)
+        );
+    }
+
+    #[test]
+    fn preflight_keeps_content_when_ancestor_git_evidence_is_broken() {
+        let dir = scratch_dir();
+        fs::write(
+            dir.path().join(".git"),
+            "gitdir: /missing/sbh-regression-gitdir\n",
+        )
+        .unwrap();
+        let artifact = dir.path().join("target/debug/build");
+        fs::create_dir_all(&artifact).unwrap();
+        fs::write(artifact.join("generated.o"), "object bytes").unwrap();
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        assert_eq!(
+            executor.explain_preflight(&make_candidate(&artifact, 1, 1.0), None),
+            Err(SkipReason::ContainsGit)
+        );
     }
 
     #[test]
