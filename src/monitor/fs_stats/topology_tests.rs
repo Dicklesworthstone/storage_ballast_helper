@@ -127,14 +127,47 @@ fn fixture() -> Fixture {
     (temp, path, platform, collector)
 }
 
+#[test]
+fn live_native_temporary_root_has_a_valid_cached_capacity_observation() {
+    let directory = tempfile::tempdir().unwrap();
+    let platform = crate::platform::pal::detect_platform().unwrap();
+    let collector = FsStatsCollector::new(platform.clone(), Duration::from_secs(60));
+    let observation = collector.collect(directory.path());
+    if observation.is_err() {
+        let snapshot = collector.cached_mounts().unwrap();
+        let resolved = crate::core::paths::resolve_absolute_path(directory.path());
+        let binding = find_mount(&resolved, &snapshot.bindings).unwrap();
+        eprintln!(
+            "native root={resolved:?} binding={binding:?} direct={:?}",
+            platform.fs_stats(&binding.path)
+        );
+    }
+    let observation = observation.expect("a real temporary scan root has usable native statistics");
+    let physical = platform.fs_stats(directory.path()).unwrap();
+    assert_eq!(observation.mount_point, physical.mount_point);
+    assert_eq!(observation.is_readonly, physical.is_readonly);
+    assert!(!observation.fs_type.is_empty());
+    assert_eq!(collector.collect(directory.path()).unwrap(), observation);
+}
+
 fn expire_discovery(collector: &FsStatsCollector) {
-    collector.state.write().mounts.as_mut().unwrap().collected_at =
-        Instant::now().checked_sub(Duration::from_hours(1)).unwrap();
+    collector
+        .state
+        .write()
+        .mounts
+        .as_mut()
+        .unwrap()
+        .collected_at = Instant::now().checked_sub(Duration::from_hours(1)).unwrap();
 }
 
 fn expire_sample(collector: &FsStatsCollector, path: &Path) {
-    collector.state.write().cache.get_mut(path).unwrap().collected_at =
-        Instant::now().checked_sub(Duration::from_hours(1)).unwrap();
+    collector
+        .state
+        .write()
+        .cache
+        .get_mut(path)
+        .unwrap()
+        .collected_at = Instant::now().checked_sub(Duration::from_hours(1)).unwrap();
 }
 
 #[test]

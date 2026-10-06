@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Cursor, Read};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -323,17 +324,29 @@ impl FirmlinkMap {
 }
 
 pub fn statfs(path: &Path) -> io::Result<StatfsSnapshot> {
-    let raw = nix_statfs(path).map_err(nix_error)?;
-    let location = whichdisk::resolve(path).ok();
-    let mount_point = location.as_ref().map_or_else(
-        || path.to_path_buf(),
-        |info| info.mount_point().to_path_buf(),
-    );
-    let device = location
-        .as_ref()
-        .map_or_else(String::new, |info| os_str_to_string(info.device()));
+    // APFS volumes can share st_dev. A separately cached mount label must
+    // not be combined with another volume's fresh counters and flags.
+    let raw = rustix::fs::statfs(path).map_err(io::Error::from)?;
+    Ok(StatfsSnapshot {
+        mount_point: PathBuf::from(statfs_name(&raw.f_mntonname)),
+        device: os_str_to_string(&statfs_name(&raw.f_mntfromname)),
+        fs_type: os_str_to_string(&statfs_name(&raw.f_fstypename)),
+        block_size: u64::from(raw.f_bsize),
+        blocks: raw.f_blocks,
+        blocks_free: raw.f_bfree,
+        blocks_available: raw.f_bavail,
+        is_readonly: raw.f_flags & libc::MNT_RDONLY.unsigned_abs() != 0,
+    })
+}
 
-    Ok(snapshot_from_statfs(&raw, mount_point, device))
+fn statfs_name(field: &[libc::c_char]) -> OsString {
+    OsString::from_vec(
+        field
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .map(|byte| byte.to_ne_bytes()[0])
+            .collect(),
+    )
 }
 
 pub fn mounted_filesystems() -> io::Result<Vec<StatfsSnapshot>> {
@@ -1783,6 +1796,55 @@ mod tests {
         assert!(stats.total_bytes() > stats.available_bytes());
         assert!(!stats.fs_type.is_empty());
         assert!(stats.mount_point.is_absolute());
+    }
+
+    #[test]
+    fn statfs_names_preserve_native_bytes_and_stop_at_the_first_nul() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let field = [
+            libc::c_char::from_ne_bytes(*b"/"),
+            libc::c_char::from_ne_bytes(*b"a"),
+            libc::c_char::from_ne_bytes([0xff]),
+            0,
+            libc::c_char::from_ne_bytes(*b"b"),
+        ];
+        let name = super::statfs_name(&field);
+        assert_eq!(name.as_os_str().as_bytes(), b"/a\xff");
+    }
+
+    #[test]
+    fn statfs_keeps_each_native_owner_when_shared_device_cache_is_primed() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_path = directory.path().to_path_buf();
+        let first_path = data_path.clone();
+        let expected_data = std::thread::spawn(move || {
+            // A fresh thread gives whichdisk an empty per-thread cache.
+            let data = whichdisk::resolve(&first_path).unwrap();
+            let kernel_root = mounted_filesystems()
+                .unwrap()
+                .into_iter()
+                .find(|mount| mount.mount_point == Path::new("/"))
+                .unwrap();
+            let root = statfs(Path::new("/")).unwrap();
+            assert_eq!(root.mount_point, kernel_root.mount_point);
+            assert_eq!(root.device, kernel_root.device);
+            assert_eq!(root.is_readonly, kernel_root.is_readonly);
+            (
+                data.mount_point().to_path_buf(),
+                data.device().to_os_string(),
+            )
+        })
+        .join()
+        .unwrap();
+        std::thread::spawn(move || {
+            let _root = whichdisk::resolve("/").unwrap();
+            let data = statfs(&data_path).unwrap();
+            assert_eq!(data.mount_point, expected_data.0);
+            assert_eq!(OsString::from(data.device), expected_data.1);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

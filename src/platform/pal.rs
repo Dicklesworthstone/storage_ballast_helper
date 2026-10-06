@@ -280,6 +280,11 @@ pub trait Platform: Send + Sync {
 
     fn fs_stats(&self, path: &Path) -> Result<FsStats>;
     fn mount_points(&self) -> Result<Vec<MountPoint>>;
+    /// Resolve a path in the namespace used by this platform's mount table.
+    /// Native platforms may need more than symlink resolution (APFS firmlinks).
+    fn mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
+        Ok(crate::core::paths::resolve_absolute_path(path))
+    }
     fn is_ram_backed(&self, path: &Path) -> Result<bool>;
     fn default_paths(&self) -> PlatformPaths;
     fn memory_info(&self) -> Result<MemoryInfo>;

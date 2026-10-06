@@ -81,11 +81,12 @@ impl FsStatsCollector {
 
     pub fn collect(&self, path: &Path) -> Result<FsStats> {
         let mounts = self.cached_mounts()?;
-        let lookup_path = crate::core::paths::resolve_absolute_path(path);
-        let mount = find_mount(&lookup_path, &mounts.bindings).ok_or_else(|| SbhError::FsStats {
-            path: path.to_path_buf(),
-            details: "path does not belong to known mount".to_string(),
-        })?;
+        let lookup_path = self.platform.mount_lookup_path(path)?;
+        let mount =
+            find_mount(&lookup_path, &mounts.bindings).ok_or_else(|| SbhError::FsStats {
+                path: path.to_path_buf(),
+                details: "path does not belong to known mount".to_string(),
+            })?;
         self.collect_for_mount(mount, mounts.generation)
     }
 
@@ -96,8 +97,8 @@ impl FsStatsCollector {
         let mounts = self.cached_mounts()?;
         let resolved_paths: Vec<PathBuf> = paths
             .iter()
-            .map(|path| crate::core::paths::resolve_absolute_path(path))
-            .collect();
+            .map(|path| self.platform.mount_lookup_path(path))
+            .collect::<Result<_>>()?;
         let mut mounts_needed = BTreeMap::new();
         let mut owners = Vec::with_capacity(paths.len());
         for (path, resolved_path) in paths.iter().zip(&resolved_paths) {
@@ -122,14 +123,14 @@ impl FsStatsCollector {
         ensure_generation(&state, mounts.generation, &paths[0])?;
         let mut out = HashMap::with_capacity(paths.len());
         for (path, mount) in owners {
-            let stats = per_mount
+            let reading = per_mount
                 .get(&mount.path)
                 .cloned()
                 .ok_or_else(|| SbhError::FsStats {
                     path: mount.path.clone(),
                     details: "mount stats missing after collection".to_string(),
                 })?;
-            out.insert(path.clone(), stats);
+            out.insert(path.clone(), reading);
         }
 
         Ok(out)
@@ -204,6 +205,7 @@ impl FsStatsCollector {
             .cache
             .retain(|_, entry| snapshot.bindings.contains(&entry.binding));
         state.mounts = Some(snapshot.clone());
+        drop(state);
         Ok(snapshot)
     }
 
@@ -260,6 +262,7 @@ impl FsStatsCollector {
                 collected_at,
             },
         );
+        drop(state);
         Ok(fresh)
     }
 

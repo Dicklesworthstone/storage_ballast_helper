@@ -282,6 +282,13 @@ impl Platform for TestOverlayPlatform {
         Ok(mounts)
     }
 
+    fn mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
+        self.table.owner(path).map_or_else(
+            || self.inner.mount_lookup_path(path),
+            |_| Ok(crate::core::paths::resolve_absolute_path(path)),
+        )
+    }
+
     fn is_ram_backed(&self, path: &Path) -> Result<bool> {
         self.table.owner(path).map_or_else(
             || self.inner.is_ram_backed(path),
