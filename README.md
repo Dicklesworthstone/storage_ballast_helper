@@ -1406,6 +1406,17 @@ The PID controller's pressure response directly determines how many ballast file
 
 Release is instant (just `unlink()`), providing space recovery in milliseconds rather than the seconds-to-minutes required for scanning and deletion.
 
+Graduated release targets count observed depletion of the physical reserve,
+rather than configured slots that might never have been provisioned. The daemon
+carries that observation in each pool's existing `state.json` record, bound to
+the directory's device, inode and creation time when the filesystem supplies it.
+A restart over the same pool keeps prior release credit; recreated reserve
+retires the credit, and a replaced pool begins a new window. Config reload keeps
+the observed window while updating the replenish cooldown. Missing, unreadable
+or non-matching history leaves the actual partial reserve usable. Critical
+pressure still releases the available reserve. State persistence retains the
+existing write cadence; emergency release adds no history-file writes or waits.
+
 On macOS/APFS, local Time Machine snapshots can retain the released ballast blocks. In that case the release operation succeeds, but apparent free space in `df`, Finder, and some system APIs may not increase until one of these happens:
 
 - The relevant local snapshots are thinned with `sudo tmutil thinlocalsnapshots <mount> 9999999999999999 4`.

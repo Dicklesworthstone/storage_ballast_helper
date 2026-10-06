@@ -1531,6 +1531,103 @@ fn red_pressure_releases_the_whole_pool_before_scanning() {
     assert_log_conforms(&dir.path().join("data"));
 }
 
+/// Wait for this process's physical pool snapshot, not its predecessor's file.
+fn wait_for_pool_history(run: &mut DaemonRun, mount: &Path, available: u64, credit: u64) {
+    let pid = u64::from(run.child.id());
+    let wanted = mount.display().to_string();
+    run.wait_for_state(
+        "this daemon's observed release inventory",
+        Duration::from_secs(45),
+        |state| {
+            state["pid"].as_u64() == Some(pid)
+                && state["ballast_pools"].as_array().is_some_and(|pools| {
+                    pools.iter().any(|pool| {
+                        pool["mount"] == wanted
+                            && pool["available"].as_u64() == Some(available)
+                            && pool["release_history"]["release_credit"].as_u64() == Some(credit)
+                    })
+                })
+        },
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+}
+
+#[test]
+fn daemon_restart_retains_observed_credit_and_absent_history_releases_partial_reserve() {
+    let dir = scratch();
+    let scan_root = dir.path().join("scan-root");
+    fs::create_dir(&scan_root).unwrap();
+    let mount = dir.path();
+    let (root, total, free, readonly) = quiet_root_mount();
+    let after_release = 80_000_000_000 + 5 * 1_048_576;
+    let first_pressure = table_of(&[
+        mount_entry(
+            mount,
+            1_000_000_000_000,
+            500_000_000_000,
+            false,
+            &[(12, 80_000_000_000), (13, after_release)],
+        ),
+        mount_entry(root, total, free, readonly, &[]),
+    ]);
+    let sustained_pressure = injected_table(&[
+        (mount, 1_000_000_000_000, after_release, false),
+        (root, total, free, readonly),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![scan_root],
+        ballast_files: 5,
+        // Stable Red requests three files without an urgency-all fallback.
+        // Injected free space includes the first release before eta settles.
+        extra_toml: "[pressure.controller]\nkp = 0.01\nki = 0.0\nkd = 0.0\nkf = 0.0\n[pressure.prediction]\nenabled = false\n".to_string(),
+        ..ScenarioConfig::default()
+    };
+    let mut original = DaemonRun::spawn(dir.path(), &scenario, Some(&first_pressure));
+    wait_for_pool_history(&mut original, mount, 2, 3);
+    assert_eq!(original.events_of("ballast_release").len(), 3);
+    assert!(original.stop().success());
+    fs::copy(
+        dir.path().join("daemon.stderr"),
+        dir.path().join("first-daemon.stderr"),
+    )
+    .unwrap();
+    fs::copy(
+        dir.path().join("data/state.json"),
+        dir.path().join("first-state.json"),
+    )
+    .unwrap();
+
+    let mut restarted = DaemonRun::spawn(dir.path(), &scenario, Some(&sustained_pressure));
+    wait_for_pool_history(&mut restarted, mount, 2, 3);
+    restarted
+        .wait_until(
+            "eight seconds of sustained Red without extra release",
+            Duration::from_secs(15),
+            |run| run.wall_secs() >= 8.0,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(restarted.events_of("ballast_release").len(), 3);
+    assert_eq!(ballast_files_in(&restarted.data_dir.join("ballast")), 2);
+    assert!(restarted.stop().success());
+    fs::copy(
+        dir.path().join("daemon.stderr"),
+        dir.path().join("restarted-daemon.stderr"),
+    )
+    .unwrap();
+
+    // Preserve the checkpoint bytes while removing the observation input.
+    // A configured shortfall cannot substitute for that missing evidence.
+    let saved_state = dir.path().join("state-with-history.json");
+    assert!(!saved_state.exists());
+    fs::rename(dir.path().join("data/state.json"), &saved_state).unwrap();
+    let mut unobserved = DaemonRun::spawn(dir.path(), &scenario, Some(&sustained_pressure));
+    wait_for_pool_history(&mut unobserved, mount, 0, 2);
+    assert_eq!(unobserved.events_of("ballast_release").len(), 5);
+    assert_eq!(ballast_files_in(&unobserved.data_dir.join("ballast")), 0);
+    assert!(saved_state.exists());
+    assert!(unobserved.stop().success());
+}
+
 /// Scenario `forced-scan`: SIGUSR1 at Green produces a forced
 /// `scan_complete` within two seconds and deletes nothing behind the
 /// default age gate.

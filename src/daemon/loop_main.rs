@@ -2870,8 +2870,25 @@ impl MonitoringDaemon {
         }
 
         // 7. Release controller.
-        let release_controller =
+        let mut release_controller =
             BallastReleaseController::new(config.ballast.replenish_cooldown_minutes);
+        if let Ok(previous) = SelfMonitor::read_state(&config.paths.state_file) {
+            for saved in previous.ballast_pools {
+                let mount = PathBuf::from(&saved.mount);
+                let Some(pool) = ballast_coordinator.pool_for_mount(&mount) else {
+                    continue;
+                };
+                if saved.skipped {
+                    continue;
+                }
+                if let Some(history) = saved.release_history
+                    && release_controller.restore_pool_history(&mount, &pool.ballast_dir, history)
+                    && let Some(efficiency) = saved.release_efficiency
+                {
+                    release_controller.set_release_efficiency(&mount, efficiency);
+                }
+            }
+        }
 
         // 8. Scoring engine.
         let scoring_engine =
@@ -3484,6 +3501,9 @@ impl MonitoringDaemon {
         }
         let mut pools = Vec::new();
         for mount in mounts {
+            if let Some(pool) = self.ballast_coordinator.pool_for_mount(&mount) {
+                self.release_controller.bind_pool(&mount, &pool.ballast_dir);
+            }
             // Operator-driven changes are logged like the daemon's own so the
             // Timeline and `sbh stats` see them; the release controller is
             // told too, so an operator's release is not refilled at once.
@@ -3654,30 +3674,40 @@ impl MonitoringDaemon {
             .ballast_coordinator
             .inventory()
             .into_iter()
-            .map(|pool| super::self_monitor::BallastPoolState {
-                mount: pool.mount_point.display().to_string(),
-                ballast_dir: pool.ballast_dir.display().to_string(),
-                fs_type: pool.fs_type,
-                strategy: match pool.strategy {
-                    super::super::ballast::coordinator::ProvisionStrategy::Fallocate => {
-                        "fallocate".to_string()
-                    }
-                    super::super::ballast::coordinator::ProvisionStrategy::RandomData => {
-                        "random_data".to_string()
-                    }
-                    super::super::ballast::coordinator::ProvisionStrategy::Skip => {
-                        "skip".to_string()
-                    }
-                },
-                available: pool.files_available,
-                total: pool.files_total,
-                releasable_bytes: pool.releasable_bytes,
-                skipped: pool.skipped,
-                skip_reason: pool.skip_reason,
-                release_efficiency: Some(
-                    self.release_controller
-                        .release_efficiency(&pool.mount_point),
-                ),
+            .map(|pool| {
+                // Bind/reset the physical observation before serializing its
+                // efficiency, so a replacement cannot inherit the old eta.
+                let release_history = self.release_controller.pool_history(
+                    &pool.mount_point,
+                    &pool.ballast_dir,
+                    pool.files_available,
+                );
+                super::self_monitor::BallastPoolState {
+                    mount: pool.mount_point.display().to_string(),
+                    ballast_dir: pool.ballast_dir.display().to_string(),
+                    fs_type: pool.fs_type,
+                    strategy: match pool.strategy {
+                        super::super::ballast::coordinator::ProvisionStrategy::Fallocate => {
+                            "fallocate".to_string()
+                        }
+                        super::super::ballast::coordinator::ProvisionStrategy::RandomData => {
+                            "random_data".to_string()
+                        }
+                        super::super::ballast::coordinator::ProvisionStrategy::Skip => {
+                            "skip".to_string()
+                        }
+                    },
+                    available: pool.files_available,
+                    total: pool.files_total,
+                    releasable_bytes: pool.releasable_bytes,
+                    skipped: pool.skipped,
+                    skip_reason: pool.skip_reason,
+                    release_efficiency: Some(
+                        self.release_controller
+                            .release_efficiency(&pool.mount_point),
+                    ),
+                    release_history,
+                }
             })
             .collect();
         pools.sort_by(|a, b| a.mount.cmp(&b.mount));
@@ -5124,6 +5154,9 @@ impl MonitoringDaemon {
         mount: &Path,
         response: &crate::monitor::pid::PressureResponse,
     ) {
+        if let Some(pool) = self.ballast_coordinator.pool_for_mount(mount) {
+            self.release_controller.bind_pool(mount, &pool.ballast_dir);
+        }
         let fs_type = self
             .fs_collector
             .collect(mount)
@@ -5232,6 +5265,8 @@ impl MonitoringDaemon {
         else {
             return false;
         };
+        self.release_controller
+            .bind_pool(mount, &pool_info.ballast_dir);
         if !self.release_controller.is_ready_for_replenish(
             mount,
             level,
@@ -5283,6 +5318,7 @@ impl MonitoringDaemon {
         };
         let available = pool.available_count();
         let expected = pool.expected_count();
+        self.release_controller.bind_pool(mount, &pool.ballast_dir);
         let count = self
             .release_controller
             .files_to_release(mount, response, available, expected);
@@ -5918,10 +5954,8 @@ impl MonitoringDaemon {
                         &new_config.scoring,
                         new_config.scanner.min_file_age_minutes,
                     );
-                    self.release_controller = BallastReleaseController::new(
-                        new_config.ballast.replenish_cooldown_minutes,
-                    );
-                    self.release_controller.reset();
+                    self.release_controller
+                        .set_replenish_cooldown(new_config.ballast.replenish_cooldown_minutes);
                     let discovery_paths =
                         ballast_discovery_paths(&new_config, &self.special_locations);
                     match BallastPoolCoordinator::discover_inner(

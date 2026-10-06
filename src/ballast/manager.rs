@@ -359,6 +359,10 @@ pub struct BallastManager {
     /// Percent of the volume that must remain free after each ballast file
     /// is created. See [`DEFAULT_PROVISION_FLOOR_PCT`].
     provision_floor_pct: f64,
+    /// Last controller observation for this manager's physical directory.
+    /// A fresh controller can retain actual release credit without treating
+    /// never-provisioned configured slots as releases.
+    release_history: Option<super::release::BallastReleaseHistory>,
 }
 
 /// Outcome of the per-file headroom check.
@@ -395,6 +399,7 @@ impl BallastManager {
             platform,
             skip_fallocate: false,
             provision_floor_pct: DEFAULT_PROVISION_FLOOR_PCT,
+            release_history: None,
         };
         mgr.scan_existing();
         Ok(mgr)
@@ -435,6 +440,18 @@ impl BallastManager {
     /// Number of ballast files currently available, not configured capacity.
     pub fn available_count(&self) -> usize {
         self.inventory.len()
+    }
+
+    pub(crate) fn release_history(&self) -> Option<super::release::BallastReleaseHistory> {
+        self.release_history
+            .filter(|history| history.matches_pool(&self.ballast_dir))
+    }
+
+    pub(crate) fn remember_release_history(
+        &mut self,
+        history: Option<super::release::BallastReleaseHistory>,
+    ) {
+        self.release_history = history.filter(|history| history.matches_pool(&self.ballast_dir));
     }
 
     /// Configured total pool size (`file_count × file_size_bytes`, saturating).

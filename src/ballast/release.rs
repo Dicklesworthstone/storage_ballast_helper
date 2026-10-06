@@ -22,6 +22,53 @@ use crate::ballast::manager::{BallastManager, ReleaseReport};
 use crate::core::errors::Result;
 use crate::monitor::pid::{PressureLevel, PressureResponse};
 
+/// Observed release inventory bound to one physical pool directory.
+///
+/// This is restart state, not configured capacity: only counts supplied by an
+/// actual pool enter the observation window. A replaced or redirected pool
+/// cannot inherit the previous directory's depletion credit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BallastReleaseHistory {
+    identity: PoolIdentity,
+    available: usize,
+    release_credit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PoolIdentity {
+    device_id: u64,
+    directory_inode: u64,
+    directory_created_at: Option<(u64, u32)>,
+}
+
+impl BallastReleaseHistory {
+    fn pool_identity(directory: &Path) -> Option<PoolIdentity> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::symlink_metadata(directory).ok()?;
+            (metadata.is_dir() && !metadata.file_type().is_symlink()).then(|| PoolIdentity {
+                device_id: metadata.dev(),
+                directory_inode: metadata.ino(),
+                directory_created_at: metadata
+                    .created()
+                    .ok()
+                    .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|created| (created.as_secs(), created.subsec_nanos())),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = directory;
+            None
+        }
+    }
+
+    pub(crate) fn matches_pool(&self, directory: &Path) -> bool {
+        Self::pool_identity(directory) == Some(self.identity)
+    }
+}
+
 // ──────────────────── release controller ────────────────────
 
 /// Minimum duration to wait after a release before measuring observed delta free (5 seconds).
@@ -41,6 +88,8 @@ pub struct PendingRelease {
 /// Per-mount state for release/replenishment tracking.
 #[derive(Debug)]
 struct MountReleaseState {
+    /// The physical directory supplying this mount's observations.
+    pool_identity: Option<PoolIdentity>,
     /// When we last released ballast (for cooldown calculation).
     last_release_time: Option<Instant>,
     /// When pressure first returned to Green (for replenishment cooldown).
@@ -72,6 +121,7 @@ struct MountReleaseState {
 impl Default for MountReleaseState {
     fn default() -> Self {
         Self {
+            pool_identity: None,
             last_release_time: None,
             green_since: None,
             last_replenish_time: None,
@@ -119,6 +169,9 @@ pub struct BallastReleaseController {
     replenish_cooldown: Duration,
     /// Minimum interval between reserve validation/growth attempts.
     replenish_interval: Duration,
+    /// An explicit reset starts a new window; a fresh controller may inherit
+    /// the manager's last real observation instead of forgetting depletion.
+    inherit_manager_history: bool,
 }
 
 impl BallastReleaseController {
@@ -128,15 +181,83 @@ impl BallastReleaseController {
             states: HashMap::new(),
             replenish_cooldown: Duration::from_secs(replenish_cooldown_minutes * 60),
             replenish_interval: Duration::from_mins(5), // 5 min between attempts
+            inherit_manager_history: true,
         }
+    }
+
+    /// Capture the current observed window for the existing state-file writer.
+    pub(crate) fn pool_history(
+        &mut self,
+        mount_path: &Path,
+        directory: &Path,
+        available: usize,
+    ) -> Option<BallastReleaseHistory> {
+        let state = self.state_for_pool(mount_path, directory)?;
+        state.observe_inventory(available);
+        let identity = state.pool_identity?;
+        Some(BallastReleaseHistory {
+            identity,
+            available,
+            release_credit: state.release_credit,
+        })
+    }
+
+    fn state_for_pool(
+        &mut self,
+        mount_path: &Path,
+        directory: &Path,
+    ) -> Option<&mut MountReleaseState> {
+        let identity = BallastReleaseHistory::pool_identity(directory)?;
+        let state = self.states.entry(mount_path.to_path_buf()).or_default();
+        if state.pool_identity.is_some_and(|old| old != identity) {
+            *state = MountReleaseState::default();
+        }
+        state.pool_identity = Some(identity);
+        Some(state)
+    }
+
+    pub(crate) fn bind_pool(&mut self, mount_path: &Path, directory: &Path) {
+        let _ = self.state_for_pool(mount_path, directory);
+    }
+
+    /// Change the cooldown without discarding the observed reserve window.
+    pub(crate) fn set_replenish_cooldown(&mut self, minutes: u64) {
+        self.replenish_cooldown = Duration::from_secs(minutes.saturating_mul(60));
+    }
+
+    /// Restore only a still-matching pool before its first new observation.
+    pub(crate) fn restore_pool_history(
+        &mut self,
+        mount_path: &Path,
+        directory: &Path,
+        history: BallastReleaseHistory,
+    ) -> bool {
+        if !history.matches_pool(directory)
+            || history
+                .available
+                .checked_add(history.release_credit)
+                .is_none()
+        {
+            return false;
+        }
+        let Some(state) = self.state_for_pool(mount_path, directory) else {
+            return false;
+        };
+        if state.last_available_count.is_some() {
+            return false;
+        }
+        state.last_available_count = Some(history.available);
+        state.release_credit = history.release_credit;
+        true
     }
 
     /// Determine how many ballast files to release based on PID urgency.
     ///
     /// `available` must be the pool's fresh physical inventory. The configured
     /// total is retained for API compatibility, but cannot prove that absent
-    /// files were ever provisioned or released. After startup/reset, begin a
-    /// new observed release window instead of stranding a partial reserve.
+    /// files were ever provisioned or released. Without matching startup
+    /// history, or after an explicit reset, begin a new observed release window
+    /// instead of stranding a partial reserve.
     /// Returns 0 if no release is needed (Green/Yellow with low urgency).
     pub fn files_to_release(
         &mut self,
@@ -203,6 +324,12 @@ impl BallastReleaseController {
         manager: &mut BallastManager,
         response: &PressureResponse,
     ) -> Result<Option<ReleaseReport>> {
+        self.bind_pool(mount_path, manager.ballast_dir());
+        if self.inherit_manager_history
+            && let Some(history) = manager.release_history()
+        {
+            self.restore_pool_history(mount_path, manager.ballast_dir(), history);
+        }
         let to_release = self.files_to_release(
             mount_path,
             response,
@@ -210,16 +337,19 @@ impl BallastReleaseController {
             manager.config().file_count,
         );
 
-        if to_release == 0 {
-            return Ok(None);
-        }
-
-        let report = manager.release(to_release)?;
-        if report.files_released > 0 {
-            self.on_released(mount_path, report.files_released);
-        }
-
-        Ok(Some(report))
+        let result = if to_release == 0 {
+            None
+        } else {
+            let report = manager.release(to_release)?;
+            if report.files_released > 0 {
+                self.on_released(mount_path, report.files_released);
+            }
+            Some(report)
+        };
+        let history =
+            self.pool_history(mount_path, manager.ballast_dir(), manager.available_count());
+        manager.remember_release_history(history);
+        Ok(result)
     }
 
     /// Record a successful release event.
@@ -346,6 +476,7 @@ impl BallastReleaseController {
         current_level: PressureLevel,
         free_pct_check: &dyn Fn() -> f64,
     ) -> Result<bool> {
+        self.bind_pool(mount_path, manager.ballast_dir());
         self.observe_level(mount_path, current_level);
         if !self.is_ready_for_replenish(
             mount_path,
@@ -434,9 +565,10 @@ impl BallastReleaseController {
         state.released_since_green = state.released_since_green.saturating_sub(count);
     }
 
-    /// Reset all state (e.g., after config reload).
+    /// Explicitly start a new observation and cooldown window.
     pub fn reset(&mut self) {
         self.states.clear();
+        self.inherit_manager_history = false;
     }
 }
 
@@ -472,6 +604,266 @@ mod tests {
             free_pct: 5.0,
             predicted_seconds: None,
         }
+    }
+
+    #[test]
+    fn release_history_survives_fresh_manager_and_real_state_file() {
+        use crate::daemon::self_monitor::{BallastPoolState, DaemonState, SelfMonitor};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("pool");
+        let mut manager = BallastManager::new_unfloored(directory.clone(), test_config()).unwrap();
+        manager.provision(None).unwrap();
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        let mut original = BallastReleaseController::new(0);
+        original
+            .maybe_release(&directory, &mut manager, &red)
+            .unwrap();
+        assert_eq!(manager.available_count(), 2);
+        let history = original.pool_history(&directory, &directory, 2).unwrap();
+        let state = DaemonState {
+            ballast_pools: vec![BallastPoolState {
+                mount: directory.display().to_string(),
+                ballast_dir: directory.display().to_string(),
+                available: manager.available_count(),
+                total: manager.config().file_count,
+                releasable_bytes: manager.releasable_bytes(),
+                release_history: Some(history),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state_path = fixture.path().join("state.json");
+        std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        drop(original);
+        drop(manager);
+
+        let saved = SelfMonitor::read_state(&state_path).unwrap();
+        let mut restarted = BallastReleaseController::new(0);
+        let mut manager = BallastManager::new_unfloored(directory.clone(), test_config()).unwrap();
+        assert!(restarted.restore_pool_history(
+            &directory,
+            &directory,
+            saved.ballast_pools[0].release_history.unwrap(),
+        ));
+        assert!(
+            restarted
+                .maybe_release(&directory, &mut manager, &red)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(manager.available_count(), 2);
+
+        // Recreated reserve retires actual depletion credit, not a configured
+        // shortfall. A subsequent pressure excursion can use the new files.
+        manager.replenish(None).unwrap();
+        assert_eq!(manager.available_count(), 5);
+        assert_eq!(
+            restarted
+                .maybe_release(&directory, &mut manager, &red)
+                .unwrap()
+                .unwrap()
+                .files_released,
+            3
+        );
+        assert_eq!(manager.available_count(), 2);
+    }
+
+    #[test]
+    fn pre_release_checkpoint_reconciles_depletion_before_the_next_state_write() {
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("pool");
+        let mut manager = BallastManager::new_unfloored(directory.clone(), test_config()).unwrap();
+        manager.provision(None).unwrap();
+        let mut original = BallastReleaseController::new(0);
+        let history = original
+            .pool_history(&directory, &directory, manager.available_count())
+            .unwrap();
+        assert_eq!(manager.release(3).unwrap().files_released, 3);
+        drop(manager);
+        let mut manager = BallastManager::new_unfloored(directory.clone(), test_config()).unwrap();
+        let mut restarted = BallastReleaseController::new(0);
+        assert!(restarted.restore_pool_history(&directory, &directory, history));
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        assert!(
+            restarted
+                .maybe_release(&directory, &mut manager, &red)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(manager.available_count(), 2);
+    }
+
+    #[test]
+    fn partial_pool_history_does_not_credit_never_provisioned_slots() {
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("pool");
+        let mut partial = test_config();
+        partial.file_count = 3;
+        let mut manager = BallastManager::new_unfloored(directory.clone(), partial).unwrap();
+        manager.provision(None).unwrap();
+        manager.update_config(test_config());
+        assert_eq!(manager.available_count(), 3);
+        let orange = test_response(PressureLevel::Orange, 0.4, 1);
+        let mut original = BallastReleaseController::new(0);
+        assert_eq!(
+            original
+                .maybe_release(&directory, &mut manager, &orange)
+                .unwrap()
+                .unwrap()
+                .files_released,
+            1
+        );
+        let history = original
+            .pool_history(&directory, &directory, manager.available_count())
+            .unwrap();
+        assert_eq!(history.release_credit, 1);
+        drop(manager);
+
+        let mut manager = BallastManager::new_unfloored(directory.clone(), test_config()).unwrap();
+        let mut restarted = BallastReleaseController::new(0);
+        assert!(restarted.restore_pool_history(&directory, &directory, history));
+        assert!(
+            restarted
+                .maybe_release(&directory, &mut manager, &orange)
+                .unwrap()
+                .is_none()
+        );
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        assert_eq!(
+            restarted
+                .maybe_release(&directory, &mut manager, &red)
+                .unwrap()
+                .unwrap()
+                .files_released,
+            2
+        );
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn pool_history_accepts_the_retained_directory_but_rejects_its_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("pool");
+        let retained = fixture.path().join("retained-pool");
+        let mut manager = BallastManager::new_unfloored(directory.clone(), test_config()).unwrap();
+        manager.provision(None).unwrap();
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        let mut controller = BallastReleaseController::new(0);
+        controller
+            .maybe_release(&directory, &mut manager, &red)
+            .unwrap();
+        let history = controller.pool_history(&directory, &directory, 2).unwrap();
+        controller.set_release_efficiency(&directory, 0.25);
+        assert!(!retained.exists());
+        std::fs::rename(&directory, &retained).unwrap();
+        assert!(history.matches_pool(&retained));
+
+        let mut replacement =
+            BallastManager::new_unfloored(directory.clone(), test_config()).unwrap();
+        replacement.provision(None).unwrap();
+        assert!(!history.matches_pool(&directory));
+        assert!(!controller.restore_pool_history(&directory, &directory, history));
+        let replacement_history = controller.pool_history(&directory, &directory, 5).unwrap();
+        assert_eq!(replacement_history.release_credit, 0);
+        assert_eq!(controller.release_efficiency(&directory), 1.0);
+        // A live controller also changes its window when the directory changes.
+        assert_eq!(
+            controller
+                .maybe_release(&directory, &mut replacement, &red)
+                .unwrap()
+                .unwrap()
+                .files_released,
+            3
+        );
+        assert_eq!(replacement.available_count(), 2);
+        assert_eq!(
+            crate::ballast::manager::BallastAvailability::observe(&retained, &test_config())
+                .available_count,
+            2
+        );
+    }
+
+    #[test]
+    fn cooldown_reload_preserves_credit_and_explicit_reset_starts_a_new_window() {
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("pool");
+        let mut manager = BallastManager::new_unfloored(directory.clone(), test_config()).unwrap();
+        manager.provision(None).unwrap();
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        let mut controller = BallastReleaseController::new(0);
+        controller
+            .maybe_release(&directory, &mut manager, &red)
+            .unwrap();
+        controller.set_replenish_cooldown(30);
+        assert!(
+            controller
+                .maybe_release(&directory, &mut manager, &red)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(manager.available_count(), 2);
+        controller.reset();
+        assert_eq!(
+            controller
+                .maybe_release(&directory, &mut manager, &red)
+                .unwrap()
+                .unwrap()
+                .files_released,
+            2
+        );
+    }
+
+    #[test]
+    fn restored_history_does_not_strand_reserve_under_critical_pressure() {
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("pool");
+        let mut manager = BallastManager::new_unfloored(directory.clone(), test_config()).unwrap();
+        manager.provision(None).unwrap();
+        let mut original = BallastReleaseController::new(0);
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        original
+            .maybe_release(&directory, &mut manager, &red)
+            .unwrap();
+        let mut restarted = BallastReleaseController::new(0);
+        let critical = test_response(PressureLevel::Critical, 1.0, 5);
+        assert_eq!(
+            restarted
+                .maybe_release(&directory, &mut manager, &critical)
+                .unwrap()
+                .unwrap()
+                .files_released,
+            2
+        );
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn malformed_or_older_history_cannot_overwrite_a_live_window() {
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("pool");
+        let mut manager = BallastManager::new_unfloored(directory.clone(), test_config()).unwrap();
+        manager.provision(None).unwrap();
+        let mut controller = BallastReleaseController::new(0);
+        let old = controller.pool_history(&directory, &directory, 5).unwrap();
+        let mut malformed = old;
+        malformed.available = usize::MAX;
+        malformed.release_credit = 1;
+        let mut restarted = BallastReleaseController::new(0);
+        assert!(!restarted.restore_pool_history(&directory, &directory, malformed));
+        assert!(restarted.restore_pool_history(&directory, &directory, old));
+        let red = test_response(PressureLevel::Red, 0.7, 3);
+        restarted
+            .maybe_release(&directory, &mut manager, &red)
+            .unwrap();
+        assert_eq!(manager.available_count(), 2);
+        assert!(!restarted.restore_pool_history(&directory, &directory, old));
+        assert!(
+            restarted
+                .maybe_release(&directory, &mut manager, &red)
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn one_hour_ago() -> Instant {
