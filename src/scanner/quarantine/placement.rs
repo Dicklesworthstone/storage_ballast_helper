@@ -360,7 +360,12 @@ mod tests {
                 .is_err()
         );
         assert!(!source.join("not-created").exists());
-        assert!(fs::symlink_metadata(alias).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[cfg(unix)]

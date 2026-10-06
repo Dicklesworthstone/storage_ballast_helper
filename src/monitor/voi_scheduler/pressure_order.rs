@@ -69,7 +69,10 @@ impl PressureOrder {
                 && index > 0
                 && !ordinary_due
             {
-                self.history.entry(paths[0].clone()).or_default().ordinary_due = true;
+                self.history
+                    .entry(paths[0].clone())
+                    .or_default()
+                    .ordinary_due = true;
                 // Preserve the relative heuristic order of every other root.
                 paths[..=index].rotate_right(1);
             }
@@ -89,8 +92,8 @@ impl PressureOrder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{MAX_REVISIT_INTERVAL, VoiConfig, VoiScheduler};
+    use super::*;
     use std::time::{Duration, Instant};
 
     fn paths(names: &[&str]) -> Vec<PathBuf> {
@@ -110,7 +113,9 @@ mod tests {
         let mut order = PressureOrder::default();
         for expected in ["/a", "/b", "/c", "/a", "/b", "/c"] {
             let mut ranked = paths(&["/c", "/b", "/a", "/c"]);
-            order.reorder(&mut ranked, true, |_| panic!("fallback must ignore forecasts"));
+            order.reorder(&mut ranked, true, |_| {
+                panic!("fallback must ignore forecasts")
+            });
             assert_eq!(ranked[0], Path::new(expected));
             assert_eq!(ranked.len(), 3);
             assert_eq!(ranked.iter().collect::<BTreeSet<_>>().len(), 3);
@@ -124,9 +129,15 @@ mod tests {
             let mut ranked = paths(&["/hot", "/c", "/b", "/a"]);
             order.reorder(&mut ranked, false, |path| path != Path::new("/hot"));
             assert_eq!(ranked[0], Path::new(expected));
-            let remainder: Vec<_> = ranked.iter().filter(|path| path.as_path() != Path::new(expected)).collect();
+            let remainder: Vec<_> = ranked
+                .iter()
+                .filter(|path| path.as_path() != Path::new(expected))
+                .collect();
             let original = paths(&["/hot", "/c", "/b", "/a"]);
-            let expected_remainder: Vec<_> = original.iter().filter(|path| path.as_path() != Path::new(expected)).collect();
+            let expected_remainder: Vec<_> = original
+                .iter()
+                .filter(|path| path.as_path() != Path::new(expected))
+                .collect();
             assert_eq!(remainder, expected_remainder);
         }
     }
@@ -202,7 +213,12 @@ mod tests {
             for expected in ["/a", "/b", "/c", "/a"] {
                 assert_eq!(scheduler.rank_paths(&scope, now)[0], Path::new(expected));
             }
-            assert!(scheduler.path_stats(&PathBuf::from("/c")).unwrap().dirty_pending);
+            assert!(
+                scheduler
+                    .path_stats(&PathBuf::from("/c"))
+                    .unwrap()
+                    .dirty_pending
+            );
         }
     }
 
@@ -248,7 +264,10 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(scheduler.rank_paths(&scope, before)[0], Path::new("/hot"));
         }
-        assert_eq!(scheduler.rank_paths(&scope, deadline)[0], Path::new("/cold"));
+        assert_eq!(
+            scheduler.rank_paths(&scope, deadline)[0],
+            Path::new("/cold")
+        );
         scheduler.record_scan_result(&PathBuf::from("/cold"), 0, 0, 0, 1000.0, deadline);
         assert_eq!(scheduler.rank_paths(&scope, deadline)[0], Path::new("/hot"));
     }
@@ -278,12 +297,18 @@ mod tests {
         let scope = paths(&["/a", "/b", "/c"]);
         for _ in 0..10 {
             let _ = scheduler.rank_paths(&scope, now);
-            assert_eq!(scheduler.schedule(now).paths[0].path, reference.schedule(now).paths[0].path);
+            assert_eq!(
+                scheduler.schedule(now).paths[0].path,
+                reference.schedule(now).paths[0].path
+            );
         }
         let mut reference = scheduler.clone();
         for _ in 0..10 {
             let _ = scheduler.schedule(now);
-            assert_eq!(scheduler.rank_paths(&scope, now), reference.rank_paths(&scope, now));
+            assert_eq!(
+                scheduler.rank_paths(&scope, now),
+                reference.rank_paths(&scope, now)
+            );
         }
     }
 
@@ -294,11 +319,22 @@ mod tests {
         scheduler.record_dirty(&PathBuf::from("/b"), true, now);
         let _ = scheduler.rank_paths(&paths(&["/a", "/b"]), now);
         assert!(scheduler.pressure_order.sequence > 0);
-        scheduler.update_config(VoiConfig { enabled: false, ..VoiConfig::default() });
+        scheduler.update_config(VoiConfig {
+            enabled: false,
+            ..VoiConfig::default()
+        });
         assert_eq!(scheduler.pressure_order.sequence, 0);
         assert!(scheduler.pressure_order.history.is_empty());
-        assert!(scheduler.path_stats(&PathBuf::from("/b")).unwrap().dirty_pending);
-        assert_eq!(scheduler.rank_paths(&paths(&["/b", "/a"]), now)[0], Path::new("/a"));
+        assert!(
+            scheduler
+                .path_stats(&PathBuf::from("/b"))
+                .unwrap()
+                .dirty_pending
+        );
+        assert_eq!(
+            scheduler.rank_paths(&paths(&["/b", "/a"]), now)[0],
+            Path::new("/a")
+        );
     }
 
     proptest::proptest! {

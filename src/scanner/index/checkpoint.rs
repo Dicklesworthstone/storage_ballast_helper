@@ -59,7 +59,9 @@ fn read_records<'de, D: Deserializer<'de>>(
             let mut records = Vec::new();
             while let Some(record) = sequence.next_element()? {
                 if records.len() == MAX_CHECKPOINT_RECORDS {
-                    return Err(de::Error::custom("scanner checkpoint record limit exceeded"));
+                    return Err(de::Error::custom(
+                        "scanner checkpoint record limit exceeded",
+                    ));
                 }
                 records.push(record);
             }
@@ -254,8 +256,7 @@ impl Drop for StagingFile {
         // Remove only our own staging inode, never a replacement or a shared
         // fixed-name temp file. A process crash may leave this private file;
         // the loader ignores it and still opens only the published checkpoint.
-        if let (Ok(owned), Ok(current)) =
-            (self.file.metadata(), fs::symlink_metadata(&self.path))
+        if let (Ok(owned), Ok(current)) = (self.file.metadata(), fs::symlink_metadata(&self.path))
             && same_identity(&owned, &current)
         {
             let _ = fs::remove_file(&self.path);
@@ -564,8 +565,16 @@ mod tests {
         symlink(&important, &old_temp).unwrap();
         save(&fixture("new"), &path).unwrap();
         assert_eq!(fs::read(important).unwrap(), b"do not truncate");
-        assert!(fs::symlink_metadata(old_temp).unwrap().file_type().is_symlink());
-        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(
+            fs::symlink_metadata(old_temp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[allow(clippy::needless_collect)]
@@ -594,9 +603,9 @@ mod tests {
         }
         let bytes = fs::read(&path).unwrap();
         assert!(
-            ["first", "second"].into_iter().any(|label| {
-                bytes == serde_json::to_vec(&legacy(&fixture(label))).unwrap()
-            }),
+            ["first", "second"]
+                .into_iter()
+                .any(|label| { bytes == serde_json::to_vec(&legacy(&fixture(label))).unwrap() }),
             "the winner must be one complete snapshot, not a mix of writers",
         );
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
@@ -616,10 +625,18 @@ mod tests {
         symlink("missing-target", &dangling).unwrap();
         let fifo = temp.path().join("fifo.json");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
-        for path in [alias.as_path(), dangling.as_path(), fifo.as_path(), temp.path()] {
+        for path in [
+            alias.as_path(),
+            dangling.as_path(),
+            fifo.as_path(),
+            temp.path(),
+        ] {
             let (loaded, status) = load(path, index.context.clone());
             assert!(loaded.is_empty());
-            assert!(matches!(status, ScannerIndexLoadStatus::Corrupt(_)), "{status:?}");
+            assert!(
+                matches!(status, ScannerIndexLoadStatus::Corrupt(_)),
+                "{status:?}"
+            );
         }
         assert_eq!(
             load(&temp.path().join("absent.json"), index.context).1,
@@ -631,7 +648,10 @@ mod tests {
     fn oversized_sparse_checkpoint_is_rejected_without_parsing_it() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("large.json");
-        File::create(&path).unwrap().set_len(MAX_CHECKPOINT_BYTES + 1).unwrap();
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_CHECKPOINT_BYTES + 1)
+            .unwrap();
         let (loaded, status) = load(&path, fixture("new").context);
         assert!(loaded.is_empty());
         assert!(matches!(status, ScannerIndexLoadStatus::Corrupt(_)));
@@ -673,8 +693,15 @@ mod tests {
             fs::write(&path, &bad).unwrap();
             let (loaded, status) = load(&path, index.context.clone());
             assert!(loaded.is_empty());
-            assert!(matches!(status, ScannerIndexLoadStatus::Corrupt(_)), "{status:?}");
-            assert_eq!(fs::read(&path).unwrap(), bad, "a read-only load never repairs the file");
+            assert!(
+                matches!(status, ScannerIndexLoadStatus::Corrupt(_)),
+                "{status:?}"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bad,
+                "a read-only load never repairs the file"
+            );
         }
     }
 
@@ -702,7 +729,10 @@ mod tests {
             fs::write(&path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
             let (loaded, status) = load(&path, index.context.clone());
             assert!(loaded.is_empty());
-            assert!(matches!(status, ScannerIndexLoadStatus::Corrupt(_)), "{status:?}");
+            assert!(
+                matches!(status, ScannerIndexLoadStatus::Corrupt(_)),
+                "{status:?}"
+            );
         }
     }
 
@@ -737,7 +767,10 @@ mod tests {
         let bytes = serde_json::to_vec(&checkpoint).unwrap();
         fs::write(&path, &bytes).unwrap();
         let (loaded, status) = load(&path, index.context);
-        assert!(matches!(status, ScannerIndexLoadStatus::Stale(_)), "{status:?}");
+        assert!(
+            matches!(status, ScannerIndexLoadStatus::Stale(_)),
+            "{status:?}"
+        );
         assert!(loaded.is_empty());
         assert!(loaded.paths.is_empty());
         assert_eq!(fs::read(path).unwrap(), bytes);

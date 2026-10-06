@@ -472,7 +472,11 @@ mod tests {
         let (_temp, mut pool) = fixture(3, UNIT, 3, UNIT);
         let retired = pool.stranded.files()[0].0.clone();
         fs::write(&retired, b"not a valid reserve").unwrap();
-        assert_eq!(pool.available_count(), 3, "cached inventory still looks full");
+        assert_eq!(
+            pool.available_count(),
+            3,
+            "cached inventory still looks full"
+        );
         let mut controller = BallastReleaseController::new(0);
         let report =
             maintenance_tick(&mut pool, &mut controller, PressureLevel::Green, None).unwrap();

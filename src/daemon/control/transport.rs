@@ -184,18 +184,28 @@ mod tests {
         assert_eq!(encoded.last(), Some(&b'\n'));
         assert!(encode_frame(&value, encoded.len() - 1).is_err());
         assert!(encode_frame(&value, 0).is_err());
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(), value);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
+            value
+        );
     }
 
     #[test]
     fn fragmented_frame_stops_at_the_first_newline() {
         let start = Instant::now();
         let mut parts = [b"{\"o".as_slice(), b"k\":true}\nignored".as_slice()].into_iter();
-        let frame = read_with(64, start, Duration::from_secs(1), |buffer, _| {
-            let part = parts.next().unwrap();
-            buffer[..part.len()].copy_from_slice(part);
-            Ok(part.len())
-        }, || start).unwrap();
+        let frame = read_with(
+            64,
+            start,
+            Duration::from_secs(1),
+            |buffer, _| {
+                let part = parts.next().unwrap();
+                buffer[..part.len()].copy_from_slice(part);
+                Ok(part.len())
+            },
+            || start,
+        )
+        .unwrap();
         assert_eq!(frame, b"{\"ok\":true}\n");
     }
 
@@ -204,8 +214,13 @@ mod tests {
         let start = Instant::now();
         for (payload, good) in [(b"1234".as_slice(), true), (b"12345".as_slice(), false)] {
             let mut input = payload;
-            let result = read_with(4, start, Duration::from_secs(1),
-                |buffer, _| input.read(buffer), || start);
+            let result = read_with(
+                4,
+                start,
+                Duration::from_secs(1),
+                |buffer, _| input.read(buffer),
+                || start,
+            );
             assert_eq!(result.is_ok(), good);
             if let Ok(frame) = result {
                 assert_eq!(frame, payload);
@@ -217,11 +232,17 @@ mod tests {
     fn an_unterminated_frame_cannot_grow_past_the_limit() {
         let start = Instant::now();
         let total_read = Cell::new(0);
-        let result = read_with(16, start, Duration::from_secs(1), |buffer, _| {
-            buffer.fill(b'x');
-            total_read.set(total_read.get() + buffer.len());
-            Ok(buffer.len())
-        }, || start);
+        let result = read_with(
+            16,
+            start,
+            Duration::from_secs(1),
+            |buffer, _| {
+                buffer.fill(b'x');
+                total_read.set(total_read.get() + buffer.len());
+                Ok(buffer.len())
+            },
+            || start,
+        );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
         assert_eq!(total_read.get(), 17);
     }
@@ -231,13 +252,19 @@ mod tests {
         let start = Instant::now();
         let clock = Cell::new(start);
         let calls = Cell::new(0);
-        let result = read_with(100, start, Duration::from_millis(5), |buffer, left| {
-            assert_eq!(left, Duration::from_millis(5 - calls.get()));
-            buffer[0] = b'x';
-            calls.set(calls.get() + 1);
-            clock.set(clock.get() + Duration::from_millis(1));
-            Ok(1)
-        }, || clock.get());
+        let result = read_with(
+            100,
+            start,
+            Duration::from_millis(5),
+            |buffer, left| {
+                assert_eq!(left, Duration::from_millis(5 - calls.get()));
+                buffer[0] = b'x';
+                calls.set(calls.get() + 1);
+                clock.set(clock.get() + Duration::from_millis(1));
+                Ok(1)
+            },
+            || clock.get(),
+        );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(calls.get(), 5);
     }
@@ -246,10 +273,16 @@ mod tests {
     fn repeated_interruptions_do_not_renew_the_deadline() {
         let start = Instant::now();
         let clock = Cell::new(start);
-        let result = read_with(100, start, Duration::from_millis(5), |_, _| {
-            clock.set(clock.get() + Duration::from_millis(1));
-            Err(io::ErrorKind::Interrupted.into())
-        }, || clock.get());
+        let result = read_with(
+            100,
+            start,
+            Duration::from_millis(5),
+            |_, _| {
+                clock.set(clock.get() + Duration::from_millis(1));
+                Err(io::ErrorKind::Interrupted.into())
+            },
+            || clock.get(),
+        );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(clock.get().duration_since(start), Duration::from_millis(5));
     }
@@ -259,13 +292,19 @@ mod tests {
         let start = Instant::now();
         let clock = Cell::new(start);
         let count = Cell::new(0);
-        let result = write_with(b"0123456789", start, Duration::from_millis(5), |bytes, left| {
-            assert_eq!(left, Duration::from_millis(5 - count.get()));
-            assert_eq!(bytes[0], b'0' + u8::try_from(count.get()).unwrap());
-            count.set(count.get() + 1);
-            clock.set(clock.get() + Duration::from_millis(1));
-            Ok(1)
-        }, || clock.get());
+        let result = write_with(
+            b"0123456789",
+            start,
+            Duration::from_millis(5),
+            |bytes, left| {
+                assert_eq!(left, Duration::from_millis(5 - count.get()));
+                assert_eq!(bytes[0], b'0' + u8::try_from(count.get()).unwrap());
+                count.set(count.get() + 1);
+                clock.set(clock.get() + Duration::from_millis(1));
+                Ok(1)
+            },
+            || clock.get(),
+        );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(count.get(), 5);
     }
@@ -274,14 +313,21 @@ mod tests {
     fn short_writes_deliver_every_byte_without_duplication() {
         let start = Instant::now();
         let mut output = Vec::new();
-        write_with(b"abcdef\n", start, Duration::from_secs(1), |bytes, _| {
-            let count = bytes.len().min(2);
-            output.extend_from_slice(&bytes[..count]);
-            Ok(count)
-        }, || start).unwrap();
+        write_with(
+            b"abcdef\n",
+            start,
+            Duration::from_secs(1),
+            |bytes, _| {
+                let count = bytes.len().min(2);
+                output.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            },
+            || start,
+        )
+        .unwrap();
         assert_eq!(output, b"abcdef\n");
-        let error = write_with(b"x", start, Duration::from_secs(1), |_, _| Ok(0), || start)
-            .unwrap_err();
+        let error =
+            write_with(b"x", start, Duration::from_secs(1), |_, _| Ok(0), || start).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WriteZero);
     }
 
@@ -289,13 +335,23 @@ mod tests {
     fn elapsed_budget_prevents_even_the_first_syscall() {
         let start = Instant::now();
         let now = start + Duration::from_secs(5);
-        let error = read_with(64, start, Duration::from_secs(5), |_, _| {
-            panic!("expired request must not read")
-        }, || now).unwrap_err();
+        let error = read_with(
+            64,
+            start,
+            Duration::from_secs(5),
+            |_, _| panic!("expired request must not read"),
+            || now,
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        let error = write_with(b"x", start, Duration::from_secs(5), |_, _| {
-            panic!("expired response must not write")
-        }, || now).unwrap_err();
+        let error = write_with(
+            b"x",
+            start,
+            Duration::from_secs(5),
+            |_, _| panic!("expired response must not write"),
+            || now,
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
@@ -307,14 +363,17 @@ mod tests {
         write_frame(&writer, &frame, Instant::now(), Duration::from_secs(1)).unwrap();
         let received = read_frame(&reader, 1024, Instant::now(), Duration::from_secs(1)).unwrap();
         assert_eq!(received, frame);
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&received).unwrap(), value);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&received).unwrap(),
+            value
+        );
     }
 
     #[test]
     fn a_silent_socket_times_out_instead_of_waiting_for_newline_forever() {
         let (_peer, reader) = UnixStream::pair().unwrap();
-        let error = read_frame(&reader, 1024, Instant::now(), Duration::from_millis(20))
-            .unwrap_err();
+        let error =
+            read_frame(&reader, 1024, Instant::now(), Duration::from_millis(20)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }

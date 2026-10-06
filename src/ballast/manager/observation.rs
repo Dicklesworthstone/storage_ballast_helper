@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use super::{
-    BallastAvailability, BallastFile, BallastHeader, BallastHealth, BallastManager,
-    HEADER_SIZE, ballast_file_name,
+    BallastAvailability, BallastFile, BallastHeader, BallastHealth, BallastManager, HEADER_SIZE,
+    ballast_file_name,
 };
 use crate::core::config::BallastConfig;
 
@@ -185,7 +185,10 @@ fn read_surplus(pool: &PoolReader, index: u32) -> std::io::Result<Option<Ballast
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error),
     }
-    let end = bytes.iter().position(|&byte| byte == 0).unwrap_or(HEADER_SIZE);
+    let end = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(HEADER_SIZE);
     let Ok(header) = serde_json::from_slice::<BallastHeader>(&bytes[..end]) else {
         return Ok(None);
     };
@@ -253,8 +256,7 @@ fn verified_surplus(
 }
 
 pub(super) fn observe(ballast_dir: &Path, config: &BallastConfig) -> BallastAvailability {
-    let configured_pool_bytes =
-        (config.file_count as u64).saturating_mul(config.file_size_bytes);
+    let configured_pool_bytes = (config.file_count as u64).saturating_mul(config.file_size_bytes);
     let mut result = BallastAvailability {
         configured_count: config.file_count,
         configured_file_size_bytes: config.file_size_bytes,
@@ -292,15 +294,13 @@ pub(super) fn observe(ballast_dir: &Path, config: &BallastConfig) -> BallastAvai
             #[cfg(unix)]
             match verified_surplus(ballast_dir, config.file_count, &pool) {
                 Ok(surplus) => {
-                    result.available_count = result
-                        .available_count
-                        .saturating_add(surplus.files.len());
+                    result.available_count =
+                        result.available_count.saturating_add(surplus.files.len());
                     for file in surplus.files {
                         result.releasable_bytes = result.releasable_bytes.saturating_add(file.size);
                     }
-                    result.unreadable_count = result
-                        .unreadable_count
-                        .saturating_add(surplus.unreadable);
+                    result.unreadable_count =
+                        result.unreadable_count.saturating_add(surplus.unreadable);
                 }
                 // Directory enumeration failed: we cannot claim that there is
                 // no surplus. Preserve any already counted unreadable slots.
@@ -400,13 +400,15 @@ fn verify_with_block_count(
     if path != manager.file_path(expected_index).as_path() {
         return Err("ballast verification path is outside the expected pool slot".to_string());
     }
-    let pool = PoolReader::open(&manager.ballast_dir)
-        .map_err(|error| format!("open pool: {error}"))?;
+    let pool =
+        PoolReader::open(&manager.ballast_dir).map_err(|error| format!("open pool: {error}"))?;
     let name = ballast_file_name(expected_index);
     let mut file = pool
         .open_slot(OsStr::new(&name))
         .map_err(|error| format!("open: {error}"))?;
-    let meta = file.metadata().map_err(|error| format!("metadata: {error}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|error| format!("metadata: {error}"))?;
     if !independently_releasable(&meta, &pool.meta) {
         return Err("ballast slot is not an independently releasable regular file".to_string());
     }
@@ -455,7 +457,9 @@ fn verify_with_block_count(
             manager.config.file_size_bytes
         ));
     }
-    let after = file.metadata().map_err(|error| format!("restat: {error}"))?;
+    let after = file
+        .metadata()
+        .map_err(|error| format!("restat: {error}"))?;
     let current = pool
         .open_slot(OsStr::new(&name))
         .map_err(|error| format!("reopen slot: {error}"))?;
@@ -798,10 +802,17 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn pressure(mount: &Path, level: crate::monitor::pid::PressureLevel) -> crate::monitor::pid::PressureResponse {
+    fn pressure(
+        mount: &Path,
+        level: crate::monitor::pid::PressureLevel,
+    ) -> crate::monitor::pid::PressureResponse {
         crate::monitor::pid::PressureResponse {
             level,
-            urgency: if level == crate::monitor::pid::PressureLevel::Critical { 1.0 } else { 0.4 },
+            urgency: if level == crate::monitor::pid::PressureLevel::Critical {
+                1.0
+            } else {
+                0.4
+            },
             scan_interval: std::time::Duration::from_secs(1),
             release_ballast_files: 0,
             max_delete_batch: 10,
@@ -825,7 +836,8 @@ mod tests {
                 changed.file_count = target;
                 changed.file_size_bytes *= 2;
                 if restart {
-                    manager = BallastManager::new(manager.ballast_dir.clone(), changed.clone()).unwrap();
+                    manager =
+                        BallastManager::new(manager.ballast_dir.clone(), changed.clone()).unwrap();
                 } else {
                     manager.update_config(changed.clone());
                 }
@@ -839,7 +851,11 @@ mod tests {
                 assert_eq!(observed.health, manager.health());
                 let mut controller = BallastReleaseController::new(0);
                 let report = controller
-                    .maybe_release(root.path(), &mut manager, &pressure(root.path(), PressureLevel::Critical))
+                    .maybe_release(
+                        root.path(),
+                        &mut manager,
+                        &pressure(root.path(), PressureLevel::Critical),
+                    )
                     .unwrap()
                     .expect("physical reserve must reach the pressure-driven release path");
                 assert_eq!(report.files_released, 3);
@@ -866,23 +882,39 @@ mod tests {
         manager.update_config(disabled);
         assert_eq!(manager.health(), BallastHealth::Unconfigured);
         let mut controller = BallastReleaseController::new(0);
-        assert!(!controller
-            .maybe_replenish(root.path(), &mut manager, PressureLevel::Green, &|| 100.0)
-            .unwrap());
+        assert!(
+            !controller
+                .maybe_replenish(root.path(), &mut manager, PressureLevel::Green, &|| 100.0)
+                .unwrap()
+        );
         assert_eq!(manager.available_count(), 3);
         let orange = pressure(root.path(), PressureLevel::Orange);
-        let first = controller.maybe_release(root.path(), &mut manager, &orange).unwrap().unwrap();
+        let first = controller
+            .maybe_release(root.path(), &mut manager, &orange)
+            .unwrap()
+            .unwrap();
         assert_eq!(first.files_released, 1);
-        assert!(controller.maybe_release(root.path(), &mut manager, &orange).unwrap().is_none());
+        assert!(
+            controller
+                .maybe_release(root.path(), &mut manager, &orange)
+                .unwrap()
+                .is_none()
+        );
         let remaining = controller
-            .maybe_release(root.path(), &mut manager, &pressure(root.path(), PressureLevel::Critical))
+            .maybe_release(
+                root.path(),
+                &mut manager,
+                &pressure(root.path(), PressureLevel::Critical),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(remaining.files_released, 2);
         assert_eq!(manager.available_count(), 0);
-        assert!(!controller
-            .maybe_replenish(root.path(), &mut manager, PressureLevel::Green, &|| 100.0)
-            .unwrap());
+        assert!(
+            !controller
+                .maybe_replenish(root.path(), &mut manager, PressureLevel::Green, &|| 100.0)
+                .unwrap()
+        );
     }
 
     #[cfg(unix)]
@@ -925,7 +957,11 @@ mod tests {
         assert_eq!(manager.available_count(), 2);
         let mut controller = BallastReleaseController::new(0);
         let report = controller
-            .maybe_release(root.path(), &mut manager, &pressure(root.path(), PressureLevel::Critical))
+            .maybe_release(
+                root.path(),
+                &mut manager,
+                &pressure(root.path(), PressureLevel::Critical),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(report.files_released, 2);
@@ -1006,11 +1042,22 @@ mod tests {
         assert_eq!(manager.available_count(), 3);
         let changed = manager.file_path(3);
         fs::write(&changed, b"replacement data").unwrap();
-        assert_eq!(manager.available_count(), 3, "the cached observation predates the write");
-        assert_eq!(BallastAvailability::observe(&manager.ballast_dir, &disabled).available_count, 2);
+        assert_eq!(
+            manager.available_count(),
+            3,
+            "the cached observation predates the write"
+        );
+        assert_eq!(
+            BallastAvailability::observe(&manager.ballast_dir, &disabled).available_count,
+            2
+        );
         let mut controller = BallastReleaseController::new(0);
         let report = controller
-            .maybe_release(root.path(), &mut manager, &pressure(root.path(), PressureLevel::Critical))
+            .maybe_release(
+                root.path(),
+                &mut manager,
+                &pressure(root.path(), PressureLevel::Critical),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(report.files_released, 2);
@@ -1024,7 +1071,8 @@ mod tests {
     fn very_high_surplus_index_does_not_imply_billions_of_missing_slots() {
         let (_root, mut manager) = verified_fixture();
         let mut bytes = fs::read(manager.file_path(1)).unwrap();
-        let header = super::super::ballast_header_buffer(u32::MAX, config().file_size_bytes).unwrap();
+        let header =
+            super::super::ballast_header_buffer(u32::MAX, config().file_size_bytes).unwrap();
         bytes[..HEADER_SIZE].copy_from_slice(&header);
         fs::write(manager.file_path(u32::MAX), bytes).unwrap();
         let mut disabled = config();

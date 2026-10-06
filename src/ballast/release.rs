@@ -1054,18 +1054,38 @@ mod tests {
         ctrl.replenish_interval = Duration::ZERO;
         let orange = test_response(PressureLevel::Orange, 0.4, 1);
         let red = test_response(PressureLevel::Red, 0.7, 3);
-        let first = ctrl.maybe_release(dir.path(), &mut mgr, &orange).unwrap().unwrap();
+        let first = ctrl
+            .maybe_release(dir.path(), &mut mgr, &orange)
+            .unwrap()
+            .unwrap();
         assert_eq!(first.files_released, 1);
         assert!(first.bytes_freed > 0);
         assert_eq!(mgr.available_count(), 2);
-        assert!(ctrl.maybe_release(dir.path(), &mut mgr, &orange).unwrap().is_none());
-        let next = ctrl.maybe_release(dir.path(), &mut mgr, &red).unwrap().unwrap();
+        assert!(
+            ctrl.maybe_release(dir.path(), &mut mgr, &orange)
+                .unwrap()
+                .is_none()
+        );
+        let next = ctrl
+            .maybe_release(dir.path(), &mut mgr, &red)
+            .unwrap()
+            .unwrap();
         assert_eq!(next.files_released, 2);
         assert_eq!(mgr.available_count(), 0);
-        assert!(ctrl.maybe_release(dir.path(), &mut mgr, &red).unwrap().is_none());
-        assert!(ctrl.maybe_replenish(dir.path(), &mut mgr, PressureLevel::Green, &|| 50.0).unwrap());
+        assert!(
+            ctrl.maybe_release(dir.path(), &mut mgr, &red)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ctrl.maybe_replenish(dir.path(), &mut mgr, PressureLevel::Green, &|| 50.0)
+                .unwrap()
+        );
         assert_eq!(mgr.available_count(), 1);
-        let rebuilt = ctrl.maybe_release(dir.path(), &mut mgr, &red).unwrap().unwrap();
+        let rebuilt = ctrl
+            .maybe_release(dir.path(), &mut mgr, &red)
+            .unwrap()
+            .unwrap();
         assert_eq!(rebuilt.files_released, 1);
     }
 
@@ -1087,7 +1107,10 @@ mod tests {
         let mount = Path::new("/test");
         let mut ctrl = BallastReleaseController::new(0);
         let start = Instant::now();
-        ctrl.states.entry(mount.to_path_buf()).or_default().green_since = Some(start);
+        ctrl.states
+            .entry(mount.to_path_buf())
+            .or_default()
+            .green_since = Some(start);
         assert!(ctrl.is_ready_for_replenish_at(mount, PressureLevel::Green, 3, start));
         // No on_replenished callback: a full pool, floor refusal, or error.
         for seconds in 0..300 {
@@ -1119,7 +1142,10 @@ mod tests {
         let mut ctrl = BallastReleaseController::new(1);
         let start = Instant::now();
         assert!(!ctrl.is_ready_for_replenish_at(mount, PressureLevel::Green, 3, start));
-        ctrl.states.entry(mount.to_path_buf()).or_default().green_since = Some(start);
+        ctrl.states
+            .entry(mount.to_path_buf())
+            .or_default()
+            .green_since = Some(start);
         assert!(!ctrl.is_ready_for_replenish_at(
             mount,
             PressureLevel::Green,
@@ -1148,7 +1174,10 @@ mod tests {
         let mut ctrl = BallastReleaseController::new(0);
         let now = Instant::now();
         for mount in [first, second] {
-            ctrl.states.entry(mount.to_path_buf()).or_default().green_since = Some(now);
+            ctrl.states
+                .entry(mount.to_path_buf())
+                .or_default()
+                .green_since = Some(now);
             assert!(ctrl.is_ready_for_replenish_at(mount, PressureLevel::Green, 3, now));
         }
         for mount in [first, second] {
@@ -1161,7 +1190,10 @@ mod tests {
         let mount = Path::new("/test");
         let mut ctrl = BallastReleaseController::new(0);
         let start = Instant::now();
-        ctrl.states.entry(mount.to_path_buf()).or_default().green_since = Some(start);
+        ctrl.states
+            .entry(mount.to_path_buf())
+            .or_default()
+            .green_since = Some(start);
         assert!(ctrl.is_ready_for_replenish_at(mount, PressureLevel::Green, 3, start));
         ctrl.on_replenished(mount, 1);
         // Inject the completion time without sleeping for a slow allocation.
@@ -1234,7 +1266,8 @@ mod tests {
         let before = std::fs::read(&retained).unwrap();
         let mut ctrl = BallastReleaseController::new(0);
         assert!(
-            !ctrl.maybe_replenish(dir.path(), &mut mgr, PressureLevel::Green, &|| 50.0)
+            !ctrl
+                .maybe_replenish(dir.path(), &mut mgr, PressureLevel::Green, &|| 50.0)
                 .unwrap()
         );
         assert!(ctrl.states[dir.path()].last_replenish_time.is_some());

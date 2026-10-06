@@ -278,7 +278,12 @@ impl ControlCommand {
                         return Err(bad(format!("{}: unknown argument {key:?}", request.cmd)));
                     }
                 }
-                _ => return Err(bad(format!("{}: args must be an object or null", request.cmd))),
+                _ => {
+                    return Err(bad(format!(
+                        "{}: args must be an object or null",
+                        request.cmd
+                    )));
+                }
             }
         }
         match request.cmd.as_str() {
@@ -306,9 +311,9 @@ impl ControlCommand {
                 };
                 let force = match args.get("force") {
                     None => false,
-                    Some(value) => value.as_bool().ok_or_else(|| {
-                        bad("scan-now: force must be a boolean".to_string())
-                    })?,
+                    Some(value) => value
+                        .as_bool()
+                        .ok_or_else(|| bad("scan-now: force must be a boolean".to_string()))?,
                 };
                 Ok(Self::ScanNow { paths, force })
             }
@@ -353,13 +358,13 @@ impl ControlCommand {
         };
         let mount = match args.get("mount") {
             None | Some(Value::Null) => None,
-            Some(Value::String(path))
-                if Path::new(path).is_absolute() && !path.contains('\0') =>
-            {
+            Some(Value::String(path)) if Path::new(path).is_absolute() && !path.contains('\0') => {
                 Some(PathBuf::from(path))
             }
             Some(_) => {
-                return Err(bad("ballast: mount must be an absolute path string or null"));
+                return Err(bad(
+                    "ballast: mount must be an absolute path string or null",
+                ));
             }
         };
         let replenish = match args.get("replenish") {
@@ -376,8 +381,8 @@ impl ControlCommand {
                 .as_u64()
                 .filter(|count| *count > 0)
                 .ok_or_else(|| bad("ballast: release must be a positive integer"))?;
-            let count = usize::try_from(count)
-                .map_err(|_| bad("ballast: release count is too large"))?;
+            let count =
+                usize::try_from(count).map_err(|_| bad("ballast: release count is too large"))?;
             return Ok(Self::Ballast(BallastAction::Release { count, mount }));
         }
         if replenish {
@@ -696,10 +701,7 @@ fn respond(stream: &UnixStream, shared: &Shared, accepted_at: Instant) -> Contro
             } else {
                 "bad_request"
             };
-            return ControlResponse::failure(
-                code,
-                format!("could not read request: {error}"),
-            );
+            return ControlResponse::failure(code, format!("could not read request: {error}"));
         }
     };
     let request: ControlRequest = match serde_json::from_slice(&line) {
@@ -755,9 +757,11 @@ pub fn request(
     };
     let write_error = transport::write_frame(&stream, &line, Instant::now(), IO_TIMEOUT).err();
     let reply = transport::read_frame(&stream, MAX_RESPONSE_BYTES, Instant::now(), IO_TIMEOUT)
-        .map_err(|error| io(write_error.as_ref().map_or(error, |write_error| {
-            std::io::Error::new(write_error.kind(), write_error.to_string())
-        })))?;
+        .map_err(|error| {
+            io(write_error.as_ref().map_or(error, |write_error| {
+                std::io::Error::new(write_error.kind(), write_error.to_string())
+            }))
+        })?;
     if reply.iter().all(u8::is_ascii_whitespace) {
         return Err(SbhError::Runtime {
             details: format!(
@@ -766,18 +770,20 @@ pub fn request(
             ),
         });
     }
-    let response: ControlResponse = serde_json::from_slice(&reply).map_err(|error| SbhError::Serialization {
-        context: "control response",
-        details: error.to_string(),
-    })?;
+    let response: ControlResponse =
+        serde_json::from_slice(&reply).map_err(|error| SbhError::Serialization {
+            context: "control response",
+            details: error.to_string(),
+        })?;
     // Admission can refuse and close before the client's first write. Surface
     // that explicit pre-dispatch refusal, not an incidental BrokenPipe. Never
     // accept a success response after an incomplete request write.
     if let Some(error) = write_error
         && (response.ok
-            || !response.error.as_ref().is_some_and(|error| {
-                matches!(error.code.as_str(), "busy" | "rate_limited")
-            }))
+            || !response
+                .error
+                .as_ref()
+                .is_some_and(|error| matches!(error.code.as_str(), "busy" | "rate_limited")))
     {
         return Err(io(error));
     }

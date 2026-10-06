@@ -502,10 +502,13 @@ mod tests {
         std::fs::write(&path, b"preserve").unwrap();
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let inner = MockPlatform::healthy().with_preallocate_failure(
-            &path, PalError::method_failed("mock", "preallocate_file", "ENOSPC"),
+            &path,
+            PalError::method_failed("mock", "preallocate_file", "ENOSPC"),
         );
         let overlay = TestOverlayPlatform::new(Arc::new(inner), InjectedFsTable::default());
-        let error = overlay.preallocate_open_file(&file, &path, 8192).unwrap_err();
+        let error = overlay
+            .preallocate_open_file(&file, &path, 8192)
+            .unwrap_err();
         assert!(error.to_string().contains("ENOSPC"));
         assert_eq!(std::fs::read(path).unwrap(), b"preserve");
     }

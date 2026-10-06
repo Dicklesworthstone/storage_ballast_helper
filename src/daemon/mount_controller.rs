@@ -1531,7 +1531,11 @@ mod tests {
             let decision = controller.observe(MountTickInput {
                 recovery_probe_ok: Some(true),
                 releasable_ballast: true,
-                ..input(PressureLevel::Critical, surface, now + RECOVERY_POLL_INTERVAL)
+                ..input(
+                    PressureLevel::Critical,
+                    surface,
+                    now + RECOVERY_POLL_INTERVAL,
+                )
             });
             assert_eq!(decision.scan, surface.scannable());
             assert_eq!(decision.release_ballast, surface.ballast_pool);
@@ -1559,12 +1563,20 @@ mod tests {
                 recovery_probe_ok: Some(true),
                 prediction_confident: predicted,
                 seconds_to_red: Some(60.0),
-                ..input(PressureLevel::Green, configured(), now + RECOVERY_POLL_INTERVAL)
+                ..input(
+                    PressureLevel::Green,
+                    configured(),
+                    now + RECOVERY_POLL_INTERVAL,
+                )
             });
             assert_eq!(decision.scan, predicted);
             assert_eq!(
                 decision.state,
-                if predicted { MountState::Reclaim } else { MountState::Maintain }
+                if predicted {
+                    MountState::Reclaim
+                } else {
+                    MountState::Maintain
+                }
             );
         }
     }
@@ -1573,26 +1585,32 @@ mod tests {
     fn failed_mount_does_not_block_an_independent_recovered_mount() {
         let now = Instant::now();
         let mut readonly = fresh();
-        let mut writable = MountController::new(
-            PathBuf::from("/other"),
-            MountControllerConfig::default(),
-        );
+        let mut writable =
+            MountController::new(PathBuf::from("/other"), MountControllerConfig::default());
         let failed = MountTickInput {
             recovery_needed: true,
             ..input(PressureLevel::Critical, configured(), now)
         };
         readonly.observe(failed);
         writable.observe(failed);
-        assert!(!readonly.observe(MountTickInput {
-            recovery_needed: false,
-            recovery_probe_ok: Some(false),
-            ..failed
-        }).scan);
-        assert!(writable.observe(MountTickInput {
-            recovery_needed: false,
-            recovery_probe_ok: Some(true),
-            ..failed
-        }).scan);
+        assert!(
+            !readonly
+                .observe(MountTickInput {
+                    recovery_needed: false,
+                    recovery_probe_ok: Some(false),
+                    ..failed
+                })
+                .scan
+        );
+        assert!(
+            writable
+                .observe(MountTickInput {
+                    recovery_needed: false,
+                    recovery_probe_ok: Some(true),
+                    ..failed
+                })
+                .scan
+        );
         assert_eq!(readonly.state(), MountState::Recovery);
         assert_eq!(writable.state(), MountState::Reclaim);
         assert_eq!(

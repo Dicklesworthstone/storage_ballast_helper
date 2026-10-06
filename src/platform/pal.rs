@@ -189,7 +189,10 @@ fn preallocate_descriptor(file: &fs::File, path: &Path, size: u64) -> Result<()>
         if !before.is_file() {
             return Err(SbhError::io(
                 path,
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "allocation requires a regular file"),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "allocation requires a regular file",
+                ),
             ));
         }
         // rustix 1.1.4 emulates macOS fallocate with F_PREALLOCATE followed
@@ -210,7 +213,8 @@ fn preallocate_descriptor(file: &fs::File, path: &Path, size: u64) -> Result<()>
             .map_err(|error| SbhError::io(path, error.into()))?;
         let metadata = file.metadata().map_err(|error| SbhError::io(path, error))?;
         if metadata.len() < size {
-            file.set_len(size).map_err(|error| SbhError::io(path, error))?;
+            file.set_len(size)
+                .map_err(|error| SbhError::io(path, error))?;
         }
         file.sync_all().map_err(|error| SbhError::io(path, error))?;
         let metadata = file.metadata().map_err(|error| SbhError::io(path, error))?;
@@ -824,28 +828,42 @@ impl Platform for MockPlatform {
 
     fn preallocate_open_file(&self, file: &fs::File, path: &Path, size: u64) -> Result<()> {
         if let Some(failure) = self.preallocate_failures.get(path) {
-            return Err(SbhError::Pal { source: failure.clone() });
+            return Err(SbhError::Pal {
+                source: failure.clone(),
+            });
         }
         if !self.preallocated.is_empty()
-            && !self.preallocated.iter().any(|(expected, bytes)| expected == path && *bytes == size)
+            && !self
+                .preallocated
+                .iter()
+                .any(|(expected, bytes)| expected == path && *bytes == size)
         {
             return Err(PalError::method_failed(
                 self.name(),
                 "preallocate_open_file",
-                format!("unexpected mock descriptor allocation for {}", path.display()),
-            ).into());
+                format!(
+                    "unexpected mock descriptor allocation for {}",
+                    path.display()
+                ),
+            )
+            .into());
         }
         // Preserve the mock's deliberately sparse allocation behavior. The
         // manager must check the descriptor and write real blocks when needed;
         // injected block-count metadata is not proof of physical allocation.
         let metadata = file.metadata().map_err(|error| SbhError::io(path, error))?;
         if !metadata.is_file() {
-            return Err(SbhError::io(path, std::io::Error::new(
-                std::io::ErrorKind::InvalidInput, "allocation requires a regular file",
-            )));
+            return Err(SbhError::io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "allocation requires a regular file",
+                ),
+            ));
         }
         if metadata.len() < size {
-            file.set_len(size).map_err(|error| SbhError::io(path, error))?;
+            file.set_len(size)
+                .map_err(|error| SbhError::io(path, error))?;
         }
         file.sync_all().map_err(|error| SbhError::io(path, error))
     }
@@ -1084,14 +1102,25 @@ mod tests {
         let unrelated = temp.path().join("unrelated");
         std::fs::write(&owned, b"preserved").unwrap();
         std::fs::write(&unrelated, b"do not touch").unwrap();
-        let file = std::fs::OpenOptions::new().write(true).open(&owned).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&owned)
+            .unwrap();
         let platform = MockPlatform::healthy();
-        platform.preallocate_open_file(&file, &unrelated, 8192).unwrap();
+        platform
+            .preallocate_open_file(&file, &unrelated, 8192)
+            .unwrap();
         assert_eq!(std::fs::read(&unrelated).unwrap(), b"do not touch");
         assert_eq!(file.metadata().unwrap().len(), 8192);
         assert!(std::fs::read(&owned).unwrap().starts_with(b"preserved"));
-        platform.preallocate_open_file(&file, &unrelated, 4096).unwrap();
-        assert_eq!(file.metadata().unwrap().len(), 8192, "never shrink old allocation");
+        platform
+            .preallocate_open_file(&file, &unrelated, 4096)
+            .unwrap();
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            8192,
+            "never shrink old allocation"
+        );
     }
 
     #[test]
@@ -1102,9 +1131,16 @@ mod tests {
         std::fs::write(&path, b"preserve").unwrap();
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let failing = MockPlatform::healthy().with_preallocate_failure(
-            &path, PalError::method_failed("mock", "preallocate_file", "ENOSPC"),
+            &path,
+            PalError::method_failed("mock", "preallocate_file", "ENOSPC"),
         );
-        assert!(failing.preallocate_open_file(&file, &path, 8192).unwrap_err().to_string().contains("ENOSPC"));
+        assert!(
+            failing
+                .preallocate_open_file(&file, &path, 8192)
+                .unwrap_err()
+                .to_string()
+                .contains("ENOSPC")
+        );
         let expected = MockPlatform::healthy().with_preallocated_file(&path, 4096);
         assert!(expected.preallocate_open_file(&file, &path, 8192).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"preserve");

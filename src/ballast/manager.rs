@@ -895,7 +895,9 @@ fn is_storage_exhausted_error(error: &SbhError) -> bool {
                     method_name,
                     ..
                 },
-        } if method_name == "preallocate_file" || method_name == "preallocate_open_file" => message_mentions_storage_full(details),
+        } if method_name == "preallocate_file" || method_name == "preallocate_open_file" => {
+            message_mentions_storage_full(details)
+        }
         SbhError::Runtime { details } => message_mentions_storage_full(details),
         _ => false,
     }

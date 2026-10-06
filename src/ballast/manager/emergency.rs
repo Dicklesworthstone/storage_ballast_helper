@@ -45,9 +45,7 @@ pub(super) fn existing_indices(
 
     let is_current = || {
         std::fs::symlink_metadata(path).is_ok_and(|current| {
-            current.is_dir()
-                && current.dev() == expected.dev()
-                && current.ino() == expected.ino()
+            current.is_dir() && current.dev() == expected.dev() && current.ino() == expected.ino()
         })
     };
     if !is_current() {
@@ -658,7 +656,10 @@ mod unix {
             assert_eq!(report.released[0].0, manager.file_path(3));
             assert_eq!(report.released[1].0, manager.file_path(2));
             assert!(!report.errors.is_empty());
-            assert_eq!(fs::read(foreign).unwrap(), b"user data with a ballast-like name");
+            assert_eq!(
+                fs::read(foreign).unwrap(),
+                b"user data with a ballast-like name"
+            );
             assert!(manager.file_path(1).exists());
         }
 
@@ -669,7 +670,10 @@ mod unix {
             // A valid header copied to another canonical index is not authority.
             fs::copy(manager.file_path(3), manager.file_path(4)).unwrap();
             // Nor is a valid header whose allocation has since been truncated.
-            let damaged = OpenOptions::new().write(true).open(manager.file_path(3)).unwrap();
+            let damaged = OpenOptions::new()
+                .write(true)
+                .open(manager.file_path(3))
+                .unwrap();
             damaged.set_len(HEADER_SIZE as u64).unwrap();
             drop(damaged);
             let mut changed = config();
@@ -680,11 +684,12 @@ mod unix {
             assert!(manager.file_path(3).exists());
             assert!(manager.file_path(4).exists());
             // Restore a correctly indexed, fully written surplus file.
-            let header = super::super::super::ballast_header_buffer(4, config().file_size_bytes)
-                .unwrap();
+            let header =
+                super::super::super::ballast_header_buffer(4, config().file_size_bytes).unwrap();
             let mut file = File::create(manager.file_path(4)).unwrap();
             file.write_all(&header).unwrap();
-            file.write_all(&vec![7u8; config().file_size_bytes as usize - HEADER_SIZE]).unwrap();
+            file.write_all(&vec![7u8; config().file_size_bytes as usize - HEADER_SIZE])
+                .unwrap();
             file.sync_all().unwrap();
             assert_eq!(manager.release(1).unwrap().files_released, 1);
         }
@@ -700,7 +705,13 @@ mod unix {
                 manager.ballast_dir.join("saved-lock"),
             )
             .unwrap();
-            assert!(manager.release(1).unwrap_err().to_string().contains("lock is missing"));
+            assert!(
+                manager
+                    .release(1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("lock is missing")
+            );
             assert!(manager.file_path(3).exists());
             assert!(!manager.ballast_dir.join(".lock").exists());
         }
@@ -725,7 +736,10 @@ mod unix {
             fs::create_dir(&manager.ballast_dir).unwrap();
             fs::write(manager.file_path(1), b"replacement contents").unwrap();
             assert!(existing_indices(&manager.ballast_dir, &before).is_err());
-            assert_eq!(fs::read(manager.file_path(1)).unwrap(), b"replacement contents");
+            assert_eq!(
+                fs::read(manager.file_path(1)).unwrap(),
+                b"replacement contents"
+            );
         }
 
         #[test]
@@ -734,11 +748,13 @@ mod unix {
             let (_root, mut manager) = fixture();
             let index = u32::MAX;
             let path = manager.file_path(index);
-            let header = super::super::super::ballast_header_buffer(index, config().file_size_bytes)
-                .unwrap();
+            let header =
+                super::super::super::ballast_header_buffer(index, config().file_size_bytes)
+                    .unwrap();
             let mut file = File::create(&path).unwrap();
             file.write_all(&header).unwrap();
-            file.write_all(&vec![11u8; config().file_size_bytes as usize - HEADER_SIZE]).unwrap();
+            file.write_all(&vec![11u8; config().file_size_bytes as usize - HEADER_SIZE])
+                .unwrap();
             file.sync_all().unwrap();
             drop(file);
             let indices = existing_indices(

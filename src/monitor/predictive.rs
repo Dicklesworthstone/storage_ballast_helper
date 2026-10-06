@@ -258,9 +258,7 @@ impl PredictiveActionPolicy {
         // plausibility gates; all evidence/confidence gates above still apply.
         let corroborated_imminent =
             corroborated_imminent_runway(estimate, self.config.imminent_danger_minutes);
-        if current_free_pct > 50.0
-            && estimate.confidence < 0.95
-            && corroborated_imminent.is_none()
+        if current_free_pct > 50.0 && estimate.confidence < 0.95 && corroborated_imminent.is_none()
         {
             return PredictiveAction::Clear;
         }
@@ -1482,12 +1480,11 @@ mod tests {
 
     #[test]
     fn corroborated_burst_rescue_keeps_both_confidence_gates() {
-        for (confidence, probability, should_release) in [
-            (0.9, 0.6, true),
-            (0.84, 0.51, false),
-            (0.86, 0.9, false),
-        ] {
-            let est = make_burst_estimate(1000.0, 60.0, confidence, Trend::Stable, probability, 800.0);
+        for (confidence, probability, should_release) in
+            [(0.9, 0.6, true), (0.84, 0.51, false), (0.86, 0.9, false)]
+        {
+            let est =
+                make_burst_estimate(1000.0, 60.0, confidence, Trend::Stable, probability, 800.0);
             let action = default_policy().evaluate(&est, 80.0, PathBuf::from("/data"));
             assert_eq!(action.should_release_ballast(), should_release);
             assert_eq!(action.should_cleanup(), should_release);
@@ -1554,7 +1551,8 @@ mod tests {
     fn safe_or_unavailable_baselines_do_not_authorize_high_free_rescue() {
         for probability in [0.0, 0.3, 0.5, 0.6, 0.9] {
             for median in [0.0, 1.0, f64::NAN, f64::INFINITY, -1.0] {
-                let est = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, probability, median);
+                let est =
+                    make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, probability, median);
                 assert_eq!(
                     default_policy().evaluate(&est, 80.0, PathBuf::from("/data")),
                     PredictiveAction::Clear
@@ -1607,7 +1605,10 @@ mod tests {
         let est = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, 0.3, 500.0);
         assert!(matches!(
             policy.evaluate(&est, 80.0, PathBuf::from("/data")),
-            PredictiveAction::ImminentDanger { critical: false, .. }
+            PredictiveAction::ImminentDanger {
+                critical: false,
+                ..
+            }
         ));
         let outside = make_burst_estimate(1000.0, 60.0, 0.9, Trend::Stable, 0.3, 300.0);
         assert_eq!(
