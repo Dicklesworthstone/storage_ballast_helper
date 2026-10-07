@@ -1117,11 +1117,21 @@ pub fn structural_signals_for_path(path: &Path) -> StructuralSignals {
     let Ok(entries) = fs::read_dir(path) else {
         return StructuralSignals::default();
     };
+    let mut has_tag_name = false;
     let names: Vec<String> = entries
         .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().to_lowercase())
+        .map(|entry| {
+            let name = entry.file_name();
+            // Keep the actual spelling before lowercasing heuristic markers.
+            // A case-insensitive filesystem must not make replay accept a
+            // lowercase tag that the live walker would ignore.
+            has_tag_name |= name == "CACHEDIR.TAG";
+            name.to_string_lossy().to_lowercase()
+        })
         .collect();
-    signals_from_children(&names)
+    let mut signals = signals_from_children(&names);
+    signals.has_cachedir_tag = has_tag_name && is_valid_cachedir_tag(&path.join("CACHEDIR.TAG"));
+    signals
 }
 
 /// Build `StructuralSignals` by checking presence of well-known child names.
@@ -1139,10 +1149,8 @@ fn signals_from_children(child_names: &[String]) -> StructuralSignals {
             ".fingerprint" => signals.has_fingerprint = true,
             ".git" => signals.has_git = true,
             "cargo.toml" => signals.has_cargo_toml = true,
-            // Presence-only in this name-list helper (the live walker validates
-            // the tag's signature). The spec name is uppercase CACHEDIR.TAG;
-            // this helper receives already-lowercased names.
-            "cachedir.tag" => signals.has_cachedir_tag = true,
+            // A name list cannot establish cache-tag contents or file type.
+            // Live collection and replay both validate that evidence on disk.
             _ => {}
         }
         // Names are already lowercased, so case-insensitive matching is not needed.
@@ -1174,16 +1182,63 @@ const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806b
 pub(crate) fn is_valid_cachedir_tag(path: &Path) -> bool {
     use std::io::Read;
 
-    let Ok(mut file) = fs::File::open(path) else {
+    // A cache tag is an ordinary file, never a link or special file. Precheck
+    // to avoid opening devices, then check the opened descriptor as well: the
+    // pathname can change between the two observations.
+    let Ok(before) = fs::symlink_metadata(path) else {
         return false;
     };
-    let mut buf = [0u8; CACHEDIR_TAG_SIGNATURE.len()];
-    // `read_exact` fills the whole buffer or fails; a file shorter than the
-    // signature cannot be a valid tag, so a short read is a clean rejection.
-    if file.read_exact(&mut buf).is_err() {
+    if !before.is_file() {
         return false;
     }
-    buf == CACHEDIR_TAG_SIGNATURE
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // NONBLOCK also covers replacement by a FIFO after the precheck.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let Ok(mut file) = options.open(path) else {
+        return false;
+    };
+    let Ok(opened) = file.metadata() else {
+        return false;
+    };
+    if !same_tag_observation(&before, &opened) {
+        return false;
+    }
+    let mut buf = [0u8; CACHEDIR_TAG_SIGNATURE.len()];
+    if file.read_exact(&mut buf).is_err() || buf != CACHEDIR_TAG_SIGNATURE {
+        return false;
+    }
+    // Do not publish positive evidence for a tag that was replaced or changed
+    // while its signature was read. This is observation, not a deletion lease.
+    file.metadata()
+        .is_ok_and(|after| same_tag_observation(&opened, &after))
+        && fs::symlink_metadata(path)
+            .is_ok_and(|current| same_tag_observation(&opened, &current))
+}
+
+fn same_tag_observation(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    if !after.is_file()
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        before.created().ok() == after.created().ok()
+    }
 }
 
 /// Allocated on-disk size of an entry in bytes.
