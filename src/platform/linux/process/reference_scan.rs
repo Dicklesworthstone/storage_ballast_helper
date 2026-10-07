@@ -17,11 +17,15 @@ use super::{
     open_file_mode_for_fd, pid_from_proc_entry_name, resolve_absolute_path,
 };
 use crate::core::errors::{Result, SbhError};
-use crate::platform::types::{OpenFile, OpenFilesResult};
+use crate::platform::types::{ExecutablesResult, OpenFile, OpenFilesResult, ProcessInfo};
 
 const MAX_DESCRIPTORS: usize = 262_144;
 const MAX_DESCRIPTORS_PER_PID: usize = 16_384;
 const MAX_PROC_ENTRIES: usize = OPEN_FILES_MAX_PIDS + 4096;
+const MAX_EXECUTABLE_COMM_BYTES: usize = 256;
+const MAX_EXECUTABLE_STAT_BYTES: usize = 8192;
+// Linux include/linux/sched.h: task has no user executable (PF_KTHREAD).
+const PF_KTHREAD: u64 = 0x0020_0000;
 
 type Entries = Box<dyn Iterator<Item = io::Result<OsString>>>;
 
@@ -32,6 +36,10 @@ trait ProcAccess {
     fn link(&self, path: &Path) -> io::Result<PathBuf>;
     fn process_gone(&self, path: &Path) -> bool;
     fn now(&self) -> Instant;
+
+    fn read_bounded(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+        read_proc_bytes(path, limit)
+    }
 }
 
 struct NativeProc;
@@ -212,6 +220,130 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
             }
         }
     }
+
+    fn executable(
+        &mut self,
+        proc_root: &Path,
+        pid: i32,
+        root: &Path,
+        out: &mut Vec<ProcessInfo>,
+    ) {
+        let process = proc_root.join(pid.to_string());
+        let target = match self.proc.link(&process.join("exe")) {
+            Ok(target) => target,
+            Err(error) => {
+                if !disappeared(&error) || !self.no_user_executable(&process, pid) {
+                    self.complete = false;
+                }
+                return;
+            }
+        };
+        if !target.is_absolute() {
+            self.complete = false;
+            return;
+        }
+        let executable = resolve_absolute_path(&target);
+        if !executable.starts_with(root) {
+            return;
+        }
+
+        // Discover the executable BEFORE optional display metadata. A missing,
+        // denied, invalid-byte or oversized comm cannot erase this reference.
+        // A name is an annotation, never evidence that the executable is absent.
+        let name = if self.expired() {
+            None
+        } else {
+            self.proc
+                .read_bounded(&process.join("comm"), MAX_EXECUTABLE_COMM_BYTES)
+                .ok()
+                .map(|raw| String::from_utf8_lossy(&raw).trim().to_string())
+                .filter(|name| !name.is_empty())
+        }
+        .unwrap_or_else(|| {
+            executable.file_name().map_or_else(
+                || format!("pid {pid}"),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        });
+        // This query supplies reference evidence. General process statistics
+        // remain available through process_list; fetching command lines and
+        // accounting for every visible PID is not required to protect a path.
+        out.push(ProcessInfo {
+            pid,
+            parent_pid: None,
+            name,
+            command_line: Vec::new(),
+            executable: Some(executable),
+            cwd: None,
+            start_time_unix_ms: None,
+            virtual_memory_bytes: None,
+            resident_memory_bytes: None,
+            cpu_user_micros: None,
+            cpu_system_micros: None,
+        });
+    }
+
+    fn no_user_executable(&mut self, process: &Path, pid: i32) -> bool {
+        if self.expired() {
+            return false;
+        }
+        if self.proc.process_gone(process) {
+            return true;
+        }
+        // ENOENT alone is not absence evidence: /proc/PID/exe can disappear
+        // when the main thread exits while sibling threads still execute.
+        // Kernel threads and terminal single-thread processes genuinely lack
+        // a user executable. Require explicit bounded stat evidence for them.
+        self.proc
+            .read_bounded(&process.join("stat"), MAX_EXECUTABLE_STAT_BYTES)
+            .ok()
+            .is_some_and(|raw| stat_has_no_user_executable(&raw, pid))
+    }
+}
+
+fn read_proc_bytes(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "non-regular proc metadata"));
+    }
+    let mut raw = Vec::new();
+    file.take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut raw)?;
+    if raw.len() > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "proc metadata exceeds limit"));
+    }
+    Ok(raw)
+}
+
+fn stat_has_no_user_executable(raw: &[u8], pid: i32) -> bool {
+    let Ok(raw) = std::str::from_utf8(raw) else {
+        return false;
+    };
+    let Some((observed_pid, _)) = raw.split_once('(') else {
+        return false;
+    };
+    if observed_pid.trim().parse::<i32>().ok() != Some(pid) {
+        return false;
+    }
+    let Ok(fields) = super::proc_stat_fields_after_comm(raw) else {
+        return false;
+    };
+    // stat fields 9 (flags) and 20 (num_threads); fields[0] is field 3 (state).
+    let Some(flags) = fields.get(6).and_then(|value| value.parse::<u64>().ok()) else {
+        return false;
+    };
+    let Some(threads) = fields.get(17).and_then(|value| value.parse::<u64>().ok()) else {
+        return false;
+    };
+    threads > 0
+        && (flags & PF_KTHREAD != 0
+            || (threads == 1 && matches!(fields.first().copied(), Some("Z" | "X" | "x"))))
 }
 
 fn disappeared(error: &io::Error) -> bool {
@@ -274,10 +406,44 @@ fn open_files_with(
     })
 }
 
+pub(super) fn executables(root: &Path) -> Result<ExecutablesResult> {
+    executables_with(&NativeProc, Path::new(PROC_ROOT), root, Limits::default())
+}
+
+fn executables_with(
+    proc: &impl ProcAccess,
+    proc_root: &Path,
+    root: &Path,
+    limits: Limits,
+) -> Result<ExecutablesResult> {
+    let root = resolve_absolute_path(root);
+    let mut sweep = Sweep::new(proc, limits);
+    let pids = sweep
+        .pids(proc_root)
+        .map_err(|error| SbhError::io(proc_root, error))?;
+    let mut processes = Vec::new();
+    for pid in pids {
+        if sweep.expired() {
+            break;
+        }
+        sweep.executable(proc_root, pid, &root, &mut processes);
+    }
+    sweep.expired();
+    processes.sort_by(|left, right| {
+        left.pid
+            .cmp(&right.pid)
+            .then_with(|| left.executable.cmp(&right.executable))
+    });
+    Ok(ExecutablesResult {
+        processes,
+        complete: sweep.complete,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::os::unix::fs::symlink;
 
@@ -325,6 +491,18 @@ mod tests {
         fn scan(&self, access: &impl ProcAccess, limits: Limits) -> OpenFilesResult {
             open_files_with(access, &self.proc_root, &self.root, limits).unwrap()
         }
+
+        fn exe(&self, pid: i32) -> PathBuf {
+            let process = self.pid(pid);
+            let path = self.root.join(format!("program-{pid}"));
+            fs::write(&path, b"retained program").unwrap();
+            symlink(&path, process.join("exe")).unwrap();
+            path
+        }
+
+        fn scan_executables(&self, access: &impl ProcAccess, limits: Limits) -> ExecutablesResult {
+            executables_with(access, &self.proc_root, &self.root, limits).unwrap()
+        }
     }
 
     /// All successful operations are actual fixture syscalls. Only named
@@ -332,11 +510,14 @@ mod tests {
     struct Faults {
         dirs: BTreeMap<PathBuf, i32>,
         links: BTreeMap<PathBuf, i32>,
+        reads: BTreeMap<PathBuf, i32>,
         entry_error: Option<PathBuf>,
         absent_pid: Option<i32>,
         now: Cell<Instant>,
         advance_per_link: Duration,
+        advance_per_read: Duration,
         link_calls: Cell<usize>,
+        read_paths: RefCell<Vec<PathBuf>>,
     }
 
     impl Default for Faults {
@@ -344,11 +525,14 @@ mod tests {
             Self {
                 dirs: BTreeMap::new(),
                 links: BTreeMap::new(),
+                reads: BTreeMap::new(),
                 entry_error: None,
                 absent_pid: None,
                 now: Cell::new(Instant::now()),
                 advance_per_link: Duration::ZERO,
+                advance_per_read: Duration::ZERO,
                 link_calls: Cell::new(0),
+                read_paths: RefCell::new(Vec::new()),
             }
         }
     }
@@ -386,6 +570,15 @@ mod tests {
 
         fn now(&self) -> Instant {
             self.now.get()
+        }
+
+        fn read_bounded(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+            self.read_paths.borrow_mut().push(path.to_path_buf());
+            self.now.set(self.now.get() + self.advance_per_read);
+            self.reads.get(path).map_or_else(
+                || read_proc_bytes(path, limit),
+                |code| Err(io::Error::from_raw_os_error(*code)),
+            )
         }
     }
 
@@ -664,5 +857,244 @@ mod tests {
         assert!(result.complete);
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].mode, crate::platform::types::OpenFileMode::ReadWrite);
+    }
+
+    fn task_stat(pid: i32, state: &str, flags: u64, threads: usize) -> String {
+        let mut fields = vec!["0".to_string(); 20];
+        fields[0] = state.to_string();
+        fields[6] = flags.to_string();
+        fields[17] = threads.to_string();
+        format!("{pid} (worker with ) parens) {}\n", fields.join(" "))
+    }
+
+    #[test]
+    fn executable_reference_does_not_require_ancillary_process_metadata() {
+        let fixture = Fixture::new();
+        let high = fixture.exe(22);
+        let low = fixture.exe(11);
+        let access = Faults::default();
+        let result = fixture.scan_executables(&access, Limits::default());
+        assert!(result.complete);
+        assert_eq!(result.processes.len(), 2);
+        assert_eq!(result.processes[0].executable.as_ref(), Some(&low));
+        assert_eq!(result.processes[1].executable.as_ref(), Some(&high));
+        assert_eq!(result.processes[0].name, "program-11");
+        assert!(access.read_paths.borrow().iter().all(|path| path.ends_with("comm")));
+        assert_eq!(fs::read(low).unwrap(), b"retained program");
+        assert_eq!(fs::read(high).unwrap(), b"retained program");
+    }
+
+    #[test]
+    fn denied_executable_keeps_other_programs_but_revokes_complete_coverage() {
+        let fixture = Fixture::new();
+        fixture.exe(1);
+        let retained = fixture.exe(2);
+        for code in [libc::EACCES, libc::EPERM, libc::EIO, libc::EMFILE] {
+            let mut access = Faults::default();
+            access.links.insert(fixture.proc_root.join("1/exe"), code);
+            let result = fixture.scan_executables(&access, Limits::default());
+            assert!(!result.complete, "link error {code}");
+            assert_eq!(result.processes.len(), 1);
+            assert_eq!(result.processes[0].executable.as_ref(), Some(&retained));
+        }
+    }
+
+    #[test]
+    fn absent_exe_for_a_live_unclassified_process_is_unknown_not_safe() {
+        let fixture = Fixture::new();
+        fixture.pid(1);
+        let retained = fixture.exe(2);
+        let result = fixture.scan_executables(&NativeProc, Limits::default());
+        assert!(!result.complete);
+        assert_eq!(result.processes.len(), 1);
+        assert_eq!(result.processes[0].executable.as_ref(), Some(&retained));
+    }
+
+    #[test]
+    fn kernel_threads_terminal_single_threads_and_gone_pids_are_not_access_failures() {
+        let fixture = Fixture::new();
+        let kernel = fixture.pid(1);
+        fs::write(kernel.join("stat"), task_stat(1, "S", PF_KTHREAD, 1)).unwrap();
+        let zombie = fixture.pid(2);
+        fs::write(zombie.join("stat"), task_stat(2, "Z", 0, 1)).unwrap();
+        let retained = fixture.exe(3);
+        let access = Faults { absent_pid: Some(99), ..Faults::default() };
+        let result = fixture.scan_executables(&access, Limits::default());
+        assert!(result.complete);
+        assert_eq!(result.processes.len(), 1);
+        assert_eq!(result.processes[0].executable.as_ref(), Some(&retained));
+    }
+
+    #[test]
+    fn exited_group_leader_does_not_hide_executing_sibling_threads() {
+        let fixture = Fixture::new();
+        let process = fixture.pid(1);
+        fs::write(process.join("stat"), task_stat(1, "Z", 0, 2)).unwrap();
+        let result = fixture.scan_executables(&NativeProc, Limits::default());
+        assert!(!result.complete);
+        assert!(result.processes.is_empty());
+        assert!(!stat_has_no_user_executable(task_stat(1, "S", 0, 1).as_bytes(), 1));
+    }
+
+    #[test]
+    fn missing_exe_requires_valid_matching_and_readable_stat_evidence() {
+        let fixture = Fixture::new();
+        let process = fixture.pid(1);
+        for raw in [
+            task_stat(2, "Z", 0, 1).into_bytes(),
+            task_stat(1, "Z", 0, 0).into_bytes(),
+            b"1 (truncated) Z 0 0".to_vec(),
+            vec![0xff; 100],
+            vec![b' '; MAX_EXECUTABLE_STAT_BYTES + 1],
+        ] {
+            fs::write(process.join("stat"), raw).unwrap();
+            assert!(!fixture.scan_executables(&NativeProc, Limits::default()).complete);
+        }
+        fs::write(process.join("stat"), task_stat(1, "Z", 0, 1)).unwrap();
+        let mut access = Faults::default();
+        access.reads.insert(process.join("stat"), libc::EACCES);
+        assert!(!fixture.scan_executables(&access, Limits::default()).complete);
+    }
+
+    #[test]
+    fn optional_name_failures_and_non_utf8_names_preserve_the_executable() {
+        let fixture = Fixture::new();
+        let target = fixture.exe(1);
+        let comm = fixture.proc_root.join("1/comm");
+        for raw in [Vec::new(), vec![b'x'; MAX_EXECUTABLE_COMM_BYTES + 1], b"worker-\xff\n".to_vec()] {
+            fs::write(&comm, raw).unwrap();
+            let result = fixture.scan_executables(&NativeProc, Limits::default());
+            assert!(result.complete);
+            assert_eq!(result.processes[0].executable.as_ref(), Some(&target));
+            assert!(!result.processes[0].name.is_empty());
+        }
+        let mut access = Faults::default();
+        access.reads.insert(comm, libc::EACCES);
+        let result = fixture.scan_executables(&access, Limits::default());
+        assert!(result.complete);
+        assert_eq!(result.processes[0].name, "program-1");
+        assert_eq!(result.processes[0].executable.as_ref(), Some(&target));
+    }
+
+    #[test]
+    fn executable_queries_keep_raw_path_bytes_and_resolved_scope() {
+        use std::os::unix::ffi::OsStringExt;
+        let fixture = Fixture::new();
+        let process = fixture.pid(1);
+        let target = fixture.root.join(OsString::from_vec(b"program-\xff".to_vec()));
+        fs::write(&target, b"byte-named program").unwrap();
+        symlink(&target, process.join("exe")).unwrap();
+        let alias = fixture.proc_root.join("artifact-alias");
+        symlink(&fixture.root, &alias).unwrap();
+        let result = executables_with(&NativeProc, &fixture.proc_root, &alias, Limits::default()).unwrap();
+        assert!(result.complete);
+        assert_eq!(result.processes.len(), 1);
+        assert_eq!(result.processes[0].executable.as_ref(), Some(&target));
+        assert_eq!(fs::read(target).unwrap(), b"byte-named program");
+    }
+
+    #[test]
+    fn executable_discovery_distinguishes_exact_pid_and_entry_limits_from_truncation() {
+        let fixture = Fixture::new();
+        for pid in 1..=3 { fixture.exe(pid); }
+        for limit in 0..=4 {
+            for limits in [
+                Limits { pids: limit, ..Limits::default() },
+                Limits { proc_entries: limit, ..Limits::default() },
+            ] {
+                let access = Faults::default();
+                let result = fixture.scan_executables(&access, limits);
+                assert_eq!(result.processes.len(), limit.min(3));
+                assert_eq!(access.link_calls.get(), limit.min(3));
+                assert_eq!(result.complete, limit >= 3);
+            }
+        }
+    }
+
+    #[test]
+    fn executable_metadata_consumes_the_same_deadline_without_losing_a_positive() {
+        let fixture = Fixture::new();
+        for pid in 1..=3 { fixture.exe(pid); }
+        let access = Faults {
+            advance_per_read: Duration::from_secs(2),
+            ..Faults::default()
+        };
+        let result = fixture.scan_executables(&access, Limits { time: Duration::from_secs(2), ..Limits::default() });
+        assert!(!result.complete);
+        assert_eq!(result.processes.len(), 1);
+        assert_eq!(access.link_calls.get(), 1);
+        assert_eq!(access.read_paths.borrow().len(), 1);
+        let slow_link = Faults {
+            advance_per_link: Duration::from_secs(3),
+            ..Faults::default()
+        };
+        let result = fixture.scan_executables(&slow_link, Limits { time: Duration::from_secs(2), ..Limits::default() });
+        assert!(!result.complete);
+        assert_eq!(result.processes.len(), 1);
+        assert_eq!(slow_link.link_calls.get(), 1);
+        assert!(slow_link.read_paths.borrow().is_empty());
+    }
+
+    #[test]
+    fn current_pid_executable_scope_has_complete_native_coverage() {
+        let executable = resolve_absolute_path(&std::env::current_exe().unwrap());
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let mut sweep = Sweep::new(&NativeProc, Limits::default());
+        let mut processes = Vec::new();
+        sweep.executable(Path::new(PROC_ROOT), pid, &executable, &mut processes);
+        sweep.expired();
+        assert!(sweep.complete);
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].pid, pid);
+        assert_eq!(processes[0].executable.as_ref(), Some(&executable));
+        assert!(!processes[0].name.is_empty());
+    }
+
+    #[test]
+    fn executable_discovery_errors_preserve_coverage_semantics() {
+        let fixture = Fixture::new();
+        let target = fixture.exe(1);
+        let access = Faults { entry_error: Some(fixture.proc_root.clone()), ..Faults::default() };
+        let result = fixture.scan_executables(&access, Limits::default());
+        assert!(!result.complete);
+        assert_eq!(result.processes[0].executable.as_ref(), Some(&target));
+        let mut denied = Faults::default();
+        denied.dirs.insert(fixture.proc_root.clone(), libc::EACCES);
+        assert!(executables_with(&denied, &fixture.proc_root, &fixture.root, Limits::default()).is_err());
+    }
+
+    #[test]
+    fn relative_executable_targets_never_become_cwd_relative_references() {
+        let fixture = Fixture::new();
+        let process = fixture.pid(1);
+        symlink("unexpected-relative-program", process.join("exe")).unwrap();
+        let result = fixture.scan_executables(&NativeProc, Limits::default());
+        assert!(!result.complete);
+        assert!(result.processes.is_empty());
+    }
+
+    #[test]
+    fn executable_scope_does_not_expand_and_outside_programs_need_no_annotations() {
+        let fixture = Fixture::new();
+        let target = fixture.exe(1);
+        fixture.exe(2);
+        let access = Faults::default();
+        let result = executables_with(&access, &fixture.proc_root, &target, Limits::default()).unwrap();
+        assert!(result.complete);
+        assert_eq!(result.processes.len(), 1);
+        assert_eq!(result.processes[0].executable.as_ref(), Some(&target));
+        assert_eq!(*access.read_paths.borrow(), vec![fixture.proc_root.join("1/comm")]);
+    }
+
+    #[test]
+    fn nonregular_optional_metadata_cannot_block_or_discard_a_running_program() {
+        let fixture = Fixture::new();
+        let target = fixture.exe(1);
+        let comm = fixture.proc_root.join("1/comm");
+        nix::unistd::mkfifo(&comm, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        let result = fixture.scan_executables(&NativeProc, Limits::default());
+        assert!(result.complete);
+        assert_eq!(result.processes[0].executable.as_ref(), Some(&target));
+        assert_eq!(result.processes[0].name, "program-1");
     }
 }

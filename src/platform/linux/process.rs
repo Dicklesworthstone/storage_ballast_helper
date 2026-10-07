@@ -68,41 +68,7 @@ pub(super) fn read_open_files_under(root: &Path) -> Result<OpenFilesResult> {
 }
 
 pub(super) fn read_executables_under(root: &Path) -> Result<ExecutablesResult> {
-    let root = resolve_absolute_path(root);
-    let boot_time_unix_ms = read_proc_file(PROC_STAT)
-        .ok()
-        .and_then(|raw| parse_proc_boot_time_unix_ms(&raw).ok());
-    let mut processes = Vec::new();
-    let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
-    let mut pids_scanned: usize = 0;
-    let mut incomplete = false;
-
-    for pid in proc_pids()? {
-        if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
-            incomplete = true;
-            break;
-        }
-        if pid > 0 {
-            pids_scanned += 1;
-            if let Some(process) = process_info_for_pid(pid, boot_time_unix_ms)
-                && process
-                    .executable
-                    .as_deref()
-                    .is_some_and(|executable| resolve_absolute_path(executable).starts_with(&root))
-            {
-                processes.push(process);
-            }
-        }
-    }
-    processes.sort_by(|left, right| {
-        left.pid
-            .cmp(&right.pid)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    Ok(ExecutablesResult {
-        processes,
-        complete: !incomplete,
-    })
+    reference_scan::executables(root)
 }
 
 /// How long one sweep of every process's `maps` serves all roots and callers.
@@ -789,7 +755,10 @@ mod tests {
 
         let result =
             read_executables_under(root).expect("executables should be readable from /proc");
-        assert!(result.complete);
+        // Keep the all-PID positive check without assuming permission to read
+        // every unrelated executable. reference_scan separately asserts full
+        // coverage for the real current PID and controlled readable scopes,
+        // and asserts incomplete coverage for denied executable links.
 
         assert!(result.processes.iter().any(|process| {
             process.pid == current_pid && process.executable.as_ref() == Some(&resolved_exe)
