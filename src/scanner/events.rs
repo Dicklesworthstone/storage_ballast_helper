@@ -7,8 +7,6 @@
 
 #![allow(missing_docs)]
 
-#[cfg(any(target_os = "linux", test))]
-use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 #[cfg(any(target_os = "linux", test))]
@@ -29,6 +27,8 @@ mod fsevents;
 mod inotify_backend;
 #[cfg(target_os = "linux")]
 use inotify_backend::LinuxInotifyBackend;
+#[cfg(any(target_os = "linux", test))]
+mod watch_planner;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EventBackendKind {
@@ -202,7 +202,7 @@ impl EventSourcePlan {
         rates: &EventRateTracker,
         now: Instant,
     ) -> Self {
-        let enumeration = enumerate_watch_candidates(root_paths, watch_budget, rates, now);
+        let enumeration = watch_planner::enumerate(root_paths, watch_budget, rates, now);
         let allocation = allocate_watches(&enumeration.candidates, watch_budget);
 
         let mut dirty_roots = enumeration.unreadable_roots.clone();
@@ -211,12 +211,12 @@ impl EventSourcePlan {
         // A directory whose children were never enumerated needs its subtree
         // reconciled, unless a dirty ancestor already covers it.
         for truncated in &enumeration.truncated {
-            if !dirty_roots.iter().any(|dirty| truncated.starts_with(dirty)) {
+            if !truncated.ancestors().any(|ancestor| dirty_roots.contains(ancestor)) {
                 dirty_roots.insert(truncated.clone());
             }
         }
 
-        let reason = if !enumeration.unreadable_roots.is_empty() {
+        let reason = if !enumeration.reason.is_empty() {
             enumeration.reason
         } else if !allocation.unwatched_roots.is_empty() {
             "recursive inotify watch budget cannot cover the roots".to_string()
@@ -249,10 +249,6 @@ impl EventSourcePlan {
     }
 }
 
-/// Directories enumerated per unit of watch budget before planning stops
-/// descending. Subtrees below the enumeration cap rely on reconciliation.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const WATCH_PLAN_ENUMERATION_FACTOR: usize = 4;
 /// Above this many unwatched frontier directories under one root, the root
 /// itself is reconciled instead of thousands of tiny scan paths.
 const MAX_FRONTIER_DIRS_PER_ROOT: usize = 256;
@@ -378,79 +374,11 @@ pub fn allocate_watches(candidates: &[WatchCandidate], budget: usize) -> WatchAl
 #[derive(Debug, Default)]
 struct WatchEnumeration {
     candidates: Vec<WatchCandidate>,
-    /// Directories whose children were not listed because the enumeration
-    /// cap was reached; their subtrees rely on reconciliation.
+    /// Directories whose children were not fully enumerated; their subtrees
+    /// rely on reconciliation rather than inferred watch coverage.
     truncated: BTreeSet<PathBuf>,
     unreadable_roots: BTreeSet<PathBuf>,
     reason: String,
-}
-
-/// Breadth-first directory enumeration bounded by the watch budget so that
-/// planning never degenerates into a full tree walk.
-#[cfg(any(target_os = "linux", test))]
-fn enumerate_watch_candidates(
-    root_paths: &[PathBuf],
-    watch_budget: usize,
-    rates: &EventRateTracker,
-    now: Instant,
-) -> WatchEnumeration {
-    let cap = watch_budget
-        .saturating_mul(WATCH_PLAN_ENUMERATION_FACTOR)
-        .max(1);
-    let now_system = SystemTime::now();
-    let mut enumeration = WatchEnumeration::default();
-
-    for root in root_paths {
-        let metadata = match fs::symlink_metadata(root) {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                enumeration.unreadable_roots.insert(root.clone());
-                enumeration.reason =
-                    format!("root metadata unavailable for {}: {err}", root.display());
-                continue;
-            }
-        };
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            enumeration.unreadable_roots.insert(root.clone());
-            enumeration.reason = format!("root is not a plain directory: {}", root.display());
-            continue;
-        }
-
-        enumeration.candidates.push(WatchCandidate {
-            path: root.clone(),
-            root: root.clone(),
-            depth: 0,
-            rate: candidate_rate(rates, root, now, &metadata, now_system),
-        });
-        let mut queue = VecDeque::from([(root.clone(), 0usize)]);
-        while let Some((dir, depth)) = queue.pop_front() {
-            if enumeration.candidates.len() >= cap {
-                enumeration.truncated.insert(dir);
-                continue;
-            }
-            let Ok(entries) = sorted_child_paths(&dir) else {
-                enumeration.truncated.insert(dir);
-                continue;
-            };
-            for child in entries {
-                let Ok(metadata) = fs::symlink_metadata(&child) else {
-                    enumeration.truncated.insert(dir.clone());
-                    continue;
-                };
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                    continue;
-                }
-                enumeration.candidates.push(WatchCandidate {
-                    path: child.clone(),
-                    root: root.clone(),
-                    depth: depth + 1,
-                    rate: candidate_rate(rates, &child, now, &metadata, now_system),
-                });
-                queue.push_back((child, depth + 1));
-            }
-        }
-    }
-    enumeration
 }
 
 /// Per-directory EWMA of the filesystem event rate, keyed by the watched
@@ -1107,15 +1035,6 @@ enum EventSourceBackend {
     #[cfg(target_os = "linux")]
     RecursiveInotify(LinuxInotifyBackend),
     ReconciliationOnly,
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn sorted_child_paths(path: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut paths = fs::read_dir(path)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .collect::<Vec<_>>();
-    paths.sort();
-    Ok(paths)
 }
 
 /// Distinct project scan paths one root may carry per drain before the
