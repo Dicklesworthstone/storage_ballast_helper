@@ -67,6 +67,12 @@ pub(super) fn read_open_files_under(root: &Path) -> Result<OpenFilesResult> {
     reference_scan::open_files(root)
 }
 
+/// The native executor needs paths and coverage, not per-descriptor display
+/// metadata. Share the bounded proc traversal without paying for annotations.
+pub(crate) fn read_open_file_targets() -> Result<(Vec<PathBuf>, bool)> {
+    reference_scan::open_targets()
+}
+
 pub(super) fn read_executables_under(root: &Path) -> Result<ExecutablesResult> {
     reference_scan::executables(root)
 }

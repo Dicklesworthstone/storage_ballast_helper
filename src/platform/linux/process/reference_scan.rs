@@ -152,6 +152,29 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
     }
 
     fn fds(&mut self, proc_root: &Path, pid: i32, root: &Path, out: &mut Vec<OpenFile>) {
+        self.fd_targets(proc_root, pid, |process, fd, fd_path, target| {
+            let path = resolve_absolute_path(&target);
+            if path.starts_with(root) {
+                out.push(OpenFile {
+                    pid,
+                    path,
+                    fd: Some(fd),
+                    kind: open_file_kind_for_fd(fd_path),
+                    mode: open_file_mode_for_fd(process, fd),
+                });
+            }
+        });
+    }
+
+    /// Shared coverage and budget enforcement for annotated PAL results and
+    /// the executor's path-only sweep. The latter does not stat each target,
+    /// read fdinfo, or resolve every process path before root filtering.
+    fn fd_targets(
+        &mut self,
+        proc_root: &Path,
+        pid: i32,
+        mut visit: impl FnMut(&Path, i32, &Path, PathBuf),
+    ) {
         let process = proc_root.join(pid.to_string());
         let fd_dir = process.join("fd");
         let entries = match self.proc.entries(&fd_dir) {
@@ -205,16 +228,7 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
                 }
                 continue;
             }
-            let path = resolve_absolute_path(&target);
-            if path.starts_with(root) {
-                out.push(OpenFile {
-                    pid,
-                    path,
-                    fd: Some(fd),
-                    kind: open_file_kind_for_fd(&fd_path),
-                    mode: open_file_mode_for_fd(&process, fd),
-                });
-            }
+            visit(&process, fd, &fd_path, target);
             if self.expired() {
                 break;
             }
@@ -368,6 +382,55 @@ fn pseudo_target(path: &Path) -> bool {
         .iter()
         .any(|prefix| text.starts_with(prefix))
     })
+}
+
+/// One bounded path-only sweep for native cleanup preflight. Coverage has the
+/// same meaning as open_files(), including partial positives on access errors.
+/// At most two path spellings are retained per inspected descriptor.
+pub(super) fn open_targets() -> Result<(Vec<PathBuf>, bool)> {
+    open_targets_with(&NativeProc, Path::new(PROC_ROOT), Limits::default())
+}
+
+fn open_targets_with(
+    proc: &impl ProcAccess,
+    proc_root: &Path,
+    limits: Limits,
+) -> Result<(Vec<PathBuf>, bool)> {
+    let mut sweep = Sweep::new(proc, limits);
+    let pids = sweep
+        .pids(proc_root)
+        .map_err(|error| SbhError::io(proc_root, error))?;
+    let mut targets = std::collections::HashSet::new();
+    for pid in pids {
+        if sweep.expired() {
+            break;
+        }
+        sweep.fd_targets(proc_root, pid, |_, _, _, target| {
+            add_target_spellings(&mut targets, target);
+        });
+    }
+    let mut targets: Vec<_> = targets.into_iter().collect();
+    targets.sort_unstable();
+    // Failed/empty directory reads and final ordering belong to the same
+    // cooperative budget. An expired observation cannot certify absence.
+    sweep.expired();
+    Ok((targets, sweep.complete))
+}
+
+fn add_target_spellings(targets: &mut std::collections::HashSet<PathBuf>, target: PathBuf) {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+    // procfs appends this suffix to unlinked files, but it can also be part
+    // of a real filename. Preserve the literal spelling AND the stripped
+    // possibility: stripping unconditionally hides a live directory named
+    // "target (deleted)". Work on bytes so neither form loses non-UTF-8 names.
+    if let Some(stripped) = target.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+        let stripped = PathBuf::from(OsString::from_vec(stripped.to_vec()));
+        if stripped.is_absolute() {
+            targets.insert(stripped);
+        }
+    }
+    targets.insert(target);
 }
 
 pub(super) fn open_files(root: &Path) -> Result<OpenFilesResult> {
@@ -857,6 +920,184 @@ mod tests {
         assert!(result.complete);
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].mode, crate::platform::types::OpenFileMode::ReadWrite);
+    }
+
+    #[test]
+    fn path_only_sweep_deduplicates_targets_and_orders_them() {
+        let fixture = Fixture::new();
+        let first = fixture.fd(1, 0);
+        let second = fixture.fd(2, 0);
+        symlink(&first, fixture.proc_root.join("2/fd/1")).unwrap();
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        assert_eq!(targets, vec![first, second]);
+    }
+
+    #[test]
+    fn path_only_sweep_retains_partial_positives_on_denied_processes() {
+        let fixture = Fixture::new();
+        fixture.fd(1, 0);
+        let retained = fixture.fd(2, 0);
+        for code in [libc::EACCES, libc::EPERM, libc::EIO, libc::EMFILE] {
+            let mut access = Faults::default();
+            access.dirs.insert(fixture.proc_root.join("1/fd"), code);
+            let (targets, complete) =
+                open_targets_with(&access, &fixture.proc_root, Limits::default()).unwrap();
+            assert!(!complete, "error {code}");
+            assert_eq!(targets, vec![retained.clone()]);
+            assert!(!fixture.scan(&access, Limits::default()).complete);
+        }
+    }
+
+    #[test]
+    fn path_only_sweep_preserves_link_and_enumeration_failures() {
+        let fixture = Fixture::new();
+        fixture.fd(1, 0);
+        let retained = fixture.fd(1, 1);
+        let mut access = Faults::default();
+        access.links.insert(fixture.proc_root.join("1/fd/0"), libc::EIO);
+        let (targets, complete) =
+            open_targets_with(&access, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(!complete);
+        assert_eq!(targets, vec![retained.clone()]);
+        for path in [&fixture.proc_root, &fixture.proc_root.join("1/fd")] {
+            let access = Faults {
+                entry_error: Some(path.clone()),
+                ..Faults::default()
+            };
+            let (targets, complete) =
+                open_targets_with(&access, &fixture.proc_root, Limits::default()).unwrap();
+            assert!(!complete);
+            assert!(targets.contains(&retained));
+        }
+    }
+
+    #[test]
+    fn path_only_discovery_failure_is_not_empty_complete_evidence() {
+        let fixture = Fixture::new();
+        let mut access = Faults::default();
+        access.dirs.insert(fixture.proc_root.clone(), libc::EACCES);
+        assert!(open_targets_with(&access, &fixture.proc_root, Limits::default()).is_err());
+    }
+
+    #[test]
+    fn path_only_sweep_keeps_the_same_exact_bounds_as_the_pal() {
+        let fixture = Fixture::new();
+        for fd in 0..3 {
+            fixture.fd(1, fd);
+        }
+        let retained = fixture.fd(2, 0);
+        for limit in 0..=5 {
+            let limits = Limits {
+                descriptors: limit,
+                ..Limits::default()
+            };
+            let access = Faults::default();
+            let (targets, complete) =
+                open_targets_with(&access, &fixture.proc_root, limits).unwrap();
+            assert_eq!(targets.len(), limit.min(4));
+            assert_eq!(access.link_calls.get(), limit.min(4));
+            assert_eq!(complete, limit >= 4);
+            assert_eq!(complete, fixture.scan(&Faults::default(), limits).complete);
+        }
+        let (targets, complete) = open_targets_with(
+            &Faults::default(),
+            &fixture.proc_root,
+            Limits { per_pid: 1, ..Limits::default() },
+        )
+        .unwrap();
+        assert!(!complete);
+        assert_eq!(targets.len(), 2);
+        assert!(targets.contains(&retained), "one busy PID must not hide later PIDs");
+    }
+
+    #[test]
+    fn path_only_deadline_applies_inside_a_single_pid() {
+        let fixture = Fixture::new();
+        for fd in 0..5 {
+            fixture.fd(1, fd);
+        }
+        let access = Faults {
+            advance_per_link: Duration::from_secs(1),
+            ..Faults::default()
+        };
+        let (targets, complete) = open_targets_with(
+            &access,
+            &fixture.proc_root,
+            Limits { time: Duration::from_secs(2), ..Limits::default() },
+        )
+        .unwrap();
+        assert!(!complete);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(access.link_calls.get(), 2);
+    }
+
+    #[test]
+    fn path_only_sweep_preserves_normal_process_and_descriptor_churn() {
+        let fixture = Fixture::new();
+        fixture.fd(1, 0);
+        let retained = fixture.fd(1, 1);
+        let mut access = Faults { absent_pid: Some(99), ..Faults::default() };
+        access.links.insert(fixture.proc_root.join("1/fd/0"), libc::ENOENT);
+        let (targets, complete) =
+            open_targets_with(&access, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        assert_eq!(targets, vec![retained]);
+    }
+
+    #[test]
+    fn path_only_sweep_keeps_literal_deleted_suffix_and_byte_paths() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let fixture = Fixture::new();
+        let process = fixture.pid(1);
+        let literal = fixture.root.join(OsString::from_vec(b"target-\xff (deleted)".to_vec()));
+        fs::create_dir(&literal).unwrap();
+        symlink(&literal, process.join("fd/0")).unwrap();
+        let stripped = fixture.root.join(OsString::from_vec(b"target-\xff".to_vec()));
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        assert_eq!(targets.len(), 2);
+        assert!(targets.contains(&literal));
+        assert!(targets.contains(&stripped));
+        assert!(literal.is_dir(), "inspection is read-only");
+    }
+
+    #[test]
+    fn path_only_sweep_leaves_resolution_to_the_scoped_ancestor_mapper() {
+        let fixture = Fixture::new();
+        let process = fixture.pid(1);
+        let directory = fixture.root.join("real");
+        fs::create_dir(&directory).unwrap();
+        let alias = fixture.root.join("alias");
+        symlink(&directory, &alias).unwrap();
+        let target = alias.join("object");
+        fs::write(directory.join("object"), b"kept").unwrap();
+        symlink(&target, process.join("fd/0")).unwrap();
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        assert_eq!(targets, vec![target]);
+        assert_eq!(fixture.scan(&NativeProc, Limits::default()).files[0].path,
+                   directory.join("object"));
+    }
+
+    #[test]
+    fn path_only_sweep_excludes_pseudo_links_but_reports_unknown_relative_targets() {
+        let fixture = Fixture::new();
+        let retained = fixture.fd(1, 0);
+        symlink("socket:[123]", fixture.proc_root.join("1/fd/1")).unwrap();
+        symlink("anon_inode:[eventpoll]", fixture.proc_root.join("1/fd/2")).unwrap();
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        assert_eq!(targets, vec![retained.clone()]);
+        symlink("unknown-relative-target", fixture.proc_root.join("1/fd/3")).unwrap();
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(!complete);
+        assert_eq!(targets, vec![retained]);
     }
 
     fn task_stat(pid: i32, state: &str, flags: u64, threads: usize) -> String {

@@ -1512,59 +1512,16 @@ fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf
 }
 
 /// Every absolute path some process holds open, from one walk of
-/// `/proc/*/fd`, plus whether the walk finished within its budget.
+/// `/proc/*/fd`, plus whether its visible scope was completely inspected.
+/// Permission, I/O and budget failures all revoke complete coverage.
 ///
 /// This is the expensive part of an open-file check and does not depend on
 /// which candidates are being checked, so one walk can serve several batches
 /// (see `deletion::OPEN_SWEEP_REUSE_WINDOW`).
 #[cfg(target_os = "linux")]
 pub(crate) fn collect_open_file_targets_linux() -> (Vec<PathBuf>, bool) {
-    use std::os::unix::ffi::OsStrExt;
-    use std::time::Instant;
-
-    let mut targets: HashSet<PathBuf> = HashSet::with_capacity(4096);
-    let Ok(proc_dir) = fs::read_dir("/proc") else {
-        return (Vec::new(), true);
-    };
-
-    let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
-    let mut pids_scanned: usize = 0;
-    let mut incomplete = false;
-
-    for proc_entry in proc_dir.flatten() {
-        // Budget checks: stop if we've exceeded time or PID limits.
-        if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
-            incomplete = true;
-            break;
-        }
-
-        let pid_name = proc_entry.file_name();
-        let pid_bytes = pid_name.as_bytes();
-        if pid_bytes.is_empty() || !pid_bytes.iter().all(u8::is_ascii_digit) {
-            continue;
-        }
-
-        pids_scanned += 1;
-
-        let Ok(fd_entries) = fs::read_dir(proc_entry.path().join("fd")) else {
-            continue;
-        };
-
-        for fd_entry in fd_entries.flatten() {
-            let Ok(mut target) = fs::read_link(fd_entry.path()) else {
-                continue;
-            };
-            if !target.is_absolute() {
-                continue;
-            }
-            if let Some(stripped) = target.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
-                target = PathBuf::from(stripped);
-            }
-            targets.insert(target);
-        }
-    }
-
-    (targets.into_iter().collect(), !incomplete)
+    crate::platform::linux::process::read_open_file_targets()
+        .unwrap_or_else(|_| (Vec::new(), false))
 }
 
 /// The open-path ancestor index for `root_paths`, built from a list of open
@@ -1690,14 +1647,16 @@ impl ActiveReferenceIndex {
 
     #[must_use]
     pub fn incomplete_reason(&self) -> Option<&str> {
-        self.incomplete_reason.as_deref()
+        self.incomplete_reason.as_deref().or_else(|| {
+            (!self.complete).then_some("active-reference inspection did not cover every visible process")
+        })
     }
 
     #[must_use]
     pub fn summary_for(&self, path: &Path) -> ActiveReferenceSummary {
         let mut summary = self.references.get(path).cloned().unwrap_or_default();
-        if let Some(reason) = &self.incomplete_reason {
-            summary.mark_incomplete(reason.clone());
+        if let Some(reason) = self.incomplete_reason() {
+            summary.mark_incomplete(reason.to_string());
         }
         summary
     }
@@ -1709,8 +1668,8 @@ impl ActiveReferenceIndex {
             .get(&identity)
             .cloned()
             .unwrap_or_default();
-        if let Some(reason) = &self.incomplete_reason {
-            summary.mark_incomplete(reason.clone());
+        if let Some(reason) = self.incomplete_reason() {
+            summary.mark_incomplete(reason.to_string());
         }
         summary
     }
@@ -2203,6 +2162,168 @@ mod tests {
             resident_memory_bytes: None,
             cpu_user_micros: None,
             cpu_system_micros: None,
+        }
+    }
+
+    struct PartialActiveRefPlatform {
+        inner: TestActiveRefPlatform,
+        failed_source: usize,
+    }
+
+    impl Platform for PartialActiveRefPlatform {
+        fn name(&self) -> &'static str {
+            "partial-active-ref-test"
+        }
+
+        fn fs_stats(&self, path: &Path) -> Result<crate::platform::pal::FsStats> {
+            self.inner.fs_stats(path)
+        }
+
+        fn mount_points(&self) -> Result<Vec<crate::platform::pal::MountPoint>> {
+            self.inner.mount_points()
+        }
+
+        fn is_ram_backed(&self, path: &Path) -> Result<bool> {
+            self.inner.is_ram_backed(path)
+        }
+
+        fn default_paths(&self) -> crate::platform::pal::PlatformPaths {
+            self.inner.default_paths()
+        }
+
+        fn memory_info(&self) -> Result<crate::platform::pal::MemoryInfo> {
+            self.inner.memory_info()
+        }
+
+        fn service_manager(&self) -> Box<dyn crate::platform::pal::ServiceManager> {
+            self.inner.service_manager()
+        }
+
+        fn process_list(&self) -> Result<Vec<crate::platform::types::ProcessInfo>> {
+            if self.failed_source == 0 {
+                return Err(crate::core::errors::SbhError::Runtime {
+                    details: "injected process enumeration failure".to_string(),
+                });
+            }
+            self.inner.process_list()
+        }
+
+        fn open_files_under(&self, path: &Path) -> Result<crate::platform::types::OpenFilesResult> {
+            let mut result = self.inner.open_files_under(path)?;
+            result.complete = self.failed_source != 1;
+            Ok(result)
+        }
+
+        fn executables_under(&self, path: &Path) -> Result<crate::platform::types::ExecutablesResult> {
+            let mut result = self.inner.executables_under(path)?;
+            result.complete = self.failed_source != 2;
+            Ok(result)
+        }
+
+        fn mmap_regions_under(&self, path: &Path) -> Result<Vec<crate::platform::types::MappedRegion>> {
+            if self.failed_source == 3 {
+                return Err(crate::core::errors::SbhError::Runtime {
+                    details: "injected maps access failure".to_string(),
+                });
+            }
+            self.inner.mmap_regions_under(path)
+        }
+    }
+
+    #[test]
+    fn partial_pal_coverage_reaches_both_candidate_summary_projections() {
+        let dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let active = root.join("active");
+        let unobserved = root.join("unobserved");
+        fs::create_dir(&active).unwrap();
+        fs::create_dir(&unobserved).unwrap();
+        let held = active.join("object");
+        fs::write(&held, b"keep").unwrap();
+        for failed_source in 0..4 {
+            let platform = PartialActiveRefPlatform {
+                failed_source,
+                inner: TestActiveRefPlatform {
+                    open_files: vec![crate::platform::types::OpenFile {
+                        pid: 42,
+                        path: held.clone(),
+                        fd: Some(7),
+                        kind: crate::platform::types::OpenFileKind::Regular,
+                        mode: crate::platform::types::OpenFileMode::Read,
+                    }],
+                    ..Default::default()
+                },
+            };
+            let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
+            assert!(!index.is_complete(), "source {failed_source}");
+            assert!(index.incomplete_reason().is_some());
+            for path in [&active, &unobserved] {
+                let identity = identity_for_path(path, false).unwrap();
+                for summary in [index.summary_for(path), index.summary_for_identity(identity)] {
+                    assert!(summary.incomplete_reason.is_some(), "source {failed_source}");
+                    assert!(summary.safe_reclaim_reason().is_some());
+                    assert!(!summary.is_empty());
+                    if path == &active {
+                        assert!(summary.processes.iter().any(|process| {
+                            process.pid == 42 && process.open_file_descriptors == 1
+                        }));
+                    } else {
+                        assert!(summary.processes.is_empty());
+                    }
+                }
+            }
+        }
+        assert_eq!(fs::read(held).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn complete_reference_coverage_does_not_manufacture_a_veto() {
+        let dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let index = collect_active_reference_index(
+            &TestActiveRefPlatform::default(),
+            std::slice::from_ref(&root),
+        );
+        assert!(index.is_complete());
+        assert!(index.incomplete_reason().is_none());
+        let identity = identity_for_path(&root, false).unwrap();
+        for summary in [index.summary_for(&root), index.summary_for_identity(identity)] {
+            assert!(summary.is_empty());
+            assert!(summary.safe_reclaim_reason().is_none());
+        }
+    }
+
+    #[test]
+    fn specific_reference_coverage_reason_is_not_replaced_by_generic_fallback() {
+        let dir = TempDir::new().unwrap();
+        let identity = identity_for_path(dir.path(), false).unwrap();
+        let index = ActiveReferenceIndex::incomplete("process visibility limited by policy");
+        assert_eq!(index.incomplete_reason(), Some("process visibility limited by policy"));
+        for summary in [index.summary_for(dir.path()), index.summary_for_identity(identity)] {
+            assert_eq!(summary.incomplete_reason.as_deref(), index.incomplete_reason());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_cleanup_veto_keeps_a_live_directory_with_a_literal_deleted_suffix() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        for name in [
+            std::ffi::OsString::from("target (deleted)"),
+            std::ffi::OsString::from_vec(b"target-\xff (deleted)".to_vec()),
+        ] {
+            let candidate = root.join(name);
+            fs::create_dir(&candidate).unwrap();
+            fs::write(candidate.join("retained"), b"keep").unwrap();
+            let _held_directory = fs::File::open(&candidate).unwrap();
+            let (ancestors, _) = collect_open_path_ancestors(std::slice::from_ref(&root));
+            // Other PIDs may be unreadable; positive evidence must survive
+            // irrespective of completeness of the host-wide observation.
+            assert!(is_path_open_by_ancestor(&candidate, &ancestors));
+            assert!(!is_path_open_by_ancestor(&root.join("unrelated"), &ancestors));
+            assert_eq!(fs::read(candidate.join("retained")).unwrap(), b"keep");
         }
     }
 
