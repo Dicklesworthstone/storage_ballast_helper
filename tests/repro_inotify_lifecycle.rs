@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use storage_ballast_helper::core::config::ScannerConfig;
 use storage_ballast_helper::scanner::events::{
-    EventBackendKind, EventInvalidation, EventSourceConfig, ScannerEventSource,
+    EventBackendKind, EventInvalidation, EventSourceConfig, EventSourcePlan, ScannerEventSource,
 };
 use storage_ballast_helper::scanner::index::{ScannerCandidateIndex, ScannerIndexContext};
 
@@ -239,4 +239,95 @@ fn large_real_event_bursts_produce_bounded_conservative_invalidation() {
     assert!(invalidation.dirty_roots().contains(&root));
     assert!(invalidation.dirty_paths().len() <= 512);
     assert_eq!(fs::read(root.join("artifact-2047")).unwrap(), b"retained");
+}
+
+#[test]
+fn file_only_flat_directories_exhaust_planning_without_claiming_complete_coverage() {
+    let (_temp, _base, root) = root_fixture();
+    // No directories: the old candidate-count cap could not stop this read.
+    for n in 0..16_384 {
+        fs::write(root.join(format!("retained-{n:05}")), b"keep").unwrap();
+    }
+    let config = EventSourceConfig::from_scanner_config(
+        std::slice::from_ref(&root),
+        &ScannerConfig { event_watch_budget: 8, ..ScannerConfig::default() },
+    );
+    let plan = EventSourcePlan::for_config(&config);
+    assert!(!plan.complete, "unobserved EOF must not become complete coverage");
+    assert_eq!(plan.watched_dirs, vec![root.clone()]);
+    assert!(plan.dirty_roots.contains(&root));
+    assert!(plan.reason.contains("planning incomplete"), "{}", plan.reason);
+
+    let now = Instant::now();
+    let mut events = ScannerEventSource::start_at(config, now);
+    assert!(!events.capability().complete);
+    assert_eq!(events.capability().watched_dirs, 1);
+    let startup = events.drain_at(now);
+    assert!(startup.requires_index_generation_bump());
+    assert!(startup.dirty_roots().contains(&root));
+    sees_write(&mut events, &root.join("new-top-level.o"), now + Duration::from_secs(1));
+    assert_eq!(fs::read(root.join("retained-16383")).unwrap(), b"keep");
+}
+
+#[test]
+fn candidate_budget_gaps_revoke_replay_and_can_recover_after_root_replacement() {
+    let (_temp, base, root) = root_fixture();
+    for n in 0..100 {
+        fs::create_dir(root.join(format!("project-{n:03}"))).unwrap();
+    }
+    fs::write(root.join("project-099/retained"), b"preserve the large tree").unwrap();
+    let now = Instant::now();
+    let mut events = source(&root, 1, now);
+    assert!(!events.capability().complete);
+    assert_eq!(events.capability().watched_dirs, 1);
+    // Previously every child was retained despite the four-candidate budget;
+    // the plan reported individual frontier children, not unenumerated root coverage.
+    let startup = events.drain_at(now);
+    assert!(startup.dirty_roots().contains(&root), "{startup:?}");
+    let mut index = ScannerCandidateIndex::new(ScannerIndexContext {
+        root_fingerprint: "bounded-plan-root".into(),
+        config_fingerprint: "bounded-plan-config".into(),
+    });
+    startup.apply_to_index(&mut index);
+    assert_eq!(index.event_generation(), 1);
+
+    let retained = base.join("retired-wide-root");
+    fs::rename(&root, &retained).unwrap();
+    fs::create_dir(&root).unwrap();
+    until(&mut events, now + Duration::from_secs(1), |source, _| {
+        source.capability().watched_dirs == 0
+    });
+    let repaired = events.drain_at(now + Duration::from_secs(30));
+    assert!(repaired.requires_index_generation_bump());
+    assert!(events.capability().complete);
+    assert_eq!(events.capability().watched_dirs, 1);
+    sees_write(&mut events, &root.join("after-repair.o"), now + Duration::from_secs(31));
+    assert_eq!(fs::read(retained.join("project-099/retained")).unwrap(), b"preserve the large tree");
+}
+
+#[test]
+fn bounded_periodic_replan_keeps_an_independent_root_observable() {
+    let (_temp, base, root) = root_fixture();
+    let healthy = base.join("z-independent");
+    fs::create_dir(&healthy).unwrap();
+    let now = Instant::now();
+    let config = EventSourceConfig::from_scanner_config(
+        &[root.clone(), healthy.clone()],
+        &ScannerConfig { event_watch_budget: 4, ..ScannerConfig::default() },
+    );
+    let mut events = ScannerEventSource::start_at(config, now);
+    assert!(events.capability().complete);
+    let _ = events.drain_at(now);
+    for n in 0..16_384 {
+        fs::write(root.join(format!("retained-{n:05}")), b"keep").unwrap();
+    }
+    let later = now + Duration::from_mins(15);
+    let replanned = events.drain_at(later);
+    assert_eq!(events.stats().replans, 1);
+    assert!(!events.capability().complete);
+    assert_eq!(events.capability().watched_dirs, 2);
+    assert!(replanned.requires_index_generation_bump());
+    assert!(replanned.dirty_roots().contains(&root));
+    sees_write(&mut events, &healthy.join("independent.o"), later + Duration::from_secs(1));
+    assert_eq!(fs::read(root.join("retained-16383")).unwrap(), b"keep");
 }
