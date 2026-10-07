@@ -4,7 +4,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use crate::core::errors::{Result, SbhError};
 use crate::core::paths::resolve_absolute_path;
@@ -20,6 +19,7 @@ const PROC_ROOT: &str = "/proc";
 const PROC_STAT: &str = "/proc/stat";
 
 mod reference_scan;
+mod mmap_scan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StatusMemory {
@@ -77,50 +77,11 @@ pub(super) fn read_executables_under(root: &Path) -> Result<ExecutablesResult> {
     reference_scan::executables(root)
 }
 
-/// How long one sweep of every process's `maps` serves all roots and callers.
-const MMAP_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-
+/// Return mappings only when the visible process scope was fully inspected.
+/// The Vec-returning PAL interface cannot carry partial coverage, so access
+/// failures, malformed data and budget exhaustion must remain explicit errors.
 pub(super) fn read_mmap_regions_under(root: &Path) -> Result<Vec<MappedRegion>> {
-    let root = resolve_absolute_path(root);
-    Ok(mmap_snapshot()?
-        .iter()
-        .filter(|region| region.path.starts_with(&root))
-        .cloned()
-        .collect())
-}
-
-/// Every file-backed mapping of every process, shared for
-/// [`MMAP_SNAPSHOT_TTL`]. Reading `/proc/*/maps` is kernel-heavy (one sweep
-/// of trj's ~2,400 processes cost ~6 CPU-seconds) and was done once per scan
-/// root on every active-reference index build, which ran almost every pass:
-/// trj's scanner sat at a full core (2026-09-28).
-fn mmap_snapshot() -> Result<std::sync::Arc<Vec<MappedRegion>>> {
-    type Snapshot = Option<(Instant, std::sync::Arc<Vec<MappedRegion>>)>;
-    static SNAPSHOT: std::sync::OnceLock<parking_lot::Mutex<Snapshot>> = std::sync::OnceLock::new();
-    let slot = SNAPSHOT.get_or_init(|| parking_lot::Mutex::new(None));
-    if let Some((at, snapshot)) = slot.lock().as_ref()
-        && at.elapsed() < MMAP_SNAPSHOT_TTL
-    {
-        return Ok(std::sync::Arc::clone(snapshot));
-    }
-    // Resolve each distinct mapped path once per sweep: ~100k maps lines are
-    // mostly the same few shared libraries.
-    let mut resolved = std::collections::HashMap::<String, PathBuf>::new();
-    let mut regions = Vec::new();
-    for pid in proc_pids()? {
-        if pid > 0 {
-            collect_mapped_regions_for_pid(pid, &mut resolved, &mut regions);
-        }
-    }
-    regions.sort_by(|left, right| {
-        left.pid
-            .cmp(&right.pid)
-            .then_with(|| left.start_address.cmp(&right.start_address))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    let snapshot = std::sync::Arc::new(regions);
-    *slot.lock() = Some((Instant::now(), std::sync::Arc::clone(&snapshot)));
-    Ok(snapshot)
+    mmap_scan::read_under(root)
 }
 
 pub(super) fn read_process_io(pid: i32) -> Result<ProcessIo> {
@@ -303,83 +264,16 @@ fn parse_fdinfo_flags(raw: &str) -> Option<u64> {
     })
 }
 
-fn collect_mapped_regions_for_pid(
-    pid: i32,
-    resolved: &mut std::collections::HashMap<String, PathBuf>,
-    regions: &mut Vec<MappedRegion>,
-) {
-    let maps_path = pid_proc_path(pid).join("maps");
-    let Ok(raw) = fs::read_to_string(maps_path) else {
-        return;
-    };
-    for line in raw.lines() {
-        if let Some(region) = parse_maps_line(pid, line, |raw_path| {
-            resolved
-                .entry(raw_path.to_string())
-                .or_insert_with(|| resolve_absolute_path(Path::new(raw_path)))
-                .clone()
-        }) {
-            regions.push(region);
-        }
-    }
-}
-
 #[cfg(test)]
 fn mapped_region_from_maps_line(pid: i32, line: &str, root: &Path) -> Option<MappedRegion> {
-    parse_maps_line(pid, line, |raw_path| {
-        resolve_absolute_path(Path::new(raw_path))
-    })
-    .filter(|region| region.path.starts_with(root))
-}
-
-/// A file-backed `maps` line as a region, its path resolved by `resolve`.
-fn parse_maps_line(
-    pid: i32,
-    line: &str,
-    resolve: impl FnOnce(&str) -> PathBuf,
-) -> Option<MappedRegion> {
-    let (range, rest) = take_whitespace_field(line)?;
-    let (perms, rest) = take_whitespace_field(rest)?;
-    let (_, rest) = take_whitespace_field(rest)?;
-    let (_, rest) = take_whitespace_field(rest)?;
-    let (_, rest) = take_whitespace_field(rest)?;
-    let raw_path = rest.trim_start();
-    if raw_path.is_empty() || raw_path.starts_with('[') {
-        return None;
-    }
-    let (start, end) = parse_maps_address_range(range)?;
-    Some(MappedRegion {
-        pid,
-        path: resolve(raw_path),
-        start_address: Some(start),
-        end_address: Some(end),
-        protection: Some(maps_protection(perms)),
-    })
-}
-
-fn take_whitespace_field(input: &str) -> Option<(&str, &str)> {
-    let trimmed = input.trim_start();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
-    Some((&trimmed[..end], &trimmed[end..]))
-}
-
-fn parse_maps_address_range(range: &str) -> Option<(u64, u64)> {
-    let (start, end) = range.split_once('-')?;
-    Some((
-        u64::from_str_radix(start, 16).ok()?,
-        u64::from_str_radix(end, 16).ok()?,
-    ))
-}
-
-fn maps_protection(perms: &str) -> String {
-    let mut protection = perms.chars().take(3).collect::<String>();
-    while protection.len() < 3 {
-        protection.push('-');
-    }
-    protection
+    mmap_scan::parse_row(pid, line.as_bytes())
+        .ok()
+        .flatten()
+        .map(|mut region| {
+            region.path = resolve_absolute_path(&region.path);
+            region
+        })
+        .filter(|region| region.path.starts_with(root))
 }
 
 fn parse_status_i32_field(raw: &str, key: &'static str) -> Option<i32> {
@@ -777,16 +671,20 @@ mod tests {
         let resolved_exe = resolve_absolute_path(&exe);
         let current_pid = i32::try_from(std::process::id()).expect("pid should fit i32");
 
-        let regions =
-            read_mmap_regions_under(&resolved_exe).expect("maps should be readable from /proc");
-
-        assert!(regions.iter().any(|region| {
-            region.pid == current_pid
-                && region.path == resolved_exe
-                && region
-                    .protection
-                    .as_deref()
-                    .is_some_and(|mode| mode.contains('x'))
-        }));
+        match read_mmap_regions_under(&resolved_exe) {
+            Ok(regions) => assert!(regions.iter().any(|region| {
+                region.pid == current_pid
+                    && region.path == resolved_exe
+                    && region.protection.as_deref().is_some_and(|mode| mode.contains('x'))
+            })),
+            // The public Vec API must reject partial host coverage. It cannot
+            // safely return this process's mappings as a complete all-PID set.
+            // mmap_scan separately always tests the real current PID's positive
+            // mapping and pairs readable-scope success with injected denials.
+            Err(crate::core::errors::SbhError::Runtime { details }) => {
+                assert!(details.starts_with("memory-map inspection incomplete:"), "{details}");
+            }
+            Err(error) => panic!("unexpected maps failure: {error}"),
+        }
     }
 }
