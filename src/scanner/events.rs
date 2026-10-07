@@ -25,6 +25,10 @@ use crate::scanner::walker::opaque_context_for_path;
 
 #[cfg(any(target_os = "macos", test))]
 mod fsevents;
+#[cfg(target_os = "linux")]
+mod inotify_backend;
+#[cfg(target_os = "linux")]
+use inotify_backend::LinuxInotifyBackend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EventBackendKind {
@@ -103,7 +107,8 @@ pub struct EventSourceCapability {
     pub complete: bool,
     pub watched_dirs: usize,
     /// Unwatched directories directly below a watched one; their subtrees
-    /// are reconciled by scanning instead of by events.
+    /// are reconciled by scanning instead of by events. While coverage repair
+    /// is pending, zero means the frontier has not yet been re-enumerated.
     pub frontier_dirs: usize,
     pub dirty_roots: Vec<PathBuf>,
     pub reason: String,
@@ -253,9 +258,12 @@ const WATCH_PLAN_ENUMERATION_FACTOR: usize = 4;
 const MAX_FRONTIER_DIRS_PER_ROOT: usize = 256;
 /// Time constant of the per-directory event-rate EWMA.
 const EVENT_RATE_TAU: Duration = Duration::from_mins(10);
-/// How often an incomplete plan is re-allocated by observed event rate.
+/// Periodic watch-plan audit, including plans that currently appear complete.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const WATCH_REPLAN_INTERVAL: Duration = Duration::from_mins(15);
+/// Retry coverage loss or a failed backend without depending on new events.
+#[cfg(target_os = "linux")]
+const WATCH_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 /// First overflow backoff window; doubles per consecutive overflow.
 const OVERFLOW_BACKOFF_BASE: Duration = Duration::from_secs(30);
 /// Cap on the overflow backoff window.
@@ -506,7 +514,7 @@ impl EventRateTracker {
 /// The first overflow reconciles immediately; overflows arriving inside the
 /// backoff window are coalesced into one deferred reconciliation when the
 /// window expires, and each consecutive overflow doubles the window up to
-/// the cap.
+/// the cap. Backoff defers scan work, never revocation of index evidence.
 #[derive(Debug, Default)]
 pub struct OverflowBackoff {
     consecutive: u32,
@@ -617,6 +625,15 @@ impl EventInvalidation {
             generation_bump: false,
             reasons: BTreeSet::new(),
         }
+    }
+
+    /// Lost events invalidate any index entries reconciled since the previous
+    /// overflow, even while the next expensive reconciliation is deferred.
+    fn deferred_overflow() -> Self {
+        let mut invalidation = Self::empty();
+        invalidation.generation_bump = true;
+        invalidation.reasons.insert("Overflow (reconciliation deferred)".to_string());
+        invalidation
     }
 
     #[must_use]
@@ -846,6 +863,10 @@ impl ScannerEventSource {
                         Err(err) => {
                             capability.selected_backend = EventBackendKind::ReconciliationOnly;
                             capability.complete = false;
+                            capability.watched_dirs = 0;
+                            capability.frontier_dirs = 0;
+                            capability.dirty_roots = config.root_paths().to_vec();
+                            capability.recursive_inotify = recursive_inotify_probe(EventBackendKind::ReconciliationOnly);
                             capability.reason = format!("recursive inotify unavailable: {err}");
                             pending.mark_all_roots(
                                 config.root_paths(),
@@ -929,6 +950,13 @@ impl ScannerEventSource {
                     &mut self.backoff,
                     now,
                 ));
+                self.capability.watched_dirs = backend.watched_dirs().count();
+                if backend.needs_repair() {
+                    self.capability.complete = false;
+                    self.capability.frontier_dirs = 0;
+                    self.capability.dirty_roots = self.config.root_paths().to_vec();
+                    self.capability.reason = "recursive inotify coverage changed; timed repair pending".to_string();
+                }
             }
             EventSourceBackend::ReconciliationOnly => {}
         }
@@ -961,7 +989,7 @@ impl ScannerEventSource {
                 invalidation.mark_all_roots(self.config.root_paths(), "Overflow", true);
                 invalidation
             }
-            OverflowDecision::Coalesced { .. } => EventInvalidation::empty(),
+            OverflowDecision::Coalesced { .. } => EventInvalidation::deferred_overflow(),
         }
     }
 
@@ -977,10 +1005,22 @@ impl ScannerEventSource {
         }
         #[cfg(target_os = "linux")]
         {
-            matches!(self.backend, EventSourceBackend::RecursiveInotify(_))
-                && !self.capability.complete
-                && now.saturating_duration_since(self.planned_at) >= WATCH_REPLAN_INTERVAL
-                && self.rates.events_since_plan() > 0
+            if self.config.mode == ScannerEventSourceMode::ReconciliationOnly
+                || self.config.watch_budget == 0
+                || self.config.root_paths().is_empty()
+            {
+                return false;
+            }
+            // Missing roots, lost watches and startup failures can recover
+            // without producing another event. Never make a retry depend on
+            // traffic from the very backend whose coverage has been lost.
+            let interval = match &self.backend {
+                EventSourceBackend::RecursiveInotify(backend) if !backend.needs_repair() => {
+                    WATCH_REPLAN_INTERVAL
+                }
+                _ => WATCH_REPAIR_INTERVAL,
+            };
+            now.saturating_duration_since(self.planned_at) >= interval
         }
     }
 
@@ -1007,9 +1047,10 @@ impl ScannerEventSource {
         invalidation
     }
 
-    /// Re-spend the watch budget by observed event rate. The new backend is
-    /// started before the old one is dropped, so no events are lost; the new
-    /// frontier is reconciled once.
+    /// Re-enumerate and replace the watch instance. Directory names alone
+    /// cannot establish that an existing watch still names the current inode.
+    /// The old queue may contain events not drained during installation, so
+    /// every replacement explicitly revokes index evidence and reconciles roots.
     #[cfg(target_os = "linux")]
     fn replan(&mut self, now: Instant) -> EventInvalidation {
         let plan = EventSourcePlan::with_rates(&self.config, &self.rates, now);
@@ -1017,35 +1058,44 @@ impl ScannerEventSource {
         self.planned_at = now;
         self.replans = self.replans.saturating_add(1);
 
-        let current: BTreeSet<&Path> = match &self.backend {
-            EventSourceBackend::RecursiveInotify(backend) => backend.watched_dirs().collect(),
-            EventSourceBackend::ReconciliationOnly => BTreeSet::new(),
-        };
-        let planned: BTreeSet<&Path> = plan.watched_dirs.iter().map(PathBuf::as_path).collect();
         if plan.backend != EventBackendKind::RecursiveInotify {
             self.backend = EventSourceBackend::ReconciliationOnly;
             self.capability = EventSourceCapability::from_plan(&plan);
+            self.rates.retain_watched(&[]);
             invalidation.mark_all_roots(self.config.root_paths(), plan.reason, true);
             return invalidation;
         }
-        if current != planned {
-            match LinuxInotifyBackend::start(&plan.watched_dirs, self.config.watch_budget) {
-                Ok(backend) => self.backend = EventSourceBackend::RecursiveInotify(backend),
-                Err(err) => {
-                    invalidation.mark_all_roots(
-                        self.config.root_paths(),
-                        format!("recursive inotify replan failed: {err}"),
-                        true,
-                    );
-                    return invalidation;
+        match LinuxInotifyBackend::start(&plan.watched_dirs, self.config.watch_budget) {
+            Ok(backend) => {
+                self.backend = EventSourceBackend::RecursiveInotify(backend);
+                self.rates.retain_watched(&plan.watched_dirs);
+                self.capability = EventSourceCapability::from_plan(&plan);
+                invalidation.mark_all_roots(
+                    self.config.root_paths(),
+                    "recursive inotify watch coverage rebuilt",
+                    true,
+                );
+            }
+            Err(err) => {
+                // Keep the previous backend's remaining live watches. Its
+                // coverage is unknown even if the planned pathname set matched.
+                if let EventSourceBackend::RecursiveInotify(backend) = &mut self.backend {
+                    backend.require_repair();
+                    self.capability.watched_dirs = backend.watched_dirs().count();
+                } else {
+                    self.capability.watched_dirs = 0;
                 }
+                self.capability.complete = false;
+                self.capability.frontier_dirs = 0;
+                self.capability.dirty_roots = self.config.root_paths().to_vec();
+                self.capability.reason = format!("recursive inotify replan failed: {err}");
+                invalidation.mark_all_roots(
+                    self.config.root_paths(),
+                    self.capability.reason.clone(),
+                    true,
+                );
             }
         }
-        self.rates.retain_watched(&plan.watched_dirs);
-        for path in &plan.dirty_roots {
-            invalidation.mark_dirty_root(path.clone(), plan.reason.clone());
-        }
-        self.capability = EventSourceCapability::from_plan(&plan);
         invalidation
     }
 }
@@ -1057,198 +1107,6 @@ enum EventSourceBackend {
     #[cfg(target_os = "linux")]
     RecursiveInotify(LinuxInotifyBackend),
     ReconciliationOnly,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-struct LinuxInotifyBackend {
-    inotify: inotify::Inotify,
-    watch_paths: BTreeMap<inotify::WatchDescriptor, PathBuf>,
-    buffer: Vec<u8>,
-    max_watches: usize,
-}
-
-#[cfg(target_os = "linux")]
-impl LinuxInotifyBackend {
-    fn start(paths: &[PathBuf], max_watches: usize) -> std::io::Result<Self> {
-        let inotify = inotify::Inotify::init()?;
-        let mut backend = Self {
-            inotify,
-            watch_paths: BTreeMap::new(),
-            buffer: vec![0; 64 * 1024],
-            max_watches,
-        };
-        for path in paths {
-            backend.add_watch(path)?;
-        }
-        Ok(backend)
-    }
-
-    fn watched_dirs(&self) -> impl Iterator<Item = &Path> {
-        self.watch_paths.values().map(PathBuf::as_path)
-    }
-
-    fn drain(
-        &mut self,
-        tracker: &DirtyRootTracker,
-        config: &EventSourceConfig,
-        rates: &mut EventRateTracker,
-        backoff: &mut OverflowBackoff,
-        now: Instant,
-    ) -> EventInvalidation {
-        use std::io::ErrorKind;
-
-        let mut invalidation = EventInvalidation::empty();
-        loop {
-            let events = match self.read_available_events() {
-                Ok(events) => events,
-                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                Err(err) => {
-                    invalidation.mark_all_roots(
-                        config.root_paths(),
-                        format!("recursive inotify read failed: {err}"),
-                        true,
-                    );
-                    break;
-                }
-            };
-            if events.is_empty() {
-                break;
-            }
-            for event in events {
-                invalidation.merge(self.handle_event(tracker, config, rates, backoff, now, &event));
-            }
-        }
-        invalidation
-    }
-
-    fn read_available_events(&mut self) -> std::io::Result<Vec<LinuxInotifyEvent>> {
-        let events = self.inotify.read_events(&mut self.buffer)?;
-        Ok(events
-            .map(|event| LinuxInotifyEvent {
-                watch: event.wd,
-                mask: event.mask,
-                name: event.name.map(PathBuf::from),
-            })
-            .collect())
-    }
-
-    fn handle_event(
-        &mut self,
-        tracker: &DirtyRootTracker,
-        config: &EventSourceConfig,
-        rates: &mut EventRateTracker,
-        backoff: &mut OverflowBackoff,
-        now: Instant,
-        event: &LinuxInotifyEvent,
-    ) -> EventInvalidation {
-        use inotify::EventMask;
-
-        if event.mask.contains(EventMask::Q_OVERFLOW) {
-            return match backoff.record(now) {
-                OverflowDecision::Reconcile { .. } => tracker.apply_event(FsEvent {
-                    kind: FsEventKind::Overflow,
-                    path: None,
-                }),
-                OverflowDecision::Coalesced { .. } => EventInvalidation::empty(),
-            };
-        }
-
-        if let Some(base) = self.watch_paths.get(&event.watch) {
-            rates.record(base, now);
-        }
-        let path = self.path_for_event(event);
-        let mut invalidation = if event.mask.intersects(
-            EventMask::IGNORED | EventMask::UNMOUNT | EventMask::DELETE_SELF | EventMask::MOVE_SELF,
-        ) {
-            tracker.apply_event(FsEvent {
-                kind: FsEventKind::PermissionLost,
-                path: path.clone(),
-            })
-        } else {
-            tracker.apply_event(FsEvent {
-                kind: event_kind_from_inotify_mask(event.mask),
-                path: path.clone(),
-            })
-        };
-
-        if event.mask.contains(EventMask::ISDIR)
-            && event
-                .mask
-                .intersects(EventMask::CREATE | EventMask::MOVED_TO)
-            && let Some(path) = path
-        {
-            if self.watch_paths.len() >= self.max_watches {
-                invalidation.merge(tracker.apply_event(FsEvent {
-                    kind: FsEventKind::WatchBudgetExceeded,
-                    path: Some(path),
-                }));
-            } else if let Err(err) = self.add_watch(&path) {
-                invalidation.mark_dirty_path(
-                    config.root_paths(),
-                    &path,
-                    format!("recursive inotify add-watch failed: {err}"),
-                );
-                invalidation.generation_bump = true;
-            }
-        }
-
-        invalidation
-    }
-
-    fn path_for_event(&self, event: &LinuxInotifyEvent) -> Option<PathBuf> {
-        let base = self.watch_paths.get(&event.watch)?;
-        Some(
-            event
-                .name
-                .as_ref()
-                .map_or_else(|| base.clone(), |name| base.join(name)),
-        )
-    }
-
-    fn add_watch(&mut self, path: &Path) -> std::io::Result<()> {
-        let watch = self.inotify.watches().add(path, inotify_watch_mask())?;
-        self.watch_paths.insert(watch, path.to_path_buf());
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-struct LinuxInotifyEvent {
-    watch: inotify::WatchDescriptor,
-    mask: inotify::EventMask,
-    name: Option<PathBuf>,
-}
-
-#[cfg(target_os = "linux")]
-fn inotify_watch_mask() -> inotify::WatchMask {
-    use inotify::WatchMask;
-    WatchMask::ATTRIB
-        | WatchMask::CLOSE_WRITE
-        | WatchMask::CREATE
-        | WatchMask::DELETE
-        | WatchMask::DELETE_SELF
-        | WatchMask::DONT_FOLLOW
-        | WatchMask::EXCL_UNLINK
-        | WatchMask::MODIFY
-        | WatchMask::MOVE
-        | WatchMask::MOVE_SELF
-        | WatchMask::ONLYDIR
-}
-
-#[cfg(target_os = "linux")]
-fn event_kind_from_inotify_mask(mask: inotify::EventMask) -> FsEventKind {
-    use inotify::EventMask;
-    if mask.intersects(EventMask::DELETE | EventMask::DELETE_SELF) {
-        FsEventKind::Remove
-    } else if mask.intersects(EventMask::MOVED_FROM | EventMask::MOVED_TO | EventMask::MOVE_SELF) {
-        FsEventKind::Rename
-    } else if mask.contains(EventMask::CREATE) {
-        FsEventKind::Create
-    } else {
-        FsEventKind::Modify
-    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1514,7 +1372,8 @@ mod tests {
 
         let second = source.note_overflow(t0 + Duration::from_secs(2));
         assert!(!second.requires_reconciliation());
-        assert!(!second.requires_index_generation_bump());
+        // Deferring scans must not retain evidence made stale by this loss.
+        assert!(second.requires_index_generation_bump());
         assert_eq!(source.stats().overflows, 2);
         assert_eq!(source.stats().coalesced_overflows, 1);
         assert_eq!(source.stats().backoff_secs, OVERFLOW_BACKOFF_BASE.as_secs());
@@ -1885,7 +1744,7 @@ mod tests {
         assert!(!startup.dirty_roots().contains(&root), "{startup:?}");
 
         // A directory created under a watched one when the budget is spent is
-        // reported as its own frontier scan path, without a generation bump.
+        // reconciled locally, but missing descendant coverage revokes replay.
         let z = a.join("z");
         fs::create_dir(&z).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1906,7 +1765,8 @@ mod tests {
                     !invalidation.dirty_roots().contains(&root),
                     "{invalidation:?}"
                 );
-                assert!(!invalidation.requires_index_generation_bump());
+                assert!(invalidation.requires_index_generation_bump());
+                assert!(!source.capability().complete);
                 saw_budget_exceeded = true;
                 break;
             }
@@ -1918,24 +1778,23 @@ mod tests {
             z.display()
         );
 
-        // Now x is the hot one: bump its mtime and let the
-        // replan interval elapse. The replan needs at least one observed event
-        // since the plan, which the directory creation above provided.
-        // Touching y or z would hand them observed events on their own
-        // watches, so only x is touched: its mtime is now the newest.
+        // Now x is the hot one: bump its mtime and let the replan interval
+        // elapse. Repair no longer requires any additional observed event.
         set_dir_mtime(&x, SystemTime::now());
         let later = t0 + WATCH_REPLAN_INTERVAL + Duration::from_secs(1);
         let replanned = source.drain_at(later);
         assert_eq!(source.stats().replans, 1, "{:?}", source.stats());
         assert_eq!(source.capability().watched_dirs, 3);
         assert_eq!(source.capability().frontier_dirs, 2);
-        // y and z are the new frontier; the mtime touch on x was itself an
-        // event on `a`, whose project scan path covers them both.
+        // The selected frontier remains y/z, but replacing an instance also
+        // reconciles the handoff gap, not merely its newly unwatched frontier.
+        assert!(source.capability().dirty_roots.contains(&y));
+        assert!(source.capability().dirty_roots.contains(&z));
+        assert!(!source.capability().dirty_roots.contains(&x));
         let covered = |path: &Path| replanned.dirty_roots().iter().any(|d| path.starts_with(d));
         assert!(covered(&y) && covered(&z), "{replanned:?}");
-        assert!(!replanned.dirty_roots().contains(&x), "{replanned:?}");
-        assert!(!replanned.dirty_roots().contains(&root), "{replanned:?}");
-        assert!(!replanned.requires_index_generation_bump());
+        assert!(replanned.dirty_roots().contains(&root), "{replanned:?}");
+        assert!(replanned.requires_index_generation_bump());
 
         // The new backend is live: a file inside x is reported.
         let changed = x.join("object.o");
