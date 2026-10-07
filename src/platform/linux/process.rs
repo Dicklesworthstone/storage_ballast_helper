@@ -9,8 +9,8 @@ use std::time::Instant;
 use crate::core::errors::{Result, SbhError};
 use crate::core::paths::resolve_absolute_path;
 use crate::platform::types::{
-    ExecutablesResult, MappedRegion, OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, OpenFile,
-    OpenFileKind, OpenFileMode, OpenFilesResult, PalError, ProcessInfo, ProcessIo, SelfStats,
+    ExecutablesResult, MappedRegion, OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET, OpenFileKind,
+    OpenFileMode, OpenFilesResult, PalError, ProcessInfo, ProcessIo, SelfStats,
 };
 
 const PROC_SELF_STATUS: &str = "/proc/self/status";
@@ -18,6 +18,8 @@ const PROC_SELF_STAT: &str = "/proc/self/stat";
 const PROC_SELF_IO: &str = "/proc/self/io";
 const PROC_ROOT: &str = "/proc";
 const PROC_STAT: &str = "/proc/stat";
+
+mod reference_scan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StatusMemory {
@@ -62,32 +64,7 @@ pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
 }
 
 pub(super) fn read_open_files_under(root: &Path) -> Result<OpenFilesResult> {
-    let root = resolve_absolute_path(root);
-    let mut open_files = Vec::new();
-    let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
-    let mut pids_scanned: usize = 0;
-    let mut incomplete = false;
-
-    for pid in proc_pids()? {
-        if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
-            incomplete = true;
-            break;
-        }
-        if pid > 0 {
-            pids_scanned += 1;
-            open_files.extend(open_files_for_pid_under(pid, &root));
-        }
-    }
-    open_files.sort_by(|left, right| {
-        left.pid
-            .cmp(&right.pid)
-            .then_with(|| left.fd.cmp(&right.fd))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    Ok(OpenFilesResult {
-        files: open_files,
-        complete: !incomplete,
-    })
+    reference_scan::open_files(root)
 }
 
 pub(super) fn read_executables_under(root: &Path) -> Result<ExecutablesResult> {
@@ -294,46 +271,6 @@ fn read_command_line(proc_path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-fn open_files_for_pid_under(pid: i32, root: &Path) -> Vec<OpenFile> {
-    let proc_path = pid_proc_path(pid);
-    let fd_dir = proc_path.join("fd");
-    let Ok(entries) = fs::read_dir(&fd_dir) else {
-        return Vec::new();
-    };
-
-    entries
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let fd_path = entry.path();
-            open_file_for_fd_under(pid, &proc_path, &fd_path, root)
-        })
-        .collect()
-}
-
-fn open_file_for_fd_under(
-    pid: i32,
-    proc_path: &Path,
-    fd_path: &Path,
-    root: &Path,
-) -> Option<OpenFile> {
-    let fd = fd_path
-        .file_name()
-        .and_then(|name| name.to_str())?
-        .parse::<i32>()
-        .ok()?;
-    let path = resolve_absolute_path(&fs::read_link(fd_path).ok()?);
-    if !path.starts_with(root) {
-        return None;
-    }
-    Some(OpenFile {
-        pid,
-        path,
-        fd: Some(fd),
-        kind: open_file_kind_for_fd(fd_path),
-        mode: open_file_mode_for_fd(proc_path, fd),
-    })
-}
-
 fn open_file_kind_for_fd(fd_path: &Path) -> OpenFileKind {
     use std::os::unix::fs::FileTypeExt;
 
@@ -357,10 +294,17 @@ fn open_file_kind_for_fd(fd_path: &Path) -> OpenFileKind {
 }
 
 fn open_file_mode_for_fd(proc_path: &Path, fd: i32) -> OpenFileMode {
+    use std::io::Read as _;
+
     let fdinfo = proc_path.join("fdinfo").join(fd.to_string());
-    let Some(flags) = fs::read_to_string(fdinfo)
+    // Only the fixed prefix is needed. Event descriptors can have arbitrarily
+    // large fdinfo bodies; optional mode annotations must not defeat the scan's
+    // resource bound or discard an already observed reference.
+    let mut raw = String::new();
+    let Some(flags) = fs::File::open(fdinfo)
+        .and_then(|file| file.take(4096).read_to_string(&mut raw))
         .ok()
-        .and_then(|raw| parse_fdinfo_flags(&raw))
+        .and_then(|_| parse_fdinfo_flags(&raw))
     else {
         return OpenFileMode::Unknown;
     };
@@ -814,7 +758,10 @@ mod tests {
 
         let result =
             read_open_files_under(dir.path()).expect("open files should be readable from /proc");
-        assert!(result.complete);
+        // Other visible PIDs may deny inspection on an unprivileged or
+        // containerized runner. Completeness is asserted for the known-readable
+        // current-PID scope in reference_scan; retain the real all-PID positive
+        // reference assertion here without assuming host-wide permissions.
         let actual = result
             .files
             .iter()
