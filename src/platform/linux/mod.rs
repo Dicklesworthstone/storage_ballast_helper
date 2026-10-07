@@ -154,7 +154,7 @@ impl Platform for LinuxPal {
         memory::subscribe_memory_pressure(callback)
     }
 
-    fn process_list(&self) -> Result<ProcessInfo>> {
+    fn process_list(&self) -> Result<Vec<ProcessInfo>> {
         process::read_process_list()
     }
 
