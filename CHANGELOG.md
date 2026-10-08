@@ -6,6 +6,101 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.25 **[release]**
+
+Compare: [`v0.6.24...v0.6.25`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.24...v0.6.25)
+
+**Scope.** v0.6.25 is cut from `c40bf57` (2026-10-06, the last commit with
+test evidence) plus the release fixes below. The Linux reference-coverage,
+inotify-repair and mount-name series committed after it (`cb0125e`..`6ae1a97`)
+is **not** in this release: it was committed without running tests and fails
+on real hosts (issue #25). It stays on `main` for the next release.
+
+### Security — a root daemon queries Git as the repository's owner
+
+- **Security-relevant behaviour change.** The tracked-content check below
+  ran `git ls-files` as root under the Linux system-scope daemon (the
+  default), and Git refuses a repository another user owns ("dubious
+  ownership"), so every candidate in users' repositories was kept and none
+  of their build output was reclaimed. A root daemon now runs that one query
+  as the owner of the repository's Git directory, with that user's primary
+  group and no supplementary groups, instead of trusting the repository's
+  configuration as root. `git` is looked up only in root-owned directories
+  and runs with a scrubbed environment, a 10 s deadline, bounded stderr and
+  discovery pinned to the repository, and "untracked" requires Git's own
+  unmatched-pathspec message. A symlinked `.git`, a malformed or swapped
+  gitfile, mixed owners or a failed user lookup keeps the candidate
+  (`998f31e`, `bf42b10`, `10358aa`).
+
+### Fixed — safety: tracked Git content is never a candidate
+
+- Tracked Git content is kept. A deep repository or worktree subtree has no
+  `.git` of its own, so one host deleted thirty tracked Lean `Lake/Build`
+  source files. A candidate under a repository now passes only if
+  `git ls-files --error-unmatch` finds nothing tracked in it; missing Git or
+  a failed query keeps it. `.lean` counts as source (`2c54bfe`).
+
+### Fixed — pressure readings and the daemon
+
+- A cached reading is bound to its mount's device, type and resolved path,
+  and a slow older probe cannot replace a newer one (`5217550`).
+- macOS: name, counters and read-only flag come from one `statfs` and
+  firmlinked paths resolve to the Data volume (it can share System's device
+  number); startup memory pressure is the kernel's level, not a Critical
+  guess that blocked the first scan (`a62d895`, `f457e62`).
+- After a write failure a mount resumes reclaiming once a probe write
+  succeeds, not once free space recovers (`e450990`); a late empty result no
+  longer idles a mount that has since escalated (`c3f32d1`).
+- A build lease is no longer judged invalid, killing its build (exit 143),
+  when a file vanishes during the size walk (`4280e87`).
+- Control socket: excess clients are refused without stalling the listener,
+  each read or write has one overall deadline, malformed arguments are
+  rejected (a bad ballast `mount` had meant every pool), and a restart no
+  longer unlinks a live daemon's socket (`6259b9d`, `26bbf82`, `e92a9e6`).
+
+### Fixed — scanning
+
+- Pressure scans rotate which root goes first; a bounded pass that always
+  began with the dirtiest root never reached the rest (`218ecec`).
+- The index drops a rebuilt path's old inode (stale identities piled up as
+  high-scoring candidates); checkpoints use an exclusive temp file, fsync
+  and a 64 MiB / 100,000-record cap (`000c854`, `a777d4a`).
+
+### Fixed — quarantine and ballast
+
+- Quarantine uses the deepest configured root on the candidate's own
+  filesystem; purge walks the recorded payload by descriptor instead of
+  `remove_dir_all`, entering no symlinked directory, other filesystem or
+  bind mount, and keeps the record if refused (`cf4d1fc`, `405d585`).
+- Ballast status counts only allocated, releasable reserve and finds pools
+  configured through a symlink; surplus left by a lowered or disabled target
+  stays releasable (`d8f3f2b`, `60b5624`, `9f0cd3f`, `3c89dfe`, `2b6e438`).
+- Release counts observed depletion, not never-filled slots, so a partial
+  pool helps at Orange/Red, not only at Critical; the credit survives
+  restarts in `state.json` (`a6639f1`, `b7891ea`).
+- Maintenance checks pools by bytes, not file count; repair works in place
+  and keeps the file on failure; new files are created `O_EXCL` through a
+  descriptor (`5503121`, `d40d4bf`, `5df350b`, `0644d3a`).
+- A child holding an inherited lock descriptor no longer keeps the
+  quarantine store or an adopted pool busy (`6b8cc2e`, `99746d9`).
+
+### Changed
+
+- Imminent exhaustion is acted on even with over half the disk free when
+  the calibrated historical rate agrees (`99cb919`).
+- Dependencies: semver-compatible lockfile refresh (46 packages), and
+  `sbh_mach`'s Apple-only dependencies are macOS-only (`d04a794`, `7dbb3c4`).
+
+### Known limitations
+
+- The tracked-content query finds `git` only in fixed system directories
+  (`/usr/local/bin`, `/usr/bin`, `/bin`, `/run/current-system/sw/bin`, plus
+  the Homebrew and Linuxbrew prefixes for a non-root daemon); where `git`
+  lives only elsewhere, such as a per-user Nix profile, candidates inside
+  repositories are kept.
+- Quarantine purge uses `openat2(2)` and fails on kernels older than 5.6 or
+  where seccomp filters it; quarantined items are kept, not lost.
+
 ## v0.6.24 **[release]**
 
 Compare: [`v0.6.23...v0.6.24`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.23...v0.6.24)
