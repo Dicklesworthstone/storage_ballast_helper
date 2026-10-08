@@ -1562,14 +1562,20 @@ const GIT_QUERY_PATH_ROOT: &str = "/usr/bin:/bin";
 #[cfg(target_os = "macos")]
 const GIT_QUERY_PATH_USER: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 #[cfg(not(target_os = "macos"))]
-const GIT_QUERY_PATH_ROOT: &str = "/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin";
+const GIT_QUERY_PATH_ROOT: &str = "/usr/bin:/bin:/usr/local/bin:/run/current-system/sw/bin";
 #[cfg(not(target_os = "macos"))]
 const GIT_QUERY_PATH_USER: &str =
-    "/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin:/home/linuxbrew/.linuxbrew/bin";
+    "/usr/bin:/bin:/usr/local/bin:/run/current-system/sw/bin:/home/linuxbrew/.linuxbrew/bin";
 
 /// Git's own wording (under `LC_ALL=C`) for a pathspec it does not track.
 /// Exit status 1 alone is not enough: a broken `git` shim can exit 1 too.
 const GIT_UNMATCHED_PATHSPEC: &str = "did not match any file(s) known to git";
+
+/// Git runs as a repository's owner, who also controls what it reads (a FIFO
+/// in `.git`, an index that makes it print without end): bound both its run
+/// time and how much of its stderr is kept. Hitting either keeps the candidate.
+const GIT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const GIT_QUERY_MAX_STDERR_BYTES: u64 = 8192;
 
 /// A gitfile is one `gitdir: <path>` line; anything larger is not one.
 #[cfg(unix)]
@@ -1627,6 +1633,11 @@ fn contains_tracked_git_content(path: &Path) -> bool {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
+        // If `root/.git` cannot be validated, Git must not fall back to an
+        // enclosing repository and answer "untracked" for this one.
+        if let Some(parent) = root.parent() {
+            git.env("GIT_CEILING_DIRECTORIES", parent);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -1641,16 +1652,48 @@ fn contains_tracked_git_content(path: &Path) -> bool {
         #[cfg(not(unix))]
         let _ = marker;
         // Only Git's explicit unmatched-path result permits continuing.
-        let Ok(output) = git.output() else {
-            return true;
-        };
-        if output.status.code() != Some(1)
-            || !String::from_utf8_lossy(&output.stderr).contains(GIT_UNMATCHED_PATHSPEC)
-        {
+        if !git_reports_unmatched(&mut git) {
             return true;
         }
     }
     false
+}
+
+/// Run the tracked-content query with a deadline and report whether Git
+/// answered "unmatched" (exit 1 with its own message). Git's stderr stays in
+/// the pipe until it exits and only the first bytes are read, so a Git that
+/// writes without end blocks on the pipe and is killed at the deadline.
+fn git_reports_unmatched(git: &mut std::process::Command) -> bool {
+    use std::io::Read as _;
+    let Ok(mut child) = git.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + GIT_QUERY_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    };
+    let mut stderr = Vec::new();
+    let Some(pipe) = child.stderr.take() else {
+        return false;
+    };
+    if pipe
+        .take(GIT_QUERY_MAX_STDERR_BYTES)
+        .read_to_end(&mut stderr)
+        .is_err()
+    {
+        return false;
+    }
+    status.code() == Some(1) && String::from_utf8_lossy(&stderr).contains(GIT_UNMATCHED_PATHSPEC)
 }
 
 /// Who runs the tracked-content query. A root daemon never runs Git as root on
@@ -3597,21 +3640,26 @@ mod tests {
         let dir = scratch_dir();
         let dot_git = dir.path().join(".git");
         fs::create_dir(&dot_git).unwrap();
-        if nix::unistd::geteuid().is_root() {
+        let running_as_root = nix::unistd::geteuid().is_root();
+        if running_as_root {
             // The suite itself runs as root on some hosts: give the fixture
-            // the non-root owner this case is about.
-            std::os::unix::fs::chown(&dot_git, Some(65534), Some(65534)).unwrap();
+            // the non-root owner this case is about, and a group that is not
+            // that owner's primary group.
+            std::os::unix::fs::chown(&dot_git, Some(65534), Some(12345)).unwrap();
         }
         let marker = fs::symlink_metadata(&dot_git).unwrap();
         let uid = marker.uid();
         assert_ne!(uid, 0);
         // The owner's primary group comes from the user database, not from
         // the directory's group.
-        let expected = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        let primary_gid = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
             .ok()
             .flatten()
-            .map(|user| Some((uid, user.gid.as_raw())))
-            .ok_or(());
+            .map(|user| user.gid.as_raw());
+        if running_as_root && let Some(gid) = primary_gid {
+            assert_ne!(gid, marker.gid());
+        }
+        let expected = primary_gid.map(|gid| Some((uid, gid))).ok_or(());
         assert_eq!(git_query_identity(0, &dot_git, &marker), expected);
         // A non-root daemon always runs Git as itself.
         assert_eq!(git_query_identity(uid, &dot_git, &marker), Ok(None));
