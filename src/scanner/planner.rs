@@ -14,6 +14,12 @@
 //! as the target is met. A best-single fallback also considers large items
 //! crowded out by the greedy prefix. Overlapping paths are alternatives,
 //! never additive space: selecting a directory consumes its descendants.
+//! For a byte target, also compare target-capped value, cheapest-first and
+//! largest-useful-item covers with sufficient single items. Remove redundant
+//! choices and prefer lower expected loss once coverage is sufficient; excess bytes do not
+//! justify a riskier deletion. Keep the original maximum-reclaim result if
+//! no cover is found. These bounded greedy alternatives are not an exact
+//! minimum-risk solver.
 //! The approximation bound for ordinary knapsack does not extend to these
 //! overlap and batch-size constraints.
 //!
@@ -298,6 +304,193 @@ fn item(candidate: &CandidacyScore, false_positive_loss: f64) -> PlannedItem {
     }
 }
 
+/// A disjoint set that reaches the target. Use a wider byte accumulator:
+/// subtracting from a saturated u64 total could discard a necessary item.
+struct TargetCover {
+    indices: Vec<usize>,
+    bytes: u128,
+    risk: f64,
+}
+
+impl TargetCover {
+    fn preferred_to(&self, other: &Self) -> bool {
+        self.risk
+            .total_cmp(&other.risk)
+            .then_with(|| self.bytes.cmp(&other.bytes))
+            .then_with(|| self.indices.len().cmp(&other.indices.len()))
+            .then_with(|| self.indices.cmp(&other.indices))
+            .is_lt()
+    }
+}
+
+/// Trim an already-disjoint proposal, most expensive redundant items first.
+/// Recompute loss in canonical execution order, never by floating subtraction.
+fn trim_cover(
+    items: &[(PlannedItem, CandidacyScore)],
+    mut indices: Vec<usize>,
+    target: u64,
+    risk_budget: Option<f64>,
+) -> Option<TargetCover> {
+    let mut bytes = indices.iter().try_fold(0u128, |total, &index| {
+        total.checked_add(u128::from(items[index].0.bytes))
+    })?;
+    if bytes < u128::from(target) {
+        return None;
+    }
+    indices.sort_unstable();
+    let mut removable = indices.clone();
+    removable.sort_by(|&a, &b| {
+        items[b]
+            .0
+            .expected_loss
+            .total_cmp(&items[a].0.expected_loss)
+            .then_with(|| items[b].0.bytes.cmp(&items[a].0.bytes))
+            .then_with(|| a.cmp(&b))
+    });
+    let mut removed = BTreeSet::new();
+    for index in removable {
+        let without = bytes - u128::from(items[index].0.bytes);
+        if without >= u128::from(target) {
+            bytes = without;
+            removed.insert(index);
+        }
+    }
+    indices.retain(|index| !removed.contains(index));
+    let risk = indices
+        .iter()
+        .map(|&index| items[index].0.expected_loss)
+        .sum::<f64>();
+    if !risk.is_finite() || risk_budget.is_some_and(|budget| risk > budget + 1e-9) {
+        return None;
+    }
+    Some(TargetCover {
+        indices,
+        bytes,
+        risk,
+    })
+}
+
+fn cover_in_order(
+    items: &[(PlannedItem, CandidacyScore)],
+    order: &[usize],
+    target: u64,
+    max_items: usize,
+    risk_budget: Option<f64>,
+) -> Option<TargetCover> {
+    let mut indices = Vec::new();
+    let mut selected = SelectedPaths::default();
+    let mut bytes = 0u64;
+    let mut risk = 0.0;
+    for &index in order {
+        if bytes >= target || indices.len() >= max_items {
+            break;
+        }
+        let planned = &items[index].0;
+        let next_risk = risk + planned.expected_loss;
+        if planned.bytes == 0
+            || !next_risk.is_finite()
+            || risk_budget.is_some_and(|budget| next_risk > budget + 1e-9)
+            || selected.overlaps(&planned.path)
+        {
+            continue;
+        }
+        selected.insert(&planned.path);
+        indices.push(index);
+        bytes = bytes.saturating_add(planned.bytes);
+        risk = next_risk;
+    }
+    trim_cover(items, indices, target, risk_budget)
+}
+
+/// Search a fixed number of O(n log n) alternatives using indices, not cloned
+/// scores. All candidates already passed admission; every proposal retains
+/// the same overlap, item-count and loss limits. An existing sufficient set
+/// is always a competitor, so finding another cover cannot increase its risk.
+#[allow(clippy::cast_precision_loss)]
+fn lower_risk_cover(
+    items: &[(PlannedItem, CandidacyScore)],
+    incumbent: &[usize],
+    request: &PlanRequest,
+    risk_budget: Option<f64>,
+) -> Option<TargetCover> {
+    let target = request.target_bytes.filter(|&target| target > 0)?;
+    if request.max_items == 0 || items.is_empty() {
+        return None;
+    }
+    let mut best = trim_cover(items, incumbent.to_vec(), target, risk_budget);
+    let mut consider = |candidate: Option<TargetCover>| {
+        if let Some(candidate) = candidate
+            && best.as_ref().is_none_or(|current| candidate.preferred_to(current))
+        {
+            best = Some(candidate);
+        }
+    };
+
+    // Check sufficient singletons even when the original greedy set met the
+    // target. Its raw bytes/loss ordering can prefer a much riskier overshoot.
+    let single = items
+        .iter()
+        .enumerate()
+        .filter(|(_, (item, _))| {
+            item.bytes >= target
+                && item.expected_loss.is_finite()
+                && risk_budget.is_none_or(|budget| item.expected_loss <= budget + 1e-9)
+        })
+        .min_by(|(a, (left, _)), (b, (right, _))| {
+            left.expected_loss
+                .total_cmp(&right.expected_loss)
+                .then_with(|| left.bytes.cmp(&right.bytes))
+                .then_with(|| a.cmp(b))
+        });
+    if let Some((index, _)) = single {
+        consider(trim_cover(items, vec![index], target, risk_budget));
+    }
+
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    let useful_value = |index: usize| {
+        items[index].0.bytes.min(target) as f64 / items[index].0.expected_loss
+    };
+    order.sort_by(|&a, &b| {
+        useful_value(b)
+            .total_cmp(&useful_value(a))
+            .then_with(|| items[a].0.expected_loss.total_cmp(&items[b].0.expected_loss))
+            .then_with(|| items[a].0.bytes.cmp(&items[b].0.bytes))
+            .then_with(|| a.cmp(&b))
+    });
+    consider(cover_in_order(
+        items, &order, target, request.max_items, risk_budget,
+    ));
+    order.sort_by(|&a, &b| {
+        items[a]
+            .0
+            .expected_loss
+            .total_cmp(&items[b].0.expected_loss)
+            .then_with(|| items[b].0.bytes.min(target).cmp(&items[a].0.bytes.min(target)))
+            .then_with(|| items[a].0.bytes.cmp(&items[b].0.bytes))
+            .then_with(|| a.cmp(&b))
+    });
+    consider(cover_in_order(
+        items, &order, target, request.max_items, risk_budget,
+    ));
+    // Small high-value children can block their parents, or fill every item
+    // slot without reaching the target. Try a space-first cover as well; it
+    // only wins over a sufficient incumbent if its total risk is no greater.
+    order.sort_by(|&a, &b| {
+        items[b]
+            .0
+            .bytes
+            .min(target)
+            .cmp(&items[a].0.bytes.min(target))
+            .then_with(|| items[a].0.expected_loss.total_cmp(&items[b].0.expected_loss))
+            .then_with(|| items[a].0.bytes.cmp(&items[b].0.bytes))
+            .then_with(|| a.cmp(&b))
+    });
+    consider(cover_in_order(
+        items, &order, target, request.max_items, risk_budget,
+    ));
+    best
+}
+
 /// Plan a batch: the chosen candidates in execution order, plus the plan.
 ///
 /// Candidates that are not plannable (vetoed, suspended, invalid evidence,
@@ -422,8 +615,15 @@ pub fn plan_batch(
         }
     }
 
-    // Rebuild from the final set: best-single may have replaced the greedy
-    // set, so overlap explanations must not retain its discarded choices.
+    if let Some(cover) = lower_risk_cover(&plannable, &chosen_idx, request, risk_budget) {
+        chosen_idx = cover.indices;
+        planned_bytes = u64::try_from(cover.bytes).unwrap_or(u64::MAX);
+        risk_used = cover.risk;
+        target_met = true;
+    }
+
+    // Rebuild from the final set, including target-cover replacements, so
+    // overlap explanations never retain discarded choices.
     let mut selected = SelectedPaths::default();
     for &index in &chosen_idx {
         selected.insert(&plannable[index].0.path);
@@ -819,8 +1019,16 @@ mod tests {
             assert_eq!(paths, reference_paths);
             assert_eq!(plan, reference_plan);
         }
-        // Equal value, equal bytes: path ascending decides.
-        assert_eq!(reference_paths[0], Path::new("/p/d"), "{reference_paths:?}");
+        // The high-value half-GiB item is redundant in a sufficient cover.
+        assert!(!reference_paths.contains(&PathBuf::from("/p/d")));
+        assert!(reference_plan.target_met);
+        assert!(reference_plan.risk_used < 30.5);
+        // Untargeted requests still retain ordinary value-first ordering.
+        let (untargeted, _) = plan_batch(
+            base,
+            &request(PressureLevel::Yellow, None, Some(100.0)),
+        );
+        assert_eq!(untargeted[0].path, Path::new("/p/d"));
     }
 
     /// The greedy set is never over budget and reclaims at least half of
@@ -1053,5 +1261,287 @@ mod tests {
         assert_eq!(plan.risk_used, f64::MAX);
         assert_eq!(plan.top_n_risk, f64::MAX);
         assert_finite_plan(&plan);
+    }
+
+    #[test]
+    fn meeting_a_small_target_does_not_justify_a_riskier_oversized_deletion() {
+        let (chosen, plan) = plan_batch(
+            vec![
+                candidate("/p/oversized", 100 * GIB, 0.8, 1.0, DecisionAction::Delete),
+                candidate("/p/sufficient", GIB, 0.99, 1.0, DecisionAction::Delete),
+            ],
+            &request(PressureLevel::Orange, Some(GIB), None),
+        );
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/p/sufficient"));
+        assert_eq!(plan.planned_bytes, GIB);
+        assert!((plan.risk_used - 0.5).abs() < 1e-9);
+        assert!(plan.target_met);
+        assert_finite_plan(&plan);
+    }
+
+    #[test]
+    fn two_safer_items_can_replace_a_single_greedy_overshoot() {
+        let (chosen, plan) = plan_batch(
+            vec![
+                candidate("/p/huge", 1000 * GIB, 0.6, 1.0, DecisionAction::Delete),
+                candidate("/p/a", 6 * GIB, 0.99, 1.0, DecisionAction::Delete),
+                candidate("/p/b", 4 * GIB, 0.99, 1.0, DecisionAction::Delete),
+            ],
+            &request(PressureLevel::Orange, Some(10 * GIB), None),
+        );
+        assert_eq!(chosen.len(), 2);
+        assert_eq!(chosen[0].path, Path::new("/p/a"));
+        assert_eq!(chosen[1].path, Path::new("/p/b"));
+        assert_eq!(plan.planned_bytes, 10 * GIB);
+        assert!((plan.risk_used - 1.0).abs() < 1e-9);
+        assert!(plan.target_met);
+    }
+
+    #[test]
+    fn sufficient_later_item_removes_a_redundant_greedy_prefix() {
+        let (chosen, plan) = plan_batch(
+            vec![
+                candidate("/p/tiny", MIB, 1.0, 1.0, DecisionAction::Delete),
+                candidate("/p/enough", 10 * GIB, 0.99, 1.0, DecisionAction::Delete),
+            ],
+            &request(PressureLevel::Yellow, Some(10 * GIB), None),
+        );
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/p/enough"));
+        assert_eq!(plan.planned_bytes, 10 * GIB);
+        assert!((plan.risk_used - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sufficient_singletons_are_considered_despite_a_tiny_item_slot_trap() {
+        let candidates = vec![
+            candidate("/p/tiny-a", MIB, 1.0, 1.0, DecisionAction::Delete),
+            candidate("/p/tiny-b", MIB, 1.0, 1.0, DecisionAction::Delete),
+            candidate("/p/huge", 100 * GIB, 0.5, 1.0, DecisionAction::Delete),
+            candidate("/p/enough", 10 * GIB, 0.99, 1.0, DecisionAction::Delete),
+        ];
+        let mut req = request(PressureLevel::Orange, Some(10 * GIB), None);
+        req.max_items = 2;
+        let (chosen, plan) = plan_batch(candidates, &req);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/p/enough"));
+        assert!(plan.target_met);
+        assert!((plan.risk_used - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cover_search_does_not_override_risk_or_item_limits() {
+        let candidates = vec![
+            candidate("/p/huge", 1000 * GIB, 0.6, 1.0, DecisionAction::Delete),
+            candidate("/p/a", 6 * GIB, 0.99, 1.0, DecisionAction::Delete),
+            candidate("/p/b", 4 * GIB, 0.99, 1.0, DecisionAction::Delete),
+        ];
+        let mut req = request(PressureLevel::Orange, Some(10 * GIB), Some(1.1));
+        req.max_items = 1;
+        let (chosen, plan) = plan_batch(candidates.clone(), &req);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/p/a"));
+        assert!(!plan.target_met);
+        assert!(plan.risk_used <= 1.1);
+        req.max_items = 2;
+        let (_, plan) = plan_batch(candidates, &req);
+        assert!(plan.target_met);
+        assert!(plan.risk_used <= 1.1);
+    }
+
+    #[test]
+    fn target_alternatives_do_not_add_overlapping_capacity() {
+        let candidates = vec![
+            candidate("/p/cache", 6 * GIB, 0.99, 1.0, DecisionAction::Delete),
+            candidate("/p/cache/sub", 5 * GIB, 1.0, 1.0, DecisionAction::Delete),
+            candidate("/p/other", 4 * GIB, 0.99, 1.0, DecisionAction::Delete),
+        ];
+        let (chosen, plan) = plan_batch(
+            candidates,
+            &request(PressureLevel::Orange, Some(10 * GIB), Some(2.0)),
+        );
+        // The old greedy set picked child+other (9 GiB), then stopped short.
+        // Parent+other reaches the target without double-counting the child.
+        assert!(plan.target_met);
+        assert_eq!(plan.planned_bytes, 10 * GIB);
+        assert_eq!(chosen.len(), 2);
+        assert_eq!(chosen[0].path, Path::new("/p/cache"));
+        assert_eq!(chosen[1].path, Path::new("/p/other"));
+        assert_eq!(plan.skipped_for_overlap.len(), 1);
+        assert_eq!(plan.skipped_for_overlap[0].path, Path::new("/p/cache/sub"));
+        for (index, planned) in plan.chosen.iter().enumerate() {
+            assert_eq!(planned.rank, index + 1);
+            assert_eq!(planned.path, chosen[index].path);
+        }
+    }
+
+    #[test]
+    fn target_cover_trimming_uses_unsaturated_bytes() {
+        let (chosen, plan) = plan_batch(
+            vec![
+                candidate("/p/almost", u64::MAX - 5, 0.99, 1.0, DecisionAction::Delete),
+                candidate("/p/necessary-tail", 10, 0.99, 1.0, DecisionAction::Delete),
+            ],
+            &request(PressureLevel::Critical, Some(u64::MAX), None),
+        );
+        assert_eq!(chosen.len(), 2);
+        assert!(plan.target_met);
+        assert_eq!(plan.planned_bytes, u64::MAX);
+        assert!((plan.risk_used - 1.0).abs() < 1e-9);
+        assert_finite_plan(&plan);
+    }
+
+    #[test]
+    fn absent_unreachable_and_zero_targets_preserve_their_contracts() {
+        let candidates = vec![
+            candidate("/p/large", 100 * GIB, 0.8, 1.0, DecisionAction::Delete),
+            candidate("/p/small", GIB, 0.99, 1.0, DecisionAction::Delete),
+        ];
+        let (chosen, plan) = plan_batch(
+            candidates.clone(),
+            &request(PressureLevel::Orange, None, None),
+        );
+        assert_eq!(chosen.len(), 2);
+        assert_eq!(chosen[0].path, Path::new("/p/large"));
+        assert_eq!(plan.planned_bytes, 101 * GIB);
+        let (_, unreachable) = plan_batch(
+            candidates.clone(),
+            &request(PressureLevel::Orange, Some(200 * GIB), None),
+        );
+        assert!(!unreachable.target_met);
+        assert_eq!(unreachable.planned_bytes, plan.planned_bytes);
+        assert_eq!(unreachable.risk_used, plan.risk_used);
+        let (chosen, zero) = plan_batch(
+            candidates.clone(),
+            &request(PressureLevel::Orange, Some(0), None),
+        );
+        assert!(chosen.is_empty());
+        assert!(zero.target_met);
+        let mut req = request(PressureLevel::Orange, Some(GIB), None);
+        req.max_items = 0;
+        assert!(plan_batch(candidates, &req).0.is_empty());
+    }
+
+    #[test]
+    fn equal_risk_covers_prefer_less_excess_then_stable_paths() {
+        let (chosen, plan) = plan_batch(
+            vec![
+                candidate("/p/huge", 100 * GIB, 0.99, 1.0, DecisionAction::Delete),
+                candidate("/p/z", 2 * GIB, 0.99, 1.0, DecisionAction::Delete),
+                candidate("/p/a", 2 * GIB, 0.99, 1.0, DecisionAction::Delete),
+            ],
+            &request(PressureLevel::Orange, Some(GIB), None),
+        );
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/p/a"));
+        assert_eq!(plan.chosen[0].rank, 1);
+        assert_eq!(plan.chosen[0].path, chosen[0].path);
+        assert_eq!(plan.planned_bytes, 2 * GIB);
+    }
+
+    #[test]
+    fn safety_vetoes_and_review_rules_survive_target_optimization() {
+        let mut vetoed = candidate("/p/vetoed", GIB, 1.0, 1.0, DecisionAction::Delete);
+        vetoed.vetoed = true;
+        let mut suspended = candidate("/p/suspended", GIB, 1.0, 1.0, DecisionAction::Delete);
+        suspended.decision.category_suspended = true;
+        let candidates = vec![
+            vetoed,
+            suspended,
+            candidate("/p/keep", GIB, 1.0, 1.0, DecisionAction::Keep),
+            candidate("/p/review", GIB, 1.0, 1.0, DecisionAction::Review),
+            candidate("/p/invalid", GIB, f64::NAN, 1.0, DecisionAction::Delete),
+            candidate("/p/valid", 2 * GIB, 0.9, 1.0, DecisionAction::Delete),
+        ];
+        for level in [PressureLevel::Green, PressureLevel::Red, PressureLevel::Critical] {
+            let req = request(level, Some(GIB), None);
+            let (chosen, plan) = plan_batch(candidates.clone(), &req);
+            assert_eq!(chosen.len(), 1);
+            assert_eq!(chosen[0].path, Path::new("/p/valid"));
+            assert!(plan.target_met);
+            assert_finite_plan(&plan);
+        }
+        let mut emergency = request(PressureLevel::Critical, Some(GIB), None);
+        emergency.include_review = true;
+        let (chosen, _) = plan_batch(candidates, &emergency);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/p/review"));
+    }
+
+    #[test]
+    fn sufficient_singletons_match_the_exhaustive_minimum_loss() {
+        for trial in 0u32..64 {
+            let candidates: Vec<_> = (0u32..6)
+                .map(|i| {
+                    candidate(
+                        &format!("/p/{i}"),
+                        u64::from(1 + (trial * 19 + i * 17) % 100) * GIB,
+                        0.5 + f64::from((trial * 7 + i * 11) % 50) / 100.0,
+                        1.0,
+                        DecisionAction::Delete,
+                    )
+                })
+                .collect();
+            let req = request(PressureLevel::Orange, Some(GIB), Some(12.5));
+            // Every item covers the target. Any multi-item set costs at least
+            // its cheapest member, so the optimum is the cheapest fitting one.
+            let optimum = candidates
+                .iter()
+                .map(|c| ((1.0 - c.decision.posterior_abandoned) * 50.0).max(1e-6))
+                .filter(|&loss| loss <= 12.5 + 1e-9)
+                .min_by(f64::total_cmp);
+            let (chosen, plan) = plan_batch(candidates, &req);
+            assert_eq!(plan.target_met, optimum.is_some());
+            if let Some(optimum) = optimum {
+                assert_eq!(chosen.len(), 1);
+                assert_eq!(plan.risk_used, optimum);
+            } else {
+                assert!(chosen.is_empty());
+            }
+            assert_finite_plan(&plan);
+        }
+    }
+
+    #[test]
+    fn every_supplied_sufficient_incumbent_bounds_the_cover_search_risk() {
+        let target = 50 * MIB;
+        let req = request(PressureLevel::Orange, Some(target), Some(30.0));
+        for trial in 0u32..32 {
+            let items: Vec<_> = (0u32..6)
+                .map(|i| {
+                    let score = candidate(
+                        &format!("/p/{i}"),
+                        u64::from(1 + (trial * 19 + i * 17) % 100) * MIB,
+                        0.5 + f64::from((trial * 7 + i * 11) % 50) / 100.0,
+                        1.0,
+                        DecisionAction::Delete,
+                    );
+                    (item(&score, req.false_positive_loss), score)
+                })
+                .collect();
+            // Feed every feasible subset as an incumbent, not only a subset
+            // selected by this implementation's greedy policy.
+            for mask in 1u32..64 {
+                let incumbent: Vec<_> = (0..6).filter(|&i| mask & (1 << i) != 0).collect();
+                let bytes: u64 = incumbent.iter().map(|&i| items[i].0.bytes).sum();
+                let loss: f64 = incumbent.iter().map(|&i| items[i].0.expected_loss).sum();
+                if bytes < target || loss > 30.0 + 1e-9 {
+                    continue;
+                }
+                let cover = lower_risk_cover(&items, &incumbent, &req, req.risk_budget).unwrap();
+                assert!(cover.risk <= loss);
+                assert!(cover.bytes >= u128::from(target));
+                assert!(cover.indices.len() <= req.max_items);
+                assert_eq!(
+                    cover.bytes,
+                    cover.indices.iter().map(|&i| u128::from(items[i].0.bytes)).sum::<u128>()
+                );
+                assert_eq!(
+                    cover.risk,
+                    cover.indices.iter().map(|&i| items[i].0.expected_loss).sum::<f64>()
+                );
+            }
+        }
     }
 }
