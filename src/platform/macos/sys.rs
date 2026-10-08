@@ -313,13 +313,36 @@ impl ApfsVolume {
     }
 }
 
+/// Bound on mapping hops for [`FirmlinkMap::resolve_canonical`]. Real tables
+/// need at most two (a synthetic link into a firmlinked directory, then the
+/// firmlink); the cap only guards against a cyclic synthetic.conf.
+const MAX_FIRMLINK_HOPS: usize = 8;
+
 impl FirmlinkMap {
+    /// Apply the single longest matching mapping, once.
     #[must_use]
     pub fn resolve(&self, path: &Path) -> PathBuf {
         self.mappings
             .iter()
             .find_map(|mapping| resolve_with_mapping(path, mapping))
             .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// Apply mappings until none matches. A synthetic.conf link can point into
+    /// a firmlinked directory (`/data` -> `/Volumes/X/data`, and `/Volumes` is
+    /// itself a firmlink), and paths and mount points must land in the same
+    /// namespace whichever spelling they start from.
+    #[must_use]
+    pub fn resolve_canonical(&self, path: &Path) -> PathBuf {
+        let mut current = path.to_path_buf();
+        for _ in 0..MAX_FIRMLINK_HOPS {
+            let next = self.resolve(&current);
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        current
     }
 }
 
@@ -958,7 +981,7 @@ pub fn firmlink_map_from_paths(
 }
 
 pub fn resolve_firmlinked_path(path: &Path) -> io::Result<PathBuf> {
-    firmlink_map().map(|map| map.resolve(path))
+    firmlink_map().map(|map| map.resolve_canonical(path))
 }
 
 #[must_use]
@@ -1976,6 +1999,36 @@ relative-target\tVolumes/External
             mapping.visible_path == Path::new("/dp")
                 && mapping.source == FirmlinkSource::SyntheticConfig
         }));
+    }
+
+    #[test]
+    fn canonical_resolution_follows_synthetic_links_into_firmlinked_volumes() {
+        let firmlinks = "/Volumes\tVolumes\n/Users\tUsers\n";
+        let synthetic_conf = "data\tVolumes/USBNVME16TB/data\nloop-a\t/loop-b\nloop-b\t/loop-a\n";
+        let map = parse_firmlink_map(firmlinks, synthetic_conf);
+
+        // One hop stops at the firmlinked spelling; canonical goes through it.
+        assert_eq!(
+            map.resolve(Path::new("/data/tmp")),
+            Path::new("/Volumes/USBNVME16TB/data/tmp")
+        );
+        assert_eq!(
+            map.resolve_canonical(Path::new("/data/tmp")),
+            Path::new("/System/Volumes/Data/Volumes/USBNVME16TB/data/tmp")
+        );
+        // A mount point and a path beneath it land in the same namespace.
+        assert_eq!(
+            map.resolve_canonical(Path::new("/Volumes/USBNVME16TB")),
+            Path::new("/System/Volumes/Data/Volumes/USBNVME16TB")
+        );
+        assert_eq!(
+            map.resolve_canonical(Path::new("/Users/jemanuel")),
+            Path::new("/System/Volumes/Data/Users/jemanuel")
+        );
+        assert_eq!(map.resolve_canonical(Path::new("/usr/bin")), Path::new("/usr/bin"));
+        // A cyclic synthetic.conf terminates instead of looping.
+        let looped = map.resolve_canonical(Path::new("/loop-a/x"));
+        assert!(looped == Path::new("/loop-a/x") || looped == Path::new("/loop-b/x"));
     }
 
     #[test]
