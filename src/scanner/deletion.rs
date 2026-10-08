@@ -1553,6 +1553,17 @@ fn contains_nested_git(path: &Path, max_depth: usize) -> bool {
     false
 }
 
+/// Fixed search path for the tracked-content query: neither the daemon's PATH
+/// nor (for a user-scope daemon) the user's chooses which `git` runs.
+#[cfg(target_os = "macos")]
+const GIT_QUERY_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+#[cfg(not(target_os = "macos"))]
+const GIT_QUERY_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+/// A gitfile is one `gitdir: <path>` line; anything larger is not one.
+#[cfg(unix)]
+const MAX_GITFILE_BYTES: u64 = 4096;
+
 /// Veto tracked subtrees independently of source extensions and artifact names.
 /// Untracked build outputs inside a valid repository remain reclaimable. If a
 /// repository marker exists but its index cannot be queried, keep the candidate:
@@ -1562,46 +1573,105 @@ fn contains_tracked_git_content(path: &Path) -> bool {
         return true;
     };
     for root in path.ancestors().skip(1) {
-        match fs::symlink_metadata(root.join(".git")) {
+        let dot_git = root.join(".git");
+        let marker = match fs::symlink_metadata(&dot_git) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return true,
             Ok(marker) if marker.file_type().is_symlink() => return true,
-            Ok(_) => {}
-        }
+            Ok(marker) => marker,
+        };
         let Ok(relative) = path.strip_prefix(root) else {
             return true;
         };
-        let status = std::process::Command::new("git")
-            .args([
-                "--no-optional-locks",
-                "--literal-pathspecs",
-                "-c",
-                "core.fsmonitor=false",
-                "-C",
-            ])
-            .arg(root)
-            .args(["ls-files", "--cached", "--error-unmatch", "--"])
-            .arg(relative)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_COMMON_DIR")
-            .env_remove("GIT_NAMESPACE")
-            .env_remove("GIT_CONFIG")
-            .env_remove("GIT_CONFIG_COUNT")
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        match status.map(|status| status.code()) {
+        let mut git = std::process::Command::new("git");
+        git.args([
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+        ])
+        .arg(root)
+        .args(["ls-files", "--cached", "--error-unmatch", "--"])
+        .arg(relative)
+        // Nothing from the daemon's environment reaches Git.
+        .env_clear()
+        .env("PATH", GIT_QUERY_PATH)
+        .env("HOME", "/nonexistent")
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            match git_query_identity(nix::unistd::geteuid().as_raw(), &dot_git, &marker) {
+                Ok(Some((uid, gid))) => {
+                    git.uid(uid).gid(gid);
+                }
+                Ok(None) => {}
+                Err(()) => return true,
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = marker;
+        match git.status().map(|status| status.code()) {
             // Only Git's explicit unmatched-path result permits continuing.
             Ok(Some(1)) => {}
             _ => return true,
         }
     }
     false
+}
+
+/// Who runs the tracked-content query. A root daemon never runs Git as root on
+/// a repository another user owns: Git refuses that as "dubious ownership"
+/// (exit 128, which kept every candidate in users' repositories), and trusting
+/// the repository instead would let user-controlled configuration run with
+/// root's privileges. Git runs as the owner of the repository's real Git
+/// directory; std's `CommandExt::uid` also clears root's supplementary groups
+/// (`setgroups(0, NULL)` before `setuid`). `Ok(None)` runs Git as the current
+/// user; `Err(())` means the owner cannot be established, so the candidate is
+/// kept.
+#[cfg(unix)]
+fn git_query_identity(
+    euid: u32,
+    dot_git: &Path,
+    marker: &fs::Metadata,
+) -> std::result::Result<Option<(u32, u32)>, ()> {
+    if euid != 0 {
+        return Ok(None);
+    }
+    let owner = git_dir_owner(dot_git, marker).ok_or(())?;
+    Ok((owner.0 != 0).then_some(owner))
+}
+
+/// Owner of the Git directory that a `.git` marker names: the directory
+/// itself, or the `gitdir:` target of a linked worktree's or submodule's
+/// `.git` file. `None` for a symlinked marker, an unreadable or malformed
+/// gitfile, a target that is not a directory, or a gitfile and target with
+/// different owners (Git refuses that mix for every user).
+#[cfg(unix)]
+fn git_dir_owner(dot_git: &Path, marker: &fs::Metadata) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let file_type = marker.file_type();
+    if file_type.is_dir() {
+        return Some((marker.uid(), marker.gid()));
+    }
+    if !file_type.is_file() || marker.len() > MAX_GITFILE_BYTES {
+        return None;
+    }
+    let contents = fs::read_to_string(dot_git).ok()?;
+    let target = contents.strip_prefix("gitdir:")?.trim();
+    if target.is_empty() || target.contains('\n') {
+        return None;
+    }
+    let git_dir = fs::canonicalize(dot_git.parent()?.join(target)).ok()?;
+    let git_dir_meta = fs::symlink_metadata(&git_dir).ok()?;
+    let owner = (git_dir_meta.uid(), git_dir_meta.gid());
+    (git_dir_meta.is_dir() && owner.0 == marker.uid()).then_some(owner)
 }
 
 /// Hardcoded refusal: paths inside well-known source-tree locations must
@@ -3457,6 +3527,173 @@ mod tests {
                 &make_candidate(&repo.join("vendor/assets/build/spec.payload"), 1, 1.0),
                 None
             ),
+            Err(SkipReason::ContainsGit)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_query_identity_switches_root_to_a_non_root_owner() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = scratch_dir();
+        let dot_git = dir.path().join(".git");
+        fs::create_dir(&dot_git).unwrap();
+        if nix::unistd::geteuid().is_root() {
+            // The suite itself runs as root on some hosts: give the fixture
+            // the non-root owner this case is about.
+            std::os::unix::fs::chown(&dot_git, Some(65534), Some(65534)).unwrap();
+        }
+        let marker = fs::symlink_metadata(&dot_git).unwrap();
+        let owner = (marker.uid(), marker.gid());
+        assert_ne!(owner.0, 0);
+        assert_eq!(git_query_identity(0, &dot_git, &marker), Ok(Some(owner)));
+        // A non-root daemon always runs Git as itself.
+        assert_eq!(git_query_identity(owner.0, &dot_git, &marker), Ok(None));
+        assert_eq!(git_query_identity(1, &dot_git, &marker), Ok(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_query_identity_keeps_root_for_a_root_owned_repository() {
+        // `/` is root-owned on every host this suite runs on.
+        let root = Path::new("/");
+        let marker = fs::symlink_metadata(root).unwrap();
+        assert_eq!(git_dir_owner(root, &marker).map(|owner| owner.0), Some(0));
+        assert_eq!(git_query_identity(0, root, &marker), Ok(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_query_identity_follows_a_gitfile_to_its_git_dir() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = scratch_dir();
+        let git_dir = dir.path().join("main/.git/worktrees/linked");
+        fs::create_dir_all(&git_dir).unwrap();
+        let worktree = dir.path().join("linked");
+        fs::create_dir(&worktree).unwrap();
+        let dot_git = worktree.join(".git");
+        let git_dir_meta = fs::metadata(&git_dir).unwrap();
+        let owner = Some((git_dir_meta.uid(), git_dir_meta.gid()));
+        // Git resolves a relative gitdir against the gitfile's directory.
+        fs::write(&dot_git, "gitdir: ../main/.git/worktrees/linked\n").unwrap();
+        let marker = fs::symlink_metadata(&dot_git).unwrap();
+        assert_eq!(git_dir_owner(&dot_git, &marker), owner);
+        fs::write(&dot_git, format!("gitdir: {}\n", git_dir.display())).unwrap();
+        let marker = fs::symlink_metadata(&dot_git).unwrap();
+        assert_eq!(git_dir_owner(&dot_git, &marker), owner);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_query_identity_refuses_when_the_owner_cannot_be_established() {
+        let dir = scratch_dir();
+        let real = dir.path().join("real-git-dir");
+        fs::create_dir(&real).unwrap();
+        let plain_file = dir.path().join("plain-file");
+        fs::write(&plain_file, "x").unwrap();
+        let check = |name: &str, setup: &dyn Fn(&Path)| {
+            let worktree = dir.path().join(name);
+            fs::create_dir(&worktree).unwrap();
+            let dot_git = worktree.join(".git");
+            setup(&dot_git);
+            let marker = fs::symlink_metadata(&dot_git).unwrap();
+            assert_eq!(git_dir_owner(&dot_git, &marker), None, "{name}");
+            assert_eq!(git_query_identity(0, &dot_git, &marker), Err(()), "{name}");
+        };
+        check("symlinked", &|dot_git: &Path| {
+            std::os::unix::fs::symlink(&real, dot_git).unwrap();
+        });
+        check("not-a-gitfile", &|dot_git: &Path| {
+            fs::write(dot_git, "nonsense\n").unwrap();
+        });
+        check("empty-gitdir", &|dot_git: &Path| {
+            fs::write(dot_git, "gitdir:   \n").unwrap();
+        });
+        check("two-lines", &|dot_git: &Path| {
+            fs::write(dot_git, format!("gitdir: {}\nextra\n", real.display())).unwrap();
+        });
+        check("missing-target", &|dot_git: &Path| {
+            fs::write(dot_git, "gitdir: ../does-not-exist\n").unwrap();
+        });
+        check("file-target", &|dot_git: &Path| {
+            fs::write(dot_git, format!("gitdir: {}\n", plain_file.display())).unwrap();
+        });
+        check("oversized", &|dot_git: &Path| {
+            let padding = " ".repeat(5000);
+            fs::write(dot_git, format!("gitdir: {}{padding}\n", real.display())).unwrap();
+        });
+    }
+
+    /// Root only (skipped otherwise; run the test binary under sudo): a root
+    /// daemon gets Git's answer for a repository another user owns, so
+    /// untracked build output there is eligible again while tracked content
+    /// stays protected.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_queries_a_user_owned_repository_as_its_owner() {
+        if !nix::unistd::geteuid().is_root() {
+            eprintln!("skipped: needs root");
+            return;
+        }
+        let dir = scratch_dir();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("vendor/assets/build")).unwrap();
+        fs::write(
+            repo.join("vendor/assets/build/spec.payload"),
+            "useful source",
+        )
+        .unwrap();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["add", "vendor"]);
+        git(&[
+            "-c",
+            "user.name=SBH regression",
+            "-c",
+            "user.email=sbh-regression@example.invalid",
+            "commit",
+            "-m",
+            "tracked source control",
+        ]);
+        let artifact = repo.join("target/debug/build");
+        fs::create_dir_all(&artifact).unwrap();
+        fs::write(artifact.join("generated.o"), "object bytes").unwrap();
+        // Hand the whole fixture to an unprivileged owner (nobody:nogroup).
+        let chown = std::process::Command::new("chown")
+            .args(["-R", "65534:65534"])
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(chown.success());
+
+        assert!(
+            !contains_tracked_git_content(&artifact),
+            "untracked build output in a user-owned repository must be eligible"
+        );
+        let tracked = repo.join("vendor/assets/build");
+        assert!(
+            contains_tracked_git_content(&tracked),
+            "tracked content must stay protected"
+        );
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        assert_eq!(
+            executor.explain_preflight(&make_candidate(&artifact, 1, 1.0), None),
+            Ok(())
+        );
+        assert_eq!(
+            executor.explain_preflight(&make_candidate(&tracked, 1, 1.0), None),
             Err(SkipReason::ContainsGit)
         );
     }
