@@ -2025,7 +2025,10 @@ relative-target\tVolumes/External
             map.resolve_canonical(Path::new("/Users/jemanuel")),
             Path::new("/System/Volumes/Data/Users/jemanuel")
         );
-        assert_eq!(map.resolve_canonical(Path::new("/usr/bin")), Path::new("/usr/bin"));
+        assert_eq!(
+            map.resolve_canonical(Path::new("/usr/bin")),
+            Path::new("/usr/bin")
+        );
         // A cyclic synthetic.conf terminates instead of looping.
         let looped = map.resolve_canonical(Path::new("/loop-a/x"));
         assert!(looped == Path::new("/loop-a/x") || looped == Path::new("/loop-b/x"));

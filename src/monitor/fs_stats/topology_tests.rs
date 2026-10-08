@@ -407,3 +407,145 @@ fn alias_retargeting_is_part_of_cache_ownership_even_with_unchanged_pal_labels()
     assert_eq!(platform.calls.lock().len(), 2);
     assert!(first.is_dir() && second.is_dir());
 }
+
+/// A platform whose mount lookup rewrites paths the way macOS does: APFS
+/// firmlinks (`/Volumes`, `/Users` live on the Data volume) plus a
+/// synthetic.conf link (`/data` -> `/Volumes/USBNVME16TB/data`), applied to a
+/// fixed point. Mount points are reported in their raw kernel spelling.
+struct FirmlinkedPlatform {
+    mounts: Vec<MountPoint>,
+}
+
+impl FirmlinkedPlatform {
+    const MAPPINGS: [(&'static str, &'static str); 3] = [
+        ("/Volumes", "/System/Volumes/Data/Volumes"),
+        ("/Users", "/System/Volumes/Data/Users"),
+        ("/data", "/Volumes/USBNVME16TB/data"),
+    ];
+
+    fn mac_mini_old() -> Self {
+        let mounts = [
+            ("/", "disk3s1s1"),
+            ("/System/Volumes/Data", "disk3s5"),
+            ("/Volumes/ExtData", "disk9s1"),
+            ("/Volumes/USBNVME16TB", "disk7s1"),
+        ]
+        .iter()
+        .map(|(path, device)| MountPoint {
+            path: PathBuf::from(path),
+            device: (*device).to_string(),
+            fs_type: "apfs".to_string(),
+            is_ram_backed: false,
+        })
+        .collect();
+        Self { mounts }
+    }
+}
+
+impl Platform for FirmlinkedPlatform {
+    fn fs_stats(&self, path: &Path) -> Result<FsStats> {
+        let mount = self
+            .mounts
+            .iter()
+            .find(|mount| mount.path == path)
+            .ok_or_else(|| SbhError::FsStats {
+                path: path.to_path_buf(),
+                details: "not a mount point in this fixture".to_string(),
+            })?;
+        Ok(FsStats {
+            total_bytes: 1000,
+            free_bytes: 10,
+            available_bytes: 10,
+            fs_type: mount.fs_type.clone(),
+            mount_point: mount.path.clone(),
+            is_readonly: false,
+        })
+    }
+
+    fn mount_points(&self) -> Result<Vec<MountPoint>> {
+        Ok(self.mounts.clone())
+    }
+
+    fn mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
+        let mut current = path.to_path_buf();
+        for _ in 0..8 {
+            let next = Self::MAPPINGS
+                .iter()
+                .filter(|(visible, _)| current.starts_with(visible))
+                .max_by_key(|(visible, _)| visible.len())
+                .map_or_else(
+                    || current.clone(),
+                    |(visible, data)| Path::new(data).join(current.strip_prefix(visible).unwrap()),
+                );
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        Ok(current)
+    }
+
+    fn is_ram_backed(&self, _path: &Path) -> Result<bool> {
+        Ok(false)
+    }
+    fn default_paths(&self) -> PlatformPaths {
+        PlatformPaths::default()
+    }
+    fn memory_info(&self) -> Result<MemoryInfo> {
+        Ok(MemoryInfo {
+            total_bytes: 1,
+            available_bytes: 1,
+            swap_total_bytes: 0,
+            swap_free_bytes: 0,
+        })
+    }
+    fn service_manager(&self) -> Box<dyn ServiceManager> {
+        Box::new(NoopServiceManager)
+    }
+}
+
+/// sbh#26 B2: paths on external volumes must be measured on their own disk,
+/// never on the Data volume that their firmlinked spelling falls under. A
+/// Data-pressure pass would otherwise delete on the wrong (external) disk.
+#[test]
+fn firmlinked_external_volumes_are_attributed_to_their_own_mounts() {
+    let collector = FsStatsCollector::new(
+        Arc::new(FirmlinkedPlatform::mac_mini_old()),
+        Duration::from_secs(60),
+    );
+    for (path, owner) in [
+        ("/Volumes/ExtData/dsr-build-root/x", "/Volumes/ExtData"),
+        ("/Volumes/ExtData", "/Volumes/ExtData"),
+        (
+            "/Volumes/USBNVME16TB/cargo_git_cache",
+            "/Volumes/USBNVME16TB",
+        ),
+        ("/data/tmp/target", "/Volumes/USBNVME16TB"),
+        ("/Users/jemanuel/projects", "/System/Volumes/Data"),
+        ("/usr/bin", "/"),
+    ] {
+        let stats = collector
+            .collect(Path::new(path))
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
+        assert_eq!(stats.mount_point, Path::new(owner), "{path}");
+    }
+    let many = collector
+        .collect_many(&[
+            PathBuf::from("/Volumes/ExtData/a"),
+            PathBuf::from("/data/b"),
+            PathBuf::from("/Users/c"),
+        ])
+        .unwrap();
+    assert_eq!(
+        many[Path::new("/Volumes/ExtData/a")].mount_point,
+        Path::new("/Volumes/ExtData")
+    );
+    assert_eq!(
+        many[Path::new("/data/b")].mount_point,
+        Path::new("/Volumes/USBNVME16TB")
+    );
+    assert_eq!(
+        many[Path::new("/Users/c")].mount_point,
+        Path::new("/System/Volumes/Data")
+    );
+}
