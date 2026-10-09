@@ -14,6 +14,8 @@
 //! as the target is met. A best-single fallback also considers large items
 //! crowded out by the greedy prefix. Overlapping paths are alternatives,
 //! never additive space: selecting a directory consumes its descendants.
+//! Observations with the same filesystem identity are alternatives too, even
+//! at unrelated paths. A hard veto on any such observation rejects its aliases.
 //! For a byte target, also compare target-capped value, cheapest-first and
 //! largest-useful-item covers with sufficient single items. Remove redundant
 //! choices and prefer lower expected loss once coverage is sufficient; excess bytes do not
@@ -27,7 +29,7 @@
 //! identical inputs plan identically whatever order the walker found them
 //! in (design principle 3).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use crate::monitor::pid::PressureLevel;
 use crate::scanner::decision_record::stable_decision_id;
 use crate::scanner::scoring::{CandidacyScore, DecisionAction};
+use crate::scanner::walker::FsIdentity;
 
 /// The risk budget per pressure level as a multiple of one false-positive
 /// loss (`scoring.false_positive_loss`): how many "average mistakes" one
@@ -152,7 +155,7 @@ pub struct BatchPlan {
     pub chosen: Vec<PlannedItem>,
     /// Plannable candidates the budget or batch size left out.
     pub skipped_for_budget: Vec<PlannedItem>,
-    /// Alternatives overlapping a chosen path (including duplicate paths).
+    /// Alternatives overlapping a chosen path or observed filesystem identity.
     /// Their bytes are not additional reclaimable space. Older persisted
     /// plans did not distinguish these from budget skips.
     #[serde(default)]
@@ -247,28 +250,39 @@ fn ordinal(n: usize) -> String {
     format!("{n}{suffix}")
 }
 
-/// A lexical antichain: no selected path contains another selected path.
+/// No selected path contains another selected path, and no selected identity
+/// appears twice. Device, inode and entry kind come from scanner observations;
+/// the planner never resolves or rewrites paths while choosing a batch.
 /// Remembering ancestors makes both directions of containment checks depend
 /// on path depth rather than the number of candidates in a scan. These are
-/// planning checks, not a replacement for executor identity/lease preflight.
+/// planning checks, not a replacement for executor identity/lease preflight or
+/// a proof that different trees share no hard-linked, reflinked or mounted data.
 #[derive(Default)]
 struct SelectedPaths {
     paths: BTreeSet<PathBuf>,
     ancestors: BTreeSet<PathBuf>,
+    identities: HashSet<FsIdentity>,
 }
 
 impl SelectedPaths {
-    fn overlaps(&self, path: &Path) -> bool {
-        self.ancestors.contains(path)
-            || path
+    fn overlaps(&self, candidate: &CandidacyScore) -> bool {
+        candidate
+            .identity
+            .is_some_and(|identity| self.identities.contains(&identity))
+            || self.ancestors.contains(&candidate.path)
+            || candidate
+                .path
                 .ancestors()
                 .any(|ancestor| self.paths.contains(ancestor))
     }
 
-    fn insert(&mut self, path: &Path) {
-        self.paths.insert(path.to_path_buf());
+    fn insert(&mut self, candidate: &CandidacyScore) {
+        self.paths.insert(candidate.path.clone());
         self.ancestors
-            .extend(path.ancestors().map(Path::to_path_buf));
+            .extend(candidate.path.ancestors().map(Path::to_path_buf));
+        if let Some(identity) = candidate.identity {
+            self.identities.insert(identity);
+        }
     }
 }
 
@@ -331,6 +345,17 @@ fn trim_cover(
     target: u64,
     risk_budget: Option<f64>,
 ) -> Option<TargetCover> {
+    // Every proposal must use distinct cleanup units, not just enough bytes.
+    // Check before trimming: removing a duplicate later could otherwise make
+    // an initially fictitious cover look like an admissible incumbent.
+    let mut selected = SelectedPaths::default();
+    for &index in &indices {
+        let score = &items[index].1;
+        if selected.overlaps(score) {
+            return None;
+        }
+        selected.insert(score);
+    }
     let mut bytes = indices.iter().try_fold(0u128, |total, &index| {
         total.checked_add(u128::from(items[index].0.bytes))
     })?;
@@ -390,11 +415,11 @@ fn cover_in_order(
         if planned.bytes == 0
             || !next_risk.is_finite()
             || risk_budget.is_some_and(|budget| next_risk > budget + 1e-9)
-            || selected.overlaps(&planned.path)
+            || selected.overlaps(&items[index].1)
         {
             continue;
         }
-        selected.insert(&planned.path);
+        selected.insert(&items[index].1);
         indices.push(index);
         bytes = bytes.saturating_add(planned.bytes);
         risk = next_risk;
@@ -496,8 +521,10 @@ fn lower_risk_cover(
 /// Candidates that are not plannable (vetoed, suspended, invalid evidence,
 /// `Keep`, or `Review` outside Critical) are dropped silently; the rest are
 /// either chosen or listed under `skipped_for_budget`/`skipped_for_overlap`.
-/// Byte totals count only disjoint chosen paths. Invalid loss units or risk
-/// bounds fail closed, even at Critical pressure.
+/// Byte totals exclude lexical overlaps and repeated observed identities.
+/// A hard-vetoed or suspended observation blocks other spellings of its
+/// identity before optimization. Invalid loss units or risk bounds fail
+/// closed, even at Critical pressure.
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub fn plan_batch(
@@ -511,9 +538,21 @@ pub fn plan_batch(
         Some(0.0)
     };
     let include_review = request.include_review && request.level == PressureLevel::Critical;
+    // Classify all observations before discarding inadmissible ones. Filtering
+    // first would let a higher-scored alias evade an existing hard safety veto.
+    // Unknown identities are not a shared sentinel: they remain independent.
+    let blocked_identities: HashSet<FsIdentity> = candidates
+        .iter()
+        .filter(|candidate| candidate.vetoed || candidate.decision.category_suspended)
+        .filter_map(|candidate| candidate.identity)
+        .collect();
     let mut plannable: Vec<(PlannedItem, CandidacyScore)> = candidates
         .into_iter()
         .filter(|c| valid_loss && plannable(c, include_review))
+        .filter(|c| {
+            c.identity
+                .is_none_or(|identity| !blocked_identities.contains(&identity))
+        })
         .map(|c| (item(&c, request.false_positive_loss), c))
         .collect();
 
@@ -531,7 +570,7 @@ pub fn plan_batch(
         let mut bytes = 0u64;
         let mut risk = 0.0;
         let mut selected = SelectedPaths::default();
-        for (planned, _) in by_score {
+        for (planned, score) in by_score {
             if selected.paths.len() >= request.max_items
                 || request.target_bytes.is_some_and(|target| bytes >= target)
             {
@@ -539,10 +578,10 @@ pub fn plan_batch(
             }
             // A duplicate or descendant must not consume a comparison slot
             // or count the same bytes toward the target twice.
-            if selected.overlaps(&planned.path) {
+            if selected.overlaps(score) {
                 continue;
             }
-            selected.insert(&planned.path);
+            selected.insert(score);
             bytes = bytes.saturating_add(planned.bytes);
             // Keep the counterfactual diagnostic serializable even when
             // individually finite losses overflow their aggregate.
@@ -568,7 +607,7 @@ pub fn plan_batch(
     let mut planned_bytes = 0u64;
     let mut risk_used = 0.0f64;
     let mut selected = SelectedPaths::default();
-    for (index, (planned, _)) in plannable.iter().enumerate() {
+    for (index, (planned, score)) in plannable.iter().enumerate() {
         let target_met = request
             .target_bytes
             .is_some_and(|target| planned_bytes >= target);
@@ -578,11 +617,11 @@ pub fn plan_batch(
         if target_met
             || chosen_idx.len() >= request.max_items
             || over_budget
-            || selected.overlaps(&planned.path)
+            || selected.overlaps(score)
         {
             continue;
         }
-        selected.insert(&planned.path);
+        selected.insert(score);
         planned_bytes = planned_bytes.saturating_add(planned.bytes);
         risk_used = next_risk;
         chosen_idx.push(index);
@@ -626,7 +665,7 @@ pub fn plan_batch(
     // overlap explanations never retain discarded choices.
     let mut selected = SelectedPaths::default();
     for &index in &chosen_idx {
-        selected.insert(&plannable[index].0.path);
+        selected.insert(&plannable[index].1);
     }
     let mut chosen = Vec::with_capacity(chosen_idx.len());
     let mut chosen_scores = Vec::with_capacity(chosen_idx.len());
@@ -640,7 +679,7 @@ pub fn plan_batch(
             planned.rank = rank + 1;
             chosen.push(planned);
             chosen_scores.push(score);
-        } else if selected.overlaps(&planned.path) {
+        } else if selected.overlaps(&score) {
             overlapping.push(planned);
         } else {
             skipped.push(planned);
@@ -1543,5 +1582,273 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn identified(path: &str, bytes: u64, device: u64, inode: u64) -> CandidacyScore {
+        let mut score = candidate(path, bytes, 0.99, 1.0, DecisionAction::Delete);
+        score.identity = Some(FsIdentity {
+            device_id: device,
+            inode,
+            kind: crate::scanner::walker::FsEntryKind::Directory,
+        });
+        score
+    }
+
+    #[test]
+    fn physical_aliases_cannot_manufacture_a_sufficient_byte_target() {
+        let (chosen, plan) = plan_batch(
+            vec![
+                identified("/p/real/target", 6 * GIB, 7, 10),
+                identified("/different/alias/target", 6 * GIB, 7, 10),
+            ],
+            &request(PressureLevel::Orange, Some(10 * GIB), None),
+        );
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(plan.planned_bytes, 6 * GIB);
+        assert_eq!(plan.top_n_bytes, 6 * GIB);
+        assert!(!plan.target_met);
+        assert_eq!(plan.skipped_for_overlap.len(), 1);
+        assert!(plan.skipped_for_budget.is_empty());
+        assert!((plan.risk_used - 0.5).abs() < 1e-9);
+        assert!((plan.top_n_risk - 0.5).abs() < 1e-9);
+        assert_finite_plan(&plan);
+    }
+
+    #[test]
+    fn alias_duplicates_do_not_consume_slots_needed_for_independent_capacity() {
+        let mut req = request(PressureLevel::Orange, Some(10 * GIB), Some(1.1));
+        req.max_items = 2;
+        let (chosen, plan) = plan_batch(
+            vec![
+                identified("/p/target", 6 * GIB, 7, 10),
+                identified("/alias/target", 6 * GIB, 7, 10),
+                identified("/p/independent", 4 * GIB, 7, 11),
+            ],
+            &req,
+        );
+        assert_eq!(chosen.len(), 2);
+        assert!(chosen.iter().any(|c| c.path == Path::new("/p/independent")));
+        assert_eq!(plan.planned_bytes, 10 * GIB);
+        assert_eq!(plan.top_n_bytes, 10 * GIB);
+        assert!(plan.target_met);
+        assert_eq!(plan.skipped_for_overlap.len(), 1);
+        assert!(plan.risk_used <= 1.1);
+        for (index, planned) in plan.chosen.iter().enumerate() {
+            assert_eq!(planned.rank, index + 1);
+            assert_eq!(planned.path, chosen[index].path);
+        }
+    }
+
+    #[test]
+    fn target_cover_search_cannot_replace_real_capacity_with_cheap_aliases() {
+        let mut real = identified("/p/sufficient", 10 * GIB, 7, 20);
+        real.decision.posterior_abandoned = 0.8;
+        let candidates = vec![
+            identified("/p/first", 6 * GIB, 7, 10),
+            identified("/alias/second", 6 * GIB, 7, 10),
+            real,
+        ];
+        let (chosen, plan) = plan_batch(
+            candidates.clone(),
+            &request(PressureLevel::Red, Some(10 * GIB), Some(20.0)),
+        );
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/p/sufficient"));
+        assert_eq!(plan.planned_bytes, 10 * GIB);
+        assert!((plan.risk_used - 10.0).abs() < 1e-9);
+        assert!(plan.target_met);
+        // No affordable real cover: do not claim that two aliases suffice.
+        let (chosen, limited) = plan_batch(
+            candidates,
+            &request(PressureLevel::Red, Some(10 * GIB), Some(2.0)),
+        );
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(limited.planned_bytes, 6 * GIB);
+        assert!(!limited.target_met);
+    }
+
+    #[test]
+    fn cover_trimming_rejects_a_duplicate_identity_incumbent() {
+        let req = request(PressureLevel::Orange, Some(10 * GIB), None);
+        let items: Vec<_> = [
+            identified("/p/a", 6 * GIB, 7, 10),
+            identified("/alias/b", 6 * GIB, 7, 10),
+            identified("/p/sufficient", 10 * GIB, 7, 20),
+        ]
+        .into_iter()
+        .map(|score| (item(&score, req.false_positive_loss), score))
+        .collect();
+        assert!(trim_cover(&items, vec![0, 1], 10 * GIB, None).is_none());
+        let cover = lower_risk_cover(&items, &[0, 1], &req, None).unwrap();
+        assert_eq!(cover.indices, vec![2]);
+        assert_eq!(cover.bytes, u128::from(10 * GIB));
+    }
+
+    #[test]
+    fn identical_inode_numbers_on_different_devices_are_independent() {
+        let (chosen, plan) = plan_batch(
+            vec![
+                identified("/first/cache", 6 * GIB, 7, 10),
+                identified("/second/cache", 4 * GIB, 8, 10),
+            ],
+            &request(PressureLevel::Orange, Some(10 * GIB), None),
+        );
+        assert_eq!(chosen.len(), 2);
+        assert_eq!(plan.planned_bytes, 10 * GIB);
+        assert!(plan.target_met);
+        assert!(plan.skipped_for_overlap.is_empty());
+    }
+
+    #[test]
+    fn unknown_identities_are_not_a_shared_cleanup_unit_or_veto() {
+        let mut vetoed = candidate("/p/vetoed", GIB, 1.0, 1.0, DecisionAction::Delete);
+        vetoed.vetoed = true;
+        let (chosen, plan) = plan_batch(
+            vec![
+                vetoed,
+                candidate("/p/a", 6 * GIB, 0.99, 1.0, DecisionAction::Delete),
+                candidate("/p/b", 4 * GIB, 0.99, 1.0, DecisionAction::Delete),
+            ],
+            &request(PressureLevel::Orange, Some(10 * GIB), None),
+        );
+        assert_eq!(chosen.len(), 2);
+        assert!(plan.target_met);
+        assert_eq!(plan.planned_bytes, 10 * GIB);
+        assert!(plan.skipped_for_overlap.is_empty());
+    }
+
+    #[test]
+    fn hard_vetoes_and_suspensions_follow_identity_across_aliases() {
+        for suspended in [false, true] {
+            let mut blocked = identified("/protected/target", 6 * GIB, 7, 10);
+            blocked.vetoed = !suspended;
+            blocked.decision.category_suspended = suspended;
+            let mut alias = identified("/other/spelling", 6 * GIB, 7, 10);
+            alias.decision.action = DecisionAction::Review;
+            let mut req = request(PressureLevel::Critical, Some(10 * GIB), None);
+            req.include_review = true;
+            let (chosen, plan) = plan_batch(
+                vec![blocked, alias, identified("/p/independent", 4 * GIB, 7, 11)],
+                &req,
+            );
+            assert_eq!(chosen.len(), 1);
+            assert_eq!(chosen[0].path, Path::new("/p/independent"));
+            assert_eq!(plan.planned_bytes, 4 * GIB);
+            assert_eq!(plan.top_n_bytes, 4 * GIB);
+            assert!(!plan.target_met);
+            assert!(plan.skipped_for_overlap.is_empty());
+            assert!(plan.skipped_for_budget.is_empty());
+        }
+    }
+
+    #[test]
+    fn ineligible_aliases_do_not_spend_a_selection_slot() {
+        let mut ineligible = identified("/p/review", 6 * GIB, 7, 10);
+        ineligible.decision.action = DecisionAction::Review;
+        let (chosen, plan) = plan_batch(
+            vec![ineligible, identified("/alias/eligible", 6 * GIB, 7, 10)],
+            &request(PressureLevel::Orange, None, None),
+        );
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].path, Path::new("/alias/eligible"));
+        assert_eq!(plan.planned_bytes, 6 * GIB);
+        assert!(plan.skipped_for_overlap.is_empty());
+    }
+
+    #[test]
+    fn identity_checks_do_not_replace_lexical_parent_child_exclusion() {
+        let (chosen, plan) = plan_batch(
+            vec![
+                identified("/p/target", 6 * GIB, 7, 10),
+                identified("/p/target/debug", 5 * GIB, 7, 11),
+                identified("/p/cache", 4 * GIB, 7, 12),
+            ],
+            &request(PressureLevel::Orange, Some(10 * GIB), None),
+        );
+        assert_eq!(chosen.len(), 2);
+        assert_eq!(plan.planned_bytes, 10 * GIB);
+        assert!(plan.target_met);
+        assert_eq!(plan.skipped_for_overlap[0].path, Path::new("/p/target/debug"));
+    }
+
+    #[test]
+    fn physical_overlap_plans_are_permutation_invariant_and_preserve_limits() {
+        let base = vec![
+            identified("/p/a", 6 * GIB, 7, 10),
+            identified("/alias/a", 6 * GIB, 7, 10),
+            identified("/p/b", 4 * GIB, 7, 11),
+            identified("/alias/b", 4 * GIB, 7, 11),
+            identified("/other/c", 3 * GIB, 8, 10),
+        ];
+        for target in [None, Some(0), Some(7 * GIB), Some(20 * GIB)] {
+            for max_items in 0..=4 {
+                let mut req = request(PressureLevel::Orange, target, Some(1.1));
+                req.max_items = max_items;
+                let (_, expected) = plan_batch(base.clone(), &req);
+                for reverse in [false, true] {
+                    for rotation in 0..base.len() {
+                        let mut permutation = base.clone();
+                        permutation.rotate_left(rotation);
+                        if reverse {
+                            permutation.reverse();
+                        }
+                        let (chosen, plan) = plan_batch(permutation, &req);
+                        assert_eq!(plan, expected);
+                        let identities: HashSet<_> = chosen.iter().filter_map(|c| c.identity).collect();
+                        assert_eq!(identities.len(), chosen.len());
+                        assert!(chosen.len() <= max_items);
+                        assert!(plan.risk_used <= 1.1 + 1e-9);
+                        assert_eq!(
+                            plan.planned_bytes,
+                            chosen.iter().map(|c| c.size_bytes).sum::<u64>()
+                        );
+                        assert_finite_plan(&plan);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_parent_aliases_share_identity_without_rewriting_execution_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let actual = temp.path().join("actual");
+        let target = actual.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let payload = vec![0x5a; 8192];
+        std::fs::write(target.join("kept.bin"), &payload).unwrap();
+        let alias = temp.path().join(std::ffi::OsString::from_vec(b"alias-\xff".to_vec()));
+        symlink(&actual, &alias).unwrap();
+        let paths = [target.clone(), alias.join("target")];
+        let candidates: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                // The final component is a real directory in both observations;
+                // only its parent spelling differs. This mirrors walker identity.
+                let metadata = std::fs::symlink_metadata(path).unwrap();
+                assert!(metadata.is_dir());
+                let mut score = identified("/unused", 8192, metadata.dev(), metadata.ino());
+                score.path = path.clone();
+                score
+            })
+            .collect();
+        assert_eq!(candidates[0].identity, candidates[1].identity);
+        let (chosen, plan) = plan_batch(
+            candidates,
+            &request(PressureLevel::Orange, Some(12_288), None),
+        );
+        assert_eq!(chosen.len(), 1);
+        assert!(paths.contains(&chosen[0].path));
+        assert_eq!(plan.chosen[0].path, chosen[0].path);
+        assert_eq!(plan.planned_bytes, 8192);
+        assert_eq!(plan.top_n_bytes, 8192);
+        assert!(!plan.target_met);
+        assert_eq!(plan.skipped_for_overlap.len(), 1);
+        assert_eq!(std::fs::read(target.join("kept.bin")).unwrap(), payload);
+        assert_eq!(std::fs::read_link(alias).unwrap(), actual);
     }
 }
