@@ -409,7 +409,7 @@ fn remove_records(store: &QuarantineStore, id: &str) -> io::Result<()> {
 }
 
 pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
-    purge_with(store, id, |lock, record| {
+    purge_with(store, id, None, |lock, record| {
         confined_purge::remove_payload(lock, record).map(Some)
     })?
     .ok_or_else(|| SbhError::Runtime {
@@ -417,17 +417,18 @@ pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
     })
 }
 
-/// A budget pause leaves the manifest intact and returns `None`, never an
-/// error that would put an ordinary partial purge into the stuck cooldown.
+/// A budget pause returns `None`. Lock contention or changed selection returns
+/// `WouldBlock`, which the batch layer defers without recording a stuck entry.
+/// The selected TTL, identity and decision must still match under the lock.
 pub(super) fn purge_with_budget(
     store: &QuarantineStore,
-    id: &str,
+    selected: &QuarantineRecord,
     budget: &mut PurgeBudget,
 ) -> Result<Option<u64>> {
     if budget.exhausted() {
         return Ok(None);
     }
-    purge_with(store, id, |lock, record| {
+    purge_with(store, &selected.decision_id, Some(selected), |lock, record| {
         confined_purge::remove_payload_with_budget(lock, record, budget)
     })
 }
@@ -435,6 +436,7 @@ pub(super) fn purge_with_budget(
 fn purge_with(
     store: &QuarantineStore,
     id: &str,
+    selected: Option<&QuarantineRecord>,
     remove: impl FnOnce(&File, &QuarantineRecord) -> io::Result<Option<bool>>,
 ) -> Result<Option<u64>> {
     validate_id(id).map_err(|e| SbhError::io(store.root(), e))?;
@@ -447,6 +449,19 @@ fn purge_with(
         store.clear_stuck(id);
         return Ok(Some(0));
     };
+    if selected.is_some_and(|selected| selected != &record) {
+        // Inventory is read before locking: another cooperating operation can
+        // restore/reuse this ID or extend its TTL meanwhile. The fresh inode
+        // matching its NEW manifest does not validate the OLD drain decision.
+        // A later batch must select the new record on its own terms.
+        return Err(SbhError::io(
+            store.root(),
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "quarantine record changed after selection; retry with fresh inventory",
+            ),
+        ));
+    }
     // Resolve the payload from the locked store descriptor, not a pathname
     // checked earlier. Nested mounts are not part of a quarantined artifact.
     // On refusal keep its manifest so later drains/undo can recover what
@@ -1011,5 +1026,106 @@ mod tests {
         );
         assert_eq!(fs::read(record.original_path).unwrap(), b"different inode");
         assert!(pending_path(&store, "pending-rebuilt").exists());
+    }
+
+    #[test]
+    fn busy_batch_drains_defer_without_poisoning_healthy_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, first) = held(dir.path(), "busy-a");
+        let (_, second) = held(dir.path(), "busy-b");
+        let (_, third) = held(dir.path(), "busy-c");
+        let lock = lock_store(store.root()).unwrap();
+        for _ in 0..3 {
+            for out in [
+                store.drain_expired(now_secs()).unwrap(),
+                store.drain_all().unwrap(),
+            ] {
+                assert_eq!(out.counts(), (0, 0));
+                assert!(out.failures.is_empty());
+                assert_eq!(out.skipped_stuck, 0);
+                assert_eq!(out.deferred_entries, 1);
+                assert!(!out.budget_exhausted, "contention is not budget exhaustion");
+            }
+        }
+        for record in [&first, &second, &third] {
+            assert_eq!(fs::read(&record.quarantine_path).unwrap(), b"original bytes");
+            assert!(!store.stuck_path(&record.decision_id).exists());
+        }
+        // Explicit mutations remain refused while another operation owns the lock.
+        assert!(store.purge("busy-a").is_err());
+        drop(lock);
+        // No hour-long cooldown was fabricated by those contending drains.
+        let out = store.drain_expired(now_secs()).unwrap();
+        assert_eq!(out.counts(), (3, 300));
+        assert_eq!(out.deferred_entries, 0);
+        assert!(out.failures.is_empty());
+    }
+
+    #[test]
+    fn an_extended_ttl_cannot_be_bypassed_by_an_old_inventory_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, selected) = held(dir.path(), "ttl-changed");
+        let mut extended = selected.clone();
+        extended.expires_at += 3600;
+        write_json(&store.record_path("ttl-changed"), &extended).unwrap();
+        let mut out = super::super::DrainOutcome::default();
+        let mut budget = PurgeBudget::bounded(32);
+        assert!(!store.try_purge(&selected, selected.expires_at, &mut out, &mut budget));
+        assert_eq!(out.deferred_entries, 1);
+        assert!(!out.budget_exhausted);
+        assert!(out.failures.is_empty());
+        assert!(!store.stuck_path("ttl-changed").exists());
+        assert_eq!(store.record("ttl-changed").unwrap(), Some(extended.clone()));
+        assert_eq!(fs::read(&extended.quarantine_path).unwrap(), b"original bytes");
+        assert_eq!(store.drain_expired(selected.expires_at).unwrap().counts(), (0, 0));
+        assert_eq!(store.drain_expired(extended.expires_at).unwrap().counts(), (1, 100));
+    }
+
+    #[test]
+    fn a_reused_decision_id_does_not_inherit_the_previous_payloads_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, selected) = held(dir.path(), "reused");
+        store.restore("reused", false).unwrap();
+        let source = dir.path().join("new-payload");
+        fs::write(&source, b"new protected-by-ttl payload").unwrap();
+        let fresh = store
+            .quarantine(&source, "reused", 200, Duration::from_hours(24), None)
+            .unwrap();
+        assert_ne!(fresh.inode, selected.inode, "original inode still exists");
+        let mut out = super::super::DrainOutcome::default();
+        assert!(!store.try_purge(
+            &selected,
+            now_secs(),
+            &mut out,
+            &mut PurgeBudget::bounded(32),
+        ));
+        assert!(out.failures.is_empty());
+        assert!(!out.budget_exhausted);
+        assert_eq!(out.deferred_entries, 1);
+        assert_eq!(out.bytes, 0);
+        assert_eq!(store.record("reused").unwrap(), Some(fresh.clone()));
+        assert_eq!(fs::read(&selected.original_path).unwrap(), b"original bytes");
+        assert_eq!(fs::read(&fresh.quarantine_path).unwrap(), b"new protected-by-ttl payload");
+        // A fresh forced selection may reclaim the newly held entry, not the original.
+        assert_eq!(store.drain_all().unwrap().counts(), (1, 200));
+        assert_eq!(fs::read(selected.original_path).unwrap(), b"original bytes");
+    }
+
+    #[test]
+    fn pending_manifest_publication_preserves_an_unchanged_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, selected) = held(dir.path(), "published");
+        fs::rename(store.record_path("published"), pending_path(&store, "published")).unwrap();
+        let from_pending = store.record("published").unwrap().unwrap();
+        assert_eq!(from_pending, selected);
+        fs::rename(pending_path(&store, "published"), store.record_path("published")).unwrap();
+        // Changing only the publication state is not changing the selected
+        // payload or policy. Admit it through the same locked snapshot check.
+        assert_eq!(
+            purge_with_budget(&store, &from_pending, &mut PurgeBudget::bounded(32)).unwrap(),
+            Some(100)
+        );
+        assert!(!selected.quarantine_path.exists());
+        assert!(store.record("published").unwrap().is_none());
     }
 }

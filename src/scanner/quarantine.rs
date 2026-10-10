@@ -95,11 +95,13 @@ pub struct DrainOutcome {
     pub failures: Vec<DrainFailure>,
     /// Entries skipped because they are still cooling down after a failure.
     pub skipped_stuck: usize,
-    /// Selected entries deferred without a deletion failure. This does not
-    /// count the unvisited suffix after a budget stop.
+    /// Selected entries deferred without a deletion failure because of a
+    /// budget pause, lock contention or changed inventory. This does not
+    /// count the unvisited suffix after the drain yields.
     pub deferred_entries: usize,
     /// The shared traversal allowance ended before all requested work could
     /// finish. Call the drain again to resume from the remaining payloads.
+    /// Contention or changed selection can defer work without setting this.
     pub budget_exhausted: bool,
 }
 
@@ -369,8 +371,9 @@ impl QuarantineStore {
         Ok(stuck)
     }
 
-    /// Try one selected entry. Return false only when the shared work budget
-    /// paused the drain; ordinary per-entry failures still let the batch continue.
+    /// Try one selected entry. Return false when a budget pause or transient
+    /// contention yields the drain; genuine per-entry failures still let the
+    /// batch continue. Never record an admission wait as a stuck payload.
     fn try_purge(
         &self,
         record: &QuarantineRecord,
@@ -381,7 +384,7 @@ impl QuarantineStore {
         // Charge attempted records as well as tree traversal, so a long run
         // of manifest/permission errors cannot receive a fresh budget per item.
         let result = if budget.take() {
-            safety::purge_with_budget(self, &record.decision_id, budget)
+            safety::purge_with_budget(self, record, budget)
         } else {
             Ok(None)
         };
@@ -393,6 +396,13 @@ impl QuarantineStore {
             Ok(None) => {
                 out.deferred_entries += 1;
                 out.budget_exhausted = true;
+                return false;
+            }
+            Err(SbhError::Io { source, .. }) if source.kind() == io::ErrorKind::WouldBlock => {
+                // Another cooperating operation owns the store, or the
+                // selected manifest changed before locking. Stop this batch
+                // without poisoning every following entry with a cooldown.
+                out.deferred_entries += 1;
                 return false;
             }
             Err(e) => {
@@ -484,7 +494,8 @@ impl QuarantineStore {
     ///
     /// Best-effort per entry: failures are recorded and skipped. A partial
     /// purge is instead deferred with its manifest intact and no stuck marker;
-    /// another call continues removing the remaining children. `Err` means the
+    /// another call continues removing the remaining children. Lock contention
+    /// or changed selection defers without a cooldown too. `Err` means the
     /// store itself could not be read. Inventory and sync are not time-bounded.
     pub fn drain_expired(&self, now_unix: u64) -> Result<DrainOutcome> {
         self.drain_expired_with_budget(now_unix, DEFAULT_DRAIN_WORK)
@@ -512,7 +523,7 @@ impl QuarantineStore {
     }
 
     /// Drain oldest-first until the byte target, store end, or shared work
-    /// allowance is reached. Inspect `budget_exhausted` before assuming all
+    /// allowance is reached. Inspect deferred work before assuming all
     /// requested space could be reclaimed in this call.
     pub fn drain_oldest(&self, bytes_needed: u64) -> Result<DrainOutcome> {
         self.drain_oldest_inner(bytes_needed, now_secs(), false, DEFAULT_DRAIN_WORK)
