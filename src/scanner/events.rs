@@ -242,7 +242,7 @@ impl EventSourcePlan {
             },
             complete: dirty_roots.is_empty(),
             watched_dirs: allocation.watched,
-            frontier_dirs: allocation.frontier.len(),
+            frontier_dirs: allocation.frontier_dirs,
             dirty_roots,
             reason,
         }
@@ -589,9 +589,21 @@ impl EventInvalidation {
         self.reasons.iter().cloned().collect::<Vec<_>>().join("; ")
     }
 
+    /// Revoke stale replay hints before the daemon selects a pressure batch.
+    /// A normal descendant write need not change an opaque root's mtime, and
+    /// a protection/source marker beside a candidate changes its context.
+    /// Invalidate both explicit paths and resolved reconciliation scopes.
+    /// This never authorizes deletion or changes unaffected generations.
     pub fn apply_to_index(&self, index: &mut ScannerCandidateIndex) {
         if self.requires_index_generation_bump() {
             index.mark_event_overflow();
+        } else {
+            index.invalidate_paths(
+                self.dirty_roots
+                    .iter()
+                    .chain(&self.dirty_paths)
+                    .map(PathBuf::as_path),
+            );
         }
     }
 
@@ -1782,5 +1794,115 @@ mod tests {
                 capability.reason
             );
         }
+    }
+
+    fn replay_fixture(root: &Path) -> (ScannerCandidateIndex, crate::scanner::index::CandidateIndexRecord) {
+        use crate::scanner::index::{
+            CandidateIndexRecord, CandidateSafetyState, IndexedEntryKind, IndexedIdentity,
+            IndexedPruneDecision, ScannerIndexContext,
+        };
+        let mut index = ScannerCandidateIndex::new(ScannerIndexContext {
+            root_fingerprint: "event-roots".to_string(),
+            config_fingerprint: "event-config".to_string(),
+        });
+        let candidate = CandidateIndexRecord {
+            path: root.join("proj/target"),
+            identity: IndexedIdentity { device_id: 7, inode: 1, kind: IndexedEntryKind::Directory },
+            parent_identity: None,
+            parent_mtime_nanos: None,
+            candidate_mtime_nanos: 200,
+            candidate_ctime_nanos: Some(300),
+            size_estimate_bytes: 8 * 1024 * 1024 * 1024,
+            prune_decision: IndexedPruneDecision::CandidateOpaque,
+            score: Some(0.99),
+            safety_state: CandidateSafetyState::Safe,
+            fail_count: 0,
+            cooldown_until_nanos: None,
+            event_generation: 0,
+            structural_signals: crate::scanner::patterns::StructuralSignals::default(),
+        };
+        index.upsert(candidate.clone());
+        let mut other = candidate.clone();
+        other.path = root.join("proj-other/target");
+        other.identity.inode = 2;
+        other.score = Some(0.8);
+        index.upsert(other);
+        (index, candidate)
+    }
+
+    #[test]
+    fn ordinary_events_revoke_opaque_hints_even_before_scan_scope_resolution() {
+        let root = PathBuf::from("/tmp/root");
+        let tracker = DirtyRootTracker::new(std::slice::from_ref(&root));
+        for kind in [FsEventKind::Create, FsEventKind::Modify, FsEventKind::Remove, FsEventKind::Rename] {
+            let (mut index, candidate) = replay_fixture(&root);
+            assert_eq!(index.ranked_records(SystemTime::UNIX_EPOCH, 1)[0].path, candidate.path);
+            let invalidation = tracker.apply_event(FsEvent {
+                kind,
+                path: Some(candidate.path.join("debug/deps/changed.o")),
+            });
+            assert!(!invalidation.requires_index_generation_bump());
+            assert!(invalidation.dirty_roots().is_empty());
+            invalidation.apply_to_index(&mut index);
+            let ranked = index.ranked_records(SystemTime::UNIX_EPOCH, 1);
+            assert_eq!(ranked.len(), 1);
+            assert_eq!(ranked[0].path, root.join("proj-other/target"));
+            assert_eq!(index.get(candidate.identity).unwrap().score, None);
+            assert_eq!(index.event_generation(), 0);
+        }
+    }
+
+    #[test]
+    fn resolved_context_changes_revoke_project_hints_not_neighboring_projects() {
+        let root = PathBuf::from("/tmp/root");
+        let roots = vec![root.clone()];
+        let tracker = DirtyRootTracker::new(&roots);
+        for marker in [".sbh-protect", ".git", "Cargo.toml"] {
+            let (mut index, candidate) = replay_fixture(&root);
+            // This is beside, not inside, target: direct path overlap alone
+            // misses the changed protection/source context of the candidate.
+            let mut invalidation = tracker.apply_event(FsEvent {
+                kind: FsEventKind::Create,
+                path: Some(root.join("proj").join(marker)),
+            });
+            invalidation.resolve_scan_roots(&roots);
+            assert!(invalidation.dirty_roots().contains(&root.join("proj")));
+            invalidation.apply_to_index(&mut index);
+            assert_eq!(index.event_generation(), 0);
+            assert_eq!(index.get(candidate.identity).unwrap().score, None);
+            let ranked = index.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX);
+            assert_eq!(ranked.len(), 1);
+            assert_eq!(ranked[0].path, root.join("proj-other/target"));
+        }
+    }
+
+    #[test]
+    fn frontier_only_invalidation_revokes_hints_without_an_explicit_path_event() {
+        let root = PathBuf::from("/tmp/root");
+        let tracker = DirtyRootTracker::new(std::slice::from_ref(&root));
+        let (mut index, candidate) = replay_fixture(&root);
+        let invalidation = tracker.apply_event(FsEvent {
+            kind: FsEventKind::WatchBudgetExceeded,
+            path: Some(root.join("proj")),
+        });
+        assert!(invalidation.dirty_paths().is_empty());
+        assert!(!invalidation.requires_index_generation_bump());
+        invalidation.apply_to_index(&mut index);
+        assert_eq!(index.get(candidate.identity).unwrap().score, None);
+        assert_eq!(index.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX).len(), 1);
+    }
+
+    #[test]
+    fn quiet_drain_preserves_hints_but_deferred_overflow_revokes_every_project() {
+        let root = PathBuf::from("/tmp/root");
+        let (mut index, candidate) = replay_fixture(&root);
+        EventInvalidation::empty().apply_to_index(&mut index);
+        assert_eq!(index.get(candidate.identity), Some(&candidate));
+        assert_eq!(index.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX).len(), 2);
+        let deferred = EventInvalidation::deferred_overflow();
+        assert!(!deferred.requires_reconciliation());
+        deferred.apply_to_index(&mut index);
+        assert_eq!(index.event_generation(), 1);
+        assert!(index.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX).is_empty());
     }
 }
