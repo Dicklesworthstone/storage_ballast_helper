@@ -25,6 +25,9 @@ const EVENT_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_EVENTS_PER_DRAIN: usize = 4096;
 const MAX_DIRTY_PATHS_PER_DRAIN: usize = 512;
 const DRAIN_TIME: Duration = Duration::from_millis(50);
+/// Cooperative installation limit, not a timeout on one blocked kernel call.
+/// The caller falls back to reconciliation instead of publishing a partial set.
+pub(super) const INSTALL_TIME_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 struct DrainBudget {
@@ -75,6 +78,29 @@ struct LinuxInotifyEvent {
 
 impl LinuxInotifyBackend {
     pub(super) fn start(paths: &[PathBuf], max_watches: usize) -> io::Result<Self> {
+        let started = Instant::now();
+        Self::start_with_check(paths, max_watches, || {
+            if started.elapsed() >= INSTALL_TIME_BUDGET {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "recursive inotify installation deadline exceeded",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// Install a complete plan, checking cancellation/deadline before and
+    /// after every registration. Checking after the last syscall matters:
+    /// a stale or timed-out final watch must not certify successful coverage.
+    /// An error drops this private instance and all its partial watches.
+    pub(super) fn start_with_check(
+        paths: &[PathBuf],
+        max_watches: usize,
+        mut check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        check()?;
         // Inotify::init uses IN_NONBLOCK and IN_CLOEXEC. Never use the crate's
         // blocking read API from the daemon's monitoring thread.
         let mut backend = Self {
@@ -89,7 +115,9 @@ impl LinuxInotifyBackend {
             repair_required: false,
         };
         for path in paths {
+            check()?;
             backend.add_watch(path)?;
+            check()?;
         }
         Ok(backend)
     }
@@ -967,5 +995,73 @@ mod tests {
         assert!(backend.pending_events.is_empty());
         assert!(next.dirty_paths().contains(&root.join("live-project")));
         assert!(!backend.retiring_roots.is_empty());
+    }
+
+    #[test]
+    fn cancelled_installation_does_not_touch_the_first_path() {
+        let (_temp, config) = fixture();
+        let missing = config.root_paths()[0].join("not-present");
+        let error = LinuxInotifyBackend::start_with_check(&[missing], 1, || {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+        }).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn cancellation_between_watches_does_not_register_the_suffix() {
+        let (_temp, config) = fixture();
+        let root = &config.root_paths()[0];
+        let mut checks = 0;
+        let error = LinuxInotifyBackend::start_with_check(
+            &[root.clone(), root.join("not-present")], 2, || {
+                checks += 1;
+                if checks == 4 {
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled after first watch"))
+                } else {
+                    Ok(())
+                }
+            },
+        ).unwrap_err();
+        assert_eq!(checks, 4);
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "must stop before the missing-path syscall");
+        assert!(root.is_dir());
+        assert_eq!(LinuxInotifyBackend::start(std::slice::from_ref(root), 1).unwrap().watched_dirs().count(), 1);
+    }
+
+    #[test]
+    fn deadline_after_the_final_registration_cannot_publish_partial_coverage() {
+        let (_temp, config) = fixture();
+        let mut checks = 0;
+        let error = LinuxInotifyBackend::start_with_check(config.root_paths(), 1, || {
+            checks += 1;
+            if checks == 3 {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "last syscall exhausted the deadline"))
+            } else {
+                Ok(())
+            }
+        }).unwrap_err();
+        assert_eq!(checks, 3);
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn successful_installation_checks_every_watch_and_preserves_both_indexes() {
+        let (_temp, config) = fixture();
+        let root = &config.root_paths()[0];
+        let child = root.join("child");
+        fs::create_dir(&child).unwrap();
+        let paths = [root.clone(), child, root.clone()];
+        let mut checks = 0;
+        let backend = LinuxInotifyBackend::start_with_check(&paths, 2, || {
+            checks += 1;
+            Ok(())
+        }).unwrap();
+        assert_eq!(checks, 1 + 2 * paths.len());
+        assert_eq!(backend.watch_paths.len(), 2);
+        assert_eq!(backend.path_watches.len(), 2);
+        for (watch, path) in &backend.watch_paths {
+            assert_eq!(backend.path_watches.get(path), Some(watch));
+        }
+        assert!(!backend.needs_repair());
     }
 }
