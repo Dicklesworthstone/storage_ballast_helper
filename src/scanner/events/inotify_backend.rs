@@ -4,6 +4,8 @@
 //! descendants by the time its event is read. Install its immediate watch,
 //! revoke coverage, and let the source's timed replan discover the whole tree.
 //! Lost or renamed watches are retired instead of consuming the budget forever.
+//! Descriptor and path indexes keep registration logarithmic and restrict
+//! subtree retirement to affected watches, not the entire recursive watch set.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -43,6 +45,9 @@ impl Default for DrainBudget {
 pub(super) struct LinuxInotifyBackend {
     inotify: inotify::Inotify,
     watch_paths: BTreeMap<WatchDescriptor, PathBuf>,
+    // Reverse index: startup must not search every prior watch for each path,
+    // and a topology event must not scan unrelated projects' watches.
+    path_watches: BTreeMap<PathBuf, WatchDescriptor>,
     buffer: Vec<u8>,
     // At most one kernel-read batch. A budget stop preserves the unprocessed
     // suffix; it must not be thrown away when the monitor gets its turn back.
@@ -65,6 +70,7 @@ impl LinuxInotifyBackend {
         let mut backend = Self {
             inotify: inotify::Inotify::init()?,
             watch_paths: BTreeMap::new(),
+            path_watches: BTreeMap::new(),
             buffer: vec![0; EVENT_BUFFER_BYTES],
             pending_events: VecDeque::new(),
             max_watches,
@@ -254,22 +260,20 @@ impl LinuxInotifyBackend {
     }
 
     fn forget_subtree(&mut self, path: &Path, rates: &mut EventRateTracker) {
-        let retired: Vec<_> = self.watch_paths.iter()
-            .filter(|(_, watched)| watched.starts_with(path))
-            .map(|(watch, _)| watch.clone())
-            .collect();
-        for watch in retired {
+        for watch in remove_subtree_entries(&mut self.path_watches, path) {
             self.watch_paths.remove(&watch);
             // IGNORED/UNMOUNT may mean the kernel has already removed it.
             // A failed explicit removal cannot restore pathname authority;
             // replacing the instance on repair releases any residual watch.
             let _ = self.inotify.watches().remove(watch);
         }
-        rates.rates.retain(|watched, _| !watched.starts_with(path));
+        // Event histories have the same component-ordered key space. Do not
+        // reintroduce an O(all watched paths) retain scan for every deletion.
+        drop(remove_subtree_entries(&mut rates.rates, path));
     }
 
     fn add_watch(&mut self, path: &Path) -> io::Result<()> {
-        if self.watch_paths.values().any(|watched| watched == path) {
+        if self.path_watches.contains_key(path) {
             return Ok(());
         }
         if self.watch_paths.len() >= self.max_watches {
@@ -282,9 +286,23 @@ impl LinuxInotifyBackend {
             self.require_repair();
             return Err(io::Error::other("recursive inotify watch aliases an existing directory"));
         }
+        self.path_watches.insert(path.to_path_buf(), watch.clone());
         self.watch_paths.insert(watch, path.to_path_buf());
         Ok(())
     }
+}
+
+// Path ordering compares components, so a subtree occupies one contiguous
+// ordered range. `starts_with` is component-aware: /cache/a-other is not a
+// descendant of /cache/a. Only matching keys are cloned, even if the root
+// itself has no entry. No canonicalization, filesystem I/O, or UTF-8 conversion.
+fn remove_subtree_entries<T>(entries: &mut BTreeMap<PathBuf, T>, root: &Path) -> Vec<T> {
+    let paths: Vec<_> = entries
+        .range(root.to_path_buf()..)
+        .take_while(|(path, _)| path.starts_with(root))
+        .map(|(path, _)| path.clone())
+        .collect();
+    paths.into_iter().filter_map(|path| entries.remove(&path)).collect()
 }
 
 fn watch_mask() -> WatchMask {
@@ -614,5 +632,69 @@ mod tests {
             assert!(!source.should_replan(now + Duration::from_hours(24)));
             assert_eq!(source.capability().selected_backend, EventBackendKind::ReconciliationOnly);
         }
+    }
+
+    #[test]
+    fn subtree_range_preserves_prefix_siblings_and_unrelated_projects() {
+        let mut entries = BTreeMap::new();
+        for n in 0..16_384 {
+            entries.insert(PathBuf::from(format!("/cache/project-{n:05}/target")), n);
+        }
+        entries.insert(PathBuf::from("/cache/project-00007/target/deep"), 20_000);
+        entries.insert(PathBuf::from("/cache/project-00007/target-other"), 20_001);
+        entries.insert(PathBuf::from("/cache/project-00007/target.other"), 20_002);
+        let removed = remove_subtree_entries(&mut entries, Path::new("/cache/project-00007/target"));
+        assert_eq!(removed, vec![7, 20_000]);
+        assert_eq!(entries.len(), 16_385);
+        assert!(entries.contains_key(Path::new("/cache/project-00007/target-other")));
+        assert!(entries.contains_key(Path::new("/cache/project-00007/target.other")));
+        assert!(remove_subtree_entries(&mut entries, Path::new("/missing")).is_empty());
+    }
+
+    #[test]
+    fn subtree_range_handles_unwatched_ancestors_and_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let root = PathBuf::from("/cache").join(OsString::from_vec(vec![b'a', 0xff]));
+        let sibling = PathBuf::from("/cache").join(OsString::from_vec(vec![b'a', 0xff, b'-']));
+        let mut entries = BTreeMap::from([
+            (root.join("one"), 1),
+            (root.join("two/deep"), 2),
+            (sibling.clone(), 3),
+        ]);
+        assert_eq!(remove_subtree_entries(&mut entries, &root), vec![1, 2]);
+        assert_eq!(entries, BTreeMap::from([(sibling, 3)]));
+    }
+
+    #[test]
+    fn both_watch_indexes_remain_consistent_through_repeated_subtree_churn() {
+        let (_temp, config) = fixture();
+        let root = &config.root_paths()[0];
+        let group = root.join("group");
+        let sibling = root.join("group-other");
+        fs::create_dir(&sibling).unwrap();
+        let mut backend = LinuxInotifyBackend::start(&[root.clone(), sibling.clone()], 8).unwrap();
+        let mut rates = EventRateTracker::default();
+        for _ in 0..32 {
+            for n in 0..6 {
+                let child = group.join(format!("child-{n}"));
+                fs::create_dir_all(&child).unwrap();
+                backend.add_watch(&child).unwrap();
+                backend.add_watch(&child).unwrap();
+                rates.record(&child, Instant::now());
+            }
+            assert_eq!(backend.watch_paths.len(), 8);
+            assert_eq!(backend.path_watches.len(), 8);
+            for (watch, path) in &backend.watch_paths {
+                assert_eq!(backend.path_watches.get(path), Some(watch));
+            }
+            backend.forget_subtree(&group, &mut rates);
+            assert_eq!(backend.watch_paths.len(), 2);
+            assert_eq!(backend.path_watches.len(), 2);
+            assert!(backend.path_watches.contains_key(root));
+            assert!(backend.path_watches.contains_key(&sibling));
+            assert_eq!(rates.tracked_dirs(), 0);
+        }
+        assert!(group.is_dir(), "watch retirement never removes user files");
     }
 }
