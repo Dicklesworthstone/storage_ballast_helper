@@ -3,6 +3,7 @@
 //! Architecture: a dedicated logger thread owns the `SqliteLogger` and `JsonlWriter`.
 //! All other threads send `ActivityEvent` via a bounded crossbeam channel. Non-blocking
 //! `try_send()` ensures the monitoring loop is never blocked by logging back-pressure.
+//! Mirror and shutdown requests use out-of-band control state, not queue capacity.
 
 #![allow(missing_docs)]
 
@@ -24,7 +25,9 @@ use crate::logger::sqlite::{ActivityRow, PressureRow, SqliteLogger};
 use crate::scanner::decision_record::DecisionRecord;
 
 mod diagnostics;
+mod lifecycle;
 use diagnostics::DiagnosticGate;
+pub use lifecycle::LoggerShutdownStatus;
 
 // ──────────────────── channel capacity ────────────────────
 
@@ -176,9 +179,10 @@ pub enum ActivityEvent {
 /// `try_send()` so callers are never blocked by logging back-pressure.
 #[derive(Clone)]
 pub struct ActivityLoggerHandle {
-    tx: Sender<ActivityEvent>,
+    tx: Sender<lifecycle::Message>,
     dropped_events: Arc<AtomicU64>,
     diagnostics: Arc<DiagnosticGate>,
+    control: Arc<lifecycle::Control>,
     /// Epoch milliseconds of the logger thread's last loop iteration.
     last_beat_ms: Arc<AtomicU64>,
 }
@@ -200,11 +204,30 @@ impl ActivityLoggerHandle {
     /// Repetitive Info/Warning/Error diagnostics are bounded before enqueueing;
     /// audit and control events are never filtered. If the channel is full the
     /// admitted event is dropped and the dropped-events counter is incremented.
+    /// Shutdown closes admission; events submitted afterwards are ignored.
     pub fn send(&self, event: ActivityEvent) {
+        match &event {
+            ActivityEvent::Shutdown => {
+                self.shutdown();
+                return;
+            }
+            ActivityEvent::MirrorJsonl(on) => {
+                self.mirror_jsonl(*on);
+                return;
+            }
+            _ => {}
+        }
+        let Some(_admission) = self.control.admit() else {
+            return;
+        };
         if !self.diagnostics.admit(&event, Instant::now()) {
             return;
         }
-        if let Err(TrySendError::Full(_)) = self.tx.try_send(event) {
+        let message = lifecycle::Message {
+            event,
+            mirror: self.control.mirror(),
+        };
+        if let Err(TrySendError::Full(_)) = self.tx.try_send(message) {
             self.dropped_events.fetch_add(1, Ordering::Relaxed);
         }
         // Disconnected is fine during shutdown.
@@ -221,22 +244,26 @@ impl ActivityLoggerHandle {
         self.diagnostics.suppressed()
     }
 
-    /// Request graceful shutdown of the logger thread.
-    ///
-    /// Uses a blocking send so the sentinel is never silently dropped when
-    /// the channel is full. The caller should `.join()` the thread handle
-    /// returned by [`spawn_logger`] after calling this.
+    /// Request shutdown without waiting for data-queue capacity or disk I/O.
+    /// Already-admitted producers and their queued events precede the writer's
+    /// final flush attempts. Repeated requests are idempotent.
+    /// Join the handle returned by [`spawn_logger`] and inspect
+    /// [`Self::shutdown_status`]; requesting shutdown is not proof of durability.
     pub fn shutdown(&self) {
-        // Blocking send: acceptable during shutdown — we must deliver the
-        // sentinel even if the channel is temporarily full.
-        let _ = self.tx.send(ActivityEvent::Shutdown);
+        self.control.request_shutdown();
     }
 
-    /// Mirror every JSONL line to the RAM fallback as well (or stop doing
-    /// so). Blocking send: a control message must not be dropped under
-    /// back-pressure.
+    /// Mirror events admitted after this setting to the RAM fallback (or stop).
+    /// The setting never waits for queue space. Each event carries its observed
+    /// mode so an on/off interval survives even while the writer is stalled.
     pub fn mirror_jsonl(&self, on: bool) {
-        let _ = self.tx.send(ActivityEvent::MirrorJsonl(on));
+        self.control.set_mirror(on);
+    }
+
+    /// Lifecycle completion, distinct from successful backend writes or fsync.
+    #[must_use]
+    pub fn shutdown_status(&self) -> LoggerShutdownStatus {
+        self.control.status()
     }
 }
 
@@ -273,19 +300,21 @@ fn dirs_default_sqlite() -> String {
 
 // ──────────────────── spawn ────────────────────
 
-/// Spawn the logger thread and return a handle.
+/// Spawn the logger and return its producer handle and lifecycle join handle.
 ///
-/// The returned handle is `Clone + Send` and can be shared across threads.
-/// The logger thread runs until `handle.shutdown()` is called or all senders
-/// are dropped.
+/// The producer handle is `Clone + Send` and can be shared across threads.
+/// Shutdown closes admission; dropping all senders also ends the input stream.
+/// Inspect `shutdown_status` separately from backend write/durability evidence.
 pub fn spawn_logger(
     config: DualLoggerConfig,
 ) -> Result<(ActivityLoggerHandle, thread::JoinHandle<()>)> {
-    let (tx, rx) = bounded::<ActivityEvent>(config.channel_capacity);
+    let (tx, rx) = bounded::<lifecycle::Message>(config.channel_capacity);
     let dropped = Arc::new(AtomicU64::new(0));
     let dropped_clone = Arc::clone(&dropped);
     let diagnostics = Arc::new(DiagnosticGate::new(Instant::now()));
     let diagnostics_clone = Arc::clone(&diagnostics);
+    let control = Arc::new(lifecycle::Control::new());
+    let worker_control = Arc::clone(&control);
     // The spawn is the first beat: a state file written before the thread's
     // first loop iteration (SQLite open, schema check) must not report the
     // logger as never having beaten.
@@ -296,25 +325,25 @@ pub fn spawn_logger(
         tx,
         dropped_events: dropped,
         diagnostics,
+        control: Arc::clone(&control),
         last_beat_ms: last_beat,
     };
 
-    let join = thread::Builder::new()
-        .name("sbh-logger".to_string())
-        .spawn(move || {
-            logger_thread_main(
-                rx,
-                config.sqlite_path,
-                config.jsonl_config,
-                dropped_clone,
-                last_beat_clone,
-                config.run_id,
-                diagnostics_clone,
-            );
-        })
-        .map_err(|e| crate::core::errors::SbhError::Runtime {
-            details: format!("failed to spawn logger thread: {e}"),
-        })?;
+    let join = lifecycle::spawn_worker(control, move || {
+        logger_thread_main(
+            rx,
+            config.sqlite_path,
+            config.jsonl_config,
+            dropped_clone,
+            last_beat_clone,
+            config.run_id,
+            diagnostics_clone,
+            worker_control,
+        );
+    })
+    .map_err(|e| crate::core::errors::SbhError::Runtime {
+        details: format!("failed to spawn logger thread: {e}"),
+    })?;
 
     Ok((handle, join))
 }
@@ -371,15 +400,16 @@ fn epoch_ms() -> u64 {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn logger_thread_main(
-    rx: Receiver<ActivityEvent>,
+    rx: Receiver<lifecycle::Message>,
     sqlite_path: Option<PathBuf>,
     jsonl_config: JsonlConfig,
     dropped: Arc<AtomicU64>,
     last_beat: Arc<AtomicU64>,
     run_id: Option<String>,
     diagnostics: Arc<DiagnosticGate>,
+    control: Arc<lifecycle::Control>,
 ) {
     #[cfg(feature = "sqlite")]
     const SQLITE_RECOVERY_INTERVAL: u32 = 50;
@@ -451,8 +481,11 @@ fn logger_thread_main(
         } else if stopping {
             break;
         } else {
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(event) => event,
+            match control.receive(&rx, Duration::from_secs(1)) {
+                Ok(message) => {
+                    jsonl.set_mirror(message.mirror);
+                    message.event
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     // Idle fsync timer: lines written before a quiet spell are
                     // made durable once the interval passes, with no new event.
