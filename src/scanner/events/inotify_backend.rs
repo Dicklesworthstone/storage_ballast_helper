@@ -55,6 +55,9 @@ pub(super) struct LinuxInotifyBackend {
     // max_watches until a bounded retirement step releases them. No pathname
     // under these prefixes is live event evidence in the meantime.
     retiring_roots: BTreeMap<PathBuf, ()>,
+    // Preserve alternation across calls, including a deadline that permits
+    // only one work unit. Restarting every drain with cleanup starves events.
+    retirement_turn: bool,
     buffer: Vec<u8>,
     // At most one kernel-read batch. A budget stop preserves the unprocessed
     // suffix; it must not be thrown away when the monitor gets its turn back.
@@ -79,6 +82,7 @@ impl LinuxInotifyBackend {
             watch_paths: BTreeMap::new(),
             path_watches: BTreeMap::new(),
             retiring_roots: BTreeMap::new(),
+            retirement_turn: true,
             buffer: vec![0; EVENT_BUFFER_BYTES],
             pending_events: VecDeque::new(),
             max_watches,
@@ -93,7 +97,7 @@ impl LinuxInotifyBackend {
     pub(super) fn watched_dirs(&self) -> impl Iterator<Item = &Path> {
         self.watch_paths
             .values()
-            .filter(|path| !self.path_is_retiring(path))
+            .filter(move |path| !self.path_is_retiring(path))
             .map(PathBuf::as_path)
     }
 
@@ -130,7 +134,6 @@ impl LinuxInotifyBackend {
         let started = clock();
         let mut handled = 0;
         let mut collapsed = false;
-        let mut retirement_turn = true;
         let mut invalidation = EventInvalidation::empty();
         loop {
             if handled >= budget.events || clock().saturating_duration_since(started) >= budget.time {
@@ -141,13 +144,13 @@ impl LinuxInotifyBackend {
             // Alternate cleanup with incoming events. Neither a large removed
             // tree nor a continuous event stream may starve the other. The
             // deadline above covers every removal, not just the next event.
-            if retirement_turn && !self.retiring_roots.is_empty() {
+            if self.retirement_turn && !self.retiring_roots.is_empty() {
                 self.retire_one(rates);
                 handled += 1;
-                retirement_turn = false;
+                self.retirement_turn = false;
                 continue;
             }
-            retirement_turn = true;
+            self.retirement_turn = true;
             if self.pending_events.is_empty() {
                 match self.read_event_batch() {
                     Ok(()) if self.pending_events.is_empty() => {
@@ -308,7 +311,10 @@ impl LinuxInotifyBackend {
     }
 
     fn path_is_retiring(&self, path: &Path) -> bool {
-        path.ancestors().any(|ancestor| self.retiring_roots.contains_key(ancestor))
+        // Quiet steady state must not walk every path's ancestors merely to
+        // discover there is no retirement work at all.
+        !self.retiring_roots.is_empty()
+            && path.ancestors().any(|ancestor| self.retiring_roots.contains_key(ancestor))
     }
 
     fn forget_subtree(&mut self, path: &Path, rates: &mut EventRateTracker) {
@@ -330,7 +336,7 @@ impl LinuxInotifyBackend {
     }
 
     fn retire_one(&mut self, rates: &mut EventRateTracker) {
-        let Some(root) = self.retiring_roots.first_key_value().map(|(root, ())| root.clone()) else {
+        let Some(root) = self.retiring_roots.first_key_value().map(|(root, _)| root.clone()) else {
             return;
         };
         if let Some(path) = first_subtree_path(&self.path_watches, &root) {
@@ -933,5 +939,33 @@ mod tests {
         assert_eq!(backend.retiring_roots.len(), 1);
         finish_retirements(&mut backend, &mut rates);
         assert_eq!(backend.watch_paths.len(), 1);
+    }
+
+    #[test]
+    fn single_step_drains_preserve_fairness_across_calls() {
+        let (_temp, config) = fixture();
+        let root = &config.root_paths()[0];
+        let group = root.join("group");
+        let mut paths = vec![root.clone()];
+        for name in ["a", "b", "c"] {
+            let path = group.join(name);
+            fs::create_dir_all(&path).unwrap();
+            paths.push(path);
+        }
+        let mut backend = LinuxInotifyBackend::start(&paths, 4).unwrap();
+        backend.forget_subtree(&group, &mut EventRateTracker::default());
+        let incoming = event(&backend, root, EventMask::MODIFY, Some("live-project"));
+        backend.pending_events.push_back(incoming);
+        let budget = DrainBudget { events: 1, ..DrainBudget::default() };
+        drain(&mut backend, &config, budget);
+        assert_eq!(backend.watch_paths.len(), 3);
+        assert_eq!(backend.pending_events.len(), 1);
+        // Even an intervening zero-work poll must not reset the turn.
+        drain(&mut backend, &config, DrainBudget { events: 0, ..budget });
+        let next = drain(&mut backend, &config, budget);
+        assert_eq!(backend.watch_paths.len(), 3, "the next step belongs to the live event");
+        assert!(backend.pending_events.is_empty());
+        assert!(next.dirty_paths().contains(&root.join("live-project")));
+        assert!(!backend.retiring_roots.is_empty());
     }
 }
