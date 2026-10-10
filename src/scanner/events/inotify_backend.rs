@@ -742,6 +742,7 @@ mod tests {
 
     #[test]
     fn recovery_retries_without_traffic_and_audits_quiet_complete_plans() {
+        let _rebuild_guard = super::super::watch_rebuild::test_serial();
         let (_temp, config) = fixture();
         let now = Instant::now();
         let mut source = ScannerEventSource::start_at(config, now);
@@ -753,7 +754,8 @@ mod tests {
         }
         assert!(!source.should_replan(now + WATCH_REPAIR_INTERVAL - Duration::from_nanos(1)));
         assert!(source.should_replan(now + WATCH_REPAIR_INTERVAL));
-        let repaired = source.drain_at(now + WATCH_REPAIR_INTERVAL);
+        let mut repaired = source.drain_at(now + WATCH_REPAIR_INTERVAL);
+        repaired.merge(super::super::watch_rebuild::finish_rebuild(&mut source, now + WATCH_REPAIR_INTERVAL));
         assert!(repaired.requires_index_generation_bump());
         assert_eq!(source.stats().replans, 1);
         assert!(source.capability().complete);

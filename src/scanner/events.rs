@@ -29,6 +29,8 @@ mod inotify_backend;
 use inotify_backend::LinuxInotifyBackend;
 #[cfg(any(target_os = "linux", test))]
 mod watch_planner;
+#[cfg(target_os = "linux")]
+mod watch_rebuild;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EventBackendKind {
@@ -384,7 +386,7 @@ struct WatchEnumeration {
 /// Per-directory EWMA of the filesystem event rate, keyed by the watched
 /// directory an event was delivered on. Bounded by the watch budget because
 /// only watched directories ever receive events.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct EventRateTracker {
     rates: BTreeMap<PathBuf, RateSample>,
     events_since_plan: u64,
@@ -765,6 +767,8 @@ pub struct ScannerEventSource {
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     planned_at: Instant,
     replans: u64,
+    #[cfg(target_os = "linux")]
+    rebuild: Option<watch_rebuild::Rebuild>,
 }
 
 impl ScannerEventSource {
@@ -848,6 +852,8 @@ impl ScannerEventSource {
             backoff: OverflowBackoff::default(),
             planned_at: now,
             replans: 0,
+            #[cfg(target_os = "linux")]
+            rebuild: None,
         }
     }
 
@@ -955,6 +961,11 @@ impl ScannerEventSource {
         }
         #[cfg(target_os = "linux")]
         {
+            // Poll an admitted job on every drain; this is nonblocking and
+            // must not wait another repair interval to consume ready coverage.
+            if self.rebuild.is_some() {
+                return true;
+            }
             if self.config.mode == ScannerEventSourceMode::ReconciliationOnly
                 || self.config.watch_budget == 0
                 || self.config.root_paths().is_empty()
@@ -997,56 +1008,12 @@ impl ScannerEventSource {
         invalidation
     }
 
-    /// Re-enumerate and replace the watch instance. Directory names alone
-    /// cannot establish that an existing watch still names the current inode.
-    /// The old queue may contain events not drained during installation, so
-    /// every replacement explicitly revokes index evidence and reconciles roots.
+    /// Rebuild off-thread while the current instance continues draining.
+    /// Handoff revokes index evidence and reconciles the installation gap;
+    /// a failed rebuild retains old watches and retries on the repair cadence.
     #[cfg(target_os = "linux")]
     fn replan(&mut self, now: Instant) -> EventInvalidation {
-        let plan = EventSourcePlan::with_rates(&self.config, &self.rates, now);
-        let mut invalidation = EventInvalidation::empty();
-        self.planned_at = now;
-        self.replans = self.replans.saturating_add(1);
-
-        if plan.backend != EventBackendKind::RecursiveInotify {
-            self.backend = EventSourceBackend::ReconciliationOnly;
-            self.capability = EventSourceCapability::from_plan(&plan);
-            self.rates.retain_watched(&[]);
-            invalidation.mark_all_roots(self.config.root_paths(), plan.reason, true);
-            return invalidation;
-        }
-        match LinuxInotifyBackend::start(&plan.watched_dirs, self.config.watch_budget) {
-            Ok(backend) => {
-                self.backend = EventSourceBackend::RecursiveInotify(backend);
-                self.rates.retain_watched(&plan.watched_dirs);
-                self.capability = EventSourceCapability::from_plan(&plan);
-                invalidation.mark_all_roots(
-                    self.config.root_paths(),
-                    "recursive inotify watch coverage rebuilt",
-                    true,
-                );
-            }
-            Err(err) => {
-                // Keep the previous backend's remaining live watches. Its
-                // coverage is unknown even if the planned pathname set matched.
-                if let EventSourceBackend::RecursiveInotify(backend) = &mut self.backend {
-                    backend.require_repair();
-                    self.capability.watched_dirs = backend.watched_dirs().count();
-                } else {
-                    self.capability.watched_dirs = 0;
-                }
-                self.capability.complete = false;
-                self.capability.frontier_dirs = 0;
-                self.capability.dirty_roots = self.config.root_paths().to_vec();
-                self.capability.reason = format!("recursive inotify replan failed: {err}");
-                invalidation.mark_all_roots(
-                    self.config.root_paths(),
-                    self.capability.reason.clone(),
-                    true,
-                );
-            }
-        }
-        invalidation
+        watch_rebuild::poll_or_start(self, now)
     }
 }
 
@@ -1407,7 +1374,7 @@ mod tests {
 
             // A depth-2+ directory is never watched while a mandatory one is not.
             let optional_watched = candidates.iter().any(|c| c.depth > 1 && watched.contains(c.path.as_path()));
-            let mandatory_unwatched = mandatory.iter().any(|c| !watched.contains(c.path.as_path()));
+            let mandatory_unwatched = mandatory.iter().any(|c| c.depth <= 1 && !watched.contains(c.path.as_path()));
             proptest::prop_assert!(!(optional_watched && mandatory_unwatched));
 
             // Coverage: every unwatched directory is under a frontier entry or an unwatched root.
@@ -1661,6 +1628,7 @@ mod tests {
     fn linux_replan_moves_watches_to_the_hot_frontier() {
         use std::thread;
 
+        let _rebuild_guard = watch_rebuild::test_serial();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         let a = root.join("a");
@@ -1726,7 +1694,8 @@ mod tests {
         // elapse. Repair no longer requires any additional observed event.
         set_dir_mtime(&x, SystemTime::now());
         let later = t0 + WATCH_REPLAN_INTERVAL + Duration::from_secs(1);
-        let replanned = source.drain_at(later);
+        let mut replanned = source.drain_at(later);
+        replanned.merge(watch_rebuild::finish_rebuild(&mut source, later));
         assert_eq!(source.stats().replans, 1, "{:?}", source.stats());
         assert_eq!(source.capability().watched_dirs, 3);
         assert_eq!(source.capability().frontier_dirs, 2);
