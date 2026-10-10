@@ -6,6 +6,8 @@
 //! Lost or renamed watches are retired instead of consuming the budget forever.
 //! Descriptor and path indexes keep registration logarithmic and restrict
 //! subtree retirement to affected watches, not the entire recursive watch set.
+//! Revocation is immediate; physical watch retirement shares the event drain's
+//! work and time budget rather than issuing thousands of removals in one event.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -26,6 +28,7 @@ const DRAIN_TIME: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy)]
 struct DrainBudget {
+    // Events and retirement steps consume the same bounded work allowance.
     events: usize,
     dirty_paths: usize,
     time: Duration,
@@ -48,6 +51,10 @@ pub(super) struct LinuxInotifyBackend {
     // Reverse index: startup must not search every prior watch for each path,
     // and a topology event must not scan unrelated projects' watches.
     path_watches: BTreeMap<PathBuf, WatchDescriptor>,
+    // Coalesced revoked prefixes. Their physical watches still count against
+    // max_watches until a bounded retirement step releases them. No pathname
+    // under these prefixes is live event evidence in the meantime.
+    retiring_roots: BTreeMap<PathBuf, ()>,
     buffer: Vec<u8>,
     // At most one kernel-read batch. A budget stop preserves the unprocessed
     // suffix; it must not be thrown away when the monitor gets its turn back.
@@ -71,6 +78,7 @@ impl LinuxInotifyBackend {
             inotify: inotify::Inotify::init()?,
             watch_paths: BTreeMap::new(),
             path_watches: BTreeMap::new(),
+            retiring_roots: BTreeMap::new(),
             buffer: vec![0; EVENT_BUFFER_BYTES],
             pending_events: VecDeque::new(),
             max_watches,
@@ -83,7 +91,10 @@ impl LinuxInotifyBackend {
     }
 
     pub(super) fn watched_dirs(&self) -> impl Iterator<Item = &Path> {
-        self.watch_paths.values().map(PathBuf::as_path)
+        self.watch_paths
+            .values()
+            .filter(|path| !self.path_is_retiring(path))
+            .map(PathBuf::as_path)
     }
 
     pub(super) fn needs_repair(&self) -> bool {
@@ -119,6 +130,7 @@ impl LinuxInotifyBackend {
         let started = clock();
         let mut handled = 0;
         let mut collapsed = false;
+        let mut retirement_turn = true;
         let mut invalidation = EventInvalidation::empty();
         loop {
             if handled >= budget.events || clock().saturating_duration_since(started) >= budget.time {
@@ -126,11 +138,31 @@ impl LinuxInotifyBackend {
                 invalidation.mark_all_roots(config.root_paths(), "recursive inotify drain budget exhausted", true);
                 break;
             }
+            // Alternate cleanup with incoming events. Neither a large removed
+            // tree nor a continuous event stream may starve the other. The
+            // deadline above covers every removal, not just the next event.
+            if retirement_turn && !self.retiring_roots.is_empty() {
+                self.retire_one(rates);
+                handled += 1;
+                retirement_turn = false;
+                continue;
+            }
+            retirement_turn = true;
             if self.pending_events.is_empty() {
                 match self.read_event_batch() {
-                    Ok(()) if self.pending_events.is_empty() => break,
+                    Ok(()) if self.pending_events.is_empty() => {
+                        if self.retiring_roots.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
                     Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if self.retiring_roots.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => {
                         self.require_repair();
@@ -213,6 +245,22 @@ impl LinuxInotifyBackend {
             invalidation.mark_all_roots(config.root_paths(), "recursive inotify event has no live watch", true);
             return invalidation;
         };
+        if self.path_is_retiring(&base) {
+            if event.mask.contains(EventMask::IGNORED) {
+                // The kernel already released this watch. Retire its metadata
+                // as this event's bounded work unit, without another syscall.
+                self.watch_paths.remove(&event.watch);
+                self.path_watches.remove(&base);
+                rates.rates.remove(&base);
+                return EventInvalidation::empty();
+            }
+            // A queued event must not revive a moved subtree's old path, grow
+            // its rate history, or install watches below that obsolete name.
+            return tracker.apply_event(FsEvent {
+                kind: FsEventKind::PermissionLost,
+                path: Some(base),
+            });
+        }
         rates.record(&base, now);
         let path = event.name.as_ref().map_or_else(|| base.clone(), |name| base.join(name));
         if event.mask.intersects(EventMask::IGNORED | EventMask::UNMOUNT | EventMask::DELETE_SELF | EventMask::MOVE_SELF) {
@@ -259,23 +307,61 @@ impl LinuxInotifyBackend {
         invalidation
     }
 
+    fn path_is_retiring(&self, path: &Path) -> bool {
+        path.ancestors().any(|ancestor| self.retiring_roots.contains_key(ancestor))
+    }
+
     fn forget_subtree(&mut self, path: &Path, rates: &mut EventRateTracker) {
-        for watch in remove_subtree_entries(&mut self.path_watches, path) {
-            self.watch_paths.remove(&watch);
-            // IGNORED/UNMOUNT may mean the kernel has already removed it.
-            // A failed explicit removal cannot restore pathname authority;
-            // replacing the instance on repair releases any residual watch.
-            let _ = self.inotify.watches().remove(watch);
+        if self.path_is_retiring(path) {
+            return;
         }
-        // Event histories have the same component-ordered key space. Do not
-        // reintroduce an O(all watched paths) retain scan for every deletion.
-        drop(remove_subtree_entries(&mut rates.rates, path));
+        // Admit only prefixes with retained state. Unwatched directory churn
+        // cannot grow a queue of empty retirement jobs without bound.
+        if first_subtree_path(&self.path_watches, path).is_none()
+            && first_subtree_path(&rates.rates, path).is_none()
+        {
+            return;
+        }
+        // A parent revocation subsumes previously queued descendants. No
+        // physical watch or rate-history walk takes place in this event.
+        drop(remove_subtree_entries(&mut self.retiring_roots, path));
+        self.retiring_roots.insert(path.to_path_buf(), ());
+        self.require_repair();
+    }
+
+    fn retire_one(&mut self, rates: &mut EventRateTracker) {
+        let Some(root) = self.retiring_roots.first_key_value().map(|(root, ())| root.clone()) else {
+            return;
+        };
+        if let Some(path) = first_subtree_path(&self.path_watches, &root) {
+            if let Some(watch) = self.path_watches.remove(&path) {
+                self.watch_paths.remove(&watch);
+                rates.rates.remove(&path);
+                // IGNORED/UNMOUNT may have removed the watch already. Failure
+                // cannot restore pathname authority; repair replaces the fd.
+                let _ = self.inotify.watches().remove(watch);
+            }
+        } else if let Some(path) = first_subtree_path(&rates.rates, &root) {
+            // Historical rate entries need not have a current watch. Their
+            // cleanup is incremental too, under the same work/time budget.
+            rates.rates.remove(&path);
+        } else {
+            self.retiring_roots.remove(&root);
+        }
     }
 
     fn add_watch(&mut self, path: &Path) -> io::Result<()> {
+        if self.path_is_retiring(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "recursive inotify subtree is awaiting bounded retirement",
+            ));
+        }
         if self.path_watches.contains_key(path) {
             return Ok(());
         }
+        // Includes revoked watches not yet physically retired. Delayed cleanup
+        // must not turn max_watches into an advisory rather than a hard limit.
         if self.watch_paths.len() >= self.max_watches {
             return Err(io::Error::other("recursive inotify watch budget exhausted"));
         }
@@ -290,6 +376,14 @@ impl LinuxInotifyBackend {
         self.watch_paths.insert(watch, path.to_path_buf());
         Ok(())
     }
+}
+
+fn first_subtree_path<T>(entries: &BTreeMap<PathBuf, T>, root: &Path) -> Option<PathBuf> {
+    entries
+        .range(root.to_path_buf()..)
+        .next()
+        .filter(|(path, _)| path.starts_with(root))
+        .map(|(path, _)| path.clone())
 }
 
 // Path ordering compares components, so a subtree occupies one contiguous
@@ -377,6 +471,15 @@ mod tests {
         )
     }
 
+    fn finish_retirements(backend: &mut LinuxInotifyBackend, rates: &mut EventRateTracker) {
+        while !backend.retiring_roots.is_empty() {
+            let before = backend.watch_paths.len() + rates.rates.len() + backend.retiring_roots.len();
+            backend.retire_one(rates);
+            let after = backend.watch_paths.len() + rates.rates.len() + backend.retiring_roots.len();
+            assert!(after < before, "each retirement step must make progress");
+        }
+    }
+
     #[test]
     fn start_enforces_the_watch_budget_instead_of_only_trusting_the_plan() {
         let (_temp, config) = fixture();
@@ -418,6 +521,8 @@ mod tests {
         assert!(invalidation.requires_index_generation_bump());
         assert_eq!(backend.watched_dirs().count(), 0);
         assert!(!handle(&mut backend, &config, &ignored).requires_reconciliation());
+        assert!(backend.add_watch(root).is_err());
+        finish_retirements(&mut backend, &mut EventRateTracker::default());
         backend.add_watch(root).unwrap();
         assert_eq!(backend.watched_dirs().count(), 1);
     }
@@ -595,6 +700,7 @@ mod tests {
         rates.record(&child, now);
         let removed = event(&backend, root, EventMask::DELETE | EventMask::ISDIR, Some("child"));
         backend.handle_event(&DirtyRootTracker::new(config.root_paths()), &config, &mut rates, &mut OverflowBackoff::default(), now, &removed);
+        finish_retirements(&mut backend, &mut rates);
         assert_eq!(rates.tracked_dirs(), 1);
         assert!(rates.rate(root, now) > 0.0);
         assert_eq!(rates.rate(&child, now), 0.0);
@@ -689,6 +795,9 @@ mod tests {
                 assert_eq!(backend.path_watches.get(path), Some(watch));
             }
             backend.forget_subtree(&group, &mut rates);
+            assert_eq!(backend.watched_dirs().count(), 2, "revocation is immediate");
+            assert_eq!(backend.watch_paths.len(), 8, "physical retirement is deferred");
+            finish_retirements(&mut backend, &mut rates);
             assert_eq!(backend.watch_paths.len(), 2);
             assert_eq!(backend.path_watches.len(), 2);
             assert!(backend.path_watches.contains_key(root));
@@ -696,5 +805,133 @@ mod tests {
             assert_eq!(rates.tracked_dirs(), 0);
         }
         assert!(group.is_dir(), "watch retirement never removes user files");
+    }
+
+    #[test]
+    fn large_retirement_obeys_work_budget_and_does_not_starve_events() {
+        let (_temp, config) = fixture();
+        let root = &config.root_paths()[0];
+        let group = root.join("group");
+        let mut paths = vec![root.clone()];
+        for n in 0..64 {
+            let path = group.join(format!("child-{n:02}"));
+            fs::create_dir_all(&path).unwrap();
+            paths.push(path);
+        }
+        let mut backend = LinuxInotifyBackend::start(&paths, 65).unwrap();
+        let mut rates = EventRateTracker::default();
+        backend.forget_subtree(&group, &mut rates);
+        for n in 0..10 {
+            let incoming = event(&backend, root, EventMask::MODIFY, Some(&format!("live-{n}")));
+            backend.pending_events.push_back(incoming);
+        }
+        let invalidation = drain(&mut backend, &config, DrainBudget { events: 6, ..DrainBudget::default() });
+        assert_eq!(backend.watch_paths.len(), 62, "only three physical retirements fit");
+        assert_eq!(backend.pending_events.len(), 7, "three live events also make progress");
+        assert_eq!(invalidation.dirty_paths().len(), 3);
+        assert!(invalidation.requires_index_generation_bump());
+        assert_eq!(backend.watched_dirs().count(), 1);
+        assert!(!backend.retiring_roots.is_empty());
+        finish_retirements(&mut backend, &mut rates);
+        assert_eq!(backend.watch_paths.len(), 1);
+        assert!(group.is_dir());
+    }
+
+    #[test]
+    fn retirement_uses_the_same_deadline_and_resumes_the_suffix() {
+        let (_temp, config) = fixture();
+        let root = &config.root_paths()[0];
+        let mut paths = vec![root.clone()];
+        for name in ["a", "b", "c"] {
+            let child = root.join("group").join(name);
+            fs::create_dir_all(&child).unwrap();
+            paths.push(child);
+        }
+        let mut backend = LinuxInotifyBackend::start(&paths, 4).unwrap();
+        let mut rates = EventRateTracker::default();
+        backend.forget_subtree(&root.join("group"), &mut rates);
+        let now = Instant::now();
+        let mut step = 0;
+        let invalidation = backend.drain_with_budget(
+            &DirtyRootTracker::new(config.root_paths()), &config,
+            &mut rates, &mut OverflowBackoff::default(), now,
+            DrainBudget { time: Duration::from_millis(2), ..DrainBudget::default() },
+            || { let time = now + Duration::from_millis(step); step += 1; time },
+        );
+        assert_eq!(backend.watch_paths.len(), 3, "deadline permits one removal, not the whole tree");
+        assert!(!backend.retiring_roots.is_empty());
+        assert!(invalidation.requires_index_generation_bump());
+        let resumed = drain(&mut backend, &config, DrainBudget::default());
+        assert!(!resumed.requires_reconciliation());
+        assert!(backend.retiring_roots.is_empty());
+        assert_eq!(backend.watch_paths.len(), 1);
+    }
+
+    #[test]
+    fn revoked_events_cannot_register_descendants_or_refresh_obsolete_rates() {
+        let (_temp, config) = fixture();
+        let root = &config.root_paths()[0];
+        let group = root.join("group");
+        fs::create_dir_all(group.join("new")).unwrap();
+        let mut backend = LinuxInotifyBackend::start(&[root.clone(), group.clone()], 16).unwrap();
+        let stale = event(&backend, &group, EventMask::CREATE | EventMask::ISDIR, Some("new"));
+        let mut rates = EventRateTracker::default();
+        backend.forget_subtree(&group, &mut rates);
+        let invalidation = backend.handle_event(
+            &DirtyRootTracker::new(config.root_paths()), &config,
+            &mut rates, &mut OverflowBackoff::default(), Instant::now(), &stale,
+        );
+        assert!(invalidation.requires_index_generation_bump());
+        assert_eq!(rates.tracked_dirs(), 0);
+        assert!(!backend.path_watches.contains_key(&group.join("new")));
+        assert!(backend.add_watch(&group).is_err());
+        assert!(backend.add_watch(&group.join("new")).is_err());
+        assert_eq!(backend.watched_dirs().count(), 1);
+    }
+
+    #[test]
+    fn deferred_kernel_watches_still_consume_the_hard_watch_budget() {
+        let (_temp, config) = fixture();
+        let root = &config.root_paths()[0];
+        let old = root.join("old");
+        let new = root.join("new");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&new).unwrap();
+        let mut backend = LinuxInotifyBackend::start(&[root.clone(), old.clone()], 2).unwrap();
+        let mut rates = EventRateTracker::default();
+        backend.forget_subtree(&old, &mut rates);
+        assert_eq!(backend.watched_dirs().count(), 1);
+        assert!(backend.add_watch(&new).is_err(), "revocation alone has not freed a kernel watch");
+        finish_retirements(&mut backend, &mut rates);
+        backend.add_watch(&new).unwrap();
+        assert_eq!(backend.watch_paths.len(), 2);
+        assert_eq!(backend.path_watches.len(), 2);
+    }
+
+    #[test]
+    fn retirement_prefixes_coalesce_and_empty_churn_cannot_grow_the_queue() {
+        let (_temp, config) = fixture();
+        let root = &config.root_paths()[0];
+        let group = root.join("group");
+        let a = group.join("a");
+        let b = group.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let mut backend = LinuxInotifyBackend::start(&[root.clone(), a.clone(), b.clone()], 3).unwrap();
+        let mut rates = EventRateTracker::default();
+        for n in 0..1024 {
+            backend.forget_subtree(&root.join(format!("unwatched-{n}")), &mut rates);
+        }
+        assert!(backend.retiring_roots.is_empty());
+        backend.forget_subtree(&a, &mut rates);
+        backend.forget_subtree(&b, &mut rates);
+        assert_eq!(backend.retiring_roots.len(), 2);
+        backend.forget_subtree(&group, &mut rates);
+        assert_eq!(backend.retiring_roots.len(), 1);
+        assert!(backend.retiring_roots.contains_key(&group));
+        backend.forget_subtree(&a, &mut rates);
+        assert_eq!(backend.retiring_roots.len(), 1);
+        finish_retirements(&mut backend, &mut rates);
+        assert_eq!(backend.watch_paths.len(), 1);
     }
 }
