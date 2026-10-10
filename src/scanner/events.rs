@@ -242,7 +242,7 @@ impl EventSourcePlan {
             },
             complete: dirty_roots.is_empty(),
             watched_dirs: allocation.watched,
-            frontier_dirs: allocation.frontier_dirs,
+            frontier_dirs: allocation.frontier.len(),
             dirty_roots,
             reason,
         }
