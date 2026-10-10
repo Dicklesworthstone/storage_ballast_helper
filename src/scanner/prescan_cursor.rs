@@ -28,8 +28,8 @@
 //!   final page clears that root's continuation. An unreadable root can yield
 //!   to the next root without losing its previous progress.
 //!
-//! Checkpoints retain the original `root`/`after` fields and add continuations
-//! for other unfinished roots. Missing or corrupt checkpoints start over.
+//! Checkpoint I/O is bounded, byte-preserving and crash-consistent. Existing
+//! UTF-8 checkpoints still load; invalid or corrupt checkpoints start over.
 
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fs;
@@ -38,6 +38,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
+
+mod checkpoint;
 
 /// Most depth-1 entries the cursor retains and hands back for one root.
 ///
@@ -105,28 +107,17 @@ impl PrescanCursor {
         Self::default()
     }
 
-    /// Load the checkpoint, falling back to the beginning when it is
-    /// missing, unreadable or corrupt. Losing the cursor costs one repeated
-    /// prefix, never correctness, so this never fails.
+    /// Load a bounded regular-file checkpoint, falling back to the beginning
+    /// on missing, changed, corrupt or unsupported input. Never wait on a FIFO.
     #[must_use]
     pub fn load(path: &Path) -> Self {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+        checkpoint::load(path)
     }
 
-    /// Persist the checkpoint, writing through a temporary file so a crash
-    /// mid-write cannot leave a truncated cursor behind.
+    /// Publish byte-exact progress through a private synced staging file.
+    /// Failure before publication preserves the previous checkpoint.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let text = serde_json::to_string(self)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, text)?;
-        fs::rename(&tmp, path)
+        checkpoint::save(self, path)
     }
 
     /// Where the next pass will resume: the root, and the entry it will
