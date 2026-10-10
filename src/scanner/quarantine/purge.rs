@@ -8,13 +8,14 @@
 //! Linux uses openat2(NO_XDEV) to reject bind mounts as well as device changes.
 //! An unavailable/blocked openat2 fails closed, without a weaker fallback.
 //! Other Unix systems use no-follow opens and device checks. The caller keeps
-//! the manifest on any error; a partial purge can have removed earlier children
-//! already, but the remaining payload is still tracked for retry or undo.
+//! the manifest on any error or budget pause. A partial purge can have removed
+//! earlier children already, but the remaining payload stays tracked for retry
+//! or undo. A later slice reopens and revalidates every traversed directory.
 
 use std::fs::File;
 use std::io;
 
-use super::QuarantineRecord;
+use super::{PurgeBudget, QuarantineRecord};
 
 pub(super) fn remove_payload(store: &File, record: &QuarantineRecord) -> io::Result<bool> {
     #[cfg(unix)]
@@ -24,6 +25,26 @@ pub(super) fn remove_payload(store: &File, record: &QuarantineRecord) -> io::Res
     #[cfg(not(unix))]
     {
         let _ = (store, record);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "confined quarantine purge requires Unix directory descriptors",
+        ))
+    }
+}
+
+/// `None` is a cooperative pause, not a filesystem failure or a removed root.
+pub(super) fn remove_payload_with_budget(
+    store: &File,
+    record: &QuarantineRecord,
+    budget: &mut PurgeBudget,
+) -> io::Result<Option<bool>> {
+    #[cfg(unix)]
+    {
+        unix::remove_payload_with_budget(store, record, budget)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (store, record, budget);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "confined quarantine purge requires Unix directory descriptors",
@@ -42,7 +63,7 @@ mod unix {
     use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat, fstat, statat, unlinkat};
     use rustix::io::Errno;
 
-    use super::QuarantineRecord;
+    use super::{PurgeBudget, QuarantineRecord};
 
     // Each level owns a directory descriptor and a directory stream. Bound
     // stack/fd consumption independently of adversarial tree depth. A wide
@@ -136,16 +157,37 @@ mod unix {
         remove_with_hook(store, record, &mut |_, _| {})
     }
 
+    pub(super) fn remove_payload_with_budget(
+        store: &File,
+        record: &QuarantineRecord,
+        budget: &mut PurgeBudget,
+    ) -> io::Result<Option<bool>> {
+        remove_with_budget_and_hook(store, record, budget, &mut |_, _| {})
+    }
+
     fn remove_with_hook(
         store: &File,
         record: &QuarantineRecord,
         hook: &mut impl FnMut(&OsStr, Step),
     ) -> io::Result<bool> {
+        remove_with_budget_and_hook(store, record, &mut PurgeBudget::unlimited(), hook)?
+            .ok_or_else(|| io::Error::other("unlimited quarantine purge unexpectedly paused"))
+    }
+
+    fn remove_with_budget_and_hook(
+        store: &File,
+        record: &QuarantineRecord,
+        budget: &mut PurgeBudget,
+        hook: &mut impl FnMut(&OsStr, Step),
+    ) -> io::Result<Option<bool>> {
+        if !budget.take() {
+            return Ok(None);
+        }
         let id = OsStr::new(&record.decision_id);
         let Some(entry_identity) = inspect(store, id)? else {
             // A prior removal may not yet have been persisted.
             store.sync_all()?;
-            return Ok(false);
+            return Ok(Some(false));
         };
         if entry_identity.kind != FileType::Directory
             || entry_identity.device != record.device_id
@@ -160,7 +202,7 @@ mod unix {
             .ok_or_else(|| invalid("quarantine origin has no basename"))?;
         let Some(payload) = inspect(&entry, name)? else {
             entry.sync_all()?;
-            return Ok(false);
+            return Ok(Some(false));
         };
         if (payload.device, payload.inode) != (record.device_id, record.inode)
             || !matches!(payload.kind, FileType::RegularFile | FileType::Directory)
@@ -169,10 +211,16 @@ mod unix {
                 "quarantine payload identity changed; refusing purge",
             ));
         }
-        let removed = remove_child(&entry, name, payload, 0, hook)?;
+        let Some(removed) = remove_child(&entry, name, payload, 0, budget, hook)? else {
+            // The manifest remains the recovery anchor. Never finalize a
+            // partially removed payload or give it a failed-deletion cooldown.
+            return Ok(None);
+        };
+        // Once the payload is gone, finish this constant-size transaction even
+        // when the last unlink spent the final traversal checkpoint.
         // Sync the SAME opened parent before the caller drops recovery data.
         entry.sync_all()?;
-        Ok(removed)
+        Ok(Some(removed))
     }
 
     fn remove_child(
@@ -180,8 +228,12 @@ mod unix {
         name: &OsStr,
         expected: Identity,
         depth: usize,
+        budget: &mut PurgeBudget,
         hook: &mut impl FnMut(&OsStr, Step),
-    ) -> io::Result<bool> {
+    ) -> io::Result<Option<bool>> {
+        if !budget.take() {
+            return Ok(None);
+        }
         hook(name, Step::Inspected);
         if expected.kind == FileType::Directory {
             if depth >= MAX_DIRECTORY_DEPTH {
@@ -192,7 +244,17 @@ mod unix {
             if !same_child(parent, name, expected)? {
                 return Err(invalid("quarantine directory disappeared before traversal"));
             }
-            for child in Dir::read_from(&directory)? {
+            let mut children = Dir::read_from(&directory)?;
+            loop {
+                // Check before advancing the stream, including empty/missing
+                // entries. A wide or concurrently changing tree cannot bypass
+                // the work allowance by avoiding successful unlinks.
+                if !budget.take() {
+                    return Ok(None);
+                }
+                let Some(child) = children.next() else {
+                    break;
+                };
                 let child = child?;
                 let bytes = child.file_name().to_bytes();
                 if bytes == b"." || bytes == b".." {
@@ -205,12 +267,17 @@ mod unix {
                 if identity.device != expected.device {
                     return Err(invalid("quarantine purge refuses a nested filesystem"));
                 }
-                remove_child(&directory, child_name, identity, depth + 1, hook)?;
+                if remove_child(&directory, child_name, identity, depth + 1, budget, hook)?.is_none() {
+                    return Ok(None);
+                }
             }
+        }
+        if !budget.take() {
+            return Ok(None);
         }
         hook(name, Step::BeforeUnlink);
         if !same_child(parent, name, expected)? {
-            return Ok(false);
+            return Ok(Some(false));
         }
         let flags = if expected.kind == FileType::Directory {
             AtFlags::REMOVEDIR
@@ -221,8 +288,8 @@ mod unix {
             AtFlags::empty()
         };
         match unlinkat(parent, name, flags) {
-            Ok(()) => Ok(true),
-            Err(Errno::NOENT) => Ok(false),
+            Ok(()) => Ok(Some(true)),
+            Err(Errno::NOENT) => Ok(Some(false)),
             Err(error) => Err(error.into()),
         }
     }

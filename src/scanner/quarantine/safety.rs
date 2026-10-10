@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};
 
+use super::budget::PurgeBudget;
 use super::{
     QuarantineRecord, QuarantineStore, QuarantineUnavailable, RestoreOutcome, device_of, now_secs,
 };
@@ -408,22 +409,53 @@ fn remove_records(store: &QuarantineStore, id: &str) -> io::Result<()> {
 }
 
 pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
+    purge_with(store, id, |lock, record| {
+        confined_purge::remove_payload(lock, record).map(Some)
+    })?
+    .ok_or_else(|| SbhError::Runtime {
+        details: "unlimited quarantine purge unexpectedly paused".to_string(),
+    })
+}
+
+/// A budget pause leaves the manifest intact and returns `None`, never an
+/// error that would put an ordinary partial purge into the stuck cooldown.
+pub(super) fn purge_with_budget(
+    store: &QuarantineStore,
+    id: &str,
+    budget: &mut PurgeBudget,
+) -> Result<Option<u64>> {
+    if budget.exhausted() {
+        return Ok(None);
+    }
+    purge_with(store, id, |lock, record| {
+        confined_purge::remove_payload_with_budget(lock, record, budget)
+    })
+}
+
+fn purge_with(
+    store: &QuarantineStore,
+    id: &str,
+    remove: impl FnOnce(&File, &QuarantineRecord) -> io::Result<Option<bool>>,
+) -> Result<Option<u64>> {
     validate_id(id).map_err(|e| SbhError::io(store.root(), e))?;
     let lock = match lock_store(store.root()) {
         Ok(lock) => lock,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some(0)),
         Err(e) => return Err(SbhError::io(store.root(), e)),
     };
     let Some(record) = read_record(store, id)? else {
         store.clear_stuck(id);
-        return Ok(0);
+        return Ok(Some(0));
     };
     // Resolve the payload from the locked store descriptor, not a pathname
     // checked earlier. Nested mounts are not part of a quarantined artifact.
     // On refusal keep its manifest so later drains/undo can recover what
     // remains; never fall back to unrestricted recursive removal.
-    let removed = confined_purge::remove_payload(&lock, &record)
-        .map_err(|e| SbhError::io(&record.quarantine_path, e))?;
+    let Some(removed) = remove(&lock, &record)
+        .map_err(|e| SbhError::io(&record.quarantine_path, e))?
+    else {
+        return Ok(None);
+    };
     let bytes = if removed {
         record.size_bytes
     } else {
@@ -435,7 +467,7 @@ pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
     remove_records(store, id).map_err(|e| SbhError::io(store.record_path(id), e))?;
     let _ = fs::remove_dir(store.entry_dir(id));
     lock.sync_all().map_err(|e| SbhError::io(store.root(), e))?;
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 fn sync_existing_directory(path: &Path) -> io::Result<()> {

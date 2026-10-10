@@ -27,8 +27,12 @@ use serde::{Deserialize, Serialize};
 use crate::core::errors::{Result, SbhError};
 use crate::scanner::protection::{MARKER_FILENAME, create_marker};
 
+mod budget;
 mod placement;
 mod safety;
+
+pub use budget::DEFAULT_DRAIN_WORK;
+use budget::PurgeBudget;
 
 /// Directory under the mount's `.sbh` that holds quarantined entries.
 pub const QUARANTINE_DIR_NAME: &str = "quarantine";
@@ -78,20 +82,30 @@ pub struct DrainFailure {
 /// per-entry error with `?`, and because `records()` is sorted oldest-first
 /// and the sweep re-enters from the top every minute, one stuck entry wedged
 /// the whole store permanently while `sbh status` still read green.
+/// A large payload may now span several calls. A budget pause preserves its
+/// recovery metadata and is reported separately from a deletion failure.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DrainOutcome {
     /// Entries unlinked.
     pub entries: usize,
-    /// Bytes their records claimed.
+    /// Bytes their records claimed. A partially purged entry is not credited
+    /// until its payload root is removed and the transaction is finalized.
     pub bytes: u64,
     /// Entries that would not unlink this pass.
     pub failures: Vec<DrainFailure>,
     /// Entries skipped because they are still cooling down after a failure.
     pub skipped_stuck: usize,
+    /// Selected entries deferred without a deletion failure. This does not
+    /// count the unvisited suffix after a budget stop.
+    pub deferred_entries: usize,
+    /// The shared traversal allowance ended before all requested work could
+    /// finish. Call the drain again to resume from the remaining payloads.
+    pub budget_exhausted: bool,
 }
 
 impl DrainOutcome {
-    /// Nothing was unlinked and nothing failed.
+    /// Nothing was fully unlinked and nothing failed. Deferred work may still
+    /// exist; inspect `budget_exhausted` and `deferred_entries` as well.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries == 0 && self.failures.is_empty()
@@ -107,9 +121,11 @@ impl DrainOutcome {
     /// run in the same sweep).
     #[must_use]
     pub fn merged(mut self, other: Self) -> Self {
-        self.entries += other.entries;
+        self.entries = self.entries.saturating_add(other.entries);
         self.bytes = self.bytes.saturating_add(other.bytes);
-        self.skipped_stuck += other.skipped_stuck;
+        self.skipped_stuck = self.skipped_stuck.saturating_add(other.skipped_stuck);
+        self.deferred_entries = self.deferred_entries.saturating_add(other.deferred_entries);
+        self.budget_exhausted |= other.budget_exhausted;
         self.failures.extend(other.failures);
         self
     }
@@ -353,13 +369,31 @@ impl QuarantineStore {
         Ok(stuck)
     }
 
-    /// Try to unlink one entry, folding the result into `out`. A per-entry
-    /// failure is recorded, never propagated: the batch must continue.
-    fn try_purge(&self, record: &QuarantineRecord, now_unix: u64, out: &mut DrainOutcome) {
-        match self.purge(&record.decision_id) {
-            Ok(bytes) => {
+    /// Try one selected entry. Return false only when the shared work budget
+    /// paused the drain; ordinary per-entry failures still let the batch continue.
+    fn try_purge(
+        &self,
+        record: &QuarantineRecord,
+        now_unix: u64,
+        out: &mut DrainOutcome,
+        budget: &mut PurgeBudget,
+    ) -> bool {
+        // Charge attempted records as well as tree traversal, so a long run
+        // of manifest/permission errors cannot receive a fresh budget per item.
+        let result = if budget.take() {
+            safety::purge_with_budget(self, &record.decision_id, budget)
+        } else {
+            Ok(None)
+        };
+        match result {
+            Ok(Some(bytes)) => {
                 out.entries += 1;
                 out.bytes = out.bytes.saturating_add(bytes);
+            }
+            Ok(None) => {
+                out.deferred_entries += 1;
+                out.budget_exhausted = true;
+                return false;
             }
             Err(e) => {
                 let code = e.code().to_string();
@@ -374,6 +408,7 @@ impl QuarantineStore {
                 });
             }
         }
+        true
     }
 
     /// Move `path` into quarantine under `decision_id`. Same filesystem
@@ -439,18 +474,28 @@ impl QuarantineStore {
     }
 
     /// Unlink one entry for good (record included). Returns the bytes its
-    /// record claimed.
+    /// record claimed. Unlike batch drains, this explicit operation runs to
+    /// completion or a filesystem error without a cooperative work limit.
     pub fn purge(&self, decision_id: &str) -> Result<u64> {
         safety::purge(self, decision_id)
     }
 
-    /// Unlink every entry whose TTL has expired.
+    /// Drain expired entries using one shared [`DEFAULT_DRAIN_WORK`] allowance.
     ///
-    /// Best-effort per entry: an entry that will not unlink is recorded and
-    /// skipped, and the rest of the batch still drains. `Err` means the store
-    /// itself could not be read.
+    /// Best-effort per entry: failures are recorded and skipped. A partial
+    /// purge is instead deferred with its manifest intact and no stuck marker;
+    /// another call continues removing the remaining children. `Err` means the
+    /// store itself could not be read. Inventory and sync are not time-bounded.
     pub fn drain_expired(&self, now_unix: u64) -> Result<DrainOutcome> {
+        self.drain_expired_with_budget(now_unix, DEFAULT_DRAIN_WORK)
+    }
+
+    /// `drain_expired` with an explicit traversal-work allowance. Very small
+    /// allowances may not reach a leaf in a deep tree; increase the allowance
+    /// or use explicit `purge` to finish one entry synchronously.
+    pub fn drain_expired_with_budget(&self, now_unix: u64, max_steps: usize) -> Result<DrainOutcome> {
         let mut out = DrainOutcome::default();
+        let mut budget = PurgeBudget::bounded(max_steps);
         for record in self.records()? {
             if record.expires_at > now_unix {
                 continue;
@@ -459,21 +504,24 @@ impl QuarantineStore {
                 out.skipped_stuck += 1;
                 continue;
             }
-            self.try_purge(&record, now_unix, &mut out);
+            if !self.try_purge(&record, now_unix, &mut out, &mut budget) {
+                break;
+            }
         }
         Ok(out)
     }
 
-    /// Unlink entries oldest-first until at least `bytes_needed` of claimed
-    /// bytes are gone (or the store is empty).
+    /// Drain oldest-first until the byte target, store end, or shared work
+    /// allowance is reached. Inspect `budget_exhausted` before assuming all
+    /// requested space could be reclaimed in this call.
     pub fn drain_oldest(&self, bytes_needed: u64) -> Result<DrainOutcome> {
-        self.drain_oldest_inner(bytes_needed, now_secs(), false)
+        self.drain_oldest_inner(bytes_needed, now_secs(), false, DEFAULT_DRAIN_WORK)
     }
 
-    /// `drain_oldest`, ignoring the stuck cooldown. For pressure and
-    /// `emergency`, where the space matters more than a tidy log.
+    /// `drain_oldest`, ignoring the stuck cooldown, not the work allowance.
+    /// For pressure and `emergency`, where held space should be retried promptly.
     pub fn drain_oldest_forced(&self, bytes_needed: u64) -> Result<DrainOutcome> {
-        self.drain_oldest_inner(bytes_needed, now_secs(), true)
+        self.drain_oldest_inner(bytes_needed, now_secs(), true, DEFAULT_DRAIN_WORK)
     }
 
     fn drain_oldest_inner(
@@ -481,8 +529,13 @@ impl QuarantineStore {
         bytes_needed: u64,
         now_unix: u64,
         force: bool,
+        max_steps: usize,
     ) -> Result<DrainOutcome> {
         let mut out = DrainOutcome::default();
+        if bytes_needed == 0 {
+            return Ok(out);
+        }
+        let mut budget = PurgeBudget::bounded(max_steps);
         for record in self.records()? {
             if out.bytes >= bytes_needed {
                 break;
@@ -491,18 +544,28 @@ impl QuarantineStore {
                 out.skipped_stuck += 1;
                 continue;
             }
-            self.try_purge(&record, now_unix, &mut out);
+            if !self.try_purge(&record, now_unix, &mut out, &mut budget) {
+                break;
+            }
         }
         Ok(out)
     }
 
-    /// Unlink everything held, retrying entries that are cooling down: this
-    /// is the pressure path, and held bytes are the cheapest space there is.
+    /// Request reclamation of everything held, including cooling-down entries.
+    /// Large stores may require several calls; a pause is reported rather than
+    /// monopolizing a monitoring tick until a whole payload tree is unlinked.
     pub fn drain_all(&self) -> Result<DrainOutcome> {
         self.drain_oldest_forced(u64::MAX)
     }
 
-    /// Unlink oldest entries until the store holds at most `max_bytes`.
+    /// `drain_all` with an explicit allowance shared by every selected entry.
+    /// This is a traversal bound, not an elapsed-time or inventory-size bound.
+    pub fn drain_all_with_budget(&self, max_steps: usize) -> Result<DrainOutcome> {
+        self.drain_oldest_inner(u64::MAX, now_secs(), true, max_steps)
+    }
+
+    /// Drain oldest entries toward `max_bytes`, within the shared work limit.
+    /// A deferred outcome means the cap may need another sweep to be reached.
     pub fn enforce_cap(&self, max_bytes: u64) -> Result<DrainOutcome> {
         let held = self.held_bytes()?;
         if held <= max_bytes {
@@ -513,7 +576,8 @@ impl QuarantineStore {
 
     /// Put an entry back where it came from by rename. Refuses when the
     /// original path exists again unless `force_suffix`, which restores to
-    /// `<original>.restored-<decision-id>` instead.
+    /// `<original>.restored-<decision-id>` instead. After a partial purge,
+    /// only the payload's remaining contents can be restored.
     pub fn restore(&self, decision_id: &str, force_suffix: bool) -> Result<RestoreOutcome> {
         safety::restore(self, decision_id, force_suffix)
     }
