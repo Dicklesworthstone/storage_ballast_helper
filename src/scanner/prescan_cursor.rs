@@ -31,21 +31,26 @@
 //! Checkpoint I/O is bounded, byte-preserving and crash-consistent. Existing
 //! UTF-8 checkpoints still load; invalid or corrupt checkpoints start over.
 
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BinaryHeap;
+#[cfg(test)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
 mod checkpoint;
+mod enumeration;
 
-/// Most depth-1 entries the cursor retains and hands back for one root.
+pub use enumeration::{RootPage, RootPageIter};
+
+/// Aggregate name allowance for cached depth-1 enumeration on one scanner thread.
 ///
-/// Selection applies the resume filter first, then retains only the smallest
-/// remaining names in a bounded max-heap. Enumeration still visits the whole
-/// directory: this is a memory bound, not an I/O deadline.
+/// Four live roots share this allowance. Selection retains the smallest names
+/// after the resume point; a sorted page still requires observing directory EOF.
 pub const ROOT_ENTRY_CAP: usize = 200_000;
 
 /// Evidence about the most recently selected page. This is not durable work:
@@ -61,7 +66,7 @@ struct PageProof {
 ///
 /// The default value — no root, no entry — means "start at the first root",
 /// which is also what a missing or corrupt checkpoint deserialises to.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrescanCursor {
     /// Root the next pass should resume in. `None` = start at `roots[0]`.
@@ -75,6 +80,23 @@ pub struct PrescanCursor {
     /// Send + Sync. A clone owns its own proof, so a budget rewind is isolated.
     #[serde(skip)]
     page: Mutex<Option<PageProof>>,
+    /// Volatile read-ahead survives budget stops and rewind snapshots. Sharing
+    /// it can only save or repeat name enumeration; each clone still owns its
+    /// independent completion proof and durable resume position.
+    #[serde(skip, default = "enumeration::shared_cache")]
+    enumeration: Arc<Mutex<enumeration::EnumerationCache>>,
+}
+
+impl Default for PrescanCursor {
+    fn default() -> Self {
+        Self {
+            root: None,
+            after: None,
+            continuations: BTreeMap::new(),
+            page: Mutex::new(None),
+            enumeration: enumeration::shared_cache(),
+        }
+    }
 }
 
 impl Clone for PrescanCursor {
@@ -84,6 +106,7 @@ impl Clone for PrescanCursor {
             after: self.after.clone(),
             continuations: self.continuations.clone(),
             page: Mutex::new(self.page_proof().clone()),
+            enumeration: Arc::clone(&self.enumeration),
         }
     }
 }
@@ -101,7 +124,8 @@ impl PartialEq for PrescanCursor {
 impl Eq for PrescanCursor {}
 
 impl PrescanCursor {
-    /// A cursor at the very beginning.
+    /// A cursor at the very beginning. Other live cursors created on this
+    /// thread may share read-ahead, never completed-work positions or proofs.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -180,17 +204,19 @@ impl PrescanCursor {
         }
     }
 
-    /// This root's next page of depth-1 entries in deterministic order, with
-    /// previously examined names skipped. A never-visited root starts at its
-    /// beginning. Selection itself does not advance the durable cursor.
+    /// Prepare this root's next page within a bounded work/time slice.
     ///
-    /// After examining entries with `advance`, call `complete_root` as usual:
-    /// it distinguishes a capped page from genuine end-of-root. Enumeration
-    /// errors are returned and do not erase the root's existing continuation.
+    /// `WouldBlock` means preparation is retained for a later call, not EOF.
+    /// The daemon already yields an unreadable root with `complete_root`;
+    /// the incomplete page proof preserves progress on this yield too. A
+    /// completed page is cached if the pass stops before examining it, so
+    /// the next pass does not pay for the same directory enumeration again.
+    /// Names are still hints: callers must perform normal fresh safety checks.
     pub fn entries_to_visit(&self, root: &Path) -> io::Result<Vec<PathBuf>> {
-        self.entries_with_capacity(root, ROOT_ENTRY_CAP)
+        self.read_entries(root)
     }
 
+    #[cfg(test)]
     fn entries_with_capacity(&self, root: &Path, capacity: usize) -> io::Result<Vec<PathBuf>> {
         // Invalidate any earlier successful observation before opening the
         // directory. A read failure is not evidence that its tail is empty.
@@ -237,6 +263,7 @@ impl PrescanCursor {
         self.remember_current();
         if !retain {
             self.continuations.remove(root);
+            self.discard_enumeration(root);
         }
         if roots.is_empty() {
             self.reset();
@@ -252,12 +279,16 @@ impl PrescanCursor {
 
     /// Reset every root to the beginning for an operator/forced scan.
     pub fn reset(&mut self) {
+        // A forced scan must not reuse a page selected before the request.
+        // Peers lose only speculative reads, not their completed positions.
+        self.clear_enumeration();
         *self = Self::default();
     }
 }
 
 /// Select a bounded page and report whether successful enumeration saw more
 /// eligible names. An exactly-full final page is distinguishable from a cap.
+#[cfg(test)]
 fn select_page_with_tail(
     entries: impl IntoIterator<Item = io::Result<PathBuf>>,
     after: Option<&Path>,
@@ -310,6 +341,19 @@ mod tests {
         }
     }
 
+    // A bounded preparation may yield, including when a test host is slow.
+    // Retry only the explicit pending state; real read errors still fail.
+    fn read_page(cursor: &PrescanCursor, root: &Path) -> Vec<PathBuf> {
+        for _ in 0..1024 {
+            match cursor.entries_to_visit(root) {
+                Ok(page) => return page,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("read failed: {error}"),
+            }
+        }
+        panic!("bounded preparation made no progress");
+    }
+
     #[test]
     fn a_fresh_cursor_starts_at_the_first_root_and_the_first_entry() {
         let dir = tempdir();
@@ -317,7 +361,7 @@ mod tests {
         let cursor = PrescanCursor::new();
         let roots = vec![dir.path().to_path_buf(), PathBuf::from("/other")];
         assert_eq!(cursor.root_order(&roots)[0], dir.path());
-        let entries = cursor.entries_to_visit(dir.path()).expect("read");
+        let entries = read_page(&cursor, dir.path());
         assert_eq!(
             entries,
             vec![
@@ -335,7 +379,7 @@ mod tests {
         make_dirs(dir.path(), &["a", "b", "c", "d"]);
         let mut cursor = PrescanCursor::new();
         cursor.advance(dir.path(), &dir.path().join("b"));
-        let entries = cursor.entries_to_visit(dir.path()).expect("read");
+        let entries = read_page(&cursor, dir.path());
         assert_eq!(entries, vec![dir.path().join("c"), dir.path().join("d")]);
     }
 
@@ -345,7 +389,7 @@ mod tests {
         make_dirs(dir.path(), &["a", "c", "d"]);
         let mut cursor = PrescanCursor::new();
         cursor.advance(dir.path(), &dir.path().join("b"));
-        let entries = cursor.entries_to_visit(dir.path()).expect("read");
+        let entries = read_page(&cursor, dir.path());
         assert_eq!(entries, vec![dir.path().join("c"), dir.path().join("d")]);
     }
 
@@ -358,11 +402,11 @@ mod tests {
         let mut cursor = PrescanCursor::new();
         cursor.advance(a.path(), &a.path().join("x"));
         assert_eq!(
-            cursor.entries_to_visit(a.path()).expect("read"),
+            read_page(&cursor, a.path()),
             vec![a.path().join("y")]
         );
         assert_eq!(
-            cursor.entries_to_visit(b.path()).expect("read"),
+            read_page(&cursor, b.path()),
             vec![b.path().join("x"), b.path().join("y")],
             "a different root starts at its beginning"
         );
@@ -415,7 +459,7 @@ mod tests {
         let mut passes = 0;
         while passes < 100 {
             passes += 1;
-            let entries = cursor.entries_to_visit(dir.path()).expect("read");
+            let entries = read_page(&cursor, dir.path());
             if entries.is_empty() {
                 cursor.complete_root(&roots, dir.path());
                 break;
