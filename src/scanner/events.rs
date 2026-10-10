@@ -783,6 +783,16 @@ impl ScannerEventSource {
         let mut capability = EventSourceCapability::from_plan(&plan);
         let mut pending = EventInvalidation::empty();
         pending.mark_plan_gaps(&plan);
+        // A complete plan describes coverage from now on, not events while
+        // the daemon was stopped or while these watches were being installed.
+        // In particular, writes inside an opaque tree need not change its
+        // root metadata. Keep checkpoint hints/backoff, but revoke their old
+        // generation and request bounded reconciliation once at startup.
+        pending.mark_all_roots(
+            config.root_paths(),
+            "BackendRestart (event history unavailable before subscription)",
+            true,
+        );
 
         let backend = match plan.backend {
             EventBackendKind::Fsevents => {
@@ -1671,8 +1681,11 @@ mod tests {
         let startup = source.drain_at(t0);
         assert_eq!(source.capability().watched_dirs, 3);
         assert_eq!(source.capability().frontier_dirs, 1);
-        assert!(startup.dirty_roots().contains(&x), "{startup:?}");
-        assert!(!startup.dirty_roots().contains(&root), "{startup:?}");
+        assert!(source.capability().dirty_roots.contains(&x));
+        // The frontier is still x, but startup must also reconcile the
+        // pre-subscription history gap covering the entire configured root.
+        assert!(startup.dirty_roots().contains(&root), "{startup:?}");
+        assert!(startup.requires_index_generation_bump());
 
         // A directory created under a watched one when the budget is spent is
         // reconciled locally, but missing descendant coverage revokes replay.
@@ -1904,5 +1917,48 @@ mod tests {
         deferred.apply_to_index(&mut index);
         assert_eq!(index.event_generation(), 1);
         assert!(index.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_startup_revokes_checkpoint_evidence_changed_while_offline() {
+        use crate::scanner::index::ScannerIndexLoadStatus;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("proj/target/debug")).unwrap();
+        fs::create_dir_all(root.join("proj-other/target")).unwrap();
+        let object = root.join("proj/target/debug/object.o");
+        fs::write(&object, b"old").unwrap();
+        let (index, candidate) = replay_fixture(&root);
+        let checkpoint = temp.path().join("scanner-index.json");
+        index.save_checkpoint(&checkpoint).unwrap();
+        let before = fs::metadata(&candidate.path).unwrap().modified().unwrap();
+        // No event source is alive here. A complete subscription installed
+        // afterwards cannot retroactively observe this descendant write.
+        fs::write(&object, b"rebuilt while the daemon was stopped").unwrap();
+        assert_eq!(fs::metadata(&candidate.path).unwrap().modified().unwrap(), before);
+        let (mut loaded, status) = ScannerCandidateIndex::load_checkpoint(&checkpoint, index.context().clone());
+        assert_eq!(status, ScannerIndexLoadStatus::Loaded);
+        assert_eq!(loaded.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX).len(), 2);
+        let t0 = Instant::now();
+        let mut source = ScannerEventSource::start_at(event_config(std::slice::from_ref(&root), 16), t0);
+        assert_eq!(source.capability().selected_backend, EventBackendKind::RecursiveInotify);
+        assert!(source.capability().complete);
+        let startup = source.drain_at(t0);
+        assert!(startup.dirty_roots().contains(&root));
+        assert!(startup.requires_index_generation_bump());
+        assert!(startup.reason_summary().contains("BackendRestart"));
+        startup.apply_to_index(&mut loaded);
+        assert!(loaded.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX).is_empty());
+        assert_eq!(loaded.len(), 2, "keep discovery hints and backoff, not old replay authority");
+        // Startup revocation is consumed once. A quiet steady-state poll
+        // does not invalidate newly reconciled candidates all over again.
+        loaded.upsert(candidate.clone());
+        let quiet = source.drain_at(t0 + Duration::from_secs(1));
+        assert!(!quiet.requires_reconciliation());
+        assert!(!quiet.requires_index_generation_bump());
+        quiet.apply_to_index(&mut loaded);
+        assert_eq!(loaded.ranked_records(SystemTime::UNIX_EPOCH, 1)[0].identity, candidate.identity);
+        assert_eq!(fs::read(&object).unwrap(), b"rebuilt while the daemon was stopped");
     }
 }
