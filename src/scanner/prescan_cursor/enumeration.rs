@@ -26,6 +26,9 @@ const PAGE_ENTRIES: usize = ROOT_ENTRY_CAP / MAX_LIVE_ROOTS;
 const READ_CHUNK_ENTRIES: usize = 256;
 const READ_POLL_CHUNKS: usize = 16;
 const READ_POLL_TIME: Duration = Duration::from_millis(50);
+// Abandoned roots must eventually release admission without a config reset.
+// Active readers renew on every visit, not just when a page is completed.
+const READER_IDLE_LEASE: Duration = Duration::from_hours(1);
 
 thread_local! {
     // The daemon constructs an event-scoped scratch cursor for each pass.
@@ -142,9 +145,9 @@ impl<I: Iterator<Item = io::Result<PathBuf>>> Selection<I> {
         keep_reading: &mut impl FnMut() -> bool,
     ) -> io::Result<Option<(Vec<PathBuf>, bool)>> {
         loop {
-            // CPU and wall limits are the caller's existing pass limits, not
-            // a new independent allowance. Also gives shutdown a bounded
-            // opportunity between chunks. One filesystem call can still block.
+            // The caller supplies either the entry API's bounded slice or
+            // explicit pass/shutdown checks. One filesystem call can still
+            // block; the check runs before each chunk, never after losing it.
             if !keep_reading() {
                 return Ok(None);
             }
@@ -186,6 +189,7 @@ struct Session {
     identity: Metadata,
     after: Option<PathBuf>,
     used_at: u64,
+    last_requested: Instant,
     // Retain the directory iterator even after EOF. Ready pages must not
     // release their directory handle while still carrying its identity.
     selection: Selection<DirectoryPaths>,
@@ -268,30 +272,47 @@ impl EnumerationCache {
     }
 
     fn prepare(&mut self, root: &Path, after: Option<&Path>) -> io::Result<()> {
+        self.prepare_at(root, after, Instant::now())
+    }
+
+    fn prepare_at(&mut self, root: &Path, after: Option<&Path>, now: Instant) -> io::Result<()> {
         let identity = self.metadata(root)?;
         self.clock = self.clock.saturating_add(1);
         if let Some(session) = self.sessions.get_mut(root)
             && session.matches(&identity, after)
         {
             session.used_at = self.clock;
+            session.last_requested = now;
             return Ok(());
         }
         // Incompatible identity/resume state is not usable read-ahead. Dropping
         // it closes only our directory handle; no filesystem entry is removed.
         self.sessions.remove(root);
-        let entries = DirectoryPaths(fs::read_dir(root)?);
         if self.sessions.len() >= MAX_LIVE_ROOTS {
-            let oldest = self.sessions.iter()
+            // LRU eviction on every miss causes permanent thrashing for a
+            // cyclic request with five large roots and four reader slots:
+            // every read is evicted before its second chunk. Keep active
+            // work, and return a resumable admission wait for this root.
+            let expired = self.sessions.iter()
+                .filter(|(_, session)| {
+                    now.saturating_duration_since(session.last_requested) >= READER_IDLE_LEASE
+                })
                 .min_by_key(|(_, session)| session.used_at)
                 .map(|(path, _)| path.clone());
-            if let Some(oldest) = oldest {
-                self.sessions.remove(&oldest);
-            }
+            let Some(expired) = expired else {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "pre-scan readers busy; unfinished preparation retained",
+                ));
+            };
+            self.sessions.remove(&expired);
         }
+        let entries = DirectoryPaths(fs::read_dir(root)?);
         self.sessions.insert(root.to_path_buf(), Session {
             identity,
             after: after.map(Path::to_path_buf),
             used_at: self.clock,
+            last_requested: now,
             selection: Selection::new(entries, after, PAGE_ENTRIES),
             prepared: None,
         });
@@ -391,9 +412,11 @@ impl PrescanCursor {
     /// Neither reading names nor yielding changes durable cursor progress.
     ///
     /// Up to four roots retain preparation concurrently. Each retains at most
-    /// one quarter of `ROOT_ENTRY_CAP` names; an evicted root is re-enumerated
-    /// from its last completed entry. Completed pages remain cached through
-    /// budget stops and rewind clones. A restart retains only completed work.
+    /// one quarter of `ROOT_ENTRY_CAP` names. When readers are occupied,
+    /// `WouldBlock` defers admission without evicting active preparation.
+    /// A reader unrequested for an hour may be reclaimed; only read-ahead is
+    /// lost. Completed pages remain cached through budget stops and rewind
+    /// clones. A restart retains only completed work.
     pub fn poll_entries_to_visit(
         &self,
         root: &Path,
@@ -609,6 +632,7 @@ mod tests {
             identity: fs::metadata(&root).unwrap(),
             after: None,
             used_at: 0,
+            last_requested: Instant::now(),
             selection: Selection::new(DirectoryPaths(fs::read_dir(&root).unwrap()), None, 2),
             prepared: None,
         });
@@ -658,18 +682,25 @@ mod tests {
     }
 
     #[test]
-    fn live_root_bound_evicts_only_read_ahead_and_an_evicted_root_starts_safely() {
+    fn live_root_bound_defers_admission_without_discarding_active_reads() {
         let temp = tempfile::tempdir().unwrap();
-        let cursor = PrescanCursor::new();
+        let mut cursor = PrescanCursor::new();
         let roots: Vec<_> = (0..=MAX_LIVE_ROOTS)
             .map(|n| make_root(temp.path(), &format!("r-{n}"), 300)).collect();
-        for root in &roots {
+        for root in &roots[..MAX_LIVE_ROOTS] {
             assert!(limited_poll(&cursor, root).unwrap().is_none());
             assert!(cursor.enumeration.lock().unwrap().sessions.len() <= MAX_LIVE_ROOTS);
         }
-        assert!(!cursor.enumeration.lock().unwrap().sessions.contains_key(&roots[0]));
+        assert_eq!(limited_poll(&cursor, &roots[MAX_LIVE_ROOTS]).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(cursor.enumeration.lock().unwrap().sessions.contains_key(&roots[0]));
         assert_eq!(cursor.position(), (None, None));
-        assert_eq!(finish(&cursor, &roots[0]).into_iter().collect::<Vec<_>>(), expected(&roots[0], 300));
+        let first: Vec<_> = finish(&cursor, &roots[0]).into_iter().collect();
+        assert_eq!(first, expected(&roots[0], 300));
+        for path in first { cursor.advance(&roots[0], &path); }
+        cursor.complete_root(&roots, &roots[0]);
+        let admitted: Vec<_> = finish(&cursor, &roots[MAX_LIVE_ROOTS]).into_iter().collect();
+        assert_eq!(admitted, expected(&roots[MAX_LIVE_ROOTS], 300));
+        assert!(cursor.enumeration.lock().unwrap().sessions.len() <= MAX_LIVE_ROOTS);
     }
 
     #[test]
@@ -781,5 +812,66 @@ mod tests {
         assert!(peer.enumeration.lock().unwrap().sessions.is_empty());
         assert_eq!(peer, before);
         assert_eq!(configured.position(), (None, None));
+    }
+
+    #[test]
+    fn cyclic_requests_exceeding_the_cache_cover_every_root_without_reader_thrashing() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots: Vec<_> = (0..MAX_LIVE_ROOTS + 3)
+            .map(|n| make_root(temp.path(), &format!("root-{n}"), 600))
+            .collect();
+        let mut cursor = PrescanCursor::new();
+        let mut completed = std::collections::BTreeSet::new();
+        let mut admission_waits = 0;
+        for _ in 0..32 {
+            for root in &roots {
+                if completed.contains(root) { continue; }
+                match limited_poll(&cursor, root) {
+                    Ok(Some(page)) => {
+                        let paths: Vec<_> = page.into_iter().collect();
+                        assert_eq!(paths, expected(root, 600));
+                        for path in paths { cursor.advance(root, &path); }
+                        assert!(completed.insert(root.clone()));
+                    }
+                    Ok(None) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        admission_waits += 1;
+                    }
+                    Err(error) => panic!("unexpected preparation error: {error}"),
+                }
+                // Both pending branches follow the production error-yield
+                // protocol. No pending root is accidentally marked complete.
+                cursor.complete_root(&roots, root);
+                assert!(cursor.enumeration.lock().unwrap().sessions.len() <= MAX_LIVE_ROOTS);
+            }
+            if completed.len() == roots.len() { break; }
+        }
+        assert!(admission_waits > 0, "the test must exercise real slot contention");
+        assert_eq!(completed.len(), roots.len(), "each root must deliver its entire page");
+        assert!(cursor.enumeration.lock().unwrap().sessions.is_empty());
+        assert!(cursor.continuations.is_empty());
+    }
+
+    #[test]
+    fn only_inactive_readers_expire_and_waits_do_not_renew_their_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots: Vec<_> = (0..=MAX_LIVE_ROOTS)
+            .map(|n| make_root(temp.path(), &format!("root-{n}"), 1))
+            .collect();
+        let now = Instant::now();
+        let mut cache = EnumerationCache::default();
+        for root in &roots[..MAX_LIVE_ROOTS] {
+            cache.prepare_at(root, None, now).unwrap();
+        }
+        let almost = now + READER_IDLE_LEASE - Duration::from_nanos(1);
+        assert_eq!(cache.prepare_at(&roots[MAX_LIVE_ROOTS], None, almost).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        // Renew the first root. The admission wait above renews no other root.
+        cache.prepare_at(&roots[0], None, almost).unwrap();
+        cache.prepare_at(&roots[MAX_LIVE_ROOTS], None, now + READER_IDLE_LEASE).unwrap();
+        assert_eq!(cache.sessions.len(), MAX_LIVE_ROOTS);
+        assert!(cache.sessions.contains_key(&roots[0]));
+        assert!(!cache.sessions.contains_key(&roots[1]));
+        assert!(cache.sessions.contains_key(&roots[MAX_LIVE_ROOTS]));
+        for root in &roots { assert!(root.join("item-0000").is_dir()); }
     }
 }
