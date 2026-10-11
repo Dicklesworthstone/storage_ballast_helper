@@ -1,4 +1,4 @@
-//! Descriptor-relative quarantine transaction bookkeeping.
+//! Descriptor-relative quarantine transactions and payload transfers.
 //!
 //! A store lock pins a directory, not its pathname. Reading recovery records or
 //! removing them through that pathname after locking can act on a replacement
@@ -7,17 +7,24 @@
 //!
 //! The lock coordinates cooperating processes. This does not authenticate
 //! manifests against a writer with access to the locked directory itself.
+//! Original parent aliases are resolved once and rejected if they lead into
+//! quarantine. Parent bindings and the captured source identity are rechecked
+//! before moving, but the last check and rename are not one conditional syscall.
+//! A namespace move after transfer does not rebase the record's stored paths;
+//! finalization preserves the record with the opened store, not its replacement.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::io;
+#[cfg(unix)]
+use std::io::Write;
 use std::path::{Component, Path};
 
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 
-use super::{QuarantineRecord, invalid};
+use super::{MAX_RECORD_BYTES, QuarantineRecord, invalid};
 #[cfg(unix)]
 use super::decode_json;
 
@@ -80,6 +87,30 @@ pub(super) struct Directory {
 }
 
 impl Directory {
+    /// Original-path aliases (including macOS /tmp) are resolved only when
+    /// opening the parent. Subsequent operations use this descriptor and one
+    /// basename, never the original parent pathname again.
+    pub(super) fn parent_of(path: &Path) -> io::Result<(Self, OsString)> {
+        let absolute = std::path::absolute(path)?;
+        let name = absolute.file_name().ok_or_else(|| invalid("payload has no basename"))?;
+        child_name(name)?;
+        let parent = absolute.parent().ok_or_else(|| invalid("payload has no parent"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open(parent)?;
+            Ok((Self { file }, name.to_os_string()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+            Err(unsupported())
+        }
+    }
+
     pub(super) fn open_store(path: &Path) -> io::Result<Self> {
         #[cfg(unix)]
         {
@@ -99,6 +130,139 @@ impl Directory {
 
     pub(super) fn from_locked(file: &File) -> io::Result<Self> {
         Ok(Self { file: file.try_clone()? })
+    }
+
+    pub(super) fn identity(&self) -> io::Result<Identity> {
+        #[cfg(unix)]
+        {
+            Ok(Identity::of(&rustix::fs::fstat(&self.file)?))
+        }
+        #[cfg(not(unix))]
+        Err(unsupported())
+    }
+
+    pub(super) fn require_path(&self, path: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(path)?;
+            let identity = self.identity()?;
+            if !metadata.is_dir() || (metadata.dev(), metadata.ino()) != (identity.device, identity.inode) {
+                return Err(invalid("quarantine transaction parent pathname changed"));
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(unsupported())
+        }
+    }
+
+    fn ancestors(&self, mut visit: impl FnMut(&Self) -> io::Result<()>) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags, openat};
+            let mut current = Self::from_locked(&self.file)?;
+            // Bound descriptors and namespace churn independently of path
+            // length. The literal '..' is internal, never a caller's child name.
+            for _ in 0..256 {
+                visit(&current)?;
+                let parent = Self { file: File::from(openat(
+                    &current.file,
+                    "..",
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?) };
+                if parent.identity()? == current.identity()? {
+                    return Ok(());
+                }
+                current = parent;
+            }
+            Err(invalid("quarantine ancestor traversal limit reached"))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &mut visit;
+            Err(unsupported())
+        }
+    }
+
+    pub(super) fn require_outside(&self, store: &Self) -> io::Result<()> {
+        let forbidden = store.identity()?;
+        self.ancestors(|directory| {
+            if directory.identity()? == forbidden {
+                Err(invalid("original payload parent resolves inside quarantine"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    pub(super) fn sync_ancestors(&self) -> io::Result<()> {
+        self.ancestors(Self::sync)
+    }
+
+    pub(super) fn create_directory(&self, name: &OsStr) -> io::Result<Self> {
+        child_name(name)?;
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, mkdirat};
+            mkdirat(&self.file, name, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
+            match self.child(name) {
+                Ok(directory) => Ok(directory),
+                Err(error) => {
+                    // Never recurse or remove an existing nonempty sibling.
+                    let _ = self.remove_directory(name);
+                    Err(error)
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        Err(unsupported())
+    }
+
+    pub(super) fn write_new_json(&self, name: &OsStr, value: &impl Serialize) -> io::Result<()> {
+        child_name(name)?;
+        let bytes = serde_json::to_vec_pretty(value)?;
+        if bytes.len() as u64 > MAX_RECORD_BYTES {
+            return Err(invalid("quarantine metadata exceeds the size limit"));
+        }
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags, fstat, openat};
+            let mut file = File::from(openat(
+                &self.file,
+                name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )?);
+            let identity = Identity::of(&fstat(&file)?);
+            let result = file.write_all(&bytes).and_then(|()| file.sync_all());
+            if result.is_err() && self.inspect(name).is_ok_and(|current| current == Some(identity)) {
+                let _ = self.remove_file(name);
+            }
+            result
+        }
+        #[cfg(not(unix))]
+        Err(unsupported())
+    }
+
+    pub(super) fn rename_noreplace(&self, name: &OsStr, to: &Self, new_name: &OsStr) -> io::Result<()> {
+        child_name(name)?;
+        child_name(new_name)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            rustix::fs::renameat_with(
+                &self.file, name, &to.file, new_name, rustix::fs::RenameFlags::NOREPLACE,
+            )?;
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = to;
+            Err(io::Error::new(io::ErrorKind::Unsupported, "atomic no-replace rename is unavailable"))
+        }
     }
 
     pub(super) fn inspect(&self, name: &OsStr) -> io::Result<Option<Identity>> {
@@ -201,11 +365,58 @@ impl Directory {
     }
 }
 
+/// One observed payload name under an opened parent. No payload file is opened
+/// (in particular, no FIFO, device or symlink target). Identity is checked again
+/// immediately before rename. This is not an atomic inode-conditional rename:
+/// an uncooperative writer to the opened source directory can still race the
+/// last check. Descriptor binding prevents ancestor replacement from redirecting
+/// the operation; the store lock supplies interoperation exclusion.
+#[derive(Debug)]
+pub(super) struct Payload {
+    pub(super) parent: Directory,
+    pub(super) name: OsString,
+    pub(super) identity: Identity,
+}
+
+impl Payload {
+    pub(super) fn observe(parent: Directory, name: OsString) -> io::Result<Option<Self>> {
+        let Some(identity) = parent.inspect(&name)? else {
+            return Ok(None);
+        };
+        if !matches!(identity.kind, Kind::File | Kind::Directory) {
+            return Err(invalid("candidate is not a regular file or directory"));
+        }
+        Ok(Some(Self { parent, name, identity }))
+    }
+
+    pub(super) fn open(path: &Path) -> io::Result<Self> {
+        let (parent, name) = Directory::parent_of(path)?;
+        Self::observe(parent, name)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "quarantine source is absent")
+        })
+    }
+
+    pub(super) fn verify(&self) -> io::Result<()> {
+        if self.parent.inspect(&self.name)? != Some(self.identity) {
+            return Err(invalid("quarantine source identity changed before rename"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn move_to(&self, parent: &Directory, name: &OsStr) -> io::Result<()> {
+        self.verify()?;
+        self.parent.rename_noreplace(&self.name, parent, name)
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::scanner::quarantine::QuarantineStore;
-    use super::super::{confined_purge, lock_store, purge_with, read_record_at};
+    use super::super::{
+        TransactionStep, confined_purge, lock_store, purge_with, quarantine_with_hook,
+        read_record_at, restore_with_hook,
+    };
     use std::fs;
     use std::time::Duration;
 
@@ -281,5 +492,192 @@ mod tests {
         }
         assert_eq!(fs::read(outside).unwrap(), b"{}\n");
         assert_eq!(directory.read_json::<QuarantineRecord>(OsStr::new("held.json")).unwrap().decision_id, "held");
+    }
+
+    #[test]
+    fn quarantine_refuses_a_replaced_store_before_moving_the_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::under(temp.path());
+        let source = temp.path().join("artifact");
+        let saved = temp.path().join("original-store");
+        fs::write(&source, b"original source").unwrap();
+        let result = quarantine_with_hook(&store, &source, "move", 15, Duration::ZERO, None, &mut |step| {
+            if step == TransactionStep::Prepared {
+                fs::rename(store.root(), &saved).unwrap();
+                fs::create_dir_all(store.root().join("move")).unwrap();
+                fs::write(store.root().join("move.pending"), b"foreign recovery").unwrap();
+                fs::write(store.root().join("move/keep"), b"foreign data").unwrap();
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(source).unwrap(), b"original source");
+        assert!(!saved.join("move.pending").exists(), "definitely unmoved reservation can be cleaned");
+        assert!(!saved.join("move").exists());
+        assert_eq!(fs::read(store.root().join("move.pending")).unwrap(), b"foreign recovery");
+        assert_eq!(fs::read(store.root().join("move/keep")).unwrap(), b"foreign data");
+        assert!(!store.root().join("move/artifact").exists());
+    }
+
+    #[test]
+    fn quarantine_publication_stays_with_the_moved_payload_after_store_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::under(temp.path());
+        let source = temp.path().join("artifact");
+        let saved = temp.path().join("original-store");
+        fs::write(&source, b"only copy").unwrap();
+        let record = quarantine_with_hook(&store, &source, "move", 9, Duration::ZERO, None, &mut |step| {
+            if step == TransactionStep::Moved {
+                fs::rename(store.root(), &saved).unwrap();
+                fs::create_dir_all(store.root().join("move")).unwrap();
+                fs::write(store.root().join("move.pending"), b"foreign pending").unwrap();
+                fs::write(store.root().join("move/keep"), b"foreign data").unwrap();
+            }
+        }).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read(saved.join("move/artifact")).unwrap(), b"only copy");
+        let persisted: QuarantineRecord = serde_json::from_slice(&fs::read(saved.join("move.json")).unwrap()).unwrap();
+        assert_eq!(persisted, record);
+        assert!(!saved.join("move.pending").exists());
+        assert_eq!(fs::read(store.root().join("move.pending")).unwrap(), b"foreign pending");
+        assert_eq!(fs::read(store.root().join("move/keep")).unwrap(), b"foreign data");
+        assert!(!store.root().join("move.json").exists(), "never publish a foreign pending file");
+    }
+
+    #[test]
+    fn a_source_replaced_during_write_ahead_preparation_is_not_moved() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::under(temp.path());
+        let source = temp.path().join("artifact");
+        let retained = temp.path().join("retained-original");
+        fs::write(&source, b"original source").unwrap();
+        let result = quarantine_with_hook(&store, &source, "move", 15, Duration::ZERO, None, &mut |step| {
+            if step == TransactionStep::Prepared {
+                fs::rename(&source, &retained).unwrap();
+                fs::write(&source, b"replacement source").unwrap();
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&source).unwrap(), b"replacement source");
+        assert_eq!(fs::read(retained).unwrap(), b"original source");
+        assert!(!store.root().join("move/artifact").exists());
+        assert!(store.root().join("move.pending").exists(), "uncertain ownership retains recovery evidence");
+        assert!(store.restore("move", false).is_err(), "replacement is not a completed undo");
+        assert_eq!(fs::read(source).unwrap(), b"replacement source");
+    }
+
+    #[test]
+    fn restore_refuses_a_replaced_decision_directory_before_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, record) = held(temp.path());
+        let saved = temp.path().join("retained-decision");
+        let result = restore_with_hook(&store, "held", false, &mut |step| {
+            if step == TransactionStep::Prepared {
+                fs::rename(store.root().join("held"), &saved).unwrap();
+                fs::create_dir(store.root().join("held")).unwrap();
+                fs::write(&record.quarantine_path, b"replacement held data").unwrap();
+            }
+        });
+        assert!(result.is_err());
+        assert!(!record.original_path.exists());
+        assert_eq!(fs::read(saved.join("artifact")).unwrap(), b"only copy");
+        assert_eq!(fs::read(&record.quarantine_path).unwrap(), b"replacement held data");
+        assert_eq!(store.record("held").unwrap(), Some(record));
+    }
+
+    #[test]
+    fn restore_cannot_be_redirected_through_a_replaced_original_parent() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::under(temp.path());
+        let project = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        let saved = temp.path().join("retained-project");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(project.join("artifact"), b"only copy").unwrap();
+        fs::write(outside.join("artifact"), b"unrelated existing file").unwrap();
+        let record = store.quarantine(&project.join("artifact"), "held", 9, Duration::ZERO, None).unwrap();
+        let result = restore_with_hook(&store, "held", true, &mut |step| {
+            if step == TransactionStep::Prepared {
+                fs::rename(&project, &saved).unwrap();
+                symlink(&outside, &project).unwrap();
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&record.quarantine_path).unwrap(), b"only copy");
+        assert_eq!(fs::read(outside.join("artifact")).unwrap(), b"unrelated existing file");
+        assert!(!outside.join("artifact.restored-held").exists());
+        assert!(!saved.join("artifact").exists());
+        assert_eq!(store.record("held").unwrap(), Some(record));
+    }
+
+    #[test]
+    fn restore_finalization_preserves_replacement_store_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, record) = held(temp.path());
+        let saved = temp.path().join("restored-store");
+        let outcome = restore_with_hook(&store, "held", false, &mut |step| {
+            if step == TransactionStep::Moved {
+                fs::rename(store.root(), &saved).unwrap();
+                fs::create_dir_all(store.root().join("held")).unwrap();
+                for name in ["held.json", "held.pending", "held.stuck", "held/keep"] {
+                    fs::write(store.root().join(name), name.as_bytes()).unwrap();
+                }
+            }
+        }).unwrap();
+        assert_eq!(outcome.restored_to, record.original_path);
+        assert_eq!(fs::read(outcome.restored_to).unwrap(), b"only copy");
+        assert!(!saved.join("held.json").exists());
+        assert!(!saved.join("held").exists());
+        for name in ["held.json", "held.pending", "held.stuck", "held/keep"] {
+            assert_eq!(fs::read(store.root().join(name)).unwrap(), name.as_bytes());
+        }
+    }
+
+    #[test]
+    fn an_original_parent_alias_into_quarantine_is_not_a_restore_destination() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::under(temp.path());
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("artifact"), b"only copy").unwrap();
+        let record = store.quarantine(&project.join("artifact"), "held", 9, Duration::ZERO, None).unwrap();
+        let redirected = store.root().join("redirected");
+        fs::create_dir(&redirected).unwrap();
+        fs::rename(&project, temp.path().join("retained-project")).unwrap();
+        symlink(&redirected, &project).unwrap();
+        assert!(store.restore("held", true).is_err());
+        assert!(!redirected.join("artifact").exists());
+        assert_eq!(fs::read(&record.quarantine_path).unwrap(), b"only copy");
+        assert_eq!(store.record("held").unwrap(), Some(record));
+    }
+
+    #[test]
+    fn stable_original_parent_aliases_support_file_and_directory_round_trips() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let actual = temp.path().join("actual");
+        let alias = temp.path().join("alias");
+        fs::create_dir(&actual).unwrap();
+        symlink(&actual, &alias).unwrap();
+        let store = QuarantineStore::under(temp.path());
+        for directory in [false, true] {
+            let name = if directory { "tree" } else { "file" };
+            let path = alias.join(name);
+            let leaf = if directory {
+                fs::create_dir(&path).unwrap();
+                path.join("leaf")
+            } else {
+                path.clone()
+            };
+            fs::write(&leaf, b"round trip").unwrap();
+            let record = store.quarantine(&path, name, 10, Duration::ZERO, None).unwrap();
+            assert_eq!(record.original_path, path);
+            assert!(!path.exists());
+            assert_eq!(store.restore(name, false).unwrap().restored_to, path);
+            assert_eq!(fs::read(leaf).unwrap(), b"round trip");
+            assert!(store.record(name).unwrap().is_none());
+        }
     }
 }
