@@ -2,16 +2,17 @@
 //!
 //! The EWMA forecaster hands out a point estimate of the seconds until a
 //! mount crosses its red threshold. Acting on a point estimate has no
-//! stated error rate. Split conformal prediction turns the history of
-//! how much the forecaster under-predicted time into a lower bound
-//! `tte_lo` that covers the true time-to-exhaustion with probability
-//! `coverage_target`, without assuming a distribution for the fill rate.
-//! Adaptive conformal inference (ACI) keeps that guarantee under
-//! distribution shift (a build burst) by moving the miscoverage level
-//! `alpha` after every resolved prediction:
+//! stated error rate. Conformal calibration uses historical overestimates
+//! of the time remaining to widen the point into a lower bound `tte_lo`.
+//! The finite-sample quantile has marginal coverage under exchangeability;
+//! overlapping online forecasts and interventions do not establish that
+//! assumption. Here `coverage_target` is an empirical calibration target,
+//! not an unconditional guarantee for the next forecast under arbitrary
+//! distribution shift. Adaptive conformal inference (ACI) adjusts `alpha`
+//! after each resolved prediction to track that target:
 //!
 //! ```text
-//! s_t        = max(0, tte_pred - tte_actual) / tte_pred        nonconformity: relative under-prediction of time
+//! s_t        = max(0, tte_pred - tte_actual) / tte_pred        relative overestimate of time remaining
 //! q          = the ceil((n + 1)(1 - alpha))-th smallest of the last n scores
 //! tte_lo     = tte_pred * (1 - q)
 //! err_t      = 1[tte_actual < tte_lo at issue]
@@ -27,6 +28,13 @@
 //! an idle mount contributes nothing (idle neutrality), and every pending
 //! prediction is discarded when an intervention (ballast release, a
 //! reclaim) changes the trajectory it was made on.
+//!
+//! A requested quantile beyond the observed ranks uses the score support's
+//! upper endpoint, 1, giving a zero lower bound. Clamping to the largest
+//! historical score would claim unsupported headroom after severe misses or
+//! with too few observations. See the finite-sample construction in
+//! Angelopoulos/Bates (arXiv:2107.07511) and ACI in Gibbs/Candes
+//! (arXiv:2106.00170); no independent-sample guarantee is asserted here.
 
 #![allow(clippy::cast_precision_loss)]
 
@@ -64,13 +72,13 @@ impl Default for ConformalConfig {
     }
 }
 
-/// Whether the bound carries its guarantee yet.
+/// Whether the configured calibration warmup has completed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoverageState {
     /// Fewer than `warmup` resolved samples: `tte_lo` is the point estimate.
     Warming,
-    /// The bound is calibrated on the resolved window.
+    /// The warmup count is met; this is not a per-forecast coverage guarantee.
     Calibrated,
 }
 
@@ -83,7 +91,7 @@ pub struct TteInterval {
     pub lo_secs: f64,
     /// The miscoverage level in force when the bound was computed.
     pub alpha: f64,
-    /// Whether the bound carries its guarantee yet.
+    /// Whether the configured calibration warmup has completed.
     pub coverage_state: CoverageState,
     /// Resolved samples in the window.
     pub samples: usize,
@@ -173,7 +181,7 @@ impl ConformalCalibrator {
     /// `Warming` below `warmup` resolved samples, else `Calibrated`.
     #[must_use]
     pub fn coverage_state(&self) -> CoverageState {
-        if self.scores.len() < self.config.warmup {
+        if self.scores.is_empty() || self.scores.len() < self.config.warmup {
             CoverageState::Warming
         } else {
             CoverageState::Calibrated
@@ -192,19 +200,28 @@ impl ConformalCalibrator {
 
     /// The `(1 - alpha)` empirical quantile of the window with the
     /// finite-sample correction `ceil((n + 1)(1 - alpha))`; `1.0` (the most
-    /// conservative bound, `tte_lo = 0`) when the window is empty.
+    /// conservative bound, `tte_lo = 0`) when the window is empty, alpha is
+    /// invalid/non-positive, or the requested rank exceeds the sample count.
+    /// At alpha >= 1 the correction is zero (the point estimate).
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn quantile(&self) -> f64 {
         let n = self.scores.len();
-        if n == 0 {
+        if n == 0 || !self.alpha.is_finite() || self.alpha <= 0.0 {
+            return 1.0;
+        }
+        if self.alpha >= 1.0 {
+            return 0.0;
+        }
+        let rank = ((n as f64 + 1.0) * (1.0 - self.alpha)).ceil();
+        if rank > n as f64 {
+            // This is the added worst-case rank, not the largest observed
+            // residual. All valid scores lie in [0, 1], so q=1 suffices.
             return 1.0;
         }
         let mut sorted: Vec<f64> = self.scores.iter().copied().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let level = (1.0 - self.alpha).clamp(0.0, 1.0);
-        // `k` is 1-based; a level of 1 (alpha <= 0) selects the maximum.
-        let k = ((n as f64 + 1.0) * level).ceil().clamp(1.0, n as f64) as usize;
+        sorted.sort_by(f64::total_cmp);
+        let k = rank.max(1.0) as usize;
         sorted[k - 1]
     }
 
@@ -289,11 +306,13 @@ impl ConformalCalibrator {
                 keep.push_back(pending);
                 continue;
             };
-            batch.resolved += 1;
-            if outcome == Some(true) {
-                batch.covered += 1;
-            } else if outcome == Some(false) {
-                batch.missed += 1;
+            if let Some(covered) = outcome {
+                batch.resolved += 1;
+                if covered {
+                    batch.covered += 1;
+                } else {
+                    batch.missed += 1;
+                }
             }
         }
         self.pending = keep;
@@ -312,10 +331,20 @@ impl ConformalCalibrator {
     /// bound issued with it held, and take the ACI step. Returns whether
     /// the bound covered the outcome (`None` for an unusable pair).
     pub fn record(&mut self, tte_pred: f64, tte_actual: f64, lo_at_issue: f64) -> Option<bool> {
-        if !tte_pred.is_finite() || tte_pred <= 0.0 || !tte_actual.is_finite() {
+        if !tte_pred.is_finite()
+            || tte_pred <= 0.0
+            || !tte_actual.is_finite()
+            || tte_actual < 0.0
+            || !lo_at_issue.is_finite()
+            || !(0.0..=tte_pred).contains(&lo_at_issue)
+            || self.config.window == 0
+            || !(0.0..=1.0).contains(&self.config.coverage_target)
+            || !self.config.gamma.is_finite()
+            || self.config.gamma < 0.0
+        {
             return None;
         }
-        let score = ((tte_pred - tte_actual.max(0.0)) / tte_pred).clamp(0.0, 1.0);
+        let score = ((tte_pred - tte_actual) / tte_pred).clamp(0.0, 1.0);
         let err = tte_actual < lo_at_issue;
         self.scores.push_back(score);
         while self.scores.len() > self.config.window {
@@ -329,7 +358,8 @@ impl ConformalCalibrator {
         let err_value = if err { 1.0 } else { 0.0 };
         // ACI: alpha drifts up while predictions are covered (the bound can
         // afford to be tighter) and down on every miss. It may leave [0, 1]
-        // briefly by design; `quantile` clamps the level it derives.
+        // briefly by design; `quantile` uses the support endpoints outside
+        // the empirical ranks rather than treating unobserved tails as known.
         self.alpha = self
             .config
             .gamma
@@ -353,6 +383,9 @@ impl ConformalCalibrator {
 
 #[cfg(test)]
 mod pending_tests;
+
+#[cfg(test)]
+mod quantile_tests;
 
 #[cfg(test)]
 mod tests {
@@ -434,7 +467,7 @@ mod tests {
         let _ = run(&mut adaptive, &mut rng_a, 1_000, |_| 1.0);
         let _ = run(&mut fixed, &mut rng_f, 1_000, |_| 1.0);
         let shifted_a = run(&mut adaptive, &mut rng_a, 100, |_| 0.5);
-        let shifted_f = run(&mut fixed, &mut rng_f, 100, |_| 0.5);
+        let shifted_f = run(&mut fixed, &mut rng_f, 100,  |_| 0.5);
         let misses_a = shifted_a.iter().filter(|c| !**c).count();
         let misses_f = shifted_f.iter().filter(|c| !**c).count();
         assert!(
@@ -470,12 +503,9 @@ mod tests {
         let _ = calibrator.record(600.0, 400.0, 600.0);
         let interval = calibrator.lower_bound(600.0);
         assert_eq!(interval.coverage_state, CoverageState::Calibrated);
-        // Every sample under-predicted by a third: the bound gives that back.
-        assert!(
-            (interval.lo_secs - 400.0).abs() < 1e-9,
-            "lo {}",
-            interval.lo_secs
-        );
+        // Five misses reduced alpha to .055. ceil(6 * .945) = 6 exceeds
+        // the five scores: the unseen tail requires a zero lower bound.
+        assert_eq!(interval.lo_secs, 0.0);
         assert_eq!(interval.samples, 5);
     }
 
@@ -506,7 +536,8 @@ mod tests {
         );
         assert_eq!(calibrator.samples(), 1);
         assert_eq!(calibrator.coverage_empirical(), Some(1.0));
-        assert_eq!(calibrator.quantile(), 0.0);
+        // One zero residual is not enough to estimate a 90% tail.
+        assert_eq!(calibrator.quantile(), 1.0);
         // A crossing resolves every pending prediction with its elapsed time.
         assert!(calibrator.enroll(t0 + Duration::from_secs(200), 300.0));
         assert!(calibrator.enroll(t0 + Duration::from_secs(250), 300.0));
@@ -515,9 +546,10 @@ mod tests {
         assert_eq!(crossed.covered + crossed.missed, 2);
         assert_eq!(calibrator.pending(), 0);
         assert_eq!(calibrator.samples(), 3);
-        // Predicted 300 s, took 150 s and 100 s: scores 0.5 and 2/3.
+        // Scores include 0.5 and 2/3, but the corrected rank still exceeds
+        // these three observations. It must not clamp to the observed max.
         let q = calibrator.quantile();
-        assert!((q - 2.0 / 3.0).abs() < 1e-9, "q {q}");
+        assert_eq!(q, 1.0);
         // An intervention drops what was pending.
         assert!(calibrator.enroll(t0 + Duration::from_secs(400), 300.0));
         assert_eq!(calibrator.discard_pending(), 1);
