@@ -217,8 +217,10 @@ impl RegretDetector {
     }
 
     /// Resolve watches: `look` reports what is at each watched path now.
-    /// Recreated entries resolve immediately; the rest resolve `clean`
-    /// when their window passes.
+    /// Recreated entries resolve immediately. A recreation first observed at or
+    /// after the deadline is `unknown`: the sighting cannot establish whether
+    /// it happened inside the window. Absent entries resolve `clean` when their
+    /// window passes. Call with the current monotonic time.
     pub fn check(
         &mut self,
         now: Instant,
@@ -231,7 +233,12 @@ impl RegretDetector {
             let age = now.saturating_duration_since(watch.deleted_at);
             let sighting = look(&watch);
             let outcome = if sighting.recreated {
-                if sighting.parent_in_use {
+                if age >= window {
+                    Some((
+                        Outcome::Unknown,
+                        "recreation first observed at or after regret window expiry",
+                    ))
+                } else if sighting.parent_in_use {
                     Some((Outcome::Regret, "recreated while a process used the parent"))
                 } else {
                     Some((
@@ -797,6 +804,120 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].outcome, Outcome::Clean);
         assert_eq!(detector.pending(), 0);
+    }
+
+    #[test]
+    fn detector_recreation_deadline_is_exclusive() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+        for (age, active_outcome) in [
+            (window - Duration::from_nanos(1), Outcome::Regret),
+            (window, Outcome::Unknown),
+            (window + Duration::from_nanos(1), Outcome::Unknown),
+            (Duration::from_hours(2), Outcome::Unknown),
+        ] {
+            for parent_in_use in [false, true] {
+                let mut detector = RegretDetector::new(window);
+                detector.watch(watch(
+                    "delayed",
+                    Path::new("/p/target"),
+                    "rust_target",
+                    t0,
+                ));
+                let outcomes = detector.check(t0 + age, |_| Sighting {
+                    recreated: true,
+                    parent_in_use,
+                });
+                assert_eq!(outcomes.len(), 1);
+                let expected = if parent_in_use {
+                    active_outcome
+                } else {
+                    Outcome::Unknown
+                };
+                assert_eq!(
+                    outcomes[0].outcome, expected,
+                    "age={age:?}, parent_in_use={parent_in_use}"
+                );
+                assert_eq!(detector.pending(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn detector_absence_remains_pending_before_expiry_and_clean_afterwards() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+        let mut detector = RegretDetector::new(window);
+        for id in ["at-deadline", "after-deadline"] {
+            detector.watch(watch(id, Path::new("/p/target"), "rust_target", t0));
+        }
+        let before = detector.check(t0 + window - Duration::from_nanos(1), |_| Sighting {
+            recreated: false,
+            parent_in_use: false,
+        });
+        assert!(before.is_empty());
+        assert_eq!(detector.pending(), 2);
+
+        let at = detector.check(t0 + window, |w| Sighting {
+            recreated: w.decision_id == "after-deadline",
+            parent_in_use: false,
+        });
+        assert_eq!(at.len(), 2);
+        let clean = at.iter().find(|o| o.decision_id == "at-deadline").unwrap();
+        assert_eq!(clean.outcome, Outcome::Clean);
+        assert_eq!(detector.pending(), 0);
+
+        detector.watch(watch("late-absence", Path::new("/p/target"), "rust_target", t0));
+        let after = detector.check(t0 + window + Duration::from_secs(1), |_| Sighting {
+            recreated: false,
+            parent_in_use: false,
+        });
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].outcome, Outcome::Clean);
+    }
+
+    #[test]
+    fn late_recreations_do_not_change_calibration_or_suspension() {
+        let t0 = Instant::now();
+        for prior_regrets in [0, 3] {
+            let mut detector = RegretDetector::new(Duration::from_secs(60));
+            let mut calibrator = RegretCalibrator::new(RegretConfig::default());
+            calibrator.record(
+                "rust_target",
+                ArtifactCertainty::Definite,
+                Outcome::Clean,
+                t0,
+            );
+            for _ in 0..prior_regrets {
+                calibrator.record(
+                    "rust_target",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    t0,
+                );
+            }
+            let before = calibrator.summary("rust_target").unwrap();
+            for id in ["late-a", "late-b", "late-c"] {
+                detector.watch(watch(id, Path::new("/p/target"), "rust_target", t0));
+            }
+            let now = t0 + Duration::from_secs(60);
+            let outcomes = detector.check(now, |_| Sighting {
+                recreated: true,
+                parent_in_use: true,
+            });
+            assert_eq!(outcomes.len(), 3);
+            for outcome in outcomes {
+                assert_eq!(outcome.outcome, Outcome::Unknown);
+                calibrator.record(
+                    &outcome.category,
+                    certainty_from_name(&outcome.certainty),
+                    outcome.outcome,
+                    now,
+                );
+            }
+            assert_eq!(calibrator.summary("rust_target").unwrap(), before);
+            assert_eq!(calibrator.suspended("rust_target", now), prior_regrets > 0);
+        }
     }
 
     #[test]
