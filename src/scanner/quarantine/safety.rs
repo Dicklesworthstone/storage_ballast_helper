@@ -19,6 +19,10 @@ use crate::core::errors::{Result, SbhError};
 
 #[path = "purge.rs"]
 mod confined_purge;
+#[path = "transaction.rs"]
+mod transaction;
+
+use transaction::Directory;
 
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 
@@ -161,6 +165,10 @@ pub(super) fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     let file = options.open(path)?;
+    decode_json(file)
+}
+
+fn decode_json<T: DeserializeOwned>(file: File) -> io::Result<T> {
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > MAX_RECORD_BYTES {
         return Err(invalid("quarantine metadata is not a bounded regular file"));
@@ -280,13 +288,65 @@ fn read_manifest(store: &QuarantineStore, id: &str) -> Result<Option<(Quarantine
 }
 
 pub(super) fn read_record(store: &QuarantineStore, id: &str) -> Result<Option<QuarantineRecord>> {
-    let Some((record, pending)) = read_manifest(store, id)? else {
+    validate_id(id).map_err(|e| SbhError::io(store.root(), e))?;
+    let root = match Directory::open_store(store.root()) {
+        Ok(root) => root,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(SbhError::io(store.root(), e)),
+    };
+    read_record_at(store, id, &root)
+}
+
+fn read_manifest_at(
+    store: &QuarantineStore,
+    id: &str,
+    root: &Directory,
+) -> Result<Option<(QuarantineRecord, bool)>> {
+    use std::ffi::OsStr;
+    validate_id(id).map_err(|e| SbhError::io(store.root(), e))?;
+    let (record, pending) = match root.read_json::<QuarantineRecord>(OsStr::new(&format!("{id}.json"))) {
+        Ok(record) => (record, false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            match root.read_json::<QuarantineRecord>(OsStr::new(&format!("{id}.pending"))) {
+                Ok(record) => (record, true),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(SbhError::io(pending_path(store, id), e)),
+            }
+        }
+        Err(e) => return Err(SbhError::io(store.record_path(id), e)),
+    };
+    validate_record(store, id, &record).map_err(|e| SbhError::io(store.record_path(id), e))?;
+    Ok(Some((record, pending)))
+}
+
+fn payload_present_at(root: &Directory, record: &QuarantineRecord) -> io::Result<bool> {
+    use std::ffi::OsStr;
+    let entry = match root.child(OsStr::new(&record.decision_id)) {
+        Ok(entry) => entry,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let name = record.original_path.file_name().ok_or_else(|| invalid("original has no basename"))?;
+    let Some(identity) = entry.inspect(name)? else {
+        return Ok(false);
+    };
+    if !identity.matches_record(record) {
+        return Err(invalid("quarantine payload identity changed; refusing transaction"));
+    }
+    Ok(true)
+}
+
+fn read_record_at(
+    store: &QuarantineStore,
+    id: &str,
+    root: &Directory,
+) -> Result<Option<QuarantineRecord>> {
+    let Some((record, pending)) = read_manifest_at(store, id, root)? else {
         return Ok(None);
     };
     if pending
-        && payload_metadata(store, &record)
+        && !payload_present_at(root, &record)
             .map_err(|e| SbhError::io(&record.quarantine_path, e))?
-            .is_none()
     {
         // The process stopped before the rename. This record is not held
         // space and never authorizes deletion of the still-live original.
@@ -408,6 +468,16 @@ fn remove_records(store: &QuarantineStore, id: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn remove_records_at(root: &Directory, id: &str) -> io::Result<()> {
+    use std::ffi::OsStr;
+    validate_id(id)?;
+    root.remove_file(OsStr::new(&format!("{id}.json")))?;
+    root.remove_file(OsStr::new(&format!("{id}.pending")))?;
+    // Stuck bookkeeping remains best-effort, as in clear_stuck.
+    let _ = root.remove_file(OsStr::new(&format!("{id}.stuck")));
+    Ok(())
+}
+
 pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
     purge_with(store, id, None, |lock, record| {
         confined_purge::remove_payload(lock, record).map(Some)
@@ -445,8 +515,9 @@ fn purge_with(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some(0)),
         Err(e) => return Err(SbhError::io(store.root(), e)),
     };
-    let Some(record) = read_record(store, id)? else {
-        store.clear_stuck(id);
+    let root = Directory::from_locked(&lock).map_err(|e| SbhError::io(store.root(), e))?;
+    let Some(record) = read_record_at(store, id, &root)? else {
+        let _ = root.remove_file(std::ffi::OsStr::new(&format!("{id}.stuck")));
         return Ok(Some(0));
     };
     if selected.is_some_and(|selected| selected != &record) {
@@ -479,9 +550,9 @@ fn purge_with(
     };
     // The confined remover synced the opened payload parent before this
     // point, including an already-absent payload from an interrupted purge.
-    remove_records(store, id).map_err(|e| SbhError::io(store.record_path(id), e))?;
-    let _ = fs::remove_dir(store.entry_dir(id));
-    lock.sync_all().map_err(|e| SbhError::io(store.root(), e))?;
+    remove_records_at(&root, id).map_err(|e| SbhError::io(store.record_path(id), e))?;
+    let _ = root.remove_directory(std::ffi::OsStr::new(id));
+    root.sync().map_err(|e| SbhError::io(store.root(), e))?;
     Ok(Some(bytes))
 }
 
