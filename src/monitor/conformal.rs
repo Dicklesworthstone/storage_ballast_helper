@@ -119,6 +119,8 @@ pub struct ConformalCalibrator {
     pending: VecDeque<Pending>,
     alpha: f64,
     resolved_total: u64,
+    last_enrolled_at: Option<Instant>,
+    last_observed_at: Option<Instant>,
 }
 
 impl ConformalCalibrator {
@@ -133,6 +135,8 @@ impl ConformalCalibrator {
             pending: VecDeque::new(),
             alpha,
             resolved_total: 0,
+            last_enrolled_at: None,
+            last_observed_at: None,
         }
     }
 
@@ -227,8 +231,19 @@ impl ConformalCalibrator {
     /// Enroll a prediction issued now. Infinite, non-positive and
     /// beyond-cap estimates are not enrolled (idle neutrality: the caller
     /// passes `None`-equivalents for mounts below the material rate).
+    /// A full pending window defers admission without evicting unresolved
+    /// forecasts. Otherwise polling faster than `horizon / window` can keep
+    /// replacing every forecast before its deadline and prevent calibration.
+    /// Duplicate or out-of-order issue times are not independent evidence.
+    /// Call `observe` before `enroll` for each new sample; both may share `now`.
     pub fn enroll(&mut self, now: Instant, tte_pred: f64) -> bool {
         if !tte_pred.is_finite() || tte_pred <= 0.0 || tte_pred > self.config.horizon_cap_secs {
+            return false;
+        }
+        if self.pending.len() >= self.config.window
+            || self.last_enrolled_at.is_some_and(|last| now <= last)
+            || self.last_observed_at.is_some_and(|last| now < last)
+        {
             return false;
         }
         let lo_at_issue = self.lower_bound(tte_pred).lo_secs;
@@ -237,11 +252,7 @@ impl ConformalCalibrator {
             tte_pred,
             lo_at_issue,
         });
-        // A pending queue bounded by the window keeps memory flat when a
-        // mount stays pressured without ever crossing.
-        while self.pending.len() > self.config.window {
-            self.pending.pop_front();
-        }
+        self.last_enrolled_at = Some(now);
         true
     }
 
@@ -249,10 +260,22 @@ impl ConformalCalibrator {
     /// `crossed` means the threshold was reached this tick, so every
     /// pending prediction learns its actual time; otherwise predictions
     /// whose own horizon has passed resolve as censored (score 0).
+    /// Repeated or out-of-order samples do not change calibration. A forecast
+    /// issued at this exact timestamp must wait for a later observation.
     pub fn observe(&mut self, now: Instant, crossed: bool) -> ResolvedBatch {
         let mut batch = ResolvedBatch::default();
+        if self.last_observed_at.is_some_and(|last| now <= last)
+            || self.last_enrolled_at.is_some_and(|last| now < last)
+        {
+            return batch;
+        }
+        self.last_observed_at = Some(now);
         let mut keep = VecDeque::with_capacity(self.pending.len());
         while let Some(pending) = self.pending.pop_front() {
+            if now <= pending.issued_at {
+                keep.push_back(pending);
+                continue;
+            }
             let elapsed = now
                 .saturating_duration_since(pending.issued_at)
                 .as_secs_f64();
@@ -323,8 +346,13 @@ impl ConformalCalibrator {
         self.pending.clear();
         self.alpha = (1.0 - self.config.coverage_target).clamp(0.0, 1.0);
         self.resolved_total = 0;
+        self.last_enrolled_at = None;
+        self.last_observed_at = None;
     }
 }
+
+#[cfg(test)]
+mod pending_tests;
 
 #[cfg(test)]
 mod tests {
