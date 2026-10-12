@@ -31,9 +31,9 @@ mod budget;
 mod placement;
 mod safety;
 
-pub(crate) use safety::remove_direct;
 pub use budget::DEFAULT_DRAIN_WORK;
 use budget::PurgeBudget;
+pub(crate) use safety::remove_direct;
 
 /// Directory under the mount's `.sbh` that holds quarantined entries.
 pub const QUARANTINE_DIR_NAME: &str = "quarantine";
@@ -505,7 +505,11 @@ impl QuarantineStore {
     /// `drain_expired` with an explicit traversal-work allowance. Very small
     /// allowances may not reach a leaf in a deep tree; increase the allowance
     /// or use explicit `purge` to finish one entry synchronously.
-    pub fn drain_expired_with_budget(&self, now_unix: u64, max_steps: usize) -> Result<DrainOutcome> {
+    pub fn drain_expired_with_budget(
+        &self,
+        now_unix: u64,
+        max_steps: usize,
+    ) -> Result<DrainOutcome> {
         let mut out = DrainOutcome::default();
         let mut budget = PurgeBudget::bounded(max_steps);
         for record in self.records()? {

@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use inotify::{EventMask, WatchDescriptor, WatchMask};
 
 use super::{
-    DirtyRootTracker, EventInvalidation, EventRateTracker, EventSourceConfig, FsEvent,
-    FsEventKind, OverflowBackoff, OverflowDecision,
+    DirtyRootTracker, EventInvalidation, EventRateTracker, EventSourceConfig, FsEvent, FsEventKind,
+    OverflowBackoff, OverflowDecision,
 };
 
 const EVENT_BUFFER_BYTES: usize = 64 * 1024;
@@ -145,7 +145,15 @@ impl LinuxInotifyBackend {
         backoff: &mut OverflowBackoff,
         now: Instant,
     ) -> EventInvalidation {
-        self.drain_with_budget(tracker, config, rates, backoff, now, DrainBudget::default(), Instant::now)
+        self.drain_with_budget(
+            tracker,
+            config,
+            rates,
+            backoff,
+            now,
+            DrainBudget::default(),
+            Instant::now,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -164,9 +172,14 @@ impl LinuxInotifyBackend {
         let mut collapsed = false;
         let mut invalidation = EventInvalidation::empty();
         loop {
-            if handled >= budget.events || clock().saturating_duration_since(started) >= budget.time {
+            if handled >= budget.events || clock().saturating_duration_since(started) >= budget.time
+            {
                 self.require_repair();
-                invalidation.mark_all_roots(config.root_paths(), "recursive inotify drain budget exhausted", true);
+                invalidation.mark_all_roots(
+                    config.root_paths(),
+                    "recursive inotify drain budget exhausted",
+                    true,
+                );
                 break;
             }
             // Alternate cleanup with incoming events. Neither a large removed
@@ -209,11 +222,17 @@ impl LinuxInotifyBackend {
                 // descheduling or kernel work consumed the remaining time.
                 if clock().saturating_duration_since(started) >= budget.time {
                     self.require_repair();
-                    invalidation.mark_all_roots(config.root_paths(), "recursive inotify drain budget exhausted", true);
+                    invalidation.mark_all_roots(
+                        config.root_paths(),
+                        "recursive inotify drain budget exhausted",
+                        true,
+                    );
                     break;
                 }
             }
-            let Some(event) = self.pending_events.pop_front() else { break };
+            let Some(event) = self.pending_events.pop_front() else {
+                break;
+            };
             handled += 1;
             let mut next = self.handle_event(tracker, config, rates, backoff, now, &event);
             if collapsed {
@@ -226,7 +245,11 @@ impl LinuxInotifyBackend {
                 // memory also bounds the subsequent project-root mapping work.
                 invalidation.dirty_paths.clear();
                 invalidation.dirty_roots.clear();
-                invalidation.mark_all_roots(config.root_paths(), "recursive inotify dirty-path budget exceeded", true);
+                invalidation.mark_all_roots(
+                    config.root_paths(),
+                    "recursive inotify dirty-path budget exceeded",
+                    true,
+                );
                 collapsed = true;
             }
         }
@@ -235,11 +258,12 @@ impl LinuxInotifyBackend {
 
     fn read_event_batch(&mut self) -> io::Result<()> {
         let events = self.inotify.read_events(&mut self.buffer)?;
-        self.pending_events.extend(events.map(|event| LinuxInotifyEvent {
-            watch: event.wd,
-            mask: event.mask,
-            name: event.name.map(PathBuf::from),
-        }));
+        self.pending_events
+            .extend(events.map(|event| LinuxInotifyEvent {
+                watch: event.wd,
+                mask: event.mask,
+                name: event.name.map(PathBuf::from),
+            }));
         Ok(())
     }
 
@@ -273,7 +297,11 @@ impl LinuxInotifyBackend {
             }
             self.require_repair();
             let mut invalidation = EventInvalidation::empty();
-            invalidation.mark_all_roots(config.root_paths(), "recursive inotify event has no live watch", true);
+            invalidation.mark_all_roots(
+                config.root_paths(),
+                "recursive inotify event has no live watch",
+                true,
+            );
             return invalidation;
         };
         if self.path_is_retiring(&base) {
@@ -293,8 +321,13 @@ impl LinuxInotifyBackend {
             });
         }
         rates.record(&base, now);
-        let path = event.name.as_ref().map_or_else(|| base.clone(), |name| base.join(name));
-        if event.mask.intersects(EventMask::IGNORED | EventMask::UNMOUNT | EventMask::DELETE_SELF | EventMask::MOVE_SELF) {
+        let path = event
+            .name
+            .as_ref()
+            .map_or_else(|| base.clone(), |name| base.join(name));
+        if event.mask.intersects(
+            EventMask::IGNORED | EventMask::UNMOUNT | EventMask::DELETE_SELF | EventMask::MOVE_SELF,
+        ) {
             // Every descendant's stored pathname also became untrustworthy.
             self.forget_subtree(&base, rates);
             self.require_repair();
@@ -309,15 +342,25 @@ impl LinuxInotifyBackend {
             path: Some(path.clone()),
         });
         if event.mask.contains(EventMask::ISDIR)
-            && event.mask.intersects(EventMask::CREATE | EventMask::MOVED_TO | EventMask::DELETE | EventMask::MOVED_FROM)
+            && event.mask.intersects(
+                EventMask::CREATE | EventMask::MOVED_TO | EventMask::DELETE | EventMask::MOVED_FROM,
+            )
         {
             self.require_repair();
             invalidation.generation_bump = true;
-            invalidation.reasons.insert("recursive inotify directory topology changed".to_string());
-            if event.mask.intersects(EventMask::DELETE | EventMask::MOVED_FROM) {
+            invalidation
+                .reasons
+                .insert("recursive inotify directory topology changed".to_string());
+            if event
+                .mask
+                .intersects(EventMask::DELETE | EventMask::MOVED_FROM)
+            {
                 self.forget_subtree(&path, rates);
             }
-            if event.mask.intersects(EventMask::CREATE | EventMask::MOVED_TO) {
+            if event
+                .mask
+                .intersects(EventMask::CREATE | EventMask::MOVED_TO)
+            {
                 // The directory might already contain arbitrarily many nested
                 // directories. Do not recursively enumerate them in a drain:
                 // report the gap and close it in the paced watch-plan repair.
@@ -342,7 +385,9 @@ impl LinuxInotifyBackend {
         // Quiet steady state must not walk every path's ancestors merely to
         // discover there is no retirement work at all.
         !self.retiring_roots.is_empty()
-            && path.ancestors().any(|ancestor| self.retiring_roots.contains_key(ancestor))
+            && path
+                .ancestors()
+                .any(|ancestor| self.retiring_roots.contains_key(ancestor))
     }
 
     fn forget_subtree(&mut self, path: &Path, rates: &mut EventRateTracker) {
@@ -364,7 +409,11 @@ impl LinuxInotifyBackend {
     }
 
     fn retire_one(&mut self, rates: &mut EventRateTracker) {
-        let Some(root) = self.retiring_roots.first_key_value().map(|(root, _)| root.clone()) else {
+        let Some(root) = self
+            .retiring_roots
+            .first_key_value()
+            .map(|(root, _)| root.clone())
+        else {
             return;
         };
         if let Some(path) = first_subtree_path(&self.path_watches, &root) {
@@ -400,11 +449,17 @@ impl LinuxInotifyBackend {
             return Err(io::Error::other("recursive inotify watch budget exhausted"));
         }
         let watch = self.inotify.watches().add(path, watch_mask())?;
-        if self.watch_paths.get(&watch).is_some_and(|previous| previous != path) {
+        if self
+            .watch_paths
+            .get(&watch)
+            .is_some_and(|previous| previous != path)
+        {
             // inotify watches inodes, so two aliases may yield the same watch.
             // A single-path map cannot promise coverage of both spellings.
             self.require_repair();
-            return Err(io::Error::other("recursive inotify watch aliases an existing directory"));
+            return Err(io::Error::other(
+                "recursive inotify watch aliases an existing directory",
+            ));
         }
         self.path_watches.insert(path.to_path_buf(), watch.clone());
         self.watch_paths.insert(watch, path.to_path_buf());
@@ -430,7 +485,10 @@ fn remove_subtree_entries<T>(entries: &mut BTreeMap<PathBuf, T>, root: &Path) ->
         .take_while(|(path, _)| path.starts_with(root))
         .map(|(path, _)| path.clone())
         .collect();
-    paths.into_iter().filter_map(|path| entries.remove(&path)).collect()
+    paths
+        .into_iter()
+        .filter_map(|path| entries.remove(&path))
+        .collect()
 }
 
 fn watch_mask() -> WatchMask {
@@ -462,54 +520,89 @@ fn event_kind(mask: EventMask) -> FsEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::core::config::ScannerConfig;
-    use crate::scanner::events::{EventBackendKind, ScannerEventSource, WATCH_REPAIR_INTERVAL, WATCH_REPLAN_INTERVAL};
+    use crate::scanner::events::{
+        EventBackendKind, ScannerEventSource, WATCH_REPAIR_INTERVAL, WATCH_REPLAN_INTERVAL,
+    };
     use crate::scanner::index::{
         CandidateIndexRecord, CandidateSafetyState, IndexedEntryKind, IndexedIdentity,
         IndexedPruneDecision, ScannerCandidateIndex, ScannerIndexContext,
     };
     use crate::scanner::patterns::StructuralSignals;
+    use std::fs;
 
     fn fixture() -> (tempfile::TempDir, EventSourceConfig) {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap().join("root");
         fs::create_dir(&root).unwrap();
-        let config = EventSourceConfig::from_scanner_config(&[root], &ScannerConfig {
-            event_watch_budget: 16,
-            ..ScannerConfig::default()
-        });
+        let config = EventSourceConfig::from_scanner_config(
+            &[root],
+            &ScannerConfig {
+                event_watch_budget: 16,
+                ..ScannerConfig::default()
+            },
+        );
         (temp, config)
     }
 
-    fn event(backend: &LinuxInotifyBackend, base: &Path, mask: EventMask, name: Option<&str>) -> LinuxInotifyEvent {
+    fn event(
+        backend: &LinuxInotifyBackend,
+        base: &Path,
+        mask: EventMask,
+        name: Option<&str>,
+    ) -> LinuxInotifyEvent {
         LinuxInotifyEvent {
-            watch: backend.watch_paths.iter().find(|(_, path)| path.as_path() == base).unwrap().0.clone(),
+            watch: backend
+                .watch_paths
+                .iter()
+                .find(|(_, path)| path.as_path() == base)
+                .unwrap()
+                .0
+                .clone(),
             mask,
             name: name.map(PathBuf::from),
         }
     }
 
-    fn handle(backend: &mut LinuxInotifyBackend, config: &EventSourceConfig, event: &LinuxInotifyEvent) -> EventInvalidation {
+    fn handle(
+        backend: &mut LinuxInotifyBackend,
+        config: &EventSourceConfig,
+        event: &LinuxInotifyEvent,
+    ) -> EventInvalidation {
         backend.handle_event(
-            &DirtyRootTracker::new(config.root_paths()), config,
-            &mut EventRateTracker::default(), &mut OverflowBackoff::default(), Instant::now(), event,
+            &DirtyRootTracker::new(config.root_paths()),
+            config,
+            &mut EventRateTracker::default(),
+            &mut OverflowBackoff::default(),
+            Instant::now(),
+            event,
         )
     }
 
-    fn drain(backend: &mut LinuxInotifyBackend, config: &EventSourceConfig, budget: DrainBudget) -> EventInvalidation {
+    fn drain(
+        backend: &mut LinuxInotifyBackend,
+        config: &EventSourceConfig,
+        budget: DrainBudget,
+    ) -> EventInvalidation {
         let now = Instant::now();
         backend.drain_with_budget(
-            &DirtyRootTracker::new(config.root_paths()), config,
-            &mut EventRateTracker::default(), &mut OverflowBackoff::default(), now, budget, || now,
+            &DirtyRootTracker::new(config.root_paths()),
+            config,
+            &mut EventRateTracker::default(),
+            &mut OverflowBackoff::default(),
+            now,
+            budget,
+            || now,
         )
     }
 
     fn finish_retirements(backend: &mut LinuxInotifyBackend, rates: &mut EventRateTracker) {
         while !backend.retiring_roots.is_empty() {
-            let before = backend.watch_paths.len() + rates.rates.len() + backend.retiring_roots.len();
+            let before =
+                backend.watch_paths.len() + rates.rates.len() + backend.retiring_roots.len();
             backend.retire_one(rates);
-            let after = backend.watch_paths.len() + rates.rates.len() + backend.retiring_roots.len();
+            let after =
+                backend.watch_paths.len() + rates.rates.len() + backend.retiring_roots.len();
             assert!(after < before, "each retirement step must make progress");
         }
     }
@@ -534,15 +627,25 @@ mod tests {
         let sibling = root.join("child-other");
         fs::create_dir_all(&deep).unwrap();
         fs::create_dir(&sibling).unwrap();
-        let mut backend = LinuxInotifyBackend::start(&[root.clone(), child.clone(), deep, sibling.clone()], 4).unwrap();
-        let changed = event(&backend, root, EventMask::MOVED_FROM | EventMask::ISDIR, Some("child"));
+        let mut backend =
+            LinuxInotifyBackend::start(&[root.clone(), child.clone(), deep, sibling.clone()], 4)
+                .unwrap();
+        let changed = event(
+            &backend,
+            root,
+            EventMask::MOVED_FROM | EventMask::ISDIR,
+            Some("child"),
+        );
         let invalidation = handle(&mut backend, &config, &changed);
         assert!(invalidation.requires_index_generation_bump());
         assert!(backend.needs_repair());
         assert_eq!(backend.watched_dirs().count(), 2);
         assert!(backend.watched_dirs().any(|path| path == sibling));
         assert!(!backend.watched_dirs().any(|path| path.starts_with(&child)));
-        assert!(child.is_dir(), "handling an event must not delete filesystem data");
+        assert!(
+            child.is_dir(),
+            "handling an event must not delete filesystem data"
+        );
     }
 
     #[test]
@@ -581,7 +684,12 @@ mod tests {
         let root = &config.root_paths()[0];
         let mut backend = LinuxInotifyBackend::start(std::slice::from_ref(root), 16).unwrap();
         fs::create_dir_all(root.join("new/deep/deeper")).unwrap();
-        let created = event(&backend, root, EventMask::CREATE | EventMask::ISDIR, Some("new"));
+        let created = event(
+            &backend,
+            root,
+            EventMask::CREATE | EventMask::ISDIR,
+            Some("new"),
+        );
         let invalidation = handle(&mut backend, &config, &created);
         assert!(backend.needs_repair());
         assert!(invalidation.requires_index_generation_bump());
@@ -597,7 +705,12 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         let mut backend = LinuxInotifyBackend::start(std::slice::from_ref(root), 16).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("new")).unwrap();
-        let created = event(&backend, root, EventMask::CREATE | EventMask::ISDIR, Some("new"));
+        let created = event(
+            &backend,
+            root,
+            EventMask::CREATE | EventMask::ISDIR,
+            Some("new"),
+        );
         let invalidation = handle(&mut backend, &config, &created);
         assert!(invalidation.reason_summary().contains("add-watch failed"));
         assert!(invalidation.requires_index_generation_bump());
@@ -617,12 +730,19 @@ mod tests {
         let mut backoff = OverflowBackoff::default();
         let now = Instant::now();
         let mut index = ScannerCandidateIndex::new(ScannerIndexContext {
-            root_fingerprint: "watch-root".into(), config_fingerprint: "watch-config".into(),
+            root_fingerprint: "watch-root".into(),
+            config_fingerprint: "watch-config".into(),
         });
-        backend.handle_event(&tracker, &config, &mut rates, &mut backoff, now, &overflow).apply_to_index(&mut index);
+        backend
+            .handle_event(&tracker, &config, &mut rates, &mut backoff, now, &overflow)
+            .apply_to_index(&mut index);
         index.upsert(CandidateIndexRecord {
             path: root.join("target"),
-            identity: IndexedIdentity { device_id: 1, inode: 2, kind: IndexedEntryKind::Directory },
+            identity: IndexedIdentity {
+                device_id: 1,
+                inode: 2,
+                kind: IndexedEntryKind::Directory,
+            },
             parent_identity: None,
             parent_mtime_nanos: None,
             candidate_mtime_nanos: 0,
@@ -637,8 +757,18 @@ mod tests {
             structural_signals: StructuralSignals::default(),
         });
         assert_eq!(index.ranked_records(std::time::UNIX_EPOCH, 1).len(), 1);
-        let coalesced = backend.handle_event(&tracker, &config, &mut rates, &mut backoff, now + Duration::from_secs(1), &overflow);
-        assert!(!coalesced.requires_reconciliation(), "expensive scans remain deferred");
+        let coalesced = backend.handle_event(
+            &tracker,
+            &config,
+            &mut rates,
+            &mut backoff,
+            now + Duration::from_secs(1),
+            &overflow,
+        );
+        assert!(
+            !coalesced.requires_reconciliation(),
+            "expensive scans remain deferred"
+        );
         coalesced.apply_to_index(&mut index);
         assert!(index.ranked_records(std::time::UNIX_EPOCH, 1).is_empty());
         assert_eq!(backoff.total(), 2);
@@ -651,10 +781,18 @@ mod tests {
         let root = &config.root_paths()[0];
         let mut backend = LinuxInotifyBackend::start(std::slice::from_ref(root), 16).unwrap();
         for n in 0..7 {
-            let next = event(&backend, root, EventMask::MODIFY, Some(&format!("item-{n}")));
+            let next = event(
+                &backend,
+                root,
+                EventMask::MODIFY,
+                Some(&format!("item-{n}")),
+            );
             backend.pending_events.push_back(next);
         }
-        let budget = DrainBudget { events: 3, ..DrainBudget::default() };
+        let budget = DrainBudget {
+            events: 3,
+            ..DrainBudget::default()
+        };
         let first = drain(&mut backend, &config, budget);
         assert_eq!(backend.pending_events.len(), 4);
         assert_eq!(first.dirty_paths().len(), 3);
@@ -668,7 +806,11 @@ mod tests {
         let mut union = first.dirty_paths().clone();
         union.extend(second.dirty_paths().iter().cloned());
         union.extend(third.dirty_paths().iter().cloned());
-        assert_eq!(union.len(), 7, "no buffered event may vanish at a budget stop");
+        assert_eq!(
+            union.len(),
+            7,
+            "no buffered event may vanish at a budget stop"
+        );
     }
 
     #[test]
@@ -677,16 +819,31 @@ mod tests {
         let root = &config.root_paths()[0];
         let mut backend = LinuxInotifyBackend::start(std::slice::from_ref(root), 16).unwrap();
         for n in 0..5 {
-            let next = event(&backend, root, EventMask::MODIFY, Some(&format!("item-{n}")));
+            let next = event(
+                &backend,
+                root,
+                EventMask::MODIFY,
+                Some(&format!("item-{n}")),
+            );
             backend.pending_events.push_back(next);
         }
         let now = Instant::now();
         let mut step = 0;
         let invalidation = backend.drain_with_budget(
-            &DirtyRootTracker::new(config.root_paths()), &config,
-            &mut EventRateTracker::default(), &mut OverflowBackoff::default(), now,
-            DrainBudget { time: Duration::from_millis(2), ..DrainBudget::default() },
-            || { let time = now + Duration::from_millis(step); step += 1; time },
+            &DirtyRootTracker::new(config.root_paths()),
+            &config,
+            &mut EventRateTracker::default(),
+            &mut OverflowBackoff::default(),
+            now,
+            DrainBudget {
+                time: Duration::from_millis(2),
+                ..DrainBudget::default()
+            },
+            || {
+                let time = now + Duration::from_millis(step);
+                step += 1;
+                time
+            },
         );
         assert_eq!(backend.pending_events.len(), 4);
         assert_eq!(invalidation.dirty_paths().len(), 1);
@@ -700,10 +857,22 @@ mod tests {
         let root = &config.root_paths()[0];
         let mut backend = LinuxInotifyBackend::start(std::slice::from_ref(root), 16).unwrap();
         for n in 0..20 {
-            let next = event(&backend, root, EventMask::MODIFY, Some(&format!("item-{n}")));
+            let next = event(
+                &backend,
+                root,
+                EventMask::MODIFY,
+                Some(&format!("item-{n}")),
+            );
             backend.pending_events.push_back(next);
         }
-        let invalidation = drain(&mut backend, &config, DrainBudget { dirty_paths: 3, ..DrainBudget::default() });
+        let invalidation = drain(
+            &mut backend,
+            &config,
+            DrainBudget {
+                dirty_paths: 3,
+                ..DrainBudget::default()
+            },
+        );
         assert!(backend.pending_events.is_empty());
         assert!(invalidation.dirty_paths().is_empty());
         assert!(invalidation.dirty_roots().contains(root));
@@ -732,8 +901,20 @@ mod tests {
         let mut rates = EventRateTracker::default();
         rates.record(root, now);
         rates.record(&child, now);
-        let removed = event(&backend, root, EventMask::DELETE | EventMask::ISDIR, Some("child"));
-        backend.handle_event(&DirtyRootTracker::new(config.root_paths()), &config, &mut rates, &mut OverflowBackoff::default(), now, &removed);
+        let removed = event(
+            &backend,
+            root,
+            EventMask::DELETE | EventMask::ISDIR,
+            Some("child"),
+        );
+        backend.handle_event(
+            &DirtyRootTracker::new(config.root_paths()),
+            &config,
+            &mut rates,
+            &mut OverflowBackoff::default(),
+            now,
+            &removed,
+        );
         finish_retirements(&mut backend, &mut rates);
         assert_eq!(rates.tracked_dirs(), 1);
         assert!(rates.rate(root, now) > 0.0);
@@ -746,7 +927,10 @@ mod tests {
         let (_temp, config) = fixture();
         let now = Instant::now();
         let mut source = ScannerEventSource::start_at(config, now);
-        assert_eq!(source.capability().selected_backend, EventBackendKind::RecursiveInotify);
+        assert_eq!(
+            source.capability().selected_backend,
+            EventBackendKind::RecursiveInotify
+        );
         assert!(!source.should_replan(now + WATCH_REPAIR_INTERVAL));
         assert!(source.should_replan(now + WATCH_REPLAN_INTERVAL));
         if let super::super::EventSourceBackend::RecursiveInotify(backend) = &mut source.backend {
@@ -755,7 +939,10 @@ mod tests {
         assert!(!source.should_replan(now + WATCH_REPAIR_INTERVAL - Duration::from_nanos(1)));
         assert!(source.should_replan(now + WATCH_REPAIR_INTERVAL));
         let mut repaired = source.drain_at(now + WATCH_REPAIR_INTERVAL);
-        repaired.merge(super::super::watch_rebuild::finish_rebuild(&mut source, now + WATCH_REPAIR_INTERVAL));
+        repaired.merge(super::super::watch_rebuild::finish_rebuild(
+            &mut source,
+            now + WATCH_REPAIR_INTERVAL,
+        ));
         assert!(repaired.requires_index_generation_bump());
         assert_eq!(source.stats().replans, 1);
         assert!(source.capability().complete);
@@ -767,12 +954,24 @@ mod tests {
         let (_temp, config) = fixture();
         let now = Instant::now();
         for scanner in [
-            ScannerConfig { event_source: crate::core::config::ScannerEventSourceMode::ReconciliationOnly, ..ScannerConfig::default() },
-            ScannerConfig { event_watch_budget: 0, ..ScannerConfig::default() },
+            ScannerConfig {
+                event_source: crate::core::config::ScannerEventSourceMode::ReconciliationOnly,
+                ..ScannerConfig::default()
+            },
+            ScannerConfig {
+                event_watch_budget: 0,
+                ..ScannerConfig::default()
+            },
         ] {
-            let source = ScannerEventSource::start_at(EventSourceConfig::from_scanner_config(config.root_paths(), &scanner), now);
+            let source = ScannerEventSource::start_at(
+                EventSourceConfig::from_scanner_config(config.root_paths(), &scanner),
+                now,
+            );
             assert!(!source.should_replan(now + Duration::from_hours(24)));
-            assert_eq!(source.capability().selected_backend, EventBackendKind::ReconciliationOnly);
+            assert_eq!(
+                source.capability().selected_backend,
+                EventBackendKind::ReconciliationOnly
+            );
         }
     }
 
@@ -785,7 +984,8 @@ mod tests {
         entries.insert(PathBuf::from("/cache/project-00007/target/deep"), 20_000);
         entries.insert(PathBuf::from("/cache/project-00007/target-other"), 20_001);
         entries.insert(PathBuf::from("/cache/project-00007/target.other"), 20_002);
-        let removed = remove_subtree_entries(&mut entries, Path::new("/cache/project-00007/target"));
+        let removed =
+            remove_subtree_entries(&mut entries, Path::new("/cache/project-00007/target"));
         assert_eq!(removed, vec![7, 20_000]);
         assert_eq!(entries.len(), 16_385);
         assert!(entries.contains_key(Path::new("/cache/project-00007/target-other")));
@@ -832,7 +1032,11 @@ mod tests {
             }
             backend.forget_subtree(&group, &mut rates);
             assert_eq!(backend.watched_dirs().count(), 2, "revocation is immediate");
-            assert_eq!(backend.watch_paths.len(), 8, "physical retirement is deferred");
+            assert_eq!(
+                backend.watch_paths.len(),
+                8,
+                "physical retirement is deferred"
+            );
             finish_retirements(&mut backend, &mut rates);
             assert_eq!(backend.watch_paths.len(), 2);
             assert_eq!(backend.path_watches.len(), 2);
@@ -858,12 +1062,32 @@ mod tests {
         let mut rates = EventRateTracker::default();
         backend.forget_subtree(&group, &mut rates);
         for n in 0..10 {
-            let incoming = event(&backend, root, EventMask::MODIFY, Some(&format!("live-{n}")));
+            let incoming = event(
+                &backend,
+                root,
+                EventMask::MODIFY,
+                Some(&format!("live-{n}")),
+            );
             backend.pending_events.push_back(incoming);
         }
-        let invalidation = drain(&mut backend, &config, DrainBudget { events: 6, ..DrainBudget::default() });
-        assert_eq!(backend.watch_paths.len(), 62, "only three physical retirements fit");
-        assert_eq!(backend.pending_events.len(), 7, "three live events also make progress");
+        let invalidation = drain(
+            &mut backend,
+            &config,
+            DrainBudget {
+                events: 6,
+                ..DrainBudget::default()
+            },
+        );
+        assert_eq!(
+            backend.watch_paths.len(),
+            62,
+            "only three physical retirements fit"
+        );
+        assert_eq!(
+            backend.pending_events.len(),
+            7,
+            "three live events also make progress"
+        );
         assert_eq!(invalidation.dirty_paths().len(), 3);
         assert!(invalidation.requires_index_generation_bump());
         assert_eq!(backend.watched_dirs().count(), 1);
@@ -889,12 +1113,26 @@ mod tests {
         let now = Instant::now();
         let mut step = 0;
         let invalidation = backend.drain_with_budget(
-            &DirtyRootTracker::new(config.root_paths()), &config,
-            &mut rates, &mut OverflowBackoff::default(), now,
-            DrainBudget { time: Duration::from_millis(2), ..DrainBudget::default() },
-            || { let time = now + Duration::from_millis(step); step += 1; time },
+            &DirtyRootTracker::new(config.root_paths()),
+            &config,
+            &mut rates,
+            &mut OverflowBackoff::default(),
+            now,
+            DrainBudget {
+                time: Duration::from_millis(2),
+                ..DrainBudget::default()
+            },
+            || {
+                let time = now + Duration::from_millis(step);
+                step += 1;
+                time
+            },
         );
-        assert_eq!(backend.watch_paths.len(), 3, "deadline permits one removal, not the whole tree");
+        assert_eq!(
+            backend.watch_paths.len(),
+            3,
+            "deadline permits one removal, not the whole tree"
+        );
         assert!(!backend.retiring_roots.is_empty());
         assert!(invalidation.requires_index_generation_bump());
         let resumed = drain(&mut backend, &config, DrainBudget::default());
@@ -910,12 +1148,21 @@ mod tests {
         let group = root.join("group");
         fs::create_dir_all(group.join("new")).unwrap();
         let mut backend = LinuxInotifyBackend::start(&[root.clone(), group.clone()], 16).unwrap();
-        let stale = event(&backend, &group, EventMask::CREATE | EventMask::ISDIR, Some("new"));
+        let stale = event(
+            &backend,
+            &group,
+            EventMask::CREATE | EventMask::ISDIR,
+            Some("new"),
+        );
         let mut rates = EventRateTracker::default();
         backend.forget_subtree(&group, &mut rates);
         let invalidation = backend.handle_event(
-            &DirtyRootTracker::new(config.root_paths()), &config,
-            &mut rates, &mut OverflowBackoff::default(), Instant::now(), &stale,
+            &DirtyRootTracker::new(config.root_paths()),
+            &config,
+            &mut rates,
+            &mut OverflowBackoff::default(),
+            Instant::now(),
+            &stale,
         );
         assert!(invalidation.requires_index_generation_bump());
         assert_eq!(rates.tracked_dirs(), 0);
@@ -937,7 +1184,10 @@ mod tests {
         let mut rates = EventRateTracker::default();
         backend.forget_subtree(&old, &mut rates);
         assert_eq!(backend.watched_dirs().count(), 1);
-        assert!(backend.add_watch(&new).is_err(), "revocation alone has not freed a kernel watch");
+        assert!(
+            backend.add_watch(&new).is_err(),
+            "revocation alone has not freed a kernel watch"
+        );
         finish_retirements(&mut backend, &mut rates);
         backend.add_watch(&new).unwrap();
         assert_eq!(backend.watch_paths.len(), 2);
@@ -953,7 +1203,8 @@ mod tests {
         let b = group.join("b");
         fs::create_dir_all(&a).unwrap();
         fs::create_dir_all(&b).unwrap();
-        let mut backend = LinuxInotifyBackend::start(&[root.clone(), a.clone(), b.clone()], 3).unwrap();
+        let mut backend =
+            LinuxInotifyBackend::start(&[root.clone(), a.clone(), b.clone()], 3).unwrap();
         let mut rates = EventRateTracker::default();
         for n in 0..1024 {
             backend.forget_subtree(&root.join(format!("unwatched-{n}")), &mut rates);
@@ -986,14 +1237,28 @@ mod tests {
         backend.forget_subtree(&group, &mut EventRateTracker::default());
         let incoming = event(&backend, root, EventMask::MODIFY, Some("live-project"));
         backend.pending_events.push_back(incoming);
-        let budget = DrainBudget { events: 1, ..DrainBudget::default() };
+        let budget = DrainBudget {
+            events: 1,
+            ..DrainBudget::default()
+        };
         drain(&mut backend, &config, budget);
         assert_eq!(backend.watch_paths.len(), 3);
         assert_eq!(backend.pending_events.len(), 1);
         // Even an intervening zero-work poll must not reset the turn.
-        drain(&mut backend, &config, DrainBudget { events: 0, ..budget });
+        drain(
+            &mut backend,
+            &config,
+            DrainBudget {
+                events: 0,
+                ..budget
+            },
+        );
         let next = drain(&mut backend, &config, budget);
-        assert_eq!(backend.watch_paths.len(), 3, "the next step belongs to the live event");
+        assert_eq!(
+            backend.watch_paths.len(),
+            3,
+            "the next step belongs to the live event"
+        );
         assert!(backend.pending_events.is_empty());
         assert!(next.dirty_paths().contains(&root.join("live-project")));
         assert!(!backend.retiring_roots.is_empty());
@@ -1005,7 +1270,8 @@ mod tests {
         let missing = config.root_paths()[0].join("not-present");
         let error = LinuxInotifyBackend::start_with_check(&[missing], 1, || {
             Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
@@ -1015,19 +1281,35 @@ mod tests {
         let root = &config.root_paths()[0];
         let mut checks = 0;
         let error = LinuxInotifyBackend::start_with_check(
-            &[root.clone(), root.join("not-present")], 2, || {
+            &[root.clone(), root.join("not-present")],
+            2,
+            || {
                 checks += 1;
                 if checks == 4 {
-                    Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled after first watch"))
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "cancelled after first watch",
+                    ))
                 } else {
                     Ok(())
                 }
             },
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert_eq!(checks, 4);
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "must stop before the missing-path syscall");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::Interrupted,
+            "must stop before the missing-path syscall"
+        );
         assert!(root.is_dir());
-        assert_eq!(LinuxInotifyBackend::start(std::slice::from_ref(root), 1).unwrap().watched_dirs().count(), 1);
+        assert_eq!(
+            LinuxInotifyBackend::start(std::slice::from_ref(root), 1)
+                .unwrap()
+                .watched_dirs()
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1037,11 +1319,15 @@ mod tests {
         let error = LinuxInotifyBackend::start_with_check(config.root_paths(), 1, || {
             checks += 1;
             if checks == 3 {
-                Err(io::Error::new(io::ErrorKind::TimedOut, "last syscall exhausted the deadline"))
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "last syscall exhausted the deadline",
+                ))
             } else {
                 Ok(())
             }
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert_eq!(checks, 3);
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
@@ -1057,7 +1343,8 @@ mod tests {
         let backend = LinuxInotifyBackend::start_with_check(&paths, 2, || {
             checks += 1;
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(checks, 1 + 2 * paths.len());
         assert_eq!(backend.watch_paths.len(), 2);
         assert_eq!(backend.path_watches.len(), 2);

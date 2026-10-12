@@ -213,7 +213,10 @@ impl EventSourcePlan {
         // A directory whose children were never enumerated needs its subtree
         // reconciled, unless a dirty ancestor already covers it.
         for truncated in &enumeration.truncated {
-            if !truncated.ancestors().any(|ancestor| dirty_roots.contains(ancestor)) {
+            if !truncated
+                .ancestors()
+                .any(|ancestor| dirty_roots.contains(ancestor))
+            {
                 dirty_roots.insert(truncated.clone());
             }
         }
@@ -562,7 +565,9 @@ impl EventInvalidation {
     fn deferred_overflow() -> Self {
         let mut invalidation = Self::empty();
         invalidation.generation_bump = true;
-        invalidation.reasons.insert("Overflow (reconciliation deferred)".to_string());
+        invalidation
+            .reasons
+            .insert("Overflow (reconciliation deferred)".to_string());
         invalidation
     }
 
@@ -820,7 +825,8 @@ impl ScannerEventSource {
                             capability.watched_dirs = 0;
                             capability.frontier_dirs = 0;
                             capability.dirty_roots = config.root_paths().to_vec();
-                            capability.recursive_inotify = recursive_inotify_probe(EventBackendKind::ReconciliationOnly);
+                            capability.recursive_inotify =
+                                recursive_inotify_probe(EventBackendKind::ReconciliationOnly);
                             capability.reason = format!("recursive inotify unavailable: {err}");
                             pending.mark_all_roots(
                                 config.root_paths(),
@@ -911,7 +917,8 @@ impl ScannerEventSource {
                     self.capability.complete = false;
                     self.capability.frontier_dirs = 0;
                     self.capability.dirty_roots = self.config.root_paths().to_vec();
-                    self.capability.reason = "recursive inotify coverage changed; timed repair pending".to_string();
+                    self.capability.reason =
+                        "recursive inotify coverage changed; timed repair pending".to_string();
                 }
             }
             EventSourceBackend::ReconciliationOnly => {}
@@ -1778,7 +1785,12 @@ mod tests {
         }
     }
 
-    fn replay_fixture(root: &Path) -> (ScannerCandidateIndex, crate::scanner::index::CandidateIndexRecord) {
+    fn replay_fixture(
+        root: &Path,
+    ) -> (
+        ScannerCandidateIndex,
+        crate::scanner::index::CandidateIndexRecord,
+    ) {
         use crate::scanner::index::{
             CandidateIndexRecord, CandidateSafetyState, IndexedEntryKind, IndexedIdentity,
             IndexedPruneDecision, ScannerIndexContext,
@@ -1789,7 +1801,11 @@ mod tests {
         });
         let candidate = CandidateIndexRecord {
             path: root.join("proj/target"),
-            identity: IndexedIdentity { device_id: 7, inode: 1, kind: IndexedEntryKind::Directory },
+            identity: IndexedIdentity {
+                device_id: 7,
+                inode: 1,
+                kind: IndexedEntryKind::Directory,
+            },
             parent_identity: None,
             parent_mtime_nanos: None,
             candidate_mtime_nanos: 200,
@@ -1816,9 +1832,17 @@ mod tests {
     fn ordinary_events_revoke_opaque_hints_even_before_scan_scope_resolution() {
         let root = PathBuf::from("/tmp/root");
         let tracker = DirtyRootTracker::new(std::slice::from_ref(&root));
-        for kind in [FsEventKind::Create, FsEventKind::Modify, FsEventKind::Remove, FsEventKind::Rename] {
+        for kind in [
+            FsEventKind::Create,
+            FsEventKind::Modify,
+            FsEventKind::Remove,
+            FsEventKind::Rename,
+        ] {
             let (mut index, candidate) = replay_fixture(&root);
-            assert_eq!(index.ranked_records(SystemTime::UNIX_EPOCH, 1)[0].path, candidate.path);
+            assert_eq!(
+                index.ranked_records(SystemTime::UNIX_EPOCH, 1)[0].path,
+                candidate.path
+            );
             let invalidation = tracker.apply_event(FsEvent {
                 kind,
                 path: Some(candidate.path.join("debug/deps/changed.o")),
@@ -1871,7 +1895,12 @@ mod tests {
         assert!(!invalidation.requires_index_generation_bump());
         invalidation.apply_to_index(&mut index);
         assert_eq!(index.get(candidate.identity).unwrap().score, None);
-        assert_eq!(index.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX).len(), 1);
+        assert_eq!(
+            index
+                .ranked_records(SystemTime::UNIX_EPOCH, usize::MAX)
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1880,12 +1909,21 @@ mod tests {
         let (mut index, candidate) = replay_fixture(&root);
         EventInvalidation::empty().apply_to_index(&mut index);
         assert_eq!(index.get(candidate.identity), Some(&candidate));
-        assert_eq!(index.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX).len(), 2);
+        assert_eq!(
+            index
+                .ranked_records(SystemTime::UNIX_EPOCH, usize::MAX)
+                .len(),
+            2
+        );
         let deferred = EventInvalidation::deferred_overflow();
         assert!(!deferred.requires_reconciliation());
         deferred.apply_to_index(&mut index);
         assert_eq!(index.event_generation(), 1);
-        assert!(index.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX).is_empty());
+        assert!(
+            index
+                .ranked_records(SystemTime::UNIX_EPOCH, usize::MAX)
+                .is_empty()
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1905,21 +1943,42 @@ mod tests {
         // No event source is alive here. A complete subscription installed
         // afterwards cannot retroactively observe this descendant write.
         fs::write(&object, b"rebuilt while the daemon was stopped").unwrap();
-        assert_eq!(fs::metadata(&candidate.path).unwrap().modified().unwrap(), before);
-        let (mut loaded, status) = ScannerCandidateIndex::load_checkpoint(&checkpoint, index.context().clone());
+        assert_eq!(
+            fs::metadata(&candidate.path).unwrap().modified().unwrap(),
+            before
+        );
+        let (mut loaded, status) =
+            ScannerCandidateIndex::load_checkpoint(&checkpoint, index.context().clone());
         assert_eq!(status, ScannerIndexLoadStatus::Loaded);
-        assert_eq!(loaded.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX).len(), 2);
+        assert_eq!(
+            loaded
+                .ranked_records(SystemTime::UNIX_EPOCH, usize::MAX)
+                .len(),
+            2
+        );
         let t0 = Instant::now();
-        let mut source = ScannerEventSource::start_at(event_config(std::slice::from_ref(&root), 16), t0);
-        assert_eq!(source.capability().selected_backend, EventBackendKind::RecursiveInotify);
+        let mut source =
+            ScannerEventSource::start_at(event_config(std::slice::from_ref(&root), 16), t0);
+        assert_eq!(
+            source.capability().selected_backend,
+            EventBackendKind::RecursiveInotify
+        );
         assert!(source.capability().complete);
         let startup = source.drain_at(t0);
         assert!(startup.dirty_roots().contains(&root));
         assert!(startup.requires_index_generation_bump());
         assert!(startup.reason_summary().contains("BackendRestart"));
         startup.apply_to_index(&mut loaded);
-        assert!(loaded.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX).is_empty());
-        assert_eq!(loaded.len(), 2, "keep discovery hints and backoff, not old replay authority");
+        assert!(
+            loaded
+                .ranked_records(SystemTime::UNIX_EPOCH, usize::MAX)
+                .is_empty()
+        );
+        assert_eq!(
+            loaded.len(),
+            2,
+            "keep discovery hints and backoff, not old replay authority"
+        );
         // Startup revocation is consumed once. A quiet steady-state poll
         // does not invalidate newly reconciled candidates all over again.
         loaded.upsert(candidate.clone());
@@ -1927,7 +1986,13 @@ mod tests {
         assert!(!quiet.requires_reconciliation());
         assert!(!quiet.requires_index_generation_bump());
         quiet.apply_to_index(&mut loaded);
-        assert_eq!(loaded.ranked_records(SystemTime::UNIX_EPOCH, 1)[0].identity, candidate.identity);
-        assert_eq!(fs::read(&object).unwrap(), b"rebuilt while the daemon was stopped");
+        assert_eq!(
+            loaded.ranked_records(SystemTime::UNIX_EPOCH, 1)[0].identity,
+            candidate.identity
+        );
+        assert_eq!(
+            fs::read(&object).unwrap(),
+            b"rebuilt while the daemon was stopped"
+        );
     }
 }

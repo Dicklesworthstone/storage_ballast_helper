@@ -113,13 +113,34 @@ fn malformed_outcomes_do_not_change_scores_coverage_or_adaptive_alpha() {
 #[test]
 fn invalid_configuration_cannot_produce_resolved_calibration_evidence() {
     let configs = [
-        ConformalConfig { window: 0, ..ConformalConfig::default() },
-        ConformalConfig { coverage_target: f64::NAN, ..ConformalConfig::default() },
-        ConformalConfig { coverage_target: -0.1, ..ConformalConfig::default() },
-        ConformalConfig { coverage_target: 1.1, ..ConformalConfig::default() },
-        ConformalConfig { gamma: f64::NAN, ..ConformalConfig::default() },
-        ConformalConfig { gamma: f64::INFINITY, ..ConformalConfig::default() },
-        ConformalConfig { gamma: -0.1, ..ConformalConfig::default() },
+        ConformalConfig {
+            window: 0,
+            ..ConformalConfig::default()
+        },
+        ConformalConfig {
+            coverage_target: f64::NAN,
+            ..ConformalConfig::default()
+        },
+        ConformalConfig {
+            coverage_target: -0.1,
+            ..ConformalConfig::default()
+        },
+        ConformalConfig {
+            coverage_target: 1.1,
+            ..ConformalConfig::default()
+        },
+        ConformalConfig {
+            gamma: f64::NAN,
+            ..ConformalConfig::default()
+        },
+        ConformalConfig {
+            gamma: f64::INFINITY,
+            ..ConformalConfig::default()
+        },
+        ConformalConfig {
+            gamma: -0.1,
+            ..ConformalConfig::default()
+        },
     ];
     for config in configs {
         let mut c = ConformalCalibrator::new(config);
@@ -175,7 +196,10 @@ fn requiring_more_coverage_never_increases_the_reported_time_remaining() {
     for alpha in [1.0, 0.75, 0.5, 0.25, 0.10, 0.01, 0.0, -0.5] {
         c.alpha = alpha;
         let current = c.lower_bound(100.0).lo_secs;
-        assert!(current <= previous, "alpha={alpha}: {previous} -> {current}");
+        assert!(
+            current <= previous,
+            "alpha={alpha}: {previous} -> {current}"
+        );
         previous = current;
     }
     assert_eq!(previous, 0.0);

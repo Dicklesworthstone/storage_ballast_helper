@@ -136,7 +136,9 @@ impl Control {
             .unwrap_or(u64::MAX - 1)
             .saturating_add(1);
         // Repeated requests never extend the first request's time budget.
-        let _ = self.stop_started.compare_exchange(0, started, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self
+            .stop_started
+            .compare_exchange(0, started, Ordering::AcqRel, Ordering::Acquire);
         self.admission.fetch_or(CLOSED, Ordering::AcqRel);
     }
 
@@ -172,7 +174,9 @@ impl Control {
         self.close_admission();
         let result = if panicked { PANICKED } else { EXITED };
         // A late exit must not overwrite an earlier supervision timeout.
-        let _ = self.result.compare_exchange(ACTIVE, result, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self
+            .result
+            .compare_exchange(ACTIVE, result, Ordering::AcqRel, Ordering::Acquire);
         self.notify_supervisor();
     }
 
@@ -334,7 +338,9 @@ mod tests {
 
     fn event(id: usize) -> ActivityEvent {
         // Audit/control-adjacent records do not pass through diagnostic coalescing.
-        ActivityEvent::ConfigReloaded { details: id.to_string() }
+        ActivityEvent::ConfigReloaded {
+            details: id.to_string(),
+        }
     }
 
     fn next_data(control: &Control, rx: &Receiver<Message>) -> Message {
@@ -372,9 +378,18 @@ mod tests {
         producer.join().unwrap();
         assert_eq!(rx.len(), 1);
         assert_eq!(handle.dropped_events(), 0);
-        assert_eq!(handle.shutdown_status(), LoggerShutdownStatus::StopRequested);
-        assert!(matches!(next_data(&handle.control, &rx).event, ActivityEvent::ConfigReloaded { .. }));
-        assert!(matches!(next_data(&handle.control, &rx).event, ActivityEvent::Shutdown));
+        assert_eq!(
+            handle.shutdown_status(),
+            LoggerShutdownStatus::StopRequested
+        );
+        assert!(matches!(
+            next_data(&handle.control, &rx).event,
+            ActivityEvent::ConfigReloaded { .. }
+        ));
+        assert!(matches!(
+            next_data(&handle.control, &rx).event,
+            ActivityEvent::Shutdown
+        ));
     }
 
     #[test]
@@ -387,12 +402,20 @@ mod tests {
         handle.send(event(2));
         handle.shutdown();
         let messages: Vec<_> = (0..3).map(|_| next_data(&handle.control, &rx)).collect();
-        assert_eq!(messages.iter().map(|m| m.mirror).collect::<Vec<_>>(), vec![false, true, false]);
+        assert_eq!(
+            messages.iter().map(|m| m.mirror).collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
         for (id, message) in messages.into_iter().enumerate() {
-            let ActivityEvent::ConfigReloaded { details } = message.event else { panic!("lost audit event") };
+            let ActivityEvent::ConfigReloaded { details } = message.event else {
+                panic!("lost audit event")
+            };
             assert_eq!(details, id.to_string());
         }
-        assert!(matches!(next_data(&handle.control, &rx).event, ActivityEvent::Shutdown));
+        assert!(matches!(
+            next_data(&handle.control, &rx).event,
+            ActivityEvent::Shutdown
+        ));
     }
 
     #[test]
@@ -402,15 +425,31 @@ mod tests {
         handle.shutdown();
         assert!(handle.control.admit().is_none());
         // Consume the shutdown wake; the in-flight producer still owns work.
-        assert!(matches!(handle.control.receive(&rx, Duration::ZERO).unwrap().event, ActivityEvent::MirrorJsonl(_)));
-        assert!(matches!(handle.control.receive(&rx, Duration::ZERO), Err(RecvTimeoutError::Timeout)));
-        handle.tx.try_send(Message { event: event(7), mirror: false }).unwrap();
+        assert!(matches!(
+            handle.control.receive(&rx, Duration::ZERO).unwrap().event,
+            ActivityEvent::MirrorJsonl(_)
+        ));
+        assert!(matches!(
+            handle.control.receive(&rx, Duration::ZERO),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        handle
+            .tx
+            .try_send(Message {
+                event: event(7),
+                mirror: false,
+            })
+            .unwrap();
         drop(admission);
-        let ActivityEvent::ConfigReloaded { details } = next_data(&handle.control, &rx).event else {
+        let ActivityEvent::ConfigReloaded { details } = next_data(&handle.control, &rx).event
+        else {
             panic!("shutdown overtook an admitted audit event");
         };
         assert_eq!(details, "7");
-        assert!(matches!(next_data(&handle.control, &rx).event, ActivityEvent::Shutdown));
+        assert!(matches!(
+            next_data(&handle.control, &rx).event,
+            ActivityEvent::Shutdown
+        ));
     }
 
     #[test]
@@ -424,15 +463,23 @@ mod tests {
         let message = next_data(&handle.control, &rx);
         assert!(message.mirror);
         assert_eq!(rx.len(), 0);
-        assert!(handle.control.mirror(), "closed admission refuses later mode changes");
+        assert!(
+            handle.control.mirror(),
+            "closed admission refuses later mode changes"
+        );
         assert_eq!(handle.dropped_events(), 0);
-        assert!(matches!(next_data(&handle.control, &rx).event, ActivityEvent::Shutdown));
+        assert!(matches!(
+            next_data(&handle.control, &rx).event,
+            ActivityEvent::Shutdown
+        ));
     }
 
     #[test]
     fn transport_loss_is_counted_but_controls_do_not_consume_data_capacity() {
         let (handle, rx) = fixture(1);
-        for id in 0..4 { handle.send(event(id)); }
+        for id in 0..4 {
+            handle.send(event(id));
+        }
         assert_eq!(handle.dropped_events(), 3);
         handle.mirror_jsonl(true);
         handle.shutdown();
@@ -446,30 +493,43 @@ mod tests {
         handle.send(event(0));
         assert_eq!(handle.dropped_events(), 1);
         handle.shutdown();
-        assert!(matches!(handle.control.receive(&rx, Duration::ZERO).unwrap().event, ActivityEvent::Shutdown));
+        assert!(matches!(
+            handle.control.receive(&rx, Duration::ZERO).unwrap().event,
+            ActivityEvent::Shutdown
+        ));
     }
 
     #[test]
     fn concurrent_producers_are_drained_once_before_shutdown() {
         let (handle, rx) = fixture(128);
-        let producers: Vec<_> = (0..8).map(|producer| {
-            let handle = handle.clone();
-            thread::spawn(move || {
-                for n in 0..16 { handle.send(event(producer * 16 + n)); }
+        let producers: Vec<_> = (0..8)
+            .map(|producer| {
+                let handle = handle.clone();
+                thread::spawn(move || {
+                    for n in 0..16 {
+                        handle.send(event(producer * 16 + n));
+                    }
+                })
             })
-        }).collect();
-        for producer in producers { producer.join().unwrap(); }
+            .collect();
+        for producer in producers {
+            producer.join().unwrap();
+        }
         handle.shutdown();
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..128 {
-            let ActivityEvent::ConfigReloaded { details } = next_data(&handle.control, &rx).event else {
+            let ActivityEvent::ConfigReloaded { details } = next_data(&handle.control, &rx).event
+            else {
                 panic!("shutdown ended before admitted producers were drained");
             };
             assert!(seen.insert(details));
         }
         assert_eq!(seen.len(), 128);
         assert_eq!(handle.dropped_events(), 0);
-        assert!(matches!(next_data(&handle.control, &rx).event, ActivityEvent::Shutdown));
+        assert!(matches!(
+            next_data(&handle.control, &rx).event,
+            ActivityEvent::Shutdown
+        ));
     }
 
     #[test]
@@ -485,12 +545,20 @@ mod tests {
     #[test]
     fn writer_exit_and_panic_are_distinct_from_a_shutdown_request() {
         let normal = Arc::new(Control::new());
-        spawn_worker(Arc::clone(&normal), || {}).unwrap().join().unwrap();
+        spawn_worker(Arc::clone(&normal), || {})
+            .unwrap()
+            .join()
+            .unwrap();
         assert_eq!(normal.status(), LoggerShutdownStatus::WriterExited);
         normal.request_shutdown();
         assert_eq!(normal.status(), LoggerShutdownStatus::WriterExited);
         let failed = Arc::new(Control::new());
-        assert!(spawn_worker(Arc::clone(&failed), || panic!("injected writer failure")).unwrap().join().is_err());
+        assert!(
+            spawn_worker(Arc::clone(&failed), || panic!("injected writer failure"))
+                .unwrap()
+                .join()
+                .is_err()
+        );
         assert_eq!(failed.status(), LoggerShutdownStatus::WriterPanicked);
         assert!(failed.admit().is_none());
     }
@@ -498,7 +566,10 @@ mod tests {
     #[test]
     fn shutdown_budget_starts_at_the_first_request_not_logger_creation() {
         let control = Control::new();
-        assert_eq!(control.shutdown_elapsed_at(control.born + Duration::from_secs(3600)), None);
+        assert_eq!(
+            control.shutdown_elapsed_at(control.born + Duration::from_secs(3600)),
+            None
+        );
         control.request_shutdown();
         let first = control.stop_started.load(Ordering::Acquire);
         assert_ne!(first, 0);
@@ -508,13 +579,19 @@ mod tests {
         assert_eq!(control.stop_started.load(Ordering::Acquire), first);
         let started = control.born + Duration::from_nanos(first - 1);
         assert_eq!(control.shutdown_elapsed_at(started), Some(Duration::ZERO));
-        assert_eq!(control.shutdown_elapsed_at(started + SHUTDOWN_WAIT), Some(SHUTDOWN_WAIT));
+        assert_eq!(
+            control.shutdown_elapsed_at(started + SHUTDOWN_WAIT),
+            Some(SHUTDOWN_WAIT)
+        );
         let just_before = started + SHUTDOWN_WAIT - Duration::from_nanos(1);
         assert_eq!(
             SHUTDOWN_WAIT.saturating_sub(control.shutdown_elapsed_at(just_before).unwrap()),
             Duration::from_nanos(1)
         );
-        assert_eq!(control.shutdown_elapsed_at(control.born), Some(Duration::ZERO));
+        assert_eq!(
+            control.shutdown_elapsed_at(control.born),
+            Some(Duration::ZERO)
+        );
     }
 
     // Release an injected stuck operation even if its test assertion panics.
@@ -531,7 +608,8 @@ mod tests {
         let waiter = thread::spawn(move || {
             let _ = done_tx.send(join.join());
         });
-        let result = done_rx.recv_timeout(Duration::from_secs(5))
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(5))
             .expect("lifecycle join is still waiting on the injected blocked writer");
         waiter.join().unwrap();
         result
@@ -553,19 +631,29 @@ mod tests {
             // Models a stuck initialization/write call. It deliberately does
             // not consult shutdown until the test lets the operation return.
             release_rx.recv().unwrap();
-            let ActivityEvent::ConfigReloaded { details } = next_data(&worker_control, &worker_rx).event else {
+            let ActivityEvent::ConfigReloaded { details } =
+                next_data(&worker_control, &worker_rx).event
+            else {
                 panic!("queued audit work was replaced by shutdown");
             };
             assert_eq!(details, "17");
             worker_processed.fetch_add(1, Ordering::Release);
-            assert!(matches!(next_data(&worker_control, &worker_rx).event, ActivityEvent::Shutdown));
-        }).unwrap();
+            assert!(matches!(
+                next_data(&worker_control, &worker_rx).event,
+                ActivityEvent::Shutdown
+            ));
+        })
+        .unwrap();
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(handle.shutdown_status(), LoggerShutdownStatus::Running);
         handle.shutdown();
         join_with_test_deadline(supervisor).unwrap();
         assert_eq!(handle.shutdown_status(), LoggerShutdownStatus::TimedOut);
-        assert_eq!(rx.len(), 1, "timeout did not consume or confirm the pending event");
+        assert_eq!(
+            rx.len(),
+            1,
+            "timeout did not consume or confirm the pending event"
+        );
         assert_eq!(processed.load(Ordering::Acquire), 0);
         handle.send(event(18));
         assert_eq!(rx.len(), 1, "admission stays closed after supervision ends");
@@ -573,9 +661,17 @@ mod tests {
         while handle.control.supervisor_rx.try_recv().is_ok() {}
         release.0.try_send(()).unwrap();
         // WriterExit publishes its result before this completion notification.
-        handle.control.supervisor_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle
+            .control
+            .supervisor_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
         assert_eq!(processed.load(Ordering::Acquire), 1);
-        assert_eq!(handle.shutdown_status(), LoggerShutdownStatus::TimedOut, "late completion cannot rewrite the timeout result");
+        assert_eq!(
+            handle.shutdown_status(),
+            LoggerShutdownStatus::TimedOut,
+            "late completion cannot rewrite the timeout result"
+        );
         assert!(handle.control.admit().is_none());
     }
 
@@ -594,11 +690,17 @@ mod tests {
             let mut seen = 0;
             loop {
                 match worker_control.receive(&rx, Duration::from_secs(1)) {
-                    Ok(Message { event: ActivityEvent::ConfigReloaded { details }, .. }) => {
+                    Ok(Message {
+                        event: ActivityEvent::ConfigReloaded { details },
+                        ..
+                    }) => {
                         assert_eq!(details, "23");
                         seen += 1;
                     }
-                    Ok(Message { event: ActivityEvent::MirrorJsonl(_), .. }) => {}
+                    Ok(Message {
+                        event: ActivityEvent::MirrorJsonl(_),
+                        ..
+                    }) => {}
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
                     other => panic!("unexpected event before producer disconnect: {other:?}"),
@@ -608,7 +710,8 @@ mod tests {
             at_flush_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             worker_flushed.store(true, Ordering::Release);
-        }).unwrap();
+        })
+        .unwrap();
         // No explicit shutdown call: all producers dropping is also a real
         // logger exit path and must arm the budget before final backend I/O.
         drop(handle);
@@ -618,7 +721,10 @@ mod tests {
         assert!(!flushed.load(Ordering::Acquire));
         while control.supervisor_rx.try_recv().is_ok() {}
         release.0.try_send(()).unwrap();
-        control.supervisor_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        control
+            .supervisor_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
         assert!(flushed.load(Ordering::Acquire));
         assert_eq!(control.status(), LoggerShutdownStatus::TimedOut);
     }
@@ -634,14 +740,19 @@ mod tests {
         let worker_flushed = Arc::clone(&flushed);
         let supervisor = spawn_worker(Arc::clone(&handle.control), move || {
             for expected in 0..2 {
-                let ActivityEvent::ConfigReloaded { details } = next_data(&control, &rx).event else {
+                let ActivityEvent::ConfigReloaded { details } = next_data(&control, &rx).event
+                else {
                     panic!("shutdown lost queued work");
                 };
                 assert_eq!(details, expected.to_string());
             }
-            assert!(matches!(next_data(&control, &rx).event, ActivityEvent::Shutdown));
+            assert!(matches!(
+                next_data(&control, &rx).event,
+                ActivityEvent::Shutdown
+            ));
             worker_flushed.store(true, Ordering::Release);
-        }).unwrap();
+        })
+        .unwrap();
         join_with_test_deadline(supervisor).unwrap();
         assert!(flushed.load(Ordering::Acquire));
         assert_eq!(handle.shutdown_status(), LoggerShutdownStatus::WriterExited);
@@ -659,12 +770,18 @@ mod tests {
         // before the old, on-stamped batch reached the writer.
         handle.control.wake_rx.try_recv().unwrap();
         assert!(handle.control.receive(&rx, Duration::ZERO).unwrap().mirror);
-        assert!(handle.control.wake_rx.is_empty(), "no repeated mode resets inside a batch");
+        assert!(
+            handle.control.wake_rx.is_empty(),
+            "no repeated mode resets inside a batch"
+        );
         assert!(handle.control.receive(&rx, Duration::ZERO).unwrap().mirror);
         let idle = handle.control.receive(&rx, Duration::ZERO).unwrap();
         assert!(matches!(idle.event, ActivityEvent::MirrorJsonl(false)));
         assert!(!idle.mirror);
         assert!(rx.is_empty());
-        assert!(matches!(handle.control.receive(&rx, Duration::ZERO), Err(RecvTimeoutError::Timeout)));
+        assert!(matches!(
+            handle.control.receive(&rx, Duration::ZERO),
+            Err(RecvTimeoutError::Timeout)
+        ));
     }
 }

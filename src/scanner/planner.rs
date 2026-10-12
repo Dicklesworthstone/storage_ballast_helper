@@ -103,7 +103,9 @@ fn rejected_observations(candidates: &[CandidacyScore]) -> Vec<bool> {
             groups.unite(index, previous);
         }
     }
-    let roots: Vec<_> = (0..candidates.len()).map(|index| groups.root(index)).collect();
+    let roots: Vec<_> = (0..candidates.len())
+        .map(|index| groups.root(index))
+        .collect();
     let mut protected = vec![false; candidates.len()];
     for (index, candidate) in candidates.iter().enumerate() {
         if hard_veto(candidate) {
@@ -220,12 +222,22 @@ mod tests {
         let req = request(Some(10));
         // Demonstrate the actual old optimizer's failure on this same input.
         let (old, _) = optimization::plan_batch(candidates.clone(), &req);
-        assert!(old.iter().any(|candidate| candidate.path == Path::new("/cache/tree")));
+        assert!(
+            old.iter()
+                .any(|candidate| candidate.path == Path::new("/cache/tree"))
+        );
         let (chosen, plan) = plan_batch(candidates, &req);
-        let paths: BTreeSet<_> = chosen.iter().map(|candidate| candidate.path.as_path()).collect();
-        assert_eq!(paths, BTreeSet::from([
-            Path::new("/cache/tree/safe"), Path::new("/cache/tree-other"),
-        ]));
+        let paths: BTreeSet<_> = chosen
+            .iter()
+            .map(|candidate| candidate.path.as_path())
+            .collect();
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                Path::new("/cache/tree/safe"),
+                Path::new("/cache/tree-other"),
+            ])
+        );
         assert_eq!(plan.planned_bytes, 10);
         assert_eq!(plan.top_n_bytes, 10);
         assert!(plan.target_met);
@@ -263,7 +275,10 @@ mod tests {
             candidate("/alias/b/deep", 100, Some((7, 3))),
             candidate("/independent", 9, None),
         ];
-        assert_eq!(rejected_observations(&candidates), vec![true, true, true, true, true, true, false]);
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, true, true, true, true, false]
+        );
         let (chosen, plan) = plan_batch(candidates, &request(Some(10)));
         assert_eq!(chosen.len(), 1);
         assert_eq!(chosen[0].path, Path::new("/independent"));
@@ -279,7 +294,10 @@ mod tests {
             candidate("/elsewhere/same-tree", 1000, Some((7, 2))),
             candidate("/cache/tree/safe", 5, Some((7, 3))),
         ];
-        assert_eq!(rejected_observations(&candidates), vec![true, true, true, false]);
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, true, false]
+        );
         let (chosen, plan) = plan_batch(candidates, &request(Some(6)));
         assert_eq!(chosen.len(), 1);
         assert_eq!(chosen[0].path, Path::new("/cache/tree/safe"));
@@ -289,9 +307,13 @@ mod tests {
 
     #[test]
     fn suspension_is_a_hard_boundary_at_every_pressure_level() {
-        for level in [PressureLevel::Green, PressureLevel::Yellow, PressureLevel::Orange,
-            PressureLevel::Red, PressureLevel::Critical]
-        {
+        for level in [
+            PressureLevel::Green,
+            PressureLevel::Yellow,
+            PressureLevel::Orange,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
             let mut suspended = candidate("/cache/tree/suspended", 1, None);
             suspended.decision.category_suspended = true;
             suspended.decision.action = DecisionAction::Keep;
@@ -300,11 +322,14 @@ mod tests {
             suspended.decision.posterior_abandoned = f64::NAN;
             let mut req = request(Some(8));
             req.level = level;
-            let (chosen, plan) = plan_batch(vec![
-                suspended,
-                candidate("/cache/tree", 1000, None),
-                candidate("/independent", 7, None),
-            ], &req);
+            let (chosen, plan) = plan_batch(
+                vec![
+                    suspended,
+                    candidate("/cache/tree", 1000, None),
+                    candidate("/independent", 7, None),
+                ],
+                &req,
+            );
             assert_eq!(chosen.len(), 1);
             assert_eq!(chosen[0].path, Path::new("/independent"));
             assert_eq!(plan.planned_bytes, 7);
@@ -332,8 +357,16 @@ mod tests {
         let other_device = candidate("/other-device", 3, Some((8, 1)));
         let mut other_kind = candidate("/other-kind", 4, Some((7, 1)));
         other_kind.identity.as_mut().unwrap().kind = FsEntryKind::File;
-        let candidates = vec![blocked, other_device, other_kind, candidate("/unknown", 5, None)];
-        assert_eq!(rejected_observations(&candidates), vec![true, false, false, false]);
+        let candidates = vec![
+            blocked,
+            other_device,
+            other_kind,
+            candidate("/unknown", 5, None),
+        ];
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, false, false, false]
+        );
         let (chosen, plan) = plan_batch(candidates, &request(None));
         assert_eq!(chosen.len(), 3);
         assert_eq!(plan.planned_bytes, 12);
@@ -353,7 +386,10 @@ mod tests {
         sibling.path = path(b"/cache/\xff-other");
         let distinct = candidate("/cache/�", 4, None);
         let candidates = vec![blocked, nested, sibling, distinct];
-        assert_eq!(rejected_observations(&candidates), vec![true, true, false, false]);
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, false, false]
+        );
         assert_eq!(plan_batch(candidates, &request(None)).1.planned_bytes, 7);
     }
 
@@ -363,7 +399,9 @@ mod tests {
     fn reference_rejections(candidates: &[CandidacyScore]) -> Vec<bool> {
         let same = |left: usize, right: usize| {
             candidates[left].path == candidates[right].path
-                || candidates[left].identity.is_some_and(|id| candidates[right].identity == Some(id))
+                || candidates[left]
+                    .identity
+                    .is_some_and(|id| candidates[right].identity == Some(id))
         };
         let expand = |marked: &mut Vec<bool>| loop {
             let mut changed = false;
@@ -375,7 +413,9 @@ mod tests {
                     }
                 }
             }
-            if !changed { break; }
+            if !changed {
+                break;
+            }
         };
         let mut protected: Vec<_> = candidates.iter().map(hard_veto).collect();
         expand(&mut protected);
@@ -383,7 +423,8 @@ mod tests {
         for (left, candidate) in candidates.iter().enumerate() {
             for (right, scope) in candidates.iter().enumerate() {
                 if protected[right]
-                    && (candidate.path.starts_with(&scope.path) || scope.path.starts_with(&candidate.path))
+                    && (candidate.path.starts_with(&scope.path)
+                        || scope.path.starts_with(&candidate.path))
                 {
                     rejected[left] = true;
                 }
@@ -395,7 +436,15 @@ mod tests {
 
     #[test]
     fn public_plans_match_exhaustive_admission_under_permutation() {
-        let names = ["/p/a", "/p/a/child", "/p/a-other", "/p/b", "/p/b/child", "/q/a", "/q/b"];
+        let names = [
+            "/p/a",
+            "/p/a/child",
+            "/p/a-other",
+            "/p/b",
+            "/p/b/child",
+            "/q/a",
+            "/q/b",
+        ];
         let mut seed = 0x91e1_0da5_34bf_0821u64;
         let mut next = || {
             seed ^= seed << 13;
@@ -404,20 +453,24 @@ mod tests {
             seed
         };
         for trial in 0..256 {
-            let mut candidates: Vec<_> = (0..12).map(|_| {
-                let path = names[(next() % names.len() as u64) as usize];
-                let identity = (next() % 3 != 0).then(|| (7 + next() % 2, next() % 5));
-                let mut candidate = candidate(path, 1 + next() % 100, identity);
-                candidate.vetoed = next() % 7 == 0;
-                candidate.decision.category_suspended = next() % 13 == 0;
-                candidate
-            }).collect();
+            let mut candidates: Vec<_> = (0..12)
+                .map(|_| {
+                    let path = names[(next() % names.len() as u64) as usize];
+                    let identity = (next() % 3 != 0).then(|| (7 + next() % 2, next() % 5));
+                    let mut candidate = candidate(path, 1 + next() % 100, identity);
+                    candidate.vetoed = next() % 7 == 0;
+                    candidate.decision.category_suspended = next() % 13 == 0;
+                    candidate
+                })
+                .collect();
             let mut req = request(Some(120));
             req.max_items = 1 + trial % 5;
             req.risk_budget = Some(1.5);
             let reference = reference_rejections(&candidates);
             assert_eq!(rejected_observations(&candidates), reference);
-            let admitted = candidates.iter().zip(&reference)
+            let admitted = candidates
+                .iter()
+                .zip(&reference)
                 .filter(|(_, rejected)| !**rejected)
                 .map(|(candidate, _)| candidate.clone())
                 .collect();
@@ -429,7 +482,10 @@ mod tests {
                 assert_eq!(actual, expected);
                 assert!(actual.0.len() <= req.max_items);
                 assert!(actual.1.risk_used <= 1.5 + 1e-9);
-                assert_eq!(actual.1.planned_bytes, actual.0.iter().map(|c| c.size_bytes).sum::<u64>());
+                assert_eq!(
+                    actual.1.planned_bytes,
+                    actual.0.iter().map(|c| c.size_bytes).sum::<u64>()
+                );
             }
         }
     }

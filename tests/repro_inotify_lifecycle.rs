@@ -42,14 +42,20 @@ fn until(
         if ready(source, &all) {
             return all;
         }
-        assert!(Instant::now() < deadline, "missing kernel event: {all:?}; {:?}", source.capability());
+        assert!(
+            Instant::now() < deadline,
+            "missing kernel event: {all:?}; {:?}",
+            source.capability()
+        );
         thread::sleep(Duration::from_millis(5));
     }
 }
 
 fn sees_write(source: &mut ScannerEventSource, path: &Path, at: Instant) {
     fs::write(path, b"observable after repair").unwrap();
-    let invalidation = until(source, at, |_, invalidation| invalidation.dirty_paths().contains(path));
+    let invalidation = until(source, at, |_, invalidation| {
+        invalidation.dirty_paths().contains(path)
+    });
     assert!(invalidation.requires_reconciliation());
     assert_eq!(fs::read(path).unwrap(), b"observable after repair");
 }
@@ -70,23 +76,37 @@ fn moved_in_populated_tree_gets_descendant_watches_without_another_topology_even
     fs::write(incoming.join("kept"), b"retain the incoming tree").unwrap();
     let now = Instant::now();
     let mut events = source(&root, 16, now);
-    assert_eq!(events.capability().selected_backend, EventBackendKind::RecursiveInotify);
+    assert_eq!(
+        events.capability().selected_backend,
+        EventBackendKind::RecursiveInotify
+    );
     assert!(events.capability().complete);
     let _ = events.drain_at(now);
 
     let project = root.join("project");
     fs::rename(incoming, &project).unwrap();
-    let changed = until(&mut events, now + Duration::from_secs(1), |source, invalidation| {
-        !source.capability().complete && invalidation.dirty_paths().contains(&project)
-    });
+    let changed = until(
+        &mut events,
+        now + Duration::from_secs(1),
+        |source, invalidation| {
+            !source.capability().complete && invalidation.dirty_paths().contains(&project)
+        },
+    );
     assert!(changed.requires_index_generation_bump());
     let repaired = events.drain_at(now + Duration::from_secs(30));
     assert!(repaired.requires_index_generation_bump());
     assert!(repaired.dirty_roots().contains(&root));
     assert!(events.capability().complete);
     assert_eq!(events.capability().watched_dirs, 4);
-    sees_write(&mut events, &project.join("deep/deeper/new.o"), now + Duration::from_secs(31));
-    assert_eq!(fs::read(project.join("kept")).unwrap(), b"retain the incoming tree");
+    sees_write(
+        &mut events,
+        &project.join("deep/deeper/new.o"),
+        now + Duration::from_secs(31),
+    );
+    assert_eq!(
+        fs::read(project.join("kept")).unwrap(),
+        b"retain the incoming tree"
+    );
 }
 
 #[test]
@@ -97,49 +117,86 @@ fn identical_pathnames_after_root_replacement_do_not_reuse_old_inode_watches() {
     let inode = fs::metadata(&root).unwrap().ino();
     let now = Instant::now();
     let mut events = source(&root, 16, now);
-    assert_eq!(events.capability().selected_backend, EventBackendKind::RecursiveInotify);
+    assert_eq!(
+        events.capability().selected_backend,
+        EventBackendKind::RecursiveInotify
+    );
     let _ = events.drain_at(now);
 
     let retired = base.join("retired");
     fs::rename(&root, &retired).unwrap();
     fs::create_dir_all(root.join("deep")).unwrap();
     assert_ne!(fs::metadata(&root).unwrap().ino(), inode);
-    let lost = until(&mut events, now + Duration::from_secs(1), |source, invalidation| {
-        !source.capability().complete && invalidation.requires_index_generation_bump()
-    });
+    let lost = until(
+        &mut events,
+        now + Duration::from_secs(1),
+        |source, invalidation| {
+            !source.capability().complete && invalidation.requires_index_generation_bump()
+        },
+    );
     assert!(lost.dirty_roots().contains(&root));
     assert_eq!(events.capability().watched_dirs, 0);
     let repaired = events.drain_at(now + Duration::from_secs(30));
     assert!(repaired.requires_index_generation_bump());
     assert!(events.capability().complete);
     assert_eq!(events.capability().watched_dirs, 2);
-    sees_write(&mut events, &root.join("deep/current.o"), now + Duration::from_secs(31));
+    sees_write(
+        &mut events,
+        &root.join("deep/current.o"),
+        now + Duration::from_secs(31),
+    );
 
-    fs::write(retired.join("deep/outside.o"), b"not under the configured root").unwrap();
+    fs::write(
+        retired.join("deep/outside.o"),
+        b"not under the configured root",
+    )
+    .unwrap();
     let outside = events.drain_at(now + Duration::from_secs(32));
-    assert!(outside.dirty_paths().is_empty(), "retired watch names leaked: {outside:?}");
-    assert_eq!(fs::read(retired.join("deep/kept")).unwrap(), b"retain old data");
+    assert!(
+        outside.dirty_paths().is_empty(),
+        "retired watch names leaked: {outside:?}"
+    );
+    assert_eq!(
+        fs::read(retired.join("deep/kept")).unwrap(),
+        b"retain old data"
+    );
 }
 
 #[test]
 fn a_root_missing_at_startup_can_recover_without_any_old_backend_traffic() {
     let temp = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(temp.path()).unwrap().join("not-yet-mounted");
+    let root = fs::canonicalize(temp.path())
+        .unwrap()
+        .join("not-yet-mounted");
     let now = Instant::now();
     let mut events = source(&root, 16, now);
-    assert_eq!(events.capability().selected_backend, EventBackendKind::ReconciliationOnly);
+    assert_eq!(
+        events.capability().selected_backend,
+        EventBackendKind::ReconciliationOnly
+    );
     assert_eq!(events.capability().watched_dirs, 0);
     let _ = events.drain_at(now);
     fs::create_dir_all(root.join("project")).unwrap();
-    assert!(!events.drain_at(now + Duration::from_secs(29)).requires_reconciliation());
+    assert!(
+        !events
+            .drain_at(now + Duration::from_secs(29))
+            .requires_reconciliation()
+    );
     assert_eq!(events.stats().replans, 0);
 
     let repaired = events.drain_at(now + Duration::from_secs(30));
     assert_eq!(events.stats().replans, 1);
-    assert_eq!(events.capability().selected_backend, EventBackendKind::RecursiveInotify);
+    assert_eq!(
+        events.capability().selected_backend,
+        EventBackendKind::RecursiveInotify
+    );
     assert!(events.capability().complete);
     assert!(repaired.requires_index_generation_bump());
-    sees_write(&mut events, &root.join("project/new.o"), now + Duration::from_secs(31));
+    sees_write(
+        &mut events,
+        &root.join("project/new.o"),
+        now + Duration::from_secs(31),
+    );
 }
 
 #[test]
@@ -166,8 +223,15 @@ fn persistent_fallback_failures_are_paced_and_eventually_recover() {
     events.drain_at(now + Duration::from_secs(90));
     assert_eq!(events.stats().replans, 3);
     assert!(events.capability().complete);
-    sees_write(&mut events, &root.join("new.o"), now + Duration::from_secs(91));
-    assert_eq!(fs::read(base.join("retained-file")).unwrap(), b"preserve the blocking file");
+    sees_write(
+        &mut events,
+        &root.join("new.o"),
+        now + Duration::from_secs(91),
+    );
+    assert_eq!(
+        fs::read(base.join("retained-file")).unwrap(),
+        b"preserve the blocking file"
+    );
 }
 
 #[test]
@@ -183,19 +247,29 @@ fn repeated_subtree_replacement_reuses_watch_capacity_and_restores_deep_events()
 
     for cycle in 1..=4 {
         fs::rename(&current, base.join(format!("retired-{cycle}"))).unwrap();
-        until(&mut events, at + Duration::from_secs(1), |source, _| source.capability().watched_dirs == 1);
+        until(&mut events, at + Duration::from_secs(1), |source, _| {
+            source.capability().watched_dirs == 1
+        });
         let incoming = base.join(format!("incoming-{cycle}"));
         fs::create_dir_all(incoming.join("deep")).unwrap();
         current = root.join(format!("project-{cycle}"));
         fs::rename(incoming, &current).unwrap();
-        until(&mut events, at + Duration::from_secs(2), |_, invalidation| invalidation.dirty_paths().contains(&current));
+        until(
+            &mut events,
+            at + Duration::from_secs(2),
+            |_, invalidation| invalidation.dirty_paths().contains(&current),
+        );
         at += Duration::from_secs(31);
         let repaired = events.drain_at(at);
         assert!(repaired.requires_index_generation_bump());
         assert!(events.capability().complete);
         assert_eq!(events.capability().watched_dirs, 3, "cycle {cycle}");
         assert_eq!(events.stats().replans, cycle);
-        sees_write(&mut events, &current.join("deep/live.o"), at + Duration::from_secs(1));
+        sees_write(
+            &mut events,
+            &current.join("deep/live.o"),
+            at + Duration::from_secs(1),
+        );
     }
     assert!(base.join("retired-1/deep").is_dir());
 }
@@ -218,7 +292,11 @@ fn quiet_instance_handoff_explicitly_invalidates_the_old_index_generation() {
     assert!(handoff.dirty_roots().contains(&root));
     handoff.apply_to_index(&mut index);
     assert_eq!(index.event_generation(), generation + 1);
-    sees_write(&mut events, &root.join("after-handoff.o"), now + Duration::from_mins(15) + Duration::from_secs(1));
+    sees_write(
+        &mut events,
+        &root.join("after-handoff.o"),
+        now + Duration::from_mins(15) + Duration::from_secs(1),
+    );
 }
 
 #[test]
@@ -250,13 +328,23 @@ fn file_only_flat_directories_exhaust_planning_without_claiming_complete_coverag
     }
     let config = EventSourceConfig::from_scanner_config(
         std::slice::from_ref(&root),
-        &ScannerConfig { event_watch_budget: 8, ..ScannerConfig::default() },
+        &ScannerConfig {
+            event_watch_budget: 8,
+            ..ScannerConfig::default()
+        },
     );
     let plan = EventSourcePlan::for_config(&config);
-    assert!(!plan.complete, "unobserved EOF must not become complete coverage");
+    assert!(
+        !plan.complete,
+        "unobserved EOF must not become complete coverage"
+    );
     assert_eq!(plan.watched_dirs, vec![root.clone()]);
     assert!(plan.dirty_roots.contains(&root));
-    assert!(plan.reason.contains("planning incomplete"), "{}", plan.reason);
+    assert!(
+        plan.reason.contains("planning incomplete"),
+        "{}",
+        plan.reason
+    );
 
     let now = Instant::now();
     let mut events = ScannerEventSource::start_at(config, now);
@@ -265,7 +353,11 @@ fn file_only_flat_directories_exhaust_planning_without_claiming_complete_coverag
     let startup = events.drain_at(now);
     assert!(startup.requires_index_generation_bump());
     assert!(startup.dirty_roots().contains(&root));
-    sees_write(&mut events, &root.join("new-top-level.o"), now + Duration::from_secs(1));
+    sees_write(
+        &mut events,
+        &root.join("new-top-level.o"),
+        now + Duration::from_secs(1),
+    );
     assert_eq!(fs::read(root.join("retained-16383")).unwrap(), b"keep");
 }
 
@@ -275,7 +367,11 @@ fn candidate_budget_gaps_revoke_replay_and_can_recover_after_root_replacement() 
     for n in 0..100 {
         fs::create_dir(root.join(format!("project-{n:03}"))).unwrap();
     }
-    fs::write(root.join("project-099/retained"), b"preserve the large tree").unwrap();
+    fs::write(
+        root.join("project-099/retained"),
+        b"preserve the large tree",
+    )
+    .unwrap();
     let now = Instant::now();
     let mut events = source(&root, 1, now);
     assert!(!events.capability().complete);
@@ -301,8 +397,15 @@ fn candidate_budget_gaps_revoke_replay_and_can_recover_after_root_replacement() 
     assert!(repaired.requires_index_generation_bump());
     assert!(events.capability().complete);
     assert_eq!(events.capability().watched_dirs, 1);
-    sees_write(&mut events, &root.join("after-repair.o"), now + Duration::from_secs(31));
-    assert_eq!(fs::read(retained.join("project-099/retained")).unwrap(), b"preserve the large tree");
+    sees_write(
+        &mut events,
+        &root.join("after-repair.o"),
+        now + Duration::from_secs(31),
+    );
+    assert_eq!(
+        fs::read(retained.join("project-099/retained")).unwrap(),
+        b"preserve the large tree"
+    );
 }
 
 #[test]
@@ -313,7 +416,10 @@ fn bounded_periodic_replan_keeps_an_independent_root_observable() {
     let now = Instant::now();
     let config = EventSourceConfig::from_scanner_config(
         &[root.clone(), healthy.clone()],
-        &ScannerConfig { event_watch_budget: 4, ..ScannerConfig::default() },
+        &ScannerConfig {
+            event_watch_budget: 4,
+            ..ScannerConfig::default()
+        },
     );
     let mut events = ScannerEventSource::start_at(config, now);
     assert!(events.capability().complete);
@@ -328,6 +434,10 @@ fn bounded_periodic_replan_keeps_an_independent_root_observable() {
     assert_eq!(events.capability().watched_dirs, 2);
     assert!(replanned.requires_index_generation_bump());
     assert!(replanned.dirty_roots().contains(&root));
-    sees_write(&mut events, &healthy.join("independent.o"), later + Duration::from_secs(1));
+    sees_write(
+        &mut events,
+        &healthy.join("independent.o"),
+        later + Duration::from_secs(1),
+    );
     assert_eq!(fs::read(root.join("retained-16383")).unwrap(), b"keep");
 }

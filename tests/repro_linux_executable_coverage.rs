@@ -64,7 +64,12 @@ fn public_executable_query_finds_a_live_program_with_a_non_utf8_kernel_name() {
     assert!(!observed.name.is_empty());
     assert!(child.0.try_wait().unwrap().is_none());
 
-    let unrelated = platform.executables_under(&root.join("other-scope")).unwrap();
+    let unrelated = platform
+        .executables_under(&root.join("other-scope"))
+        .unwrap();
     assert!(!unrelated.processes.iter().any(|process| process.pid == pid));
-    assert_eq!(fs::metadata(&executable).unwrap().len(), fs::metadata(source).unwrap().len());
+    assert_eq!(
+        fs::metadata(&executable).unwrap().len(),
+        fs::metadata(source).unwrap().len()
+    );
 }

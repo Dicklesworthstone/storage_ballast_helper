@@ -160,7 +160,11 @@ impl<I: Iterator<Item = io::Result<PathBuf>>> Selection<I> {
                     return Ok(Some((paths, self.has_more)));
                 };
                 let path = entry?;
-                if self.after.as_deref().is_some_and(|after| path.as_path() <= after) {
+                if self
+                    .after
+                    .as_deref()
+                    .is_some_and(|after| path.as_path() <= after)
+                {
                     continue;
                 }
                 if self.selected.len() < self.capacity {
@@ -245,7 +249,9 @@ fn same_directory(left: &Metadata, right: &Metadata) -> bool {
         // The daemon's supported Unix platforms have real device/inode IDs.
         // Elsewhere reuse only when the platform supplies a birth timestamp
         // and neither it nor the directory mtime changed.
-        left.created().ok().is_some_and(|created| right.created().ok() == Some(created))
+        left.created()
+            .ok()
+            .is_some_and(|created| right.created().ok() == Some(created))
             && left.modified().ok() == right.modified().ok()
     }
 }
@@ -293,7 +299,9 @@ impl EnumerationCache {
             // cyclic request with five large roots and four reader slots:
             // every read is evicted before its second chunk. Keep active
             // work, and return a resumable admission wait for this root.
-            let expired = self.sessions.iter()
+            let expired = self
+                .sessions
+                .iter()
                 .filter(|(_, session)| {
                     now.saturating_duration_since(session.last_requested) >= READER_IDLE_LEASE
                 })
@@ -308,14 +316,17 @@ impl EnumerationCache {
             self.sessions.remove(&expired);
         }
         let entries = DirectoryPaths(fs::read_dir(root)?);
-        self.sessions.insert(root.to_path_buf(), Session {
-            identity,
-            after: after.map(Path::to_path_buf),
-            used_at: self.clock,
-            last_requested: now,
-            selection: Selection::new(entries, after, PAGE_ENTRIES),
-            prepared: None,
-        });
+        self.sessions.insert(
+            root.to_path_buf(),
+            Session {
+                identity,
+                after: after.map(Path::to_path_buf),
+                used_at: self.clock,
+                last_requested: now,
+                selection: Selection::new(entries, after, PAGE_ENTRIES),
+                prepared: None,
+            },
+        );
         Ok(())
     }
 
@@ -329,7 +340,9 @@ impl EnumerationCache {
             return Ok(None);
         }
         self.prepare(root, after)?;
-        let result = self.sessions.get_mut(root)
+        let result = self
+            .sessions
+            .get_mut(root)
             .ok_or_else(|| io::Error::other("missing pre-scan preparation"))?
             .poll(keep_reading);
         match result {
@@ -348,16 +361,22 @@ impl EnumerationCache {
         // Check again before handing out a completed page. Preparation may
         // span several passes while a mount or directory is replaced.
         let current = self.metadata(root)?;
-        let session = self.sessions.get(root)
+        let session = self
+            .sessions
+            .get(root)
             .ok_or_else(|| io::Error::other("missing prepared pre-scan page"))?;
         if !same_directory(&session.identity, &current) {
             self.sessions.remove(root);
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "pre-scan root changed"));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "pre-scan root changed",
+            ));
         }
         let Some(PreparedPage { names, has_more }) = &session.prepared else {
             return Err(io::Error::other("pre-scan preparation has not finished"));
         };
-        let start = names.partition_point(|path| after.is_some_and(|after| path.as_path() <= after));
+        let start =
+            names.partition_point(|path| after.is_some_and(|after| path.as_path() <= after));
         Ok(Some(RootPage {
             names: Arc::clone(names),
             start,
@@ -427,7 +446,9 @@ impl PrescanCursor {
             last: None,
             exhausted: false,
         });
-        let page = self.enumeration.lock()
+        let page = self
+            .enumeration
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .poll(root, self.resume_after(root), &mut keep_reading)?;
         if let Some(page) = &page {
@@ -441,9 +462,11 @@ impl PrescanCursor {
     }
 
     pub(super) fn discard_enumeration(&self, root: &Path) {
-        self.enumeration.lock()
+        self.enumeration
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .sessions.remove(root);
+            .sessions
+            .remove(root);
     }
 }
 
@@ -470,7 +493,9 @@ mod tests {
     }
 
     fn expected(root: &Path, count: usize) -> Vec<PathBuf> {
-        (0..count).map(|n| root.join(format!("item-{n:04}"))).collect()
+        (0..count)
+            .map(|n| root.join(format!("item-{n:04}")))
+            .collect()
     }
 
     fn finish(cursor: &PrescanCursor, root: &Path) -> RootPage {
@@ -489,10 +514,15 @@ mod tests {
                 let mut input: Vec<_> = (0..777)
                     .map(|n| PathBuf::from(format!("/root/{:04}", (n * 73) % 777)))
                     .collect();
-                if reverse { input.reverse(); }
+                if reverse {
+                    input.reverse();
+                }
                 let after = Path::new("/root/0123");
-                let mut reference: Vec<_> = input.iter()
-                    .filter(|path| path.as_path() > after).cloned().collect();
+                let mut reference: Vec<_> = input
+                    .iter()
+                    .filter(|path| path.as_path() > after)
+                    .cloned()
+                    .collect();
                 reference.sort();
                 let more = reference.len() > capacity;
                 reference.truncate(capacity);
@@ -509,7 +539,9 @@ mod tests {
                     actual = selection.poll(&mut || std::mem::take(&mut permit)).unwrap();
                     assert!(read_count.get() - before <= READ_CHUNK_ENTRIES);
                     assert!(selection.selected.len() <= capacity);
-                    if actual.is_some() { break; }
+                    if actual.is_some() {
+                        break;
+                    }
                 }
                 assert_eq!(read_count.get(), 777, "no repeated enumeration prefix");
                 assert_eq!(actual.unwrap(), (reference, more));
@@ -534,7 +566,10 @@ mod tests {
             Ok(PathBuf::from("/root/b")),
         ];
         let mut selection = Selection::new(entries.into_iter(), None, 8);
-        assert_eq!(selection.poll(&mut || true).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            selection.poll(&mut || true).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
@@ -547,7 +582,11 @@ mod tests {
         assert!(limited_poll(&cursor, &root).unwrap().is_none());
         assert!(limited_poll(&cursor, &root).unwrap().is_none());
         assert!(limited_poll(&cursor, &root).unwrap().is_none());
-        assert!(cursor.enumeration.lock().unwrap().sessions[&root].prepared.is_some());
+        assert!(
+            cursor.enumeration.lock().unwrap().sessions[&root]
+                .prepared
+                .is_some()
+        );
         let page = limited_poll(&cursor, &root).unwrap().unwrap();
         assert_eq!(page.into_iter().collect::<Vec<_>>(), expected(&root, 512));
         assert_eq!(cursor, before, "read-ahead is not durable coverage");
@@ -566,8 +605,14 @@ mod tests {
             assert!(limited_poll(&cursor, &a).unwrap().is_none());
             assert!(limited_poll(&cursor, &b).unwrap().is_none());
         }
-        assert_eq!(finish(&cursor, &a).into_iter().collect::<Vec<_>>(), expected(&a, 600));
-        assert_eq!(finish(&cursor, &b).into_iter().collect::<Vec<_>>(), expected(&b, 600));
+        assert_eq!(
+            finish(&cursor, &a).into_iter().collect::<Vec<_>>(),
+            expected(&a, 600)
+        );
+        assert_eq!(
+            finish(&cursor, &b).into_iter().collect::<Vec<_>>(),
+            expected(&b, 600)
+        );
     }
 
     #[test]
@@ -583,7 +628,9 @@ mod tests {
             assert_eq!(scratch.position(), (None, None));
             if let Some(page) = limited_poll(&scratch, &root).unwrap() {
                 let names: Vec<_> = page.into_iter().collect();
-                for name in &names { scratch.advance(&root, name); }
+                for name in &names {
+                    scratch.advance(&root, name);
+                }
                 scratch.complete_root(std::slice::from_ref(&root), &root);
                 observed = Some(names);
                 break;
@@ -600,7 +647,10 @@ mod tests {
         let root = make_root(temp.path(), "root", 12);
         let roots = vec![root.clone()];
         let mut cursor = PrescanCursor::new();
-        let page = cursor.poll_entries_to_visit(&root, || true).unwrap().unwrap();
+        let page = cursor
+            .poll_entries_to_visit(&root, || true)
+            .unwrap()
+            .unwrap();
         let names: Vec<_> = page.clone().into_iter().collect();
         cursor.advance(&root, &names[0]);
         let rewind = cursor.clone();
@@ -608,16 +658,31 @@ mod tests {
         // Same directory identity, new name: cached names are discovery hints,
         // not a snapshot of live contents. The next completed sweep sees it.
         fs::create_dir(root.join("aaa-new")).unwrap();
-        let suffix = cursor.poll_entries_to_visit(&root, || true).unwrap().unwrap();
+        let suffix = cursor
+            .poll_entries_to_visit(&root, || true)
+            .unwrap()
+            .unwrap();
         assert_eq!(suffix.into_iter().collect::<Vec<_>>(), names[2..]);
-        let rewound = rewind.poll_entries_to_visit(&root, || true).unwrap().unwrap();
+        let rewound = rewind
+            .poll_entries_to_visit(&root, || true)
+            .unwrap()
+            .unwrap();
         assert_eq!(rewound.into_iter().collect::<Vec<_>>(), names[1..]);
-        for name in &names[2..] { cursor.advance(&root, name); }
+        for name in &names[2..] {
+            cursor.advance(&root, name);
+        }
         cursor.complete_root(&roots, &root);
         assert!(cursor.enumeration.lock().unwrap().sessions.is_empty());
-        let next = cursor.poll_entries_to_visit(&root, || true).unwrap().unwrap();
+        let next = cursor
+            .poll_entries_to_visit(&root, || true)
+            .unwrap()
+            .unwrap();
         assert_eq!(next.into_iter().next(), Some(root.join("aaa-new")));
-        assert_eq!(page.into_iter().collect::<Vec<_>>(), names, "retained pages are immutable");
+        assert_eq!(
+            page.into_iter().collect::<Vec<_>>(),
+            names,
+            "retained pages are immutable"
+        );
     }
 
     #[test]
@@ -628,24 +693,37 @@ mod tests {
         let mut cursor = PrescanCursor::new();
         // Exercise a real directory iterator with a small page capacity,
         // without needing 50,001 filesystem entries to reach the tail branch.
-        cursor.enumeration.lock().unwrap().sessions.insert(root.clone(), Session {
-            identity: fs::metadata(&root).unwrap(),
-            after: None,
-            used_at: 0,
-            last_requested: Instant::now(),
-            selection: Selection::new(DirectoryPaths(fs::read_dir(&root).unwrap()), None, 2),
-            prepared: None,
-        });
-        let first = cursor.poll_entries_to_visit(&root, || true).unwrap().unwrap();
+        cursor.enumeration.lock().unwrap().sessions.insert(
+            root.clone(),
+            Session {
+                identity: fs::metadata(&root).unwrap(),
+                after: None,
+                used_at: 0,
+                last_requested: Instant::now(),
+                selection: Selection::new(DirectoryPaths(fs::read_dir(&root).unwrap()), None, 2),
+                prepared: None,
+            },
+        );
+        let first = cursor
+            .poll_entries_to_visit(&root, || true)
+            .unwrap()
+            .unwrap();
         let first: Vec<_> = first.into_iter().collect();
         assert_eq!(first, expected(&root, 2));
-        for path in &first { cursor.advance(&root, path); }
+        for path in &first {
+            cursor.advance(&root, path);
+        }
         cursor.complete_root(&roots, &root);
         assert_eq!(cursor.position().1, Some(root.join("item-0001").as_path()));
-        let tail = cursor.poll_entries_to_visit(&root, || true).unwrap().unwrap();
+        let tail = cursor
+            .poll_entries_to_visit(&root, || true)
+            .unwrap()
+            .unwrap();
         let tail: Vec<_> = tail.into_iter().collect();
         assert_eq!(tail, expected(&root, 6)[2..]);
-        for path in &tail { cursor.advance(&root, path); }
+        for path in &tail {
+            cursor.advance(&root, path);
+        }
         cursor.complete_root(&roots, &root);
         assert!(cursor.position().1.is_none());
         assert!(cursor.continuations.is_empty());
@@ -663,7 +741,10 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("replacement")).unwrap();
         let page = finish(&cursor, &root);
-        assert_eq!(page.into_iter().collect::<Vec<_>>(), vec![root.join("replacement")]);
+        assert_eq!(
+            page.into_iter().collect::<Vec<_>>(),
+            vec![root.join("replacement")]
+        );
         assert!(retired.join("item-0000").is_dir());
     }
 
@@ -676,7 +757,13 @@ mod tests {
         let before = cursor.clone();
         assert!(limited_poll(&cursor, &root).unwrap().is_none());
         fs::rename(&root, temp.path().join("away")).unwrap();
-        assert_eq!(cursor.poll_entries_to_visit(&root, || true).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            cursor
+                .poll_entries_to_visit(&root, || true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
         assert_eq!(cursor, before);
         assert!(cursor.enumeration.lock().unwrap().sessions.is_empty());
     }
@@ -686,19 +773,36 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut cursor = PrescanCursor::new();
         let roots: Vec<_> = (0..=MAX_LIVE_ROOTS)
-            .map(|n| make_root(temp.path(), &format!("r-{n}"), 300)).collect();
+            .map(|n| make_root(temp.path(), &format!("r-{n}"), 300))
+            .collect();
         for root in &roots[..MAX_LIVE_ROOTS] {
             assert!(limited_poll(&cursor, root).unwrap().is_none());
             assert!(cursor.enumeration.lock().unwrap().sessions.len() <= MAX_LIVE_ROOTS);
         }
-        assert_eq!(limited_poll(&cursor, &roots[MAX_LIVE_ROOTS]).unwrap_err().kind(), io::ErrorKind::WouldBlock);
-        assert!(cursor.enumeration.lock().unwrap().sessions.contains_key(&roots[0]));
+        assert_eq!(
+            limited_poll(&cursor, &roots[MAX_LIVE_ROOTS])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(
+            cursor
+                .enumeration
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key(&roots[0])
+        );
         assert_eq!(cursor.position(), (None, None));
         let first: Vec<_> = finish(&cursor, &roots[0]).into_iter().collect();
         assert_eq!(first, expected(&roots[0], 300));
-        for path in first { cursor.advance(&roots[0], &path); }
+        for path in first {
+            cursor.advance(&roots[0], &path);
+        }
         cursor.complete_root(&roots, &roots[0]);
-        let admitted: Vec<_> = finish(&cursor, &roots[MAX_LIVE_ROOTS]).into_iter().collect();
+        let admitted: Vec<_> = finish(&cursor, &roots[MAX_LIVE_ROOTS])
+            .into_iter()
+            .collect();
         assert_eq!(admitted, expected(&roots[MAX_LIVE_ROOTS], 300));
         assert!(cursor.enumeration.lock().unwrap().sessions.len() <= MAX_LIVE_ROOTS);
     }
@@ -712,7 +816,10 @@ mod tests {
         assert!(limited_poll(&cursor, &root).unwrap().is_none());
         cursor.reset();
         assert!(cursor.enumeration.lock().unwrap().sessions.is_empty());
-        assert_eq!(finish(&cursor, &root).into_iter().collect::<Vec<_>>(), expected(&root, 600));
+        assert_eq!(
+            finish(&cursor, &root).into_iter().collect::<Vec<_>>(),
+            expected(&root, 600)
+        );
     }
 
     #[cfg(unix)]
@@ -740,11 +847,21 @@ mod tests {
         // This is the daemon's existing error branch. A paused preparation
         // must survive complete_root without claiming a completed sweep.
         cursor.complete_root(&roots, &root);
-        assert!(cursor.enumeration.lock().unwrap().sessions.contains_key(&root));
+        assert!(
+            cursor
+                .enumeration
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key(&root)
+        );
         let mut result = None;
         for _ in 0..1024 {
             match cursor.entries_to_visit(&root) {
-                Ok(page) => { result = Some(page); break; }
+                Ok(page) => {
+                    result = Some(page);
+                    break;
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     cursor.complete_root(&roots, &root);
                 }
@@ -753,7 +870,9 @@ mod tests {
         }
         let page = result.expect("preparation must eventually finish");
         assert_eq!(page, expected(&root, count));
-        for path in &page { cursor.advance(&root, path); }
+        for path in &page {
+            cursor.advance(&root, path);
+        }
         cursor.complete_root(&roots, &root);
         assert!(cursor.enumeration.lock().unwrap().sessions.is_empty());
         assert_eq!(cursor.position(), (Some(root.as_path()), None));
@@ -774,7 +893,9 @@ mod tests {
             assert_eq!(scratch.position(), (None, None));
             if let Some(page) = limited_poll(&scratch, &root).unwrap() {
                 let names: Vec<_> = page.into_iter().collect();
-                for name in &names { scratch.advance(&root, name); }
+                for name in &names {
+                    scratch.advance(&root, name);
+                }
                 scratch.complete_root(std::slice::from_ref(&root), &root);
                 observed = Some(names);
                 break;
@@ -794,7 +915,10 @@ mod tests {
             assert!(limited_poll(&cursor, &root).unwrap().is_none());
             Arc::downgrade(&cursor.enumeration)
         };
-        assert!(weak.upgrade().is_none(), "thread-local cache must not retain directory handles");
+        assert!(
+            weak.upgrade().is_none(),
+            "thread-local cache must not retain directory handles"
+        );
         let next = PrescanCursor::new();
         assert!(next.enumeration.lock().unwrap().sessions.is_empty());
     }
@@ -825,12 +949,16 @@ mod tests {
         let mut admission_waits = 0;
         for _ in 0..32 {
             for root in &roots {
-                if completed.contains(root) { continue; }
+                if completed.contains(root) {
+                    continue;
+                }
                 match limited_poll(&cursor, root) {
                     Ok(Some(page)) => {
                         let paths: Vec<_> = page.into_iter().collect();
                         assert_eq!(paths, expected(root, 600));
-                        for path in paths { cursor.advance(root, &path); }
+                        for path in paths {
+                            cursor.advance(root, &path);
+                        }
                         assert!(completed.insert(root.clone()));
                     }
                     Ok(None) => {}
@@ -844,10 +972,19 @@ mod tests {
                 cursor.complete_root(&roots, root);
                 assert!(cursor.enumeration.lock().unwrap().sessions.len() <= MAX_LIVE_ROOTS);
             }
-            if completed.len() == roots.len() { break; }
+            if completed.len() == roots.len() {
+                break;
+            }
         }
-        assert!(admission_waits > 0, "the test must exercise real slot contention");
-        assert_eq!(completed.len(), roots.len(), "each root must deliver its entire page");
+        assert!(
+            admission_waits > 0,
+            "the test must exercise real slot contention"
+        );
+        assert_eq!(
+            completed.len(),
+            roots.len(),
+            "each root must deliver its entire page"
+        );
         assert!(cursor.enumeration.lock().unwrap().sessions.is_empty());
         assert!(cursor.continuations.is_empty());
     }
@@ -864,14 +1001,24 @@ mod tests {
             cache.prepare_at(root, None, now).unwrap();
         }
         let almost = now + READER_IDLE_LEASE - Duration::from_nanos(1);
-        assert_eq!(cache.prepare_at(&roots[MAX_LIVE_ROOTS], None, almost).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            cache
+                .prepare_at(&roots[MAX_LIVE_ROOTS], None, almost)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
         // Renew the first root. The admission wait above renews no other root.
         cache.prepare_at(&roots[0], None, almost).unwrap();
-        cache.prepare_at(&roots[MAX_LIVE_ROOTS], None, now + READER_IDLE_LEASE).unwrap();
+        cache
+            .prepare_at(&roots[MAX_LIVE_ROOTS], None, now + READER_IDLE_LEASE)
+            .unwrap();
         assert_eq!(cache.sessions.len(), MAX_LIVE_ROOTS);
         assert!(cache.sessions.contains_key(&roots[0]));
         assert!(!cache.sessions.contains_key(&roots[1]));
         assert!(cache.sessions.contains_key(&roots[MAX_LIVE_ROOTS]));
-        for root in &roots { assert!(root.join("item-0000").is_dir()); }
+        for root in &roots {
+            assert!(root.join("item-0000").is_dir());
+        }
     }
 }

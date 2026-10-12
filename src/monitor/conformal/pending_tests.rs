@@ -45,14 +45,20 @@ fn a_full_window_preserves_issue_times_and_bounds_until_crossing() {
     for second in 4..50 {
         let now = start + Duration::from_secs(second);
         assert_eq!(c.observe(now, false), ResolvedBatch::default());
-        assert!(!c.enroll(now, 1.0), "full admission must not replace a forecast");
+        assert!(
+            !c.enroll(now, 1.0),
+            "full admission must not replace a forecast"
+        );
     }
     assert_eq!(c.alpha(), alpha);
     assert_eq!(c.samples(), 0);
     let batch = c.observe(start + Duration::from_secs(50), true);
     assert_eq!((batch.resolved, batch.covered, batch.missed), (4, 0, 4));
     for second in 0..4 {
-        assert_eq!(reference.record(100.0, f64::from(50 - second), 100.0), Some(false));
+        assert_eq!(
+            reference.record(100.0, f64::from(50 - second), 100.0),
+            Some(false)
+        );
     }
     assert_eq!(c.scores, reference.scores);
     assert_eq!(c.alpha(), reference.alpha());
@@ -68,11 +74,20 @@ fn later_short_horizons_resolve_without_waiting_for_the_oldest_forecast() {
     assert!(c.enroll(start + Duration::from_secs(1), 10.0));
     assert!(c.enroll(start + Duration::from_secs(2), 200.0));
     assert!(!c.enroll(start + Duration::from_secs(3), 1.0));
-    assert_eq!(c.observe(start + Duration::from_secs(11), false).resolved, 1);
+    assert_eq!(
+        c.observe(start + Duration::from_secs(11), false).resolved,
+        1
+    );
     assert_eq!(c.pending(), 2);
     assert!(c.enroll(start + Duration::from_secs(11), 1.0));
-    assert_eq!(c.observe(start + Duration::from_secs(12), false).resolved, 1);
-    assert_eq!(c.observe(start + Duration::from_secs(300), false).resolved, 2);
+    assert_eq!(
+        c.observe(start + Duration::from_secs(12), false).resolved,
+        1
+    );
+    assert_eq!(
+        c.observe(start + Duration::from_secs(300), false).resolved,
+        2
+    );
     assert_eq!(c.resolved_total(), 4);
     assert_eq!(c.pending(), 0);
 }
@@ -86,7 +101,11 @@ fn duplicate_timestamps_cannot_manufacture_calibration_samples() {
         assert!(!c.enroll(start, 60.0));
     }
     assert_eq!(c.observe(start, true), ResolvedBatch::default());
-    assert_eq!(c.pending(), 1, "a forecast cannot evaluate its own issuing sample");
+    assert_eq!(
+        c.pending(),
+        1,
+        "a forecast cannot evaluate its own issuing sample"
+    );
     let next = start + Duration::from_secs(60);
     assert_eq!(c.observe(next, false).resolved, 1);
     assert!(c.enroll(next, 60.0));
@@ -106,10 +125,16 @@ fn out_of_order_observations_leave_pending_and_resolved_evidence_unchanged() {
     assert_eq!(c.pending(), 1);
     assert_eq!(c.samples(), 0);
     assert_eq!(c.alpha(), alpha);
-    assert_eq!(c.observe(start + Duration::from_secs(20), false).resolved, 0);
+    assert_eq!(
+        c.observe(start + Duration::from_secs(20), false).resolved,
+        0
+    );
     assert_eq!(c.observe(start + Duration::from_secs(15), true).resolved, 0);
     assert!(!c.enroll(start + Duration::from_secs(15), 1.0));
-    assert_eq!(c.observe(start + Duration::from_secs(110), false).resolved, 1);
+    assert_eq!(
+        c.observe(start + Duration::from_secs(110), false).resolved,
+        1
+    );
     assert_eq!(c.coverage_empirical(), Some(1.0));
 }
 
@@ -130,7 +155,10 @@ fn intervention_releases_capacity_without_creating_resolution_evidence() {
     assert_eq!(c.pending(), 0);
     assert_eq!(c.samples(), 0);
     assert_eq!(c.resolved_total(), 0);
-    assert!(c.enroll(start, 100.0), "reset establishes a fresh clock history");
+    assert!(
+        c.enroll(start, 100.0),
+        "reset establishes a fresh clock history"
+    );
 }
 
 #[test]
@@ -140,9 +168,19 @@ fn zero_capacity_and_invalid_forecasts_never_claim_admission() {
     assert!(!disabled.enroll(start, 60.0));
     assert_eq!(disabled.pending(), 0);
     let mut c = calibrator(1);
-    for point in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0, 7201.0] {
+    for point in [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        -1.0,
+        0.0,
+        7201.0,
+    ] {
         assert!(!c.enroll(start, point));
     }
-    assert!(c.enroll(start, 60.0), "rejected inputs must not reserve the timestamp");
+    assert!(
+        c.enroll(start, 60.0),
+        "rejected inputs must not reserve the timestamp"
+    );
     assert_eq!(c.pending(), 1);
 }

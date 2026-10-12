@@ -467,7 +467,7 @@ mod tests {
         let _ = run(&mut adaptive, &mut rng_a, 1_000, |_| 1.0);
         let _ = run(&mut fixed, &mut rng_f, 1_000, |_| 1.0);
         let shifted_a = run(&mut adaptive, &mut rng_a, 100, |_| 0.5);
-        let shifted_f = run(&mut fixed, &mut rng_f, 100,  |_| 0.5);
+        let shifted_f = run(&mut fixed, &mut rng_f, 100, |_| 0.5);
         let misses_a = shifted_a.iter().filter(|c| !**c).count();
         let misses_f = shifted_f.iter().filter(|c| !**c).count();
         assert!(

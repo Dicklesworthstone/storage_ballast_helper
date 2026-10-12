@@ -401,10 +401,7 @@ mod tests {
         make_dirs(b.path(), &["x", "y"]);
         let mut cursor = PrescanCursor::new();
         cursor.advance(a.path(), &a.path().join("x"));
-        assert_eq!(
-            read_page(&cursor, a.path()),
-            vec![a.path().join("y")]
-        );
+        assert_eq!(read_page(&cursor, a.path()), vec![a.path().join("y")]);
         assert_eq!(
             read_page(&cursor, b.path()),
             vec![b.path().join("x"), b.path().join("y")],
