@@ -220,7 +220,10 @@ impl FsStatsCollector {
 
     fn collect_for_mount(&self, mount: &MountBinding, generation: u64) -> Result<FsStats> {
         let collected_at = Instant::now();
-        if crate::core::paths::resolve_absolute_path(&mount.path) != mount.resolved {
+        // Compare in the binding's own namespace. `resolved` was spelled by
+        // the platform's mount lookup, so a plain path resolution reports
+        // every firmlinked macOS volume (`/Volumes/X`) as changed.
+        if self.platform.mount_lookup_path(&mount.path).ok().as_ref() != Some(&mount.resolved) {
             self.invalidate(mount, generation, collected_at);
             return Err(changed_mount(&mount.path));
         }
