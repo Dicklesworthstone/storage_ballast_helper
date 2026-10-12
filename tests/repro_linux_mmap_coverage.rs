@@ -64,10 +64,10 @@ fn check_scope(result: Result<Vec<MappedRegion>>, scope: &Path, expected: &[(i32
 fn public_maps_query_never_silently_omits_live_byte_named_executables() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
-    let source = [Path::new("/bin/sleep"), Path::new("/usr/bin/sleep")]
+    let source = [Path::new("/bin/sh"), Path::new("/usr/bin/sh")]
         .into_iter()
         .find(|path| path.is_file())
-        .expect("Linux integration fixture requires the system sleep utility");
+        .expect("Linux integration fixture requires a POSIX shell");
     let original = fs::read(source).unwrap();
     let names = [
         b"sbh-mapped-\xff".as_slice(),
@@ -81,10 +81,13 @@ fn public_maps_query_never_silently_omits_live_byte_named_executables() {
         fs::copy(source, &executable).unwrap();
         let mut child = RunningChild(
             Command::new(&executable)
-                // BusyBox may implement sleep as a multi-call binary.
-                .arg0("sleep")
-                .arg("300")
-                .stdin(Stdio::null())
+                // The shell blocks in `read` while this test holds its stdin
+                // open. A copied `sleep` is not usable: rust-coreutils takes
+                // the applet name from the executable path, cannot decode
+                // these names, prints its usage and exits at once.
+                .arg0("sh")
+                .args(["-c", "read line"])
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
