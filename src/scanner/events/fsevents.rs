@@ -43,8 +43,9 @@ fn inspect_root(root: &Path) -> io::Result<Option<PathBuf>> {
             "root must be absolute without ..",
         ));
     }
-    // Ancestor aliases such as /tmp -> /private/tmp are supported; a leaf
-    // symlink remains subject to the scanner's plain-directory rule.
+    // Follow configured-root links such as macOS /tmp -> /private/tmp,
+    // preserving their configured spelling and canonical watch identity.
+    // Links inside the tree remain excluded by the scanner's traversal policy.
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         // Only the initial pathname observation proves a currently absent
@@ -52,10 +53,17 @@ fn inspect_root(root: &Path) -> io::Result<Option<PathBuf>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    let metadata = if metadata.file_type().is_symlink() {
+        // A dangling configured link exists. Its failed target lookup is a
+        // coverage gap, not a verified absent root.
+        fs::metadata(root)?
+    } else {
+        metadata
+    };
+    if !metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "root is not a plain directory",
+            "root is not a directory",
         ));
     }
     let canonical = fs::canonicalize(root)?;
@@ -631,5 +639,38 @@ mod tests {
                 .any(|alias| alias.configured == healthy)
         );
         assert!(after.aliases.iter().any(|alias| alias.configured == later));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_roots_resolve_to_their_directory_but_links_to_files_do_not() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap().keep();
+        let real = dir.join("private-tmp");
+        fs::create_dir(&real).unwrap();
+        let link = dir.join("tmp");
+        symlink(&real, &link).unwrap();
+        // Like macOS `/tmp -> /private/tmp`: the configured spelling is kept
+        // as the alias and the canonical directory is what gets watched.
+        assert_eq!(
+            inspect_root(&link).unwrap(),
+            Some(fs::canonicalize(&real).unwrap())
+        );
+        let cfg = EventSourceConfig::from_scanner_config(
+            std::slice::from_ref(&link),
+            &ScannerConfig::default(),
+        );
+        let plan = root_plan(&cfg);
+        assert!(plan.summary.complete, "{}", plan.summary.reason);
+        assert_eq!(plan.aliases[0].configured, link);
+
+        let file = dir.join("file");
+        fs::write(&file, b"data").unwrap();
+        let file_link = dir.join("file-link");
+        symlink(&file, &file_link).unwrap();
+        assert!(inspect_root(&file_link).is_err());
+        let dangling = dir.join("dangling");
+        symlink(dir.join("gone"), &dangling).unwrap();
+        assert!(inspect_root(&dangling).is_err());
     }
 }

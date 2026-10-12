@@ -1121,16 +1121,19 @@ impl Default for ScannerConfig {
             engine: ScannerEngineMode::V2,
             event_source: ScannerEventSourceMode::Auto,
             event_watch_budget: 8192,
-            root_paths: {
-                let mut roots = vec![PathBuf::from("/tmp")];
-                // /data/tmp is a Linux fleet convention, not a macOS default.
-                // Keep it configured on Linux even before creation: event-root
-                // admission separately tracks absence and later rechecks it.
-                if cfg!(target_os = "linux") {
-                    roots.push(PathBuf::from("/data/tmp"));
-                }
-                roots.push(PathBuf::from("/var/tmp"));
-                roots
+            // `/data/tmp` is the fleet's Linux scratch volume. macOS has no
+            // `/data`, and an absent root there was reported as a permanent
+            // event-coverage gap (bd-9acu).
+            // Explicit configured roots remain eligible for later admission;
+            // event planning tracks initial absence without discarding them.
+            root_paths: if cfg!(target_os = "linux") {
+                vec![
+                    PathBuf::from("/tmp"),
+                    PathBuf::from("/data/tmp"),
+                    PathBuf::from("/var/tmp"),
+                ]
+            } else {
+                vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]
             },
             // Note: `/data/projects` is intentionally NOT in this list.
             // The setup wizard (cli/wizard.rs) actively adds `/data/projects`

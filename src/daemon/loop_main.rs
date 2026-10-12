@@ -778,6 +778,32 @@ fn effective_empty_pass_cooldown(base_secs: u64, consecutive_empty_passes: u32) 
     Duration::from_secs(base_secs.saturating_mul(multiplier))
 }
 
+/// bd-qxrh: fold a pass that dispatched nothing into the empty-pass streak.
+///
+/// One *timed-out* empty pass is inconclusive: its budget may have run out
+/// before the walk reached anything reclaimable. A run of them is not. When
+/// every pass is cut short (by `scan_time_budget_secs` or, more often, by the
+/// daemon CPU bucket), counting none of them meant the streak never grew, so
+/// Red/Critical never reached terminal idle and re-scanned as fast as the duty
+/// cycle allowed, for hours, with nothing to reclaim (mac-mini-max on
+/// 2026-10-12: a `red_pressure` pass every ~20 s, all `timed_out=true`,
+/// 0 candidates, 0 bytes freed). Every [`TERMINAL_IDLE_EMPTY_PASSES`]
+/// consecutive timed-out empty passes therefore count as one conclusive one.
+fn record_empty_pass(
+    consecutive_empty_passes: &mut u32,
+    inconclusive_empty_passes: &mut u32,
+    timed_out: bool,
+) {
+    if timed_out {
+        *inconclusive_empty_passes = inconclusive_empty_passes.saturating_add(1);
+        if *inconclusive_empty_passes < TERMINAL_IDLE_EMPTY_PASSES {
+            return;
+        }
+    }
+    *inconclusive_empty_passes = 0;
+    *consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
+}
+
 /// Process CPU (user+system) this process has consumed so far, in micros.
 fn current_scan_cpu_micros() -> Option<u64> {
     let stats = crate::platform::current().self_stats().ok()?;
@@ -7133,6 +7159,8 @@ fn scanner_thread_main(
     // stays pressured with nothing to reclaim, and resets on a productive pass.
     let mut last_empty_pass_at: Option<Instant> = None;
     let mut consecutive_empty_passes: u32 = 0;
+    // Timed-out empty passes since the last conclusive one (`record_empty_pass`).
+    let mut inconclusive_empty_passes: u32 = 0;
     // bd-8aeq: the executor's reclaim counter as it stood when the last
     // dispatching pass started. Confirmed at the next pass start: if the
     // counter has not moved, those dispatches reclaimed nothing (dry-run,
@@ -7196,7 +7224,11 @@ fn scanner_thread_main(
         if let Some(reclaim_before) = unconfirmed_dispatch.take()
             && executor_config.reclaim_events() == reclaim_before
         {
-            consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
+            record_empty_pass(
+                &mut consecutive_empty_passes,
+                &mut inconclusive_empty_passes,
+                false,
+            );
             last_empty_pass_at = Some(Instant::now());
             eprintln!(
                 "[SBH-SCANNER] the last pass dispatched candidates but nothing was reclaimed (dry-run, observe, dampened or failed); pacing it as an empty pass (consecutive={consecutive_empty_passes})"
@@ -7214,6 +7246,7 @@ fn scanner_thread_main(
             );
             last_empty_pass_at = None;
             consecutive_empty_passes = 0;
+            inconclusive_empty_passes = 0;
         }
         let request_level = request.pressure_level;
 
@@ -8981,13 +9014,15 @@ fn scanner_thread_main(
         // before the flush would misclassify it as empty and wrongly arm the
         // backoff (#15).
         //
-        // A *timed-out* pass with nothing dispatched is inconclusive for the
-        // exponential streak (the budget may simply have expired before the
-        // walker reached reclaimable files), so it does not grow the counter —
-        // but it still arms the base cooldown timestamp. The old behavior of
-        // fully resetting on timeout meant a tree big enough to exhaust the
-        // scan budget on every pass could never back off at all and re-walked
-        // back-to-back forever (~95% CPU at 82% disk, #15 case 1).
+        // A single *timed-out* pass with nothing dispatched is inconclusive for
+        // the exponential streak (the budget may simply have expired before
+        // the walker reached reclaimable files), but it still arms the base
+        // cooldown timestamp, and every TERMINAL_IDLE_EMPTY_PASSES of them in
+        // a row count as one empty pass (`record_empty_pass`, bd-qxrh). The
+        // old behavior of fully resetting on timeout meant a tree big enough
+        // to exhaust the scan budget on every pass could never back off at all
+        // and re-walked back-to-back forever (~95% CPU at 82% disk, #15 case
+        // 1); never counting timeouts kept Red/Critical out of terminal idle.
         //
         // NOTE: keying on dispatched-count, not candidates_found, is the fix for
         // the perpetual-Yellow hot-loop where every candidate is a sacred-marker
@@ -9003,9 +9038,11 @@ fn scanner_thread_main(
             });
         }
         if dispatched_this_pass.count == 0 {
-            if !scan_timed_out {
-                consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
-            }
+            record_empty_pass(
+                &mut consecutive_empty_passes,
+                &mut inconclusive_empty_passes,
+                scan_timed_out,
+            );
             last_empty_pass_at = Some(Instant::now());
             let next_secs = effective_empty_pass_cooldown(
                 current_scanner_config.min_rescan_interval_secs,
@@ -9019,6 +9056,7 @@ fn scanner_thread_main(
             }
         } else {
             consecutive_empty_passes = 0;
+            inconclusive_empty_passes = 0;
             last_empty_pass_at = None;
             unconfirmed_dispatch = Some(reclaim_at_pass_start);
         }
@@ -13528,6 +13566,43 @@ mod tests {
             &critical,
             TERMINAL_IDLE_EMPTY_PASSES,
         ));
+    }
+
+    #[test]
+    fn timed_out_empty_passes_still_reach_terminal_idle_under_red() {
+        // bd-qxrh: when the CPU bucket cuts every pass short, no pass is
+        // "complete", the streak used to stay at 0, and Red bypassed the
+        // cooldown forever with nothing to reclaim.
+        let now = Instant::now();
+        let request = cooldown_request(PressureLevel::Red);
+        let cooldown = Duration::from_secs(90);
+        let (mut streak, mut inconclusive) = (0u32, 0u32);
+        let mut passes = 0;
+        while !empty_pass_cooldown_active(Some(now), now, cooldown, &request, streak) {
+            record_empty_pass(&mut streak, &mut inconclusive, true);
+            passes += 1;
+            assert!(
+                passes <= 100,
+                "timed-out empty passes never reached terminal idle"
+            );
+        }
+        assert_eq!(
+            passes,
+            TERMINAL_IDLE_EMPTY_PASSES * TERMINAL_IDLE_EMPTY_PASSES
+        );
+        assert_eq!(streak, TERMINAL_IDLE_EMPTY_PASSES);
+    }
+
+    #[test]
+    fn a_few_timed_out_empty_passes_stay_inconclusive() {
+        let (mut streak, mut inconclusive) = (0u32, 0u32);
+        for _ in 1..TERMINAL_IDLE_EMPTY_PASSES {
+            record_empty_pass(&mut streak, &mut inconclusive, true);
+        }
+        assert_eq!(streak, 0, "a budget that ran out early proves nothing yet");
+        // A completed empty pass counts at once and clears the inconclusive run.
+        record_empty_pass(&mut streak, &mut inconclusive, false);
+        assert_eq!((streak, inconclusive), (1, 0));
     }
 
     #[test]
