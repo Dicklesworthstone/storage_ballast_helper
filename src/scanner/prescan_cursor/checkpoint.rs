@@ -65,7 +65,9 @@ impl StoredPath {
         }
         #[cfg(not(unix))]
         {
-            Err(invalid("pre-scan path cannot be represented on this platform"))
+            Err(invalid(
+                "pre-scan path cannot be represented on this platform",
+            ))
         }
     }
 
@@ -98,7 +100,9 @@ fn validate(cursor: &PrescanCursor) -> io::Result<()> {
             .as_deref()
             .is_none_or(|root| !direct_child(root, after))
     {
-        return Err(invalid("pre-scan resume point is not a root's direct child"));
+        return Err(invalid(
+            "pre-scan resume point is not a root's direct child",
+        ));
     }
     if cursor
         .continuations
@@ -139,13 +143,15 @@ impl Progress {
         validate(cursor)?;
         Ok(Self {
             root: cursor.root.as_deref().map(StoredPath::encode).transpose()?,
-            after: cursor.after.as_deref().map(StoredPath::encode).transpose()?,
+            after: cursor
+                .after
+                .as_deref()
+                .map(StoredPath::encode)
+                .transpose()?,
             continuations: cursor
                 .continuations
                 .iter()
-                .map(|(root, after)| {
-                    Ok((StoredPath::encode(root)?, StoredPath::encode(after)?))
-                })
+                .map(|(root, after)| Ok((StoredPath::encode(root)?, StoredPath::encode(after)?)))
                 .collect::<io::Result<_>>()?,
         })
     }
@@ -364,7 +370,9 @@ impl StagingFile {
     fn still_bound(&self) -> io::Result<()> {
         let current = fs::symlink_metadata(&self.parent_path)?;
         if !current.is_dir() || !same_file(&self.parent.metadata()?, &current) {
-            return Err(invalid("pre-scan state directory changed before publication"));
+            return Err(invalid(
+                "pre-scan state directory changed before publication",
+            ));
         }
         Ok(())
     }
@@ -378,7 +386,9 @@ impl StagingFile {
             let owned = fstat(&self.file)?;
             let named = statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW)?;
             if owned.st_dev != named.st_dev || owned.st_ino != named.st_ino {
-                return Err(invalid("pre-scan staging file was replaced before publication"));
+                return Err(invalid(
+                    "pre-scan staging file was replaced before publication",
+                ));
             }
             renameat(&self.parent, &self.name, &self.parent, filename)?;
         }
@@ -386,7 +396,9 @@ impl StagingFile {
         {
             let source = self.parent_path.join(&self.name);
             if !same_file(&self.file.metadata()?, &fs::symlink_metadata(&source)?) {
-                return Err(invalid("pre-scan staging file was replaced before publication"));
+                return Err(invalid(
+                    "pre-scan staging file was replaced before publication",
+                ));
             }
             fs::rename(source, self.parent_path.join(filename))?;
         }
@@ -508,7 +520,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("cursor.json");
         save(&cursor("/root", "a"), &path).unwrap();
-        let original: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let original: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         let mut corrupted = original.clone();
         corrupted["progress"]["after"] = serde_json::json!("/root/z");
         fs::write(&path, serde_json::to_vec(&corrupted).unwrap()).unwrap();
@@ -539,8 +552,14 @@ mod tests {
             root: None,
             after: None,
             continuations: vec![
-                (StoredPath::Text("/r".into()), StoredPath::Text("/r/a".into())),
-                (StoredPath::Text("/r".into()), StoredPath::Text("/r/z".into())),
+                (
+                    StoredPath::Text("/r".into()),
+                    StoredPath::Text("/r/a".into()),
+                ),
+                (
+                    StoredPath::Text("/r".into()),
+                    StoredPath::Text("/r/z".into()),
+                ),
             ],
         };
         assert!(duplicate.into_cursor().is_err());
@@ -654,7 +673,11 @@ mod tests {
         fs::write(outside.join("cursor.json"), b"unrelated checkpoint").unwrap();
         fs::write(outside.join(&name), b"unrelated staging file").unwrap();
         symlink(&outside, &parent).unwrap();
-        assert!(staging.publish(std::ffi::OsStr::new("cursor.json")).is_err());
+        assert!(
+            staging
+                .publish(std::ffi::OsStr::new("cursor.json"))
+                .is_err()
+        );
         assert_eq!(
             fs::read(outside.join("cursor.json")).unwrap(),
             b"unrelated checkpoint"

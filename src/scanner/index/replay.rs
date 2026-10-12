@@ -19,10 +19,7 @@ impl ScannerCandidateIndex {
     /// not walk the filesystem, clone the record map, or scan the whole index
     /// for every event. Temporary storage depends on the number of scopes,
     /// not the number of candidates. Returns the number of changed records.
-    pub fn invalidate_paths<'a>(
-        &mut self,
-        paths: impl IntoIterator<Item = &'a Path>,
-    ) -> usize {
+    pub fn invalidate_paths<'a>(&mut self, paths: impl IntoIterator<Item = &'a Path>) -> usize {
         let scopes: BTreeSet<&Path> = paths.into_iter().collect();
         let mut covered: Option<&Path> = None;
         let mut invalidated = 0;
@@ -374,7 +371,10 @@ mod tests {
         let changed = current.path.join("debug/deps/object.o");
         assert_eq!(index.invalidate_paths([changed.as_path()]), 1);
         let invalidated = index.get(current.identity).unwrap();
-        assert!(invalidated.evidence_matches(&current), "root metadata need not change");
+        assert!(
+            invalidated.evidence_matches(&current),
+            "root metadata need not change"
+        );
         assert_eq!(invalidated.score, None);
         assert_eq!(invalidated.safety_state, CandidateSafetyState::Unknown);
         assert_eq!(index.event_generation(), 0);
@@ -409,7 +409,9 @@ mod tests {
         assert_eq!(index.invalidate_paths(scopes), 3);
         assert_eq!(index.len(), paths.len(), "invalidation is not eviction");
         for (n, _) in paths.iter().enumerate() {
-            let current = index.get(record(u64::try_from(n).unwrap()).identity).unwrap();
+            let current = index
+                .get(record(u64::try_from(n).unwrap()).identity)
+                .unwrap();
             assert_eq!(current.score.is_none(), n < 3);
         }
         assert_eq!(index.invalidate_paths([Path::new("/cache/absent")]), 0);
@@ -421,15 +423,28 @@ mod tests {
         let mut index = index();
         let current = record(1);
         index.upsert(current.clone());
-        index.record_failure(current.identity, UNIX_EPOCH, Duration::from_secs(10), Duration::from_secs(60));
+        index.record_failure(
+            current.identity,
+            UNIX_EPOCH,
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
         let before = index.get(current.identity).unwrap().clone();
         index.invalidate_paths([current.path.as_path()]);
         let invalidated = index.get(current.identity).unwrap();
         assert_eq!(invalidated.fail_count, before.fail_count);
-        assert_eq!(invalidated.cooldown_until_nanos, before.cooldown_until_nanos);
+        assert_eq!(
+            invalidated.cooldown_until_nanos,
+            before.cooldown_until_nanos
+        );
         assert!(invalidated.evidence_matches(&before));
         // The daemon drains executor feedback after applying event invalidation.
-        index.record_failure(current.identity, UNIX_EPOCH, Duration::from_secs(10), Duration::from_secs(60));
+        index.record_failure(
+            current.identity,
+            UNIX_EPOCH,
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        );
         let after_cooldown = UNIX_EPOCH + Duration::from_secs(100);
         assert!(index.ranked_records(after_cooldown, 1).is_empty());
         assert_eq!(index.get(current.identity).unwrap().score, None);
@@ -438,7 +453,10 @@ mod tests {
         index.upsert(current.clone());
         assert_eq!(index.get(current.identity).unwrap().fail_count, 2);
         assert!(index.ranked_records(UNIX_EPOCH, 1).is_empty());
-        assert_eq!(index.ranked_records(after_cooldown, 1)[0].identity, current.identity);
+        assert_eq!(
+            index.ranked_records(after_cooldown, 1)[0].identity,
+            current.identity
+        );
     }
 
     #[test]
@@ -452,7 +470,8 @@ mod tests {
         index.upsert(other.clone());
         index.invalidate_paths([current.path.join("debug/changed.o").as_path()]);
         index.save_checkpoint(&checkpoint).unwrap();
-        let (mut loaded, status) = ScannerCandidateIndex::load_checkpoint(&checkpoint, index.context().clone());
+        let (mut loaded, status) =
+            ScannerCandidateIndex::load_checkpoint(&checkpoint, index.context().clone());
         assert_eq!(status, ScannerIndexLoadStatus::Loaded);
         assert_eq!(loaded.event_generation(), index.event_generation());
         assert_eq!(loaded.get(current.identity).unwrap().score, None);

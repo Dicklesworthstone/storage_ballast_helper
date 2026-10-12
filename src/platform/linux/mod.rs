@@ -310,11 +310,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let alias = temp.path().join("kernel");
         std::os::unix::fs::symlink("/proc/sys/kernel", &alias).unwrap();
-        assert_same_mount(
-            &LinuxPal::new(),
-            Path::new("/proc/sys"),
-            &alias.join(".."),
-        );
+        assert_same_mount(&LinuxPal::new(), Path::new("/proc/sys"), &alias.join(".."));
     }
 
     #[test]
@@ -336,9 +332,9 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let temp = tempfile::tempdir().unwrap();
-        let alias = temp
-            .path()
-            .join(std::ffi::OsString::from_vec(b"alias-\xff\n with space".to_vec()));
+        let alias = temp.path().join(std::ffi::OsString::from_vec(
+            b"alias-\xff\n with space".to_vec(),
+        ));
         std::os::unix::fs::symlink("/proc", &alias).unwrap();
         assert_same_mount(&LinuxPal::new(), Path::new("/proc"), &alias);
     }

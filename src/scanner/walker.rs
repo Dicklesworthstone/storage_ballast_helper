@@ -1216,8 +1216,7 @@ pub(crate) fn is_valid_cachedir_tag(path: &Path) -> bool {
     // while its signature was read. This is observation, not a deletion lease.
     file.metadata()
         .is_ok_and(|after| same_tag_observation(&opened, &after))
-        && fs::symlink_metadata(path)
-            .is_ok_and(|current| same_tag_observation(&opened, &current))
+        && fs::symlink_metadata(path).is_ok_and(|current| same_tag_observation(&opened, &current))
 }
 
 fn same_tag_observation(before: &fs::Metadata, after: &fs::Metadata) -> bool {
@@ -1703,7 +1702,8 @@ impl ActiveReferenceIndex {
     #[must_use]
     pub fn incomplete_reason(&self) -> Option<&str> {
         self.incomplete_reason.as_deref().or_else(|| {
-            (!self.complete).then_some("active-reference inspection did not cover every visible process")
+            (!self.complete)
+                .then_some("active-reference inspection did not cover every visible process")
         })
     }
 
@@ -2269,13 +2269,19 @@ mod tests {
             Ok(result)
         }
 
-        fn executables_under(&self, path: &Path) -> Result<crate::platform::types::ExecutablesResult> {
+        fn executables_under(
+            &self,
+            path: &Path,
+        ) -> Result<crate::platform::types::ExecutablesResult> {
             let mut result = self.inner.executables_under(path)?;
             result.complete = self.failed_source != 2;
             Ok(result)
         }
 
-        fn mmap_regions_under(&self, path: &Path) -> Result<Vec<crate::platform::types::MappedRegion>> {
+        fn mmap_regions_under(
+            &self,
+            path: &Path,
+        ) -> Result<Vec<crate::platform::types::MappedRegion>> {
             if self.failed_source == 3 {
                 return Err(crate::core::errors::SbhError::Runtime {
                     details: "injected maps access failure".to_string(),
@@ -2314,8 +2320,14 @@ mod tests {
             assert!(index.incomplete_reason().is_some());
             for path in [&active, &unobserved] {
                 let identity = identity_for_path(path, false).unwrap();
-                for summary in [index.summary_for(path), index.summary_for_identity(identity)] {
-                    assert!(summary.incomplete_reason.is_some(), "source {failed_source}");
+                for summary in [
+                    index.summary_for(path),
+                    index.summary_for_identity(identity),
+                ] {
+                    assert!(
+                        summary.incomplete_reason.is_some(),
+                        "source {failed_source}"
+                    );
                     assert!(summary.safe_reclaim_reason().is_some());
                     assert!(!summary.is_empty());
                     if path == &active {
@@ -2342,7 +2354,10 @@ mod tests {
         assert!(index.is_complete());
         assert!(index.incomplete_reason().is_none());
         let identity = identity_for_path(&root, false).unwrap();
-        for summary in [index.summary_for(&root), index.summary_for_identity(identity)] {
+        for summary in [
+            index.summary_for(&root),
+            index.summary_for_identity(identity),
+        ] {
             assert!(summary.is_empty());
             assert!(summary.safe_reclaim_reason().is_none());
         }
@@ -2353,9 +2368,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let identity = identity_for_path(dir.path(), false).unwrap();
         let index = ActiveReferenceIndex::incomplete("process visibility limited by policy");
-        assert_eq!(index.incomplete_reason(), Some("process visibility limited by policy"));
-        for summary in [index.summary_for(dir.path()), index.summary_for_identity(identity)] {
-            assert_eq!(summary.incomplete_reason.as_deref(), index.incomplete_reason());
+        assert_eq!(
+            index.incomplete_reason(),
+            Some("process visibility limited by policy")
+        );
+        for summary in [
+            index.summary_for(dir.path()),
+            index.summary_for_identity(identity),
+        ] {
+            assert_eq!(
+                summary.incomplete_reason.as_deref(),
+                index.incomplete_reason()
+            );
         }
     }
 
@@ -2377,7 +2401,10 @@ mod tests {
             // Other PIDs may be unreadable; positive evidence must survive
             // irrespective of completeness of the host-wide observation.
             assert!(is_path_open_by_ancestor(&candidate, &ancestors));
-            assert!(!is_path_open_by_ancestor(&root.join("unrelated"), &ancestors));
+            assert!(!is_path_open_by_ancestor(
+                &root.join("unrelated"),
+                &ancestors
+            ));
             assert_eq!(fs::read(candidate.join("retained")).unwrap(), b"keep");
         }
     }

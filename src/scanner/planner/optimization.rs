@@ -445,7 +445,9 @@ fn lower_risk_cover(
     let mut best = trim_cover(items, incumbent.to_vec(), target, risk_budget);
     let mut consider = |candidate: Option<TargetCover>| {
         if let Some(candidate) = candidate
-            && best.as_ref().is_none_or(|current| candidate.preferred_to(current))
+            && best
+                .as_ref()
+                .is_none_or(|current| candidate.preferred_to(current))
         {
             best = Some(candidate);
         }
@@ -472,30 +474,48 @@ fn lower_risk_cover(
     }
 
     let mut order: Vec<usize> = (0..items.len()).collect();
-    let useful_value = |index: usize| {
-        items[index].0.bytes.min(target) as f64 / items[index].0.expected_loss
-    };
+    let useful_value =
+        |index: usize| items[index].0.bytes.min(target) as f64 / items[index].0.expected_loss;
     order.sort_by(|&a, &b| {
         useful_value(b)
             .total_cmp(&useful_value(a))
-            .then_with(|| items[a].0.expected_loss.total_cmp(&items[b].0.expected_loss))
+            .then_with(|| {
+                items[a]
+                    .0
+                    .expected_loss
+                    .total_cmp(&items[b].0.expected_loss)
+            })
             .then_with(|| items[a].0.bytes.cmp(&items[b].0.bytes))
             .then_with(|| a.cmp(&b))
     });
     consider(cover_in_order(
-        items, &order, target, request.max_items, risk_budget,
+        items,
+        &order,
+        target,
+        request.max_items,
+        risk_budget,
     ));
     order.sort_by(|&a, &b| {
         items[a]
             .0
             .expected_loss
             .total_cmp(&items[b].0.expected_loss)
-            .then_with(|| items[b].0.bytes.min(target).cmp(&items[a].0.bytes.min(target)))
+            .then_with(|| {
+                items[b]
+                    .0
+                    .bytes
+                    .min(target)
+                    .cmp(&items[a].0.bytes.min(target))
+            })
             .then_with(|| items[a].0.bytes.cmp(&items[b].0.bytes))
             .then_with(|| a.cmp(&b))
     });
     consider(cover_in_order(
-        items, &order, target, request.max_items, risk_budget,
+        items,
+        &order,
+        target,
+        request.max_items,
+        risk_budget,
     ));
     // Small high-value children can block their parents, or fill every item
     // slot without reaching the target. Try a space-first cover as well; it
@@ -506,12 +526,21 @@ fn lower_risk_cover(
             .bytes
             .min(target)
             .cmp(&items[a].0.bytes.min(target))
-            .then_with(|| items[a].0.expected_loss.total_cmp(&items[b].0.expected_loss))
+            .then_with(|| {
+                items[a]
+                    .0
+                    .expected_loss
+                    .total_cmp(&items[b].0.expected_loss)
+            })
             .then_with(|| items[a].0.bytes.cmp(&items[b].0.bytes))
             .then_with(|| a.cmp(&b))
     });
     consider(cover_in_order(
-        items, &order, target, request.max_items, risk_budget,
+        items,
+        &order,
+        target,
+        request.max_items,
+        risk_budget,
     ));
     best
 }
@@ -1063,10 +1092,7 @@ mod tests {
         assert!(reference_plan.target_met);
         assert!(reference_plan.risk_used < 30.5);
         // Untargeted requests still retain ordinary value-first ordering.
-        let (untargeted, _) = plan_batch(
-            base,
-            &request(PressureLevel::Yellow, None, Some(100.0)),
-        );
+        let (untargeted, _) = plan_batch(base, &request(PressureLevel::Yellow, None, Some(100.0)));
         assert_eq!(untargeted[0].path, Path::new("/p/d"));
     }
 
@@ -1493,7 +1519,11 @@ mod tests {
             candidate("/p/invalid", GIB, f64::NAN, 1.0, DecisionAction::Delete),
             candidate("/p/valid", 2 * GIB, 0.9, 1.0, DecisionAction::Delete),
         ];
-        for level in [PressureLevel::Green, PressureLevel::Red, PressureLevel::Critical] {
+        for level in [
+            PressureLevel::Green,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
             let req = request(level, Some(GIB), None);
             let (chosen, plan) = plan_batch(candidates.clone(), &req);
             assert_eq!(chosen.len(), 1);
@@ -1574,11 +1604,19 @@ mod tests {
                 assert!(cover.indices.len() <= req.max_items);
                 assert_eq!(
                     cover.bytes,
-                    cover.indices.iter().map(|&i| u128::from(items[i].0.bytes)).sum::<u128>()
+                    cover
+                        .indices
+                        .iter()
+                        .map(|&i| u128::from(items[i].0.bytes))
+                        .sum::<u128>()
                 );
                 assert_eq!(
                     cover.risk,
-                    cover.indices.iter().map(|&i| items[i].0.expected_loss).sum::<f64>()
+                    cover
+                        .indices
+                        .iter()
+                        .map(|&i| items[i].0.expected_loss)
+                        .sum::<f64>()
                 );
             }
         }
@@ -1768,7 +1806,10 @@ mod tests {
         assert_eq!(chosen.len(), 2);
         assert_eq!(plan.planned_bytes, 10 * GIB);
         assert!(plan.target_met);
-        assert_eq!(plan.skipped_for_overlap[0].path, Path::new("/p/target/debug"));
+        assert_eq!(
+            plan.skipped_for_overlap[0].path,
+            Path::new("/p/target/debug")
+        );
     }
 
     #[test]
@@ -1794,7 +1835,8 @@ mod tests {
                         }
                         let (chosen, plan) = plan_batch(permutation, &req);
                         assert_eq!(plan, expected);
-                        let identities: HashSet<_> = chosen.iter().filter_map(|c| c.identity).collect();
+                        let identities: HashSet<_> =
+                            chosen.iter().filter_map(|c| c.identity).collect();
                         assert_eq!(identities.len(), chosen.len());
                         assert!(chosen.len() <= max_items);
                         assert!(plan.risk_used <= 1.1 + 1e-9);
@@ -1821,7 +1863,9 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         let payload = vec![0x5a; 8192];
         std::fs::write(target.join("kept.bin"), &payload).unwrap();
-        let alias = temp.path().join(std::ffi::OsString::from_vec(b"alias-\xff".to_vec()));
+        let alias = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"alias-\xff".to_vec()));
         symlink(&actual, &alias).unwrap();
         let paths = [target.clone(), alias.join("target")];
         let candidates: Vec<_> = paths

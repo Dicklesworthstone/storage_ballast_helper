@@ -15,8 +15,8 @@ pub(crate) fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::
     }
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStrExt;
         use serde::Serialize;
+        use std::os::unix::ffi::OsStrExt;
 
         #[derive(Serialize)]
         struct UnixPath<'a> {
@@ -107,9 +107,7 @@ mod tests {
     #[cfg(not(unix))]
     #[test]
     fn foreign_unix_bytes_are_not_reinterpreted_as_native_names() {
-        assert!(
-            serde_json::from_str::<EncodedPath>(r#"{"unix_bytes":[47,114,255]}"#).is_err()
-        );
+        assert!(serde_json::from_str::<EncodedPath>(r#"{"unix_bytes":[47,114,255]}"#).is_err());
     }
 
     #[cfg(unix)]
@@ -122,7 +120,8 @@ mod tests {
 
         use crate::scanner::index::{
             CandidateIndexRecord, CandidateSafetyState, IndexedEntryKind, IndexedIdentity,
-            IndexedPruneDecision, ScannerCandidateIndex, ScannerIndexContext, ScannerIndexLoadStatus,
+            IndexedPruneDecision, ScannerCandidateIndex, ScannerIndexContext,
+            ScannerIndexLoadStatus,
         };
         use crate::scanner::patterns::StructuralSignals;
 
@@ -184,7 +183,10 @@ mod tests {
             assert_ne!(encoded[0], encoded[2]);
             for (bytes, expected) in encoded.iter().zip(&paths) {
                 let restored: EncodedPath = serde_json::from_slice(bytes).unwrap();
-                assert_eq!(restored.0.as_os_str().as_bytes(), expected.as_os_str().as_bytes());
+                assert_eq!(
+                    restored.0.as_os_str().as_bytes(),
+                    expected.as_os_str().as_bytes()
+                );
             }
             assert!(serde_json::to_vec(&paths[0]).is_err());
         }
@@ -225,7 +227,8 @@ mod tests {
                 loaded.ranked_records(UNIX_EPOCH, 3),
                 index.ranked_records(UNIX_EPOCH, 3)
             );
-            let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
             assert!(value["records"][0]["path"].is_string());
             assert!(value["records"][1]["path"]["unix_bytes"].is_array());
         }
@@ -244,8 +247,15 @@ mod tests {
                 Duration::from_secs(120),
             );
             let loaded = restart(&index, &path);
-            assert_eq!(loaded.get(candidate.identity), index.get(candidate.identity));
-            assert!(loaded.ranked_records(UNIX_EPOCH + Duration::from_secs(29), 1).is_empty());
+            assert_eq!(
+                loaded.get(candidate.identity),
+                index.get(candidate.identity)
+            );
+            assert!(
+                loaded
+                    .ranked_records(UNIX_EPOCH + Duration::from_secs(29), 1)
+                    .is_empty()
+            );
             let ready = loaded.ranked_records(UNIX_EPOCH + Duration::from_secs(30), 1);
             assert_eq!(ready.len(), 1);
             assert_eq!(ready[0].path.as_os_str(), candidate.path.as_os_str());
@@ -303,7 +313,8 @@ mod tests {
             let mut index = index();
             index.upsert(record(native(b"/cache/project-\xff/target"), 1));
             index.save_checkpoint(&path).unwrap();
-            let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             value["records"][0]["path"]["unix_bytes"][0] = serde_json::json!(256);
             fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
             let (loaded, status) =

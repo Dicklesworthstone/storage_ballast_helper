@@ -15,9 +15,7 @@ use std::time::Duration;
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::budget::PurgeBudget;
-use super::{
-    QuarantineRecord, QuarantineStore, QuarantineUnavailable, RestoreOutcome, now_secs,
-};
+use super::{QuarantineRecord, QuarantineStore, QuarantineUnavailable, RestoreOutcome, now_secs};
 use crate::core::errors::{Result, SbhError};
 
 #[path = "purge.rs"]
@@ -207,17 +205,18 @@ fn read_manifest_at(
     root: &Directory,
 ) -> Result<Option<(QuarantineRecord, bool)>> {
     validate_id(id).map_err(|e| SbhError::io(store.root(), e))?;
-    let (record, pending) = match root.read_json::<QuarantineRecord>(OsStr::new(&format!("{id}.json"))) {
-        Ok(record) => (record, false),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            match root.read_json::<QuarantineRecord>(OsStr::new(&format!("{id}.pending"))) {
-                Ok(record) => (record, true),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(SbhError::io(pending_path(store, id), e)),
+    let (record, pending) =
+        match root.read_json::<QuarantineRecord>(OsStr::new(&format!("{id}.json"))) {
+            Ok(record) => (record, false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                match root.read_json::<QuarantineRecord>(OsStr::new(&format!("{id}.pending"))) {
+                    Ok(record) => (record, true),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(SbhError::io(pending_path(store, id), e)),
+                }
             }
-        }
-        Err(e) => return Err(SbhError::io(store.record_path(id), e)),
-    };
+            Err(e) => return Err(SbhError::io(store.record_path(id), e)),
+        };
     validate_record(store, id, &record).map_err(|e| SbhError::io(store.record_path(id), e))?;
     Ok(Some((record, pending)))
 }
@@ -228,12 +227,17 @@ fn payload_at(root: &Directory, record: &QuarantineRecord) -> io::Result<Option<
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let name = record.original_path.file_name().ok_or_else(|| invalid("original has no basename"))?;
+    let name = record
+        .original_path
+        .file_name()
+        .ok_or_else(|| invalid("original has no basename"))?;
     let Some(payload) = Payload::observe(entry, name.to_os_string())? else {
         return Ok(None);
     };
     if !payload.identity.matches_record(record) {
-        return Err(invalid("quarantine payload identity changed; refusing transaction"));
+        return Err(invalid(
+            "quarantine payload identity changed; refusing transaction",
+        ));
     }
     Ok(Some(payload))
 }
@@ -330,7 +334,11 @@ fn quarantine_with_hook(
     hook(TransactionStep::Locked);
     let manifest = format!("{id}.json");
     let pending = format!("{id}.pending");
-    if root.inspect(OsStr::new(&manifest)).map_err(unavailable)?.is_some() {
+    if root
+        .inspect(OsStr::new(&manifest))
+        .map_err(unavailable)?
+        .is_some()
+    {
         return Err(unavailable(invalid(
             "decision id already has a quarantine record",
         )));
@@ -367,7 +375,12 @@ fn quarantine_with_hook(
     let transfer = || -> io::Result<()> {
         root.require_path(store.root())?;
         entry.require_path(&dir)?;
-        source.parent.require_path(record.original_path.parent().ok_or_else(|| invalid("original has no parent"))?)?;
+        source.parent.require_path(
+            record
+                .original_path
+                .parent()
+                .ok_or_else(|| invalid("original has no parent"))?,
+        )?;
         source.parent.require_outside(&root)?;
         source.move_to(&entry, &source.name)
     };
@@ -393,11 +406,20 @@ fn quarantine_with_hook(
     Ok(record)
 }
 
-fn discard_unmoved_reservation(root: &Directory, entry: &Directory, source: &Payload, record: &QuarantineRecord) {
+fn discard_unmoved_reservation(
+    root: &Directory,
+    entry: &Directory,
+    source: &Payload,
+    record: &QuarantineRecord,
+) {
     let pending = format!("{}.pending", record.decision_id);
     if source.verify().is_ok()
-        && entry.inspect(&source.name).is_ok_and(|payload| payload.is_none())
-        && root.read_json::<QuarantineRecord>(OsStr::new(&pending)).is_ok_and(|current| current == *record)
+        && entry
+            .inspect(&source.name)
+            .is_ok_and(|payload| payload.is_none())
+        && root
+            .read_json::<QuarantineRecord>(OsStr::new(&pending))
+            .is_ok_and(|current| current == *record)
     {
         let _ = root.remove_file(OsStr::new(&pending));
         let _ = root.remove_directory(OsStr::new(&record.decision_id));
@@ -434,9 +456,12 @@ pub(super) fn purge_with_budget(
     if budget.exhausted() {
         return Ok(None);
     }
-    purge_with(store, &selected.decision_id, Some(selected), |lock, record| {
-        confined_purge::remove_payload_with_budget(lock, record, budget)
-    })
+    purge_with(
+        store,
+        &selected.decision_id,
+        Some(selected),
+        |lock, record| confined_purge::remove_payload_with_budget(lock, record, budget),
+    )
 }
 
 fn purge_with(
@@ -473,8 +498,8 @@ fn purge_with(
     // checked earlier. Nested mounts are not part of a quarantined artifact.
     // On refusal keep its manifest so later drains/undo can recover what
     // remains; never fall back to unrestricted recursive removal.
-    let Some(removed) = remove(&lock, &record)
-        .map_err(|e| SbhError::io(&record.quarantine_path, e))?
+    let Some(removed) =
+        remove(&lock, &record).map_err(|e| SbhError::io(&record.quarantine_path, e))?
     else {
         return Ok(None);
     };
@@ -505,7 +530,10 @@ fn restored_destination(record: &QuarantineRecord) -> Option<(PathBuf, Payload)>
         .into_iter()
         .find_map(|path| {
             let payload = Payload::open(&path).ok()?;
-            payload.identity.matches_record(record).then_some((path, payload))
+            payload
+                .identity
+                .matches_record(record)
+                .then_some((path, payload))
         })
 }
 
@@ -556,17 +584,23 @@ fn restore_with_hook(
             details: format!("no quarantined entry for decision {id}"),
         });
     };
-    let Some(source) = payload_at(&root, &record)
-        .map_err(|e| SbhError::io(&record.quarantine_path, e))?
+    let Some(source) =
+        payload_at(&root, &record).map_err(|e| SbhError::io(&record.quarantine_path, e))?
     else {
         // Undo may have completed its rename before the process stopped.
         // Recognize that exact inode, including a force-suffix destination,
         // rather than moving or overwriting a newly rebuilt original.
-        let (destination, payload) = restored_destination(&record).ok_or_else(|| SbhError::Runtime {
-            details: format!("quarantined entry for {id} is gone"),
-        })?;
-        payload.parent.require_outside(&root).map_err(|e| SbhError::io(&destination, e))?;
-        payload.verify().map_err(|e| SbhError::io(&destination, e))?;
+        let (destination, payload) =
+            restored_destination(&record).ok_or_else(|| SbhError::Runtime {
+                details: format!("quarantined entry for {id} is gone"),
+            })?;
+        payload
+            .parent
+            .require_outside(&root)
+            .map_err(|e| SbhError::io(&destination, e))?;
+        payload
+            .verify()
+            .map_err(|e| SbhError::io(&destination, e))?;
         finish_restore(&root, id, None, &payload.parent);
         return Ok(RestoreOutcome {
             decision_id: id.to_string(),
@@ -578,12 +612,17 @@ fn restore_with_hook(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|e| SbhError::io(parent, e))?;
     }
-    let (target, name) = Directory::parent_of(&destination).map_err(|e| SbhError::io(&destination, e))?;
+    let (target, name) =
+        Directory::parent_of(&destination).map_err(|e| SbhError::io(&destination, e))?;
     hook(TransactionStep::Prepared);
     let check = || -> io::Result<()> {
         root.require_path(store.root())?;
         source.parent.require_path(&store.entry_dir(id))?;
-        target.require_path(destination.parent().ok_or_else(|| invalid("restore has no parent"))?)?;
+        target.require_path(
+            destination
+                .parent()
+                .ok_or_else(|| invalid("restore has no parent"))?,
+        )?;
         target.require_outside(&root)
     };
     check().map_err(|e| SbhError::io(&destination, e))?;
@@ -599,8 +638,11 @@ fn restore_with_hook(
                 });
             }
             destination = suffixed_destination(&record);
-            let suffix = destination.file_name().ok_or_else(|| SbhError::io(&destination, invalid("restore has no basename")))?;
-            source.move_to(&target, suffix)
+            let suffix = destination
+                .file_name()
+                .ok_or_else(|| SbhError::io(&destination, invalid("restore has no basename")))?;
+            source
+                .move_to(&target, suffix)
                 .map_err(|e| SbhError::io(&destination, e))?;
         }
         Err(e) => return Err(SbhError::io(&destination, e)),
@@ -1076,7 +1118,10 @@ mod tests {
             }
         }
         for record in [&first, &second, &third] {
-            assert_eq!(fs::read(&record.quarantine_path).unwrap(), b"original bytes");
+            assert_eq!(
+                fs::read(&record.quarantine_path).unwrap(),
+                b"original bytes"
+            );
             assert!(!store.stuck_path(&record.decision_id).exists());
         }
         // Explicit mutations remain refused while another operation owns the lock.
@@ -1104,9 +1149,18 @@ mod tests {
         assert!(out.failures.is_empty());
         assert!(!store.stuck_path("ttl-changed").exists());
         assert_eq!(store.record("ttl-changed").unwrap(), Some(extended.clone()));
-        assert_eq!(fs::read(&extended.quarantine_path).unwrap(), b"original bytes");
-        assert_eq!(store.drain_expired(selected.expires_at).unwrap().counts(), (0, 0));
-        assert_eq!(store.drain_expired(extended.expires_at).unwrap().counts(), (1, 100));
+        assert_eq!(
+            fs::read(&extended.quarantine_path).unwrap(),
+            b"original bytes"
+        );
+        assert_eq!(
+            store.drain_expired(selected.expires_at).unwrap().counts(),
+            (0, 0)
+        );
+        assert_eq!(
+            store.drain_expired(extended.expires_at).unwrap().counts(),
+            (1, 100)
+        );
     }
 
     #[test]
@@ -1132,8 +1186,14 @@ mod tests {
         assert_eq!(out.deferred_entries, 1);
         assert_eq!(out.bytes, 0);
         assert_eq!(store.record("reused").unwrap(), Some(fresh.clone()));
-        assert_eq!(fs::read(&selected.original_path).unwrap(), b"original bytes");
-        assert_eq!(fs::read(&fresh.quarantine_path).unwrap(), b"new protected-by-ttl payload");
+        assert_eq!(
+            fs::read(&selected.original_path).unwrap(),
+            b"original bytes"
+        );
+        assert_eq!(
+            fs::read(&fresh.quarantine_path).unwrap(),
+            b"new protected-by-ttl payload"
+        );
         // A fresh forced selection may reclaim the newly held entry, not the original.
         assert_eq!(store.drain_all().unwrap().counts(), (1, 200));
         assert_eq!(fs::read(selected.original_path).unwrap(), b"original bytes");
@@ -1143,10 +1203,18 @@ mod tests {
     fn pending_manifest_publication_preserves_an_unchanged_selection() {
         let dir = tempfile::tempdir().unwrap();
         let (store, selected) = held(dir.path(), "published");
-        fs::rename(store.record_path("published"), pending_path(&store, "published")).unwrap();
+        fs::rename(
+            store.record_path("published"),
+            pending_path(&store, "published"),
+        )
+        .unwrap();
         let from_pending = store.record("published").unwrap().unwrap();
         assert_eq!(from_pending, selected);
-        fs::rename(pending_path(&store, "published"), store.record_path("published")).unwrap();
+        fs::rename(
+            pending_path(&store, "published"),
+            store.record_path("published"),
+        )
+        .unwrap();
         // Changing only the publication state is not changing the selected
         // payload or policy. Admit it through the same locked snapshot check.
         assert_eq!(
