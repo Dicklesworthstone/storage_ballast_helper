@@ -5,6 +5,7 @@
 #![cfg(unix)]
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -227,6 +228,95 @@ fn ordinary_direct_cleanup_keeps_readonly_directories_as_a_permission_boundary()
     assert_eq!(unchanged_mode.unwrap(), 0o555);
     assert_eq!(fs::read(locked.join("artifact.bin")).unwrap(), PAYLOAD);
     assert!(!dir.path().join(".sbh").exists());
+}
+
+#[test]
+fn live_category_refusal_is_a_typed_skip_in_both_modes_and_dry_runs() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        for dry_run in [false, true] {
+            for include_review in [false, true] {
+                let dir = scratch();
+                let target = dir.path().join("target");
+                fs::create_dir(&target).unwrap();
+                fs::write(target.join("artifact.o"), PAYLOAD).unwrap();
+                let mut item = candidate(&target);
+                if include_review {
+                    item.decision.action = DecisionAction::Review;
+                }
+                let mut cfg = config(dir.path(), mode);
+                cfg.dry_run = dry_run;
+                cfg.include_review = include_review;
+                let executor = DeletionExecutor::new(cfg, None);
+                let plan = executor.plan(vec![item]);
+                assert_eq!(plan.estimated_items, 1);
+                let calls = Cell::new(0);
+                let authorize = |item: &CandidacyScore| {
+                    assert_eq!(item.path, target);
+                    assert_eq!(item.classification.category, ArtifactCategory::RustTarget);
+                    calls.set(calls.get() + 1);
+                    Err(SkipReason::CategorySuspended)
+                };
+
+                let report = executor.execute_with_guard(&plan, None, Some(&authorize));
+                assert_eq!(calls.get(), 1);
+                assert_eq!(
+                    report.sacred_scans, 1,
+                    "full preflight must precede the guard"
+                );
+                assert_eq!(report.items_skipped, 1);
+                assert_eq!(report.skipped_by_reason.get("category_suspended"), Some(&1));
+                assert!(!report.skipped_by_reason.contains_key("target_free_reached"));
+                assert_eq!(report.items_deleted, 0);
+                assert_eq!(report.items_failed, 0);
+                assert_eq!(report.items_would_delete, 0);
+                assert_eq!(report.items_quarantined, 0);
+                assert_eq!(report.quarantine_unavailable, 0);
+                assert_eq!(report.bytes_freed, 0);
+                assert_eq!(report.bytes_freed_observed, Some(0));
+                assert_eq!(report.bytes_would_free, 0);
+                assert_eq!(report.bytes_quarantined, 0);
+                assert!(report.errors.is_empty());
+                assert!(report.deleted_paths.is_empty());
+                assert!(report.backoff_candidates.is_empty());
+                assert!(!report.circuit_breaker_tripped);
+                assert_eq!(fs::read(target.join("artifact.o")).unwrap(), PAYLOAD);
+                assert!(!dir.path().join(".sbh").exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn live_authorization_cannot_bypass_preflight_protection() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let dir = scratch();
+        let target = dir.path().join("target");
+        let nested = target.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(target.join("artifact.o"), PAYLOAD).unwrap();
+        let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+        let plan = executor.plan(vec![candidate(&target)]);
+        assert_eq!(plan.estimated_items, 1);
+        // Descendant protection appears after planning. It must be found
+        // by the full preflight before any live authorization is requested.
+        fs::write(nested.join(".sbh-protect"), b"").unwrap();
+        let calls = Cell::new(0);
+        let authorize = |_: &CandidacyScore| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+
+        let report = executor.execute_with_guard(&plan, None, Some(&authorize));
+        assert_eq!(calls.get(), 0);
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert_eq!(report.bytes_freed, 0);
+        assert!(nested.join(".sbh-protect").exists());
+        assert_eq!(fs::read(target.join("artifact.o")).unwrap(), PAYLOAD);
+        assert!(!dir.path().join(".sbh").exists());
+    }
 }
 
 type RefusalCase = (&'static str, fn(&mut CandidacyScore), SkipReason);

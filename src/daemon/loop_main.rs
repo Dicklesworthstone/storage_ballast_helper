@@ -76,7 +76,7 @@ use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
 use crate::platform::types::{
     FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
 };
-use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionMode};
+use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionMode, SkipReason};
 use crate::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use crate::scanner::events::{
     EventInvalidation, EventSourceConfig, EventSourceStats, ScannerEventSource,
@@ -322,6 +322,32 @@ impl SharedRegret {
             .map(|summary| summary.category)
             .collect();
         (calibrator.calibrations(), suspended)
+    }
+
+    /// Recheck queued work at the execution boundary: its scoring snapshot
+    /// may predate a category alarm raised during the scan or this batch.
+    fn authorize_deletion(
+        &self,
+        candidate: &CandidacyScore,
+        logger: &ActivityLoggerHandle,
+    ) -> std::result::Result<(), SkipReason> {
+        let category = format!("{:?}", candidate.classification.category);
+        let suspended = {
+            let calibrator = self.calibrator.lock();
+            calibrator.suspended(&category, Instant::now())
+        };
+        if suspended {
+            // Release the evidence lock before logging or filesystem work.
+            logger.send(ActivityEvent::Info {
+                message: format!(
+                    "regret category {category} is suspended; skipped {}",
+                    candidate.path.display()
+                ),
+            });
+            Err(SkipReason::CategorySuspended)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -9450,7 +9476,10 @@ fn executor_thread_main(
             HashMap::new()
         };
 
-        let report = executor.execute(&plan, Some(&skip_protected));
+        let authorize_candidate =
+            |candidate: &CandidacyScore| regret.authorize_deletion(candidate, logger);
+        let report =
+            executor.execute_with_guard(&plan, Some(&skip_protected), Some(&authorize_candidate));
 
         if scanner_config.engine == ScannerEngineMode::V2 {
             for candidate in &report.backoff_candidates {
@@ -10562,6 +10591,139 @@ mod tests {
             protected.exists(),
             "protected candidate must remain present after executor preflight"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_regret_guard_stops_queued_category_after_a_midbatch_alarm() {
+        use std::cell::Cell;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let project = fixture.directory.path().join("project");
+        let first = project.join("first/target");
+        let held = project.join("held/target");
+        let other = project.join("other/node_modules");
+        let mut candidates = Vec::new();
+        for (path, category, score) in [
+            (&first, ArtifactCategory::RustTarget, 3.0),
+            (&held, ArtifactCategory::RustTarget, 2.0),
+            (&other, ArtifactCategory::NodeModules, 1.0),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("artifact.o"), [0u8; 16]).unwrap();
+            let mut candidate = test_candidate(&path.to_string_lossy(), score);
+            candidate.classification.category = category;
+            candidate.size_bytes = 16;
+            assert!(!candidate.decision.category_suspended);
+            candidates.push(candidate);
+        }
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                check_open_files: true,
+                ..Default::default()
+            },
+            Some(fixture.daemon.logger_handle.clone()),
+        )
+        .with_platform(Arc::clone(&fixture.daemon.platform));
+        let plan = executor.plan(candidates);
+        assert_eq!(plan.candidates.len(), 3);
+        let checks = Cell::new(0);
+        let authorize = |candidate: &CandidacyScore| {
+            checks.set(checks.get() + 1);
+            if candidate.path == held {
+                // The queued scores were all made before this alarm. Raise
+                // it only after a real deletion in this batch has completed.
+                assert!(!first.exists());
+                assert!(other.exists());
+                let mut calibrator = fixture.daemon.regret.calibrator.lock();
+                for _ in 0..3 {
+                    calibrator.record(
+                        "RustTarget",
+                        ArtifactCertainty::Definite,
+                        Outcome::Regret,
+                        Instant::now(),
+                    );
+                }
+            }
+            fixture
+                .daemon
+                .regret
+                .authorize_deletion(candidate, &fixture.daemon.logger_handle)
+        };
+        let report = executor.execute_with_guard(&plan, None, Some(&authorize));
+
+        assert_eq!(checks.get(), 3);
+        assert_eq!(report.items_deleted, 2);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.bytes_freed, 32);
+        assert_eq!(report.deleted_paths, vec![first.clone(), other.clone()]);
+        assert_eq!(report.skipped_by_reason.get("category_suspended"), Some(&1));
+        assert!(report.backoff_candidates.is_empty());
+        assert!(report.errors.is_empty());
+        assert!(!report.circuit_breaker_tripped);
+        assert!(!first.exists());
+        assert!(held.join("artifact.o").exists());
+        assert!(!other.exists());
+        fixture.flush_logger();
+        let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+        assert!(log.contains("regret category RustTarget is suspended; skipped "));
+        assert!(log.contains(held.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_regret_guard_allows_an_expired_category_suspension() {
+        let fixture = RegretDaemonFixture::new();
+        let path = fixture.directory.path().join("project/target");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("artifact.o"), [0u8; 16]).unwrap();
+        // A zero-duration suspension expires at its alarm timestamp, so
+        // this exercises expiry without a sleep or wall-clock tolerance.
+        let mut config = fixture.daemon.config.clone();
+        config.scoring.regret_suspend_minutes = 0;
+        fixture.daemon.regret.update_config(&config);
+        {
+            let mut calibrator = fixture.daemon.regret.calibrator.lock();
+            for _ in 0..3 {
+                calibrator.record(
+                    "RustTarget",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    Instant::now(),
+                );
+            }
+            let summary = calibrator.summary("RustTarget").unwrap();
+            assert_eq!(summary.regrets, 3);
+            assert_eq!(summary.e_value, 1.0, "the alarm resets its likelihood");
+            assert!(!calibrator.suspended("RustTarget", Instant::now()));
+        }
+        let mut candidate = test_candidate(&path.to_string_lossy(), 1.0);
+        candidate.classification.category = ArtifactCategory::RustTarget;
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                check_open_files: true,
+                ..Default::default()
+            },
+            Some(fixture.daemon.logger_handle.clone()),
+        )
+        .with_platform(Arc::clone(&fixture.daemon.platform));
+        let plan = executor.plan(vec![candidate]);
+        let authorize = |candidate: &CandidacyScore| {
+            fixture
+                .daemon
+                .regret
+                .authorize_deletion(candidate, &fixture.daemon.logger_handle)
+        };
+        let report = executor.execute_with_guard(&plan, None, Some(&authorize));
+        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.items_skipped, 0);
+        assert_eq!(report.items_failed, 0);
+        assert!(!path.exists());
     }
 
     #[test]

@@ -467,6 +467,9 @@ pub enum SkipReason {
     /// Open file or process scan could not complete within the 5s deadline or
     /// 50,000 PID cap; the executor fails conservative (bd-rc-master-ajg1.10.2).
     OpenScanIncomplete,
+    /// The category's live regret guard currently suspends deletion. This
+    /// transient category decision must not create a per-path backoff.
+    CategorySuspended,
 }
 
 impl SkipReason {
@@ -476,7 +479,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -495,6 +498,7 @@ impl SkipReason {
         Self::SacredStowaway,
         Self::FilesystemReadOnly,
         Self::OpenScanIncomplete,
+        Self::CategorySuspended,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -527,6 +531,7 @@ impl SkipReason {
             Self::SacredStowaway => "sacred_stowaway",
             Self::FilesystemReadOnly => "filesystem_read_only",
             Self::OpenScanIncomplete => "open_scan_incomplete",
+            Self::CategorySuspended => "category_suspended",
         }
     }
 
@@ -568,6 +573,7 @@ impl SkipReason {
                 "open file or process scan incomplete due to system load (deadline/budget exceeded) — \
                  aborted batch for safety"
             }
+            Self::CategorySuspended => "category deletion temporarily suspended after regrets",
         }
     }
 }
@@ -602,8 +608,8 @@ pub fn error_recovery_cause(error: &SbhError) -> Option<RecoveryCause> {
 }
 
 /// Whether a skipped candidate earns a per-path repeat-deletion backoff. A
-/// read-only filesystem is a mount incident handled by mount recovery, not a
-/// fault of the path, so it gets none.
+/// read-only filesystem is a mount incident handled by mount recovery, and a
+/// category suspension is transient feedback, so neither penalizes the path.
 fn should_backoff_skip(reason: SkipReason) -> bool {
     !matches!(
         reason,
@@ -611,6 +617,7 @@ fn should_backoff_skip(reason: SkipReason) -> bool {
             | SkipReason::BelowThreshold
             | SkipReason::UserDeclined
             | SkipReason::FilesystemReadOnly
+            | SkipReason::CategorySuspended
     )
 }
 
@@ -709,11 +716,28 @@ impl DeletionExecutor {
     ///
     /// Returns a report summarizing what was deleted, skipped, or failed.
     /// If `should_skip` returns `true` for a candidate path, it is skipped.
-    #[allow(clippy::too_many_lines)]
     pub fn execute(
         &self,
         plan: &DeletionPlan,
         should_skip: Option<&dyn Fn(&Path) -> bool>,
+    ) -> DeletionReport {
+        self.execute_with_guard(plan, should_skip, None)
+    }
+
+    /// Execute with a live per-candidate authorization check. The guard runs
+    /// after expensive preflight and free-space observations, before either
+    /// mutation backend or dry-run admission. It may refuse an otherwise
+    /// eligible candidate, but cannot override any earlier safety veto.
+    ///
+    /// A refusal is a typed skip, never a failed deletion or reclaimed bytes.
+    /// Mutation backends retain their final lease and filesystem identity
+    /// checks after authorization; an already-started removal is not cancelled.
+    #[allow(clippy::too_many_lines)]
+    pub fn execute_with_guard(
+        &self,
+        plan: &DeletionPlan,
+        should_skip: Option<&dyn Fn(&Path) -> bool>,
+        authorize: Option<&dyn Fn(&CandidacyScore) -> std::result::Result<(), SkipReason>>,
     ) -> DeletionReport {
         let start = Instant::now();
         let mut report = DeletionReport {
@@ -882,6 +906,23 @@ impl DeletionExecutor {
                 }
             }
 
+            // Measure space before the live guard: an observation on a slow
+            // filesystem must not leave authorization stale before mutation.
+            let del_start = Instant::now();
+            let free_before = (!self.config.dry_run && plan.mode == DeletionMode::Unlink)
+                .then(|| available_bytes_beside(&candidate.path))
+                .flatten();
+            if let Some(authorize) = authorize
+                && let Err(reason) = authorize(candidate)
+            {
+                report.record_skip(reason);
+                consecutive_failures = 0;
+                if should_backoff_skip(reason) {
+                    report.backoff_candidates.push(candidate.clone());
+                }
+                continue;
+            }
+
             if self.config.dry_run {
                 report.items_would_delete += 1;
                 report.bytes_would_free =
@@ -892,10 +933,6 @@ impl DeletionExecutor {
 
             // Actual deletion, or quarantine (Layer 7). Quarantine has no
             // successful-unlink outcome: failure cannot widen this plan.
-            let del_start = Instant::now();
-            let free_before = (plan.mode == DeletionMode::Unlink)
-                .then(|| available_bytes_beside(&candidate.path))
-                .flatten();
             let outcome = match plan.mode {
                 DeletionMode::Unlink => self.delete_path(candidate).map(|()| false),
                 DeletionMode::Quarantine => self.quarantine_path(candidate).map(|()| true),
@@ -2196,6 +2233,7 @@ mod tests {
     #[test]
     fn mount_incidents_get_no_per_path_backoff() {
         assert!(!should_backoff_skip(SkipReason::FilesystemReadOnly));
+        assert!(!should_backoff_skip(SkipReason::CategorySuspended));
         assert!(should_backoff_skip(SkipReason::Symlink));
         assert!(!should_backoff_skip(SkipReason::PathGone));
     }
@@ -2226,6 +2264,7 @@ mod tests {
                 SkipReason::SacredStowaway => 15,
                 SkipReason::FilesystemReadOnly => 16,
                 SkipReason::OpenScanIncomplete => 17,
+                SkipReason::CategorySuspended => 18,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];
