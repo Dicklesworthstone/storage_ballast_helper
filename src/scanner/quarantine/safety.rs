@@ -25,6 +25,7 @@ mod confined_purge;
 #[path = "transaction.rs"]
 mod transaction;
 
+pub(crate) use confined_purge::remove_direct;
 use transaction::{Directory, Payload};
 
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;

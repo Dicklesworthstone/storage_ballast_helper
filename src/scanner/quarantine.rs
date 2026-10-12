@@ -31,6 +31,7 @@ mod budget;
 mod placement;
 mod safety;
 
+pub(crate) use safety::remove_direct;
 pub use budget::DEFAULT_DRAIN_WORK;
 use budget::PurgeBudget;
 

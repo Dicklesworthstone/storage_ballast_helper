@@ -97,7 +97,7 @@ impl Control {
 
     pub(super) fn admit(&self) -> Option<Admission<'_>> {
         self.admission
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if current >= CLOSED - 1 {
                     None
                 } else {

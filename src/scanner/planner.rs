@@ -194,7 +194,7 @@ mod tests {
 
     fn veto(mut candidate: CandidacyScore) -> CandidacyScore {
         candidate.vetoed = true;
-        candidate.veto_reason = Some("active or protected contents".to_string());
+        candidate.veto_reason = Some("active or protected contents".into());
         candidate
     }
 

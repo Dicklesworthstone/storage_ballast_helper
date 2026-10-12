@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -99,6 +100,133 @@ fn raw_plan(candidates: Vec<CandidacyScore>, mode: DeletionMode) -> DeletionPlan
         mode,
         refused: Vec::new(),
     }
+}
+
+#[test]
+fn direct_tree_cleanup_does_not_follow_links_or_open_special_entries() {
+    let dir = scratch();
+    let root = dir.path().join("target");
+    let nested = root.join("debug/deps");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("artifact.o"), PAYLOAD).unwrap();
+    let outside = dir.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("precious"), b"outside data").unwrap();
+    fs::write(dir.path().join("sibling"), b"unrelated sibling").unwrap();
+    symlink(&outside, nested.join("directory-link")).unwrap();
+    symlink(outside.join("precious"), root.join("file-link")).unwrap();
+    symlink("absent", root.join("dangling-link")).unwrap();
+    nix::unistd::mkfifo(
+        &root.join("pipe"),
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+
+    let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+    assert_eq!(
+        executor
+            .delete_candidate_checked(&candidate(&root), None)
+            .unwrap(),
+        CheckedDeletion::Deleted
+    );
+    assert!(fs::symlink_metadata(&root).is_err());
+    assert_eq!(fs::read(outside.join("precious")).unwrap(), b"outside data");
+    assert_eq!(
+        fs::read(dir.path().join("sibling")).unwrap(),
+        b"unrelated sibling"
+    );
+    // Direct and emergency cleanup cannot allocate a recovery store first.
+    assert!(!dir.path().join(".sbh").exists());
+}
+
+#[test]
+fn direct_cache_cleanup_preserves_external_hardlink_permissions() {
+    for (name, pattern, category) in [
+        ("gomodcache", "go-module-cache", ArtifactCategory::GoCache),
+        (
+            "cargo-cache",
+            "opaque-cargo-cache",
+            ArtifactCategory::CacheDir,
+        ),
+    ] {
+        let dir = scratch();
+        let root = dir.path().join(name);
+        let module = root.join("module");
+        fs::create_dir_all(&module).unwrap();
+        let leaf = module.join("artifact.bin");
+        fs::write(&leaf, PAYLOAD).unwrap();
+        let retained = dir.path().join("retained-hardlink");
+        fs::hard_link(&leaf, &retained).unwrap();
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&module, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+        let original_mode = fs::metadata(&retained).unwrap().permissions().mode();
+        let mut item = candidate(&root);
+        item.classification.pattern_name = Cow::Borrowed(pattern);
+        item.classification.category = category;
+        let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+
+        let report = executor.execute(&executor.plan(vec![item]), None);
+        // Restore fixture directories on failure so a failed regression still
+        // leaves TempDir able to clean up. Never change the hardlinked file.
+        let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o755));
+        let _ = fs::set_permissions(&module, fs::Permissions::from_mode(0o755));
+        assert_eq!(report.items_deleted, 1, "{pattern}: {:?}", report.errors);
+        assert_eq!(report.items_failed, 0, "{pattern}");
+        assert_eq!(report.items_skipped, 0, "{pattern}");
+        assert_eq!(report.items_quarantined, 0, "{pattern}");
+        assert!(fs::symlink_metadata(&root).is_err(), "{pattern}");
+        assert_eq!(fs::read(&retained).unwrap(), PAYLOAD, "{pattern}");
+        assert_eq!(
+            fs::metadata(&retained).unwrap().permissions().mode(),
+            original_mode,
+            "cleanup must not chmod surviving hardlinks: {pattern}"
+        );
+        assert!(!dir.path().join(".sbh").exists(), "{pattern}");
+    }
+}
+
+#[test]
+fn ordinary_direct_cleanup_keeps_readonly_directories_as_a_permission_boundary() {
+    let dir = scratch();
+    let root = dir.path().join("target");
+    let locked = root.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("artifact.bin"), PAYLOAD).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    // UID 0 can still lack DAC override in a user namespace. Probe the actual
+    // permission boundary rather than skipping a meaningful test by UID alone.
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(locked.join("permission-probe"))
+    {
+        Ok(_) => {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("TEST SKIP: this process bypasses readonly directory permissions");
+            return;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => panic!("readonly-directory fixture probe failed: {error}"),
+    }
+    let item = candidate(&root);
+    let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+    let preflight = executor.explain_preflight(&item, None);
+    let report = executor.execute(&executor.plan(vec![item]), None);
+    let unchanged_mode = fs::metadata(&locked).map(|meta| meta.permissions().mode() & 0o777);
+    let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+
+    assert!(
+        preflight.is_ok(),
+        "the fixture must reach removal: {preflight:?}"
+    );
+    assert_eq!(report.items_deleted, 0);
+    assert_eq!(report.items_failed, 1);
+    assert_eq!(report.items_skipped, 0);
+    assert_eq!(report.bytes_freed, 0);
+    assert_eq!(unchanged_mode.unwrap(), 0o555);
+    assert_eq!(fs::read(locked.join("artifact.bin")).unwrap(), PAYLOAD);
+    assert!(!dir.path().join(".sbh").exists());
 }
 
 type RefusalCase = (&'static str, fn(&mut CandidacyScore), SkipReason);

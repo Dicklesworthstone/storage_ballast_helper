@@ -1078,7 +1078,7 @@ impl DeletionExecutor {
         }
 
         // 3. Scanner-observed identity must still refer to this same entry.
-        self.verify_candidate_identity(candidate)?;
+        self.verify_candidate_identity(candidate, &meta)?;
 
         // 4. Parent directory is writable (effective permission for this
         //    process). A read-only filesystem is classified apart from a
@@ -1156,6 +1156,7 @@ impl DeletionExecutor {
     fn verify_candidate_identity(
         &self,
         candidate: &CandidacyScore,
+        metadata: &fs::Metadata,
     ) -> std::result::Result<(), SkipReason> {
         let Some(expected) = candidate.identity else {
             return if self.config.require_identity {
@@ -1168,8 +1169,7 @@ impl DeletionExecutor {
             return Err(SkipReason::IdentityUnavailable);
         }
 
-        let current =
-            walker::identity_for_path(&candidate.path, false).map_err(|_| SkipReason::PathGone)?;
+        let current = walker::entry_metadata(metadata).identity();
         if !identity_is_supported(current) {
             return Err(SkipReason::IdentityUnavailable);
         }
@@ -1206,7 +1206,7 @@ impl DeletionExecutor {
                 details: format!("path became a symlink before deletion: {}", path.display()),
             });
         }
-        self.verify_candidate_identity(candidate)
+        self.verify_candidate_identity(candidate, &meta)
             .map_err(|skip| SbhError::Runtime {
                 details: format!(
                     "path identity changed before deletion: {} ({skip:?})",
@@ -1220,22 +1220,16 @@ impl DeletionExecutor {
         let path = &candidate.path;
         let meta = self.recheck_before_mutation(candidate)?;
 
-        if meta.is_dir() {
-            // Read-only regenerable caches (Go GOCACHE/GOMODCACHE, cargo
-            // registry/git caches) are written 0555/0444 by their toolchains,
-            // which makes a plain `remove_dir_all` fail partway with EACCES and
-            // leave the disk space behind. For those — and only those — defeat
-            // the read-only bits within the (already preflight-approved)
-            // subtree. Every other candidate uses conservative removal, where a
-            // read-only directory acts as a natural brake.
-            if classification_allows_force_remove(&candidate.classification) {
-                remove_dir_all_force(path).map_err(|e| SbhError::io(path, e))?;
-            } else {
-                fs::remove_dir_all(path).map_err(|e| SbhError::io(path, e))?;
-            }
-        } else {
-            fs::remove_file(path).map_err(|e| SbhError::io(path, e))?;
-        }
+        // Reuse the confined quarantine traversal without creating a store or
+        // recovery record: emergency removal must work at ENOSPC. The exact
+        // metadata checked above remains the expected root identity. Only
+        // recognized regenerable caches may widen directory permissions.
+        quarantine::remove_direct(
+            path,
+            &meta,
+            classification_allows_force_remove(&candidate.classification),
+        )
+        .map_err(|e| SbhError::io(path, e))?;
 
         // Post-deletion verification (symlink_metadata to avoid following dangling symlinks).
         if fs::symlink_metadata(path).is_ok() {
@@ -1460,74 +1454,6 @@ fn available_bytes_beside(path: &Path) -> Option<u64> {
         u64::from(stat.fragment_size()),
     );
     Some(blocks.saturating_mul(fragment))
-}
-
-/// `fs::remove_dir_all` that defeats read-only directory/file permission bits.
-///
-/// Standard `remove_dir_all` cannot unlink an entry inside a `0555` directory —
-/// removing a child requires *write* permission on the parent directory — so on
-/// a Go module cache (every module dir `0555`) it fails partway with `EACCES`
-/// and leaves the tree, and its disk space, behind. We try the fast path first;
-/// only on a permission error do we walk the subtree granting `u+rwx` to
-/// directories (and `u+w` to files) and retry. Permission widening is confined
-/// to the candidate subtree the executor already approved for deletion, and the
-/// walk never follows symlinks, so it can never affect paths outside it.
-fn remove_dir_all_force(path: &Path) -> std::io::Result<()> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            chmod_tree_writable(path);
-            fs::remove_dir_all(path)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Recursively grant the owner the traversal/write permission needed to remove
-/// a subtree. Best-effort: individual `set_permissions` failures are ignored so
-/// one odd entry can't abort the whole reclaim — the subsequent
-/// `remove_dir_all` is the real success/failure signal. Operates on
-/// `symlink_metadata` and never recurses through a symlink, so it cannot chmod
-/// anything outside the subtree.
-#[cfg(unix)]
-fn chmod_tree_writable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return;
-    };
-    let file_type = meta.file_type();
-    if file_type.is_symlink() {
-        return;
-    }
-    let mode = meta.permissions().mode();
-    if file_type.is_dir() {
-        // u+rwx so we can list, traverse, and unlink children. Chmod before
-        // descending so a `0000`/`0555` dir becomes readable for `read_dir`.
-        if mode & 0o700 != 0o700 {
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700));
-        }
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                chmod_tree_writable(&entry.path());
-            }
-        }
-    } else if mode & 0o200 == 0 {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o200));
-    }
-}
-
-/// Non-Unix fallback: clear the read-only attribute on the directory itself.
-#[cfg(not(unix))]
-fn chmod_tree_writable(path: &Path) {
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        let mut perms = meta.permissions();
-        if perms.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(path, perms);
-        }
-    }
 }
 
 /// Shallow recursive check for `.git` directories within `path`.
@@ -4221,7 +4147,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn remove_dir_all_force_defeats_readonly_module_cache_tree() {
+    fn confined_removal_defeats_readonly_module_cache_tree() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = scratch_dir();
@@ -4241,7 +4167,7 @@ mod tests {
         // Root bypasses mode bits, so skip the negative assertion there.
         if crate::platform::running_as_root() {
             eprintln!(
-                "SKIP: running as root (remove_dir_all_force_defeats_readonly_module_cache_tree: negative half only)"
+                "SKIP: running as root (confined_removal_defeats_readonly_module_cache_tree: negative half only)"
             );
         } else {
             assert!(
@@ -4251,8 +4177,9 @@ mod tests {
             assert!(root.exists());
         }
 
-        // The force variant chmods the subtree writable and succeeds.
-        remove_dir_all_force(&root).expect("force remove should defeat read-only bits");
+        // Only verified directory handles gain the permission needed to unlink.
+        quarantine::remove_direct(&root, &fs::symlink_metadata(&root).unwrap(), true)
+            .expect("confined cache removal should defeat read-only directory bits");
         assert!(!root.exists());
     }
 

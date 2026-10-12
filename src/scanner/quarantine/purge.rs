@@ -1,4 +1,4 @@
-//! Descriptor-relative removal of one recorded quarantine payload.
+//! Descriptor-relative removal of an approved artifact or quarantine payload.
 //!
 //! The store lock serializes cooperating daemon/CLI operations. Every child
 //! lookup is relative to an opened directory, with no symlink traversal and
@@ -11,11 +11,37 @@
 //! the manifest on any error or budget pause. A partial purge can have removed
 //! earlier children already, but the remaining payload stays tracked for retry
 //! or undo. A later slice reopens and revalidates every traversed directory.
+//!
+//! Direct removal uses the same traversal without allocating recovery files.
+//! It binds the checked root identity to an opened parent, and only recognized
+//! caches may change permissions through verified directory descriptors. A
+//! read-open failure remains a refusal; no pathname chmod fallback is used.
 
 use std::fs::File;
 use std::io;
+use std::path::Path;
 
 use super::{PurgeBudget, QuarantineRecord};
+
+/// Remove exactly the artifact observed by the executor's final safety check.
+pub(crate) fn remove_direct(
+    path: &Path,
+    expected: &std::fs::Metadata,
+    allow_permission_changes: bool,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        unix::remove_direct(path, expected, allow_permission_changes)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, expected, allow_permission_changes);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "confined artifact removal requires Unix directory descriptors",
+        ))
+    }
+}
 
 pub(super) fn remove_payload(store: &File, record: &QuarantineRecord) -> io::Result<bool> {
     #[cfg(unix)]
@@ -55,9 +81,10 @@ pub(super) fn remove_payload_with_budget(
 #[cfg(unix)]
 mod unix {
     use std::ffi::OsStr;
-    use std::fs::File;
+    use std::fs::{File, Metadata, OpenOptions};
     use std::io;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Component, Path};
 
     use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat, fstat, statat, unlinkat};
@@ -78,6 +105,21 @@ mod unix {
     }
 
     impl Identity {
+        fn from_metadata(metadata: &Metadata) -> io::Result<Self> {
+            let kind = if metadata.is_dir() {
+                FileType::Directory
+            } else if metadata.is_file() {
+                FileType::RegularFile
+            } else {
+                return Err(invalid("artifact root must be a regular file or directory"));
+            };
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                kind,
+            })
+        }
+
         #[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
         fn of(stat: &Stat) -> Self {
             Self {
@@ -148,9 +190,78 @@ mod unix {
     // Production passes a no-op closure which is monomorphized away.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Step {
+        ParentOpened,
         Inspected,
         Opened,
         BeforeUnlink,
+    }
+
+    pub(super) fn remove_direct(
+        path: &Path,
+        expected: &Metadata,
+        allow_permission_changes: bool,
+    ) -> io::Result<()> {
+        remove_direct_with_hook(path, expected, allow_permission_changes, &mut |_, _| {})
+    }
+
+    fn remove_direct_with_hook(
+        path: &Path,
+        expected: &Metadata,
+        allow_permission_changes: bool,
+        hook: &mut impl FnMut(&OsStr, Step),
+    ) -> io::Result<()> {
+        let expected = Identity::from_metadata(expected)?;
+        let absolute = std::path::absolute(path)?;
+        let name = absolute
+            .file_name()
+            .ok_or_else(|| invalid("artifact root has no basename"))?;
+        validate_name(name)?;
+        let parent_path = absolute
+            .parent()
+            .ok_or_else(|| invalid("artifact root has no parent"))?;
+        // Parent aliases such as macOS /tmp are resolved on this one open.
+        // Check the binding on both sides, then use only the descriptor and
+        // basename for traversal and mutations.
+        let before = Identity::from_metadata(&std::fs::metadata(parent_path)?)?;
+        let parent = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(parent_path)?;
+        let parent_identity = Identity::of(&fstat(&parent)?);
+        hook(name, Step::ParentOpened);
+        if before != parent_identity
+            || Identity::from_metadata(&std::fs::metadata(parent_path)?)? != parent_identity
+        {
+            return Err(invalid("artifact parent pathname changed before removal"));
+        }
+        if parent_identity.kind != FileType::Directory || expected.device != parent_identity.device
+        {
+            return Err(invalid("artifact removal refuses a filesystem boundary"));
+        }
+        if !same_child(&parent, name, expected)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "artifact root disappeared",
+            ));
+        }
+        match remove_child(
+            &parent,
+            name,
+            expected,
+            0,
+            allow_permission_changes,
+            &mut PurgeBudget::unlimited(),
+            hook,
+        )? {
+            Some(true) => Ok(()),
+            Some(false) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "artifact root disappeared during removal",
+            )),
+            None => Err(io::Error::other(
+                "unlimited artifact removal unexpectedly paused",
+            )),
+        }
     }
 
     pub(super) fn remove_payload(store: &File, record: &QuarantineRecord) -> io::Result<bool> {
@@ -211,7 +322,7 @@ mod unix {
                 "quarantine payload identity changed; refusing purge",
             ));
         }
-        let Some(removed) = remove_child(&entry, name, payload, 0, budget, hook)? else {
+        let Some(removed) = remove_child(&entry, name, payload, 0, false, budget, hook)? else {
             // The manifest remains the recovery anchor. Never finalize a
             // partially removed payload or give it a failed-deletion cooldown.
             return Ok(None);
@@ -228,6 +339,7 @@ mod unix {
         name: &OsStr,
         expected: Identity,
         depth: usize,
+        allow_permission_changes: bool,
         budget: &mut PurgeBudget,
         hook: &mut impl FnMut(&OsStr, Step),
     ) -> io::Result<Option<bool>> {
@@ -243,6 +355,17 @@ mod unix {
             hook(name, Step::Opened);
             if !same_child(parent, name, expected)? {
                 return Err(invalid("quarantine directory disappeared before traversal"));
+            }
+            if allow_permission_changes {
+                // Unlink needs write/search access to the directory, never
+                // write access to the file. In particular, chmodding a file
+                // would also change any surviving hardlinks outside this tree.
+                let mut permissions = directory.metadata()?.permissions();
+                let mode = permissions.mode();
+                if mode & 0o700 != 0o700 {
+                    permissions.set_mode(mode | 0o700);
+                    directory.set_permissions(permissions)?;
+                }
             }
             let mut children = Dir::read_from(&directory)?;
             loop {
@@ -267,7 +390,17 @@ mod unix {
                 if identity.device != expected.device {
                     return Err(invalid("quarantine purge refuses a nested filesystem"));
                 }
-                if remove_child(&directory, child_name, identity, depth + 1, budget, hook)?.is_none() {
+                if remove_child(
+                    &directory,
+                    child_name,
+                    identity,
+                    depth + 1,
+                    allow_permission_changes,
+                    budget,
+                    hook,
+                )?
+                .is_none()
+                {
                     return Ok(None);
                 }
             }
@@ -312,6 +445,164 @@ mod unix {
                 .quarantine(&source, id, 100, Duration::ZERO, None)
                 .unwrap();
             (store, record)
+        }
+
+        #[test]
+        fn direct_removal_rejects_a_replaced_root_using_the_captured_metadata() {
+            for is_directory in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("artifact");
+                let saved = temp.path().join("saved");
+                if is_directory {
+                    fs::create_dir(&path).unwrap();
+                    fs::write(path.join("leaf"), b"original").unwrap();
+                } else {
+                    fs::write(&path, b"original").unwrap();
+                }
+                let expected = fs::symlink_metadata(&path).unwrap();
+                fs::rename(&path, &saved).unwrap();
+                if is_directory {
+                    fs::create_dir(&path).unwrap();
+                    fs::write(path.join("leaf"), b"replacement").unwrap();
+                } else {
+                    fs::write(&path, b"replacement").unwrap();
+                }
+                assert!(remove_direct(&path, &expected, true).is_err());
+                let leaf = |root: &Path| {
+                    if is_directory {
+                        root.join("leaf")
+                    } else {
+                        root.to_path_buf()
+                    }
+                };
+                assert_eq!(fs::read(leaf(&saved)).unwrap(), b"original");
+                assert_eq!(fs::read(leaf(&path)).unwrap(), b"replacement");
+            }
+        }
+
+        #[test]
+        fn direct_removal_rejects_parent_replacement_before_mutation() {
+            let temp = tempfile::tempdir().unwrap();
+            let parent = temp.path().join("parent");
+            let path = parent.join("artifact");
+            let saved = temp.path().join("saved-parent");
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("leaf"), b"original").unwrap();
+            let expected = fs::symlink_metadata(&path).unwrap();
+            let mut fired = false;
+            let result = remove_direct_with_hook(&path, &expected, true, &mut |_, step| {
+                if step == Step::ParentOpened && !fired {
+                    fired = true;
+                    fs::rename(&parent, &saved).unwrap();
+                    fs::create_dir_all(&path).unwrap();
+                    fs::write(path.join("leaf"), b"replacement").unwrap();
+                }
+            });
+            assert!(fired);
+            assert!(result.is_err());
+            assert_eq!(fs::read(saved.join("artifact/leaf")).unwrap(), b"original");
+            assert_eq!(fs::read(path.join("leaf")).unwrap(), b"replacement");
+        }
+
+        #[test]
+        fn direct_cache_removal_never_chmods_or_traverses_a_replacement_symlink() {
+            for boundary in [Step::Inspected, Step::Opened] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("artifact");
+                let nested = path.join("nested");
+                let saved = temp.path().join("saved");
+                let outside = temp.path().join("outside");
+                fs::create_dir_all(&nested).unwrap();
+                fs::create_dir(&outside).unwrap();
+                fs::write(nested.join("leaf"), b"original").unwrap();
+                fs::write(outside.join("precious"), b"keep").unwrap();
+                fs::set_permissions(&outside, fs::Permissions::from_mode(0o555)).unwrap();
+                let expected = fs::symlink_metadata(&path).unwrap();
+                let mut fired = false;
+                let result = remove_direct_with_hook(&path, &expected, true, &mut |name, step| {
+                    if name == "nested" && step == boundary && !fired {
+                        fired = true;
+                        fs::rename(&nested, &saved).unwrap();
+                        symlink(&outside, &nested).unwrap();
+                    }
+                });
+                assert!(fired);
+                assert!(result.is_err());
+                assert_eq!(fs::read(saved.join("leaf")).unwrap(), b"original");
+                assert_eq!(fs::read(outside.join("precious")).unwrap(), b"keep");
+                assert_eq!(
+                    fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+                    0o555
+                );
+                assert!(
+                    fs::symlink_metadata(&nested)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                // Restore the fixture's mode so TempDir can clean up as a non-root user.
+                fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+
+        #[test]
+        fn direct_removal_preserves_a_leaf_replaced_before_unlink() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("artifact");
+            let leaf = path.join("leaf");
+            let saved = temp.path().join("saved");
+            fs::create_dir(&path).unwrap();
+            fs::write(&leaf, b"original").unwrap();
+            let expected = fs::symlink_metadata(&path).unwrap();
+            let mut fired = false;
+            let result = remove_direct_with_hook(&path, &expected, false, &mut |name, step| {
+                if name == "leaf" && step == Step::BeforeUnlink && !fired {
+                    fired = true;
+                    fs::rename(&leaf, &saved).unwrap();
+                    fs::write(&leaf, b"replacement").unwrap();
+                }
+            });
+            assert!(fired);
+            assert!(result.is_err());
+            assert_eq!(fs::read(saved).unwrap(), b"original");
+            assert_eq!(fs::read(leaf).unwrap(), b"replacement");
+        }
+
+        #[test]
+        fn direct_removal_resolves_parent_aliases_but_refuses_a_symlink_root() {
+            let temp = tempfile::tempdir().unwrap();
+            let parent = temp.path().join("parent");
+            let alias = temp.path().join("alias");
+            fs::create_dir(&parent).unwrap();
+            symlink(&parent, &alias).unwrap();
+            let path = alias.join("artifact");
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("leaf"), b"artifact").unwrap();
+            remove_direct(&path, &fs::symlink_metadata(&path).unwrap(), false).unwrap();
+            assert!(!parent.join("artifact").exists());
+            let survivor = parent.join("survivor");
+            fs::write(&survivor, b"keep").unwrap();
+            symlink(&survivor, &path).unwrap();
+            assert!(remove_direct(&path, &fs::symlink_metadata(&path).unwrap(), true).is_err());
+            assert_eq!(fs::read(survivor).unwrap(), b"keep");
+            assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+            assert!(!temp.path().join(".sbh").exists());
+            assert!(!parent.join(".sbh").exists());
+        }
+
+        #[test]
+        fn direct_removal_does_not_report_success_for_a_vanished_root() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("artifact");
+            let saved = temp.path().join("saved");
+            fs::write(&path, b"keep").unwrap();
+            let expected = fs::symlink_metadata(&path).unwrap();
+            fs::rename(&path, &saved).unwrap();
+            assert_eq!(
+                remove_direct(&path, &expected, false).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            assert_eq!(fs::read(saved).unwrap(), b"keep");
         }
 
         #[test]
@@ -685,6 +976,24 @@ mod unix {
                         assert_eq!(source.raw_os_error(), Some(code), "{source}");
                     }
                     other => panic!("expected a filesystem boundary error, got {other}"),
+                }
+            }
+
+            #[test]
+            fn direct_removal_refuses_nested_root_and_file_bind_mounts() {
+                for (at, errno) in [
+                    (BoundAt::Subtree, libc::EXDEV),
+                    (BoundAt::Payload, libc::EXDEV),
+                    (BoundAt::File, libc::EBUSY),
+                ] {
+                    let Some(fixture) = Mounted::bind(at) else {
+                        return;
+                    };
+                    let path = &fixture.record.quarantine_path;
+                    let metadata = fs::symlink_metadata(path).unwrap();
+                    let error = remove_direct(path, &metadata, true).unwrap_err();
+                    assert_eq!(error.raw_os_error(), Some(errno), "{error}");
+                    fixture.assert_preserved();
                 }
             }
 
