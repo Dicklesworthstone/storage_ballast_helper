@@ -4,8 +4,9 @@
 //! and inode, name) is recreated within `window` of the deletion while a
 //! process with its working directory or an open file under the parent is
 //! alive: something was still using it. That is a `regret` outcome; a
-//! window that passes without a recreation is `clean`; a recreation with no
-//! live user is `unknown` (a later rebuild, not evidence either way).
+//! window that passes with verified absence is `clean`; a recreation with no
+//! live user, a late sighting, or an unresolved filesystem observation is
+//! `unknown` (not evidence either way).
 //!
 //! Outcomes calibrate the fast lane per category. Each category keeps a
 //! Beta posterior on its regret rate under an empirical-Bayes prior pooled
@@ -69,7 +70,7 @@ pub enum Outcome {
     Regret,
     /// The window passed without a recreation.
     Clean,
-    /// Recreated with no live user under the parent.
+    /// The observation cannot establish either regret or a clean deletion.
     Unknown,
 }
 
@@ -116,6 +117,9 @@ impl EntryIdentity {
         let parent = path.parent()?;
         let name = path.file_name()?.to_string_lossy().into_owned();
         let meta = std::fs::metadata(parent).ok()?;
+        if !meta.is_dir() {
+            return None;
+        }
         Some(Self::from_parent_meta(&meta, name))
     }
 
@@ -156,6 +160,58 @@ pub struct Watch {
     pub deleted_at: Instant,
 }
 
+impl Watch {
+    /// Observe the original directory entry, asking about live users only
+    /// after a successful lookup. A missing entry is evidence only when its
+    /// original parent can still be verified.
+    #[must_use]
+    pub fn observe(&self, parent_in_use: impl FnOnce(&Path) -> bool) -> Sighting {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let (Some(parent), Some(name)) = (self.path.parent(), self.path.file_name()) else {
+                return Sighting::Indeterminate;
+            };
+            // Anchor the lookup to the opened parent. A pathname swap cannot
+            // redirect the entry lookup into a replacement directory.
+            let Ok(directory) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open(parent)
+            else {
+                return Sighting::Indeterminate;
+            };
+            let Ok(meta) = directory.metadata() else {
+                return Sighting::Indeterminate;
+            };
+            if EntryIdentity::from_parent_meta(&meta, name.to_string_lossy().into_owned())
+                != self.identity
+            {
+                return Sighting::Indeterminate;
+            }
+            let lookup =
+                rustix::fs::statat(&directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                    .map(|_| ())
+                    .map_err(std::io::Error::from);
+            let sighting = Sighting::from_entry_lookup(lookup, || parent_in_use(parent));
+            // The original directory must still occupy the watched path,
+            // including after any slower process-table observation.
+            if EntryIdentity::of(&self.path).as_ref() != Some(&self.identity) {
+                return Sighting::Indeterminate;
+            }
+            sighting
+        }
+        #[cfg(not(unix))]
+        {
+            // EntryIdentity has no stable device/inode implementation here.
+            // Do not manufacture evidence from a pathname-only observation.
+            let _ = parent_in_use;
+            Sighting::Indeterminate
+        }
+    }
+}
+
 /// A resolved outcome, ready for the ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionOutcome {
@@ -179,11 +235,32 @@ pub struct DecisionOutcome {
 
 /// What the detector sees when it looks at a watched path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Sighting {
-    /// The entry exists again with the same parent identity.
-    pub recreated: bool,
-    /// A process has its cwd or an open file under the parent.
-    pub parent_in_use: bool,
+pub enum Sighting {
+    /// The entry is absent from its verified original parent.
+    Absent,
+    /// The entry exists again in its verified original parent.
+    Recreated {
+        /// A process has its cwd or an open file under the parent.
+        parent_in_use: bool,
+    },
+    /// The entry or its original parent could not be observed reliably.
+    Indeterminate,
+}
+
+impl Sighting {
+    #[cfg(unix)]
+    fn from_entry_lookup(
+        lookup: std::io::Result<()>,
+        parent_in_use: impl FnOnce() -> bool,
+    ) -> Self {
+        match lookup {
+            Ok(()) => Self::Recreated {
+                parent_in_use: parent_in_use(),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Absent,
+            Err(_) => Self::Indeterminate,
+        }
+    }
 }
 
 /// Watches deletions and labels them.
@@ -219,8 +296,9 @@ impl RegretDetector {
     /// Resolve watches: `look` reports what is at each watched path now.
     /// Recreated entries resolve immediately. A recreation first observed at or
     /// after the deadline is `unknown`: the sighting cannot establish whether
-    /// it happened inside the window. Absent entries resolve `clean` when their
-    /// window passes. Call with the current monotonic time.
+    /// it happened inside the window. Verified absent entries resolve `clean`
+    /// when their window passes; indeterminate observations remain pending
+    /// until then and expire as `unknown`. Call with the current monotonic time.
     pub fn check(
         &mut self,
         now: Instant,
@@ -232,24 +310,28 @@ impl RegretDetector {
         for watch in self.watches.drain(..) {
             let age = now.saturating_duration_since(watch.deleted_at);
             let sighting = look(&watch);
-            let outcome = if sighting.recreated {
-                if age >= window {
-                    Some((
-                        Outcome::Unknown,
-                        "recreation first observed at or after regret window expiry",
-                    ))
-                } else if sighting.parent_in_use {
-                    Some((Outcome::Regret, "recreated while a process used the parent"))
-                } else {
-                    Some((
-                        Outcome::Unknown,
-                        "recreated with no live user under the parent",
-                    ))
+            let outcome = match sighting {
+                Sighting::Recreated { .. } if age >= window => Some((
+                    Outcome::Unknown,
+                    "recreation first observed at or after regret window expiry",
+                )),
+                Sighting::Recreated {
+                    parent_in_use: true,
+                } => Some((Outcome::Regret, "recreated while a process used the parent")),
+                Sighting::Recreated {
+                    parent_in_use: false,
+                } => Some((
+                    Outcome::Unknown,
+                    "recreated with no live user under the parent",
+                )),
+                Sighting::Absent if age >= window => {
+                    Some((Outcome::Clean, "window passed without a recreation"))
                 }
-            } else if age >= window {
-                Some((Outcome::Clean, "window passed without a recreation"))
-            } else {
-                None
+                Sighting::Indeterminate if age >= window => Some((
+                    Outcome::Unknown,
+                    "regret window expired without a reliable filesystem observation",
+                )),
+                Sighting::Absent | Sighting::Indeterminate => None,
             };
             match outcome {
                 Some((outcome, detail)) => outcomes.push(DecisionOutcome {
@@ -783,9 +865,14 @@ mod tests {
         assert_eq!(detector.pending(), 3);
         // Ten minutes in: a is back with a live user, b is back unused,
         // c is still gone.
-        let outcomes = detector.check(t0 + Duration::from_secs(600), |w| Sighting {
-            recreated: w.path == a || w.path == b,
-            parent_in_use: w.path == a,
+        let outcomes = detector.check(t0 + Duration::from_secs(600), |w| {
+            if w.path == a || w.path == b {
+                Sighting::Recreated {
+                    parent_in_use: w.path == a,
+                }
+            } else {
+                Sighting::Absent
+            }
         });
         assert_eq!(outcomes.len(), 2);
         let by_id: HashMap<_, _> = outcomes
@@ -797,10 +884,7 @@ mod tests {
         assert_eq!(by_id["d-a"].after_secs, 600);
         assert_eq!(detector.pending(), 1);
         // The window passes for c.
-        let outcomes = detector.check(t0 + Duration::from_mins(30), |_| Sighting {
-            recreated: false,
-            parent_in_use: true,
-        });
+        let outcomes = detector.check(t0 + Duration::from_mins(30), |_| Sighting::Absent);
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].outcome, Outcome::Clean);
         assert_eq!(detector.pending(), 0);
@@ -818,16 +902,8 @@ mod tests {
         ] {
             for parent_in_use in [false, true] {
                 let mut detector = RegretDetector::new(window);
-                detector.watch(watch(
-                    "delayed",
-                    Path::new("/p/target"),
-                    "rust_target",
-                    t0,
-                ));
-                let outcomes = detector.check(t0 + age, |_| Sighting {
-                    recreated: true,
-                    parent_in_use,
-                });
+                detector.watch(watch("delayed", Path::new("/p/target"), "rust_target", t0));
+                let outcomes = detector.check(t0 + age, |_| Sighting::Recreated { parent_in_use });
                 assert_eq!(outcomes.len(), 1);
                 let expected = if parent_in_use {
                     active_outcome
@@ -851,27 +927,31 @@ mod tests {
         for id in ["at-deadline", "after-deadline"] {
             detector.watch(watch(id, Path::new("/p/target"), "rust_target", t0));
         }
-        let before = detector.check(t0 + window - Duration::from_nanos(1), |_| Sighting {
-            recreated: false,
-            parent_in_use: false,
-        });
+        let before = detector.check(t0 + window - Duration::from_nanos(1), |_| Sighting::Absent);
         assert!(before.is_empty());
         assert_eq!(detector.pending(), 2);
 
-        let at = detector.check(t0 + window, |w| Sighting {
-            recreated: w.decision_id == "after-deadline",
-            parent_in_use: false,
+        let at = detector.check(t0 + window, |w| {
+            if w.decision_id == "after-deadline" {
+                Sighting::Recreated {
+                    parent_in_use: false,
+                }
+            } else {
+                Sighting::Absent
+            }
         });
         assert_eq!(at.len(), 2);
         let clean = at.iter().find(|o| o.decision_id == "at-deadline").unwrap();
         assert_eq!(clean.outcome, Outcome::Clean);
         assert_eq!(detector.pending(), 0);
 
-        detector.watch(watch("late-absence", Path::new("/p/target"), "rust_target", t0));
-        let after = detector.check(t0 + window + Duration::from_secs(1), |_| Sighting {
-            recreated: false,
-            parent_in_use: false,
-        });
+        detector.watch(watch(
+            "late-absence",
+            Path::new("/p/target"),
+            "rust_target",
+            t0,
+        ));
+        let after = detector.check(t0 + window + Duration::from_secs(1), |_| Sighting::Absent);
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].outcome, Outcome::Clean);
     }
@@ -901,8 +981,7 @@ mod tests {
                 detector.watch(watch(id, Path::new("/p/target"), "rust_target", t0));
             }
             let now = t0 + Duration::from_secs(60);
-            let outcomes = detector.check(now, |_| Sighting {
-                recreated: true,
+            let outcomes = detector.check(now, |_| Sighting::Recreated {
                 parent_in_use: true,
             });
             assert_eq!(outcomes.len(), 3);
@@ -918,6 +997,183 @@ mod tests {
             assert_eq!(calibrator.summary("rust_target").unwrap(), before);
             assert_eq!(calibrator.suspended("rust_target", now), prior_regrets > 0);
         }
+    }
+
+    #[test]
+    fn indeterminate_observations_expire_unknown_without_changing_calibration() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+        for prior_regrets in [0, 3] {
+            let mut detector = RegretDetector::new(window);
+            let mut calibrator = RegretCalibrator::new(RegretConfig::default());
+            calibrator.record(
+                "rust_target",
+                ArtifactCertainty::Definite,
+                Outcome::Clean,
+                t0,
+            );
+            for _ in 0..prior_regrets {
+                calibrator.record(
+                    "rust_target",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    t0,
+                );
+            }
+            let before = calibrator.summary("rust_target").unwrap();
+            detector.watch(watch(
+                "unreadable",
+                Path::new("/p/target"),
+                "rust_target",
+                t0,
+            ));
+            for age in [Duration::ZERO, window - Duration::from_nanos(1)] {
+                assert!(
+                    detector
+                        .check(t0 + age, |_| Sighting::Indeterminate)
+                        .is_empty()
+                );
+                assert_eq!(detector.pending(), 1);
+            }
+            let now = t0 + window;
+            let outcomes = detector.check(now, |_| Sighting::Indeterminate);
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].outcome, Outcome::Unknown);
+            calibrator.record(
+                &outcomes[0].category,
+                certainty_from_name(&outcomes[0].certainty),
+                outcomes[0].outcome,
+                now,
+            );
+            assert_eq!(calibrator.summary("rust_target").unwrap(), before);
+            assert_eq!(calibrator.suspended("rust_target", now), prior_regrets > 0);
+            assert_eq!(detector.pending(), 0);
+        }
+    }
+
+    #[test]
+    fn a_reliable_observation_can_resolve_a_previously_indeterminate_watch() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+        for (sighting, at, expected) in [
+            (Sighting::Absent, t0 + window, Outcome::Clean),
+            (
+                Sighting::Recreated {
+                    parent_in_use: true,
+                },
+                t0 + Duration::from_secs(30),
+                Outcome::Regret,
+            ),
+        ] {
+            let mut detector = RegretDetector::new(window);
+            detector.watch(watch("retry", Path::new("/p/target"), "rust_target", t0));
+            assert!(detector.check(t0, |_| Sighting::Indeterminate).is_empty());
+            let outcomes = detector.check(at, |_| sighting);
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].outcome, expected);
+            assert_eq!(detector.pending(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_entry_lookups_do_not_become_absence_or_query_processes() {
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotADirectory,
+            ErrorKind::Interrupted,
+            ErrorKind::Other,
+        ] {
+            let sighting = Sighting::from_entry_lookup(Err(kind.into()), || {
+                panic!("failed lookup must not query processes")
+            });
+            assert_eq!(sighting, Sighting::Indeterminate, "{kind:?}");
+        }
+        let absent = Sighting::from_entry_lookup(Err(ErrorKind::NotFound.into()), || {
+            panic!("absent entry must not query processes")
+        });
+        assert_eq!(absent, Sighting::Absent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_observation_verifies_absence_recreation_and_parent_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("project");
+        let target = parent.join("target");
+        std::fs::create_dir(&parent).unwrap();
+        let mut watched = watch("deleted", &target, "rust_target", Instant::now());
+        watched.identity = EntryIdentity::of(&target).unwrap();
+        assert_eq!(
+            watched.observe(|_| panic!("absent entry must not query processes")),
+            Sighting::Absent
+        );
+
+        std::fs::create_dir(&target).unwrap();
+        for parent_in_use in [false, true] {
+            assert_eq!(
+                watched.observe(|observed_parent| {
+                    assert_eq!(observed_parent, parent);
+                    parent_in_use
+                }),
+                Sighting::Recreated { parent_in_use }
+            );
+        }
+
+        std::fs::rename(&parent, dir.path().join("original-project")).unwrap();
+        assert_eq!(watched.observe(|_| true), Sighting::Indeterminate);
+        std::fs::create_dir(&parent).unwrap();
+        assert_eq!(watched.observe(|_| true), Sighting::Indeterminate);
+        std::fs::create_dir(&target).unwrap();
+        assert_eq!(watched.observe(|_| true), Sighting::Indeterminate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_observation_rechecks_parent_after_process_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("project");
+        let target = parent.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let mut watched = watch("deleted", &target, "rust_target", Instant::now());
+        watched.identity = EntryIdentity::of(&target).unwrap();
+        let observation = watched.observe(|_| {
+            std::fs::rename(&parent, dir.path().join("original-project")).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            true
+        });
+        assert_eq!(observation, Sighting::Indeterminate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_observation_accepts_stable_parent_aliases_but_not_retargeting() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        let replacement = dir.path().join("replacement");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let target = alias.join("target");
+        let mut watched = watch("deleted", &target, "rust_target", Instant::now());
+        watched.identity = EntryIdentity::of(&target).unwrap();
+        assert_eq!(watched.observe(|_| true), Sighting::Absent);
+        std::fs::create_dir(&target).unwrap();
+        assert_eq!(
+            watched.observe(|_| true),
+            Sighting::Recreated {
+                parent_in_use: true
+            }
+        );
+
+        std::fs::rename(&alias, dir.path().join("previous-alias")).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        assert_eq!(watched.observe(|_| true), Sighting::Indeterminate);
+        std::fs::create_dir(&target).unwrap();
+        assert_eq!(watched.observe(|_| true), Sighting::Indeterminate);
     }
 
     #[test]

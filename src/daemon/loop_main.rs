@@ -94,7 +94,7 @@ use crate::scanner::prescan_cursor::PrescanCursor;
 use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::quarantine::{DrainOutcome as QuarantineDrainOutcome, QuarantineStore};
 use crate::scanner::regret::{
-    EntryIdentity, Outcome, RegretCalibrator, RegretConfig, RegretDetector, Sighting, Watch,
+    EntryIdentity, Outcome, RegretCalibrator, RegretConfig, RegretDetector, Watch,
     certainty_from_name,
 };
 use crate::scanner::scoring::{
@@ -6160,18 +6160,7 @@ impl MonitoringDaemon {
     fn resolve_regrets(&self, now: Instant) {
         let platform = Arc::clone(&self.platform);
         let outcomes = self.regret.detector.lock().check(now, |watch| {
-            let recreated = std::fs::symlink_metadata(&watch.path).is_ok()
-                && EntryIdentity::of(&watch.path)
-                    .is_some_and(|identity| identity == watch.identity);
-            let parent_in_use = recreated
-                && watch
-                    .path
-                    .parent()
-                    .is_some_and(|parent| parent_in_use(platform.as_ref(), parent));
-            Sighting {
-                recreated,
-                parent_in_use,
-            }
+            watch.observe(|parent| parent_in_use(platform.as_ref(), parent))
         });
         if outcomes.is_empty() {
             return;
