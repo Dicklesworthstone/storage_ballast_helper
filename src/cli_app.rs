@@ -7985,6 +7985,10 @@ fn system_doctor_checks(
     checks.extend(reserve_coverage_doctor_checks(config, bursts, pools));
     checks.push(logging_placement_doctor_check(platform, config, pools));
     checks.extend(reclaim_capability_doctor_checks(config));
+    checks.extend(scanner_privilege_doctor_check(
+        platform.name(),
+        reclaimer_is_root(&config.paths.state_file),
+    ));
     checks
 }
 
@@ -10007,7 +10011,8 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     };
     let memory_info = platform.memory_info().ok();
     let memory_pressure = platform.memory_pressure().ok();
-    let process_visibility = process_attribution_visibility(platform.name());
+    let process_visibility =
+        process_attribution_visibility(platform.name(), &config.paths.state_file);
 
     match output_mode(cli) {
         OutputMode::Human => {
@@ -10134,8 +10139,12 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             }
 
             if let Some(visibility) = process_visibility {
-                println!("\nProcess Attribution:");
-                println!("  Visibility: {}", visibility.detail);
+                if platform.name().eq_ignore_ascii_case("linux") {
+                    println!("\nWARNING: {}", visibility.detail);
+                } else {
+                    println!("\nProcess Attribution:");
+                    println!("  Visibility: {}", visibility.detail);
+                }
             }
 
             // Rate estimates from daemon state (v2 `rates`): fill rate,
@@ -10877,14 +10886,37 @@ fn linux_platform_json(_capacity: &Capacity) -> Value {
     json!({})
 }
 
-fn process_attribution_visibility(platform_name: &str) -> Option<ProcessAttributionVisibility> {
-    process_attribution_visibility_for(platform_name, effective_user_is_root())
+/// What a Linux sbh without root cannot do, and what that costs. Every other
+/// surface describes the refusals as an incomplete scan without saying why.
+const LINUX_UNPRIVILEGED_SCANNER_NOTICE: &str = "scanner reclaim is disabled: sbh is not running as root, so it cannot inspect other users' processes for open or mapped files and refuses every deletion candidate. Ballast release still works. Run the daemon as a system service (`sudo sbh install --systemd --scope system`) to reclaim build artifacts";
+
+fn process_attribution_visibility(
+    platform_name: &str,
+    state_file: &Path,
+) -> Option<ProcessAttributionVisibility> {
+    // On Linux the question is whether the sbh that reclaims is root, which
+    // is the daemon when one has written state, not this CLI.
+    let is_root = if platform_name.eq_ignore_ascii_case("linux") {
+        reclaimer_is_root(state_file)
+    } else {
+        effective_user_is_root()
+    };
+    process_attribution_visibility_for(platform_name, is_root)
 }
 
 fn process_attribution_visibility_for(
     platform_name: &str,
     is_root: bool,
 ) -> Option<ProcessAttributionVisibility> {
+    if platform_name.eq_ignore_ascii_case("linux") {
+        // A root sbh reads every process, so there is nothing to report.
+        return (!is_root).then_some(ProcessAttributionVisibility {
+            scope: "own_user_processes",
+            all_processes: false,
+            requires_root_for_all_users: true,
+            detail: LINUX_UNPRIVILEGED_SCANNER_NOTICE,
+        });
+    }
     if !platform_name.eq_ignore_ascii_case("macos") {
         return None;
     }
@@ -10914,6 +10946,38 @@ fn effective_user_is_root() -> bool {
 #[cfg(not(unix))]
 fn effective_user_is_root() -> bool {
     false
+}
+
+/// Whether the sbh that does the reclaiming runs as root: the daemon that
+/// owns the state file when there is one, otherwise this process.
+#[cfg(unix)]
+fn reclaimer_is_root(state_file: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(state_file).map_or_else(|_| effective_user_is_root(), |meta| meta.uid() == 0)
+}
+
+#[cfg(not(unix))]
+fn reclaimer_is_root(_state_file: &Path) -> bool {
+    false
+}
+
+/// `doctor --system`: a Linux sbh without root reclaims nothing by scanning,
+/// and no other check or status line says so.
+fn scanner_privilege_doctor_check(platform_name: &str, is_root: bool) -> Option<DoctorCheck> {
+    if !platform_name.eq_ignore_ascii_case("linux") {
+        return None;
+    }
+    let visibility = process_attribution_visibility_for(platform_name, is_root)?;
+    Some(doctor_check(
+        "reclaim.privilege",
+        "Scanner reclaim privileges",
+        "FAIL",
+        visibility.detail,
+        Some(
+            "Run `sbh uninstall --scope user`, then `sudo sbh install --systemd --scope system`."
+                .to_string(),
+        ),
+    ))
 }
 
 fn process_attribution_visibility_json(visibility: &ProcessAttributionVisibility) -> Value {
@@ -20388,8 +20452,50 @@ mod tests {
     }
 
     #[test]
-    fn process_attribution_visibility_is_macos_specific() {
-        assert!(process_attribution_visibility_for("linux", false).is_none());
+    fn linux_without_root_reports_that_the_scanner_reclaims_nothing() {
+        let visibility = process_attribution_visibility_for("linux", false)
+            .expect("an unprivileged Linux sbh must say what it cannot do");
+        let payload = process_attribution_visibility_json(&visibility);
+
+        assert_eq!(payload["scope"], "own_user_processes");
+        assert_eq!(payload["all_processes"], false);
+        assert_eq!(payload["requires_root_for_all_users"], true);
+        for expected in [
+            "scanner reclaim is disabled",
+            "not running as root",
+            "refuses every deletion candidate",
+            "Ballast release still works",
+            "--scope system",
+        ] {
+            assert!(visibility.detail.contains(expected), "{expected}");
+        }
+        assert!(process_attribution_visibility_for("linux", true).is_none());
+    }
+
+    #[test]
+    fn doctor_fails_an_unprivileged_linux_scanner_and_nothing_else() {
+        let check = scanner_privilege_doctor_check("linux", false)
+            .expect("an unprivileged Linux sbh is a doctor finding");
+        assert_eq!(check.id, "reclaim.privilege");
+        assert_eq!(check.status, "FAIL");
+        assert!(check.message.contains("scanner reclaim is disabled"));
+        assert!(
+            check
+                .remediation
+                .is_some_and(|remediation| remediation.contains("--scope system"))
+        );
+        assert!(doctor_checks_have_failures(&[
+            scanner_privilege_doctor_check("linux", false).unwrap()
+        ]));
+        assert!(scanner_privilege_doctor_check("linux", true).is_none());
+        assert!(scanner_privilege_doctor_check("macos", false).is_none());
+        assert!(scanner_privilege_doctor_check("macos", true).is_none());
+    }
+
+    #[test]
+    fn platforms_without_a_visibility_model_report_none() {
+        assert!(process_attribution_visibility_for("freebsd", false).is_none());
+        assert!(process_attribution_visibility_for("freebsd", true).is_none());
     }
 
     fn cli_app_snapshot_settings(assertion: impl FnOnce()) {

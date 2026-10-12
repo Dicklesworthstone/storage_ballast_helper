@@ -137,6 +137,13 @@ service binary when one is already registered. First-time daemon registration is
 still handled by `sbh install --auto`, which chooses systemd on Linux and
 launchd on macOS.
 
+On Linux, register the daemon in system scope instead:
+`sudo sbh install --systemd --scope system`. `sbh install --auto` registers a
+user-scope service, and an sbh without root cannot inspect other users'
+processes for open or mapped files, so its scanner refuses every deletion
+candidate and only ballast release works. `sbh status` and
+`sbh doctor --system` report this.
+
 Pin a specific version:
 
 ```bash

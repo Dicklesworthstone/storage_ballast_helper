@@ -570,8 +570,8 @@ impl SkipReason {
                  the daemon pauses deletions on it until a probe write succeeds"
             }
             Self::OpenScanIncomplete => {
-                "open file or process scan incomplete due to system load (deadline/budget exceeded) — \
-                 aborted batch for safety"
+                "open file or process scan incomplete (scan budget exceeded, or other users' \
+                 processes cannot be inspected without root) — aborted batch for safety"
             }
             Self::CategorySuspended => "category deletion temporarily suspended after regrets",
         }
@@ -830,9 +830,9 @@ impl DeletionExecutor {
             if !complete {
                 self.log_event(ActivityEvent::Error {
                     code: "SBH-3003".to_string(),
-                    message:
-                        "open file scan incomplete due to system load - aborting batch for safety"
-                            .to_string(),
+                    message: "open file scan incomplete (scan budget exceeded, or other users' \
+                              processes cannot be inspected without root) - aborting batch for safety"
+                        .to_string(),
                 });
                 // Fail safe: abort the entire batch because we cannot guarantee
                 // that any candidate is safe to delete. Every candidate is a
