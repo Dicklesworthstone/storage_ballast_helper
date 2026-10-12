@@ -29,10 +29,12 @@ struct Permit(Arc<AtomicBool>);
 impl Permit {
     fn acquire(gate: Arc<AtomicBool>) -> io::Result<Self> {
         gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "a recursive inotify rebuild is still running",
-            ))?;
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "a recursive inotify rebuild is still running",
+                )
+            })?;
         Ok(Self(gate))
     }
 }
@@ -58,7 +60,9 @@ pub(super) struct Rebuild {
 
 impl Rebuild {
     fn start(config: EventSourceConfig, rates: EventRateTracker, now: Instant) -> io::Result<Self> {
-        Self::spawn(global_gate(), move |cancelled| build(&config, &rates, now, cancelled))
+        Self::spawn(global_gate(), move |cancelled| {
+            build(&config, &rates, now, cancelled)
+        })
     }
 
     fn spawn(
@@ -85,7 +89,11 @@ impl Rebuild {
                     drop(retired_rx.recv());
                 }
             })?;
-        Ok(Self { completed, retired, cancelled })
+        Ok(Self {
+            completed,
+            retired,
+            cancelled,
+        })
     }
 
     fn poll(&self) -> Option<io::Result<Prepared>> {
@@ -121,9 +129,15 @@ fn build(
     let started = Instant::now();
     let check = || {
         if cancelled.load(Ordering::Acquire) {
-            Err(io::Error::new(io::ErrorKind::Interrupted, "recursive inotify rebuild cancelled"))
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "recursive inotify rebuild cancelled",
+            ))
         } else if started.elapsed() >= INSTALL_TIME_BUDGET {
-            Err(io::Error::new(io::ErrorKind::TimedOut, "recursive inotify rebuild deadline exceeded"))
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "recursive inotify rebuild deadline exceeded",
+            ))
         } else {
             Ok(())
         }
@@ -158,6 +172,20 @@ pub(super) fn poll_or_start(source: &mut ScannerEventSource, now: Instant) -> Ev
         // start time. A slow failed build cannot immediately restart itself.
         source.planned_at = now;
         return match result {
+            Ok(Prepared { plan, .. })
+                if plan.absent_roots.iter().any(|root| {
+                    !matches!(std::fs::symlink_metadata(root), Err(error) if error.kind() == io::ErrorKind::NotFound)
+                }) =>
+            {
+                // Discovery and handoff are separated by a worker queue. A
+                // root may appear after discovery, even before the live
+                // source's next absence audit. Keep old watches and revoke
+                // coverage instead of publishing that stale absence as safe.
+                failed(
+                    source,
+                    &io::Error::other("absent root changed before watch handoff"),
+                )
+            }
             Ok(Prepared { plan, backend }) => {
                 let old = std::mem::replace(&mut source.backend, backend);
                 source.rates.retain_watched(&plan.watched_dirs);
@@ -208,7 +236,11 @@ fn failed(source: &mut ScannerEventSource, error: &io::Error) -> EventInvalidati
     source.capability.dirty_roots = source.config.root_paths().to_vec();
     source.capability.reason = format!("recursive inotify replan failed: {error}");
     let mut invalidation = EventInvalidation::empty();
-    invalidation.mark_all_roots(source.config.root_paths(), source.capability.reason.clone(), true);
+    invalidation.mark_all_roots(
+        source.config.root_paths(),
+        source.capability.reason.clone(),
+        true,
+    );
     invalidation
 }
 
@@ -220,11 +252,16 @@ const TEST_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]
 pub(super) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let guard = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let deadline = Instant::now() + TEST_WAIT;
     let gate = global_gate();
     while gate.load(Ordering::Acquire) {
-        assert!(Instant::now() < deadline, "previous rebuild did not release its admission slot");
+        assert!(
+            Instant::now() < deadline,
+            "previous rebuild did not release its admission slot"
+        );
         thread::sleep(std::time::Duration::from_millis(1));
     }
     guard
@@ -234,7 +271,10 @@ pub(super) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
 pub(super) fn finish_rebuild(source: &mut ScannerEventSource, now: Instant) -> EventInvalidation {
     let deadline = Instant::now() + TEST_WAIT;
     let mut invalidation = EventInvalidation::empty();
-    assert!(source.rebuild.is_some(), "a real rebuild must have been admitted");
+    assert!(
+        source.rebuild.is_some(),
+        "a real rebuild must have been admitted"
+    );
     while source.rebuild.is_some() {
         assert!(Instant::now() < deadline, "rebuild did not complete");
         invalidation.merge(source.drain_at(now));
@@ -246,11 +286,11 @@ pub(super) fn finish_rebuild(source: &mut ScannerEventSource, now: Instant) -> E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::ScannerConfig;
+    use crate::scanner::events::WATCH_REPAIR_INTERVAL;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
-    use crate::core::config::ScannerConfig;
-    use crate::scanner::events::WATCH_REPAIR_INTERVAL;
 
     fn gate() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
@@ -259,7 +299,10 @@ mod tests {
     fn wait_free(gate: &AtomicBool) {
         let deadline = Instant::now() + TEST_WAIT;
         while gate.load(Ordering::Acquire) {
-            assert!(Instant::now() < deadline, "worker leaked its admission permit");
+            assert!(
+                Instant::now() < deadline,
+                "worker leaked its admission permit"
+            );
             thread::sleep(Duration::from_millis(1));
         }
     }
@@ -282,17 +325,100 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prepared_absent_root_is_rechecked_before_publishing_coverage() {
+        let _serial = test_serial();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let healthy = retained.join("healthy");
+        let later = retained.join("later");
+        fs::create_dir(&healthy).unwrap();
+        let config = EventSourceConfig::from_scanner_config(
+            &[healthy.clone(), later.clone()],
+            &ScannerConfig {
+                event_watch_budget: 16,
+                ..ScannerConfig::default()
+            },
+        );
+        let now = Instant::now();
+        let mut source = ScannerEventSource::start_at(config.clone(), now);
+        source.drain_at(now);
+        let plan = EventSourcePlan::with_rates(&config, &EventRateTracker::default(), now);
+        assert!(plan.complete);
+        assert!(plan.absent_roots.contains(&later));
+        let backend = EventSourceBackend::RecursiveInotify(
+            LinuxInotifyBackend::start(&plan.watched_dirs, config.watch_budget).unwrap(),
+        );
+        let gate = gate();
+        source.rebuild = Some(
+            Rebuild::spawn(Arc::clone(&gate), move |_| Ok(Prepared { plan, backend })).unwrap(),
+        );
+        // Appearance is after the replacement's plan was prepared, but before
+        // the live source's 30-second audit. Handoff must recheck the absence.
+        fs::create_dir(&later).unwrap();
+        let completed_at = now + Duration::from_secs(1);
+        let rejected = finish_rebuild(&mut source, completed_at);
+        assert!(rejected.requires_index_generation_bump());
+        assert!(rejected.dirty_roots().contains(&later));
+        assert!(!source.capability().complete);
+        assert_eq!(source.capability().watched_dirs, 1);
+        assert!(
+            source
+                .capability()
+                .reason
+                .contains("absent root changed before watch handoff")
+        );
+        assert!(
+            !source.should_replan(completed_at + WATCH_REPAIR_INTERVAL - Duration::from_nanos(1))
+        );
+        wait_free(&gate);
+        let old_canary = healthy.join("still-watched");
+        fs::write(&old_canary, b"old backend is retained").unwrap();
+        assert!(
+            source
+                .drain_at(completed_at)
+                .dirty_paths()
+                .contains(&old_canary)
+        );
+
+        let retry_at = completed_at + WATCH_REPAIR_INTERVAL;
+        assert!(source.drain_at(retry_at).requires_index_generation_bump());
+        let installed = finish_rebuild(&mut source, retry_at);
+        assert!(installed.requires_index_generation_bump());
+        assert!(source.capability().complete);
+        assert!(source.capability().absent_roots.is_empty());
+        assert_eq!(source.capability().watched_dirs, 2);
+        let new_canary = later.join("now-watched");
+        fs::write(&new_canary, b"new backend covers later root").unwrap();
+        assert!(
+            source
+                .drain_at(retry_at)
+                .dirty_paths()
+                .contains(&new_canary)
+        );
+        assert_eq!(fs::read(old_canary).unwrap(), b"old backend is retained");
+        assert_eq!(
+            fs::read(new_canary).unwrap(),
+            b"new backend covers later root"
+        );
+    }
+
     fn fixture() -> (tempfile::TempDir, ScannerEventSource, PathBuf, Instant) {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap().join("root");
         fs::create_dir_all(root.join("project")).unwrap();
-        let config = EventSourceConfig::from_scanner_config(std::slice::from_ref(&root), &ScannerConfig {
-            event_watch_budget: 16,
-            ..ScannerConfig::default()
-        });
+        let config = EventSourceConfig::from_scanner_config(
+            std::slice::from_ref(&root),
+            &ScannerConfig {
+                event_watch_budget: 16,
+                ..ScannerConfig::default()
+            },
+        );
         let now = Instant::now();
         let mut source = ScannerEventSource::start_at(config, now);
-        assert_eq!(source.capability().selected_backend, EventBackendKind::RecursiveInotify);
+        assert_eq!(
+            source.capability().selected_backend,
+            EventBackendKind::RecursiveInotify
+        );
         assert!(source.capability().complete);
         source.drain_at(now);
         (temp, source, root, now)
@@ -307,11 +433,13 @@ mod tests {
             entered_tx.send(()).unwrap();
             release_rx.recv_timeout(TEST_WAIT).unwrap();
             Ok(empty_prepared())
-        }).unwrap();
+        })
+        .unwrap();
         entered_rx.recv_timeout(TEST_WAIT).unwrap();
         assert!(task.poll().is_none());
         assert!(task.poll().is_none());
-        let error = Rebuild::spawn(Arc::clone(&gate), |_| panic!("second builder ran")).unwrap_err();
+        let error =
+            Rebuild::spawn(Arc::clone(&gate), |_| panic!("second builder ran")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         release_tx.send(()).unwrap();
         assert!(ready(&task).is_ok());
@@ -331,11 +459,17 @@ mod tests {
             release_rx.recv_timeout(TEST_WAIT).unwrap();
             cancel_tx.send(cancelled.load(Ordering::Acquire)).unwrap();
             Ok(empty_prepared())
-        }).unwrap();
+        })
+        .unwrap();
         entered_rx.recv_timeout(TEST_WAIT).unwrap();
         drop(task);
         assert!(gate.load(Ordering::Acquire));
-        assert_eq!(Rebuild::spawn(Arc::clone(&gate), |_| Ok(empty_prepared())).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            Rebuild::spawn(Arc::clone(&gate), |_| Ok(empty_prepared()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
         release_tx.send(()).unwrap();
         assert!(cancel_rx.recv_timeout(TEST_WAIT).unwrap());
         wait_free(&gate);
@@ -358,9 +492,16 @@ mod tests {
     #[test]
     fn cancellation_precedes_discovery_and_kernel_installation() {
         let config = EventSourceConfig::from_scanner_config(
-            &[PathBuf::from("/absent-watch-root")], &ScannerConfig::default(),
+            &[PathBuf::from("/absent-watch-root")],
+            &ScannerConfig::default(),
         );
-        let error = build(&config, &EventRateTracker::default(), Instant::now(), &AtomicBool::new(true)).unwrap_err();
+        let error = build(
+            &config,
+            &EventRateTracker::default(),
+            Instant::now(),
+            &AtomicBool::new(true),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
@@ -371,11 +512,14 @@ mod tests {
         let config = source.config.clone();
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
-        source.rebuild = Some(Rebuild::spawn(Arc::clone(&gate), move |cancelled| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(TEST_WAIT).unwrap();
-            build(&config, &EventRateTracker::default(), now, cancelled)
-        }).unwrap());
+        source.rebuild = Some(
+            Rebuild::spawn(Arc::clone(&gate), move |cancelled| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(TEST_WAIT).unwrap();
+                build(&config, &EventRateTracker::default(), now, cancelled)
+            })
+            .unwrap(),
+        );
         source.replans = 1;
         entered_rx.recv_timeout(TEST_WAIT).unwrap();
         let changed = root.join("project/object.o");
@@ -410,23 +554,44 @@ mod tests {
     fn failed_rebuild_preserves_live_watches_and_waits_before_retry() {
         let (_temp, mut source, root, now) = fixture();
         let gate = gate();
-        source.rebuild = Some(Rebuild::spawn(Arc::clone(&gate), |_| {
-            Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected installation failure"))
-        }).unwrap());
+        source.rebuild = Some(
+            Rebuild::spawn(Arc::clone(&gate), |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected installation failure",
+                ))
+            })
+            .unwrap(),
+        );
         source.replans = 1;
         let completed_at = now + Duration::from_secs(7);
         let failure = finish_rebuild(&mut source, completed_at);
         assert!(failure.requires_index_generation_bump());
         assert!(failure.dirty_roots().contains(&root));
-        assert_eq!(source.capability().selected_backend, EventBackendKind::RecursiveInotify);
+        assert_eq!(
+            source.capability().selected_backend,
+            EventBackendKind::RecursiveInotify
+        );
         assert_eq!(source.capability().watched_dirs, 2);
         assert!(!source.capability().complete);
-        assert!(source.capability().reason.contains("injected installation failure"));
-        assert!(!source.should_replan(completed_at + WATCH_REPAIR_INTERVAL - Duration::from_nanos(1)));
+        assert!(
+            source
+                .capability()
+                .reason
+                .contains("injected installation failure")
+        );
+        assert!(
+            !source.should_replan(completed_at + WATCH_REPAIR_INTERVAL - Duration::from_nanos(1))
+        );
         assert!(source.should_replan(completed_at + WATCH_REPAIR_INTERVAL));
         let changed = root.join("project/after-failure.o");
         fs::write(&changed, b"old backend survives").unwrap();
-        assert!(source.drain_at(completed_at).dirty_paths().contains(&changed));
+        assert!(
+            source
+                .drain_at(completed_at)
+                .dirty_paths()
+                .contains(&changed)
+        );
         assert_eq!(source.stats().replans, 1);
         wait_free(&gate);
     }
@@ -438,11 +603,14 @@ mod tests {
         let config = source.config.clone();
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
-        source.rebuild = Some(Rebuild::spawn(Arc::clone(&gate), move |cancelled| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(TEST_WAIT).unwrap();
-            build(&config, &EventRateTracker::default(), now, cancelled)
-        }).unwrap());
+        source.rebuild = Some(
+            Rebuild::spawn(Arc::clone(&gate), move |cancelled| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(TEST_WAIT).unwrap();
+                build(&config, &EventRateTracker::default(), now, cancelled)
+            })
+            .unwrap(),
+        );
         entered_rx.recv_timeout(TEST_WAIT).unwrap();
         drop(source);
         let (_other_temp, mut replacement, other_root, other_now) = fixture();
@@ -453,6 +621,11 @@ mod tests {
         assert!(replacement.rebuild.is_none());
         let changed = other_root.join("project/reconfigured.o");
         fs::write(&changed, b"new scope").unwrap();
-        assert!(replacement.drain_at(other_now).dirty_paths().contains(&changed));
+        assert!(
+            replacement
+                .drain_at(other_now)
+                .dirty_paths()
+                .contains(&changed)
+        );
     }
 }

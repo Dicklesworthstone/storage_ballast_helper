@@ -71,7 +71,9 @@ struct Limits {
 impl Limits {
     fn for_budget(watches: usize) -> Self {
         Self {
-            candidates: watches.saturating_mul(ENUMERATION_FACTOR).min(MAX_CANDIDATES),
+            candidates: watches
+                .saturating_mul(ENUMERATION_FACTOR)
+                .min(MAX_CANDIDATES),
             entries: MAX_ENTRIES,
             directory_entries: MAX_DIRECTORY_ENTRIES,
             path_bytes: MAX_PATH_BYTES,
@@ -90,7 +92,9 @@ struct Budget {
 
 impl Budget {
     fn live(&self, access: &impl Access) -> bool {
-        access.now().checked_duration_since(self.started)
+        access
+            .now()
+            .checked_duration_since(self.started)
             .is_some_and(|elapsed| elapsed < self.limits.time)
     }
 
@@ -119,12 +123,24 @@ pub(super) fn enumerate(
 }
 
 fn gap(result: &mut WatchEnumeration, path: &Path, reason: &str) {
-    if !path.ancestors().any(|ancestor| result.truncated.contains(ancestor)) {
+    if !path
+        .ancestors()
+        .any(|ancestor| result.truncated.contains(ancestor))
+    {
         result.truncated.insert(path.to_path_buf());
     }
     if result.reason.is_empty() {
-        result.reason = format!("recursive inotify planning incomplete at {}: {reason}", path.display());
+        result.reason = format!(
+            "recursive inotify planning incomplete at {}: {reason}",
+            path.display()
+        );
     }
+}
+
+fn observation_room(result: &WatchEnumeration, limit: usize) -> usize {
+    limit
+        .saturating_sub(result.candidates.len())
+        .saturating_sub(result.absent_roots.len())
 }
 
 /// Seed all configured roots before spending discovery on descendants. The
@@ -136,7 +152,12 @@ fn enumerate_with(
     now: Instant,
     limits: Limits,
 ) -> WatchEnumeration {
-    let mut budget = Budget { limits, started: access.now(), entries: 0, path_bytes: 0 };
+    let mut budget = Budget {
+        limits,
+        started: access.now(),
+        entries: 0,
+        path_bytes: 0,
+    };
     let wall_time = SystemTime::now();
     let mut result = WatchEnumeration::default();
     let mut seen = BTreeSet::new();
@@ -148,33 +169,56 @@ fn enumerate_with(
         if seen.contains(root) {
             continue;
         }
-        if !budget.live(access) || result.candidates.len() >= limits.candidates {
+        if !budget.live(access) || observation_room(&result, limits.candidates) == 0 {
             gap(&mut result, root, "root discovery budget exhausted");
             continue;
         }
         let metadata = match access.metadata(root) {
             Ok(metadata) if metadata.is_dir() && !metadata.is_symlink() => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !budget.live(access) || !budget.admit_paths(root, root) {
+                    gap(
+                        &mut result,
+                        root,
+                        "absent root observation budget exhausted",
+                    );
+                    continue;
+                }
+                result.absent_roots.insert(root.clone());
+                seen.insert(root.clone());
+                continue;
+            }
             _ => {
                 result.unreadable_roots.insert(root.clone());
-                gap(&mut result, root, "root is unavailable or is not a plain directory");
+                gap(
+                    &mut result,
+                    root,
+                    "root is unavailable or is not a plain directory",
+                );
                 continue;
             }
         };
         if !budget.live(access) || !budget.admit_paths(root, root) {
-            gap(&mut result, root, "root discovery time or path budget exhausted");
+            gap(
+                &mut result,
+                root,
+                "root discovery time or path budget exhausted",
+            );
             continue;
         }
         seen.insert(root.clone());
         queue.push_back((result.candidates.len(), metadata.clone()));
         result.candidates.push(WatchCandidate {
-            path: root.clone(), root: root.clone(), depth: 0,
+            path: root.clone(),
+            root: root.clone(),
+            depth: 0,
             rate: candidate_rate(rates, root, now, &metadata, wall_time),
         });
     }
 
     while let Some((index, before)) = queue.pop_front() {
         let parent = result.candidates[index].clone();
-        let room = limits.candidates.saturating_sub(result.candidates.len());
+        let room = observation_room(&result, limits.candidates);
         if !budget.live(access) || room == 0 || budget.entries >= limits.entries {
             gap(&mut result, &parent.path, "discovery budget exhausted");
             continue;
@@ -189,14 +233,24 @@ fn enumerate_with(
         // Do not certify an old directory's listing after its pathname, type,
         // or contents changed. This is best-effort observation, not a lease.
         if !budget.live(access)
-            || !access.metadata(&parent.path).is_ok_and(|after| unchanged_directory(&before, &after))
+            || !access
+                .metadata(&parent.path)
+                .is_ok_and(|after| unchanged_directory(&before, &after))
             || !budget.live(access)
         {
-            gap(&mut result, &parent.path, "directory changed or deadline expired during discovery");
+            gap(
+                &mut result,
+                &parent.path,
+                "directory changed or deadline expired during discovery",
+            );
             continue;
         }
         if omitted {
-            gap(&mut result, &parent.path, "candidate budget omitted child directories");
+            gap(
+                &mut result,
+                &parent.path,
+                "candidate budget omitted child directories",
+            );
         }
         for name in children {
             if !budget.live(access) {
@@ -210,18 +264,28 @@ fn enumerate_with(
             let metadata = match access.metadata(&path) {
                 Ok(metadata) if metadata.is_dir() && !metadata.is_symlink() => metadata,
                 _ => {
-                    gap(&mut result, &parent.path, "child directory changed or metadata is unavailable");
+                    gap(
+                        &mut result,
+                        &parent.path,
+                        "child directory changed or metadata is unavailable",
+                    );
                     continue;
                 }
             };
             if !budget.live(access) || !budget.admit_paths(&path, &parent.root) {
-                gap(&mut result, &parent.path, "discovery time or retained-path budget exhausted");
+                gap(
+                    &mut result,
+                    &parent.path,
+                    "discovery time or retained-path budget exhausted",
+                );
                 break;
             }
             seen.insert(path.clone());
             queue.push_back((result.candidates.len(), metadata.clone()));
             result.candidates.push(WatchCandidate {
-                path: path.clone(), root: parent.root.clone(), depth: parent.depth + 1,
+                path: path.clone(),
+                root: parent.root.clone(),
+                depth: parent.depth + 1,
                 rate: candidate_rate(rates, &path, now, &metadata, wall_time),
             });
         }
@@ -236,8 +300,10 @@ fn unchanged_directory(before: &Metadata, after: &Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        before.dev() == after.dev() && before.ino() == after.ino()
-            && before.ctime() == after.ctime() && before.ctime_nsec() == after.ctime_nsec()
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
     }
     #[cfg(not(unix))]
     {
@@ -268,7 +334,9 @@ fn select_children(
         if !budget.live(access) {
             return Err(exhausted("discovery deadline expired"));
         }
-        if budget.entries >= budget.limits.entries || local_entries >= budget.limits.directory_entries {
+        if budget.entries >= budget.limits.entries
+            || local_entries >= budget.limits.directory_entries
+        {
             return Err(exhausted("directory-entry budget exhausted"));
         }
         let Some(entry) = entries.next() else {
@@ -282,7 +350,10 @@ fn select_children(
         }
         let mut components = Path::new(&child.name).components();
         if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid directory child name"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid directory child name",
+            ));
         }
         if selected.len() >= room {
             omitted = true;
@@ -293,7 +364,8 @@ fn select_children(
                 name_bytes -= last.len();
             }
         }
-        name_bytes = name_bytes.checked_add(child.name.len())
+        name_bytes = name_bytes
+            .checked_add(child.name.len())
             .filter(|bytes| *bytes <= budget.limits.selected_name_bytes)
             .ok_or_else(|| exhausted("selected-name memory budget exhausted"))?;
         selected.push(child.name);
@@ -319,6 +391,7 @@ mod tests {
         metadata: Metadata,
         listings: BTreeMap<PathBuf, Listing>,
         denied: BTreeSet<PathBuf>,
+        missing: BTreeSet<PathBuf>,
         opened: RefCell<Vec<PathBuf>>,
         reads: Rc<Cell<usize>>,
         milliseconds: Rc<Cell<u64>>,
@@ -327,27 +400,42 @@ mod tests {
     }
 
     impl Mock {
-        fn fixture() -> (tempfile::TempDir, Self) {
-            let temp = tempfile::tempdir().unwrap();
+        fn fixture() -> (PathBuf, Self) {
+            let temp = tempfile::tempdir().unwrap().keep();
             let mock = Self {
-                metadata: fs::symlink_metadata(temp.path()).unwrap(),
-                listings: BTreeMap::new(), denied: BTreeSet::new(),
-                opened: RefCell::new(Vec::new()), reads: Rc::new(Cell::new(0)),
-                milliseconds: Rc::new(Cell::new(0)), entry_millis: 0,
+                metadata: fs::symlink_metadata(&temp).unwrap(),
+                listings: BTreeMap::new(),
+                denied: BTreeSet::new(),
+                missing: BTreeSet::new(),
+                opened: RefCell::new(Vec::new()),
+                reads: Rc::new(Cell::new(0)),
+                milliseconds: Rc::new(Cell::new(0)),
+                entry_millis: 0,
                 start: Instant::now(),
             };
             (temp, mock)
         }
 
         fn dirs(&mut self, path: &str, names: &[&str]) {
-            self.listings.insert(PathBuf::from(path), Listing::Rows(
-                names.iter().map(|name| Ok((OsString::from(*name), true))).collect(),
-            ));
+            self.listings.insert(
+                PathBuf::from(path),
+                Listing::Rows(
+                    names
+                        .iter()
+                        .map(|name| Ok((OsString::from(*name), true)))
+                        .collect(),
+                ),
+            );
         }
 
         fn run(&self, roots: &[&str], limits: Limits) -> WatchEnumeration {
-            enumerate_with(self, &roots.iter().map(PathBuf::from).collect::<Vec<_>>(),
-                &EventRateTracker::default(), self.start, limits)
+            enumerate_with(
+                self,
+                &roots.iter().map(PathBuf::from).collect::<Vec<_>>(),
+                &EventRateTracker::default(),
+                self.start,
+                limits,
+            )
         }
     }
 
@@ -355,6 +443,8 @@ mod tests {
         fn metadata(&self, path: &Path) -> io::Result<Metadata> {
             if self.denied.contains(path) {
                 Err(io::ErrorKind::PermissionDenied.into())
+            } else if self.missing.contains(path) {
+                Err(io::ErrorKind::NotFound.into())
             } else {
                 Ok(self.metadata.clone())
             }
@@ -362,7 +452,11 @@ mod tests {
 
         fn entries(&self, path: &Path) -> io::Result<Entries> {
             self.opened.borrow_mut().push(path.to_path_buf());
-            let listing = self.listings.get(path).cloned().unwrap_or(Listing::Rows(Vec::new()));
+            let listing = self
+                .listings
+                .get(path)
+                .cloned()
+                .unwrap_or(Listing::Rows(Vec::new()));
             if let Listing::Error(kind) = listing {
                 return Err(kind.into());
             }
@@ -382,8 +476,10 @@ mod tests {
                     index += 1;
                     clock.set(clock.get() + step);
                 }
-                next.map(|row| row.map(|(name, directory)| Child { name, directory })
-                    .map_err(io::Error::from))
+                next.map(|row| {
+                    row.map(|(name, directory)| Child { name, directory })
+                        .map_err(io::Error::from)
+                })
             })))
         }
 
@@ -393,20 +489,38 @@ mod tests {
     }
 
     fn limits() -> Limits {
-        Limits { candidates: 32, time: Duration::from_secs(1), ..Limits::for_budget(8) }
+        Limits {
+            candidates: 32,
+            time: Duration::from_secs(1),
+            ..Limits::for_budget(8)
+        }
     }
 
     fn paths(result: &WatchEnumeration) -> Vec<PathBuf> {
-        result.candidates.iter().map(|candidate| candidate.path.clone()).collect()
+        result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect()
     }
 
     #[test]
     fn a_million_files_cannot_bypass_the_entry_budget() {
         let (_temp, mut mock) = Mock::fixture();
-        mock.listings.insert(PathBuf::from("/r"), Listing::Generated {
-            count: 1_000_000, directories: false,
-        });
-        let result = mock.run(&["/r"], Limits { entries: 7, ..limits() });
+        mock.listings.insert(
+            PathBuf::from("/r"),
+            Listing::Generated {
+                count: 1_000_000,
+                directories: false,
+            },
+        );
+        let result = mock.run(
+            &["/r"],
+            Limits {
+                entries: 7,
+                ..limits()
+            },
+        );
         assert_eq!(mock.reads.get(), 7, "no extra EOF probe after the limit");
         assert_eq!(paths(&result), vec![PathBuf::from("/r")]);
         assert!(result.truncated.contains(Path::new("/r")));
@@ -416,12 +530,24 @@ mod tests {
     #[test]
     fn one_flat_directory_cannot_overfill_the_candidate_queue() {
         let (_temp, mut mock) = Mock::fixture();
-        mock.listings.insert(PathBuf::from("/r"), Listing::Generated {
-            count: 1000, directories: true,
-        });
-        let result = mock.run(&["/r"], Limits { candidates: 4, ..limits() });
-        assert_eq!(paths(&result), ["/r", "/r/n00000000", "/r/n00000001", "/r/n00000002"]
-            .map(PathBuf::from));
+        mock.listings.insert(
+            PathBuf::from("/r"),
+            Listing::Generated {
+                count: 1000,
+                directories: true,
+            },
+        );
+        let result = mock.run(
+            &["/r"],
+            Limits {
+                candidates: 4,
+                ..limits()
+            },
+        );
+        assert_eq!(
+            paths(&result),
+            ["/r", "/r/n00000000", "/r/n00000001", "/r/n00000002"].map(PathBuf::from)
+        );
         assert_eq!(mock.reads.get(), 1001);
         assert_eq!(mock.opened.borrow().as_slice(), [PathBuf::from("/r")]);
         assert!(result.truncated.contains(Path::new("/r")));
@@ -431,21 +557,43 @@ mod tests {
     fn all_roots_are_seeded_before_a_large_first_root_spends_the_capacity() {
         let (_temp, mut mock) = Mock::fixture();
         mock.dirs("/first", &["a", "b", "c", "d", "e"]);
-        let result = mock.run(&["/first", "/second", "/third"], Limits { candidates: 4, ..limits() });
-        assert_eq!(paths(&result)[..3], ["/first", "/second", "/third"].map(PathBuf::from));
+        let result = mock.run(
+            &["/first", "/second", "/third"],
+            Limits {
+                candidates: 4,
+                ..limits()
+            },
+        );
+        assert_eq!(
+            paths(&result)[..3],
+            ["/first", "/second", "/third"].map(PathBuf::from)
+        );
         assert_eq!(result.candidates.len(), 4);
         let allocation = super::super::allocate_watches(&result.candidates, 3);
-        assert_eq!(allocation.watched, ["/first", "/second", "/third"].map(PathBuf::from));
+        assert_eq!(
+            allocation.watched,
+            ["/first", "/second", "/third"].map(PathBuf::from)
+        );
     }
 
     #[test]
     fn per_directory_exhaustion_does_not_discard_other_roots() {
         let (_temp, mut mock) = Mock::fixture();
-        mock.listings.insert(PathBuf::from("/large"), Listing::Generated {
-            count: 1000, directories: false,
-        });
+        mock.listings.insert(
+            PathBuf::from("/large"),
+            Listing::Generated {
+                count: 1000,
+                directories: false,
+            },
+        );
         mock.dirs("/healthy", &["child"]);
-        let result = mock.run(&["/large", "/healthy"], Limits { directory_entries: 3, ..limits() });
+        let result = mock.run(
+            &["/large", "/healthy"],
+            Limits {
+                directory_entries: 3,
+                ..limits()
+            },
+        );
         assert!(paths(&result).contains(&PathBuf::from("/healthy/child")));
         assert!(result.truncated.contains(Path::new("/large")));
         assert!(!result.truncated.contains(Path::new("/healthy")));
@@ -453,11 +601,20 @@ mod tests {
 
     #[test]
     fn iteration_errors_do_not_become_successful_partial_directory_listings() {
-        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other, io::ErrorKind::Interrupted] {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+            io::ErrorKind::Interrupted,
+        ] {
             let (_temp, mut mock) = Mock::fixture();
-            mock.listings.insert(PathBuf::from("/r"), Listing::Rows(vec![
-                Ok((OsString::from("a"), true)), Err(kind), Ok((OsString::from("b"), true)),
-            ]));
+            mock.listings.insert(
+                PathBuf::from("/r"),
+                Listing::Rows(vec![
+                    Ok((OsString::from("a"), true)),
+                    Err(kind),
+                    Ok((OsString::from("b"), true)),
+                ]),
+            );
             mock.dirs("/healthy", &["retained"]);
             let result = mock.run(&["/r", "/healthy"], limits());
             assert!(!paths(&result).contains(&PathBuf::from("/r/a")));
@@ -470,10 +627,20 @@ mod tests {
     fn exact_entry_limit_is_unknown_until_eof_was_actually_observed() {
         for count in [3, 4, 5] {
             let (_temp, mut mock) = Mock::fixture();
-            mock.listings.insert(PathBuf::from("/r"), Listing::Generated {
-                count, directories: false,
-            });
-            let result = mock.run(&["/r"], Limits { directory_entries: 4, ..limits() });
+            mock.listings.insert(
+                PathBuf::from("/r"),
+                Listing::Generated {
+                    count,
+                    directories: false,
+                },
+            );
+            let result = mock.run(
+                &["/r"],
+                Limits {
+                    directory_entries: 4,
+                    ..limits()
+                },
+            );
             assert_eq!(mock.reads.get(), (count + 1).min(4));
             assert_eq!(result.truncated.is_empty(), count < 4);
         }
@@ -483,10 +650,20 @@ mod tests {
     fn deadline_applies_inside_one_directory_and_is_not_restarted_for_the_next() {
         let (_temp, mut mock) = Mock::fixture();
         mock.entry_millis = 10;
-        mock.listings.insert(PathBuf::from("/first"), Listing::Generated {
-            count: 1000, directories: true,
-        });
-        let result = mock.run(&["/first", "/second"], Limits { time: Duration::from_millis(50), ..limits() });
+        mock.listings.insert(
+            PathBuf::from("/first"),
+            Listing::Generated {
+                count: 1000,
+                directories: true,
+            },
+        );
+        let result = mock.run(
+            &["/first", "/second"],
+            Limits {
+                time: Duration::from_millis(50),
+                ..limits()
+            },
+        );
         assert_eq!(mock.reads.get(), 5);
         assert_eq!(paths(&result), ["/first", "/second"].map(PathBuf::from));
         assert_eq!(mock.opened.borrow().as_slice(), [PathBuf::from("/first")]);
@@ -500,8 +677,17 @@ mod tests {
         for names in orders {
             let (_temp, mut mock) = Mock::fixture();
             mock.dirs("/r", &names);
-            let result = mock.run(&["/r"], Limits { candidates: 4, ..limits() });
-            assert_eq!(paths(&result), ["/r", "/r/a", "/r/b", "/r/c"].map(PathBuf::from));
+            let result = mock.run(
+                &["/r"],
+                Limits {
+                    candidates: 4,
+                    ..limits()
+                },
+            );
+            assert_eq!(
+                paths(&result),
+                ["/r", "/r/a", "/r/b", "/r/c"].map(PathBuf::from)
+            );
         }
     }
 
@@ -509,10 +695,22 @@ mod tests {
     fn retained_candidate_paths_and_temporary_names_have_separate_bounds() {
         let (_temp, mut mock) = Mock::fixture();
         mock.dirs("/r", &["long-directory-name"]);
-        let result = mock.run(&["/r"], Limits { selected_name_bytes: 3, ..limits() });
+        let result = mock.run(
+            &["/r"],
+            Limits {
+                selected_name_bytes: 3,
+                ..limits()
+            },
+        );
         assert_eq!(result.candidates.len(), 1);
         assert!(result.reason.contains("selected-name"));
-        let result = mock.run(&["/r"], Limits { path_bytes: 4, ..limits() });
+        let result = mock.run(
+            &["/r"],
+            Limits {
+                path_bytes: 4,
+                ..limits()
+            },
+        );
         assert_eq!(result.candidates.len(), 1);
         assert!(result.reason.contains("retained-path"));
     }
@@ -520,7 +718,13 @@ mod tests {
     #[test]
     fn zero_limits_and_huge_configuration_cannot_force_unbounded_preallocation() {
         assert_eq!(Limits::for_budget(usize::MAX).candidates, MAX_CANDIDATES);
-        for config in [Limits::for_budget(0), Limits { time: Duration::ZERO, ..limits() }] {
+        for config in [
+            Limits::for_budget(0),
+            Limits {
+                time: Duration::ZERO,
+                ..limits()
+            },
+        ] {
             let (_temp, mock) = Mock::fixture();
             let result = mock.run(&["/r"], config);
             assert!(result.candidates.is_empty());
@@ -534,7 +738,10 @@ mod tests {
         let (_temp, mut mock) = Mock::fixture();
         mock.denied.insert(PathBuf::from("/denied"));
         mock.denied.insert(PathBuf::from("/r/bad"));
-        mock.listings.insert(PathBuf::from("/unreadable"), Listing::Error(io::ErrorKind::PermissionDenied));
+        mock.listings.insert(
+            PathBuf::from("/unreadable"),
+            Listing::Error(io::ErrorKind::PermissionDenied),
+        );
         mock.dirs("/r", &["bad", "good"]);
         let result = mock.run(&["/denied", "/unreadable", "/r"], limits());
         assert!(result.unreadable_roots.contains(Path::new("/denied")));
@@ -546,14 +753,99 @@ mod tests {
     }
 
     #[test]
+    fn absent_configured_roots_are_separate_from_descendant_lookup_failures() {
+        let (_retained, mut mock) = Mock::fixture();
+        mock.missing.insert(PathBuf::from("/absent"));
+        mock.missing.insert(PathBuf::from("/healthy/lost-child"));
+        mock.dirs("/healthy", &["lost-child", "retained"]);
+        let result = mock.run(&["/absent", "/healthy"], limits());
+        assert_eq!(
+            result.absent_roots,
+            BTreeSet::from([PathBuf::from("/absent")])
+        );
+        assert!(!result.truncated.contains(Path::new("/absent")));
+        assert!(!result.unreadable_roots.contains(Path::new("/absent")));
+        assert!(result.truncated.contains(Path::new("/healthy")));
+        assert!(paths(&result).contains(&PathBuf::from("/healthy/retained")));
+        assert!(!paths(&result).contains(&PathBuf::from("/healthy/lost-child")));
+    }
+
+    #[test]
+    fn an_entry_listing_not_found_is_not_a_verified_absent_root() {
+        let (_retained, mut mock) = Mock::fixture();
+        mock.listings
+            .insert(PathBuf::from("/r"), Listing::Error(io::ErrorKind::NotFound));
+        let result = mock.run(&["/r"], limits());
+        assert!(result.absent_roots.is_empty());
+        assert!(result.truncated.contains(Path::new("/r")));
+    }
+
+    #[test]
+    fn absent_roots_consume_discovery_and_retained_path_budgets() {
+        let (_retained, mut mock) = Mock::fixture();
+        mock.missing
+            .extend([PathBuf::from("/one"), PathBuf::from("/two")]);
+        let count_limited = mock.run(
+            &["/one", "/one", "/two"],
+            Limits {
+                candidates: 1,
+                ..limits()
+            },
+        );
+        assert_eq!(
+            count_limited.absent_roots,
+            BTreeSet::from([PathBuf::from("/one")])
+        );
+        assert!(!count_limited.truncated.contains(Path::new("/one")));
+        assert!(count_limited.truncated.contains(Path::new("/two")));
+        let bytes_limited = mock.run(
+            &["/one"],
+            Limits {
+                path_bytes: 1,
+                ..limits()
+            },
+        );
+        assert!(bytes_limited.absent_roots.is_empty());
+        assert!(bytes_limited.truncated.contains(Path::new("/one")));
+    }
+
+    #[test]
+    fn mixed_absent_roots_share_the_descendant_discovery_budget() {
+        let (_retained, mut mock) = Mock::fixture();
+        mock.missing.extend(["/a", "/b", "/c"].map(PathBuf::from));
+        mock.dirs("/healthy", &["child-one", "child-two", "child-three"]);
+        let result = mock.run(
+            &["/a", "/b", "/c", "/healthy"],
+            Limits {
+                candidates: 4,
+                ..limits()
+            },
+        );
+        assert_eq!(result.absent_roots.len(), 3);
+        assert_eq!(paths(&result), vec![PathBuf::from("/healthy")]);
+        assert_eq!(result.candidates.len() + result.absent_roots.len(), 4);
+        assert!(result.truncated.contains(Path::new("/healthy")));
+    }
+
+    #[test]
     fn overlapping_roots_are_not_charged_or_enumerated_twice() {
         let (_temp, mut mock) = Mock::fixture();
         mock.dirs("/r", &["nested"]);
         mock.dirs("/r/nested", &["child"]);
         let result = mock.run(&["/r", "/r/nested", "/r/nested"], limits());
-        assert_eq!(paths(&result), ["/r", "/r/nested", "/r/nested/child"].map(PathBuf::from));
+        assert_eq!(
+            paths(&result),
+            ["/r", "/r/nested", "/r/nested/child"].map(PathBuf::from)
+        );
         assert!(result.truncated.is_empty());
-        assert_eq!(mock.opened.borrow().iter().filter(|path| path.as_path() == Path::new("/r/nested")).count(), 1);
+        assert_eq!(
+            mock.opened
+                .borrow()
+                .iter()
+                .filter(|path| path.as_path() == Path::new("/r/nested"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -569,36 +861,56 @@ mod tests {
 
     #[test]
     fn real_directory_enumeration_preserves_contents_and_hot_watch_priority() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
+        let temp = tempfile::tempdir().unwrap().keep();
+        let root = fs::canonicalize(&temp).unwrap();
         fs::create_dir_all(root.join("a/cold")).unwrap();
         fs::create_dir_all(root.join("b/hot")).unwrap();
         fs::write(root.join("retained"), b"never mutate during planning").unwrap();
         let now = Instant::now();
         let mut rates = EventRateTracker::default();
-        for _ in 0..100 { rates.record(&root.join("b/hot"), now); }
-        let result = enumerate_with(&Native, std::slice::from_ref(&root), &rates, now,
-            Limits { time: Duration::from_secs(10), ..limits() });
+        for _ in 0..100 {
+            rates.record(&root.join("b/hot"), now);
+        }
+        let result = enumerate_with(
+            &Native,
+            std::slice::from_ref(&root),
+            &rates,
+            now,
+            Limits {
+                time: Duration::from_secs(10),
+                ..limits()
+            },
+        );
         assert!(result.truncated.is_empty(), "{result:?}");
         assert!(result.unreadable_roots.is_empty());
         let allocation = super::super::allocate_watches(&result.candidates, 4);
         assert!(allocation.watched.contains(&root.join("b/hot")));
         assert!(!allocation.watched.contains(&root.join("a/cold")));
-        assert_eq!(fs::read(root.join("retained")).unwrap(), b"never mutate during planning");
+        assert_eq!(
+            fs::read(root.join("retained")).unwrap(),
+            b"never mutate during planning"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn real_symlinked_directories_are_not_traversed_or_certified_as_roots() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        let outside = temp.path().join("outside");
+        let temp = tempfile::tempdir().unwrap().keep();
+        let root = temp.join("root");
+        let outside = temp.join("outside");
         fs::create_dir(&root).unwrap();
         fs::create_dir_all(outside.join("must-not-watch")).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("alias")).unwrap();
-        let result = enumerate_with(&Native, &[root.clone(), root.join("alias")],
-            &EventRateTracker::default(), Instant::now(),
-            Limits { time: Duration::from_secs(10), ..limits() });
+        let result = enumerate_with(
+            &Native,
+            &[root.clone(), root.join("alias")],
+            &EventRateTracker::default(),
+            Instant::now(),
+            Limits {
+                time: Duration::from_secs(10),
+                ..limits()
+            },
+        );
         assert_eq!(paths(&result), vec![root.clone()]);
         assert!(result.unreadable_roots.contains(&root.join("alias")));
         assert!(outside.join("must-not-watch").exists());

@@ -1121,11 +1121,17 @@ impl Default for ScannerConfig {
             engine: ScannerEngineMode::V2,
             event_source: ScannerEventSourceMode::Auto,
             event_watch_budget: 8192,
-            root_paths: vec![
-                PathBuf::from("/tmp"),
-                PathBuf::from("/data/tmp"),
-                PathBuf::from("/var/tmp"),
-            ],
+            root_paths: {
+                let mut roots = vec![PathBuf::from("/tmp")];
+                // /data/tmp is a Linux fleet convention, not a macOS default.
+                // Keep it configured on Linux even before creation: event-root
+                // admission separately tracks absence and later rechecks it.
+                if cfg!(target_os = "linux") {
+                    roots.push(PathBuf::from("/data/tmp"));
+                }
+                roots.push(PathBuf::from("/var/tmp"));
+                roots
+            },
             // Note: `/data/projects` is intentionally NOT in this list.
             // The setup wizard (cli/wizard.rs) actively adds `/data/projects`
             // to `root_paths` when run, and adding it ALSO to `excluded_paths`
@@ -3057,6 +3063,23 @@ mod tests {
         BehaviorPreset, Config, PathsConfig, SacredConfig, SbhError, ScannerEngineMode,
         add_root_unless_covered, load_sacred_config, sacred_config_path_for, write_sacred_config,
     };
+
+    #[test]
+    fn default_temp_roots_preserve_linux_policy_without_adding_data_on_other_platforms() {
+        let roots = super::ScannerConfig::default().root_paths;
+        let expected = if cfg!(target_os = "linux") {
+            vec!["/tmp", "/data/tmp", "/var/tmp"]
+        } else {
+            vec!["/tmp", "/var/tmp"]
+        };
+        assert_eq!(
+            roots,
+            expected
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn the_user_temp_dir_is_added_once_and_only_when_uncovered() {
