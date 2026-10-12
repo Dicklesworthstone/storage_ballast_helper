@@ -301,6 +301,16 @@ impl SharedRegret {
         }
     }
 
+    /// Reconfigure both feedback components while retaining pending
+    /// observation deadlines and the category evidence already collected.
+    fn update_config(&self, config: &Config) {
+        let regret = regret_config(config);
+        let mut detector = self.detector.lock();
+        let mut calibrator = self.calibrator.lock();
+        detector.set_window(regret.window);
+        calibrator.update_config(regret);
+    }
+
     /// The scoring engine's view: a calibration factor per category and
     /// the categories whose deletions are suspended right now.
     fn scoring_view(&self, now: Instant) -> (HashMap<String, f64>, HashSet<String>) {
@@ -2734,9 +2744,16 @@ fn build_status_dump_payload(input: &StatusDumpPayloadInput<'_>) -> Value {
 
 impl MonitoringDaemon {
     /// Build and initialize the daemon from configuration.
-    #[allow(clippy::too_many_lines)]
     pub fn init(config: Config, args: &DaemonArgs) -> Result<Self> {
-        let platform = detect_platform()?;
+        Self::init_with_platform(config, args, detect_platform()?)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn init_with_platform(
+        config: Config,
+        args: &DaemonArgs,
+        platform: Arc<dyn Platform>,
+    ) -> Result<Self> {
         let start_time = Instant::now();
 
         // 0. Liveness lock. Taken before anything else so a second daemon on
@@ -6038,6 +6055,7 @@ impl MonitoringDaemon {
                     }
 
                     // Update shared configs for scanner thread.
+                    self.regret.update_config(&new_config);
                     *self.shared_scoring_config.write() = new_config.scoring.clone();
                     *self.shared_scanner_config.write() = new_config.scanner.clone();
 
@@ -9656,6 +9674,298 @@ mod tests {
     use crate::scanner::scoring::{DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::path::Path;
     use std::time::Duration;
+
+    /// An initialized daemon with all writes under a temporary directory
+    /// and platform observations supplied by the regular mock PAL. No
+    /// monitoring, scanner, or executor thread is started.
+    #[cfg(unix)]
+    struct RegretDaemonFixture {
+        daemon: MonitoringDaemon,
+        directory: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl RegretDaemonFixture {
+        fn new() -> Self {
+            use crate::core::config::PathsConfig;
+            use crate::platform::types::{OpenFile, OpenFileKind, OpenFileMode};
+
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let paths = PathsConfig {
+                config_file: root.join("config.toml"),
+                ballast_dir: root.join("ballast"),
+                state_file: root.join("state.json"),
+                sqlite_db: root.join("activity.sqlite3"),
+                jsonl_log: root.join("activity.jsonl"),
+            };
+            let mut config = Config::with_paths(paths);
+            let project = root.join("project");
+            std::fs::create_dir(&project).unwrap();
+            config.scanner.root_paths = vec![project.clone()];
+            config.ballast.auto_provision = false;
+            config.scoring.regret_window_minutes = 1;
+            let platform = MockPlatform::healthy()
+                .with_home(root)
+                .with_temp_dirs(Vec::new())
+                .with_cache_roots(Vec::new())
+                .with_open_file(OpenFile {
+                    pid: 42,
+                    path: project.join("Cargo.toml"),
+                    fd: Some(3),
+                    kind: OpenFileKind::Regular,
+                    mode: OpenFileMode::Read,
+                });
+            let daemon = MonitoringDaemon::init_with_platform(
+                config,
+                &DaemonArgs::default(),
+                Arc::new(platform),
+            )
+            .unwrap();
+            Self { daemon, directory }
+        }
+
+        fn flush_logger(&mut self) {
+            self.daemon.logger_handle.shutdown();
+            if let Some(logger) = self.daemon.logger_join.take() {
+                logger.join().unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RegretDaemonFixture {
+        fn drop(&mut self) {
+            self.daemon.logger_handle.shutdown();
+            if let Some(logger) = self.daemon.logger_join.take() {
+                let _ = logger.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn regret_watch_for_test(id: &str, path: &Path, category: &str, now: Instant) -> Watch {
+        Watch {
+            decision_id: id.to_string(),
+            path: path.to_path_buf(),
+            identity: EntryIdentity::of(path).unwrap(),
+            category: category.to_string(),
+            certainty: ArtifactCertainty::Definite,
+            deleted_at: now,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_regret_observation_keeps_failed_and_replaced_parents_out_of_evidence() {
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.directory.path();
+        let live = root.join("project/target");
+        let absent = root.join("project/absent");
+        let replaced_parent = root.join("replaced");
+        let unreadable_parent = root.join("unreadable");
+        std::fs::create_dir(&replaced_parent).unwrap();
+        std::fs::create_dir(&unreadable_parent).unwrap();
+        let replaced = replaced_parent.join("target");
+        let unreadable = unreadable_parent.join("target");
+        let now = Instant::now();
+        for (id, path, category) in [
+            ("live", &live, "live"),
+            ("absent", &absent, "absent"),
+            ("replaced", &replaced, "unknown"),
+            ("unreadable", &unreadable, "unknown"),
+        ] {
+            fixture
+                .daemon
+                .regret
+                .detector
+                .lock()
+                .watch(regret_watch_for_test(id, path, category, now));
+        }
+        std::fs::create_dir(&live).unwrap();
+        std::fs::rename(&replaced_parent, root.join("original-replaced")).unwrap();
+        std::fs::create_dir(&replaced_parent).unwrap();
+        std::fs::rename(&unreadable_parent, root.join("original-unreadable")).unwrap();
+        std::fs::write(&unreadable_parent, b"parent is no longer a directory").unwrap();
+
+        fixture
+            .daemon
+            .resolve_regrets(now + Duration::from_secs(30));
+        assert_eq!(fixture.daemon.regret.detector.lock().pending(), 3);
+        assert_eq!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("live")
+                .unwrap()
+                .regrets,
+            1
+        );
+        assert!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("unknown")
+                .is_none()
+        );
+
+        fixture
+            .daemon
+            .resolve_regrets(now + Duration::from_secs(60));
+        assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+        assert_eq!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("absent")
+                .unwrap()
+                .decisions,
+            1
+        );
+        assert!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("unknown")
+                .is_none()
+        );
+        fixture.flush_logger();
+        let ledger = crate::logger::sqlite::SqliteLogger::open_read_only(
+            &fixture.daemon.config.paths.sqlite_db,
+        )
+        .unwrap();
+        for (id, expected) in [
+            ("live", "regret"),
+            ("absent", "clean"),
+            ("replaced", "unknown"),
+            ("unreadable", "unknown"),
+        ] {
+            let outcomes = ledger.outcomes_for_decision(id).unwrap();
+            assert_eq!(outcomes.len(), 1, "{id}");
+            assert_eq!(outcomes[0].outcome, expected, "{id}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn daemon_config_reload_updates_regret_settings_and_preserves_pending_deadlines() {
+        let mut fixture = RegretDaemonFixture::new();
+        let now = Instant::now();
+        let project = fixture.directory.path().join("project");
+        let daemon = &mut fixture.daemon;
+        daemon.regret.detector.lock().watch(regret_watch_for_test(
+            "old-window",
+            &project.join("old"),
+            "old-window",
+            now,
+        ));
+        {
+            let mut calibrator = daemon.regret.calibrator.lock();
+            calibrator.record(
+                "definite",
+                ArtifactCertainty::Definite,
+                Outcome::Regret,
+                now,
+            );
+            calibrator.record("likely", ArtifactCertainty::Likely, Outcome::Regret, now);
+            for _ in 0..3 {
+                calibrator.record(
+                    "suspended",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    now,
+                );
+            }
+        }
+        let mut updated = daemon.config.clone();
+        updated.scoring.regret_window_minutes = 3;
+        updated.scoring.regret_alpha_definite = 0.04;
+        updated.scoring.regret_alpha_likely = 0.01;
+        updated.scoring.regret_suspend_minutes = 2;
+        std::fs::write(
+            &updated.paths.config_file,
+            toml::to_string(&updated).unwrap(),
+        )
+        .unwrap();
+        let (scan_tx, _scan_rx) = bounded(1);
+        daemon.handle_config_reload(&scan_tx);
+        assert!(daemon.wake_next_tick.reload);
+        assert_eq!(daemon.config.scoring.regret_window_minutes, 3);
+        {
+            let calibrator = daemon.regret.calibrator.lock();
+            assert_eq!(calibrator.config(), &regret_config(&updated));
+            for (category, alpha, decisions) in [
+                ("definite", 0.04, 1),
+                ("likely", 0.01, 1),
+                ("suspended", 0.04, 3),
+            ] {
+                let summary = calibrator.summary(category).unwrap();
+                assert_eq!(summary.alpha, alpha);
+                assert_eq!(summary.decisions, decisions);
+                assert_eq!(summary.regrets, decisions);
+                assert_eq!(summary.e_value, 1.0);
+            }
+            assert!(calibrator.suspended("suspended", now + Duration::from_mins(3)));
+        }
+        daemon.regret.detector.lock().watch(regret_watch_for_test(
+            "new-window",
+            &project.join("new"),
+            "new-window",
+            now,
+        ));
+
+        // A rejected reload must leave the live feedback settings and the
+        // two existing watches untouched.
+        std::fs::write(&updated.paths.config_file, "[scoring\n").unwrap();
+        daemon.handle_config_reload(&scan_tx);
+        assert_eq!(
+            daemon.regret.calibrator.lock().config(),
+            &regret_config(&updated)
+        );
+        assert_eq!(daemon.regret.detector.lock().pending(), 2);
+
+        daemon.resolve_regrets(now + Duration::from_secs(60));
+        assert_eq!(daemon.regret.detector.lock().pending(), 1);
+        assert_eq!(
+            daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("old-window")
+                .unwrap()
+                .decisions,
+            1
+        );
+        assert!(
+            daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("new-window")
+                .is_none()
+        );
+        daemon.resolve_regrets(now + Duration::from_secs(180));
+        assert_eq!(daemon.regret.detector.lock().pending(), 0);
+        assert_eq!(
+            daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("new-window")
+                .unwrap()
+                .decisions,
+            1
+        );
+    }
 
     /// A fresh heartbeat for a `scanner_thread_main` test.
     fn heartbeat_for_test() -> Arc<ThreadHeartbeat> {

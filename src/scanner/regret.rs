@@ -267,7 +267,15 @@ impl Sighting {
 #[derive(Debug, Clone)]
 pub struct RegretDetector {
     window: Duration,
-    watches: Vec<Watch>,
+    watches: Vec<PendingWatch>,
+}
+
+/// The window in force when this deletion started being observed. Config
+/// reloads change future watches without moving an existing deadline.
+#[derive(Debug, Clone)]
+struct PendingWatch {
+    watch: Watch,
+    window: Duration,
 }
 
 impl RegretDetector {
@@ -286,11 +294,21 @@ impl RegretDetector {
         self.watches.len()
     }
 
+    /// Change the observation window for future deletions. Watches already
+    /// pending retain the window with which they were registered.
+    pub fn set_window(&mut self, window: Duration) {
+        self.window = window;
+    }
+
     /// Start watching a deletion. The identity must have been captured
     /// before the entry was removed.
     pub fn watch(&mut self, watch: Watch) {
-        self.watches.retain(|w| w.decision_id != watch.decision_id);
-        self.watches.push(watch);
+        self.watches
+            .retain(|pending| pending.watch.decision_id != watch.decision_id);
+        self.watches.push(PendingWatch {
+            watch,
+            window: self.window,
+        });
     }
 
     /// Resolve watches: `look` reports what is at each watched path now.
@@ -304,10 +322,9 @@ impl RegretDetector {
         now: Instant,
         mut look: impl FnMut(&Watch) -> Sighting,
     ) -> Vec<DecisionOutcome> {
-        let window = self.window;
         let mut outcomes = Vec::new();
         let mut keep = Vec::with_capacity(self.watches.len());
-        for watch in self.watches.drain(..) {
+        for PendingWatch { watch, window } in self.watches.drain(..) {
             let age = now.saturating_duration_since(watch.deleted_at);
             let sighting = look(&watch);
             let outcome = match sighting {
@@ -344,7 +361,7 @@ impl RegretDetector {
                     after_secs: age.as_secs(),
                     detail: detail.to_string(),
                 }),
-                None => keep.push(watch),
+                None => keep.push(PendingWatch { watch, window }),
             }
         }
         self.watches = keep;
@@ -442,6 +459,27 @@ impl RegretCalibrator {
         &self.config
     }
 
+    /// Apply live settings without losing observed outcomes or shortening
+    /// an existing suspension. A changed tolerated rate starts that
+    /// category's sequential test afresh: its likelihood was accumulated
+    /// against a different null hypothesis.
+    pub fn update_config(&mut self, config: RegretConfig) {
+        let definite_changed =
+            self.config.alpha_definite.to_bits() != config.alpha_definite.to_bits();
+        let likely_changed = self.config.alpha_likely.to_bits() != config.alpha_likely.to_bits();
+        for stats in self.categories.values_mut() {
+            let alpha_changed = if stats.definite_decisions * 2 >= stats.decisions {
+                definite_changed
+            } else {
+                likely_changed
+            };
+            if alpha_changed {
+                stats.e_log = 0.0;
+            }
+        }
+        self.config = config;
+    }
+
     /// Record an outcome. `Unknown` outcomes are not evidence.
     pub fn record(
         &mut self,
@@ -469,7 +507,9 @@ impl RegretCalibrator {
         };
         stats.e_log = (stats.e_log + step).clamp(-5.0, 6.0);
         if stats.e_log.exp() >= self.config.e_threshold {
-            stats.suspended_until = Some(now + self.config.suspend);
+            // A new alarm may extend an active suspension, but a shorter
+            // duration loaded since the previous alarm must not reduce it.
+            stats.suspended_until = stats.suspended_until.max(Some(now + self.config.suspend));
             stats.e_log = 0.0;
         }
     }
@@ -850,6 +890,191 @@ mod tests {
         );
         assert_eq!(rebuilt.summary("pip_cache").unwrap().regrets, 3);
         assert!(!rebuilt.suspended("pip_cache", now));
+    }
+
+    #[test]
+    fn reconfiguration_preserves_evidence_and_resets_only_changed_nulls() {
+        let now = Instant::now();
+        let mut calibrator = RegretCalibrator::new(RegretConfig::default());
+        for (category, certainty, clean, regrets) in [
+            ("rust_target", ArtifactCertainty::Definite, 20, 1),
+            ("node_modules", ArtifactCertainty::Likely, 3, 1),
+            ("suspended", ArtifactCertainty::Definite, 0, 4),
+        ] {
+            for _ in 0..clean {
+                calibrator.record(category, certainty, Outcome::Clean, now);
+            }
+            for _ in 0..regrets {
+                calibrator.record(category, certainty, Outcome::Regret, now);
+            }
+        }
+        let before = calibrator.categories.clone();
+        let rust_before = calibrator.summary("rust_target").unwrap();
+        assert!(calibrator.suspended("suspended", now));
+        assert_ne!(before["rust_target"].e_log, 0.0);
+        assert_ne!(before["node_modules"].e_log, 0.0);
+
+        let mut updated = calibrator.config().clone();
+        updated.alpha_definite = 0.04;
+        updated.suspend = Duration::from_secs(1);
+        calibrator.update_config(updated.clone());
+        assert_eq!(calibrator.config(), &updated);
+        for (category, original) in &before {
+            let current = &calibrator.categories[category];
+            assert_eq!(current.decisions, original.decisions);
+            assert_eq!(current.regrets, original.regrets);
+            assert_eq!(current.definite_decisions, original.definite_decisions);
+            assert_eq!(current.suspended_until, original.suspended_until);
+        }
+        assert_eq!(calibrator.categories["rust_target"].e_log, 0.0);
+        assert_eq!(calibrator.categories["suspended"].e_log, 0.0);
+        assert_eq!(
+            calibrator.categories["node_modules"].e_log,
+            before["node_modules"].e_log
+        );
+        let rust_after = calibrator.summary("rust_target").unwrap();
+        assert_eq!(rust_after.alpha, 0.04);
+        assert_eq!(rust_after.posterior_mean, rust_before.posterior_mean);
+        assert_eq!(rust_after.upper_bound, rust_before.upper_bound);
+        assert!(rust_after.calibration > rust_before.calibration);
+        assert!(calibrator.suspended("suspended", now + Duration::from_secs(2)));
+
+        calibrator.record(
+            "rust_target",
+            ArtifactCertainty::Definite,
+            Outcome::Clean,
+            now,
+        );
+        // The next likelihood step uses the new alpha: (1 - 4 * .04) /
+        // (1 - .04), starting from the reset e-value of one.
+        assert!((calibrator.summary("rust_target").unwrap().e_value - 0.875).abs() < 1e-12);
+
+        // Identical rates keep the accumulated likelihood, including a
+        // category whose rate was unchanged by the preceding reload.
+        let unchanged = calibrator.summaries();
+        calibrator.update_config(updated.clone());
+        assert_eq!(calibrator.summaries(), unchanged);
+
+        updated.alpha_likely = 0.01;
+        calibrator.update_config(updated);
+        assert_eq!(calibrator.categories["node_modules"].e_log, 0.0);
+        assert_eq!(calibrator.summary("node_modules").unwrap().alpha, 0.01);
+    }
+
+    #[test]
+    fn reconfiguration_changes_future_suspensions_without_truncating_existing_ones() {
+        let now = Instant::now();
+        let mut config = RegretConfig {
+            suspend: Duration::from_secs(600),
+            ..RegretConfig::default()
+        };
+        let mut calibrator = RegretCalibrator::new(config.clone());
+        for _ in 0..3 {
+            calibrator.record("old", ArtifactCertainty::Definite, Outcome::Regret, now);
+        }
+        for _ in 0..2 {
+            calibrator.record("future", ArtifactCertainty::Definite, Outcome::Regret, now);
+        }
+        let future_likelihood = calibrator.summary("future").unwrap().e_value;
+        config.suspend = Duration::from_secs(30);
+        calibrator.update_config(config);
+        assert_eq!(
+            calibrator.summary("future").unwrap().e_value,
+            future_likelihood
+        );
+        calibrator.record("future", ArtifactCertainty::Definite, Outcome::Regret, now);
+        assert!(calibrator.suspended("future", now + Duration::from_secs(29)));
+        assert!(!calibrator.suspended("future", now + Duration::from_secs(30)));
+        assert!(calibrator.suspended("old", now + Duration::from_secs(599)));
+        assert!(!calibrator.suspended("old", now + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn a_shorter_reloaded_suspension_cannot_shorten_an_active_alarm() {
+        let now = Instant::now();
+        let mut config = RegretConfig {
+            suspend: Duration::from_secs(600),
+            ..RegretConfig::default()
+        };
+        let mut calibrator = RegretCalibrator::new(config.clone());
+        for _ in 0..3 {
+            calibrator.record("active", ArtifactCertainty::Definite, Outcome::Regret, now);
+        }
+        config.suspend = Duration::from_secs(30);
+        calibrator.update_config(config);
+        let next_alarm = now + Duration::from_secs(5);
+        for category in ["active", "fresh"] {
+            for _ in 0..3 {
+                calibrator.record(
+                    category,
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    next_alarm,
+                );
+            }
+        }
+        assert!(calibrator.suspended("fresh", now + Duration::from_secs(34)));
+        assert!(!calibrator.suspended("fresh", now + Duration::from_secs(35)));
+        assert!(calibrator.suspended("active", now + Duration::from_secs(599)));
+        assert!(!calibrator.suspended("active", now + Duration::from_secs(600)));
+
+        // An alarm near the existing deadline must still extend it by the
+        // newly configured duration; preserving a deadline cannot freeze it.
+        for _ in 0..3 {
+            calibrator.record(
+                "active",
+                ArtifactCertainty::Definite,
+                Outcome::Regret,
+                now + Duration::from_secs(590),
+            );
+        }
+        assert!(calibrator.suspended("active", now + Duration::from_secs(619)));
+        assert!(!calibrator.suspended("active", now + Duration::from_secs(620)));
+    }
+
+    #[test]
+    fn changed_windows_apply_only_to_new_watches_in_both_directions() {
+        let t0 = Instant::now();
+        for (old_secs, new_secs, first, last) in [(60, 120, "old", "new"), (120, 60, "new", "old")]
+        {
+            let old_window = Duration::from_secs(old_secs);
+            let new_window = Duration::from_secs(new_secs);
+            let mut detector = RegretDetector::new(old_window);
+            detector.watch(watch("old", Path::new("/p/old"), "rust_target", t0));
+            detector.set_window(new_window);
+            detector.watch(watch("new", Path::new("/p/new"), "rust_target", t0));
+            let first_deadline = t0 + old_window.min(new_window);
+            let mut recreated = detector.clone();
+            let before = detector.check(first_deadline - Duration::from_nanos(1), |_| {
+                Sighting::Absent
+            });
+            assert!(before.is_empty());
+            let expired = detector.check(first_deadline, |_| Sighting::Absent);
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0].decision_id, first);
+            assert_eq!(expired[0].outcome, Outcome::Clean);
+            assert_eq!(detector.pending(), 1);
+            let remaining = detector.check(t0 + old_window.max(new_window), |_| Sighting::Absent);
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].decision_id, last);
+            assert_eq!(detector.pending(), 0);
+
+            // The same captured windows also govern recreation: extending
+            // the config cannot turn an expired old watch into regret, and
+            // shortening it cannot expire an old watch early.
+            let outcomes = recreated.check(first_deadline, |_| Sighting::Recreated {
+                parent_in_use: true,
+            });
+            assert_eq!(outcomes.len(), 2);
+            for outcome in outcomes {
+                let expected = if outcome.decision_id == first {
+                    Outcome::Unknown
+                } else {
+                    Outcome::Regret
+                };
+                assert_eq!(outcome.outcome, expected);
+            }
+        }
     }
 
     #[test]
