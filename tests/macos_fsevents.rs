@@ -112,6 +112,27 @@ fn configured_ancestor_aliases_receive_canonical_kernel_events() {
 }
 
 #[test]
+fn a_configured_root_that_is_itself_a_link_is_watched_like_macos_tmp() {
+    // The default root `/tmp` is a link to `/private/tmp`. It used to be
+    // rejected as "not a plain directory", leaving it with no event coverage.
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("private-tmp");
+    fs::create_dir(&real).unwrap();
+    let link = temp.path().join("tmp");
+    symlink(&real, &link).unwrap();
+    let mut source = ScannerEventSource::start(config(std::slice::from_ref(&link), 1));
+    assert_native(&source);
+    assert!(source.capability().complete, "{:?}", source.capability());
+    assert_eq!(source.capability().watched_dirs, 1);
+    let _ = source.drain();
+
+    fs::write(real.join("object.o"), b"written through the real path").unwrap();
+    let events = await_paths(&mut source, &[link.join("object.o")]);
+    assert!(events.dirty_roots().contains(&link));
+}
+
+#[test]
 fn missing_roots_retry_without_events_and_unchanged_gaps_do_not_rescan() {
     let temp = tempfile::tempdir().unwrap();
     let healthy = temp.path().join("healthy");

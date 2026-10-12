@@ -43,13 +43,19 @@ fn inspect_root(root: &Path) -> io::Result<PathBuf> {
             "root must be absolute without ..",
         ));
     }
-    // Ancestor aliases such as /tmp -> /private/tmp are supported; a leaf
-    // symlink remains subject to the scanner's plain-directory rule.
-    let metadata = fs::symlink_metadata(root)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    // Ancestor aliases such as /tmp/work -> /private/tmp/work are supported,
+    // and so is a configured root that is itself a link: the default `/tmp`
+    // is a link to `/private/tmp` on macOS. The walker follows configured
+    // roots for the same reason, so rejecting the link here left the main
+    // scratch root with no event coverage at all. Links inside the tree are
+    // still never followed, and `root_identity` re-resolves the link on every
+    // check, so a retargeted root restarts the stream instead of watching the
+    // old directory.
+    let metadata = fs::metadata(root)?;
+    if !metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "root is not a plain directory",
+            "root is not a directory",
         ));
     }
     let canonical = fs::canonicalize(root)?;
@@ -553,5 +559,37 @@ mod tests {
         assert!(inspect_root(&file).is_err());
         assert!(inspect_root(&dir.path().join("../elsewhere")).is_err());
         assert!(inspect_root(Path::new("relative")).is_err());
+    }
+
+    #[test]
+    fn linked_roots_resolve_to_their_directory_but_links_to_files_do_not() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("private-tmp");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("tmp");
+        symlink(&real, &link).unwrap();
+        // Like macOS `/tmp -> /private/tmp`: the configured spelling is kept
+        // as the alias and the canonical directory is what gets watched.
+        assert_eq!(
+            inspect_root(&link).unwrap(),
+            fs::canonicalize(&real).unwrap()
+        );
+        let cfg = EventSourceConfig::from_scanner_config(
+            std::slice::from_ref(&link),
+            &ScannerConfig::default(),
+        );
+        let plan = root_plan(&cfg);
+        assert!(plan.summary.complete, "{}", plan.summary.reason);
+        assert_eq!(plan.aliases[0].configured, link);
+
+        let file = dir.path().join("file");
+        fs::write(&file, b"data").unwrap();
+        let file_link = dir.path().join("file-link");
+        symlink(&file, &file_link).unwrap();
+        assert!(inspect_root(&file_link).is_err());
+        let dangling = dir.path().join("dangling");
+        symlink(dir.path().join("gone"), &dangling).unwrap();
+        assert!(inspect_root(&dangling).is_err());
     }
 }
