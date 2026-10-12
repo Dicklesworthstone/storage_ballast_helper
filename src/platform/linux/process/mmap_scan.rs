@@ -563,6 +563,23 @@ fn number(raw: &[u8], radix: u32) -> io::Result<u64> {
         .map_err(|_| malformed())
 }
 
+/// A mapping of a kernel object that has no pathname on any filesystem. The
+/// kernel prints a file on a mounted filesystem with a leading `/`; these
+/// names come from the object's own pseudo-filesystem instead. Only the two
+/// that can be mapped are recognized: anonymous inodes (`anon_inode:bpf-map`,
+/// `anon_inode:[io_uring]`) and packet-socket rings (`socket:[4026]`).
+fn kernel_object(path: &[u8]) -> bool {
+    if path.contains(&0) {
+        return false;
+    }
+    if let Some(name) = path.strip_prefix(b"anon_inode:") {
+        return !name.is_empty();
+    }
+    path.strip_prefix(b"socket:[")
+        .and_then(|inode| inode.strip_suffix(b"]"))
+        .is_some_and(|inode| !inode.is_empty() && inode.iter().all(u8::is_ascii_digit))
+}
+
 pub(super) fn parse_row(pid: i32, raw: &[u8]) -> io::Result<Option<MappedRegion>> {
     let mut rest = raw;
     let range = field(&mut rest)?;
@@ -594,7 +611,7 @@ pub(super) fn parse_row(pid: i32, raw: &[u8]) -> io::Result<Option<MappedRegion>
     number(&device[split + 1..], 16)?;
     number(inode, 10)?;
     let path = rest.trim_ascii_start();
-    if path.is_empty() || (path.starts_with(b"[") && path.ends_with(b"]")) {
+    if path.is_empty() || (path.starts_with(b"[") && path.ends_with(b"]")) || kernel_object(path) {
         return Ok(None);
     }
     if !path.starts_with(b"/") || path.contains(&0) {
@@ -933,6 +950,10 @@ mod tests {
             "1000-2000 r-xp 0 BAD 42 /cache/x",
             "1000-2000 r-xp 0 00:01 nope /cache/x",
             "1000-2000 r-xp 0 00:01 42 relative",
+            "1000-2000 r--s 0 00:11 42 anon_inode:",
+            "1000-2000 rw-s 0 00:08 42 socket:[12a]",
+            "1000-2000 rw-s 0 00:08 42 socket:[]",
+            "1000-2000 rw-s 0 00:0d 42 pipe:[42]",
         ] {
             let mut bytes = format!("{malformed}\n").into_bytes();
             bytes.extend_from_slice(&valid);
@@ -944,9 +965,36 @@ mod tests {
         for row in [
             b"1000-2000 rw-p 0 00:00 0".as_slice(),
             b"1000-2000 rw-p 0 00:00 0 [anon:name]",
+            // systemd-networkd on Ubuntu, verbatim from /proc/<pid>/maps.
+            b"76e6f157f000-76e6f1600000 r--s 00001000 00:11 1045                       anon_inode:bpf-map",
+            b"76e6f2783000-76e6f2784000 rw-s 00000000 00:11 1045                       anon_inode:bpf-map",
+            b"1000-2000 rw-s 0 00:11 7 anon_inode:[io_uring]",
+            b"1000-2000 rw-s 0 00:08 4026 socket:[4026]",
         ] {
             assert!(parse_row(1, row).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn a_file_whose_name_resembles_a_kernel_object_is_still_a_mapped_file() {
+        for path in ["/cache/anon_inode:bpf-map", "/cache/socket:[4026]"] {
+            let row = format!("1000-2000 r-xp 0 00:01 42 {path}");
+            let region = parse_row(7, row.as_bytes()).unwrap().unwrap();
+            assert_eq!(region.path, Path::new(path));
+        }
+    }
+
+    #[test]
+    fn kernel_object_rows_keep_coverage_complete_beside_a_mapped_file() {
+        let fixture = Fixture::new();
+        let mut bytes =
+            b"76e6f157f000-76e6f1600000 r--s 00001000 00:11 1045                       anon_inode:bpf-map\n"
+                .to_vec();
+        bytes.extend_from_slice(&fixture.row("kept"));
+        fixture.maps(1, &bytes);
+        let result = fixture.scan(&Native, Limits::default());
+        assert!(result.incomplete.is_none(), "{:?}", result.incomplete);
+        assert_eq!(result.regions.len(), 1);
     }
 
     #[test]
