@@ -349,6 +349,29 @@ impl SharedRegret {
             Ok(())
         }
     }
+
+    /// Begin observation at the unlink's completion, without moving the
+    /// deadline if acquiring the detector lock takes time.
+    fn watch_unlinked(
+        &self,
+        candidate: &CandidacyScore,
+        identity: &EntryIdentity,
+        completed_at: Instant,
+    ) {
+        let watch = Watch {
+            decision_id: crate::scanner::decision_record::stable_decision_id(
+                &candidate.path,
+                candidate.identity,
+                candidate.size_bytes,
+            ),
+            path: candidate.path.clone(),
+            identity: identity.clone(),
+            category: format!("{:?}", candidate.classification.category),
+            certainty: candidate.decision.certainty,
+            deleted_at: completed_at,
+        };
+        self.detector.lock().watch(watch);
+    }
 }
 
 fn regret_config(config: &Config) -> RegretConfig {
@@ -9478,8 +9501,17 @@ fn executor_thread_main(
 
         let authorize_candidate =
             |candidate: &CandidacyScore| regret.authorize_deletion(candidate, logger);
-        let report =
-            executor.execute_with_guard(&plan, Some(&skip_protected), Some(&authorize_candidate));
+        let on_unlinked = |candidate: &CandidacyScore, completed_at: Instant| {
+            if let Some(identity) = watch_identities.get(&candidate.path) {
+                regret.watch_unlinked(candidate, identity, completed_at);
+            }
+        };
+        let report = executor.execute_with_hooks(
+            &plan,
+            Some(&skip_protected),
+            Some(&authorize_candidate),
+            Some(&on_unlinked),
+        );
 
         if scanner_config.engine == ScannerEngineMode::V2 {
             for candidate in &report.backoff_candidates {
@@ -9541,34 +9573,6 @@ fn executor_thread_main(
 
         // Record deletions for repeat-deletion dampening.
         tracker.record_deletions(&report.deleted_paths);
-        if !report.dry_run {
-            let watches: Vec<Watch> = report
-                .deleted_paths
-                .iter()
-                .filter_map(|path| {
-                    let identity = watch_identities.get(path)?;
-                    let candidate = plan.candidates.iter().find(|c| &c.path == path)?;
-                    Some(Watch {
-                        decision_id: crate::scanner::decision_record::stable_decision_id(
-                            &candidate.path,
-                            candidate.identity,
-                            candidate.size_bytes,
-                        ),
-                        path: path.clone(),
-                        identity: identity.clone(),
-                        category: format!("{:?}", candidate.classification.category),
-                        certainty: candidate.decision.certainty,
-                        deleted_at: Instant::now(),
-                    })
-                })
-                .collect();
-            if !watches.is_empty() {
-                let mut detector = regret.detector.lock();
-                for watch in watches {
-                    detector.watch(watch);
-                }
-            }
-        }
         if !report.dry_run && report.items_deleted > 0 {
             shared_config.note_reclaim();
         }
@@ -10724,6 +10728,129 @@ mod tests {
         assert_eq!(report.items_skipped, 0);
         assert_eq!(report.items_failed, 0);
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn executor_watches_each_unlink_before_the_next_candidate_and_keeps_its_deadline() {
+        use std::cell::Cell;
+
+        for (after_secs, expected_outcome) in [(59, "regret"), (60, "unknown")] {
+            let mut fixture = RegretDaemonFixture::new();
+            let project = fixture.directory.path().join("project");
+            let first = project.join("target");
+            let later = project.join("node_modules");
+            let mut candidates = Vec::new();
+            for (path, category, score) in [
+                (&first, ArtifactCategory::RustTarget, 2.0),
+                (&later, ArtifactCategory::NodeModules, 1.0),
+            ] {
+                std::fs::create_dir(path).unwrap();
+                std::fs::write(path.join("artifact.o"), [0u8; 16]).unwrap();
+                let mut candidate = test_candidate(&path.to_string_lossy(), score);
+                candidate.classification.category = category;
+                candidate.size_bytes = 16;
+                candidates.push(candidate);
+            }
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    dry_run: false,
+                    min_score: 0.0,
+                    check_open_files: true,
+                    ..Default::default()
+                },
+                Some(fixture.daemon.logger_handle.clone()),
+            )
+            .with_platform(Arc::clone(&fixture.daemon.platform));
+            let plan = executor.plan(candidates);
+            assert_eq!(plan.candidates.len(), 2);
+            let identities: HashMap<_, _> = plan
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.path.clone(),
+                        EntryIdentity::of(&candidate.path).unwrap(),
+                    )
+                })
+                .collect();
+            let first_completed = Cell::new(None);
+            let later_completed = Cell::new(None);
+            let authorize = |candidate: &CandidacyScore| {
+                if candidate.path == later {
+                    let completed_at = first_completed
+                        .get()
+                        .expect("first unlink completes before the next authorization");
+                    assert_eq!(fixture.daemon.regret.detector.lock().pending(), 1);
+                    assert!(!first.exists());
+                    assert!(later.exists());
+                    // A recreation is observable while the same batch is
+                    // still running. Resolve it against the actual first
+                    // unlink timestamp, including the exact 60s boundary.
+                    std::fs::create_dir(&first).unwrap();
+                    fixture.daemon.resolve_regrets_with_clock(|| {
+                        completed_at + Duration::from_secs(after_secs)
+                    });
+                    assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+                }
+                fixture
+                    .daemon
+                    .regret
+                    .authorize_deletion(candidate, &fixture.daemon.logger_handle)
+            };
+            let on_unlinked = |candidate: &CandidacyScore, completed_at: Instant| {
+                assert!(!candidate.path.exists());
+                fixture.daemon.regret.watch_unlinked(
+                    candidate,
+                    &identities[&candidate.path],
+                    completed_at,
+                );
+                if candidate.path == first {
+                    first_completed.set(Some(completed_at));
+                } else {
+                    assert_eq!(candidate.path, later);
+                    later_completed.set(Some(completed_at));
+                }
+            };
+            let report =
+                executor.execute_with_hooks(&plan, None, Some(&authorize), Some(&on_unlinked));
+
+            assert_eq!(report.items_deleted, 2);
+            assert_eq!(report.items_skipped, 0);
+            assert_eq!(report.items_failed, 0);
+            assert!(
+                first.exists(),
+                "the first path was recreated during the batch"
+            );
+            assert!(!later.exists());
+            assert_eq!(fixture.daemon.regret.detector.lock().pending(), 1);
+            let completed_at = later_completed.get().expect("later unlink observed");
+            fixture
+                .daemon
+                .resolve_regrets_with_clock(|| completed_at + Duration::from_secs(60));
+            assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+
+            fixture.flush_logger();
+            let ledger = crate::logger::sqlite::SqliteLogger::open_read_only(
+                &fixture.daemon.config.paths.sqlite_db,
+            )
+            .unwrap();
+            for (candidate, expected, age) in [
+                (&plan.candidates[0], expected_outcome, after_secs),
+                (&plan.candidates[1], "clean", 60),
+            ] {
+                let id = crate::scanner::decision_record::stable_decision_id(
+                    &candidate.path,
+                    candidate.identity,
+                    candidate.size_bytes,
+                );
+                let outcomes = ledger.outcomes_for_decision(&id).unwrap();
+                assert_eq!(outcomes.len(), 1);
+                assert_eq!(outcomes[0].outcome, expected);
+                assert_eq!(outcomes[0].after_secs, age);
+            }
+        }
     }
 
     #[test]

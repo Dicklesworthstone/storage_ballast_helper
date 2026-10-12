@@ -5,12 +5,12 @@
 #![cfg(unix)]
 
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use storage_ballast_helper::scanner::decision_record::stable_decision_id;
 use storage_ballast_helper::scanner::deletion::{
@@ -316,6 +316,112 @@ fn live_authorization_cannot_bypass_preflight_protection() {
         assert!(nested.join(".sbh-protect").exists());
         assert_eq!(fs::read(target.join("artifact.o")).unwrap(), PAYLOAD);
         assert!(!dir.path().join(".sbh").exists());
+    }
+}
+
+#[test]
+fn unlink_observer_runs_before_the_next_candidate_with_its_completion_time() {
+    let dir = scratch();
+    let first = artifact(dir.path(), "first");
+    let second = artifact(dir.path(), "second");
+    let plan = raw_plan(vec![first.clone(), second.clone()], DeletionMode::Unlink);
+    let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+    let observed = RefCell::new(Vec::new());
+    let started = Instant::now();
+    let on_unlinked = |item: &CandidacyScore, completed_at: Instant| {
+        assert!(completed_at >= started);
+        assert!(completed_at <= Instant::now());
+        assert!(!item.path.exists());
+        if observed.borrow().is_empty() {
+            assert_eq!(item.path, first.path);
+            assert!(
+                second.path.exists(),
+                "observer must run before the next deletion"
+            );
+            // Registration may wait for a detector lock. The timestamp
+            // handed to it must remain the earlier removal completion.
+            let delay = Duration::from_millis(10);
+            std::thread::sleep(delay);
+            assert!(completed_at.elapsed() >= delay);
+        } else {
+            assert_eq!(item.path, second.path);
+        }
+        observed
+            .borrow_mut()
+            .push((item.path.clone(), completed_at));
+    };
+
+    let report = executor.execute_with_hooks(&plan, None, None, Some(&on_unlinked));
+    assert_eq!(report.items_deleted, 2);
+    assert_eq!(report.items_failed, 0);
+    assert_eq!(report.items_skipped, 0);
+    let observed = observed.into_inner();
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].0, first.path);
+    assert_eq!(observed[1].0, second.path);
+    assert!(observed[0].1 < observed[1].1);
+    assert_eq!(report.deleted_paths, vec![first.path, second.path]);
+}
+
+#[test]
+fn unlink_observer_notifies_only_successful_real_permanent_removals() {
+    for (mode, dry_run, refuse, replace_before_mutation) in [
+        (DeletionMode::Unlink, false, false, false),
+        (DeletionMode::Quarantine, false, false, false),
+        (DeletionMode::Unlink, true, false, false),
+        (DeletionMode::Quarantine, true, false, false),
+        (DeletionMode::Unlink, false, true, false),
+        (DeletionMode::Quarantine, false, true, false),
+        (DeletionMode::Unlink, false, false, true),
+        (DeletionMode::Quarantine, false, false, true),
+    ] {
+        let dir = scratch();
+        let item = artifact(dir.path(), "target");
+        let original = dir.path().join("original");
+        let mut cfg = config(dir.path(), mode);
+        cfg.dry_run = dry_run;
+        let executor = DeletionExecutor::new(cfg, None);
+        let plan = executor.plan(vec![item.clone()]);
+        assert_eq!(plan.estimated_items, 1);
+        let authorize = |candidate: &CandidacyScore| {
+            if refuse {
+                return Err(SkipReason::CategorySuspended);
+            }
+            if replace_before_mutation {
+                // Deterministic backend failure, independent of uid and
+                // permission overrides: keep the original inode alive and
+                // substitute a different one after preflight has passed.
+                fs::rename(&candidate.path, &original).unwrap();
+                fs::write(&candidate.path, b"replacement data").unwrap();
+            }
+            Ok(())
+        };
+        let notifications = Cell::new(0);
+        let on_unlinked = |candidate: &CandidacyScore, _: Instant| {
+            assert_eq!(candidate.path, item.path);
+            notifications.set(notifications.get() + 1);
+        };
+
+        let report = executor.execute_with_hooks(&plan, None, Some(&authorize), Some(&on_unlinked));
+        let removed = !dry_run && !refuse && !replace_before_mutation;
+        assert_eq!(report.items_deleted, usize::from(removed));
+        assert_eq!(report.items_failed, usize::from(replace_before_mutation));
+        assert_eq!(report.items_skipped, usize::from(refuse));
+        assert_eq!(report.items_would_delete, usize::from(dry_run));
+        assert_eq!(
+            report.items_quarantined,
+            usize::from(removed && mode == DeletionMode::Quarantine)
+        );
+        assert_eq!(
+            notifications.get(),
+            usize::from(removed && mode == DeletionMode::Unlink)
+        );
+        if replace_before_mutation {
+            assert_eq!(fs::read(original).unwrap(), PAYLOAD);
+            assert_eq!(fs::read(item.path).unwrap(), b"replacement data");
+        } else if !removed {
+            assert_eq!(fs::read(item.path).unwrap(), PAYLOAD);
+        }
     }
 }
 

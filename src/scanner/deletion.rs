@@ -732,12 +732,30 @@ impl DeletionExecutor {
     /// A refusal is a typed skip, never a failed deletion or reclaimed bytes.
     /// Mutation backends retain their final lease and filesystem identity
     /// checks after authorization; an already-started removal is not cancelled.
-    #[allow(clippy::too_many_lines)]
     pub fn execute_with_guard(
         &self,
         plan: &DeletionPlan,
         should_skip: Option<&dyn Fn(&Path) -> bool>,
         authorize: Option<&dyn Fn(&CandidacyScore) -> std::result::Result<(), SkipReason>>,
+    ) -> DeletionReport {
+        self.execute_with_hooks(plan, should_skip, authorize, None)
+    }
+
+    /// Execute with live authorization and an immediate unlink observer.
+    /// `on_unlinked` receives each successful permanent removal and the
+    /// monotonic time its backend completed, before post-delete free-space
+    /// observation, logging, or work on the next candidate. This lets a
+    /// caller watch early removals while a long batch is still running.
+    ///
+    /// Dry-runs, quarantines, refusals, and failed removals never notify the
+    /// observer. It cannot change whether a completed removal succeeded.
+    #[allow(clippy::too_many_lines)]
+    pub fn execute_with_hooks(
+        &self,
+        plan: &DeletionPlan,
+        should_skip: Option<&dyn Fn(&Path) -> bool>,
+        authorize: Option<&dyn Fn(&CandidacyScore) -> std::result::Result<(), SkipReason>>,
+        on_unlinked: Option<&dyn Fn(&CandidacyScore, Instant)>,
     ) -> DeletionReport {
         let start = Instant::now();
         let mut report = DeletionReport {
@@ -937,10 +955,14 @@ impl DeletionExecutor {
                 DeletionMode::Unlink => self.delete_path(candidate).map(|()| false),
                 DeletionMode::Quarantine => self.quarantine_path(candidate).map(|()| true),
             };
+            let completed_at = Instant::now();
             match outcome {
                 Ok(quarantined) => {
+                    if !quarantined && let Some(on_unlinked) = on_unlinked {
+                        on_unlinked(candidate, completed_at);
+                    }
                     #[allow(clippy::cast_possible_truncation)]
-                    let duration_ms = del_start.elapsed().as_millis() as u64;
+                    let duration_ms = completed_at.duration_since(del_start).as_millis() as u64;
                     report.items_deleted += 1;
                     report.deleted_paths.push(candidate.path.clone());
                     if quarantined {
