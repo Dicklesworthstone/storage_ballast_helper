@@ -311,26 +311,41 @@ impl RegretDetector {
         });
     }
 
-    /// Resolve watches: `look` reports what is at each watched path now.
-    /// Recreated entries resolve immediately. A recreation first observed at or
-    /// after the deadline is `unknown`: the sighting cannot establish whether
-    /// it happened inside the window. Verified absent entries resolve `clean`
-    /// when their window passes; indeterminate observations remain pending
-    /// until then and expire as `unknown`. Call with the current monotonic time.
+    /// Resolve observations assigned the same monotonic instant. For live
+    /// filesystem or process-table lookups, use [`Self::check_with_clock`]
+    /// so time spent observing a path cannot make its timestamp stale.
     pub fn check(
         &mut self,
         now: Instant,
+        look: impl FnMut(&Watch) -> Sighting,
+    ) -> Vec<DecisionOutcome> {
+        self.check_with_clock(|| now, look)
+    }
+
+    /// Resolve watches using a monotonic clock sampled immediately before
+    /// and after each `look` (two clock reads per watched entry).
+    /// Recreated entries resolve immediately. An observation completing at or
+    /// after the deadline is `unknown`: the sighting cannot establish whether
+    /// the recreation happened inside the window. Verified absent entries
+    /// resolve `clean` only when their observation starts at or after expiry.
+    /// An absent lookup that straddles the deadline remains pending for a fresh
+    /// observation; indeterminate observations expire as `unknown`.
+    pub fn check_with_clock(
+        &mut self,
+        mut clock: impl FnMut() -> Instant,
         mut look: impl FnMut(&Watch) -> Sighting,
     ) -> Vec<DecisionOutcome> {
         let mut outcomes = Vec::new();
         let mut keep = Vec::with_capacity(self.watches.len());
         for PendingWatch { watch, window } in self.watches.drain(..) {
-            let age = now.saturating_duration_since(watch.deleted_at);
+            let observation_started = clock();
             let sighting = look(&watch);
+            let observed_at = clock();
+            let age = observed_at.saturating_duration_since(watch.deleted_at);
             let outcome = match sighting {
                 Sighting::Recreated { .. } if age >= window => Some((
                     Outcome::Unknown,
-                    "recreation first observed at or after regret window expiry",
+                    "recreation observation completed at or after regret window expiry",
                 )),
                 Sighting::Recreated {
                     parent_in_use: true,
@@ -341,7 +356,10 @@ impl RegretDetector {
                     Outcome::Unknown,
                     "recreated with no live user under the parent",
                 )),
-                Sighting::Absent if age >= window => {
+                Sighting::Absent
+                    if observation_started.saturating_duration_since(watch.deleted_at)
+                        >= window =>
+                {
                     Some((Outcome::Clean, "window passed without a recreation"))
                 }
                 Sighting::Indeterminate if age >= window => Some((
@@ -1142,6 +1160,78 @@ mod tests {
                 assert_eq!(detector.pending(), 0);
             }
         }
+    }
+
+    #[test]
+    fn slow_observations_use_each_completion_time_instead_of_the_sweep_start() {
+        use std::cell::Cell;
+
+        let t0 = Instant::now();
+        let clock = Cell::new(t0 + Duration::from_secs(59));
+        let clock_reads = Cell::new(0);
+        let mut detector = RegretDetector::new(Duration::from_secs(60));
+        for id in ["first", "later", "uncertain"] {
+            detector.watch(watch(id, Path::new("/p/target"), "rust_target", t0));
+        }
+        let outcomes = detector.check_with_clock(
+            || {
+                clock_reads.set(clock_reads.get() + 1);
+                clock.get()
+            },
+            |watched| {
+                // The first observation alone crosses the deadline. Every
+                // subsequent lookup must get its own completion timestamp.
+                clock.set(clock.get() + Duration::from_secs(2));
+                if watched.decision_id == "uncertain" {
+                    Sighting::Indeterminate
+                } else {
+                    Sighting::Recreated {
+                        parent_in_use: true,
+                    }
+                }
+            },
+        );
+        assert_eq!(clock_reads.get(), 6);
+        assert_eq!(outcomes.len(), 3);
+        for (outcome, after_secs) in outcomes.iter().zip([61, 63, 65]) {
+            assert_eq!(outcome.outcome, Outcome::Unknown, "{}", outcome.decision_id);
+            assert_eq!(outcome.after_secs, after_secs);
+        }
+        assert_eq!(detector.pending(), 0);
+    }
+
+    #[test]
+    fn an_absent_observation_crossing_expiry_waits_for_a_fresh_lookup() {
+        use std::cell::Cell;
+
+        let t0 = Instant::now();
+        let clock = Cell::new(t0 + Duration::from_secs(59));
+        let mut detector = RegretDetector::new(Duration::from_secs(60));
+        detector.watch(watch("absent", Path::new("/p/target"), "rust_target", t0));
+        let crossing = detector.check_with_clock(
+            || clock.get(),
+            |_| {
+                clock.set(clock.get() + Duration::from_secs(2));
+                Sighting::Absent
+            },
+        );
+        assert!(
+            crossing.is_empty(),
+            "absence may have been seen before expiry"
+        );
+        assert_eq!(detector.pending(), 1);
+
+        let after = detector.check_with_clock(
+            || clock.get(),
+            |_| {
+                clock.set(clock.get() + Duration::from_secs(2));
+                Sighting::Absent
+            },
+        );
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].outcome, Outcome::Clean);
+        assert_eq!(after[0].after_secs, 63);
+        assert_eq!(detector.pending(), 0);
     }
 
     #[test]

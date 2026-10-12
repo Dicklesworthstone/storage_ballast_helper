@@ -4888,7 +4888,7 @@ impl MonitoringDaemon {
             }
             self.last_tick_cleanup_ran = true;
         }
-        self.resolve_regrets(now);
+        self.resolve_regrets();
 
         // Green maintenance (Q6): once per maintenance interval, a routine
         // pass over the roots the hazard-driven scheduler picks within its
@@ -6175,11 +6175,22 @@ impl MonitoringDaemon {
     /// Regret labels (Q4): resolve watched deletions against the filesystem
     /// and the process table, store each outcome, and feed the category
     /// calibrator the scanner reads before its next pass.
-    fn resolve_regrets(&self, now: Instant) {
+    fn resolve_regrets(&self) {
+        self.resolve_regrets_with_clock(Instant::now);
+    }
+
+    /// Sample time around each observation and again when its evidence is
+    /// applied. Ballast work, quarantine sweeps, and earlier observations
+    /// must not backdate a later sighting or its suspension deadline.
+    fn resolve_regrets_with_clock(&self, mut clock: impl FnMut() -> Instant) {
         let platform = Arc::clone(&self.platform);
-        let outcomes = self.regret.detector.lock().check(now, |watch| {
-            watch.observe(|parent| parent_in_use(platform.as_ref(), parent))
-        });
+        let outcomes = self
+            .regret
+            .detector
+            .lock()
+            .check_with_clock(&mut clock, |watch| {
+                watch.observe(|parent| parent_in_use(platform.as_ref(), parent))
+            });
         if outcomes.is_empty() {
             return;
         }
@@ -6190,6 +6201,7 @@ impl MonitoringDaemon {
             outcomes
                 .iter()
                 .map(|outcome| {
+                    let now = clock();
                     calibrator.record(
                         &outcome.category,
                         certainty_from_name(&outcome.certainty),
@@ -9790,7 +9802,7 @@ mod tests {
 
         fixture
             .daemon
-            .resolve_regrets(now + Duration::from_secs(30));
+            .resolve_regrets_with_clock(|| now + Duration::from_secs(30));
         assert_eq!(fixture.daemon.regret.detector.lock().pending(), 3);
         assert_eq!(
             fixture
@@ -9815,7 +9827,7 @@ mod tests {
 
         fixture
             .daemon
-            .resolve_regrets(now + Duration::from_secs(60));
+            .resolve_regrets_with_clock(|| now + Duration::from_secs(60));
         assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
         assert_eq!(
             fixture
@@ -9852,6 +9864,88 @@ mod tests {
             assert_eq!(outcomes.len(), 1, "{id}");
             assert_eq!(outcomes[0].outcome, expected, "{id}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_regret_observation_uses_completion_time_for_each_watched_path() {
+        let mut fixture = RegretDaemonFixture::new();
+        let now = Instant::now();
+        let project = fixture.directory.path().join("project");
+        for id in ["first", "later"] {
+            let path = project.join(id);
+            fixture
+                .daemon
+                .regret
+                .detector
+                .lock()
+                .watch(regret_watch_for_test(id, &path, "timed", now));
+            std::fs::create_dir(&path).unwrap();
+        }
+        // Each pair brackets a real filesystem/process observation. The
+        // first begins before expiry but completes after it; the second
+        // begins later still. The last two samples timestamp calibration.
+        let mut seconds = [59, 61, 61, 63, 64, 65].into_iter();
+        fixture.daemon.resolve_regrets_with_clock(|| {
+            now + Duration::from_secs(seconds.next().expect("bounded clock samples"))
+        });
+        assert!(seconds.next().is_none());
+        assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+        assert!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("timed")
+                .is_none()
+        );
+        fixture.flush_logger();
+        let ledger = crate::logger::sqlite::SqliteLogger::open_read_only(
+            &fixture.daemon.config.paths.sqlite_db,
+        )
+        .unwrap();
+        for (id, after_secs) in [("first", 61), ("later", 63)] {
+            let outcomes = ledger.outcomes_for_decision(id).unwrap();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].outcome, "unknown");
+            assert_eq!(outcomes[0].after_secs, after_secs);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_regret_alarm_uses_fresh_calibration_time_for_its_full_suspension() {
+        let fixture = RegretDaemonFixture::new();
+        let now = Instant::now();
+        let project = fixture.directory.path().join("project");
+        let mut config = fixture.daemon.config.clone();
+        config.scoring.regret_suspend_minutes = 1;
+        fixture.daemon.regret.update_config(&config);
+        for id in ["first", "second", "third"] {
+            let path = project.join(id);
+            fixture
+                .daemon
+                .regret
+                .detector
+                .lock()
+                .watch(regret_watch_for_test(id, &path, "timed", now));
+            std::fs::create_dir(&path).unwrap();
+        }
+        // All three recreations are observed inside the 60-second window.
+        // Applying their evidence happens later, with the third raising the
+        // alarm at +50s. Its 60-second suspension must last until +110s.
+        let mut seconds = [1, 2, 3, 4, 5, 6, 40, 45, 50].into_iter();
+        fixture.daemon.resolve_regrets_with_clock(|| {
+            now + Duration::from_secs(seconds.next().expect("bounded clock samples"))
+        });
+        assert!(seconds.next().is_none());
+        let calibrator = fixture.daemon.regret.calibrator.lock();
+        let summary = calibrator.summary("timed").unwrap();
+        assert_eq!(summary.decisions, 3);
+        assert_eq!(summary.regrets, 3);
+        assert!(calibrator.suspended("timed", now + Duration::from_secs(109)));
+        assert!(!calibrator.suspended("timed", now + Duration::from_secs(110)));
     }
 
     #[cfg(unix)]
@@ -9933,7 +10027,7 @@ mod tests {
         );
         assert_eq!(daemon.regret.detector.lock().pending(), 2);
 
-        daemon.resolve_regrets(now + Duration::from_secs(60));
+        daemon.resolve_regrets_with_clock(|| now + Duration::from_secs(60));
         assert_eq!(daemon.regret.detector.lock().pending(), 1);
         assert_eq!(
             daemon
@@ -9953,7 +10047,7 @@ mod tests {
                 .summary("new-window")
                 .is_none()
         );
-        daemon.resolve_regrets(now + Duration::from_secs(180));
+        daemon.resolve_regrets_with_clock(|| now + Duration::from_secs(180));
         assert_eq!(daemon.regret.detector.lock().pending(), 0);
         assert_eq!(
             daemon
