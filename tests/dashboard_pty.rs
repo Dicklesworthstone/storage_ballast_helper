@@ -62,6 +62,7 @@ yellow_min_free_pct = 0.03
 orange_min_free_pct = 0.02
 red_min_free_pct = 0.01
 [scanner]
+include_user_temp_dir = false
 root_paths = [{root:?}]
 [notifications]
 enabled = false

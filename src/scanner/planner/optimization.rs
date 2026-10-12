@@ -1853,6 +1853,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "APFS rejects non-UTF-8 file names (EILSEQ)"
+    )]
     fn real_parent_aliases_share_identity_without_rewriting_execution_paths() {
         use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::{MetadataExt, symlink};

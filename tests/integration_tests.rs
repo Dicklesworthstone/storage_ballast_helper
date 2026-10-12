@@ -161,7 +161,10 @@ fn active_target_lease_cli_binds_lifetime_renewal_and_machine_status() {
     let config_path = fixture_path.join("sbh.toml");
     fs::write(
         &config_path,
-        format!("[scanner]\nroot_paths = [\"{}\"]\n", toml_path(&scan_root)),
+        format!(
+            "[scanner]\ninclude_user_temp_dir = false\nroot_paths = [\"{}\"]\n",
+            toml_path(&scan_root)
+        ),
     )
     .expect("write active lease config");
     let active_status_path = fixture_path.join("active-status.json");
@@ -292,7 +295,10 @@ fn active_target_lease_watchdog_cancels_an_over_quota_process_group() {
     let config_path = fixture.path().join("sbh.toml");
     fs::write(
         &config_path,
-        format!("[scanner]\nroot_paths = [\"{}\"]\n", toml_path(&scan_root)),
+        format!(
+            "[scanner]\ninclude_user_temp_dir = false\nroot_paths = [\"{}\"]\n",
+            toml_path(&scan_root)
+        ),
     )
     .expect("write watchdog config");
     let args = [
@@ -366,7 +372,10 @@ fn active_target_lease_owner_crash_releases_lock_without_deleting_target() {
     let config_path = fixture.path().join("sbh.toml");
     fs::write(
         &config_path,
-        format!("[scanner]\nroot_paths = [\"{}\"]\n", toml_path(&scan_root)),
+        format!(
+            "[scanner]\ninclude_user_temp_dir = false\nroot_paths = [\"{}\"]\n",
+            toml_path(&scan_root)
+        ),
     )
     .expect("write crash config");
     let args = [
@@ -658,6 +667,7 @@ jsonl_log = "{}"
 ballast_dir = "{}"
 
 [scanner]
+include_user_temp_dir = false
 root_paths = ["{}"]
 protected_paths = ["{}"]
 min_file_age_minutes = 0
@@ -852,7 +862,7 @@ fn scan_reports_home_trash_without_candidate() {
     fs::write(
         &config_path,
         format!(
-            "[paths]\nstate_file = \"{}\"\nsqlite_db = \"{}\"\njsonl_log = \"{}\"\nballast_dir = \"{}\"\n\n[scanner]\nroot_paths = [\"{}\"]\n",
+            "[paths]\nstate_file = \"{}\"\nsqlite_db = \"{}\"\njsonl_log = \"{}\"\nballast_dir = \"{}\"\n\n[scanner]\ninclude_user_temp_dir = false\nroot_paths = [\"{}\"]\n",
             state_dir.join("state.json").display(),
             state_dir.join("activity.sqlite3").display(),
             state_dir.join("activity.jsonl").display(),
@@ -982,7 +992,7 @@ fn scan_json_reports_v2_engine_and_opaque_pruning_metrics() {
     fs::write(
         &config_path,
         format!(
-            "[paths]\nstate_file = \"{}\"\nsqlite_db = \"{}\"\njsonl_log = \"{}\"\nballast_dir = \"{}\"\n\n[scanner]\nengine = \"v2\"\nroot_paths = [\"{}\"]\nmin_file_age_minutes = 0\n",
+            "[paths]\nstate_file = \"{}\"\nsqlite_db = \"{}\"\njsonl_log = \"{}\"\nballast_dir = \"{}\"\n\n[scanner]\ninclude_user_temp_dir = false\nengine = \"v2\"\nroot_paths = [\"{}\"]\nmin_file_age_minutes = 0\n",
             state_dir.join("state.json").display(),
             state_dir.join("activity.sqlite3").display(),
             state_dir.join("activity.jsonl").display(),
@@ -1486,7 +1496,7 @@ fn macos_synthetic_writer_surfaces_in_blame_top_rows() {
     fs::write(
         &config_path,
         format!(
-            "[paths]\nstate_file = \"{}\"\nsqlite_db = \"{}\"\njsonl_log = \"{}\"\nballast_dir = \"{}\"\n\n[scanner]\nroot_paths = [\"{}\"]\n",
+            "[paths]\nstate_file = \"{}\"\nsqlite_db = \"{}\"\njsonl_log = \"{}\"\nballast_dir = \"{}\"\n\n[scanner]\ninclude_user_temp_dir = false\nroot_paths = [\"{}\"]\n",
             state_dir.join("state.json").display(),
             state_dir.join("activity.sqlite3").display(),
             state_dir.join("activity.jsonl").display(),
@@ -1703,6 +1713,7 @@ poll_interval_ms = 100
 enabled = false
 
 [scanner]
+include_user_temp_dir = false
 root_paths = ["{}"]
 min_file_age_minutes = 60
 max_depth = 1
@@ -2343,6 +2354,7 @@ jsonl_log = "{}"
 ballast_dir = "{}"
 
 [scanner]
+include_user_temp_dir = false
 root_paths = ["{}"]
 min_file_age_minutes = 0
 max_depth = 8
@@ -2479,6 +2491,7 @@ jsonl_log = "{}"
 ballast_dir = "{}"
 
 [scanner]
+include_user_temp_dir = false
 root_paths = ["{}"]
 min_file_age_minutes = 0
 max_depth = 8
@@ -2690,6 +2703,7 @@ jsonl_log = "{}"
 ballast_dir = "{}"
 
 [scanner]
+include_user_temp_dir = false
 root_paths = ["{}"]
 min_file_age_minutes = 0
 max_depth = 8
@@ -3687,6 +3701,7 @@ ballast_dir = "{}"
 poll_interval_ms = 15000
 
 [scanner]
+include_user_temp_dir = false
 root_paths = ["{}"]
 min_file_age_minutes = 60
 max_depth = 1
@@ -4187,6 +4202,7 @@ poll_interval_ms = 100
 enabled = false
 
 [scanner]
+include_user_temp_dir = false
 root_paths = ["{}"]
 min_file_age_minutes = 60
 max_depth = 1
@@ -4246,6 +4262,7 @@ poll_interval_ms = 100
 enabled = false
 
 [scanner]
+include_user_temp_dir = false
 root_paths = ["{}"]
 min_file_age_minutes = {}
 max_depth = 2
@@ -5789,6 +5806,7 @@ red_min_free_pct = 7.0
 poll_interval_ms = 2000
 
 [scanner]
+include_user_temp_dir = false
 max_depth = 8
 parallelism = 2
 dry_run = true

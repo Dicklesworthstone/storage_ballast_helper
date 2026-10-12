@@ -189,6 +189,10 @@ fn tag_validation_does_not_erase_symlinked_source_safety_markers() {
 
 #[cfg(unix)]
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS rejects non-UTF-8 file names (EILSEQ)"
+)]
 fn valid_tag_evidence_preserves_non_utf8_directory_names() {
     use std::os::unix::ffi::OsStringExt;
     let temp = tempfile::tempdir().unwrap();
