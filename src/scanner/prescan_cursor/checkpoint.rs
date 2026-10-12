@@ -51,8 +51,10 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-impl StoredPath {
-    fn encode(path: &Path) -> io::Result<Self> {
+impl TryFrom<&Path> for StoredPath {
+    type Error = io::Error;
+
+    fn try_from(path: &Path) -> io::Result<Self> {
         if let Some(text) = path.to_str() {
             return Ok(Self::Text(text.to_owned()));
         }
@@ -70,15 +72,19 @@ impl StoredPath {
             ))
         }
     }
+}
 
-    fn decode(self) -> io::Result<PathBuf> {
-        match self {
-            Self::Text(text) => Ok(PathBuf::from(text)),
-            Self::UnixBytes { unix_bytes } => {
+impl TryFrom<StoredPath> for PathBuf {
+    type Error = io::Error;
+
+    fn try_from(path: StoredPath) -> io::Result<Self> {
+        match path {
+            StoredPath::Text(text) => Ok(Self::from(text)),
+            StoredPath::UnixBytes { unix_bytes } => {
                 #[cfg(unix)]
                 {
                     use std::os::unix::ffi::OsStringExt;
-                    Ok(PathBuf::from(OsString::from_vec(unix_bytes)))
+                    Ok(Self::from(OsString::from_vec(unix_bytes)))
                 }
                 #[cfg(not(unix))]
                 {
@@ -112,12 +118,12 @@ fn validate(cursor: &PrescanCursor) -> io::Result<()> {
         return Err(invalid("pre-scan continuation escapes its root"));
     }
     let mut raw_bytes = 0usize;
-    for path in cursor.root.iter().chain(&cursor.after).chain(
-        cursor
-            .continuations
-            .iter()
-            .flat_map(|(root, after)| [root, after]),
-    ) {
+    for path in cursor
+        .root
+        .iter()
+        .chain(&cursor.after)
+        .chain(cursor.continuations.iter().flat_map(<[_; 2]>::from))
+    {
         let bytes = path.as_os_str().as_encoded_bytes();
         if bytes.is_empty() || bytes.len() > MAX_PATH_BYTES || bytes.contains(&0) {
             return Err(invalid("invalid or oversized pre-scan path"));
@@ -142,16 +148,25 @@ impl Progress {
     fn from_cursor(cursor: &PrescanCursor) -> io::Result<Self> {
         validate(cursor)?;
         Ok(Self {
-            root: cursor.root.as_deref().map(StoredPath::encode).transpose()?,
+            root: cursor
+                .root
+                .as_deref()
+                .map(StoredPath::try_from)
+                .transpose()?,
             after: cursor
                 .after
                 .as_deref()
-                .map(StoredPath::encode)
+                .map(StoredPath::try_from)
                 .transpose()?,
             continuations: cursor
                 .continuations
                 .iter()
-                .map(|(root, after)| Ok((StoredPath::encode(root)?, StoredPath::encode(after)?)))
+                .map(|(root, after)| {
+                    Ok((
+                        StoredPath::try_from(root.as_path())?,
+                        StoredPath::try_from(after.as_path())?,
+                    ))
+                })
                 .collect::<io::Result<_>>()?,
         })
     }
@@ -163,15 +178,15 @@ impl Progress {
         let mut continuations = BTreeMap::new();
         for (root, after) in self.continuations {
             if continuations
-                .insert(root.decode()?, after.decode()?)
+                .insert(PathBuf::try_from(root)?, PathBuf::try_from(after)?)
                 .is_some()
             {
                 return Err(invalid("duplicate pre-scan continuation root"));
             }
         }
         let cursor = PrescanCursor {
-            root: self.root.map(StoredPath::decode).transpose()?,
-            after: self.after.map(StoredPath::decode).transpose()?,
+            root: self.root.map(PathBuf::try_from).transpose()?,
+            after: self.after.map(PathBuf::try_from).transpose()?,
             continuations,
             ..PrescanCursor::default()
         };

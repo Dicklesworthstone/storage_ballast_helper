@@ -36,7 +36,9 @@ fn check_scope(result: Result<Vec<MappedRegion>>, scope: &Path, expected: &[(i32
                             .protection
                             .as_deref()
                             .is_some_and(|mode| mode.contains('x'))),
-                    "a successful maps snapshot omitted running PID {pid} at {path:?}: {regions:?}"
+                    "a successful maps snapshot omitted running PID {pid} at {} (native bytes {:?}): {regions:?}",
+                    path.display(),
+                    path.as_os_str().as_encoded_bytes()
                 );
             }
             if expected.is_empty() {

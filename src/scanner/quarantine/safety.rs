@@ -23,7 +23,7 @@ mod confined_purge;
 #[path = "transaction.rs"]
 mod transaction;
 
-pub(crate) use confined_purge::remove_direct;
+pub use confined_purge::remove_direct;
 use transaction::{Directory, Payload};
 
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
@@ -431,7 +431,7 @@ fn remove_records_at(root: &Directory, id: &str) -> io::Result<()> {
     validate_id(id)?;
     root.remove_file(OsStr::new(&format!("{id}.json")))?;
     root.remove_file(OsStr::new(&format!("{id}.pending")))?;
-    // Stuck bookkeeping remains best-effort, as in clear_stuck.
+    // Stuck bookkeeping remains best-effort after guarded record cleanup.
     let _ = root.remove_file(OsStr::new(&format!("{id}.stuck")));
     Ok(())
 }

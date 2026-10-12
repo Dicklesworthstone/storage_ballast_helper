@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serializer};
 
-pub(crate) fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+pub fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
     if let Some(text) = path.to_str() {
         return serializer.serialize_str(text);
     }
@@ -36,7 +36,7 @@ pub(crate) fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::
     }
 }
 
-pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged, deny_unknown_fields)]
     enum StoredPath {

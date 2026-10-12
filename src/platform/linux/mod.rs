@@ -270,8 +270,20 @@ mod tests {
     fn assert_same_mount(platform: &LinuxPal, target: &Path, query: &Path) {
         let expected = platform.fs_stats(target).unwrap();
         let actual = platform.fs_stats(query).unwrap();
-        assert_eq!(actual.mount_point, expected.mount_point, "query={query:?}");
-        assert_eq!(actual.fs_type, expected.fs_type, "query={query:?}");
+        assert_eq!(
+            actual.mount_point,
+            expected.mount_point,
+            "query={} query_bytes={:?}",
+            query.display(),
+            query.as_os_str().as_encoded_bytes()
+        );
+        assert_eq!(
+            actual.fs_type,
+            expected.fs_type,
+            "query={} query_bytes={:?}",
+            query.display(),
+            query.as_os_str().as_encoded_bytes()
+        );
         assert_eq!(actual.total_bytes, expected.total_bytes);
         assert_eq!(actual.is_readonly, expected.is_readonly);
         assert_eq!(

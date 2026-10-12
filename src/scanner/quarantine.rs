@@ -326,10 +326,6 @@ impl QuarantineStore {
         marker
     }
 
-    fn clear_stuck(&self, decision_id: &str) {
-        let _ = fs::remove_file(self.stuck_path(decision_id));
-    }
-
     /// Whether a previously-failed entry is still inside its retry cooldown.
     fn cooling_down(&self, decision_id: &str, now_unix: u64) -> bool {
         self.stuck(decision_id)

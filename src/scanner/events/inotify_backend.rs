@@ -9,7 +9,7 @@
 //! Revocation is immediate; physical watch retirement shares the event drain's
 //! work and time budget rather than issuing thousands of removals in one event.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -57,7 +57,7 @@ pub(super) struct LinuxInotifyBackend {
     // Coalesced revoked prefixes. Their physical watches still count against
     // max_watches until a bounded retirement step releases them. No pathname
     // under these prefixes is live event evidence in the meantime.
-    retiring_roots: BTreeMap<PathBuf, ()>,
+    retiring_roots: BTreeSet<PathBuf>,
     // Preserve alternation across calls, including a deadline that permits
     // only one work unit. Restarting every drain with cleanup starves events.
     retirement_turn: bool,
@@ -107,7 +107,7 @@ impl LinuxInotifyBackend {
             inotify: inotify::Inotify::init()?,
             watch_paths: BTreeMap::new(),
             path_watches: BTreeMap::new(),
-            retiring_roots: BTreeMap::new(),
+            retiring_roots: BTreeSet::new(),
             retirement_turn: true,
             buffer: vec![0; EVENT_BUFFER_BYTES],
             pending_events: VecDeque::new(),
@@ -387,10 +387,10 @@ impl LinuxInotifyBackend {
         !self.retiring_roots.is_empty()
             && path
                 .ancestors()
-                .any(|ancestor| self.retiring_roots.contains_key(ancestor))
+                .any(|ancestor| self.retiring_roots.contains(ancestor))
     }
 
-    fn forget_subtree(&mut self, path: &Path, rates: &mut EventRateTracker) {
+    fn forget_subtree(&mut self, path: &Path, rates: &EventRateTracker) {
         if self.path_is_retiring(path) {
             return;
         }
@@ -404,16 +404,12 @@ impl LinuxInotifyBackend {
         // A parent revocation subsumes previously queued descendants. No
         // physical watch or rate-history walk takes place in this event.
         drop(remove_subtree_entries(&mut self.retiring_roots, path));
-        self.retiring_roots.insert(path.to_path_buf(), ());
+        self.retiring_roots.insert(path.to_path_buf());
         self.require_repair();
     }
 
     fn retire_one(&mut self, rates: &mut EventRateTracker) {
-        let Some(root) = self
-            .retiring_roots
-            .first_key_value()
-            .map(|(root, _)| root.clone())
-        else {
+        let Some(root) = self.retiring_roots.first().cloned() else {
             return;
         };
         if let Some(path) = first_subtree_path(&self.path_watches, &root) {
@@ -479,16 +475,19 @@ fn first_subtree_path<T>(entries: &BTreeMap<PathBuf, T>, root: &Path) -> Option<
 // ordered range. `starts_with` is component-aware: /cache/a-other is not a
 // descendant of /cache/a. Only matching keys are cloned, even if the root
 // itself has no entry. No canonicalization, filesystem I/O, or UTF-8 conversion.
-fn remove_subtree_entries<T>(entries: &mut BTreeMap<PathBuf, T>, root: &Path) -> Vec<T> {
-    let paths: Vec<_> = entries
+fn remove_subtree_entries(entries: &mut BTreeSet<PathBuf>, root: &Path) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    while let Some(path) = entries
         .range(root.to_path_buf()..)
-        .take_while(|(path, _)| path.starts_with(root))
-        .map(|(path, _)| path.clone())
-        .collect();
-    paths
-        .into_iter()
-        .filter_map(|path| entries.remove(&path))
-        .collect()
+        .next()
+        .filter(|path| path.starts_with(root))
+        .cloned()
+    {
+        if let Some(entry) = entries.take(&path) {
+            removed.push(entry);
+        }
+    }
+    removed
 }
 
 fn watch_mask() -> WatchMask {
@@ -936,7 +935,13 @@ mod tests {
         if let super::super::EventSourceBackend::RecursiveInotify(backend) = &mut source.backend {
             backend.require_repair();
         }
-        assert!(!source.should_replan(now + WATCH_REPAIR_INTERVAL - Duration::from_nanos(1)));
+        assert!(
+            !source.should_replan(
+                (now + WATCH_REPAIR_INTERVAL)
+                    .checked_sub(Duration::from_nanos(1))
+                    .unwrap()
+            )
+        );
         assert!(source.should_replan(now + WATCH_REPAIR_INTERVAL));
         let mut repaired = source.drain_at(now + WATCH_REPAIR_INTERVAL);
         repaired.merge(super::super::watch_rebuild::finish_rebuild(
@@ -977,19 +982,25 @@ mod tests {
 
     #[test]
     fn subtree_range_preserves_prefix_siblings_and_unrelated_projects() {
-        let mut entries = BTreeMap::new();
+        let mut entries = BTreeSet::new();
         for n in 0..16_384 {
-            entries.insert(PathBuf::from(format!("/cache/project-{n:05}/target")), n);
+            entries.insert(PathBuf::from(format!("/cache/project-{n:05}/target")));
         }
-        entries.insert(PathBuf::from("/cache/project-00007/target/deep"), 20_000);
-        entries.insert(PathBuf::from("/cache/project-00007/target-other"), 20_001);
-        entries.insert(PathBuf::from("/cache/project-00007/target.other"), 20_002);
+        entries.insert(PathBuf::from("/cache/project-00007/target/deep"));
+        entries.insert(PathBuf::from("/cache/project-00007/target-other"));
+        entries.insert(PathBuf::from("/cache/project-00007/target.other"));
         let removed =
             remove_subtree_entries(&mut entries, Path::new("/cache/project-00007/target"));
-        assert_eq!(removed, vec![7, 20_000]);
+        assert_eq!(
+            removed,
+            vec![
+                PathBuf::from("/cache/project-00007/target"),
+                PathBuf::from("/cache/project-00007/target/deep"),
+            ]
+        );
         assert_eq!(entries.len(), 16_385);
-        assert!(entries.contains_key(Path::new("/cache/project-00007/target-other")));
-        assert!(entries.contains_key(Path::new("/cache/project-00007/target.other")));
+        assert!(entries.contains(Path::new("/cache/project-00007/target-other")));
+        assert!(entries.contains(Path::new("/cache/project-00007/target.other")));
         assert!(remove_subtree_entries(&mut entries, Path::new("/missing")).is_empty());
     }
 
@@ -999,13 +1010,13 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let root = PathBuf::from("/cache").join(OsString::from_vec(vec![b'a', 0xff]));
         let sibling = PathBuf::from("/cache").join(OsString::from_vec(vec![b'a', 0xff, b'-']));
-        let mut entries = BTreeMap::from([
-            (root.join("one"), 1),
-            (root.join("two/deep"), 2),
-            (sibling.clone(), 3),
-        ]);
-        assert_eq!(remove_subtree_entries(&mut entries, &root), vec![1, 2]);
-        assert_eq!(entries, BTreeMap::from([(sibling, 3)]));
+        let mut entries =
+            BTreeSet::from([root.join("one"), root.join("two/deep"), sibling.clone()]);
+        assert_eq!(
+            remove_subtree_entries(&mut entries, &root),
+            vec![root.join("one"), root.join("two/deep")]
+        );
+        assert_eq!(entries, BTreeSet::from([sibling]));
     }
 
     #[test]
@@ -1030,7 +1041,7 @@ mod tests {
             for (watch, path) in &backend.watch_paths {
                 assert_eq!(backend.path_watches.get(path), Some(watch));
             }
-            backend.forget_subtree(&group, &mut rates);
+            backend.forget_subtree(&group, &rates);
             assert_eq!(backend.watched_dirs().count(), 2, "revocation is immediate");
             assert_eq!(
                 backend.watch_paths.len(),
@@ -1060,7 +1071,7 @@ mod tests {
         }
         let mut backend = LinuxInotifyBackend::start(&paths, 65).unwrap();
         let mut rates = EventRateTracker::default();
-        backend.forget_subtree(&group, &mut rates);
+        backend.forget_subtree(&group, &rates);
         for n in 0..10 {
             let incoming = event(
                 &backend,
@@ -1109,7 +1120,7 @@ mod tests {
         }
         let mut backend = LinuxInotifyBackend::start(&paths, 4).unwrap();
         let mut rates = EventRateTracker::default();
-        backend.forget_subtree(&root.join("group"), &mut rates);
+        backend.forget_subtree(&root.join("group"), &rates);
         let now = Instant::now();
         let mut step = 0;
         let invalidation = backend.drain_with_budget(
@@ -1155,7 +1166,7 @@ mod tests {
             Some("new"),
         );
         let mut rates = EventRateTracker::default();
-        backend.forget_subtree(&group, &mut rates);
+        backend.forget_subtree(&group, &rates);
         let invalidation = backend.handle_event(
             &DirtyRootTracker::new(config.root_paths()),
             &config,
@@ -1182,7 +1193,7 @@ mod tests {
         fs::create_dir(&new).unwrap();
         let mut backend = LinuxInotifyBackend::start(&[root.clone(), old.clone()], 2).unwrap();
         let mut rates = EventRateTracker::default();
-        backend.forget_subtree(&old, &mut rates);
+        backend.forget_subtree(&old, &rates);
         assert_eq!(backend.watched_dirs().count(), 1);
         assert!(
             backend.add_watch(&new).is_err(),
@@ -1207,16 +1218,16 @@ mod tests {
             LinuxInotifyBackend::start(&[root.clone(), a.clone(), b.clone()], 3).unwrap();
         let mut rates = EventRateTracker::default();
         for n in 0..1024 {
-            backend.forget_subtree(&root.join(format!("unwatched-{n}")), &mut rates);
+            backend.forget_subtree(&root.join(format!("unwatched-{n}")), &rates);
         }
         assert!(backend.retiring_roots.is_empty());
-        backend.forget_subtree(&a, &mut rates);
-        backend.forget_subtree(&b, &mut rates);
+        backend.forget_subtree(&a, &rates);
+        backend.forget_subtree(&b, &rates);
         assert_eq!(backend.retiring_roots.len(), 2);
-        backend.forget_subtree(&group, &mut rates);
+        backend.forget_subtree(&group, &rates);
         assert_eq!(backend.retiring_roots.len(), 1);
-        assert!(backend.retiring_roots.contains_key(&group));
-        backend.forget_subtree(&a, &mut rates);
+        assert!(backend.retiring_roots.contains(&group));
+        backend.forget_subtree(&a, &rates);
         assert_eq!(backend.retiring_roots.len(), 1);
         finish_retirements(&mut backend, &mut rates);
         assert_eq!(backend.watch_paths.len(), 1);
@@ -1234,7 +1245,7 @@ mod tests {
             paths.push(path);
         }
         let mut backend = LinuxInotifyBackend::start(&paths, 4).unwrap();
-        backend.forget_subtree(&group, &mut EventRateTracker::default());
+        backend.forget_subtree(&group, &EventRateTracker::default());
         let incoming = event(&backend, root, EventMask::MODIFY, Some("live-project"));
         backend.pending_events.push_back(incoming);
         let budget = DrainBudget {

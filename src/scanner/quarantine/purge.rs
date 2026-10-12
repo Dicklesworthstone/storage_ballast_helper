@@ -24,7 +24,7 @@ use std::path::Path;
 use super::{PurgeBudget, QuarantineRecord};
 
 /// Remove exactly the artifact observed by the executor's final safety check.
-pub(crate) fn remove_direct(
+pub fn remove_direct(
     path: &Path,
     expected: &std::fs::Metadata,
     allow_permission_changes: bool,

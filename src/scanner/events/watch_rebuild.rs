@@ -368,7 +368,11 @@ mod tests {
                 .contains("absent root changed before watch handoff")
         );
         assert!(
-            !source.should_replan(completed_at + WATCH_REPAIR_INTERVAL - Duration::from_nanos(1))
+            !source.should_replan(
+                (completed_at + WATCH_REPAIR_INTERVAL)
+                    .checked_sub(Duration::from_nanos(1))
+                    .unwrap()
+            )
         );
         wait_free(&gate);
         let old_canary = healthy.join("still-watched");
@@ -581,7 +585,11 @@ mod tests {
                 .contains("injected installation failure")
         );
         assert!(
-            !source.should_replan(completed_at + WATCH_REPAIR_INTERVAL - Duration::from_nanos(1))
+            !source.should_replan(
+                (completed_at + WATCH_REPAIR_INTERVAL)
+                    .checked_sub(Duration::from_nanos(1))
+                    .unwrap()
+            )
         );
         assert!(source.should_replan(completed_at + WATCH_REPAIR_INTERVAL));
         let changed = root.join("project/after-failure.o");
@@ -616,7 +624,10 @@ mod tests {
         let (_other_temp, mut replacement, other_root, other_now) = fixture();
         release_tx.send(()).unwrap();
         wait_free(&gate);
-        assert_eq!(replacement.config.root_paths(), &[other_root.clone()]);
+        assert_eq!(
+            replacement.config.root_paths(),
+            std::slice::from_ref(&other_root)
+        );
         assert_eq!(replacement.stats().replans, 0);
         assert!(replacement.rebuild.is_none());
         let changed = other_root.join("project/reconfigured.o");

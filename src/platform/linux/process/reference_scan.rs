@@ -304,8 +304,7 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
         // a user executable. Require explicit bounded stat evidence for them.
         self.proc
             .read_bounded(&process.join("stat"), MAX_EXECUTABLE_STAT_BYTES)
-            .ok()
-            .is_some_and(|raw| stat_has_no_user_executable(&raw, pid))
+            .is_ok_and(|raw| stat_has_no_user_executable(&raw, pid))
     }
 }
 

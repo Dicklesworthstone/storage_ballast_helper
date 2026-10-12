@@ -637,6 +637,9 @@ pub enum CheckedDeletion {
 
 // ──────────────────── executor ────────────────────
 
+type AuthorizationCheck<'a> = &'a dyn Fn(&CandidacyScore) -> std::result::Result<(), SkipReason>;
+type UnlinkObserver<'a> = &'a dyn Fn(&CandidacyScore, Instant);
+
 /// The deletion executor: takes scored candidates and deletes them safely.
 pub struct DeletionExecutor {
     config: DeletionConfig,
@@ -736,7 +739,7 @@ impl DeletionExecutor {
         &self,
         plan: &DeletionPlan,
         should_skip: Option<&dyn Fn(&Path) -> bool>,
-        authorize: Option<&dyn Fn(&CandidacyScore) -> std::result::Result<(), SkipReason>>,
+        authorize: Option<AuthorizationCheck<'_>>,
     ) -> DeletionReport {
         self.execute_with_hooks(plan, should_skip, authorize, None)
     }
@@ -754,8 +757,8 @@ impl DeletionExecutor {
         &self,
         plan: &DeletionPlan,
         should_skip: Option<&dyn Fn(&Path) -> bool>,
-        authorize: Option<&dyn Fn(&CandidacyScore) -> std::result::Result<(), SkipReason>>,
-        on_unlinked: Option<&dyn Fn(&CandidacyScore, Instant)>,
+        authorize: Option<AuthorizationCheck<'_>>,
+        on_unlinked: Option<UnlinkObserver<'_>>,
     ) -> DeletionReport {
         let start = Instant::now();
         let mut report = DeletionReport {

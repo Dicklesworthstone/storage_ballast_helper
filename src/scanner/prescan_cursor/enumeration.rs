@@ -1000,7 +1000,9 @@ mod tests {
         for root in &roots[..MAX_LIVE_ROOTS] {
             cache.prepare_at(root, None, now).unwrap();
         }
-        let almost = now + READER_IDLE_LEASE - Duration::from_nanos(1);
+        let almost = (now + READER_IDLE_LEASE)
+            .checked_sub(Duration::from_nanos(1))
+            .unwrap();
         assert_eq!(
             cache
                 .prepare_at(&roots[MAX_LIVE_ROOTS], None, almost)

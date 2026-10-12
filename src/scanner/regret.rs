@@ -1063,9 +1063,10 @@ mod tests {
             detector.watch(watch("new", Path::new("/p/new"), "rust_target", t0));
             let first_deadline = t0 + old_window.min(new_window);
             let mut recreated = detector.clone();
-            let before = detector.check(first_deadline - Duration::from_nanos(1), |_| {
-                Sighting::Absent
-            });
+            let before = detector.check(
+                first_deadline.checked_sub(Duration::from_nanos(1)).unwrap(),
+                |_| Sighting::Absent,
+            );
             assert!(before.is_empty());
             let expired = detector.check(first_deadline, |_| Sighting::Absent);
             assert_eq!(expired.len(), 1);
@@ -1138,7 +1139,10 @@ mod tests {
         let t0 = Instant::now();
         let window = Duration::from_secs(60);
         for (age, active_outcome) in [
-            (window - Duration::from_nanos(1), Outcome::Regret),
+            (
+                window.checked_sub(Duration::from_nanos(1)).unwrap(),
+                Outcome::Regret,
+            ),
             (window, Outcome::Unknown),
             (window + Duration::from_nanos(1), Outcome::Unknown),
             (Duration::from_hours(2), Outcome::Unknown),
@@ -1242,7 +1246,10 @@ mod tests {
         for id in ["at-deadline", "after-deadline"] {
             detector.watch(watch(id, Path::new("/p/target"), "rust_target", t0));
         }
-        let before = detector.check(t0 + window - Duration::from_nanos(1), |_| Sighting::Absent);
+        let before = detector.check(
+            (t0 + window).checked_sub(Duration::from_nanos(1)).unwrap(),
+            |_| Sighting::Absent,
+        );
         assert!(before.is_empty());
         assert_eq!(detector.pending(), 2);
 
@@ -1342,7 +1349,10 @@ mod tests {
                 "rust_target",
                 t0,
             ));
-            for age in [Duration::ZERO, window - Duration::from_nanos(1)] {
+            for age in [
+                Duration::ZERO,
+                window.checked_sub(Duration::from_nanos(1)).unwrap(),
+            ] {
                 assert!(
                     detector
                         .check(t0 + age, |_| Sighting::Indeterminate)

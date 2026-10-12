@@ -159,7 +159,10 @@ impl Cache {
         } else {
             SNAPSHOT_TTL
         };
-        (now.checked_duration_since(entry.at)? < ttl).then(|| Arc::clone(&entry.snapshot))
+        let snapshot =
+            (now.checked_duration_since(entry.at)? < ttl).then(|| Arc::clone(&entry.snapshot));
+        drop(cached);
+        snapshot
     }
 
     fn obtain(
@@ -412,7 +415,7 @@ impl<'a, A: Access> Sweep<'a, A> {
                         return false;
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => return false,
             }
         }

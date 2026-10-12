@@ -309,6 +309,9 @@ impl SharedRegret {
         let mut calibrator = self.calibrator.lock();
         detector.set_window(regret.window);
         calibrator.update_config(regret);
+        // Publish the paired update before releasing either guard. Retain the
+        // original reverse acquisition order while making the release explicit.
+        drop((calibrator, detector));
     }
 
     /// The scoring engine's view: a calibration factor per category and
@@ -10017,6 +10020,7 @@ mod tests {
         assert_eq!(summary.regrets, 3);
         assert!(calibrator.suspended("timed", now + Duration::from_secs(109)));
         assert!(!calibrator.suspended("timed", now + Duration::from_secs(110)));
+        drop(calibrator);
     }
 
     #[cfg(unix)]
@@ -10080,6 +10084,7 @@ mod tests {
                 assert_eq!(summary.e_value, 1.0);
             }
             assert!(calibrator.suspended("suspended", now + Duration::from_mins(3)));
+            drop(calibrator);
         }
         daemon.regret.detector.lock().watch(regret_watch_for_test(
             "new-window",
@@ -10741,6 +10746,7 @@ mod tests {
             assert_eq!(summary.regrets, 3);
             assert_eq!(summary.e_value, 1.0, "the alarm resets its likelihood");
             assert!(!calibrator.suspended("RustTarget", Instant::now()));
+            drop(calibrator);
         }
         let mut candidate = test_candidate(&path.to_string_lossy(), 1.0);
         candidate.classification.category = ArtifactCategory::RustTarget;

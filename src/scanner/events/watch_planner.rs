@@ -145,6 +145,67 @@ fn observation_room(result: &WatchEnumeration, limit: usize) -> usize {
 
 /// Seed all configured roots before spending discovery on descendants. The
 /// queue owns indices and metadata, not another copy of every path and root.
+fn seed_roots(
+    access: &impl Access,
+    roots: &[PathBuf],
+    rates: &EventRateTracker,
+    now: Instant,
+    wall_time: SystemTime,
+    budget: &mut Budget,
+    result: &mut WatchEnumeration,
+) -> (BTreeSet<PathBuf>, VecDeque<(usize, Metadata)>) {
+    let limits = budget.limits;
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::new();
+
+    // Production config supplies sorted, deduplicated roots. Overlapping roots
+    // are seeded independently and are not rediscovered through their parents.
+    for root in roots {
+        if seen.contains(root) {
+            continue;
+        }
+        if !budget.live(access) || observation_room(result, limits.candidates) == 0 {
+            gap(result, root, "root discovery budget exhausted");
+            continue;
+        }
+        let metadata = match access.metadata(root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.is_symlink() => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !budget.live(access) || !budget.admit_paths(root, root) {
+                    gap(result, root, "absent root observation budget exhausted");
+                    continue;
+                }
+                result.absent_roots.insert(root.clone());
+                seen.insert(root.clone());
+                continue;
+            }
+            _ => {
+                result.unreadable_roots.insert(root.clone());
+                gap(
+                    result,
+                    root,
+                    "root is unavailable or is not a plain directory",
+                );
+                continue;
+            }
+        };
+        if !budget.live(access) || !budget.admit_paths(root, root) {
+            gap(result, root, "root discovery time or path budget exhausted");
+            continue;
+        }
+        seen.insert(root.clone());
+        queue.push_back((result.candidates.len(), metadata.clone()));
+        result.candidates.push(WatchCandidate {
+            path: root.clone(),
+            root: root.clone(),
+            depth: 0,
+            rate: candidate_rate(rates, root, now, &metadata, wall_time),
+        });
+    }
+
+    (seen, queue)
+}
+
 fn enumerate_with(
     access: &impl Access,
     roots: &[PathBuf],
@@ -160,61 +221,15 @@ fn enumerate_with(
     };
     let wall_time = SystemTime::now();
     let mut result = WatchEnumeration::default();
-    let mut seen = BTreeSet::new();
-    let mut queue = VecDeque::new();
-
-    // Production config supplies sorted, deduplicated roots. Overlapping roots
-    // are seeded independently and are not rediscovered through their parents.
-    for root in roots {
-        if seen.contains(root) {
-            continue;
-        }
-        if !budget.live(access) || observation_room(&result, limits.candidates) == 0 {
-            gap(&mut result, root, "root discovery budget exhausted");
-            continue;
-        }
-        let metadata = match access.metadata(root) {
-            Ok(metadata) if metadata.is_dir() && !metadata.is_symlink() => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if !budget.live(access) || !budget.admit_paths(root, root) {
-                    gap(
-                        &mut result,
-                        root,
-                        "absent root observation budget exhausted",
-                    );
-                    continue;
-                }
-                result.absent_roots.insert(root.clone());
-                seen.insert(root.clone());
-                continue;
-            }
-            _ => {
-                result.unreadable_roots.insert(root.clone());
-                gap(
-                    &mut result,
-                    root,
-                    "root is unavailable or is not a plain directory",
-                );
-                continue;
-            }
-        };
-        if !budget.live(access) || !budget.admit_paths(root, root) {
-            gap(
-                &mut result,
-                root,
-                "root discovery time or path budget exhausted",
-            );
-            continue;
-        }
-        seen.insert(root.clone());
-        queue.push_back((result.candidates.len(), metadata.clone()));
-        result.candidates.push(WatchCandidate {
-            path: root.clone(),
-            root: root.clone(),
-            depth: 0,
-            rate: candidate_rate(rates, root, now, &metadata, wall_time),
-        });
-    }
+    let (mut seen, mut queue) = seed_roots(
+        access,
+        roots,
+        rates,
+        now,
+        wall_time,
+        &mut budget,
+        &mut result,
+    );
 
     while let Some((index, before)) = queue.pop_front() {
         let parent = result.candidates[index].clone();
@@ -357,7 +372,7 @@ fn select_children(
         }
         if selected.len() >= room {
             omitted = true;
-            if !selected.peek().is_some_and(|last| child.name < *last) {
+            if selected.peek().is_none_or(|last| child.name >= *last) {
                 continue;
             }
             if let Some(last) = selected.pop() {

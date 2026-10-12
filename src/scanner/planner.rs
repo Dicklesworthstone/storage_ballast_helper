@@ -455,7 +455,8 @@ mod tests {
         for trial in 0..256 {
             let mut candidates: Vec<_> = (0..12)
                 .map(|_| {
-                    let path = names[(next() % names.len() as u64) as usize];
+                    let index = usize::try_from(next() % names.len() as u64).unwrap();
+                    let path = names[index];
                     let identity = (next() % 3 != 0).then(|| (7 + next() % 2, next() % 5));
                     let mut candidate = candidate(path, 1 + next() % 100, identity);
                     candidate.vetoed = next() % 7 == 0;

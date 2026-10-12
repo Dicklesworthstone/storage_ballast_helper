@@ -329,7 +329,7 @@ pub fn spawn_logger(
         last_beat_ms: last_beat,
     };
 
-    let join = lifecycle::spawn_worker(control, move || {
+    let join = lifecycle::spawn_worker(&control, move || {
         logger_thread_main(
             rx,
             config.sqlite_path,

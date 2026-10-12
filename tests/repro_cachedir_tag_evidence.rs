@@ -59,7 +59,13 @@ fn assert_tag_evidence(path: &Path, expected: bool) {
         walked(path, false),
         walked(path, true),
     ] {
-        assert_eq!(signals.has_cachedir_tag, expected, "{path:?}: {signals:?}");
+        assert_eq!(
+            signals.has_cachedir_tag,
+            expected,
+            "{} (native bytes {:?}): {signals:?}",
+            path.display(),
+            path.as_os_str().as_encoded_bytes()
+        );
         let classification = ArtifactPatternRegistry::default().classify(path, signals);
         let certainty = classify_certainty(&classification, signals, 0.0);
         assert_eq!(

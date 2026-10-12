@@ -244,25 +244,25 @@ impl Drop for WriterExit {
 /// I/O worker. Existing daemon shutdown callers therefore gain a bounded
 /// logging wait without a separate, easily forgotten join-timeout API.
 pub(super) fn spawn_worker(
-    control: Arc<Control>,
+    control: &Arc<Control>,
     worker: impl FnOnce() + Send + 'static,
 ) -> io::Result<JoinHandle<()>> {
     spawn_supervised(control, SHUTDOWN_WAIT, worker)
 }
 
 fn spawn_supervised(
-    control: Arc<Control>,
+    control: &Arc<Control>,
     shutdown_wait: Duration,
     worker: impl FnOnce() + Send + 'static,
 ) -> io::Result<JoinHandle<()>> {
-    let writer_control = Arc::clone(&control);
+    let writer_control = Arc::clone(control);
     let writer = thread::Builder::new()
         .name("sbh-logger".to_string())
         .spawn(move || {
             let _exit = WriterExit(writer_control);
             worker();
         })?;
-    let supervisor_control = Arc::clone(&control);
+    let supervisor_control = Arc::clone(control);
     let supervisor = thread::Builder::new()
         .name("sbh-log-supervisor".to_string())
         .spawn(move || supervise(&supervisor_control, writer, shutdown_wait));
@@ -545,16 +545,13 @@ mod tests {
     #[test]
     fn writer_exit_and_panic_are_distinct_from_a_shutdown_request() {
         let normal = Arc::new(Control::new());
-        spawn_worker(Arc::clone(&normal), || {})
-            .unwrap()
-            .join()
-            .unwrap();
+        spawn_worker(&normal, || {}).unwrap().join().unwrap();
         assert_eq!(normal.status(), LoggerShutdownStatus::WriterExited);
         normal.request_shutdown();
         assert_eq!(normal.status(), LoggerShutdownStatus::WriterExited);
         let failed = Arc::new(Control::new());
         assert!(
-            spawn_worker(Arc::clone(&failed), || panic!("injected writer failure"))
+            spawn_worker(&failed, || panic!("injected writer failure"))
                 .unwrap()
                 .join()
                 .is_err()
@@ -583,7 +580,9 @@ mod tests {
             control.shutdown_elapsed_at(started + SHUTDOWN_WAIT),
             Some(SHUTDOWN_WAIT)
         );
-        let just_before = started + SHUTDOWN_WAIT - Duration::from_nanos(1);
+        let just_before = (started + SHUTDOWN_WAIT)
+            .checked_sub(Duration::from_nanos(1))
+            .unwrap();
         assert_eq!(
             SHUTDOWN_WAIT.saturating_sub(control.shutdown_elapsed_at(just_before).unwrap()),
             Duration::from_nanos(1)
@@ -626,7 +625,7 @@ mod tests {
         let worker_processed = Arc::clone(&processed);
         let worker_control = Arc::clone(&handle.control);
         let worker_rx = rx.clone();
-        let supervisor = spawn_supervised(Arc::clone(&handle.control), Duration::ZERO, move || {
+        let supervisor = spawn_supervised(&handle.control, Duration::ZERO, move || {
             ready_tx.send(()).unwrap();
             // Models a stuck initialization/write call. It deliberately does
             // not consult shutdown until the test lets the operation return.
@@ -686,7 +685,7 @@ mod tests {
         let release = Release(release_tx);
         let flushed = Arc::new(AtomicBool::new(false));
         let worker_flushed = Arc::clone(&flushed);
-        let supervisor = spawn_supervised(Arc::clone(&control), Duration::ZERO, move || {
+        let supervisor = spawn_supervised(&control, Duration::ZERO, move || {
             let mut seen = 0;
             loop {
                 match worker_control.receive(&rx, Duration::from_secs(1)) {
@@ -700,8 +699,8 @@ mod tests {
                     Ok(Message {
                         event: ActivityEvent::MirrorJsonl(_),
                         ..
-                    }) => {}
-                    Err(RecvTimeoutError::Timeout) => {}
+                    })
+                    | Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
                     other => panic!("unexpected event before producer disconnect: {other:?}"),
                 }
@@ -738,7 +737,7 @@ mod tests {
         let control = Arc::clone(&handle.control);
         let flushed = Arc::new(AtomicBool::new(false));
         let worker_flushed = Arc::clone(&flushed);
-        let supervisor = spawn_worker(Arc::clone(&handle.control), move || {
+        let supervisor = spawn_worker(&handle.control, move || {
             for expected in 0..2 {
                 let ActivityEvent::ConfigReloaded { details } = next_data(&control, &rx).event
                 else {
