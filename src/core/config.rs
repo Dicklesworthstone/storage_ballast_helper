@@ -294,6 +294,19 @@ pub struct PressureConfig {
     pub yellow_min_free_pct: f64,
     pub orange_min_free_pct: f64,
     pub red_min_free_pct: f64,
+    /// Absolute free-space floors in bytes for the green, yellow, orange and
+    /// red levels; 0 (the default) disables them. When set, all four must be
+    /// set and strictly descend. A mount's level is then the less severe of
+    /// the percentage rule and this one (see
+    /// [`floored_free_pct_thresholds`]): on a 2 TB volume,
+    /// `green_min_free_bytes = 107374182400` (100 GiB) keeps 160 GB free (8%)
+    /// at Green instead of treating a fixed share of a large disk as an
+    /// emergency. Small volumes are unaffected, because a floor above a
+    /// level's percentage never raises that level's threshold.
+    pub green_min_free_bytes: u64,
+    pub yellow_min_free_bytes: u64,
+    pub orange_min_free_bytes: u64,
+    pub red_min_free_bytes: u64,
     pub poll_interval_ms: u64,
     /// Seconds between routine maintenance passes at Green (Q6): the
     /// hazard-driven scheduler picks the roots within `[scheduler]
@@ -1066,6 +1079,62 @@ fn protected_path_matches(known: &str, path: &str) -> bool {
             == crate::core::paths::resolve_absolute_path(Path::new(path))
 }
 
+impl PressureConfig {
+    /// `[green, yellow, orange, red]` minimum free percentages.
+    #[must_use]
+    pub const fn free_pct_thresholds(&self) -> [f64; 4] {
+        [
+            self.green_min_free_pct,
+            self.yellow_min_free_pct,
+            self.orange_min_free_pct,
+            self.red_min_free_pct,
+        ]
+    }
+
+    /// `[green, yellow, orange, red]` absolute floors in bytes (0 = off).
+    #[must_use]
+    pub const fn min_free_bytes(&self) -> [u64; 4] {
+        [
+            self.green_min_free_bytes,
+            self.yellow_min_free_bytes,
+            self.orange_min_free_bytes,
+            self.red_min_free_bytes,
+        ]
+    }
+
+    /// The free-percentage thresholds in force on a volume of `total_bytes`.
+    #[must_use]
+    pub fn free_pct_thresholds_for(&self, total_bytes: u64) -> [f64; 4] {
+        floored_free_pct_thresholds(
+            self.free_pct_thresholds(),
+            self.min_free_bytes(),
+            total_bytes,
+        )
+    }
+}
+
+/// Each level's free-percentage threshold on a volume of `total_bytes`.
+///
+/// bd-ud9s: with absolute floors, a threshold is the lower of the percentage
+/// and the floor expressed as a percentage of this volume, so a level is the
+/// less severe of the two rules. With every floor 0, or an unknown volume
+/// size, the percentages apply unchanged.
+#[must_use]
+pub fn floored_free_pct_thresholds(pct: [f64; 4], floors: [u64; 4], total_bytes: u64) -> [f64; 4] {
+    if total_bytes == 0 || floors.iter().all(|floor| *floor == 0) {
+        return pct;
+    }
+    let mut thresholds = pct;
+    for (threshold, floor) in thresholds.iter_mut().zip(floors) {
+        if floor > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let floor_pct = floor as f64 * 100.0 / total_bytes as f64;
+            *threshold = threshold.min(floor_pct);
+        }
+    }
+    thresholds
+}
+
 impl Default for PressureConfig {
     fn default() -> Self {
         Self {
@@ -1073,6 +1142,10 @@ impl Default for PressureConfig {
             yellow_min_free_pct: 14.0,
             orange_min_free_pct: 10.0,
             red_min_free_pct: 6.0,
+            green_min_free_bytes: 0,
+            yellow_min_free_bytes: 0,
+            orange_min_free_bytes: 0,
+            red_min_free_bytes: 0,
             poll_interval_ms: 5_000,
             maintenance_interval_secs: 1_800,
             behavior_hysteresis_secs: 5,
@@ -2418,6 +2491,20 @@ impl Config {
             });
         }
 
+        // Partial or non-descending floors would let a level's effective
+        // threshold cross its neighbour's.
+        let floors = self.pressure.min_free_bytes();
+        if floors.iter().any(|floor| *floor > 0)
+            && !(floors.iter().all(|floor| *floor > 0)
+                && floors.windows(2).all(|pair| pair[0] > pair[1]))
+        {
+            return Err(SbhError::InvalidConfig {
+                details: "pressure.*_min_free_bytes must be all 0 (off) or all set and strictly \
+                          descending: green > yellow > orange > red"
+                    .to_string(),
+            });
+        }
+
         // Prevent CPU spin from zero poll interval.
         if self.pressure.poll_interval_ms < 100 {
             return Err(SbhError::InvalidConfig {
@@ -3082,6 +3169,43 @@ mod tests {
                 .map(std::path::PathBuf::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn absolute_floors_relax_large_volumes_only() {
+        const GIB: u64 = 1 << 30;
+        let pct = [17.0, 14.0, 10.0, 6.0];
+        let floors = [100 * GIB, 80 * GIB, 50 * GIB, 30 * GIB];
+        // 2 TB: every floor binds; 8% free (~160 GB) is above the 100 GiB green floor.
+        let large = super::floored_free_pct_thresholds(pct, floors, 2_000_000_000_000);
+        assert!(
+            large[0] < 8.0 && large[3] < large[2] && large[2] < large[1] && large[1] < large[0]
+        );
+        // 200 GB: each floor is above its percentage, so nothing changes.
+        assert_eq!(
+            super::floored_free_pct_thresholds(pct, floors, 200_000_000_000),
+            pct
+        );
+        // Floors off, or an unknown size: the percentages apply as-is.
+        assert_eq!(
+            super::floored_free_pct_thresholds(pct, [0; 4], 2_000_000_000_000),
+            pct
+        );
+        assert_eq!(super::floored_free_pct_thresholds(pct, floors, 0), pct);
+    }
+
+    #[test]
+    fn absolute_floors_must_be_all_off_or_all_set_and_descending() {
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok(), "floors default to off");
+        cfg.pressure.green_min_free_bytes = 100;
+        assert!(cfg.validate().is_err(), "a partial set is rejected");
+        cfg.pressure.yellow_min_free_bytes = 80;
+        cfg.pressure.orange_min_free_bytes = 90;
+        cfg.pressure.red_min_free_bytes = 30;
+        assert!(cfg.validate().is_err(), "floors must strictly descend");
+        cfg.pressure.orange_min_free_bytes = 50;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
