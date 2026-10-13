@@ -1260,7 +1260,9 @@ mod tests {
         assert_eq!(slow.read_paths.borrow().len(), 2);
         fs::write(process.join("comm"), b"bash\n").unwrap();
         let unrelated = Faults::default();
-        assert!(build_directories_with(&unrelated, &fixture.proc_root, Limits::default()).is_empty());
+        assert!(
+            build_directories_with(&unrelated, &fixture.proc_root, Limits::default()).is_empty()
+        );
         assert_eq!(*unrelated.read_paths.borrow(), vec![process.join("comm")]);
     }
 

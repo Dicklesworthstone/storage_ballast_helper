@@ -59,9 +59,9 @@ pub(super) fn tool(comm: &[u8]) -> Option<Tool> {
 fn versioned(name: &str, prefix: &str) -> bool {
     name.strip_prefix(prefix).is_some_and(|suffix| {
         !suffix.is_empty()
-            && suffix.split('.').all(|part| {
-                !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
-            })
+            && suffix
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
     })
 }
 
@@ -100,7 +100,8 @@ pub(super) fn references(tool: Tool, environ: &[u8], cwd: Option<&Path>) -> Vec<
             // npm's lowercase script environment takes precedence.
             let cache = value(environ, b"npm_config_cache").or_else(|| {
                 entries(environ).find_map(|(key, value)| {
-                    key.eq_ignore_ascii_case(b"npm_config_cache").then_some(value)
+                    key.eq_ignore_ascii_case(b"npm_config_cache")
+                        .then_some(value)
                 })
             });
             if let Some(path) = directory(cache, cwd) {
@@ -183,7 +184,8 @@ fn directory(value: Option<&[u8]>, cwd: Option<&Path>) -> Option<PathBuf> {
         Some(path)
     } else {
         // Preserve .. through symlinks; resolution belongs to the caller.
-        cwd.filter(|cwd| cwd.is_absolute()).map(|cwd| cwd.join(path))
+        cwd.filter(|cwd| cwd.is_absolute())
+            .map(|cwd| cwd.join(path))
     }
 }
 
@@ -239,7 +241,14 @@ mod tests {
         ] {
             assert_eq!(tool(name.as_bytes()), Some(family), "{name}");
         }
-        for name in ["bash", "sbh", "cargo-data", "python-notes", "python3..1", "npmx"] {
+        for name in [
+            "bash",
+            "sbh",
+            "cargo-data",
+            "python-notes",
+            "python3..1",
+            "npmx",
+        ] {
             assert_eq!(tool(name.as_bytes()), None, "{name}");
         }
         assert_eq!(tool(b"rustc\xff"), None);
@@ -250,15 +259,25 @@ mod tests {
         let mut expected = cargo_paths("/cache");
         expected.push(PathBuf::from("/target"));
         assert_eq!(
-            references(Tool::Rust, b"CARGO_HOME=/cache\0CARGO_TARGET_DIR=/target\0", None),
+            references(
+                Tool::Rust,
+                b"CARGO_HOME=/cache\0CARGO_TARGET_DIR=/target\0",
+                None
+            ),
             expected
         );
     }
 
     #[test]
     fn cargo_defaults_use_the_builds_home_when_override_is_absent_or_empty() {
-        for env in [b"HOME=/build-user\0".as_slice(), b"HOME=/build-user\0CARGO_HOME=\0"] {
-            assert_eq!(references(Tool::Rust, env, None), cargo_paths("/build-user/.cargo"));
+        for env in [
+            b"HOME=/build-user\0".as_slice(),
+            b"HOME=/build-user\0CARGO_HOME=\0",
+        ] {
+            assert_eq!(
+                references(Tool::Rust, env, None),
+                cargo_paths("/build-user/.cargo")
+            );
         }
     }
 
@@ -321,21 +340,38 @@ mod tests {
 
     #[test]
     fn npm_keys_are_case_insensitive_and_lowercase_scripts_win() {
-        for env in [b"NPM_CONFIG_CACHE=/cache\0".as_slice(), b"Npm_Config_Cache=/cache\0"] {
+        for env in [
+            b"NPM_CONFIG_CACHE=/cache\0".as_slice(),
+            b"Npm_Config_Cache=/cache\0",
+        ] {
             assert_eq!(references(Tool::Node, env, None), paths(&["/cache"]));
         }
         assert_eq!(
-            references(Tool::Node, b"NPM_CONFIG_CACHE=/upper\0npm_config_cache=/lower\0", None),
+            references(
+                Tool::Node,
+                b"NPM_CONFIG_CACHE=/upper\0npm_config_cache=/lower\0",
+                None
+            ),
             paths(&["/lower"])
         );
-        assert!(references(Tool::Node, b"NPM_CONFIG_CACHE=/upper\0npm_config_cache=\0", None).is_empty());
+        assert!(
+            references(
+                Tool::Node,
+                b"NPM_CONFIG_CACHE=/upper\0npm_config_cache=\0",
+                None
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn python_and_compiler_cache_keys_are_family_scoped() {
         let env = b"CARGO_HOME=/cargo\0GOCACHE=/go\0npm_config_cache=/npm\0UV_CACHE_DIR=/uv\0PIP_CACHE_DIR=/pip\0SCCACHE_DIR=/sccache\0CCACHE_DIR=/ccache\0";
         assert_eq!(references(Tool::Python, env, None), paths(&["/uv", "/pip"]));
-        assert_eq!(references(Tool::Compiler, env, None), paths(&["/sccache", "/ccache"]));
+        assert_eq!(
+            references(Tool::Compiler, env, None),
+            paths(&["/sccache", "/ccache"])
+        );
         assert_eq!(references(Tool::Go, env, None), paths(&["/go"]));
     }
 
@@ -346,7 +382,10 @@ mod tests {
         assert!(references(Tool::Rust, env, Some(Path::new("relative"))).is_empty());
         assert_eq!(
             references(Tool::Rust, env, Some(Path::new("/workspace/project"))),
-            paths(&["/workspace/project/../pooled target", "/workspace/project/cache"])
+            paths(&[
+                "/workspace/project/../pooled target",
+                "/workspace/project/cache"
+            ])
         );
     }
 
@@ -354,15 +393,24 @@ mod tests {
     fn native_path_bytes_spaces_and_equals_survive_parsing() {
         assert_eq!(
             references(Tool::Python, b"UV_CACHE_DIR=/tmp/cache-\xff = data\0", None),
-            vec![PathBuf::from(OsString::from_vec(b"/tmp/cache-\xff = data".to_vec()))]
+            vec![PathBuf::from(OsString::from_vec(
+                b"/tmp/cache-\xff = data".to_vec()
+            ))]
         );
-        let expected = PathBuf::from(OsString::from_vec(b"/home/\xff/.cargo/registry/src".to_vec()));
+        let expected = PathBuf::from(OsString::from_vec(
+            b"/home/\xff/.cargo/registry/src".to_vec(),
+        ));
         assert!(references(Tool::Rust, b"HOME=/home/\xff\0", None).contains(&expected));
     }
 
     #[test]
     fn incomplete_buffers_keep_complete_positives_but_cannot_infer_defaults() {
-        for env in [b"".as_slice(), b"CARGO_HOME=\0", b"CARGO_HOME\0", b"CARGO_HOME=/tail"] {
+        for env in [
+            b"".as_slice(),
+            b"CARGO_HOME=\0",
+            b"CARGO_HOME\0",
+            b"CARGO_HOME=/tail",
+        ] {
             assert!(references(Tool::Rust, env, Some(Path::new("/work"))).is_empty());
         }
         let env = b"HOME=/builder\0CARGO_HOME=/truncated";
@@ -370,7 +418,11 @@ mod tests {
         let env = b"HOME=/builder\0GOCACHE=/kept\0GOMODCACHE=/truncated";
         assert_eq!(references(Tool::Go, env, None), paths(&["/kept"]));
         assert_eq!(
-            references(Tool::Python, b"UV_CACHE_DIR=/kept\0PIP_CACHE_DIR=/tail", None),
+            references(
+                Tool::Python,
+                b"UV_CACHE_DIR=/kept\0PIP_CACHE_DIR=/tail",
+                None
+            ),
             paths(&["/kept"])
         );
     }
@@ -386,8 +438,19 @@ mod tests {
 
     #[test]
     fn missing_or_relative_home_never_uses_daemon_environment() {
-        for family in [Tool::Rust, Tool::Go, Tool::Node, Tool::Python, Tool::Compiler] {
-            for env in [b"".as_slice(), b"HOME=\0", b"HOME=relative\0", b"OTHER=/cache\0"] {
+        for family in [
+            Tool::Rust,
+            Tool::Go,
+            Tool::Node,
+            Tool::Python,
+            Tool::Compiler,
+        ] {
+            for env in [
+                b"".as_slice(),
+                b"HOME=\0",
+                b"HOME=relative\0",
+                b"OTHER=/cache\0",
+            ] {
                 assert!(references(family, env, Some(Path::new("/workspace"))).is_empty());
             }
         }
