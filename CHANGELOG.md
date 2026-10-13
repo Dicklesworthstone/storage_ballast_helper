@@ -8,6 +8,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- The predictive rescue no longer releases ballast and cleans up on a mostly
+  empty disk (#29). Its second, "corroborating" runway was the first forecast
+  rescaled after the conformal correction had already shortened it. It is now
+  the measured free bytes at the median rate of the intervals that consumed
+  space; intervals that freed space no longer count as consumption
+  (`f970594`).
 - Linux: a damaged ballast slot is repaired where a seccomp filter blocks
   `openat2`, as systemd's `RestrictSUIDSGID=` does (#28). Repair now falls
   back the way confined deletion has since v0.7.2: `openat` plus a mount-ID
