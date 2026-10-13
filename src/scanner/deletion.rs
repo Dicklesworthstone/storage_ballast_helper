@@ -1600,27 +1600,29 @@ fn contains_tracked_git_content(path: &Path) -> bool {
         let euid = nix::unistd::geteuid().as_raw();
         #[cfg(not(unix))]
         let euid = u32::MAX;
+        // Match the path literally but without regard to case. On a
+        // case-insensitive volume (macOS APFS by default) a tracked `Build/`
+        // renamed on disk to `build/` is still tracked as far as Git is
+        // concerned, yet a case-sensitive query would call it unmatched. On a
+        // case-sensitive volume this can keep an untracked `build/` beside a
+        // tracked `Build/`, which errs toward keeping.
+        let mut pathspec = std::ffi::OsString::from(":(literal,icase)");
+        pathspec.push(relative);
         let mut git = std::process::Command::new("git");
-        git.args([
-            "--no-optional-locks",
-            "--literal-pathspecs",
-            "-c",
-            "core.fsmonitor=false",
-            "-C",
-        ])
-        .arg(root)
-        .args(["ls-files", "--cached", "--error-unmatch", "--"])
-        .arg(relative)
-        // Nothing from the daemon's environment reaches Git.
-        .env_clear()
-        .env("PATH", git_query_path(euid == 0))
-        .env("HOME", "/nonexistent")
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
+        git.args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-C"])
+            .arg(root)
+            .args(["ls-files", "--cached", "--error-unmatch", "--"])
+            .arg(pathspec)
+            // Nothing from the daemon's environment reaches Git.
+            .env_clear()
+            .env("PATH", git_query_path(euid == 0))
+            .env("HOME", "/nonexistent")
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
         // If `root/.git` cannot be validated, Git must not fall back to an
         // enclosing repository and answer "untracked" for this one.
         if let Some(parent) = root.parent() {
@@ -3621,6 +3623,52 @@ mod tests {
             ),
             Err(SkipReason::ContainsGit)
         );
+    }
+
+    #[test]
+    fn tracked_content_check_ignores_case_drift_between_disk_and_index() {
+        // A case-only rename on disk (`Build/` to `build/`) leaves the files
+        // tracked, and on case-insensitive APFS `git status` stays clean. A
+        // case-sensitive query called the renamed subtree unmatched, so an
+        // artifact-looking `build/` full of tracked files was reclaimable.
+        let dir = scratch_dir();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("vendor/Build")).unwrap();
+        fs::write(repo.join("vendor/Build/spec.payload"), "useful source").unwrap();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["add", "vendor"]);
+        git(&[
+            "-c",
+            "user.name=SBH regression",
+            "-c",
+            "user.email=sbh-regression@example.invalid",
+            "commit",
+            "-m",
+            "tracked source control",
+        ]);
+        fs::rename(repo.join("vendor/Build"), repo.join("vendor/build")).unwrap();
+        assert!(contains_tracked_git_content(&repo.join("vendor/build")));
+        assert!(contains_tracked_git_content(
+            &repo.join("vendor/build/spec.payload")
+        ));
+        // Untracked output in the same repository stays reclaimable.
+        let artifact = repo.join("target/debug");
+        fs::create_dir_all(&artifact).unwrap();
+        fs::write(artifact.join("generated.o"), "object bytes").unwrap();
+        assert!(!contains_tracked_git_content(&artifact));
     }
 
     #[cfg(unix)]
