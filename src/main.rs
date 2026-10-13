@@ -228,7 +228,7 @@ mod linux_rollback {
         service_restart: Option<UpdateServiceRestart>,
     }
 
-    pub(super) fn run(matches: &ArgMatches) -> Result<bool, CliError> {
+    pub fn run(matches: &ArgMatches) -> Result<bool, CliError> {
         let Some(("update", update)) = matches.subcommand() else {
             return Ok(false);
         };
