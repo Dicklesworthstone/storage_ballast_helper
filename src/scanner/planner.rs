@@ -520,10 +520,7 @@ mod tests {
             candidate("/b/sub/safe", 5, None),
             candidate("/b/other", 7, None),
         ];
-        let expected = BTreeSet::from([
-            PathBuf::from("/b/sub/safe"),
-            PathBuf::from("/b/other"),
-        ]);
+        let expected = BTreeSet::from([PathBuf::from("/b/sub/safe"), PathBuf::from("/b/other")]);
         for _ in 0..candidates.len() {
             let actual: BTreeSet<_> = candidates
                 .iter()
@@ -820,7 +817,10 @@ mod tests {
                 }
             }
         }
-        observations.into_iter().map(|index| marked[index]).collect()
+        observations
+            .into_iter()
+            .map(|index| marked[index])
+            .collect()
     }
 
     #[test]

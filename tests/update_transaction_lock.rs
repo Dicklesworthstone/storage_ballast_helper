@@ -304,7 +304,9 @@ fn replacement_retains_ownership(rollback: bool) {
         expected = digest(&snapshot.path);
         command.args(["--rollback", &snapshot.id, "--user"]);
     } else {
-        command.args(["--force", "--user", "--offline"]).arg(&bundle);
+        command
+            .args(["--force", "--user", "--offline"])
+            .arg(&bundle);
     }
     let before = fs::metadata(&fixture.binary).unwrap().ino();
     let stdout = fixture.root().join("first.json");
@@ -497,7 +499,12 @@ fn rollback_activation_checks_the_running_image(stale: bool) {
     let queries = fs::read_to_string(fixture.root().join("bus-calls")).unwrap();
     assert!(queries.matches("ExecStart").count() >= 2);
     assert!(queries.matches("ActiveState SubState").count() >= 2);
-    assert!(queries.matches("MainPID ExecMainStartTimestampMonotonic").count() >= 2);
+    assert!(
+        queries
+            .matches("MainPID ExecMainStartTimestampMonotonic")
+            .count()
+            >= 2
+    );
     assert!(acquire_update_lock(&fixture.binary).is_ok());
 }
 

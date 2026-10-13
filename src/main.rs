@@ -162,7 +162,14 @@ mod entrypoint_tests {
             &["update", "--dry-run", "--force"],
             &["update", "--rollback", "--dry-run"],
             &["update", "--rollback", "--check"],
-            &["update", "--rollback", "snapshot", "--dry-run", "--prune", "0"],
+            &[
+                "update",
+                "--rollback",
+                "snapshot",
+                "--dry-run",
+                "--prune",
+                "0",
+            ],
             &["update", "--list-backups"],
             &["update", "--list-backups", "--rollback"],
             &["update", "--prune", "0"],
@@ -323,9 +330,7 @@ mod linux_rollback {
         // Match the ordinary update's ordering: missing services succeed even
         // for non-root callers; only loaded system services require root.
         match manager.is_loaded() {
-            Ok(false) => {
-                UpdateServiceRestart::skipped("systemd", scope, "service is not loaded")
-            }
+            Ok(false) => UpdateServiceRestart::skipped("systemd", scope, "service is not loaded"),
             Ok(true) if !user_scope && !root => UpdateServiceRestart::failed(
                 "systemd",
                 scope,
@@ -553,7 +558,9 @@ mod linux_rollback {
                 request.dry_run = dry_run;
                 request.check_only = !dry_run;
                 let before = std::fs::metadata(&request.install_path).unwrap().ino();
-                let report = execute(&request, &store, false, || panic!("preview touched service"));
+                let report = execute(&request, &store, false, || {
+                    panic!("preview touched service")
+                });
                 assert!(report.result.success);
                 assert!(!report.applied);
                 assert!(report.service_restart.is_none());
@@ -561,7 +568,10 @@ mod linux_rollback {
                     std::fs::metadata(&request.install_path).unwrap().ino(),
                     before
                 );
-                assert_eq!(std::fs::read(&request.install_path).unwrap(), b"current image");
+                assert_eq!(
+                    std::fs::read(&request.install_path).unwrap(),
+                    b"current image"
+                );
                 assert_eq!(store.list().len(), 1);
                 let mut out = Vec::new();
                 write_human(&mut out, &report).unwrap();
@@ -586,7 +596,10 @@ mod linux_rollback {
                 assert!(!report.applied);
                 assert!(report.service_restart.is_none());
                 assert!(report.result.error.unwrap().contains("not found"));
-                assert_eq!(std::fs::read(&request.install_path).unwrap(), b"current image");
+                assert_eq!(
+                    std::fs::read(&request.install_path).unwrap(),
+                    b"current image"
+                );
             }
         }
 
@@ -596,7 +609,9 @@ mod linux_rollback {
             let snapshot = store.list().remove(0);
             request.backup_id = None;
             request.dry_run = true;
-            let report = execute(&request, &store, false, || panic!("preview touched service"));
+            let report = execute(&request, &store, false, || {
+                panic!("preview touched service")
+            });
             assert_eq!(report.result.snapshot_id, snapshot.id);
             assert!(report.result.success);
             let saved = snapshot.path.with_extension("retained");
@@ -610,7 +625,10 @@ mod linux_rollback {
                 assert!(!report.result.success);
                 assert!(!report.applied);
                 assert!(report.service_restart.is_none());
-                assert_eq!(std::fs::read(&request.install_path).unwrap(), b"current image");
+                assert_eq!(
+                    std::fs::read(&request.install_path).unwrap(),
+                    b"current image"
+                );
             }
         }
     }
