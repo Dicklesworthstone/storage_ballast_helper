@@ -17,8 +17,7 @@ static STARTUP_BINARY: OnceLock<PathBuf> = OnceLock::new();
 /// resolver will report it if needed. Repeated calls never change the snapshot.
 pub fn capture_sbh_binary_path() {
     if STARTUP_BINARY.get().is_none()
-        && let Ok(exe) = std::env::current_exe()
-        && exe.is_file()
+        && let Ok(exe) = resolve_uncaptured_binary()
     {
         let _ = STARTUP_BINARY.set(exe);
     }
@@ -30,11 +29,48 @@ pub(super) fn resolve_sbh_binary() -> Result<PathBuf> {
         // description. Never strip a literal suffix or select another install.
         return require_binary(exe);
     }
+    resolve_uncaptured_binary()
+}
 
-    let exe = std::env::current_exe().map_err(|error| SbhError::Runtime {
+fn current_exe_path() -> Result<PathBuf> {
+    std::env::current_exe().map_err(|error| SbhError::Runtime {
         details: format!("could not determine the running sbh executable: {error}"),
-    })?;
-    resolve_current_exe_path(&exe)
+    })
+}
+
+fn resolve_uncaptured_binary() -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let running = std::fs::metadata("/proc/self/exe").map_err(|source| SbhError::Io {
+            path: PathBuf::from("/proc/self/exe"),
+            source,
+        })?;
+        // A real file can have the exact name of the kernel's deleted-path
+        // description. Existence alone cannot distinguish it from a literal
+        // live filename ending in " (deleted)". Compare the running image's
+        // identity, and retry if a rename changed the name during inspection.
+        // Link count is not sufficient: another hard link can retain the image.
+        for _ in 0..3 {
+            let exe = current_exe_path()?;
+            let matches_running_image = std::fs::metadata(&exe).is_ok_and(|metadata| {
+                metadata.dev() == running.dev() && metadata.ino() == running.ino()
+            });
+            if current_exe_path()? != exe {
+                continue;
+            }
+            return resolve_current_exe_path(&exe, matches_running_image);
+        }
+        Err(SbhError::Runtime {
+            details: "running sbh executable changed location during path resolution; retry the command"
+                .to_string(),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        require_binary(&current_exe_path()?)
+    }
 }
 
 fn require_binary(path: &Path) -> Result<PathBuf> {
@@ -49,15 +85,17 @@ fn require_binary(path: &Path) -> Result<PathBuf> {
     })
 }
 
-fn resolve_current_exe_path(exe: &Path) -> Result<PathBuf> {
-    if exe.is_file() {
-        return Ok(exe.to_path_buf());
+#[cfg(any(target_os = "linux", test))]
+fn resolve_current_exe_path(exe: &Path, matches_running_image: bool) -> Result<PathBuf> {
+    if matches_running_image {
+        return require_binary(exe);
     }
 
     // Library callers may not run the CLI startup hook. Recover exactly the
     // replaced pathname, without lossy UTF-8 conversion or a PATH search. Strip
     // only one final kernel marker; a directory or a real filename may itself
-    // contain the same text.
+    // contain the same text. An unrelated file at the decorated path must not
+    // take precedence over the actual installation's replacement.
     #[cfg(target_os = "linux")]
     {
         use std::ffi::OsStr;
@@ -94,7 +132,7 @@ mod tests {
             "usr/bin/sbh",
         ] {
             let binary = binary_at(temp.path(), Path::new(relative));
-            assert_eq!(resolve_current_exe_path(&binary).unwrap(), binary);
+            assert_eq!(resolve_current_exe_path(&binary, true).unwrap(), binary);
         }
     }
 
@@ -103,10 +141,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let unrelated = binary_at(temp.path(), Path::new("other/bin/sbh"));
         let missing = temp.path().join("original/bin/sbh");
-        let error = resolve_current_exe_path(&missing).unwrap_err().to_string();
+        let error = resolve_current_exe_path(&missing, true).unwrap_err().to_string();
         assert!(error.contains(&missing.display().to_string()));
         assert!(unrelated.is_file());
-        assert!(resolve_current_exe_path(temp.path()).is_err());
+        assert!(resolve_current_exe_path(temp.path(), true).is_err());
     }
 
     #[test]
@@ -114,7 +152,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let literal = binary_at(temp.path(), Path::new("sbh (deleted)"));
         binary_at(temp.path(), Path::new("sbh"));
-        assert_eq!(resolve_current_exe_path(&literal).unwrap(), literal);
+        assert_eq!(resolve_current_exe_path(&literal, true).unwrap(), literal);
     }
 
     #[test]
@@ -140,7 +178,7 @@ mod tests {
             let binary = binary_at(temp.path(), Path::new(relative));
             let deleted = deleted_path(&binary);
             assert!(!deleted.exists());
-            assert_eq!(resolve_current_exe_path(&deleted).unwrap(), binary);
+            assert_eq!(resolve_current_exe_path(&deleted, false).unwrap(), binary);
         }
     }
 
@@ -150,7 +188,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let binary = binary_at(temp.path(), Path::new("dir (deleted)/sbh (deleted)"));
         assert_eq!(
-            resolve_current_exe_path(&deleted_path(&binary)).unwrap(),
+            resolve_current_exe_path(&deleted_path(&binary), false).unwrap(),
             binary
         );
     }
@@ -167,7 +205,7 @@ mod tests {
             Path::new(OsStr::from_bytes(b"custom-\xff/sbh")),
         );
         assert_eq!(
-            resolve_current_exe_path(&deleted_path(&binary)).unwrap(),
+            resolve_current_exe_path(&deleted_path(&binary), false).unwrap(),
             binary
         );
     }
@@ -177,8 +215,81 @@ mod tests {
     fn deleted_executable_without_a_replacement_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing/sbh");
-        assert!(resolve_current_exe_path(&deleted_path(&missing)).is_err());
-        assert!(resolve_current_exe_path(&deleted_path(temp.path())).is_err());
+        assert!(resolve_current_exe_path(&deleted_path(&missing), false).is_err());
+        assert!(resolve_current_exe_path(&deleted_path(temp.path()), false).is_err());
+        // A similarly named file must not turn a missing installation into success.
+        fs::create_dir_all(missing.parent().unwrap()).unwrap();
+        fs::write(deleted_path(&missing), b"unrelated file").unwrap();
+        assert!(resolve_current_exe_path(&deleted_path(&missing), false).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unrelated_deleted_name_never_beats_the_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = binary_at(temp.path(), Path::new("sbh"));
+        let decorated = deleted_path(&binary);
+        fs::write(&decorated, b"unrelated executable").unwrap();
+        assert_eq!(resolve_current_exe_path(&decorated, false).unwrap(), binary);
+        // The same spelling is literal when it really denotes the running image.
+        assert_eq!(resolve_current_exe_path(&decorated, true).unwrap(), decorated);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uncaptured_path_ignores_a_deleted_name_decoy() {
+        use std::os::unix::fs::MetadataExt;
+        use std::process::Command;
+
+        const PROBE_ENV: &str = "SBH_EXECUTABLE_REPLACEMENT_PROBE";
+        if let Some(original) = std::env::var_os(PROBE_ENV).map(PathBuf::from) {
+            assert!(STARTUP_BINARY.get().is_none());
+            assert_eq!(resolve_sbh_binary().unwrap(), original);
+            // Retain a hard link to the old image: nlink stays nonzero even
+            // though procfs adds the deleted marker to the original dentry.
+            fs::hard_link(&original, original.with_extension("retained")).unwrap();
+            let staged = original.with_extension("next");
+            fs::copy(&original, &staged).unwrap();
+            fs::rename(&staged, &original).unwrap();
+            let decorated = deleted_path(&original);
+            fs::write(&decorated, b"unrelated file at the procfs description").unwrap();
+            assert_eq!(std::env::current_exe().unwrap(), decorated);
+            assert!(fs::metadata("/proc/self/exe").unwrap().nlink() > 0);
+            assert!(decorated.is_file());
+            assert_eq!(resolve_sbh_binary().unwrap(), original);
+            assert_eq!(
+                super::super::SystemdConfig::from_env(true).unwrap().binary_path,
+                original
+            );
+            capture_sbh_binary_path();
+            assert_eq!(STARTUP_BINARY.get().unwrap(), &original);
+            assert_eq!(resolve_sbh_binary().unwrap(), original);
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        for relative in ["home/.local/bin/sbh", "custom dir/sbh", "literal/sbh (deleted)"] {
+            let binary = temp.path().join(relative);
+            fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+            let binary = fs::canonicalize(binary).unwrap();
+            let output = Command::new(&binary)
+                .args([
+                    "--exact",
+                    "daemon::service::executable::tests::uncaptured_path_ignores_a_deleted_name_decoy",
+                    "--nocapture",
+                ])
+                .env(PROBE_ENV, &binary)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "uncaptured replacement probe failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
     }
 
     #[cfg(target_os = "linux")]
