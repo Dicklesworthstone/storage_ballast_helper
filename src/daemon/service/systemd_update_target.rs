@@ -31,28 +31,27 @@ struct ExecStartProperty {
 
 pub(super) fn verify(user_scope: bool, installed: &Path) -> Result<()> {
     let scope = if user_scope { "--user" } else { "--system" };
-    let output = Command::new("busctl")
-        .args([
-            scope,
-            "--json=short",
-            "--timeout=5s",
-            "--auto-start=no",
-            "--allow-interactive-authorization=no",
-            "get-property",
-            SERVICE_BUS_NAME,
-            SERVICE_OBJECT,
-            SERVICE_INTERFACE,
-            "ExecStart",
-        ])
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| {
-            runtime(format!(
-                "cannot verify sbh.service's update target: could not run busctl: {error}; \
-                 install the systemd busctl utility before retrying the service restart"
-            ))
-        })?;
+    // Bound the client and the JSON before deserialization, not just the D-Bus
+    // method call. A hung/noisy client must fail preflight, not hang an applied
+    // update or consume unbounded memory while the old daemon keeps running.
+    let output = super::query_output(
+        Command::new("busctl")
+            .args([
+                scope,
+                "--json=short",
+                "--timeout=5s",
+                "--auto-start=no",
+                "--allow-interactive-authorization=no",
+                "get-property",
+                SERVICE_BUS_NAME,
+                SERVICE_OBJECT,
+                SERVICE_INTERFACE,
+                "ExecStart",
+            ])
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null()),
+    )
+    .map_err(query_error)?;
     if !output.status.success() {
         return Err(runtime(format!(
             "cannot verify sbh.service's update target: busctl {scope} ExecStart failed \
@@ -63,6 +62,17 @@ pub(super) fn verify(user_scope: bool, installed: &Path) -> Result<()> {
     }
     let executable = parse_exec_start(&output.stdout)?;
     verify_same_binary(installed, &executable)
+}
+
+fn query_error(error: std::io::Error) -> SbhError {
+    let advice = if error.kind() == std::io::ErrorKind::NotFound {
+        "; install the systemd busctl utility before retrying the service restart"
+    } else {
+        ""
+    };
+    runtime(format!(
+        "cannot verify sbh.service's update target: busctl query failed: {error}{advice}"
+    ))
 }
 
 fn parse_exec_start(json: &[u8]) -> Result<PathBuf> {
@@ -231,5 +241,40 @@ mod tests {
         assert!(verify_same_binary(&installed, &temp.path().join("missing")).is_err());
         assert!(verify_same_binary(&temp.path().join("missing"), &installed).is_err());
         assert!(verify_same_binary(Path::new("sbh"), &installed).is_err());
+    }
+
+    #[test]
+    fn resource_failures_are_not_reported_as_a_missing_busctl_installation() {
+        use std::io::{Error, ErrorKind};
+
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::InvalidData,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::PermissionDenied,
+        ] {
+            let error = query_error(Error::new(kind, "fixture query failure")).to_string();
+            assert!(error.contains("cannot verify sbh.service's update target"));
+            assert!(error.contains("fixture query failure"));
+            assert!(!error.contains("install the systemd busctl utility"));
+        }
+        let error = query_error(Error::new(ErrorKind::NotFound, "missing")).to_string();
+        assert!(error.contains("install the systemd busctl utility"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_client_keeps_typed_exec_start_json_intact() {
+        let path = "/opt/custom \"quoted\" 日本語/sbh";
+        let json = property(json!([command(path)]));
+        let output = super::super::query_output(
+            Command::new("/bin/sh")
+                .args(["-c", "printf '%s' \"$1\"", "query-test"])
+                .arg(String::from_utf8(json.clone()).unwrap()),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, json);
+        assert_eq!(parse_exec_start(&output.stdout).unwrap(), Path::new(path));
     }
 }
