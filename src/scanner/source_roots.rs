@@ -924,7 +924,13 @@ mod tests {
             fs::rename(&parked_alias, &alias).unwrap();
             policy.replace(&roots, true);
             assert!(queued.authorize(&candidate).is_ok());
-            assert!(policy.snapshot().roots.iter().all(|root| root.reclaim_allowed));
+            assert!(
+                policy
+                    .snapshot()
+                    .roots
+                    .iter()
+                    .all(|root| root.reclaim_allowed)
+            );
             assert_eq!(fs::read(&evidence).unwrap(), b"keep during reload");
         }
     }
