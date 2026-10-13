@@ -647,6 +647,36 @@ pub struct DeletionExecutor {
     platform: Option<Arc<dyn Platform>>,
 }
 
+/// Activity-log code for a deletion batch aborted because the open-file or
+/// process scan was incomplete. It used to be logged as SBH-3003, which the
+/// error catalog gives to a closed daemon channel.
+const INCOMPLETE_SCAN_CODE: &str = "SBH-3005";
+
+/// The aborted-batch event, naming the cause. Without root the scan cannot
+/// read other users' processes, so it is incomplete on every pass; with root
+/// it ran into one of its limits or an unreadable process.
+fn incomplete_scan_event(without_root: bool) -> ActivityEvent {
+    let cause = if without_root {
+        "other users' processes cannot be inspected without root"
+    } else {
+        "the scan could not read every process within its limits"
+    };
+    ActivityEvent::Error {
+        code: INCOMPLETE_SCAN_CODE.to_string(),
+        message: format!("open file scan incomplete ({cause}) - aborting batch for safety"),
+    }
+}
+
+#[cfg(unix)]
+fn scans_without_root() -> bool {
+    !nix::unistd::Uid::effective().is_root()
+}
+
+#[cfg(not(unix))]
+fn scans_without_root() -> bool {
+    false
+}
+
 impl DeletionExecutor {
     /// Create a new executor with the given config and optional logger handle.
     pub fn new(config: DeletionConfig, logger: Option<ActivityLoggerHandle>) -> Self {
@@ -828,12 +858,7 @@ impl DeletionExecutor {
             );
 
             if !complete {
-                self.log_event(ActivityEvent::Error {
-                    code: "SBH-3003".to_string(),
-                    message: "open file scan incomplete (scan budget exceeded, or other users' \
-                              processes cannot be inspected without root) - aborting batch for safety"
-                        .to_string(),
-                });
+                self.log_event(incomplete_scan_event(scans_without_root()));
                 // Fail safe: abort the entire batch because we cannot guarantee
                 // that any candidate is safe to delete. Every candidate is a
                 // skip, not a failure, and is not backed off: the missing
@@ -3623,6 +3648,21 @@ mod tests {
             ),
             Err(SkipReason::ContainsGit)
         );
+    }
+
+    #[test]
+    fn an_aborted_batch_has_its_own_code_and_names_its_cause() {
+        for (without_root, cause) in [
+            (true, "cannot be inspected without root"),
+            (false, "within its limits"),
+        ] {
+            let ActivityEvent::Error { code, message } = incomplete_scan_event(without_root) else {
+                panic!("an aborted batch is logged as an error");
+            };
+            assert_eq!(code, "SBH-3005");
+            assert!(message.contains(cause), "{message}");
+            assert!(message.ends_with("aborting batch for safety"), "{message}");
+        }
     }
 
     #[test]

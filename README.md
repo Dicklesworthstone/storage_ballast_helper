@@ -80,7 +80,7 @@ sbh emergency /data --target-free 10 --yes
 - **`#![forbid(unsafe_code)]`** in both `lib.rs` and `main.rs`. No unsafe blocks, no raw pointer arithmetic, no manual memory management. All platform-specific behavior goes through safe abstractions (`nix`, `libc` bindings, `signal-hook`).
 - **No async runtime.** Concurrency uses OS threads with `crossbeam-channel` for bounded message passing and `parking_lot` for synchronization. This avoids the complexity and debugging opacity of async runtimes while providing predictable scheduling behavior for a daemon that needs to respond to pressure signals in bounded time.
 - **Pedantic + nursery Clippy lints** are enabled project-wide. The code is held to strict Rust idiom standards beyond the default warning set.
-- **Deterministic builds.** The release profile uses `opt-level = "z"` (size optimization), `lto = true` (link-time optimization), `codegen-units = 1`, `panic = "abort"`, and `strip = true` for a lean, predictable binary.
+- **Deterministic builds.** The release profile uses `opt-level = 3` (speed optimization), `lto = true` (link-time optimization), `codegen-units = 1`, `panic = "abort"`, and `strip = true` for a lean, predictable binary.
 
 ## The Problem in Depth
 
@@ -2178,6 +2178,8 @@ Every command's error goes through one mapping (C-EXIT). `--json` reports carry 
 <!-- sbh-docs:end -->
 
 All errors implement `code()` for the stable string code, `is_retryable()` to indicate whether retry might help, and standard `Display` formatting with the code prefix.
+
+Two more codes appear only in the activity log and are not `SbhError` variants: `SBH-3004` (warning: the daemon exceeded its CPU budget) and `SBH-3005` (error: the open-file or process scan was incomplete, so the deletion batch was aborted; an sbh without root gets this on every batch on Linux).
 
 ## Testing
 

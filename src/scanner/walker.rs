@@ -1415,7 +1415,8 @@ pub const MAX_ENTRIES_PER_DIR: u32 = 65_536;
 /// unit's `CPUQuota=10%`: it gets at most 0.1 CPU-second per wall second,
 /// less on a loaded host. At 5 s the sweep had ~0.5 CPU-s, which a busy agent
 /// host (1,600 processes, 40k fds, load 64) could not fit, so every deletion
-/// batch failed closed with SBH-3003 while the disk sat at 100% (css,
+/// batch failed closed (logged then as SBH-3003, now SBH-3005) while the disk
+/// sat at 100% (css,
 /// 2026-09-24). 30 s keeps the sweep bounded and fail-closed with room to
 /// finish under the quota.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
