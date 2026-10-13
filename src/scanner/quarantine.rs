@@ -33,6 +33,8 @@ mod safety;
 
 pub use budget::DEFAULT_DRAIN_WORK;
 use budget::PurgeBudget;
+#[cfg(unix)]
+pub(crate) use safety::open_beneath;
 pub(crate) use safety::remove_direct;
 
 /// Directory under the mount's `.sbh` that holds quarantined entries.

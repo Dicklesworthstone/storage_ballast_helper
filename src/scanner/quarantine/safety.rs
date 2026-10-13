@@ -26,6 +26,8 @@ mod confined_purge;
 #[path = "transaction.rs"]
 mod transaction;
 
+#[cfg(unix)]
+pub use beneath::open_beneath;
 pub use confined_purge::remove_direct;
 use transaction::{Directory, Payload};
 

@@ -10,6 +10,10 @@
 //! `statx` reports the parent's own mount ID, which a bind mount, even of the
 //! same device, does not share. Nothing below the entry is read or changed
 //! before that check. A kernel that cannot report mount IDs still fails closed.
+//!
+//! In-place ballast repair opens a regular file the same way (#28): a
+//! same-device file bind mount on a slot would make the repair write through
+//! to an external file.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -21,7 +25,18 @@ use rustix::fs::{Mode, OFlags};
 /// Open the directory `name` (a single component the caller has validated)
 /// beneath `parent`, refusing a symlink or a mount boundary.
 pub(super) fn open_dir_beneath(parent: &File, name: &OsStr) -> io::Result<OwnedFd> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    open_beneath(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+    )
+}
+
+/// Open the entry `name` beneath `parent` with `flags` (which must include
+/// `NOFOLLOW`), refusing a symlink or a mount boundary, a same-device bind
+/// mount included.
+pub fn open_beneath(parent: &File, name: &OsStr, flags: OFlags) -> io::Result<OwnedFd> {
+    debug_assert!(flags.contains(OFlags::NOFOLLOW));
     #[cfg(target_os = "linux")]
     {
         use rustix::fs::{ResolveFlags, openat2};
@@ -35,7 +50,7 @@ pub(super) fn open_dir_beneath(parent: &File, name: &OsStr) -> io::Result<OwnedF
                 | ResolveFlags::NO_MAGICLINKS
                 | ResolveFlags::NO_XDEV,
         ) {
-            Err(rustix::io::Errno::NOSYS) => open_dir_beneath_same_mount(parent, name, flags),
+            Err(rustix::io::Errno::NOSYS) => open_beneath_same_mount(parent, name, flags),
             result => result.map_err(Into::into),
         }
     }
@@ -48,7 +63,7 @@ pub(super) fn open_dir_beneath(parent: &File, name: &OsStr) -> io::Result<OwnedF
 /// The `openat2`-less path: open without following, then require the
 /// parent's mount ID.
 #[cfg(target_os = "linux")]
-fn open_dir_beneath_same_mount(parent: &File, name: &OsStr, flags: OFlags) -> io::Result<OwnedFd> {
+fn open_beneath_same_mount(parent: &File, name: &OsStr, flags: OFlags) -> io::Result<OwnedFd> {
     let parent_mount = mount_id(parent)?;
     let fd = rustix::fs::openat(parent, name, flags, Mode::empty())?;
     if mount_id(&fd)? != parent_mount {
@@ -84,7 +99,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("child")).unwrap();
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let fd = open_dir_beneath_same_mount(&parent(dir.path()), OsStr::new("child"), flags)
+        let fd = open_beneath_same_mount(&parent(dir.path()), OsStr::new("child"), flags)
             .expect("same-mount child opens");
         let opened = rustix::fs::fstat(&fd).unwrap();
         let expected = rustix::fs::stat(dir.path().join("child")).unwrap();
@@ -102,8 +117,59 @@ mod tests {
         fs::write(dir.path().join("file"), b"x").unwrap();
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let p = parent(dir.path());
-        assert!(open_dir_beneath_same_mount(&p, OsStr::new("link"), flags).is_err());
-        assert!(open_dir_beneath_same_mount(&p, OsStr::new("file"), flags).is_err());
+        assert!(open_beneath_same_mount(&p, OsStr::new("link"), flags).is_err());
+        assert!(open_beneath_same_mount(&p, OsStr::new("file"), flags).is_err());
+    }
+
+    /// #28: ballast repair opens a regular file read-write the same way.
+    #[test]
+    fn fallback_opens_a_plain_file_and_refuses_a_symlink_to_one() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("slot"), b"ballast").unwrap();
+        symlink(dir.path().join("slot"), dir.path().join("link")).unwrap();
+        let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let p = parent(dir.path());
+        let fd =
+            open_beneath_same_mount(&p, OsStr::new("slot"), flags).expect("same-mount file opens");
+        let expected = rustix::fs::stat(dir.path().join("slot")).unwrap();
+        let opened = rustix::fs::fstat(&fd).unwrap();
+        assert_eq!(
+            (opened.st_dev, opened.st_ino),
+            (expected.st_dev, expected.st_ino)
+        );
+        assert!(open_beneath_same_mount(&p, OsStr::new("link"), flags).is_err());
+    }
+
+    /// A same-device file bind mount on a slot would make an in-place repair
+    /// write through to the external file. Needs root (mount); skipped
+    /// otherwise.
+    #[test]
+    fn fallback_refuses_a_same_device_file_bind_mount() {
+        if !nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let slot = dir.path().join("slot");
+        fs::write(&outside, b"external file").unwrap();
+        fs::write(&slot, b"ballast").unwrap();
+        if mount(
+            Some(&outside),
+            &slot,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let outcome = open_beneath_same_mount(&parent(dir.path()), OsStr::new("slot"), flags);
+        umount2(&slot, MntFlags::MNT_DETACH).unwrap();
+        let error = outcome.expect_err("a file bind mount is a mount boundary");
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+        assert_eq!(fs::read(&outside).unwrap(), b"external file");
     }
 
     /// A bind mount of the same filesystem keeps the device number but not the
@@ -131,7 +197,7 @@ mod tests {
             return;
         }
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let outcome = open_dir_beneath_same_mount(&parent(dir.path()), OsStr::new("bound"), flags);
+        let outcome = open_beneath_same_mount(&parent(dir.path()), OsStr::new("bound"), flags);
         let same_device =
             fs::metadata(&target).map(|m| m.dev() == fs::metadata(dir.path()).unwrap().dev());
         umount2(&target, MntFlags::MNT_DETACH).unwrap();
