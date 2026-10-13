@@ -46,9 +46,9 @@ pub fn acquire_update_lock(install_path: &Path) -> std::io::Result<std::fs::File
             "update transaction requires an absolute binary destination",
         ));
     }
-    let parent = install_path.parent().ok_or_else(|| {
-        Error::new(ErrorKind::InvalidInput, "update destination has no parent")
-    })?;
+    let parent = install_path
+        .parent()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "update destination has no parent"))?;
     // First-time --system installs may not have an installation directory yet.
     // O_DIRECTORY also refuses substituted non-directories without blocking.
     std::fs::create_dir_all(parent)?;

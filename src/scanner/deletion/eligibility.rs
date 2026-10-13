@@ -42,7 +42,9 @@ pub(super) fn check(candidate: &CandidacyScore, config: &DeletionConfig) -> Resu
     // must not lose whole-root protection of untracked repository siblings.
     // This initializes deny-only scope, never an opt-in; the existing root
     // authorizations still refresh it during preflight and final mutation.
-    config.source_roots.include_default_roots(&config.quarantine_roots);
+    config
+        .source_roots
+        .include_default_roots(&config.quarantine_roots);
     check_path(candidate, config)
 }
 

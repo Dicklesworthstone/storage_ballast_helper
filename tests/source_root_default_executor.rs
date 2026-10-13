@@ -326,7 +326,11 @@ fn source_root_fallback_covers_all_declared_roots_and_preserves_an_independent_c
             let cache = directory.path().join("cache");
             fs::create_dir_all(first.join("team/project/.git")).unwrap();
             fs::create_dir_all(second.join("nested/worktree")).unwrap();
-            fs::write(second.join("nested/worktree/.git"), b"gitdir: /missing/metadata\n").unwrap();
+            fs::write(
+                second.join("nested/worktree/.git"),
+                b"gitdir: /missing/metadata\n",
+            )
+            .unwrap();
             let a = artifact(&first.join("target"));
             let b = artifact(&second.join("target"));
             let independent = artifact(&cache.join("target"));
@@ -340,7 +344,11 @@ fn source_root_fallback_covers_all_declared_roots_and_preserves_an_independent_c
             let observed_policy = cfg.source_roots.clone();
             let executor = DeletionExecutor::new(cfg, None);
             let plan = executor.plan(vec![a.clone(), b.clone(), independent.clone()]);
-            assert_eq!(plan.candidates.len(), 3, "all pass ordinary scoring admission");
+            assert_eq!(
+                plan.candidates.len(),
+                3,
+                "all pass ordinary scoring admission"
+            );
             let installed = observed_policy.snapshot();
             assert_eq!(installed.roots.len(), 3);
             assert!(!installed.allow_source_tree_roots);
@@ -357,7 +365,10 @@ fn source_root_fallback_covers_all_declared_roots_and_preserves_an_independent_c
                 assert_eq!(report.bytes_would_free, independent.size_bytes);
             } else {
                 assert!(!independent.path.exists(), "positive control must reclaim");
-                assert_eq!(report.items_quarantined, usize::from(mode == DeletionMode::Quarantine));
+                assert_eq!(
+                    report.items_quarantined,
+                    usize::from(mode == DeletionMode::Quarantine)
+                );
             }
             retained(&a);
             retained(&b);
@@ -383,7 +394,11 @@ fn source_root_fallback_rechecks_a_new_sibling_repository_after_preflight() {
             Ok(())
         };
         let report = executor.execute_with_guard(&plan, None, Some(&add_sibling));
-        assert_eq!(calls.get(), 1, "the final-boundary test must reach its guard");
+        assert_eq!(
+            calls.get(),
+            1,
+            "the final-boundary test must reach its guard"
+        );
         denied(&report);
         retained(&candidate);
     }

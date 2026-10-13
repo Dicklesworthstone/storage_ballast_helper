@@ -229,7 +229,12 @@ fn contention_precedes_update_and_rollback_but_not_backup_inventory() {
     let output = fixture.command().arg("--list-backups").output().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(!fixture.root().join("calls").exists());
-    assert!(!fixture.root().join("home/.local/share/sbh/backups").exists());
+    assert!(
+        !fixture
+            .root()
+            .join("home/.local/share/sbh/backups")
+            .exists()
+    );
     assert_eq!(digest(&fixture.binary), before);
     drop(guard);
     // The unlocked command now reaches offline validation rather than the lock.
@@ -290,7 +295,10 @@ fn real_replacement_retains_ownership_during_restart_and_releases_on_failure() {
     let rollback = fixture.command().arg("--rollback").output().unwrap();
     assert_contention(&rollback);
     assert_eq!(digest(&fixture.binary), expected);
-    assert_eq!(fs::read(fixture.root().join("calls")).unwrap(), calls_before);
+    assert_eq!(
+        fs::read(fixture.root().join("calls")).unwrap(),
+        calls_before
+    );
     fs::write(fixture.root().join("release-restart"), b"done").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {

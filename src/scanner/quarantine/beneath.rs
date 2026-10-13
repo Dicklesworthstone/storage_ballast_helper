@@ -231,7 +231,8 @@ fn parse_proc_mount_id(contents: &str) -> io::Result<u64> {
             continue;
         };
         let value = value.trim();
-        if result.is_some() || value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        if result.is_some() || value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
             return Err(invalid());
         }
         let id = value.parse::<u64>().map_err(|_| invalid())?;
@@ -448,7 +449,13 @@ mod tests {
 
     #[test]
     fn definitive_statx_errors_are_not_hidden_by_proc() {
-        for errno in [libc::EBADF, libc::EIO, libc::ENOMEM, libc::EFAULT, libc::ENOENT] {
+        for errno in [
+            libc::EBADF,
+            libc::EIO,
+            libc::ENOMEM,
+            libc::EFAULT,
+            libc::ENOENT,
+        ] {
             let error = resolve_mount_id(Err(io::Error::from_raw_os_error(errno)), || {
                 panic!("definitive errors must not fall back")
             })
@@ -459,10 +466,8 @@ mod tests {
 
     #[test]
     fn unavailable_proc_evidence_still_fails_closed() {
-        let error = resolve_mount_id(Ok(None), || {
-            Err(io::Error::from_raw_os_error(libc::EACCES))
-        })
-        .unwrap_err();
+        let error = resolve_mount_id(Ok(None), || Err(io::Error::from_raw_os_error(libc::EACCES)))
+            .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EACCES));
     }
 
@@ -599,7 +604,9 @@ mod tests {
         ] {
             for name in ["child", "link"] {
                 assert_eq!(
-                    open_beneath(&p, OsStr::new(name), flags).unwrap_err().kind(),
+                    open_beneath(&p, OsStr::new(name), flags)
+                        .unwrap_err()
+                        .kind(),
                     io::ErrorKind::InvalidInput
                 );
             }

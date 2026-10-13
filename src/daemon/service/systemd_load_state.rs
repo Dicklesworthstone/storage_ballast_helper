@@ -591,7 +591,10 @@ mod query_lifecycle_tests {
             query.has_exited().unwrap_err().raw_os_error(),
             Some(libc::ECHILD)
         );
-        assert!(query.reaped, "Drop must not signal this now-unowned PID/group");
+        assert!(
+            query.reaped,
+            "Drop must not signal this now-unowned PID/group"
+        );
     }
 
     fn process_is_running(pid: u32) -> bool {
@@ -633,6 +636,9 @@ mod query_lifecycle_tests {
         let survived = process_is_running(pid);
         std::fs::write(release, b"done").unwrap();
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
-        assert!(!survived, "inherited writer survived the failed service query");
+        assert!(
+            !survived,
+            "inherited writer survived the failed service query"
+        );
     }
 }
