@@ -8,6 +8,15 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- An idle daemon no longer spends 10-46% of a core rescanning a busy temp
+  root with nothing to reclaim (bd-os02). A pass cut short inside the priority
+  pre-scan skipped the pass accounting, so the empty-pass cooldown never armed
+  and a large `$TMPDIR` was rescanned every ~20 s at the CPU-budget ceiling;
+  such passes are now paced like any other. Ancestor `.sbh-protect` probes are
+  remembered within a pass, the quarantine sweep reads its records once
+  instead of three or four times, and macOS caches the firmlink table
+  (`9e0119e`, `4c4788e`).
+
 - macOS: the launchd daemon runs at `ProcessType=Standard`, `Nice=5` instead
   of `Background`, `Nice=19`. macOS schedules by priority rather than by
   share, so under a saturated CPU a background or Nice 19 daemon got no time
