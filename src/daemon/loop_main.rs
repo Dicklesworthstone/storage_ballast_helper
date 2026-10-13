@@ -7301,6 +7301,17 @@ fn scanner_thread_main(
         if let Some(reclaim_before) = unconfirmed_dispatch.take() {
             dispatch_confirmed_empty = executor_config.reclaim_events() == reclaim_before;
             last_dispatch_reclaimed_nothing = dispatch_confirmed_empty;
+            if !dispatch_confirmed_empty {
+                // A confirmed reclaim ends the streak that earlier fruitless
+                // dispatches built; the empty passes that follow it start
+                // from the base interval again.
+                record_dispatching_pass(
+                    false,
+                    &mut consecutive_empty_passes,
+                    &mut inconclusive_empty_passes,
+                    &mut last_empty_pass_at,
+                );
+            }
         }
         if dispatch_confirmed_empty {
             record_empty_pass(
