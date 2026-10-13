@@ -76,6 +76,29 @@ pub struct DrainFailure {
     pub error: String,
 }
 
+/// How [`QuarantineStore::sweep`] drains a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepMode {
+    /// The mount is under pressure: drain everything, cooldowns ignored.
+    Pressure,
+    /// Routine upkeep: expired entries, then the oldest toward `cap_bytes`.
+    Maintenance {
+        /// Most bytes the store may hold; `None` skips the cap.
+        cap_bytes: Option<u64>,
+    },
+}
+
+/// What one [`QuarantineStore::sweep`] did.
+#[derive(Debug, Default)]
+pub struct SweepOutcome {
+    /// Everything drained (expiry and cap merged).
+    pub drained: DrainOutcome,
+    /// Why entries were drained: `pressure`, `size cap` or `ttl`.
+    pub reason: &'static str,
+    /// Bytes still held afterwards (record estimates).
+    pub held_bytes: u64,
+}
+
 /// What a drain actually managed to do.
 ///
 /// Drains are best-effort per entry: a single unremovable entry must never
@@ -586,6 +609,85 @@ impl QuarantineStore {
         self.drain_oldest(held - max_bytes)
     }
 
+    /// One sweep over a single read of the records: in [`SweepMode::Pressure`]
+    /// drain everything (cooldowns ignored, like [`Self::drain_all`]); in
+    /// [`SweepMode::Maintenance`] drain expired entries, then the oldest toward
+    /// the byte cap (like [`Self::drain_expired`] then [`Self::enforce_cap`]).
+    /// Reports what is still held. The daemon sweeps every store each minute,
+    /// and every tick under pressure; the separate calls read and parsed every
+    /// record three or four times per sweep (bd-os02).
+    pub fn sweep(&self, now_unix: u64, mode: SweepMode) -> Result<SweepOutcome> {
+        let records = self.records()?;
+        let mut held = records
+            .iter()
+            .map(|r| r.size_bytes)
+            .fold(0u64, u64::saturating_add);
+        let mut drained = DrainOutcome::default();
+        let mut reason = "ttl";
+        match mode {
+            SweepMode::Pressure => {
+                reason = "pressure";
+                let mut budget = PurgeBudget::bounded(DEFAULT_DRAIN_WORK);
+                for entry in &records {
+                    if !self.try_purge(entry, now_unix, &mut drained, &mut budget) {
+                        break;
+                    }
+                }
+            }
+            SweepMode::Maintenance { cap_bytes } => {
+                let mut purged = std::collections::HashSet::new();
+                let mut budget = PurgeBudget::bounded(DEFAULT_DRAIN_WORK);
+                for entry in records.iter().filter(|r| r.expires_at <= now_unix) {
+                    if self.cooling_down(&entry.decision_id, now_unix) {
+                        drained.skipped_stuck += 1;
+                        continue;
+                    }
+                    let before = drained.entries;
+                    let keep_going = self.try_purge(entry, now_unix, &mut drained, &mut budget);
+                    if drained.entries > before {
+                        purged.insert(entry.decision_id.as_str());
+                    }
+                    if !keep_going {
+                        break;
+                    }
+                }
+                let remaining = held.saturating_sub(drained.bytes);
+                if let Some(cap) = cap_bytes
+                    && remaining > cap
+                {
+                    let needed = remaining - cap;
+                    let mut capped = DrainOutcome::default();
+                    let mut budget = PurgeBudget::bounded(DEFAULT_DRAIN_WORK);
+                    for entry in records
+                        .iter()
+                        .filter(|r| !purged.contains(r.decision_id.as_str()))
+                    {
+                        if capped.bytes >= needed {
+                            break;
+                        }
+                        if self.cooling_down(&entry.decision_id, now_unix) {
+                            capped.skipped_stuck += 1;
+                            continue;
+                        }
+                        if !self.try_purge(entry, now_unix, &mut capped, &mut budget) {
+                            break;
+                        }
+                    }
+                    if capped.entries > 0 {
+                        reason = "size cap";
+                    }
+                    drained = drained.merged(capped);
+                }
+            }
+        }
+        held = held.saturating_sub(drained.bytes);
+        Ok(SweepOutcome {
+            drained,
+            reason,
+            held_bytes: held,
+        })
+    }
+
     /// Put an entry back where it came from by rename. Refuses when the
     /// original path exists again unless `force_suffix`, which restores to
     /// `<original>.restored-<decision-id>` instead. After a partial purge,
@@ -821,6 +923,102 @@ mod tests {
         assert_eq!(store.drain_all().unwrap().counts(), (1, 5000));
         assert_eq!(store.held_bytes().unwrap(), 0);
         assert_eq!(store.enforce_cap(0).unwrap().counts(), (0, 0));
+    }
+
+    #[test]
+    fn one_sweep_matches_the_separate_drains_and_reports_what_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::at(dir.path().join("q"));
+        // d0 1000 B (live), d1 2000 B (expired), d2 3000 B (live), oldest first.
+        for (i, ttl) in [3600u64, 0, 7200].iter().enumerate() {
+            let target = tree(dir.path(), &format!("p{i}/target"), 1);
+            store
+                .quarantine(
+                    &target,
+                    &format!("d{i}"),
+                    1000 * (i as u64 + 1),
+                    Duration::from_secs(*ttl),
+                    None,
+                )
+                .unwrap();
+            let path = store.record_path(&format!("d{i}"));
+            let mut record: QuarantineRecord =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            record.quarantined_at = 1_000 + i as u64;
+            record.expires_at = record.quarantined_at + ttl;
+            write_record(&path, &record).unwrap();
+        }
+        // Maintenance without a cap: only the expired entry goes.
+        let swept = store
+            .sweep(1_500, SweepMode::Maintenance { cap_bytes: None })
+            .unwrap();
+        assert_eq!((swept.drained.counts(), swept.reason), ((1, 2000), "ttl"));
+        assert_eq!(swept.held_bytes, 4000);
+        assert_eq!(swept.held_bytes, store.held_bytes().unwrap());
+        // A cap drains oldest first, and never the entry expiry just removed.
+        let swept = store
+            .sweep(
+                1_500,
+                SweepMode::Maintenance {
+                    cap_bytes: Some(3500),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (swept.drained.counts(), swept.reason),
+            ((1, 1000), "size cap")
+        );
+        assert!(store.record("d0").unwrap().is_none());
+        assert_eq!(swept.held_bytes, 3000);
+        assert_eq!(swept.held_bytes, store.held_bytes().unwrap());
+        // Pressure drains everything left.
+        let swept = store.sweep(1_500, SweepMode::Pressure).unwrap();
+        assert_eq!(
+            (swept.drained.counts(), swept.reason),
+            ((1, 3000), "pressure")
+        );
+        assert_eq!(swept.held_bytes, 0);
+        // An empty store sweeps to nothing.
+        let swept = store.sweep(1_500, SweepMode::Pressure).unwrap();
+        assert_eq!((swept.drained.counts(), swept.held_bytes), ((0, 0), 0));
+    }
+
+    #[test]
+    fn a_sweep_expiring_and_capping_in_one_pass_counts_each_entry_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::at(dir.path().join("q"));
+        // d0 expired (1000 B), d1 live (2000 B): with a 500 B cap the sweep
+        // expires d0, then caps d1; the cap never re-selects d0.
+        for (i, ttl) in [0u64, 3600].iter().enumerate() {
+            let target = tree(dir.path(), &format!("p{i}/target"), 1);
+            store
+                .quarantine(
+                    &target,
+                    &format!("d{i}"),
+                    1000 * (i as u64 + 1),
+                    Duration::from_secs(*ttl),
+                    None,
+                )
+                .unwrap();
+            let path = store.record_path(&format!("d{i}"));
+            let mut record: QuarantineRecord =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            record.quarantined_at = 1_000 + i as u64;
+            record.expires_at = record.quarantined_at + ttl;
+            write_record(&path, &record).unwrap();
+        }
+        let swept = store
+            .sweep(
+                1_500,
+                SweepMode::Maintenance {
+                    cap_bytes: Some(500),
+                },
+            )
+            .unwrap();
+        assert_eq!(swept.drained.counts(), (2, 3000));
+        assert_eq!(swept.reason, "size cap");
+        assert_eq!(swept.held_bytes, 0);
+        assert!(store.records().unwrap().is_empty());
     }
 
     #[test]

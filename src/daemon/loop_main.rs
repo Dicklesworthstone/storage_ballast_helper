@@ -92,7 +92,7 @@ use crate::scanner::patterns::{
 use crate::scanner::planner::{PlanRequest, RiskBudgetByLevel, plan_batch};
 use crate::scanner::prescan_cursor::PrescanCursor;
 use crate::scanner::protection::{self, ProtectionRegistry};
-use crate::scanner::quarantine::{DrainOutcome as QuarantineDrainOutcome, QuarantineStore};
+use crate::scanner::quarantine::{QuarantineStore, SweepMode as QuarantineSweepMode};
 use crate::scanner::regret::{
     EntryIdentity, Outcome, RegretCalibrator, RegretConfig, RegretDetector, Watch,
     certainty_from_name,
@@ -6401,24 +6401,15 @@ impl MonitoringDaemon {
                     continue;
                 }
                 let store = QuarantineStore::under(root);
-                let outcome = if pressured {
-                    store.drain_all().map(|drained| ("pressure", drained))
+                let mode = if pressured {
+                    QuarantineSweepMode::Pressure
                 } else {
-                    store.drain_expired(now_unix).and_then(|expired| {
-                        let capped = match cap_bytes {
-                            Some(cap) => store.enforce_cap(cap)?,
-                            None => QuarantineDrainOutcome::default(),
-                        };
-                        let why = if capped.entries > 0 {
-                            "size cap"
-                        } else {
-                            "ttl"
-                        };
-                        Ok((why, expired.merged(capped)))
-                    })
+                    QuarantineSweepMode::Maintenance { cap_bytes }
                 };
-                match outcome {
-                    Ok((why, drained)) => {
+                match store.sweep(now_unix, mode) {
+                    Ok(swept) => {
+                        held = held.saturating_add(swept.held_bytes);
+                        let (why, drained) = (swept.reason, swept.drained);
                         if drained.entries > 0 {
                             let count = drained.entries;
                             let bytes = drained.bytes;
@@ -6455,7 +6446,6 @@ impl MonitoringDaemon {
                         );
                     }
                 }
-                held = held.saturating_add(store.held_bytes().unwrap_or(0));
             }
             self.quarantine_held.insert(mount.clone(), held);
         }
