@@ -663,6 +663,45 @@ fn pressure_escalated(last_pass_level: Option<PressureLevel>, request: &ScanRequ
         && last_pass_level.is_some_and(|previous| request.pressure_level > previous)
 }
 
+/// How long an empty pass at a level keeps a return to that level from
+/// counting as an escalation. A host whose free space hovers at a threshold
+/// crosses it every minute or two: each return to Red after an Orange event
+/// pass looked like new information and cleared the backoff, so Red never
+/// reached terminal idle and rescanned the same tree back-to-back (hz1 on
+/// 2026-10-13: 365 resets and 816 passes in 6 h, 723 of them finding nothing).
+/// The window equals the terminal-idle wake, so a flapping host is re-checked
+/// as often as one that stays put.
+const ESCALATION_HYSTERESIS: Duration = TERMINAL_IDLE_PRESSURED_RESCAN_CAP;
+
+/// Remember the highest level a recent pass found nothing at. A lower-level
+/// empty pass does not erase a higher one still inside the window; a pass at
+/// the same or a higher level refreshes it.
+fn note_empty_pass_level(
+    peak: &mut Option<(PressureLevel, Instant)>,
+    level: PressureLevel,
+    now: Instant,
+) {
+    let keep = peak.is_some_and(|(peak_level, at)| {
+        peak_level > level && now.saturating_duration_since(at) < ESCALATION_HYSTERESIS
+    });
+    if !keep {
+        *peak = Some((level, now));
+    }
+}
+
+/// Whether a pass at `level` or above came back empty within the hysteresis
+/// window: a rise to `level` is then the threshold flapping, not new
+/// information, and keeps the empty-pass streak.
+fn rise_already_scanned_empty(
+    peak: Option<(PressureLevel, Instant)>,
+    level: PressureLevel,
+    now: Instant,
+) -> bool {
+    peak.is_some_and(|(peak_level, at)| {
+        peak_level >= level && now.saturating_duration_since(at) < ESCALATION_HYSTERESIS
+    })
+}
+
 /// Absolute floor between pressure-driven scan passes when the duty-cycle
 /// limiter is enabled.
 ///
@@ -7253,6 +7292,8 @@ fn scanner_thread_main(
     // The level of the last completed pass: a rise since then is new
     // information and clears the pacing (`pressure_escalated`).
     let mut last_pass_level: Option<PressureLevel> = None;
+    // The highest level a recent pass found nothing at (`note_empty_pass_level`).
+    let mut empty_level_peak: Option<(PressureLevel, Instant)> = None;
 
     // #15: duty-cycle limiter. The empty-pass cooldown above only paces passes
     // that reclaimed nothing; a chronically-full host reclaims a trickle every
@@ -7327,6 +7368,9 @@ fn scanner_thread_main(
                 false,
             );
             last_empty_pass_at = Some(Instant::now());
+            if let Some(level) = last_pass_level {
+                note_empty_pass_level(&mut empty_level_peak, level, Instant::now());
+            }
             eprintln!(
                 "[SBH-SCANNER] the last pass dispatched candidates but nothing was reclaimed (dry-run, observe, dampened or failed); pacing it as an empty pass (consecutive={consecutive_empty_passes})"
             );
@@ -7336,7 +7380,10 @@ fn scanner_thread_main(
         // pacing built up by routine empty passes on a calm mount (routine
         // maintenance on a healthy host saturates the backoff within hours)
         // must not hold the first Orange scan for the backed-off interval.
-        if pressure_escalated(last_pass_level, &request) && last_empty_pass_at.is_some() {
+        if pressure_escalated(last_pass_level, &request)
+            && last_empty_pass_at.is_some()
+            && !rise_already_scanned_empty(empty_level_peak, request.pressure_level, Instant::now())
+        {
             eprintln!(
                 "[SBH-SCANNER] pressure rose to {:?} since the last pass; empty-pass backoff reset (was consecutive={consecutive_empty_passes})",
                 request.pressure_level
@@ -8505,6 +8552,7 @@ fn scanner_thread_main(
                     true,
                 );
                 last_empty_pass_at = Some(Instant::now());
+                note_empty_pass_level(&mut empty_level_peak, request_level, Instant::now());
             } else {
                 record_dispatching_pass(
                     last_dispatch_reclaimed_nothing,
@@ -9202,6 +9250,7 @@ fn scanner_thread_main(
                 scan_timed_out,
             );
             last_empty_pass_at = Some(Instant::now());
+            note_empty_pass_level(&mut empty_level_peak, request_level, Instant::now());
             let next_secs = effective_empty_pass_cooldown(
                 current_scanner_config.min_rescan_interval_secs,
                 consecutive_empty_passes,
@@ -13824,6 +13873,45 @@ mod tests {
             !pressure_escalated(Some(PressureLevel::Green), &maintenance),
             "maintenance passes carry no pressure signal"
         );
+    }
+
+    #[test]
+    fn a_return_to_a_level_scanned_empty_minutes_ago_is_not_an_escalation() {
+        let start = Instant::now();
+        let mut peak = None;
+        note_empty_pass_level(&mut peak, PressureLevel::Red, start);
+        // Free space flapping at the Red line: an empty Orange pass in
+        // between neither erases the Red pass nor makes Red new again.
+        let orange_at = start + Duration::from_secs(90);
+        note_empty_pass_level(&mut peak, PressureLevel::Orange, orange_at);
+        assert_eq!(peak, Some((PressureLevel::Red, start)));
+        let back_to_red = start + Duration::from_secs(100);
+        assert!(rise_already_scanned_empty(
+            peak,
+            PressureLevel::Red,
+            back_to_red
+        ));
+        assert!(rise_already_scanned_empty(
+            peak,
+            PressureLevel::Orange,
+            back_to_red
+        ));
+        // A level above anything scanned empty is new information.
+        assert!(!rise_already_scanned_empty(
+            peak,
+            PressureLevel::Critical,
+            back_to_red
+        ));
+        // Another empty Red pass refreshes the window.
+        let red_again = start + Duration::from_secs(200);
+        note_empty_pass_level(&mut peak, PressureLevel::Red, red_again);
+        assert_eq!(peak, Some((PressureLevel::Red, red_again)));
+        // Once the window has passed, a return to Red clears the pacing again.
+        let later = red_again + ESCALATION_HYSTERESIS;
+        assert!(!rise_already_scanned_empty(peak, PressureLevel::Red, later));
+        note_empty_pass_level(&mut peak, PressureLevel::Orange, later);
+        assert_eq!(peak, Some((PressureLevel::Orange, later)));
+        assert!(!rise_already_scanned_empty(None, PressureLevel::Red, later));
     }
 
     #[test]
