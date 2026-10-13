@@ -337,7 +337,13 @@ fn running_but_disabled_service_is_restarted_after_update() {
     assert!(calls.contains("--user show sbh.service --property=LoadState --value"));
     assert!(calls.contains("--user restart sbh.service"));
     assert!(!calls.contains("is-enabled"));
-    assert_eq!(fs::read_to_string(&fixture.versions).unwrap().lines().count(), 1);
+    assert_eq!(
+        fs::read_to_string(&fixture.versions)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
 }
 
 #[test]
