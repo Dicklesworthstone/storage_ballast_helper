@@ -1646,14 +1646,8 @@ fn clean_plan_target(
     let Ok(stats) = collector.collect(root) else {
         return (PressureLevel::Green, None);
     };
-    let pressure = &config.pressure;
-    let level = classify_level(
-        stats.free_pct(),
-        pressure.green_min_free_pct,
-        pressure.yellow_min_free_pct,
-        pressure.orange_min_free_pct,
-        pressure.red_min_free_pct,
-    );
+    let [green, yellow, orange, red] = config.pressure.free_pct_thresholds_for(stats.total_bytes);
+    let level = classify_level(stats.free_pct(), green, yellow, orange, red);
     let target = target_free
         .map(|pct| {
             ((stats.total_bytes as f64 * pct / 100.0) as u64).saturating_sub(stats.available_bytes)
@@ -10061,7 +10055,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 }
 
                 let free_pct = capacity_free_pct(&capacity);
-                let level = pressure_level_str(free_pct, &config);
+                let level = pressure_level_str(free_pct, capacity.total_bytes, &config);
                 if pressure_severity(level) > pressure_severity(overall_level) {
                     overall_level = level;
                 }
@@ -10467,7 +10461,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     continue;
                 }
                 let free_pct = capacity_free_pct(&capacity);
-                let level = pressure_level_str(free_pct, &config);
+                let level = pressure_level_str(free_pct, capacity.total_bytes, &config);
                 if pressure_severity(level) > pressure_severity(overall_level) {
                     overall_level = level;
                 }
@@ -10753,15 +10747,17 @@ fn format_log_line(line: &str) -> String {
     )
 }
 
-/// Map free percentage to pressure level string.
-fn pressure_level_str(free_pct: f64, config: &Config) -> &'static str {
-    if free_pct >= config.pressure.green_min_free_pct {
+/// Map free percentage on a volume of `total_bytes` to a pressure level
+/// string (absolute floors apply, see `floored_free_pct_thresholds`).
+fn pressure_level_str(free_pct: f64, total_bytes: u64, config: &Config) -> &'static str {
+    let [green, yellow, orange, red] = config.pressure.free_pct_thresholds_for(total_bytes);
+    if free_pct >= green {
         "green"
-    } else if free_pct >= config.pressure.yellow_min_free_pct {
+    } else if free_pct >= yellow {
         "yellow"
-    } else if free_pct >= config.pressure.orange_min_free_pct {
+    } else if free_pct >= orange {
         "orange"
-    } else if free_pct >= config.pressure.red_min_free_pct {
+    } else if free_pct >= red {
         "red"
     } else {
         "critical"
