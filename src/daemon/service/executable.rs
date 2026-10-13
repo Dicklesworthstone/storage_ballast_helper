@@ -54,8 +54,10 @@ fn resolve_uncaptured_binary() -> Result<PathBuf> {
         // Link count is not sufficient: another hard link can retain the image.
         for _ in 0..3 {
             let exe = current_exe_path()?;
-            let matches_running_image = std::fs::metadata(&exe).is_ok_and(|metadata| {
-                metadata.dev() == running.dev() && metadata.ino() == running.ino()
+            let matches_running_image = std::fs::symlink_metadata(&exe).is_ok_and(|metadata| {
+                metadata.is_file()
+                    && metadata.dev() == running.dev()
+                    && metadata.ino() == running.ino()
             });
             if current_exe_path()? != exe {
                 continue;
@@ -261,9 +263,22 @@ mod tests {
                 super::super::SystemdConfig::from_env(true).unwrap().binary_path,
                 original
             );
+            // A synthetic-name symlink to procfs has the same target inode as
+            // the running image. It is still not that image's real pathname.
+            fs::rename(&decorated, original.with_extension("saved-decoy")).unwrap();
+            std::os::unix::fs::symlink("/proc/self/exe", &decorated).unwrap();
+            assert_eq!(
+                fs::metadata(&decorated).unwrap().ino(),
+                fs::metadata("/proc/self/exe").unwrap().ino()
+            );
+            assert_eq!(resolve_sbh_binary().unwrap(), original);
             capture_sbh_binary_path();
             assert_eq!(STARTUP_BINARY.get().unwrap(), &original);
             assert_eq!(resolve_sbh_binary().unwrap(), original);
+            // Neither the decoy nor the retained old image may hide a missing
+            // replacement after the original spelling has been captured.
+            fs::rename(&original, original.with_extension("saved-replacement")).unwrap();
+            assert!(resolve_sbh_binary().is_err());
             return;
         }
 
