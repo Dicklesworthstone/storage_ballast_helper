@@ -19,6 +19,8 @@ use super::{
 use crate::core::errors::{Result, SbhError};
 use crate::platform::types::{ExecutablesResult, OpenFile, OpenFilesResult, ProcessInfo};
 
+mod build_environment;
+
 const MAX_DESCRIPTORS: usize = 262_144;
 const MAX_DESCRIPTORS_PER_PID: usize = 16_384;
 const MAX_PROC_ENTRIES: usize = OPEN_FILES_MAX_PIDS + 4096;
@@ -425,7 +427,7 @@ fn open_targets_with(
             add_target_spellings(&mut targets, cwd);
         }
     }
-    // So is the cargo home and target directory a live build names.
+    // So are the external cache and output directories a live build names.
     for (_, directory) in build_directories_with(proc, proc_root, limits) {
         add_target_spellings(&mut targets, directory);
     }
@@ -437,9 +439,6 @@ fn open_targets_with(
     Ok((targets, sweep.complete))
 }
 
-/// Process names whose environment is read for build directories. `comm` is
-/// at most 15 bytes, which all of these fit.
-const BUILD_TOOL_COMMS: [&str; 5] = ["cargo", "rustc", "rustdoc", "clippy-driver", "cargo-clippy"];
 /// An environment larger than this is skipped, not truncated.
 const BUILD_ENVIRON_LIMIT: usize = 512 * 1024;
 
@@ -447,21 +446,16 @@ pub(super) fn build_directories() -> Vec<(i32, PathBuf)> {
     build_directories_with(&NativeProc, Path::new(PROC_ROOT), Limits::default())
 }
 
-/// Directories a running Rust build is using without necessarily holding
-/// anything open in them (bd-d1kt): `CARGO_HOME`'s cache subtrees and
-/// `CARGO_TARGET_DIR`, read from the environment of live cargo/rustc
-/// processes. rustc reads a source file and closes it, and compiles workspace
-/// crates from the workspace, so neither descriptors nor the working directory
-/// show that rch's shared cargo cache is in use; sbh deleted its `registry/`
-/// hundreds of times on the workers, under builds that then failed. Best
-/// effort: an unreadable process is skipped, never an error.
+/// Positive directory references from live Rust, Go, Node, Python and native
+/// compiler processes (bd-d1kt, bd-j7ho). A build need not hold a descriptor in
+/// its external cache between reads. The same bounded discovery feeds scoring
+/// and the native executor. Unreadable metadata remains best-effort evidence,
+/// not a claim of complete coverage; raw environments are never logged.
 fn build_directories_with(
     proc: &impl ProcAccess,
     proc_root: &Path,
     limits: Limits,
 ) -> Vec<(i32, PathBuf)> {
-    use std::os::unix::ffi::OsStringExt as _;
-
     let mut sweep = Sweep::new(proc, limits);
     let Ok(pids) = sweep.pids(proc_root) else {
         return Vec::new();
@@ -480,42 +474,25 @@ fn build_directories_with(
         let Ok(comm) = proc.read_bounded(&process.join("comm"), 64) else {
             continue;
         };
-        let comm = String::from_utf8_lossy(&comm);
-        if !BUILD_TOOL_COMMS.contains(&comm.trim_end()) {
+        let Some(tool) = build_environment::tool(&comm) else {
             continue;
+        };
+        if sweep.expired() {
+            break;
         }
         let Ok(environ) = proc.read_bounded(&process.join("environ"), BUILD_ENVIRON_LIMIT) else {
             continue;
         };
-        for variable in environ.split(|byte| *byte == 0) {
-            let Some(split) = variable.iter().position(|byte| *byte == b'=') else {
-                continue;
-            };
-            let (name, value) = (&variable[..split], &variable[split + 1..]);
-            let directory = PathBuf::from(OsString::from_vec(value.to_vec()));
-            if !directory.is_absolute() {
-                continue;
-            }
-            let paths: Vec<PathBuf> = match name {
-                // A candidate is one of the cache subtrees cargo manages, or
-                // an ancestor of one (the cargo home itself, `registry`, `git`).
-                b"CARGO_HOME" => [
-                    "registry/index",
-                    "registry/cache",
-                    "registry/src",
-                    "git/db",
-                    "git/checkouts",
-                ]
-                .iter()
-                .map(|subtree| directory.join(subtree))
-                .collect(),
-                b"CARGO_TARGET_DIR" => vec![directory],
-                _ => continue,
-            };
-            for path in paths {
-                if seen.insert(path.clone()) {
-                    directories.push((pid, path));
-                }
+        // Do not start another syscall after the budget expires, but retain
+        // absolute references from the environment we already observed.
+        let cwd = if sweep.expired() {
+            None
+        } else {
+            proc.link(&process.join("cwd")).ok()
+        };
+        for path in build_environment::references(tool, &environ, cwd.as_deref()) {
+            if seen.insert(path.clone()) {
+                directories.push((pid, path));
             }
         }
     }
@@ -1171,6 +1148,82 @@ mod tests {
             open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
         assert!(targets.contains(&home.join("registry/src")));
         assert!(targets.contains(&target));
+    }
+
+    #[test]
+    fn external_build_caches_reach_scoring_and_executor_without_open_files() {
+        let fixture = Fixture::new();
+        let first = i32::try_from(std::process::id()).unwrap().checked_add(1).unwrap();
+        for (offset, (comm, key)) in [
+            ("go", "GOCACHE"),
+            ("go", "GOMODCACHE"),
+            ("npm install", "npm_config_cache"),
+            ("uv", "UV_CACHE_DIR"),
+            ("python3.13", "PIP_CACHE_DIR"),
+            ("sccache", "SCCACHE_DIR"),
+            ("clang-20", "CCACHE_DIR"),
+        ].iter().enumerate() {
+            let pid = first + i32::try_from(offset).unwrap();
+            let process = fixture.pid(pid);
+            let cache = fixture.root.join(key);
+            fs::create_dir(&cache).unwrap();
+            fs::write(cache.join("keep"), b"active cache").unwrap();
+            fs::write(process.join("comm"), format!("{comm}\n")).unwrap();
+            fs::write(process.join("environ"), format!("{key}={}\0", cache.display())).unwrap();
+        }
+        let found = build_directories_with(&NativeProc, &fixture.proc_root, Limits::default());
+        assert_eq!(found.len(), 7);
+        let (targets, complete) = open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        let roots = vec![fixture.root.clone()];
+        let ancestors = crate::scanner::walker::open_path_ancestors_for_roots(&targets, &roots);
+        for (pid, cache) in found {
+            assert!(targets.contains(&cache));
+            assert!(ancestors.contains(&cache));
+            assert!(ancestors.contains(&fixture.root));
+            assert_eq!(fs::read_dir(fixture.proc_root.join(pid.to_string()).join("fd")).unwrap().count(), 0);
+            assert_eq!(fs::read(cache.join("keep")).unwrap(), b"active cache");
+        }
+    }
+
+    #[test]
+    fn relative_build_roots_use_the_process_cwd_and_keep_absolute_evidence_on_denial() {
+        let fixture = Fixture::new();
+        let pid = i32::try_from(std::process::id()).unwrap().checked_add(1).unwrap();
+        let process = fixture.pid(pid);
+        fs::write(process.join("comm"), b"rustc\n").unwrap();
+        fs::write(process.join("environ"), b"CARGO_TARGET_DIR=../target\0SCCACHE_DIR=/shared/cache\0").unwrap();
+        let cwd = fixture.root.join("workspace");
+        fs::create_dir(&cwd).unwrap();
+        symlink(&cwd, process.join("cwd")).unwrap();
+        assert_eq!(
+            build_directories_with(&NativeProc, &fixture.proc_root, Limits::default()),
+            vec![(pid, cwd.join("../target")), (pid, PathBuf::from("/shared/cache"))]
+        );
+        let mut denied = Faults::default();
+        denied.links.insert(process.join("cwd"), libc::EACCES);
+        assert_eq!(
+            build_directories_with(&denied, &fixture.proc_root, Limits::default()),
+            vec![(pid, PathBuf::from("/shared/cache"))]
+        );
+    }
+
+    #[test]
+    fn build_metadata_does_not_renew_deadlines_or_read_unrelated_environments() {
+        let fixture = Fixture::new();
+        let pid = i32::try_from(std::process::id()).unwrap().checked_add(1).unwrap();
+        let process = fixture.pid(pid);
+        fs::write(process.join("comm"), b"go\n").unwrap();
+        fs::write(process.join("environ"), b"GOCACHE=/shared/go\0").unwrap();
+        let slow = Faults { advance_per_read: Duration::from_secs(1), ..Faults::default() };
+        let limits = Limits { time: Duration::from_secs(2), ..Limits::default() };
+        assert_eq!(build_directories_with(&slow, &fixture.proc_root, limits), vec![(pid, PathBuf::from("/shared/go"))]);
+        assert_eq!(slow.link_calls.get(), 0);
+        assert_eq!(slow.read_paths.borrow().len(), 2);
+        fs::write(process.join("comm"), b"bash\n").unwrap();
+        let unrelated = Faults::default();
+        assert!(build_directories_with(&unrelated, &fixture.proc_root, Limits::default()).is_empty());
+        assert_eq!(*unrelated.read_paths.borrow(), vec![process.join("comm")]);
     }
 
     #[test]
