@@ -38,6 +38,19 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.7.0...v0.7.1`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.0...v0.7.1)
 
+### Upgrade note: source trees under `scanner.root_paths`
+
+- This applies to v0.7.0 as well. If a scan root contains Git repositories,
+  sbh reclaims untracked build output inside them, as the v0.6.24 release
+  did. Since v0.7.0 it also asks Git what is tracked and keeps that; a root
+  daemon asks as the repository's owner.
+- Builds of `main` made between 2026-10-05 and 2026-10-08 also report
+  `0.6.24`, and under a root daemon they kept every in-repo candidate,
+  because that query failed with "dubious ownership". A host running one of
+  those will see reclaiming inside repositories resume when it upgrades.
+- If source trees must never be cleaned, remove them from `root_paths`, or
+  mark them with `.sbh-protect`, before upgrading.
+
 ### Fixed — safety: tracked Git content on case-insensitive filesystems
 
 - Tracked Git content is matched without regard to case. On a
