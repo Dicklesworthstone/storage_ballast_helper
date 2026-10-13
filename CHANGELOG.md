@@ -8,6 +8,15 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- Deletion now refuses a candidate that holds a Git repository or a
+  `.sbh-protect` marker at any depth (bd-jydu). Every containment check
+  stopped three levels below the candidate, so a clone deeper inside an
+  agent's temp tree could be deleted. Below that depth the executor counts
+  real repositories (a `.git` directory, or a `gitdir:` file such as a linked
+  worktree), not uv's empty `.git` marker or a cargo git checkout. The walk
+  is bounded at 250k directories and refuses the candidate when that runs
+  out; the largest real caches measured opened 54k (`7f229fd`).
+
 - An idle daemon no longer spends 10-46% of a core rescanning a busy temp
   root with nothing to reclaim (bd-os02). A pass cut short inside the priority
   pre-scan skipped the pass accounting, so the empty-pass cooldown never armed
