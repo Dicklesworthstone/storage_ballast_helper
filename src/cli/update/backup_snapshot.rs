@@ -3,9 +3,13 @@
 #[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest as _, Sha256};
+
+use crate::core::hex_lower;
 
 use super::BackupSnapshot;
 
@@ -26,6 +30,93 @@ pub(super) fn create(
         let _ = fs::remove_dir_all(&entry);
     }
     result
+}
+
+/// Verify that a published snapshot still matches the digest recorded when it
+/// was created. Rollback refuses legacy or corrupted snapshots before staging
+/// can replace the currently working installation.
+pub(super) fn verify(snapshot: &BackupSnapshot) -> Result<(), String> {
+    let entry = snapshot
+        .path
+        .parent()
+        .ok_or_else(|| "backup snapshot has no parent directory".to_string())?;
+    let metadata_path = entry.join("backup.json");
+    let encoded = fs::read(&metadata_path)
+        .map_err(|error| format!("failed to read backup metadata: {error}"))?;
+    let metadata: serde_json::Value = serde_json::from_slice(&encoded)
+        .map_err(|error| format!("failed to decode backup metadata: {error}"))?;
+    let expected_size = metadata
+        .get("binary_size")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "backup metadata is missing binary_size".to_string())?;
+    let expected_sha256 = metadata
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            "backup metadata is missing sha256; refusing an unverifiable rollback snapshot"
+                .to_string()
+        })?;
+
+    let raw = fs::symlink_metadata(&snapshot.path)
+        .map_err(|error| format!("failed to inspect backup binary: {error}"))?;
+    if !raw.is_file() {
+        return Err(format!(
+            "backup binary is not a regular file: {}",
+            snapshot.path.display()
+        ));
+    }
+    if raw.len() != expected_size {
+        return Err(format!(
+            "backup binary size mismatch: expected {expected_size} bytes, found {}",
+            raw.len()
+        ));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut input = options
+        .open(&snapshot.path)
+        .map_err(|error| format!("failed to open backup binary: {error}"))?;
+    let opened = input
+        .metadata()
+        .map_err(|error| format!("failed to inspect open backup binary: {error}"))?;
+    if !opened.is_file() || opened.len() != expected_size {
+        return Err("backup binary changed while validating rollback snapshot".to_string());
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut observed_size = 0u64;
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to read backup binary: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        observed_size = observed_size
+            .checked_add(u64::try_from(count).map_err(|_| "backup size overflow".to_string())?)
+            .ok_or_else(|| "backup size overflow".to_string())?;
+        hasher.update(&buffer[..count]);
+    }
+    if observed_size != expected_size {
+        return Err(format!(
+            "backup binary size changed during verification: expected {expected_size} bytes, read {observed_size}"
+        ));
+    }
+    let observed_sha256 = hex_lower(hasher.finalize());
+    if observed_sha256 != expected_sha256 {
+        return Err(format!(
+            "backup binary SHA-256 mismatch for snapshot {}",
+            snapshot.id
+        ));
+    }
+    Ok(())
 }
 
 fn allocate_entry(store: &Path, now: Duration) -> Result<(String, PathBuf), String> {
@@ -91,8 +182,25 @@ fn write_snapshot(
         .create_new(true)
         .open(&partial)
         .map_err(|error| format!("failed to create partial backup: {error}"))?;
-    let binary_size = io::copy(&mut input, &mut output)
-        .map_err(|error| format!("failed to copy binary for backup: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut binary_size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to read binary for backup: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|error| format!("failed to copy binary for backup: {error}"))?;
+        binary_size = binary_size
+            .checked_add(u64::try_from(count).map_err(|_| "backup size overflow".to_string())?)
+            .ok_or_else(|| "backup size overflow".to_string())?;
+        hasher.update(&buffer[..count]);
+    }
+    let sha256 = hex_lower(hasher.finalize());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -110,6 +218,7 @@ fn write_snapshot(
         "version": version,
         "timestamp": timestamp,
         "binary_size": binary_size,
+        "sha256": sha256,
     });
     let encoded = serde_json::to_vec_pretty(&meta)
         .map_err(|error| format!("failed to encode backup metadata: {error}"))?;
