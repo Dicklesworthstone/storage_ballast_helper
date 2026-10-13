@@ -190,6 +190,46 @@ fn source_root_default_executor_still_reclaims_ordinary_non_repository_artifacts
     }
 }
 
+/// The release contract while #33 is report-only: an executor that was given
+/// no policy, with the daemon's declared roots (`quarantine_roots`), still
+/// reclaims under a root that has a Git work tree beneath it. Both the
+/// ordinary temp artifact beside the checkout and the untracked build output
+/// inside it go; refusing them is the fleet-wide reclaim stop that enforcing
+/// the policy as written would cause. If enforcement is switched back on by
+/// default, this is the test that must be changed on purpose.
+#[test]
+fn source_root_report_only_default_executor_reclaims_under_a_root_that_contains_a_repository() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let directory = scratch();
+        let checkout = directory.path().join("team/project");
+        fs::create_dir_all(&checkout).unwrap();
+        git(&checkout, &["init", "--initial-branch=main"]);
+        let beside = artifact(&directory.path().join("scratch/target"));
+        let inside = artifact(&checkout.join("target"));
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                require_identity: true,
+                check_open_files: false,
+                quarantine_roots: vec![directory.path().to_path_buf()],
+                mode,
+                ..DeletionConfig::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![beside.clone(), inside.clone()]);
+        let report = executor.execute(&plan, None);
+        assert_eq!(report.items_deleted, 2, "{report:?}");
+        assert_eq!(report.items_skipped, 0, "{report:?}");
+        assert!(report.skipped_by_reason.is_empty(), "{report:?}");
+        assert!(!beside.path.exists());
+        assert!(!inside.path.exists());
+        assert!(
+            checkout.join(".git").is_dir(),
+            "the repository is untouched"
+        );
+    }
+}
+
 #[test]
 fn source_root_default_executor_rechecks_after_the_live_guard() {
     for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {

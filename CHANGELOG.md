@@ -37,7 +37,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   while the scan was still in progress was vetoed or skipped, backed off, and
   its mount could sit idle for a whole rescan interval (90 s by default) with
   space to reclaim. sbh's own regular files and every other process's
-  handles still count (`add621c`, `4dfed72`).
+  handles still count. In a Linux container the reclaim end-to-end test that
+  hit this passed 6 of 6 runs with the fix against 4 of 6 and 5 of 6 without,
+  and the quarantine-drain test, which had failed in every container run,
+  passed 6 of 6 (`add621c`, `6725772`).
 - Linux: a watch-coverage rebuild whose worker is stuck in a kernel call (a
   hung network mount under a scan root) no longer leaves earlier coverage
   trusted indefinitely (#30). After 30 s the rebuild is treated as failed,
