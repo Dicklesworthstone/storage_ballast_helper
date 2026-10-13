@@ -6,6 +6,17 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Fixed — safety and reclaim under a hardened systemd unit
+
+- Every deletion failed with "Function not implemented (os error 38)" when the
+  sbh unit sets `RestrictSUIDSGID=`: systemd's seccomp filter for it returns
+  `ENOSYS` for `openat2()`, which sbh 0.7.x used, failing closed, to open each
+  directory without crossing a mount. The open now falls back to
+  `openat(O_NOFOLLOW)` and keeps the directory only when `statx` reports the
+  parent's own mount ID, so a bind mount is still refused; a kernel without
+  mount IDs still fails closed (`329e75f`). On trj and vmi1227854 no deletion
+  had succeeded since 0.7.1.
+
 ### Added
 
 - Optional absolute free-space floors per pressure level:
