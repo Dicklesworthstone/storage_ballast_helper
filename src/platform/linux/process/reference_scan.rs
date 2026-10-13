@@ -425,12 +425,101 @@ fn open_targets_with(
             add_target_spellings(&mut targets, cwd);
         }
     }
+    // So is the cargo home and target directory a live build names.
+    for (_, directory) in build_directories_with(proc, proc_root, limits) {
+        add_target_spellings(&mut targets, directory);
+    }
     let mut targets: Vec<_> = targets.into_iter().collect();
     targets.sort_unstable();
     // Failed/empty directory reads and final ordering belong to the same
     // cooperative budget. An expired observation cannot certify absence.
     sweep.expired();
     Ok((targets, sweep.complete))
+}
+
+/// Process names whose environment is read for build directories. `comm` is
+/// at most 15 bytes, which all of these fit.
+const BUILD_TOOL_COMMS: [&str; 5] = ["cargo", "rustc", "rustdoc", "clippy-driver", "cargo-clippy"];
+/// An environment larger than this is skipped, not truncated.
+const BUILD_ENVIRON_LIMIT: usize = 512 * 1024;
+
+pub(super) fn build_directories() -> Vec<(i32, PathBuf)> {
+    build_directories_with(&NativeProc, Path::new(PROC_ROOT), Limits::default())
+}
+
+/// Directories a running Rust build is using without necessarily holding
+/// anything open in them (bd-d1kt): `CARGO_HOME`'s cache subtrees and
+/// `CARGO_TARGET_DIR`, read from the environment of live cargo/rustc
+/// processes. rustc reads a source file and closes it, and compiles workspace
+/// crates from the workspace, so neither descriptors nor the working directory
+/// show that rch's shared cargo cache is in use; sbh deleted its `registry/`
+/// hundreds of times on the workers, under builds that then failed. Best
+/// effort: an unreadable process is skipped, never an error.
+fn build_directories_with(
+    proc: &impl ProcAccess,
+    proc_root: &Path,
+    limits: Limits,
+) -> Vec<(i32, PathBuf)> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let mut sweep = Sweep::new(proc, limits);
+    let Ok(pids) = sweep.pids(proc_root) else {
+        return Vec::new();
+    };
+    let own = i32::try_from(std::process::id()).ok();
+    let mut seen = std::collections::HashSet::new();
+    let mut directories = Vec::new();
+    for pid in pids {
+        if sweep.expired() {
+            break;
+        }
+        if Some(pid) == own {
+            continue;
+        }
+        let process = proc_root.join(pid.to_string());
+        let Ok(comm) = proc.read_bounded(&process.join("comm"), 64) else {
+            continue;
+        };
+        let comm = String::from_utf8_lossy(&comm);
+        if !BUILD_TOOL_COMMS.contains(&comm.trim_end()) {
+            continue;
+        }
+        let Ok(environ) = proc.read_bounded(&process.join("environ"), BUILD_ENVIRON_LIMIT) else {
+            continue;
+        };
+        for variable in environ.split(|byte| *byte == 0) {
+            let Some(split) = variable.iter().position(|byte| *byte == b'=') else {
+                continue;
+            };
+            let (name, value) = (&variable[..split], &variable[split + 1..]);
+            let directory = PathBuf::from(OsString::from_vec(value.to_vec()));
+            if !directory.is_absolute() {
+                continue;
+            }
+            let paths: Vec<PathBuf> = match name {
+                // A candidate is one of the cache subtrees cargo manages, or
+                // an ancestor of one (the cargo home itself, `registry`, `git`).
+                b"CARGO_HOME" => [
+                    "registry/index",
+                    "registry/cache",
+                    "registry/src",
+                    "git/db",
+                    "git/checkouts",
+                ]
+                .iter()
+                .map(|subtree| directory.join(subtree))
+                .collect(),
+                b"CARGO_TARGET_DIR" => vec![directory],
+                _ => continue,
+            };
+            for path in paths {
+                if seen.insert(path.clone()) {
+                    directories.push((pid, path));
+                }
+            }
+        }
+    }
+    directories
 }
 
 fn add_target_spellings(targets: &mut std::collections::HashSet<PathBuf>, target: PathBuf) {
@@ -1026,6 +1115,62 @@ mod tests {
             open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
         assert!(complete);
         assert_eq!(targets, vec![building]);
+    }
+
+    /// bd-d1kt: rch's shared cargo cache is named in every rustc's environment
+    /// and held open by none of them.
+    #[test]
+    fn a_live_build_names_its_cargo_home_and_target_directory() {
+        let fixture = Fixture::new();
+        let own = i32::try_from(std::process::id()).unwrap();
+        let home = fixture.root.join("rch-cargo-cache");
+        let target = fixture.root.join("pooled-target");
+        let environ = |home: &Path, target: &Path| {
+            format!(
+                "PATH=/usr/bin\0CARGO_HOME={}\0CARGO_TARGET_DIR={}\0RELATIVE=x\0",
+                home.display(),
+                target.display()
+            )
+        };
+        let tool = |pid: i32, comm: &str, env: &str| {
+            let process = fixture.pid(pid);
+            fs::write(process.join("comm"), format!("{comm}\n")).unwrap();
+            fs::write(process.join("environ"), env).unwrap();
+        };
+        let other = own.checked_add(1).unwrap();
+        tool(other, "rustc", &environ(&home, &target));
+        // Not a build tool, sbh itself, and a relative value: none count.
+        tool(
+            other + 1,
+            "bash",
+            &environ(&fixture.root.join("shell"), &target),
+        );
+        tool(
+            own,
+            "rustc",
+            &environ(&fixture.root.join("own"), &fixture.root.join("own-t")),
+        );
+        tool(other + 2, "cargo", "CARGO_HOME=relative/home\0");
+
+        let found = build_directories_with(&NativeProc, &fixture.proc_root, Limits::default());
+        let paths: Vec<_> = found.iter().map(|(_, path)| path.clone()).collect();
+        assert!(found.iter().all(|(pid, _)| *pid == other));
+        assert_eq!(
+            paths,
+            vec![
+                home.join("registry/index"),
+                home.join("registry/cache"),
+                home.join("registry/src"),
+                home.join("git/db"),
+                home.join("git/checkouts"),
+                target.clone(),
+            ]
+        );
+
+        let (targets, _) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(targets.contains(&home.join("registry/src")));
+        assert!(targets.contains(&target));
     }
 
     #[test]

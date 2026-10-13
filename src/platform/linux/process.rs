@@ -77,6 +77,10 @@ pub(super) fn read_executables_under(root: &Path) -> Result<ExecutablesResult> {
     reference_scan::executables(root)
 }
 
+pub(super) fn read_build_directories_in_use() -> Vec<(i32, PathBuf)> {
+    reference_scan::build_directories()
+}
+
 /// Return mappings only when the visible process scope was fully inspected.
 /// The Vec-returning PAL interface cannot carry partial coverage, so access
 /// failures, malformed data and budget exhaustion must remain explicit errors.

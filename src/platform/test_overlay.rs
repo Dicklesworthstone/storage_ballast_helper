@@ -348,6 +348,10 @@ impl Platform for TestOverlayPlatform {
         self.inner.open_files_under(path)
     }
 
+    fn build_directories_in_use(&self) -> Vec<(i32, std::path::PathBuf)> {
+        self.inner.build_directories_in_use()
+    }
+
     fn executables_under(&self, path: &Path) -> Result<ExecutablesResult> {
         self.inner.executables_under(path)
     }

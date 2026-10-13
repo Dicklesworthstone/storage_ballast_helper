@@ -1818,6 +1818,15 @@ pub fn collect_active_reference_index(
         Err(_) => index.complete = false,
     }
 
+    // The cargo home and target directory a live build names are in use for
+    // as long as it runs, whatever it holds open (bd-d1kt).
+    for (pid, directory) in platform.build_directories_in_use() {
+        let name = process_names.get(&pid).cloned();
+        index.add_reference(&roots, &directory, |summary| {
+            summary.add_build_directory(pid, name.clone());
+        });
+    }
+
     for root in &roots {
         match platform.open_files_under(root) {
             Ok(result) => {
@@ -2157,6 +2166,7 @@ mod tests {
         open_files: Vec<crate::platform::types::OpenFile>,
         executables: Vec<crate::platform::types::ProcessInfo>,
         mmap_regions: Vec<crate::platform::types::MappedRegion>,
+        build_directories: Vec<(i32, PathBuf)>,
         probe_calls: AtomicUsize,
     }
 
@@ -2213,6 +2223,10 @@ mod tests {
             Ok(crate::platform::types::OpenFilesResult::complete(
                 self.open_files.clone(),
             ))
+        }
+
+        fn build_directories_in_use(&self) -> Vec<(i32, PathBuf)> {
+            self.build_directories.clone()
         }
 
         fn executables_under(
@@ -2519,6 +2533,48 @@ mod tests {
             dir_entry.metadata.content_size_bytes,
             APPARENT
         );
+    }
+
+    /// bd-d1kt: every rustc on an rch worker names the shared cargo cache as
+    /// its CARGO_HOME and works from the workspace, holding nothing open in
+    /// the cache. sbh deleted that cache's registry/ under running builds.
+    #[test]
+    fn a_live_builds_cargo_home_and_target_are_active_references() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let home = root.join("rch-cargo-cache");
+        let target = root.join("pooled-target");
+        let idle = root.join("idle-cargo-home/registry");
+        for dir in [
+            &home.join("registry/src"),
+            &home.join("git/db"),
+            &target,
+            &idle,
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let platform = TestActiveRefPlatform {
+            processes: vec![process(42, "rustc", None)],
+            build_directories: vec![
+                (42, home.join("registry/src")),
+                (42, home.join("git/db")),
+                (42, target.clone()),
+            ],
+            ..Default::default()
+        };
+
+        let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
+        let resolve = |path: &Path| crate::core::paths::resolve_absolute_path(path);
+        for in_use in [&home.join("registry"), &home.join("git"), &home, &target] {
+            let summary = index.summary_for(&resolve(in_use));
+            assert!(!summary.is_empty(), "{}", in_use.display());
+            let reason = summary.safe_reclaim_reason().unwrap();
+            assert!(
+                reason.contains("pid 42 (rustc) has its cargo home or target directory here"),
+                "{reason}"
+            );
+        }
+        assert!(index.summary_for(&resolve(&idle)).is_empty());
     }
 
     /// sbh's own directory handles are its scanner mid-walk: a candidate must

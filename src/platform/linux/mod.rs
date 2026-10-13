@@ -170,6 +170,10 @@ impl Platform for LinuxPal {
         process::read_executables_under(path)
     }
 
+    fn build_directories_in_use(&self) -> Vec<(i32, std::path::PathBuf)> {
+        process::read_build_directories_in_use()
+    }
+
     fn mmap_regions_under(&self, path: &Path) -> Result<Vec<crate::platform::types::MappedRegion>> {
         process::read_mmap_regions_under(path)
     }

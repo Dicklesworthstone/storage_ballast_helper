@@ -179,6 +179,8 @@ pub struct ActiveReferenceProcess {
     pub mmap_regions: usize,
     /// The process's working directory is inside the tree (bd-d1kt).
     pub working_directory: bool,
+    /// The process names the tree as its cargo home or target directory.
+    pub build_directory: bool,
 }
 
 impl ActiveReferenceSummary {
@@ -206,6 +208,12 @@ impl ActiveReferenceSummary {
     /// only for as long as it reads it.
     pub fn add_working_directory(&mut self, pid: i32, name: Option<String>) {
         self.process_mut(pid, name).working_directory = true;
+    }
+
+    /// A running build names the tree as its cargo home or target directory
+    /// (bd-d1kt). It is in use for as long as that build runs.
+    pub fn add_build_directory(&mut self, pid: i32, name: Option<String>) {
+        self.process_mut(pid, name).build_directory = true;
     }
 
     pub fn mark_incomplete(&mut self, reason: impl Into<String>) {
@@ -257,6 +265,7 @@ impl ActiveReferenceSummary {
                 running_executable: false,
                 mmap_regions: 0,
                 working_directory: false,
+                build_directory: false,
             });
             self.processes.sort_by_key(|p| p.pid);
             self.processes
@@ -282,6 +291,7 @@ impl ActiveReferenceProcess {
             && !self.running_executable
             && self.mmap_regions == 0
             && !self.working_directory
+            && !self.build_directory
     }
 
     fn safe_reclaim_reason(&self) -> String {
@@ -306,6 +316,9 @@ impl ActiveReferenceProcess {
         }
         if self.working_directory {
             evidence.push("its working directory here".to_string());
+        }
+        if self.build_directory {
+            evidence.push("its cargo home or target directory here".to_string());
         }
         format!("{label} has {}", evidence.join(", "))
     }

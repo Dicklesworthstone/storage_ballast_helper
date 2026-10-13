@@ -338,6 +338,14 @@ pub trait Platform: Send + Sync {
         pal_not_implemented(self.name(), "mmap_regions_under")
     }
 
+    /// Directories a running build names as its own without necessarily
+    /// holding anything open in them: the cargo home's cache subtrees and the
+    /// target directory in a live cargo/rustc's environment (bd-d1kt). Each
+    /// entry is `(pid, path)`. Platforms that cannot tell report none.
+    fn build_directories_in_use(&self) -> Vec<(i32, PathBuf)> {
+        Vec::new()
+    }
+
     fn self_stats(&self) -> Result<SelfStats> {
         pal_not_implemented(self.name(), "self_stats")
     }
