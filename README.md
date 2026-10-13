@@ -163,13 +163,20 @@ sbh status
 
 `sbh install --auto` detects macOS, chooses launchd, installs a user-scoped
 LaunchAgent, uses native Application Support paths, and provisions the default
-ballast preset. Use system scope only when `sbh` must inspect system-wide paths
-or all users' process activity:
+ballast preset. A user-scoped sbh cannot see other users' processes (macOS
+hides them), so its open-file check is never complete and the scanner refuses
+every candidate it must walk or that is 100 MB or larger: it reclaims almost
+nothing, and only ballast release works fully. `sbh status` and
+`sbh doctor --system` report this. To reclaim build artifacts, register the
+daemon in system scope:
 
 ```bash
 sudo sbh install --launchd --scope system --auto
 sudo sbh doctor --pal
 ```
+
+Under root, `scanner.include_user_temp_dir` adds root's temporary directory,
+not yours: list your `$TMPDIR` in `scanner.root_paths` explicitly.
 
 Homebrew is supported by the packaged formula skeleton and the
 `Dicklesworthstone/homebrew-sbh` tap. Every release runs
