@@ -836,8 +836,11 @@ fn direct_pool(
     let fallback = fallback.ok_or_else(|| {
         "no running daemon and no pool settings; start sbh or use `sbh ballast release`".to_string()
     })?;
-    let mut manager = BallastManager::new(PathBuf::from(ballast_dir), fallback.config.clone())
-        .map_err(|err| format!("ballast pool {ballast_dir}: {err}"))?;
+    let mut manager = BallastManager::new(
+        crate::ballast::coordinator::resolve_configured_pool_alias(Path::new(ballast_dir)),
+        fallback.config.clone(),
+    )
+    .map_err(|err| format!("ballast pool {ballast_dir}: {err}"))?;
     manager.set_provision_floor(fallback.provision_floor_pct);
     Ok(manager)
 }

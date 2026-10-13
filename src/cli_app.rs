@@ -17,6 +17,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use storage_ballast_helper::ballast::coordinator::resolve_configured_pool_alias;
 use storage_ballast_helper::ballast::manager::{
     BallastAvailability, BallastHealth, BallastManager,
 };
@@ -6933,8 +6934,11 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
 
-    let mut manager = BallastManager::new(config.paths.ballast_dir.clone(), config.ballast.clone())
-        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let mut manager = BallastManager::new(
+        resolve_configured_pool_alias(&config.paths.ballast_dir),
+        config.ballast.clone(),
+    )
+    .map_err(|e| CliError::Runtime(e.to_string()))?;
     manager.set_provision_floor(config.ballast_provision_floor_pct());
 
     match &args.command {
@@ -8309,7 +8313,10 @@ fn quarantine_stuck_doctor_check(config: &Config) -> DoctorCheck {
 }
 
 fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
-    let availability = BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
+    let availability = BallastAvailability::observe(
+        &resolve_configured_pool_alias(&config.paths.ballast_dir),
+        &config.ballast,
+    );
     match availability.health {
         BallastHealth::Unconfigured => doctor_check(
             "ballast.reserve",
@@ -10376,7 +10383,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             }
 
             // Ballast info: configured pool vs actually releasable reserve (#16).
-            let ballast = BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
+            let ballast = BallastAvailability::observe(
+                &resolve_configured_pool_alias(&config.paths.ballast_dir),
+                &config.ballast,
+            );
             println!("\nBallast:");
             println!(
                 "  Configured: {} files x {}",
@@ -10447,8 +10457,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
         }
         OutputMode::Json => {
             // #16: actual ballast availability, not just configured totals.
-            let ballast_availability =
-                BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
+            let ballast_availability = BallastAvailability::observe(
+                &resolve_configured_pool_alias(&config.paths.ballast_dir),
+                &config.ballast,
+            );
             let mut mounts_json: Vec<Value> = Vec::new();
             let mut overall_level = "green";
 
@@ -14154,7 +14166,10 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 
     // Check 2.6 (#16): warn when a configured ballast reserve is not actually
     // releasable — the emergency reserve does not exist when it may be needed.
-    let ballast = BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
+    let ballast = BallastAvailability::observe(
+        &resolve_configured_pool_alias(&config.paths.ballast_dir),
+        &config.ballast,
+    );
     if output_mode(cli) == OutputMode::Human {
         if ballast.health == BallastHealth::Empty {
             eprintln!(
