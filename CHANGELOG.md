@@ -18,6 +18,19 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- sbh no longer deletes the cargo home of a running build (bd-d1kt). Under
+  Orange or higher pressure, the `registry/` and `git/` of a live cargo home
+  were reclaimed minutes after creation: on the rch workers the shared cargo
+  cache was deleted under running builds again and again (eleven times on
+  one host in a day), and the builds failed with their dependency sources
+  gone. Three causes are fixed:
+  - a directory recognised only by its `CACHEDIR.TAG` was given the minimum
+    age after two minutes of observation; it now has to be its real age;
+  - a process whose working directory is inside a tree now counts as using
+    it;
+  - on Linux, the `CARGO_HOME` and `CARGO_TARGET_DIR` in the environment of a
+    running cargo or rustc count as in use for as long as it runs.
+  `sbh explain` names the process and the reason (`53942a3`, `5a6f04a`).
 - sbh no longer treats a candidate as "open" because its own scanner was
   still walking it. The open-file sweep and the active-reference index
   counted sbh's own directory handles, so a candidate examined or dispatched
