@@ -5,11 +5,13 @@
 //! additionally requires the operator's explicit opt-in. No Git subprocess is
 //! used, so dubious ownership cannot silently change this policy.
 //!
-//! The shared policy is refreshed at startup, reload, scan admission and the
-//! final mutation boundary. A config replacement affects existing executor
-//! clones and queued candidates. It does not cancel a removal already admitted
-//! at its final authorization boundary. Filesystem probes are cooperatively
-//! bounded; an individual blocking filesystem syscall cannot be interrupted.
+//! Consumers must install the same policy in the scanner and executor, refresh
+//! it at scan admission, replace it on accepted config reload, and publish its
+//! snapshot as enforced state. Constructing a Config alone does not do this.
+//! A config replacement affects existing executor clones and queued candidates.
+//! It does not cancel a removal already admitted at its final authorization
+//! boundary. Filesystem probes are cooperatively bounded; an individual
+//! blocking filesystem syscall cannot be interrupted.
 
 use std::fs;
 use std::io;
@@ -65,7 +67,7 @@ pub struct SourceRootStatus {
     pub repositories: Vec<PathBuf>,
     /// Whether the root was proven clear, contains Git, or is unverified.
     pub finding: RootFinding,
-    /// Effective permission, not merely the presence of an opt-in.
+    /// Effective permission, including overlapping-root vetoes.
     pub reclaim_allowed: bool,
     /// Human-readable evidence, including the offending path or exhausted limit.
     pub detail: String,
@@ -88,7 +90,7 @@ impl SourceRootStatus {
     }
 }
 
-/// Serializable live state for `sbh status` and the daemon state file.
+/// Serializable policy evidence; only an installed policy is enforced state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SourceRootReport {
@@ -110,7 +112,9 @@ impl SourceRootReport {
             .collect()
     }
 
-    /// Configured roots eligible for scanner reclamation.
+    /// Configured roots eligible for scanner reclamation. The report already
+    /// includes deny-wins propagation, so a clear child cannot re-admit work
+    /// below a blocked parent through a second configured root.
     #[must_use]
     pub fn allowed_roots(&self) -> Vec<PathBuf> {
         self.roots
@@ -118,6 +122,39 @@ impl SourceRootReport {
             .filter(|root| root.reclaim_allowed)
             .map(|root| root.root.clone())
             .collect()
+    }
+
+    fn apply_overlap_denials(&mut self) {
+        // A newly denied parent may also overlap a different configured child.
+        // Iterate to a fixed point so root order cannot change admission. Every
+        // productive iteration revokes at least one root; none can re-enable it.
+        loop {
+            let blocked: Vec<_> = self
+                .roots
+                .iter()
+                .filter(|root| !root.reclaim_allowed)
+                .cloned()
+                .collect();
+            let mut changed = false;
+            for root in &mut self.roots {
+                if !root.reclaim_allowed {
+                    continue;
+                }
+                if let Some(denied) = blocked.iter().find(|denied| roots_overlap(root, denied)) {
+                    root.reclaim_allowed = false;
+                    root.detail = format!(
+                        "{}; blocked by overlapping scanner root {}: {}",
+                        root.detail,
+                        denied.root.display(),
+                        denied.detail
+                    );
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
     }
 }
 
@@ -128,15 +165,31 @@ struct Budget {
 }
 
 impl Budget {
-    fn step(&mut self) -> std::result::Result<(), &'static str> {
+    fn check_time(&self) -> std::result::Result<(), &'static str> {
         if self.start.elapsed() >= self.limits.time_budget {
             return Err("source-root inspection time budget exhausted");
         }
+        Ok(())
+    }
+
+    fn step(&mut self) -> std::result::Result<(), &'static str> {
+        self.check_time()?;
         if self.entries >= self.limits.max_entries {
             return Err("source-root inspection entry budget exhausted");
         }
         self.entries += 1;
         Ok(())
+    }
+
+    fn finish(
+        &self,
+        finding: Option<PathBuf>,
+    ) -> std::result::Result<Option<PathBuf>, String> {
+        // The last filesystem call (including read_dir's final next()) can
+        // outlive the last step. Never publish permission based on that stale
+        // deadline check. Completion itself does not consume an entry.
+        self.check_time()?;
+        Ok(finding)
     }
 }
 
@@ -190,7 +243,7 @@ fn inspect(
         if git_marker(ancestor)
             .map_err(|error| format!("cannot inspect {}: {error}", ancestor.display()))?
         {
-            return Ok(Some(ancestor.to_path_buf()));
+            return budget.finish(Some(ancestor.to_path_buf()));
         }
     }
 
@@ -205,7 +258,7 @@ fn inspect(
                 format!("cannot read entry in {}: {error}", directory.display())
             })?;
             if entry.file_name() == ".git" {
-                return Ok(Some(directory));
+                return budget.finish(Some(directory));
             }
             let path = entry.path();
             let kind = entry
@@ -229,7 +282,7 @@ fn inspect(
                 if git_marker(&path)
                     .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
                 {
-                    return Ok(Some(path));
+                    return budget.finish(Some(path));
                 }
                 if depth >= limits.max_depth {
                     return Err(format!(
@@ -241,7 +294,7 @@ fn inspect(
             }
         }
     }
-    Ok(None)
+    budget.finish(None)
 }
 
 /// Inspect a configured root without relying on candidate classification,
@@ -281,23 +334,26 @@ pub fn inspect_root(root: &Path, allow: bool, limits: InspectionLimits) -> Sourc
     }
 }
 
-/// Inspect all configured roots, retaining every root's diagnostic.
+/// Inspect all configured roots, retaining every root's diagnostic and applying
+/// the same overlapping-root vetoes used by final deletion authorization.
 #[must_use]
 pub fn inspect_roots(roots: &[PathBuf], allow: bool) -> SourceRootReport {
-    SourceRootReport {
+    let mut report = SourceRootReport {
         allow_source_tree_roots: allow,
         roots: roots
             .iter()
             .map(|root| inspect_root(root, allow, InspectionLimits::default()))
             .collect(),
-    }
+    };
+    report.apply_overlap_denials();
+    report
 }
 
 #[derive(Debug, Default)]
 struct PolicyState {
     report: SourceRootReport,
     // Old locations remain denied for queued candidates after removal or
-    // retargeting. A current matching root is evaluated under the new policy.
+    // retargeting. A current containing root is evaluated under the new policy.
     retired_paths: Vec<PathBuf>,
 }
 
@@ -331,6 +387,8 @@ impl PolicyState {
                 fresh.resolved_root.clone_from(&previous.resolved_root);
             }
         }
+        // Restored canonical locations may reveal another overlap.
+        report.apply_overlap_denials();
         self.report = report;
     }
 }
@@ -344,6 +402,24 @@ pub struct SourceRootPolicy {
 
 fn overlaps(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
+}
+
+fn roots_overlap(left: &SourceRootStatus, right: &SourceRootStatus) -> bool {
+    let lexical = match (absolute_lexical(&left.root), absolute_lexical(&right.root)) {
+        (Ok(left), Ok(right)) => overlaps(&left, &right),
+        // A spelling that cannot be normalized is not evidence of separation.
+        _ => true,
+    };
+    lexical
+        || left
+            .resolved_root
+            .as_ref()
+            .zip(right.resolved_root.as_ref())
+            .is_some_and(|(left, right)| overlaps(left, right))
+}
+
+fn strict_ancestor(ancestor: &Path, descendant: &Path) -> bool {
+    ancestor != descendant && descendant.starts_with(ancestor)
 }
 
 impl SourceRootPolicy {
@@ -384,6 +460,8 @@ impl SourceRootPolicy {
     /// Recheck the whole configured root, not merely the candidate's ancestors.
     /// A repository created in a sibling directory after startup thus blocks
     /// old queued candidates too. Overlapping roots obey deny-wins semantics.
+    /// Strict ancestors of a configured root are never admitted: permission for
+    /// a subtree is not permission to delete its parent and unrelated siblings.
     /// Paths outside current and retired configured roots are not governed by
     /// this policy (e.g. separately handled special locations and ballast).
     ///
@@ -392,10 +470,12 @@ impl SourceRootPolicy {
     pub fn authorize(&self, path: &Path) -> std::result::Result<(), String> {
         let lexical = absolute_lexical(path)
             .map_err(|error| format!("cannot resolve candidate {}: {error}", path.display()))?;
-        let canonical = fs::canonicalize(path)
-            .map_err(|error| format!("cannot resolve candidate {}: {error}", path.display()))?;
         let mut state = self.inner.lock();
         state.refresh();
+        // Resolve after the potentially slow root inspection rather than using
+        // a candidate alias observed before that inspection began.
+        let canonical = fs::canonicalize(path)
+            .map_err(|error| format!("cannot resolve candidate {}: {error}", path.display()))?;
         let mut matched = false;
         for root in &state.report.roots {
             let configured = absolute_lexical(&root.root).map_err(|error| {
@@ -410,6 +490,18 @@ impl SourceRootPolicy {
                 .as_ref()
                 .is_some_and(|resolved| overlaps(&canonical, resolved));
             if lexical_match || canonical_match {
+                if strict_ancestor(&lexical, &configured)
+                    || root
+                        .resolved_root
+                        .as_ref()
+                        .is_some_and(|resolved| strict_ancestor(&canonical, resolved))
+                {
+                    return Err(format!(
+                        "candidate {} contains configured scanner root {}; subtree permission does not authorize deleting an ancestor",
+                        path.display(),
+                        root.root.display()
+                    ));
+                }
                 matched = true;
                 if !root.reclaim_allowed {
                     return Err(root.diagnostic());
@@ -618,8 +710,9 @@ mod tests {
         let policy = SourceRootPolicy::new(&[dir.path().to_path_buf(), cache.clone()], false);
         assert!(policy.authorize(&cache).is_err());
         let report = policy.snapshot();
-        assert!(report.roots.iter().any(|root| root.reclaim_allowed));
-        assert!(report.roots.iter().any(|root| !root.reclaim_allowed));
+        assert!(report.roots.iter().all(|root| !root.reclaim_allowed));
+        assert!(report.allowed_roots().is_empty());
+        assert_eq!(report.failures().len(), 2);
     }
 
     #[test]
@@ -682,5 +775,95 @@ mod tests {
         );
         assert_eq!(report.failures().len(), 1);
         assert!(report.allowed_roots().is_empty());
+    }
+
+    #[test]
+    fn narrowing_roots_revokes_queued_ancestor_and_sibling_candidates() {
+        let dir = scratch();
+        let retained = dir.path().join("retained");
+        let sibling = dir.path().join("untracked-target");
+        mkdir(&retained);
+        mkdir(&sibling);
+        fs::write(sibling.join("evidence.txt"), b"keep").unwrap();
+        let policy = SourceRootPolicy::new(&[dir.path().to_path_buf()], false);
+        let queued = policy.clone();
+        assert!(queued.authorize(dir.path()).is_ok());
+        policy.replace(std::slice::from_ref(&retained), false);
+        assert!(queued.authorize(dir.path()).is_err());
+        assert!(queued.authorize(&sibling).is_err());
+        assert!(queued.authorize(&retained).is_ok());
+        assert_eq!(fs::read(sibling.join("evidence.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn opting_in_never_authorizes_an_ancestor_of_the_configured_root() {
+        let dir = scratch();
+        let root = dir.path().join("project/target");
+        mkdir(&root);
+        mkdir(&dir.path().join("project/.git"));
+        let policy = SourceRootPolicy::new(std::slice::from_ref(&root), true);
+        assert!(policy.authorize(&root).is_ok());
+        assert!(policy.authorize(dir.path()).is_err());
+        assert!(policy.authorize(&dir.path().join("project")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_alias_cannot_authorize_deleting_a_configured_roots_parent() {
+        use std::os::unix::fs::symlink;
+        let dir = scratch();
+        let aliases = scratch();
+        let root = dir.path().join("target");
+        mkdir(&root);
+        let alias = aliases.path().join("root");
+        symlink(&root, &alias).unwrap();
+        let policy = SourceRootPolicy::new(&[alias], false);
+        assert!(policy.authorize(&root).is_ok());
+        assert!(policy.authorize(dir.path()).is_err());
+    }
+
+    #[test]
+    fn overlapping_denials_reach_a_fixed_point_independent_of_root_order() {
+        let dir = scratch();
+        let cache = dir.path().join("cache");
+        let missing = dir.path().join("missing");
+        mkdir(&cache);
+        // The missing root vetoes the clear parent; that parent must then veto
+        // the disjoint child. Opt-in cannot override incomplete inspection.
+        for roots in [
+            vec![cache.clone(), dir.path().to_path_buf(), missing.clone()],
+            vec![missing, dir.path().to_path_buf(), cache],
+        ] {
+            let report = inspect_roots(&roots, true);
+            assert!(report.allowed_roots().is_empty());
+            assert_eq!(report.failures().len(), 3);
+        }
+    }
+
+    #[test]
+    fn final_deadline_check_refuses_clear_and_git_results_without_sleeping() {
+        let budget = Budget {
+            start: Instant::now(),
+            entries: 1,
+            limits: InspectionLimits {
+                time_budget: Duration::ZERO,
+                ..limits()
+            },
+        };
+        assert!(budget.finish(None).is_err());
+        assert!(budget.finish(Some(PathBuf::from("repository"))).is_err());
+    }
+
+    #[test]
+    fn finishing_a_complete_inspection_does_not_charge_an_extra_entry() {
+        let budget = Budget {
+            start: Instant::now(),
+            entries: 1,
+            limits: InspectionLimits {
+                max_entries: 1,
+                ..limits()
+            },
+        };
+        assert_eq!(budget.finish(None).unwrap(), None);
     }
 }
