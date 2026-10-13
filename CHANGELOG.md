@@ -8,6 +8,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- A host whose deletions reclaim nothing (dry-run, observe mode, or every
+  candidate failing, as under `RestrictSUIDSGID=` with 0.7.1) now backs off
+  its rescans (#36). The empty-pass streak never grew past one, so such a
+  host rescanned at the base interval for as long as it lasted (`fa3837e`).
 - A confident prediction that a mount is about to turn red gets its scan
   (bd-lihi). The prediction escalates the mount while it is still Green, so
   a Green maintenance walk already in flight could finish empty at the same
