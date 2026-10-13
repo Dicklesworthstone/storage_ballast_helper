@@ -12,6 +12,11 @@
 //! It does not cancel a removal already admitted at its final authorization
 //! boundary. Filesystem probes are cooperatively bounded; an individual
 //! blocking filesystem syscall cannot be interrupted.
+//!
+//! An uninstalled default policy still refuses candidates inside Git work
+//! trees. This candidate-level backstop is not whole-root enforcement: only
+//! installing every configured root can protect an untracked sibling of a
+//! repository elsewhere beneath that root.
 
 use std::fs;
 use std::io;
@@ -372,6 +377,9 @@ pub fn inspect_roots(roots: &[PathBuf], allow: bool) -> SourceRootReport {
 #[derive(Debug, Default)]
 struct PolicyState {
     report: SourceRootReport,
+    // An omitted policy is not an intentionally configured empty root set.
+    // Refreshing default state must not silently disable its Git backstop.
+    installed: bool,
     // Old locations remain denied for queued candidates after removal or
     // retargeting. A current containing root is evaluated under the new policy.
     retired_paths: Vec<PathBuf>,
@@ -407,6 +415,11 @@ impl PolicyState {
 
 /// Live policy shared by scanner, executor and monitor. Cloning shares state;
 /// it does not create a stale authorization snapshot.
+///
+/// `Default` has no configured-root scope, but still refuses candidates inside
+/// Git work trees. Use `new` or `replace` to install the full root-level policy,
+/// including any explicit opt-in. The backstop never infers that opt-in from
+/// an artifact's name, score, pressure, or an uninstalled Config object.
 #[derive(Debug, Clone, Default)]
 pub struct SourceRootPolicy {
     inner: Arc<Mutex<PolicyState>>,
@@ -434,6 +447,39 @@ fn strict_ancestor(ancestor: &Path, descendant: &Path) -> bool {
     ancestor != descendant && descendant.starts_with(ancestor)
 }
 
+/// A caller that forgot to install its policy must not silently reclaim
+/// untracked repository contents. Check canonical ancestors without a Git
+/// subprocess or a recursive tree walk. The ordinary candidate checks still
+/// own nested Git metadata and every other veto.
+fn authorize_without_config(path: &Path, mut budget: Budget) -> std::result::Result<(), String> {
+    budget.step()?;
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("cannot inspect candidate {}: {error}", path.display()))?;
+    let directory = if metadata.is_dir() {
+        path
+    } else {
+        // File candidates must start at their parent: probing file/.git
+        // would return ENOTDIR and incorrectly refuse every ordinary file.
+        path.parent()
+            .ok_or_else(|| format!("candidate {} has no parent", path.display()))?
+    };
+    for ancestor in directory.ancestors() {
+        budget.step()?;
+        if git_marker(ancestor)
+            .map_err(|error| format!("cannot inspect {}: {error}", ancestor.display()))?
+        {
+            return Err(format!(
+                "source-root policy is not installed; refusing content in Git work tree {}; \
+                 install the configured policy before permitting source-tree reclamation",
+                ancestor.display()
+            ));
+        }
+    }
+    // The last metadata lookup can outlive the last step's deadline check.
+    budget.check_time()?;
+    Ok(())
+}
+
 impl SourceRootPolicy {
     /// Inspect and install the initial configured-root policy.
     #[must_use]
@@ -441,6 +487,7 @@ impl SourceRootPolicy {
         Self {
             inner: Arc::new(Mutex::new(PolicyState {
                 report: inspect_roots(roots, allow),
+                installed: true,
                 retired_paths: Vec::new(),
             })),
         }
@@ -455,6 +502,7 @@ impl SourceRootPolicy {
         let mut report = inspect_roots(roots, allow);
         report.retain_unresolved_boundaries(&state.report);
         state.report = report;
+        state.installed = true;
     }
 
     /// Reinspect current roots (e.g. before a scan), publishing their new state.
@@ -478,10 +526,13 @@ impl SourceRootPolicy {
     /// a subtree is not permission to delete its parent and unrelated siblings.
     /// Paths outside current and retired configured roots are not governed by
     /// this policy (e.g. separately handled special locations and ballast).
+    /// With no policy installed at all, the canonical-ancestor Git backstop
+    /// applies instead; an empty snapshot alone is not unrestricted permission.
     ///
     /// Call at the final mutation boundary as well as during preflight. This
     /// check can only veto; opting in never replaces other candidate checks.
     pub fn authorize(&self, path: &Path) -> std::result::Result<(), String> {
+        let start = Instant::now();
         let lexical = absolute_lexical(path)
             .map_err(|error| format!("cannot resolve candidate {}: {error}", path.display()))?;
         let mut state = self.inner.lock();
@@ -490,6 +541,16 @@ impl SourceRootPolicy {
         // a candidate alias observed before that inspection began.
         let canonical = fs::canonicalize(path)
             .map_err(|error| format!("cannot resolve candidate {}: {error}", path.display()))?;
+        if !state.installed {
+            return authorize_without_config(
+                &canonical,
+                Budget {
+                    start,
+                    entries: 0,
+                    limits: InspectionLimits::default(),
+                },
+            );
+        }
         let mut matched = false;
         for root in &state.report.roots {
             let configured = absolute_lexical(&root.root).map_err(|error| {
@@ -568,6 +629,49 @@ mod tests {
             time_budget: Duration::from_secs(5),
             ..InspectionLimits::default()
         }
+    }
+
+    #[test]
+    fn uninstalled_backstop_fails_closed_when_its_budget_is_exhausted() {
+        let dir = scratch();
+        for limits in [
+            InspectionLimits {
+                max_entries: 0,
+                ..limits()
+            },
+            InspectionLimits {
+                time_budget: Duration::ZERO,
+                ..limits()
+            },
+        ] {
+            let budget = Budget {
+                start: Instant::now(),
+                entries: 0,
+                limits,
+            };
+            assert!(authorize_without_config(dir.path(), budget).is_err());
+        }
+    }
+
+    #[test]
+    fn refreshing_a_default_policy_does_not_mark_it_installed() {
+        let dir = scratch();
+        mkdir(&dir.path().join(".git"));
+        let target = dir.path().join("target");
+        mkdir(&target);
+        let policy = SourceRootPolicy::default();
+        let queued = policy.clone();
+        assert!(policy.refresh().roots.is_empty());
+        assert!(
+            queued
+                .authorize(&target)
+                .unwrap_err()
+                .contains("not installed")
+        );
+        policy.replace(&[dir.path().to_path_buf()], true);
+        assert!(queued.authorize(&target).is_ok());
+        policy.replace(&[dir.path().to_path_buf()], false);
+        assert!(queued.authorize(&target).is_err());
     }
 
     #[test]
