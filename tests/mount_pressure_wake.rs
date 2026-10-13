@@ -88,7 +88,7 @@ fn a_late_green_empty_pass_cannot_park_the_new_orange_scan() {
     let at = now + Duration::from_millis(500);
     assert!(controller.observe(tick(PressureLevel::Orange, at)).scan);
     assert_eq!(
-        controller.note_pass_at_level(PressureLevel::Green, 0, false, at),
+        controller.note_pass_at_level(PressureLevel::Green, false, 0, false, at),
         None,
         "Green did not examine the conditions that triggered Orange"
     );
@@ -99,13 +99,73 @@ fn a_late_green_empty_pass_cannot_park_the_new_orange_scan() {
 
     // Once Orange actually finishes empty, unchanged pressure must back off.
     assert_eq!(
-        controller.note_pass_at_level(PressureLevel::Orange, 0, false, at),
+        controller.note_pass_at_level(PressureLevel::Orange, false, 0, false, at),
         Some((MountState::Reclaim, MountState::Idle))
     );
     let deadline = controller.idle_until();
     assert!(!controller.observe(tick(PressureLevel::Orange, at)).scan);
     assert_eq!(controller.idle_until(), deadline);
     assert_eq!(controller.empty_passes(), 1);
+}
+
+/// A confident prediction that red is less than the action horizon away.
+fn predicted(now: Instant) -> MountTickInput {
+    MountTickInput {
+        seconds_to_red: Some(120.0),
+        prediction_confident: true,
+        ..tick(PressureLevel::Green, now)
+    }
+}
+
+/// bd-lihi: a confident prediction escalates at Green, so a late empty Green
+/// maintenance walk is level-equal to the prediction's own pass. Only a pass
+/// dispatched for the prediction may park the mount.
+#[test]
+fn a_late_green_maintenance_pass_cannot_park_a_prediction_triggered_reclaim() {
+    let now = Instant::now();
+    let mut controller = MountController::new(
+        PathBuf::from("/pressured"),
+        MountControllerConfig::default(),
+    );
+    controller.observe(tick(PressureLevel::Green, now));
+    assert_eq!(controller.state(), MountState::Maintain);
+
+    // The prediction turned confident while a maintenance walk was in flight.
+    let at = now + Duration::from_millis(500);
+    assert!(controller.observe(predicted(at)).scan);
+    assert_eq!(controller.state(), MountState::Reclaim);
+    assert_eq!(
+        controller.note_pass_at_level(PressureLevel::Green, true, 0, false, at),
+        None,
+        "the maintenance walk was not dispatched for the prediction"
+    );
+    assert_eq!(controller.state(), MountState::Reclaim);
+    assert_eq!(controller.empty_passes(), 0);
+    assert_eq!(controller.idle_until(), None);
+    assert!(controller.observe(predicted(at)).scan);
+
+    // The prediction's own pass finishing empty still parks it, and the
+    // unchanged prediction then backs off instead of rescanning every tick.
+    assert_eq!(
+        controller.note_pass_at_level(PressureLevel::Green, false, 0, false, at),
+        Some((MountState::Reclaim, MountState::Idle))
+    );
+    assert!(!controller.observe(predicted(at)).scan);
+    assert_eq!(controller.empty_passes(), 1);
+}
+
+#[test]
+fn a_background_pass_still_parks_a_mount_that_is_only_maintained() {
+    let now = Instant::now();
+    let mut controller =
+        MountController::new(PathBuf::from("/calm"), MountControllerConfig::default());
+    controller.observe(tick(PressureLevel::Green, now));
+    assert_eq!(controller.state(), MountState::Maintain);
+    assert_eq!(
+        controller.note_pass_at_level(PressureLevel::Green, true, 0, false, now),
+        Some((MountState::Maintain, MountState::Idle))
+    );
+    assert_eq!(controller.idle_reason(), Some(IdleReason::NothingToReclaim));
 }
 
 #[test]
@@ -115,13 +175,13 @@ fn a_late_yellow_empty_pass_does_not_consume_a_critical_wake() {
     let prior_empty_passes = controller.empty_passes();
     assert!(controller.observe(tick(PressureLevel::Critical, now)).scan);
     assert_eq!(
-        controller.note_pass_at_level(PressureLevel::Yellow, 0, false, now),
+        controller.note_pass_at_level(PressureLevel::Yellow, false, 0, false, now),
         None
     );
     assert_eq!(controller.empty_passes(), prior_empty_passes);
     assert_eq!(controller.idle_until(), None);
     assert!(controller.observe(tick(PressureLevel::Critical, now)).scan);
-    controller.note_pass_at_level(PressureLevel::Critical, 0, false, now);
+    controller.note_pass_at_level(PressureLevel::Critical, false, 0, false, now);
     assert!(!controller.observe(tick(PressureLevel::Critical, now)).scan);
     assert_eq!(controller.empty_passes(), prior_empty_passes + 1);
 }
@@ -134,13 +194,13 @@ fn attributed_scan_results_retain_positive_ballast_and_recovery_boundaries() {
     // An older positive result is still useful work, rather than an empty
     // verdict on a severity the pass never examined.
     assert_eq!(
-        controller.note_pass_at_level(PressureLevel::Green, 2, false, now),
+        controller.note_pass_at_level(PressureLevel::Green, false, 2, false, now),
         None
     );
     assert_eq!(controller.empty_passes(), 0);
     assert_eq!(controller.state(), MountState::Reclaim);
     assert_eq!(
-        controller.note_pass_at_level(PressureLevel::Orange, 0, true, now),
+        controller.note_pass_at_level(PressureLevel::Orange, false, 0, true, now),
         None
     );
     assert_eq!(controller.state(), MountState::Reclaim);
@@ -149,7 +209,7 @@ fn attributed_scan_results_retain_positive_ballast_and_recovery_boundaries() {
     recovery.recovery_needed = true;
     controller.observe(recovery);
     assert_eq!(
-        controller.note_pass_at_level(PressureLevel::Orange, 0, false, now),
+        controller.note_pass_at_level(PressureLevel::Orange, false, 0, false, now),
         None
     );
     assert_eq!(controller.state(), MountState::Recovery);
@@ -160,7 +220,7 @@ fn attributed_scan_results_retain_positive_ballast_and_recovery_boundaries() {
     assert!(controller.observe(recovered).scan);
     // A pass completed at greater severity is usable after pressure falls.
     assert_eq!(
-        controller.note_pass_at_level(PressureLevel::Critical, 0, false, now),
+        controller.note_pass_at_level(PressureLevel::Critical, false, 0, false, now),
         Some((MountState::Reclaim, MountState::Idle))
     );
 }

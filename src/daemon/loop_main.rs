@@ -883,6 +883,10 @@ enum WorkerReport {
         timed_out: bool,
         /// Pressure examined by this pass, before any newer monitor tick.
         pressure_level: PressureLevel,
+        /// A Green maintenance walk or an event-scoped pass: run on the
+        /// scanner's own schedule, not for any mount's pressure or prediction
+        /// (bd-lihi). Its empty result cannot park a mount in Reclaim.
+        background: bool,
     },
     /// Executor completed a deletion batch.
     DeletionCompleted {
@@ -4183,6 +4187,7 @@ impl MonitoringDaemon {
                         root_stats,
                         timed_out,
                         pressure_level,
+                        background,
                     } => {
                         self.summary_scans += 1;
                         if timed_out {
@@ -4208,7 +4213,12 @@ impl MonitoringDaemon {
                         // A completed (not timed-out) pass with nothing found
                         // on a mount parks that mount's controller in Idle.
                         if !timed_out {
-                            self.note_scan_pass_per_mount(&root_stats, pressure_level, now);
+                            self.note_scan_pass_per_mount(
+                                &root_stats,
+                                pressure_level,
+                                background,
+                                now,
+                            );
                         }
                     }
                     WorkerReport::DeletionCompleted {
@@ -5357,6 +5367,7 @@ impl MonitoringDaemon {
         &mut self,
         root_stats: &[RootScanResult],
         pressure_level: PressureLevel,
+        background: bool,
         now: Instant,
     ) {
         let mut found_by_mount: HashMap<PathBuf, usize> = HashMap::new();
@@ -5375,7 +5386,7 @@ impl MonitoringDaemon {
                 continue;
             };
             if let Some((from, to)) =
-                controller.note_pass_at_level(pressure_level, found, releasable, now)
+                controller.note_pass_at_level(pressure_level, background, found, releasable, now)
             {
                 let message = format!(
                     "mount {} {from} -> {to} (empty_passes={} rescan_in={}s idle_reason={})",
@@ -7289,6 +7300,7 @@ fn scanner_thread_main(
             inconclusive_empty_passes = 0;
         }
         let request_level = request.pressure_level;
+        let request_background = request.maintenance || request_from_events;
 
         // B6: skip this pressure-driven pass if recent passes dispatched
         // nothing reclaimable and the (backed-off) cooldown has not elapsed.
@@ -7560,6 +7572,7 @@ fn scanner_thread_main(
                 root_stats,
                 timed_out: false,
                 pressure_level: request.pressure_level,
+                background: request_background,
             });
             continue;
         }
@@ -7823,6 +7836,7 @@ fn scanner_thread_main(
                         root_stats,
                         timed_out: false,
                         pressure_level: request.pressure_level,
+                        background: request_background,
                     });
                     if held_by_certainty > 0 {
                         logger.send(ActivityEvent::Info {
@@ -8401,6 +8415,7 @@ fn scanner_thread_main(
                 root_stats,
                 timed_out: true,
                 pressure_level: request.pressure_level,
+                background: request_background,
             });
             eprintln!(
                 "[SBH-SCANNER] scan complete: {prescan_entries} entries, \
@@ -8504,6 +8519,7 @@ fn scanner_thread_main(
                 root_stats,
                 timed_out: false,
                 pressure_level: request.pressure_level,
+                background: request_background,
             });
             if held_by_certainty > 0 {
                 logger.send(ActivityEvent::Info {
@@ -9040,6 +9056,7 @@ fn scanner_thread_main(
             root_stats: root_stats_map.into_values().collect(),
             timed_out: scan_timed_out,
             pressure_level: request.pressure_level,
+            background: request_background,
         });
 
         // Flush remaining candidates in bounded batches.

@@ -522,14 +522,24 @@ impl MountController {
     /// An empty result from before an escalation cannot prove that the new
     /// pressure has nothing reclaimable. Keep that retry live; positive
     /// results still reset the streak, and same-level empty passes still pace.
+    ///
+    /// A `background` pass (a Green maintenance walk or an event-scoped pass)
+    /// ran on the scanner's own schedule, not for whatever put this mount in
+    /// Reclaim. A confident prediction escalates at Green, so the level alone
+    /// cannot tell a late maintenance result from the prediction's own pass:
+    /// an empty background result leaves a Reclaim mount live (bd-lihi). It
+    /// still parks a Maintain mount, as before.
     pub fn note_pass_at_level(
         &mut self,
         pass_level: PressureLevel,
+        background: bool,
         dispatchable_candidates: usize,
         releasable_ballast: bool,
         now: Instant,
     ) -> Option<(MountState, MountState)> {
-        if dispatchable_candidates == 0 && pass_level < self.level {
+        if dispatchable_candidates == 0
+            && (pass_level < self.level || (background && self.state == MountState::Reclaim))
+        {
             return None;
         }
         self.note_pass(dispatchable_candidates, releasable_ballast, now)
