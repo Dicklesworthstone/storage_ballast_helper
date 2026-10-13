@@ -6,8 +6,23 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Changed
+
+- #33 source-root detection is report-only in this release; enforcement is
+  pending a narrower definition. `sbh doctor` lists each scanner root with
+  any Git work tree found beneath it, or `unverified` when the bounded
+  inspection could not finish, and `sbh doctor <target>` and
+  `sbh config validate` print the same findings as warnings. They do not
+  change `valid` or the exit code, and nothing is refused: on real hosts every
+  temp root holds a checkout or exceeds the inspection budget.
+
 ### Fixed
 
+- Linux: a watch-coverage rebuild whose worker is stuck in a kernel call (a
+  hung network mount under a scan root) no longer leaves earlier coverage
+  trusted indefinitely (#30). After 30 s the rebuild is treated as failed,
+  every root is marked dirty and the index generation is bumped, and that
+  repeats every 30 s while the worker stays stuck (`d90bb12`).
 - The predictive rescue no longer releases ballast and cleans up on a mostly
   empty disk (#29). Its second, "corroborating" runway was the first forecast
   rescaled after the conformal correction had already shortened it. It is now

@@ -507,6 +507,9 @@ pub struct ScannerConfig {
     /// for both new and existing configurations. This does not bypass candidate
     /// vetoes and does not authorize roots whose inspection is inconclusive.
     /// Ballast management is independent of this scanner-only policy.
+    ///
+    /// Report-only in this release (#33): the policy is not enforced, so this
+    /// only clears the `doctor` / `config validate` warning for such roots.
     pub allow_source_tree_roots: bool,
     pub excluded_paths: Vec<PathBuf>,
     pub protected_paths: Vec<String>,
