@@ -21,6 +21,12 @@ Compare: [`v0.7.0...v0.7.1`](https://github.com/Dicklesworthstone/storage_ballas
 
 ### Changed
 
+- macOS: `sbh status` warns, and `sbh doctor --system` fails a
+  `reclaim.privilege` check, when the sbh that reclaims is not root. A
+  user-scope sbh there refuses every candidate it must walk and every
+  candidate of 100 MB or more, so almost nothing is reclaimed; that has been
+  so since before v0.7.0 and was not reported. The remedy is a system
+  LaunchDaemon: `sudo sbh install --launchd --scope system` (`01d8780`).
 - A deletion batch aborted because the open-file or process scan was
   incomplete is logged as `SBH-3005` and names its cause: no root, or a scan
   that could not read every process within its limits. It had been logged as
