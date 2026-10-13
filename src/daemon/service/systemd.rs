@@ -1,5 +1,8 @@
 //! systemd service integration.
 
+#[path = "systemd_load_state.rs"]
+mod load_state;
+
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -557,11 +560,7 @@ impl ServiceManager for SystemdServiceManager {
     }
 
     fn is_loaded(&self) -> Result<bool> {
-        let state = self.run_systemctl_lenient(&["is-enabled", SYSTEMD_UNIT_NAME]);
-        Ok(matches!(
-            state.as_str(),
-            "enabled" | "static" | "linked" | "generated" | "transient"
-        ))
+        load_state::is_loaded(self.config.user_scope, &self.config.unit_path())
     }
 }
 

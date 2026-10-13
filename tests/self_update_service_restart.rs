@@ -21,10 +21,32 @@ printf '%s\n' "$*" >> "$SBH_TEST_SYSTEMCTL_LOG"
 readlink "/proc/$PPID/exe" >> "$SBH_TEST_UPDATER_EXE"
 if [ "${1-}" = --user ]; then shift; fi
 case "${1-}" in
-    is-enabled)
+    show)
+        [ "$*" = 'show sbh.service --property=LoadState --value' ]
+        [ "${LC_ALL-}" = C ]
         case "$SBH_TEST_SERVICE_STATE" in
-            unloaded) printf 'disabled\n'; exit 1 ;;
-            no-manager) printf 'System has not been booted with systemd\n' >&2; exit 1 ;;
+            unloaded) printf 'not-found\n' ;;
+            unloaded-exit-four) printf 'not-found\n'; exit 4 ;;
+            no-manager)
+                printf '%s\n' "System has not been booted with systemd as init system (PID 1). Can't operate." >&2
+                printf 'Failed to connect to bus: Host is down\n' >&2
+                exit 1
+                ;;
+            query-failure) printf 'fixture state query denied\n' >&2; exit 23 ;;
+            bus-failure) printf 'Failed to connect to bus: Permission denied\n' >&2; exit 1 ;;
+            bus-disconnected) printf 'Failed to connect to bus: Host is down\n' >&2; exit 1 ;;
+            masked) printf 'masked\n' ;;
+            bad-setting) printf 'bad-setting\n' ;;
+            empty-response) : ;;
+            unknown-response) printf 'future-load-state\n' ;;
+            *) printf 'loaded\n' ;;
+        esac
+        ;;
+    is-enabled)
+        # A service can run without boot-time enablement. This branch ensures
+        # reverting to the old command fails the loaded-disabled regression.
+        case "$SBH_TEST_SERVICE_STATE" in
+            loaded-disabled|unloaded|unloaded-exit-four) printf 'disabled\n'; exit 1 ;;
             *) printf 'enabled\n' ;;
         esac
         ;;
@@ -174,6 +196,7 @@ impl Fixture {
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env_remove("SBH_CONFIG")
             .env_remove("SBH_CONFIG_PATH")
+            .env("LC_ALL", "C.UTF-8")
             .env("PATH", &self.path)
             .env("SBH_TEST_SERVICE_STATE", service_state)
             .env("SBH_TEST_SERVICE_BINARY", &self.binary)
@@ -300,5 +323,56 @@ fn check_dry_run_and_up_to_date_do_not_restart_or_replace() {
         assert!(report["service_restart"].is_null());
         assert_eq!(sha256(&fixture.binary), original_sha);
         assert!(!fixture.calls.exists());
+    }
+}
+
+#[test]
+fn running_but_disabled_service_is_restarted_after_update() {
+    let fixture = Fixture::new("custom destination/sbh");
+    let output = fixture.run("loaded-disabled", &["--force", "--user"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = fixture.assert_applied(&output, "restarted");
+    assert_eq!(report["success"], true);
+    let calls = fs::read_to_string(&fixture.calls).unwrap();
+    assert!(calls.contains("--user show sbh.service --property=LoadState --value"));
+    assert!(calls.contains("--user restart sbh.service"));
+    assert!(!calls.contains("is-enabled"));
+    assert_eq!(fs::read_to_string(&fixture.versions).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn absent_user_units_are_successful_with_either_unknown_unit_exit_code() {
+    for state in ["unloaded", "unloaded-exit-four"] {
+        let fixture = Fixture::new("home/.local/bin/sbh");
+        let output = fixture.run(state, &["--force", "--user"]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let report = fixture.assert_applied(&output, "skipped");
+        assert_eq!(report["success"], true);
+        assert_eq!(report["service_restart"]["scope"], "user");
+        assert!(!fixture.versions.exists());
+    }
+}
+
+#[test]
+fn inspection_failures_never_report_a_successful_skipped_update() {
+    for (state, diagnostic) in [
+        ("query-failure", "fixture state query denied"),
+        ("bus-failure", "Permission denied"),
+        ("bus-disconnected", "Host is down"),
+        ("masked", "LoadState=masked"),
+        ("bad-setting", "LoadState=bad-setting"),
+        ("empty-response", "unexpected LoadState"),
+        ("unknown-response", "future-load-state"),
+    ] {
+        let fixture = Fixture::new("opt/sbhprev/sbh");
+        let output = fixture.run(state, &["--force", "--user"]);
+        assert_eq!(output.status.code(), Some(2), "{state}: {output:?}");
+        let report = fixture.assert_applied(&output, "failed");
+        assert_eq!(report["success"], false);
+        let error = report["service_restart"]["error"].as_str().unwrap();
+        assert!(error.contains(diagnostic), "{state}: {error}");
+        let calls = fs::read_to_string(&fixture.calls).unwrap();
+        assert!(!calls.contains("restart"), "{state}: {calls}");
+        assert!(!fixture.versions.exists());
     }
 }
