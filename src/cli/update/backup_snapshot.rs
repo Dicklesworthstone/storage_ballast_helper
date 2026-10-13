@@ -90,7 +90,7 @@ pub(super) fn verify_staged(snapshot: &BackupSnapshot, candidate: &Path) -> Resu
     }
 
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     let mut observed_size = 0u64;
     loop {
         let count = input
@@ -184,7 +184,7 @@ fn write_snapshot(
         .map_err(|error| format!("failed to create partial backup: {error}"))?;
     let mut hasher = Sha256::new();
     let mut binary_size = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let count = input
             .read(&mut buffer)
