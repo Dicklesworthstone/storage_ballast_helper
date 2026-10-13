@@ -81,7 +81,11 @@ struct Assessment {
 impl Assessment {
     fn from_config(diagnostic: Diagnostic, config: &Config) -> Self {
         let report = config.source_root_report();
-        let warnings = report.failures();
+        let warnings = report
+            .failures()
+            .iter()
+            .map(|w| report_only(w))
+            .collect::<Vec<_>>();
         Self {
             command: diagnostic.command(),
             status: if warnings.is_empty() { "ok" } else { "warn" },
@@ -132,7 +136,7 @@ impl Assessment {
         )?;
         if let Some(report) = &self.source_roots {
             for root in &report.roots {
-                writeln!(output, "  {}", root.diagnostic())?;
+                writeln!(output, "  {}", report_only(&root.diagnostic()))?;
             }
         } else {
             for error in &self.errors {
@@ -162,6 +166,16 @@ impl Assessment {
         }
         Ok(())
     }
+}
+
+/// The policy's diagnostics say "BLOCKED"; while it is report-only, say what
+/// is true.
+fn report_only(diagnostic: &str) -> String {
+    diagnostic.replacen(
+        "reclaim BLOCKED",
+        "reclaim would be blocked once enforced",
+        1,
+    )
 }
 
 const REPORT_ONLY_NOTE: &str = "source-root detection is report-only in this release: \
@@ -275,11 +289,14 @@ mod tests {
         assert!(text.contains("team/repository"));
         assert!(text.contains("scanner.allow_source_tree_roots = true"));
         assert!(text.contains("report-only in this release"));
+        assert!(text.contains("reclaim would be blocked once enforced"));
+        assert!(!text.contains("BLOCKED"));
         let mut stderr = Vec::new();
         assessment.warn(&mut stderr).unwrap();
         let stderr = String::from_utf8(stderr).unwrap();
         assert_eq!(stderr.matches("sbh: warning: ").count(), 3);
         assert!(stderr.contains("team/repository"));
+        assert!(!stderr.contains("BLOCKED"));
     }
 
     #[test]
