@@ -433,6 +433,8 @@ impl BackupStore {
             });
         }
 
+        backup_snapshot::verify(snap)
+            .map_err(|error| format!("rollback snapshot verification failed: {error}"))?;
         binary_install::install_with_validation(&snap.path, install_path, |_| Ok(()))
             .map_err(|error| format!("failed to restore backup: {error}"))?;
 
@@ -2435,13 +2437,15 @@ mod tests {
             let ed = store.dir().join(id);
             std::fs::create_dir_all(&ed).unwrap();
             std::fs::write(ed.join("sbh"), content).unwrap();
+            let sha256 = hex_lower(Sha256::digest(content));
             std::fs::write(
                 ed.join("backup.json"),
                 format!(
-                    r#"{{"version":"{}","timestamp":{},"binary_size":{}}}"#,
+                    r#"{{"version":"{}","timestamp":{},"binary_size":{},"sha256":"{}"}}"#,
                     ver,
                     id,
-                    content.len()
+                    content.len(),
+                    sha256
                 ),
             )
             .unwrap();
