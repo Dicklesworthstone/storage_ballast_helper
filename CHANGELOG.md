@@ -8,6 +8,10 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- Linux: a damaged ballast slot is repaired where a seccomp filter blocks
+  `openat2`, as systemd's `RestrictSUIDSGID=` does (#28). Repair now falls
+  back the way confined deletion has since v0.7.2: `openat` plus a mount-ID
+  check, which still refuses a file bind-mounted onto the slot (`864adf2`).
 - A host whose deletions reclaim nothing (dry-run, observe mode, or every
   candidate failing, as under `RestrictSUIDSGID=` with 0.7.1) now backs off
   its rescans (#36). The empty-pass streak never grew past one, so such a
