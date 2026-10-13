@@ -5,7 +5,8 @@ mod update_target;
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use crate::core::errors::{Result, SbhError};
 
@@ -21,12 +22,12 @@ pub(super) fn is_loaded(user_scope: bool, unit_path: &Path) -> Result<bool> {
             .into_iter()
             .map(str::to_string),
     );
-    let output = match Command::new("systemctl")
-        .args(&args)
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .output()
-    {
+    let output = match query_output(
+        Command::new("systemctl")
+            .args(&args)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null()),
+    ) {
         Ok(output) => output,
         Err(source) => {
             // A minimal container may lack both systemctl and systemd. Missing
@@ -68,6 +69,143 @@ pub(super) fn is_loaded(user_scope: bool, unit_path: &Path) -> Result<bool> {
         update_target::verify(user_scope, installed)?;
     }
     Ok(loaded)
+}
+
+// These are read-only queries, not the restart job (whose service-defined
+// startup/stop timeouts must remain intact). Bound the client process itself:
+// busctl's D-Bus timeout does not bound a stuck client or inherited output FDs.
+pub(super) fn query_output(command: &mut Command) -> io::Result<Output> {
+    query_output_with_limits(command, Duration::from_secs(5), 1024 * 1024)
+}
+
+#[cfg(unix)]
+fn query_output_with_limits(
+    command: &mut Command,
+    timeout: Duration,
+    max_output: usize,
+) -> io::Result<Output> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt as _;
+    use std::time::Instant;
+
+    // Separate sockets let us drain both streams without reader threads, disk
+    // writes or unsafe fcntl calls. The child's endpoints remain blocking.
+    let (mut stdout, stdout_writer) = UnixStream::pair()?;
+    let (mut stderr, stderr_writer) = UnixStream::pair()?;
+    stdout.set_nonblocking(true)?;
+    stderr.set_nonblocking(true)?;
+    let started = Instant::now();
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(stdout_writer)))
+        .stderr(Stdio::from(OwnedFd::from(stderr_writer)))
+        .process_group(0)
+        .spawn();
+    // Command retains explicitly supplied FDs after spawn. Close those parent
+    // copies even on spawn failure, or our own readers would never see EOF.
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = QueryChild {
+        child: child?,
+        reaped: false,
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut remaining = max_output;
+    loop {
+        drain_query_stream(&mut stdout, &mut out, &mut remaining)?;
+        drain_query_stream(&mut stderr, &mut err, &mut remaining)?;
+        if let Some(status) = child.child.try_wait()? {
+            child.reaped = true;
+            // Catch bytes written between the first drain and process exit.
+            // Never block on a descendant that inherited a writer. A partial
+            // response cannot establish that a unit is absent or safe to run.
+            let out_closed = drain_query_stream(&mut stdout, &mut out, &mut remaining)?;
+            let err_closed = drain_query_stream(&mut stderr, &mut err, &mut remaining)?;
+            if !out_closed || !err_closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "service query exited without closing its output; refusing a partial response",
+                ));
+            }
+            return Ok(Output {
+                status,
+                stdout: out,
+                stderr: err,
+            });
+        }
+        let Some(left) = timeout.checked_sub(started.elapsed()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("service query exceeded its {timeout:?} deadline"),
+            ));
+        };
+        std::thread::sleep(left.min(Duration::from_millis(5)));
+    }
+}
+
+#[cfg(not(unix))]
+fn query_output_with_limits(
+    _command: &mut Command,
+    _timeout: Duration,
+    _max_output: usize,
+) -> io::Result<Output> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "systemd service queries require a Unix host",
+    ))
+}
+
+#[cfg(unix)]
+fn drain_query_stream(
+    stream: &mut impl io::Read,
+    output: &mut Vec<u8>,
+    remaining: &mut usize,
+) -> io::Result<bool> {
+    let mut buffer = [0u8; 4096];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(count) => {
+                *remaining = remaining.checked_sub(count).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "service query exceeded its combined stdout/stderr byte limit",
+                    )
+                })?;
+                output.extend_from_slice(&buffer[..count]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct QueryChild {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+#[cfg(unix)]
+impl Drop for QueryChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // The unreaped leader pins this private process-group ID. Never
+            // signal a group after reaping: its ID could already be reused.
+            if let Ok(pid) = i32::try_from(self.child.id())
+                && pid > 0
+            {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 fn missing_client_means_no_manager(
@@ -190,8 +328,124 @@ mod tests {
             (io::ErrorKind::NotFound, true, true),
             (io::ErrorKind::PermissionDenied, false, true),
             (io::ErrorKind::Other, false, true),
+            (io::ErrorKind::TimedOut, false, true),
+            (io::ErrorKind::InvalidData, false, true),
+            (io::ErrorKind::UnexpectedEof, false, true),
         ] {
             assert!(!missing_client_means_no_manager(error, user_scope, absent));
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod query_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[test]
+    fn query_preserves_both_streams_exit_code_and_null_stdin() {
+        let output = query_output(&mut shell(
+            "if read -r line; then exit 99; fi; printf 'loaded\\n'; printf 'diagnostic\\n' >&2; exit 7",
+        ))
+        .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"loaded\n");
+        assert_eq!(output.stderr, b"diagnostic\n");
+    }
+
+    #[test]
+    fn both_streams_are_drained_above_pipe_capacity() {
+        let output = query_output(&mut shell(
+            "head -c 262144 /dev/zero; head -c 262144 /dev/zero >&2",
+        ))
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, vec![0; 262144]);
+        assert_eq!(output.stderr, vec![0; 262144]);
+    }
+
+    #[test]
+    fn combined_output_limit_is_enforced_even_on_successful_exit() {
+        let error = query_output_with_limits(
+            &mut shell("printf '12345'; printf '67890' >&2"),
+            Duration::from_secs(5),
+            9,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let output = query_output_with_limits(
+            &mut shell("printf '12345'; printf '67890' >&2"),
+            Duration::from_secs(5),
+            10,
+        )
+        .unwrap();
+        assert_eq!(output.stdout.len() + output.stderr.len(), 10);
+    }
+
+    #[test]
+    fn continuously_writing_query_is_stopped_at_the_byte_limit() {
+        let started = Instant::now();
+        let error = query_output_with_limits(
+            &mut shell("while :; do printf '0123456789abcdef'; done"),
+            Duration::from_secs(5),
+            1024,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stalled_query_is_killed_and_reaped_at_the_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pid");
+        let mut command = shell("printf '%s' $$ > \"$1\"; exec sleep 30");
+        command.arg("query-test").arg(&pid_file);
+        let started = Instant::now();
+        let error = query_output_with_limits(&mut command, Duration::from_secs(1), 1024)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(
+            nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ECHILD),
+            "timed-out client must already have been reaped"
+        );
+    }
+
+    #[test]
+    fn missing_client_error_is_not_reclassified() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = query_output(&mut Command::new(temp.path().join("missing-systemctl")))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn inherited_writer_cannot_block_or_authorize_a_partial_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let release = temp.path().join("release-writer");
+        // Release the descendant by a fixture file, never by signalling a PID
+        // that may have been reaped/reused. The loop also expires on test failure.
+        let mut command = shell(
+            "(i=0; while [ ! -e \"$1\" ] && [ \"$i\" -lt 100 ]; do i=$((i+1)); sleep 0.1; done) & printf 'not-found\\n'; exit 0",
+        );
+        command.arg("query-test").arg(&release);
+        let started = Instant::now();
+        let result = query_output_with_limits(&mut command, Duration::from_secs(5), 1024);
+        std::fs::write(release, b"done").unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
