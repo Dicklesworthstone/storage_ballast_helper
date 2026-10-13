@@ -2172,6 +2172,8 @@ Every command's error goes through one mapping (C-EXIT). `--json` reports carry 
 
 All errors implement `code()` for the stable string code, `is_retryable()` to indicate whether retry might help, and standard `Display` formatting with the code prefix.
 
+Two more codes appear only in the activity log and are not `SbhError` variants: `SBH-3004` (warning: the daemon exceeded its CPU budget) and `SBH-3005` (error: the open-file or process scan was incomplete, so the deletion batch was aborted; an sbh without root gets this on every batch on Linux).
+
 ## Testing
 
 ```bash
