@@ -1818,7 +1818,6 @@ fn prescan_timeouts_on_a_busy_root_are_paced_by_the_rescan_interval() {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = {
         let stop = std::sync::Arc::clone(&stop);
-        let root = root.clone();
         std::thread::spawn(move || {
             let mut n = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {

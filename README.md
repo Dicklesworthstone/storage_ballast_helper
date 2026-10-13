@@ -924,6 +924,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_PRESSURE_ORANGE_MIN_FREE_PCT` | config override | `pressure.orange_min_free_pct` |
 | `SBH_PRESSURE_RED_MIN_FREE_PCT` | config override | `pressure.red_min_free_pct` |
 | `SBH_PRESSURE_BEHAVIOR_HYSTERESIS_SECS` | config override | `pressure.behavior_hysteresis_secs` |
+| `SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS` | config override | `scanner.allow_source_tree_roots` (opt in to scan roots that contain Git work trees) |
 | `SBH_SCANNER_ENGINE` | config override | `scanner.engine` |
 | `SBH_SCANNER_EVENT_SOURCE` | config override | `scanner.event_source` |
 | `SBH_SCANNER_EVENT_WATCH_BUDGET` | config override | `scanner.event_watch_budget` |
@@ -981,6 +982,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_TEST_FS_STATS` | test | Injected per-mount filesystem statistics table (test mode) |
 | `SBH_ARTIFACT_DIR` | test | Where the dashboard e2e artifact bundles are written |
 | `SBH_TUI_ARTIFACT_DIR` | test | Where the TUI test artifacts are written |
+| `SBH_EXECUTABLE_REPLACEMENT_PROBE` | test | Binary the Linux self-replacement test rewrites in place to check the service restart path (#35) |
 | `SBH_TUI_ARTIFACT_FRAMES` | test | Include rendered frame text in the TUI test artifacts |
 <!-- sbh-docs:end -->
 

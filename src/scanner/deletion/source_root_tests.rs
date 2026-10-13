@@ -10,18 +10,19 @@ fn scratch() -> tempfile::TempDir {
         PathBuf::from("/tmp"),
         PathBuf::from("/var/tmp"),
     ] {
-        if base.is_dir() && !is_hardcoded_source_tree(&base) {
-            if let Ok(dir) = tempfile::tempdir_in(base) {
-                // A test runner may redirect TMPDIR into its checkout. An
-                // ancestor repository would invalidate a clear-root fixture.
-                if !dir
-                    .path()
-                    .ancestors()
-                    .skip(1)
-                    .any(|p| p.join(".git").exists())
-                {
-                    return dir;
-                }
+        if base.is_dir()
+            && !is_hardcoded_source_tree(&base)
+            && let Ok(dir) = tempfile::tempdir_in(base)
+        {
+            // A test runner may redirect TMPDIR into its checkout. An
+            // ancestor repository would invalidate a clear-root fixture.
+            if !dir
+                .path()
+                .ancestors()
+                .skip(1)
+                .any(|p| p.join(".git").exists())
+            {
+                return dir;
             }
         }
     }

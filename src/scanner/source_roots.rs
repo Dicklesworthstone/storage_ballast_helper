@@ -428,12 +428,13 @@ impl SourceRootPolicy {
                 }
             }
         }
-        if !matched
+        let retired = !matched
             && state
                 .retired_paths
                 .iter()
-                .any(|root| overlaps(&lexical, root) || overlaps(&canonical, root))
-        {
+                .any(|root| overlaps(&lexical, root) || overlaps(&canonical, root));
+        drop(state);
+        if retired {
             return Err(format!(
                 "candidate {} belongs to a removed or retargeted scanner root",
                 path.display()
@@ -643,7 +644,7 @@ mod tests {
         mkdir(&target);
         let alias = dir.path().join("alias");
         symlink(&root, &alias).unwrap();
-        let policy = SourceRootPolicy::new(&[alias.clone()], false);
+        let policy = SourceRootPolicy::new(std::slice::from_ref(&alias), false);
         assert!(policy.authorize(&target).is_err());
         assert!(policy.authorize(&alias.join("target")).is_err());
     }
