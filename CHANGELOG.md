@@ -4,6 +4,27 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
+## Unreleased
+
+### Fixed
+
+- macOS: the launchd daemon runs at `ProcessType=Standard`, `Nice=5` instead
+  of `Background`, `Nice=19`. macOS schedules by priority rather than by
+  share, so under a saturated CPU a background or Nice 19 daemon got no time
+  at all: on a Mac at load ~700 sbh wrote no state for 40 minutes and a
+  four-entry scan took over half an hour. sbh's CPU budget and scan duty
+  cycle still bound what it takes. Reinstall the service
+  (`sudo sbh install --launchd --scope system`) to pick it up.
+- A mount that is idle at Yellow with nothing left to reclaim now rebuilds
+  its emptied ballast reserve (bd-7spb). Replenishing had waited for Green,
+  which a large volume running hot may not see for days; provisioning still
+  keeps free space above the Orange floor, so a refill cannot itself
+  trigger a release.
+- Linux: `sbh update` restarts the service with the new binary when sbh runs
+  from outside `/usr/local/bin` and `/usr/bin` (for example `~/.local/bin`).
+  It had applied the update, then exited 2 with "could not locate sbh
+  binary" and left the service on the old binary (#35).
+
 ## v0.7.2 **[release]**
 
 Compare: [`v0.7.1...v0.7.2`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.1...v0.7.2)
