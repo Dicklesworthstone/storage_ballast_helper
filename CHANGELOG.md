@@ -6,6 +6,30 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.7.1 **[release]**
+
+Compare: [`v0.7.0...v0.7.1`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.0...v0.7.1)
+
+### Fixed — safety: tracked Git content on case-insensitive filesystems
+
+- Tracked Git content is matched without regard to case. On a
+  case-insensitive filesystem (the macOS default) a tracked directory whose
+  on-disk case differs from the Git index, such as a tracked `Build/` renamed
+  to `build/`, read as untracked, so the tracked-content veto did not protect
+  it. On a case-sensitive filesystem this can keep an untracked `build/`
+  beside a tracked `Build/`, which errs toward keeping (`1100bad`).
+
+### Changed
+
+- A deletion batch aborted because the open-file or process scan was
+  incomplete is logged as `SBH-3005` and names its cause: no root, or a scan
+  that could not read every process within its limits. It had been logged as
+  `SBH-3003`, which the catalog gives to a closed daemon channel (`c82411e`;
+  issue #27).
+- `[profile.release]` says `opt-level = 3`. v0.7.0's binaries were already
+  built that way through an environment override; the profile had still said
+  `"z"` (`1d2b3da`).
+
 ## v0.7.0 **[release]**
 
 Compare: [`v0.6.24...v0.7.0`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.24...v0.7.0)
