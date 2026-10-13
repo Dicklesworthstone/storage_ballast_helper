@@ -8931,6 +8931,23 @@ fn scanner_thread_main(
                 );
             }
 
+            // A walked (not opaque-measured) directory carries only its
+            // immediate files' size. Measure one that is about to be recorded
+            // and dispatched, as the pre-scan does (bd-3rlm): on hz2 two such
+            // candidates, 4 KiB each on paper, freed 2.5 GB, and a byte target
+            // counted in paper bytes is never met, so the pass kept choosing.
+            if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
+                && !score.vetoed
+                && entry.metadata.is_dir
+                && entry.opaque_tree.is_none()
+            {
+                score.size_bytes = score.size_bytes.max(prescan_dir_size(
+                    &entry.path,
+                    current_scanner_config.cross_devices,
+                    shutdown,
+                ));
+            }
+
             score.identity = Some(entry.metadata.identity());
             let mut scanner_index_backoff_active = false;
             if scanner_index_enabled {
@@ -8978,13 +8995,14 @@ fn scanner_thread_main(
                 }
             } else if deletable {
                 candidates_found += 1;
-                v2_candidate_bytes_seen = v2_candidate_bytes_seen.saturating_add(score.size_bytes);
+                let potential_bytes = score.size_bytes;
+                v2_candidate_bytes_seen = v2_candidate_bytes_seen.saturating_add(potential_bytes);
                 scored.push(score);
                 if let Some(root) = root_path
                     && let Some(stat) = root_stats_map.get_mut(root)
                 {
                     stat.candidates_found += 1;
-                    stat.potential_bytes += input.size_bytes;
+                    stat.potential_bytes += potential_bytes;
                 }
             } else if score.vetoed
                 && let Some(root) = root_path
@@ -10318,6 +10336,119 @@ mod tests {
              # This file is a cache directory tag created by cargo.\n",
         )
         .unwrap();
+    }
+
+    /// bd-3rlm: a directory the walk recognises only by its CACHEDIR.TAG is
+    /// not pruned and measured as an opaque tree, so it carried just its
+    /// immediate files' size: on hz2 two candidates of 4 KiB each on paper
+    /// freed 2.5 GB. The size the planner and the executor see is measured.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_walked_directory_candidate_is_measured_before_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("scan-root");
+        let cache = root.join("srw");
+        let deep = cache.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        write_cargo_cachedir_tag(&cache);
+        let payload = vec![7_u8; 512 * 1024];
+        std::fs::write(deep.join("blob.bin"), &payload).unwrap();
+        // Old enough to be abandoned by its real age.
+        let old = SystemTime::now() - Duration::from_hours(6);
+        for path in [
+            deep.join("blob.bin"),
+            cache.join("CACHEDIR.TAG"),
+            deep.clone(),
+            cache.join("a"),
+            cache.clone(),
+        ] {
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+
+        let mut config = Config::default();
+        config.scanner.root_paths = vec![root.clone()];
+        config.scanner.min_file_age_minutes = 0;
+        config.scanner.active_reference_min_size_bytes = u64::MAX;
+        config.validate().expect("the tuned config stays valid");
+        let (scanner_index_path, prescan_cursor_path) = scanner_state_paths(temp.path());
+        let scoring = Arc::new(RwLock::new(config.scoring.clone()));
+        let scanner_cfg = Arc::new(RwLock::new(config.scanner));
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+            sqlite_path: None,
+            jsonl_config: crate::logger::jsonl::JsonlConfig {
+                path: temp.path().join("activity.jsonl"),
+                fallback_path: None,
+                max_size_bytes: 1_048_576,
+                max_rotated_files: 0,
+                fsync_interval_secs: 0,
+            },
+            channel_capacity: 1024,
+            run_id: None,
+        })
+        .unwrap();
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(64);
+        let (report_tx, _report_rx) = bounded::<WorkerReport>(64);
+        let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+        scan_tx
+            .send(ScanRequest {
+                paths: vec![root],
+                urgency: 0.9,
+                pressure_level: PressureLevel::Orange,
+                free_pct: Some(9.0),
+                max_delete_batch: 10,
+                force_full_scan: false,
+                config_update: None,
+                catalog_roots: Vec::new(),
+                maintenance: false,
+                target_bytes: None,
+            })
+            .unwrap();
+        drop(scan_tx);
+        scanner_thread_main(
+            &scan_rx,
+            &del_tx,
+            &logger,
+            &scoring,
+            &scanner_cfg,
+            &platform,
+            &heartbeat_for_test(),
+            &report_tx,
+            &shutdown,
+            &scanner_index_path,
+            &prescan_cursor_path,
+            &feedback_rx,
+            &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+            &Arc::new(SharedExecutorConfig::new(
+                false, 10, 0.0, 60, 3600, false, 0,
+            )),
+            &Arc::new(SharedRegret::new(&Config::default())),
+        );
+        logger.shutdown();
+        logger_join.join().unwrap();
+
+        let mut dispatched = Vec::new();
+        while let Ok(batch) = del_rx.try_recv() {
+            dispatched.extend(batch.candidates);
+        }
+        let candidate = dispatched
+            .iter()
+            .find(|candidate| candidate.path == cache)
+            .unwrap_or_else(|| panic!("the tagged cache is dispatched: {dispatched:?}"));
+        assert_eq!(
+            candidate.classification.pattern_name, "cachedir-tagged-cache",
+            "{candidate:?}"
+        );
+        assert!(
+            candidate.size_bytes >= payload.len() as u64,
+            "measured, not the directory's own entries: {} bytes",
+            candidate.size_bytes
+        );
     }
 
     fn scanner_state_paths(dir: &Path) -> (PathBuf, PathBuf) {
