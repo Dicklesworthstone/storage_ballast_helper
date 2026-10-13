@@ -16,6 +16,10 @@
 //! In-place ballast repair opens a regular file the same way (#28): a
 //! same-device file bind mount on a slot would make the repair write through
 //! to an external file.
+//!
+//! The fallback is also used when a seccomp profile reports `EPERM` instead
+//! of `ENOSYS`. Every backend enforces the same single-component, no-follow,
+//! non-creating/non-truncating input contract before opening anything.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -26,7 +30,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 
 use rustix::fs::{Mode, OFlags};
 
-/// Open the directory `name` (a single component the caller has validated)
+/// Open the directory `name` (one normal path component)
 /// beneath `parent`, refusing a symlink or a mount boundary.
 pub(super) fn open_dir_beneath(parent: &File, name: &OsStr) -> io::Result<OwnedFd> {
     open_beneath(
@@ -36,31 +40,83 @@ pub(super) fn open_dir_beneath(parent: &File, name: &OsStr) -> io::Result<OwnedF
     )
 }
 
-/// Open the entry `name` beneath `parent` with `flags` (which must include
-/// `NOFOLLOW`), refusing a symlink or a mount boundary, a same-device bind
-/// mount included.
+/// Open an existing entry `name` beneath `parent`, refusing a symlink or a
+/// mount boundary, a same-device bind mount included on Linux.
+///
+/// `name` must be one normal path component. `flags` must include `NOFOLLOW`
+/// and must not create, truncate, or request a symlink descriptor. Invalid
+/// inputs are refused before any filesystem access, in release builds too.
 pub fn open_beneath(parent: &File, name: &OsStr, flags: OFlags) -> io::Result<OwnedFd> {
-    debug_assert!(flags.contains(OFlags::NOFOLLOW));
+    validate_open(name, flags)?;
     #[cfg(target_os = "linux")]
     {
         use rustix::fs::{ResolveFlags, openat2};
-        match openat2(
-            parent,
-            name,
-            flags,
-            Mode::empty(),
-            ResolveFlags::BENEATH
-                | ResolveFlags::NO_SYMLINKS
-                | ResolveFlags::NO_MAGICLINKS
-                | ResolveFlags::NO_XDEV,
-        ) {
-            Err(rustix::io::Errno::NOSYS) => open_beneath_same_mount(parent, name, flags),
-            result => result.map_err(Into::into),
-        }
+        resolve_open(
+            openat2(
+                parent,
+                name,
+                flags,
+                Mode::empty(),
+                ResolveFlags::BENEATH
+                    | ResolveFlags::NO_SYMLINKS
+                    | ResolveFlags::NO_MAGICLINKS
+                    | ResolveFlags::NO_XDEV,
+            ),
+            || open_beneath_same_mount(parent, name, flags),
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
         Ok(rustix::fs::openat(parent, name, flags, Mode::empty())?)
+    }
+}
+
+/// Unlike `openat2`, `openat(O_NOFOLLOW)` only protects the last component.
+/// Never normalize a caller's path: even `child/` or `child/.` can change
+/// symlink handling. Reject the original bytes, including NUL, before open.
+fn validate_open(name: &OsStr, flags: OFlags) -> io::Result<()> {
+    let bytes = name.as_encoded_bytes();
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.contains(&b'/')
+        || bytes.contains(&0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "confined open requires one normal path component",
+        ));
+    }
+    if !flags.contains(OFlags::NOFOLLOW) || flags.intersects(OFlags::CREATE | OFlags::TRUNC) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "confined open requires NOFOLLOW and cannot create or truncate",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if flags.contains(OFlags::TMPFILE) || flags.contains(OFlags::PATH) {
+        // TMPFILE includes DIRECTORY: testing intersects(TMPFILE) would
+        // incorrectly reject every ordinary directory open. PATH|NOFOLLOW
+        // can return a descriptor to the symlink itself instead of refusing it.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "confined open cannot create temporary files or open symlink descriptors",
+        ));
+    }
+    Ok(())
+}
+
+/// Seccomp profiles report either NOSYS or PERM for unavailable openat2.
+/// The fallback repeats pathname, no-follow and mount checks; do not retry
+/// actual resolution failures (XDEV/LOOP), access denial or arbitrary I/O.
+#[cfg(target_os = "linux")]
+fn resolve_open(
+    primary: rustix::io::Result<OwnedFd>,
+    fallback: impl FnOnce() -> io::Result<OwnedFd>,
+) -> io::Result<OwnedFd> {
+    match primary {
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::PERM) => fallback(),
+        result => result.map_err(Into::into),
     }
 }
 
@@ -78,6 +134,7 @@ fn open_beneath_with_mount_id(
     flags: OFlags,
     lookup: fn(BorrowedFd<'_>) -> io::Result<u64>,
 ) -> io::Result<OwnedFd> {
+    validate_open(name, flags)?;
     let parent_mount = lookup(parent.as_fd())?;
     let fd = rustix::fs::openat(parent, name, flags, Mode::empty())?;
     if lookup(fd.as_fd())? != parent_mount {
@@ -454,5 +511,208 @@ mod tests {
             );
         }
         assert!(open_beneath_with_mount_id(&p, OsStr::new("link"), flags, proc_mount_id).is_err());
+    }
+
+    #[test]
+    fn both_seccomp_denials_use_the_verified_fallback() {
+        for error in [rustix::io::Errno::NOSYS, rustix::io::Errno::PERM] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("slot"), b"ballast").unwrap();
+            let p = parent(dir.path());
+            let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let fd = resolve_open(Err(error), || {
+                open_beneath_with_mount_id(&p, OsStr::new("slot"), flags, proc_mount_id)
+            })
+            .expect("denied openat2 still admits a verified same-mount slot");
+            assert_eq!(File::from(fd).metadata().unwrap().len(), 7);
+        }
+    }
+
+    #[test]
+    fn resolution_and_access_errors_never_take_the_compatibility_path() {
+        for error in [
+            rustix::io::Errno::XDEV,
+            rustix::io::Errno::LOOP,
+            rustix::io::Errno::ACCES,
+            rustix::io::Errno::NOENT,
+            rustix::io::Errno::INVAL,
+            rustix::io::Errno::IO,
+        ] {
+            let outcome = resolve_open(Err(error), || panic!("must preserve rejection"));
+            assert_eq!(
+                outcome.unwrap_err().raw_os_error(),
+                Some(error.raw_os_error())
+            );
+        }
+    }
+
+    #[test]
+    fn a_successful_primary_open_does_not_use_the_fallback() {
+        let file = tempfile::tempfile().unwrap();
+        let fd = resolve_open(Ok(file.into()), || panic!("must keep primary descriptor"));
+        assert!(fd.is_ok());
+    }
+
+    #[test]
+    fn a_denied_primary_does_not_hide_a_failed_mount_check() {
+        let error = resolve_open(Err(rustix::io::Errno::PERM), || {
+            Err(io::Error::from_raw_os_error(libc::EXDEV))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+    }
+
+    #[test]
+    fn fallback_rejects_unsafe_arguments_before_mount_lookup() {
+        fn no_lookup(_: BorrowedFd<'_>) -> io::Result<u64> {
+            panic!("invalid inputs must be refused before any filesystem access")
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = parent(dir.path());
+        let normal = OFlags::RDWR | OFlags::NOFOLLOW;
+        for (name, flags) in [
+            ("../slot", normal),
+            ("/slot", normal),
+            ("alias/slot", normal),
+            ("slot/", normal),
+            ("slot", OFlags::RDWR),
+            ("slot", normal | OFlags::TRUNC),
+            ("slot", normal | OFlags::CREATE),
+            ("slot", normal | OFlags::TMPFILE),
+            ("slot", normal | OFlags::PATH),
+        ] {
+            let error =
+                open_beneath_with_mount_id(&p, OsStr::new(name), flags, no_lookup).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn linux_special_open_modes_cannot_bypass_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("child")).unwrap();
+        symlink("child", dir.path().join("link")).unwrap();
+        let p = parent(dir.path());
+        for flags in [
+            OFlags::NOFOLLOW | OFlags::PATH,
+            OFlags::NOFOLLOW | OFlags::RDWR | OFlags::TMPFILE,
+        ] {
+            for name in ["child", "link"] {
+                assert_eq!(
+                    open_beneath(&p, OsStr::new(name), flags).unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+            }
+        }
+        // TMPFILE overlaps DIRECTORY. The normal directory flag must remain legal.
+        assert!(open_dir_beneath(&p, OsStr::new("child")).is_ok());
+        assert!(
+            fs::read_dir(dir.path().join("child"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn every_backend_rejects_non_component_names_before_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = File::open(dir.path()).unwrap();
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        for name in [
+            "",
+            ".",
+            "..",
+            "/",
+            "/outside",
+            "../outside",
+            "child/../outside",
+            "child/grandchild",
+            "child/",
+            "./child",
+            "child/.",
+            "nul\0tail",
+        ] {
+            assert_eq!(
+                open_beneath(&parent, OsStr::new(name), flags)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput,
+                "accepted {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_same_mount_symlink_cannot_supply_an_intermediate_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let inside = dir.path().join("inside");
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(&inside).unwrap();
+        fs::write(outside.join("precious"), b"keep").unwrap();
+        symlink(&outside, inside.join("alias")).unwrap();
+        let parent = File::open(&inside).unwrap();
+        let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        assert_eq!(
+            open_beneath(&parent, OsStr::new("alias/precious"), flags)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(open_beneath(&parent, OsStr::new("alias"), flags).is_err());
+        assert_eq!(fs::read(outside.join("precious")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn creating_truncating_and_following_flags_never_modify_a_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = File::open(dir.path()).unwrap();
+        let slot = dir.path().join("slot");
+        fs::write(&slot, b"keep ballast").unwrap();
+        for flags in [
+            OFlags::RDWR,
+            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::TRUNC,
+            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CREATE,
+        ] {
+            for name in ["slot", "missing"] {
+                assert_eq!(
+                    open_beneath(&parent, OsStr::new(name), flags)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidInput
+                );
+            }
+            assert_eq!(fs::read(&slot).unwrap(), b"keep ballast");
+            assert!(!dir.path().join("missing").exists());
+        }
+    }
+
+    #[test]
+    fn ordinary_non_utf8_and_dot_names_are_still_valid_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = File::open(dir.path()).unwrap();
+        for name in [
+            OsStr::new(".hidden"),
+            OsStr::new("..."),
+            OsStr::new("a..b"),
+            OsStr::new("with space"),
+            OsStr::from_bytes(b"nonutf8-\xff"),
+        ] {
+            fs::write(dir.path().join(name), b"keep").unwrap();
+            let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let fd = open_beneath(&parent, name, flags).expect("normal existing entry opens");
+            assert_eq!(File::from(fd).metadata().unwrap().len(), 4);
+        }
+        fs::create_dir(dir.path().join("child")).unwrap();
+        assert!(open_dir_beneath(&parent, OsStr::new("child")).is_ok());
     }
 }
