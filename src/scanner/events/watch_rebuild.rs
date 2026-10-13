@@ -56,7 +56,18 @@ pub(super) struct Rebuild {
     completed: Receiver<io::Result<Prepared>>,
     retired: SyncSender<EventSourceBackend>,
     cancelled: Arc<AtomicBool>,
+    /// Drain-clock admission time, and the last time a still-running
+    /// rebuild's coverage was revoked as overdue (#30).
+    admitted_at: Option<Instant>,
+    overdue_revoked_at: Option<Instant>,
 }
+
+/// A rebuild still running this long after admission may be blocked in a
+/// kernel call that no cooperative check can interrupt (a hung network mount
+/// under a root). Its worker keeps the admission slot, so no handoff, failure
+/// or retry would ever arrive; see [`revoke_if_overdue`]. Discovery and watch
+/// installation have their own, much shorter, budgets.
+const REBUILD_OVERDUE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Rebuild {
     fn start(config: EventSourceConfig, rates: EventRateTracker, now: Instant) -> io::Result<Self> {
@@ -93,6 +104,8 @@ impl Rebuild {
             completed,
             retired,
             cancelled,
+            admitted_at: None,
+            overdue_revoked_at: None,
         })
     }
 
@@ -163,10 +176,11 @@ fn build(
 /// Poll one completion or admit one rebuild. Never wait for discovery, watch
 /// registration, worker exit, or the old backend's ordinary retirement.
 pub(super) fn poll_or_start(source: &mut ScannerEventSource, now: Instant) -> EventInvalidation {
-    if let Some(task) = source.rebuild.take() {
+    if let Some(mut task) = source.rebuild.take() {
         let Some(result) = task.poll() else {
+            let invalidation = revoke_if_overdue(source, &mut task, now);
             source.rebuild = Some(task);
-            return EventInvalidation::empty();
+            return invalidation;
         };
         // Retry/audit cadence begins at completion, not at a possibly distant
         // start time. A slow failed build cannot immediately restart itself.
@@ -209,7 +223,8 @@ pub(super) fn poll_or_start(source: &mut ScannerEventSource, now: Instant) -> Ev
     source.planned_at = now;
     source.replans = source.replans.saturating_add(1);
     match Rebuild::start(source.config.clone(), source.rates.clone(), now) {
-        Ok(task) => {
+        Ok(mut task) => {
+            task.admitted_at = Some(now);
             source.rebuild = Some(task);
             // Keep actual old coverage and counters. A running worker has
             // not yet installed usable replacement coverage for the caller.
@@ -219,6 +234,41 @@ pub(super) fn poll_or_start(source: &mut ScannerEventSource, now: Instant) -> Ev
         }
         Err(error) => failed(source, &error),
     }
+}
+
+/// While a rebuild is pending, evidence indexed under still-unwatched
+/// subtrees would stay replayable for as long as its worker is stuck. Past
+/// [`REBUILD_OVERDUE_AFTER`], treat it as failed (coverage incomplete, every
+/// root dirty, a generation bump) and repeat on the repair cadence, without
+/// waiting for the admission slot (#30). A worker that does finish later
+/// still hands off, which revokes coverage again.
+fn revoke_if_overdue(
+    source: &mut ScannerEventSource,
+    task: &mut Rebuild,
+    now: Instant,
+) -> EventInvalidation {
+    let Some(admitted_at) = task.admitted_at else {
+        return EventInvalidation::empty();
+    };
+    let running = now.saturating_duration_since(admitted_at);
+    if running < REBUILD_OVERDUE_AFTER
+        || task.overdue_revoked_at.is_some_and(|at| {
+            now.saturating_duration_since(at) < crate::scanner::events::WATCH_REPAIR_INTERVAL
+        })
+    {
+        return EventInvalidation::empty();
+    }
+    task.overdue_revoked_at = Some(now);
+    failed(
+        source,
+        &io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "rebuild still running after {}s; its worker may be blocked in a kernel call",
+                running.as_secs()
+            ),
+        ),
+    )
 }
 
 fn failed(source: &mut ScannerEventSource, error: &io::Error) -> EventInvalidation {
@@ -551,6 +601,58 @@ mod tests {
         assert!(!next.requires_index_generation_bump());
         let quiet = source.drain_at(now);
         assert!(!quiet.requires_reconciliation());
+        wait_free(&gate);
+    }
+
+    /// #30: a worker blocked in a kernel call never hands off or fails. Its
+    /// coverage is revoked once it is overdue, and again on each repair
+    /// cadence while it stays stuck; the worker keeps its slot and may still
+    /// finish.
+    #[test]
+    fn an_overdue_rebuild_revokes_coverage_on_the_repair_cadence() {
+        let (_temp, mut source, root, now) = fixture();
+        let gate = gate();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mut task = Rebuild::spawn(Arc::clone(&gate), move |_| {
+            let _ = release_rx.recv();
+            Err(io::Error::other("released after the test"))
+        })
+        .unwrap();
+        task.admitted_at = Some(now);
+        source.rebuild = Some(task);
+
+        let early = (now + REBUILD_OVERDUE_AFTER)
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        assert!(!poll_or_start(&mut source, early).requires_index_generation_bump());
+        assert!(source.capability().complete);
+
+        let overdue_at = now + REBUILD_OVERDUE_AFTER;
+        let overdue = poll_or_start(&mut source, overdue_at);
+        assert!(overdue.requires_index_generation_bump());
+        assert!(overdue.dirty_roots().contains(&root));
+        assert!(!source.capability().complete);
+        assert!(
+            source
+                .capability()
+                .reason
+                .contains("blocked in a kernel call")
+        );
+        assert!(source.rebuild.is_some(), "the stuck worker keeps its slot");
+        assert!(gate.load(Ordering::Acquire));
+
+        let soon = (overdue_at + WATCH_REPAIR_INTERVAL)
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        assert!(!poll_or_start(&mut source, soon).requires_index_generation_bump());
+        let again = poll_or_start(&mut source, overdue_at + WATCH_REPAIR_INTERVAL);
+        assert!(again.requires_index_generation_bump());
+        assert!(again.dirty_roots().contains(&root));
+
+        release_tx.send(()).unwrap();
+        let finished = finish_rebuild(&mut source, overdue_at + WATCH_REPAIR_INTERVAL);
+        assert!(finished.requires_index_generation_bump());
+        assert!(source.rebuild.is_none());
         wait_free(&gate);
     }
 
