@@ -10140,11 +10140,11 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             }
 
             if let Some(visibility) = process_visibility {
-                if platform.name().eq_ignore_ascii_case("linux") {
-                    println!("\nWARNING: {}", visibility.detail);
-                } else {
+                if visibility.all_processes {
                     println!("\nProcess Attribution:");
                     println!("  Visibility: {}", visibility.detail);
+                } else {
+                    println!("\nWARNING: {}", visibility.detail);
                 }
             }
 
@@ -10898,13 +10898,20 @@ fn linux_platform_json(_capacity: &Capacity) -> Value {
 /// surface describes the refusals as an incomplete scan without saying why.
 const LINUX_UNPRIVILEGED_SCANNER_NOTICE: &str = "scanner reclaim is disabled: sbh is not running as root, so it cannot inspect other users' processes for open or mapped files and refuses every deletion candidate. Ballast release still works. Run the daemon as a system service (`sudo sbh install --systemd --scope system`) to reclaim build artifacts";
 
+/// macOS hides other users' processes from a non-root sbh, so its open-file
+/// check is never complete; candidates it must walk, or that reach
+/// `active_reference_min_size_bytes`, are then refused.
+const MACOS_UNPRIVILEGED_SCANNER_NOTICE: &str = "own-user processes only: sbh is not running as root, so macOS hides other users' processes from its open-file check, which is never complete, and the scanner refuses every candidate it must walk or that is 100 MB or larger (scanner.active_reference_min_size_bytes): almost nothing is reclaimed. Ballast release still works. Run the daemon as a root LaunchDaemon (`sudo sbh install --launchd --scope system`) to reclaim build artifacts";
+
 fn process_attribution_visibility(
     platform_name: &str,
     state_file: &Path,
 ) -> Option<ProcessAttributionVisibility> {
-    // On Linux the question is whether the sbh that reclaims is root, which
-    // is the daemon when one has written state, not this CLI.
-    let is_root = if platform_name.eq_ignore_ascii_case("linux") {
+    // The question is whether the sbh that reclaims is root, which is the
+    // daemon when one has written state, not this CLI.
+    let is_root = if platform_name.eq_ignore_ascii_case("linux")
+        || platform_name.eq_ignore_ascii_case("macos")
+    {
         reclaimer_is_root(state_file)
     } else {
         effective_user_is_root()
@@ -10941,7 +10948,7 @@ fn process_attribution_visibility_for(
             scope: "own_user_processes",
             all_processes: false,
             requires_root_for_all_users: true,
-            detail: "own-user processes only; run sbh as a root LaunchDaemon for all-user process I/O attribution",
+            detail: MACOS_UNPRIVILEGED_SCANNER_NOTICE,
         })
     }
 }
@@ -10969,22 +10976,28 @@ fn reclaimer_is_root(_state_file: &Path) -> bool {
     false
 }
 
-/// `doctor --system`: a Linux sbh without root reclaims nothing by scanning,
-/// and no other check or status line says so.
+/// `doctor --system`: an sbh without root reclaims nothing (Linux) or almost
+/// nothing (macOS) by scanning, and no other check or status line says so.
 fn scanner_privilege_doctor_check(platform_name: &str, is_root: bool) -> Option<DoctorCheck> {
-    if !platform_name.eq_ignore_ascii_case("linux") {
+    let service = if platform_name.eq_ignore_ascii_case("linux") {
+        "--systemd"
+    } else if platform_name.eq_ignore_ascii_case("macos") {
+        "--launchd"
+    } else {
+        return None;
+    };
+    let visibility = process_attribution_visibility_for(platform_name, is_root)?;
+    if visibility.all_processes {
         return None;
     }
-    let visibility = process_attribution_visibility_for(platform_name, is_root)?;
     Some(doctor_check(
         "reclaim.privilege",
         "Scanner reclaim privileges",
         "FAIL",
         visibility.detail,
-        Some(
-            "Run `sbh uninstall --scope user`, then `sudo sbh install --systemd --scope system`."
-                .to_string(),
-        ),
+        Some(format!(
+            "Run `sbh uninstall --scope user`, then `sudo sbh install {service} --scope system`."
+        )),
     ))
 }
 
@@ -20499,7 +20512,32 @@ mod tests {
             scanner_privilege_doctor_check("linux", false).unwrap()
         ]));
         assert!(scanner_privilege_doctor_check("linux", true).is_none());
-        assert!(scanner_privilege_doctor_check("macos", false).is_none());
+        assert!(scanner_privilege_doctor_check("freebsd", false).is_none());
+    }
+
+    #[test]
+    fn macos_without_root_says_the_scanner_reclaims_almost_nothing() {
+        let visibility = process_attribution_visibility_for("macos", false)
+            .expect("an unprivileged macOS sbh must say what it cannot do");
+        for expected in [
+            "not running as root",
+            "other users' processes",
+            "refuses every candidate it must walk",
+            "almost nothing is reclaimed",
+            "Ballast release still works",
+            "sudo sbh install --launchd --scope system",
+        ] {
+            assert!(visibility.detail.contains(expected), "{expected}");
+        }
+        let check = scanner_privilege_doctor_check("macos", false)
+            .expect("an unprivileged macOS sbh is a doctor finding");
+        assert_eq!(check.id, "reclaim.privilege");
+        assert_eq!(check.status, "FAIL");
+        assert!(
+            check
+                .remediation
+                .is_some_and(|remediation| remediation.contains("--launchd --scope system"))
+        );
         assert!(scanner_privilege_doctor_check("macos", true).is_none());
     }
 
