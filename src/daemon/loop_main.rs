@@ -12054,8 +12054,8 @@ mod tests {
             held.log
         );
 
-        // The record persisted by the open run is replayed from the index on
-        // the next pass and held there too, without a walk.
+        // The next daemon holds the same tree too. Its event source revokes
+        // the record the open run persisted, so the root is reconciled.
         let replayed = run_scan(
             temp.path(),
             &root,
@@ -12069,7 +12069,7 @@ mod tests {
             replayed.log.contains(
                 "scanner certainty gate held 1 candidate(s) below likely (pressure=Orange)"
             ),
-            "the replayed record, the pre-scan and the walk hold one path: {}",
+            "the pre-scan and the walk hold one path: {}",
             replayed.log
         );
 
@@ -12118,20 +12118,22 @@ mod tests {
             1,
             "index-cargo.json",
         );
-        // On macOS the FSEvents backend's startup replan marks the roots
-        // dirty, so a fresh daemon reconciles instead of replaying (by
-        // design, see README "What feeds the index"); the certainty
+        // A fresh event source revokes the evidence saved before it started
+        // (`BackendRestart` on Linux, the FSEvents startup replan on macOS;
+        // by design, see README "What feeds the index"), so a new daemon
+        // reconciles the root instead of replaying the record. The certainty
         // assertions below hold either way.
         if cfg!(target_os = "linux") {
             assert!(
-                replayed_target.log.contains("replayed_records=1"),
-                "the second pass replays the persisted record: {}",
+                replayed_target.log.contains("replayed_records=0")
+                    && replayed_target.log.contains("reason=BackendRestart"),
+                "a fresh daemon revokes evidence saved before it started instead of replaying it: {}",
                 replayed_target.log
             );
         }
         assert!(
             replayed_target.dispatched,
-            "the replayed target keeps its definite certainty and is dispatched again: {}",
+            "the target keeps its definite certainty on the next daemon's pass and is dispatched again: {}",
             replayed_target.log
         );
         assert!(

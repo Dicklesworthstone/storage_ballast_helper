@@ -8,6 +8,7 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,47 @@ fn until(
         );
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Whether the watch-rebuild worker thread has exited. The process admits one
+/// rebuild at a time and frees that slot only when its worker exits, which is
+/// just after the worker retires the old backend it was handed.
+fn rebuild_worker_exited() -> bool {
+    !fs::read_dir("/proc/self/task")
+        .unwrap()
+        .flatten()
+        .any(|task| {
+            fs::read_to_string(task.path().join("comm"))
+                .is_ok_and(|name| name.starts_with("sbh-watch-rebui"))
+        })
+}
+
+/// Admit the watch rebuild that is due at `at` and drain until it has been
+/// handed off or has failed. Rebuilds run on a worker thread: the drain that
+/// admits one reports nothing, and a later drain delivers the handoff, which
+/// is also when the next repair interval starts. Tests in this file share the
+/// process's single admission slot, so they take turns.
+fn rebuilt(source: &mut ScannerEventSource, at: Instant) -> EventInvalidation {
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    let before = source.stats().replans;
+    let all = until(source, at, |source, _| {
+        source.stats().replans > before && !source.capability().reason.contains("rebuild running")
+    });
+    assert_eq!(
+        source.stats().replans,
+        before + 1,
+        "exactly one rebuild is admitted for a due repair"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !rebuild_worker_exited() {
+        assert!(
+            Instant::now() < deadline,
+            "the rebuild worker kept its admission slot"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    all
 }
 
 fn sees_write(source: &mut ScannerEventSource, path: &Path, at: Instant) {
@@ -93,7 +135,7 @@ fn moved_in_populated_tree_gets_descendant_watches_without_another_topology_even
         },
     );
     assert!(changed.requires_index_generation_bump());
-    let repaired = events.drain_at(now + Duration::from_secs(30));
+    let repaired = rebuilt(&mut events, now + Duration::from_secs(30));
     assert!(repaired.requires_index_generation_bump());
     assert!(repaired.dirty_roots().contains(&root));
     assert!(events.capability().complete);
@@ -136,7 +178,7 @@ fn identical_pathnames_after_root_replacement_do_not_reuse_old_inode_watches() {
     );
     assert!(lost.dirty_roots().contains(&root));
     assert_eq!(events.capability().watched_dirs, 0);
-    let repaired = events.drain_at(now + Duration::from_secs(30));
+    let repaired = rebuilt(&mut events, now + Duration::from_secs(30));
     assert!(repaired.requires_index_generation_bump());
     assert!(events.capability().complete);
     assert_eq!(events.capability().watched_dirs, 2);
@@ -184,7 +226,7 @@ fn a_root_missing_at_startup_can_recover_without_any_old_backend_traffic() {
     );
     assert_eq!(events.stats().replans, 0);
 
-    let repaired = events.drain_at(now + Duration::from_secs(30));
+    let repaired = rebuilt(&mut events, now + Duration::from_secs(30));
     assert_eq!(events.stats().replans, 1);
     assert_eq!(
         events.capability().selected_backend,
@@ -208,19 +250,26 @@ fn persistent_fallback_failures_are_paced_and_eventually_recover() {
     let now = Instant::now();
     let mut events = source(&root, 16, now);
     let _ = events.drain_at(now);
-    for second in 1..60 {
-        events.drain_at(now + Duration::from_secs(second));
-        assert_eq!(events.stats().replans, u64::from(second >= 30));
+    // One attempt per repair interval, and the interval restarts when an
+    // attempt completes: nothing is admitted in the 29 s after each one.
+    for attempt in 0..2 {
+        let due = 30 * (attempt + 1);
+        for second in due - 29..due {
+            events.drain_at(now + Duration::from_secs(second));
+            assert_eq!(events.stats().replans, attempt);
+            assert_eq!(events.capability().watched_dirs, 0);
+            assert!(!events.capability().complete);
+        }
+        rebuilt(&mut events, now + Duration::from_secs(due));
+        assert_eq!(events.stats().replans, attempt + 1);
         assert_eq!(events.capability().watched_dirs, 0);
         assert!(!events.capability().complete);
     }
-    events.drain_at(now + Duration::from_secs(60));
-    assert_eq!(events.stats().replans, 2);
     fs::rename(&root, base.join("retained-file")).unwrap();
     fs::create_dir(&root).unwrap();
     events.drain_at(now + Duration::from_secs(89));
     assert_eq!(events.stats().replans, 2);
-    events.drain_at(now + Duration::from_secs(90));
+    rebuilt(&mut events, now + Duration::from_secs(90));
     assert_eq!(events.stats().replans, 3);
     assert!(events.capability().complete);
     sees_write(
@@ -260,7 +309,7 @@ fn repeated_subtree_replacement_reuses_watch_capacity_and_restores_deep_events()
             |_, invalidation| invalidation.dirty_paths().contains(&current),
         );
         at += Duration::from_secs(31);
-        let repaired = events.drain_at(at);
+        let repaired = rebuilt(&mut events, at);
         assert!(repaired.requires_index_generation_bump());
         assert!(events.capability().complete);
         assert_eq!(events.capability().watched_dirs, 3, "cycle {cycle}");
@@ -286,7 +335,7 @@ fn quiet_instance_handoff_explicitly_invalidates_the_old_index_generation() {
         config_fingerprint: "quiet-config".into(),
     });
     let generation = index.event_generation();
-    let handoff = events.drain_at(now + Duration::from_mins(15));
+    let handoff = rebuilt(&mut events, now + Duration::from_mins(15));
     assert_eq!(events.stats().replans, 1);
     assert!(events.capability().complete);
     assert!(handoff.dirty_roots().contains(&root));
@@ -393,7 +442,7 @@ fn candidate_budget_gaps_revoke_replay_and_can_recover_after_root_replacement() 
     until(&mut events, now + Duration::from_secs(1), |source, _| {
         source.capability().watched_dirs == 0
     });
-    let repaired = events.drain_at(now + Duration::from_secs(30));
+    let repaired = rebuilt(&mut events, now + Duration::from_secs(30));
     assert!(repaired.requires_index_generation_bump());
     assert!(events.capability().complete);
     assert_eq!(events.capability().watched_dirs, 1);
@@ -428,7 +477,7 @@ fn bounded_periodic_replan_keeps_an_independent_root_observable() {
         fs::write(root.join(format!("retained-{n:05}")), b"keep").unwrap();
     }
     let later = now + Duration::from_mins(15);
-    let replanned = events.drain_at(later);
+    let replanned = rebuilt(&mut events, later);
     assert_eq!(events.stats().replans, 1);
     assert!(!events.capability().complete);
     assert_eq!(events.capability().watched_dirs, 2);
