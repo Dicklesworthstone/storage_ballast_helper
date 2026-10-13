@@ -5,6 +5,7 @@
 use clap::{CommandFactory, FromArgMatches};
 
 mod cli_app;
+mod cli_source_roots;
 
 fn main() {
     storage_ballast_helper::daemon::service::capture_sbh_binary_path();
@@ -14,6 +15,15 @@ fn main() {
     // running executable's directory. Do not restart that other installation.
     storage_ballast_helper::update_handoff::capture_install_path(update_install_path(&matches));
     let args = cli_app::Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    match cli_source_roots::run(&matches) {
+        Ok(Some(0)) => return,
+        Ok(Some(code)) => std::process::exit(code),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("sbh: could not write source-root diagnostics: {error}");
+            std::process::exit(2);
+        }
+    }
     if let Err(e) = cli_app::run(&args) {
         eprintln!("sbh: {e}");
         std::process::exit(e.exit_code());
