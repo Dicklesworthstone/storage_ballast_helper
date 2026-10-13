@@ -1,5 +1,8 @@
 //! Distinguish a missing systemd unit from a failed runtime-state query.
 
+#[cfg(target_os = "linux")]
+#[path = "systemd_update_activation.rs"]
+mod update_activation;
 #[path = "systemd_update_target.rs"]
 mod update_target;
 
@@ -11,6 +14,19 @@ use std::time::Duration;
 use crate::core::errors::{Result, SbhError};
 
 use super::{SYSTEMD_UNIT_NAME, format_systemctl_failure};
+
+pub(super) fn restart<F>(user_scope: bool, restart_command: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    #[cfg(target_os = "linux")]
+    if let Some(installed) = crate::update_handoff::install_path() {
+        return update_activation::restart_verified(user_scope, installed, restart_command);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = user_scope;
+    restart_command()
+}
 
 pub(super) fn is_loaded(user_scope: bool, unit_path: &Path) -> Result<bool> {
     let mut args = Vec::with_capacity(5);

@@ -4,9 +4,12 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write as _;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -59,6 +62,7 @@ case "${1-}" in
         actual=$(sha256sum "$SBH_TEST_SERVICE_BINARY")
         [ "${actual%% *}" = "$SBH_TEST_EXPECTED_SHA" ]
         "$SBH_TEST_SERVICE_BINARY" --version >> "$SBH_TEST_RESTART_VERSIONS"
+        : > "$SBH_TEST_RESTART_REQUEST"
         ;;
     *) printf 'unexpected systemctl command: %s\n' "$*" >&2; exit 91 ;;
 esac
@@ -70,13 +74,108 @@ printf '%s\n' "$*" >> "$SBH_TEST_BUSCTL_LOG"
 [ "${LC_ALL-}" = C ]
 case "${1-}" in --user|--system) ;; *) exit 92 ;; esac
 shift
-[ "$*" = '--json=short --timeout=5s --auto-start=no --allow-interactive-authorization=no get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/sbh_2eservice org.freedesktop.systemd1.Service ExecStart' ]
-if [ "$SBH_TEST_SERVICE_STATE" = target-query-failure ]; then
-    printf 'fixture ExecStart access denied\n' >&2
-    exit 24
-fi
-cat "$SBH_TEST_EXEC_START_JSON"
+while [ "${1-}" != get-property ]; do
+    case "${1-}" in
+        --json=short|--timeout=*|--auto-start=no|--allow-interactive-authorization=no) ;;
+        *) exit 92 ;;
+    esac
+    shift
+done
+shift
+[ "$1" = org.freedesktop.systemd1 ]
+[ "$2" = /org/freedesktop/systemd1/unit/sbh_2eservice ]
+shift 2
+case "$*" in
+    'org.freedesktop.systemd1.Service ExecStart')
+        if [ "$SBH_TEST_SERVICE_STATE" = target-query-failure ]; then
+            printf 'fixture ExecStart access denied\n' >&2
+            exit 24
+        fi
+        cat "$SBH_TEST_EXEC_START_JSON"
+        ;;
+    'org.freedesktop.systemd1.Unit ActiveState SubState')
+        case "$SBH_TEST_SERVICE_STATE" in
+            activation-query-failure) printf 'fixture activation access denied\n' >&2; exit 25 ;;
+            condition-skipped) active=inactive; sub=dead ;;
+            exited-runtime) active=active; sub=exited ;;
+            delayed-activation)
+                if [ -e "$SBH_TEST_RUNTIME_PID.first" ]; then
+                    active=active; sub=running
+                else
+                    : > "$SBH_TEST_RUNTIME_PID.first"
+                    active=activating; sub=start
+                fi
+                ;;
+            *) active=active; sub=running ;;
+        esac
+        printf '{"type":"s","data":"%s"}\n{"type":"s","data":"%s"}\n' "$active" "$sub"
+        ;;
+    'org.freedesktop.systemd1.Service MainPID ExecMainStartTimestampMonotonic')
+        attempt=0
+        while [ ! -s "$SBH_TEST_RUNTIME_PID" ]; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -gt 100 ]; then
+                printf 'fixture runtime not ready\n' >&2
+                exit 96
+            fi
+            sleep 0.01
+        done
+        pid=$(cat "$SBH_TEST_RUNTIME_PID")
+        if [ "$SBH_TEST_SERVICE_STATE" = zero-runtime-pid ]; then pid=0; fi
+        printf '{"type":"u","data":%s}\n{"type":"t","data":1}\n' "$pid"
+        ;;
+    *) printf 'unexpected busctl property query: %s\n' "$*" >&2; exit 93 ;;
+esac
 "#;
+
+// A live process running the selected SBH image, without starting its daemon.
+// Fill stdout's pipe before launching --version, so the process blocks inside
+// the installed executable. The reader stays open until Drop kills/reaps it.
+struct HeldVersion {
+    child: Child,
+    _reader: OwnedFd,
+}
+
+impl HeldVersion {
+    fn start(binary: &Path) -> Self {
+        use nix::errno::Errno;
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        use nix::unistd::{pipe2, write};
+
+        let (reader, writer) = pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK).unwrap();
+        loop {
+            match write(&writer, &[0_u8; 4096]) {
+                Ok(n) => assert!(n > 0),
+                Err(Errno::EAGAIN) => break,
+                Err(error) => panic!("fill version pipe: {error}"),
+            }
+        }
+        fcntl(&writer, FcntlArg::F_SETFL(OFlag::empty())).unwrap();
+        let child = Command::new(binary)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Self { child, _reader: reader }
+    }
+}
+
+impl Drop for HeldVersion {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+struct FinishOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for FinishOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -217,30 +316,62 @@ impl Fixture {
     }
 
     fn run(&self, service_state: &str, args: &[&str]) -> Output {
-        Command::new(&self.binary)
-            .args(["update", "--json", "--offline"])
-            .arg(&self.manifest)
-            .arg("--config")
-            .arg(self.home.join("config.toml"))
-            .args(args)
-            .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", self.home.join(".config"))
-            .env("XDG_DATA_HOME", self.home.join(".local/share"))
-            .env("XDG_CACHE_HOME", self.home.join(".cache"))
-            .env_remove("SBH_CONFIG")
-            .env_remove("SBH_CONFIG_PATH")
-            .env("LC_ALL", "C.UTF-8")
-            .env("PATH", &self.path)
-            .env("SBH_TEST_SERVICE_STATE", service_state)
-            .env("SBH_TEST_SERVICE_BINARY", &self.service_binary)
-            .env("SBH_TEST_EXEC_START_JSON", &self.exec_start)
-            .env("SBH_TEST_BUSCTL_LOG", &self.bus_calls)
-            .env("SBH_TEST_EXPECTED_SHA", &self.expected_sha)
-            .env("SBH_TEST_SYSTEMCTL_LOG", &self.calls)
-            .env("SBH_TEST_UPDATER_EXE", &self.updater_exe)
-            .env("SBH_TEST_RESTART_VERSIONS", &self.versions)
-            .output()
-            .unwrap()
+        let invocation = tempfile::tempdir_in(&self.home).unwrap();
+        let request = invocation.path().join("restart-request");
+        let pid_file = invocation.path().join("runtime-pid");
+        let old_runtime = invocation.path().join("old-sbh");
+        if service_state == "stale-runtime" {
+            fs::copy(&self.binary, &old_runtime).unwrap();
+        }
+        let finished = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let helper = scope.spawn(|| {
+                let mut held = None;
+                while !finished.load(Ordering::Relaxed) {
+                    if request.is_file() && held.is_none() {
+                        let binary = if service_state == "stale-runtime" {
+                            &old_runtime
+                        } else {
+                            &self.service_binary
+                        };
+                        let process = HeldVersion::start(binary);
+                        fs::write(&pid_file, process.child.id().to_string()).unwrap();
+                        held = Some(process);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            // Stop and reap the fixture even if spawning the updater fails.
+            let finish = FinishOnDrop(&finished);
+            let output = Command::new(&self.binary)
+                .args(["update", "--json", "--offline"])
+                .arg(&self.manifest)
+                .arg("--config")
+                .arg(self.home.join("config.toml"))
+                .args(args)
+                .env("HOME", &self.home)
+                .env("XDG_CONFIG_HOME", self.home.join(".config"))
+                .env("XDG_DATA_HOME", self.home.join(".local/share"))
+                .env("XDG_CACHE_HOME", self.home.join(".cache"))
+                .env_remove("SBH_CONFIG")
+                .env_remove("SBH_CONFIG_PATH")
+                .env("LC_ALL", "C.UTF-8")
+                .env("PATH", &self.path)
+                .env("SBH_TEST_SERVICE_STATE", service_state)
+                .env("SBH_TEST_SERVICE_BINARY", &self.service_binary)
+                .env("SBH_TEST_EXEC_START_JSON", &self.exec_start)
+                .env("SBH_TEST_BUSCTL_LOG", &self.bus_calls)
+                .env("SBH_TEST_EXPECTED_SHA", &self.expected_sha)
+                .env("SBH_TEST_SYSTEMCTL_LOG", &self.calls)
+                .env("SBH_TEST_UPDATER_EXE", &self.updater_exe)
+                .env("SBH_TEST_RESTART_VERSIONS", &self.versions)
+                .env("SBH_TEST_RESTART_REQUEST", &request)
+                .env("SBH_TEST_RUNTIME_PID", &pid_file)
+                .output();
+            drop(finish);
+            helper.join().unwrap();
+            output.unwrap()
+        })
     }
 
     fn assert_applied(&self, output: &Output, restart_status: &str) -> Value {
@@ -302,13 +433,10 @@ fn loaded_user_service_restarts_the_new_executable_on_each_update() {
         }
         let calls = fs::read_to_string(&fixture.calls).unwrap();
         assert_eq!(calls.matches("--user restart sbh.service").count(), 2);
-        assert_eq!(
-            fs::read_to_string(&fixture.bus_calls)
-                .unwrap()
-                .lines()
-                .count(),
-            2
-        );
+        let queries = fs::read_to_string(&fixture.bus_calls).unwrap();
+        assert_eq!(queries.matches("org.freedesktop.systemd1.Service ExecStart").count(), 4);
+        assert!(queries.matches("org.freedesktop.systemd1.Unit ActiveState SubState").count() >= 4);
+        assert!(queries.lines().all(|line| line.starts_with("--user ")));
         let versions = fs::read_to_string(&fixture.versions).unwrap();
         assert_eq!(versions.lines().count(), 2);
         assert!(
@@ -330,6 +458,7 @@ fn real_restart_failure_preserves_applied_update_and_exit_two() {
     assert!(error.contains("fixture restart denied"), "{error}");
     assert!(error.contains("23"), "{error}");
     assert!(!fixture.versions.exists());
+    assert!(!fs::read_to_string(&fixture.bus_calls).unwrap().contains("ActiveState"));
 }
 
 #[test]
@@ -528,4 +657,52 @@ fn failed_exec_start_verification_never_restarts_a_loaded_service() {
         );
         assert!(!fixture.versions.exists());
     }
+}
+
+#[test]
+fn successful_restart_job_without_activation_is_a_failure() {
+    for state in ["condition-skipped", "exited-runtime", "zero-runtime-pid"] {
+        let fixture = Fixture::new("home/.local/bin/sbh");
+        let output = fixture.run(state, &["--force", "--user"]);
+        assert_eq!(output.status.code(), Some(2), "{state}: {output:?}");
+        let report = fixture.assert_applied(&output, "failed");
+        assert_eq!(report["success"], false);
+        let calls = fs::read_to_string(&fixture.calls).unwrap();
+        assert_eq!(calls.matches("--user restart sbh.service").count(), 1);
+        assert!(fixture.versions.is_file(), "the restart command really succeeded");
+    }
+}
+
+#[test]
+fn running_old_image_after_successful_restart_is_a_failure() {
+    let fixture = Fixture::new("custom destination/sbh");
+    let output = fixture.run("stale-runtime", &["--force", "--user"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let report = fixture.assert_applied(&output, "failed");
+    assert_eq!(report["success"], false);
+    let error = report["service_restart"]["error"].as_str().unwrap();
+    assert!(error.contains("activation") || error.contains("running executable differs"), "{error}");
+    assert_eq!(fs::read_to_string(&fixture.calls).unwrap().matches("--user restart sbh.service").count(), 1);
+}
+
+#[test]
+fn activation_query_failure_is_not_reported_as_restarted() {
+    let fixture = Fixture::new("opt/sbhprev/sbh");
+    let output = fixture.run("activation-query-failure", &["--force", "--user"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let report = fixture.assert_applied(&output, "failed");
+    assert_eq!(report["success"], false);
+    assert!(report["service_restart"]["error"].as_str().unwrap().contains("fixture activation access denied"));
+    assert_eq!(fs::read_to_string(&fixture.calls).unwrap().matches("--user restart sbh.service").count(), 1);
+}
+
+#[test]
+fn activation_waits_for_startup_to_finish_without_restarting_twice() {
+    let fixture = Fixture::new("home/.local/bin/sbh");
+    let output = fixture.run("delayed-activation", &["--force", "--user"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = fixture.assert_applied(&output, "restarted");
+    assert_eq!(report["success"], true);
+    assert_eq!(fs::read_to_string(&fixture.calls).unwrap().matches("--user restart sbh.service").count(), 1);
+    assert!(fs::read_to_string(&fixture.bus_calls).unwrap().matches("ActiveState SubState").count() >= 3);
 }
