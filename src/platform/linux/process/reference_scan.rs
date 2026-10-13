@@ -418,6 +418,12 @@ fn open_targets_with(
             }
             add_target_spellings(&mut targets, target);
         });
+        // A process working inside a tree is using it, whatever it holds
+        // open at this instant (bd-d1kt): rustc compiles a registry crate
+        // from that crate's source directory.
+        if !own && let Ok(cwd) = fs::read_link(proc_root.join(pid.to_string()).join("cwd")) {
+            add_target_spellings(&mut targets, cwd);
+        }
     }
     let mut targets: Vec<_> = targets.into_iter().collect();
     targets.sort_unstable();
@@ -1002,6 +1008,24 @@ mod tests {
         assert!(complete);
         assert!(targets.contains(&walked));
         assert!(targets.contains(&own_log));
+    }
+
+    /// bd-d1kt: a process's working directory counts, sbh's own does not.
+    #[test]
+    fn path_only_sweep_counts_a_process_working_directory() {
+        let fixture = Fixture::new();
+        let own = i32::try_from(std::process::id()).unwrap();
+        let other = own.checked_add(1).unwrap();
+        let building = fixture.root.join("cargo-home/registry/src/serde");
+        let idle = fixture.root.join("idle");
+        fs::create_dir_all(&building).unwrap();
+        fs::create_dir(&idle).unwrap();
+        symlink(&building, fixture.pid(other).join("cwd")).unwrap();
+        symlink(&idle, fixture.pid(own).join("cwd")).unwrap();
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        assert_eq!(targets, vec![building]);
     }
 
     #[test]

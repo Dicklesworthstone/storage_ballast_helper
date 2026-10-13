@@ -177,6 +177,8 @@ pub struct ActiveReferenceProcess {
     pub open_file_descriptors: usize,
     pub running_executable: bool,
     pub mmap_regions: usize,
+    /// The process's working directory is inside the tree (bd-d1kt).
+    pub working_directory: bool,
 }
 
 impl ActiveReferenceSummary {
@@ -196,6 +198,14 @@ impl ActiveReferenceSummary {
 
     pub fn add_mmap_region(&mut self, pid: i32, name: Option<String>) {
         self.process_mut(pid, name).mmap_regions += 1;
+    }
+
+    /// A process working inside a tree is using it even when it holds no
+    /// descriptor there at the instant of the sweep (bd-d1kt): rustc compiles
+    /// a registry crate from that crate's source directory, opening each file
+    /// only for as long as it reads it.
+    pub fn add_working_directory(&mut self, pid: i32, name: Option<String>) {
+        self.process_mut(pid, name).working_directory = true;
     }
 
     pub fn mark_incomplete(&mut self, reason: impl Into<String>) {
@@ -246,6 +256,7 @@ impl ActiveReferenceSummary {
                 open_file_descriptors: 0,
                 running_executable: false,
                 mmap_regions: 0,
+                working_directory: false,
             });
             self.processes.sort_by_key(|p| p.pid);
             self.processes
@@ -267,7 +278,10 @@ impl ActiveReferenceSummary {
 impl ActiveReferenceProcess {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.open_file_descriptors == 0 && !self.running_executable && self.mmap_regions == 0
+        self.open_file_descriptors == 0
+            && !self.running_executable
+            && self.mmap_regions == 0
+            && !self.working_directory
     }
 
     fn safe_reclaim_reason(&self) -> String {
@@ -289,6 +303,9 @@ impl ActiveReferenceProcess {
         }
         if self.mmap_regions > 0 {
             evidence.push(pluralize(self.mmap_regions, "mmap region", "mmap regions"));
+        }
+        if self.working_directory {
+            evidence.push("its working directory here".to_string());
         }
         format!("{label} has {}", evidence.join(", "))
     }

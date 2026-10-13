@@ -2090,6 +2090,13 @@ fn should_fast_track_temp_age(
     if classification.category == ArtifactCategory::Unknown {
         return false;
     }
+    // A CACHEDIR.TAG proves "regenerable", not "abandoned", and this
+    // name-agnostic classification relies on the minimum age (patterns.rs).
+    // Fast-tracking it gave a live cargo home's registry/ and git/, minutes
+    // old and being compiled from, the configured minimum age (bd-d1kt).
+    if classification.pattern_name == "cachedir-tagged-cache" {
+        return false;
+    }
     // Restrict fast-track to tmp-like roots, with one carved-out exception:
     // explicit bare in-tree rch target dirs (see `is_named_in_tree_rch_target`).
     if !is_tmp_like_path(path) && !is_named_in_tree_rch_target(classification) {
@@ -14427,6 +14434,64 @@ mod tests {
             &classification,
         );
         assert_eq!(adjusted, Duration::from_mins(30));
+    }
+
+    /// bd-d1kt: on hz2 at Red, the registry/ and git/ of a cargo home that a
+    /// running `cargo test` was compiling from were 5 and 8 minutes old,
+    /// recorded as 1800 s and deleted. A CACHEDIR.TAG says a directory is
+    /// regenerable, not that it is abandoned: it must be its real age.
+    #[test]
+    fn a_cachedir_tagged_cache_is_never_age_fast_tracked() {
+        let tagged = ArtifactClassification {
+            pattern_name: "cachedir-tagged-cache".into(),
+            category: ArtifactCategory::CacheDir,
+            name_confidence: 0.75,
+            structural_confidence: 0.0,
+            combined_confidence: 0.75,
+        };
+        let registry = Path::new("/data/tmp/ftcairo-1013/cargo-home/registry");
+        for level in [
+            PressureLevel::Orange,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
+            for observed in [Duration::from_mins(5), Duration::from_mins(8)] {
+                assert_eq!(
+                    adjusted_candidate_age(observed, 30, level, registry, &tagged),
+                    observed,
+                    "{level:?}"
+                );
+            }
+        }
+        // A cache old enough by its real age is unaffected.
+        assert_eq!(
+            adjusted_candidate_age(
+                Duration::from_mins(45),
+                30,
+                PressureLevel::Red,
+                registry,
+                &tagged
+            ),
+            Duration::from_mins(45)
+        );
+        // A named build target beside it is still fast-tracked.
+        let target = ArtifactClassification {
+            pattern_name: "target".into(),
+            category: ArtifactCategory::RustTarget,
+            name_confidence: 0.95,
+            structural_confidence: 0.9,
+            combined_confidence: 0.93,
+        };
+        assert_eq!(
+            adjusted_candidate_age(
+                Duration::from_mins(5),
+                30,
+                PressureLevel::Red,
+                Path::new("/data/tmp/ftcairo-1013/target"),
+                &target
+            ),
+            Duration::from_mins(30)
+        );
     }
 
     #[test]

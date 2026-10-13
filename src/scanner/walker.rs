@@ -1799,7 +1799,19 @@ pub fn collect_active_reference_index(
     let mut process_names = HashMap::new();
     match platform.process_list() {
         Ok(processes) => {
+            let own = i32::try_from(std::process::id()).ok();
             for process in processes {
+                // A process working inside a tree is using it, whatever it
+                // holds open at this instant (bd-d1kt). sbh's own working
+                // directory is no more a reference than its own handles.
+                if Some(process.pid) != own
+                    && let Some(cwd) = &process.cwd
+                {
+                    let name = Some(process.name.clone());
+                    index.add_reference(&roots, cwd, |summary| {
+                        summary.add_working_directory(process.pid, name.clone());
+                    });
+                }
                 process_names.insert(process.pid, process.name);
             }
         }
@@ -2560,6 +2572,44 @@ mod tests {
             logged.parent().unwrap(),
             &ancestors
         ));
+    }
+
+    /// bd-d1kt: rustc compiles a registry crate from that crate's source
+    /// directory and holds no descriptor there between reads. The cargo home
+    /// it is building from is in use.
+    #[test]
+    fn a_process_working_inside_a_tree_is_an_active_reference() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let registry = root.join("job/cargo-home/registry");
+        let crate_dir = registry.join("src/index.crates.io-0000/serde-1.0.0");
+        let idle = root.join("idle/cargo-home/registry");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::create_dir_all(&idle).unwrap();
+        let own = i32::try_from(std::process::id()).unwrap();
+        let working_in = |pid, name: &str, cwd: &Path| crate::platform::types::ProcessInfo {
+            cwd: Some(cwd.to_path_buf()),
+            ..process(pid, name, None)
+        };
+        let platform = TestActiveRefPlatform {
+            processes: vec![
+                working_in(42, "rustc", &crate_dir),
+                // sbh's own working directory is not a reference.
+                working_in(own, "sbh", &idle),
+            ],
+            ..Default::default()
+        };
+
+        let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
+        let resolve = |path: &Path| crate::core::paths::resolve_absolute_path(path);
+        let summary = index.summary_for(&resolve(&registry));
+        assert!(!summary.is_empty());
+        let reason = summary.safe_reclaim_reason().unwrap();
+        assert!(
+            reason.contains("pid 42 (rustc) has its working directory here"),
+            "{reason}"
+        );
+        assert!(index.summary_for(&resolve(&idle)).is_empty());
     }
 
     #[test]
