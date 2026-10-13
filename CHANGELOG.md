@@ -6,6 +6,20 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Upgrade note: rollback snapshots
+
+- `sbh update --rollback` now refuses a snapshot without a recorded SHA-256.
+  Snapshots taken by v0.7.2 and earlier have none, so they cannot be rolled
+  back to; the first update made by this release takes a verifiable one.
+
+### Known limitations
+
+- macOS: the evidence that a live build is using a tree (its working
+  directory, and the caches its environment names) is Linux-only. On a Mac a
+  build is recognised only by the files and executables it holds open, so a
+  cache it is not reading at that moment can still be reclaimed under Orange
+  or higher pressure (bd-j7ho).
+
 ### Changed
 
 - #33 source-root detection is report-only in this release; enforcement is
@@ -28,9 +42,34 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
     age after two minutes of observation; it now has to be its real age;
   - a process whose working directory is inside a tree now counts as using
     it;
-  - on Linux, the `CARGO_HOME` and `CARGO_TARGET_DIR` in the environment of a
-    running cargo or rustc count as in use for as long as it runs.
-  `sbh explain` names the process and the reason (`53942a3`, `5a6f04a`).
+  - on Linux, the cargo home and target directory of a running cargo or
+    rustc count as in use for as long as it runs: `CARGO_HOME` and
+    `CARGO_TARGET_DIR` from its environment, or `$HOME/.cargo` when it sets
+    no `CARGO_HOME`. Builds from the default home were hit almost as often:
+    in one 12-hour window of fleet logs, 15 of 35 deletions of
+    `~/.cargo/registry` and `~/.cargo/git/db` stores were recreated under a
+    live process.
+  `sbh explain` names the process and the reason. Affected: v0.5.0 through
+  v0.7.2 (`53942a3`, `5a6f04a`, `11a609c`).
+- On Linux, live builds of other toolchains hold their caches the same way
+  (bd-j7ho): Go's build and module caches (`GOCACHE`, `GOMODCACHE`,
+  `GOTMPDIR`, or their defaults under `XDG_CACHE_HOME`, the first `GOPATH`
+  element and `$HOME`), npm's (`npm_config_cache`), uv's and pip's
+  (`UV_CACHE_DIR`, `PIP_CACHE_DIR`), and sccache's and ccache's
+  (`SCCACHE_DIR`, `CCACHE_DIR`). sbh reads these only from the environment of
+  a process with a recognised build-tool name; a cache no live build names
+  stays reclaimable (`40f15f3`, `11a609c`).
+- A candidate directory the scan recognises by its contents (a
+  `CACHEDIR.TAG`, for one) is measured before it is planned (bd-3rlm). It
+  carried only the size of its immediate files: two candidates planned at
+  4 KiB each freed 2.5 GB, so the pass met its byte target only on paper,
+  kept choosing, and reported the paper size as freed (`122d355`).
+- `sbh update --rollback` verifies a snapshot before it replaces the
+  installed binary (#35). Each snapshot records its size and SHA-256 when it
+  is taken, and rollback checks the private copy it is about to publish, so
+  a missing, symlinked, resized or corrupted snapshot is refused and the
+  installed binary is left as it is (`972f8f8`, `b021028`, `d560b32`,
+  `bed564e`).
 - sbh no longer treats a candidate as "open" because its own scanner was
   still walking it. The open-file sweep and the active-reference index
   counted sbh's own directory handles, so a candidate examined or dispatched
