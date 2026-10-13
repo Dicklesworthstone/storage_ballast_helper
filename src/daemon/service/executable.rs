@@ -243,6 +243,26 @@ mod tests {
         );
     }
 
+    /// Run a test binary copied a moment ago. A child that another test
+    /// thread forks while the copy is still open for writing holds that
+    /// descriptor until it execs, and exec fails with ETXTBSY meanwhile; retry
+    /// like `execution_probe::verify` does.
+    #[cfg(target_os = "linux")]
+    fn output_retrying_text_busy(command: &mut std::process::Command) -> std::process::Output {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match command.output() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => return other.unwrap(),
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn uncaptured_path_ignores_a_deleted_name_decoy() {
@@ -300,15 +320,15 @@ mod tests {
             fs::create_dir_all(binary.parent().unwrap()).unwrap();
             fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
             let binary = fs::canonicalize(binary).unwrap();
-            let output = Command::new(&binary)
-                .args([
-                    "--exact",
-                    "daemon::service::executable::tests::uncaptured_path_ignores_a_deleted_name_decoy",
-                    "--nocapture",
-                ])
-                .env(PROBE_ENV, &binary)
-                .output()
-                .unwrap();
+            let output = output_retrying_text_busy(
+                Command::new(&binary)
+                    .args([
+                        "--exact",
+                        "daemon::service::executable::tests::uncaptured_path_ignores_a_deleted_name_decoy",
+                        "--nocapture",
+                    ])
+                    .env(PROBE_ENV, &binary),
+            );
             assert!(
                 output.status.success(),
                 "uncaptured replacement probe failed:\n{}\n{}",
@@ -352,15 +372,15 @@ mod tests {
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
         fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
         let binary = fs::canonicalize(binary).unwrap();
-        let output = Command::new(&binary)
-            .args([
-                "--exact",
-                "daemon::service::executable::tests::captured_path_survives_real_repeated_replacement",
-                "--nocapture",
-            ])
-            .env(PROBE_ENV, &binary)
-            .output()
-            .unwrap();
+        let output = output_retrying_text_busy(
+            Command::new(&binary)
+                .args([
+                    "--exact",
+                    "daemon::service::executable::tests::captured_path_survives_real_repeated_replacement",
+                    "--nocapture",
+                ])
+                .env(PROBE_ENV, &binary),
+        );
         assert!(
             output.status.success(),
             "replacement probe failed:\n{}\n{}",
