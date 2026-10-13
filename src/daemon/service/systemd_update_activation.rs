@@ -115,7 +115,7 @@ where
 }
 
 fn same_image(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.is_file() && right.is_file() && (left.dev(), left.ino()) == (right.dev(), right.ino())
+    left.is_file() && right.is_file() && left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 fn require_unchanged_installation(installed: &Path, expected: &fs::Metadata) -> Result<()> {
@@ -173,8 +173,7 @@ fn parse_runtime(unit: &[u8], service: &[u8]) -> Result<RuntimeState> {
     Ok(RuntimeState {
         active: unit[0].data.as_str().ok_or_else(invalid)?.to_string(),
         sub: unit[1].data.as_str().ok_or_else(invalid)?.to_string(),
-        pid: u32::try_from(service[0].data.as_u64().ok_or_else(invalid)?)
-            .map_err(|_| invalid())?,
+        pid: u32::try_from(service[0].data.as_u64().ok_or_else(invalid)?).map_err(|_| invalid())?,
         started: service[1].data.as_u64().ok_or_else(invalid)?,
     })
 }
@@ -203,7 +202,9 @@ fn read_properties(
 ) -> Result<Vec<u8>> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(runtime("timed out verifying sbh.service activation after update"));
+        return Err(runtime(
+            "timed out verifying sbh.service activation after update",
+        ));
     }
     let scope = if user_scope { "--user" } else { "--system" };
     // Bound the client process and combined output too, not just each D-Bus
@@ -221,7 +222,9 @@ fn read_properties(
         1024 * 1024,
     )
     .map_err(|error| {
-        runtime(format!("could not verify service activation with busctl: {error}"))
+        runtime(format!(
+            "could not verify service activation with busctl: {error}"
+        ))
     })?;
     if !output.status.success() {
         return Err(runtime(format!(

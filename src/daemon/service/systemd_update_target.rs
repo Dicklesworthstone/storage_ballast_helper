@@ -51,7 +51,7 @@ pub(super) fn verify(user_scope: bool, installed: &Path) -> Result<()> {
             .env("LC_ALL", "C")
             .stdin(Stdio::null()),
     )
-    .map_err(query_error)?;
+    .map_err(|error| query_error(&error))?;
     if !output.status.success() {
         return Err(runtime(format!(
             "cannot verify sbh.service's update target: busctl {scope} ExecStart failed \
@@ -64,7 +64,7 @@ pub(super) fn verify(user_scope: bool, installed: &Path) -> Result<()> {
     verify_same_binary(installed, &executable)
 }
 
-fn query_error(error: std::io::Error) -> SbhError {
+fn query_error(error: &std::io::Error) -> SbhError {
     let advice = if error.kind() == std::io::ErrorKind::NotFound {
         "; install the systemd busctl utility before retrying the service restart"
     } else {
@@ -159,7 +159,7 @@ mod tests {
         json!([path, [path, "daemon"], false, 0, 0, 0, 0, 0, 0, 0])
     }
 
-    fn property(commands: serde_json::Value) -> Vec<u8> {
+    fn property(commands: &serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&json!({"type": EXEC_START_TYPE, "data": commands})).unwrap()
     }
 
@@ -174,7 +174,7 @@ mod tests {
             "/opt/日本語/sbh",
         ] {
             assert_eq!(
-                parse_exec_start(&property(json!([command(path)]))).unwrap(),
+                parse_exec_start(&property(&json!([command(path)]))).unwrap(),
                 Path::new(path)
             );
         }
@@ -187,14 +187,14 @@ mod tests {
             json!([command("/one"), command("/two")]),
             json!([["/short"]]),
         ] {
-            assert!(parse_exec_start(&property(commands)).is_err());
+            assert!(parse_exec_start(&property(&commands)).is_err());
         }
         for path in ["", "sbh", "/opt/null\0byte/sbh"] {
-            assert!(parse_exec_start(&property(json!([command(path)]))).is_err());
+            assert!(parse_exec_start(&property(&json!([command(path)]))).is_err());
         }
         assert!(parse_exec_start(br#"{"type":"as","data":[]}"#).is_err());
         assert!(parse_exec_start(b"not json").is_err());
-        let no_args = property(json!([["/sbh", [], false, 0, 0, 0, 0, 0, 0, 0]]));
+        let no_args = property(&json!([["/sbh", [], false, 0, 0, 0, 0, 0, 0, 0]]));
         assert!(parse_exec_start(&no_args).is_err());
     }
 
@@ -253,12 +253,12 @@ mod tests {
             ErrorKind::UnexpectedEof,
             ErrorKind::PermissionDenied,
         ] {
-            let error = query_error(Error::new(kind, "fixture query failure")).to_string();
+            let error = query_error(&Error::new(kind, "fixture query failure")).to_string();
             assert!(error.contains("cannot verify sbh.service's update target"));
             assert!(error.contains("fixture query failure"));
             assert!(!error.contains("install the systemd busctl utility"));
         }
-        let error = query_error(Error::new(ErrorKind::NotFound, "missing")).to_string();
+        let error = query_error(&Error::new(ErrorKind::NotFound, "missing")).to_string();
         assert!(error.contains("install the systemd busctl utility"));
     }
 
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn bounded_client_keeps_typed_exec_start_json_intact() {
         let path = "/opt/custom \"quoted\" 日本語/sbh";
-        let json = property(json!([command(path)]));
+        let json = property(&json!([command(path)]));
         let output = super::super::query_output(
             Command::new("/bin/sh")
                 .args(["-c", "printf '%s' \"$1\"", "query-test"])

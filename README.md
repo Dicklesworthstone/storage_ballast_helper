@@ -983,6 +983,7 @@ Operator automation can override configuration via environment variables. These 
 | `SBH_ARTIFACT_DIR` | test | Where the dashboard e2e artifact bundles are written |
 | `SBH_TUI_ARTIFACT_DIR` | test | Where the TUI test artifacts are written |
 | `SBH_EXECUTABLE_REPLACEMENT_PROBE` | test | Binary the Linux self-replacement test rewrites in place to check the service restart path (#35) |
+| `SBH_UPDATE_HANDOFF_CONTEXT_PROBE` | test | Mode (`update` or another value) the update-handoff test runs its child process in, to check that a command's install-path intent is captured once (#35) |
 | `SBH_TUI_ARTIFACT_FRAMES` | test | Include rendered frame text in the TUI test artifacts |
 <!-- sbh-docs:end -->
 

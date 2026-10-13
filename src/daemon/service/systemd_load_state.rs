@@ -382,8 +382,8 @@ mod query_tests {
         ))
         .unwrap();
         assert!(output.status.success());
-        assert_eq!(output.stdout, vec![0; 262144]);
-        assert_eq!(output.stderr, vec![0; 262144]);
+        assert_eq!(output.stdout, vec![0; 262_144]);
+        assert_eq!(output.stderr, vec![0; 262_144]);
     }
 
     #[test]
@@ -424,8 +424,8 @@ mod query_tests {
         let mut command = shell("printf '%s' $$ > \"$1\"; exec sleep 30");
         command.arg("query-test").arg(&pid_file);
         let started = Instant::now();
-        let error = query_output_with_limits(&mut command, Duration::from_secs(1), 1024)
-            .unwrap_err();
+        let error =
+            query_output_with_limits(&mut command, Duration::from_secs(1), 1024).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(5));
         let pid = std::fs::read_to_string(pid_file)
@@ -442,8 +442,8 @@ mod query_tests {
     #[test]
     fn missing_client_error_is_not_reclassified() {
         let temp = tempfile::tempdir().unwrap();
-        let error = query_output(&mut Command::new(temp.path().join("missing-systemctl")))
-            .unwrap_err();
+        let error =
+            query_output(&mut Command::new(temp.path().join("missing-systemctl"))).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 

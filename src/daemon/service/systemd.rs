@@ -547,7 +547,8 @@ impl ServiceManager for SystemdServiceManager {
 
     fn restart(&self) -> Result<()> {
         load_state::restart(self.config.user_scope, || {
-            self.run_systemctl(&["restart", SYSTEMD_UNIT_NAME]).map(|_| ())
+            self.run_systemctl(&["restart", SYSTEMD_UNIT_NAME])
+                .map(|_| ())
         })
     }
 

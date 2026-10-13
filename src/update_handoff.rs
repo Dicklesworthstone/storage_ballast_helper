@@ -34,7 +34,7 @@ mod tests {
         if let Ok(mode) = std::env::var(PROBE) {
             let target = PathBuf::from("/opt/custom destination/sbh");
             assert_eq!(install_path(), None);
-            let selected = (mode == "update").then_some(target.clone());
+            let selected = (mode == "update").then_some(target);
             capture_install_path(selected.clone());
             capture_install_path(Some(PathBuf::from("/unrelated/sbh")));
             assert_eq!(install_path(), selected.as_deref());

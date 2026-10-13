@@ -158,7 +158,10 @@ impl HeldVersion {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        Self { child, _reader: reader }
+        Self {
+            child,
+            _reader: reader,
+        }
     }
 }
 
@@ -434,8 +437,18 @@ fn loaded_user_service_restarts_the_new_executable_on_each_update() {
         let calls = fs::read_to_string(&fixture.calls).unwrap();
         assert_eq!(calls.matches("--user restart sbh.service").count(), 2);
         let queries = fs::read_to_string(&fixture.bus_calls).unwrap();
-        assert_eq!(queries.matches("org.freedesktop.systemd1.Service ExecStart").count(), 4);
-        assert!(queries.matches("org.freedesktop.systemd1.Unit ActiveState SubState").count() >= 4);
+        assert_eq!(
+            queries
+                .matches("org.freedesktop.systemd1.Service ExecStart")
+                .count(),
+            4
+        );
+        assert!(
+            queries
+                .matches("org.freedesktop.systemd1.Unit ActiveState SubState")
+                .count()
+                >= 4
+        );
         assert!(queries.lines().all(|line| line.starts_with("--user ")));
         let versions = fs::read_to_string(&fixture.versions).unwrap();
         assert_eq!(versions.lines().count(), 2);
@@ -458,7 +471,11 @@ fn real_restart_failure_preserves_applied_update_and_exit_two() {
     assert!(error.contains("fixture restart denied"), "{error}");
     assert!(error.contains("23"), "{error}");
     assert!(!fixture.versions.exists());
-    assert!(!fs::read_to_string(&fixture.bus_calls).unwrap().contains("ActiveState"));
+    assert!(
+        !fs::read_to_string(&fixture.bus_calls)
+            .unwrap()
+            .contains("ActiveState")
+    );
 }
 
 #[test]
@@ -669,7 +686,10 @@ fn successful_restart_job_without_activation_is_a_failure() {
         assert_eq!(report["success"], false);
         let calls = fs::read_to_string(&fixture.calls).unwrap();
         assert_eq!(calls.matches("--user restart sbh.service").count(), 1);
-        assert!(fixture.versions.is_file(), "the restart command really succeeded");
+        assert!(
+            fixture.versions.is_file(),
+            "the restart command really succeeded"
+        );
     }
 }
 
@@ -681,8 +701,17 @@ fn running_old_image_after_successful_restart_is_a_failure() {
     let report = fixture.assert_applied(&output, "failed");
     assert_eq!(report["success"], false);
     let error = report["service_restart"]["error"].as_str().unwrap();
-    assert!(error.contains("activation") || error.contains("running executable differs"), "{error}");
-    assert_eq!(fs::read_to_string(&fixture.calls).unwrap().matches("--user restart sbh.service").count(), 1);
+    assert!(
+        error.contains("activation") || error.contains("running executable differs"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.calls)
+            .unwrap()
+            .matches("--user restart sbh.service")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -692,8 +721,19 @@ fn activation_query_failure_is_not_reported_as_restarted() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     let report = fixture.assert_applied(&output, "failed");
     assert_eq!(report["success"], false);
-    assert!(report["service_restart"]["error"].as_str().unwrap().contains("fixture activation access denied"));
-    assert_eq!(fs::read_to_string(&fixture.calls).unwrap().matches("--user restart sbh.service").count(), 1);
+    assert!(
+        report["service_restart"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("fixture activation access denied")
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.calls)
+            .unwrap()
+            .matches("--user restart sbh.service")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -703,6 +743,18 @@ fn activation_waits_for_startup_to_finish_without_restarting_twice() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let report = fixture.assert_applied(&output, "restarted");
     assert_eq!(report["success"], true);
-    assert_eq!(fs::read_to_string(&fixture.calls).unwrap().matches("--user restart sbh.service").count(), 1);
-    assert!(fs::read_to_string(&fixture.bus_calls).unwrap().matches("ActiveState SubState").count() >= 3);
+    assert_eq!(
+        fs::read_to_string(&fixture.calls)
+            .unwrap()
+            .matches("--user restart sbh.service")
+            .count(),
+        1
+    );
+    assert!(
+        fs::read_to_string(&fixture.bus_calls)
+            .unwrap()
+            .matches("ActiveState SubState")
+            .count()
+            >= 3
+    );
 }

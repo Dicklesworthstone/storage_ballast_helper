@@ -382,6 +382,11 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         "Binary the Linux self-replacement test rewrites in place to check the service restart path (#35)",
     ),
     var(
+        "SBH_UPDATE_HANDOFF_CONTEXT_PROBE",
+        EnvArea::Test,
+        "Mode (`update` or another value) the update-handoff test runs its child process in, to check that a command's install-path intent is captured once (#35)",
+    ),
+    var(
         "SBH_TUI_ARTIFACT_FRAMES",
         EnvArea::Test,
         "Include rendered frame text in the TUI test artifacts",
