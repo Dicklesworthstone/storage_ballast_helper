@@ -2808,21 +2808,34 @@ mod tests {
             ..Default::default()
         };
 
-        let first = collect_active_reference_index_cached(
-            &platform,
-            std::slice::from_ref(&root),
-            Duration::from_secs(30),
-        );
-        let second = collect_active_reference_index_cached(
-            &platform,
-            std::slice::from_ref(&root),
-            Duration::from_secs(30),
-        );
-
         let candidate_identity = identity_for_path(&candidate, false).unwrap();
-        assert!(!first.summary_for_identity(candidate_identity).is_empty());
-        assert!(!second.summary_for_identity(candidate_identity).is_empty());
-        assert_eq!(platform.probe_calls.load(Ordering::SeqCst), 1);
+        // The cache is one process-wide slot, and tests running in parallel
+        // replace it between two calls. A disturbed pair proves nothing, so
+        // try again; without the cache every pair would probe twice.
+        let mut shared = false;
+        for _ in 0..20 {
+            platform.probe_calls.store(0, Ordering::SeqCst);
+            let first = collect_active_reference_index_cached(
+                &platform,
+                std::slice::from_ref(&root),
+                Duration::from_secs(30),
+            );
+            let second = collect_active_reference_index_cached(
+                &platform,
+                std::slice::from_ref(&root),
+                Duration::from_secs(30),
+            );
+            assert!(!first.summary_for_identity(candidate_identity).is_empty());
+            assert!(!second.summary_for_identity(candidate_identity).is_empty());
+            if platform.probe_calls.load(Ordering::SeqCst) <= 1 {
+                shared = true;
+                break;
+            }
+        }
+        assert!(
+            shared,
+            "two collections within the TTL never shared a probe"
+        );
     }
 
     #[cfg(unix)]
