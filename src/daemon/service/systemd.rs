@@ -470,7 +470,7 @@ impl ServiceManager for SystemdServiceManager {
         let unit_content = self.generate_unit_file();
 
         fs::create_dir_all(&unit_dir).map_err(|source| SbhError::Io {
-            path: unit_dir.clone(),
+            path: unit_path.clone(),
             source,
         })?;
 
@@ -1550,10 +1550,7 @@ mod unit_drift_tests {
         );
         assert_eq!(drift.foreign_dropins.len(), 4);
         assert!(
-            drift
-                .foreign_dropins
-                .iter()
-                .any(|d| d.overrides_hardening),
+            drift.foreign_dropins.iter().any(|d| d.overrides_hardening),
             "CPUQuota drop-in"
         );
         let gates = drift.blocking_gates();
@@ -1569,6 +1566,7 @@ mod unit_drift_tests {
             &host_dropins(&gate),
         );
         assert!(drift.blocking_gates().is_empty());
+        assert_eq!(drift.condition_gates.len(), 1);
         assert_eq!(drift.severity(), DriftSeverity::Fail);
     }
 
