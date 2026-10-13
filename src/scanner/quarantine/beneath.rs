@@ -538,7 +538,7 @@ mod tests {
         for error in [
             rustix::io::Errno::XDEV,
             rustix::io::Errno::LOOP,
-            rustix::io::Errno::ACCES,
+            rustix::io::Errno::ACCESS,
             rustix::io::Errno::NOENT,
             rustix::io::Errno::INVAL,
             rustix::io::Errno::IO,
@@ -707,13 +707,17 @@ mod input_tests {
     fn ordinary_non_utf8_and_dot_names_are_still_valid_entries() {
         let dir = tempfile::tempdir().unwrap();
         let parent = File::open(dir.path()).unwrap();
-        for name in [
+        let mut names = vec![
             OsStr::new(".hidden"),
             OsStr::new("..."),
             OsStr::new("a..b"),
             OsStr::new("with space"),
-            OsStr::from_bytes(b"nonutf8-\xff"),
-        ] {
+        ];
+        // APFS refuses names that are not valid UTF-8 (EILSEQ).
+        if cfg!(target_os = "linux") {
+            names.push(OsStr::from_bytes(b"nonutf8-\xff"));
+        }
+        for name in names {
             fs::write(dir.path().join(name), b"keep").unwrap();
             let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
             let fd = open_beneath(&parent, name, flags).expect("normal existing entry opens");
