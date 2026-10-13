@@ -75,7 +75,11 @@ impl SourceRootStatus {
     /// A diagnostic shared by doctor, validation, status and the executor.
     #[must_use]
     pub fn diagnostic(&self) -> String {
-        let action = if self.reclaim_allowed { "allowed" } else { "BLOCKED" };
+        let action = if self.reclaim_allowed {
+            "allowed"
+        } else {
+            "BLOCKED"
+        };
         format!(
             "scanner root {}: reclaim {action}: {}",
             self.root.display(),
@@ -164,7 +168,11 @@ fn inspect(
     limits: InspectionLimits,
     resolved: &mut Option<PathBuf>,
 ) -> std::result::Result<Option<PathBuf>, String> {
-    let mut budget = Budget { start: Instant::now(), entries: 0, limits };
+    let mut budget = Budget {
+        start: Instant::now(),
+        entries: 0,
+        limits,
+    };
     budget.step()?;
     let canonical = fs::canonicalize(root)
         .map_err(|error| format!("cannot resolve {}: {error}", root.display()))?;
@@ -193,13 +201,15 @@ fn inspect(
             .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
         for entry in entries {
             budget.step()?;
-            let entry = entry
-                .map_err(|error| format!("cannot read entry in {}: {error}", directory.display()))?;
+            let entry = entry.map_err(|error| {
+                format!("cannot read entry in {}: {error}", directory.display())
+            })?;
             if entry.file_name() == ".git" {
                 return Ok(Some(directory));
             }
             let path = entry.path();
-            let kind = entry.file_type()
+            let kind = entry
+                .file_type()
                 .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
             if kind.is_symlink() {
                 // Never follow directory links into an unbounded/cyclic tree.
@@ -208,7 +218,10 @@ fn inspect(
                 let target = fs::metadata(&path)
                     .map_err(|error| format!("cannot resolve link {}: {error}", path.display()))?;
                 if target.is_dir() {
-                    return Err(format!("directory link {} requires a narrower scan root", path.display()));
+                    return Err(format!(
+                        "directory link {} requires a narrower scan root",
+                        path.display()
+                    ));
                 }
             } else if kind.is_dir() {
                 // Probe the marker even at the depth boundary. If none is
@@ -219,7 +232,10 @@ fn inspect(
                     return Ok(Some(path));
                 }
                 if depth >= limits.max_depth {
-                    return Err(format!("source-root inspection depth limit at {}", path.display()));
+                    return Err(format!(
+                        "source-root inspection depth limit at {}",
+                        path.display()
+                    ));
                 }
                 pending.push((path, depth + 1));
             }
@@ -235,7 +251,12 @@ pub fn inspect_root(root: &Path, allow: bool, limits: InspectionLimits) -> Sourc
     let mut resolved_root = None;
     let result = inspect(root, limits, &mut resolved_root);
     let (finding, repositories, reclaim_allowed, detail) = match result {
-        Ok(None) => (RootFinding::Clear, Vec::new(), true, "no Git work tree found".to_string()),
+        Ok(None) => (
+            RootFinding::Clear,
+            Vec::new(),
+            true,
+            "no Git work tree found".to_string(),
+        ),
         Ok(Some(repository)) => {
             let detail = format!(
                 "Git work tree {}{}",
@@ -250,7 +271,14 @@ pub fn inspect_root(root: &Path, allow: bool, limits: InspectionLimits) -> Sourc
         }
         Err(detail) => (RootFinding::Unverified, Vec::new(), false, detail),
     };
-    SourceRootStatus { root: root.to_path_buf(), resolved_root, repositories, finding, reclaim_allowed, detail }
+    SourceRootStatus {
+        root: root.to_path_buf(),
+        resolved_root,
+        repositories,
+        finding,
+        reclaim_allowed,
+        detail,
+    }
 }
 
 /// Inspect all configured roots, retaining every root's diagnostic.
@@ -258,7 +286,10 @@ pub fn inspect_root(root: &Path, allow: bool, limits: InspectionLimits) -> Sourc
 pub fn inspect_roots(roots: &[PathBuf], allow: bool) -> SourceRootReport {
     SourceRootReport {
         allow_source_tree_roots: allow,
-        roots: roots.iter().map(|root| inspect_root(root, allow, InspectionLimits::default())).collect(),
+        roots: roots
+            .iter()
+            .map(|root| inspect_root(root, allow, InspectionLimits::default()))
+            .collect(),
     }
 }
 
@@ -286,7 +317,12 @@ impl PolicyState {
 
     fn refresh(&mut self) {
         self.remember_locations();
-        let roots: Vec<_> = self.report.roots.iter().map(|root| root.root.clone()).collect();
+        let roots: Vec<_> = self
+            .report
+            .roots
+            .iter()
+            .map(|root| root.root.clone())
+            .collect();
         let mut report = inspect_roots(&roots, self.report.allow_source_tree_roots);
         for (fresh, previous) in report.roots.iter_mut().zip(&self.report.roots) {
             // If resolution now fails, keep the previous location as a denied
@@ -362,24 +398,46 @@ impl SourceRootPolicy {
         state.refresh();
         let mut matched = false;
         for root in &state.report.roots {
-            let configured = absolute_lexical(&root.root)
-                .map_err(|error| format!("cannot resolve scanner root {}: {error}", root.root.display()))?;
+            let configured = absolute_lexical(&root.root).map_err(|error| {
+                format!(
+                    "cannot resolve scanner root {}: {error}",
+                    root.root.display()
+                )
+            })?;
             let lexical_match = overlaps(&lexical, &configured);
-            let canonical_match = root.resolved_root.as_ref().is_some_and(|resolved| overlaps(&canonical, resolved));
+            let canonical_match = root
+                .resolved_root
+                .as_ref()
+                .is_some_and(|resolved| overlaps(&canonical, resolved));
             if lexical_match || canonical_match {
                 matched = true;
                 if !root.reclaim_allowed {
                     return Err(root.diagnostic());
                 }
                 if lexical.starts_with(&configured)
-                    && !root.resolved_root.as_ref().is_some_and(|resolved| canonical.starts_with(resolved))
+                    && !root
+                        .resolved_root
+                        .as_ref()
+                        .is_some_and(|resolved| canonical.starts_with(resolved))
                 {
-                    return Err(format!("candidate {} escapes configured scanner root {}", path.display(), root.root.display()));
+                    return Err(format!(
+                        "candidate {} escapes configured scanner root {}",
+                        path.display(),
+                        root.root.display()
+                    ));
                 }
             }
         }
-        if !matched && state.retired_paths.iter().any(|root| overlaps(&lexical, root) || overlaps(&canonical, root)) {
-            return Err(format!("candidate {} belongs to a removed or retargeted scanner root", path.display()));
+        if !matched
+            && state
+                .retired_paths
+                .iter()
+                .any(|root| overlaps(&lexical, root) || overlaps(&canonical, root))
+        {
+            return Err(format!(
+                "candidate {} belongs to a removed or retargeted scanner root",
+                path.display()
+            ));
         }
         Ok(())
     }
@@ -399,7 +457,10 @@ mod tests {
     }
 
     fn limits() -> InspectionLimits {
-        InspectionLimits { time_budget: Duration::from_secs(5), ..InspectionLimits::default() }
+        InspectionLimits {
+            time_budget: Duration::from_secs(5),
+            ..InspectionLimits::default()
+        }
     }
 
     #[test]
@@ -421,7 +482,10 @@ mod tests {
             let report = inspect_root(root, false, limits());
             assert_eq!(report.finding, RootFinding::GitWorktree);
             assert!(!report.reclaim_allowed);
-            assert_eq!(report.repositories, vec![fs::canonicalize(dir.path()).unwrap()]);
+            assert_eq!(
+                report.repositories,
+                vec![fs::canonicalize(dir.path()).unwrap()]
+            );
         }
     }
 
@@ -434,13 +498,20 @@ mod tests {
         fs::write(untracked.join("evidence.txt"), b"irreplaceable").unwrap();
         let policy = SourceRootPolicy::new(&[dir.path().to_path_buf()], false);
         assert!(policy.authorize(&untracked).is_err());
-        assert_eq!(fs::read(untracked.join("evidence.txt")).unwrap(), b"irreplaceable");
+        assert_eq!(
+            fs::read(untracked.join("evidence.txt")).unwrap(),
+            b"irreplaceable"
+        );
     }
 
     #[test]
     fn linked_worktree_gitfile_is_detected_without_invoking_git() {
         let dir = scratch();
-        fs::write(dir.path().join(".git"), b"gitdir: /unavailable/main/.git/worktrees/topic\n").unwrap();
+        fs::write(
+            dir.path().join(".git"),
+            b"gitdir: /unavailable/main/.git/worktrees/topic\n",
+        )
+        .unwrap();
         let report = inspect_root(dir.path(), false, limits());
         assert_eq!(report.finding, RootFinding::GitWorktree);
         assert!(!report.reclaim_allowed);
@@ -464,9 +535,18 @@ mod tests {
         mkdir(&dir.path().join("deep/child/grandchild"));
         for allow in [false, true] {
             for bound in [
-                InspectionLimits { max_depth: 0, ..limits() },
-                InspectionLimits { max_entries: 0, ..limits() },
-                InspectionLimits { time_budget: Duration::ZERO, ..limits() },
+                InspectionLimits {
+                    max_depth: 0,
+                    ..limits()
+                },
+                InspectionLimits {
+                    max_entries: 0,
+                    ..limits()
+                },
+                InspectionLimits {
+                    time_budget: Duration::ZERO,
+                    ..limits()
+                },
             ] {
                 let report = inspect_root(dir.path(), allow, bound);
                 assert_eq!(report.finding, RootFinding::Unverified);
@@ -574,7 +654,11 @@ mod tests {
         use std::os::unix::fs::symlink;
         for dangling in [false, true] {
             let dir = scratch();
-            let destination = if dangling { dir.path().join("missing") } else { dir.path().to_path_buf() };
+            let destination = if dangling {
+                dir.path().join("missing")
+            } else {
+                dir.path().to_path_buf()
+            };
             symlink(destination, dir.path().join("link")).unwrap();
             let report = inspect_root(dir.path(), false, limits());
             assert_eq!(report.finding, RootFinding::Unverified);
@@ -591,7 +675,10 @@ mod tests {
         assert_eq!(json["allow_source_tree_roots"], false);
         assert_eq!(json["roots"][0]["finding"], "git_worktree");
         assert_eq!(json["roots"][0]["reclaim_allowed"], false);
-        assert_eq!(json["roots"][0]["repositories"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            json["roots"][0]["repositories"].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(report.failures().len(), 1);
         assert!(report.allowed_roots().is_empty());
     }

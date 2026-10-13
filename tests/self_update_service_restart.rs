@@ -182,7 +182,10 @@ impl Fixture {
             .unwrap_or_else(|error| panic!("invalid update JSON: {error}; {output:?}"));
         assert_eq!(report["applied"], true, "{report}");
         assert_eq!(report["install_path"], self.binary.to_str().unwrap());
-        assert_eq!(report["service_restart"]["status"], restart_status, "{report}");
+        assert_eq!(
+            report["service_restart"]["status"], restart_status,
+            "{report}"
+        );
         assert_eq!(sha256(&self.binary), self.expected_sha);
         let observed = fs::read_to_string(&self.updater_exe).unwrap();
         let deleted = format!("{} (deleted)", self.binary.display());

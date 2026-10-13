@@ -162,7 +162,10 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let temp = tempfile::tempdir().unwrap();
-        let binary = binary_at(temp.path(), Path::new(OsStr::from_bytes(b"custom-\xff/sbh")));
+        let binary = binary_at(
+            temp.path(),
+            Path::new(OsStr::from_bytes(b"custom-\xff/sbh")),
+        );
         assert_eq!(
             resolve_current_exe_path(&deleted_path(&binary)).unwrap(),
             binary

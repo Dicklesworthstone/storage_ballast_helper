@@ -5,12 +5,21 @@ use crate::scanner::scoring::{ArtifactCertainty, DecisionOutcome, EvidenceLedger
 use std::borrow::Cow;
 
 fn scratch() -> tempfile::TempDir {
-    for base in [std::env::temp_dir(), PathBuf::from("/tmp"), PathBuf::from("/var/tmp")] {
+    for base in [
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/var/tmp"),
+    ] {
         if base.is_dir() && !is_hardcoded_source_tree(&base) {
             if let Ok(dir) = tempfile::tempdir_in(base) {
                 // A test runner may redirect TMPDIR into its checkout. An
                 // ancestor repository would invalidate a clear-root fixture.
-                if !dir.path().ancestors().skip(1).any(|p| p.join(".git").exists()) {
+                if !dir
+                    .path()
+                    .ancestors()
+                    .skip(1)
+                    .any(|p| p.join(".git").exists())
+                {
                     return dir;
                 }
             }
@@ -26,7 +35,11 @@ fn git(root: &Path, args: &[&str]) {
         .args(args)
         .output()
         .expect("git is required by repository protection tests");
-    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn repository(root: &Path) {
@@ -72,7 +85,10 @@ fn artifact(path: &Path) -> CandidacyScore {
             regret_calibration: 1.0,
             category_suspended: false,
         },
-        ledger: EvidenceLedger { terms: Vec::new(), summary: "source-root regression".to_string() },
+        ledger: EvidenceLedger {
+            terms: Vec::new(),
+            summary: "source-root regression".to_string(),
+        },
     }
 }
 
@@ -91,7 +107,10 @@ fn executor(root: &Path, policy: SourceRootPolicy, mode: DeletionMode) -> Deleti
 }
 
 fn retained(candidate: &CandidacyScore) {
-    assert_eq!(fs::read(candidate.path.join("debug/deps/generated.o")).unwrap(), b"object bytes");
+    assert_eq!(
+        fs::read(candidate.path.join("debug/deps/generated.o")).unwrap(),
+        b"object bytes"
+    );
 }
 
 #[test]
@@ -120,12 +139,19 @@ fn nested_repository_blocks_untracked_evidence_in_a_sibling_directory() {
     let dir = scratch();
     repository(&dir.path().join("deep/nested/project"));
     let candidate = artifact(&dir.path().join("target"));
-    fs::write(candidate.path.join("release-evidence.txt"), b"not regenerable").unwrap();
+    fs::write(
+        candidate.path.join("release-evidence.txt"),
+        b"not regenerable",
+    )
+    .unwrap();
     let policy = SourceRootPolicy::new(&[dir.path().to_path_buf()], false);
     let executor = executor(dir.path(), policy, DeletionMode::Unlink);
     let report = executor.execute(&executor.plan(vec![candidate.clone()]), None);
     assert_eq!(report.skipped_by_reason.get("source_root_denied"), Some(&1));
-    assert_eq!(fs::read(candidate.path.join("release-evidence.txt")).unwrap(), b"not regenerable");
+    assert_eq!(
+        fs::read(candidate.path.join("release-evidence.txt")).unwrap(),
+        b"not regenerable"
+    );
     retained(&candidate);
 }
 
@@ -151,10 +177,18 @@ fn explicit_opt_in_keeps_untracked_build_artifact_reclamation_available() {
                 assert_eq!(report.bytes_freed, 0);
                 assert_eq!(report.items_quarantined, 1);
                 let id = crate::scanner::decision_record::stable_decision_id(
-                    &candidate.path, candidate.identity, candidate.size_bytes,
+                    &candidate.path,
+                    candidate.identity,
+                    candidate.size_bytes,
                 );
-                let record = QuarantineStore::under(dir.path()).record(&id).unwrap().unwrap();
-                assert_eq!(fs::read(record.quarantine_path.join("debug/deps/generated.o")).unwrap(), b"object bytes");
+                let record = QuarantineStore::under(dir.path())
+                    .record(&id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    fs::read(record.quarantine_path.join("debug/deps/generated.o")).unwrap(),
+                    b"object bytes"
+                );
             }
         }
     }
@@ -176,7 +210,11 @@ fn explicit_opt_in_does_not_override_tracked_content_or_sacred_paths() {
         let report = executor.execute(&executor.plan(vec![candidate.clone()]), None);
         assert_eq!(report.items_deleted, 0);
         assert_eq!(report.items_skipped, 1);
-        let reason = if tracked { "contains_git" } else { "sacred_stowaway" };
+        let reason = if tracked {
+            "contains_git"
+        } else {
+            "sacred_stowaway"
+        };
         assert_eq!(report.skipped_by_reason.get(reason), Some(&1), "{report:?}");
         retained(&candidate);
     }
@@ -233,9 +271,8 @@ fn reload_during_live_guard_revokes_preflight_authorization() {
         policy.replace(&roots, false);
         Ok(())
     };
-    let report = executor.execute_with_guard(
-        &executor.plan(vec![candidate.clone()]), None, Some(&revoke),
-    );
+    let report =
+        executor.execute_with_guard(&executor.plan(vec![candidate.clone()]), None, Some(&revoke));
     assert_eq!(report.skipped_by_reason.get("source_root_denied"), Some(&1));
     assert_eq!(report.bytes_freed, 0);
     retained(&candidate);
@@ -254,7 +291,10 @@ fn both_private_mutation_backends_recheck_after_preflight() {
             DeletionMode::Unlink => executor.delete_path(&candidate),
             DeletionMode::Quarantine => executor.quarantine_path(&candidate),
         };
-        assert!(matches!(result, Err(SbhError::SafetyVeto { .. })), "{result:?}");
+        assert!(
+            matches!(result, Err(SbhError::SafetyVeto { .. })),
+            "{result:?}"
+        );
         retained(&candidate);
     }
 }
@@ -289,10 +329,17 @@ fn removed_configured_root_does_not_authorize_a_stale_plan() {
 #[test]
 fn gitfile_source_root_is_denied_without_querying_its_missing_git_directory() {
     let dir = scratch();
-    fs::write(dir.path().join(".git"), b"gitdir: /missing/worktree-metadata\n").unwrap();
+    fs::write(
+        dir.path().join(".git"),
+        b"gitdir: /missing/worktree-metadata\n",
+    )
+    .unwrap();
     let candidate = artifact(&dir.path().join("target"));
     let policy = SourceRootPolicy::new(&[dir.path().to_path_buf()], false);
     let executor = executor(dir.path(), policy, DeletionMode::Unlink);
-    assert_eq!(executor.explain_preflight(&candidate, None), Err(SkipReason::SourceRootDenied));
+    assert_eq!(
+        executor.explain_preflight(&candidate, None),
+        Err(SkipReason::SourceRootDenied)
+    );
     retained(&candidate);
 }

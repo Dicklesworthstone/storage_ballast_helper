@@ -3184,10 +3184,8 @@ mod tests {
             assert!(unknown.is_empty());
             assert!(!cfg.scanner.allow_source_tree_roots);
         }
-        let (cfg, unknown) = Config::parse_toml(
-            "[scanner]\nallow_source_tree_roots = true\n",
-        )
-        .unwrap();
+        let (cfg, unknown) =
+            Config::parse_toml("[scanner]\nallow_source_tree_roots = true\n").unwrap();
         assert!(unknown.is_empty());
         assert!(cfg.scanner.allow_source_tree_roots);
         let text = toml::to_string_pretty(&cfg).unwrap();
@@ -3196,10 +3194,7 @@ mod tests {
         let mut denied = cfg.clone();
         denied.scanner.allow_source_tree_roots = false;
         assert_ne!(cfg.stable_hash().unwrap(), denied.stable_hash().unwrap());
-        assert!(Config::parse_toml(
-            "[scanner]\nallow_source_tree_roots = \"true\"\n",
-        )
-        .is_err());
+        assert!(Config::parse_toml("[scanner]\nallow_source_tree_roots = \"true\"\n",).is_err());
     }
 
     #[test]
@@ -3217,7 +3212,11 @@ mod tests {
                 (name == "SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS").then(|| "yes".to_string())
             })
             .unwrap_err();
-        assert!(error.to_string().contains("SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS"));
+        assert!(
+            error
+                .to_string()
+                .contains("SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS")
+        );
         assert!(!cfg.scanner.allow_source_tree_roots);
     }
 
@@ -3229,7 +3228,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.scanner.root_paths = vec![dir.path().to_path_buf()];
         let ballast = cfg.ballast.clone();
-        assert!(cfg.validate().is_ok(), "structural validation must permit ballast");
+        assert!(
+            cfg.validate().is_ok(),
+            "structural validation must permit ballast"
+        );
         let report = cfg.source_root_report();
         assert_eq!(report.roots.len(), 1);
         assert!(!report.roots[0].reclaim_allowed);
@@ -3242,7 +3244,10 @@ mod tests {
         assert!(cfg.validate_source_roots().is_ok());
         assert_eq!(cfg.ballast, ballast);
         cfg.scanner.root_paths = vec![dir.path().join("missing")];
-        assert!(cfg.validate_source_roots().is_err(), "opt-in is not an I/O-error bypass");
+        assert!(
+            cfg.validate_source_roots().is_err(),
+            "opt-in is not an I/O-error bypass"
+        );
         assert!(cfg.validate().is_ok());
     }
 
