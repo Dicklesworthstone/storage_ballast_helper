@@ -102,7 +102,9 @@ filetime = "0.2"
 criterion = "0.8.2"
 insta = { version = "1.47.2", default-features = false }
 [profile.release]
-opt-level = "z"
+# Speed, not size: release binaries are performance-optimized (the size build
+# was 28-36% slower in user CPU on scan and plan workloads, and 46% smaller).
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
