@@ -159,7 +159,8 @@ impl Fixture {
             .output()
             .unwrap();
         assert!(output.status.success(), "tar failed: {output:?}");
-        let checksum = root.join("archive.sha256");
+        // The updater accepts a bundle only under the release asset names.
+        let checksum = root.join(contract.checksum_name());
         fs::write(
             &checksum,
             format!("{}  {}\n", sha256(&archive), contract.asset_name()),
