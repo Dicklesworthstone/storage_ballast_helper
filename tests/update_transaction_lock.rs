@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use storage_ballast_helper::cli::update::{BackupSnapshot, BackupStore};
 use storage_ballast_helper::cli::{
     HostSpecifier, OfflineBundleArtifact, OfflineBundleManifest, RELEASE_REPOSITORY,
     ReleaseChannel, resolve_updater_artifact_contract,
@@ -23,9 +24,16 @@ set -eu
 printf '%s\n' "$*" >> "$SBH_TEST_TRANSACTION_ROOT/calls"
 if [ "${1-}" = --user ]; then shift; fi
 case "$*" in
-    'show sbh.service --property=LoadState --value') printf 'loaded\n' ;;
+    'show sbh.service --property=LoadState --value')
+        if [ -e "$SBH_TEST_TRANSACTION_ROOT/service-unloaded" ]; then
+            printf 'not-found\n'
+        else
+            printf 'loaded\n'
+        fi
+        ;;
     'restart sbh.service')
         : > "$SBH_TEST_TRANSACTION_ROOT/restart-entered"
+        if [ -e "$SBH_TEST_TRANSACTION_ROOT/restart-success" ]; then exit 0; fi
         i=0
         while [ ! -e "$SBH_TEST_TRANSACTION_ROOT/release-restart" ] && [ "$i" -lt 600 ]; do
             i=$((i + 1))
@@ -40,9 +48,22 @@ esac
 
 const BUSCTL: &str = r#"#!/bin/sh
 set -eu
+printf '%s\n' "$*" >> "$SBH_TEST_TRANSACTION_ROOT/bus-calls"
 case "$*" in
     *' org.freedesktop.systemd1.Service ExecStart')
         cat "$SBH_TEST_TRANSACTION_ROOT/exec-start.json"
+        ;;
+    *' org.freedesktop.systemd1.Unit ActiveState SubState')
+        printf '{"type":"s","data":"active"}\n{"type":"s","data":"running"}\n'
+        ;;
+    *' org.freedesktop.systemd1.Service MainPID ExecMainStartTimestampMonotonic')
+        i=0
+        while [ ! -s "$SBH_TEST_TRANSACTION_ROOT/runtime-pid" ] && [ "$i" -lt 200 ]; do
+            i=$((i + 1))
+            sleep 0.01
+        done
+        pid=$(cat "$SBH_TEST_TRANSACTION_ROOT/runtime-pid")
+        printf '{"type":"u","data":%s}\n{"type":"t","data":1}\n' "$pid"
         ;;
     *) printf 'unexpected busctl arguments: %s\n' "$*" >&2; exit 92 ;;
 esac
@@ -168,6 +189,20 @@ impl Fixture {
         fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         (path, expected)
     }
+
+    fn rollback_snapshot(&self) -> BackupSnapshot {
+        let candidate = self.root().join("rollback-candidate");
+        fs::copy(&self.binary, &candidate).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&candidate)
+            .unwrap()
+            .write_all(b"\nrollback activation fixture\n")
+            .unwrap();
+        BackupStore::open(self.root().join("home/.local/share/sbh/backups"))
+            .create(&candidate, "rollback-fixture")
+            .unwrap()
+    }
 }
 
 struct Running {
@@ -252,16 +287,30 @@ fn contention_precedes_update_and_rollback_but_not_backup_inventory() {
 
 #[test]
 fn real_replacement_retains_ownership_during_restart_and_releases_on_failure() {
+    replacement_retains_ownership(false);
+}
+
+#[test]
+fn rollback_retains_ownership_during_restart_and_releases_on_failure() {
+    replacement_retains_ownership(true);
+}
+
+fn replacement_retains_ownership(rollback: bool) {
     let fixture = Fixture::new("custom destination");
-    let (bundle, expected) = fixture.bundle();
+    let (bundle, mut expected) = fixture.bundle();
+    let mut command = fixture.command();
+    if rollback {
+        let snapshot = fixture.rollback_snapshot();
+        expected = digest(&snapshot.path);
+        command.args(["--rollback", &snapshot.id, "--user"]);
+    } else {
+        command.args(["--force", "--user", "--offline"]).arg(&bundle);
+    }
     let before = fs::metadata(&fixture.binary).unwrap().ino();
     let stdout = fixture.root().join("first.json");
     let stderr = fixture.root().join("first.stderr");
     let mut first = Running {
-        child: fixture
-            .command()
-            .args(["--force", "--user", "--offline"])
-            .arg(&bundle)
+        child: command
             .stdout(File::create(&stdout).unwrap())
             .stderr(File::create(&stderr).unwrap())
             .process_group(0)
@@ -322,4 +371,210 @@ fn real_replacement_retains_ownership_during_restart_and_releases_on_failure() {
     );
     assert!(acquire_update_lock(&fixture.binary).is_ok());
     assert_eq!(digest(&fixture.binary), expected);
+}
+
+// Hold the actual restored executable at its --version write. This exercises
+// procfs image verification without starting a daemon or scanning host files.
+struct HeldImage {
+    process: Running,
+    _reader: std::os::unix::net::UnixStream,
+}
+
+impl HeldImage {
+    fn start(binary: &Path) -> Self {
+        use std::io::ErrorKind;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        loop {
+            match writer.write(&[0_u8; 4096]) {
+                Ok(count) => assert!(count > 0),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill version socket: {error}"),
+            }
+        }
+        writer.set_nonblocking(false).unwrap();
+        let child = Command::new(binary)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(OwnedFd::from(writer)))
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        Self {
+            process: Running {
+                child,
+                reaped: false,
+            },
+            _reader: reader,
+        }
+    }
+}
+
+#[test]
+fn rollback_at_custom_path_activates_the_restored_image() {
+    rollback_activation_checks_the_running_image(false);
+}
+
+#[test]
+fn rollback_does_not_report_success_when_the_old_image_is_still_running() {
+    rollback_activation_checks_the_running_image(true);
+}
+
+fn rollback_activation_checks_the_running_image(stale: bool) {
+    let fixture = Fixture::new("custom destination");
+    let snapshot = fixture.rollback_snapshot();
+    let expected = digest(&snapshot.path);
+    let original = digest(&fixture.binary);
+    assert_ne!(original, expected);
+    let old_runtime = stale.then(|| HeldImage::start(&fixture.binary));
+    fs::write(fixture.root().join("restart-success"), b"yes").unwrap();
+    let stdout = fixture.root().join("rollback.json");
+    let stderr = fixture.root().join("rollback.stderr");
+    let mut rollback = Running {
+        child: fixture
+            .command()
+            .args(["--rollback", &snapshot.id, "--user"])
+            .stdout(File::create(&stdout).unwrap())
+            .stderr(File::create(&stderr).unwrap())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+        reaped: false,
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.root().join("restart-entered").exists() {
+        assert!(
+            rollback.status().is_none(),
+            "rollback exited before restart: {}\n{}",
+            fs::read_to_string(&stdout).unwrap(),
+            fs::read_to_string(&stderr).unwrap()
+        );
+        assert!(Instant::now() < deadline, "rollback never reached restart");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(digest(&fixture.binary), expected);
+    let mut held = old_runtime.unwrap_or_else(|| HeldImage::start(&fixture.binary));
+    fs::write(
+        fixture.root().join("runtime-pid"),
+        held.process.child.id().to_string(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = rollback.status() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "rollback activation timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        status.code(),
+        Some(if stale { 2 } else { 0 }),
+        "{}",
+        fs::read_to_string(&stderr).unwrap()
+    );
+    assert!(
+        held.process.status().is_none(),
+        "fixture image must still be running"
+    );
+    let report: Value = serde_json::from_slice(&fs::read(stdout).unwrap()).unwrap();
+    assert_eq!(report["success"], !stale);
+    assert_eq!(report["applied"], true);
+    assert_eq!(report["snapshot_id"], snapshot.id);
+    assert_eq!(report["restored_version"], "rollback-fixture");
+    assert_eq!(
+        report["service_restart"]["status"],
+        if stale { "failed" } else { "restarted" }
+    );
+    assert_eq!(report["service_restart"]["scope"], "user");
+    assert_eq!(report["error"].is_null(), !stale);
+    assert_eq!(digest(&fixture.binary), expected);
+    assert_eq!(digest(&snapshot.path), expected);
+    let queries = fs::read_to_string(fixture.root().join("bus-calls")).unwrap();
+    assert!(queries.matches("ExecStart").count() >= 2);
+    assert!(queries.matches("ActiveState SubState").count() >= 2);
+    assert!(queries.matches("MainPID ExecMainStartTimestampMonotonic").count() >= 2);
+    assert!(acquire_update_lock(&fixture.binary).is_ok());
+}
+
+#[test]
+fn rollback_without_a_service_restores_the_default_user_local_installation() {
+    let fixture = Fixture::new("home/.local/bin");
+    let snapshot = fixture.rollback_snapshot();
+    let expected = digest(&snapshot.path);
+    let old_inode = fs::metadata(&fixture.binary).unwrap().ino();
+    fs::write(fixture.root().join("service-unloaded"), b"yes").unwrap();
+    // Omitted backup ID selects the newest snapshot, and no --user flag means
+    // system service scope even though the executable is installed user-locally.
+    let output = fixture.command().arg("--rollback").output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["success"], true);
+    assert_eq!(report["applied"], true);
+    assert_eq!(report["snapshot_id"], snapshot.id);
+    assert_eq!(report["service_restart"]["status"], "skipped");
+    assert_eq!(report["service_restart"]["scope"], "system");
+    assert_ne!(fs::metadata(&fixture.binary).unwrap().ino(), old_inode);
+    assert_eq!(digest(&fixture.binary), expected);
+    assert!(!fixture.root().join("restart-entered").exists());
+    assert!(!fixture.root().join("bus-calls").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.root().join("calls")).unwrap(),
+        "show sbh.service --property=LoadState --value\n"
+    );
+}
+
+#[test]
+fn rollback_previews_under_contention_do_not_restore_prune_or_query_services() {
+    let fixture = Fixture::new("custom destination");
+    let snapshot = fixture.rollback_snapshot();
+    let original = digest(&fixture.binary);
+    let old_inode = fs::metadata(&fixture.binary).unwrap().ino();
+    let _guard = acquire_update_lock(&fixture.binary).unwrap();
+    for preview in ["--dry-run", "--check"] {
+        let output = fixture
+            .command()
+            .args(["--rollback", &snapshot.id, preview, "--prune", "0"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["success"], true);
+        assert_eq!(report["applied"], false);
+        assert_eq!(report["dry_run"], preview == "--dry-run");
+        assert_eq!(report["check_only"], preview == "--check");
+        assert_eq!(report["snapshot_id"], snapshot.id);
+        assert!(report["service_restart"].is_null());
+        assert_eq!(digest(&fixture.binary), original);
+        assert_eq!(fs::metadata(&fixture.binary).unwrap().ino(), old_inode);
+        assert!(snapshot.path.is_file(), "preview must not prune the backup");
+        assert!(!fixture.root().join("calls").exists());
+        assert!(!fixture.root().join("bus-calls").exists());
+    }
+}
+
+#[test]
+fn rollback_selection_failure_is_structured_and_has_no_activation_side_effects() {
+    let fixture = Fixture::new("home/.local/bin");
+    let _snapshot = fixture.rollback_snapshot();
+    let original = digest(&fixture.binary);
+    let output = fixture
+        .command()
+        .args(["--rollback", "missing-snapshot", "--user"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["success"], false);
+    assert_eq!(report["applied"], false);
+    assert!(report["error"].as_str().unwrap().contains("not found"));
+    assert!(report["service_restart"].is_null());
+    assert_eq!(digest(&fixture.binary), original);
+    assert!(!fixture.root().join("calls").exists());
+    assert!(!fixture.root().join("bus-calls").exists());
+    assert!(acquire_update_lock(&fixture.binary).is_ok());
 }
