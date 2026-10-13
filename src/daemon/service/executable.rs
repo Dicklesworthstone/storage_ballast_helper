@@ -65,8 +65,9 @@ fn resolve_uncaptured_binary() -> Result<PathBuf> {
             return resolve_current_exe_path(&exe, matches_running_image);
         }
         Err(SbhError::Runtime {
-            details: "running sbh executable changed location during path resolution; retry the command"
-                .to_string(),
+            details:
+                "running sbh executable changed location during path resolution; retry the command"
+                    .to_string(),
         })
     }
     #[cfg(not(target_os = "linux"))]
@@ -143,7 +144,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let unrelated = binary_at(temp.path(), Path::new("other/bin/sbh"));
         let missing = temp.path().join("original/bin/sbh");
-        let error = resolve_current_exe_path(&missing, true).unwrap_err().to_string();
+        let error = resolve_current_exe_path(&missing, true)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains(&missing.display().to_string()));
         assert!(unrelated.is_file());
         assert!(resolve_current_exe_path(temp.path(), true).is_err());
@@ -234,7 +237,10 @@ mod tests {
         fs::write(&decorated, b"unrelated executable").unwrap();
         assert_eq!(resolve_current_exe_path(&decorated, false).unwrap(), binary);
         // The same spelling is literal when it really denotes the running image.
-        assert_eq!(resolve_current_exe_path(&decorated, true).unwrap(), decorated);
+        assert_eq!(
+            resolve_current_exe_path(&decorated, true).unwrap(),
+            decorated
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -260,7 +266,9 @@ mod tests {
             assert!(decorated.is_file());
             assert_eq!(resolve_sbh_binary().unwrap(), original);
             assert_eq!(
-                super::super::SystemdConfig::from_env(true).unwrap().binary_path,
+                super::super::SystemdConfig::from_env(true)
+                    .unwrap()
+                    .binary_path,
                 original
             );
             // A synthetic-name symlink to procfs has the same target inode as
@@ -283,7 +291,11 @@ mod tests {
         }
 
         let temp = tempfile::tempdir().unwrap();
-        for relative in ["home/.local/bin/sbh", "custom dir/sbh", "literal/sbh (deleted)"] {
+        for relative in [
+            "home/.local/bin/sbh",
+            "custom dir/sbh",
+            "literal/sbh (deleted)",
+        ] {
             let binary = temp.path().join(relative);
             fs::create_dir_all(binary.parent().unwrap()).unwrap();
             fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
