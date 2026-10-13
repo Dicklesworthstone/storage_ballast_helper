@@ -55,7 +55,15 @@ struct Fixture {
 }
 
 fn sha256(path: &Path) -> String {
-    format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+    // sha2 0.11's digest array has no `LowerHex`; hex-encode the bytes.
+    use std::fmt::Write as _;
+    Sha256::digest(fs::read(path).unwrap()).iter().fold(
+        String::with_capacity(64),
+        |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        },
+    )
 }
 
 fn executable(path: &Path, contents: &[u8]) {
