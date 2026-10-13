@@ -5,11 +5,17 @@
 //! another observation at the same path, or an observed identity alias. Perform
 //! these checks before any risk/byte optimization or counterfactual accounting.
 //!
+//! Directory aliases also carry their descendants' vetoes: if `/a` and `/b`
+//! name the same directory, `/a/busy` protects `/b/busy/child` even without an
+//! observation of `/b/busy` itself. Only prefixes of supplied paths are stored;
+//! alias cycles never generate an unbounded set of synthetic pathnames.
+//!
 //! Admission uses only the observations supplied in this batch. It neither
 //! canonicalizes paths nor discovers unseen aliases, mounts or active references.
 //! The executor must still perform fresh identity, protection and lease checks.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::path::Path;
 
 use crate::scanner::scoring::CandidacyScore;
@@ -50,13 +56,16 @@ fn hard_veto(candidate: &CandidacyScore) -> bool {
     candidate.vetoed || candidate.decision.category_suspended
 }
 
-/// Identity/path equivalence is transitive, even when observations disagree
-/// about which inode occupied a path. Unknown identities never form a group.
-/// Path containment is deliberately NOT an equivalence edge: a rejected parent
-/// must not turn its independently safe children into vetoed scopes.
+/// Identity/path equivalence, closed under equal child names. Children of
+/// equivalent directories are equivalent observations too, including prefix
+/// nodes for which the batch has no separate candidacy score.
+///
+/// Containment is NOT an equivalence edge. In particular, rejecting a parent
+/// because it contains a protected child must not protect its safe siblings.
 struct Groups {
     parent: Vec<usize>,
     size: Vec<usize>,
+    children: Vec<BTreeMap<OsString, usize>>,
 }
 
 impl Groups {
@@ -64,6 +73,7 @@ impl Groups {
         Self {
             parent: (0..len).collect(),
             size: vec![1; len],
+            children: vec![BTreeMap::new(); len],
         }
     }
 
@@ -76,69 +86,102 @@ impl Groups {
     }
 
     fn unite(&mut self, left: usize, right: usize) {
-        let mut left = self.root(left);
-        let mut right = self.root(right);
-        if left == right {
-            return;
+        // Iterative congruence closure also handles an observed directory
+        // aliasing one of its ancestors. No recursion or path expansion.
+        let mut pending = vec![(left, right)];
+        while let Some((left, right)) = pending.pop() {
+            let mut left = self.root(left);
+            let mut right = self.root(right);
+            if left == right {
+                continue;
+            }
+            if self.size[left] < self.size[right] {
+                std::mem::swap(&mut left, &mut right);
+            }
+            self.parent[right] = left;
+            self.size[left] += self.size[right];
+            // Move the smaller group's edges. Each edge is moved only as its
+            // owning equivalence class grows; duplicate labels induce unions.
+            for (name, child) in std::mem::take(&mut self.children[right]) {
+                if let Some(previous) = self.children[left].insert(name, child) {
+                    pending.push((previous, child));
+                }
+            }
         }
-        if self.size[left] < self.size[right] {
-            std::mem::swap(&mut left, &mut right);
+    }
+}
+
+fn mark_reachable(marked: &mut [bool], edges: &[Vec<usize>]) {
+    let mut pending: Vec<_> = marked
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &marked)| marked.then_some(index))
+        .collect();
+    while let Some(index) = pending.pop() {
+        for &next in &edges[index] {
+            if !marked[next] {
+                marked[next] = true;
+                pending.push(next);
+            }
         }
-        self.parent[right] = left;
-        self.size[left] += self.size[right];
     }
 }
 
 fn rejected_observations(candidates: &[CandidacyScore]) -> Vec<bool> {
-    let mut groups = Groups::new(candidates.len());
+    // The finite prefix trie is bounded by the input's total path components,
+    // not by the filesystem's size or the number of spellings an alias cycle
+    // could produce. Native components are never converted through UTF-8.
     let mut paths: BTreeMap<&Path, usize> = BTreeMap::new();
-    let mut identities: HashMap<FsIdentity, usize> = HashMap::new();
-    for (index, candidate) in candidates.iter().enumerate() {
-        if let Some(previous) = paths.insert(candidate.path.as_path(), index) {
-            groups.unite(index, previous);
+    let mut observations = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let next = paths.len();
+        observations.push(*paths.entry(candidate.path.as_path()).or_insert(next));
+        for ancestor in candidate.path.ancestors().skip(1) {
+            let next = paths.len();
+            paths.entry(ancestor).or_insert(next);
         }
+    }
+    let mut groups = Groups::new(paths.len());
+    for (&path, &index) in &paths {
+        if let Some(parent) = path.parent()
+            && let Some(&parent_index) = paths.get(parent)
+            && let Some(name) = path.components().next_back()
+        {
+            groups.children[parent_index].insert(name.as_os_str().to_os_string(), index);
+        }
+    }
+    let mut identities: HashMap<FsIdentity, usize> = HashMap::new();
+    for (candidate, &index) in candidates.iter().zip(&observations) {
         if let Some(identity) = candidate.identity
             && let Some(previous) = identities.insert(identity, index)
         {
             groups.unite(index, previous);
         }
     }
-    let roots: Vec<_> = (0..candidates.len())
-        .map(|index| groups.root(index))
-        .collect();
-    let mut protected = vec![false; candidates.len()];
-    for (index, candidate) in candidates.iter().enumerate() {
-        if hard_veto(candidate) {
-            protected[roots[index]] = true;
+    let roots: Vec<_> = (0..paths.len()).map(|index| groups.root(index)).collect();
+    let mut descendants = vec![Vec::new(); paths.len()];
+    let mut ancestors = vec![Vec::new(); paths.len()];
+    for (parent, children) in groups.children.iter().enumerate() {
+        for &child in children.values() {
+            descendants[roots[parent]].push(roots[child]);
+            ancestors[roots[child]].push(roots[parent]);
         }
     }
-    // All observed spellings of an explicitly vetoed cleanup unit are veto
-    // scopes. Collect them before filtering so an invalid/Keep observation
-    // carrying a real veto cannot disappear ahead of a more optimistic alias.
-    let scopes: BTreeSet<_> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| protected[roots[*index]])
-        .map(|(_, candidate)| candidate.path.clone())
-        .collect();
-    let mut rejected = protected;
-    for (index, candidate) in candidates.iter().enumerate() {
-        let path = candidate.path.as_path();
-        let under_veto = path.ancestors().any(|ancestor| scopes.contains(ancestor));
-        // Path ordering compares components. A descendant, when present, is
-        // the first scope at or after this path; prefix siblings do not match.
-        let contains_veto = scopes
-            .range(candidate.path.clone()..)
-            .next()
-            .is_some_and(|scope| scope.starts_with(path));
-        if under_veto || contains_veto {
-            // An alias of a parent that would remove a vetoed descendant is
-            // also inadmissible as a WHOLE cleanup unit. Do not promote that
-            // parent to a veto scope: doing so would wrongly exclude siblings.
+    let mut rejected = vec![false; paths.len()];
+    for (candidate, &index) in candidates.iter().zip(&observations) {
+        if hard_veto(candidate) {
             rejected[roots[index]] = true;
         }
     }
-    roots.into_iter().map(|root| rejected[root]).collect()
+    // First protect the vetoed subtrees, across all observed directory aliases.
+    mark_reachable(&mut rejected, &descendants);
+    // Then refuse enclosing cleanup units. NEVER feed this upward result into
+    // downward propagation: their independently safe siblings stay eligible.
+    mark_reachable(&mut rejected, &ancestors);
+    observations
+        .into_iter()
+        .map(|index| rejected[roots[index]])
+        .collect()
 }
 
 #[cfg(test)]
@@ -150,6 +193,7 @@ mod tests {
         ArtifactCertainty, DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors,
     };
     use crate::scanner::walker::FsEntryKind;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -393,10 +437,127 @@ mod tests {
         assert_eq!(plan_batch(candidates, &request(None)).1.planned_bytes, 7);
     }
 
-    // Independent small-instance reference: explicit graph reachability and
-    // all-pairs component-aware containment, not the production union/find or
-    // ordered-range lookup. Containment never joins equivalence components.
-    fn reference_rejections(candidates: &[CandidacyScore]) -> Vec<bool> {
+    #[test]
+    fn a_veto_follows_parent_aliases_without_an_explicit_child_observation() {
+        let candidates = vec![
+            candidate("/cache/tree", 1000, Some((7, 1))),
+            candidate("/mirror", 1000, Some((7, 1))),
+            veto(candidate("/cache/tree/busy", 1, Some((7, 2)))),
+            candidate("/mirror/busy/deep", 1000, None),
+            candidate("/mirror/safe", 5, Some((7, 3))),
+            candidate("/independent", 7, None),
+        ];
+        assert_eq!(
+            direct_reference_rejections(&candidates),
+            vec![true, true, true, false, false, false],
+            "the previous boundary missed the aliased descendant"
+        );
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, true, true, false, false]
+        );
+        let (chosen, plan) = plan_batch(candidates, &request(Some(13)));
+        let paths: BTreeSet<_> = chosen.iter().map(|c| c.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            BTreeSet::from([Path::new("/mirror/safe"), Path::new("/independent")])
+        );
+        assert_eq!(plan.planned_bytes, 12);
+        assert_eq!(plan.top_n_bytes, 12);
+        assert!(!plan.target_met);
+        assert!(plan.skipped_for_budget.is_empty());
+        assert!(plan.skipped_for_overlap.is_empty());
+    }
+
+    #[test]
+    fn nested_directory_aliases_reach_a_fixed_point_independently_of_order() {
+        let mut candidates = vec![
+            candidate("/a", 1000, Some((7, 1))),
+            candidate("/b", 1000, Some((7, 1))),
+            candidate("/a/sub", 1000, Some((7, 2))),
+            candidate("/third", 1000, Some((7, 2))),
+            veto(candidate("/third/busy", 1, None)),
+            candidate("/b/sub/busy/deep", 1000, None),
+            candidate("/b/sub/safe", 5, None),
+            candidate("/b/other", 7, None),
+        ];
+        let expected = BTreeSet::from([PathBuf::from("/b/sub/safe"), PathBuf::from("/b/other")]);
+        for _ in 0..candidates.len() {
+            let actual: BTreeSet<_> = candidates
+                .iter()
+                .zip(rejected_observations(&candidates))
+                .filter(|(_, rejected)| !*rejected)
+                .map(|(candidate, _)| candidate.path.clone())
+                .collect();
+            assert_eq!(actual, expected);
+            candidates.rotate_left(1);
+        }
+        candidates.reverse();
+        assert_eq!(rejected_observations(&candidates), reference_rejections(&candidates));
+    }
+
+    #[test]
+    fn directory_alias_cycles_terminate_without_protecting_safe_siblings() {
+        let candidates = vec![
+            candidate("/tree", 1000, Some((7, 1))),
+            candidate("/tree/again", 1000, Some((7, 1))),
+            veto(candidate("/tree/busy", 1, None)),
+            candidate("/tree/again/again/busy/deep", 1000, None),
+            candidate("/tree/again/safe", 5, None),
+            candidate("/other", 7, None),
+        ];
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, true, true, false, false]
+        );
+        let (chosen, plan) = plan_batch(candidates, &request(Some(13)));
+        assert_eq!(chosen.len(), 2);
+        assert_eq!(plan.planned_bytes, 12);
+        assert!(!plan.target_met);
+    }
+
+    #[test]
+    fn a_veto_below_an_alias_refuses_the_other_aliases_enclosing_scope() {
+        let candidates = vec![
+            candidate("/source", 1000, Some((7, 1))),
+            candidate("/holder/alias", 1000, Some((7, 1))),
+            veto(candidate("/source/held", 1, None)),
+            candidate("/holder", 1000, None),
+            candidate("/holder/safe", 5, None),
+        ];
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, true, true, false]
+        );
+        assert_eq!(plan_batch(candidates, &request(None)).1.planned_bytes, 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_alias_child_names_preserve_native_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut held = veto(candidate("/unused", 1, None));
+        held.path = PathBuf::from(OsString::from_vec(b"/a/\xff".to_vec()));
+        let mut child = candidate("/unused", 1000, None);
+        child.path = PathBuf::from(OsString::from_vec(b"/b/\xff/deep".to_vec()));
+        let candidates = vec![
+            candidate("/a", 1000, Some((7, 1))),
+            candidate("/b", 1000, Some((7, 1))),
+            held,
+            child,
+            candidate("/b/�/deep", 5, None),
+        ];
+        assert_eq!(
+            rejected_observations(&candidates),
+            vec![true, true, true, true, false]
+        );
+        assert_eq!(plan_batch(candidates, &request(None)).1.planned_bytes, 5);
+    }
+
+    // Previous small-instance oracle, retained to assert no old refusal is
+    // weakened. Its direct path/identity relation does not infer descendants
+    // of parent aliases; the concrete regressions above pin the difference.
+    fn direct_reference_rejections(candidates: &[CandidacyScore]) -> Vec<bool> {
         let same = |left: usize, right: usize| {
             candidates[left].path == candidates[right].path
                 || candidates[left]
@@ -434,6 +595,91 @@ mod tests {
         rejected
     }
 
+    // Independent small-instance oracle: an explicit all-pairs equivalence
+    // relation, transitive closure and pairwise path containment. No production
+    // trie unions, edge merging or reachability helpers are used here.
+    fn reference_rejections(candidates: &[CandidacyScore]) -> Vec<bool> {
+        let paths: Vec<_> = candidates
+            .iter()
+            .flat_map(|candidate| candidate.path.ancestors())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let observations: Vec<_> = candidates
+            .iter()
+            .map(|candidate| paths.iter().position(|path| *path == candidate.path).unwrap())
+            .collect();
+        let parents: Vec<_> = paths
+            .iter()
+            .map(|path| path.parent().and_then(|parent| paths.iter().position(|path| *path == parent)))
+            .collect();
+        let mut equivalent = vec![vec![false; paths.len()]; paths.len()];
+        for (index, row) in equivalent.iter_mut().enumerate() {
+            row[index] = true;
+        }
+        for (left, candidate) in candidates.iter().enumerate() {
+            for (right, other) in candidates.iter().enumerate() {
+                if candidate.identity.is_some() && candidate.identity == other.identity {
+                    equivalent[observations[left]][observations[right]] = true;
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            for via in 0..paths.len() {
+                for left in 0..paths.len() {
+                    for right in 0..paths.len() {
+                        if equivalent[left][via] && equivalent[via][right] && !equivalent[left][right] {
+                            equivalent[left][right] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            for left in 0..paths.len() {
+                for right in 0..paths.len() {
+                    if let (Some(a), Some(b)) = (parents[left], parents[right])
+                        && equivalent[a][b]
+                        && paths[left].components().next_back() == paths[right].components().next_back()
+                        && !equivalent[left][right]
+                    {
+                        equivalent[left][right] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut marked = vec![false; paths.len()];
+        for (candidate, &index) in candidates.iter().zip(&observations) {
+            marked[index] |= hard_veto(candidate);
+        }
+        for upwards in [false, true] {
+            loop {
+                let mut changed = false;
+                for left in 0..paths.len() {
+                    for right in 0..paths.len() {
+                        let contains = if upwards {
+                            paths[left].starts_with(paths[right])
+                        } else {
+                            paths[right].starts_with(paths[left])
+                        };
+                        if marked[left] && !marked[right] && (equivalent[left][right] || contains) {
+                            marked[right] = true;
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        observations.into_iter().map(|index| marked[index]).collect()
+    }
+
     #[test]
     fn public_plans_match_exhaustive_admission_under_permutation() {
         let names = [
@@ -469,6 +715,9 @@ mod tests {
             req.risk_budget = Some(1.5);
             let reference = reference_rejections(&candidates);
             assert_eq!(rejected_observations(&candidates), reference);
+            for (old, &current) in direct_reference_rejections(&candidates).iter().zip(&reference) {
+                assert!(!old || current, "an existing veto must never be weakened");
+            }
             let admitted = candidates
                 .iter()
                 .zip(&reference)
