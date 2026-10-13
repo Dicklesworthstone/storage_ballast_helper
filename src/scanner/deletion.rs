@@ -12,6 +12,7 @@
 //! 6. Candidate identity still matches the object observed by the scanner
 //! 7. Candidate is not covered by a kernel-held active-target lease
 //! 8. Scoring vetoes, decision eligibility, and numeric evidence are still valid
+//! 9. The configured scanner root permits reclamation under the live source-root policy
 //!
 //! Quarantine is a recoverability requirement, not a best-effort hint: a failed
 //! quarantine never falls through to irreversible removal.
@@ -42,9 +43,12 @@ use crate::scanner::patterns::{
 use crate::scanner::protection::{self, StowawayScanConfig};
 use crate::scanner::quarantine::{self, QuarantineStore, QuarantineUnavailable};
 use crate::scanner::scoring::{CandidacyScore, DecisionAction, ScoreFactors};
+use crate::scanner::source_roots::SourceRootPolicy;
 use crate::scanner::walker;
 
 mod eligibility;
+#[cfg(test)]
+mod source_root_tests;
 
 // ──────────────────── configuration ────────────────────
 
@@ -113,6 +117,12 @@ pub struct DeletionConfig {
     /// them (longest prefix wins); a candidate under none of them is
     /// quarantined under its mount point.
     pub quarantine_roots: Vec<PathBuf>,
+    /// Root-level reclamation policy shared with startup/reload and scanner
+    /// admission. Cloning this config shares live policy, not a stale snapshot.
+    /// Install every configured scanner root, including roots excluded from
+    /// the current scan pass. This can only veto; opt-in never bypasses the
+    /// candidate checks. Ballast operations do not use this executor.
+    pub source_roots: SourceRootPolicy,
 }
 
 impl Default for DeletionConfig {
@@ -131,6 +141,7 @@ impl Default for DeletionConfig {
             mode: DeletionMode::Unlink,
             quarantine_ttl: Duration::from_secs(quarantine::DEFAULT_TTL_HOURS * 3600),
             quarantine_roots: Vec::new(),
+            source_roots: SourceRootPolicy::default(),
         }
     }
 }
@@ -471,6 +482,10 @@ pub enum SkipReason {
     /// The category's live regret guard currently suspends deletion. This
     /// transient category decision must not create a per-path backoff.
     CategorySuspended,
+    /// A configured root contains source without explicit authorization, could
+    /// not be fully inspected, or was removed/retargeted after this candidate
+    /// was queued. Root diagnostics identify the offending path/repository.
+    SourceRootDenied,
 }
 
 impl SkipReason {
@@ -480,7 +495,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -500,6 +515,7 @@ impl SkipReason {
         Self::FilesystemReadOnly,
         Self::OpenScanIncomplete,
         Self::CategorySuspended,
+        Self::SourceRootDenied,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -533,6 +549,7 @@ impl SkipReason {
             Self::FilesystemReadOnly => "filesystem_read_only",
             Self::OpenScanIncomplete => "open_scan_incomplete",
             Self::CategorySuspended => "category_suspended",
+            Self::SourceRootDenied => "source_root_denied",
         }
     }
 
@@ -575,6 +592,10 @@ impl SkipReason {
                  processes cannot be inspected without root) — aborted batch for safety"
             }
             Self::CategorySuspended => "category deletion temporarily suspended after regrets",
+            Self::SourceRootDenied => {
+                "scanner root is blocked by source-tree policy; inspect doctor/status, narrow \
+                 root_paths or explicitly authorize scanner.allow_source_tree_roots"
+            }
         }
     }
 }
@@ -610,7 +631,7 @@ pub fn error_recovery_cause(error: &SbhError) -> Option<RecoveryCause> {
 
 /// Whether a skipped candidate earns a per-path repeat-deletion backoff. A
 /// read-only filesystem is a mount incident handled by mount recovery, and a
-/// category suspension is transient feedback, so neither penalizes the path.
+/// category or source-root restriction is live policy, not a fault in the path.
 fn should_backoff_skip(reason: SkipReason) -> bool {
     !matches!(
         reason,
@@ -619,6 +640,7 @@ fn should_backoff_skip(reason: SkipReason) -> bool {
             | SkipReason::UserDeclined
             | SkipReason::FilesystemReadOnly
             | SkipReason::CategorySuspended
+            | SkipReason::SourceRootDenied
     )
 }
 
@@ -914,7 +936,7 @@ impl DeletionExecutor {
                     consecutive_failures = 0;
                     // NotWritable goes into a dedicated bucket so the daemon can
                     // emit one actionable warning per batch (systemd unit fix)
-                    // instead of one log line per candidate.
+                    // instead of one log line per skip.
                     if matches!(skip, SkipReason::NotWritable) {
                         report.not_writable_paths.push(candidate.path.clone());
                     }
@@ -937,6 +959,7 @@ impl DeletionExecutor {
                             | SkipReason::LooksLikeSourceCode
                             | SkipReason::UserDeclined
                             | SkipReason::SacredStowaway
+                            | SkipReason::SourceRootDenied
                     ) {
                         eprintln!(
                             "[SBH-EXECUTOR] skip: {} ({:?})",
@@ -967,6 +990,15 @@ impl DeletionExecutor {
                 if should_backoff_skip(reason) {
                     report.backoff_candidates.push(candidate.clone());
                 }
+                continue;
+            }
+
+            // Configuration may have changed, or a sibling repository may
+            // have appeared, while preflight/observer hooks were running.
+            // Never report such a refusal as reclaimed (including dry-run).
+            if self.config.source_roots.authorize(&candidate.path).is_err() {
+                report.record_skip(SkipReason::SourceRootDenied);
+                consecutive_failures = 0;
                 continue;
             }
 
@@ -1065,7 +1097,7 @@ impl DeletionExecutor {
     /// complete `preflight_check` veto suite (hardcoded source-tree floor,
     /// scoring eligibility, active lease, symlink, identity, source markers,
     /// open-file index) followed by `delete_path`'s lease/symlink/identity
-    /// rechecks at the mutation point.
+    /// and live configured-root rechecks at the mutation point.
     ///
     /// Interactive flows MUST route accepted candidates through this instead
     /// of deleting directly: operator confirmation widens *consent*, never the
@@ -1164,6 +1196,14 @@ impl DeletionExecutor {
         if meta.file_type().is_symlink() {
             return Err(SkipReason::Symlink);
         }
+
+        // Root policy is independent of the candidate's score, tracking state
+        // or artifact name. An untracked sibling of a nested repository is
+        // protected just as a target directory inside the repository is.
+        self.config
+            .source_roots
+            .authorize(path)
+            .map_err(|_| SkipReason::SourceRootDenied)?;
 
         // 3. Scanner-observed identity must still refer to this same entry.
         self.verify_candidate_identity(candidate, &meta)?;
@@ -1270,13 +1310,21 @@ impl DeletionExecutor {
 
     #[allow(clippy::unused_self)]
     /// The last-moment checks shared by removal and quarantine, run right
-    /// before the mutation: eligibility, lease, symlink and identity re-checks.
+    /// before the mutation: source-root policy, eligibility, lease, symlink
+    /// and identity re-checks. A cached plan cannot authorize a revoked root.
     fn recheck_before_mutation(&self, candidate: &CandidacyScore) -> Result<fs::Metadata> {
         let path = &candidate.path;
         eligibility::check(candidate, &self.config).map_err(|reason| SbhError::SafetyVeto {
             path: path.clone(),
             reason: reason.explanation().to_string(),
         })?;
+        self.config
+            .source_roots
+            .authorize(path)
+            .map_err(|reason| SbhError::SafetyVeto {
+                path: path.clone(),
+                reason,
+            })?;
         // Recheck immediately before mutation. A lease can begin after the
         // earlier preflight, and deleting despite the newly held lock would
         // recreate the exact scan/reap race this protection exists to close.
@@ -2295,6 +2343,7 @@ mod tests {
     fn mount_incidents_get_no_per_path_backoff() {
         assert!(!should_backoff_skip(SkipReason::FilesystemReadOnly));
         assert!(!should_backoff_skip(SkipReason::CategorySuspended));
+        assert!(!should_backoff_skip(SkipReason::SourceRootDenied));
         assert!(should_backoff_skip(SkipReason::Symlink));
         assert!(!should_backoff_skip(SkipReason::PathGone));
     }
@@ -2326,6 +2375,7 @@ mod tests {
                 SkipReason::FilesystemReadOnly => 16,
                 SkipReason::OpenScanIncomplete => 17,
                 SkipReason::CategorySuspended => 18,
+                SkipReason::SourceRootDenied => 19,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];
