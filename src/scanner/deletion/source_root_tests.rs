@@ -344,3 +344,92 @@ fn gitfile_source_root_is_denied_without_querying_its_missing_git_directory() {
     );
     retained(&candidate);
 }
+
+#[test]
+fn source_root_narrowing_during_guard_blocks_parent_but_allows_retained_build_output() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let dir = scratch();
+        let parent = artifact(&dir.path().join("target"));
+        let narrowed_root = parent.path.join("retained");
+        let child = artifact(&narrowed_root.join("target"));
+        let evidence = parent.path.join("release-evidence.txt");
+        fs::write(&evidence, b"irreplaceable evidence").unwrap();
+        let policy = SourceRootPolicy::new(&[dir.path().to_path_buf()], false);
+        let executor = executor(dir.path(), policy.clone(), mode);
+        let plan = executor.plan(vec![parent.clone()]);
+        let guard_calls = std::cell::Cell::new(0);
+        let narrow = |_: &CandidacyScore| {
+            guard_calls.set(guard_calls.get() + 1);
+            policy.replace(std::slice::from_ref(&narrowed_root), false);
+            Ok(())
+        };
+
+        // This guard runs after preflight. The assertion on its call count
+        // prevents an unrelated earlier veto from making this a false pass.
+        let report = executor.execute_with_guard(&plan, None, Some(&narrow));
+        assert_eq!(guard_calls.get(), 1, "{report:?}");
+        assert_eq!(report.items_deleted, 0, "{report:?}");
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.bytes_freed, 0);
+        assert_eq!(report.bytes_quarantined, 0);
+        assert_eq!(report.skipped_by_reason.get("source_root_denied"), Some(&1));
+        assert!(report.backoff_candidates.is_empty());
+        assert!(!dir.path().join(".sbh/quarantine").exists());
+        retained(&parent);
+        retained(&child);
+        assert_eq!(fs::read(&evidence).unwrap(), b"irreplaceable evidence");
+
+        // The same executor sees the narrowed permission, rather than a stale
+        // snapshot or a blanket ban on all cleanup after a reload.
+        let report = executor.execute(&executor.plan(vec![child.clone()]), None);
+        assert_eq!(report.items_deleted, 1, "{report:?}");
+        assert_eq!(report.items_failed, 0);
+        assert!(!child.path.exists());
+        retained(&parent);
+        assert_eq!(fs::read(&evidence).unwrap(), b"irreplaceable evidence");
+        match mode {
+            DeletionMode::Unlink => assert_eq!(report.bytes_freed, child.size_bytes),
+            DeletionMode::Quarantine => {
+                assert_eq!(report.bytes_freed, 0);
+                assert_eq!(report.items_quarantined, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn source_root_reload_to_separate_cache_keeps_retired_repository_candidates_denied() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let dir = scratch();
+        let repo = dir.path().join("team/project");
+        repository(&repo);
+        let source_candidate = artifact(&repo.join("target"));
+        let evidence = repo.join("untracked-evidence.txt");
+        fs::write(&evidence, b"not checked into Git").unwrap();
+        let cache_root = dir.path().join("cache");
+        let cache_candidate = artifact(&cache_root.join("target"));
+        let policy = SourceRootPolicy::new(&[dir.path().to_path_buf()], false);
+        let executor = executor(dir.path(), policy.clone(), mode);
+        let plan = executor.plan(vec![cache_candidate.clone(), source_candidate.clone()]);
+        let denied = executor.execute(&plan, None);
+        assert_eq!(denied.items_deleted, 0);
+        assert_eq!(denied.skipped_by_reason.get("source_root_denied"), Some(&2));
+        retained(&source_candidate);
+        retained(&cache_candidate);
+
+        // Removing the broad source-containing root can enable a genuinely
+        // separate cache. It must not admit a source candidate queued earlier.
+        policy.replace(std::slice::from_ref(&cache_root), false);
+        let report = executor.execute(&plan, None);
+        assert_eq!(report.items_deleted, 1, "{report:?}");
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.skipped_by_reason.get("source_root_denied"), Some(&1));
+        assert!(report.backoff_candidates.is_empty());
+        assert!(!cache_candidate.path.exists());
+        retained(&source_candidate);
+        assert!(repo.join(".git").is_dir());
+        assert_eq!(fs::read(&evidence).unwrap(), b"not checked into Git");
+    }
+}
