@@ -303,7 +303,10 @@ fn loaded_user_service_restarts_the_new_executable_on_each_update() {
         let calls = fs::read_to_string(&fixture.calls).unwrap();
         assert_eq!(calls.matches("--user restart sbh.service").count(), 2);
         assert_eq!(
-            fs::read_to_string(&fixture.bus_calls).unwrap().lines().count(),
+            fs::read_to_string(&fixture.bus_calls)
+                .unwrap()
+                .lines()
+                .count(),
             2
         );
         let versions = fs::read_to_string(&fixture.versions).unwrap();
@@ -455,7 +458,11 @@ fn a_loaded_unit_pointing_at_another_installation_is_not_restarted() {
         "{error}"
     );
     assert_eq!(sha256(&other), before);
-    assert!(!fs::read_to_string(&fixture.calls).unwrap().contains("restart"));
+    assert!(
+        !fs::read_to_string(&fixture.calls)
+            .unwrap()
+            .contains("restart")
+    );
     assert!(!fixture.versions.exists());
 }
 
@@ -494,7 +501,11 @@ fn effective_exec_start_retaining_the_old_inode_is_rejected() {
             .unwrap()
             .contains("different installation")
     );
-    assert!(!fs::read_to_string(&fixture.calls).unwrap().contains("restart"));
+    assert!(
+        !fs::read_to_string(&fixture.calls)
+            .unwrap()
+            .contains("restart")
+    );
 }
 
 #[test]
@@ -510,7 +521,11 @@ fn failed_exec_start_verification_never_restarts_a_loaded_service() {
         assert_eq!(report["success"], false);
         let error = report["service_restart"]["error"].as_str().unwrap();
         assert!(error.contains("ExecStart"), "{error}");
-        assert!(!fs::read_to_string(&fixture.calls).unwrap().contains("restart"));
+        assert!(
+            !fs::read_to_string(&fixture.calls)
+                .unwrap()
+                .contains("restart")
+        );
         assert!(!fixture.versions.exists());
     }
 }

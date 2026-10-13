@@ -196,7 +196,9 @@ mod tests {
         fs::write(&installed, b"same version").unwrap();
         fs::copy(&installed, &other).unwrap();
         assert!(verify_same_binary(&installed, &installed).is_ok());
-        let error = verify_same_binary(&installed, &other).unwrap_err().to_string();
+        let error = verify_same_binary(&installed, &other)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("refusing to restart a different installation"));
         assert!(error.contains(&installed.display().to_string()));
         assert!(error.contains(&other.display().to_string()));

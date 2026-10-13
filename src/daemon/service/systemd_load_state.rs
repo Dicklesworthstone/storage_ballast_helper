@@ -44,8 +44,8 @@ pub(super) fn is_loaded(user_scope: bool, unit_path: &Path) -> Result<bool> {
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let loaded = classify_load_state(output.status.code(), &stdout, &stderr, user_scope)
-        .map_err(|reason| SbhError::Runtime {
+    let loaded = classify_load_state(output.status.code(), &stdout, &stderr, user_scope).map_err(
+        |reason| SbhError::Runtime {
             details: if output.status.success() {
                 format!("cannot determine whether {SYSTEMD_UNIT_NAME} is loaded: {reason}")
             } else {
@@ -58,14 +58,13 @@ pub(super) fn is_loaded(user_scope: bool, unit_path: &Path) -> Result<bool> {
                     user_scope,
                 )
             },
-        })?;
+        },
+    )?;
     // Only the update command arms this preflight. Normal status/control flows
     // still inspect arbitrary installations. Missing units skip successfully
     // without requiring busctl; loaded units must target the published binary
     // before the caller can proceed to its privilege check and restart.
-    if loaded
-        && let Some(installed) = crate::update_handoff::install_path()
-    {
+    if loaded && let Some(installed) = crate::update_handoff::install_path() {
         update_target::verify(user_scope, installed)?;
     }
     Ok(loaded)

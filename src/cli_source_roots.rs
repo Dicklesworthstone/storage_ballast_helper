@@ -146,9 +146,7 @@ pub(super) fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
         Ok(config) => Assessment::from_config(diagnostic, &config),
         Err(error) => Assessment::load_error(diagnostic, explicit_path.cloned(), error.to_string()),
     };
-    if assessment.valid
-        && !matches!(diagnostic, Diagnostic::Doctor { source_only: true })
-    {
+    if assessment.valid && !matches!(diagnostic, Diagnostic::Doctor { source_only: true }) {
         // Existing validation still owns strict/unknown-key checks, and the
         // existing doctor owns every selected PAL/service/release diagnostic.
         return Ok(None);
@@ -218,7 +216,12 @@ mod tests {
         assert!(report.roots.iter().all(|root| !root.reclaim_allowed));
         assert_eq!(report.roots[0].root, first);
         assert_eq!(report.roots[1].root, second);
-        assert!(report.roots.iter().all(|root| !root.repositories.is_empty()));
+        assert!(
+            report
+                .roots
+                .iter()
+                .all(|root| !root.repositories.is_empty())
+        );
         let mut json = Vec::new();
         assessment.write(true, &mut json).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();

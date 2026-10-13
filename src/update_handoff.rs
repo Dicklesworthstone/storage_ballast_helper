@@ -42,7 +42,10 @@ mod tests {
         }
         for mode in ["update", "ordinary"] {
             let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "update_handoff::tests::command_intent_is_captured_once"])
+                .args([
+                    "--exact",
+                    "update_handoff::tests::command_intent_is_captured_once",
+                ])
                 .env(PROBE, mode)
                 .output()
                 .unwrap();

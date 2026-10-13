@@ -19,7 +19,11 @@ impl Fixture {
         let config = directory.path().join("sbh.toml");
         let root = directory.path().join("scan");
         fs::create_dir(&root).unwrap();
-        let fixture = Self { directory, config, root };
+        let fixture = Self {
+            directory,
+            config,
+            root,
+        };
         fixture.configure(allow, "");
         fixture
     }
@@ -103,12 +107,18 @@ fn source_root_doctor_and_validation_fail_for_nested_repositories_without_mutati
         vec!["config", "validate", "--json"],
     ] {
         let report = refused(&fixture.run(&args), &fixture.root);
-        assert_eq!(report["source_roots"]["roots"][0]["finding"], "git_worktree");
+        assert_eq!(
+            report["source_roots"]["roots"][0]["finding"],
+            "git_worktree"
+        );
         assert_eq!(
             report["source_roots"]["roots"][0]["repositories"][0],
             json!(fs::canonicalize(&repository).unwrap())
         );
-        assert_eq!(fs::read(&evidence).unwrap(), b"irreplaceable release evidence");
+        assert_eq!(
+            fs::read(&evidence).unwrap(),
+            b"irreplaceable release evidence"
+        );
         assert!(repository.join(".git").is_dir());
     }
 }
@@ -116,18 +126,30 @@ fn source_root_doctor_and_validation_fail_for_nested_repositories_without_mutati
 #[test]
 fn source_root_gitfile_and_scan_root_inside_repository_are_detected() {
     let fixture = Fixture::new(false);
-    fs::write(fixture.root.join(".git"), "gitdir: /missing/main/.git/worktrees/topic\n")
-        .unwrap();
-    refused(&fixture.run(&["config", "validate", "--json"]), &fixture.root);
+    fs::write(
+        fixture.root.join(".git"),
+        "gitdir: /missing/main/.git/worktrees/topic\n",
+    )
+    .unwrap();
+    refused(
+        &fixture.run(&["config", "validate", "--json"]),
+        &fixture.root,
+    );
     let build = fixture.root.join("target");
     fs::create_dir(&build).unwrap();
     fs::write(
         &fixture.config,
-        format!("[scanner]\nroot_paths = [{}]\n", serde_json::to_string(&build).unwrap()),
+        format!(
+            "[scanner]\nroot_paths = [{}]\n",
+            serde_json::to_string(&build).unwrap()
+        ),
     )
     .unwrap();
     let report = refused(&fixture.run(&["doctor", "--json"]), &build);
-    assert_eq!(report["source_roots"]["roots"][0]["finding"], "git_worktree");
+    assert_eq!(
+        report["source_roots"]["roots"][0]["finding"],
+        "git_worktree"
+    );
 }
 
 #[test]
@@ -143,26 +165,38 @@ fn source_root_explicit_opt_in_passes_and_revocation_is_visible_on_next_command(
     assert!(validation.status.success(), "{validation:?}");
     fixture.configure(false, "");
     refused(&fixture.run(&["doctor", "--json"]), &fixture.root);
-    refused(&fixture.run(&["config", "validate", "--json"]), &fixture.root);
+    refused(
+        &fixture.run(&["config", "validate", "--json"]),
+        &fixture.root,
+    );
 }
 
 #[test]
 fn source_root_environment_override_is_explicit_and_can_revoke_file_opt_in() {
     let fixture = Fixture::new(false);
     fixture.repository("project");
-    let allowed = fixture.command(&["doctor", "--json"])
+    let allowed = fixture
+        .command(&["doctor", "--json"])
         .env("SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS", "true")
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(allowed.status.success(), "{allowed:?}");
-    assert_eq!(json(&allowed)["source_roots"]["allow_source_tree_roots"], true);
+    assert_eq!(
+        json(&allowed)["source_roots"]["allow_source_tree_roots"],
+        true
+    );
     fixture.configure(true, "");
-    let denied = fixture.command(&["doctor", "--json"])
+    let denied = fixture
+        .command(&["doctor", "--json"])
         .env("SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS", "false")
-        .output().unwrap();
+        .output()
+        .unwrap();
     refused(&denied, &fixture.root);
-    let invalid = fixture.command(&["doctor", "--json"])
+    let invalid = fixture
+        .command(&["doctor", "--json"])
         .env("SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS", "definitely")
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(!invalid.status.success());
     assert_eq!(json(&invalid)["valid"], false);
     assert_eq!(json(&invalid)["source_roots"], Value::Null);
@@ -173,7 +207,10 @@ fn source_root_clear_configuration_passes_but_new_repository_is_not_cached() {
     let fixture = Fixture::new(false);
     let initial = fixture.run(&["doctor", "--json"]);
     assert!(initial.status.success(), "{initial:?}");
-    assert_eq!(json(&initial)["source_roots"]["roots"][0]["finding"], "clear");
+    assert_eq!(
+        json(&initial)["source_roots"]["roots"][0]["finding"],
+        "clear"
+    );
     fixture.repository("new/project");
     refused(&fixture.run(&["doctor", "--json"]), &fixture.root);
 }
@@ -185,7 +222,10 @@ fn source_root_diagnostics_do_not_make_unsafe_config_impossible_to_inspect() {
     let output = fixture.run(&["config", "show", "--json"]);
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("allow_source_tree_roots"));
-    refused(&fixture.run(&["config", "validate", "--json"]), &fixture.root);
+    refused(
+        &fixture.run(&["config", "validate", "--json"]),
+        &fixture.root,
+    );
 }
 
 #[test]
