@@ -4,7 +4,28 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
-## Unreleased
+## v0.7.2 **[release]**
+
+Compare: [`v0.7.1...v0.7.2`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.1...v0.7.2)
+
+A fix release. Under a systemd unit with `RestrictSUIDSGID=`, sbh 0.7.0 and
+0.7.1 could not delete anything; v0.7.2 can. It also stops treating a
+directory as build output on a `*-target` name alone (#34).
+
+### Upgrade note: hosts with an `openat2` workaround
+
+- If a host runs sbh with a drop-in that sets `RestrictSUIDSGID=false` to work
+  around the failure below, remove the drop-in after upgrading to v0.7.2.
+
+### Known limitations
+
+- The `openat2()` fallback below needs `statx` mount IDs (Linux 5.8 and
+  later). On an older kernel, deletion and quarantine purge still fail closed
+  (issue #28).
+- In-place repair of a ballast file with a damaged header has no fallback.
+  Under `RestrictSUIDSGID=`, or on a kernel without `openat2()` (before 5.6),
+  that repair fails and leaves the file as it is; the file can still be
+  released by the ordinary pressure path.
 
 ### Fixed — safety and reclaim under a hardened systemd unit
 
