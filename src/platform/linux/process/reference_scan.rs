@@ -1151,6 +1151,62 @@ mod tests {
     }
 
     #[test]
+    fn a_default_home_build_holds_its_cargo_caches_and_an_idle_home_does_not() {
+        let fixture = Fixture::new();
+        let pid = i32::try_from(std::process::id())
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+        let user_home = fixture.root.join("home/user");
+        let cargo_home = user_home.join(".cargo");
+        for store in ["registry/src", "git/db"] {
+            fs::create_dir_all(cargo_home.join(store)).unwrap();
+        }
+        let process = fixture.pid(pid);
+        let environ = format!("PATH=/usr/bin\0HOME={}\0", user_home.display());
+        fs::write(process.join("environ"), &environ).unwrap();
+        let roots = vec![fixture.root.clone()];
+
+        // Control: the same home under a shell, no build running. Nothing
+        // names the caches, so they stay reclaimable.
+        fs::write(process.join("comm"), b"bash\n").unwrap();
+        assert!(
+            build_directories_with(&NativeProc, &fixture.proc_root, Limits::default()).is_empty()
+        );
+        let (targets, _) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        let ancestors = crate::scanner::walker::open_path_ancestors_for_roots(&targets, &roots);
+        assert!(!ancestors.contains(&cargo_home.join("registry")));
+        assert!(!ancestors.contains(&cargo_home.join("git/db")));
+
+        // A build with no CARGO_HOME uses `$HOME/.cargo`: its stores, and the
+        // directories above them, are references with no descriptor open.
+        fs::write(process.join("comm"), b"rustc\n").unwrap();
+        let found = build_directories_with(&NativeProc, &fixture.proc_root, Limits::default());
+        assert_eq!(
+            found,
+            [
+                "registry/index",
+                "registry/cache",
+                "registry/src",
+                "git/db",
+                "git/checkouts"
+            ]
+            .iter()
+            .map(|store| (pid, cargo_home.join(store)))
+            .collect::<Vec<_>>()
+        );
+        let (targets, _) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        let ancestors = crate::scanner::walker::open_path_ancestors_for_roots(&targets, &roots);
+        for held in ["registry", "registry/src", "git", "git/db"] {
+            assert!(ancestors.contains(&cargo_home.join(held)), "{held} is held");
+        }
+        assert!(ancestors.contains(&cargo_home));
+        assert_eq!(fs::read_dir(process.join("fd")).unwrap().count(), 0);
+    }
+
+    #[test]
     fn external_build_caches_reach_scoring_and_executor_without_open_files() {
         let fixture = Fixture::new();
         let first = i32::try_from(std::process::id())
