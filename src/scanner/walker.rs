@@ -27,6 +27,9 @@ use crate::scanner::patterns::{
 use crate::scanner::protection::ProtectionRegistry;
 use crate::scanner::scoring::ActiveReferenceSummary;
 
+mod build_scopes;
+use build_scopes::BuildDirectoryScopes;
+
 pub const DEFAULT_ACTIVE_REFERENCE_CACHE_TTL_SECS: u64 = 30;
 pub const DEFAULT_ACTIVE_REFERENCE_MIN_SIZE_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -1594,6 +1597,13 @@ pub(crate) fn open_path_ancestors_for_roots(
     for target in targets {
         add_open_path_ancestor_chain(&mut ancestors, target, &normalized_roots);
     }
+    // Cache/output declarations are subtree references, unlike descriptors.
+    // Refresh them once per batch even when the expensive fd sweep is reused.
+    build_scopes::add_candidate_scopes(
+        crate::platform::current().build_directories_in_use(),
+        &normalized_roots,
+        &mut ancestors,
+    );
     ancestors
 }
 
@@ -1608,6 +1618,12 @@ pub fn collect_open_path_ancestors_with_platform(
     }
 
     let mut ancestors = HashSet::with_capacity(4096);
+    // Preserve positive build-scope evidence even if a later fd query fails.
+    build_scopes::add_candidate_scopes(
+        platform.build_directories_in_use(),
+        &normalized_roots,
+        &mut ancestors,
+    );
     let mut incomplete = false;
     let probe_roots = common_open_file_probe_root(&normalized_roots).map_or_else(
         || {
@@ -1645,6 +1661,9 @@ fn collect_open_path_ancestors_platform(root_paths: &[PathBuf]) -> (HashSet<Path
 struct CachedActiveReferenceIndex {
     platform_name: &'static str,
     roots: Vec<PathBuf>,
+    // A scope snapshot binds the supplied aliases too. Equal resolved roots
+    // must not reuse a snapshot that only knows a different input spelling.
+    input_roots: Vec<PathBuf>,
     collected_at: Instant,
     index: ActiveReferenceIndex,
 }
@@ -1667,6 +1686,7 @@ fn normalized_root_cache_key(root_paths: &[PathBuf]) -> Vec<PathBuf> {
 pub struct ActiveReferenceIndex {
     references: HashMap<PathBuf, ActiveReferenceSummary>,
     references_by_identity: HashMap<FsIdentity, ActiveReferenceSummary>,
+    build_scopes: BuildDirectoryScopes,
     complete: bool,
     incomplete_reason: Option<String>,
 }
@@ -1683,6 +1703,7 @@ impl ActiveReferenceIndex {
         Self {
             references: HashMap::new(),
             references_by_identity: HashMap::new(),
+            build_scopes: BuildDirectoryScopes::default(),
             complete: true,
             incomplete_reason: None,
         }
@@ -1693,6 +1714,7 @@ impl ActiveReferenceIndex {
         Self {
             references: HashMap::new(),
             references_by_identity: HashMap::new(),
+            build_scopes: BuildDirectoryScopes::default(),
             complete: false,
             incomplete_reason: Some(reason.into()),
         }
@@ -1714,6 +1736,7 @@ impl ActiveReferenceIndex {
     #[must_use]
     pub fn summary_for(&self, path: &Path) -> ActiveReferenceSummary {
         let mut summary = self.references.get(path).cloned().unwrap_or_default();
+        self.build_scopes.extend_summary(path, &mut summary);
         if let Some(reason) = self.incomplete_reason() {
             summary.mark_incomplete(reason.to_string());
         }
@@ -1790,6 +1813,7 @@ pub fn collect_active_reference_index(
     let mut index = ActiveReferenceIndex {
         references: HashMap::new(),
         references_by_identity: HashMap::new(),
+        build_scopes: BuildDirectoryScopes::new(root_paths),
         complete: true,
         incomplete_reason: active_reference_visibility_warning(platform).map(str::to_string),
     };
@@ -1825,6 +1849,9 @@ pub fn collect_active_reference_index(
         index.add_reference(&roots, &directory, |summary| {
             summary.add_build_directory(pid, name.clone());
         });
+        // Unlike an open-file point, a cache declaration also protects every
+        // candidate below it, even when the scan root is itself inside it.
+        index.build_scopes.insert(pid, &directory, name);
     }
 
     for root in &roots {
@@ -1934,15 +1961,17 @@ pub fn collect_active_reference_index_cached(
     if let Some(cached) = cache.lock().as_ref()
         && cached.platform_name == platform_name
         && cached.roots == roots
+        && cached.input_roots.as_slice() == root_paths
         && now.duration_since(cached.collected_at) <= cache_ttl
     {
         return cached.index.clone();
     }
 
-    let index = collect_active_reference_index(platform, &roots);
+    let index = collect_active_reference_index(platform, root_paths);
     *cache.lock() = Some(CachedActiveReferenceIndex {
         platform_name,
         roots,
+        input_roots: root_paths.to_vec(),
         collected_at: now,
         index: index.clone(),
     });
@@ -4391,5 +4420,138 @@ mod tests {
             proj_entry.structural_signals.has_git,
             "should detect symlinked .git"
         );
+    }
+
+    #[test]
+    fn build_scope_references_cover_nested_candidates_and_narrow_roots() {
+        let tmp = TempDir::new().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let cache = root.join("shared-cache");
+        let child = cache.join("objects/deep");
+        let idle = root.join("shared-cache-other");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&idle).unwrap();
+        let platform = TestActiveRefPlatform {
+            processes: vec![process(42, "go", None)],
+            build_directories: vec![(42, cache)],
+            ..Default::default()
+        };
+        for scan_root in [&root, &child] {
+            let index =
+                collect_active_reference_index(&platform, std::slice::from_ref(scan_root));
+            assert!(index.is_complete());
+            for path in [&child, &child.join("object.o")] {
+                // These paths were not individually declared or held open.
+                assert!(!index.references.contains_key(path));
+                let summary = index.summary_for(path);
+                assert_eq!(summary.processes.len(), 1);
+                assert_eq!(summary.processes[0].pid, 42);
+                assert!(summary.processes[0].build_directory);
+                assert_eq!(summary.processes[0].open_file_descriptors, 0);
+                assert!(summary.safe_reclaim_reason().is_some());
+            }
+            assert!(index.summary_for(&idle).is_empty());
+        }
+        let roots = vec![child.clone(), idle.clone()];
+        let (ancestors, complete) = collect_open_path_ancestors_with_platform(&platform, &roots);
+        assert!(complete);
+        assert!(is_path_open_by_ancestor(&child, &ancestors));
+        assert!(!is_path_open_by_ancestor(&idle, &ancestors));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_build_scopes_follow_the_current_configured_alias_spelling() {
+        let tmp = TempDir::new().unwrap();
+        let real = fs::canonicalize(tmp.path()).unwrap().join("real");
+        fs::create_dir_all(real.join("cache/objects")).unwrap();
+        let first_alias = tmp.path().join("first");
+        let second_alias = tmp.path().join("second");
+        std::os::unix::fs::symlink(&real, &first_alias).unwrap();
+        std::os::unix::fs::symlink(&real, &second_alias).unwrap();
+        let platform = TestActiveRefPlatform {
+            build_directories: vec![(42, real.join("cache"))],
+            ..Default::default()
+        };
+        for root in [&first_alias, &second_alias, &first_alias] {
+            let index = collect_active_reference_index_cached(
+                &platform,
+                std::slice::from_ref(root),
+                Duration::from_secs(30),
+            );
+            assert!(!index.summary_for(&root.join("cache/objects")).is_empty());
+            assert!(index.summary_for(&root.join("idle")).is_empty());
+        }
+    }
+
+    #[test]
+    fn executor_refuses_nested_live_cache_files_and_directories_in_both_modes() {
+        use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionMode};
+        use crate::scanner::patterns::ArtifactClassification;
+
+        for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+            for directory in [false, true] {
+                let tmp = tempfile::tempdir_in("/tmp").unwrap();
+                let root = fs::canonicalize(tmp.path()).unwrap();
+                let cache = root.join("cache");
+                let candidate = cache.join("objects/target");
+                fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+                let payload = if directory {
+                    fs::create_dir(&candidate).unwrap();
+                    candidate.join("artifact.o")
+                } else {
+                    candidate.clone()
+                };
+                fs::write(&payload, b"active build bytes").unwrap();
+                let input = CandidateInput {
+                    path: candidate.clone(),
+                    size_bytes: 18,
+                    age: Duration::from_hours(48),
+                    classification: ArtifactClassification::unknown(),
+                    signals: StructuralSignals::default(),
+                    active_references: ActiveReferenceSummary::default(),
+                    is_open: false,
+                    excluded: false,
+                };
+                // A queued/public score is deliberately optimistic. The live
+                // executor must refuse independently of score-time evidence.
+                let mut score = ScoringEngine::from_config(&ScoringConfig::default(), 0)
+                    .score_candidate(&input, 0.9);
+                score.identity = Some(identity_for_path(&candidate, false).unwrap());
+                score.total_score = 0.99;
+                score.vetoed = false;
+                score.veto_reason = None;
+                score.decision.action = DecisionAction::Delete;
+                let platform = TestActiveRefPlatform {
+                    build_directories: vec![(42, cache)],
+                    ..Default::default()
+                };
+                let executor = DeletionExecutor::new(
+                    DeletionConfig {
+                        mode,
+                        require_identity: true,
+                        quarantine_roots: vec![root.clone()],
+                        ..DeletionConfig::default()
+                    },
+                    None,
+                )
+                .with_platform(Arc::new(platform));
+                let plan = executor.plan(vec![score]);
+                assert_eq!(plan.estimated_items, 1);
+                let report = executor.execute(&plan, None);
+                assert_eq!(report.items_deleted, 0);
+                assert_eq!(report.items_failed, 0);
+                assert_eq!(report.items_skipped, 1);
+                assert_eq!(report.skipped_by_reason.get("file_open"), Some(&1));
+                assert_eq!(report.bytes_freed, 0);
+                assert_eq!(report.bytes_quarantined, 0);
+                assert_eq!(fs::read(payload).unwrap(), b"active build bytes");
+                assert!(
+                    !crate::scanner::quarantine::QuarantineStore::under(&root)
+                        .root()
+                        .exists()
+                );
+            }
+        }
     }
 }
