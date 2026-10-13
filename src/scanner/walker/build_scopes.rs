@@ -8,16 +8,20 @@
 //! The index stores only declarations, not the contents of a cache. Scope
 //! checks use path components and ordered lookups; no recursive scan, string
 //! prefix guess, or per-candidate canonicalization is performed. Configured
-//! root aliases are resolved once when the observation is collected. Unseen
-//! aliases and a provider's omitted declarations remain outside this evidence.
+//! root aliases are resolved once when the observation is collected. The
+//! executor additionally checks observed directory identities along ancestry
+//! to recognize bind aliases which canonicalization does not rewrite. Neither
+//! mechanism proves that a provider's omitted declarations are unused.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use crate::core::paths::resolve_absolute_path;
 use crate::scanner::scoring::ActiveReferenceSummary;
+
+use super::{FsEntryKind, FsIdentity};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct BuildDirectoryScopes {
@@ -132,6 +136,11 @@ pub(super) fn add_candidate_scopes(
     if directories.is_empty() || normalized_roots.is_empty() {
         return;
     }
+    let directories: Vec<_> = directories
+        .into_iter()
+        .filter(|(pid, path)| *pid > 0 && path.is_absolute())
+        .map(|(pid, path)| (pid, resolve_absolute_path(&path)))
+        .collect();
     let mut scopes = BuildDirectoryScopes {
         roots: normalized_roots
             .iter()
@@ -139,17 +148,72 @@ pub(super) fn add_candidate_scopes(
             .collect(),
         scopes: BTreeMap::new(),
     };
-    for (pid, directory) in directories {
-        scopes.insert(pid, &directory, None);
-        if pid > 0 && directory.is_absolute() {
-            super::add_open_path_ancestor_chain(ancestors, &directory, normalized_roots);
-        }
+    for (pid, directory) in &directories {
+        scopes.insert(*pid, directory, None);
+        super::add_open_path_ancestor_chain(ancestors, directory, normalized_roots);
     }
     for (candidate, _) in normalized_roots {
         if scopes.is_busy(candidate) {
             super::add_open_path_ancestor_chain(ancestors, candidate, normalized_roots);
         }
     }
+    // A bind-mounted view can have no lexical relationship to the build's
+    // declaration. Inspect only ancestry, never the contents of either tree.
+    // This stage only adds refusals; failed metadata cannot erase a path veto.
+    for candidate in identity_refusals(&directories, normalized_roots, |path| {
+        super::identity_for_path(path, true).ok()
+    }) {
+        super::add_open_path_ancestor_chain(ancestors, &candidate, normalized_roots);
+    }
+}
+
+/// Additional deny-only alias evidence for this executor batch. Keep the two
+/// directions separate: a declared directory protects all its descendants,
+/// whereas an ancestor of a declaration is refused only as a WHOLE candidate.
+/// Intersecting two sets of ancestors would mark unrelated siblings busy just
+/// because they share `/` or a mount root.
+///
+/// Each distinct pathname is inspected at most once per call, including failed
+/// observations. Nothing is cached across batches. These are point-in-time
+/// observations, not deletion authority or an atomic mount-namespace snapshot;
+/// the executor retains its independent identity, lease and no-cross-mount rails.
+fn identity_refusals(
+    directories: &[(i32, PathBuf)],
+    roots: &[(PathBuf, usize)],
+    mut identify: impl FnMut(&Path) -> Option<FsIdentity>,
+) -> HashSet<PathBuf> {
+    let mut observations = HashMap::new();
+    let mut lookup = |path: &Path| {
+        *observations.entry(path.to_path_buf()).or_insert_with(|| {
+            identify(path).filter(|identity| identity.kind == FsEntryKind::Directory)
+        })
+    };
+    let mut declared = HashSet::new();
+    let mut enclosing = HashSet::new();
+    for (pid, directory) in directories {
+        if *pid <= 0 || !directory.is_absolute() {
+            continue;
+        }
+        if let Some(identity) = lookup(directory) {
+            declared.insert(identity);
+        }
+        for parent in directory.ancestors().skip(1) {
+            if let Some(identity) = lookup(parent) {
+                enclosing.insert(identity);
+            }
+        }
+    }
+    let mut refused = HashSet::new();
+    for (candidate, _) in roots {
+        if lookup(candidate).is_some_and(|identity| enclosing.contains(&identity))
+            || candidate
+                .ancestors()
+                .any(|parent| lookup(parent).is_some_and(|identity| declared.contains(&identity)))
+        {
+            refused.insert(candidate.clone());
+        }
+    }
+    refused
 }
 
 #[cfg(test)]
@@ -351,5 +415,159 @@ mod tests {
         scopes.insert(42, &cache, None);
         assert!(scopes.is_busy(&cache.join("child")));
         assert!(!scopes.is_busy(&root.join("cache-\u{fffd}/child")));
+    }
+
+    fn directory_identity(device_id: u64, inode: u64) -> FsIdentity {
+        FsIdentity {
+            device_id,
+            inode,
+            kind: FsEntryKind::Directory,
+        }
+    }
+
+    fn candidate_roots(names: &[&str]) -> Vec<(PathBuf, usize)> {
+        names
+            .iter()
+            .map(|name| {
+                let path = PathBuf::from(name);
+                let depth = path.components().count();
+                (path, depth)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn declaration_identity_protects_an_unrelated_mount_spelling_and_its_descendants() {
+        let cache = directory_identity(7, 10);
+        let identities = BTreeMap::from([
+            (Path::new("/source/cache"), cache),
+            (Path::new("/view/cache"), cache),
+            (Path::new("/view/cache/objects"), directory_identity(7, 11)),
+            (Path::new("/view/cache-other"), directory_identity(7, 12)),
+            (Path::new("/"), directory_identity(7, 1)),
+        ]);
+        let roots = candidate_roots(&[
+            "/view/cache/objects",
+            "/view/cache/objects/artifact.o",
+            "/view/cache-other",
+        ]);
+        let declarations = vec![(42, PathBuf::from("/source/cache"))];
+        let refused = identity_refusals(&declarations, &roots, |path| {
+            identities.get(path).copied()
+        });
+        assert_eq!(
+            refused,
+            HashSet::from([roots[0].0.clone(), roots[1].0.clone()])
+        );
+        assert!(
+            roots.iter().all(|(path, _)| {
+                !path.starts_with(&declarations[0].1)
+                    && !declarations[0].1.starts_with(path)
+            }),
+            "path-only projection cannot establish any of these alias refusals"
+        );
+    }
+
+    #[test]
+    fn enclosing_alias_is_refused_without_promoting_its_idle_children_to_scopes() {
+        let parent = directory_identity(7, 2);
+        let cache = directory_identity(7, 10);
+        let identities = BTreeMap::from([
+            (Path::new("/source"), parent),
+            (Path::new("/source/cache"), cache),
+            (Path::new("/view/job"), parent),
+            (Path::new("/view/job/cache"), cache),
+            (Path::new("/view/job/idle"), directory_identity(7, 12)),
+            (Path::new("/view"), directory_identity(7, 3)),
+            (Path::new("/"), directory_identity(7, 1)),
+        ]);
+        let roots = candidate_roots(&[
+            "/view/job",
+            "/view/job/idle",
+            "/view/job/cache/deep/file.o",
+        ]);
+        let declarations = vec![(42, PathBuf::from("/source/cache"))];
+        assert_eq!(
+            identity_refusals(&declarations, &roots, |path| identities.get(path).copied()),
+            HashSet::from([roots[0].0.clone(), roots[2].0.clone()])
+        );
+    }
+
+    #[test]
+    fn missing_metadata_other_devices_and_file_identities_do_not_invent_aliases() {
+        let cache = directory_identity(7, 10);
+        let identities = BTreeMap::from([
+            (Path::new("/source/cache"), cache),
+            (Path::new("/different-device"), directory_identity(8, 10)),
+            (
+                Path::new("/not-a-directory"),
+                FsIdentity {
+                    kind: FsEntryKind::File,
+                    ..cache
+                },
+            ),
+            (Path::new("/"), directory_identity(7, 1)),
+        ]);
+        let roots = candidate_roots(&[
+            "/different-device/child",
+            "/not-a-directory/child",
+            "/unreadable/child",
+        ]);
+        let declarations = vec![(42, PathBuf::from("/source/cache"))];
+        assert!(
+            identity_refusals(&declarations, &roots, |path| identities.get(path).copied())
+                .is_empty()
+        );
+        assert!(identity_refusals(&declarations, &roots, |_| None).is_empty());
+        let invalid = vec![(0, PathBuf::from("/source/cache"))];
+        assert!(identity_refusals(&invalid, &roots, |_| Some(cache)).is_empty());
+    }
+
+    #[test]
+    fn identity_observations_are_memoized_only_within_the_current_batch() {
+        let cache = directory_identity(7, 10);
+        let roots = candidate_roots(&["/view/cache/a", "/view/cache/b"]);
+        let declarations = vec![
+            (42, PathBuf::from("/source/cache")),
+            (43, PathBuf::from("/source/cache")),
+        ];
+        let mut calls = BTreeMap::<PathBuf, usize>::new();
+        let old = identity_refusals(&declarations, &roots, |path| {
+            *calls.entry(path.to_path_buf()).or_default() += 1;
+            matches!(path.to_str(), Some("/source/cache" | "/view/cache"))
+                .then_some(cache)
+        });
+        assert_eq!(old.len(), 2);
+        assert!(calls.values().all(|count| *count == 1));
+        let new = identity_refusals(&declarations, &roots, |path| {
+            (path == Path::new("/source/cache")).then_some(cache)
+        });
+        assert!(new.is_empty(), "a new batch must not reuse the former alias");
+        assert_eq!(old.len(), 2, "the old observation remains immutable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_ancestry_identity_preserves_an_active_directory_through_an_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = resolve_absolute_path(temp.path());
+        let cache = root.join("source/cache");
+        fs::create_dir_all(cache.join("objects")).unwrap();
+        fs::write(cache.join("objects/artifact.o"), b"keep active bytes").unwrap();
+        let alias = root.join("view");
+        std::os::unix::fs::symlink(&cache, &alias).unwrap();
+        let child = alias.join("objects/artifact.o");
+        let sibling = root.join("idle");
+        fs::create_dir(&sibling).unwrap();
+        // Deliberately leave the alias unresolved to exercise identity rather
+        // than the normal path normalization used by the caller. This is a
+        // native symlink control, not a claim to have mounted a bind fixture.
+        let roots = vec![(child.clone(), 0), (sibling.clone(), 0)];
+        let refused = identity_refusals(&[(42, cache.clone())], &roots, |path| {
+            super::super::identity_for_path(path, true).ok()
+        });
+        assert_eq!(refused, HashSet::from([child]));
+        assert!(sibling.is_dir());
+        assert_eq!(fs::read(cache.join("objects/artifact.o")).unwrap(), b"keep active bytes");
     }
 }
