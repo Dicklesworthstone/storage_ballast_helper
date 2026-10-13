@@ -6,48 +6,123 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
-## v0.6.25 **[release]**
+## v0.7.0 **[release]**
 
-Compare: [`v0.6.24...v0.6.25`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.24...v0.6.25)
+Compare: [`v0.6.24...v0.7.0`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.24...v0.7.0)
 
-**Scope.** v0.6.25 is cut from `c40bf57` (2026-10-06, the last commit with
-test evidence) plus the release fixes below. The Linux reference-coverage,
-inotify-repair and mount-name series committed after it (`cb0125e`..`6ae1a97`)
-is **not** in this release: it was committed without running tests and fails
-on real hosts (issue #25). It stays on `main` for the next release.
+**Scope.** Everything on `main` since v0.6.24. A v0.6.25 was prepared on
+2026-10-08 and never tagged or published (issue #26 held it); its entries are
+included here. The minor version changes because two behaviours change for
+existing Linux installs; read the upgrade notes first.
+
+### Upgrade notes
+
+- **Linux: sbh must run as root to reclaim by scanning.** The open-file,
+  executable and memory-map sweeps now fail closed: if any process cannot be
+  inspected, the scan is incomplete and every candidate is refused. A normal
+  user cannot read root-owned processes, so a user-scope daemon, `sbh clean`
+  and `sbh emergency` run without root free nothing. Ballast release still
+  works. `sbh status` prints a warning and `sbh doctor --system` fails a
+  `reclaim.privilege` check in that case. Install the daemon in system scope:
+  `sudo sbh install --systemd --scope system` (`cb0125e`, `460661d`,
+  `c49b533`, `a0b99c7`, `a795b8a`; issue #27).
+- **Linux: deleting a directory tree needs `openat2(2)`.** Permanent deletion,
+  quarantine purge and in-place ballast repair walk through verified directory
+  handles and have no fallback on kernels older than 5.6 or where seccomp
+  filters the call; there they refuse and keep the data (`57a8f79`, `405d585`,
+  `d40d4bf`; issue #28).
+- Saved scan evidence is revoked at every start, so expect reconciliation
+  scans after the upgrade (`b50984c`).
+- The default `scanner.root_paths` no longer lists `/data/tmp` outside Linux
+  (`6545e88`).
 
 ### Security — a root daemon queries Git as the repository's owner
 
 - **Security-relevant behaviour change.** The tracked-content check below
-  ran `git ls-files` as root under the Linux system-scope daemon (the
-  default), and Git refuses a repository another user owns ("dubious
-  ownership"), so every candidate in users' repositories was kept and none
-  of their build output was reclaimed. A root daemon now runs that one query
-  as the owner of the repository's Git directory, with that user's primary
-  group and no supplementary groups, instead of trusting the repository's
-  configuration as root. `git` is looked up only in root-owned directories
-  and runs with a scrubbed environment, a 10 s deadline, bounded stderr and
-  discovery pinned to the repository, and "untracked" requires Git's own
-  unmatched-pathspec message. A symlinked `.git`, a malformed or swapped
-  gitfile, mixed owners or a failed user lookup keeps the candidate
-  (`998f31e`, `bf42b10`, `10358aa`).
+  ran `git ls-files` as root under the Linux system-scope daemon, and Git
+  refuses a repository another user owns ("dubious ownership"), so every
+  candidate in users' repositories was kept and none of their build output
+  was reclaimed. A root daemon now runs that one query as the owner of the
+  repository's Git directory, with that user's primary group and no
+  supplementary groups, instead of trusting the repository's configuration as
+  root. `git` is looked up only in root-owned directories and runs with a
+  scrubbed environment, a 10 s deadline, bounded stderr and discovery pinned
+  to the repository, and "untracked" requires Git's own unmatched-pathspec
+  message. A symlinked `.git`, a malformed or swapped gitfile, mixed owners or
+  a failed user lookup keeps the candidate (`c0281be`, `f494404`, `8ff4fc1`).
 
-### Fixed — safety: tracked Git content is never a candidate
+### Fixed — safety: what may be deleted
 
 - Tracked Git content is kept. A deep repository or worktree subtree has no
   `.git` of its own, so one host deleted thirty tracked Lean `Lake/Build`
   source files. A candidate under a repository now passes only if
   `git ls-files --error-unmatch` finds nothing tracked in it; missing Git or
   a failed query keeps it. `.lean` counts as source (`2c54bfe`).
+- Permanent deletion goes through verified directory handles and refuses a
+  replaced root or parent and any nested mount. Only directory modes of Go
+  and Cargo caches are widened, and an unreadable directory is refused rather
+  than chmodded open. A refusal can leave a tree partly removed (`57a8f79`).
+- The planner no longer picks a parent whose vetoed or suspended child is in
+  the same batch, nor a child or alias of a vetoed entry. One directory seen
+  under two spellings counts once toward the target and inherits a veto placed
+  on either (`3cf1a01`, `8450490`).
+- The executor rechecks a category's regret suspension just before each
+  delete or quarantine, so candidates queued before an alarm are skipped
+  (`category_suspended`) instead of deleted (`08cd42f`).
+- Regret evidence: a recreation first seen after its window expired, and a
+  path that could not be inspected, are "unknown" instead of a regret or a
+  clean result; each window starts when that item's unlink completes and is
+  timed at the observation, not the tick start (`2cea9f6`, `5577f70`,
+  `c034e7e`, `f3194fd`).
+- A filesystem event inside or above an indexed candidate clears its saved
+  score, so it is rescanned before a pressure pass can replay it; evidence
+  from before a restart is revoked (`9e3c42e`, `7146953`, `b50984c`).
+- Cache evidence needs an exact `CACHEDIR.TAG` regular file with the valid
+  signature. Any-case names, symlinks and special files no longer count, and a
+  FIFO of that name can no longer block a scanner worker (`6404e2e`).
+- Quarantine moves and restores use opened directory handles and recheck the
+  source and parent; a swapped source or parent, or a candidate whose parent
+  lies inside the store, is refused. Purge removes records through the locked
+  store handle, and a drain skips an entry whose record changed between
+  selection and locking (`1f17acf`, `e906896`, `e9775e6`).
+
+### Fixed — Linux process and mount inspection
+
+- The open-file sweep skipped processes whose descriptors it could not read
+  and still reported a complete scan; a running program with an unreadable or
+  non-UTF-8 name was dropped from the executable query; unreadable maps files
+  were skipped. All three now mark the scan incomplete, within caps of 262,144
+  descriptors and 64 MiB of maps (`cb0125e`, `460661d`, `c49b533`,
+  `a0b99c7`). See the upgrade notes for what this means without root.
+- `anon_inode:` and `socket:[N]` rows in `/proc/<pid>/maps` are mappings of no
+  file. They were rejected as malformed, so on Ubuntu, where systemd-networkd
+  maps BPF maps, a root daemon's coverage was incomplete and it reclaimed
+  nothing (`179c0e7`; issue #25).
+- A live directory literally named `... (deleted)` is no longer mistaken for
+  an unlinked file (`c49b533`).
+- One non-UTF-8 mount name made reading the mount table fail and disabled all
+  pressure readings; the table is parsed as bytes. A malformed row is now an
+  error for the whole table rather than a skipped line (`c3dc95a`).
+- Capacity followed symlinks while the mount, type and RAM-backed lookups used
+  the unresolved path, so a link into tmpfs mixed tmpfs capacity with the
+  parent disk's identity. Paths are canonicalized first (`0f17092`,
+  `6ae1a97`).
 
 ### Fixed — pressure readings and the daemon
 
 - A cached reading is bound to its mount's device, type and resolved path,
   and a slow older probe cannot replace a newer one (`5217550`).
-- macOS: name, counters and read-only flag come from one `statfs` and
-  firmlinked paths resolve to the Data volume (it can share System's device
-  number); startup memory pressure is the kernel's level, not a Critical
-  guess that blocked the first scan (`a62d895`, `f457e62`).
+- macOS: name, counters and read-only flag come from one `statfs`; startup
+  memory pressure is the kernel's level, not a Critical guess that blocked the
+  first scan (`a62d895`, `f457e62`).
+- macOS: a path on an external volume is measured on that volume. `a62d895`
+  had attributed every `/Volumes/*` path to the Data volume, so Data pressure
+  could delete on an external disk. Firmlinks and `synthetic.conf` links now
+  resolve to a fixed point and mount points are compared in the same spelling
+  (`8c6bde5`, `18992f7`, `a50eb77`; issue #26).
+- Under Red or Critical with nothing reclaimable, passes that always timed
+  out never counted as empty and rescanned about every 20 s; runs of them now
+  reach terminal idle (`6545e88`).
 - After a write failure a mount resumes reclaiming once a probe write
   succeeds, not once free space recovers (`e450990`); a late empty result no
   longer idles a mount that has since escalated (`c3f32d1`).
@@ -57,14 +132,34 @@ on real hosts (issue #25). It stays on `main` for the next release.
   each read or write has one overall deadline, malformed arguments are
   rejected (a bad ballast `mount` had meant every pool), and a restart no
   longer unlinks a live daemon's socket (`6259b9d`, `26bbf82`, `e92a9e6`).
+- Forecast calibration: a full pending window now defers new forecasts
+  instead of evicting unscored ones, and with too few samples the lower bound
+  is 0 rather than derived from the worst past miss (`2759874`, `cb67d7d`).
+- Logger: shutdown and the JSONL mirror toggle no longer block on a full
+  queue, and shutdown waits at most 5 s for a writer stuck in I/O (`ac88f2c`,
+  `6d12d55`).
 
-### Fixed — scanning
+### Fixed — scanning and event coverage
 
 - Pressure scans rotate which root goes first; a bounded pass that always
   began with the dirtiest root never reached the rest (`218ecec`).
 - The index drops a rebuilt path's old inode (stale identities piled up as
   high-scoring candidates); checkpoints use an exclusive temp file, fsync
   and a 64 MiB / 100,000-record cap (`000c854`, `a777d4a`).
+- Linux inotify coverage decayed silently: moved-in trees got only a
+  top-level watch, removed directories kept using the watch budget, and a
+  failed startup never retried. Topology changes now trigger a bounded,
+  background watch rebuild that keeps the old watches until it succeeds, and
+  draining and watch retirement share a 50 ms budget per tick (`254f386`,
+  `0870b65`, `6516db4`, `d601c4a`, `32e5cae`, `175c131`, `fc2d456`).
+- A configured root that does not exist was a permanent coverage gap that
+  caused repeated repair planning. Absent roots are tracked separately and
+  rechecked every 30 s (`9d0c040`). macOS: a symlinked root such as `/tmp`
+  gets FSEvents coverage (`6545e88`).
+- Prescan reads each root in resumable slices and keeps unfinished reads
+  across passes, with at most four roots in progress; its checkpoint is
+  versioned, checksummed and holds non-UTF-8 paths (`ef580f0`, `3d389a5`,
+  `97970d5`, `73eecab`).
 
 ### Fixed — quarantine and ballast
 
@@ -72,6 +167,15 @@ on real hosts (issue #25). It stays on `main` for the next release.
   filesystem; purge walks the recorded payload by descriptor instead of
   `remove_dir_all`, entering no symlinked directory, other filesystem or
   bind mount, and keeps the record if refused (`cf4d1fc`, `405d585`).
+- Batch drains share a step budget per call, so a large entry is purged over
+  several sweeps and stays recorded meanwhile; a restore after a partial purge
+  returns what remains (`d0181ae`).
+- Ballast on ZFS: a new file was written, then unlinked, on every pass,
+  because ZFS reports a file's blocks only after its transaction group syncs
+  and the block count was checked straight after `fsync`. A payload written in
+  full is now accepted on the completed write; block coverage is still checked
+  on every later pass. An under-allocated creation ends the batch instead of
+  repeating the write for each remaining file (`ce6b871`; issue #26).
 - Ballast status counts only allocated, releasable reserve and finds pools
   configured through a symlink; surplus left by a lowered or disabled target
   stays releasable (`d8f3f2b`, `60b5624`, `9f0cd3f`, `3c89dfe`, `2b6e438`).
@@ -86,20 +190,36 @@ on real hosts (issue #25). It stays on `main` for the next release.
 
 ### Changed
 
+- With a byte target, the planner also tries lower-loss sets that still cover
+  the target and drops redundant items, instead of one large risky item that
+  overshoots (`221e1c5`).
 - Imminent exhaustion is acted on even with over half the disk free when
   the calibrated historical rate agrees (`99cb919`).
-- Dependencies: semver-compatible lockfile refresh (46 packages), and
-  `sbh_mach`'s Apple-only dependencies are macOS-only (`d04a794`, `7dbb3c4`).
+- A config reload applies regret settings without a restart; pending watches
+  keep their window and active suspensions are never shortened (`114515d`).
+- Dependencies: the TUI crates come from crates.io (`ftui` 0.6.0) instead of
+  a git tag; semver-compatible lockfile refreshes; `sbh_mach`'s Apple-only
+  dependencies are macOS-only (`5d77619`, `115b199`, `7dbb3c4`).
 
 ### Known limitations
 
+- Linux without root, and Linux without `openat2`: see the upgrade notes
+  (issues #27, #28).
+- macOS: a user-scope sbh (the default LaunchAgent install) refuses every
+  walked candidate and every candidate of 100 MB or more, because it cannot
+  see other users' processes. This predates this release (bead `bd-0nx9`).
+- Ballast on a filesystem whose settled block count stays below the file
+  size: such files fail verification on every pass and are rewritten in
+  place each time. Not observed; inferred for some raidz geometries.
+- The predictive rescue's two runways are derived from the same corrected
+  forecast, so under steady writes it can release ballast and run a
+  Green-level cleanup on a mostly empty disk. Scoring vetoes still apply
+  (issue #29).
 - The tracked-content query finds `git` only in fixed system directories
   (`/usr/local/bin`, `/usr/bin`, `/bin`, `/run/current-system/sw/bin`, plus
   the Homebrew and Linuxbrew prefixes for a non-root daemon); where `git`
   lives only elsewhere, such as a per-user Nix profile, candidates inside
   repositories are kept.
-- Quarantine purge uses `openat2(2)` and fails on kernels older than 5.6 or
-  where seccomp filters it; quarantined items are kept, not lost.
 
 ## v0.6.24 **[release]**
 
