@@ -8,6 +8,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- A confident prediction that a mount is about to turn red gets its scan
+  (bd-lihi). The prediction escalates the mount while it is still Green, so
+  a Green maintenance walk already in flight could finish empty at the same
+  level, park the mount and consume the prediction's wake. A maintenance walk
+  or event-scoped pass that comes back empty no longer parks a mount that is
+  reclaiming (`f0dd99c`).
 - `sbh lease run` no longer stops a live build when part of its target cannot
   be measured (bd-am3p). A directory replaced by a file mid-walk (ENOTDIR) or
   a directory the watchdog cannot read (EACCES/EPERM, such as the mode-000
