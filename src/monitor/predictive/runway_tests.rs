@@ -26,8 +26,10 @@ fn forecast(acceleration: f64, burst_probability: f64, median_rate: f64) -> Rate
             burst_probability,
             median_rate,
             burst_duration_samples: 3,
+            median_consumption_rate: median_rate,
             ..BurstState::default()
         },
+        free_bytes: 60_000,
     }
 }
 
