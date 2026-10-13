@@ -1,0 +1,39 @@
+name: Source-root safety
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/source-root-safety.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-root-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record exact source for reproducible validation
+        run: git archive --format=tar --output=sbh-source.tar HEAD
+      - name: Source-root policy regressions
+        run: cargo test --locked --lib scanner::source_roots::tests
+      - name: Check source-root formatting
+        if: always()
+        run: rustfmt --edition 2024 --check src/scanner/source_roots.rs
+      - name: Preserve validation source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-root-validation-source
+          path: sbh-source.tar
+          retention-days: 3
