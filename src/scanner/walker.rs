@@ -1626,6 +1626,9 @@ pub fn collect_open_path_ancestors_with_platform(
             incomplete = true;
         }
         for open_file in result.files {
+            if own_directory_handle(&open_file) {
+                continue;
+            }
             add_open_path_ancestor_chain(&mut ancestors, &open_file.path, &normalized_roots);
         }
     }
@@ -1810,6 +1813,9 @@ pub fn collect_active_reference_index(
                     index.complete = false;
                 }
                 for open_file in result.files {
+                    if own_directory_handle(&open_file) {
+                        continue;
+                    }
                     let name = process_names.get(&open_file.pid).cloned();
                     index.add_reference(&roots, &open_file.path, |summary| {
                         summary.add_open_file_descriptor(open_file.pid, name.clone());
@@ -1850,6 +1856,19 @@ pub fn collect_active_reference_index(
     }
 
     index
+}
+
+/// sbh's own directory handles are its scanner walking a tree (or the
+/// executor and quarantine at work), not a user of what is below them.
+/// Counting them made a candidate look in use to the very pass that was
+/// examining it: scoring vetoed it as open, or the executor skipped it as
+/// FileOpen, and the mount could then sit idle for a rescan interval. sbh's
+/// own regular files (logs, databases) and every other process's handles
+/// still count. The Linux executor sweep applies the same rule in
+/// `reference_scan::open_targets_with`.
+fn own_directory_handle(open_file: &crate::platform::types::OpenFile) -> bool {
+    open_file.kind == crate::platform::types::OpenFileKind::Directory
+        && i32::try_from(std::process::id()).is_ok_and(|own| own == open_file.pid)
 }
 
 fn active_reference_visibility_warning(platform: &dyn Platform) -> Option<&'static str> {
@@ -2488,6 +2507,59 @@ mod tests {
             dir_entry.metadata.content_size_bytes,
             APPARENT
         );
+    }
+
+    /// sbh's own directory handles are its scanner mid-walk: a candidate must
+    /// not look in use to the pass that is examining it. Its own regular
+    /// files, and another process's directory handle, still count.
+    #[test]
+    fn own_directory_handles_are_not_active_references() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let walked = root.join("walked/target");
+        let logged = root.join("state/sbh.jsonl");
+        let used = root.join("used/target");
+        for dir in [&walked, &used, &logged.parent().unwrap().to_path_buf()] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(&logged, b"log").unwrap();
+        let own = i32::try_from(std::process::id()).unwrap();
+        let open = |pid, path: &Path, kind| crate::platform::types::OpenFile {
+            pid,
+            path: path.to_path_buf(),
+            fd: Some(7),
+            kind,
+            mode: crate::platform::types::OpenFileMode::Read,
+        };
+        let platform = TestActiveRefPlatform {
+            processes: vec![process(own, "sbh", None), process(42, "rustc", None)],
+            open_files: vec![
+                open(
+                    own,
+                    &walked,
+                    crate::platform::types::OpenFileKind::Directory,
+                ),
+                open(own, &logged, crate::platform::types::OpenFileKind::Regular),
+                open(42, &used, crate::platform::types::OpenFileKind::Directory),
+            ],
+            ..Default::default()
+        };
+
+        let index = collect_active_reference_index(&platform, std::slice::from_ref(&root));
+        let resolve = |path: &Path| crate::core::paths::resolve_absolute_path(path);
+        assert!(index.summary_for(&resolve(&walked)).is_empty());
+        assert!(!index.summary_for(&resolve(&logged)).is_empty());
+        assert!(!index.summary_for(&resolve(&used)).is_empty());
+
+        let (ancestors, complete) =
+            collect_open_path_ancestors_with_platform(&platform, std::slice::from_ref(&root));
+        assert!(complete);
+        assert!(!is_path_open_by_ancestor(&walked, &ancestors));
+        assert!(is_path_open_by_ancestor(&used, &ancestors));
+        assert!(is_path_open_by_ancestor(
+            logged.parent().unwrap(),
+            &ancestors
+        ));
     }
 
     #[test]
