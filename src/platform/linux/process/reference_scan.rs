@@ -400,11 +400,22 @@ fn open_targets_with(
         .pids(proc_root)
         .map_err(|error| SbhError::io(proc_root, error))?;
     let mut targets = std::collections::HashSet::new();
+    let current = i32::try_from(std::process::id()).ok();
     for pid in pids {
         if sweep.expired() {
             break;
         }
+        let own = Some(pid) == current;
         sweep.fd_targets(proc_root, pid, |_, _, _, target| {
+            // sbh's own directory handles are its scanner walking a tree (or
+            // the executor and quarantine at work), not a user of what is
+            // below them. Counting them skipped as FileOpen whatever candidate
+            // the scanner was still walking when its batch arrived, which then
+            // backed off and could park the mount for a whole rescan interval.
+            // sbh's own regular files (logs, databases) still count.
+            if own && fs::metadata(&target).is_ok_and(|metadata| metadata.is_dir()) {
+                return;
+            }
             add_target_spellings(&mut targets, target);
         });
     }
@@ -963,6 +974,34 @@ mod tests {
             open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
         assert!(complete);
         assert_eq!(targets, vec![first, second]);
+    }
+
+    /// sbh's own directory handles are its scanner mid-walk, not a user of
+    /// the tree: the executor used to skip whatever candidate the scanner was
+    /// still walking as FileOpen. Its own regular files, and every other
+    /// process's handles, still count.
+    #[test]
+    fn path_only_sweep_ignores_this_process_own_directory_handles() {
+        let fixture = Fixture::new();
+        let own = i32::try_from(std::process::id()).unwrap();
+        let walked = fixture.root.join("candidate-target");
+        fs::create_dir(&walked).unwrap();
+        let own_log = fixture.fd(own, 3);
+        symlink(&walked, fixture.proc_root.join(format!("{own}/fd/4"))).unwrap();
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        assert_eq!(targets, vec![own_log.clone()]);
+
+        // Another process holding the same directory is a user of it.
+        let other = own.checked_add(1).unwrap();
+        fixture.pid(other);
+        symlink(&walked, fixture.proc_root.join(format!("{other}/fd/0"))).unwrap();
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        assert!(targets.contains(&walked));
+        assert!(targets.contains(&own_log));
     }
 
     #[test]

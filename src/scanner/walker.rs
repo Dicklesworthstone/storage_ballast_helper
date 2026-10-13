@@ -2397,15 +2397,24 @@ mod tests {
             let candidate = root.join(name);
             fs::create_dir(&candidate).unwrap();
             fs::write(candidate.join("retained"), b"keep").unwrap();
-            let _held_directory = fs::File::open(&candidate).unwrap();
+            // Another process holds the directory. sbh's own directory
+            // handles are its scanner at work and are not counted.
+            let mut holder = std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(fs::File::open(&candidate).unwrap())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
             let (ancestors, _) = collect_open_path_ancestors(std::slice::from_ref(&root));
+            let held = is_path_open_by_ancestor(&candidate, &ancestors);
+            let unrelated = is_path_open_by_ancestor(&root.join("unrelated"), &ancestors);
+            holder.kill().unwrap();
+            holder.wait().unwrap();
             // Other PIDs may be unreadable; positive evidence must survive
             // irrespective of completeness of the host-wide observation.
-            assert!(is_path_open_by_ancestor(&candidate, &ancestors));
-            assert!(!is_path_open_by_ancestor(
-                &root.join("unrelated"),
-                &ancestors
-            ));
+            assert!(held);
+            assert!(!unrelated);
             assert_eq!(fs::read(candidate.join("retained")).unwrap(), b"keep");
         }
     }
