@@ -13,11 +13,24 @@
 //! boundary. Filesystem probes are cooperatively bounded; an individual
 //! blocking filesystem syscall cannot be interrupted.
 //!
-//! An uninstalled default policy still refuses candidates inside Git work
-//! trees. Executors can also supply their declared roots as a deny-only
-//! fallback: that protects untracked siblings of nested repositories without
-//! mistaking a missing explicit policy for permission. This never infers an
-//! opt-in, and is not a substitute for daemon startup/reload/status wiring.
+//! An uninstalled policy built with [`SourceRootPolicy::with_backstop`]
+//! refuses candidates inside Git work trees. Executors can also supply their
+//! declared roots as a deny-only fallback: that protects untracked siblings of
+//! nested repositories without mistaking a missing explicit policy for
+//! permission. This never infers an opt-in, and is not a substitute for daemon
+//! startup/reload/status wiring.
+//!
+//! Report-only in this release (#33). The daemon and `sbh clean` do not
+//! install a policy, and `Default` carries neither the backstop nor fallback
+//! scope, so nothing here refuses a deletion yet: `doctor` and
+//! `config validate` report the findings as warnings. As defined, a source
+//! root is any root with a Git marker anywhere beneath it or an inconclusive
+//! inspection, which on real hosts is every temp root (agent clones, release
+//! checkouts, more entries than the inspection budget). Refusing a candidate
+//! for having a work tree among its ancestors would likewise refuse every
+//! `<checkout>/target`, the artifact sbh exists to reclaim; tracked content
+//! and nested repositories are already vetoed per candidate. Enforcement
+//! waits for a narrower definition.
 
 use std::fs;
 use std::io;
@@ -381,6 +394,9 @@ struct PolicyState {
     // Only new/replace constitute explicit installation. Deny-only fallback
     // roots do not disable the ancestor backstop outside their known scope.
     installed: bool,
+    // Whether an uninstalled policy refuses candidates inside Git work trees.
+    // Off for `Default` while #33 is report-only.
+    backstop: bool,
     // Old locations remain denied for queued candidates after removal or
     // retargeting. A current containing root is evaluated under the new policy.
     retired_paths: Vec<PathBuf>,
@@ -417,10 +433,12 @@ impl PolicyState {
 /// Live policy shared by scanner, executor and monitor. Cloning shares state;
 /// it does not create a stale authorization snapshot.
 ///
-/// `Default` has no configured-root scope, but still refuses candidates inside
-/// Git work trees. Use `new` or `replace` to install the full root-level policy,
-/// including any explicit opt-in. The backstop never infers that opt-in from
-/// an artifact's name, score, pressure, or an uninstalled Config object.
+/// `Default` has no configured-root scope and, while #33 is report-only,
+/// authorizes every candidate; [`Self::with_backstop`] also refuses candidates
+/// inside Git work trees. Use `new` or `replace` to install the full
+/// root-level policy, including any explicit opt-in. The backstop never
+/// infers that opt-in from an artifact's name, score, pressure, or an
+/// uninstalled Config object.
 #[derive(Debug, Clone, Default)]
 pub struct SourceRootPolicy {
     inner: Arc<Mutex<PolicyState>>,
@@ -482,6 +500,19 @@ fn authorize_without_config(path: &Path, mut budget: Budget) -> std::result::Res
 }
 
 impl SourceRootPolicy {
+    /// An uninstalled policy that refuses candidates inside Git work trees
+    /// until a root set is installed. Not what `Default` gives while #33 is
+    /// report-only: it would refuse every `<checkout>/target`.
+    #[must_use]
+    pub fn with_backstop() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(PolicyState {
+                backstop: true,
+                ..PolicyState::default()
+            })),
+        }
+    }
+
     /// Inspect and install the initial configured-root policy.
     #[must_use]
     pub fn new(roots: &[PathBuf], allow: bool) -> Self {
@@ -489,6 +520,7 @@ impl SourceRootPolicy {
             inner: Arc::new(Mutex::new(PolicyState {
                 report: inspect_roots(roots, allow),
                 installed: true,
+                backstop: false,
                 retired_paths: Vec::new(),
             })),
         }
@@ -507,10 +539,17 @@ impl SourceRootPolicy {
             return;
         }
         let mut state = self.inner.lock();
-        if state.installed {
+        // Report-only (#33): fallback scope belongs to the backstop, and
+        // gathering it would inspect every declared root on each admission.
+        if state.installed || !state.backstop {
             return;
         }
-        let mut combined: Vec<_> = state.report.roots.iter().map(|root| root.root.clone()).collect();
+        let mut combined: Vec<_> = state
+            .report
+            .roots
+            .iter()
+            .map(|root| root.root.clone())
+            .collect();
         let previous_len = combined.len();
         for root in roots {
             if !combined.contains(root) {
@@ -576,6 +615,11 @@ impl SourceRootPolicy {
         // a candidate alias observed before that inspection began.
         let canonical = fs::canonicalize(path)
             .map_err(|error| format!("cannot resolve candidate {}: {error}", path.display()))?;
+        if !state.installed && !state.backstop {
+            // Report-only (#33): an executor nobody gave a policy authorizes
+            // as it did before the backstop existed.
+            return Ok(());
+        }
         if !state.installed && state.report.roots.is_empty() {
             return authorize_without_config(
                 &canonical,
@@ -702,13 +746,30 @@ mod tests {
         }
     }
 
+    /// #33 is report-only in this release: an executor given no policy
+    /// authorizes untracked output inside a checkout, as it always has.
+    #[test]
+    fn a_default_policy_carries_no_backstop_while_report_only() {
+        let dir = scratch();
+        mkdir(&dir.path().join(".git"));
+        let target = dir.path().join("target");
+        mkdir(&target);
+        assert!(SourceRootPolicy::default().authorize(&target).is_ok());
+        assert!(
+            SourceRootPolicy::with_backstop()
+                .authorize(&target)
+                .unwrap_err()
+                .contains("not installed")
+        );
+    }
+
     #[test]
     fn refreshing_a_default_policy_does_not_mark_it_installed() {
         let dir = scratch();
         mkdir(&dir.path().join(".git"));
         let target = dir.path().join("target");
         mkdir(&target);
-        let policy = SourceRootPolicy::default();
+        let policy = SourceRootPolicy::with_backstop();
         let queued = policy.clone();
         assert!(policy.refresh().roots.is_empty());
         assert!(
@@ -1098,7 +1159,7 @@ mod tests {
             mkdir(&root.join("project/.git"));
             mkdir(&root.join("target"));
         }
-        let policy = SourceRootPolicy::default();
+        let policy = SourceRootPolicy::with_backstop();
         policy.include_default_roots(std::slice::from_ref(&first));
         let other = policy.clone();
         other.include_default_roots(std::slice::from_ref(&second));

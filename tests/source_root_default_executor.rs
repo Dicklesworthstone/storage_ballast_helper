@@ -1,9 +1,14 @@
 //! Regression coverage for executors whose caller omitted the source-root policy.
 //!
-//! These tests deliberately leave DeletionConfig::source_roots at its default.
+//! These tests give the executor the uninstalled backstop policy
+//! (`SourceRootPolicy::with_backstop`) and never install a root set.
 //! Configured-policy tests cannot detect the missing-wiring failure: they install
 //! the very policy that the production caller forgot. All mutations are confined
 //! to disposable fixtures outside the checkout; no daemon or ballast is started.
+//!
+//! #33 is report-only in v0.7.3, so `DeletionConfig::default()` carries no
+//! backstop: it would refuse every `<checkout>/target`. The backstop these
+//! tests pin becomes the default again when enforcement is switched on.
 
 #![cfg(unix)]
 
@@ -19,7 +24,8 @@ use storage_ballast_helper::scanner::deletion::{
 };
 use storage_ballast_helper::scanner::patterns::{ArtifactCategory, ArtifactClassification};
 use storage_ballast_helper::scanner::scoring::{
-    ArtifactCertainty, CandidacyScore, DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors,
+    ArtifactCertainty, CandidacyScore, DecisionAction, DecisionOutcome, EvidenceLedger,
+    ScoreFactors,
 };
 use storage_ballast_helper::scanner::source_roots::SourceRootPolicy;
 use storage_ballast_helper::scanner::walker::identity_for_path;
@@ -103,6 +109,7 @@ fn config(root: &Path, mode: DeletionMode) -> DeletionConfig {
         check_open_files: false,
         quarantine_roots: vec![root.to_path_buf()],
         mode,
+        source_roots: SourceRootPolicy::with_backstop(),
         ..DeletionConfig::default()
     }
 }
@@ -123,7 +130,10 @@ fn denied(report: &DeletionReport) {
     assert_eq!(report.bytes_freed, 0, "{report:?}");
     assert_eq!(report.bytes_quarantined, 0, "{report:?}");
     assert_eq!(report.skipped_by_reason.get("source_root_denied"), Some(&1));
-    assert!(report.errors.is_empty(), "a safety veto is not an I/O failure");
+    assert!(
+        report.errors.is_empty(),
+        "a safety veto is not an I/O failure"
+    );
     assert!(report.backoff_candidates.is_empty());
     assert!(!report.circuit_breaker_tripped);
 }
@@ -195,7 +205,11 @@ fn source_root_default_executor_rechecks_after_the_live_guard() {
             Ok(())
         };
         let report = executor.execute_with_guard(&plan, None, Some(&create_repository));
-        assert_eq!(guard_calls.get(), 1, "preflight must actually reach the guard");
+        assert_eq!(
+            guard_calls.get(),
+            1,
+            "preflight must actually reach the guard"
+        );
         denied(&report);
         retained(&candidate);
         assert!(!directory.path().join(".sbh/quarantine").exists());
@@ -239,7 +253,7 @@ fn source_root_default_policy_checks_file_parents_and_fresh_repository_markers()
     let directory = scratch();
     let file = directory.path().join("generated.o");
     fs::write(&file, b"ordinary file").unwrap();
-    let policy = SourceRootPolicy::default();
+    let policy = SourceRootPolicy::with_backstop();
     assert!(policy.authorize(&file).is_ok(), "do not probe file/.git");
     assert!(policy.refresh().roots.is_empty());
     fs::create_dir(directory.path().join(".git")).unwrap();
@@ -256,7 +270,7 @@ fn source_root_explicit_installation_allows_untracked_output_but_not_tracked_con
         if tracked {
             git(directory.path(), &["add", "target"]);
         }
-        let policy = SourceRootPolicy::default();
+        let policy = SourceRootPolicy::with_backstop();
         let executor = DeletionExecutor::new(
             DeletionConfig {
                 source_roots: policy.clone(),

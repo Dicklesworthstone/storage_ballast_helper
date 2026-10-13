@@ -79,48 +79,72 @@ fn json(output: &Output) -> Value {
     })
 }
 
-fn refused(output: &Output, root: &Path) -> Value {
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
+/// #33 is report-only in this release: plain `doctor` answers with the
+/// source-root report, and a finding is a warning, not a failure.
+fn reported(output: &Output, root: &Path) -> Value {
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
     let report = json(output);
-    assert_eq!(report["valid"], false);
-    assert_eq!(report["exit_code"], 1);
+    assert_eq!(report["valid"], true);
+    assert_eq!(report["status"], "warn");
+    assert_eq!(report["exit_code"], 0);
     assert_eq!(report["source_roots"]["roots"][0]["root"], json!(root));
     assert_eq!(report["source_roots"]["roots"][0]["reclaim_allowed"], false);
     assert_eq!(
         report["assessment"],
-        "configuration_only_not_live_daemon_enforcement"
+        "report_only_configuration_not_enforced"
     );
+    assert!(!report["warnings"].as_array().unwrap().is_empty());
     report
 }
 
+/// Commands with checks of their own name the root on stderr, keep stdout a
+/// single JSON document, and go on to run those checks.
+fn warned(output: &Output, root: &Path) -> Value {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("sbh: warning: ") && stderr.contains(&root.display().to_string()),
+        "{output:?}"
+    );
+    assert!(stderr.contains("report-only in this release"), "{output:?}");
+    let own = json(output);
+    assert!(
+        own.get("source_roots").is_none(),
+        "the command's own report"
+    );
+    own
+}
+
 #[test]
-fn source_root_doctor_and_validation_fail_for_nested_repositories_without_mutation() {
+fn source_root_doctor_and_validation_report_nested_repositories_without_failing_or_mutating() {
     let fixture = Fixture::new(false);
     let repository = fixture.repository("team/project");
     let untracked = fixture.root.join("untracked-target");
     fs::create_dir(&untracked).unwrap();
     let evidence = untracked.join("evidence.txt");
     fs::write(&evidence, b"irreplaceable release evidence").unwrap();
-    for args in [
-        vec!["doctor", "--json"],
-        vec!["doctor", "--system", "--json"],
-        vec!["config", "validate", "--json"],
-    ] {
-        let report = refused(&fixture.run(&args), &fixture.root);
-        assert_eq!(
-            report["source_roots"]["roots"][0]["finding"],
-            "git_worktree"
-        );
-        assert_eq!(
-            report["source_roots"]["roots"][0]["repositories"][0],
-            json!(fs::canonicalize(&repository).unwrap())
-        );
-        assert_eq!(
-            fs::read(&evidence).unwrap(),
-            b"irreplaceable release evidence"
-        );
-        assert!(repository.join(".git").is_dir());
-    }
+
+    let report = reported(&fixture.run(&["doctor", "--json"]), &fixture.root);
+    assert_eq!(
+        report["source_roots"]["roots"][0]["finding"],
+        "git_worktree"
+    );
+    assert_eq!(
+        report["source_roots"]["roots"][0]["repositories"][0],
+        json!(fs::canonicalize(&repository).unwrap())
+    );
+    warned(
+        &fixture.run(&["doctor", "--system", "--json"]),
+        &fixture.root,
+    );
+    let validation = fixture.run(&["config", "validate", "--json"]);
+    assert!(validation.status.success(), "{validation:?}");
+    assert_eq!(warned(&validation, &fixture.root)["valid"], true);
+
+    assert_eq!(
+        fs::read(&evidence).unwrap(),
+        b"irreplaceable release evidence"
+    );
+    assert!(repository.join(".git").is_dir());
 }
 
 #[test]
@@ -131,7 +155,7 @@ fn source_root_gitfile_and_scan_root_inside_repository_are_detected() {
         "gitdir: /missing/main/.git/worktrees/topic\n",
     )
     .unwrap();
-    refused(
+    warned(
         &fixture.run(&["config", "validate", "--json"]),
         &fixture.root,
     );
@@ -145,7 +169,7 @@ fn source_root_gitfile_and_scan_root_inside_repository_are_detected() {
         ),
     )
     .unwrap();
-    let report = refused(&fixture.run(&["doctor", "--json"]), &build);
+    let report = reported(&fixture.run(&["doctor", "--json"]), &build);
     assert_eq!(
         report["source_roots"]["roots"][0]["finding"],
         "git_worktree"
@@ -153,7 +177,7 @@ fn source_root_gitfile_and_scan_root_inside_repository_are_detected() {
 }
 
 #[test]
-fn source_root_explicit_opt_in_passes_and_revocation_is_visible_on_next_command() {
+fn source_root_explicit_opt_in_clears_the_warning_and_revocation_is_visible_on_next_command() {
     let fixture = Fixture::new(true);
     fixture.repository("project");
     let doctor = fixture.run(&["doctor", "--json"]);
@@ -164,8 +188,8 @@ fn source_root_explicit_opt_in_passes_and_revocation_is_visible_on_next_command(
     let validation = fixture.run(&["config", "validate", "--json"]);
     assert!(validation.status.success(), "{validation:?}");
     fixture.configure(false, "");
-    refused(&fixture.run(&["doctor", "--json"]), &fixture.root);
-    refused(
+    reported(&fixture.run(&["doctor", "--json"]), &fixture.root);
+    warned(
         &fixture.run(&["config", "validate", "--json"]),
         &fixture.root,
     );
@@ -191,7 +215,7 @@ fn source_root_environment_override_is_explicit_and_can_revoke_file_opt_in() {
         .env("SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS", "false")
         .output()
         .unwrap();
-    refused(&denied, &fixture.root);
+    reported(&denied, &fixture.root);
     let invalid = fixture
         .command(&["doctor", "--json"])
         .env("SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS", "definitely")
@@ -212,7 +236,7 @@ fn source_root_clear_configuration_passes_but_new_repository_is_not_cached() {
         "clear"
     );
     fixture.repository("new/project");
-    refused(&fixture.run(&["doctor", "--json"]), &fixture.root);
+    reported(&fixture.run(&["doctor", "--json"]), &fixture.root);
 }
 
 #[test]
@@ -222,7 +246,7 @@ fn source_root_diagnostics_do_not_make_unsafe_config_impossible_to_inspect() {
     let output = fixture.run(&["config", "show", "--json"]);
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("allow_source_tree_roots"));
-    refused(
+    warned(
         &fixture.run(&["config", "validate", "--json"]),
         &fixture.root,
     );
