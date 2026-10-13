@@ -198,6 +198,10 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         "SBH_PRESSURE_BEHAVIOR_HYSTERESIS_SECS",
         "`pressure.behavior_hysteresis_secs`",
     ),
+    cfg(
+        "SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS",
+        "`scanner.allow_source_tree_roots` (opt in to scan roots that contain Git work trees)",
+    ),
     cfg("SBH_SCANNER_ENGINE", "`scanner.engine`"),
     cfg("SBH_SCANNER_EVENT_SOURCE", "`scanner.event_source`"),
     cfg(
@@ -371,6 +375,11 @@ pub const ENV_VARS: &[EnvVarDoc] = &[
         "SBH_TUI_ARTIFACT_DIR",
         EnvArea::Test,
         "Where the TUI test artifacts are written",
+    ),
+    var(
+        "SBH_EXECUTABLE_REPLACEMENT_PROBE",
+        EnvArea::Test,
+        "Binary the Linux self-replacement test rewrites in place to check the service restart path (#35)",
     ),
     var(
         "SBH_TUI_ARTIFACT_FRAMES",
