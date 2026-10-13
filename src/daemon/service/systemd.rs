@@ -1370,8 +1370,10 @@ fn preserved_unit_config(
             directives.insert(key.to_string(), commands);
         }
     }
-    let invalid = || SbhError::Runtime {
+    let invalid = || {
+        SbhError::Runtime {
         details: "cannot preserve the installed systemd --config path; refusing to rewrite the unit; use one absolute literal config path without environment or unit specifiers".to_string(),
+    }
     };
     let Some(commands) = directives.get(key) else {
         return Ok(None);
@@ -1901,9 +1903,9 @@ mod exec_path_tests {
     fn ordinary_execstart_output_stays_unchanged() {
         let unit = manager("/usr/local/bin/sbh", false)
             .generate_unit_file_with_config(Some(Path::new("/etc/sbh/config.toml")));
-        assert!(unit.contains(
-            "ExecStart=/usr/local/bin/sbh daemon --config /etc/sbh/config.toml\n"
-        ));
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/sbh daemon --config /etc/sbh/config.toml\n")
+        );
         assert!(unit.contains("ExecReload=/bin/kill -HUP $MAINPID\n"));
         assert!(unit.contains("NoNewPrivileges=true\n"));
         assert!(unit.contains("ProtectSystem=strict\n"));
@@ -1929,8 +1931,7 @@ mod exec_path_tests {
     #[test]
     fn config_paths_cannot_inject_unit_directives() {
         let path = Path::new("/etc/quoted\"/back\\slash\nUser=root\n/config.toml");
-        let unit = manager("/usr/local/bin/sbh", false)
-            .generate_unit_file_with_config(Some(path));
+        let unit = manager("/usr/local/bin/sbh", false).generate_unit_file_with_config(Some(path));
         let directives = parse_unit_directives(&unit);
         assert!(!directives.contains_key("Service/User"));
         assert_eq!(directives["Service/ExecStart"].len(), 1);
@@ -1986,18 +1987,30 @@ mod exec_path_tests {
             let parsed = parse_unit_directives(&format!("[Service]\nExecStart={command}\n"));
             assert!(exec_start_binary(&parsed).is_none(), "{command}");
         }
-        let multiple = parse_unit_directives(
-            "[Service]\nExecStart=/opt/one/sbh\nExecStart=/opt/two/sbh\n",
-        );
+        let multiple =
+            parse_unit_directives("[Service]\nExecStart=/opt/one/sbh\nExecStart=/opt/two/sbh\n");
         assert!(exec_start_binary(&multiple).is_none());
     }
 
     #[test]
     fn unsupported_systemd_executables_are_rejected_before_install() {
-        for path in ["sbh", "/opt/a\"b/sbh", "/opt/a'b/sbh", "/opt/a\\b/sbh", "/opt/a\nb/sbh"] {
-            assert!(validate_systemd_binary(Path::new(path)).is_err(), "{path:?}");
+        for path in [
+            "sbh",
+            "/opt/a\"b/sbh",
+            "/opt/a'b/sbh",
+            "/opt/a\\b/sbh",
+            "/opt/a\nb/sbh",
+        ] {
+            assert!(
+                validate_systemd_binary(Path::new(path)).is_err(),
+                "{path:?}"
+            );
         }
-        for path in ["/usr/local/bin/sbh", "/opt/custom path/sbh", "/opt/%h/${HOME}/sbh"] {
+        for path in [
+            "/usr/local/bin/sbh",
+            "/opt/custom path/sbh",
+            "/opt/%h/${HOME}/sbh",
+        ] {
             assert!(validate_systemd_binary(Path::new(path)).is_ok());
         }
     }
@@ -2063,7 +2076,10 @@ mod exec_path_tests {
                     .arg(&unit_path)
                     .output()
                     .unwrap();
-                assert!(!output.status.success(), "baseline unexpectedly passed: {relative}");
+                assert!(
+                    !output.status.success(),
+                    "baseline unexpectedly passed: {relative}"
+                );
             }
         }
     }
