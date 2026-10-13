@@ -807,6 +807,27 @@ fn record_empty_pass(
     *consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
 }
 
+/// A pass that dispatched candidates. Its dispatch is unconfirmed until the
+/// next pass sees the executor's reclaim counter move, so it resets the
+/// empty-pass streak only when the previous dispatch did reclaim something.
+/// Resetting on every dispatch capped the streak at one (#36): a host whose
+/// dispatches never reclaim (dry-run, observe, every candidate failing)
+/// rescanned at the base interval forever instead of backing off toward
+/// terminal idle.
+fn record_dispatching_pass(
+    previous_dispatch_reclaimed_nothing: bool,
+    consecutive_empty_passes: &mut u32,
+    inconclusive_empty_passes: &mut u32,
+    last_empty_pass_at: &mut Option<Instant>,
+) {
+    if previous_dispatch_reclaimed_nothing {
+        return;
+    }
+    *consecutive_empty_passes = 0;
+    *inconclusive_empty_passes = 0;
+    *last_empty_pass_at = None;
+}
+
 /// Process CPU (user+system) this process has consumed so far, in micros.
 fn current_scan_cpu_micros() -> Option<u64> {
     let stats = crate::platform::current().self_stats().ok()?;
@@ -7218,6 +7239,10 @@ fn scanner_thread_main(
     // observe mode, every candidate dampened or failed) and the pass is paced
     // like an empty one instead of rescanning every tick.
     let mut unconfirmed_dispatch: Option<u64> = None;
+    // Whether the last confirmed dispatch reclaimed nothing (#36). Kept across
+    // requests: the request that notices arms the cooldown and is itself
+    // skipped, so the verdict must reach the pass that eventually runs.
+    let mut last_dispatch_reclaimed_nothing = false;
     // The level of the last completed pass: a rise since then is new
     // information and clears the pacing (`pressure_escalated`).
     let mut last_pass_level: Option<PressureLevel> = None;
@@ -7272,9 +7297,12 @@ fn scanner_thread_main(
         let current_scoring_config = shared_scoring_config.read().clone();
         let current_scanner_config = shared_scanner_config.read().clone();
 
-        if let Some(reclaim_before) = unconfirmed_dispatch.take()
-            && executor_config.reclaim_events() == reclaim_before
-        {
+        let mut dispatch_confirmed_empty = false;
+        if let Some(reclaim_before) = unconfirmed_dispatch.take() {
+            dispatch_confirmed_empty = executor_config.reclaim_events() == reclaim_before;
+            last_dispatch_reclaimed_nothing = dispatch_confirmed_empty;
+        }
+        if dispatch_confirmed_empty {
             record_empty_pass(
                 &mut consecutive_empty_passes,
                 &mut inconclusive_empty_passes,
@@ -8460,9 +8488,12 @@ fn scanner_thread_main(
                 );
                 last_empty_pass_at = Some(Instant::now());
             } else {
-                consecutive_empty_passes = 0;
-                inconclusive_empty_passes = 0;
-                last_empty_pass_at = None;
+                record_dispatching_pass(
+                    last_dispatch_reclaimed_nothing,
+                    &mut consecutive_empty_passes,
+                    &mut inconclusive_empty_passes,
+                    &mut last_empty_pass_at,
+                );
                 unconfirmed_dispatch = Some(reclaim_at_pass_start);
             }
             last_pass_duration = pass_started_at.elapsed();
@@ -8531,9 +8562,12 @@ fn scanner_thread_main(
             }
             // The pre-scan alone met the byte target: a productive pass, which
             // still owes the duty cycle its cost (bd-os02).
-            consecutive_empty_passes = 0;
-            inconclusive_empty_passes = 0;
-            last_empty_pass_at = None;
+            record_dispatching_pass(
+                last_dispatch_reclaimed_nothing,
+                &mut consecutive_empty_passes,
+                &mut inconclusive_empty_passes,
+                &mut last_empty_pass_at,
+            );
             unconfirmed_dispatch = Some(reclaim_at_pass_start);
             last_pass_duration = pass_started_at.elapsed();
             last_pass_finished_at = Some(Instant::now());
@@ -9143,9 +9177,12 @@ fn scanner_thread_main(
                 );
             }
         } else {
-            consecutive_empty_passes = 0;
-            inconclusive_empty_passes = 0;
-            last_empty_pass_at = None;
+            record_dispatching_pass(
+                last_dispatch_reclaimed_nothing,
+                &mut consecutive_empty_passes,
+                &mut inconclusive_empty_passes,
+                &mut last_empty_pass_at,
+            );
             unconfirmed_dispatch = Some(reclaim_at_pass_start);
         }
 
@@ -13525,6 +13562,30 @@ mod tests {
             &request,
             5,
         ));
+    }
+
+    /// #36: a dispatch that is followed by another dispatch, with nothing
+    /// reclaimed in between, must not reset the streak, or the backoff never
+    /// grows past its first step.
+    #[test]
+    fn dispatches_that_reclaim_nothing_keep_growing_the_empty_pass_streak() {
+        let (mut consecutive, mut inconclusive, mut last_empty) = (0_u32, 0_u32, None);
+        for expected in 1..=4 {
+            // Pass start: the previous dispatch reclaimed nothing.
+            record_empty_pass(&mut consecutive, &mut inconclusive, false);
+            last_empty = Some(Instant::now());
+            // This pass dispatches again.
+            record_dispatching_pass(true, &mut consecutive, &mut inconclusive, &mut last_empty);
+            assert_eq!(consecutive, expected);
+            assert!(last_empty.is_some(), "the cooldown stays armed");
+        }
+        assert_eq!(
+            effective_empty_pass_cooldown(5, consecutive),
+            Duration::from_secs(40)
+        );
+        // A dispatch after one that did reclaim starts a fresh streak.
+        record_dispatching_pass(false, &mut consecutive, &mut inconclusive, &mut last_empty);
+        assert_eq!((consecutive, inconclusive, last_empty), (0, 0, None));
     }
 
     #[test]

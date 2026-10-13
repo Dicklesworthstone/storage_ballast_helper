@@ -3238,25 +3238,30 @@ fn dry_run_orange_pressure_backs_off_after_the_first_dispatch() {
         run.stderr_count("dry-run would_delete=") >= 1
     })
     .unwrap_or_else(|e| panic!("{e}"));
+    // Count only the passes after the first dispatch (#36): on a loaded host
+    // the empty passes before it vary and say nothing about the pacing.
+    let passes_before = run.events_of("scan_complete").len();
     let observed = Duration::from_secs(30);
     std::thread::sleep(observed);
 
-    let passes = run.events_of("scan_complete").len();
+    let passes = run.events_of("scan_complete").len() - passes_before;
     let stderr = run.stderr();
     assert!(
         run.deleted_paths().is_empty(),
         "dry-run removes nothing: {stderr}"
     );
     assert!(fixtures.stale_target.exists());
+    // Each dispatch that reclaimed nothing grows the streak, even though the
+    // pass that notices it dispatches again (#36: it stayed at 1).
     assert!(
-        run.stderr_count("pacing it as an empty pass") >= 1,
-        "an unconfirmed dispatch is paced as empty: {stderr}"
+        stderr.contains("pacing it as an empty pass (consecutive=2)"),
+        "the empty-pass streak grows past one: {stderr}"
     );
-    // Base cooldown 5 s doubling per unconfirmed pass: 0, 5, 15, 35 s, plus
-    // one pass to notice; the unpaced daemon produced about sixty in 30 s.
+    // Base cooldown 5 s doubling per unconfirmed pass: passes about 5 and 15 s
+    // after the first; a streak stuck at one rescans every 5 s.
     assert!(
-        passes <= 7,
-        "{passes} scan passes in {observed:?}: dry-run dispatches still count as progress: {stderr}"
+        passes <= 3,
+        "{passes} scan passes in {observed:?} after the first dispatch: dry-run dispatches still count as progress: {stderr}"
     );
     let status = run.stop();
     assert!(status.success(), "{status}");
