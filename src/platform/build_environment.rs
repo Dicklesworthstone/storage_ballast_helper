@@ -17,7 +17,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Tool {
+pub enum Tool {
     Rust,
     Go,
     Node,
@@ -29,12 +29,12 @@ pub(crate) enum Tool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CacheLayout {
+pub enum CacheLayout {
     Linux,
     MacOs,
 }
 
-pub(crate) fn tool(comm: &[u8]) -> Option<Tool> {
+pub fn tool(comm: &[u8]) -> Option<Tool> {
     let name = std::str::from_utf8(comm).ok()?.trim_end();
     match name {
         "cargo" | "rustc" | "rustdoc" | "clippy-driver" | "cargo-clippy" => Some(Tool::Rust),
@@ -46,10 +46,25 @@ pub(crate) fn tool(comm: &[u8]) -> Option<Tool> {
         "python" | "pypy" => Some(Tool::Python),
         "sccache" | "ccache" | "cc" | "c++" | "gcc" | "g++" | "clang" | "clang++" | "cc1"
         | "cc1plus" => Some(Tool::Compiler),
-        _ if ["npm ", "npx "].iter().any(|prefix| name.starts_with(prefix)) => Some(Tool::Npm),
-        _ if ["pnpm ", "yarn "].iter().any(|prefix| name.starts_with(prefix)) => Some(Tool::Node),
+        _ if ["npm ", "npx "]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)) =>
+        {
+            Some(Tool::Npm)
+        }
+        _ if ["pnpm ", "yarn "]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)) =>
+        {
+            Some(Tool::Node)
+        }
         _ if versioned(name, "pip") => Some(Tool::Pip),
-        _ if ["python", "pypy"].iter().any(|prefix| versioned(name, prefix)) => Some(Tool::Python),
+        _ if ["python", "pypy"]
+            .iter()
+            .any(|prefix| versioned(name, prefix)) =>
+        {
+            Some(Tool::Python)
+        }
         _ if ["gcc-", "g++-", "clang-", "clang++-"]
             .iter()
             .any(|prefix| versioned(name, prefix)) =>
@@ -69,7 +84,7 @@ fn versioned(name: &str, prefix: &str) -> bool {
     })
 }
 
-pub(crate) fn references(tool: Tool, environ: &[u8], cwd: Option<&Path>) -> Vec<PathBuf> {
+pub fn references(tool: Tool, environ: &[u8], cwd: Option<&Path>) -> Vec<PathBuf> {
     let layout = if cfg!(target_os = "macos") {
         CacheLayout::MacOs
     } else {
@@ -78,7 +93,7 @@ pub(crate) fn references(tool: Tool, environ: &[u8], cwd: Option<&Path>) -> Vec<
     references_with_layout(layout, tool, environ, cwd)
 }
 
-pub(crate) fn references_with_layout(
+pub fn references_with_layout(
     layout: CacheLayout,
     tool: Tool,
     environ: &[u8],
@@ -119,7 +134,8 @@ pub(crate) fn references_with_layout(
             // an empty value: it must not fall through to an uppercase key.
             let cache = value(environ, b"npm_config_cache").or_else(|| {
                 entries(environ).find_map(|(key, value)| {
-                    key.eq_ignore_ascii_case(b"npm_config_cache").then_some(value)
+                    key.eq_ignore_ascii_case(b"npm_config_cache")
+                        .then_some(value)
                 })
             });
             if let Some(path) = directory(cache, cwd).or_else(|| {
@@ -236,7 +252,8 @@ fn directory(value: Option<&[u8]>, cwd: Option<&Path>) -> Option<PathBuf> {
         Some(path)
     } else {
         // Preserve .. through symlinks; resolution belongs to the caller.
-        cwd.filter(|cwd| cwd.is_absolute()).map(|cwd| cwd.join(path))
+        cwd.filter(|cwd| cwd.is_absolute())
+            .map(|cwd| cwd.join(path))
     }
 }
 
@@ -297,7 +314,14 @@ mod tests {
         ] {
             assert_eq!(tool(name.as_bytes()), Some(family), "{name}");
         }
-        for name in ["bash", "sbh", "cargo-data", "python-notes", "python3..1", "npmx"] {
+        for name in [
+            "bash",
+            "sbh",
+            "cargo-data",
+            "python-notes",
+            "python3..1",
+            "npmx",
+        ] {
             assert_eq!(tool(name.as_bytes()), None, "{name}");
         }
         assert_eq!(tool(b"rustc\xff"), None);
@@ -308,15 +332,25 @@ mod tests {
         let mut expected = cargo_paths("/cache");
         expected.push(PathBuf::from("/target"));
         assert_eq!(
-            references(Tool::Rust, b"CARGO_HOME=/cache\0CARGO_TARGET_DIR=/target\0", None),
+            references(
+                Tool::Rust,
+                b"CARGO_HOME=/cache\0CARGO_TARGET_DIR=/target\0",
+                None
+            ),
             expected
         );
     }
 
     #[test]
     fn cargo_defaults_use_the_builds_home_when_override_is_absent_or_empty() {
-        for env in [b"HOME=/build-user\0".as_slice(), b"HOME=/build-user\0CARGO_HOME=\0"] {
-            assert_eq!(references(Tool::Rust, env, None), cargo_paths("/build-user/.cargo"));
+        for env in [
+            b"HOME=/build-user\0".as_slice(),
+            b"HOME=/build-user\0CARGO_HOME=\0",
+        ] {
+            assert_eq!(
+                references(Tool::Rust, env, None),
+                cargo_paths("/build-user/.cargo")
+            );
         }
     }
 
@@ -345,13 +379,19 @@ mod tests {
     #[test]
     fn go_xdg_and_first_gopath_element_override_home_defaults() {
         let env = b"HOME=/builder\0XDG_CACHE_HOME=/scratch/cache\0GOPATH=/first:/second\0";
-        assert_eq!(references(Tool::Go, env, None), paths(&["/scratch/cache/go-build", "/first/pkg/mod"]));
+        assert_eq!(
+            references(Tool::Go, env, None),
+            paths(&["/scratch/cache/go-build", "/first/pkg/mod"])
+        );
     }
 
     #[test]
     fn explicit_go_cache_overrides_take_precedence_over_all_defaults() {
         let env = b"HOME=/builder\0XDG_CACHE_HOME=/xdg\0GOPATH=/gp\0GOCACHE=/build-cache\0GOMODCACHE=/modules\0GOTMPDIR=/go-tmp\0";
-        assert_eq!(references(Tool::Go, env, None), paths(&["/build-cache", "/modules", "/go-tmp"]));
+        assert_eq!(
+            references(Tool::Go, env, None),
+            paths(&["/build-cache", "/modules", "/go-tmp"])
+        );
     }
 
     #[test]
@@ -365,26 +405,46 @@ mod tests {
     #[test]
     fn empty_go_overrides_and_empty_xdg_gopath_use_home_defaults() {
         let env = b"HOME=/builder\0GOCACHE=\0GOMODCACHE=\0GOPATH=\0XDG_CACHE_HOME=\0";
-        assert_eq!(references(Tool::Go, env, None), paths(&["/builder/.cache/go-build", "/builder/go/pkg/mod"]));
+        assert_eq!(
+            references(Tool::Go, env, None),
+            paths(&["/builder/.cache/go-build", "/builder/go/pkg/mod"])
+        );
     }
 
     #[test]
     fn npm_keys_are_case_insensitive_and_lowercase_scripts_win() {
-        for env in [b"NPM_CONFIG_CACHE=/cache\0".as_slice(), b"Npm_Config_Cache=/cache\0"] {
+        for env in [
+            b"NPM_CONFIG_CACHE=/cache\0".as_slice(),
+            b"Npm_Config_Cache=/cache\0",
+        ] {
             assert_eq!(references(Tool::Node, env, None), paths(&["/cache"]));
         }
         assert_eq!(
-            references(Tool::Node, b"NPM_CONFIG_CACHE=/upper\0npm_config_cache=/lower\0", None),
+            references(
+                Tool::Node,
+                b"NPM_CONFIG_CACHE=/upper\0npm_config_cache=/lower\0",
+                None
+            ),
             paths(&["/lower"])
         );
-        assert!(references(Tool::Node, b"NPM_CONFIG_CACHE=/upper\0npm_config_cache=\0", None).is_empty());
+        assert!(
+            references(
+                Tool::Node,
+                b"NPM_CONFIG_CACHE=/upper\0npm_config_cache=\0",
+                None
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn python_and_compiler_cache_keys_are_family_scoped() {
         let env = b"CARGO_HOME=/cargo\0GOCACHE=/go\0npm_config_cache=/npm\0UV_CACHE_DIR=/uv\0PIP_CACHE_DIR=/pip\0SCCACHE_DIR=/sccache\0CCACHE_DIR=/ccache\0";
         assert_eq!(references(Tool::Python, env, None), paths(&["/uv", "/pip"]));
-        assert_eq!(references(Tool::Compiler, env, None), paths(&["/sccache", "/ccache"]));
+        assert_eq!(
+            references(Tool::Compiler, env, None),
+            paths(&["/sccache", "/ccache"])
+        );
         assert_eq!(references(Tool::Go, env, None), paths(&["/go"]));
     }
 
@@ -395,7 +455,10 @@ mod tests {
         assert!(references(Tool::Rust, env, Some(Path::new("relative"))).is_empty());
         assert_eq!(
             references(Tool::Rust, env, Some(Path::new("/workspace/project"))),
-            paths(&["/workspace/project/../pooled target", "/workspace/project/cache"])
+            paths(&[
+                "/workspace/project/../pooled target",
+                "/workspace/project/cache"
+            ])
         );
     }
 
@@ -403,22 +466,38 @@ mod tests {
     fn native_path_bytes_spaces_and_equals_survive_parsing() {
         assert_eq!(
             references(Tool::Python, b"UV_CACHE_DIR=/tmp/cache-\xff = data\0", None),
-            vec![PathBuf::from(OsString::from_vec(b"/tmp/cache-\xff = data".to_vec()))]
+            vec![PathBuf::from(OsString::from_vec(
+                b"/tmp/cache-\xff = data".to_vec()
+            ))]
         );
-        let expected = PathBuf::from(OsString::from_vec(b"/home/\xff/.cargo/registry/src".to_vec()));
+        let expected = PathBuf::from(OsString::from_vec(
+            b"/home/\xff/.cargo/registry/src".to_vec(),
+        ));
         assert!(references(Tool::Rust, b"HOME=/home/\xff\0", None).contains(&expected));
     }
 
     #[test]
     fn incomplete_buffers_keep_complete_positives_but_cannot_infer_defaults() {
-        for env in [b"".as_slice(), b"CARGO_HOME=\0", b"CARGO_HOME\0", b"CARGO_HOME=/tail"] {
+        for env in [
+            b"".as_slice(),
+            b"CARGO_HOME=\0",
+            b"CARGO_HOME\0",
+            b"CARGO_HOME=/tail",
+        ] {
             assert!(references(Tool::Rust, env, Some(Path::new("/work"))).is_empty());
         }
         let env = b"HOME=/builder\0CARGO_HOME=/truncated";
         assert!(references(Tool::Rust, env, None).is_empty());
         let env = b"HOME=/builder\0GOCACHE=/kept\0GOMODCACHE=/truncated";
         assert_eq!(references(Tool::Go, env, None), paths(&["/kept"]));
-        assert_eq!(references(Tool::Python, b"UV_CACHE_DIR=/kept\0PIP_CACHE_DIR=/tail", None), paths(&["/kept"]));
+        assert_eq!(
+            references(
+                Tool::Python,
+                b"UV_CACHE_DIR=/kept\0PIP_CACHE_DIR=/tail",
+                None
+            ),
+            paths(&["/kept"])
+        );
     }
 
     #[test]
@@ -432,8 +511,22 @@ mod tests {
 
     #[test]
     fn missing_or_relative_home_never_uses_daemon_environment() {
-        for family in [Tool::Rust, Tool::Go, Tool::Node, Tool::Python, Tool::Compiler, Tool::Npm, Tool::Pip, Tool::Uv] {
-            for env in [b"".as_slice(), b"HOME=\0", b"HOME=relative\0", b"OTHER=/cache\0"] {
+        for family in [
+            Tool::Rust,
+            Tool::Go,
+            Tool::Node,
+            Tool::Python,
+            Tool::Compiler,
+            Tool::Npm,
+            Tool::Pip,
+            Tool::Uv,
+        ] {
+            for env in [
+                b"".as_slice(),
+                b"HOME=\0",
+                b"HOME=relative\0",
+                b"OTHER=/cache\0",
+            ] {
                 assert!(references(family, env, Some(Path::new("/workspace"))).is_empty());
             }
         }
@@ -444,23 +537,40 @@ mod tests {
 
     #[test]
     fn identified_package_managers_protect_their_conventional_caches() {
-        for (name, expected) in [("npm install", "/builder/.npm"), ("pip3.13", "/builder/.cache/pip"), ("uv", "/builder/.cache/uv"), ("uvx", "/builder/.cache/uv")] {
-            assert_eq!(references(tool(name.as_bytes()).unwrap(), b"HOME=/builder\0", None), paths(&[expected]));
+        for (name, expected) in [
+            ("npm install", "/builder/.npm"),
+            ("pip3.13", "/builder/.cache/pip"),
+            ("uv", "/builder/.cache/uv"),
+            ("uvx", "/builder/.cache/uv"),
+        ] {
+            assert_eq!(
+                references(tool(name.as_bytes()).unwrap(), b"HOME=/builder\0", None),
+                paths(&[expected])
+            );
         }
         for name in ["node", "python3.13", "pnpm", "yarn"] {
-            assert!(references(tool(name.as_bytes()).unwrap(), b"HOME=/builder\0", None).is_empty());
+            assert!(
+                references(tool(name.as_bytes()).unwrap(), b"HOME=/builder\0", None).is_empty()
+            );
         }
     }
 
     #[test]
     fn package_overrides_suppress_defaults_even_when_empty_or_unresolvable() {
-        for (family, key) in [(Tool::Npm, "npm_config_cache"), (Tool::Pip, "PIP_CACHE_DIR"), (Tool::Uv, "UV_CACHE_DIR")] {
+        for (family, key) in [
+            (Tool::Npm, "npm_config_cache"),
+            (Tool::Pip, "PIP_CACHE_DIR"),
+            (Tool::Uv, "UV_CACHE_DIR"),
+        ] {
             for override_value in ["", "relative"] {
                 let env = format!("HOME=/builder\0{key}={override_value}\0");
                 assert!(references(family, env.as_bytes(), None).is_empty());
             }
             let env = format!("HOME=/builder\0{key}=/explicit\0");
-            assert_eq!(references(family, env.as_bytes(), None), paths(&["/explicit"]));
+            assert_eq!(
+                references(family, env.as_bytes(), None),
+                paths(&["/explicit"])
+            );
             let env = format!("HOME=/builder\0{key}=/unterminated");
             assert!(references(family, env.as_bytes(), None).is_empty());
         }
@@ -473,24 +583,48 @@ mod tests {
         assert_eq!(references(Tool::Pip, env, None), paths(&["/shared/pip"]));
         assert_eq!(references(Tool::Npm, env, None), paths(&["/builder/.npm"]));
         for family in [Tool::Uv, Tool::Pip] {
-            assert!(references(family, b"HOME=/builder\0XDG_CACHE_HOME=relative\0", None).is_empty());
+            assert!(
+                references(family, b"HOME=/builder\0XDG_CACHE_HOME=relative\0", None).is_empty()
+            );
         }
     }
 
     #[test]
     fn darwin_defaults_use_each_tools_native_layout() {
         let env = b"HOME=/builder\0XDG_CACHE_HOME=/xdg\0GOPATH=/first:/second\0";
-        assert_eq!(references_with_layout(CacheLayout::MacOs, Tool::Go, env, None), paths(&["/builder/Library/Caches/go-build", "/first/pkg/mod"]));
-        assert_eq!(references_with_layout(CacheLayout::MacOs, Tool::Uv, env, None), paths(&["/xdg/uv"]));
-        assert_eq!(references_with_layout(CacheLayout::MacOs, Tool::Pip, env, None), paths(&["/xdg/pip", "/builder/Library/Caches/pip"]));
-        assert_eq!(references_with_layout(CacheLayout::MacOs, Tool::Npm, env, None), paths(&["/builder/.npm"]));
-        assert_eq!(references_with_layout(CacheLayout::MacOs, Tool::Rust, env, None), cargo_paths("/builder/.cargo"));
+        assert_eq!(
+            references_with_layout(CacheLayout::MacOs, Tool::Go, env, None),
+            paths(&["/builder/Library/Caches/go-build", "/first/pkg/mod"])
+        );
+        assert_eq!(
+            references_with_layout(CacheLayout::MacOs, Tool::Uv, env, None),
+            paths(&["/xdg/uv"])
+        );
+        assert_eq!(
+            references_with_layout(CacheLayout::MacOs, Tool::Pip, env, None),
+            paths(&["/xdg/pip", "/builder/Library/Caches/pip"])
+        );
+        assert_eq!(
+            references_with_layout(CacheLayout::MacOs, Tool::Npm, env, None),
+            paths(&["/builder/.npm"])
+        );
+        assert_eq!(
+            references_with_layout(CacheLayout::MacOs, Tool::Rust, env, None),
+            cargo_paths("/builder/.cargo")
+        );
     }
 
     #[test]
     fn native_entry_point_selects_the_compiled_platform_layout() {
         let env = b"HOME=/builder\0";
-        let layout = if cfg!(target_os = "macos") { CacheLayout::MacOs } else { CacheLayout::Linux };
-        assert_eq!(super::references(Tool::Go, env, None), references_with_layout(layout, Tool::Go, env, None));
+        let layout = if cfg!(target_os = "macos") {
+            CacheLayout::MacOs
+        } else {
+            CacheLayout::Linux
+        };
+        assert_eq!(
+            super::references(Tool::Go, env, None),
+            references_with_layout(layout, Tool::Go, env, None)
+        );
     }
 }
