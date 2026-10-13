@@ -1587,14 +1587,22 @@ mod tests {
         );
 
         let notarize = shell_function(script, "step_notarize");
+        assert!(
+            notarize.contains(
+                "|| die \"set all of SBH_NOTARY_KEY, SBH_NOTARY_KEY_ID and SBH_NOTARY_ISSUER, or none\""
+            ),
+            "a partial App Store Connect key configuration must stop notarize"
+        );
         assert_in_order(
             notarize,
-            "step_notarize must refuse unsigned binaries, zip, submit with notarytool, and require Accepted",
+            "step_notarize must choose its credentials, refuse unsigned binaries, zip, submit with notarytool, and require Accepted",
             &[
+                "auth=(--key \"${SBH_NOTARY_KEY}\" --key-id \"${SBH_NOTARY_KEY_ID}\" --issuer \"${SBH_NOTARY_ISSUER}\")",
+                "auth=(--keychain-profile \"${NOTARY_PROFILE}\")",
                 "for triple in \"${darwin_triples[@]}\"; do",
                 "signed_by_identity \"${raw}\" || die",
                 "ditto -c -k --keepParent \"${raw}\" \"${zip}\"",
-                "xcrun notarytool submit \"${zip}\" --keychain-profile \"${NOTARY_PROFILE}\"",
+                "xcrun notarytool submit \"${zip}\" \"${auth[@]}\"",
                 "--wait",
                 "[ \"${status}\" = \"Accepted\" ] || die",
             ],
