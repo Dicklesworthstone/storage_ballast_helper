@@ -317,7 +317,7 @@ impl Directory {
         child_name(name)?;
         #[cfg(unix)]
         {
-            use rustix::fs::{Mode, OFlags, fstat};
+            use rustix::fs::fstat;
             let expected = self.inspect(name)?.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
@@ -331,21 +331,7 @@ impl Directory {
                     "quarantine decision is not a same-device directory",
                 ));
             }
-            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            #[cfg(target_os = "linux")]
-            let fd = rustix::fs::openat2(
-                &self.file,
-                name,
-                flags,
-                Mode::empty(),
-                rustix::fs::ResolveFlags::BENEATH
-                    | rustix::fs::ResolveFlags::NO_SYMLINKS
-                    | rustix::fs::ResolveFlags::NO_MAGICLINKS
-                    | rustix::fs::ResolveFlags::NO_XDEV,
-            )?;
-            #[cfg(not(target_os = "linux"))]
-            let fd = rustix::fs::openat(&self.file, name, flags, Mode::empty())?;
-            let file = File::from(fd);
+            let file = File::from(super::beneath::open_dir_beneath(&self.file, name)?);
             if Identity::of(&fstat(&file)?) != expected {
                 return Err(invalid(
                     "quarantine decision directory changed while opening",

@@ -18,6 +18,9 @@ use super::budget::PurgeBudget;
 use super::{QuarantineRecord, QuarantineStore, QuarantineUnavailable, RestoreOutcome, now_secs};
 use crate::core::errors::{Result, SbhError};
 
+#[cfg(unix)]
+#[path = "beneath.rs"]
+mod beneath;
 #[path = "purge.rs"]
 mod confined_purge;
 #[path = "transaction.rs"]
