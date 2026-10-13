@@ -83,7 +83,6 @@ fn pruning_preserves_the_newest_snapshot_within_the_same_second() {
     assert_eq!(store.list()[0].id, second.id);
 }
 
-
 #[test]
 fn rollback_rejects_same_size_snapshot_corruption_before_publication() {
     let temp = tempfile::tempdir().unwrap();
@@ -99,9 +98,7 @@ fn rollback_rejects_same_size_snapshot_corruption_before_publication() {
     corrupted[0] ^= 0xff;
     fs::write(&snapshot.path, &corrupted).unwrap();
 
-    let error = store
-        .rollback(&install, Some(&snapshot.id))
-        .unwrap_err();
+    let error = store.rollback(&install, Some(&snapshot.id)).unwrap_err();
     assert!(error.contains("SHA-256 mismatch"), "{error}");
     assert_eq!(fs::read(&install).unwrap(), installed_before);
 }
@@ -119,12 +116,14 @@ fn rollback_refuses_legacy_snapshot_without_digest_before_publication() {
     let mut metadata: serde_json::Value =
         serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
     metadata.as_object_mut().unwrap().remove("sha256");
-    fs::write(&metadata_path, serde_json::to_vec_pretty(&metadata).unwrap()).unwrap();
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
 
     let installed_before = fs::read(&install).unwrap();
-    let error = store
-        .rollback(&install, Some(&snapshot.id))
-        .unwrap_err();
+    let error = store.rollback(&install, Some(&snapshot.id)).unwrap_err();
     assert!(error.contains("missing sha256"), "{error}");
     assert_eq!(fs::read(&install).unwrap(), installed_before);
 }
