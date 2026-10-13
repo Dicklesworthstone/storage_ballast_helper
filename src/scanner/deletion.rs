@@ -1220,9 +1220,17 @@ impl DeletionExecutor {
             }
         }
 
-        // 5. Does not contain .git (safety net — checks 3 levels deep).
-        if meta.is_dir() && contains_nested_git(path, 3) {
-            return Err(SkipReason::ContainsGit);
+        // 5. Does not contain a Git repository or a `.sbh-protect` marker at
+        //    any depth (bd-jydu). The sacred walk in 6c stops at depth 3, so a
+        //    clone deeper inside an agent's temp tree reached remove_dir_all.
+        if meta.is_dir() {
+            match deep_containment(path, DEEP_CONTAINMENT_MAX_DIRS) {
+                DeepContainment::Clear => {}
+                DeepContainment::Repository => return Err(SkipReason::ContainsGit),
+                DeepContainment::ProtectMarker | DeepContainment::Truncated => {
+                    return Err(SkipReason::SacredStowaway);
+                }
+            }
         }
 
         // A deep source subtree need not contain its repository's .git marker.
@@ -1592,27 +1600,94 @@ fn available_bytes_beside(path: &Path) -> Option<u64> {
     Some(blocks.saturating_mul(fragment))
 }
 
-/// Shallow recursive check for `.git` directories within `path`.
+/// Levels below a candidate within which any `.git` entry vetoes it, as the
+/// executor always has. Deeper, only a real repository does (see
+/// [`deep_containment`]).
+const NESTED_GIT_ANY_DEPTH: usize = 3;
+
+/// Directory budget of [`deep_containment`]. Measured on real candidates
+/// (2026-10): the largest cargo `target/` opened 18.5k directories, a
+/// node_modules 11.3k, the cargo registry 35.7k and a Go module cache 54.3k.
+/// Exhausting it fails closed.
+const DEEP_CONTAINMENT_MAX_DIRS: usize = 250_000;
+
+/// What [`deep_containment`] found inside a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeepContainment {
+    Clear,
+    Repository,
+    ProtectMarker,
+    /// The directory budget ran out before the subtree was proven clear.
+    Truncated,
+}
+
+/// Whether a candidate holds a Git repository or a `.sbh-protect` marker at
+/// any depth, breadth-first and bounded by `max_dirs` opened directories.
 ///
-/// Walks at most `max_depth` levels to catch nested git repositories
-/// that the immediate `path.join(".git").exists()` check would miss.
-fn contains_nested_git(path: &Path, max_depth: usize) -> bool {
-    if max_depth == 0 {
-        return false;
-    }
-    let Ok(entries) = fs::read_dir(path) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        if entry.file_name() == ".git" {
-            return true;
+/// Within [`NESTED_GIT_ANY_DEPTH`] levels every `.git` entry counts. Below
+/// that only a real repository does: a `.git` directory or symlink, or a
+/// `.git` file that points at one (`gitdir:`, a linked worktree or a
+/// submodule). Two deep `.git` entries are not repositories with work in
+/// them: uv's empty `.git` bucket marker, and a cargo git checkout
+/// (`git/checkouts/<name>/<rev>/` with `.cargo-ok`), which rch and temporary
+/// `CARGO_HOME`s hold four levels down and which the force-remove carve-out
+/// exists for. An agent's clone deep inside a temp tree is what this finds.
+fn deep_containment(path: &Path, max_dirs: usize) -> DeepContainment {
+    let mut queue = std::collections::VecDeque::from([(path.to_path_buf(), 0usize)]);
+    let mut opened = 0usize;
+    while let Some((dir, depth)) = queue.pop_front() {
+        if opened >= max_dirs {
+            return DeepContainment::Truncated;
         }
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() && !ft.is_symlink() && contains_nested_git(&entry.path(), max_depth - 1) {
-            return true;
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        opened += 1;
+        let child_depth = depth + 1;
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            if name == ".git" {
+                if child_depth <= NESTED_GIT_ANY_DEPTH
+                    || (is_repository_link(&entry.path(), file_type)
+                        && !is_cargo_git_checkout(&dir))
+                {
+                    return DeepContainment::Repository;
+                }
+                continue;
+            }
+            if name == protection::MARKER_FILENAME {
+                return DeepContainment::ProtectMarker;
+            }
+            if file_type.is_dir() && !file_type.is_symlink() {
+                queue.push_back((entry.path(), child_depth));
+            }
         }
     }
-    false
+    DeepContainment::Clear
+}
+
+/// A `.git` entry that is, or points at, a repository: any directory or
+/// symlink, or a file starting with `gitdir:`.
+fn is_repository_link(path: &Path, file_type: fs::FileType) -> bool {
+    if !file_type.is_file() {
+        return true;
+    }
+    let mut head = [0u8; 7];
+    fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut head))
+        .is_ok_and(|()| &head == b"gitdir:")
+}
+
+/// `dir` is a cargo git checkout: `<CARGO_HOME>/git/checkouts/<name>/<rev>`,
+/// with the `.cargo-ok` cargo writes once the checkout is complete.
+fn is_cargo_git_checkout(dir: &Path) -> bool {
+    let checkouts = dir.parent().and_then(Path::parent);
+    checkouts.and_then(Path::file_name) == Some("checkouts".as_ref())
+        && checkouts.and_then(Path::parent).and_then(Path::file_name) == Some("git".as_ref())
+        && dir.join(".cargo-ok").exists()
 }
 
 /// Fixed search paths for the tracked-content query: the daemon's inherited
@@ -1901,7 +1976,7 @@ pub(crate) fn is_hardcoded_source_tree_given(path: &Path, cargo_evidence: bool) 
     // and the leaf case (`/repo/.git` as the deletion target itself). It
     // runs UNCONDITIONALLY — there is no artifact carve-out for `.git`
     // metadata, even if the basename happens to look like an artifact.
-    // (`contains_nested_git` only inspects CHILDREN of the candidate, so a
+    // (`deep_containment` only inspects DESCENDANTS of the candidate, so a
     // `.git` directory passed in directly would not be caught without this
     // loop checking the path itself.)
     for ancestor in path.ancestors() {
@@ -2883,6 +2958,138 @@ mod tests {
         assert_eq!(report.items_deleted, 0);
         assert_eq!(report.items_skipped, 1);
         assert!(git_dir.exists());
+    }
+
+    /// bd-jydu: a clone four or more levels inside a candidate (an agent's
+    /// temp tree) reached remove_dir_all, because every containment walk
+    /// stopped at depth 3.
+    #[test]
+    fn skips_a_candidate_holding_a_repository_below_depth_three() {
+        for depth in [4_usize, 9] {
+            let dir = scratch_dir();
+            let candidate = dir.path().join("stale_target");
+            let repo = (1..depth).fold(candidate.clone(), |path, level| {
+                path.join(format!("level{level}"))
+            });
+            fs::create_dir_all(repo.join(".git/objects")).unwrap();
+            fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+            fs::write(repo.join("notes.txt"), "unpushed work").unwrap();
+
+            // The open-file scan is not under test; under a loaded parallel
+            // run it can skip first as open_scan_incomplete.
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    check_open_files: false,
+                    ..Default::default()
+                },
+                None,
+            );
+            let plan = executor.plan(vec![make_candidate(&candidate, 13, 0.95)]);
+            let report = executor.execute(&plan, None);
+
+            assert_eq!(report.items_deleted, 0, ".git at depth {depth}");
+            assert_eq!(
+                report.skipped_by_reason.get("contains_git"),
+                Some(&1),
+                ".git at depth {depth}: {:?}",
+                report.skipped_by_reason
+            );
+            assert!(repo.join("notes.txt").exists());
+        }
+    }
+
+    #[test]
+    fn skips_a_candidate_holding_a_protect_marker_below_depth_three() {
+        let dir = scratch_dir();
+        let candidate = dir.path().join("stale_target");
+        let kept = candidate.join("a/b/c/d/keep");
+        fs::create_dir_all(&kept).unwrap();
+        fs::write(kept.join(protection::MARKER_FILENAME), "").unwrap();
+
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                check_open_files: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let plan = executor.plan(vec![make_candidate(&candidate, 1, 0.95)]);
+        let report = executor.execute(&plan, None);
+
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(
+            report.skipped_by_reason.get("sacred_stowaway"),
+            Some(&1),
+            "{:?}",
+            report.skipped_by_reason
+        );
+        assert!(kept.exists());
+    }
+
+    /// The deep search must not turn regenerable caches into vetoes, nor
+    /// loosen the shallow rule.
+    #[test]
+    fn deep_containment_tells_repositories_from_cache_git_entries() {
+        let dir = scratch_dir();
+        let tree = |name: &str| {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            root
+        };
+
+        // A cargo git checkout in a temporary CARGO_HOME, `.git` at depth 5.
+        let cargo_home = tree("tmp-cargo-home");
+        let checkout = cargo_home.join("git/checkouts/dep-0123abcd/c48399f");
+        fs::create_dir_all(checkout.join(".git/objects")).unwrap();
+        fs::write(checkout.join(".git/HEAD"), "c48399f\n").unwrap();
+        fs::write(checkout.join(".cargo-ok"), "").unwrap();
+        assert_eq!(
+            deep_containment(&cargo_home, DEEP_CONTAINMENT_MAX_DIRS),
+            DeepContainment::Clear
+        );
+        // The same layout before cargo marked the checkout complete is kept.
+        fs::remove_file(checkout.join(".cargo-ok")).unwrap();
+        assert_eq!(
+            deep_containment(&cargo_home, DEEP_CONTAINMENT_MAX_DIRS),
+            DeepContainment::Repository
+        );
+
+        // uv's empty `.git` bucket marker at depth 4 is not a repository...
+        let uv = tree("uv-cache");
+        let bucket = uv.join("a/b/sdists-v10");
+        fs::create_dir_all(&bucket).unwrap();
+        fs::write(bucket.join(".git"), "").unwrap();
+        assert_eq!(
+            deep_containment(&uv, DEEP_CONTAINMENT_MAX_DIRS),
+            DeepContainment::Clear
+        );
+        // ...but a `.git` file pointing at one (a linked worktree) is.
+        fs::write(bucket.join(".git"), "gitdir: /src/repo/.git/worktrees/x\n").unwrap();
+        assert_eq!(
+            deep_containment(&uv, DEEP_CONTAINMENT_MAX_DIRS),
+            DeepContainment::Repository
+        );
+
+        // Within depth 3 any `.git` entry still vetoes, as before.
+        let shallow = tree("shallow");
+        fs::create_dir_all(shallow.join("a/b")).unwrap();
+        fs::write(shallow.join("a/b/.git"), "").unwrap();
+        assert_eq!(
+            deep_containment(&shallow, DEEP_CONTAINMENT_MAX_DIRS),
+            DeepContainment::Repository
+        );
+    }
+
+    #[test]
+    fn deep_containment_fails_closed_when_the_budget_runs_out() {
+        let dir = scratch_dir();
+        let root = dir.path().join("wide");
+        for branch in 0..4 {
+            fs::create_dir_all(root.join(format!("b{branch}/leaf"))).unwrap();
+        }
+        // 1 + 4 + 4 directories to open.
+        assert_eq!(deep_containment(&root, 9), DeepContainment::Clear);
+        assert_eq!(deep_containment(&root, 8), DeepContainment::Truncated);
     }
 
     /// EROFS is a mount incident, everything else a refusal: the two must
