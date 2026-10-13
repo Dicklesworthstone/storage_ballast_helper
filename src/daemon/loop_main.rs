@@ -4855,6 +4855,8 @@ impl MonitoringDaemon {
                 now,
             });
             cadence.push(controller.cadence(base_poll, tick.response.scan_interval));
+            let idle_with_nothing_to_reclaim = decision.state == MountState::Idle
+                && controller.idle_reason() == Some(IdleReason::NothingToReclaim);
             if let Some((from, to)) = decision.transition {
                 let message = format!(
                     "mount {} {from} -> {to} (level={:?} urgency={:.2} surface={} idle_reason={})",
@@ -4876,8 +4878,19 @@ impl MonitoringDaemon {
 
             // The replenish cooldown watches every tick, whatever the mount
             // is doing: an Orange excursion while reclaiming restarts it.
+            // A mount idle at Yellow with nothing left to reclaim counts as
+            // Green here (bd-7spb): after a release a large volume can sit at
+            // Yellow for days, and a Green-only gate never rebuilt its
+            // reserve. Provisioning still keeps free space above the Orange
+            // floor, so a refill cannot push the mount into a release.
+            let replenish_level =
+                if tick.response.level == PressureLevel::Yellow && idle_with_nothing_to_reclaim {
+                    PressureLevel::Green
+                } else {
+                    tick.response.level
+                };
             self.release_controller
-                .observe_level(&mount, tick.response.level);
+                .observe_level(&mount, replenish_level);
 
             let mut files_released = 0;
             match decision.state {
@@ -4934,6 +4947,12 @@ impl MonitoringDaemon {
                         {
                             pressured_without_surface = Some((mount.clone(), tick.response.level));
                         }
+                    }
+                }
+                MountState::Idle if replenish_level == PressureLevel::Green => {
+                    if !replenished_this_tick && self.maybe_replenish_pool(&mount, replenish_level)
+                    {
+                        replenished_this_tick = true;
                     }
                 }
                 MountState::Recovery | MountState::Idle => {}

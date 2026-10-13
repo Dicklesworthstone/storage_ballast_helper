@@ -140,6 +140,8 @@ pub struct ScenarioConfig {
     pub thresholds: (f64, f64, f64, f64),
     pub ballast_files: usize,
     pub ballast_file_bytes: u64,
+    /// Extra lines for the `[ballast]` table (e.g. `auto_provision = false`).
+    pub ballast_toml: String,
     /// Scanner engine: `v2` (default) or the `v1` rollback engine.
     pub engine: &'static str,
     /// `scanner.dry_run`: plan deletions without removing anything.
@@ -172,6 +174,7 @@ impl Default for ScenarioConfig {
             // smallest reserve the daemon accepts.
             ballast_files: 1,
             ballast_file_bytes: 1_048_576,
+            ballast_toml: String::new(),
             engine: "v2",
             dry_run: false,
             metrics_enabled: true,
@@ -211,7 +214,7 @@ state_file = {state:?}
 [ballast]
 file_count = {ballast_files}
 file_size_bytes = {ballast_bytes}
-[pressure]
+{ballast_extra}[pressure]
 poll_interval_ms = {poll}
 maintenance_interval_secs = {maint}
 green_min_free_pct = {green}
@@ -240,6 +243,7 @@ metrics_enabled = {metrics}
         state = data.join("state.json").display().to_string(),
         ballast_files = scenario.ballast_files,
         ballast_bytes = scenario.ballast_file_bytes,
+        ballast_extra = scenario.ballast_toml,
         poll = scenario.poll_interval_ms,
         maint = scenario.maintenance_interval_secs,
         engine = scenario.engine,
@@ -1723,6 +1727,48 @@ fn alias_mount_release_credit_survives_state_writes_and_restart() {
     assert_eq!(restarted.events_of("ballast_release").len(), 3);
     assert_eq!(ballast_files_in(&restarted.data_dir.join("ballast")), 2);
     assert!(restarted.stop().success());
+}
+
+/// bd-7spb: after a release a large volume can sit at Yellow for days with
+/// nothing left to reclaim. Replenishing only after a Green cooldown left its
+/// reserve empty for good; an idle Yellow mount now rebuilds it (provisioning
+/// still keeps free space above the Orange floor).
+#[test]
+fn an_idle_yellow_mount_rebuilds_an_empty_reserve() {
+    let dir = scratch();
+    let scan_root = dir.path().join("scan-root");
+    fs::create_dir(&scan_root).unwrap();
+    let mount = dir.path();
+    // 1 TB at 16% free: Yellow (green 20, yellow 14), far above Orange (10).
+    let table = injected_table(&[
+        (mount, 1_000_000_000_000, 160_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![scan_root],
+        ballast_files: 3,
+        // An empty pool from the start; the refill is all the daemon's doing.
+        ballast_toml: "auto_provision = false\nreplenish_cooldown_minutes = 0\n".to_string(),
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    let pool = run.data_dir.join("ballast");
+    assert_eq!(
+        ballast_files_in(&pool),
+        0,
+        "auto_provision = false starts empty"
+    );
+    run.wait_until(
+        "a ballast file replenished at Yellow",
+        Duration::from_secs(90),
+        |_| ballast_files_in(&pool) >= 1,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        run.stderr().contains("idle -> ") || run.stderr().contains("reclaim -> idle"),
+        "the mount went idle before refilling"
+    );
+    assert!(run.stop().success());
 }
 
 /// Scenario `forced-scan`: SIGUSR1 at Green produces a forced
