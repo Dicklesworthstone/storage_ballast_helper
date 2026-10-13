@@ -4773,12 +4773,19 @@ mod tests {
         let report = executor.execute(&executor.plan(vec![make_candidate(&first, 6, 0.95)]), None);
         assert_eq!(report.items_deleted, 1, "{report:?}");
 
-        // A build starts in `second` after that sweep: its root changes and
-        // a file under it is held open by this process.
-        std::thread::sleep(Duration::from_millis(20));
+        // A build starts in `second` after that sweep: a file under it is
+        // held open by this process, and only then does the root change. The
+        // last sweep is process-wide, so another test's executor may sweep at
+        // any moment; marking the root changed after the open means a sweep
+        // that missed the descriptor started before the change and cannot be
+        // reused for `second`.
         let live = second.join("build.lock");
-        fs::write(&live, b"lock").unwrap();
-        let handle = fs::File::open(&live).unwrap();
+        let mut handle = fs::File::create(&live).unwrap();
+        std::io::Write::write_all(&mut handle, b"lock").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let marker = second.join("started");
+        fs::write(&marker, b"").unwrap();
+        fs::remove_file(&marker).unwrap();
         let (visible, _) = walker::collect_open_path_ancestors(std::slice::from_ref(&second));
         if !visible.contains(&live) {
             // /proc hides our own fds here (hidepid, containers): nothing to prove.

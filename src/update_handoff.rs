@@ -112,6 +112,25 @@ mod transaction_lock_tests {
     use std::io::ErrorKind;
     use std::os::unix::fs::{MetadataExt as _, symlink};
 
+    /// Take the lock again once a guard is dropped. A child that another test
+    /// thread forked while the guard was open holds a duplicate of the locked
+    /// descriptor until it execs, so the lock can outlive the drop for a
+    /// moment; the full lib suite saw this fail as WouldBlock.
+    fn reacquire_after_drop(binary: &Path) -> std::io::Result<fs::File> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match acquire_update_lock(binary) {
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+    }
+
     #[test]
     fn same_destination_is_exclusive_until_the_guard_is_dropped() {
         let temp = tempfile::tempdir().unwrap();
@@ -127,7 +146,7 @@ mod transaction_lock_tests {
                 .is_none()
         );
         drop(guard);
-        assert!(acquire_update_lock(&binary).is_ok());
+        assert!(reacquire_after_drop(&binary).is_ok());
     }
 
     #[test]
@@ -147,7 +166,7 @@ mod transaction_lock_tests {
         );
         assert_eq!(fs::read(&binary).unwrap(), b"new");
         drop(guard);
-        assert!(acquire_update_lock(&binary).is_ok());
+        assert!(reacquire_after_drop(&binary).is_ok());
     }
 
     #[test]
