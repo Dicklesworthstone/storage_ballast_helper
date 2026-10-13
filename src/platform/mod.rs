@@ -1,5 +1,7 @@
 //! Platform Abstraction Layer (PAL) — trait-based cross-platform support.
 
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod build_environment;
 pub mod cleanup_catalog;
 pub mod linux;
 pub mod macos;
