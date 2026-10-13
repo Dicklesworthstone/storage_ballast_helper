@@ -18,6 +18,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- Safety: a directory named `<prefix>-target` or `<prefix>_target` is treated
+  as build output only when it carries cargo's own root markers (a validated
+  `CACHEDIR.TAG`, `.rustc_info.json`, or a `debug/`, `release/`,
+  `.fingerprint/`, `deps/` or `incremental/` directory). On the name alone,
+  the classifier nominated such directories, and the source-tree floor let
+  them through, so fixtures deliberately named `invalid_target` and
+  `ambient-target` inside non-git release-evidence trees were deleted
+  (`0d9a52f`; issue #34). Exact names (`target`, `node_modules`, ...) and the
+  `.rch-target-*` / `target-*` forms are unchanged; a real stranded
+  `CARGO_TARGET_DIR` keeps its markers and stays reclaimable.
 - A mount on the same filesystem as another (folded onto it, sharing its
   ballast pool) kept its own ballast release state when it was the pressured
   mount. That state was never saved, so a restart released the same shortfall
