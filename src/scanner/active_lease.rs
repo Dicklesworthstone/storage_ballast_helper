@@ -434,28 +434,26 @@ pub fn watch(target: &Path, expected_process_group_id: i32, policy: LeasePolicy)
         let Some(inspection) = inspect_exact_target(target) else {
             return Ok(());
         };
-        let state = if inspection
+        let (state, reason) = if inspection
             .metadata
             .as_ref()
             .is_some_and(|metadata| metadata.process_group_id != expected_process_group_id)
         {
-            ActiveLeaseState::Invalid
+            (
+                ActiveLeaseState::Invalid,
+                "invalid: lease names another process group".to_string(),
+            )
         } else {
-            inspection.state
+            (inspection.state, inspection.detail)
         };
-        match state {
-            ActiveLeaseState::Active => thread::sleep(policy.watch_interval),
-            state => {
-                terminate_process_group(expected_process_group_id, target, state, policy)?;
-                return Err(SbhError::Runtime {
-                    details: format!(
-                        "active lease cancelled for {}: {}",
-                        target.display(),
-                        state_label(state)
-                    ),
-                });
-            }
+        if state == ActiveLeaseState::Active {
+            thread::sleep(policy.watch_interval);
+            continue;
         }
+        terminate_process_group(expected_process_group_id, target, &reason, policy)?;
+        return Err(SbhError::Runtime {
+            details: format!("active lease cancelled for {}: {reason}", target.display()),
+        });
     }
 }
 
@@ -463,14 +461,13 @@ pub fn watch(target: &Path, expected_process_group_id: i32, policy: LeasePolicy)
 fn terminate_process_group(
     process_group_id: i32,
     target: &Path,
-    state: ActiveLeaseState,
+    reason: &str,
     policy: LeasePolicy,
 ) -> Result<()> {
     let pgid = Pid::from_raw(process_group_id);
     eprintln!(
-        "[SBH-ACTIVE-LEASE] cancelling process group {process_group_id} for {}: {}",
+        "[SBH-ACTIVE-LEASE] cancelling process group {process_group_id} for {}: {reason}",
         target.display(),
-        state_label(state)
     );
     if let Err(error) = killpg(pgid, Signal::SIGTERM)
         && error != nix::errno::Errno::ESRCH
@@ -554,13 +551,26 @@ fn inspect_exact_target(target: &Path) -> Option<ActiveLeaseInspection> {
         });
     }
 
-    let state = current_state(&metadata).unwrap_or(ActiveLeaseState::Invalid);
+    let (state, detail) = state_with_detail(current_state(&metadata));
     Some(ActiveLeaseInspection {
         leased_target: target.to_path_buf(),
         state,
         metadata: Some(metadata),
-        detail: state_label(state).to_string(),
+        detail,
     })
+}
+
+/// A failed inspection is Invalid, and keeps its error: "invalid" alone
+/// cannot say why the watchdog stopped a live build.
+#[cfg(unix)]
+fn state_with_detail(state: Result<ActiveLeaseState>) -> (ActiveLeaseState, String) {
+    match state {
+        Ok(state) => (state, state_label(state).to_string()),
+        Err(error) => (
+            ActiveLeaseState::Invalid,
+            format!("invalid: target inspection failed: {error}"),
+        ),
+    }
 }
 
 #[cfg(unix)]
@@ -1096,6 +1106,29 @@ mod tests {
         assert_eq!(
             fs::read(retained.join("payload.o")).unwrap(),
             b"preserved payload"
+        );
+    }
+
+    #[test]
+    fn a_failed_inspection_is_invalid_and_keeps_its_error_for_the_kill_log() {
+        let failed = state_with_detail(Err(SbhError::io(
+            Path::new("/leased/target/debug/obj"),
+            std::io::Error::new(std::io::ErrorKind::NotADirectory, "not a directory"),
+        )));
+        assert_eq!(failed.0, ActiveLeaseState::Invalid);
+        assert!(failed.1.starts_with("invalid"), "{}", failed.1);
+        assert!(
+            failed.1.contains("/leased/target/debug/obj"),
+            "{}",
+            failed.1
+        );
+        assert!(failed.1.contains("not a directory"), "{}", failed.1);
+        assert_eq!(
+            state_with_detail(Ok(ActiveLeaseState::Active)),
+            (
+                ActiveLeaseState::Active,
+                state_label(ActiveLeaseState::Active).to_string()
+            )
         );
     }
 

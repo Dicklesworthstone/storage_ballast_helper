@@ -235,13 +235,7 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
         }
     }
 
-    fn executable(
-        &mut self,
-        proc_root: &Path,
-        pid: i32,
-        root: &Path,
-        out: &mut Vec<ProcessInfo>,
-    ) {
+    fn executable(&mut self, proc_root: &Path, pid: i32, root: &Path, out: &mut Vec<ProcessInfo>) {
         let process = proc_root.join(pid.to_string());
         let target = match self.proc.link(&process.join("exe")) {
             Ok(target) => target,
@@ -310,8 +304,7 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
         // a user executable. Require explicit bounded stat evidence for them.
         self.proc
             .read_bounded(&process.join("stat"), MAX_EXECUTABLE_STAT_BYTES)
-            .ok()
-            .is_some_and(|raw| stat_has_no_user_executable(&raw, pid))
+            .is_ok_and(|raw| stat_has_no_user_executable(&raw, pid))
     }
 }
 
@@ -324,13 +317,19 @@ fn read_proc_bytes(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
     if !file.metadata()?.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "non-regular proc metadata"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-regular proc metadata",
+        ));
     }
     let mut raw = Vec::new();
     file.take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
         .read_to_end(&mut raw)?;
     if raw.len() > limit {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "proc metadata exceeds limit"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "proc metadata exceeds limit",
+        ));
     }
     Ok(raw)
 }
@@ -653,7 +652,11 @@ mod tests {
         let result = fixture.scan(&NativeProc, Limits::default());
         assert!(result.complete);
         assert_eq!(
-            result.files.iter().map(|file| &file.path).collect::<Vec<_>>(),
+            result
+                .files
+                .iter()
+                .map(|file| &file.path)
+                .collect::<Vec<_>>(),
             vec![&low, &high]
         );
         for file in result.files {
@@ -674,7 +677,11 @@ mod tests {
         sweep.fds(Path::new(PROC_ROOT), pid, &fixture.root, &mut files);
         sweep.expired();
         assert!(sweep.complete);
-        assert!(files.iter().any(|file| file.pid == pid && file.path == target));
+        assert!(
+            files
+                .iter()
+                .any(|file| file.pid == pid && file.path == target)
+        );
     }
 
     #[test]
@@ -764,7 +771,13 @@ mod tests {
         assert!(!result.complete);
         assert_eq!(result.files.len(), 2);
         assert!(result.files.iter().any(|file| file.path == retained));
-        let result = fixture.scan(&NativeProc, Limits { per_pid: 2, ..limits });
+        let result = fixture.scan(
+            &NativeProc,
+            Limits {
+                per_pid: 2,
+                ..limits
+            },
+        );
         assert!(result.complete);
         assert_eq!(result.files.len(), 3);
     }
@@ -809,7 +822,11 @@ mod tests {
         );
         assert!(!result.complete);
         assert_eq!(result.files.len(), 2);
-        assert_eq!(access.link_calls.get(), 2, "deadline applies inside one PID");
+        assert_eq!(
+            access.link_calls.get(),
+            2,
+            "deadline applies inside one PID"
+        );
     }
 
     #[test]
@@ -886,14 +903,19 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let fixture = Fixture::new();
         let process = fixture.pid(1);
-        let target = fixture.root.join(OsString::from_vec(b"artifact-\xff".to_vec()));
+        let target = fixture
+            .root
+            .join(OsString::from_vec(b"artifact-\xff".to_vec()));
         fs::write(&target, b"non-UTF-8 path").unwrap();
         symlink(&target, process.join("fd/0")).unwrap();
         let result = fixture.scan(&NativeProc, Limits::default());
         assert!(result.complete);
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].path, target);
-        assert_eq!(result.files[0].mode, crate::platform::types::OpenFileMode::Unknown);
+        assert_eq!(
+            result.files[0].mode,
+            crate::platform::types::OpenFileMode::Unknown
+        );
     }
 
     #[test]
@@ -902,7 +924,13 @@ mod tests {
         let mut access = Faults::default();
         access.dirs.insert(fixture.proc_root.clone(), libc::EACCES);
         assert!(
-            open_files_with(&access, &fixture.proc_root, &fixture.root, Limits::default()).is_err()
+            open_files_with(
+                &access,
+                &fixture.proc_root,
+                &fixture.root,
+                Limits::default()
+            )
+            .is_err()
         );
     }
 
@@ -919,7 +947,10 @@ mod tests {
         let result = fixture.scan(&NativeProc, Limits::default());
         assert!(result.complete);
         assert_eq!(result.files.len(), 1);
-        assert_eq!(result.files[0].mode, crate::platform::types::OpenFileMode::ReadWrite);
+        assert_eq!(
+            result.files[0].mode,
+            crate::platform::types::OpenFileMode::ReadWrite
+        );
     }
 
     #[test]
@@ -956,7 +987,9 @@ mod tests {
         fixture.fd(1, 0);
         let retained = fixture.fd(1, 1);
         let mut access = Faults::default();
-        access.links.insert(fixture.proc_root.join("1/fd/0"), libc::EIO);
+        access
+            .links
+            .insert(fixture.proc_root.join("1/fd/0"), libc::EIO);
         let (targets, complete) =
             open_targets_with(&access, &fixture.proc_root, Limits::default()).unwrap();
         assert!(!complete);
@@ -1004,12 +1037,18 @@ mod tests {
         let (targets, complete) = open_targets_with(
             &Faults::default(),
             &fixture.proc_root,
-            Limits { per_pid: 1, ..Limits::default() },
+            Limits {
+                per_pid: 1,
+                ..Limits::default()
+            },
         )
         .unwrap();
         assert!(!complete);
         assert_eq!(targets.len(), 2);
-        assert!(targets.contains(&retained), "one busy PID must not hide later PIDs");
+        assert!(
+            targets.contains(&retained),
+            "one busy PID must not hide later PIDs"
+        );
     }
 
     #[test]
@@ -1025,7 +1064,10 @@ mod tests {
         let (targets, complete) = open_targets_with(
             &access,
             &fixture.proc_root,
-            Limits { time: Duration::from_secs(2), ..Limits::default() },
+            Limits {
+                time: Duration::from_secs(2),
+                ..Limits::default()
+            },
         )
         .unwrap();
         assert!(!complete);
@@ -1038,8 +1080,13 @@ mod tests {
         let fixture = Fixture::new();
         fixture.fd(1, 0);
         let retained = fixture.fd(1, 1);
-        let mut access = Faults { absent_pid: Some(99), ..Faults::default() };
-        access.links.insert(fixture.proc_root.join("1/fd/0"), libc::ENOENT);
+        let mut access = Faults {
+            absent_pid: Some(99),
+            ..Faults::default()
+        };
+        access
+            .links
+            .insert(fixture.proc_root.join("1/fd/0"), libc::ENOENT);
         let (targets, complete) =
             open_targets_with(&access, &fixture.proc_root, Limits::default()).unwrap();
         assert!(complete);
@@ -1051,10 +1098,14 @@ mod tests {
         use std::os::unix::ffi::OsStringExt as _;
         let fixture = Fixture::new();
         let process = fixture.pid(1);
-        let literal = fixture.root.join(OsString::from_vec(b"target-\xff (deleted)".to_vec()));
+        let literal = fixture
+            .root
+            .join(OsString::from_vec(b"target-\xff (deleted)".to_vec()));
         fs::create_dir(&literal).unwrap();
         symlink(&literal, process.join("fd/0")).unwrap();
-        let stripped = fixture.root.join(OsString::from_vec(b"target-\xff".to_vec()));
+        let stripped = fixture
+            .root
+            .join(OsString::from_vec(b"target-\xff".to_vec()));
         let (targets, complete) =
             open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
         assert!(complete);
@@ -1079,8 +1130,10 @@ mod tests {
             open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
         assert!(complete);
         assert_eq!(targets, vec![target]);
-        assert_eq!(fixture.scan(&NativeProc, Limits::default()).files[0].path,
-                   directory.join("object"));
+        assert_eq!(
+            fixture.scan(&NativeProc, Limits::default()).files[0].path,
+            directory.join("object")
+        );
     }
 
     #[test]
@@ -1120,7 +1173,13 @@ mod tests {
         assert_eq!(result.processes[0].executable.as_ref(), Some(&low));
         assert_eq!(result.processes[1].executable.as_ref(), Some(&high));
         assert_eq!(result.processes[0].name, "program-11");
-        assert!(access.read_paths.borrow().iter().all(|path| path.ends_with("comm")));
+        assert!(
+            access
+                .read_paths
+                .borrow()
+                .iter()
+                .all(|path| path.ends_with("comm"))
+        );
         assert_eq!(fs::read(low).unwrap(), b"retained program");
         assert_eq!(fs::read(high).unwrap(), b"retained program");
     }
@@ -1159,7 +1218,10 @@ mod tests {
         let zombie = fixture.pid(2);
         fs::write(zombie.join("stat"), task_stat(2, "Z", 0, 1)).unwrap();
         let retained = fixture.exe(3);
-        let access = Faults { absent_pid: Some(99), ..Faults::default() };
+        let access = Faults {
+            absent_pid: Some(99),
+            ..Faults::default()
+        };
         let result = fixture.scan_executables(&access, Limits::default());
         assert!(result.complete);
         assert_eq!(result.processes.len(), 1);
@@ -1174,7 +1236,10 @@ mod tests {
         let result = fixture.scan_executables(&NativeProc, Limits::default());
         assert!(!result.complete);
         assert!(result.processes.is_empty());
-        assert!(!stat_has_no_user_executable(task_stat(1, "S", 0, 1).as_bytes(), 1));
+        assert!(!stat_has_no_user_executable(
+            task_stat(1, "S", 0, 1).as_bytes(),
+            1
+        ));
     }
 
     #[test]
@@ -1189,12 +1254,20 @@ mod tests {
             vec![b' '; MAX_EXECUTABLE_STAT_BYTES + 1],
         ] {
             fs::write(process.join("stat"), raw).unwrap();
-            assert!(!fixture.scan_executables(&NativeProc, Limits::default()).complete);
+            assert!(
+                !fixture
+                    .scan_executables(&NativeProc, Limits::default())
+                    .complete
+            );
         }
         fs::write(process.join("stat"), task_stat(1, "Z", 0, 1)).unwrap();
         let mut access = Faults::default();
         access.reads.insert(process.join("stat"), libc::EACCES);
-        assert!(!fixture.scan_executables(&access, Limits::default()).complete);
+        assert!(
+            !fixture
+                .scan_executables(&access, Limits::default())
+                .complete
+        );
     }
 
     #[test]
@@ -1202,7 +1275,11 @@ mod tests {
         let fixture = Fixture::new();
         let target = fixture.exe(1);
         let comm = fixture.proc_root.join("1/comm");
-        for raw in [Vec::new(), vec![b'x'; MAX_EXECUTABLE_COMM_BYTES + 1], b"worker-\xff\n".to_vec()] {
+        for raw in [
+            Vec::new(),
+            vec![b'x'; MAX_EXECUTABLE_COMM_BYTES + 1],
+            b"worker-\xff\n".to_vec(),
+        ] {
             fs::write(&comm, raw).unwrap();
             let result = fixture.scan_executables(&NativeProc, Limits::default());
             assert!(result.complete);
@@ -1222,12 +1299,15 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let fixture = Fixture::new();
         let process = fixture.pid(1);
-        let target = fixture.root.join(OsString::from_vec(b"program-\xff".to_vec()));
+        let target = fixture
+            .root
+            .join(OsString::from_vec(b"program-\xff".to_vec()));
         fs::write(&target, b"byte-named program").unwrap();
         symlink(&target, process.join("exe")).unwrap();
         let alias = fixture.proc_root.join("artifact-alias");
         symlink(&fixture.root, &alias).unwrap();
-        let result = executables_with(&NativeProc, &fixture.proc_root, &alias, Limits::default()).unwrap();
+        let result =
+            executables_with(&NativeProc, &fixture.proc_root, &alias, Limits::default()).unwrap();
         assert!(result.complete);
         assert_eq!(result.processes.len(), 1);
         assert_eq!(result.processes[0].executable.as_ref(), Some(&target));
@@ -1237,11 +1317,19 @@ mod tests {
     #[test]
     fn executable_discovery_distinguishes_exact_pid_and_entry_limits_from_truncation() {
         let fixture = Fixture::new();
-        for pid in 1..=3 { fixture.exe(pid); }
+        for pid in 1..=3 {
+            fixture.exe(pid);
+        }
         for limit in 0..=4 {
             for limits in [
-                Limits { pids: limit, ..Limits::default() },
-                Limits { proc_entries: limit, ..Limits::default() },
+                Limits {
+                    pids: limit,
+                    ..Limits::default()
+                },
+                Limits {
+                    proc_entries: limit,
+                    ..Limits::default()
+                },
             ] {
                 let access = Faults::default();
                 let result = fixture.scan_executables(&access, limits);
@@ -1255,12 +1343,20 @@ mod tests {
     #[test]
     fn executable_metadata_consumes_the_same_deadline_without_losing_a_positive() {
         let fixture = Fixture::new();
-        for pid in 1..=3 { fixture.exe(pid); }
+        for pid in 1..=3 {
+            fixture.exe(pid);
+        }
         let access = Faults {
             advance_per_read: Duration::from_secs(2),
             ..Faults::default()
         };
-        let result = fixture.scan_executables(&access, Limits { time: Duration::from_secs(2), ..Limits::default() });
+        let result = fixture.scan_executables(
+            &access,
+            Limits {
+                time: Duration::from_secs(2),
+                ..Limits::default()
+            },
+        );
         assert!(!result.complete);
         assert_eq!(result.processes.len(), 1);
         assert_eq!(access.link_calls.get(), 1);
@@ -1269,7 +1365,13 @@ mod tests {
             advance_per_link: Duration::from_secs(3),
             ..Faults::default()
         };
-        let result = fixture.scan_executables(&slow_link, Limits { time: Duration::from_secs(2), ..Limits::default() });
+        let result = fixture.scan_executables(
+            &slow_link,
+            Limits {
+                time: Duration::from_secs(2),
+                ..Limits::default()
+            },
+        );
         assert!(!result.complete);
         assert_eq!(result.processes.len(), 1);
         assert_eq!(slow_link.link_calls.get(), 1);
@@ -1295,13 +1397,24 @@ mod tests {
     fn executable_discovery_errors_preserve_coverage_semantics() {
         let fixture = Fixture::new();
         let target = fixture.exe(1);
-        let access = Faults { entry_error: Some(fixture.proc_root.clone()), ..Faults::default() };
+        let access = Faults {
+            entry_error: Some(fixture.proc_root.clone()),
+            ..Faults::default()
+        };
         let result = fixture.scan_executables(&access, Limits::default());
         assert!(!result.complete);
         assert_eq!(result.processes[0].executable.as_ref(), Some(&target));
         let mut denied = Faults::default();
         denied.dirs.insert(fixture.proc_root.clone(), libc::EACCES);
-        assert!(executables_with(&denied, &fixture.proc_root, &fixture.root, Limits::default()).is_err());
+        assert!(
+            executables_with(
+                &denied,
+                &fixture.proc_root,
+                &fixture.root,
+                Limits::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1320,11 +1433,15 @@ mod tests {
         let target = fixture.exe(1);
         fixture.exe(2);
         let access = Faults::default();
-        let result = executables_with(&access, &fixture.proc_root, &target, Limits::default()).unwrap();
+        let result =
+            executables_with(&access, &fixture.proc_root, &target, Limits::default()).unwrap();
         assert!(result.complete);
         assert_eq!(result.processes.len(), 1);
         assert_eq!(result.processes[0].executable.as_ref(), Some(&target));
-        assert_eq!(*access.read_paths.borrow(), vec![fixture.proc_root.join("1/comm")]);
+        assert_eq!(
+            *access.read_paths.borrow(),
+            vec![fixture.proc_root.join("1/comm")]
+        );
     }
 
     #[test]
@@ -1332,7 +1449,11 @@ mod tests {
         let fixture = Fixture::new();
         let target = fixture.exe(1);
         let comm = fixture.proc_root.join("1/comm");
-        nix::unistd::mkfifo(&comm, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        nix::unistd::mkfifo(
+            &comm,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
         let result = fixture.scan_executables(&NativeProc, Limits::default());
         assert!(result.complete);
         assert_eq!(result.processes[0].executable.as_ref(), Some(&target));

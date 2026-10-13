@@ -80,7 +80,7 @@ sbh emergency /data --target-free 10 --yes
 - **`#![forbid(unsafe_code)]`** in both `lib.rs` and `main.rs`. No unsafe blocks, no raw pointer arithmetic, no manual memory management. All platform-specific behavior goes through safe abstractions (`nix`, `libc` bindings, `signal-hook`).
 - **No async runtime.** Concurrency uses OS threads with `crossbeam-channel` for bounded message passing and `parking_lot` for synchronization. This avoids the complexity and debugging opacity of async runtimes while providing predictable scheduling behavior for a daemon that needs to respond to pressure signals in bounded time.
 - **Pedantic + nursery Clippy lints** are enabled project-wide. The code is held to strict Rust idiom standards beyond the default warning set.
-- **Deterministic builds.** The release profile uses `opt-level = "z"` (size optimization), `lto = true` (link-time optimization), `codegen-units = 1`, `panic = "abort"`, and `strip = true` for a lean, predictable binary.
+- **Deterministic builds.** The release profile uses `opt-level = 3` (speed optimization), `lto = true` (link-time optimization), `codegen-units = 1`, `panic = "abort"`, and `strip = true` for a lean, predictable binary.
 
 ## The Problem in Depth
 
@@ -137,6 +137,13 @@ service binary when one is already registered. First-time daemon registration is
 still handled by `sbh install --auto`, which chooses systemd on Linux and
 launchd on macOS.
 
+On Linux, register the daemon in system scope instead:
+`sudo sbh install --systemd --scope system`. `sbh install --auto` registers a
+user-scope service, and an sbh without root cannot inspect other users'
+processes for open or mapped files, so its scanner refuses every deletion
+candidate and only ballast release works. `sbh status` and
+`sbh doctor --system` report this.
+
 Pin a specific version:
 
 ```bash
@@ -156,13 +163,20 @@ sbh status
 
 `sbh install --auto` detects macOS, chooses launchd, installs a user-scoped
 LaunchAgent, uses native Application Support paths, and provisions the default
-ballast preset. Use system scope only when `sbh` must inspect system-wide paths
-or all users' process activity:
+ballast preset. A user-scoped sbh cannot see other users' processes (macOS
+hides them), so its open-file check is never complete and the scanner refuses
+every candidate it must walk or that is 100 MB or larger: it reclaims almost
+nothing, and only ballast release works fully. `sbh status` and
+`sbh doctor --system` report this. To reclaim build artifacts, register the
+daemon in system scope:
 
 ```bash
 sudo sbh install --launchd --scope system --auto
 sudo sbh doctor --pal
 ```
+
+Under root, `scanner.include_user_temp_dir` adds root's temporary directory,
+not yours: list your `$TMPDIR` in `scanner.root_paths` explicitly.
 
 Homebrew is supported by the packaged formula skeleton and the
 `Dicklesworthstone/homebrew-sbh` tap. Every release runs
@@ -1674,6 +1688,8 @@ What feeds the index is platform-specific, and the daemon says which at startup 
 - **macOS:** a recursive FSEvents stream over the configured roots (`crates/sbh_mach` owns the native stream behind safe wrappers; `src/scanner/events/fsevents.rs` translates paths and invalidates the scanner view). Startup and every replan mark the roots dirty, so the first pass after a daemon start reconciles instead of replaying the candidate index; a dropped or overflowing stream forces a full reconciliation. `scanner.event_source = "reconciliation-only"` turns it off.
 - **Everything else:** reconciliation only; the bound on staleness is the maintenance cadence (`pressure.maintenance_interval_secs`) plus the pressure-driven passes.
 
+On Linux and macOS, a configured root whose initial metadata lookup reports that it does not exist is tracked separately from coverage gaps. Existing roots retain their watches; absent roots are checked every 30 seconds without rebuilding healthy coverage. When one appears, the scanner immediately revokes the old index generation, reconciles the roots, and installs coverage for the new directory. Permission failures, unreadable directory listings, disappearing descendants, invalid root types, dangling root links and exhausted watch budgets still require reconciliation. macOS also follows configured directory links such as `/tmp -> /private/tmp`, preserving their configured spelling and rechecking their canonical identity; links inside the scanned tree remain excluded. Explicit reconciliation-only mode and a zero watch budget continue to disable event subscriptions. The default roots remain `/tmp`, `/data/tmp`, `/var/tmp` on Linux; other platforms default to `/tmp`, `/var/tmp` (macOS configuration loading also includes the user's temporary directory unless opted out).
+
 For validation and A/B artifacts, `sbh scan --json` reports `scanner_engine`, `scanner_dispatch`, `opaque_pruning`, `opaque_pruned_dirs`, `scanned_entries`, and nullable `process_cpu_micros` alongside the existing candidate totals. Daemon `scan_complete` activity events also include the selected dispatch, pruning state, dirty event-root count, index generation, indexed-record count, candidate bytes seen, and timeout state in their `details` payload, plus `process_cpu_micros=` when the pass measured its CPU. `sbh stats --json` aggregates those events into a `scanner` block (`cpu_seconds_by_day`, `passes`, `entries_scanned`, `opaque_pruned_dirs`), and human `sbh stats` prints the scanner's 7-day CPU-seconds/day average. These fields are intended to make v1/v2 scan captures auditable without scraping human output.
 
 The in-repo scanner-v2 validation tests emit focused JSON artifacts for synthetic v1/v2 walk effort and safety parity, event-overflow reconciliation fallback, and memory-pressure transition latency. v2 has been the default engine since v0.4.32 (it is what the production fleet runs and it is required for structural detection of caches under arbitrary names, such as Go's `GOCACHE`); the A/B evidence measured on 2026-09-02 is in `docs/internal/scanner-ab-2026-09-02.md` and does not yet meet the design document's promotion criteria (a one-shot `sbh scan` of a large project tree costs v2 3.4x the CPU of v1 because of its opaque-root size probes, and the daemon's v2 steady state was a replay hot loop rather than a cheap rescan), so `engine = "v1"` remains available as the rollback.
@@ -2162,6 +2178,8 @@ Every command's error goes through one mapping (C-EXIT). `--json` reports carry 
 <!-- sbh-docs:end -->
 
 All errors implement `code()` for the stable string code, `is_retryable()` to indicate whether retry might help, and standard `Display` formatting with the code prefix.
+
+Two more codes appear only in the activity log and are not `SbhError` variants: `SBH-3004` (warning: the daemon exceeded its CPU budget) and `SBH-3005` (error: the open-file or process scan was incomplete, so the deletion batch was aborted; an sbh without root gets this on every batch on Linux).
 
 ## Testing
 

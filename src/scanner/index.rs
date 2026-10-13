@@ -155,6 +155,7 @@ impl ScannerIndexContext {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CandidateIndexRecord {
+    #[serde(with = "crate::core::path_serde")]
     pub path: PathBuf,
     pub identity: IndexedIdentity,
     pub parent_identity: Option<IndexedIdentity>,

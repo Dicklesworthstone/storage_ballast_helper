@@ -125,6 +125,7 @@ file_size_bytes = 1048576
 [pressure]
 poll_interval_ms = 500
 [scanner]
+include_user_temp_dir = false
 root_paths = ["{root}"]
 min_file_age_minutes = 0
 min_rescan_interval_secs = 5
@@ -156,6 +157,7 @@ enabled = false
             .env_remove("INVOCATION_ID")
             .env_remove("NOTIFY_SOCKET")
             .env("SBH_TEST_MODE", "1")
+            .env_remove("XPC_SERVICE_NAME")
             .env("SBH_TEST_FS_STATS", table)
             .spawn()
             .expect("spawn sbh daemon");
@@ -619,6 +621,9 @@ fn emergency_prints_decision_ids_and_writes_no_ledger() {
     // is actually removed (100% target-free never stops early).
     let root_json = dir.path().join("root-json");
     let target = definite_target(&root_json.join("proj"), Duration::from_hours(48), 64 * 1024);
+    // Emergency reports canonical paths (macOS temp dirs live under the
+    // /var -> /private/var link), and the target is gone afterwards.
+    let canonical_target = fs::canonicalize(&target).unwrap();
     let mut command = Command::new(common::sbh_bin_path());
     command
         .args(["--json", "emergency"])
@@ -647,7 +652,7 @@ fn emergency_prints_decision_ids_and_writes_no_ledger() {
     assert!(
         candidates
             .iter()
-            .any(|c| c["path"].as_str() == Some(&target.to_string_lossy())),
+            .any(|c| c["path"].as_str() == Some(&canonical_target.to_string_lossy())),
         "the target is listed: {payload}"
     );
     assert_eq!(
@@ -711,6 +716,7 @@ jsonl_log = "{jsonl}"
 sqlite_db = "{sqlite}"
 state_file = "{state}"
 [scanner]
+include_user_temp_dir = false
 min_file_age_minutes = 0
 [notifications]
 enabled = false
@@ -871,7 +877,15 @@ fn why_not_names_the_first_rail_for_each_fixture_class() {
             .replace("min_file_age_minutes = 0", "min_file_age_minutes = 5"),
     )
     .unwrap();
-    let report = why_not(&floored, &target, false);
+    // On Linux the 48-hour mtime leaves the birth time at now, so the same
+    // target is too young. APFS moves the birth time back with the mtime, so
+    // macOS needs a target that really is new.
+    let young = if cfg!(target_os = "macos") {
+        definite_target(&root.join("young-proj"), Duration::ZERO, 256 * 1024)
+    } else {
+        target.clone()
+    };
+    let report = why_not(&floored, &young, false);
     assert!(
         report["trace"]["mtime_check"]
             .as_str()

@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::core::config::PressureConfig;
+use crate::core::config::{PressureConfig, floored_free_pct_thresholds};
 
 /// The controller arithmetic, verbatim in the README ("PID Pressure
 /// Controller" section).
@@ -90,6 +90,9 @@ pub struct PidConfig {
     pub hysteresis_pct: f64,
     /// `[green, yellow, orange, red]` minimum free percentages.
     pub thresholds: [f64; 4],
+    /// `[green, yellow, orange, red]` absolute floors in bytes; all 0 = off
+    /// (see [`floored_free_pct_thresholds`]).
+    pub min_free_bytes: [u64; 4],
     /// Volume size at which `Kp` applies unscaled.
     pub reference_total_bytes: u64,
     /// Bounds on the capacity multiplier of `Kp`.
@@ -108,6 +111,7 @@ impl Default for PidConfig {
             target_free_pct: 18.0,
             hysteresis_pct: 1.0,
             thresholds: [20.0, 14.0, 10.0, 6.0],
+            min_free_bytes: [0; 4],
             reference_total_bytes: 1 << 40,
             kp_scale_min: 0.5,
             kp_scale_max: 2.0,
@@ -137,12 +141,8 @@ impl From<&PressureConfig> for PidConfig {
             integral_cap: controller.integral_cap,
             target_free_pct: pressure.green_min_free_pct,
             hysteresis_pct: controller.hysteresis_pct,
-            thresholds: [
-                pressure.green_min_free_pct,
-                pressure.yellow_min_free_pct,
-                pressure.orange_min_free_pct,
-                pressure.red_min_free_pct,
-            ],
+            thresholds: pressure.free_pct_thresholds(),
+            min_free_bytes: pressure.min_free_bytes(),
             reference_total_bytes: controller.reference_total_bytes,
             kp_scale_min: controller.kp_scale_min,
             kp_scale_max: controller.kp_scale_max,
@@ -169,6 +169,7 @@ pub struct PidPressureController {
     yellow_min_free_pct: f64,
     orange_min_free_pct: f64,
     red_min_free_pct: f64,
+    min_free_bytes: [u64; 4],
     reference_total_bytes: u64,
     kp_scale_min: f64,
     kp_scale_max: f64,
@@ -201,6 +202,7 @@ impl PidPressureController {
             yellow_min_free_pct: yellow,
             orange_min_free_pct: orange,
             red_min_free_pct: red,
+            min_free_bytes: config.min_free_bytes,
             reference_total_bytes: config.reference_total_bytes,
             kp_scale_min: config.kp_scale_min,
             kp_scale_max: config.kp_scale_max,
@@ -226,6 +228,7 @@ impl PidPressureController {
         self.integral = self.integral.clamp(-self.integral_cap, self.integral_cap);
         self.hysteresis_pct = config.hysteresis_pct;
         self.reference_total_bytes = config.reference_total_bytes;
+        self.min_free_bytes = config.min_free_bytes;
         self.kp_scale_min = config.kp_scale_min;
         self.kp_scale_max = config.kp_scale_max;
         let [green, yellow, orange, red] = config.thresholds;
@@ -354,6 +357,23 @@ impl PidPressureController {
         now: Instant,
     ) -> PressureResponse {
         let free_pct = reading.free_pct();
+        // Absolute floors (bd-ud9s) lower the thresholds, and with them the
+        // setpoint, on volumes large enough for a floor to bind.
+        let [green, yellow, orange, red] = floored_free_pct_thresholds(
+            [
+                self.green_min_free_pct,
+                self.yellow_min_free_pct,
+                self.orange_min_free_pct,
+                self.red_min_free_pct,
+            ],
+            self.min_free_bytes,
+            reading.total_bytes,
+        );
+        let target_free_pct = if green < self.green_min_free_pct {
+            self.target_free_pct.min(green)
+        } else {
+            self.target_free_pct
+        };
 
         // Robust dt calculation: handle backward clock jumps and tiny intervals.
         // If time went backward or dt is negligible (< 100µs), fall back to the
@@ -365,7 +385,7 @@ impl PidPressureController {
             .filter(|&d| d > 1e-4)
             .unwrap_or_else(|| self.base_poll_interval.as_secs_f64().max(0.1));
 
-        let error = self.target_free_pct - free_pct;
+        let error = target_free_pct - free_pct;
         if !self.integral_frozen {
             self.integral = error
                 .mul_add(dt, self.integral)
@@ -392,10 +412,10 @@ impl PidPressureController {
             self.level,
             free_pct,
             self.hysteresis_pct,
-            self.green_min_free_pct,
-            self.yellow_min_free_pct,
-            self.orange_min_free_pct,
-            self.red_min_free_pct,
+            green,
+            yellow,
+            orange,
+            red,
         );
 
         // Reset integral on level change to prevent windup from previous state.
@@ -727,6 +747,34 @@ mod tests {
                 | PressureLevel::Critical
         ));
         assert!(response.urgency > 0.0);
+    }
+
+    #[test]
+    fn absolute_floors_keep_a_large_volume_green_at_a_low_percentage() {
+        const GIB: u64 = 1 << 30;
+        // 2 TB at 8% free: Red by percentage, Green once 100 GiB counts as enough.
+        let reading = || PressureReading {
+            free_bytes: 160_000_000_000,
+            total_bytes: 2_000_000_000_000,
+            mount: PathBuf::from("/"),
+        };
+        let percentage_only = PidConfig::with_thresholds(17.0, 14.0, 10.0, 6.0);
+        let mut floored = percentage_only.clone();
+        floored.min_free_bytes = [100 * GIB, 80 * GIB, 50 * GIB, 30 * GIB];
+        let now = Instant::now();
+        let plain = PidPressureController::new(&percentage_only, Duration::from_secs(1)).update(
+            reading(),
+            None,
+            now,
+        );
+        assert_eq!(plain.level, PressureLevel::Red);
+        let relaxed = PidPressureController::new(&floored, Duration::from_secs(1)).update(
+            reading(),
+            None,
+            now,
+        );
+        assert_eq!(relaxed.level, PressureLevel::Green);
+        assert!(relaxed.urgency < plain.urgency);
     }
 
     #[test]

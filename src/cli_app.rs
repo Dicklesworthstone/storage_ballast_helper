@@ -17,6 +17,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use storage_ballast_helper::ballast::coordinator::resolve_configured_pool_alias;
 use storage_ballast_helper::ballast::manager::{
     BallastAvailability, BallastHealth, BallastManager,
 };
@@ -1646,14 +1647,8 @@ fn clean_plan_target(
     let Ok(stats) = collector.collect(root) else {
         return (PressureLevel::Green, None);
     };
-    let pressure = &config.pressure;
-    let level = classify_level(
-        stats.free_pct(),
-        pressure.green_min_free_pct,
-        pressure.yellow_min_free_pct,
-        pressure.orange_min_free_pct,
-        pressure.red_min_free_pct,
-    );
+    let [green, yellow, orange, red] = config.pressure.free_pct_thresholds_for(stats.total_bytes);
+    let level = classify_level(stats.free_pct(), green, yellow, orange, red);
     let target = target_free
         .map(|pct| {
             ((stats.total_bytes as f64 * pct / 100.0) as u64).saturating_sub(stats.available_bytes)
@@ -6939,8 +6934,11 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
     let config =
         Config::load(cli.config.as_deref()).map_err(|e| CliError::Runtime(e.to_string()))?;
 
-    let mut manager = BallastManager::new(config.paths.ballast_dir.clone(), config.ballast.clone())
-        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let mut manager = BallastManager::new(
+        resolve_configured_pool_alias(&config.paths.ballast_dir),
+        config.ballast.clone(),
+    )
+    .map_err(|e| CliError::Runtime(e.to_string()))?;
     manager.set_provision_floor(config.ballast_provision_floor_pct());
 
     match &args.command {
@@ -7985,6 +7983,10 @@ fn system_doctor_checks(
     checks.extend(reserve_coverage_doctor_checks(config, bursts, pools));
     checks.push(logging_placement_doctor_check(platform, config, pools));
     checks.extend(reclaim_capability_doctor_checks(config));
+    checks.extend(scanner_privilege_doctor_check(
+        platform.name(),
+        reclaimer_is_root(&config.paths.state_file),
+    ));
     checks
 }
 
@@ -8311,7 +8313,10 @@ fn quarantine_stuck_doctor_check(config: &Config) -> DoctorCheck {
 }
 
 fn ballast_reserve_doctor_check(config: &Config) -> DoctorCheck {
-    let availability = BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
+    let availability = BallastAvailability::observe(
+        &resolve_configured_pool_alias(&config.paths.ballast_dir),
+        &config.ballast,
+    );
     match availability.health {
         BallastHealth::Unconfigured => doctor_check(
             "ballast.reserve",
@@ -10007,7 +10012,8 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
     };
     let memory_info = platform.memory_info().ok();
     let memory_pressure = platform.memory_pressure().ok();
-    let process_visibility = process_attribution_visibility(platform.name());
+    let process_visibility =
+        process_attribution_visibility(platform.name(), &config.paths.state_file);
 
     match output_mode(cli) {
         OutputMode::Human => {
@@ -10056,7 +10062,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                 }
 
                 let free_pct = capacity_free_pct(&capacity);
-                let level = pressure_level_str(free_pct, &config);
+                let level = pressure_level_str(free_pct, capacity.total_bytes, &config);
                 if pressure_severity(level) > pressure_severity(overall_level) {
                     overall_level = level;
                 }
@@ -10134,8 +10140,12 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             }
 
             if let Some(visibility) = process_visibility {
-                println!("\nProcess Attribution:");
-                println!("  Visibility: {}", visibility.detail);
+                if visibility.all_processes {
+                    println!("\nProcess Attribution:");
+                    println!("  Visibility: {}", visibility.detail);
+                } else {
+                    println!("\nWARNING: {}", visibility.detail);
+                }
             }
 
             // Rate estimates from daemon state (v2 `rates`): fill rate,
@@ -10373,7 +10383,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
             }
 
             // Ballast info: configured pool vs actually releasable reserve (#16).
-            let ballast = BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
+            let ballast = BallastAvailability::observe(
+                &resolve_configured_pool_alias(&config.paths.ballast_dir),
+                &config.ballast,
+            );
             println!("\nBallast:");
             println!(
                 "  Configured: {} files x {}",
@@ -10444,8 +10457,10 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
         }
         OutputMode::Json => {
             // #16: actual ballast availability, not just configured totals.
-            let ballast_availability =
-                BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
+            let ballast_availability = BallastAvailability::observe(
+                &resolve_configured_pool_alias(&config.paths.ballast_dir),
+                &config.ballast,
+            );
             let mut mounts_json: Vec<Value> = Vec::new();
             let mut overall_level = "green";
 
@@ -10458,7 +10473,7 @@ fn render_status(cli: &Cli) -> Result<(), CliError> {
                     continue;
                 }
                 let free_pct = capacity_free_pct(&capacity);
-                let level = pressure_level_str(free_pct, &config);
+                let level = pressure_level_str(free_pct, capacity.total_bytes, &config);
                 if pressure_severity(level) > pressure_severity(overall_level) {
                     overall_level = level;
                 }
@@ -10744,15 +10759,17 @@ fn format_log_line(line: &str) -> String {
     )
 }
 
-/// Map free percentage to pressure level string.
-fn pressure_level_str(free_pct: f64, config: &Config) -> &'static str {
-    if free_pct >= config.pressure.green_min_free_pct {
+/// Map free percentage on a volume of `total_bytes` to a pressure level
+/// string (absolute floors apply, see `floored_free_pct_thresholds`).
+fn pressure_level_str(free_pct: f64, total_bytes: u64, config: &Config) -> &'static str {
+    let [green, yellow, orange, red] = config.pressure.free_pct_thresholds_for(total_bytes);
+    if free_pct >= green {
         "green"
-    } else if free_pct >= config.pressure.yellow_min_free_pct {
+    } else if free_pct >= yellow {
         "yellow"
-    } else if free_pct >= config.pressure.orange_min_free_pct {
+    } else if free_pct >= orange {
         "orange"
-    } else if free_pct >= config.pressure.red_min_free_pct {
+    } else if free_pct >= red {
         "red"
     } else {
         "critical"
@@ -10877,14 +10894,44 @@ fn linux_platform_json(_capacity: &Capacity) -> Value {
     json!({})
 }
 
-fn process_attribution_visibility(platform_name: &str) -> Option<ProcessAttributionVisibility> {
-    process_attribution_visibility_for(platform_name, effective_user_is_root())
+/// What a Linux sbh without root cannot do, and what that costs. Every other
+/// surface describes the refusals as an incomplete scan without saying why.
+const LINUX_UNPRIVILEGED_SCANNER_NOTICE: &str = "scanner reclaim is disabled: sbh is not running as root, so it cannot inspect other users' processes for open or mapped files and refuses every deletion candidate. Ballast release still works. Run the daemon as a system service (`sudo sbh install --systemd --scope system`) to reclaim build artifacts";
+
+/// macOS hides other users' processes from a non-root sbh, so its open-file
+/// check is never complete; candidates it must walk, or that reach
+/// `active_reference_min_size_bytes`, are then refused.
+const MACOS_UNPRIVILEGED_SCANNER_NOTICE: &str = "own-user processes only: sbh is not running as root, so macOS hides other users' processes from its open-file check, which is never complete, and the scanner refuses every candidate it must walk or that is 100 MB or larger (scanner.active_reference_min_size_bytes): almost nothing is reclaimed. Ballast release still works. Run the daemon as a root LaunchDaemon (`sudo sbh install --launchd --scope system`) to reclaim build artifacts";
+
+fn process_attribution_visibility(
+    platform_name: &str,
+    state_file: &Path,
+) -> Option<ProcessAttributionVisibility> {
+    // The question is whether the sbh that reclaims is root, which is the
+    // daemon when one has written state, not this CLI.
+    let is_root = if platform_name.eq_ignore_ascii_case("linux")
+        || platform_name.eq_ignore_ascii_case("macos")
+    {
+        reclaimer_is_root(state_file)
+    } else {
+        effective_user_is_root()
+    };
+    process_attribution_visibility_for(platform_name, is_root)
 }
 
 fn process_attribution_visibility_for(
     platform_name: &str,
     is_root: bool,
 ) -> Option<ProcessAttributionVisibility> {
+    if platform_name.eq_ignore_ascii_case("linux") {
+        // A root sbh reads every process, so there is nothing to report.
+        return (!is_root).then_some(ProcessAttributionVisibility {
+            scope: "own_user_processes",
+            all_processes: false,
+            requires_root_for_all_users: true,
+            detail: LINUX_UNPRIVILEGED_SCANNER_NOTICE,
+        });
+    }
     if !platform_name.eq_ignore_ascii_case("macos") {
         return None;
     }
@@ -10901,7 +10948,7 @@ fn process_attribution_visibility_for(
             scope: "own_user_processes",
             all_processes: false,
             requires_root_for_all_users: true,
-            detail: "own-user processes only; run sbh as a root LaunchDaemon for all-user process I/O attribution",
+            detail: MACOS_UNPRIVILEGED_SCANNER_NOTICE,
         })
     }
 }
@@ -10914,6 +10961,44 @@ fn effective_user_is_root() -> bool {
 #[cfg(not(unix))]
 fn effective_user_is_root() -> bool {
     false
+}
+
+/// Whether the sbh that does the reclaiming runs as root: the daemon that
+/// owns the state file when there is one, otherwise this process.
+#[cfg(unix)]
+fn reclaimer_is_root(state_file: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(state_file).map_or_else(|_| effective_user_is_root(), |meta| meta.uid() == 0)
+}
+
+#[cfg(not(unix))]
+fn reclaimer_is_root(_state_file: &Path) -> bool {
+    false
+}
+
+/// `doctor --system`: an sbh without root reclaims nothing (Linux) or almost
+/// nothing (macOS) by scanning, and no other check or status line says so.
+fn scanner_privilege_doctor_check(platform_name: &str, is_root: bool) -> Option<DoctorCheck> {
+    let service = if platform_name.eq_ignore_ascii_case("linux") {
+        "--systemd"
+    } else if platform_name.eq_ignore_ascii_case("macos") {
+        "--launchd"
+    } else {
+        return None;
+    };
+    let visibility = process_attribution_visibility_for(platform_name, is_root)?;
+    if visibility.all_processes {
+        return None;
+    }
+    Some(doctor_check(
+        "reclaim.privilege",
+        "Scanner reclaim privileges",
+        "FAIL",
+        visibility.detail,
+        Some(format!(
+            "Run `sbh uninstall --scope user`, then `sudo sbh install {service} --scope system`."
+        )),
+    ))
 }
 
 fn process_attribution_visibility_json(visibility: &ProcessAttributionVisibility) -> Value {
@@ -14094,7 +14179,10 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 
     // Check 2.6 (#16): warn when a configured ballast reserve is not actually
     // releasable — the emergency reserve does not exist when it may be needed.
-    let ballast = BallastAvailability::observe(&config.paths.ballast_dir, &config.ballast);
+    let ballast = BallastAvailability::observe(
+        &resolve_configured_pool_alias(&config.paths.ballast_dir),
+        &config.ballast,
+    );
     if output_mode(cli) == OutputMode::Human {
         if ballast.health == BallastHealth::Empty {
             eprintln!(
@@ -20388,8 +20476,75 @@ mod tests {
     }
 
     #[test]
-    fn process_attribution_visibility_is_macos_specific() {
-        assert!(process_attribution_visibility_for("linux", false).is_none());
+    fn linux_without_root_reports_that_the_scanner_reclaims_nothing() {
+        let visibility = process_attribution_visibility_for("linux", false)
+            .expect("an unprivileged Linux sbh must say what it cannot do");
+        let payload = process_attribution_visibility_json(&visibility);
+
+        assert_eq!(payload["scope"], "own_user_processes");
+        assert_eq!(payload["all_processes"], false);
+        assert_eq!(payload["requires_root_for_all_users"], true);
+        for expected in [
+            "scanner reclaim is disabled",
+            "not running as root",
+            "refuses every deletion candidate",
+            "Ballast release still works",
+            "--scope system",
+        ] {
+            assert!(visibility.detail.contains(expected), "{expected}");
+        }
+        assert!(process_attribution_visibility_for("linux", true).is_none());
+    }
+
+    #[test]
+    fn doctor_fails_an_unprivileged_linux_scanner_and_nothing_else() {
+        let check = scanner_privilege_doctor_check("linux", false)
+            .expect("an unprivileged Linux sbh is a doctor finding");
+        assert_eq!(check.id, "reclaim.privilege");
+        assert_eq!(check.status, "FAIL");
+        assert!(check.message.contains("scanner reclaim is disabled"));
+        assert!(
+            check
+                .remediation
+                .is_some_and(|remediation| remediation.contains("--scope system"))
+        );
+        assert!(doctor_checks_have_failures(&[
+            scanner_privilege_doctor_check("linux", false).unwrap()
+        ]));
+        assert!(scanner_privilege_doctor_check("linux", true).is_none());
+        assert!(scanner_privilege_doctor_check("freebsd", false).is_none());
+    }
+
+    #[test]
+    fn macos_without_root_says_the_scanner_reclaims_almost_nothing() {
+        let visibility = process_attribution_visibility_for("macos", false)
+            .expect("an unprivileged macOS sbh must say what it cannot do");
+        for expected in [
+            "not running as root",
+            "other users' processes",
+            "refuses every candidate it must walk",
+            "almost nothing is reclaimed",
+            "Ballast release still works",
+            "sudo sbh install --launchd --scope system",
+        ] {
+            assert!(visibility.detail.contains(expected), "{expected}");
+        }
+        let check = scanner_privilege_doctor_check("macos", false)
+            .expect("an unprivileged macOS sbh is a doctor finding");
+        assert_eq!(check.id, "reclaim.privilege");
+        assert_eq!(check.status, "FAIL");
+        assert!(
+            check
+                .remediation
+                .is_some_and(|remediation| remediation.contains("--launchd --scope system"))
+        );
+        assert!(scanner_privilege_doctor_check("macos", true).is_none());
+    }
+
+    #[test]
+    fn platforms_without_a_visibility_model_report_none() {
+        assert!(process_attribution_visibility_for("freebsd", false).is_none());
+        assert!(process_attribution_visibility_for("freebsd", true).is_none());
     }
 
     fn cli_app_snapshot_settings(assertion: impl FnOnce()) {

@@ -1914,6 +1914,7 @@ fn run_fake_update(tmp: &Path, server: &FakeReleaseServer, release: &FakeRelease
         .args(["--json", "update", "--user", "--version", &release.tag])
         .env("HOME", &home)
         .env("SBH_TEST_MODE", "1")
+        .env_remove("XPC_SERVICE_NAME")
         .env("SBH_RELEASE_API_BASE", &server.base_url)
         .env("SBH_RELEASE_DOWNLOAD_BASE", &server.base_url)
         .output()
@@ -1948,6 +1949,10 @@ fn run_fake_update(tmp: &Path, server: &FakeReleaseServer, release: &FakeRelease
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS updates require the release Developer ID signature, which a fake release cannot carry (the trust check is unit-tested with an injected runner)"
+)]
 fn e2e_update_resolves_every_release_layout_against_a_fake_release_server() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("www");

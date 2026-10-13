@@ -29,6 +29,8 @@ mod inotify_backend;
 use inotify_backend::LinuxInotifyBackend;
 #[cfg(any(target_os = "linux", test))]
 mod watch_planner;
+#[cfg(target_os = "linux")]
+mod watch_rebuild;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EventBackendKind {
@@ -111,6 +113,9 @@ pub struct EventSourceCapability {
     /// is pending, zero means the frontier has not yet been re-enumerated.
     pub frontier_dirs: usize,
     pub dirty_roots: Vec<PathBuf>,
+    /// Configured roots verified absent by their initial metadata lookup.
+    /// They remain configured and are periodically checked for admission.
+    pub absent_roots: Vec<PathBuf>,
     pub reason: String,
     pub fanotify: BackendProbe,
     pub recursive_inotify: BackendProbe,
@@ -124,6 +129,7 @@ impl EventSourceCapability {
             watched_dirs: plan.watched_dirs.len(),
             frontier_dirs: plan.frontier_dirs,
             dirty_roots: plan.dirty_roots.iter().cloned().collect(),
+            absent_roots: plan.absent_roots.iter().cloned().collect(),
             reason: plan.reason.clone(),
             fanotify: fanotify_probe(),
             recursive_inotify: recursive_inotify_probe(plan.backend),
@@ -138,6 +144,8 @@ pub struct EventSourcePlan {
     pub watched_dirs: Vec<PathBuf>,
     pub frontier_dirs: usize,
     pub dirty_roots: BTreeSet<PathBuf>,
+    /// Current absence is separate from incomplete event coverage.
+    pub absent_roots: BTreeSet<PathBuf>,
     pub reason: String,
 }
 
@@ -191,6 +199,7 @@ impl EventSourcePlan {
             watched_dirs: Vec::new(),
             frontier_dirs: 0,
             dirty_roots: root_paths.iter().cloned().collect(),
+            absent_roots: BTreeSet::new(),
             reason: reason.into(),
         }
     }
@@ -211,12 +220,15 @@ impl EventSourcePlan {
         // A directory whose children were never enumerated needs its subtree
         // reconciled, unless a dirty ancestor already covers it.
         for truncated in &enumeration.truncated {
-            if !truncated.ancestors().any(|ancestor| dirty_roots.contains(ancestor)) {
+            if !truncated
+                .ancestors()
+                .any(|ancestor| dirty_roots.contains(ancestor))
+            {
                 dirty_roots.insert(truncated.clone());
             }
         }
 
-        let reason = if !enumeration.reason.is_empty() {
+        let mut reason = if !enumeration.reason.is_empty() {
             enumeration.reason
         } else if !allocation.unwatched_roots.is_empty() {
             "recursive inotify watch budget cannot cover the roots".to_string()
@@ -233,6 +245,12 @@ impl EventSourcePlan {
         } else {
             "recursive inotify plan covers all current directories".to_string()
         };
+        if !enumeration.absent_roots.is_empty() {
+            reason = format!(
+                "{reason}; {} configured roots are absent and periodically rechecked",
+                enumeration.absent_roots.len()
+            );
+        }
 
         Self {
             backend: if allocation.watched.is_empty() {
@@ -244,6 +262,7 @@ impl EventSourcePlan {
             watched_dirs: allocation.watched,
             frontier_dirs: allocation.frontier.len(),
             dirty_roots,
+            absent_roots: enumeration.absent_roots,
             reason,
         }
     }
@@ -378,13 +397,14 @@ struct WatchEnumeration {
     /// rely on reconciliation rather than inferred watch coverage.
     truncated: BTreeSet<PathBuf>,
     unreadable_roots: BTreeSet<PathBuf>,
+    absent_roots: BTreeSet<PathBuf>,
     reason: String,
 }
 
 /// Per-directory EWMA of the filesystem event rate, keyed by the watched
 /// directory an event was delivered on. Bounded by the watch budget because
 /// only watched directories ever receive events.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct EventRateTracker {
     rates: BTreeMap<PathBuf, RateSample>,
     events_since_plan: u64,
@@ -560,7 +580,9 @@ impl EventInvalidation {
     fn deferred_overflow() -> Self {
         let mut invalidation = Self::empty();
         invalidation.generation_bump = true;
-        invalidation.reasons.insert("Overflow (reconciliation deferred)".to_string());
+        invalidation
+            .reasons
+            .insert("Overflow (reconciliation deferred)".to_string());
         invalidation
     }
 
@@ -589,9 +611,21 @@ impl EventInvalidation {
         self.reasons.iter().cloned().collect::<Vec<_>>().join("; ")
     }
 
+    /// Revoke stale replay hints before the daemon selects a pressure batch.
+    /// A normal descendant write need not change an opaque root's mtime, and
+    /// a protection/source marker beside a candidate changes its context.
+    /// Invalidate both explicit paths and resolved reconciliation scopes.
+    /// This never authorizes deletion or changes unaffected generations.
     pub fn apply_to_index(&self, index: &mut ScannerCandidateIndex) {
         if self.requires_index_generation_bump() {
             index.mark_event_overflow();
+        } else {
+            index.invalidate_paths(
+                self.dirty_roots
+                    .iter()
+                    .chain(&self.dirty_paths)
+                    .map(PathBuf::as_path),
+            );
         }
     }
 
@@ -752,7 +786,11 @@ pub struct ScannerEventSource {
     backoff: OverflowBackoff,
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     planned_at: Instant,
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    absent_checked_at: Instant,
     replans: u64,
+    #[cfg(target_os = "linux")]
+    rebuild: Option<watch_rebuild::Rebuild>,
 }
 
 impl ScannerEventSource {
@@ -771,6 +809,16 @@ impl ScannerEventSource {
         let mut capability = EventSourceCapability::from_plan(&plan);
         let mut pending = EventInvalidation::empty();
         pending.mark_plan_gaps(&plan);
+        // A complete plan describes coverage from now on, not events while
+        // the daemon was stopped or while these watches were being installed.
+        // In particular, writes inside an opaque tree need not change its
+        // root metadata. Keep checkpoint hints/backoff, but revoke their old
+        // generation and request bounded reconciliation once at startup.
+        pending.mark_all_roots(
+            config.root_paths(),
+            "BackendRestart (event history unavailable before subscription)",
+            true,
+        );
 
         let backend = match plan.backend {
             EventBackendKind::Fsevents => {
@@ -794,7 +842,8 @@ impl ScannerEventSource {
                             capability.watched_dirs = 0;
                             capability.frontier_dirs = 0;
                             capability.dirty_roots = config.root_paths().to_vec();
-                            capability.recursive_inotify = recursive_inotify_probe(EventBackendKind::ReconciliationOnly);
+                            capability.recursive_inotify =
+                                recursive_inotify_probe(EventBackendKind::ReconciliationOnly);
                             capability.reason = format!("recursive inotify unavailable: {err}");
                             pending.mark_all_roots(
                                 config.root_paths(),
@@ -825,7 +874,10 @@ impl ScannerEventSource {
             rates,
             backoff: OverflowBackoff::default(),
             planned_at: now,
+            absent_checked_at: now,
             replans: 0,
+            #[cfg(target_os = "linux")]
+            rebuild: None,
         }
     }
 
@@ -883,7 +935,8 @@ impl ScannerEventSource {
                     self.capability.complete = false;
                     self.capability.frontier_dirs = 0;
                     self.capability.dirty_roots = self.config.root_paths().to_vec();
-                    self.capability.reason = "recursive inotify coverage changed; timed repair pending".to_string();
+                    self.capability.reason =
+                        "recursive inotify coverage changed; timed repair pending".to_string();
                 }
             }
             EventSourceBackend::ReconciliationOnly => {}
@@ -895,7 +948,13 @@ impl ScannerEventSource {
                 true,
             );
         }
-        if self.should_replan(now) {
+        if self.absent_roots_changed(now) || self.should_replan(now) {
+            // An absent root's first state change revokes the current view
+            // immediately, before an asynchronous replacement can complete.
+            invalidation.merge(std::mem::replace(
+                &mut self.pending,
+                EventInvalidation::empty(),
+            ));
             invalidation.merge(self.replan(now));
         }
         invalidation.resolve_scan_roots(self.config.root_paths());
@@ -921,6 +980,36 @@ impl ScannerEventSource {
         }
     }
 
+    fn absent_roots_changed(&mut self, now: Instant) -> bool {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = now;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.config.mode != ScannerEventSourceMode::ReconciliationOnly
+            && self.config.watch_budget > 0
+            && !self.capability.absent_roots.is_empty()
+            && now.saturating_duration_since(self.absent_checked_at) >= Duration::from_secs(30)
+        {
+            self.absent_checked_at = now;
+            // Continued absence needs only one lookup per previously inspected
+            // root, never recursive enumeration or healthy-watch replacement.
+            // Any other result needs a normal plan: permission/type changes are
+            // not absence, and new roots need reconciliation before admission.
+            if self.capability.absent_roots.iter().any(|root| {
+                !matches!(std::fs::symlink_metadata(root), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            }) {
+                self.capability.complete = false;
+                self.capability.dirty_roots = self.config.root_paths().to_vec();
+                self.pending.mark_all_roots(
+                    self.config.root_paths(),
+                    "previously absent event root changed; reconcile coverage",
+                    true,
+                );
+                return true;
+            }
+        }
+        false
+    }
+
     fn should_replan(&self, now: Instant) -> bool {
         #[cfg(target_os = "macos")]
         {
@@ -933,9 +1022,22 @@ impl ScannerEventSource {
         }
         #[cfg(target_os = "linux")]
         {
+            // Poll an admitted job on every drain; this is nonblocking and
+            // must not wait another repair interval to consume ready coverage.
+            if self.rebuild.is_some() {
+                return true;
+            }
             if self.config.mode == ScannerEventSourceMode::ReconciliationOnly
                 || self.config.watch_budget == 0
                 || self.config.root_paths().is_empty()
+            {
+                return false;
+            }
+            // With no present roots there is no backend to repair. The cheap
+            // absence audit discovers creation without repeated rebuilds.
+            if self.capability.complete
+                && self.capability.watched_dirs == 0
+                && !self.capability.absent_roots.is_empty()
             {
                 return false;
             }
@@ -975,56 +1077,12 @@ impl ScannerEventSource {
         invalidation
     }
 
-    /// Re-enumerate and replace the watch instance. Directory names alone
-    /// cannot establish that an existing watch still names the current inode.
-    /// The old queue may contain events not drained during installation, so
-    /// every replacement explicitly revokes index evidence and reconciles roots.
+    /// Rebuild off-thread while the current instance continues draining.
+    /// Handoff revokes index evidence and reconciles the installation gap;
+    /// a failed rebuild retains old watches and retries on the repair cadence.
     #[cfg(target_os = "linux")]
     fn replan(&mut self, now: Instant) -> EventInvalidation {
-        let plan = EventSourcePlan::with_rates(&self.config, &self.rates, now);
-        let mut invalidation = EventInvalidation::empty();
-        self.planned_at = now;
-        self.replans = self.replans.saturating_add(1);
-
-        if plan.backend != EventBackendKind::RecursiveInotify {
-            self.backend = EventSourceBackend::ReconciliationOnly;
-            self.capability = EventSourceCapability::from_plan(&plan);
-            self.rates.retain_watched(&[]);
-            invalidation.mark_all_roots(self.config.root_paths(), plan.reason, true);
-            return invalidation;
-        }
-        match LinuxInotifyBackend::start(&plan.watched_dirs, self.config.watch_budget) {
-            Ok(backend) => {
-                self.backend = EventSourceBackend::RecursiveInotify(backend);
-                self.rates.retain_watched(&plan.watched_dirs);
-                self.capability = EventSourceCapability::from_plan(&plan);
-                invalidation.mark_all_roots(
-                    self.config.root_paths(),
-                    "recursive inotify watch coverage rebuilt",
-                    true,
-                );
-            }
-            Err(err) => {
-                // Keep the previous backend's remaining live watches. Its
-                // coverage is unknown even if the planned pathname set matched.
-                if let EventSourceBackend::RecursiveInotify(backend) = &mut self.backend {
-                    backend.require_repair();
-                    self.capability.watched_dirs = backend.watched_dirs().count();
-                } else {
-                    self.capability.watched_dirs = 0;
-                }
-                self.capability.complete = false;
-                self.capability.frontier_dirs = 0;
-                self.capability.dirty_roots = self.config.root_paths().to_vec();
-                self.capability.reason = format!("recursive inotify replan failed: {err}");
-                invalidation.mark_all_roots(
-                    self.config.root_paths(),
-                    self.capability.reason.clone(),
-                    true,
-                );
-            }
-        }
-        invalidation
+        watch_rebuild::poll_or_start(self, now)
     }
 }
 
@@ -1110,7 +1168,131 @@ fn recursive_inotify_probe(selected_backend: EventBackendKind) -> BackendProbe {
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn absent_root_recovers_real_events_without_replacing_healthy_watches() {
+        #[cfg(target_os = "linux")]
+        let _serial = watch_rebuild::test_serial();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let healthy = retained.join("healthy");
+        let later = retained.join("later");
+        fs::create_dir(&healthy).unwrap();
+        let roots = vec![healthy.clone(), later.clone()];
+        let t0 = Instant::now();
+        let mut source = ScannerEventSource::start_at(event_config(&roots, 16), t0);
+        assert!(source.capability().complete);
+        assert!(!source.capability().dirty_roots.contains(&later));
+        assert_eq!(source.capability().watched_dirs, 1);
+        let startup = source.drain_at(t0);
+        assert!(startup.requires_index_generation_bump());
+        for seconds in [29, 30, 59] {
+            let quiet = source.drain_at(t0 + Duration::from_secs(seconds));
+            assert!(!quiet.requires_reconciliation(), "{seconds}: {quiet:?}");
+            assert!(source.capability().complete);
+            assert_eq!(
+                source.stats().replans,
+                0,
+                "continued absence must retain healthy watches"
+            );
+        }
+
+        fs::create_dir(&later).unwrap();
+        let admitted_at = t0 + Duration::from_secs(60);
+        let appeared = source.drain_at(admitted_at);
+        assert!(appeared.requires_index_generation_bump());
+        assert!(appeared.dirty_roots().contains(&later));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                !source.capability().complete,
+                "new coverage is not installed yet"
+            );
+            let handoff = watch_rebuild::finish_rebuild(&mut source, admitted_at);
+            assert!(handoff.requires_index_generation_bump());
+        }
+        assert!(source.capability().complete);
+        assert!(source.capability().dirty_roots.is_empty());
+        assert_eq!(source.capability().watched_dirs, 2);
+
+        let old_canary = healthy.join("retained-canary");
+        let new_canary = later.join("new-canary");
+        fs::write(&old_canary, b"old root remains covered").unwrap();
+        fs::write(&new_canary, b"new root events are observable").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut events = EventInvalidation::empty();
+        while Instant::now() < deadline {
+            events.merge(source.drain_at(admitted_at + Duration::from_secs(1)));
+            if events.dirty_paths().contains(&old_canary)
+                && events.dirty_paths().contains(&new_canary)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(events.dirty_paths().contains(&old_canary), "{events:?}");
+        assert!(events.dirty_paths().contains(&new_canary), "{events:?}");
+        assert_eq!(fs::read(old_canary).unwrap(), b"old root remains covered");
+        assert_eq!(
+            fs::read(new_canary).unwrap(),
+            b"new root events are observable"
+        );
+    }
+
     #[cfg(target_os = "linux")]
+    #[test]
+    fn all_absent_roots_wait_cheaply_then_recover_without_overriding_opt_out() {
+        let _serial = watch_rebuild::test_serial();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let root = retained.join("later");
+        let t0 = Instant::now();
+        let config = event_config(std::slice::from_ref(&root), 4);
+        let mut source = ScannerEventSource::start_at(config.clone(), t0);
+        assert!(source.capability().complete);
+        assert_eq!(
+            source.capability().selected_backend,
+            EventBackendKind::ReconciliationOnly
+        );
+        source.drain_at(t0);
+        for seconds in [30, 60] {
+            assert!(
+                !source
+                    .drain_at(t0 + Duration::from_secs(seconds))
+                    .requires_reconciliation()
+            );
+            assert_eq!(source.stats().replans, 0);
+        }
+        fs::create_dir(&root).unwrap();
+        let later = t0 + Duration::from_secs(90);
+        assert!(source.drain_at(later).requires_index_generation_bump());
+        watch_rebuild::finish_rebuild(&mut source, later);
+        assert_eq!(
+            source.capability().selected_backend,
+            EventBackendKind::RecursiveInotify
+        );
+        assert!(source.capability().complete);
+        for disabled in [
+            EventSourceConfig {
+                mode: ScannerEventSourceMode::ReconciliationOnly,
+                ..config.clone()
+            },
+            EventSourceConfig {
+                watch_budget: 0,
+                ..config
+            },
+        ] {
+            let mut source = ScannerEventSource::start_at(disabled, t0);
+            source.drain_at(t0);
+            assert!(!source.drain_at(later).requires_reconciliation());
+            assert_eq!(source.stats().replans, 0);
+            assert_eq!(
+                source.capability().selected_backend,
+                EventBackendKind::ReconciliationOnly
+            );
+            assert!(!source.capability().complete);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn event_config(root_paths: &[PathBuf], watch_budget: usize) -> EventSourceConfig {
         let scanner_config = ScannerConfig {
             event_watch_budget: watch_budget,
@@ -1385,7 +1567,7 @@ mod tests {
 
             // A depth-2+ directory is never watched while a mandatory one is not.
             let optional_watched = candidates.iter().any(|c| c.depth > 1 && watched.contains(c.path.as_path()));
-            let mandatory_unwatched = mandatory.iter().any(|c| !watched.contains(c.path.as_path()));
+            let mandatory_unwatched = mandatory.iter().any(|c| c.depth <= 1 && !watched.contains(c.path.as_path()));
             proptest::prop_assert!(!(optional_watched && mandatory_unwatched));
 
             // Coverage: every unwatched directory is under a frontier entry or an unwatched root.
@@ -1639,6 +1821,7 @@ mod tests {
     fn linux_replan_moves_watches_to_the_hot_frontier() {
         use std::thread;
 
+        let _rebuild_guard = watch_rebuild::test_serial();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         let a = root.join("a");
@@ -1659,8 +1842,11 @@ mod tests {
         let startup = source.drain_at(t0);
         assert_eq!(source.capability().watched_dirs, 3);
         assert_eq!(source.capability().frontier_dirs, 1);
-        assert!(startup.dirty_roots().contains(&x), "{startup:?}");
-        assert!(!startup.dirty_roots().contains(&root), "{startup:?}");
+        assert!(source.capability().dirty_roots.contains(&x));
+        // The frontier is still x, but startup must also reconcile the
+        // pre-subscription history gap covering the entire configured root.
+        assert!(startup.dirty_roots().contains(&root), "{startup:?}");
+        assert!(startup.requires_index_generation_bump());
 
         // A directory created under a watched one when the budget is spent is
         // reconciled locally, but missing descendant coverage revokes replay.
@@ -1701,7 +1887,8 @@ mod tests {
         // elapse. Repair no longer requires any additional observed event.
         set_dir_mtime(&x, SystemTime::now());
         let later = t0 + WATCH_REPLAN_INTERVAL + Duration::from_secs(1);
-        let replanned = source.drain_at(later);
+        let mut replanned = source.drain_at(later);
+        replanned.merge(watch_rebuild::finish_rebuild(&mut source, later));
         assert_eq!(source.stats().replans, 1, "{:?}", source.stats());
         assert_eq!(source.capability().watched_dirs, 3);
         assert_eq!(source.capability().frontier_dirs, 2);
@@ -1782,5 +1969,216 @@ mod tests {
                 capability.reason
             );
         }
+    }
+
+    fn replay_fixture(
+        root: &Path,
+    ) -> (
+        ScannerCandidateIndex,
+        crate::scanner::index::CandidateIndexRecord,
+    ) {
+        use crate::scanner::index::{
+            CandidateIndexRecord, CandidateSafetyState, IndexedEntryKind, IndexedIdentity,
+            IndexedPruneDecision, ScannerIndexContext,
+        };
+        let mut index = ScannerCandidateIndex::new(ScannerIndexContext {
+            root_fingerprint: "event-roots".to_string(),
+            config_fingerprint: "event-config".to_string(),
+        });
+        let candidate = CandidateIndexRecord {
+            path: root.join("proj/target"),
+            identity: IndexedIdentity {
+                device_id: 7,
+                inode: 1,
+                kind: IndexedEntryKind::Directory,
+            },
+            parent_identity: None,
+            parent_mtime_nanos: None,
+            candidate_mtime_nanos: 200,
+            candidate_ctime_nanos: Some(300),
+            size_estimate_bytes: 8 * 1024 * 1024 * 1024,
+            prune_decision: IndexedPruneDecision::CandidateOpaque,
+            score: Some(0.99),
+            safety_state: CandidateSafetyState::Safe,
+            fail_count: 0,
+            cooldown_until_nanos: None,
+            event_generation: 0,
+            structural_signals: crate::scanner::patterns::StructuralSignals::default(),
+        };
+        index.upsert(candidate.clone());
+        let mut other = candidate.clone();
+        other.path = root.join("proj-other/target");
+        other.identity.inode = 2;
+        other.score = Some(0.8);
+        index.upsert(other);
+        (index, candidate)
+    }
+
+    #[test]
+    fn ordinary_events_revoke_opaque_hints_even_before_scan_scope_resolution() {
+        let root = PathBuf::from("/tmp/root");
+        let tracker = DirtyRootTracker::new(std::slice::from_ref(&root));
+        for kind in [
+            FsEventKind::Create,
+            FsEventKind::Modify,
+            FsEventKind::Remove,
+            FsEventKind::Rename,
+        ] {
+            let (mut index, candidate) = replay_fixture(&root);
+            assert_eq!(
+                index.ranked_records(SystemTime::UNIX_EPOCH, 1)[0].path,
+                candidate.path
+            );
+            let invalidation = tracker.apply_event(FsEvent {
+                kind,
+                path: Some(candidate.path.join("debug/deps/changed.o")),
+            });
+            assert!(!invalidation.requires_index_generation_bump());
+            assert!(invalidation.dirty_roots().is_empty());
+            invalidation.apply_to_index(&mut index);
+            let ranked = index.ranked_records(SystemTime::UNIX_EPOCH, 1);
+            assert_eq!(ranked.len(), 1);
+            assert_eq!(ranked[0].path, root.join("proj-other/target"));
+            assert_eq!(index.get(candidate.identity).unwrap().score, None);
+            assert_eq!(index.event_generation(), 0);
+        }
+    }
+
+    #[test]
+    fn resolved_context_changes_revoke_project_hints_not_neighboring_projects() {
+        let root = PathBuf::from("/tmp/root");
+        let roots = vec![root.clone()];
+        let tracker = DirtyRootTracker::new(&roots);
+        for marker in [".sbh-protect", ".git", "Cargo.toml"] {
+            let (mut index, candidate) = replay_fixture(&root);
+            // This is beside, not inside, target: direct path overlap alone
+            // misses the changed protection/source context of the candidate.
+            let mut invalidation = tracker.apply_event(FsEvent {
+                kind: FsEventKind::Create,
+                path: Some(root.join("proj").join(marker)),
+            });
+            invalidation.resolve_scan_roots(&roots);
+            assert!(invalidation.dirty_roots().contains(&root.join("proj")));
+            invalidation.apply_to_index(&mut index);
+            assert_eq!(index.event_generation(), 0);
+            assert_eq!(index.get(candidate.identity).unwrap().score, None);
+            let ranked = index.ranked_records(SystemTime::UNIX_EPOCH, usize::MAX);
+            assert_eq!(ranked.len(), 1);
+            assert_eq!(ranked[0].path, root.join("proj-other/target"));
+        }
+    }
+
+    #[test]
+    fn frontier_only_invalidation_revokes_hints_without_an_explicit_path_event() {
+        let root = PathBuf::from("/tmp/root");
+        let tracker = DirtyRootTracker::new(std::slice::from_ref(&root));
+        let (mut index, candidate) = replay_fixture(&root);
+        let invalidation = tracker.apply_event(FsEvent {
+            kind: FsEventKind::WatchBudgetExceeded,
+            path: Some(root.join("proj")),
+        });
+        assert!(invalidation.dirty_paths().is_empty());
+        assert!(!invalidation.requires_index_generation_bump());
+        invalidation.apply_to_index(&mut index);
+        assert_eq!(index.get(candidate.identity).unwrap().score, None);
+        assert_eq!(
+            index
+                .ranked_records(SystemTime::UNIX_EPOCH, usize::MAX)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn quiet_drain_preserves_hints_but_deferred_overflow_revokes_every_project() {
+        let root = PathBuf::from("/tmp/root");
+        let (mut index, candidate) = replay_fixture(&root);
+        EventInvalidation::empty().apply_to_index(&mut index);
+        assert_eq!(index.get(candidate.identity), Some(&candidate));
+        assert_eq!(
+            index
+                .ranked_records(SystemTime::UNIX_EPOCH, usize::MAX)
+                .len(),
+            2
+        );
+        let deferred = EventInvalidation::deferred_overflow();
+        assert!(!deferred.requires_reconciliation());
+        deferred.apply_to_index(&mut index);
+        assert_eq!(index.event_generation(), 1);
+        assert!(
+            index
+                .ranked_records(SystemTime::UNIX_EPOCH, usize::MAX)
+                .is_empty()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_startup_revokes_checkpoint_evidence_changed_while_offline() {
+        use crate::scanner::index::ScannerIndexLoadStatus;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("proj/target/debug")).unwrap();
+        fs::create_dir_all(root.join("proj-other/target")).unwrap();
+        let object = root.join("proj/target/debug/object.o");
+        fs::write(&object, b"old").unwrap();
+        let (index, candidate) = replay_fixture(&root);
+        let checkpoint = temp.path().join("scanner-index.json");
+        index.save_checkpoint(&checkpoint).unwrap();
+        let before = fs::metadata(&candidate.path).unwrap().modified().unwrap();
+        // No event source is alive here. A complete subscription installed
+        // afterwards cannot retroactively observe this descendant write.
+        fs::write(&object, b"rebuilt while the daemon was stopped").unwrap();
+        assert_eq!(
+            fs::metadata(&candidate.path).unwrap().modified().unwrap(),
+            before
+        );
+        let (mut loaded, status) =
+            ScannerCandidateIndex::load_checkpoint(&checkpoint, index.context().clone());
+        assert_eq!(status, ScannerIndexLoadStatus::Loaded);
+        assert_eq!(
+            loaded
+                .ranked_records(SystemTime::UNIX_EPOCH, usize::MAX)
+                .len(),
+            2
+        );
+        let t0 = Instant::now();
+        let mut source =
+            ScannerEventSource::start_at(event_config(std::slice::from_ref(&root), 16), t0);
+        assert_eq!(
+            source.capability().selected_backend,
+            EventBackendKind::RecursiveInotify
+        );
+        assert!(source.capability().complete);
+        let startup = source.drain_at(t0);
+        assert!(startup.dirty_roots().contains(&root));
+        assert!(startup.requires_index_generation_bump());
+        assert!(startup.reason_summary().contains("BackendRestart"));
+        startup.apply_to_index(&mut loaded);
+        assert!(
+            loaded
+                .ranked_records(SystemTime::UNIX_EPOCH, usize::MAX)
+                .is_empty()
+        );
+        assert_eq!(
+            loaded.len(),
+            2,
+            "keep discovery hints and backoff, not old replay authority"
+        );
+        // Startup revocation is consumed once. A quiet steady-state poll
+        // does not invalidate newly reconciled candidates all over again.
+        loaded.upsert(candidate.clone());
+        let quiet = source.drain_at(t0 + Duration::from_secs(1));
+        assert!(!quiet.requires_reconciliation());
+        assert!(!quiet.requires_index_generation_bump());
+        quiet.apply_to_index(&mut loaded);
+        assert_eq!(
+            loaded.ranked_records(SystemTime::UNIX_EPOCH, 1)[0].identity,
+            candidate.identity
+        );
+        assert_eq!(
+            fs::read(&object).unwrap(),
+            b"rebuilt while the daemon was stopped"
+        );
     }
 }

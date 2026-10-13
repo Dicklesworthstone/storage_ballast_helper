@@ -36,7 +36,8 @@ use crate::platform::sacred_catalog::cross_platform_sacred_paths;
 use crate::platform::types::SacredPath;
 use crate::scanner::active_lease;
 use crate::scanner::patterns::{
-    ArtifactCategory, ArtifactClassification, StructuralSignals, is_obvious_build_artifact_basename,
+    ArtifactCategory, ArtifactClassification, StructuralSignals,
+    is_obvious_build_artifact_basename_given,
 };
 use crate::scanner::protection::{self, StowawayScanConfig};
 use crate::scanner::quarantine::{self, QuarantineStore, QuarantineUnavailable};
@@ -467,6 +468,9 @@ pub enum SkipReason {
     /// Open file or process scan could not complete within the 5s deadline or
     /// 50,000 PID cap; the executor fails conservative (bd-rc-master-ajg1.10.2).
     OpenScanIncomplete,
+    /// The category's live regret guard currently suspends deletion. This
+    /// transient category decision must not create a per-path backoff.
+    CategorySuspended,
 }
 
 impl SkipReason {
@@ -476,7 +480,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -495,6 +499,7 @@ impl SkipReason {
         Self::SacredStowaway,
         Self::FilesystemReadOnly,
         Self::OpenScanIncomplete,
+        Self::CategorySuspended,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -527,6 +532,7 @@ impl SkipReason {
             Self::SacredStowaway => "sacred_stowaway",
             Self::FilesystemReadOnly => "filesystem_read_only",
             Self::OpenScanIncomplete => "open_scan_incomplete",
+            Self::CategorySuspended => "category_suspended",
         }
     }
 
@@ -565,9 +571,10 @@ impl SkipReason {
                  the daemon pauses deletions on it until a probe write succeeds"
             }
             Self::OpenScanIncomplete => {
-                "open file or process scan incomplete due to system load (deadline/budget exceeded) — \
-                 aborted batch for safety"
+                "open file or process scan incomplete (scan budget exceeded, or other users' \
+                 processes cannot be inspected without root) — aborted batch for safety"
             }
+            Self::CategorySuspended => "category deletion temporarily suspended after regrets",
         }
     }
 }
@@ -602,8 +609,8 @@ pub fn error_recovery_cause(error: &SbhError) -> Option<RecoveryCause> {
 }
 
 /// Whether a skipped candidate earns a per-path repeat-deletion backoff. A
-/// read-only filesystem is a mount incident handled by mount recovery, not a
-/// fault of the path, so it gets none.
+/// read-only filesystem is a mount incident handled by mount recovery, and a
+/// category suspension is transient feedback, so neither penalizes the path.
 fn should_backoff_skip(reason: SkipReason) -> bool {
     !matches!(
         reason,
@@ -611,6 +618,7 @@ fn should_backoff_skip(reason: SkipReason) -> bool {
             | SkipReason::BelowThreshold
             | SkipReason::UserDeclined
             | SkipReason::FilesystemReadOnly
+            | SkipReason::CategorySuspended
     )
 }
 
@@ -630,11 +638,44 @@ pub enum CheckedDeletion {
 
 // ──────────────────── executor ────────────────────
 
+type AuthorizationCheck<'a> = &'a dyn Fn(&CandidacyScore) -> std::result::Result<(), SkipReason>;
+type UnlinkObserver<'a> = &'a dyn Fn(&CandidacyScore, Instant);
+
 /// The deletion executor: takes scored candidates and deletes them safely.
 pub struct DeletionExecutor {
     config: DeletionConfig,
     logger: Option<ActivityLoggerHandle>,
     platform: Option<Arc<dyn Platform>>,
+}
+
+/// Activity-log code for a deletion batch aborted because the open-file or
+/// process scan was incomplete. It used to be logged as SBH-3003, which the
+/// error catalog gives to a closed daemon channel.
+const INCOMPLETE_SCAN_CODE: &str = "SBH-3005";
+
+/// The aborted-batch event, naming the cause. Without root the scan cannot
+/// read other users' processes, so it is incomplete on every pass; with root
+/// it ran into one of its limits or an unreadable process.
+fn incomplete_scan_event(without_root: bool) -> ActivityEvent {
+    let cause = if without_root {
+        "other users' processes cannot be inspected without root"
+    } else {
+        "the scan could not read every process within its limits"
+    };
+    ActivityEvent::Error {
+        code: INCOMPLETE_SCAN_CODE.to_string(),
+        message: format!("open file scan incomplete ({cause}) - aborting batch for safety"),
+    }
+}
+
+#[cfg(unix)]
+fn scans_without_root() -> bool {
+    !nix::unistd::Uid::effective().is_root()
+}
+
+#[cfg(not(unix))]
+fn scans_without_root() -> bool {
+    false
 }
 
 impl DeletionExecutor {
@@ -709,11 +750,46 @@ impl DeletionExecutor {
     ///
     /// Returns a report summarizing what was deleted, skipped, or failed.
     /// If `should_skip` returns `true` for a candidate path, it is skipped.
-    #[allow(clippy::too_many_lines)]
     pub fn execute(
         &self,
         plan: &DeletionPlan,
         should_skip: Option<&dyn Fn(&Path) -> bool>,
+    ) -> DeletionReport {
+        self.execute_with_guard(plan, should_skip, None)
+    }
+
+    /// Execute with a live per-candidate authorization check. The guard runs
+    /// after expensive preflight and free-space observations, before either
+    /// mutation backend or dry-run admission. It may refuse an otherwise
+    /// eligible candidate, but cannot override any earlier safety veto.
+    ///
+    /// A refusal is a typed skip, never a failed deletion or reclaimed bytes.
+    /// Mutation backends retain their final lease and filesystem identity
+    /// checks after authorization; an already-started removal is not cancelled.
+    pub fn execute_with_guard(
+        &self,
+        plan: &DeletionPlan,
+        should_skip: Option<&dyn Fn(&Path) -> bool>,
+        authorize: Option<AuthorizationCheck<'_>>,
+    ) -> DeletionReport {
+        self.execute_with_hooks(plan, should_skip, authorize, None)
+    }
+
+    /// Execute with live authorization and an immediate unlink observer.
+    /// `on_unlinked` receives each successful permanent removal and the
+    /// monotonic time its backend completed, before post-delete free-space
+    /// observation, logging, or work on the next candidate. This lets a
+    /// caller watch early removals while a long batch is still running.
+    ///
+    /// Dry-runs, quarantines, refusals, and failed removals never notify the
+    /// observer. It cannot change whether a completed removal succeeded.
+    #[allow(clippy::too_many_lines)]
+    pub fn execute_with_hooks(
+        &self,
+        plan: &DeletionPlan,
+        should_skip: Option<&dyn Fn(&Path) -> bool>,
+        authorize: Option<AuthorizationCheck<'_>>,
+        on_unlinked: Option<UnlinkObserver<'_>>,
     ) -> DeletionReport {
         let start = Instant::now();
         let mut report = DeletionReport {
@@ -783,12 +859,7 @@ impl DeletionExecutor {
             );
 
             if !complete {
-                self.log_event(ActivityEvent::Error {
-                    code: "SBH-3003".to_string(),
-                    message:
-                        "open file scan incomplete due to system load - aborting batch for safety"
-                            .to_string(),
-                });
+                self.log_event(incomplete_scan_event(scans_without_root()));
                 // Fail safe: abort the entire batch because we cannot guarantee
                 // that any candidate is safe to delete. Every candidate is a
                 // skip, not a failure, and is not backed off: the missing
@@ -882,6 +953,23 @@ impl DeletionExecutor {
                 }
             }
 
+            // Measure space before the live guard: an observation on a slow
+            // filesystem must not leave authorization stale before mutation.
+            let del_start = Instant::now();
+            let free_before = (!self.config.dry_run && plan.mode == DeletionMode::Unlink)
+                .then(|| available_bytes_beside(&candidate.path))
+                .flatten();
+            if let Some(authorize) = authorize
+                && let Err(reason) = authorize(candidate)
+            {
+                report.record_skip(reason);
+                consecutive_failures = 0;
+                if should_backoff_skip(reason) {
+                    report.backoff_candidates.push(candidate.clone());
+                }
+                continue;
+            }
+
             if self.config.dry_run {
                 report.items_would_delete += 1;
                 report.bytes_would_free =
@@ -892,18 +980,18 @@ impl DeletionExecutor {
 
             // Actual deletion, or quarantine (Layer 7). Quarantine has no
             // successful-unlink outcome: failure cannot widen this plan.
-            let del_start = Instant::now();
-            let free_before = (plan.mode == DeletionMode::Unlink)
-                .then(|| available_bytes_beside(&candidate.path))
-                .flatten();
             let outcome = match plan.mode {
                 DeletionMode::Unlink => self.delete_path(candidate).map(|()| false),
                 DeletionMode::Quarantine => self.quarantine_path(candidate).map(|()| true),
             };
+            let completed_at = Instant::now();
             match outcome {
                 Ok(quarantined) => {
+                    if !quarantined && let Some(on_unlinked) = on_unlinked {
+                        on_unlinked(candidate, completed_at);
+                    }
                     #[allow(clippy::cast_possible_truncation)]
-                    let duration_ms = del_start.elapsed().as_millis() as u64;
+                    let duration_ms = completed_at.duration_since(del_start).as_millis() as u64;
                     report.items_deleted += 1;
                     report.deleted_paths.push(candidate.path.clone());
                     if quarantined {
@@ -1078,7 +1166,7 @@ impl DeletionExecutor {
         }
 
         // 3. Scanner-observed identity must still refer to this same entry.
-        self.verify_candidate_identity(candidate)?;
+        self.verify_candidate_identity(candidate, &meta)?;
 
         // 4. Parent directory is writable (effective permission for this
         //    process). A read-only filesystem is classified apart from a
@@ -1156,6 +1244,7 @@ impl DeletionExecutor {
     fn verify_candidate_identity(
         &self,
         candidate: &CandidacyScore,
+        metadata: &fs::Metadata,
     ) -> std::result::Result<(), SkipReason> {
         let Some(expected) = candidate.identity else {
             return if self.config.require_identity {
@@ -1168,8 +1257,7 @@ impl DeletionExecutor {
             return Err(SkipReason::IdentityUnavailable);
         }
 
-        let current =
-            walker::identity_for_path(&candidate.path, false).map_err(|_| SkipReason::PathGone)?;
+        let current = walker::entry_metadata(metadata).identity();
         if !identity_is_supported(current) {
             return Err(SkipReason::IdentityUnavailable);
         }
@@ -1206,7 +1294,7 @@ impl DeletionExecutor {
                 details: format!("path became a symlink before deletion: {}", path.display()),
             });
         }
-        self.verify_candidate_identity(candidate)
+        self.verify_candidate_identity(candidate, &meta)
             .map_err(|skip| SbhError::Runtime {
                 details: format!(
                     "path identity changed before deletion: {} ({skip:?})",
@@ -1220,22 +1308,16 @@ impl DeletionExecutor {
         let path = &candidate.path;
         let meta = self.recheck_before_mutation(candidate)?;
 
-        if meta.is_dir() {
-            // Read-only regenerable caches (Go GOCACHE/GOMODCACHE, cargo
-            // registry/git caches) are written 0555/0444 by their toolchains,
-            // which makes a plain `remove_dir_all` fail partway with EACCES and
-            // leave the disk space behind. For those — and only those — defeat
-            // the read-only bits within the (already preflight-approved)
-            // subtree. Every other candidate uses conservative removal, where a
-            // read-only directory acts as a natural brake.
-            if classification_allows_force_remove(&candidate.classification) {
-                remove_dir_all_force(path).map_err(|e| SbhError::io(path, e))?;
-            } else {
-                fs::remove_dir_all(path).map_err(|e| SbhError::io(path, e))?;
-            }
-        } else {
-            fs::remove_file(path).map_err(|e| SbhError::io(path, e))?;
-        }
+        // Reuse the confined quarantine traversal without creating a store or
+        // recovery record: emergency removal must work at ENOSPC. The exact
+        // metadata checked above remains the expected root identity. Only
+        // recognized regenerable caches may widen directory permissions.
+        quarantine::remove_direct(
+            path,
+            &meta,
+            classification_allows_force_remove(&candidate.classification),
+        )
+        .map_err(|e| SbhError::io(path, e))?;
 
         // Post-deletion verification (symlink_metadata to avoid following dangling symlinks).
         if fs::symlink_metadata(path).is_ok() {
@@ -1462,74 +1544,6 @@ fn available_bytes_beside(path: &Path) -> Option<u64> {
     Some(blocks.saturating_mul(fragment))
 }
 
-/// `fs::remove_dir_all` that defeats read-only directory/file permission bits.
-///
-/// Standard `remove_dir_all` cannot unlink an entry inside a `0555` directory —
-/// removing a child requires *write* permission on the parent directory — so on
-/// a Go module cache (every module dir `0555`) it fails partway with `EACCES`
-/// and leaves the tree, and its disk space, behind. We try the fast path first;
-/// only on a permission error do we walk the subtree granting `u+rwx` to
-/// directories (and `u+w` to files) and retry. Permission widening is confined
-/// to the candidate subtree the executor already approved for deletion, and the
-/// walk never follows symlinks, so it can never affect paths outside it.
-fn remove_dir_all_force(path: &Path) -> std::io::Result<()> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            chmod_tree_writable(path);
-            fs::remove_dir_all(path)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Recursively grant the owner the traversal/write permission needed to remove
-/// a subtree. Best-effort: individual `set_permissions` failures are ignored so
-/// one odd entry can't abort the whole reclaim — the subsequent
-/// `remove_dir_all` is the real success/failure signal. Operates on
-/// `symlink_metadata` and never recurses through a symlink, so it cannot chmod
-/// anything outside the subtree.
-#[cfg(unix)]
-fn chmod_tree_writable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return;
-    };
-    let file_type = meta.file_type();
-    if file_type.is_symlink() {
-        return;
-    }
-    let mode = meta.permissions().mode();
-    if file_type.is_dir() {
-        // u+rwx so we can list, traverse, and unlink children. Chmod before
-        // descending so a `0000`/`0555` dir becomes readable for `read_dir`.
-        if mode & 0o700 != 0o700 {
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700));
-        }
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                chmod_tree_writable(&entry.path());
-            }
-        }
-    } else if mode & 0o200 == 0 {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o200));
-    }
-}
-
-/// Non-Unix fallback: clear the read-only attribute on the directory itself.
-#[cfg(not(unix))]
-fn chmod_tree_writable(path: &Path) {
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        let mut perms = meta.permissions();
-        if perms.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(path, perms);
-        }
-    }
-}
-
 /// Shallow recursive check for `.git` directories within `path`.
 ///
 /// Walks at most `max_depth` levels to catch nested git repositories
@@ -1612,27 +1626,29 @@ fn contains_tracked_git_content(path: &Path) -> bool {
         let euid = nix::unistd::geteuid().as_raw();
         #[cfg(not(unix))]
         let euid = u32::MAX;
+        // Match the path literally but without regard to case. On a
+        // case-insensitive volume (macOS APFS by default) a tracked `Build/`
+        // renamed on disk to `build/` is still tracked as far as Git is
+        // concerned, yet a case-sensitive query would call it unmatched. On a
+        // case-sensitive volume this can keep an untracked `build/` beside a
+        // tracked `Build/`, which errs toward keeping.
+        let mut pathspec = std::ffi::OsString::from(":(literal,icase)");
+        pathspec.push(relative);
         let mut git = std::process::Command::new("git");
-        git.args([
-            "--no-optional-locks",
-            "--literal-pathspecs",
-            "-c",
-            "core.fsmonitor=false",
-            "-C",
-        ])
-        .arg(root)
-        .args(["ls-files", "--cached", "--error-unmatch", "--"])
-        .arg(relative)
-        // Nothing from the daemon's environment reaches Git.
-        .env_clear()
-        .env("PATH", git_query_path(euid == 0))
-        .env("HOME", "/nonexistent")
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
+        git.args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-C"])
+            .arg(root)
+            .args(["ls-files", "--cached", "--error-unmatch", "--"])
+            .arg(pathspec)
+            // Nothing from the daemon's environment reaches Git.
+            .env_clear()
+            .env("PATH", git_query_path(euid == 0))
+            .env("HOME", "/nonexistent")
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
         // If `root/.git` cannot be validated, Git must not fall back to an
         // enclosing repository and answer "untracked" for this one.
         if let Some(parent) = root.parent() {
@@ -1803,6 +1819,13 @@ fn git_dir_owner(dot_git: &Path, marker: &fs::Metadata) -> Option<u32> {
 /// (`C:\Users\...`) are not currently covered — sbh's target deployments
 /// are Linux and macOS only.
 pub(crate) fn is_hardcoded_source_tree(path: &Path) -> bool {
+    is_hardcoded_source_tree_given(path, false)
+}
+
+/// [`is_hardcoded_source_tree`] for the scorer, which holds the walker's
+/// structural signals: `cargo_evidence` corroborates a suffix-only artifact
+/// name (`<x>-target`, `<x>_target`) without another read of its root.
+pub(crate) fn is_hardcoded_source_tree_given(path: &Path, cargo_evidence: bool) -> bool {
     let s = path.to_string_lossy();
 
     // Determine whether the candidate sits under a protected source-tree root.
@@ -1820,7 +1843,7 @@ pub(crate) fn is_hardcoded_source_tree(path: &Path) -> bool {
         // inside operator-configured source roots. Arbitrary unknown
         // basenames (e.g., `src`, `docs`, or a misclassified crate name)
         // stay vetoed — that's the carnage-prevention guarantee.
-        if !is_obvious_build_artifact_basename(path) {
+        if !is_obvious_build_artifact_basename_given(path, cargo_evidence) {
             return true;
         }
     }
@@ -1985,6 +2008,7 @@ fn factors_to_record(f: &ScoreFactors) -> ScoreFactorsRecord {
 mod tests {
     use super::*;
     use crate::scanner::active_lease::{ActiveLease, LeasePolicy};
+    use crate::scanner::patterns::is_obvious_build_artifact_basename;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::scoring::{DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::borrow::Cow;
@@ -2270,6 +2294,7 @@ mod tests {
     #[test]
     fn mount_incidents_get_no_per_path_backoff() {
         assert!(!should_backoff_skip(SkipReason::FilesystemReadOnly));
+        assert!(!should_backoff_skip(SkipReason::CategorySuspended));
         assert!(should_backoff_skip(SkipReason::Symlink));
         assert!(!should_backoff_skip(SkipReason::PathGone));
     }
@@ -2300,6 +2325,7 @@ mod tests {
                 SkipReason::SacredStowaway => 15,
                 SkipReason::FilesystemReadOnly => 16,
                 SkipReason::OpenScanIncomplete => 17,
+                SkipReason::CategorySuspended => 18,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];
@@ -3633,6 +3659,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_aborted_batch_has_its_own_code_and_names_its_cause() {
+        for (without_root, cause) in [
+            (true, "cannot be inspected without root"),
+            (false, "within its limits"),
+        ] {
+            let ActivityEvent::Error { code, message } = incomplete_scan_event(without_root) else {
+                panic!("an aborted batch is logged as an error");
+            };
+            assert_eq!(code, "SBH-3005");
+            assert!(message.contains(cause), "{message}");
+            assert!(message.ends_with("aborting batch for safety"), "{message}");
+        }
+    }
+
+    #[test]
+    fn tracked_content_check_ignores_case_drift_between_disk_and_index() {
+        // A case-only rename on disk (`Build/` to `build/`) leaves the files
+        // tracked, and on case-insensitive APFS `git status` stays clean. A
+        // case-sensitive query called the renamed subtree unmatched, so an
+        // artifact-looking `build/` full of tracked files was reclaimable.
+        let dir = scratch_dir();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("vendor/Build")).unwrap();
+        fs::write(repo.join("vendor/Build/spec.payload"), "useful source").unwrap();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["add", "vendor"]);
+        git(&[
+            "-c",
+            "user.name=SBH regression",
+            "-c",
+            "user.email=sbh-regression@example.invalid",
+            "commit",
+            "-m",
+            "tracked source control",
+        ]);
+        fs::rename(repo.join("vendor/Build"), repo.join("vendor/build")).unwrap();
+        assert!(contains_tracked_git_content(&repo.join("vendor/build")));
+        assert!(contains_tracked_git_content(
+            &repo.join("vendor/build/spec.payload")
+        ));
+        // Untracked output in the same repository stays reclaimable.
+        let artifact = repo.join("target/debug");
+        fs::create_dir_all(&artifact).unwrap();
+        fs::write(artifact.join("generated.o"), "object bytes").unwrap();
+        assert!(!contains_tracked_git_content(&artifact));
+    }
+
     #[cfg(unix)]
     #[test]
     fn git_query_identity_switches_root_to_a_non_root_owner() {
@@ -3928,10 +4015,12 @@ mod tests {
 
     #[test]
     fn obvious_build_artifact_basename_suffix_matches() {
-        // Descriptive `CARGO_TARGET_DIR` names: `<prefix>-target` /
-        // `<prefix>_target` with a non-empty prefix. This is the rule that lets
-        // the stranded `/root/cass-ft-target` (241 GB) be reclaimed, and it
-        // also newly covers `my-target` (previously start-anchored-only).
+        // Descriptive `CARGO_TARGET_DIR` names (`<prefix>-target` /
+        // `<prefix>_target`) count when the directory carries cargo's root
+        // markers: that keeps a stranded `/root/cass-ft-target` (241 GB)
+        // reclaimable. Without them the name alone proves nothing (issue
+        // #34: `invalid_target` / `ambient-target` evidence fixtures on ts2).
+        let base = tempfile::tempdir().unwrap();
         for name in [
             "cass-ft-target",
             "cass_ft_target",
@@ -3940,10 +4029,27 @@ mod tests {
             "my-target",
             "my_target",
         ] {
-            let p = PathBuf::from(format!("/root/{name}"));
+            let p = base.path().join(name);
+            fs::create_dir_all(&p).unwrap();
+            assert!(
+                !is_obvious_build_artifact_basename(&p),
+                "`{name}` without cargo markers must not pass on its name"
+            );
+            fs::write(p.join(".rustc_info.json"), "{}").unwrap();
             assert!(
                 is_obvious_build_artifact_basename(&p),
-                "expected `{name}` to be recognized as a build artifact"
+                "expected `{name}` with cargo markers to be a build artifact"
+            );
+        }
+        // Inside a project root the floor refuses the evidence shapes outright.
+        for path in [
+            "/data/projects/hfdt-release-v0.3.15/publish-gates-v1/sanitizer-wrapper-controls-v1/invalid_target",
+            "/data/projects/hfdt-fon4nq/baseline/ambient-target",
+        ] {
+            assert!(is_hardcoded_source_tree(Path::new(path)), "{path}");
+            assert!(
+                !is_hardcoded_source_tree_given(Path::new(path), true),
+                "{path}"
             );
         }
     }
@@ -4221,7 +4327,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn remove_dir_all_force_defeats_readonly_module_cache_tree() {
+    fn confined_removal_defeats_readonly_module_cache_tree() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = scratch_dir();
@@ -4241,7 +4347,7 @@ mod tests {
         // Root bypasses mode bits, so skip the negative assertion there.
         if crate::platform::running_as_root() {
             eprintln!(
-                "SKIP: running as root (remove_dir_all_force_defeats_readonly_module_cache_tree: negative half only)"
+                "SKIP: running as root (confined_removal_defeats_readonly_module_cache_tree: negative half only)"
             );
         } else {
             assert!(
@@ -4251,8 +4357,9 @@ mod tests {
             assert!(root.exists());
         }
 
-        // The force variant chmods the subtree writable and succeeds.
-        remove_dir_all_force(&root).expect("force remove should defeat read-only bits");
+        // Only verified directory handles gain the permission needed to unlink.
+        quarantine::remove_direct(&root, &fs::symlink_metadata(&root).unwrap(), true)
+            .expect("confined cache removal should defeat read-only directory bits");
         assert!(!root.exists());
     }
 

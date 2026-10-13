@@ -5,10 +5,12 @@
 #![cfg(unix)]
 
 use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use storage_ballast_helper::scanner::decision_record::stable_decision_id;
 use storage_ballast_helper::scanner::deletion::{
@@ -98,6 +100,333 @@ fn raw_plan(candidates: Vec<CandidacyScore>, mode: DeletionMode) -> DeletionPlan
         candidates,
         mode,
         refused: Vec::new(),
+    }
+}
+
+#[test]
+fn direct_tree_cleanup_does_not_follow_links_or_open_special_entries() {
+    let dir = scratch();
+    let root = dir.path().join("target");
+    let nested = root.join("debug/deps");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("artifact.o"), PAYLOAD).unwrap();
+    let outside = dir.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("precious"), b"outside data").unwrap();
+    fs::write(dir.path().join("sibling"), b"unrelated sibling").unwrap();
+    symlink(&outside, nested.join("directory-link")).unwrap();
+    symlink(outside.join("precious"), root.join("file-link")).unwrap();
+    symlink("absent", root.join("dangling-link")).unwrap();
+    nix::unistd::mkfifo(
+        &root.join("pipe"),
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+
+    let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+    assert_eq!(
+        executor
+            .delete_candidate_checked(&candidate(&root), None)
+            .unwrap(),
+        CheckedDeletion::Deleted
+    );
+    assert!(fs::symlink_metadata(&root).is_err());
+    assert_eq!(fs::read(outside.join("precious")).unwrap(), b"outside data");
+    assert_eq!(
+        fs::read(dir.path().join("sibling")).unwrap(),
+        b"unrelated sibling"
+    );
+    // Direct and emergency cleanup cannot allocate a recovery store first.
+    assert!(!dir.path().join(".sbh").exists());
+}
+
+#[test]
+fn direct_cache_cleanup_preserves_external_hardlink_permissions() {
+    for (name, pattern, category) in [
+        ("gomodcache", "go-module-cache", ArtifactCategory::GoCache),
+        (
+            "cargo-cache",
+            "opaque-cargo-cache",
+            ArtifactCategory::CacheDir,
+        ),
+    ] {
+        let dir = scratch();
+        let root = dir.path().join(name);
+        let module = root.join("module");
+        fs::create_dir_all(&module).unwrap();
+        if category == ArtifactCategory::GoCache {
+            // A cache label alone cannot authorize permission widening:
+            // admission re-verifies the GOMODCACHE marker on disk.
+            fs::create_dir_all(root.join("cache").join("download")).unwrap();
+        }
+        let leaf = module.join("artifact.bin");
+        fs::write(&leaf, PAYLOAD).unwrap();
+        let retained = dir.path().join("retained-hardlink");
+        fs::hard_link(&leaf, &retained).unwrap();
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&module, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+        let original_mode = fs::metadata(&retained).unwrap().permissions().mode();
+        let mut item = candidate(&root);
+        item.classification.pattern_name = Cow::Borrowed(pattern);
+        item.classification.category = category;
+        let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+
+        let report = executor.execute(&executor.plan(vec![item]), None);
+        // Restore fixture directories on failure so a failed regression still
+        // leaves TempDir able to clean up. Never change the hardlinked file.
+        let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o755));
+        let _ = fs::set_permissions(&module, fs::Permissions::from_mode(0o755));
+        assert_eq!(report.items_deleted, 1, "{pattern}: {:?}", report.errors);
+        assert_eq!(report.items_failed, 0, "{pattern}");
+        assert_eq!(report.items_skipped, 0, "{pattern}");
+        assert_eq!(report.items_quarantined, 0, "{pattern}");
+        assert!(fs::symlink_metadata(&root).is_err(), "{pattern}");
+        assert_eq!(fs::read(&retained).unwrap(), PAYLOAD, "{pattern}");
+        assert_eq!(
+            fs::metadata(&retained).unwrap().permissions().mode(),
+            original_mode,
+            "cleanup must not chmod surviving hardlinks: {pattern}"
+        );
+        assert!(!dir.path().join(".sbh").exists(), "{pattern}");
+    }
+}
+
+#[test]
+fn ordinary_direct_cleanup_keeps_readonly_directories_as_a_permission_boundary() {
+    let dir = scratch();
+    let root = dir.path().join("target");
+    let locked = root.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("artifact.bin"), PAYLOAD).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    // UID 0 can still lack DAC override in a user namespace. Probe the actual
+    // permission boundary rather than skipping a meaningful test by UID alone.
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(locked.join("permission-probe"))
+    {
+        Ok(_) => {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("TEST SKIP: this process bypasses readonly directory permissions");
+            return;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => panic!("readonly-directory fixture probe failed: {error}"),
+    }
+    let item = candidate(&root);
+    let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+    let preflight = executor.explain_preflight(&item, None);
+    let report = executor.execute(&executor.plan(vec![item]), None);
+    let unchanged_mode = fs::metadata(&locked).map(|meta| meta.permissions().mode() & 0o777);
+    let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+
+    assert!(
+        preflight.is_ok(),
+        "the fixture must reach removal: {preflight:?}"
+    );
+    assert_eq!(report.items_deleted, 0);
+    assert_eq!(report.items_failed, 1);
+    assert_eq!(report.items_skipped, 0);
+    assert_eq!(report.bytes_freed, 0);
+    assert_eq!(unchanged_mode.unwrap(), 0o555);
+    assert_eq!(fs::read(locked.join("artifact.bin")).unwrap(), PAYLOAD);
+    assert!(!dir.path().join(".sbh").exists());
+}
+
+#[test]
+fn live_category_refusal_is_a_typed_skip_in_both_modes_and_dry_runs() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        for dry_run in [false, true] {
+            for include_review in [false, true] {
+                let dir = scratch();
+                let target = dir.path().join("target");
+                fs::create_dir(&target).unwrap();
+                fs::write(target.join("artifact.o"), PAYLOAD).unwrap();
+                let mut item = candidate(&target);
+                if include_review {
+                    item.decision.action = DecisionAction::Review;
+                }
+                let mut cfg = config(dir.path(), mode);
+                cfg.dry_run = dry_run;
+                cfg.include_review = include_review;
+                let executor = DeletionExecutor::new(cfg, None);
+                let plan = executor.plan(vec![item]);
+                assert_eq!(plan.estimated_items, 1);
+                let calls = Cell::new(0);
+                let authorize = |item: &CandidacyScore| {
+                    assert_eq!(item.path, target);
+                    assert_eq!(item.classification.category, ArtifactCategory::RustTarget);
+                    calls.set(calls.get() + 1);
+                    Err(SkipReason::CategorySuspended)
+                };
+
+                let report = executor.execute_with_guard(&plan, None, Some(&authorize));
+                assert_eq!(calls.get(), 1);
+                assert_eq!(
+                    report.sacred_scans, 1,
+                    "full preflight must precede the guard"
+                );
+                assert_eq!(report.items_skipped, 1);
+                assert_eq!(report.skipped_by_reason.get("category_suspended"), Some(&1));
+                assert!(!report.skipped_by_reason.contains_key("target_free_reached"));
+                assert_eq!(report.items_deleted, 0);
+                assert_eq!(report.items_failed, 0);
+                assert_eq!(report.items_would_delete, 0);
+                assert_eq!(report.items_quarantined, 0);
+                assert_eq!(report.quarantine_unavailable, 0);
+                assert_eq!(report.bytes_freed, 0);
+                assert_eq!(report.bytes_freed_observed, Some(0));
+                assert_eq!(report.bytes_would_free, 0);
+                assert_eq!(report.bytes_quarantined, 0);
+                assert!(report.errors.is_empty());
+                assert!(report.deleted_paths.is_empty());
+                assert!(report.backoff_candidates.is_empty());
+                assert!(!report.circuit_breaker_tripped);
+                assert_eq!(fs::read(target.join("artifact.o")).unwrap(), PAYLOAD);
+                assert!(!dir.path().join(".sbh").exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn live_authorization_cannot_bypass_preflight_protection() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let dir = scratch();
+        let target = dir.path().join("target");
+        let nested = target.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(target.join("artifact.o"), PAYLOAD).unwrap();
+        let executor = DeletionExecutor::new(config(dir.path(), mode), None);
+        let plan = executor.plan(vec![candidate(&target)]);
+        assert_eq!(plan.estimated_items, 1);
+        // Descendant protection appears after planning. It must be found
+        // by the full preflight before any live authorization is requested.
+        fs::write(nested.join(".sbh-protect"), b"").unwrap();
+        let calls = Cell::new(0);
+        let authorize = |_: &CandidacyScore| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+
+        let report = executor.execute_with_guard(&plan, None, Some(&authorize));
+        assert_eq!(calls.get(), 0);
+        assert_eq!(report.items_deleted, 0);
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert_eq!(report.bytes_freed, 0);
+        assert!(nested.join(".sbh-protect").exists());
+        assert_eq!(fs::read(target.join("artifact.o")).unwrap(), PAYLOAD);
+        assert!(!dir.path().join(".sbh").exists());
+    }
+}
+
+#[test]
+fn unlink_observer_runs_before_the_next_candidate_with_its_completion_time() {
+    let dir = scratch();
+    let first = artifact(dir.path(), "first");
+    let second = artifact(dir.path(), "second");
+    let plan = raw_plan(vec![first.clone(), second.clone()], DeletionMode::Unlink);
+    let executor = DeletionExecutor::new(config(dir.path(), DeletionMode::Unlink), None);
+    let observed = RefCell::new(Vec::new());
+    let started = Instant::now();
+    let on_unlinked = |item: &CandidacyScore, completed_at: Instant| {
+        assert!(completed_at >= started);
+        assert!(completed_at <= Instant::now());
+        assert!(!item.path.exists());
+        if observed.borrow().is_empty() {
+            assert_eq!(item.path, first.path);
+            assert!(
+                second.path.exists(),
+                "observer must run before the next deletion"
+            );
+            // Registration may wait for a detector lock. The timestamp
+            // handed to it must remain the earlier removal completion.
+            let delay = Duration::from_millis(10);
+            std::thread::sleep(delay);
+            assert!(completed_at.elapsed() >= delay);
+        } else {
+            assert_eq!(item.path, second.path);
+        }
+        observed
+            .borrow_mut()
+            .push((item.path.clone(), completed_at));
+    };
+
+    let report = executor.execute_with_hooks(&plan, None, None, Some(&on_unlinked));
+    assert_eq!(report.items_deleted, 2);
+    assert_eq!(report.items_failed, 0);
+    assert_eq!(report.items_skipped, 0);
+    let observed = observed.into_inner();
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].0, first.path);
+    assert_eq!(observed[1].0, second.path);
+    assert!(observed[0].1 < observed[1].1);
+    assert_eq!(report.deleted_paths, vec![first.path, second.path]);
+}
+
+#[test]
+fn unlink_observer_notifies_only_successful_real_permanent_removals() {
+    for (mode, dry_run, refuse, replace_before_mutation) in [
+        (DeletionMode::Unlink, false, false, false),
+        (DeletionMode::Quarantine, false, false, false),
+        (DeletionMode::Unlink, true, false, false),
+        (DeletionMode::Quarantine, true, false, false),
+        (DeletionMode::Unlink, false, true, false),
+        (DeletionMode::Quarantine, false, true, false),
+        (DeletionMode::Unlink, false, false, true),
+        (DeletionMode::Quarantine, false, false, true),
+    ] {
+        let dir = scratch();
+        let item = artifact(dir.path(), "target");
+        let original = dir.path().join("original");
+        let mut cfg = config(dir.path(), mode);
+        cfg.dry_run = dry_run;
+        let executor = DeletionExecutor::new(cfg, None);
+        let plan = executor.plan(vec![item.clone()]);
+        assert_eq!(plan.estimated_items, 1);
+        let authorize = |candidate: &CandidacyScore| {
+            if refuse {
+                return Err(SkipReason::CategorySuspended);
+            }
+            if replace_before_mutation {
+                // Deterministic backend failure, independent of uid and
+                // permission overrides: keep the original inode alive and
+                // substitute a different one after preflight has passed.
+                fs::rename(&candidate.path, &original).unwrap();
+                fs::write(&candidate.path, b"replacement data").unwrap();
+            }
+            Ok(())
+        };
+        let notifications = Cell::new(0);
+        let on_unlinked = |candidate: &CandidacyScore, _: Instant| {
+            assert_eq!(candidate.path, item.path);
+            notifications.set(notifications.get() + 1);
+        };
+
+        let report = executor.execute_with_hooks(&plan, None, Some(&authorize), Some(&on_unlinked));
+        let removed = !dry_run && !refuse && !replace_before_mutation;
+        assert_eq!(report.items_deleted, usize::from(removed));
+        assert_eq!(report.items_failed, usize::from(replace_before_mutation));
+        assert_eq!(report.items_skipped, usize::from(refuse));
+        assert_eq!(report.items_would_delete, usize::from(dry_run));
+        assert_eq!(
+            report.items_quarantined,
+            usize::from(removed && mode == DeletionMode::Quarantine)
+        );
+        assert_eq!(
+            notifications.get(),
+            usize::from(removed && mode == DeletionMode::Unlink)
+        );
+        if replace_before_mutation {
+            assert_eq!(fs::read(original).unwrap(), PAYLOAD);
+            assert_eq!(fs::read(item.path).unwrap(), b"replacement data");
+        } else if !removed {
+            assert_eq!(fs::read(item.path).unwrap(), PAYLOAD);
+        }
     }
 }
 

@@ -6,6 +6,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
@@ -24,18 +25,23 @@ impl Drop for RunningChild {
 fn public_executable_query_finds_a_live_program_with_a_non_utf8_kernel_name() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
-    let executable = root.join(OsString::from_vec(b"sbh-\xff-sleep".to_vec()));
+    let executable = root.join(OsString::from_vec(b"sbh-\xff-sh".to_vec()));
     // No synthetic proc directory or injected link: execute a real binary at
     // the byte-named path. Child is reaped before TempDir cleans the fixture.
-    let source = [Path::new("/bin/sleep"), Path::new("/usr/bin/sleep")]
+    let source = [Path::new("/bin/sh"), Path::new("/usr/bin/sh")]
         .into_iter()
         .find(|path| path.is_file())
-        .expect("Linux integration fixture requires the system sleep utility");
+        .expect("Linux integration fixture requires a POSIX shell");
     fs::copy(source, &executable).unwrap();
     let mut child = RunningChild(
         Command::new(&executable)
-            .arg("300")
-            .stdin(Stdio::null())
+            // The shell blocks in `read` for as long as this test holds its
+            // stdin open. A copied `sleep` is not usable: rust-coreutils takes
+            // the applet name from the executable path, cannot decode this
+            // one, prints its usage and exits at once.
+            .arg0("sh")
+            .args(["-c", "read line"])
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -64,7 +70,12 @@ fn public_executable_query_finds_a_live_program_with_a_non_utf8_kernel_name() {
     assert!(!observed.name.is_empty());
     assert!(child.0.try_wait().unwrap().is_none());
 
-    let unrelated = platform.executables_under(&root.join("other-scope")).unwrap();
+    let unrelated = platform
+        .executables_under(&root.join("other-scope"))
+        .unwrap();
     assert!(!unrelated.processes.iter().any(|process| process.pid == pid));
-    assert_eq!(fs::metadata(&executable).unwrap().len(), fs::metadata(source).unwrap().len());
+    assert_eq!(
+        fs::metadata(&executable).unwrap().len(),
+        fs::metadata(source).unwrap().len()
+    );
 }

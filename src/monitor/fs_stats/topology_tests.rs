@@ -150,6 +150,39 @@ fn live_native_temporary_root_has_a_valid_cached_capacity_observation() {
     assert_eq!(collector.collect(directory.path()).unwrap(), observation);
 }
 
+/// The collector against the real kernel on a Mac: every local volume mounted
+/// under `/Volumes` is measured on its own mount point, neither attributed to
+/// the Data volume nor refused. Network mounts are left out because a stalled
+/// server would hang the probe.
+#[cfg(target_os = "macos")]
+#[test]
+fn live_native_external_volumes_are_collected_on_their_own_mounts() {
+    let platform = crate::platform::pal::detect_platform().unwrap();
+    let collector = FsStatsCollector::new(platform.clone(), Duration::from_secs(60));
+    let external: Vec<_> = platform
+        .mount_points()
+        .unwrap()
+        .into_iter()
+        .filter(|mount| {
+            mount.path.starts_with("/Volumes")
+                && matches!(mount.fs_type.as_str(), "apfs" | "hfs" | "exfat" | "msdos")
+        })
+        .collect();
+    if external.is_empty() {
+        eprintln!("SKIP: no local volume is mounted under /Volumes on this host");
+        return;
+    }
+    for mount in external {
+        let observed = collector
+            .collect(&mount.path)
+            .unwrap_or_else(|error| panic!("{}: {error}", mount.path.display()));
+        assert_eq!(observed.mount_point, mount.path);
+        let inside = mount.path.join("sbh-probe-path-that-need-not-exist");
+        assert_eq!(collector.collect(&inside).unwrap().mount_point, mount.path);
+        eprintln!("collected {} on its own mount", mount.path.display());
+    }
+}
+
 fn expire_discovery(collector: &FsStatsCollector) {
     collector
         .state

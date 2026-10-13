@@ -896,6 +896,12 @@ fn record_create_error(
             path.display()
         ));
         true
+    } else if creation::is_underallocated(error) {
+        report.errors.push(format!(
+            "file {index}: {error}; skipping remaining ballast provisioning because each further file at {} would repeat the same write",
+            path.parent().unwrap_or(path).display()
+        ));
+        true
     } else {
         report.errors.push(format!("file {index}: {error}"));
         false

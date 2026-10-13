@@ -4,8 +4,9 @@
 //! and inode, name) is recreated within `window` of the deletion while a
 //! process with its working directory or an open file under the parent is
 //! alive: something was still using it. That is a `regret` outcome; a
-//! window that passes without a recreation is `clean`; a recreation with no
-//! live user is `unknown` (a later rebuild, not evidence either way).
+//! window that passes with verified absence is `clean`; a recreation with no
+//! live user, a late sighting, or an unresolved filesystem observation is
+//! `unknown` (not evidence either way).
 //!
 //! Outcomes calibrate the fast lane per category. Each category keeps a
 //! Beta posterior on its regret rate under an empirical-Bayes prior pooled
@@ -69,7 +70,7 @@ pub enum Outcome {
     Regret,
     /// The window passed without a recreation.
     Clean,
-    /// Recreated with no live user under the parent.
+    /// The observation cannot establish either regret or a clean deletion.
     Unknown,
 }
 
@@ -116,6 +117,9 @@ impl EntryIdentity {
         let parent = path.parent()?;
         let name = path.file_name()?.to_string_lossy().into_owned();
         let meta = std::fs::metadata(parent).ok()?;
+        if !meta.is_dir() {
+            return None;
+        }
         Some(Self::from_parent_meta(&meta, name))
     }
 
@@ -156,6 +160,58 @@ pub struct Watch {
     pub deleted_at: Instant,
 }
 
+impl Watch {
+    /// Observe the original directory entry, asking about live users only
+    /// after a successful lookup. A missing entry is evidence only when its
+    /// original parent can still be verified.
+    #[must_use]
+    pub fn observe(&self, parent_in_use: impl FnOnce(&Path) -> bool) -> Sighting {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let (Some(parent), Some(name)) = (self.path.parent(), self.path.file_name()) else {
+                return Sighting::Indeterminate;
+            };
+            // Anchor the lookup to the opened parent. A pathname swap cannot
+            // redirect the entry lookup into a replacement directory.
+            let Ok(directory) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open(parent)
+            else {
+                return Sighting::Indeterminate;
+            };
+            let Ok(meta) = directory.metadata() else {
+                return Sighting::Indeterminate;
+            };
+            if EntryIdentity::from_parent_meta(&meta, name.to_string_lossy().into_owned())
+                != self.identity
+            {
+                return Sighting::Indeterminate;
+            }
+            let lookup =
+                rustix::fs::statat(&directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                    .map(|_| ())
+                    .map_err(std::io::Error::from);
+            let sighting = Sighting::from_entry_lookup(lookup, || parent_in_use(parent));
+            // The original directory must still occupy the watched path,
+            // including after any slower process-table observation.
+            if EntryIdentity::of(&self.path).as_ref() != Some(&self.identity) {
+                return Sighting::Indeterminate;
+            }
+            sighting
+        }
+        #[cfg(not(unix))]
+        {
+            // EntryIdentity has no stable device/inode implementation here.
+            // Do not manufacture evidence from a pathname-only observation.
+            let _ = parent_in_use;
+            Sighting::Indeterminate
+        }
+    }
+}
+
 /// A resolved outcome, ready for the ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionOutcome {
@@ -179,18 +235,47 @@ pub struct DecisionOutcome {
 
 /// What the detector sees when it looks at a watched path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Sighting {
-    /// The entry exists again with the same parent identity.
-    pub recreated: bool,
-    /// A process has its cwd or an open file under the parent.
-    pub parent_in_use: bool,
+pub enum Sighting {
+    /// The entry is absent from its verified original parent.
+    Absent,
+    /// The entry exists again in its verified original parent.
+    Recreated {
+        /// A process has its cwd or an open file under the parent.
+        parent_in_use: bool,
+    },
+    /// The entry or its original parent could not be observed reliably.
+    Indeterminate,
+}
+
+impl Sighting {
+    #[cfg(unix)]
+    fn from_entry_lookup(
+        lookup: std::io::Result<()>,
+        parent_in_use: impl FnOnce() -> bool,
+    ) -> Self {
+        match lookup {
+            Ok(()) => Self::Recreated {
+                parent_in_use: parent_in_use(),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Absent,
+            Err(_) => Self::Indeterminate,
+        }
+    }
 }
 
 /// Watches deletions and labels them.
 #[derive(Debug, Clone)]
 pub struct RegretDetector {
     window: Duration,
-    watches: Vec<Watch>,
+    watches: Vec<PendingWatch>,
+}
+
+/// The window in force when this deletion started being observed. Config
+/// reloads change future watches without moving an existing deadline.
+#[derive(Debug, Clone)]
+struct PendingWatch {
+    watch: Watch,
+    window: Duration,
 }
 
 impl RegretDetector {
@@ -209,40 +294,79 @@ impl RegretDetector {
         self.watches.len()
     }
 
+    /// Change the observation window for future deletions. Watches already
+    /// pending retain the window with which they were registered.
+    pub fn set_window(&mut self, window: Duration) {
+        self.window = window;
+    }
+
     /// Start watching a deletion. The identity must have been captured
     /// before the entry was removed.
     pub fn watch(&mut self, watch: Watch) {
-        self.watches.retain(|w| w.decision_id != watch.decision_id);
-        self.watches.push(watch);
+        self.watches
+            .retain(|pending| pending.watch.decision_id != watch.decision_id);
+        self.watches.push(PendingWatch {
+            watch,
+            window: self.window,
+        });
     }
 
-    /// Resolve watches: `look` reports what is at each watched path now.
-    /// Recreated entries resolve immediately; the rest resolve `clean`
-    /// when their window passes.
+    /// Resolve observations assigned the same monotonic instant. For live
+    /// filesystem or process-table lookups, use [`Self::check_with_clock`]
+    /// so time spent observing a path cannot make its timestamp stale.
     pub fn check(
         &mut self,
         now: Instant,
+        look: impl FnMut(&Watch) -> Sighting,
+    ) -> Vec<DecisionOutcome> {
+        self.check_with_clock(|| now, look)
+    }
+
+    /// Resolve watches using a monotonic clock sampled immediately before
+    /// and after each `look` (two clock reads per watched entry).
+    /// Recreated entries resolve immediately. An observation completing at or
+    /// after the deadline is `unknown`: the sighting cannot establish whether
+    /// the recreation happened inside the window. Verified absent entries
+    /// resolve `clean` only when their observation starts at or after expiry.
+    /// An absent lookup that straddles the deadline remains pending for a fresh
+    /// observation; indeterminate observations expire as `unknown`.
+    pub fn check_with_clock(
+        &mut self,
+        mut clock: impl FnMut() -> Instant,
         mut look: impl FnMut(&Watch) -> Sighting,
     ) -> Vec<DecisionOutcome> {
-        let window = self.window;
         let mut outcomes = Vec::new();
         let mut keep = Vec::with_capacity(self.watches.len());
-        for watch in self.watches.drain(..) {
-            let age = now.saturating_duration_since(watch.deleted_at);
+        for PendingWatch { watch, window } in self.watches.drain(..) {
+            let observation_started = clock();
             let sighting = look(&watch);
-            let outcome = if sighting.recreated {
-                if sighting.parent_in_use {
-                    Some((Outcome::Regret, "recreated while a process used the parent"))
-                } else {
-                    Some((
-                        Outcome::Unknown,
-                        "recreated with no live user under the parent",
-                    ))
+            let observed_at = clock();
+            let age = observed_at.saturating_duration_since(watch.deleted_at);
+            let outcome = match sighting {
+                Sighting::Recreated { .. } if age >= window => Some((
+                    Outcome::Unknown,
+                    "recreation observation completed at or after regret window expiry",
+                )),
+                Sighting::Recreated {
+                    parent_in_use: true,
+                } => Some((Outcome::Regret, "recreated while a process used the parent")),
+                Sighting::Recreated {
+                    parent_in_use: false,
+                } => Some((
+                    Outcome::Unknown,
+                    "recreated with no live user under the parent",
+                )),
+                Sighting::Absent
+                    if observation_started.saturating_duration_since(watch.deleted_at)
+                        >= window =>
+                {
+                    Some((Outcome::Clean, "window passed without a recreation"))
                 }
-            } else if age >= window {
-                Some((Outcome::Clean, "window passed without a recreation"))
-            } else {
-                None
+                Sighting::Indeterminate if age >= window => Some((
+                    Outcome::Unknown,
+                    "regret window expired without a reliable filesystem observation",
+                )),
+                Sighting::Absent | Sighting::Indeterminate => None,
             };
             match outcome {
                 Some((outcome, detail)) => outcomes.push(DecisionOutcome {
@@ -255,7 +379,7 @@ impl RegretDetector {
                     after_secs: age.as_secs(),
                     detail: detail.to_string(),
                 }),
-                None => keep.push(watch),
+                None => keep.push(PendingWatch { watch, window }),
             }
         }
         self.watches = keep;
@@ -353,6 +477,27 @@ impl RegretCalibrator {
         &self.config
     }
 
+    /// Apply live settings without losing observed outcomes or shortening
+    /// an existing suspension. A changed tolerated rate starts that
+    /// category's sequential test afresh: its likelihood was accumulated
+    /// against a different null hypothesis.
+    pub fn update_config(&mut self, config: RegretConfig) {
+        let definite_changed =
+            self.config.alpha_definite.to_bits() != config.alpha_definite.to_bits();
+        let likely_changed = self.config.alpha_likely.to_bits() != config.alpha_likely.to_bits();
+        for stats in self.categories.values_mut() {
+            let alpha_changed = if stats.definite_decisions * 2 >= stats.decisions {
+                definite_changed
+            } else {
+                likely_changed
+            };
+            if alpha_changed {
+                stats.e_log = 0.0;
+            }
+        }
+        self.config = config;
+    }
+
     /// Record an outcome. `Unknown` outcomes are not evidence.
     pub fn record(
         &mut self,
@@ -380,7 +525,9 @@ impl RegretCalibrator {
         };
         stats.e_log = (stats.e_log + step).clamp(-5.0, 6.0);
         if stats.e_log.exp() >= self.config.e_threshold {
-            stats.suspended_until = Some(now + self.config.suspend);
+            // A new alarm may extend an active suspension, but a shorter
+            // duration loaded since the previous alarm must not reduce it.
+            stats.suspended_until = stats.suspended_until.max(Some(now + self.config.suspend));
             stats.e_log = 0.0;
         }
     }
@@ -764,6 +911,192 @@ mod tests {
     }
 
     #[test]
+    fn reconfiguration_preserves_evidence_and_resets_only_changed_nulls() {
+        let now = Instant::now();
+        let mut calibrator = RegretCalibrator::new(RegretConfig::default());
+        for (category, certainty, clean, regrets) in [
+            ("rust_target", ArtifactCertainty::Definite, 20, 1),
+            ("node_modules", ArtifactCertainty::Likely, 3, 1),
+            ("suspended", ArtifactCertainty::Definite, 0, 4),
+        ] {
+            for _ in 0..clean {
+                calibrator.record(category, certainty, Outcome::Clean, now);
+            }
+            for _ in 0..regrets {
+                calibrator.record(category, certainty, Outcome::Regret, now);
+            }
+        }
+        let before = calibrator.categories.clone();
+        let rust_before = calibrator.summary("rust_target").unwrap();
+        assert!(calibrator.suspended("suspended", now));
+        assert_ne!(before["rust_target"].e_log, 0.0);
+        assert_ne!(before["node_modules"].e_log, 0.0);
+
+        let mut updated = calibrator.config().clone();
+        updated.alpha_definite = 0.04;
+        updated.suspend = Duration::from_secs(1);
+        calibrator.update_config(updated.clone());
+        assert_eq!(calibrator.config(), &updated);
+        for (category, original) in &before {
+            let current = &calibrator.categories[category];
+            assert_eq!(current.decisions, original.decisions);
+            assert_eq!(current.regrets, original.regrets);
+            assert_eq!(current.definite_decisions, original.definite_decisions);
+            assert_eq!(current.suspended_until, original.suspended_until);
+        }
+        assert_eq!(calibrator.categories["rust_target"].e_log, 0.0);
+        assert_eq!(calibrator.categories["suspended"].e_log, 0.0);
+        assert_eq!(
+            calibrator.categories["node_modules"].e_log,
+            before["node_modules"].e_log
+        );
+        let rust_after = calibrator.summary("rust_target").unwrap();
+        assert_eq!(rust_after.alpha, 0.04);
+        assert_eq!(rust_after.posterior_mean, rust_before.posterior_mean);
+        assert_eq!(rust_after.upper_bound, rust_before.upper_bound);
+        assert!(rust_after.calibration > rust_before.calibration);
+        assert!(calibrator.suspended("suspended", now + Duration::from_secs(2)));
+
+        calibrator.record(
+            "rust_target",
+            ArtifactCertainty::Definite,
+            Outcome::Clean,
+            now,
+        );
+        // The next likelihood step uses the new alpha: (1 - 4 * .04) /
+        // (1 - .04), starting from the reset e-value of one.
+        assert!((calibrator.summary("rust_target").unwrap().e_value - 0.875).abs() < 1e-12);
+
+        // Identical rates keep the accumulated likelihood, including a
+        // category whose rate was unchanged by the preceding reload.
+        let unchanged = calibrator.summaries();
+        calibrator.update_config(updated.clone());
+        assert_eq!(calibrator.summaries(), unchanged);
+
+        updated.alpha_likely = 0.01;
+        calibrator.update_config(updated);
+        assert_eq!(calibrator.categories["node_modules"].e_log, 0.0);
+        assert_eq!(calibrator.summary("node_modules").unwrap().alpha, 0.01);
+    }
+
+    #[test]
+    fn reconfiguration_changes_future_suspensions_without_truncating_existing_ones() {
+        let now = Instant::now();
+        let mut config = RegretConfig {
+            suspend: Duration::from_secs(600),
+            ..RegretConfig::default()
+        };
+        let mut calibrator = RegretCalibrator::new(config.clone());
+        for _ in 0..3 {
+            calibrator.record("old", ArtifactCertainty::Definite, Outcome::Regret, now);
+        }
+        for _ in 0..2 {
+            calibrator.record("future", ArtifactCertainty::Definite, Outcome::Regret, now);
+        }
+        let future_likelihood = calibrator.summary("future").unwrap().e_value;
+        config.suspend = Duration::from_secs(30);
+        calibrator.update_config(config);
+        assert_eq!(
+            calibrator.summary("future").unwrap().e_value,
+            future_likelihood
+        );
+        calibrator.record("future", ArtifactCertainty::Definite, Outcome::Regret, now);
+        assert!(calibrator.suspended("future", now + Duration::from_secs(29)));
+        assert!(!calibrator.suspended("future", now + Duration::from_secs(30)));
+        assert!(calibrator.suspended("old", now + Duration::from_secs(599)));
+        assert!(!calibrator.suspended("old", now + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn a_shorter_reloaded_suspension_cannot_shorten_an_active_alarm() {
+        let now = Instant::now();
+        let mut config = RegretConfig {
+            suspend: Duration::from_secs(600),
+            ..RegretConfig::default()
+        };
+        let mut calibrator = RegretCalibrator::new(config.clone());
+        for _ in 0..3 {
+            calibrator.record("active", ArtifactCertainty::Definite, Outcome::Regret, now);
+        }
+        config.suspend = Duration::from_secs(30);
+        calibrator.update_config(config);
+        let next_alarm = now + Duration::from_secs(5);
+        for category in ["active", "fresh"] {
+            for _ in 0..3 {
+                calibrator.record(
+                    category,
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    next_alarm,
+                );
+            }
+        }
+        assert!(calibrator.suspended("fresh", now + Duration::from_secs(34)));
+        assert!(!calibrator.suspended("fresh", now + Duration::from_secs(35)));
+        assert!(calibrator.suspended("active", now + Duration::from_secs(599)));
+        assert!(!calibrator.suspended("active", now + Duration::from_secs(600)));
+
+        // An alarm near the existing deadline must still extend it by the
+        // newly configured duration; preserving a deadline cannot freeze it.
+        for _ in 0..3 {
+            calibrator.record(
+                "active",
+                ArtifactCertainty::Definite,
+                Outcome::Regret,
+                now + Duration::from_secs(590),
+            );
+        }
+        assert!(calibrator.suspended("active", now + Duration::from_secs(619)));
+        assert!(!calibrator.suspended("active", now + Duration::from_secs(620)));
+    }
+
+    #[test]
+    fn changed_windows_apply_only_to_new_watches_in_both_directions() {
+        let t0 = Instant::now();
+        for (old_secs, new_secs, first, last) in [(60, 120, "old", "new"), (120, 60, "new", "old")]
+        {
+            let old_window = Duration::from_secs(old_secs);
+            let new_window = Duration::from_secs(new_secs);
+            let mut detector = RegretDetector::new(old_window);
+            detector.watch(watch("old", Path::new("/p/old"), "rust_target", t0));
+            detector.set_window(new_window);
+            detector.watch(watch("new", Path::new("/p/new"), "rust_target", t0));
+            let first_deadline = t0 + old_window.min(new_window);
+            let mut recreated = detector.clone();
+            let before = detector.check(
+                first_deadline.checked_sub(Duration::from_nanos(1)).unwrap(),
+                |_| Sighting::Absent,
+            );
+            assert!(before.is_empty());
+            let expired = detector.check(first_deadline, |_| Sighting::Absent);
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0].decision_id, first);
+            assert_eq!(expired[0].outcome, Outcome::Clean);
+            assert_eq!(detector.pending(), 1);
+            let remaining = detector.check(t0 + old_window.max(new_window), |_| Sighting::Absent);
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].decision_id, last);
+            assert_eq!(detector.pending(), 0);
+
+            // The same captured windows also govern recreation: extending
+            // the config cannot turn an expired old watch into regret, and
+            // shortening it cannot expire an old watch early.
+            let outcomes = recreated.check(first_deadline, |_| Sighting::Recreated {
+                parent_in_use: true,
+            });
+            assert_eq!(outcomes.len(), 2);
+            for outcome in outcomes {
+                let expected = if outcome.decision_id == first {
+                    Outcome::Unknown
+                } else {
+                    Outcome::Regret
+                };
+                assert_eq!(outcome.outcome, expected);
+            }
+        }
+    }
+
+    #[test]
     fn detector_labels_recreation_in_use_as_regret_and_expiry_as_clean() {
         let t0 = Instant::now();
         let mut detector = RegretDetector::new(Duration::from_mins(30));
@@ -776,9 +1109,14 @@ mod tests {
         assert_eq!(detector.pending(), 3);
         // Ten minutes in: a is back with a live user, b is back unused,
         // c is still gone.
-        let outcomes = detector.check(t0 + Duration::from_secs(600), |w| Sighting {
-            recreated: w.path == a || w.path == b,
-            parent_in_use: w.path == a,
+        let outcomes = detector.check(t0 + Duration::from_secs(600), |w| {
+            if w.path == a || w.path == b {
+                Sighting::Recreated {
+                    parent_in_use: w.path == a,
+                }
+            } else {
+                Sighting::Absent
+            }
         });
         assert_eq!(outcomes.len(), 2);
         let by_id: HashMap<_, _> = outcomes
@@ -790,13 +1128,377 @@ mod tests {
         assert_eq!(by_id["d-a"].after_secs, 600);
         assert_eq!(detector.pending(), 1);
         // The window passes for c.
-        let outcomes = detector.check(t0 + Duration::from_mins(30), |_| Sighting {
-            recreated: false,
-            parent_in_use: true,
-        });
+        let outcomes = detector.check(t0 + Duration::from_mins(30), |_| Sighting::Absent);
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].outcome, Outcome::Clean);
         assert_eq!(detector.pending(), 0);
+    }
+
+    #[test]
+    fn detector_recreation_deadline_is_exclusive() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+        for (age, active_outcome) in [
+            (
+                window.checked_sub(Duration::from_nanos(1)).unwrap(),
+                Outcome::Regret,
+            ),
+            (window, Outcome::Unknown),
+            (window + Duration::from_nanos(1), Outcome::Unknown),
+            (Duration::from_hours(2), Outcome::Unknown),
+        ] {
+            for parent_in_use in [false, true] {
+                let mut detector = RegretDetector::new(window);
+                detector.watch(watch("delayed", Path::new("/p/target"), "rust_target", t0));
+                let outcomes = detector.check(t0 + age, |_| Sighting::Recreated { parent_in_use });
+                assert_eq!(outcomes.len(), 1);
+                let expected = if parent_in_use {
+                    active_outcome
+                } else {
+                    Outcome::Unknown
+                };
+                assert_eq!(
+                    outcomes[0].outcome, expected,
+                    "age={age:?}, parent_in_use={parent_in_use}"
+                );
+                assert_eq!(detector.pending(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn slow_observations_use_each_completion_time_instead_of_the_sweep_start() {
+        use std::cell::Cell;
+
+        let t0 = Instant::now();
+        let clock = Cell::new(t0 + Duration::from_secs(59));
+        let clock_reads = Cell::new(0);
+        let mut detector = RegretDetector::new(Duration::from_secs(60));
+        for id in ["first", "later", "uncertain"] {
+            detector.watch(watch(id, Path::new("/p/target"), "rust_target", t0));
+        }
+        let outcomes = detector.check_with_clock(
+            || {
+                clock_reads.set(clock_reads.get() + 1);
+                clock.get()
+            },
+            |watched| {
+                // The first observation alone crosses the deadline. Every
+                // subsequent lookup must get its own completion timestamp.
+                clock.set(clock.get() + Duration::from_secs(2));
+                if watched.decision_id == "uncertain" {
+                    Sighting::Indeterminate
+                } else {
+                    Sighting::Recreated {
+                        parent_in_use: true,
+                    }
+                }
+            },
+        );
+        assert_eq!(clock_reads.get(), 6);
+        assert_eq!(outcomes.len(), 3);
+        for (outcome, after_secs) in outcomes.iter().zip([61, 63, 65]) {
+            assert_eq!(outcome.outcome, Outcome::Unknown, "{}", outcome.decision_id);
+            assert_eq!(outcome.after_secs, after_secs);
+        }
+        assert_eq!(detector.pending(), 0);
+    }
+
+    #[test]
+    fn an_absent_observation_crossing_expiry_waits_for_a_fresh_lookup() {
+        use std::cell::Cell;
+
+        let t0 = Instant::now();
+        let clock = Cell::new(t0 + Duration::from_secs(59));
+        let mut detector = RegretDetector::new(Duration::from_secs(60));
+        detector.watch(watch("absent", Path::new("/p/target"), "rust_target", t0));
+        let crossing = detector.check_with_clock(
+            || clock.get(),
+            |_| {
+                clock.set(clock.get() + Duration::from_secs(2));
+                Sighting::Absent
+            },
+        );
+        assert!(
+            crossing.is_empty(),
+            "absence may have been seen before expiry"
+        );
+        assert_eq!(detector.pending(), 1);
+
+        let after = detector.check_with_clock(
+            || clock.get(),
+            |_| {
+                clock.set(clock.get() + Duration::from_secs(2));
+                Sighting::Absent
+            },
+        );
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].outcome, Outcome::Clean);
+        assert_eq!(after[0].after_secs, 63);
+        assert_eq!(detector.pending(), 0);
+    }
+
+    #[test]
+    fn detector_absence_remains_pending_before_expiry_and_clean_afterwards() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+        let mut detector = RegretDetector::new(window);
+        for id in ["at-deadline", "after-deadline"] {
+            detector.watch(watch(id, Path::new("/p/target"), "rust_target", t0));
+        }
+        let before = detector.check(
+            (t0 + window).checked_sub(Duration::from_nanos(1)).unwrap(),
+            |_| Sighting::Absent,
+        );
+        assert!(before.is_empty());
+        assert_eq!(detector.pending(), 2);
+
+        let at = detector.check(t0 + window, |w| {
+            if w.decision_id == "after-deadline" {
+                Sighting::Recreated {
+                    parent_in_use: false,
+                }
+            } else {
+                Sighting::Absent
+            }
+        });
+        assert_eq!(at.len(), 2);
+        let clean = at.iter().find(|o| o.decision_id == "at-deadline").unwrap();
+        assert_eq!(clean.outcome, Outcome::Clean);
+        assert_eq!(detector.pending(), 0);
+
+        detector.watch(watch(
+            "late-absence",
+            Path::new("/p/target"),
+            "rust_target",
+            t0,
+        ));
+        let after = detector.check(t0 + window + Duration::from_secs(1), |_| Sighting::Absent);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].outcome, Outcome::Clean);
+    }
+
+    #[test]
+    fn late_recreations_do_not_change_calibration_or_suspension() {
+        let t0 = Instant::now();
+        for prior_regrets in [0, 3] {
+            let mut detector = RegretDetector::new(Duration::from_secs(60));
+            let mut calibrator = RegretCalibrator::new(RegretConfig::default());
+            calibrator.record(
+                "rust_target",
+                ArtifactCertainty::Definite,
+                Outcome::Clean,
+                t0,
+            );
+            for _ in 0..prior_regrets {
+                calibrator.record(
+                    "rust_target",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    t0,
+                );
+            }
+            let before = calibrator.summary("rust_target").unwrap();
+            for id in ["late-a", "late-b", "late-c"] {
+                detector.watch(watch(id, Path::new("/p/target"), "rust_target", t0));
+            }
+            let now = t0 + Duration::from_secs(60);
+            let outcomes = detector.check(now, |_| Sighting::Recreated {
+                parent_in_use: true,
+            });
+            assert_eq!(outcomes.len(), 3);
+            for outcome in outcomes {
+                assert_eq!(outcome.outcome, Outcome::Unknown);
+                calibrator.record(
+                    &outcome.category,
+                    certainty_from_name(&outcome.certainty),
+                    outcome.outcome,
+                    now,
+                );
+            }
+            assert_eq!(calibrator.summary("rust_target").unwrap(), before);
+            assert_eq!(calibrator.suspended("rust_target", now), prior_regrets > 0);
+        }
+    }
+
+    #[test]
+    fn indeterminate_observations_expire_unknown_without_changing_calibration() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+        for prior_regrets in [0, 3] {
+            let mut detector = RegretDetector::new(window);
+            let mut calibrator = RegretCalibrator::new(RegretConfig::default());
+            calibrator.record(
+                "rust_target",
+                ArtifactCertainty::Definite,
+                Outcome::Clean,
+                t0,
+            );
+            for _ in 0..prior_regrets {
+                calibrator.record(
+                    "rust_target",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    t0,
+                );
+            }
+            let before = calibrator.summary("rust_target").unwrap();
+            detector.watch(watch(
+                "unreadable",
+                Path::new("/p/target"),
+                "rust_target",
+                t0,
+            ));
+            for age in [
+                Duration::ZERO,
+                window.checked_sub(Duration::from_nanos(1)).unwrap(),
+            ] {
+                assert!(
+                    detector
+                        .check(t0 + age, |_| Sighting::Indeterminate)
+                        .is_empty()
+                );
+                assert_eq!(detector.pending(), 1);
+            }
+            let now = t0 + window;
+            let outcomes = detector.check(now, |_| Sighting::Indeterminate);
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].outcome, Outcome::Unknown);
+            calibrator.record(
+                &outcomes[0].category,
+                certainty_from_name(&outcomes[0].certainty),
+                outcomes[0].outcome,
+                now,
+            );
+            assert_eq!(calibrator.summary("rust_target").unwrap(), before);
+            assert_eq!(calibrator.suspended("rust_target", now), prior_regrets > 0);
+            assert_eq!(detector.pending(), 0);
+        }
+    }
+
+    #[test]
+    fn a_reliable_observation_can_resolve_a_previously_indeterminate_watch() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+        for (sighting, at, expected) in [
+            (Sighting::Absent, t0 + window, Outcome::Clean),
+            (
+                Sighting::Recreated {
+                    parent_in_use: true,
+                },
+                t0 + Duration::from_secs(30),
+                Outcome::Regret,
+            ),
+        ] {
+            let mut detector = RegretDetector::new(window);
+            detector.watch(watch("retry", Path::new("/p/target"), "rust_target", t0));
+            assert!(detector.check(t0, |_| Sighting::Indeterminate).is_empty());
+            let outcomes = detector.check(at, |_| sighting);
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].outcome, expected);
+            assert_eq!(detector.pending(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_entry_lookups_do_not_become_absence_or_query_processes() {
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotADirectory,
+            ErrorKind::Interrupted,
+            ErrorKind::Other,
+        ] {
+            let sighting = Sighting::from_entry_lookup(Err(kind.into()), || {
+                panic!("failed lookup must not query processes")
+            });
+            assert_eq!(sighting, Sighting::Indeterminate, "{kind:?}");
+        }
+        let absent = Sighting::from_entry_lookup(Err(ErrorKind::NotFound.into()), || {
+            panic!("absent entry must not query processes")
+        });
+        assert_eq!(absent, Sighting::Absent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_observation_verifies_absence_recreation_and_parent_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("project");
+        let target = parent.join("target");
+        std::fs::create_dir(&parent).unwrap();
+        let mut watched = watch("deleted", &target, "rust_target", Instant::now());
+        watched.identity = EntryIdentity::of(&target).unwrap();
+        assert_eq!(
+            watched.observe(|_| panic!("absent entry must not query processes")),
+            Sighting::Absent
+        );
+
+        std::fs::create_dir(&target).unwrap();
+        for parent_in_use in [false, true] {
+            assert_eq!(
+                watched.observe(|observed_parent| {
+                    assert_eq!(observed_parent, parent);
+                    parent_in_use
+                }),
+                Sighting::Recreated { parent_in_use }
+            );
+        }
+
+        std::fs::rename(&parent, dir.path().join("original-project")).unwrap();
+        assert_eq!(watched.observe(|_| true), Sighting::Indeterminate);
+        std::fs::create_dir(&parent).unwrap();
+        assert_eq!(watched.observe(|_| true), Sighting::Indeterminate);
+        std::fs::create_dir(&target).unwrap();
+        assert_eq!(watched.observe(|_| true), Sighting::Indeterminate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_observation_rechecks_parent_after_process_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("project");
+        let target = parent.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let mut watched = watch("deleted", &target, "rust_target", Instant::now());
+        watched.identity = EntryIdentity::of(&target).unwrap();
+        let observation = watched.observe(|_| {
+            std::fs::rename(&parent, dir.path().join("original-project")).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            true
+        });
+        assert_eq!(observation, Sighting::Indeterminate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_observation_accepts_stable_parent_aliases_but_not_retargeting() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        let replacement = dir.path().join("replacement");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let target = alias.join("target");
+        let mut watched = watch("deleted", &target, "rust_target", Instant::now());
+        watched.identity = EntryIdentity::of(&target).unwrap();
+        assert_eq!(watched.observe(|_| true), Sighting::Absent);
+        std::fs::create_dir(&target).unwrap();
+        assert_eq!(
+            watched.observe(|_| true),
+            Sighting::Recreated {
+                parent_in_use: true
+            }
+        );
+
+        std::fs::rename(&alias, dir.path().join("previous-alias")).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        assert_eq!(watched.observe(|_| true), Sighting::Indeterminate);
+        std::fs::create_dir(&target).unwrap();
+        assert_eq!(watched.observe(|_| true), Sighting::Indeterminate);
     }
 
     #[test]

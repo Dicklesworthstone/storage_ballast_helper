@@ -36,20 +36,34 @@ pub(super) struct RootPlan {
     aliases: Vec<RootAlias>,
 }
 
-fn inspect_root(root: &Path) -> io::Result<PathBuf> {
+fn inspect_root(root: &Path) -> io::Result<Option<PathBuf>> {
     if !root.is_absolute() || root.components().any(|part| part == Component::ParentDir) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "root must be absolute without ..",
         ));
     }
-    // Ancestor aliases such as /tmp -> /private/tmp are supported; a leaf
-    // symlink remains subject to the scanner's plain-directory rule.
-    let metadata = fs::symlink_metadata(root)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    // Follow configured-root links such as macOS /tmp -> /private/tmp,
+    // preserving their configured spelling and canonical watch identity.
+    // Links inside the tree remain excluded by the scanner's traversal policy.
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        // Only the initial pathname observation proves a currently absent
+        // configured root. A later lookup/listing failure remains a gap.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = if metadata.file_type().is_symlink() {
+        // A dangling configured link exists. Its failed target lookup is a
+        // coverage gap, not a verified absent root.
+        fs::metadata(root)?
+    } else {
+        metadata
+    };
+    if !metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "root is not a plain directory",
+            "root is not a directory",
         ));
     }
     let canonical = fs::canonicalize(root)?;
@@ -65,7 +79,7 @@ fn inspect_root(root: &Path) -> io::Result<PathBuf> {
     if let Some(entry) = entries.next() {
         entry?;
     }
-    Ok(canonical)
+    Ok(Some(canonical))
 }
 
 pub(super) fn root_plan(config: &EventSourceConfig) -> RootPlan {
@@ -74,7 +88,7 @@ pub(super) fn root_plan(config: &EventSourceConfig) -> RootPlan {
 
 fn resolve_roots(
     config: &EventSourceConfig,
-    mut inspect: impl FnMut(&Path) -> io::Result<PathBuf>,
+    mut inspect: impl FnMut(&Path) -> io::Result<Option<PathBuf>>,
 ) -> RootPlan {
     let budget = config.watch_budget.min(MAX_ROOTS);
     if config.mode == ScannerEventSourceMode::ReconciliationOnly || budget == 0 {
@@ -89,12 +103,13 @@ fn resolve_roots(
     let mut watched = BTreeSet::new();
     let mut dirty: BTreeSet<PathBuf> = config.root_paths().iter().cloned().collect();
     let mut aliases = Vec::new();
+    let mut absent_roots = BTreeSet::new();
     let mut first_error = None;
     // Bound startup/retry metadata work as well as native stream resources.
     // Uninspected roots remain explicitly outside the event coverage.
     for configured in config.root_paths().iter().take(MAX_ROOTS) {
         match inspect(configured) {
-            Ok(canonical) => {
+            Ok(Some(canonical)) => {
                 if !watched.contains(&canonical) && watched.len() >= budget {
                     continue;
                 }
@@ -105,14 +120,18 @@ fn resolve_roots(
                     canonical,
                 });
             }
+            Ok(None) => {
+                dirty.remove(configured);
+                absent_roots.insert(configured.clone());
+            }
             Err(err) => {
                 first_error.get_or_insert_with(|| format!("{}: {err}", configured.display()));
             }
         }
     }
-    let complete = dirty.is_empty() && !watched.is_empty();
-    let reason = if complete {
-        "FSEvents recursively covers all configured roots; periodic reconciliation remains required"
+    let complete = dirty.is_empty();
+    let mut reason = if complete {
+        "FSEvents recursively covers all present configured roots; periodic reconciliation remains required"
             .to_string()
     } else {
         format!(
@@ -121,6 +140,12 @@ fn resolve_roots(
             first_error.map_or_else(String::new, |err| format!("; {err}")),
         )
     };
+    if !absent_roots.is_empty() {
+        reason = format!(
+            "{reason}; {} configured roots are absent and periodically rechecked",
+            absent_roots.len()
+        );
+    }
     RootPlan {
         summary: EventSourcePlan {
             backend: if watched.is_empty() {
@@ -132,6 +157,7 @@ fn resolve_roots(
             watched_dirs: watched.into_iter().collect(),
             frontier_dirs: dirty.len(),
             dirty_roots: dirty,
+            absent_roots,
             reason,
         },
         aliases,
@@ -231,7 +257,7 @@ pub(super) struct MacOsFseventsBackend {
 #[cfg(target_os = "macos")]
 fn root_identity(alias: &RootAlias) -> io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    if inspect_root(&alias.configured)? != alias.canonical {
+    if inspect_root(&alias.configured)?.as_ref() != Some(&alias.canonical) {
         return Err(io::Error::other(
             "configured root resolves to a different directory",
         ));
@@ -409,7 +435,7 @@ mod tests {
             if path == Path::new("/a") {
                 Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
             } else {
-                Ok(path.to_path_buf())
+                Ok(Some(path.to_path_buf()))
             }
         });
         assert_eq!(plan.summary.backend, EventBackendKind::Fsevents);
@@ -425,7 +451,7 @@ mod tests {
     #[test]
     fn canonical_aliases_share_one_recursive_watch_and_translate_both_ways() {
         let cfg = config(&["/tmp/work", "/private/tmp/work"], 1);
-        let plan = resolve_roots(&cfg, |_| Ok(PathBuf::from("/private/tmp/work")));
+        let plan = resolve_roots(&cfg, |_| Ok(Some(PathBuf::from("/private/tmp/work"))));
         assert!(plan.summary.complete);
         assert_eq!(plan.summary.watched_dirs.len(), 1);
         let mut rates = EventRateTracker::default();
@@ -458,7 +484,7 @@ mod tests {
     #[test]
     fn translation_is_component_aware_and_unknown_paths_revoke_the_index() {
         let cfg = config(&["/root"], 1);
-        let plan = resolve_roots(&cfg, |path| Ok(path.to_path_buf()));
+        let plan = resolve_roots(&cfg, |path| Ok(Some(path.to_path_buf())));
         for path in ["/root-other/a", "/outside/a", "/root/../outside/a"] {
             let result = translate_paths(
                 &plan.aliases,
@@ -477,7 +503,7 @@ mod tests {
     #[test]
     fn mapped_path_growth_fails_closed_instead_of_amplifying_aliases() {
         let cfg = config(&["/root"], 1);
-        let plan = resolve_roots(&cfg, |path| Ok(path.to_path_buf()));
+        let plan = resolve_roots(&cfg, |path| Ok(Some(path.to_path_buf())));
         let paths = (0..=MAX_MAPPED_PATHS)
             .map(|i| PathBuf::from(format!("/root/file{i}")))
             .collect::<Vec<_>>();
@@ -538,20 +564,113 @@ mod tests {
 
     #[test]
     fn root_inspection_rejects_files_and_traversal_and_accepts_real_directories() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
         assert_eq!(
-            inspect_root(dir.path()).unwrap(),
-            fs::canonicalize(dir.path()).unwrap()
+            inspect_root(&dir).unwrap(),
+            Some(fs::canonicalize(&dir).unwrap())
         );
         let cfg = EventSourceConfig::from_scanner_config(
-            &[dir.path().to_path_buf()],
+            std::slice::from_ref(&dir),
             &ScannerConfig::default(),
         );
         assert!(root_plan(&cfg).summary.complete);
-        let file = dir.path().join("not-a-directory");
+        let file = dir.join("not-a-directory");
         fs::write(&file, b"data").unwrap();
         assert!(inspect_root(&file).is_err());
-        assert!(inspect_root(&dir.path().join("../elsewhere")).is_err());
+        assert!(inspect_root(&dir.join("../elsewhere")).is_err());
         assert!(inspect_root(Path::new("relative")).is_err());
+    }
+
+    #[test]
+    fn verified_absent_roots_are_not_coverage_gaps_but_later_lookup_failures_are() {
+        let cfg = config(&["/healthy", "/absent"], 2);
+        let plan = resolve_roots(&cfg, |path| {
+            Ok((path != Path::new("/absent")).then(|| path.to_path_buf()))
+        });
+        assert!(plan.summary.complete);
+        assert!(plan.summary.dirty_roots.is_empty());
+        assert_eq!(
+            plan.summary.absent_roots,
+            BTreeSet::from([PathBuf::from("/absent")])
+        );
+        assert_eq!(plan.summary.watched_dirs, vec![PathBuf::from("/healthy")]);
+        assert!(
+            plan.summary
+                .reason
+                .contains("absent and periodically rechecked")
+        );
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::PermissionDenied] {
+            let failed = resolve_roots(&cfg, |path| {
+                if path == Path::new("/absent") {
+                    Err(kind.into())
+                } else {
+                    Ok(Some(path.to_path_buf()))
+                }
+            });
+            assert!(!failed.summary.complete);
+            assert!(failed.summary.absent_roots.is_empty());
+            assert!(failed.summary.dirty_roots.contains(Path::new("/absent")));
+        }
+    }
+
+    #[test]
+    fn real_absent_root_is_admitted_when_created_without_losing_existing_aliases() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let healthy = retained.join("healthy");
+        let later = retained.join("later");
+        fs::create_dir(&healthy).unwrap();
+        let cfg = EventSourceConfig::from_scanner_config(
+            &[healthy.clone(), later.clone()],
+            &ScannerConfig::default(),
+        );
+        let before = root_plan(&cfg);
+        assert!(before.summary.complete);
+        assert_eq!(before.summary.absent_roots, BTreeSet::from([later.clone()]));
+        assert!(inspect_root(&later).unwrap().is_none());
+        fs::create_dir(&later).unwrap();
+        let after = root_plan(&cfg);
+        assert!(after.summary.complete);
+        assert!(after.summary.absent_roots.is_empty());
+        assert_eq!(after.aliases.len(), 2);
+        assert!(
+            after
+                .aliases
+                .iter()
+                .any(|alias| alias.configured == healthy)
+        );
+        assert!(after.aliases.iter().any(|alias| alias.configured == later));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_roots_resolve_to_their_directory_but_links_to_files_do_not() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap().keep();
+        let real = dir.join("private-tmp");
+        fs::create_dir(&real).unwrap();
+        let link = dir.join("tmp");
+        symlink(&real, &link).unwrap();
+        // Like macOS `/tmp -> /private/tmp`: the configured spelling is kept
+        // as the alias and the canonical directory is what gets watched.
+        assert_eq!(
+            inspect_root(&link).unwrap(),
+            Some(fs::canonicalize(&real).unwrap())
+        );
+        let cfg = EventSourceConfig::from_scanner_config(
+            std::slice::from_ref(&link),
+            &ScannerConfig::default(),
+        );
+        let plan = root_plan(&cfg);
+        assert!(plan.summary.complete, "{}", plan.summary.reason);
+        assert_eq!(plan.aliases[0].configured, link);
+
+        let file = dir.join("file");
+        fs::write(&file, b"data").unwrap();
+        let file_link = dir.join("file-link");
+        symlink(&file, &file_link).unwrap();
+        assert!(inspect_root(&file_link).is_err());
+        let dangling = dir.join("dangling");
+        symlink(dir.join("gone"), &dangling).unwrap();
+        assert!(inspect_root(&dangling).is_err());
     }
 }

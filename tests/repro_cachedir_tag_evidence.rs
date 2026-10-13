@@ -18,9 +18,15 @@ const SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 
 fn fixture() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
-    let path = fs::canonicalize(temp.path()).unwrap().join("unclassified-payload");
+    let path = fs::canonicalize(temp.path())
+        .unwrap()
+        .join("unclassified-payload");
     fs::create_dir(&path).unwrap();
-    fs::write(path.join("retained.bin"), b"not disposable merely because a tag is named").unwrap();
+    fs::write(
+        path.join("retained.bin"),
+        b"not disposable merely because a tag is named",
+    )
+    .unwrap();
     (temp, path)
 }
 
@@ -53,7 +59,13 @@ fn assert_tag_evidence(path: &Path, expected: bool) {
         walked(path, false),
         walked(path, true),
     ] {
-        assert_eq!(signals.has_cachedir_tag, expected, "{path:?}: {signals:?}");
+        assert_eq!(
+            signals.has_cachedir_tag,
+            expected,
+            "{} (native bytes {:?}): {signals:?}",
+            path.display(),
+            path.as_os_str().as_encoded_bytes()
+        );
         let classification = ArtifactPatternRegistry::default().classify(path, signals);
         let certainty = classify_certainty(&classification, signals, 0.0);
         assert_eq!(
@@ -86,7 +98,10 @@ fn every_short_prefix_is_rejected_and_exact_signature_is_sufficient() {
     let (_temp, path) = fixture();
     for length in 0..SIGNATURE.len() {
         fs::write(path.join("CACHEDIR.TAG"), &SIGNATURE[..length]).unwrap();
-        assert!(!structural_signals_for_path(&path).has_cachedir_tag, "prefix {length}");
+        assert!(
+            !structural_signals_for_path(&path).has_cachedir_tag,
+            "prefix {length}"
+        );
     }
     fs::write(path.join("CACHEDIR.TAG"), SIGNATURE).unwrap();
     assert_tag_evidence(&path, true);
@@ -148,7 +163,11 @@ fn dangling_tag_links_do_not_manufacture_cache_evidence() {
     let (temp, path) = fixture();
     std::os::unix::fs::symlink(temp.path().join("absent"), path.join("CACHEDIR.TAG")).unwrap();
     assert_tag_evidence(&path, false);
-    assert!(fs::symlink_metadata(path.join("CACHEDIR.TAG")).unwrap().is_symlink());
+    assert!(
+        fs::symlink_metadata(path.join("CACHEDIR.TAG"))
+            .unwrap()
+            .is_symlink()
+    );
 }
 
 #[cfg(unix)]
@@ -170,6 +189,10 @@ fn tag_validation_does_not_erase_symlinked_source_safety_markers() {
 
 #[cfg(unix)]
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS rejects non-UTF-8 file names (EILSEQ)"
+)]
 fn valid_tag_evidence_preserves_non_utf8_directory_names() {
     use std::os::unix::ffi::OsStringExt;
     let temp = tempfile::tempdir().unwrap();
@@ -202,14 +225,16 @@ fn fifo_tags_cannot_hang_live_scanning_or_replay() {
         nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
     )
     .unwrap();
-    let mut child = RunningChild(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "fifo_tag_worker", "--nocapture"])
-        .env("SBH_TEST_FIFO_TAG_ROOT", &path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap());
+    let mut child = RunningChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "fifo_tag_worker", "--nocapture"])
+            .env("SBH_TEST_FIFO_TAG_ROOT", &path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {

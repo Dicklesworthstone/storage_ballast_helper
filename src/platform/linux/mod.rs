@@ -270,8 +270,20 @@ mod tests {
     fn assert_same_mount(platform: &LinuxPal, target: &Path, query: &Path) {
         let expected = platform.fs_stats(target).unwrap();
         let actual = platform.fs_stats(query).unwrap();
-        assert_eq!(actual.mount_point, expected.mount_point, "query={query:?}");
-        assert_eq!(actual.fs_type, expected.fs_type, "query={query:?}");
+        assert_eq!(
+            actual.mount_point,
+            expected.mount_point,
+            "query={} query_bytes={:?}",
+            query.display(),
+            query.as_os_str().as_encoded_bytes()
+        );
+        assert_eq!(
+            actual.fs_type,
+            expected.fs_type,
+            "query={} query_bytes={:?}",
+            query.display(),
+            query.as_os_str().as_encoded_bytes()
+        );
         assert_eq!(actual.total_bytes, expected.total_bytes);
         assert_eq!(actual.is_readonly, expected.is_readonly);
         assert_eq!(
@@ -310,11 +322,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let alias = temp.path().join("kernel");
         std::os::unix::fs::symlink("/proc/sys/kernel", &alias).unwrap();
-        assert_same_mount(
-            &LinuxPal::new(),
-            Path::new("/proc/sys"),
-            &alias.join(".."),
-        );
+        assert_same_mount(&LinuxPal::new(), Path::new("/proc/sys"), &alias.join(".."));
     }
 
     #[test]
@@ -336,9 +344,9 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let temp = tempfile::tempdir().unwrap();
-        let alias = temp
-            .path()
-            .join(std::ffi::OsString::from_vec(b"alias-\xff\n with space".to_vec()));
+        let alias = temp.path().join(std::ffi::OsString::from_vec(
+            b"alias-\xff\n with space".to_vec(),
+        ));
         std::os::unix::fs::symlink("/proc", &alias).unwrap();
         assert_same_mount(&LinuxPal::new(), Path::new("/proc"), &alias);
     }

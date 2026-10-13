@@ -24,11 +24,7 @@ impl Drop for RunningChild {
     }
 }
 
-fn check_scope(
-    result: Result<Vec<MappedRegion>>,
-    scope: &Path,
-    expected: &[(i32, PathBuf)],
-) {
+fn check_scope(result: Result<Vec<MappedRegion>>, scope: &Path, expected: &[(i32, PathBuf)]) {
     match result {
         Ok(regions) => {
             assert!(regions.iter().all(|region| region.path.starts_with(scope)));
@@ -36,8 +32,13 @@ fn check_scope(
                 assert!(
                     regions.iter().any(|region| region.pid == *pid
                         && region.path == *path
-                        && region.protection.as_deref().is_some_and(|mode| mode.contains('x'))),
-                    "a successful maps snapshot omitted running PID {pid} at {path:?}: {regions:?}"
+                        && region
+                            .protection
+                            .as_deref()
+                            .is_some_and(|mode| mode.contains('x'))),
+                    "a successful maps snapshot omitted running PID {pid} at {} (native bytes {:?}): {regions:?}",
+                    path.display(),
+                    path.as_os_str().as_encoded_bytes()
                 );
             }
             if expected.is_empty() {
@@ -49,7 +50,10 @@ fn check_scope(
         // Controlled readable/denied scopes and an unconditional real-current-
         // PID positive check are separately covered by mmap_scan's unit tests.
         Err(SbhError::Runtime { details }) => {
-            assert!(details.starts_with("memory-map inspection incomplete:"), "{details}");
+            assert!(
+                details.starts_with("memory-map inspection incomplete:"),
+                "{details}"
+            );
             eprintln!("Public host-wide maps coverage refused: {details}");
         }
         Err(error) => panic!("unexpected maps query failure: {error}"),
@@ -60,10 +64,10 @@ fn check_scope(
 fn public_maps_query_never_silently_omits_live_byte_named_executables() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
-    let source = [Path::new("/bin/sleep"), Path::new("/usr/bin/sleep")]
+    let source = [Path::new("/bin/sh"), Path::new("/usr/bin/sh")]
         .into_iter()
         .find(|path| path.is_file())
-        .expect("Linux integration fixture requires the system sleep utility");
+        .expect("Linux integration fixture requires a POSIX shell");
     let original = fs::read(source).unwrap();
     let names = [
         b"sbh-mapped-\xff".as_slice(),
@@ -77,10 +81,13 @@ fn public_maps_query_never_silently_omits_live_byte_named_executables() {
         fs::copy(source, &executable).unwrap();
         let mut child = RunningChild(
             Command::new(&executable)
-                // BusyBox may implement sleep as a multi-call binary.
-                .arg0("sleep")
-                .arg("300")
-                .stdin(Stdio::null())
+                // The shell blocks in `read` while this test holds its stdin
+                // open. A copied `sleep` is not usable: rust-coreutils takes
+                // the applet name from the executable path, cannot decode
+                // these names, prints its usage and exits at once.
+                .arg0("sh")
+                .args(["-c", "read line"])
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -99,10 +106,15 @@ fn public_maps_query_never_silently_omits_live_byte_named_executables() {
                 rendered.push(*byte);
             }
         }
-        assert!(raw.windows(rendered.len()).any(|window| window == rendered.as_slice()));
+        assert!(
+            raw.windows(rendered.len())
+                .any(|window| window == rendered.as_slice())
+        );
         if index == 0 {
-            assert!(std::str::from_utf8(&raw).is_err(),
-                "the old whole-file UTF-8 reader must actually fail on this fixture");
+            assert!(
+                std::str::from_utf8(&raw).is_err(),
+                "the old whole-file UTF-8 reader must actually fail on this fixture"
+            );
         }
         expected.push((pid, executable));
         children.push(child);
@@ -111,7 +123,11 @@ fn public_maps_query_never_silently_omits_live_byte_named_executables() {
     let platform = storage_ballast_helper::platform::current();
     check_scope(platform.mmap_regions_under(&root), &root, &expected);
     for item in &expected {
-        check_scope(platform.mmap_regions_under(&item.1), &item.1, std::slice::from_ref(item));
+        check_scope(
+            platform.mmap_regions_under(&item.1),
+            &item.1,
+            std::slice::from_ref(item),
+        );
     }
     let alias = root.join("alias-to-root");
     symlink(&root, &alias).unwrap();
@@ -123,7 +139,11 @@ fn public_maps_query_never_silently_omits_live_byte_named_executables() {
         assert!(child.0.try_wait().unwrap().is_none());
     }
     for (_, executable) in expected {
-        assert_eq!(fs::read(executable).unwrap(), original, "inspection must be read-only");
+        assert_eq!(
+            fs::read(executable).unwrap(),
+            original,
+            "inspection must be read-only"
+        );
     }
     // RunningChild reaps each process before TempDir removes the fixture.
 }

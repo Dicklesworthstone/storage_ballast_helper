@@ -76,7 +76,7 @@ use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
 use crate::platform::types::{
     FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
 };
-use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionMode};
+use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionMode, SkipReason};
 use crate::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use crate::scanner::events::{
     EventInvalidation, EventSourceConfig, EventSourceStats, ScannerEventSource,
@@ -94,7 +94,7 @@ use crate::scanner::prescan_cursor::PrescanCursor;
 use crate::scanner::protection::{self, ProtectionRegistry};
 use crate::scanner::quarantine::{DrainOutcome as QuarantineDrainOutcome, QuarantineStore};
 use crate::scanner::regret::{
-    EntryIdentity, Outcome, RegretCalibrator, RegretConfig, RegretDetector, Sighting, Watch,
+    EntryIdentity, Outcome, RegretCalibrator, RegretConfig, RegretDetector, Watch,
     certainty_from_name,
 };
 use crate::scanner::scoring::{
@@ -301,6 +301,19 @@ impl SharedRegret {
         }
     }
 
+    /// Reconfigure both feedback components while retaining pending
+    /// observation deadlines and the category evidence already collected.
+    fn update_config(&self, config: &Config) {
+        let regret = regret_config(config);
+        let mut detector = self.detector.lock();
+        let mut calibrator = self.calibrator.lock();
+        detector.set_window(regret.window);
+        calibrator.update_config(regret);
+        // Publish the paired update before releasing either guard. Retain the
+        // original reverse acquisition order while making the release explicit.
+        drop((calibrator, detector));
+    }
+
     /// The scoring engine's view: a calibration factor per category and
     /// the categories whose deletions are suspended right now.
     fn scoring_view(&self, now: Instant) -> (HashMap<String, f64>, HashSet<String>) {
@@ -312,6 +325,55 @@ impl SharedRegret {
             .map(|summary| summary.category)
             .collect();
         (calibrator.calibrations(), suspended)
+    }
+
+    /// Recheck queued work at the execution boundary: its scoring snapshot
+    /// may predate a category alarm raised during the scan or this batch.
+    fn authorize_deletion(
+        &self,
+        candidate: &CandidacyScore,
+        logger: &ActivityLoggerHandle,
+    ) -> std::result::Result<(), SkipReason> {
+        let category = format!("{:?}", candidate.classification.category);
+        let suspended = {
+            let calibrator = self.calibrator.lock();
+            calibrator.suspended(&category, Instant::now())
+        };
+        if suspended {
+            // Release the evidence lock before logging or filesystem work.
+            logger.send(ActivityEvent::Info {
+                message: format!(
+                    "regret category {category} is suspended; skipped {}",
+                    candidate.path.display()
+                ),
+            });
+            Err(SkipReason::CategorySuspended)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Begin observation at the unlink's completion, without moving the
+    /// deadline if acquiring the detector lock takes time.
+    fn watch_unlinked(
+        &self,
+        candidate: &CandidacyScore,
+        identity: &EntryIdentity,
+        completed_at: Instant,
+    ) {
+        let watch = Watch {
+            decision_id: crate::scanner::decision_record::stable_decision_id(
+                &candidate.path,
+                candidate.identity,
+                candidate.size_bytes,
+            ),
+            path: candidate.path.clone(),
+            identity: identity.clone(),
+            category: format!("{:?}", candidate.classification.category),
+            certainty: candidate.decision.certainty,
+            deleted_at: completed_at,
+        };
+        self.detector.lock().watch(watch);
     }
 }
 
@@ -717,6 +779,32 @@ fn effective_empty_pass_cooldown(base_secs: u64, consecutive_empty_passes: u32) 
     let shift = consecutive_empty_passes.saturating_sub(1).min(5);
     let multiplier = 1u64 << shift; // 1, 2, 4, 8, 16, 32
     Duration::from_secs(base_secs.saturating_mul(multiplier))
+}
+
+/// bd-qxrh: fold a pass that dispatched nothing into the empty-pass streak.
+///
+/// One *timed-out* empty pass is inconclusive: its budget may have run out
+/// before the walk reached anything reclaimable. A run of them is not. When
+/// every pass is cut short (by `scan_time_budget_secs` or, more often, by the
+/// daemon CPU bucket), counting none of them meant the streak never grew, so
+/// Red/Critical never reached terminal idle and re-scanned as fast as the duty
+/// cycle allowed, for hours, with nothing to reclaim (mac-mini-max on
+/// 2026-10-12: a `red_pressure` pass every ~20 s, all `timed_out=true`,
+/// 0 candidates, 0 bytes freed). Every [`TERMINAL_IDLE_EMPTY_PASSES`]
+/// consecutive timed-out empty passes therefore count as one conclusive one.
+fn record_empty_pass(
+    consecutive_empty_passes: &mut u32,
+    inconclusive_empty_passes: &mut u32,
+    timed_out: bool,
+) {
+    if timed_out {
+        *inconclusive_empty_passes = inconclusive_empty_passes.saturating_add(1);
+        if *inconclusive_empty_passes < TERMINAL_IDLE_EMPTY_PASSES {
+            return;
+        }
+    }
+    *inconclusive_empty_passes = 0;
+    *consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
 }
 
 /// Process CPU (user+system) this process has consumed so far, in micros.
@@ -2734,9 +2822,16 @@ fn build_status_dump_payload(input: &StatusDumpPayloadInput<'_>) -> Value {
 
 impl MonitoringDaemon {
     /// Build and initialize the daemon from configuration.
-    #[allow(clippy::too_many_lines)]
     pub fn init(config: Config, args: &DaemonArgs) -> Result<Self> {
-        let platform = detect_platform()?;
+        Self::init_with_platform(config, args, detect_platform()?)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn init_with_platform(
+        config: Config,
+        args: &DaemonArgs,
+        platform: Arc<dyn Platform>,
+    ) -> Result<Self> {
         let start_time = Instant::now();
 
         // 0. Liveness lock. Taken before anything else so a second daemon on
@@ -3503,8 +3598,10 @@ impl MonitoringDaemon {
         }
         let mut pools = Vec::new();
         for mount in mounts {
+            let pool_mount = self.pool_mount(&mount);
             if let Some(pool) = self.ballast_coordinator.pool_for_mount(&mount) {
-                self.release_controller.bind_pool(&mount, &pool.ballast_dir);
+                self.release_controller
+                    .bind_pool(&pool_mount, &pool.ballast_dir);
             }
             // Operator-driven changes are logged like the daemon's own so the
             // Timeline and `sbh stats` see them; the release controller is
@@ -3514,7 +3611,7 @@ impl MonitoringDaemon {
                     match self.ballast_coordinator.release_for_mount(&mount, *count) {
                         Ok(Some(report)) => {
                             self.release_controller
-                                .on_released(&mount, report.files_released);
+                                .on_released(&pool_mount, report.files_released);
                             self.log_control_ballast_release(&mount, &report.released);
                             Ok(json!({
                                 "mount": mount,
@@ -3535,7 +3632,7 @@ impl MonitoringDaemon {
                         Ok(Some(report)) => {
                             if report.files_created > 0 {
                                 self.release_controller
-                                    .on_replenished(&mount, report.files_created);
+                                    .on_replenished(&pool_mount, report.files_created);
                             }
                             for (path, size_bytes) in &report.created {
                                 self.logger_handle.send(ActivityEvent::BallastReplenished {
@@ -3679,11 +3776,18 @@ impl MonitoringDaemon {
             .map(|pool| {
                 // Bind/reset the physical observation before serializing its
                 // efficiency, so a replacement cannot inherit the old eta.
-                let release_history = self.release_controller.pool_history(
-                    &pool.mount_point,
-                    &pool.ballast_dir,
-                    pool.files_available,
-                );
+                // A skipped row (an alias or excluded mount) names no pool of
+                // its own; binding it would reset the history kept under the
+                // pool's mount.
+                let release_history = if pool.skipped {
+                    None
+                } else {
+                    self.release_controller.pool_history(
+                        &pool.mount_point,
+                        &pool.ballast_dir,
+                        pool.files_available,
+                    )
+                };
                 super::self_monitor::BallastPoolState {
                     mount: pool.mount_point.display().to_string(),
                     ballast_dir: pool.ballast_dir.display().to_string(),
@@ -4871,7 +4975,7 @@ impl MonitoringDaemon {
             }
             self.last_tick_cleanup_ran = true;
         }
-        self.resolve_regrets(now);
+        self.resolve_regrets();
 
         // Green maintenance (Q6): once per maintenance interval, a routine
         // pass over the roots the hazard-driven scheduler picks within its
@@ -5161,8 +5265,10 @@ impl MonitoringDaemon {
         mount: &Path,
         response: &crate::monitor::pid::PressureResponse,
     ) {
+        let pool_mount = self.pool_mount(mount);
         if let Some(pool) = self.ballast_coordinator.pool_for_mount(mount) {
-            self.release_controller.bind_pool(mount, &pool.ballast_dir);
+            self.release_controller
+                .bind_pool(&pool_mount, &pool.ballast_dir);
         }
         let fs_type = self
             .fs_collector
@@ -5194,7 +5300,7 @@ impl MonitoringDaemon {
         {
             released = report.files_released;
             self.release_controller
-                .on_released(mount, report.files_released);
+                .on_released(&pool_mount, report.files_released);
             self.log_ballast_releases(&report.released, response);
         }
 
@@ -5267,22 +5373,34 @@ impl MonitoringDaemon {
         }
     }
 
+    /// The mount whose pool serves `mount` (itself unless it is a
+    /// same-filesystem alias). Release history, cooldowns and the floor flag
+    /// are kept under this key, which is also what the state file saves.
+    fn pool_mount(&self, mount: &Path) -> PathBuf {
+        self.ballast_coordinator
+            .pool_for_mount(mount)
+            .map_or_else(|| mount.to_path_buf(), |pool| pool.mount_point.clone())
+    }
+
     /// Replenish one released ballast file on `mount` if its pool is short and
     /// the release controller's cooldown allows it. Returns whether a file was
     /// created.
     fn maybe_replenish_pool(&mut self, mount: &Path, level: PressureLevel) -> bool {
+        // An alias mount's inventory row is skipped and names its keeper's
+        // default directory: pace the pool under its own mount instead.
+        let pool_mount = self.pool_mount(mount);
         let Some(pool_info) = self
             .ballast_coordinator
             .inventory()
             .into_iter()
-            .find(|item| item.mount_point == mount)
+            .find(|item| item.mount_point == pool_mount && !item.skipped)
         else {
             return false;
         };
         self.release_controller
-            .bind_pool(mount, &pool_info.ballast_dir);
+            .bind_pool(&pool_mount, &pool_info.ballast_dir);
         if !self.release_controller.is_ready_for_replenish(
-            mount,
+            &pool_mount,
             level,
             pool_info.files_available,
             pool_info.files_total,
@@ -5298,9 +5416,9 @@ impl MonitoringDaemon {
             return false;
         };
         if report.skipped_for_floor > 0 {
-            self.floor_limited.insert(mount.to_path_buf());
+            self.floor_limited.insert(pool_mount.clone());
         } else if report.files_created > 0 {
-            self.floor_limited.remove(mount);
+            self.floor_limited.remove(&pool_mount);
         }
         if report.files_created == 0 {
             return false;
@@ -5312,7 +5430,7 @@ impl MonitoringDaemon {
             });
         }
         self.release_controller
-            .on_replenished(mount, report.files_created);
+            .on_replenished(&pool_mount, report.files_created);
         self.notification_manager
             .notify(&NotificationEvent::BallastReplenished {
                 mount: mount.to_string_lossy().to_string(),
@@ -5332,10 +5450,15 @@ impl MonitoringDaemon {
         };
         let available = pool.available_count();
         let expected = pool.expected_count();
-        self.release_controller.bind_pool(mount, &pool.ballast_dir);
-        let count = self
-            .release_controller
-            .files_to_release(mount, response, available, expected);
+        // A same-filesystem alias mount shares its keeper's pool; release
+        // history lives under the pool's own mount, the key it is saved and
+        // restored under across restarts.
+        let pool_mount = pool.mount_point.clone();
+        self.release_controller
+            .bind_pool(&pool_mount, &pool.ballast_dir);
+        let count =
+            self.release_controller
+                .files_to_release(&pool_mount, response, available, expected);
 
         let mut released = 0;
         if count > 0 {
@@ -5350,9 +5473,9 @@ impl MonitoringDaemon {
 
                 released = report.files_released;
                 self.release_controller
-                    .on_released(mount, report.files_released);
+                    .on_released(&pool_mount, report.files_released);
                 self.release_controller.record_release(
-                    mount,
+                    &pool_mount,
                     report.bytes_freed,
                     free_before,
                     Instant::now(),
@@ -6038,6 +6161,7 @@ impl MonitoringDaemon {
                     }
 
                     // Update shared configs for scanner thread.
+                    self.regret.update_config(&new_config);
                     *self.shared_scoring_config.write() = new_config.scoring.clone();
                     *self.shared_scanner_config.write() = new_config.scanner.clone();
 
@@ -6157,22 +6281,22 @@ impl MonitoringDaemon {
     /// Regret labels (Q4): resolve watched deletions against the filesystem
     /// and the process table, store each outcome, and feed the category
     /// calibrator the scanner reads before its next pass.
-    fn resolve_regrets(&self, now: Instant) {
+    fn resolve_regrets(&self) {
+        self.resolve_regrets_with_clock(Instant::now);
+    }
+
+    /// Sample time around each observation and again when its evidence is
+    /// applied. Ballast work, quarantine sweeps, and earlier observations
+    /// must not backdate a later sighting or its suspension deadline.
+    fn resolve_regrets_with_clock(&self, mut clock: impl FnMut() -> Instant) {
         let platform = Arc::clone(&self.platform);
-        let outcomes = self.regret.detector.lock().check(now, |watch| {
-            let recreated = std::fs::symlink_metadata(&watch.path).is_ok()
-                && EntryIdentity::of(&watch.path)
-                    .is_some_and(|identity| identity == watch.identity);
-            let parent_in_use = recreated
-                && watch
-                    .path
-                    .parent()
-                    .is_some_and(|parent| parent_in_use(platform.as_ref(), parent));
-            Sighting {
-                recreated,
-                parent_in_use,
-            }
-        });
+        let outcomes = self
+            .regret
+            .detector
+            .lock()
+            .check_with_clock(&mut clock, |watch| {
+                watch.observe(|parent| parent_in_use(platform.as_ref(), parent))
+            });
         if outcomes.is_empty() {
             return;
         }
@@ -6183,6 +6307,7 @@ impl MonitoringDaemon {
             outcomes
                 .iter()
                 .map(|outcome| {
+                    let now = clock();
                     calibrator.record(
                         &outcome.category,
                         certainty_from_name(&outcome.certainty),
@@ -7065,6 +7190,8 @@ fn scanner_thread_main(
     // stays pressured with nothing to reclaim, and resets on a productive pass.
     let mut last_empty_pass_at: Option<Instant> = None;
     let mut consecutive_empty_passes: u32 = 0;
+    // Timed-out empty passes since the last conclusive one (`record_empty_pass`).
+    let mut inconclusive_empty_passes: u32 = 0;
     // bd-8aeq: the executor's reclaim counter as it stood when the last
     // dispatching pass started. Confirmed at the next pass start: if the
     // counter has not moved, those dispatches reclaimed nothing (dry-run,
@@ -7128,7 +7255,11 @@ fn scanner_thread_main(
         if let Some(reclaim_before) = unconfirmed_dispatch.take()
             && executor_config.reclaim_events() == reclaim_before
         {
-            consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
+            record_empty_pass(
+                &mut consecutive_empty_passes,
+                &mut inconclusive_empty_passes,
+                false,
+            );
             last_empty_pass_at = Some(Instant::now());
             eprintln!(
                 "[SBH-SCANNER] the last pass dispatched candidates but nothing was reclaimed (dry-run, observe, dampened or failed); pacing it as an empty pass (consecutive={consecutive_empty_passes})"
@@ -7146,6 +7277,7 @@ fn scanner_thread_main(
             );
             last_empty_pass_at = None;
             consecutive_empty_passes = 0;
+            inconclusive_empty_passes = 0;
         }
         let request_level = request.pressure_level;
 
@@ -8913,13 +9045,15 @@ fn scanner_thread_main(
         // before the flush would misclassify it as empty and wrongly arm the
         // backoff (#15).
         //
-        // A *timed-out* pass with nothing dispatched is inconclusive for the
-        // exponential streak (the budget may simply have expired before the
-        // walker reached reclaimable files), so it does not grow the counter —
-        // but it still arms the base cooldown timestamp. The old behavior of
-        // fully resetting on timeout meant a tree big enough to exhaust the
-        // scan budget on every pass could never back off at all and re-walked
-        // back-to-back forever (~95% CPU at 82% disk, #15 case 1).
+        // A single *timed-out* pass with nothing dispatched is inconclusive for
+        // the exponential streak (the budget may simply have expired before
+        // the walker reached reclaimable files), but it still arms the base
+        // cooldown timestamp, and every TERMINAL_IDLE_EMPTY_PASSES of them in
+        // a row count as one empty pass (`record_empty_pass`, bd-qxrh). The
+        // old behavior of fully resetting on timeout meant a tree big enough
+        // to exhaust the scan budget on every pass could never back off at all
+        // and re-walked back-to-back forever (~95% CPU at 82% disk, #15 case
+        // 1); never counting timeouts kept Red/Critical out of terminal idle.
         //
         // NOTE: keying on dispatched-count, not candidates_found, is the fix for
         // the perpetual-Yellow hot-loop where every candidate is a sacred-marker
@@ -8935,9 +9069,11 @@ fn scanner_thread_main(
             });
         }
         if dispatched_this_pass.count == 0 {
-            if !scan_timed_out {
-                consecutive_empty_passes = consecutive_empty_passes.saturating_add(1);
-            }
+            record_empty_pass(
+                &mut consecutive_empty_passes,
+                &mut inconclusive_empty_passes,
+                scan_timed_out,
+            );
             last_empty_pass_at = Some(Instant::now());
             let next_secs = effective_empty_pass_cooldown(
                 current_scanner_config.min_rescan_interval_secs,
@@ -8951,6 +9087,7 @@ fn scanner_thread_main(
             }
         } else {
             consecutive_empty_passes = 0;
+            inconclusive_empty_passes = 0;
             last_empty_pass_at = None;
             unconfirmed_dispatch = Some(reclaim_at_pass_start);
         }
@@ -9431,7 +9568,19 @@ fn executor_thread_main(
             HashMap::new()
         };
 
-        let report = executor.execute(&plan, Some(&skip_protected));
+        let authorize_candidate =
+            |candidate: &CandidacyScore| regret.authorize_deletion(candidate, logger);
+        let on_unlinked = |candidate: &CandidacyScore, completed_at: Instant| {
+            if let Some(identity) = watch_identities.get(&candidate.path) {
+                regret.watch_unlinked(candidate, identity, completed_at);
+            }
+        };
+        let report = executor.execute_with_hooks(
+            &plan,
+            Some(&skip_protected),
+            Some(&authorize_candidate),
+            Some(&on_unlinked),
+        );
 
         if scanner_config.engine == ScannerEngineMode::V2 {
             for candidate in &report.backoff_candidates {
@@ -9493,34 +9642,6 @@ fn executor_thread_main(
 
         // Record deletions for repeat-deletion dampening.
         tracker.record_deletions(&report.deleted_paths);
-        if !report.dry_run {
-            let watches: Vec<Watch> = report
-                .deleted_paths
-                .iter()
-                .filter_map(|path| {
-                    let identity = watch_identities.get(path)?;
-                    let candidate = plan.candidates.iter().find(|c| &c.path == path)?;
-                    Some(Watch {
-                        decision_id: crate::scanner::decision_record::stable_decision_id(
-                            &candidate.path,
-                            candidate.identity,
-                            candidate.size_bytes,
-                        ),
-                        path: path.clone(),
-                        identity: identity.clone(),
-                        category: format!("{:?}", candidate.classification.category),
-                        certainty: candidate.decision.certainty,
-                        deleted_at: Instant::now(),
-                    })
-                })
-                .collect();
-            if !watches.is_empty() {
-                let mut detector = regret.detector.lock();
-                for watch in watches {
-                    detector.watch(watch);
-                }
-            }
-        }
         if !report.dry_run && report.items_deleted > 0 {
             shared_config.note_reclaim();
         }
@@ -9667,6 +9788,382 @@ mod tests {
     use crate::scanner::scoring::{DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::path::Path;
     use std::time::Duration;
+
+    /// An initialized daemon with all writes under a temporary directory
+    /// and platform observations supplied by the regular mock PAL. No
+    /// monitoring, scanner, or executor thread is started.
+    #[cfg(unix)]
+    struct RegretDaemonFixture {
+        daemon: MonitoringDaemon,
+        directory: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl RegretDaemonFixture {
+        fn new() -> Self {
+            use crate::core::config::PathsConfig;
+            use crate::platform::types::{OpenFile, OpenFileKind, OpenFileMode};
+
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let paths = PathsConfig {
+                config_file: root.join("config.toml"),
+                ballast_dir: root.join("ballast"),
+                state_file: root.join("state.json"),
+                sqlite_db: root.join("activity.sqlite3"),
+                jsonl_log: root.join("activity.jsonl"),
+            };
+            let mut config = Config::with_paths(paths);
+            let project = root.join("project");
+            std::fs::create_dir(&project).unwrap();
+            config.scanner.root_paths = vec![project.clone()];
+            config.ballast.auto_provision = false;
+            config.scoring.regret_window_minutes = 1;
+            let platform = MockPlatform::healthy()
+                .with_home(root)
+                .with_temp_dirs(Vec::new())
+                .with_cache_roots(Vec::new())
+                .with_open_file(OpenFile {
+                    pid: 42,
+                    path: project.join("Cargo.toml"),
+                    fd: Some(3),
+                    kind: OpenFileKind::Regular,
+                    mode: OpenFileMode::Read,
+                });
+            let daemon = MonitoringDaemon::init_with_platform(
+                config,
+                &DaemonArgs::default(),
+                Arc::new(platform),
+            )
+            .unwrap();
+            Self { daemon, directory }
+        }
+
+        fn flush_logger(&mut self) {
+            self.daemon.logger_handle.shutdown();
+            if let Some(logger) = self.daemon.logger_join.take() {
+                logger.join().unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RegretDaemonFixture {
+        fn drop(&mut self) {
+            self.daemon.logger_handle.shutdown();
+            if let Some(logger) = self.daemon.logger_join.take() {
+                let _ = logger.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn regret_watch_for_test(id: &str, path: &Path, category: &str, now: Instant) -> Watch {
+        Watch {
+            decision_id: id.to_string(),
+            path: path.to_path_buf(),
+            identity: EntryIdentity::of(path).unwrap(),
+            category: category.to_string(),
+            certainty: ArtifactCertainty::Definite,
+            deleted_at: now,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_regret_observation_keeps_failed_and_replaced_parents_out_of_evidence() {
+        let mut fixture = RegretDaemonFixture::new();
+        let root = fixture.directory.path();
+        let live = root.join("project/target");
+        let absent = root.join("project/absent");
+        let replaced_parent = root.join("replaced");
+        let unreadable_parent = root.join("unreadable");
+        std::fs::create_dir(&replaced_parent).unwrap();
+        std::fs::create_dir(&unreadable_parent).unwrap();
+        let replaced = replaced_parent.join("target");
+        let unreadable = unreadable_parent.join("target");
+        let now = Instant::now();
+        for (id, path, category) in [
+            ("live", &live, "live"),
+            ("absent", &absent, "absent"),
+            ("replaced", &replaced, "unknown"),
+            ("unreadable", &unreadable, "unknown"),
+        ] {
+            fixture
+                .daemon
+                .regret
+                .detector
+                .lock()
+                .watch(regret_watch_for_test(id, path, category, now));
+        }
+        std::fs::create_dir(&live).unwrap();
+        std::fs::rename(&replaced_parent, root.join("original-replaced")).unwrap();
+        std::fs::create_dir(&replaced_parent).unwrap();
+        std::fs::rename(&unreadable_parent, root.join("original-unreadable")).unwrap();
+        std::fs::write(&unreadable_parent, b"parent is no longer a directory").unwrap();
+
+        fixture
+            .daemon
+            .resolve_regrets_with_clock(|| now + Duration::from_secs(30));
+        assert_eq!(fixture.daemon.regret.detector.lock().pending(), 3);
+        assert_eq!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("live")
+                .unwrap()
+                .regrets,
+            1
+        );
+        assert!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("unknown")
+                .is_none()
+        );
+
+        fixture
+            .daemon
+            .resolve_regrets_with_clock(|| now + Duration::from_secs(60));
+        assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+        assert_eq!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("absent")
+                .unwrap()
+                .decisions,
+            1
+        );
+        assert!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("unknown")
+                .is_none()
+        );
+        fixture.flush_logger();
+        let ledger = crate::logger::sqlite::SqliteLogger::open_read_only(
+            &fixture.daemon.config.paths.sqlite_db,
+        )
+        .unwrap();
+        for (id, expected) in [
+            ("live", "regret"),
+            ("absent", "clean"),
+            ("replaced", "unknown"),
+            ("unreadable", "unknown"),
+        ] {
+            let outcomes = ledger.outcomes_for_decision(id).unwrap();
+            assert_eq!(outcomes.len(), 1, "{id}");
+            assert_eq!(outcomes[0].outcome, expected, "{id}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_regret_observation_uses_completion_time_for_each_watched_path() {
+        let mut fixture = RegretDaemonFixture::new();
+        let now = Instant::now();
+        let project = fixture.directory.path().join("project");
+        for id in ["first", "later"] {
+            let path = project.join(id);
+            fixture
+                .daemon
+                .regret
+                .detector
+                .lock()
+                .watch(regret_watch_for_test(id, &path, "timed", now));
+            std::fs::create_dir(&path).unwrap();
+        }
+        // Each pair brackets a real filesystem/process observation. The
+        // first begins before expiry but completes after it; the second
+        // begins later still. The last two samples timestamp calibration.
+        let mut seconds = [59, 61, 61, 63, 64, 65].into_iter();
+        fixture.daemon.resolve_regrets_with_clock(|| {
+            now + Duration::from_secs(seconds.next().expect("bounded clock samples"))
+        });
+        assert!(seconds.next().is_none());
+        assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+        assert!(
+            fixture
+                .daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("timed")
+                .is_none()
+        );
+        fixture.flush_logger();
+        let ledger = crate::logger::sqlite::SqliteLogger::open_read_only(
+            &fixture.daemon.config.paths.sqlite_db,
+        )
+        .unwrap();
+        for (id, after_secs) in [("first", 61), ("later", 63)] {
+            let outcomes = ledger.outcomes_for_decision(id).unwrap();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].outcome, "unknown");
+            assert_eq!(outcomes[0].after_secs, after_secs);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_regret_alarm_uses_fresh_calibration_time_for_its_full_suspension() {
+        let fixture = RegretDaemonFixture::new();
+        let now = Instant::now();
+        let project = fixture.directory.path().join("project");
+        let mut config = fixture.daemon.config.clone();
+        config.scoring.regret_suspend_minutes = 1;
+        fixture.daemon.regret.update_config(&config);
+        for id in ["first", "second", "third"] {
+            let path = project.join(id);
+            fixture
+                .daemon
+                .regret
+                .detector
+                .lock()
+                .watch(regret_watch_for_test(id, &path, "timed", now));
+            std::fs::create_dir(&path).unwrap();
+        }
+        // All three recreations are observed inside the 60-second window.
+        // Applying their evidence happens later, with the third raising the
+        // alarm at +50s. Its 60-second suspension must last until +110s.
+        let mut seconds = [1, 2, 3, 4, 5, 6, 40, 45, 50].into_iter();
+        fixture.daemon.resolve_regrets_with_clock(|| {
+            now + Duration::from_secs(seconds.next().expect("bounded clock samples"))
+        });
+        assert!(seconds.next().is_none());
+        let calibrator = fixture.daemon.regret.calibrator.lock();
+        let summary = calibrator.summary("timed").unwrap();
+        assert_eq!(summary.decisions, 3);
+        assert_eq!(summary.regrets, 3);
+        assert!(calibrator.suspended("timed", now + Duration::from_secs(109)));
+        assert!(!calibrator.suspended("timed", now + Duration::from_secs(110)));
+        drop(calibrator);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn daemon_config_reload_updates_regret_settings_and_preserves_pending_deadlines() {
+        let mut fixture = RegretDaemonFixture::new();
+        let now = Instant::now();
+        let project = fixture.directory.path().join("project");
+        let daemon = &mut fixture.daemon;
+        daemon.regret.detector.lock().watch(regret_watch_for_test(
+            "old-window",
+            &project.join("old"),
+            "old-window",
+            now,
+        ));
+        {
+            let mut calibrator = daemon.regret.calibrator.lock();
+            calibrator.record(
+                "definite",
+                ArtifactCertainty::Definite,
+                Outcome::Regret,
+                now,
+            );
+            calibrator.record("likely", ArtifactCertainty::Likely, Outcome::Regret, now);
+            for _ in 0..3 {
+                calibrator.record(
+                    "suspended",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    now,
+                );
+            }
+        }
+        let mut updated = daemon.config.clone();
+        updated.scoring.regret_window_minutes = 3;
+        updated.scoring.regret_alpha_definite = 0.04;
+        updated.scoring.regret_alpha_likely = 0.01;
+        updated.scoring.regret_suspend_minutes = 2;
+        std::fs::write(
+            &updated.paths.config_file,
+            toml::to_string(&updated).unwrap(),
+        )
+        .unwrap();
+        let (scan_tx, _scan_rx) = bounded(1);
+        daemon.handle_config_reload(&scan_tx);
+        assert!(daemon.wake_next_tick.reload);
+        assert_eq!(daemon.config.scoring.regret_window_minutes, 3);
+        {
+            let calibrator = daemon.regret.calibrator.lock();
+            assert_eq!(calibrator.config(), &regret_config(&updated));
+            for (category, alpha, decisions) in [
+                ("definite", 0.04, 1),
+                ("likely", 0.01, 1),
+                ("suspended", 0.04, 3),
+            ] {
+                let summary = calibrator.summary(category).unwrap();
+                assert_eq!(summary.alpha, alpha);
+                assert_eq!(summary.decisions, decisions);
+                assert_eq!(summary.regrets, decisions);
+                assert_eq!(summary.e_value, 1.0);
+            }
+            assert!(calibrator.suspended("suspended", now + Duration::from_mins(3)));
+            drop(calibrator);
+        }
+        daemon.regret.detector.lock().watch(regret_watch_for_test(
+            "new-window",
+            &project.join("new"),
+            "new-window",
+            now,
+        ));
+
+        // A rejected reload must leave the live feedback settings and the
+        // two existing watches untouched.
+        std::fs::write(&updated.paths.config_file, "[scoring\n").unwrap();
+        daemon.handle_config_reload(&scan_tx);
+        assert_eq!(
+            daemon.regret.calibrator.lock().config(),
+            &regret_config(&updated)
+        );
+        assert_eq!(daemon.regret.detector.lock().pending(), 2);
+
+        daemon.resolve_regrets_with_clock(|| now + Duration::from_secs(60));
+        assert_eq!(daemon.regret.detector.lock().pending(), 1);
+        assert_eq!(
+            daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("old-window")
+                .unwrap()
+                .decisions,
+            1
+        );
+        assert!(
+            daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("new-window")
+                .is_none()
+        );
+        daemon.resolve_regrets_with_clock(|| now + Duration::from_secs(180));
+        assert_eq!(daemon.regret.detector.lock().pending(), 0);
+        assert_eq!(
+            daemon
+                .regret
+                .calibrator
+                .lock()
+                .summary("new-window")
+                .unwrap()
+                .decisions,
+            1
+        );
+    }
 
     /// A fresh heartbeat for a `scanner_thread_main` test.
     fn heartbeat_for_test() -> Arc<ThreadHeartbeat> {
@@ -10169,6 +10666,263 @@ mod tests {
             protected.exists(),
             "protected candidate must remain present after executor preflight"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_regret_guard_stops_queued_category_after_a_midbatch_alarm() {
+        use std::cell::Cell;
+
+        let mut fixture = RegretDaemonFixture::new();
+        let project = fixture.directory.path().join("project");
+        let first = project.join("first/target");
+        let held = project.join("held/target");
+        let other = project.join("other/node_modules");
+        let mut candidates = Vec::new();
+        for (path, category, score) in [
+            (&first, ArtifactCategory::RustTarget, 3.0),
+            (&held, ArtifactCategory::RustTarget, 2.0),
+            (&other, ArtifactCategory::NodeModules, 1.0),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("artifact.o"), [0u8; 16]).unwrap();
+            let mut candidate = test_candidate(&path.to_string_lossy(), score);
+            candidate.classification.category = category;
+            candidate.size_bytes = 16;
+            assert!(!candidate.decision.category_suspended);
+            candidates.push(candidate);
+        }
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                check_open_files: true,
+                ..Default::default()
+            },
+            Some(fixture.daemon.logger_handle.clone()),
+        )
+        .with_platform(Arc::clone(&fixture.daemon.platform));
+        let plan = executor.plan(candidates);
+        assert_eq!(plan.candidates.len(), 3);
+        let checks = Cell::new(0);
+        let authorize = |candidate: &CandidacyScore| {
+            checks.set(checks.get() + 1);
+            if candidate.path == held {
+                // The queued scores were all made before this alarm. Raise
+                // it only after a real deletion in this batch has completed.
+                assert!(!first.exists());
+                assert!(other.exists());
+                let mut calibrator = fixture.daemon.regret.calibrator.lock();
+                for _ in 0..3 {
+                    calibrator.record(
+                        "RustTarget",
+                        ArtifactCertainty::Definite,
+                        Outcome::Regret,
+                        Instant::now(),
+                    );
+                }
+            }
+            fixture
+                .daemon
+                .regret
+                .authorize_deletion(candidate, &fixture.daemon.logger_handle)
+        };
+        let report = executor.execute_with_guard(&plan, None, Some(&authorize));
+
+        assert_eq!(checks.get(), 3);
+        assert_eq!(report.items_deleted, 2);
+        assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(report.bytes_freed, 32);
+        assert_eq!(report.deleted_paths, vec![first.clone(), other.clone()]);
+        assert_eq!(report.skipped_by_reason.get("category_suspended"), Some(&1));
+        assert!(report.backoff_candidates.is_empty());
+        assert!(report.errors.is_empty());
+        assert!(!report.circuit_breaker_tripped);
+        assert!(!first.exists());
+        assert!(held.join("artifact.o").exists());
+        assert!(!other.exists());
+        fixture.flush_logger();
+        let log = std::fs::read_to_string(&fixture.daemon.config.paths.jsonl_log).unwrap();
+        assert!(log.contains("regret category RustTarget is suspended; skipped "));
+        assert!(log.contains(held.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_regret_guard_allows_an_expired_category_suspension() {
+        let fixture = RegretDaemonFixture::new();
+        let path = fixture.directory.path().join("project/target");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("artifact.o"), [0u8; 16]).unwrap();
+        // A zero-duration suspension expires at its alarm timestamp, so
+        // this exercises expiry without a sleep or wall-clock tolerance.
+        let mut config = fixture.daemon.config.clone();
+        config.scoring.regret_suspend_minutes = 0;
+        fixture.daemon.regret.update_config(&config);
+        {
+            let mut calibrator = fixture.daemon.regret.calibrator.lock();
+            for _ in 0..3 {
+                calibrator.record(
+                    "RustTarget",
+                    ArtifactCertainty::Definite,
+                    Outcome::Regret,
+                    Instant::now(),
+                );
+            }
+            let summary = calibrator.summary("RustTarget").unwrap();
+            assert_eq!(summary.regrets, 3);
+            assert_eq!(summary.e_value, 1.0, "the alarm resets its likelihood");
+            assert!(!calibrator.suspended("RustTarget", Instant::now()));
+            drop(calibrator);
+        }
+        let mut candidate = test_candidate(&path.to_string_lossy(), 1.0);
+        candidate.classification.category = ArtifactCategory::RustTarget;
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                dry_run: false,
+                min_score: 0.0,
+                check_open_files: true,
+                ..Default::default()
+            },
+            Some(fixture.daemon.logger_handle.clone()),
+        )
+        .with_platform(Arc::clone(&fixture.daemon.platform));
+        let plan = executor.plan(vec![candidate]);
+        let authorize = |candidate: &CandidacyScore| {
+            fixture
+                .daemon
+                .regret
+                .authorize_deletion(candidate, &fixture.daemon.logger_handle)
+        };
+        let report = executor.execute_with_guard(&plan, None, Some(&authorize));
+        assert_eq!(report.items_deleted, 1);
+        assert_eq!(report.items_skipped, 0);
+        assert_eq!(report.items_failed, 0);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn executor_watches_each_unlink_before_the_next_candidate_and_keeps_its_deadline() {
+        use std::cell::Cell;
+
+        for (after_secs, expected_outcome) in [(59, "regret"), (60, "unknown")] {
+            let mut fixture = RegretDaemonFixture::new();
+            let project = fixture.directory.path().join("project");
+            let first = project.join("target");
+            let later = project.join("node_modules");
+            let mut candidates = Vec::new();
+            for (path, category, score) in [
+                (&first, ArtifactCategory::RustTarget, 2.0),
+                (&later, ArtifactCategory::NodeModules, 1.0),
+            ] {
+                std::fs::create_dir(path).unwrap();
+                std::fs::write(path.join("artifact.o"), [0u8; 16]).unwrap();
+                let mut candidate = test_candidate(&path.to_string_lossy(), score);
+                candidate.classification.category = category;
+                candidate.size_bytes = 16;
+                candidates.push(candidate);
+            }
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    dry_run: false,
+                    min_score: 0.0,
+                    check_open_files: true,
+                    ..Default::default()
+                },
+                Some(fixture.daemon.logger_handle.clone()),
+            )
+            .with_platform(Arc::clone(&fixture.daemon.platform));
+            let plan = executor.plan(candidates);
+            assert_eq!(plan.candidates.len(), 2);
+            let identities: HashMap<_, _> = plan
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.path.clone(),
+                        EntryIdentity::of(&candidate.path).unwrap(),
+                    )
+                })
+                .collect();
+            let first_completed = Cell::new(None);
+            let later_completed = Cell::new(None);
+            let authorize = |candidate: &CandidacyScore| {
+                if candidate.path == later {
+                    let completed_at = first_completed
+                        .get()
+                        .expect("first unlink completes before the next authorization");
+                    assert_eq!(fixture.daemon.regret.detector.lock().pending(), 1);
+                    assert!(!first.exists());
+                    assert!(later.exists());
+                    // A recreation is observable while the same batch is
+                    // still running. Resolve it against the actual first
+                    // unlink timestamp, including the exact 60s boundary.
+                    std::fs::create_dir(&first).unwrap();
+                    fixture.daemon.resolve_regrets_with_clock(|| {
+                        completed_at + Duration::from_secs(after_secs)
+                    });
+                    assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+                }
+                fixture
+                    .daemon
+                    .regret
+                    .authorize_deletion(candidate, &fixture.daemon.logger_handle)
+            };
+            let on_unlinked = |candidate: &CandidacyScore, completed_at: Instant| {
+                assert!(!candidate.path.exists());
+                fixture.daemon.regret.watch_unlinked(
+                    candidate,
+                    &identities[&candidate.path],
+                    completed_at,
+                );
+                if candidate.path == first {
+                    first_completed.set(Some(completed_at));
+                } else {
+                    assert_eq!(candidate.path, later);
+                    later_completed.set(Some(completed_at));
+                }
+            };
+            let report =
+                executor.execute_with_hooks(&plan, None, Some(&authorize), Some(&on_unlinked));
+
+            assert_eq!(report.items_deleted, 2);
+            assert_eq!(report.items_skipped, 0);
+            assert_eq!(report.items_failed, 0);
+            assert!(
+                first.exists(),
+                "the first path was recreated during the batch"
+            );
+            assert!(!later.exists());
+            assert_eq!(fixture.daemon.regret.detector.lock().pending(), 1);
+            let completed_at = later_completed.get().expect("later unlink observed");
+            fixture
+                .daemon
+                .resolve_regrets_with_clock(|| completed_at + Duration::from_secs(60));
+            assert_eq!(fixture.daemon.regret.detector.lock().pending(), 0);
+
+            fixture.flush_logger();
+            let ledger = crate::logger::sqlite::SqliteLogger::open_read_only(
+                &fixture.daemon.config.paths.sqlite_db,
+            )
+            .unwrap();
+            for (candidate, expected, age) in [
+                (&plan.candidates[0], expected_outcome, after_secs),
+                (&plan.candidates[1], "clean", 60),
+            ] {
+                let id = crate::scanner::decision_record::stable_decision_id(
+                    &candidate.path,
+                    candidate.identity,
+                    candidate.size_bytes,
+                );
+                let outcomes = ledger.outcomes_for_decision(&id).unwrap();
+                assert_eq!(outcomes.len(), 1);
+                assert_eq!(outcomes[0].outcome, expected);
+                assert_eq!(outcomes[0].after_secs, age);
+            }
+        }
     }
 
     #[test]
@@ -11328,8 +12082,8 @@ mod tests {
             held.log
         );
 
-        // The record persisted by the open run is replayed from the index on
-        // the next pass and held there too, without a walk.
+        // The next daemon holds the same tree too. Its event source revokes
+        // the record the open run persisted, so the root is reconciled.
         let replayed = run_scan(
             temp.path(),
             &root,
@@ -11343,7 +12097,7 @@ mod tests {
             replayed.log.contains(
                 "scanner certainty gate held 1 candidate(s) below likely (pressure=Orange)"
             ),
-            "the replayed record, the pre-scan and the walk hold one path: {}",
+            "the pre-scan and the walk hold one path: {}",
             replayed.log
         );
 
@@ -11392,20 +12146,22 @@ mod tests {
             1,
             "index-cargo.json",
         );
-        // On macOS the FSEvents backend's startup replan marks the roots
-        // dirty, so a fresh daemon reconciles instead of replaying (by
-        // design, see README "What feeds the index"); the certainty
+        // A fresh event source revokes the evidence saved before it started
+        // (`BackendRestart` on Linux, the FSEvents startup replan on macOS;
+        // by design, see README "What feeds the index"), so a new daemon
+        // reconciles the root instead of replaying the record. The certainty
         // assertions below hold either way.
         if cfg!(target_os = "linux") {
             assert!(
-                replayed_target.log.contains("replayed_records=1"),
-                "the second pass replays the persisted record: {}",
+                replayed_target.log.contains("replayed_records=0")
+                    && replayed_target.log.contains("reason=BackendRestart"),
+                "a fresh daemon revokes evidence saved before it started instead of replaying it: {}",
                 replayed_target.log
             );
         }
         assert!(
             replayed_target.dispatched,
-            "the replayed target keeps its definite certainty and is dispatched again: {}",
+            "the target keeps its definite certainty on the next daemon's pass and is dispatched again: {}",
             replayed_target.log
         );
         assert!(
@@ -12846,6 +13602,43 @@ mod tests {
             &critical,
             TERMINAL_IDLE_EMPTY_PASSES,
         ));
+    }
+
+    #[test]
+    fn timed_out_empty_passes_still_reach_terminal_idle_under_red() {
+        // bd-qxrh: when the CPU bucket cuts every pass short, no pass is
+        // "complete", the streak used to stay at 0, and Red bypassed the
+        // cooldown forever with nothing to reclaim.
+        let now = Instant::now();
+        let request = cooldown_request(PressureLevel::Red);
+        let cooldown = Duration::from_secs(90);
+        let (mut streak, mut inconclusive) = (0u32, 0u32);
+        let mut passes = 0;
+        while !empty_pass_cooldown_active(Some(now), now, cooldown, &request, streak) {
+            record_empty_pass(&mut streak, &mut inconclusive, true);
+            passes += 1;
+            assert!(
+                passes <= 100,
+                "timed-out empty passes never reached terminal idle"
+            );
+        }
+        assert_eq!(
+            passes,
+            TERMINAL_IDLE_EMPTY_PASSES * TERMINAL_IDLE_EMPTY_PASSES
+        );
+        assert_eq!(streak, TERMINAL_IDLE_EMPTY_PASSES);
+    }
+
+    #[test]
+    fn a_few_timed_out_empty_passes_stay_inconclusive() {
+        let (mut streak, mut inconclusive) = (0u32, 0u32);
+        for _ in 1..TERMINAL_IDLE_EMPTY_PASSES {
+            record_empty_pass(&mut streak, &mut inconclusive, true);
+        }
+        assert_eq!(streak, 0, "a budget that ran out early proves nothing yet");
+        // A completed empty pass counts at once and clears the inconclusive run.
+        record_empty_pass(&mut streak, &mut inconclusive, false);
+        assert_eq!((streak, inconclusive), (1, 0));
     }
 
     #[test]

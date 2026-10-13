@@ -18,8 +18,8 @@ const PROC_SELF_IO: &str = "/proc/self/io";
 const PROC_ROOT: &str = "/proc";
 const PROC_STAT: &str = "/proc/stat";
 
-mod reference_scan;
 mod mmap_scan;
+mod reference_scan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StatusMemory {
@@ -675,14 +675,20 @@ mod tests {
             Ok(regions) => assert!(regions.iter().any(|region| {
                 region.pid == current_pid
                     && region.path == resolved_exe
-                    && region.protection.as_deref().is_some_and(|mode| mode.contains('x'))
+                    && region
+                        .protection
+                        .as_deref()
+                        .is_some_and(|mode| mode.contains('x'))
             })),
             // The public Vec API must reject partial host coverage. It cannot
             // safely return this process's mappings as a complete all-PID set.
             // mmap_scan separately always tests the real current PID's positive
             // mapping and pairs readable-scope success with injected denials.
             Err(crate::core::errors::SbhError::Runtime { details }) => {
-                assert!(details.starts_with("memory-map inspection incomplete:"), "{details}");
+                assert!(
+                    details.starts_with("memory-map inspection incomplete:"),
+                    "{details}"
+                );
             }
             Err(error) => panic!("unexpected maps failure: {error}"),
         }

@@ -29,7 +29,7 @@ fn config_in(dir: &Path) -> std::path::PathBuf {
     fs::create_dir_all(&data).unwrap();
     let config = format!(
         "[paths]\nballast_dir = {:?}\njsonl_log = {:?}\nsqlite_db = {:?}\nstate_file = {:?}\n\
-         [scanner]\nroot_paths = [{:?}]\nmin_file_age_minutes = 0\n[notifications]\nenabled = false\n",
+         [scanner]\ninclude_user_temp_dir = false\nroot_paths = [{:?}]\nmin_file_age_minutes = 0\n[notifications]\nenabled = false\n",
         data.join("ballast").display().to_string(),
         data.join("activity.jsonl").display().to_string(),
         data.join("activity.sqlite3").display().to_string(),

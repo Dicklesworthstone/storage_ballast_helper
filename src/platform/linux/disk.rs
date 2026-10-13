@@ -32,7 +32,10 @@ pub(super) fn parse_proc_mounts(raw: &[u8]) -> Result<Vec<MountPoint>> {
         };
         let malformed = || SbhError::MountParse {
             // Do not echo mount options, which can contain credentials.
-            details: format!("invalid /proc/self/mounts record at line {}", line_number + 1),
+            details: format!(
+                "invalid /proc/self/mounts record at line {}",
+                line_number + 1
+            ),
         };
         let (Some(path), Some(kind), Some(_options), Some(dump), Some(pass)) = (
             fields.next(),
@@ -241,7 +244,9 @@ mod tests {
             "ext4"
         );
         assert!(
-            mounts.iter().any(|mount| mount.path.as_os_str().as_bytes() == b"/mnt/escaped\xfe")
+            mounts
+                .iter()
+                .any(|mount| mount.path.as_os_str().as_bytes() == b"/mnt/escaped\xfe")
         );
     }
 
@@ -267,15 +272,21 @@ mod tests {
         .unwrap();
         assert_eq!(mounts.len(), 3);
         assert_eq!(
-            find_mount(Path::new("/mnt/a b/child"), &mounts).unwrap().fs_type,
+            find_mount(Path::new("/mnt/a b/child"), &mounts)
+                .unwrap()
+                .fs_type,
             "ext4"
         );
         assert_eq!(
-            find_mount(Path::new("/mnt/a\\040b/child"), &mounts).unwrap().fs_type,
+            find_mount(Path::new("/mnt/a\\040b/child"), &mounts)
+                .unwrap()
+                .fs_type,
             "xfs"
         );
         assert!(
-            mounts.iter().any(|mount| mount.path == Path::new("/mnt/tab\tnewline\nslash\\"))
+            mounts
+                .iter()
+                .any(|mount| mount.path == Path::new("/mnt/tab\tnewline\nslash\\"))
         );
     }
 
@@ -298,10 +309,9 @@ mod tests {
 
     #[test]
     fn malformed_child_mount_is_not_silently_replaced_by_parent_coverage() {
-        let error = parse_proc_mounts(
-            b"rootfs / ext4 rw 0 0\ndisk /data xfs\ntmpfs /tmp tmpfs rw 0 0\n",
-        )
-        .unwrap_err();
+        let error =
+            parse_proc_mounts(b"rootfs / ext4 rw 0 0\ndisk /data xfs\ntmpfs /tmp tmpfs rw 0 0\n")
+                .unwrap_err();
         assert!(matches!(
             error,
             crate::core::errors::SbhError::MountParse { .. }

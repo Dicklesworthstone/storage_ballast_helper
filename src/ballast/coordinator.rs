@@ -760,7 +760,14 @@ impl BallastPoolCoordinator {
 
 // ──────────────────── helpers ────────────────────
 
-fn resolve_configured_pool_alias(path: &Path) -> PathBuf {
+/// Bind a configured ballast directory that is a symlink to its target.
+///
+/// Pool roots are opened without following links, so every reader of
+/// `paths.ballast_dir` (daemon, CLI, TUI) must bind the alias first or it
+/// reports an existing reserve as unreadable. Regular, nonexistent and
+/// dangling paths are returned unchanged.
+#[must_use]
+pub fn resolve_configured_pool_alias(path: &Path) -> PathBuf {
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
         std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     } else {
@@ -2218,6 +2225,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(observed[0].files_available, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_alias_to_a_non_default_reserve_binds_for_planning_and_observation() {
+        // The alias names a reserve away from the default `.sbh/ballast`, so
+        // ignoring the configured directory cannot pass by falling back to
+        // the default. The mount is canonical so the alias target lies inside
+        // it on macOS too (`/var` is a link to `/private/var`).
+        let mount = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(mount.path()).unwrap();
+        let reserve = root.join("reserve");
+        BallastManager::new_unfloored(reserve.clone(), tiny_ballast_config())
+            .unwrap()
+            .provision(None)
+            .unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&reserve, &alias).unwrap();
+        assert_eq!(resolve_configured_pool_alias(&alias), reserve);
+        assert_eq!(resolve_configured_pool_alias(&reserve), reserve);
+        let dangling = root.join("dangling");
+        std::os::unix::fs::symlink(root.join("absent"), &dangling).unwrap();
+        assert_eq!(resolve_configured_pool_alias(&dangling), dangling);
+
+        let platform = MockPlatform::new(
+            vec![mock_mount(&root, "/dev/sda1")],
+            HashMap::from([(root.clone(), mock_stats(&root, false))]),
+            mock_memory(),
+            PlatformPaths::default(),
+        );
+        let coordinator = BallastPoolCoordinator::discover_with_configured_dir(
+            &tiny_ballast_config(),
+            std::slice::from_ref(&root),
+            &platform,
+            Some(&alias),
+        )
+        .unwrap();
+        let pool = coordinator.pool_for_mount(&root).unwrap();
+        assert_eq!(pool.available_count(), 3);
+        assert!(pool.stranded_files().is_empty());
+        // The CLI's read-only observation sees the same reserve once bound.
+        let observed = crate::ballast::manager::BallastAvailability::observe(
+            &resolve_configured_pool_alias(&alias),
+            &tiny_ballast_config(),
+        );
+        assert_eq!(observed.available_count, 3);
     }
 
     #[cfg(unix)]

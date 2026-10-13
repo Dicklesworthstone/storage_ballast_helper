@@ -758,8 +758,8 @@ Exit codes: 0 = healthy, 1 = pressure, 2 = error.
 
 ```bash
 sbh daemon                          # Foreground (debugging)
-systemctl --user start sbh          # Systemd user scope
-sbh install --systemd --user --auto # Install + start (Linux)
+sudo systemctl start sbh            # Systemd system scope
+sudo sbh install --systemd --scope system  # Install + start (Linux; root is needed to reclaim)
 sbh install --launchd --auto        # Install + start (macOS)
 sbh install --wizard                # Guided interactive setup
 ```
@@ -846,7 +846,7 @@ sbh tune --apply --yes         # Auto-tune for this system
 | Don't | Do Instead |
 |-------|------------|
 | Ballast on `/tmp` | `paths.ballast_dir` on same mount as pressure source |
-| Daemon as root, CLI as user | `--user` scope — avoids state file permission mismatch |
+| User-scope daemon on Linux | System scope — without root the scanner cannot check other users' open files and deletes nothing |
 | Skip pre-build check | `sbh check --need 10G` in CI/hook |
 | Delete `.sbh-protect` by hand | `sbh unprotect /path` |
 | Wait for Red to act | Act at Yellow — agent swarms escalate fast |

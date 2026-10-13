@@ -219,6 +219,7 @@ yellow_min_free_pct = {yellow}
 orange_min_free_pct = {orange}
 red_min_free_pct = {red}
 [scanner]
+include_user_temp_dir = false
 engine = {engine:?}
 dry_run = {dry_run}
 cross_devices = {cross}
@@ -310,6 +311,9 @@ impl DaemonRun {
         if let Some(table) = injected {
             command
                 .env("SBH_TEST_MODE", "1")
+                // macOS GUI terminals export XPC_SERVICE_NAME to every child; the
+                // daemon would read it as launchd and refuse injected statistics.
+                .env_remove("XPC_SERVICE_NAME")
                 .env("SBH_TEST_FS_STATS", table);
         }
         let child = command.spawn().expect("spawn sbh daemon");
@@ -386,6 +390,7 @@ impl DaemonRun {
 
     /// The daemon's CPU time right now from the kernel (user + system), so
     /// a budget assertion does not depend on the 30 s state-write cadence.
+    #[cfg(target_os = "linux")]
     #[allow(clippy::cast_precision_loss)]
     pub fn proc_cpu_secs(&self) -> f64 {
         let stat = fs::read_to_string(format!("/proc/{}/stat", self.child.id())).unwrap();
@@ -397,6 +402,25 @@ impl DaemonRun {
             .flatten()
             .unwrap_or(100);
         ticks as f64 / hz as f64
+    }
+
+    /// No `/proc` on macOS: `ps` reports user + system CPU time as
+    /// `[[dd-]hh:]mm:ss.cc`.
+    #[cfg(not(target_os = "linux"))]
+    pub fn proc_cpu_secs(&self) -> f64 {
+        let output = Command::new("ps")
+            .args(["-o", "cputime=", "-p", &self.child.id().to_string()])
+            .output()
+            .expect("run ps for the daemon's CPU time");
+        let text = String::from_utf8_lossy(&output.stdout);
+        let text = text.trim();
+        let (days, clock) = text.split_once('-').map_or((0.0, text), |(days, clock)| {
+            (days.parse::<f64>().expect("ps cputime days"), clock)
+        });
+        let clock_secs = clock.split(':').fold(0.0, |total: f64, part| {
+            total.mul_add(60.0, part.parse::<f64>().expect("ps cputime field"))
+        });
+        days.mul_add(86_400.0, clock_secs)
     }
 
     pub fn wall_secs(&self) -> f64 {
@@ -745,6 +769,7 @@ fn test_mode_daemon_refuses_to_start_under_a_service_manager() {
         .arg(&config_path)
         .arg("daemon")
         .env("SBH_TEST_MODE", "1")
+        .env_remove("XPC_SERVICE_NAME")
         .env("SBH_TEST_FS_STATS", r#"{"mounts":[]}"#)
         .env("INVOCATION_ID", "e2e-fake-unit")
         .output()
@@ -873,6 +898,7 @@ fn injected_orange_mount_reclaims_only_the_stale_target() {
             .arg(&run.config_path)
             .args(args)
             .env("SBH_TEST_MODE", "1")
+            .env_remove("XPC_SERVICE_NAME")
             .env("SBH_TEST_FS_STATS", &table)
             .env("SBH_OUTPUT_FORMAT", "human")
             .output()
@@ -1628,6 +1654,77 @@ fn daemon_restart_retains_observed_credit_and_absent_history_releases_partial_re
     assert!(unobserved.stop().success());
 }
 
+/// A mount on the same filesystem as the ballast pool's mount is folded onto
+/// it. When that alias is the pressured mount, release credit must be kept
+/// under the pool's own mount: the key the state file saves and a restart
+/// restores. Keyed by the alias instead, each state write reset the credit
+/// and a restart released the same shortfall again.
+#[test]
+fn alias_mount_release_credit_survives_state_writes_and_restart() {
+    let dir = scratch();
+    let keeper = dir.path();
+    let alias = keeper.join("alias-mount");
+    let scan_root = alias.join("scan-root");
+    fs::create_dir_all(&scan_root).unwrap();
+    let (root, total, free, readonly) = quiet_root_mount();
+    let after_release = 80_000_000_000 + 5 * 1_048_576;
+    // One filesystem seen at two mount points: both report the same space.
+    let shared = |free: u64, series: &[(u64, u64)]| {
+        [keeper, alias.as_path()].map(|mount| {
+            mount_entry(mount, 1_000_000_000_000, free, false, series).replacen(
+                '{',
+                r#"{"device":"/dev/sbh-e2e-shared","#,
+                1,
+            )
+        })
+    };
+    let [keeper_first, alias_first] = shared(
+        500_000_000_000,
+        &[(12, 80_000_000_000), (13, after_release)],
+    );
+    let first_pressure = table_of(&[
+        keeper_first,
+        alias_first,
+        mount_entry(root, total, free, readonly, &[]),
+    ]);
+    let [keeper_sustained, alias_sustained] = shared(after_release, &[]);
+    let sustained_pressure = table_of(&[
+        keeper_sustained,
+        alias_sustained,
+        mount_entry(root, total, free, readonly, &[]),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![scan_root],
+        ballast_files: 5,
+        extra_toml: "[pressure.controller]\nkp = 0.01\nki = 0.0\nkd = 0.0\nkf = 0.0\n[pressure.prediction]\nenabled = false\n".to_string(),
+        ..ScenarioConfig::default()
+    };
+    let mut original = DaemonRun::spawn(dir.path(), &scenario, Some(&first_pressure));
+    wait_for_pool_history(&mut original, keeper, 2, 3);
+    original
+        .wait_until(
+            "twenty seconds of Red on both mounts across several state writes",
+            Duration::from_secs(30),
+            |run| run.wall_secs() >= 20.0,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(original.events_of("ballast_release").len(), 3);
+    assert!(original.stop().success());
+
+    let mut restarted = DaemonRun::spawn(dir.path(), &scenario, Some(&sustained_pressure));
+    wait_for_pool_history(&mut restarted, keeper, 2, 3);
+    restarted
+        .wait_until(
+            "eight seconds of sustained Red without extra release",
+            Duration::from_secs(15),
+            |run| run.wall_secs() >= 8.0,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(restarted.events_of("ballast_release").len(), 3);
+    assert_eq!(ballast_files_in(&restarted.data_dir.join("ballast")), 2);
+    assert!(restarted.stop().success());
+}
+
 /// Scenario `forced-scan`: SIGUSR1 at Green produces a forced
 /// `scan_complete` within two seconds and deletes nothing behind the
 /// default age gate.
@@ -1642,6 +1739,9 @@ fn sigusr1_forces_a_green_scan_within_two_seconds() {
     ]);
     let scenario = ScenarioConfig {
         root_paths: vec![fixtures.root],
+        // Gate above the fixtures' 5 h mtimes: APFS moves the birth time back
+        // with the mtime, so it cannot be relied on to keep them young.
+        min_file_age_minutes: 6 * 60,
         ..ScenarioConfig::default()
     };
     let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
@@ -2070,6 +2170,7 @@ fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
         .arg(&run.config_path)
         .args(["--json", "explain", "--id", &decision_id])
         .env("SBH_TEST_MODE", "1")
+        .env_remove("XPC_SERVICE_NAME")
         .env("SBH_TEST_FS_STATS", &table)
         .output()
         .expect("run sbh explain");
@@ -2117,6 +2218,7 @@ fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
         .arg(&stale_path)
         .args(["--level", "2"])
         .env("SBH_TEST_MODE", "1")
+        .env_remove("XPC_SERVICE_NAME")
         .env("SBH_TEST_FS_STATS", &table)
         .output()
         .expect("run sbh explain --why-not");
@@ -2779,6 +2881,7 @@ fn cpu_budget_bounds_an_expensive_scanner_at_green() {
 /// check exits 0 and reports the forecast as unknown instead of reusing
 /// the stale number.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn check_predict_reads_the_daemon_forecast_and_refuses_stale_state() {
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 4096);
@@ -2828,6 +2931,7 @@ fn check_predict_reads_the_daemon_forecast_and_refuses_stale_state() {
             .arg(&run.config_path)
             .args(args)
             .env("SBH_TEST_MODE", "1")
+            .env_remove("XPC_SERVICE_NAME")
             .env("SBH_TEST_FS_STATS", &table)
             .env("SBH_OUTPUT_FORMAT", "human")
             .output()
@@ -2873,6 +2977,7 @@ fn check_predict_reads_the_daemon_forecast_and_refuses_stale_state() {
         .arg(dir.path().join("config.toml"))
         .args(["--json", "check", "--predict", "30", &path])
         .env("SBH_TEST_MODE", "1")
+        .env_remove("XPC_SERVICE_NAME")
         .env("SBH_TEST_FS_STATS", &table)
         .output()
         .expect("run sbh check");
@@ -3070,6 +3175,7 @@ fn metrics_export_is_written_with_state_and_validates() {
             .arg(&config_path)
             .args(args)
             .env("SBH_TEST_MODE", "1")
+            .env_remove("XPC_SERVICE_NAME")
             .env("SBH_TEST_FS_STATS", &table)
             .output()
             .expect("run sbh")
@@ -3080,6 +3186,7 @@ fn metrics_export_is_written_with_state_and_validates() {
         .arg(&config_path)
         .arg("metrics")
         .env("SBH_TEST_MODE", "1")
+        .env_remove("XPC_SERVICE_NAME")
         .env("SBH_TEST_FS_STATS", &table)
         .env("SBH_OUTPUT_FORMAT", "human")
         .output()
@@ -3242,6 +3349,7 @@ fn control_socket_serves_ping_scan_now_policy_and_shutdown() {
             .arg(&config_path)
             .args(args)
             .env("SBH_TEST_MODE", "1")
+            .env_remove("XPC_SERVICE_NAME")
             .env("SBH_TEST_FS_STATS", &table)
             .output()
             .expect("run sbh")
