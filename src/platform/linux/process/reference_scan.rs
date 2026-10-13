@@ -1153,7 +1153,10 @@ mod tests {
     #[test]
     fn external_build_caches_reach_scoring_and_executor_without_open_files() {
         let fixture = Fixture::new();
-        let first = i32::try_from(std::process::id()).unwrap().checked_add(1).unwrap();
+        let first = i32::try_from(std::process::id())
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
         for (offset, (comm, key)) in [
             ("go", "GOCACHE"),
             ("go", "GOMODCACHE"),
@@ -1162,18 +1165,26 @@ mod tests {
             ("python3.13", "PIP_CACHE_DIR"),
             ("sccache", "SCCACHE_DIR"),
             ("clang-20", "CCACHE_DIR"),
-        ].iter().enumerate() {
+        ]
+        .iter()
+        .enumerate()
+        {
             let pid = first + i32::try_from(offset).unwrap();
             let process = fixture.pid(pid);
             let cache = fixture.root.join(key);
             fs::create_dir(&cache).unwrap();
             fs::write(cache.join("keep"), b"active cache").unwrap();
             fs::write(process.join("comm"), format!("{comm}\n")).unwrap();
-            fs::write(process.join("environ"), format!("{key}={}\0", cache.display())).unwrap();
+            fs::write(
+                process.join("environ"),
+                format!("{key}={}\0", cache.display()),
+            )
+            .unwrap();
         }
         let found = build_directories_with(&NativeProc, &fixture.proc_root, Limits::default());
         assert_eq!(found.len(), 7);
-        let (targets, complete) = open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
         assert!(complete);
         let roots = vec![fixture.root.clone()];
         let ancestors = crate::scanner::walker::open_path_ancestors_for_roots(&targets, &roots);
@@ -1181,7 +1192,12 @@ mod tests {
             assert!(targets.contains(&cache));
             assert!(ancestors.contains(&cache));
             assert!(ancestors.contains(&fixture.root));
-            assert_eq!(fs::read_dir(fixture.proc_root.join(pid.to_string()).join("fd")).unwrap().count(), 0);
+            assert_eq!(
+                fs::read_dir(fixture.proc_root.join(pid.to_string()).join("fd"))
+                    .unwrap()
+                    .count(),
+                0
+            );
             assert_eq!(fs::read(cache.join("keep")).unwrap(), b"active cache");
         }
     }
@@ -1189,16 +1205,26 @@ mod tests {
     #[test]
     fn relative_build_roots_use_the_process_cwd_and_keep_absolute_evidence_on_denial() {
         let fixture = Fixture::new();
-        let pid = i32::try_from(std::process::id()).unwrap().checked_add(1).unwrap();
+        let pid = i32::try_from(std::process::id())
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
         let process = fixture.pid(pid);
         fs::write(process.join("comm"), b"rustc\n").unwrap();
-        fs::write(process.join("environ"), b"CARGO_TARGET_DIR=../target\0SCCACHE_DIR=/shared/cache\0").unwrap();
+        fs::write(
+            process.join("environ"),
+            b"CARGO_TARGET_DIR=../target\0SCCACHE_DIR=/shared/cache\0",
+        )
+        .unwrap();
         let cwd = fixture.root.join("workspace");
         fs::create_dir(&cwd).unwrap();
         symlink(&cwd, process.join("cwd")).unwrap();
         assert_eq!(
             build_directories_with(&NativeProc, &fixture.proc_root, Limits::default()),
-            vec![(pid, cwd.join("../target")), (pid, PathBuf::from("/shared/cache"))]
+            vec![
+                (pid, cwd.join("../target")),
+                (pid, PathBuf::from("/shared/cache")),
+            ]
         );
         let mut denied = Faults::default();
         denied.links.insert(process.join("cwd"), libc::EACCES);
@@ -1211,13 +1237,25 @@ mod tests {
     #[test]
     fn build_metadata_does_not_renew_deadlines_or_read_unrelated_environments() {
         let fixture = Fixture::new();
-        let pid = i32::try_from(std::process::id()).unwrap().checked_add(1).unwrap();
+        let pid = i32::try_from(std::process::id())
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
         let process = fixture.pid(pid);
         fs::write(process.join("comm"), b"go\n").unwrap();
         fs::write(process.join("environ"), b"GOCACHE=/shared/go\0").unwrap();
-        let slow = Faults { advance_per_read: Duration::from_secs(1), ..Faults::default() };
-        let limits = Limits { time: Duration::from_secs(2), ..Limits::default() };
-        assert_eq!(build_directories_with(&slow, &fixture.proc_root, limits), vec![(pid, PathBuf::from("/shared/go"))]);
+        let slow = Faults {
+            advance_per_read: Duration::from_secs(1),
+            ..Faults::default()
+        };
+        let limits = Limits {
+            time: Duration::from_secs(2),
+            ..Limits::default()
+        };
+        assert_eq!(
+            build_directories_with(&slow, &fixture.proc_root, limits),
+            vec![(pid, PathBuf::from("/shared/go"))]
+        );
         assert_eq!(slow.link_calls.get(), 0);
         assert_eq!(slow.read_paths.borrow().len(), 2);
         fs::write(process.join("comm"), b"bash\n").unwrap();
