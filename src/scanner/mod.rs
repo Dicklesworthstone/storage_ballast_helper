@@ -15,4 +15,5 @@ pub mod protection;
 pub mod quarantine;
 pub mod regret;
 pub mod scoring;
+pub mod source_roots;
 pub mod walker;
