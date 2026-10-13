@@ -301,3 +301,174 @@ fn source_root_default_executor_keeps_interactive_confirmation_behind_the_same_v
     );
     retained(&candidate);
 }
+
+#[test]
+fn source_root_fallback_covers_all_declared_roots_and_preserves_an_independent_cache() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        for dry_run in [false, true] {
+            let directory = scratch();
+            let first = directory.path().join("source-one");
+            let second = directory.path().join("source-two");
+            let cache = directory.path().join("cache");
+            fs::create_dir_all(first.join("team/project/.git")).unwrap();
+            fs::create_dir_all(second.join("nested/worktree")).unwrap();
+            fs::write(second.join("nested/worktree/.git"), b"gitdir: /missing/metadata\n").unwrap();
+            let a = artifact(&first.join("target"));
+            let b = artifact(&second.join("target"));
+            let independent = artifact(&cache.join("target"));
+            let evidence = a.path.join("untracked-release-evidence.txt");
+            fs::write(&evidence, b"irreplaceable").unwrap();
+            let cfg = DeletionConfig {
+                quarantine_roots: vec![first.clone(), second.clone(), cache.clone()],
+                dry_run,
+                ..config(directory.path(), mode)
+            };
+            let observed_policy = cfg.source_roots.clone();
+            let executor = DeletionExecutor::new(cfg, None);
+            let plan = executor.plan(vec![a.clone(), b.clone(), independent.clone()]);
+            assert_eq!(plan.candidates.len(), 3, "all pass ordinary scoring admission");
+            let installed = observed_policy.snapshot();
+            assert_eq!(installed.roots.len(), 3);
+            assert!(!installed.allow_source_tree_roots);
+            assert_eq!(installed.allowed_roots(), vec![cache]);
+            let report = executor.execute(&plan, None);
+            assert_eq!(report.items_failed, 0, "{report:?}");
+            assert_eq!(report.items_skipped, 2, "{report:?}");
+            assert_eq!(report.skipped_by_reason.get("source_root_denied"), Some(&2));
+            assert!(report.backoff_candidates.is_empty());
+            assert_eq!(report.items_deleted, usize::from(!dry_run));
+            assert_eq!(report.items_would_delete, usize::from(dry_run));
+            if dry_run {
+                retained(&independent);
+                assert_eq!(report.bytes_would_free, independent.size_bytes);
+            } else {
+                assert!(!independent.path.exists(), "positive control must reclaim");
+                assert_eq!(report.items_quarantined, usize::from(mode == DeletionMode::Quarantine));
+            }
+            retained(&a);
+            retained(&b);
+            assert_eq!(fs::read(evidence).unwrap(), b"irreplaceable");
+            assert!(!first.join(".sbh/quarantine").exists());
+            assert!(!second.join(".sbh/quarantine").exists());
+        }
+    }
+}
+
+#[test]
+fn source_root_fallback_rechecks_a_new_sibling_repository_after_preflight() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let directory = scratch();
+        let candidate = artifact(&directory.path().join("target"));
+        let executor = DeletionExecutor::new(config(directory.path(), mode), None);
+        let plan = executor.plan(vec![candidate.clone()]);
+        assert_eq!(executor.explain_preflight(&candidate, None), Ok(()));
+        let calls = Cell::new(0);
+        let add_sibling = |_: &CandidacyScore| {
+            calls.set(calls.get() + 1);
+            fs::create_dir_all(directory.path().join("new/team/repository/.git")).unwrap();
+            Ok(())
+        };
+        let report = executor.execute_with_guard(&plan, None, Some(&add_sibling));
+        assert_eq!(calls.get(), 1, "the final-boundary test must reach its guard");
+        denied(&report);
+        retained(&candidate);
+    }
+}
+
+#[test]
+fn source_root_fallback_also_applies_to_raw_plans_and_interactive_deletion() {
+    use storage_ballast_helper::scanner::deletion::{CheckedDeletion, DeletionPlan};
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let directory = scratch();
+        fs::create_dir_all(directory.path().join("team/project/.git")).unwrap();
+        let candidate = artifact(&directory.path().join("target"));
+        let executor = DeletionExecutor::new(config(directory.path(), mode), None);
+        // Do not call plan(): callers cannot bypass scope installation by
+        // constructing public plan data themselves.
+        let plan = DeletionPlan {
+            candidates: vec![candidate.clone()],
+            total_reclaimable_bytes: candidate.size_bytes,
+            estimated_items: 1,
+            mode,
+            refused: Vec::new(),
+        };
+        denied(&executor.execute(&plan, None));
+        assert_eq!(
+            executor.delete_candidate_checked(&candidate, None).unwrap(),
+            CheckedDeletion::Skipped(SkipReason::SourceRootDenied)
+        );
+        retained(&candidate);
+    }
+}
+
+#[test]
+fn source_root_fallback_retains_the_ancestor_backstop_outside_declared_scope() {
+    let declared = scratch();
+    let outside = scratch();
+    git(outside.path(), &["init", "--initial-branch=main"]);
+    let candidate = artifact(&outside.path().join("target"));
+    let executor = DeletionExecutor::new(config(declared.path(), DeletionMode::Unlink), None);
+    denied(&executor.execute(&executor.plan(vec![candidate.clone()]), None));
+    retained(&candidate);
+}
+
+#[test]
+fn source_root_fallback_refuses_unverified_roots_without_claiming_reclamation() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let directory = scratch();
+        let mut deep = directory.path().join("deep");
+        for _ in 0..35 {
+            deep.push("next");
+        }
+        fs::create_dir_all(deep).unwrap();
+        let candidate = artifact(&directory.path().join("target"));
+        let cfg = config(directory.path(), mode);
+        let observed = cfg.source_roots.clone();
+        let executor = DeletionExecutor::new(cfg, None);
+        denied(&executor.execute(&executor.plan(vec![candidate.clone()]), None));
+        assert_eq!(
+            observed.snapshot().roots[0].finding,
+            storage_ballast_helper::scanner::source_roots::RootFinding::Unverified
+        );
+        retained(&candidate);
+    }
+}
+
+#[test]
+fn source_root_fallback_does_not_override_explicitly_authorized_build_reclamation() {
+    for mode in [DeletionMode::Unlink, DeletionMode::Quarantine] {
+        let directory = scratch();
+        let repo = directory.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "--initial-branch=main"]);
+        let candidate = artifact(&repo.join("target"));
+        let explicit = SourceRootPolicy::new(std::slice::from_ref(&repo), true);
+        let executor = DeletionExecutor::new(
+            DeletionConfig {
+                source_roots: explicit.clone(),
+                ..config(directory.path(), mode)
+            },
+            None,
+        );
+        let report = executor.execute(&executor.plan(vec![candidate.clone()]), None);
+        assert_eq!(report.items_deleted, 1, "{report:?}");
+        assert_eq!(report.items_failed, 0);
+        assert_eq!(explicit.snapshot().roots.len(), 1);
+        assert!(explicit.snapshot().allow_source_tree_roots);
+        assert!(!candidate.path.exists());
+        assert!(repo.join(".git").is_dir());
+    }
+}
+
+#[test]
+fn source_root_fallback_resolves_a_configured_alias_when_protecting_siblings() {
+    let directory = scratch();
+    let aliases = scratch();
+    fs::create_dir_all(directory.path().join("team/project/.git")).unwrap();
+    let candidate = artifact(&directory.path().join("target"));
+    let alias = aliases.path().join("root");
+    std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+    let executor = DeletionExecutor::new(config(&alias, DeletionMode::Unlink), None);
+    denied(&executor.execute(&executor.plan(vec![candidate.clone()]), None));
+    retained(&candidate);
+}

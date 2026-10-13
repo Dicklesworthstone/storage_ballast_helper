@@ -14,9 +14,10 @@
 //! blocking filesystem syscall cannot be interrupted.
 //!
 //! An uninstalled default policy still refuses candidates inside Git work
-//! trees. This candidate-level backstop is not whole-root enforcement: only
-//! installing every configured root can protect an untracked sibling of a
-//! repository elsewhere beneath that root.
+//! trees. Executors can also supply their declared roots as a deny-only
+//! fallback: that protects untracked siblings of nested repositories without
+//! mistaking a missing explicit policy for permission. This never infers an
+//! opt-in, and is not a substitute for daemon startup/reload/status wiring.
 
 use std::fs;
 use std::io;
@@ -377,8 +378,8 @@ pub fn inspect_roots(roots: &[PathBuf], allow: bool) -> SourceRootReport {
 #[derive(Debug, Default)]
 struct PolicyState {
     report: SourceRootReport,
-    // An omitted policy is not an intentionally configured empty root set.
-    // Refreshing default state must not silently disable its Git backstop.
+    // Only new/replace constitute explicit installation. Deny-only fallback
+    // roots do not disable the ancestor backstop outside their known scope.
     installed: bool,
     // Old locations remain denied for queued candidates after removal or
     // retargeting. A current containing root is evaluated under the new policy.
@@ -493,6 +494,40 @@ impl SourceRootPolicy {
         }
     }
 
+    /// Add declared executor roots to an otherwise uninstalled policy.
+    ///
+    /// This is deny-only fallback scope, not an opt-in or a live daemon
+    /// configuration. Explicit `new`/`replace` installation always wins.
+    /// Fallback scopes are accumulated across clones, never removed by a
+    /// stale caller, and outside them the canonical-ancestor backstop remains.
+    /// Repeated admission with the same roots does not repeat inspection here;
+    /// `authorize` still refreshes the entire scope before each mutation.
+    pub(crate) fn include_default_roots(&self, roots: &[PathBuf]) {
+        if roots.is_empty() {
+            return;
+        }
+        let mut state = self.inner.lock();
+        if state.installed {
+            return;
+        }
+        let mut combined: Vec<_> = state.report.roots.iter().map(|root| root.root.clone()).collect();
+        let previous_len = combined.len();
+        for root in roots {
+            if !combined.contains(root) {
+                combined.push(root.clone());
+            }
+        }
+        if combined.len() == previous_len {
+            return;
+        }
+        state.remember_locations();
+        let mut report = inspect_roots(&combined, false);
+        report.retain_unresolved_boundaries(&state.report);
+        state.report = report;
+        // Do not mark this explicit: otherwise adding a clear fallback root
+        // would silently permit in-repository candidates outside that root.
+    }
+
     /// Replace policy for every existing clone, retaining removed-root denial
     /// for stale queued candidates. Inspection and publication are serialized
     /// with final authorization; no partially replaced config is visible.
@@ -524,10 +559,10 @@ impl SourceRootPolicy {
     /// old queued candidates too. Overlapping roots obey deny-wins semantics.
     /// Strict ancestors of a configured root are never admitted: permission for
     /// a subtree is not permission to delete its parent and unrelated siblings.
-    /// Paths outside current and retired configured roots are not governed by
-    /// this policy (e.g. separately handled special locations and ballast).
-    /// With no policy installed at all, the canonical-ancestor Git backstop
-    /// applies instead; an empty snapshot alone is not unrestricted permission.
+    /// Paths outside current and retired explicitly configured roots are not
+    /// governed by this policy (e.g. separately handled special locations).
+    /// Without explicit installation, declared fallback roots can only add
+    /// vetoes; the canonical-ancestor Git backstop still applies outside them.
     ///
     /// Call at the final mutation boundary as well as during preflight. This
     /// check can only veto; opting in never replaces other candidate checks.
@@ -541,7 +576,7 @@ impl SourceRootPolicy {
         // a candidate alias observed before that inspection began.
         let canonical = fs::canonicalize(path)
             .map_err(|error| format!("cannot resolve candidate {}: {error}", path.display()))?;
-        if !state.installed {
+        if !state.installed && state.report.roots.is_empty() {
             return authorize_without_config(
                 &canonical,
                 Budget {
@@ -600,12 +635,26 @@ impl SourceRootPolicy {
                 .retired_paths
                 .iter()
                 .any(|root| overlaps(&lexical, root) || overlaps(&canonical, root));
+        let needs_ancestor_backstop = !state.installed && !matched;
         drop(state);
         if retired {
             return Err(format!(
                 "candidate {} belongs to a removed or retargeted scanner root",
                 path.display()
             ));
+        }
+        if needs_ancestor_backstop {
+            // Each root inspection has its own budget. Give this separate
+            // ancestor probe its own budget too, rather than interpreting an
+            // unrelated root's inspection time as missing path evidence.
+            return authorize_without_config(
+                &canonical,
+                Budget {
+                    start: Instant::now(),
+                    entries: 0,
+                    limits: InspectionLimits::default(),
+                },
+            );
         }
         Ok(())
     }
@@ -1037,5 +1086,36 @@ mod tests {
             );
             assert_eq!(fs::read(&evidence).unwrap(), b"keep during reload");
         }
+    }
+
+    #[test]
+    fn inferred_roots_accumulate_without_widening_outside_scope_or_erasing_explicit_policy() {
+        let dir = scratch();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let outside = dir.path().join("outside");
+        for root in [&first, &second, &outside] {
+            mkdir(&root.join("project/.git"));
+            mkdir(&root.join("target"));
+        }
+        let policy = SourceRootPolicy::default();
+        policy.include_default_roots(std::slice::from_ref(&first));
+        let other = policy.clone();
+        other.include_default_roots(std::slice::from_ref(&second));
+        policy.include_default_roots(std::slice::from_ref(&first));
+        assert_eq!(policy.snapshot().roots.len(), 2);
+        assert!(!policy.inner.lock().installed);
+        assert!(policy.authorize(&first.join("target")).is_err());
+        assert!(policy.authorize(&second.join("target")).is_err());
+        assert!(policy.authorize(&outside.join("project")).is_err());
+        assert!(policy.authorize(&outside.join("target")).is_ok());
+
+        policy.replace(std::slice::from_ref(&first), true);
+        other.include_default_roots(std::slice::from_ref(&second));
+        let report = policy.snapshot();
+        assert_eq!(report.roots.len(), 1);
+        assert!(report.allow_source_tree_roots);
+        assert!(policy.authorize(&first.join("target")).is_ok());
+        assert!(policy.authorize(&second.join("target")).is_err());
     }
 }
