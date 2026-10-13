@@ -8,6 +8,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
+- `sbh lease run` no longer stops a live build when part of its target cannot
+  be measured (bd-am3p). A directory replaced by a file mid-walk (ENOTDIR) or
+  a directory the watchdog cannot read (EACCES/EPERM, such as the mode-000
+  directories permission tests leave under `target/tmp`) made the lease
+  "invalid" and killed the build's process group. Those parts now go
+  uncounted for that round. A replaced or symlinked target still stops the
+  build, as does any other error (`49f8ea0`).
 - Deletion now refuses a candidate that holds a Git repository or a
   `.sbh-protect` marker at any depth (bd-jydu). Every containment check
   stopped three levels below the candidate, so a clone deeper inside an
