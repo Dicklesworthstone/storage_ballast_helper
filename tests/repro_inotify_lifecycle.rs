@@ -74,8 +74,13 @@ fn rebuilt(source: &mut ScannerEventSource, at: Instant) -> EventInvalidation {
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let before = source.stats().replans;
-    let all = until(source, at, |source, _| {
-        source.stats().replans > before && !source.capability().reason.contains("rebuild running")
+    // Wait for the handoff's own reason, not for the capability text: the
+    // old backend keeps draining meanwhile and may rewrite that text.
+    let all = until(source, at, |source, invalidation| {
+        let reasons = invalidation.reason_summary();
+        source.stats().replans > before
+            && (reasons.contains("recursive inotify watch coverage rebuilt")
+                || reasons.contains("recursive inotify replan failed"))
     });
     assert_eq!(
         source.stats().replans,
