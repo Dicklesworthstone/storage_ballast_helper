@@ -4,6 +4,7 @@
 //! `service/launchd.rs`. This file remains the module root so the repo can split
 //! the code without deleting or moving `src/daemon/service.rs`.
 
+mod executable;
 mod launchctl;
 mod launchd;
 mod systemd;
@@ -19,6 +20,8 @@ pub const SYSTEMD_MEMORY_MAX: &str = "256M";
 use crate::platform::pal::{NoopServiceManager, Platform, ServiceManager};
 use crate::platform::types::ServiceKind;
 
+pub use executable::capture_sbh_binary_path;
+use executable::resolve_sbh_binary;
 pub use launchctl::{LaunchctlDomain, LaunchctlServiceTarget};
 pub use launchd::{LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport};
 pub(crate) use systemd::test_unit_dir_override;
@@ -245,24 +248,6 @@ pub fn try_service_manager_for_kind_control(
     }
 }
 
-/// Resolve the sbh binary path (prefers the running binary, falls back to PATH).
-fn resolve_sbh_binary() -> Result<PathBuf> {
-    if let Ok(exe) = std::env::current_exe()
-        && exe.exists()
-    {
-        return Ok(exe);
-    }
-    for candidate in &["/usr/local/bin/sbh", "/usr/bin/sbh"] {
-        let p = Path::new(candidate);
-        if p.exists() {
-            return Ok(p.to_path_buf());
-        }
-    }
-    Err(crate::core::errors::SbhError::Runtime {
-        details: "could not locate sbh binary; install it to a PATH directory first".to_string(),
-    })
-}
-
 #[cfg(test)]
 mod service_ownership_policy_tests {
     use super::*;
@@ -329,9 +314,10 @@ mod legacy_inline {
     use std::env;
     use std::fmt::Write as _;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::Command;
 
+    use super::resolve_sbh_binary;
     use crate::core::errors::{Result, SbhError};
     use crate::platform::pal::ServiceManager;
 
@@ -694,27 +680,6 @@ mod legacy_inline {
     // ---------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------
-
-    /// Resolve the sbh binary path (prefers the running binary, falls back to PATH).
-    fn resolve_sbh_binary() -> Result<PathBuf> {
-        // First try: the currently running executable.
-        if let Ok(exe) = env::current_exe()
-            && exe.exists()
-        {
-            return Ok(exe);
-        }
-        // Fallback: search PATH.
-        for candidate in &["/usr/local/bin/sbh", "/usr/bin/sbh"] {
-            let p = Path::new(candidate);
-            if p.exists() {
-                return Ok(p.to_path_buf());
-            }
-        }
-        Err(SbhError::Runtime {
-            details: "could not locate sbh binary; install it to a PATH directory first"
-                .to_string(),
-        })
-    }
 
     /// Default paths that sbh needs write access to under `ProtectSystem=strict`.
     ///
