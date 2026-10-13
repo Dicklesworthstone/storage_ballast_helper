@@ -6,7 +6,9 @@
 //! removed; unrelated decision-directory siblings are never enumerated.
 //!
 //! Linux uses openat2(NO_XDEV) to reject bind mounts as well as device changes.
-//! An unavailable/blocked openat2 fails closed, without a weaker fallback.
+//! Where a seccomp filter blocks openat2 (ENOSYS), the open falls back to
+//! O_NOFOLLOW plus an equal-mount-ID check, which also refuses bind mounts; a
+//! kernel without mount IDs fails closed (see `beneath`).
 //! Other Unix systems use no-follow opens and device checks. The caller keeps
 //! the manifest on any error or budget pause. A partial purge can have removed
 //! earlier children already, but the remaining payload stays tracked for retry
@@ -87,7 +89,7 @@ mod unix {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::{Component, Path};
 
-    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat, fstat, statat, unlinkat};
+    use rustix::fs::{AtFlags, Dir, FileType, Stat, fstat, statat, unlinkat};
     use rustix::io::Errno;
 
     use super::{PurgeBudget, QuarantineRecord};
@@ -162,24 +164,7 @@ mod unix {
 
     fn open_directory(parent: &File, name: &OsStr, expected: Identity) -> io::Result<File> {
         validate_name(name)?;
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        #[cfg(target_os = "linux")]
-        let fd = {
-            use rustix::fs::{ResolveFlags, openat2};
-            openat2(
-                parent,
-                name,
-                flags,
-                Mode::empty(),
-                ResolveFlags::BENEATH
-                    | ResolveFlags::NO_SYMLINKS
-                    | ResolveFlags::NO_MAGICLINKS
-                    | ResolveFlags::NO_XDEV,
-            )?
-        };
-        #[cfg(not(target_os = "linux"))]
-        let fd = rustix::fs::openat(parent, name, flags, Mode::empty())?;
-        let directory = File::from(fd);
+        let directory = File::from(super::super::beneath::open_dir_beneath(parent, name)?);
         if Identity::of(&fstat(&directory)?) != expected {
             return Err(invalid("quarantine directory changed while opening it"));
         }
