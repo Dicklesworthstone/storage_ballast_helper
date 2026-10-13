@@ -91,7 +91,8 @@ impl BuildDirectoryScopes {
         let Some(path) = self.query_path(path) else {
             return false;
         };
-        path.ancestors().any(|parent| self.scopes.contains_key(parent))
+        path.ancestors()
+            .any(|parent| self.scopes.contains_key(parent))
             || self
                 .scopes
                 .range::<Path, _>((Bound::Included(path.as_ref()), Bound::Unbounded))
@@ -117,7 +118,7 @@ impl BuildDirectoryScopes {
             .range::<Path, _>((Bound::Excluded(path.as_ref()), Bound::Unbounded))
             .take_while(|(scope, _)| scope.starts_with(path.as_ref()))
         {
-            debug_assert!(scope != path.as_ref());
+            debug_assert_ne!(scope.as_path(), path.as_ref());
             for (pid, name) in processes {
                 summary.add_build_directory(*pid, name.clone());
             }
@@ -254,7 +255,10 @@ mod tests {
         scopes.insert(42, &cache, None);
         assert!(scopes.is_busy(&candidate));
         assert!(scopes.is_busy(&candidate.join("object.o")));
-        assert!(!scopes.is_busy(&cache), "queries remain scoped to scan roots");
+        assert!(
+            !scopes.is_busy(&cache),
+            "queries remain scoped to scan roots"
+        );
 
         let roots = vec![(candidate.clone(), candidate.components().count())];
         let mut ancestors = HashSet::new();
@@ -452,17 +456,15 @@ mod tests {
             "/view/cache-other",
         ]);
         let declarations = vec![(42, PathBuf::from("/source/cache"))];
-        let refused = identity_refusals(&declarations, &roots, |path| {
-            identities.get(path).copied()
-        });
+        let refused =
+            identity_refusals(&declarations, &roots, |path| identities.get(path).copied());
         assert_eq!(
             refused,
             HashSet::from([roots[0].0.clone(), roots[1].0.clone()])
         );
         assert!(
             roots.iter().all(|(path, _)| {
-                !path.starts_with(&declarations[0].1)
-                    && !declarations[0].1.starts_with(path)
+                !path.starts_with(&declarations[0].1) && !declarations[0].1.starts_with(path)
             }),
             "path-only projection cannot establish any of these alias refusals"
         );
@@ -481,11 +483,8 @@ mod tests {
             (Path::new("/view"), directory_identity(7, 3)),
             (Path::new("/"), directory_identity(7, 1)),
         ]);
-        let roots = candidate_roots(&[
-            "/view/job",
-            "/view/job/idle",
-            "/view/job/cache/deep/file.o",
-        ]);
+        let roots =
+            candidate_roots(&["/view/job", "/view/job/idle", "/view/job/cache/deep/file.o"]);
         let declarations = vec![(42, PathBuf::from("/source/cache"))];
         assert_eq!(
             identity_refusals(&declarations, &roots, |path| identities.get(path).copied()),
@@ -534,15 +533,17 @@ mod tests {
         let mut calls = BTreeMap::<PathBuf, usize>::new();
         let old = identity_refusals(&declarations, &roots, |path| {
             *calls.entry(path.to_path_buf()).or_default() += 1;
-            matches!(path.to_str(), Some("/source/cache" | "/view/cache"))
-                .then_some(cache)
+            matches!(path.to_str(), Some("/source/cache" | "/view/cache")).then_some(cache)
         });
         assert_eq!(old.len(), 2);
         assert!(calls.values().all(|count| *count == 1));
         let new = identity_refusals(&declarations, &roots, |path| {
             (path == Path::new("/source/cache")).then_some(cache)
         });
-        assert!(new.is_empty(), "a new batch must not reuse the former alias");
+        assert!(
+            new.is_empty(),
+            "a new batch must not reuse the former alias"
+        );
         assert_eq!(old.len(), 2, "the old observation remains immutable");
     }
 
@@ -568,6 +569,9 @@ mod tests {
         });
         assert_eq!(refused, HashSet::from([child]));
         assert!(sibling.is_dir());
-        assert_eq!(fs::read(cache.join("objects/artifact.o")).unwrap(), b"keep active bytes");
+        assert_eq!(
+            fs::read(cache.join("objects/artifact.o")).unwrap(),
+            b"keep active bytes"
+        );
     }
 }

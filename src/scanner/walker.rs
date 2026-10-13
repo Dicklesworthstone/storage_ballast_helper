@@ -4437,8 +4437,7 @@ mod tests {
             ..Default::default()
         };
         for scan_root in [&root, &child] {
-            let index =
-                collect_active_reference_index(&platform, std::slice::from_ref(scan_root));
+            let index = collect_active_reference_index(&platform, std::slice::from_ref(scan_root));
             assert!(index.is_complete());
             for path in [&child, &child.join("object.o")] {
                 // These paths were not individually declared or held open.
