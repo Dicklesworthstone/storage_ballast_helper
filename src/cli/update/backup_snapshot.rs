@@ -35,7 +35,7 @@ pub(super) fn create(
 /// Verify that a published snapshot still matches the digest recorded when it
 /// was created. Rollback refuses legacy or corrupted snapshots before staging
 /// can replace the currently working installation.
-pub(super) fn verify(snapshot: &BackupSnapshot) -> Result<(), String> {
+pub(super) fn verify_staged(snapshot: &BackupSnapshot, candidate: &Path) -> Result<(), String> {
     let entry = snapshot
         .path
         .parent()
@@ -57,12 +57,12 @@ pub(super) fn verify(snapshot: &BackupSnapshot) -> Result<(), String> {
                 .to_string()
         })?;
 
-    let raw = fs::symlink_metadata(&snapshot.path)
-        .map_err(|error| format!("failed to inspect backup binary: {error}"))?;
+    let raw = fs::symlink_metadata(candidate)
+        .map_err(|error| format!("failed to inspect staged rollback binary: {error}"))?;
     if !raw.is_file() {
         return Err(format!(
-            "backup binary is not a regular file: {}",
-            snapshot.path.display()
+            "staged rollback binary is not a regular file: {}",
+            candidate.display()
         ));
     }
     if raw.len() != expected_size {
@@ -80,11 +80,11 @@ pub(super) fn verify(snapshot: &BackupSnapshot) -> Result<(), String> {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let mut input = options
-        .open(&snapshot.path)
-        .map_err(|error| format!("failed to open backup binary: {error}"))?;
+        .open(candidate)
+        .map_err(|error| format!("failed to open staged rollback binary: {error}"))?;
     let opened = input
         .metadata()
-        .map_err(|error| format!("failed to inspect open backup binary: {error}"))?;
+        .map_err(|error| format!("failed to inspect open staged rollback binary: {error}"))?;
     if !opened.is_file() || opened.len() != expected_size {
         return Err("backup binary changed while validating rollback snapshot".to_string());
     }
