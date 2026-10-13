@@ -131,8 +131,7 @@ fn query_output_with_limits(
     loop {
         drain_query_stream(&mut stdout, &mut out, &mut remaining)?;
         drain_query_stream(&mut stderr, &mut err, &mut remaining)?;
-        if let Some(status) = child.child.try_wait()? {
-            child.reaped = true;
+        if child.has_exited()? {
             // Catch bytes written between the first drain and process exit.
             // Never block on a descendant that inherited a writer. A partial
             // response cannot establish that a unit is absent or safe to run.
@@ -144,6 +143,7 @@ fn query_output_with_limits(
                     "service query exited without closing its output; refusing a partial response",
                 ));
             }
+            let status = child.reap()?;
             return Ok(Output {
                 status,
                 stdout: out,
@@ -202,6 +202,75 @@ fn drain_query_stream(
 struct QueryChild {
     child: std::process::Child,
     reaped: bool,
+}
+
+#[cfg(unix)]
+impl QueryChild {
+    // Linux must keep the exited leader waitable until output validation is
+    // finished. try_wait() reaps it too early: a descendant holding a writer
+    // then survives the error path, since its group can no longer be signalled
+    // safely. WNOWAIT preserves ownership of the PID/process-group identity.
+    #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+    fn has_exited(&mut self) -> io::Result<bool> {
+        use nix::errno::Errno;
+        use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+        use nix::unistd::Pid;
+
+        let pid = i32::try_from(self.child.id()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid service query PID")
+        })?;
+        loop {
+            match waitid(
+                Id::Pid(Pid::from_raw(pid)),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+            ) {
+                Ok(WaitStatus::StillAlive) => return Ok(false),
+                Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => return Ok(true),
+                Ok(_) => return Err(io::Error::other("unexpected service query wait status")),
+                Err(Errno::EINTR) => {}
+                Err(error) => {
+                    // Another child reaper (or SIGCHLD disposition) may have
+                    // consumed it. Never signal a PID/group we no longer own.
+                    if error == Errno::ECHILD {
+                        self.reaped = true;
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+    }
+
+    // Keep the existing behavior on platforms without nix's waitid wrapper.
+    #[cfg(not(all(target_os = "linux", not(target_env = "uclibc"))))]
+    fn has_exited(&mut self) -> io::Result<bool> {
+        match self.child.try_wait() {
+            Ok(status) => {
+                self.reaped = status.is_some();
+                Ok(self.reaped)
+            }
+            Err(error) => {
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    self.reaped = true;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn reap(&mut self) -> io::Result<std::process::ExitStatus> {
+        match self.child.wait() {
+            Ok(status) => {
+                self.reaped = true;
+                Ok(status)
+            }
+            Err(error) => {
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    self.reaped = true;
+                }
+                Err(error)
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -463,5 +532,107 @@ mod query_tests {
         let error = result.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+#[cfg(all(test, target_os = "linux", not(target_env = "uclibc")))]
+mod query_lifecycle_tests {
+    use super::*;
+    use nix::errno::Errno;
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
+    use nix::unistd::Pid;
+    use std::os::unix::process::CommandExt as _;
+    use std::time::Instant;
+
+    fn exited_query() -> QueryChild {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut query = QueryChild {
+            child,
+            reaped: false,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !query.has_exited().unwrap() {
+            assert!(Instant::now() < deadline, "fixture did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        query
+    }
+
+    #[test]
+    fn exit_observation_keeps_the_linux_leader_waitable() {
+        let mut query = exited_query();
+        let pid = Pid::from_raw(i32::try_from(query.child.id()).unwrap());
+        for _ in 0..2 {
+            assert!(query.has_exited().unwrap());
+            assert!(!query.reaped);
+            assert_eq!(
+                waitid(Id::Pid(pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT),
+                Ok(WaitStatus::Exited(pid, 7))
+            );
+        }
+        assert_eq!(query.reap().unwrap().code(), Some(7));
+        assert!(query.reaped);
+        assert_eq!(waitpid(pid, None), Err(Errno::ECHILD));
+    }
+
+    #[test]
+    fn an_external_reaper_disarms_process_group_cleanup() {
+        let mut query = exited_query();
+        let pid = Pid::from_raw(i32::try_from(query.child.id()).unwrap());
+        assert_eq!(waitpid(pid, None), Ok(WaitStatus::Exited(pid, 7)));
+        assert_eq!(
+            query.has_exited().unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(query.reaped, "Drop must not signal this now-unowned PID/group");
+    }
+
+    fn process_is_running(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                let (_, fields) = stat.rsplit_once(')').expect("proc stat comm terminator");
+                !matches!(fields.split_whitespace().next(), Some("Z" | "X"))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => panic!("inspect fixture process: {error}"),
+        }
+    }
+
+    #[test]
+    fn inherited_writer_is_terminated_before_the_leader_is_reaped() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("writer-pid");
+        let release = temp.path().join("release-writer");
+        // The fallback release file and bounded loop also clean up when this
+        // regression is run against the old runner. Never signal a recorded PID.
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "(i=0; while [ ! -e \"$2\" ] && [ \"$i\" -lt 100 ]; do i=$((i+1)); sleep 0.1; done) & printf '%s' $! > \"$1\"; printf 'not-found\\n'; exit 0",
+                "query-test",
+            ])
+            .arg(&pid_file)
+            .arg(&release);
+        let result = query_output_with_limits(&mut command, Duration::from_secs(5), 1024);
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process_is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let survived = process_is_running(pid);
+        std::fs::write(release, b"done").unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert!(!survived, "inherited writer survived the failed service query");
     }
 }
