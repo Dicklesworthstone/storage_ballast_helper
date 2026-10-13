@@ -154,6 +154,11 @@ fn direct_cache_cleanup_preserves_external_hardlink_permissions() {
         let root = dir.path().join(name);
         let module = root.join("module");
         fs::create_dir_all(&module).unwrap();
+        if category == ArtifactCategory::GoCache {
+            // A cache label alone cannot authorize permission widening:
+            // admission re-verifies the GOMODCACHE marker on disk.
+            fs::create_dir_all(root.join("cache").join("download")).unwrap();
+        }
         let leaf = module.join("artifact.bin");
         fs::write(&leaf, PAYLOAD).unwrap();
         let retained = dir.path().join("retained-hardlink");
