@@ -268,22 +268,26 @@ pub fn classify_opaque_tree(
         // alone is not enough to promote them: the tree must additionally
         // carry a cargo build marker at its root. Every other shape keeps the
         // plain temp-context promotion.
-        let tmp_promotes =
-            tmp_like && (!has_broad_target_prefix(&name) || has_cargo_target_root_markers(path));
+        // Descriptive `<prefix>-target` / `<prefix>_target` names need the
+        // same corroboration: release-evidence and fixture trees name
+        // directories `invalid_target` or `ambient-target` on purpose, and on
+        // ts2 (2026-09-25) eight such directories inside non-git hfdt
+        // evidence bundles were deleted on the name alone.
+        let needs_markers = has_broad_target_prefix(&name) || has_descriptive_target_suffix(&name);
+        let has_markers = needs_markers && has_cargo_target_root_markers(path);
+        let tmp_promotes = tmp_like && (!needs_markers || has_markers);
         if (name == "target" && context.parent_has_cargo_toml)
             || tmp_promotes
             || is_agent_build_target_name(&name)
-            // Descriptive `<prefix>-target` / `<prefix>_target` names (e.g.
-            // `cass-ft-target`) are a strong stand-alone signal of a
-            // `CARGO_TARGET_DIR` output, so V2 nominates them as a single
-            // opaque candidate even without tmp/agent/parent-cargo context.
-            // This is what lets a stranded `/root/cass-ft-target` be reclaimed.
-            // The broad `target-`/`target_` PREFIX forms are intentionally NOT
-            // promoted here (see `has_descriptive_target_suffix`): they stay
-            // SignalOnly in a source context, matching the conservative
+            // A descriptive suffix name WITH cargo's root markers is a
+            // `CARGO_TARGET_DIR` output, so V2 nominates it as a single opaque
+            // candidate even without tmp/agent/parent-cargo context. This is
+            // what lets a stranded `/root/cass-ft-target` be reclaimed. The
+            // broad `target-`/`target_` PREFIX forms stay SignalOnly in a
+            // source context, matching the conservative
             // `opaque_tree_does_not_promote_broad_target_like_names_in_source_context`
             // guarantee. All downstream deletion vetoes still apply.
-            || has_descriptive_target_suffix(&name)
+            || (has_descriptive_target_suffix(&name) && has_markers)
         {
             return Some(OpaqueTreeClassification::candidate(
                 "cargo/build target with regenerable context",
@@ -420,6 +424,12 @@ pub(crate) fn has_descriptive_target_suffix(name: &str) -> bool {
 /// Matching is case-sensitive (real build-artifact dir names are lowercase).
 /// Returns true if the directory name matches an obvious build/cache artifact directory.
 pub(crate) fn is_obvious_artifact_name(name: &str) -> bool {
+    is_exact_or_prefix_artifact_name(name) || has_descriptive_target_suffix(name)
+}
+
+/// The exact and prefix forms of [`is_obvious_artifact_name`], which name build
+/// output on their own.
+fn is_exact_or_prefix_artifact_name(name: &str) -> bool {
     // Exact-match basenames (alphabetized for ease of audit). Bare rch
     // target dir names without a job-suffix are included here so the prefix
     // matchers below can safely require a separator (`-` or `_`) — this
@@ -472,15 +482,21 @@ pub(crate) fn is_obvious_artifact_name(name: &str) -> bool {
     {
         return true;
     }
+    false
+}
 
-    // Suffix-match basenames — descriptive `CARGO_TARGET_DIR` names such as
-    // `cass-ft-target`, `hfdt-release-target`, `foo_target`. Requires a
-    // non-empty prefix before the `-target` / `_target` separator, so a bare
-    // `target` (already handled above) and a leading-separator `-target`
-    // never match, and `mytarget` (no separator) is excluded. This mirrors the
-    // `target-suffix` (0.88) / `underscore-target-suffix` (0.92) patterns in
-    // the artifact registry.
-    has_descriptive_target_suffix(name)
+/// A name that is an artifact name only through the descriptive suffix
+/// (`cass-ft-target`, `foo_target`, but also `invalid_target`).
+fn is_suffix_only_artifact_name(name: &str) -> bool {
+    has_descriptive_target_suffix(name) && !is_exact_or_prefix_artifact_name(name)
+}
+
+/// Whether the directory `path` named `name` is build output by its name.
+/// A suffix-only name (`<x>-target`, `<x>_target`) names data as often as a
+/// `CARGO_TARGET_DIR`, so it counts only with cargo's own target-root
+/// markers; every other artifact name stands on its own.
+fn is_corroborated_artifact_dir(path: &Path, name: &str) -> bool {
+    !is_suffix_only_artifact_name(name) || has_cargo_target_root_markers(path)
 }
 
 /// Returns true if the candidate's basename clearly identifies it as a
@@ -505,12 +521,19 @@ pub(crate) fn is_obvious_artifact_name(name: &str) -> bool {
 ///
 /// Matching is case-sensitive (real build-artifact dir names are lowercase).
 pub(crate) fn is_obvious_build_artifact_basename(path: &Path) -> bool {
+    is_obvious_build_artifact_basename_given(path, false)
+}
+
+/// [`is_obvious_build_artifact_basename`], where `cargo_evidence` (the
+/// walker's structural signals for this candidate, which the scorer already
+/// holds) can stand in for reading a suffix-only name's root markers.
+pub(crate) fn is_obvious_build_artifact_basename_given(path: &Path, cargo_evidence: bool) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
 
     if is_obvious_artifact_name(name) {
-        return true;
+        return cargo_evidence || is_corroborated_artifact_dir(path, name);
     }
 
     // Build-profile, output, and target-triple subdirectories produced by cargo or
@@ -528,7 +551,9 @@ pub(crate) fn is_obvious_build_artifact_basename(path: &Path) -> bool {
             ancestor
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(is_obvious_artifact_name)
+                .is_some_and(|n| {
+                    is_obvious_artifact_name(n) && is_corroborated_artifact_dir(ancestor, n)
+                })
         });
     }
 
@@ -1785,7 +1810,8 @@ mod tests {
         OpaqueTreeContext, OpaqueTreeDisposition, StructuralSignals, classify_opaque_tree,
         extract_pattern_label, extract_pattern_label_with_cleanup_rules,
         has_descriptive_target_suffix, is_cargo_cache_store, is_cargo_registry_internal_path,
-        is_obvious_build_artifact_basename, structural_score,
+        is_obvious_build_artifact_basename, is_obvious_build_artifact_basename_given,
+        structural_score,
     };
     use crate::platform::{linux, macos};
     use std::path::Path;
@@ -2335,9 +2361,13 @@ mod tests {
         let opaque = classify_opaque_tree(&forged, OpaqueTreeContext::default()).unwrap();
         assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
 
-        // Non-broad shapes keep the plain temp promotion (no markers needed).
+        // Descriptive suffix shapes need the same markers (issue #34); the
+        // plain `target` keeps the temp promotion.
         let descriptive = base.path().join("cass-ft-target");
         std::fs::create_dir_all(&descriptive).unwrap();
+        let opaque = classify_opaque_tree(&descriptive, OpaqueTreeContext::default()).unwrap();
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::SignalOnly);
+        std::fs::write(descriptive.join(".rustc_info.json"), "{}").unwrap();
         let opaque = classify_opaque_tree(&descriptive, OpaqueTreeContext::default()).unwrap();
         assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
         let plain = base.path().join("target");
@@ -2346,27 +2376,63 @@ mod tests {
         assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
     }
 
+    /// A non-temp scratch parent inside the checkout (`tmp/` is gitignored and
+    /// is not a temp root to sbh, unlike `/tmp` or `$TMPDIR`).
+    fn non_temp_scratch() -> tempfile::TempDir {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&parent).unwrap();
+        tempfile::tempdir_in(parent).unwrap()
+    }
+
     #[test]
-    fn opaque_tree_promotes_descriptive_target_suffix_under_root() {
-        // The backstop: `/root/cass-ft-target` is nominated as a single opaque
-        // RustTarget candidate (was SignalOnly) even with no tmp/agent context.
-        let opaque = classify_opaque_tree(
+    fn opaque_tree_promotes_a_descriptive_target_suffix_only_with_cargo_markers() {
+        // Issue #34: on ts2 sbh deleted `invalid_target` and `ambient-target`
+        // fixtures inside non-git release-evidence bundles on the name alone.
+        let base = non_temp_scratch();
+        for (name, fixture) in [
+            ("invalid_target", "expected-rejection.json"),
+            ("ambient-target", "probe.log"),
+            ("cargo-target", "README"),
+        ] {
+            let dir = base.path().join("publish-gates-v1").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(fixture), "evidence").unwrap();
+            let opaque = classify_opaque_tree(&dir, OpaqueTreeContext::default()).unwrap();
+            assert_eq!(
+                opaque.disposition,
+                OpaqueTreeDisposition::SignalOnly,
+                "{name}"
+            );
+            assert!(!is_obvious_build_artifact_basename(&dir), "{name}");
+        }
+        // Nothing readable at the root is no evidence either.
+        let unread = classify_opaque_tree(
             Path::new("/root/cass-ft-target"),
             OpaqueTreeContext::default(),
         )
-        .expect("descriptive -target suffix should be classified");
+        .unwrap();
+        assert_eq!(unread.disposition, OpaqueTreeDisposition::SignalOnly);
+
+        // A real `CARGO_TARGET_DIR` (the stranded /root/cass-ft-target case)
+        // carries cargo's root markers and is nominated outside temp storage.
+        let real = base.path().join("cass-ft-target");
+        std::fs::create_dir_all(real.join("debug")).unwrap();
+        std::fs::write(
+            real.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n",
+        )
+        .unwrap();
+        let opaque = classify_opaque_tree(&real, OpaqueTreeContext::default()).unwrap();
         assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
         assert_eq!(opaque.classification.category, ArtifactCategory::RustTarget);
         assert_eq!(opaque.classification.pattern_name, "opaque-cargo-target");
-
-        // `_target` suffix works the same way.
-        let underscore =
-            classify_opaque_tree(Path::new("/root/foo_target"), OpaqueTreeContext::default())
-                .expect("descriptive _target suffix should be classified");
-        assert_eq!(
-            underscore.disposition,
-            OpaqueTreeDisposition::CandidateOpaque
-        );
+        assert!(is_obvious_build_artifact_basename(&real));
+        assert!(is_obvious_build_artifact_basename(&real.join("debug")));
+        let underscore = base.path().join("foo_target");
+        std::fs::create_dir_all(&underscore).unwrap();
+        std::fs::write(underscore.join(".rustc_info.json"), "{}").unwrap();
+        let opaque = classify_opaque_tree(&underscore, OpaqueTreeContext::default()).unwrap();
+        assert_eq!(opaque.disposition, OpaqueTreeDisposition::CandidateOpaque);
     }
 
     #[test]
@@ -2398,16 +2464,20 @@ mod tests {
 
     #[test]
     fn is_obvious_build_artifact_basename_covers_suffix_but_not_secrets() {
-        for name in [
-            "cass-ft-target",
-            "foo_target",
-            "hfdt-release-target",
-            "target",
-        ] {
+        assert!(is_obvious_build_artifact_basename(Path::new("target")));
+        // A suffix-only name needs cargo's root markers; the scorer can supply
+        // the walker's structural evidence instead.
+        let base = non_temp_scratch();
+        for name in ["cass-ft-target", "foo_target", "hfdt-release-target"] {
+            let dir = base.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(!is_obvious_build_artifact_basename(&dir), "{name}");
             assert!(
-                is_obvious_build_artifact_basename(Path::new(name)),
+                is_obvious_build_artifact_basename_given(&dir, true),
                 "{name}"
             );
+            std::fs::create_dir_all(dir.join(".fingerprint")).unwrap();
+            assert!(is_obvious_build_artifact_basename(&dir), "{name}");
         }
         for name in [".ssh", ".rustup", ".cargo", ".config", ".local", "mytarget"] {
             assert!(

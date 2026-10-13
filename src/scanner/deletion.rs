@@ -36,7 +36,8 @@ use crate::platform::sacred_catalog::cross_platform_sacred_paths;
 use crate::platform::types::SacredPath;
 use crate::scanner::active_lease;
 use crate::scanner::patterns::{
-    ArtifactCategory, ArtifactClassification, StructuralSignals, is_obvious_build_artifact_basename,
+    ArtifactCategory, ArtifactClassification, StructuralSignals,
+    is_obvious_build_artifact_basename_given,
 };
 use crate::scanner::protection::{self, StowawayScanConfig};
 use crate::scanner::quarantine::{self, QuarantineStore, QuarantineUnavailable};
@@ -1818,6 +1819,13 @@ fn git_dir_owner(dot_git: &Path, marker: &fs::Metadata) -> Option<u32> {
 /// (`C:\Users\...`) are not currently covered — sbh's target deployments
 /// are Linux and macOS only.
 pub(crate) fn is_hardcoded_source_tree(path: &Path) -> bool {
+    is_hardcoded_source_tree_given(path, false)
+}
+
+/// [`is_hardcoded_source_tree`] for the scorer, which holds the walker's
+/// structural signals: `cargo_evidence` corroborates a suffix-only artifact
+/// name (`<x>-target`, `<x>_target`) without another read of its root.
+pub(crate) fn is_hardcoded_source_tree_given(path: &Path, cargo_evidence: bool) -> bool {
     let s = path.to_string_lossy();
 
     // Determine whether the candidate sits under a protected source-tree root.
@@ -1835,7 +1843,7 @@ pub(crate) fn is_hardcoded_source_tree(path: &Path) -> bool {
         // inside operator-configured source roots. Arbitrary unknown
         // basenames (e.g., `src`, `docs`, or a misclassified crate name)
         // stay vetoed — that's the carnage-prevention guarantee.
-        if !is_obvious_build_artifact_basename(path) {
+        if !is_obvious_build_artifact_basename_given(path, cargo_evidence) {
             return true;
         }
     }
@@ -2000,6 +2008,7 @@ fn factors_to_record(f: &ScoreFactors) -> ScoreFactorsRecord {
 mod tests {
     use super::*;
     use crate::scanner::active_lease::{ActiveLease, LeasePolicy};
+    use crate::scanner::patterns::is_obvious_build_artifact_basename;
     use crate::scanner::patterns::{ArtifactCategory, ArtifactClassification};
     use crate::scanner::scoring::{DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::borrow::Cow;
@@ -4006,10 +4015,12 @@ mod tests {
 
     #[test]
     fn obvious_build_artifact_basename_suffix_matches() {
-        // Descriptive `CARGO_TARGET_DIR` names: `<prefix>-target` /
-        // `<prefix>_target` with a non-empty prefix. This is the rule that lets
-        // the stranded `/root/cass-ft-target` (241 GB) be reclaimed, and it
-        // also newly covers `my-target` (previously start-anchored-only).
+        // Descriptive `CARGO_TARGET_DIR` names (`<prefix>-target` /
+        // `<prefix>_target`) count when the directory carries cargo's root
+        // markers: that keeps a stranded `/root/cass-ft-target` (241 GB)
+        // reclaimable. Without them the name alone proves nothing (issue
+        // #34: `invalid_target` / `ambient-target` evidence fixtures on ts2).
+        let base = tempfile::tempdir().unwrap();
         for name in [
             "cass-ft-target",
             "cass_ft_target",
@@ -4018,10 +4029,27 @@ mod tests {
             "my-target",
             "my_target",
         ] {
-            let p = PathBuf::from(format!("/root/{name}"));
+            let p = base.path().join(name);
+            fs::create_dir_all(&p).unwrap();
+            assert!(
+                !is_obvious_build_artifact_basename(&p),
+                "`{name}` without cargo markers must not pass on its name"
+            );
+            fs::write(p.join(".rustc_info.json"), "{}").unwrap();
             assert!(
                 is_obvious_build_artifact_basename(&p),
-                "expected `{name}` to be recognized as a build artifact"
+                "expected `{name}` with cargo markers to be a build artifact"
+            );
+        }
+        // Inside a project root the floor refuses the evidence shapes outright.
+        for path in [
+            "/data/projects/hfdt-release-v0.3.15/publish-gates-v1/sanitizer-wrapper-controls-v1/invalid_target",
+            "/data/projects/hfdt-fon4nq/baseline/ambient-target",
+        ] {
+            assert!(is_hardcoded_source_tree(Path::new(path)), "{path}");
+            assert!(
+                !is_hardcoded_source_tree_given(Path::new(path), true),
+                "{path}"
             );
         }
     }

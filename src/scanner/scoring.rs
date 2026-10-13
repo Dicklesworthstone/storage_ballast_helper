@@ -673,7 +673,10 @@ impl ScoringEngine {
         // re-dispatch from the index every pass and an "empty pass" back-off
         // (fmd: 902 refused plans an hour, hz1: 58 back-offs at Critical,
         // 2026-09-30). The executor keeps its own checks.
-        if crate::scanner::deletion::is_hardcoded_source_tree(&input.path) {
+        if crate::scanner::deletion::is_hardcoded_source_tree_given(
+            &input.path,
+            input.signals.has_strong_signal(),
+        ) {
             return Some(Cow::Borrowed(
                 "inside a project source tree and not an obvious build-artifact name",
             ));
@@ -1922,9 +1925,11 @@ mod tests {
     fn is_system_path_lifts_only_root_build_artifacts() {
         // THE fix: a proven regenerable build artifact stranded under /root is
         // no longer a system path, so it can be scored + reclaimed.
-        assert!(!is_system_path(Path::new("/root/cass-ft-target")));
         assert!(!is_system_path(Path::new("/root/target")));
-        assert!(!is_system_path(Path::new("/root/foo_target")));
+        // A descriptive suffix name lifts only with cargo's root markers
+        // readable (issue #34); nothing is readable at these test paths.
+        assert!(is_system_path(Path::new("/root/cass-ft-target")));
+        assert!(is_system_path(Path::new("/root/foo_target")));
         // A cargo target nested a level under a non-artifact dir is also
         // liftable (only its own basename matters); the parent stays vetoed.
         assert!(!is_system_path(Path::new("/root/build-area/target")));
@@ -2957,6 +2962,38 @@ mod tests {
         let score = engine.score_candidate(&candidate(scratch_crate), 0.95);
         assert!(!score.vetoed, "{score:?}");
         assert_eq!(score.decision.action, DecisionAction::Delete);
+    }
+
+    #[test]
+    fn suffix_named_evidence_without_cargo_structure_is_vetoed_in_a_project_tree() {
+        // Issue #34 (ts2, 2026-09-25): these scored name=1.0, structure=0.4 and
+        // were deleted on the `*_target` / `*-target` suffix alone.
+        let engine = default_engine();
+        for path in [
+            "/data/projects/hfdt-release-v0.3.15/publish-gates-v1/sanitizer-wrapper-controls-v1/invalid_target",
+            "/data/projects/hfdt-fon4nq/baseline/ambient-target",
+        ] {
+            let input = CandidateInput {
+                path: PathBuf::from(path),
+                size_bytes: 28_672,
+                age: Duration::from_hours(400),
+                classification: classification(0.93, ArtifactCategory::RustTarget),
+                signals: StructuralSignals::default(),
+                active_references: ActiveReferenceSummary::default(),
+                is_open: false,
+                excluded: false,
+            };
+            let score = engine.score_candidate(&input, 0.95);
+            assert!(score.vetoed, "{path}");
+            assert!(
+                score
+                    .veto_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("project source tree")),
+                "{path}: {:?}",
+                score.veto_reason
+            );
+        }
     }
 
     #[test]
