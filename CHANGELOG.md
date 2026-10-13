@@ -6,6 +6,34 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+### Added
+
+- Optional absolute free-space floors per pressure level:
+  `pressure.green_min_free_bytes`, `yellow_min_free_bytes`,
+  `orange_min_free_bytes` and `red_min_free_bytes`. A level's threshold becomes
+  the smaller of its percentage and its floor, so a large volume is not called
+  pressured at a low percentage that still leaves plenty of space. Off by
+  default (all zero); when set, all four must be given in descending order
+  (`eba87f2`).
+
+### Fixed
+
+- A mount on the same filesystem as another (folded onto it, sharing its
+  ballast pool) kept its own ballast release state when it was the pressured
+  mount. That state was never saved, so a restart released the same shortfall
+  again, and every state write reset it. With both mounts pressured the pool
+  could drain completely where three of five files were enough. Release
+  history, cooldowns and the floor flag are now kept under the pool's own
+  mount (`2c2f99f`).
+- `sbh status`, `sbh doctor`, `sbh ballast` and the TUI read a configured
+  `paths.ballast_dir` that is a symlink through to its target, as the daemon
+  already did. With an alias configured, `sbh status` had reported a
+  provisioned reserve as indeterminate, with every file unreadable
+  (`8818aa4`).
+- When the active-lease watchdog stops a build, its log line and error name
+  the reason, including the I/O error from inspecting the target, instead of
+  only "invalid" (`dd11f40`).
+
 ## v0.7.1 **[release]**
 
 Compare: [`v0.7.0...v0.7.1`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.0...v0.7.1)
