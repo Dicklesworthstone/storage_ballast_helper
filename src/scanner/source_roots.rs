@@ -124,6 +124,29 @@ impl SourceRootReport {
             .collect()
     }
 
+    fn retain_unresolved_boundaries(&mut self, previous: &Self) {
+        for fresh in &mut self.roots {
+            if fresh.resolved_root.is_some() {
+                continue;
+            }
+            let configured = absolute_lexical(&fresh.root).ok();
+            if let Some(old) = previous.roots.iter().find(|old| {
+                old.root == fresh.root
+                    || configured.as_ref().is_some_and(|configured| {
+                        absolute_lexical(&old.root)
+                            .as_ref()
+                            .is_ok_and(|old_path| old_path == configured)
+                    })
+            }) {
+                // A configured alias that disappeared has not relinquished
+                // its last known boundary. Otherwise a reordered reload could
+                // admit a clear child through another still-resolvable root.
+                fresh.resolved_root.clone_from(&old.resolved_root);
+            }
+        }
+        self.apply_overlap_denials();
+    }
+
     fn apply_overlap_denials(&mut self) {
         // A newly denied parent may also overlap a different configured child.
         // Iterate to a fixed point so root order cannot change admission. Every
@@ -181,10 +204,7 @@ impl Budget {
         Ok(())
     }
 
-    fn finish(
-        &self,
-        finding: Option<PathBuf>,
-    ) -> std::result::Result<Option<PathBuf>, String> {
+    fn finish(&self, finding: Option<PathBuf>) -> std::result::Result<Option<PathBuf>, String> {
         // The last filesystem call (including read_dir's final next()) can
         // outlive the last step. Never publish permission based on that stale
         // deadline check. Completion itself does not consume an entry.
@@ -380,15 +400,7 @@ impl PolicyState {
             .map(|root| root.root.clone())
             .collect();
         let mut report = inspect_roots(&roots, self.report.allow_source_tree_roots);
-        for (fresh, previous) in report.roots.iter_mut().zip(&self.report.roots) {
-            // If resolution now fails, keep the previous location as a denied
-            // boundary for cached candidates addressed by its canonical name.
-            if fresh.resolved_root.is_none() {
-                fresh.resolved_root.clone_from(&previous.resolved_root);
-            }
-        }
-        // Restored canonical locations may reveal another overlap.
-        report.apply_overlap_denials();
+        report.retain_unresolved_boundaries(&self.report);
         self.report = report;
     }
 }
@@ -440,7 +452,9 @@ impl SourceRootPolicy {
     pub fn replace(&self, roots: &[PathBuf], allow: bool) {
         let mut state = self.inner.lock();
         state.remember_locations();
-        state.report = inspect_roots(roots, allow);
+        let mut report = inspect_roots(roots, allow);
+        report.retain_unresolved_boundaries(&state.report);
+        state.report = report;
     }
 
     /// Reinspect current roots (e.g. before a scan), publishing their new state.
@@ -865,5 +879,53 @@ mod tests {
             },
         };
         assert_eq!(budget.finish(None).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reload_preserves_missing_alias_boundary_across_reordering_and_spelling_changes() {
+        use std::os::unix::fs::symlink;
+        for allow in [false, true] {
+            let dir = scratch();
+            let links = scratch();
+            mkdir(&dir.path().join("team/project/.git"));
+            let cache = dir.path().join("cache");
+            let candidate = cache.join("target");
+            mkdir(&candidate);
+            let evidence = candidate.join("evidence.txt");
+            fs::write(&evidence, b"keep during reload").unwrap();
+            let alias = links.path().join("root");
+            let parked_alias = links.path().join("parked-root");
+            symlink(dir.path(), &alias).unwrap();
+            mkdir(&links.path().join("spelling"));
+            let old_spelling = links.path().join("spelling/../root");
+            let policy = SourceRootPolicy::new(&[old_spelling, cache.clone()], allow);
+            let queued = policy.clone();
+            assert_eq!(queued.authorize(&candidate).is_ok(), allow);
+
+            // The alias is still configured, but temporarily cannot resolve.
+            // Reordering root_paths and normalizing its spelling must not drop
+            // its canonical deny boundary or let the child root override it.
+            fs::rename(&alias, &parked_alias).unwrap();
+            let roots = vec![cache, alias.clone()];
+            policy.replace(&roots, allow);
+            let report = policy.snapshot();
+            assert_eq!(report.roots[1].finding, RootFinding::Unverified);
+            assert_eq!(
+                report.roots[1].resolved_root,
+                Some(fs::canonicalize(dir.path()).unwrap())
+            );
+            assert!(report.allowed_roots().is_empty());
+            assert!(queued.authorize(&candidate).is_err());
+            assert_eq!(fs::read(&evidence).unwrap(), b"keep during reload");
+
+            // An actually restored alias plus explicit permission can resume
+            // cleanup. Missing-root denial must not become permanent history.
+            fs::rename(&parked_alias, &alias).unwrap();
+            policy.replace(&roots, true);
+            assert!(queued.authorize(&candidate).is_ok());
+            assert!(policy.snapshot().roots.iter().all(|root| root.reclaim_allowed));
+            assert_eq!(fs::read(&evidence).unwrap(), b"keep during reload");
+        }
     }
 }
