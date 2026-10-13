@@ -8,7 +8,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use storage_ballast_helper::cli::{
     HostSpecifier, OfflineBundleArtifact, OfflineBundleManifest, RELEASE_REPOSITORY,
@@ -64,10 +64,27 @@ case "${1-}" in
 esac
 "#;
 
+const BUSCTL: &str = r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SBH_TEST_BUSCTL_LOG"
+[ "${LC_ALL-}" = C ]
+case "${1-}" in --user|--system) ;; *) exit 92 ;; esac
+shift
+[ "$*" = '--json=short --timeout=5s --auto-start=no --allow-interactive-authorization=no get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/sbh_2eservice org.freedesktop.systemd1.Service ExecStart' ]
+if [ "$SBH_TEST_SERVICE_STATE" = target-query-failure ]; then
+    printf 'fixture ExecStart access denied\n' >&2
+    exit 24
+fi
+cat "$SBH_TEST_EXEC_START_JSON"
+"#;
+
 struct Fixture {
     _temp: tempfile::TempDir,
     home: PathBuf,
     binary: PathBuf,
+    service_binary: PathBuf,
+    exec_start: PathBuf,
+    bus_calls: PathBuf,
     manifest: PathBuf,
     expected_sha: String,
     path: OsString,
@@ -162,6 +179,7 @@ impl Fixture {
         };
         fs::write(&manifest, serde_json::to_vec(&bundle).unwrap()).unwrap();
         executable(&tools.join("systemctl"), SYSTEMCTL.as_bytes());
+        executable(&tools.join("busctl"), BUSCTL.as_bytes());
         executable(
             &tools.join("sbh"),
             b"#!/bin/sh\nprintf 'unrelated PATH binary invoked\\n' >&2\nexit 99\n",
@@ -170,9 +188,12 @@ impl Fixture {
         paths.extend(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin")),
         ));
-        Self {
+        let mut fixture = Self {
             home,
+            service_binary: binary.clone(),
             binary,
+            exec_start: root.join("exec-start.json"),
+            bus_calls: root.join("busctl.log"),
             manifest,
             expected_sha,
             path: std::env::join_paths(paths).unwrap(),
@@ -180,7 +201,18 @@ impl Fixture {
             updater_exe: root.join("updater-exe.log"),
             versions: root.join("versions.log"),
             _temp: temp,
-        }
+        };
+        fixture.set_service_binary(fixture.binary.clone());
+        fixture
+    }
+
+    fn set_service_binary(&mut self, path: PathBuf) {
+        let value = json!({
+            "type": "a(sasbttttuii)",
+            "data": [[path, [path, "daemon"], false, 0, 0, 0, 0, 0, 0, 0]]
+        });
+        fs::write(&self.exec_start, serde_json::to_vec(&value).unwrap()).unwrap();
+        self.service_binary = path;
     }
 
     fn run(&self, service_state: &str, args: &[&str]) -> Output {
@@ -199,7 +231,9 @@ impl Fixture {
             .env("LC_ALL", "C.UTF-8")
             .env("PATH", &self.path)
             .env("SBH_TEST_SERVICE_STATE", service_state)
-            .env("SBH_TEST_SERVICE_BINARY", &self.binary)
+            .env("SBH_TEST_SERVICE_BINARY", &self.service_binary)
+            .env("SBH_TEST_EXEC_START_JSON", &self.exec_start)
+            .env("SBH_TEST_BUSCTL_LOG", &self.bus_calls)
             .env("SBH_TEST_EXPECTED_SHA", &self.expected_sha)
             .env("SBH_TEST_SYSTEMCTL_LOG", &self.calls)
             .env("SBH_TEST_UPDATER_EXE", &self.updater_exe)
@@ -246,28 +280,39 @@ fn user_and_custom_installations_survive_two_actual_updates() {
         assert_eq!(calls.lines().count(), 2, "{calls}");
         assert!(!calls.contains("restart"));
         assert!(!fixture.versions.exists());
+        assert!(!fixture.bus_calls.exists());
     }
 }
 
 #[test]
 fn loaded_user_service_restarts_the_new_executable_on_each_update() {
-    let fixture = Fixture::new("home/.local/bin/sbh");
-    for _ in 0..2 {
-        let output = fixture.run("loaded", &["--force", "--user"]);
-        assert_eq!(output.status.code(), Some(0), "{output:?}");
-        let report = fixture.assert_applied(&output, "restarted");
-        assert_eq!(report["success"], true);
-        assert_eq!(report["service_restart"]["scope"], "user");
+    for location in [
+        "home/.local/bin/sbh",
+        "custom destination/sbh",
+        "quoted\" destination/sbh",
+    ] {
+        let fixture = Fixture::new(location);
+        for _ in 0..2 {
+            let output = fixture.run("loaded", &["--force", "--user"]);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            let report = fixture.assert_applied(&output, "restarted");
+            assert_eq!(report["success"], true);
+            assert_eq!(report["service_restart"]["scope"], "user");
+        }
+        let calls = fs::read_to_string(&fixture.calls).unwrap();
+        assert_eq!(calls.matches("--user restart sbh.service").count(), 2);
+        assert_eq!(
+            fs::read_to_string(&fixture.bus_calls).unwrap().lines().count(),
+            2
+        );
+        let versions = fs::read_to_string(&fixture.versions).unwrap();
+        assert_eq!(versions.lines().count(), 2);
+        assert!(
+            versions
+                .lines()
+                .all(|line| line.contains(env!("CARGO_PKG_VERSION")))
+        );
     }
-    let calls = fs::read_to_string(&fixture.calls).unwrap();
-    assert_eq!(calls.matches("--user restart sbh.service").count(), 2);
-    let versions = fs::read_to_string(&fixture.versions).unwrap();
-    assert_eq!(versions.lines().count(), 2);
-    assert!(
-        versions
-            .lines()
-            .all(|line| line.contains(env!("CARGO_PKG_VERSION")))
-    );
 }
 
 #[test]
@@ -298,6 +343,11 @@ fn system_scope_preserves_privilege_checks_after_replacement() {
         fixture.assert_applied(&output, "failed")
     };
     assert_eq!(report["service_restart"]["scope"], "system");
+    assert!(
+        fs::read_to_string(&fixture.bus_calls)
+            .unwrap()
+            .starts_with("--system ")
+    );
 }
 
 #[test]
@@ -307,6 +357,7 @@ fn container_without_a_systemd_manager_does_not_fail_an_applied_update() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let report = fixture.assert_applied(&output, "skipped");
     assert_eq!(report["success"], true);
+    assert!(!fixture.bus_calls.exists());
 }
 
 #[test]
@@ -323,6 +374,7 @@ fn check_dry_run_and_up_to_date_do_not_restart_or_replace() {
         assert!(report["service_restart"].is_null());
         assert_eq!(sha256(&fixture.binary), original_sha);
         assert!(!fixture.calls.exists());
+        assert!(!fixture.bus_calls.exists());
     }
 }
 
@@ -356,6 +408,7 @@ fn absent_user_units_are_successful_with_either_unknown_unit_exit_code() {
         assert_eq!(report["success"], true);
         assert_eq!(report["service_restart"]["scope"], "user");
         assert!(!fixture.versions.exists());
+        assert!(!fixture.bus_calls.exists());
     }
 }
 
@@ -379,6 +432,84 @@ fn inspection_failures_never_report_a_successful_skipped_update() {
         assert!(error.contains(diagnostic), "{state}: {error}");
         let calls = fs::read_to_string(&fixture.calls).unwrap();
         assert!(!calls.contains("restart"), "{state}: {calls}");
+        assert!(!fixture.versions.exists());
+        assert!(!fixture.bus_calls.exists());
+    }
+}
+
+#[test]
+fn a_loaded_unit_pointing_at_another_installation_is_not_restarted() {
+    let mut fixture = Fixture::new("home/.local/bin/sbh");
+    let other = fixture.home.join("other-sbh");
+    fs::copy(&fixture.binary, &other).unwrap();
+    let before = sha256(&other);
+    fixture.set_service_binary(other.clone());
+    let output = fixture.run("loaded", &["--force", "--user"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let report = fixture.assert_applied(&output, "failed");
+    assert_eq!(report["success"], false);
+    let error = report["service_restart"]["error"].as_str().unwrap();
+    assert!(
+        error.contains("refusing to restart a different installation"),
+        "{error}"
+    );
+    assert_eq!(sha256(&other), before);
+    assert!(!fs::read_to_string(&fixture.calls).unwrap().contains("restart"));
+    assert!(!fixture.versions.exists());
+}
+
+#[test]
+fn effective_exec_start_symlink_tracks_both_replacements() {
+    let mut fixture = Fixture::new("custom destination/sbh");
+    let link = fixture.home.join("service-sbh");
+    std::os::unix::fs::symlink(&fixture.binary, &link).unwrap();
+    fixture.set_service_binary(link);
+    for _ in 0..2 {
+        let output = fixture.run("loaded", &["--force", "--user"]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        fixture.assert_applied(&output, "restarted");
+    }
+    assert_eq!(
+        fs::read_to_string(&fixture.versions)
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn effective_exec_start_retaining_the_old_inode_is_rejected() {
+    let mut fixture = Fixture::new("opt/sbhprev/sbh");
+    let old = fixture.home.join("old-inode");
+    fs::hard_link(&fixture.binary, &old).unwrap();
+    fixture.set_service_binary(old);
+    let output = fixture.run("loaded", &["--force", "--user"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let report = fixture.assert_applied(&output, "failed");
+    assert!(
+        report["service_restart"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("different installation")
+    );
+    assert!(!fs::read_to_string(&fixture.calls).unwrap().contains("restart"));
+}
+
+#[test]
+fn failed_exec_start_verification_never_restarts_a_loaded_service() {
+    for state in ["target-query-failure", "malformed-target"] {
+        let fixture = Fixture::new("opt/sbhprev/sbh");
+        if state == "malformed-target" {
+            fs::write(&fixture.exec_start, "not json").unwrap();
+        }
+        let output = fixture.run(state, &["--force", "--user"]);
+        assert_eq!(output.status.code(), Some(2), "{state}: {output:?}");
+        let report = fixture.assert_applied(&output, "failed");
+        assert_eq!(report["success"], false);
+        let error = report["service_restart"]["error"].as_str().unwrap();
+        assert!(error.contains("ExecStart"), "{error}");
+        assert!(!fs::read_to_string(&fixture.calls).unwrap().contains("restart"));
         assert!(!fixture.versions.exists());
     }
 }
