@@ -502,6 +502,12 @@ pub struct ScannerConfig {
     pub event_source: ScannerEventSourceMode,
     pub event_watch_budget: usize,
     pub root_paths: Vec<PathBuf>,
+    /// Explicitly authorize scanner reclamation beneath configured roots that
+    /// are inside, are themselves, or contain Git work trees. Defaults to false
+    /// for both new and existing configurations. This does not bypass candidate
+    /// vetoes and does not authorize roots whose inspection is inconclusive.
+    /// Ballast management is independent of this scanner-only policy.
+    pub allow_source_tree_roots: bool,
     pub excluded_paths: Vec<PathBuf>,
     pub protected_paths: Vec<String>,
     pub min_file_age_minutes: u64,
@@ -1173,16 +1179,11 @@ impl Default for PredictionConfig {
 
 impl Default for ScannerConfig {
     fn default() -> Self {
-        // Safe-by-default scan roots: only ephemeral temp directories.
-        // `/data/projects`, `/home`, and `/root` are NOT included by default —
-        // these hold source code and personal files, and historical scanner
-        // heuristics have proven unsafe there (2026-05-16 fleet carnage wiped
-        // ~87 working trees under `/data/projects` on trj; 2026-05-22 vmi
-        // rerun deleted synced source crate stubs across the worker fleet).
-        // Operators who want broader sweeps must opt in via config (or the
-        // setup wizard), and the hardcoded refusal in
-        // `deletion::preflight_check` will still veto anything that looks
-        // like source code regardless of which roots are configured.
+        // Default scan roots are ephemeral temp directories, not source or
+        // personal directories. Roots containing Git work trees additionally
+        // require allow_source_tree_roots, even when root_paths was explicitly
+        // configured by an older setup wizard. Candidate-level source, lease,
+        // sacred-path and active-reference vetoes remain independent defenses.
         Self {
             // V2 (opaque-pruning) is the default engine: it is the modern
             // traversal path that reuses v1's scoring/guardrail/deletion safety
@@ -1208,17 +1209,11 @@ impl Default for ScannerConfig {
             } else {
                 vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")]
             },
-            // Note: `/data/projects` is intentionally NOT in this list.
-            // The setup wizard (cli/wizard.rs) actively adds `/data/projects`
-            // to `root_paths` when run, and adding it ALSO to `excluded_paths`
-            // would silently break wizard-generated configs (the walker would
-            // refuse to descend into the configured root). The hardcoded
-            // `is_hardcoded_source_tree` check in
-            // `scanner::deletion::preflight_check` is the real defense and
-            // applies regardless of config — operators can scan
-            // `/data/projects` for legitimate target-dir cleanup, and
-            // deletions of anything that looks like source code are vetoed
-            // at preflight time.
+            allow_source_tree_roots: false,
+            // Do not silently rewrite or exclude operator-configured roots.
+            // The source-root policy reports and blocks unsafe roots instead;
+            // an explicit opt-in can admit build output without weakening any
+            // of the existing candidate-level deletion vetoes.
             excluded_paths: vec![
                 PathBuf::from("/"),
                 PathBuf::from("/boot"),
@@ -2321,6 +2316,10 @@ impl Config {
     where
         F: FnMut(&str) -> Option<String>,
     {
+        if let Some(raw) = lookup("SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS") {
+            self.scanner.allow_source_tree_roots =
+                parse_env_bool("SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS", &raw)?;
+        }
         if let Some(raw) = lookup("SBH_SCANNER_ENGINE") {
             self.scanner.engine =
                 raw.parse::<ScannerEngineMode>()
@@ -2440,6 +2439,30 @@ impl Config {
                     *path = PathBuf::from(stripped);
                 }
             }
+        }
+    }
+
+    /// Inspect source-root safety without making configuration loading depend
+    /// on filesystem availability. A blocked scanner root must not disable
+    /// ballast provisioning, monitoring or emergency ballast release.
+    #[must_use]
+    pub fn source_root_report(&self) -> crate::scanner::source_roots::SourceRootReport {
+        crate::scanner::source_roots::inspect_roots(
+            &self.scanner.root_paths,
+            self.scanner.allow_source_tree_roots,
+        )
+    }
+
+    /// Additional filesystem-dependent validation for operator diagnostics.
+    /// Runtime enforcement uses a shared `SourceRootPolicy`, not this snapshot.
+    pub fn validate_source_roots(&self) -> Result<()> {
+        let failures = self.source_root_report().failures();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(SbhError::InvalidConfig {
+                details: failures.join("; "),
+            })
         }
     }
 
@@ -3153,6 +3176,75 @@ mod tests {
         BehaviorPreset, Config, PathsConfig, SacredConfig, SbhError, ScannerEngineMode,
         add_root_unless_covered, load_sacred_config, sacred_config_path_for, write_sacred_config,
     };
+
+    #[test]
+    fn source_root_opt_in_defaults_false_and_is_a_known_roundtrippable_key() {
+        for raw in ["", "[scanner]\nroot_paths = [\"/data/projects\"]\n"] {
+            let (cfg, unknown) = Config::parse_toml(raw).unwrap();
+            assert!(unknown.is_empty());
+            assert!(!cfg.scanner.allow_source_tree_roots);
+        }
+        let (cfg, unknown) = Config::parse_toml(
+            "[scanner]\nallow_source_tree_roots = true\n",
+        )
+        .unwrap();
+        assert!(unknown.is_empty());
+        assert!(cfg.scanner.allow_source_tree_roots);
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let roundtrip: Config = toml::from_str(&text).unwrap();
+        assert!(roundtrip.scanner.allow_source_tree_roots);
+        let mut denied = cfg.clone();
+        denied.scanner.allow_source_tree_roots = false;
+        assert_ne!(cfg.stable_hash().unwrap(), denied.stable_hash().unwrap());
+        assert!(Config::parse_toml(
+            "[scanner]\nallow_source_tree_roots = \"true\"\n",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn source_root_env_override_can_grant_and_revoke_but_rejects_invalid_values() {
+        let mut cfg = Config::default();
+        for (raw, expected) in [("true", true), ("false", false)] {
+            cfg.apply_scanner_env_overrides_from(|name| {
+                (name == "SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS").then(|| raw.to_string())
+            })
+            .unwrap();
+            assert_eq!(cfg.scanner.allow_source_tree_roots, expected);
+        }
+        let error = cfg
+            .apply_scanner_env_overrides_from(|name| {
+                (name == "SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS").then(|| "yes".to_string())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("SBH_SCANNER_ALLOW_SOURCE_TREE_ROOTS"));
+        assert!(!cfg.scanner.allow_source_tree_roots);
+    }
+
+    #[test]
+    fn source_root_safety_validation_does_not_disable_ballast_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = dir.path().join("nested/project");
+        std::fs::create_dir_all(repository.join(".git")).unwrap();
+        let mut cfg = Config::default();
+        cfg.scanner.root_paths = vec![dir.path().to_path_buf()];
+        let ballast = cfg.ballast.clone();
+        assert!(cfg.validate().is_ok(), "structural validation must permit ballast");
+        let report = cfg.source_root_report();
+        assert_eq!(report.roots.len(), 1);
+        assert!(!report.roots[0].reclaim_allowed);
+        assert_eq!(
+            report.roots[0].repositories,
+            vec![std::fs::canonicalize(&repository).unwrap()]
+        );
+        assert!(cfg.validate_source_roots().is_err());
+        cfg.scanner.allow_source_tree_roots = true;
+        assert!(cfg.validate_source_roots().is_ok());
+        assert_eq!(cfg.ballast, ballast);
+        cfg.scanner.root_paths = vec![dir.path().join("missing")];
+        assert!(cfg.validate_source_roots().is_err(), "opt-in is not an I/O-error bypass");
+        assert!(cfg.validate().is_ok());
+    }
 
     #[test]
     fn default_temp_roots_preserve_linux_policy_without_adding_data_on_other_platforms() {
