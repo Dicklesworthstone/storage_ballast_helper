@@ -834,7 +834,7 @@ mod legacy_inline {
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>Nice</key>
-    <integer>19</integer>
+    <integer>5</integer>
     <key>LowPriorityIO</key>
     <true/>
     <key>StandardOutPath</key>
@@ -1337,20 +1337,20 @@ mod tests {
         let plist = mgr.generate_plist();
 
         assert!(plist.contains("<key>Nice</key>"));
-        assert!(plist.contains("<integer>19</integer>"));
+        assert!(plist.contains("<integer>5</integer>"));
         assert!(plist.contains("<key>LowPriorityIO</key>"));
         assert!(plist.contains("<true/>"));
     }
 
     #[test]
-    fn plist_sets_background_qos_controls() {
+    fn plist_sets_standard_qos_at_low_priority() {
         let mgr = LaunchdServiceManager::new(test_launchd_config(false));
         let value = parse_plist(&mgr.generate_plist());
         let dict = value.as_dictionary().expect("plist root should be a dict");
 
         assert_eq!(
             dict.get("ProcessType").and_then(plist::Value::as_string),
-            Some("Background")
+            Some("Standard")
         );
         assert_eq!(
             dict.get("LowPriorityIO").and_then(plist::Value::as_boolean),
@@ -1358,7 +1358,7 @@ mod tests {
         );
         assert_eq!(
             dict.get("Nice").and_then(plist::Value::as_signed_integer),
-            Some(19)
+            Some(5)
         );
         assert_eq!(
             dict.get("ThrottleInterval")
@@ -1433,7 +1433,7 @@ mod tests {
         );
         assert_eq!(
             dict.get("ProcessType").and_then(plist::Value::as_string),
-            Some("Background")
+            Some("Standard")
         );
         assert_eq!(
             env.get("SBH_CONFIG_PATH").and_then(plist::Value::as_string),

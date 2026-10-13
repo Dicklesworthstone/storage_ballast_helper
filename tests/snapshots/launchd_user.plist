@@ -21,9 +21,9 @@
 	<key>ThrottleInterval</key>
 	<integer>60</integer>
 	<key>Nice</key>
-	<integer>19</integer>
+	<integer>5</integer>
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Standard</string>
 	<key>LowPriorityIO</key>
 	<true/>
 	<key>WorkingDirectory</key>

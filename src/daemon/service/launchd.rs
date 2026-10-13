@@ -311,10 +311,17 @@ impl LaunchdServiceManager {
         root.insert("RunAtLoad".to_string(), Value::Boolean(true));
         root.insert("KeepAlive".to_string(), Value::Dictionary(keep_alive));
         root.insert("ThrottleInterval".to_string(), Value::Integer(60.into()));
-        root.insert("Nice".to_string(), Value::Integer(19.into()));
+        // macOS schedules by priority, not by share: under a saturated CPU a
+        // `ProcessType=Background` (efficiency cores, throttled) or Nice 19
+        // daemon gets no time at all. On mac-mini-max at load ~700 the root
+        // daemon ran 0.1 s in two minutes and wrote no state for 40 minutes,
+        // exactly while the machine needed a disk guardian. Standard QoS at
+        // Nice 5 still yields to normal work; sbh's own CPU budget and scan
+        // duty cycle bound what it takes.
+        root.insert("Nice".to_string(), Value::Integer(5.into()));
         root.insert(
             "ProcessType".to_string(),
-            Value::String("Background".to_string()),
+            Value::String("Standard".to_string()),
         );
         root.insert("LowPriorityIO".to_string(), Value::Boolean(true));
         root.insert(
