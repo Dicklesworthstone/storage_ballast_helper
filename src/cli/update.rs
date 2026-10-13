@@ -433,10 +433,11 @@ impl BackupStore {
             });
         }
 
-        backup_snapshot::verify(snap)
-            .map_err(|error| format!("rollback snapshot verification failed: {error}"))?;
-        binary_install::install_with_validation(&snap.path, install_path, |_| Ok(()))
-            .map_err(|error| format!("failed to restore backup: {error}"))?;
+        binary_install::install_with_validation(&snap.path, install_path, |candidate| {
+            backup_snapshot::verify_staged(snap, candidate)
+                .map_err(|error| format!("rollback snapshot verification failed: {error}"))
+        })
+        .map_err(|error| format!("failed to restore backup: {error}"))?;
 
         Ok(RollbackResult {
             success: true,
