@@ -960,11 +960,57 @@ pub fn current_mach_thread_basic_info() -> io::Result<MachThreadBasicInfo> {
         .map_err(mach_error)
 }
 
+/// The system firmlink table, cached while both source files are unchanged.
+///
+/// Path resolution asks for it many times per scan (each file was read and
+/// parsed 126 times in 10 s on mac-studio, bd-os02). `/usr/share/firmlinks`
+/// changes only with an OS update and `/etc/synthetic.conf` only when edited,
+/// so two `stat`s decide whether the parsed map can be reused.
 pub fn firmlink_map() -> io::Result<FirmlinkMap> {
-    firmlink_map_from_paths(
-        Path::new("/usr/share/firmlinks"),
-        Path::new("/etc/synthetic.conf"),
-    )
+    static CACHE: std::sync::Mutex<Option<(FirmlinkStamp, FirmlinkMap)>> =
+        std::sync::Mutex::new(None);
+    let firmlinks = Path::new("/usr/share/firmlinks");
+    let synthetic_conf = Path::new("/etc/synthetic.conf");
+    let stamp = FirmlinkStamp::of(firmlinks, synthetic_conf)?;
+    let cached = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|(cached, _)| *cached == stamp)
+        .map(|(_, map)| map.clone());
+    if let Some(map) = cached {
+        return Ok(map);
+    }
+    let map = firmlink_map_from_paths(firmlinks, synthetic_conf)?;
+    *CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((stamp, map.clone()));
+    Ok(map)
+}
+
+/// Modification time and length of the firmlink sources (`None` when
+/// `synthetic.conf` is absent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FirmlinkStamp {
+    firmlinks: (std::time::SystemTime, u64),
+    synthetic_conf: Option<(std::time::SystemTime, u64)>,
+}
+
+impl FirmlinkStamp {
+    fn of(firmlinks: &Path, synthetic_conf: &Path) -> io::Result<Self> {
+        let stamp = |meta: fs::Metadata| -> io::Result<(std::time::SystemTime, u64)> {
+            Ok((meta.modified()?, meta.len()))
+        };
+        let synthetic_conf = match fs::metadata(synthetic_conf) {
+            Ok(meta) => Some(stamp(meta)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            firmlinks: stamp(fs::metadata(firmlinks)?)?,
+            synthetic_conf,
+        })
+    }
 }
 
 pub fn firmlink_map_from_paths(
@@ -1688,12 +1734,13 @@ impl ApfsVolumeRole {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::fs;
     use std::path::Path;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
     use super::{
-        ApfsVolumeRole, FirmlinkSource, LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES,
+        ApfsVolumeRole, FirmlinkSource, FirmlinkStamp, LOCAL_SNAPSHOT_THIN_AMOUNT_BYTES,
         LOCAL_SNAPSHOT_THIN_URGENCY, SwapUsage, SwapUsageInfo, command_output_with_timeout,
         command_output_with_timeout_inner, firmlink_map, firmlink_map_from_paths,
         important_usage_available_bytes, mounted_filesystems, parent_apfs_volume_device,
@@ -2032,6 +2079,29 @@ relative-target\tVolumes/External
         // A cyclic synthetic.conf terminates instead of looping.
         let looped = map.resolve_canonical(Path::new("/loop-a/x"));
         assert!(looped == Path::new("/loop-a/x") || looped == Path::new("/loop-b/x"));
+    }
+
+    #[test]
+    fn firmlink_stamp_changes_with_either_source_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let firmlinks = dir.path().join("firmlinks");
+        let synthetic = dir.path().join("synthetic.conf");
+        fs::write(&firmlinks, "/Users\tUsers\n").unwrap();
+        let without_synthetic = FirmlinkStamp::of(&firmlinks, &synthetic).unwrap();
+        assert_eq!(without_synthetic.synthetic_conf, None);
+        fs::write(&synthetic, "data\n").unwrap();
+        let with_synthetic = FirmlinkStamp::of(&firmlinks, &synthetic).unwrap();
+        assert_ne!(with_synthetic, without_synthetic);
+        assert_eq!(
+            FirmlinkStamp::of(&firmlinks, &synthetic).unwrap(),
+            with_synthetic
+        );
+        fs::write(&firmlinks, "/Users\tUsers\n/opt\topt\n").unwrap();
+        assert_ne!(
+            FirmlinkStamp::of(&firmlinks, &synthetic).unwrap(),
+            with_synthetic
+        );
+        assert!(FirmlinkStamp::of(&dir.path().join("absent"), &synthetic).is_err());
     }
 
     #[test]

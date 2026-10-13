@@ -142,6 +142,10 @@ pub struct ScenarioConfig {
     pub ballast_file_bytes: u64,
     /// Extra lines for the `[ballast]` table (e.g. `auto_provision = false`).
     pub ballast_toml: String,
+    /// Extra lines for the `[scanner]` table.
+    pub scanner_toml: String,
+    /// Extra lines for the `[telemetry]` table.
+    pub telemetry_toml: String,
     /// Scanner engine: `v2` (default) or the `v1` rollback engine.
     pub engine: &'static str,
     /// `scanner.dry_run`: plan deletions without removing anything.
@@ -175,6 +179,8 @@ impl Default for ScenarioConfig {
             ballast_files: 1,
             ballast_file_bytes: 1_048_576,
             ballast_toml: String::new(),
+            scanner_toml: String::new(),
+            telemetry_toml: String::new(),
             engine: "v2",
             dry_run: false,
             metrics_enabled: true,
@@ -233,10 +239,10 @@ min_rescan_interval_secs = {rescan}
 max_scan_duty_cycle_pct = {duty}
 max_depth = 6
 parallelism = 2
-[telemetry]
+{scanner_extra}[telemetry]
 cpu_budget_pct = {budget}
 metrics_enabled = {metrics}
-{notifications}{extra}",
+{telemetry_extra}{notifications}{extra}",
         ballast = data.join("ballast").display().to_string(),
         jsonl = data.join("activity.jsonl").display().to_string(),
         sqlite = data.join("activity.sqlite3").display().to_string(),
@@ -244,6 +250,8 @@ metrics_enabled = {metrics}
         ballast_files = scenario.ballast_files,
         ballast_bytes = scenario.ballast_file_bytes,
         ballast_extra = scenario.ballast_toml,
+        scanner_extra = scenario.scanner_toml,
+        telemetry_extra = scenario.telemetry_toml,
         poll = scenario.poll_interval_ms,
         maint = scenario.maintenance_interval_secs,
         engine = scenario.engine,
@@ -1767,6 +1775,87 @@ fn an_idle_yellow_mount_rebuilds_an_empty_reserve() {
     assert!(
         run.stderr().contains("idle -> ") || run.stderr().contains("reclaim -> idle"),
         "the mount went idle before refilling"
+    );
+    assert!(run.stop().success());
+}
+
+/// bd-os02: a pass cut short in the priority pre-scan skipped the pass
+/// accounting, so the empty-pass cooldown never armed and a large, busy root
+/// was rescanned back to back at the CPU-budget ceiling with nothing to
+/// reclaim. Such passes are now paced by `min_rescan_interval_secs`.
+#[test]
+fn prescan_timeouts_on_a_busy_root_are_paced_by_the_rescan_interval() {
+    let dir = scratch();
+    let root = dir.path().join("busy-root");
+    fs::create_dir(&root).unwrap();
+    // Far more than one CPU-second of pre-scan can visit: like the test and
+    // agent directories in a busy $TMPDIR, each entry has a small tree the
+    // pre-scan's depth-2/3 sweep must read.
+    for i in 0..8_000 {
+        for j in 0..4 {
+            for k in 0..3 {
+                fs::create_dir_all(root.join(format!("d{i:05}/s{j}/t{k}"))).unwrap();
+            }
+        }
+    }
+    let table = injected_table(&[
+        (dir.path(), 1_000_000_000_000, 500_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![root.clone()],
+        maintenance_interval_secs: 3600,
+        min_rescan_interval_secs: 20,
+        duty_cycle_pct: 50,
+        // As on mac-studio: the daemon CPU bucket, not the wall clock, cuts
+        // each pass short inside the pre-scan.
+        cpu_budget_pct: 25,
+        telemetry_toml: "cpu_budget_burst_secs = 1.0\n".to_string(),
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    // Keep the root dirty, as agents writing to $TMPDIR do.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = std::sync::Arc::clone(&stop);
+        let root = root.clone();
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = fs::write(root.join("churn.txt"), n.to_string());
+                n += 1;
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        })
+    };
+    let prescan_timeouts = |run: &DaemonRun| {
+        run.stderr()
+            .lines()
+            .filter(|line| line.contains("timed out in the priority pre-scan"))
+            .count()
+    };
+    run.wait_until(
+        "the first pre-scan timeout",
+        Duration::from_secs(60),
+        |run| prescan_timeouts(run) >= 1,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let first = prescan_timeouts(&run);
+    let window_start = run.wall_secs();
+    run.wait_until("a 60 s window", Duration::from_secs(80), |run| {
+        run.wall_secs() >= window_start + 60.0
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    let in_window = prescan_timeouts(&run) - first;
+    eprintln!("prescan timeouts in the 60 s window: {in_window}");
+    // A 20 s interval allows at most four in 60 s. Unpaced, the passes are
+    // limited only by the CPU bucket refilling one CPU-second (~6.5 s at 25%),
+    // about nine in 60 s.
+    assert!(
+        in_window <= 4,
+        "{in_window} pre-scan timeouts in 60 s; expected pacing by the 20 s interval"
     );
     assert!(run.stop().success());
 }

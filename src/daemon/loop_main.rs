@@ -8430,6 +8430,29 @@ fn scanner_thread_main(
                     process_cpu_micros,
                 ),
             });
+            // bd-os02: a pass cut short in the priority pre-scan is a
+            // timed-out pass like any other. Skipping the accounting below
+            // left the empty-pass cooldown unarmed and the duty cycle blind, so
+            // a large $TMPDIR, walked one ~4,000-entry cursor slice per pass,
+            // was rescanned every ~20 s at the CPU-budget ceiling for as long
+            // as anything under it changed (mac-studio: 36 of the daemon's 60
+            // CPU-minutes in 6.4 h, nothing to reclaim).
+            if dispatched_this_pass.count == 0 {
+                record_empty_pass(
+                    &mut consecutive_empty_passes,
+                    &mut inconclusive_empty_passes,
+                    true,
+                );
+                last_empty_pass_at = Some(Instant::now());
+            } else {
+                consecutive_empty_passes = 0;
+                inconclusive_empty_passes = 0;
+                last_empty_pass_at = None;
+                unconfirmed_dispatch = Some(reclaim_at_pass_start);
+            }
+            last_pass_duration = pass_started_at.elapsed();
+            last_pass_finished_at = Some(Instant::now());
+            last_pass_level = Some(request_level);
             continue;
         }
         if let Some(target_bytes) = v2_candidate_byte_target
@@ -8490,7 +8513,15 @@ fn scanner_thread_main(
                     ),
                 });
             }
+            // The pre-scan alone met the byte target: a productive pass, which
+            // still owes the duty cycle its cost (bd-os02).
+            consecutive_empty_passes = 0;
+            inconclusive_empty_passes = 0;
+            last_empty_pass_at = None;
             unconfirmed_dispatch = Some(reclaim_at_pass_start);
+            last_pass_duration = pass_started_at.elapsed();
+            last_pass_finished_at = Some(Instant::now());
+            last_pass_level = Some(request_level);
             continue;
         }
 
