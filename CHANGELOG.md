@@ -18,12 +18,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Fixed
 
-- Linux: sbh no longer skips a candidate as "open" because its own scanner
-  was still walking it. The executor's open-file sweep counted sbh's own
-  directory handles, so a candidate dispatched while the scan was still in
-  progress was skipped, backed off, and its mount could sit idle for a whole
-  rescan interval (90 s by default) with space to reclaim. sbh's own regular
-  files and every other process's handles still count (`add621c`).
+- sbh no longer treats a candidate as "open" because its own scanner was
+  still walking it. The open-file sweep and the active-reference index
+  counted sbh's own directory handles, so a candidate examined or dispatched
+  while the scan was still in progress was vetoed or skipped, backed off, and
+  its mount could sit idle for a whole rescan interval (90 s by default) with
+  space to reclaim. sbh's own regular files and every other process's
+  handles still count (`add621c`, `4dfed72`).
 - Linux: a watch-coverage rebuild whose worker is stuck in a kernel call (a
   hung network mount under a scan root) no longer leaves earlier coverage
   trusted indefinitely (#30). After 30 s the rebuild is treated as failed,
