@@ -1654,6 +1654,77 @@ fn daemon_restart_retains_observed_credit_and_absent_history_releases_partial_re
     assert!(unobserved.stop().success());
 }
 
+/// A mount on the same filesystem as the ballast pool's mount is folded onto
+/// it. When that alias is the pressured mount, release credit must be kept
+/// under the pool's own mount: the key the state file saves and a restart
+/// restores. Keyed by the alias instead, each state write reset the credit
+/// and a restart released the same shortfall again.
+#[test]
+fn alias_mount_release_credit_survives_state_writes_and_restart() {
+    let dir = scratch();
+    let keeper = dir.path();
+    let alias = keeper.join("alias-mount");
+    let scan_root = alias.join("scan-root");
+    fs::create_dir_all(&scan_root).unwrap();
+    let (root, total, free, readonly) = quiet_root_mount();
+    let after_release = 80_000_000_000 + 5 * 1_048_576;
+    // One filesystem seen at two mount points: both report the same space.
+    let shared = |free: u64, series: &[(u64, u64)]| {
+        [keeper, alias.as_path()].map(|mount| {
+            mount_entry(mount, 1_000_000_000_000, free, false, series).replacen(
+                '{',
+                r#"{"device":"/dev/sbh-e2e-shared","#,
+                1,
+            )
+        })
+    };
+    let [keeper_first, alias_first] = shared(
+        500_000_000_000,
+        &[(12, 80_000_000_000), (13, after_release)],
+    );
+    let first_pressure = table_of(&[
+        keeper_first,
+        alias_first,
+        mount_entry(root, total, free, readonly, &[]),
+    ]);
+    let [keeper_sustained, alias_sustained] = shared(after_release, &[]);
+    let sustained_pressure = table_of(&[
+        keeper_sustained,
+        alias_sustained,
+        mount_entry(root, total, free, readonly, &[]),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![scan_root],
+        ballast_files: 5,
+        extra_toml: "[pressure.controller]\nkp = 0.01\nki = 0.0\nkd = 0.0\nkf = 0.0\n[pressure.prediction]\nenabled = false\n".to_string(),
+        ..ScenarioConfig::default()
+    };
+    let mut original = DaemonRun::spawn(dir.path(), &scenario, Some(&first_pressure));
+    wait_for_pool_history(&mut original, keeper, 2, 3);
+    original
+        .wait_until(
+            "twenty seconds of Red on both mounts across several state writes",
+            Duration::from_secs(30),
+            |run| run.wall_secs() >= 20.0,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(original.events_of("ballast_release").len(), 3);
+    assert!(original.stop().success());
+
+    let mut restarted = DaemonRun::spawn(dir.path(), &scenario, Some(&sustained_pressure));
+    wait_for_pool_history(&mut restarted, keeper, 2, 3);
+    restarted
+        .wait_until(
+            "eight seconds of sustained Red without extra release",
+            Duration::from_secs(15),
+            |run| run.wall_secs() >= 8.0,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(restarted.events_of("ballast_release").len(), 3);
+    assert_eq!(ballast_files_in(&restarted.data_dir.join("ballast")), 2);
+    assert!(restarted.stop().success());
+}
+
 /// Scenario `forced-scan`: SIGUSR1 at Green produces a forced
 /// `scan_complete` within two seconds and deletes nothing behind the
 /// default age gate.

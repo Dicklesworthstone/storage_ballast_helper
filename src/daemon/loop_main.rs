@@ -3598,8 +3598,10 @@ impl MonitoringDaemon {
         }
         let mut pools = Vec::new();
         for mount in mounts {
+            let pool_mount = self.pool_mount(&mount);
             if let Some(pool) = self.ballast_coordinator.pool_for_mount(&mount) {
-                self.release_controller.bind_pool(&mount, &pool.ballast_dir);
+                self.release_controller
+                    .bind_pool(&pool_mount, &pool.ballast_dir);
             }
             // Operator-driven changes are logged like the daemon's own so the
             // Timeline and `sbh stats` see them; the release controller is
@@ -3609,7 +3611,7 @@ impl MonitoringDaemon {
                     match self.ballast_coordinator.release_for_mount(&mount, *count) {
                         Ok(Some(report)) => {
                             self.release_controller
-                                .on_released(&mount, report.files_released);
+                                .on_released(&pool_mount, report.files_released);
                             self.log_control_ballast_release(&mount, &report.released);
                             Ok(json!({
                                 "mount": mount,
@@ -3630,7 +3632,7 @@ impl MonitoringDaemon {
                         Ok(Some(report)) => {
                             if report.files_created > 0 {
                                 self.release_controller
-                                    .on_replenished(&mount, report.files_created);
+                                    .on_replenished(&pool_mount, report.files_created);
                             }
                             for (path, size_bytes) in &report.created {
                                 self.logger_handle.send(ActivityEvent::BallastReplenished {
@@ -3774,11 +3776,18 @@ impl MonitoringDaemon {
             .map(|pool| {
                 // Bind/reset the physical observation before serializing its
                 // efficiency, so a replacement cannot inherit the old eta.
-                let release_history = self.release_controller.pool_history(
-                    &pool.mount_point,
-                    &pool.ballast_dir,
-                    pool.files_available,
-                );
+                // A skipped row (an alias or excluded mount) names no pool of
+                // its own; binding it would reset the history kept under the
+                // pool's mount.
+                let release_history = if pool.skipped {
+                    None
+                } else {
+                    self.release_controller.pool_history(
+                        &pool.mount_point,
+                        &pool.ballast_dir,
+                        pool.files_available,
+                    )
+                };
                 super::self_monitor::BallastPoolState {
                     mount: pool.mount_point.display().to_string(),
                     ballast_dir: pool.ballast_dir.display().to_string(),
@@ -5256,8 +5265,10 @@ impl MonitoringDaemon {
         mount: &Path,
         response: &crate::monitor::pid::PressureResponse,
     ) {
+        let pool_mount = self.pool_mount(mount);
         if let Some(pool) = self.ballast_coordinator.pool_for_mount(mount) {
-            self.release_controller.bind_pool(mount, &pool.ballast_dir);
+            self.release_controller
+                .bind_pool(&pool_mount, &pool.ballast_dir);
         }
         let fs_type = self
             .fs_collector
@@ -5289,7 +5300,7 @@ impl MonitoringDaemon {
         {
             released = report.files_released;
             self.release_controller
-                .on_released(mount, report.files_released);
+                .on_released(&pool_mount, report.files_released);
             self.log_ballast_releases(&report.released, response);
         }
 
@@ -5362,22 +5373,34 @@ impl MonitoringDaemon {
         }
     }
 
+    /// The mount whose pool serves `mount` (itself unless it is a
+    /// same-filesystem alias). Release history, cooldowns and the floor flag
+    /// are kept under this key, which is also what the state file saves.
+    fn pool_mount(&self, mount: &Path) -> PathBuf {
+        self.ballast_coordinator
+            .pool_for_mount(mount)
+            .map_or_else(|| mount.to_path_buf(), |pool| pool.mount_point.clone())
+    }
+
     /// Replenish one released ballast file on `mount` if its pool is short and
     /// the release controller's cooldown allows it. Returns whether a file was
     /// created.
     fn maybe_replenish_pool(&mut self, mount: &Path, level: PressureLevel) -> bool {
+        // An alias mount's inventory row is skipped and names its keeper's
+        // default directory: pace the pool under its own mount instead.
+        let pool_mount = self.pool_mount(mount);
         let Some(pool_info) = self
             .ballast_coordinator
             .inventory()
             .into_iter()
-            .find(|item| item.mount_point == mount)
+            .find(|item| item.mount_point == pool_mount && !item.skipped)
         else {
             return false;
         };
         self.release_controller
-            .bind_pool(mount, &pool_info.ballast_dir);
+            .bind_pool(&pool_mount, &pool_info.ballast_dir);
         if !self.release_controller.is_ready_for_replenish(
-            mount,
+            &pool_mount,
             level,
             pool_info.files_available,
             pool_info.files_total,
@@ -5393,9 +5416,9 @@ impl MonitoringDaemon {
             return false;
         };
         if report.skipped_for_floor > 0 {
-            self.floor_limited.insert(mount.to_path_buf());
+            self.floor_limited.insert(pool_mount.clone());
         } else if report.files_created > 0 {
-            self.floor_limited.remove(mount);
+            self.floor_limited.remove(&pool_mount);
         }
         if report.files_created == 0 {
             return false;
@@ -5407,7 +5430,7 @@ impl MonitoringDaemon {
             });
         }
         self.release_controller
-            .on_replenished(mount, report.files_created);
+            .on_replenished(&pool_mount, report.files_created);
         self.notification_manager
             .notify(&NotificationEvent::BallastReplenished {
                 mount: mount.to_string_lossy().to_string(),
@@ -5427,10 +5450,15 @@ impl MonitoringDaemon {
         };
         let available = pool.available_count();
         let expected = pool.expected_count();
-        self.release_controller.bind_pool(mount, &pool.ballast_dir);
-        let count = self
-            .release_controller
-            .files_to_release(mount, response, available, expected);
+        // A same-filesystem alias mount shares its keeper's pool; release
+        // history lives under the pool's own mount, the key it is saved and
+        // restored under across restarts.
+        let pool_mount = pool.mount_point.clone();
+        self.release_controller
+            .bind_pool(&pool_mount, &pool.ballast_dir);
+        let count =
+            self.release_controller
+                .files_to_release(&pool_mount, response, available, expected);
 
         let mut released = 0;
         if count > 0 {
@@ -5445,9 +5473,9 @@ impl MonitoringDaemon {
 
                 released = report.files_released;
                 self.release_controller
-                    .on_released(mount, report.files_released);
+                    .on_released(&pool_mount, report.files_released);
                 self.release_controller.record_release(
-                    mount,
+                    &pool_mount,
                     report.bytes_freed,
                     free_before,
                     Instant::now(),
