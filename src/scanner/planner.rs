@@ -9,12 +9,14 @@
 //! name the same directory, `/a/busy` protects `/b/busy/child` even without an
 //! observation of `/b/busy` itself. Only prefixes of supplied paths are stored;
 //! alias cycles never generate an unbounded set of synthetic pathnames.
+//! Ordinary batches without aliases use direct path scopes instead of building
+//! that graph; alias detection includes observations that cannot be selected.
 //!
 //! Admission uses only the observations supplied in this batch. It neither
 //! canonicalizes paths nor discovers unseen aliases, mounts or active references.
 //! The executor must still perform fresh identity, protection and lease checks.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -54,6 +56,44 @@ pub fn plan_batch(
 
 fn hard_veto(candidate: &CandidacyScore) -> bool {
     candidate.vetoed || candidate.decision.category_suspended
+}
+
+fn has_path_aliases(candidates: &[CandidacyScore]) -> bool {
+    let mut identities: HashMap<FsIdentity, &Path> = HashMap::new();
+    for candidate in candidates {
+        if let Some(identity) = candidate.identity
+            && let Some(previous) = identities.insert(identity, candidate.path.as_path())
+            && previous != candidate.path.as_path()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn rejected_observations(candidates: &[CandidacyScore]) -> Vec<bool> {
+    // Most walks observe each physical entry at one path. Do not materialize
+    // every path prefix and graph edge just because one candidate is protected.
+    // Keep/invalid-score observations still participate in alias detection.
+    if has_path_aliases(candidates) {
+        return rejected_with_aliases(candidates);
+    }
+    let scopes: BTreeSet<_> = candidates
+        .iter()
+        .filter(|candidate| hard_veto(candidate))
+        .map(|candidate| candidate.path.clone())
+        .collect();
+    candidates
+        .iter()
+        .map(|candidate| {
+            let path = candidate.path.as_path();
+            path.ancestors().any(|ancestor| scopes.contains(ancestor))
+                || scopes
+                    .range(candidate.path.clone()..)
+                    .next()
+                    .is_some_and(|scope| scope.starts_with(path))
+        })
+        .collect()
 }
 
 /// Identity/path equivalence, closed under equal child names. Children of
@@ -127,7 +167,7 @@ fn mark_reachable(marked: &mut [bool], edges: &[Vec<usize>]) {
     }
 }
 
-fn rejected_observations(candidates: &[CandidacyScore]) -> Vec<bool> {
+fn rejected_with_aliases(candidates: &[CandidacyScore]) -> Vec<bool> {
     // The finite prefix trie is bounded by the input's total path components,
     // not by the filesystem's size or the number of spellings an alias cycle
     // could produce. Native components are never converted through UTF-8.
@@ -193,7 +233,6 @@ mod tests {
         ArtifactCertainty, DecisionAction, DecisionOutcome, EvidenceLedger, ScoreFactors,
     };
     use crate::scanner::walker::FsEntryKind;
-    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -481,7 +520,10 @@ mod tests {
             candidate("/b/sub/safe", 5, None),
             candidate("/b/other", 7, None),
         ];
-        let expected = BTreeSet::from([PathBuf::from("/b/sub/safe"), PathBuf::from("/b/other")]);
+        let expected = BTreeSet::from([
+            PathBuf::from("/b/sub/safe"),
+            PathBuf::from("/b/other"),
+        ]);
         for _ in 0..candidates.len() {
             let actual: BTreeSet<_> = candidates
                 .iter()
@@ -493,7 +535,10 @@ mod tests {
             candidates.rotate_left(1);
         }
         candidates.reverse();
-        assert_eq!(rejected_observations(&candidates), reference_rejections(&candidates));
+        assert_eq!(
+            rejected_observations(&candidates),
+            reference_rejections(&candidates)
+        );
     }
 
     #[test]
@@ -554,6 +599,81 @@ mod tests {
         assert_eq!(plan_batch(candidates, &request(None)).1.planned_bytes, 5);
     }
 
+    #[test]
+    fn alias_detection_requires_a_full_identity_at_distinct_paths() {
+        let mut other_kind = candidate("/file", 1, Some((7, 1)));
+        other_kind.identity.as_mut().unwrap().kind = FsEntryKind::File;
+        let mut candidates = vec![
+            candidate("/a", 1, Some((7, 1))),
+            candidate("/a", 2, Some((7, 1))),
+            candidate("/a", 3, Some((7, 2))),
+            candidate("/other-device", 4, Some((8, 1))),
+            other_kind,
+            candidate("/unknown", 5, None),
+            candidate("/other-unknown", 6, None),
+        ];
+        assert!(!has_path_aliases(&candidates));
+        candidates.push(candidate("/b", 7, Some((7, 2))));
+        assert!(has_path_aliases(&candidates));
+    }
+
+    #[test]
+    fn large_nonaliased_batches_preserve_every_independent_sibling() {
+        let mut candidates = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..5000u64 {
+            let path = format!("/cache/group-{index}/target");
+            let mut root = candidate(&path, 1000, Some((7, index + 1)));
+            root.vetoed = index % 1000 == 0;
+            expected.extend([root.vetoed, root.vetoed, false]);
+            candidates.push(root);
+            candidates.push(candidate(&format!("{path}/child"), 1, None));
+            candidates.push(candidate(&format!("/cache/group-{index}/safe"), 1, None));
+        }
+        assert!(!has_path_aliases(&candidates));
+        let actual = rejected_observations(&candidates);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.iter().filter(|&&rejected| rejected).count(), 10);
+    }
+
+    #[test]
+    fn nonplannable_alias_evidence_still_propagates_category_suspensions() {
+        for level in [
+            PressureLevel::Green,
+            PressureLevel::Yellow,
+            PressureLevel::Orange,
+            PressureLevel::Red,
+            PressureLevel::Critical,
+        ] {
+            let mut source = candidate("/a", 1000, Some((7, 1)));
+            source.decision.action = DecisionAction::Keep;
+            source.total_score = f64::NAN;
+            let mut alias = source.clone();
+            alias.path = PathBuf::from("/b");
+            let mut suspended = candidate("/a/busy", 1, None);
+            suspended.decision.action = DecisionAction::Keep;
+            suspended.decision.category_suspended = true;
+            suspended.decision.posterior_abandoned = f64::NAN;
+            let candidates = vec![
+                source,
+                alias,
+                suspended,
+                candidate("/b/busy/deep", 1000, None),
+                candidate("/b/safe", 5, None),
+            ];
+            assert!(has_path_aliases(&candidates));
+            let mut req = request(Some(6));
+            req.level = level;
+            req.include_review = false;
+            let (chosen, plan) = plan_batch(candidates, &req);
+            assert_eq!(chosen.len(), 1);
+            assert_eq!(chosen[0].path, Path::new("/b/safe"));
+            assert_eq!(plan.planned_bytes, 5);
+            assert_eq!(plan.top_n_bytes, 5);
+            assert!(!plan.target_met);
+        }
+    }
+
     // Previous small-instance oracle, retained to assert no old refusal is
     // weakened. Its direct path/identity relation does not infer descendants
     // of parent aliases; the concrete regressions above pin the difference.
@@ -595,6 +715,66 @@ mod tests {
         rejected
     }
 
+    fn reference_equivalence(
+        candidates: &[CandidacyScore],
+        paths: &[&Path],
+        observations: &[usize],
+    ) -> Vec<Vec<bool>> {
+        let parents: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                path.parent()
+                    .and_then(|parent| paths.iter().position(|path| *path == parent))
+            })
+            .collect();
+        let mut equivalent = vec![vec![false; paths.len()]; paths.len()];
+        for (index, row) in equivalent.iter_mut().enumerate() {
+            row[index] = true;
+        }
+        for (left, candidate) in candidates.iter().enumerate() {
+            for (right, other) in candidates.iter().enumerate() {
+                if candidate
+                    .identity
+                    .is_some_and(|identity| other.identity == Some(identity))
+                {
+                    equivalent[observations[left]][observations[right]] = true;
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (via, _) in paths.iter().enumerate() {
+                for (left, _) in paths.iter().enumerate() {
+                    for (right, _) in paths.iter().enumerate() {
+                        if equivalent[left][via]
+                            && equivalent[via][right]
+                            && !equivalent[left][right]
+                        {
+                            equivalent[left][right] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            for (left, path) in paths.iter().enumerate() {
+                for (right, other) in paths.iter().enumerate() {
+                    if let (Some(a), Some(b)) = (parents[left], parents[right])
+                        && equivalent[a][b]
+                        && path.components().next_back() == other.components().next_back()
+                        && !equivalent[left][right]
+                    {
+                        equivalent[left][right] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        equivalent
+    }
+
     // Independent small-instance oracle: an explicit all-pairs equivalence
     // relation, transitive closure and pairwise path containment. No production
     // trie unions, edge merging or reachability helpers are used here.
@@ -607,51 +787,14 @@ mod tests {
             .collect();
         let observations: Vec<_> = candidates
             .iter()
-            .map(|candidate| paths.iter().position(|path| *path == candidate.path).unwrap())
+            .map(|candidate| {
+                paths
+                    .iter()
+                    .position(|path| *path == candidate.path)
+                    .unwrap()
+            })
             .collect();
-        let parents: Vec<_> = paths
-            .iter()
-            .map(|path| path.parent().and_then(|parent| paths.iter().position(|path| *path == parent)))
-            .collect();
-        let mut equivalent = vec![vec![false; paths.len()]; paths.len()];
-        for (index, row) in equivalent.iter_mut().enumerate() {
-            row[index] = true;
-        }
-        for (left, candidate) in candidates.iter().enumerate() {
-            for (right, other) in candidates.iter().enumerate() {
-                if candidate.identity.is_some() && candidate.identity == other.identity {
-                    equivalent[observations[left]][observations[right]] = true;
-                }
-            }
-        }
-        loop {
-            let mut changed = false;
-            for via in 0..paths.len() {
-                for left in 0..paths.len() {
-                    for right in 0..paths.len() {
-                        if equivalent[left][via] && equivalent[via][right] && !equivalent[left][right] {
-                            equivalent[left][right] = true;
-                            changed = true;
-                        }
-                    }
-                }
-            }
-            for left in 0..paths.len() {
-                for right in 0..paths.len() {
-                    if let (Some(a), Some(b)) = (parents[left], parents[right])
-                        && equivalent[a][b]
-                        && paths[left].components().next_back() == paths[right].components().next_back()
-                        && !equivalent[left][right]
-                    {
-                        equivalent[left][right] = true;
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
+        let equivalent = reference_equivalence(candidates, &paths, &observations);
         let mut marked = vec![false; paths.len()];
         for (candidate, &index) in candidates.iter().zip(&observations) {
             marked[index] |= hard_veto(candidate);
@@ -659,12 +802,12 @@ mod tests {
         for upwards in [false, true] {
             loop {
                 let mut changed = false;
-                for left in 0..paths.len() {
-                    for right in 0..paths.len() {
+                for (left, path) in paths.iter().enumerate() {
+                    for (right, other) in paths.iter().enumerate() {
                         let contains = if upwards {
-                            paths[left].starts_with(paths[right])
+                            path.starts_with(other)
                         } else {
-                            paths[right].starts_with(paths[left])
+                            other.starts_with(path)
                         };
                         if marked[left] && !marked[right] && (equivalent[left][right] || contains) {
                             marked[right] = true;
@@ -715,7 +858,11 @@ mod tests {
             req.risk_budget = Some(1.5);
             let reference = reference_rejections(&candidates);
             assert_eq!(rejected_observations(&candidates), reference);
-            for (old, &current) in direct_reference_rejections(&candidates).iter().zip(&reference) {
+            if !has_path_aliases(&candidates) {
+                assert_eq!(rejected_with_aliases(&candidates), reference);
+            }
+            let old = direct_reference_rejections(&candidates);
+            for (old, &current) in old.iter().zip(&reference) {
                 assert!(!old || current, "an existing veto must never be weakened");
             }
             let admitted = candidates
