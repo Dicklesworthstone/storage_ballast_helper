@@ -10325,6 +10325,21 @@ mod tests {
         tempfile::tempdir_in(&scratch_base).unwrap()
     }
 
+    /// A scratch dir inside a temp root, wherever the runner's `TMPDIR`
+    /// points: the counterpart of `non_temp_scratch_dir`. A scanner test whose
+    /// fixture is an artifact only because it sits in temp storage must not
+    /// inherit `TMPDIR`. The rch workers set it to `<project>/.rch-tmp`, a
+    /// temp root only when the project was synced under `/data/tmp` and not
+    /// when it runs from `/data/projects`, so the same test passed on one
+    /// worker and failed every time on the next (#31).
+    fn temp_root_scratch_dir() -> tempfile::TempDir {
+        if is_tmp_like_path(&std::env::temp_dir()) {
+            tempfile::tempdir().unwrap()
+        } else {
+            tempfile::tempdir_in("/tmp").unwrap()
+        }
+    }
+
     /// The `CACHEDIR.TAG` cargo writes into every target dir. Without it a
     /// fixture target has no structural evidence, and whether it scores
     /// `Delete` or `Review` then depends on where the test runs (it passed on
@@ -10345,7 +10360,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn a_walked_directory_candidate_is_measured_before_dispatch() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = temp_root_scratch_dir();
         let root = temp.path().join("scan-root");
         let cache = root.join("srw");
         let deep = cache.join("a").join("b");
@@ -11555,7 +11570,7 @@ mod tests {
             walker_targets: usize,
             replayed: usize,
         }
-        let temp = tempfile::tempdir().unwrap();
+        let temp = temp_root_scratch_dir();
         let root = temp.path().join("scan-root");
         // 600 repositories, each with a nested `target/debug` the pre-scan
         // must classify: several thousand directories in total.
@@ -11803,7 +11818,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // one end-to-end scanner pass
     fn scanner_prescan_discovers_target_in_repo_with_beads_tracker() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = temp_root_scratch_dir();
         let root = temp.path().join("scan-root");
         let repo = root.join("my_beads_project");
         let beads_dir = repo.join(".beads");
