@@ -228,6 +228,35 @@ cargo build --release
 gh release download --repo Dicklesworthstone/storage_ballast_helper --pattern "sbh-*.tar.xz"
 ```
 
+### Verify a Release
+
+Each release ships a manifest, `storage_ballast_helper-vX.Y.Z-manifest.json`,
+that lists every artifact's SHA-256, and a minisign signature for it
+(`.minisig`). Check the signature, then check the file you downloaded
+against the manifest:
+
+```bash
+V=0.7.4
+A="sbh-v$V-x86_64-unknown-linux-gnu.tar.xz"   # or the archive for your platform
+gh release download "v$V" --repo Dicklesworthstone/storage_ballast_helper \
+  --pattern "storage_ballast_helper-v$V-manifest.json*" --pattern "$A"
+minisign -Vm "storage_ballast_helper-v$V-manifest.json" \
+  -P RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70
+jq -r --arg a "$A" '.artifacts[] | select(.name == $a) | .sha256' \
+  "storage_ballast_helper-v$V-manifest.json"
+sha256sum "$A"   # must print the same hash (macOS: shasum -a 256 "$A")
+```
+
+The release signing public key (minisign key id `1BBD79B28BF718D0`):
+
+```
+RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70
+```
+
+`SHA256SUMS` lists the same hashes but is not signed; the signed manifest is
+what ties a binary to the release. The macOS binaries are also signed with a
+Developer ID and notarized: `codesign --verify --strict sbh`.
+
 ## Environment Health and Migration
 
 The bootstrap system detects and repairs common installation problems, from stale PATH entries to misconfigured service files. It runs automatically during `sbh install` and can be invoked manually with `sbh bootstrap`.
