@@ -1,4 +1,4 @@
-//! Decode the framing around Darwin's KERN_PROCARGS2 environment.
+//! Decode the framing around Darwin's KERN_PROCARGS2 argument and environment tables.
 //!
 //! The native transport must first obtain a complete, bounded syscall result.
 //! This parser never allocates from argc, logs arguments, or treats argv as
@@ -6,12 +6,23 @@
 
 const ARGC_BYTES: usize = std::mem::size_of::<i32>();
 
-/// Borrow only the NUL-terminated environment after the counted argv table.
+/// Separate, borrowed NUL-terminated tables from a complete process record.
+/// Empty later arguments are preserved; executable padding and auxiliary
+/// strings are excluded. Neither table is decoded as text or copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DarwinArguments<'a> {
+    /// Exactly argc arguments, including argv[0] and each terminating NUL.
+    pub argv: &'a [u8],
+    /// Environment entries only, excluding a double-NUL auxiliary tail.
+    pub environment: &'a [u8],
+}
+
+/// Borrow argv and the environment without conflating their contents.
 /// Zero argc, missing terminators and truncated tails return None. The
 /// conventional nonempty argv[0] delimits executable-path alignment padding.
 /// An empty environment is valid. A double NUL ends the environment; any
 /// auxiliary strings following it are not configuration evidence.
-pub fn darwin_environment(raw: &[u8]) -> Option<&[u8]> {
+pub fn darwin_arguments(raw: &[u8]) -> Option<DarwinArguments<'_>> {
     let argc = i32::from_ne_bytes(raw.get(..ARGC_BYTES)?.try_into().ok()?);
     let argc = usize::try_from(argc).ok().filter(|argc| *argc > 0)?;
     let strings = raw.get(ARGC_BYTES..)?;
@@ -31,18 +42,26 @@ pub fn darwin_environment(raw: &[u8]) -> Option<&[u8]> {
             .iter()
             .position(|byte| *byte != 0)?,
     )?;
+    let argv_start = cursor;
     for _ in 0..argc {
         cursor = next_nul(strings, cursor)?.checked_add(1)?;
     }
+    let argv = strings.get(argv_start..cursor)?;
     let start = cursor;
     while cursor < strings.len() {
         let end = next_nul(strings, cursor)?;
         if end == cursor {
-            return strings.get(start..cursor);
+            return Some(DarwinArguments {
+                argv,
+                environment: strings.get(start..cursor)?,
+            });
         }
         cursor = end.checked_add(1)?;
     }
-    strings.get(start..cursor)
+    Some(DarwinArguments {
+        argv,
+        environment: strings.get(start..cursor)?,
+    })
 }
 
 fn next_nul(bytes: &[u8], start: usize) -> Option<usize> {
@@ -58,6 +77,25 @@ mod tests {
     use super::*;
     use crate::platform::build_environment::{CacheLayout, Tool, references_with_layout};
     use std::path::{Path, PathBuf};
+
+    // Keep the original environment-only assertions as regression controls
+    // while the production caller consumes both tables.
+    fn darwin_environment(raw: &[u8]) -> Option<&[u8]> {
+        darwin_arguments(raw).map(|arguments| arguments.environment)
+    }
+
+    #[test]
+    fn argv_is_borrowed_separately_from_environment_and_padding() {
+        let env = b"HOME=/builder\0\0npm-cli.js\0";
+        for padding in 0..=16 {
+            let raw = frame(&[b"python3", b"", b"-m", b"pip", b"path-\xff"], env, padding);
+            let parsed = darwin_arguments(&raw).unwrap();
+            assert_eq!(parsed.argv, b"python3\0\0-m\0pip\0path-\xff\0");
+            assert_eq!(parsed.environment, b"HOME=/builder\0");
+            assert!(raw.as_ptr_range().contains(&parsed.argv.as_ptr()));
+            assert!(raw.as_ptr_range().contains(&parsed.environment.as_ptr()));
+        }
+    }
 
     fn frame(args: &[&[u8]], environment: &[u8], padding: usize) -> Vec<u8> {
         let mut raw = i32::try_from(args.len()).unwrap().to_ne_bytes().to_vec();

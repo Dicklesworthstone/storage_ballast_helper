@@ -10,8 +10,9 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::platform::build_environment;
-use crate::platform::process_arguments::darwin_environment;
+use crate::platform::build_environment::CacheLayout;
+use crate::platform::build_invocation;
+use crate::platform::process_arguments::darwin_arguments;
 use crate::platform::types::{OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET};
 
 const MAX_DECLARED_PATHS: usize = 65_536;
@@ -126,7 +127,7 @@ fn collect_with(access: &impl ProcessAccess, own: u32, limits: Limits) -> Vec<(i
         if before.pid != pid {
             continue;
         }
-        let Some(tool) = build_environment::tool(&before.name) else {
+        let Some(tool) = build_invocation::observed_tool(&before.name) else {
             continue;
         };
         if !in_budget() {
@@ -138,7 +139,7 @@ fn collect_with(access: &impl ProcessAccess, own: u32, limits: Limits) -> Vec<(i
         if raw.len() > sbh_mach::PROCESS_ARGUMENTS_MAX_BYTES {
             continue;
         }
-        let Some(environment) = darwin_environment(&raw) else {
+        let Some(arguments) = darwin_arguments(&raw) else {
             continue;
         };
         if !in_budget() {
@@ -155,7 +156,13 @@ fn collect_with(access: &impl ProcessAccess, own: u32, limits: Limits) -> Vec<(i
         if access.identity(pid).ok().as_ref() != Some(&before) {
             continue;
         }
-        for directory in build_environment::references(tool, environment, cwd.as_deref()) {
+        for directory in build_invocation::references(
+            CacheLayout::MacOs,
+            tool,
+            arguments.argv,
+            arguments.environment,
+            cwd.as_deref(),
+        ) {
             if directories.len() >= limits.paths {
                 break;
             }
@@ -226,6 +233,18 @@ mod tests {
             self.reads.borrow_mut().push((pid, kind));
             self.now.set(self.now.get() + self.elapsed_per_read);
         }
+
+        fn invocation(&mut self, pid: i32, name: &str, argv: &[&[u8]], environment: &[u8]) {
+            self.add(pid, name, environment);
+            let mut raw = i32::try_from(argv.len()).unwrap().to_ne_bytes().to_vec();
+            raw.extend_from_slice(b"/usr/bin/interpreter\0\0");
+            for arg in argv {
+                raw.extend_from_slice(arg);
+                raw.push(0);
+            }
+            raw.extend_from_slice(environment);
+            self.processes.get_mut(&pid).unwrap().arguments = raw;
+        }
     }
 
     impl ProcessAccess for Fixture {
@@ -267,6 +286,28 @@ mod tests {
         fn now(&self) -> Instant {
             self.now.get()
         }
+    }
+
+    #[test]
+    fn interpreter_hosted_package_managers_reach_native_cache_protection() {
+        let mut fixture = Fixture::default();
+        fixture.invocation(41, "Python", &[b"python3", b"-m", b"pip"], b"HOME=/builder\0");
+        fixture.invocation(42, "node", &[b"node", b"/opt/npm/bin/npm-cli.js"], b"HOME=/builder\0");
+        fixture.invocation(43, "python3", &[b"python3", b"worker.py", b"-m", b"pip"], b"HOME=/builder\0");
+        assert_eq!(
+            collect_with(&fixture, 99, Limits::default()),
+            vec![
+                (41, PathBuf::from("/builder/Library/Caches/pip")),
+                (42, PathBuf::from("/builder/.npm")),
+            ]
+        );
+        // A changed PID/start-time still defeats invocation-based evidence.
+        fixture.changed = Some(41);
+        fixture.reads.borrow_mut().clear();
+        assert_eq!(
+            collect_with(&fixture, 99, Limits::default()),
+            vec![(42, PathBuf::from("/builder/.npm"))]
+        );
     }
 
     #[test]
