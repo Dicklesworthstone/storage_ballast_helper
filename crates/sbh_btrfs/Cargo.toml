@@ -1,0 +1,14 @@
+[package]
+name = "sbh_btrfs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Small, descriptor-only Btrfs compression and physical-extent inspection boundary for sbh"
+
+# Keep the Linux syscall boundary independently testable, like sbh_mach's
+# platform-specific tests. The main application remains unsafe-free.
+[workspace]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"

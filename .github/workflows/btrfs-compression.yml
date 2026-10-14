@@ -1,0 +1,49 @@
+name: Btrfs compression safety
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/sbh_btrfs/**'
+      - 'src/scanner/compression/**'
+      - 'src/cli_compress.rs'
+      - '.github/workflows/btrfs-compression.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-compression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/sbh-btrfs-target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Verify syscall ABI and pure tests
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror crates/sbh_btrfs/tests/uapi_abi.c -o "$RUNNER_TEMP/sbh-uapi"
+          "$RUNNER_TEMP/sbh-uapi"
+          cargo test --locked --manifest-path crates/sbh_btrfs/Cargo.toml
+      - name: Create a disposable Btrfs filesystem
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs
+          truncate -s 1G "$RUNNER_TEMP/sbh-btrfs.img"
+          mkfs.btrfs -f "$RUNNER_TEMP/sbh-btrfs.img"
+          mkdir "$RUNNER_TEMP/sbh-btrfs-mount"
+          sudo mount -o loop "$RUNNER_TEMP/sbh-btrfs.img" "$RUNNER_TEMP/sbh-btrfs-mount"
+      - name: Verify real compression and reflink refusal
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(find "$CARGO_TARGET_DIR/debug/deps" -maxdepth 1 -type f -name 'btrfs_native-*' -executable)
+          test "${#tests[@]}" -eq 1
+          sudo env SBH_BTRFS_TEST_ROOT="$RUNNER_TEMP/sbh-btrfs-mount" "${tests[0]}" --ignored --nocapture
+      - name: Unmount the disposable filesystem
+        if: always()
+        run: |
+          if mountpoint -q "$RUNNER_TEMP/sbh-btrfs-mount"; then
+            sudo umount "$RUNNER_TEMP/sbh-btrfs-mount"
+          fi
