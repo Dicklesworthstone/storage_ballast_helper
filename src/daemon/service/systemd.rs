@@ -2,6 +2,8 @@
 
 #[path = "systemd_load_state.rs"]
 mod load_state;
+#[path = "systemd_namespace.rs"]
+mod namespace;
 
 use std::env;
 use std::fmt::Write as _;
@@ -165,53 +167,18 @@ impl SystemdConfig {
         paths
     }
 
-    /// `ReadWritePaths=` value for `paths`, with systemd quoting for paths
-    /// that contain spaces or quotes.
+    /// `ReadWritePaths=` value for `paths`, with systemd C escaping and
+    /// literal percent specifiers. This never expands environment variables.
     #[must_use]
     pub fn render_read_write_paths(paths: &[PathBuf]) -> String {
-        paths
-            .iter()
-            .map(|p| {
-                let s = p.display().to_string();
-                if s.contains(' ') || s.contains('"') {
-                    // Systemd quote escaping: escape internal quotes and wrap in quotes.
-                    format!("\"{}\"", s.replace('"', "\\\""))
-                } else {
-                    s
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
+        namespace::render(paths)
     }
 
     /// Parse the value of a `ReadWritePaths=` line (the inverse of
-    /// [`Self::render_read_write_paths`]).
+    /// [`Self::render_read_write_paths`]). Invalid syntax grants no paths.
     #[must_use]
     pub fn parse_read_write_paths(value: &str) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        let mut current = String::new();
-        let mut in_quotes = false;
-        let mut chars = value.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' if in_quotes => {
-                    if let Some(next) = chars.next() {
-                        current.push(next);
-                    }
-                }
-                '"' => in_quotes = !in_quotes,
-                ' ' if !in_quotes => {
-                    if !current.is_empty() {
-                        paths.push(PathBuf::from(std::mem::take(&mut current)));
-                    }
-                }
-                _ => current.push(c),
-            }
-        }
-        if !current.is_empty() {
-            paths.push(PathBuf::from(current));
-        }
-        paths
+        namespace::parse(value).unwrap_or_default()
     }
 
     /// Paths in `required` that a unit file's `ReadWritePaths=` line does not
@@ -469,6 +436,12 @@ impl ServiceManager for SystemdServiceManager {
         let unit_path = self.config.unit_path();
         let unit_content = self.generate_unit_file();
 
+        // Namespace setup precedes ExecStart (and ExecStartPre). Prepare the
+        // exact grants before publishing/enabling a unit; never broaden them
+        // to an existing ancestor or turn off ProtectSystem to make it start.
+        if !self.config.user_scope {
+            namespace::prepare(&self.config.read_write_paths)?;
+        }
         fs::create_dir_all(&unit_dir).map_err(|source| SbhError::Io {
             path: unit_path.clone(),
             source,
@@ -1113,18 +1086,21 @@ pub struct ReinstallReport {
 
 impl SystemdServiceManager {
     /// Compare the installed unit and its drop-ins with what sbh would
-    /// generate now. Errors when no unit is installed.
+    /// generate now. Errors when no unit is installed or a required sandbox
+    /// path cannot be resolved; the latter names the 226/NAMESPACE blocker.
     pub fn drift_report(&self) -> Result<UnitDrift> {
         let unit_path = self.config.unit_path();
         let installed = fs::read_to_string(&unit_path).map_err(|source| SbhError::Io {
             path: unit_path.clone(),
             source,
         })?;
+        let dropins = self.config.read_dropins();
+        namespace::validate_unit(&installed, &dropins)?;
         Ok(UnitDrift::compute(
             &unit_path,
             &installed,
             &self.generate_unit_file(),
-            &self.config.read_dropins(),
+            &dropins,
         ))
     }
 
@@ -1153,6 +1129,11 @@ impl SystemdServiceManager {
         let dropins = self.config.read_dropins();
         let preserved_config = preserved_unit_config(previous.as_deref().unwrap_or(""), &dropins)?;
         let generated = self.generate_unit_file_with_config(preserved_config.as_deref());
+        // The repair path needs the same preparation as a fresh install.
+        // Failure must leave the existing unit and its drop-ins untouched.
+        if !self.config.user_scope {
+            namespace::prepare(&self.config.read_write_paths)?;
+        }
 
         let backup_path = if previous.is_some() {
             fs::copy(&unit_path, &backup_path).map_err(|source| SbhError::Io {
