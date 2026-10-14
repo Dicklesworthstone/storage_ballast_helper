@@ -2136,6 +2136,17 @@ mod tests {
     use crate::scanner::scoring::{DecisionOutcome, EvidenceLedger, ScoreFactors};
     use std::borrow::Cow;
 
+    /// For tests about planning and execution, not live process evidence. The
+    /// live sweep reads every process on the machine and holds the batch when
+    /// one is unreadable. In a container root lacks CAP_SYS_PTRACE and cannot
+    /// read a concurrent test's child that runs under another uid.
+    fn offline_config() -> DeletionConfig {
+        DeletionConfig {
+            check_open_files: false,
+            ..Default::default()
+        }
+    }
+
     /// Fixture root for deletion tests, guaranteed to sit OUTSIDE the
     /// hardcoded source-tree roots (`/data/projects`, `/home/<u>/projects`,
     /// `/Users/<u>/projects`). The preflight refuses to delete anything under
@@ -2370,6 +2381,7 @@ mod tests {
 
         let executor = DeletionExecutor::new(
             DeletionConfig {
+                check_open_files: false,
                 include_review: true,
                 ..Default::default()
             },
@@ -2633,7 +2645,7 @@ mod tests {
         let c1 = make_candidate(&file_path, 13, 0.85);
         let c2 = make_candidate(&dir_path, 100, 0.90);
 
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c1, c2]);
         let report = executor.execute(&plan, None);
 
@@ -2957,7 +2969,7 @@ mod tests {
         fs::write(git_dir.join("Cargo.toml"), "[package]").unwrap();
 
         let c = make_candidate(&git_dir, 5000, 0.95);
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c]);
         let report = executor.execute(&plan, None);
 
@@ -3327,7 +3339,7 @@ mod tests {
         let gone = dir.path().join("already_gone");
 
         let c = make_candidate(&gone, 1000, 0.85);
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c]);
         let report = executor.execute(&plan, None);
 
@@ -3392,6 +3404,7 @@ mod tests {
 
         let executor = DeletionExecutor::new(
             DeletionConfig {
+                check_open_files: false,
                 max_batch_size: 3,
                 ..Default::default()
             },
@@ -3416,7 +3429,7 @@ mod tests {
             candidates.push(make_candidate(&p, 100, 0.8));
         }
 
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(candidates);
 
         // Pressure check: resolved after first deletion.
@@ -3449,6 +3462,7 @@ mod tests {
         // With a valid setup, all should succeed.
         let executor = DeletionExecutor::new(
             DeletionConfig {
+                check_open_files: false,
                 circuit_breaker_threshold: 3,
                 circuit_breaker_cooldown: Duration::from_millis(10),
                 ..Default::default()
@@ -3475,7 +3489,7 @@ mod tests {
         let c1 = make_candidate(&good, 2, 0.85);
         let c2 = make_candidate(&gone, 3, 0.80);
 
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c1, c2]);
 
         // Remove the file before execution to trigger skip.
@@ -3614,7 +3628,7 @@ mod tests {
         let c2 = make_candidate(&file2, 5, 0.80);
         let c3 = make_candidate(&file3, 5, 0.75);
 
-        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        let executor = DeletionExecutor::new(offline_config(), None);
         let plan = executor.plan(vec![c1, c2, c3]);
         let report = executor.execute(&plan, None);
 
