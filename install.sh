@@ -37,8 +37,9 @@ esac
 if command -v gh &>/dev/null; then
   TAG="$(gh release list --repo "${REPO}" --limit 1 --json tagName -q '.[0].tagName')"
 else
-  TAG="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
+  TAG="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep -o '"tag_name": *"[^"]*"' | head -n 1 | cut -d'"' -f4)"
 fi
+case "${TAG}" in v[0-9]*|[0-9]*) ;; *) TAG="" ;; esac
 
 if [ -z "${TAG}" ]; then
   echo "Could not determine latest release tag" >&2
