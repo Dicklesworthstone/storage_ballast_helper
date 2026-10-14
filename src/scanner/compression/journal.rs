@@ -21,6 +21,8 @@ const SCHEMA: &str = "sbh.compression.journal.v1";
 const MAX_JOURNAL_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 128 * 1024;
 const MAX_PATH_BYTES: usize = 16 * 1024;
+/// How long recovery waits for the writer's lock before calling the pass live.
+const LIVE_LOCK_PATIENCE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,7 +191,7 @@ pub fn recover(path: &Path, max_bytes: u64, timeout_secs: u64) -> io::Result<Rec
     }
     // A second descriptor in the same process also conflicts with the writer's
     // exclusive lock. A live pass is not an interrupted pass.
-    journal.try_lock_shared()?;
+    lock_shared_patiently(&journal, deadline)?;
     let before = Identity::read(&journal)?;
     if before.size > MAX_JOURNAL_BYTES {
         return Err(invalid(
@@ -442,6 +444,34 @@ fn decode_path(hex: &str) -> io::Result<PathBuf> {
         ));
     }
     Ok(path)
+}
+
+/// Take the shared lock, waiting briefly while the exclusive one is held.
+///
+/// A live pass holds the writer's exclusive lock for its whole run. A child
+/// that any thread of this process is spawning also holds the writer's
+/// descriptor, and so its lock, until the child execs: usually microseconds,
+/// but a whole CPU-quota period when the cgroup is throttled. Recovery right
+/// after a pass ended must not call the pass live because of that.
+fn lock_shared_patiently(journal: &File, deadline: Instant) -> io::Result<()> {
+    let give_up = deadline.min(Instant::now() + LIVE_LOCK_PATIENCE);
+    let mut pause = Duration::from_millis(5);
+    loop {
+        match journal.try_lock_shared() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < give_up => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "the journal is locked by a compression pass that is still running",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
 }
 
 fn open_read_only(path: &Path) -> io::Result<File> {
