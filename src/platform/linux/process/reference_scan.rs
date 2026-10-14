@@ -128,10 +128,13 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
                 &proc_root.join("net").join("unix"),
                 MAX_UNIX_SOCKET_TABLE_BYTES,
             )
-            .map(|raw| unix_sockets::Table::parse(&raw, MAX_DESCRIPTORS, || {
-                proc.now().checked_duration_since(started)
-                    .is_none_or(|elapsed| elapsed >= time)
-            }))
+            .map(|raw| {
+                unix_sockets::Table::parse(&raw, MAX_DESCRIPTORS, || {
+                    proc.now()
+                        .checked_duration_since(started)
+                        .is_none_or(|elapsed| elapsed >= time)
+                })
+            })
             .unwrap_or_default()
         });
         self.complete &= table.complete_for(inode);
@@ -267,7 +270,10 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
                 {
                     visit(&process, fd, &fd_path, bound);
                 } else if !pseudo_target(&target)
-                    || (target.as_os_str().as_encoded_bytes().starts_with(b"socket:[")
+                    || (target
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .starts_with(b"socket:[")
                         && socket_inode(&target).is_none())
                 {
                     // Kernel pseudo-links must not become paths relative to
@@ -398,7 +404,7 @@ fn stat_has_no_user_executable(raw: &[u8], pid: i32) -> bool {
     };
     if observed_pid.trim().parse::<i32>().ok() != Some(pid) {
         return false;
-    };
+    }
     let Ok(fields) = super::proc_stat_fields_after_comm(raw) else {
         return false;
     };
@@ -419,8 +425,11 @@ fn disappeared(error: &io::Error) -> bool {
 }
 
 fn socket_inode(target: &Path) -> Option<u64> {
-    let raw = target.as_os_str().as_encoded_bytes()
-        .strip_prefix(b"socket:[")?.strip_suffix(b"]")?;
+    let raw = target
+        .as_os_str()
+        .as_encoded_bytes()
+        .strip_prefix(b"socket:[")?
+        .strip_suffix(b"]")?;
     unix_sockets::decimal(raw).filter(|inode| *inode != 0)
 }
 
@@ -2156,7 +2165,13 @@ mod tests {
         let retained = fixture.fd(77, 0);
         socket_fd_fixture(&fixture, 77, 1, 4242);
         let table = socket_table_fixture(&fixture, b"");
-        for error in [libc::ENOENT, libc::EACCES, libc::EPERM, libc::EIO, libc::EFBIG] {
+        for error in [
+            libc::ENOENT,
+            libc::EACCES,
+            libc::EPERM,
+            libc::EIO,
+            libc::EFBIG,
+        ] {
             let mut access = Faults::default();
             access.reads.insert(table.clone(), error);
             let result = fixture.scan(&access, Limits::default());
@@ -2178,7 +2193,8 @@ mod tests {
         let served = fixture.root.join("server.sock");
         socket_fd_fixture(&fixture, 77, 1, 4242);
         let rows = format!(
-            "garbage\n0: 2 0 10000 1 1 4242 {}\nbroken final row\n", served.display()
+            "garbage\n0: 2 0 10000 1 1 4242 {}\nbroken final row\n",
+            served.display()
         );
         socket_table_fixture(&fixture, rows.as_bytes());
         let result = fixture.scan(&NativeProc, Limits::default());
@@ -2207,7 +2223,10 @@ mod tests {
             open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
         assert!(!complete);
         assert!(!targets.contains(&current.join("relative.sock")));
-        assert!(targets.contains(&current), "the independent cwd reference still counts");
+        assert!(
+            targets.contains(&current),
+            "the independent cwd reference still counts"
+        );
     }
 
     #[test]
@@ -2226,7 +2245,12 @@ mod tests {
             assert_eq!(result.complete, !denied);
             assert!(result.files.is_empty());
             assert_eq!(
-                access.read_paths.borrow().iter().filter(|read| **read == path).count(),
+                access
+                    .read_paths
+                    .borrow()
+                    .iter()
+                    .filter(|read| **read == path)
+                    .count(),
                 1,
                 "failure does not start a per-descriptor retry loop"
             );
@@ -2235,7 +2259,13 @@ mod tests {
 
     #[test]
     fn malformed_socket_pseudo_links_are_not_known_fileless_descriptors() {
-        for target in ["socket:[+42]", "socket:[]", "socket:[bad]", "socket:[0]", "socket:[42]extra"] {
+        for target in [
+            "socket:[+42]",
+            "socket:[]",
+            "socket:[bad]",
+            "socket:[0]",
+            "socket:[42]extra",
+        ] {
             let fixture = Fixture::new();
             let retained = fixture.fd(77, 0);
             symlink(target, fixture.proc_root.join("77/fd/1")).unwrap();
@@ -2263,7 +2293,13 @@ mod tests {
             advance_per_link: Duration::from_secs(2),
             ..Faults::default()
         };
-        let result = fixture.scan(&access, Limits { time: Duration::from_secs(1), ..Limits::default() });
+        let result = fixture.scan(
+            &access,
+            Limits {
+                time: Duration::from_secs(1),
+                ..Limits::default()
+            },
+        );
         assert!(!result.complete);
         assert!(access.read_paths.borrow().is_empty());
     }
@@ -2273,14 +2309,18 @@ mod tests {
         let fixture = Fixture::new();
         socket_fd_fixture(&fixture, 77, 1, 4242);
         let table = socket_table_fixture(&fixture, b"");
-        fs::File::create(&table).unwrap()
-            .set_len(u64::try_from(MAX_UNIX_SOCKET_TABLE_BYTES).unwrap() + 1).unwrap();
+        fs::File::create(&table)
+            .unwrap()
+            .set_len(u64::try_from(MAX_UNIX_SOCKET_TABLE_BYTES).unwrap() + 1)
+            .unwrap();
         assert!(!fixture.scan(&NativeProc, Limits::default()).complete);
         let saved = table.with_extension("oversized");
         fs::rename(&table, &saved).unwrap();
         nix::unistd::mkfifo(
-            &table, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR
-        ).unwrap();
+            &table,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
         assert!(!fixture.scan(&NativeProc, Limits::default()).complete);
     }
 
@@ -2294,7 +2334,10 @@ mod tests {
         let target = fs::read_link(format!("/proc/self/fd/{}", listener.as_raw_fd())).unwrap();
         let inode = socket_inode(&target).unwrap();
         let mut sweep = Sweep::new(&NativeProc, Limits::default());
-        assert_eq!(sweep.unix_socket_path(Path::new(PROC_ROOT), inode), Some(path));
+        assert_eq!(
+            sweep.unix_socket_path(Path::new(PROC_ROOT), inode),
+            Some(path)
+        );
         assert!(sweep.complete);
     }
 }

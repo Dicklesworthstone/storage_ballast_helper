@@ -22,19 +22,19 @@ pub(super) struct Table {
 impl Table {
     /// Only a validated, fully observed table can supply negative evidence.
     /// Row and clock limits bound parsing as well as the caller's bounded read.
-    pub(super) fn parse(
-        raw: &[u8],
-        max_rows: usize,
-        mut expired: impl FnMut() -> bool,
-    ) -> Self {
+    pub(super) fn parse(raw: &[u8], max_rows: usize, mut expired: impl FnMut() -> bool) -> Self {
         let mut lines = raw.split_inclusive(|byte| *byte == b'\n');
         let Some(header) = lines.next() else {
             return Self::default();
         };
         let mut table = Self {
             complete: header.ends_with(b"\n")
-                && header.split(u8::is_ascii_whitespace).filter(|word| !word.is_empty())
-                    .eq(HEADER.split(u8::is_ascii_whitespace).filter(|word| !word.is_empty())),
+                && header
+                    .split(u8::is_ascii_whitespace)
+                    .filter(|word| !word.is_empty())
+                    .eq(HEADER
+                        .split(u8::is_ascii_whitespace)
+                        .filter(|word| !word.is_empty())),
             ..Self::default()
         };
         let mut seen = HashSet::new();
@@ -63,9 +63,10 @@ impl Table {
             }
             match binding {
                 Some(bytes) if bytes.first() == Some(&b'/') => {
-                    table.paths.entry(inode).or_insert_with(|| {
-                        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
-                    });
+                    table
+                        .paths
+                        .entry(inode)
+                        .or_insert_with(|| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
                 }
                 // Linux prints abstract names with '@'; they have no pathname
                 // in this representation. Unbound sockets have no path column.
@@ -98,12 +99,19 @@ fn row(mut rest: &[u8]) -> Option<(u64, Option<&[u8]>)> {
     for index in 0..7 {
         let start = rest.iter().position(|byte| !byte.is_ascii_whitespace())?;
         rest = &rest[start..];
-        let end = rest.iter().position(u8::is_ascii_whitespace).unwrap_or(rest.len());
+        let end = rest
+            .iter()
+            .position(u8::is_ascii_whitespace)
+            .unwrap_or(rest.len());
         let token = &rest[..end];
         if index == 6 {
             inode = decimal(token)?;
         } else {
-            let hex = if index == 0 { token.strip_suffix(b":")? } else { token };
+            let hex = if index == 0 {
+                token.strip_suffix(b":")?
+            } else {
+                token
+            };
             if hex.is_empty() || hex.len() > 16 || !hex.iter().all(u8::is_ascii_hexdigit) {
                 return None;
             }
@@ -132,9 +140,8 @@ mod tests {
     use super::*;
 
     fn line(inode: u64, binding: Option<&[u8]>) -> Vec<u8> {
-        let mut raw = format!(
-            "0000000000000000: 00000002 00000000 00010000 0001 01 {inode:7}"
-        ).into_bytes();
+        let mut raw =
+            format!("0000000000000000: 00000002 00000000 00010000 0001 01 {inode:7}").into_bytes();
         if let Some(path) = binding {
             raw.push(b' ');
             raw.extend_from_slice(path);
@@ -158,7 +165,9 @@ mod tests {
             assert!(!Table::parse(raw, 100, || false).complete_for(1));
         }
         let table = Table::parse(
-            b"Num\tRefCount Protocol Flags Type St Inode Path\n", 100, || false
+            b"Num\tRefCount Protocol Flags Type St Inode Path\n",
+            100,
+            || false,
         );
         assert!(table.complete_for(1));
     }
@@ -166,10 +175,16 @@ mod tests {
     #[test]
     fn absolute_bindings_keep_spaces_tabs_trailing_spaces_and_native_bytes() {
         let names: [&[u8]; 4] = [
-            b"/tmp/socket with spaces", b"/tmp/socket\tname", b"/tmp/socket ", b"/tmp/socket-\xff",
+            b"/tmp/socket with spaces",
+            b"/tmp/socket\tname",
+            b"/tmp/socket ",
+            b"/tmp/socket-\xff",
         ];
-        let rows: Vec<_> = names.iter().enumerate()
-            .map(|(i, name)| line(i as u64 + 1, Some(name))).collect();
+        let rows: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| line(i as u64 + 1, Some(name)))
+            .collect();
         let table = parse(&rows);
         for (index, name) in names.iter().enumerate() {
             let inode = index as u64 + 1;
@@ -181,8 +196,10 @@ mod tests {
     #[test]
     fn relative_binding_is_unknown_only_for_the_referencing_inode() {
         let table = parse(&[
-            line(1, Some(b"relative.sock")), line(2, Some(b"../old/socket")),
-            line(3, Some(b"  leading-space.sock")), line(4, Some(b"/tmp/absolute")),
+            line(1, Some(b"relative.sock")),
+            line(2, Some(b"../old/socket")),
+            line(3, Some(b"  leading-space.sock")),
+            line(4, Some(b"/tmp/absolute")),
         ]);
         for inode in 1..=3 {
             assert!(!table.complete_for(inode));
@@ -206,13 +223,18 @@ mod tests {
     #[test]
     fn malformed_rows_revoke_coverage_without_erasing_other_positive_paths() {
         for bad in [
-            b"garbage\n".to_vec(), b"\n".to_vec(),
+            b"garbage\n".to_vec(),
+            b"\n".to_vec(),
             b"0: 2 0 10000 1 1 +42 /tmp/malformed\n".to_vec(),
             b"0: 2 0 10000 1 1 18446744073709551616 /tmp/overflow\n".to_vec(),
             b"0: 2 0 G 1 1 42 /tmp/bad-flags\n".to_vec(),
             line(42, Some(b"/tmp/embedded\0nul")),
         ] {
-            let table = parse(&[line(1, Some(b"/tmp/first")), bad, line(2, Some(b"/tmp/last"))]);
+            let table = parse(&[
+                line(1, Some(b"/tmp/first")),
+                bad,
+                line(2, Some(b"/tmp/last")),
+            ]);
             assert!(!table.complete_for(1));
             assert!(!table.complete_for(99));
             assert_eq!(table.path(1), Some(Path::new("/tmp/first")));
