@@ -4,6 +4,37 @@ set -euo pipefail
 REPO="Dicklesworthstone/storage_ballast_helper"
 INSTALL_DIR="${SBH_INSTALL_DIR:-/usr/local/bin}"
 BINARY="sbh"
+TAG=""
+
+usage() {
+  cat <<'USAGE'
+Usage: install.sh [--dest <dir>] [--version <tag>]
+
+  --dest <dir>       Install sbh into <dir> (default: $SBH_INSTALL_DIR, else /usr/local/bin)
+  --version <tag>    Install this release, e.g. v0.7.5 (default: the latest release)
+  -h, --help         Show this help
+
+For service setup, per-user installs and agent skills, use scripts/install.sh.
+USAGE
+}
+
+# An unknown argument must never fall through to the default destination:
+# as root that would silently replace /usr/local/bin/sbh, the system daemon.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dest)
+      [ $# -ge 2 ] && [ -n "$2" ] || { echo "--dest requires a directory" >&2; exit 2; }
+      INSTALL_DIR="$2"; shift 2 ;;
+    --dest=?*) INSTALL_DIR="${1#--dest=}"; shift ;;
+    --version)
+      [ $# -ge 2 ] && [ -n "$2" ] || { echo "--version requires a release tag" >&2; exit 2; }
+      TAG="$2"; shift 2 ;;
+    --version=?*) TAG="${1#--version=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+case "${TAG}" in [0-9]*) TAG="v${TAG}" ;; esac
 
 # Detect platform.
 #
@@ -33,8 +64,10 @@ case "${OS}" in
     ;;
 esac
 
-# Get latest release tag
-if command -v gh &>/dev/null; then
+# Get latest release tag unless one was requested
+if [ -n "${TAG}" ]; then
+  :
+elif command -v gh &>/dev/null; then
   TAG="$(gh release list --repo "${REPO}" --limit 1 --json tagName -q '.[0].tagName')"
 else
   TAG="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep -o '"tag_name": *"[^"]*"' | head -n 1 | cut -d'"' -f4)"
@@ -79,6 +112,9 @@ fi
 chmod +x "${ASSET}"
 
 # Install
+if [ ! -d "${INSTALL_DIR}" ]; then
+  mkdir -p "${INSTALL_DIR}" 2>/dev/null || sudo mkdir -p "${INSTALL_DIR}"
+fi
 if [ -w "${INSTALL_DIR}" ]; then
   mv "${ASSET}" "${INSTALL_DIR}/${BINARY}"
 else
