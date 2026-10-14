@@ -17,6 +17,11 @@ Compare: [`v0.7.5...v0.7.6`](https://github.com/Dicklesworthstone/storage_ballas
   --need 20G` exited 1 on a 3.6 TiB volume with 453 GB free. `check` now
   uses the daemon's Yellow line for that volume; `--target-free` still
   overrides it.
+- **The root `install.sh` honours `--dest` and refuses unknown arguments**
+  (bd-fgxo; `651445a`). It never parsed its arguments, so `--dest /opt/x`
+  installed to `$SBH_INSTALL_DIR` or `/usr/local/bin` and, run as root,
+  silently replaced the system daemon's binary. It now takes `--dest`,
+  `--version` and `--help`; anything else exits 2 before downloading.
 
 ## v0.7.5 **[release]**
 
