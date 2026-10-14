@@ -1068,7 +1068,11 @@ fn open_files_for_pid_under(pid: i32, root: &Path) -> Vec<OpenFile> {
 }
 
 fn open_file_for_fd_under(pid: i32, fd: ProcFdInfo, root_variants: &[PathBuf]) -> Option<OpenFile> {
-    if fd.fd_type().ok()? != ProcFdType::VNODE {
+    let fd_type = fd.fd_type().ok()?;
+    if fd_type == ProcFdType::SOCKET {
+        return bound_socket_under(pid, fd, root_variants);
+    }
+    if fd_type != ProcFdType::VNODE {
         return None;
     }
     let info = proc_pidfdinfo_vnode_path(pid, fd.proc_fd.0)
@@ -1081,6 +1085,25 @@ fn open_file_for_fd_under(pid: i32, fd: ProcFdInfo, root_variants: &[PathBuf]) -
         fd: Some(fd.proc_fd.0),
         kind: open_file_kind(&info),
         mode: open_file_mode(info.pfi.fi_openflags),
+    })
+}
+
+/// A listening `AF_UNIX` socket holds its path through a socket descriptor,
+/// not a vnode. On mac-studio (2026-10-14) sbh deleted the
+/// `/private/tmp/com.apple.launchd.*` directories of a running iOS
+/// Simulator's `launchd_sim` and `testmanagerd`: the sockets were still
+/// served, but no client could reach them any more.
+fn bound_socket_under(pid: i32, fd: ProcFdInfo, root_variants: &[PathBuf]) -> Option<OpenFile> {
+    let bound = sbh_mach::proc_pid_unix_socket_path(pid, fd.proc_fd.0)
+        .ok()
+        .flatten()?;
+    let path = observed_process_path_under_root(&bound, root_variants)?;
+    Some(OpenFile {
+        pid,
+        path,
+        fd: Some(fd.proc_fd.0),
+        kind: OpenFileKind::Socket,
+        mode: OpenFileMode::ReadWrite,
     })
 }
 
@@ -2016,6 +2039,25 @@ mod tests {
                 .bytes_written
                 .is_some_and(|bytes| bytes <= raw.ri_diskio_byteswritten)
         );
+    }
+
+    /// A served socket holds its directory: the descriptor is a socket, not a
+    /// vnode, and before this it was invisible (launchd_sim, 2026-10-14).
+    #[test]
+    fn a_listening_socket_is_an_open_file_under_its_directory() {
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let socket_path = dir.path().join("serve.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("socket should bind");
+        let canonical = std::fs::canonicalize(&socket_path).expect("socket should canonicalize");
+
+        let open_files = super::open_files_for_pid_under(super::current_process_pid(), dir.path());
+        let socket = open_files
+            .iter()
+            .find(|open_file| open_file.path == socket_path || open_file.path == canonical)
+            .unwrap_or_else(|| panic!("listening socket not reported: {open_files:?}"));
+        assert_eq!(socket.kind, crate::platform::types::OpenFileKind::Socket);
+        assert!(socket.fd.is_some());
     }
 
     #[test]

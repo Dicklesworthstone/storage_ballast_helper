@@ -26,6 +26,9 @@ const MAX_DESCRIPTORS_PER_PID: usize = 16_384;
 const MAX_PROC_ENTRIES: usize = OPEN_FILES_MAX_PIDS + 4096;
 const MAX_EXECUTABLE_COMM_BYTES: usize = 256;
 const MAX_EXECUTABLE_STAT_BYTES: usize = 8192;
+/// `/proc/net/unix` larger than this (about 300,000 sockets) is not read;
+/// the sweep then sees no bound socket paths, as before they were read.
+const MAX_UNIX_SOCKET_TABLE_BYTES: usize = 32 * 1024 * 1024;
 // Linux include/linux/sched.h: task has no user executable (PF_KTHREAD).
 const PF_KTHREAD: u64 = 0x0020_0000;
 
@@ -93,6 +96,9 @@ struct Sweep<'a, P> {
     started: Instant,
     complete: bool,
     descriptors_seen: usize,
+    /// Bound socket paths by inode, read once, when the first socket
+    /// descriptor is seen.
+    unix_sockets: Option<std::collections::HashMap<u64, PathBuf>>,
 }
 
 impl<'a, P: ProcAccess> Sweep<'a, P> {
@@ -103,7 +109,24 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
             started: proc.now(),
             complete: true,
             descriptors_seen: 0,
+            unix_sockets: None,
         }
+    }
+
+    /// The filesystem path the socket with this inode is bound to.
+    fn unix_socket_path(&mut self, proc_root: &Path, inode: u64) -> Option<PathBuf> {
+        let proc = self.proc;
+        self.unix_sockets
+            .get_or_insert_with(|| {
+                proc.read_bounded(
+                    &proc_root.join("net").join("unix"),
+                    MAX_UNIX_SOCKET_TABLE_BYTES,
+                )
+                .map(|raw| parse_unix_socket_paths(&raw))
+                .unwrap_or_default()
+            })
+            .get(&inode)
+            .cloned()
     }
 
     fn expired(&mut self) -> bool {
@@ -223,9 +246,19 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
                 }
             };
             if !target.is_absolute() {
-                // Kernel pseudo-links must not become paths relative to sbh's
-                // cwd. Unknown relative targets are not absence evidence.
-                if !pseudo_target(&target) {
+                // A listening AF_UNIX socket links as `socket:[inode]`; its
+                // file is named only in /proc/net/unix. tmux, ssh-agent and
+                // the iOS Simulator's launchd serve such sockets from
+                // otherwise empty temp directories, and deleting the
+                // directory leaves the server running but unreachable.
+                if let Some(bound) =
+                    socket_inode(&target).and_then(|inode| self.unix_socket_path(proc_root, inode))
+                {
+                    visit(&process, fd, &fd_path, bound);
+                } else if !pseudo_target(&target) {
+                    // Kernel pseudo-links must not become paths relative to
+                    // sbh's cwd. Unknown relative targets are not absence
+                    // evidence.
                     self.complete = false;
                 }
                 continue;
@@ -369,6 +402,51 @@ fn stat_has_no_user_executable(raw: &[u8], pid: i32) -> bool {
 
 fn disappeared(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+fn socket_inode(target: &Path) -> Option<u64> {
+    target
+        .to_str()?
+        .strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+/// `/proc/net/unix` rows are `Num RefCount Protocol Flags Type St Inode Path`
+/// with a padded inode column. Only sockets bound to an absolute filesystem
+/// path are kept: abstract (`@name`) and unbound sockets have no file.
+fn parse_unix_socket_paths(raw: &[u8]) -> std::collections::HashMap<u64, PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut paths = std::collections::HashMap::new();
+    for line in raw.split(|byte| *byte == b'\n').skip(1) {
+        let mut rest = line;
+        let mut inode = None;
+        for field in 0..7 {
+            let start = rest
+                .iter()
+                .position(|byte| *byte != b' ')
+                .unwrap_or(rest.len());
+            rest = &rest[start..];
+            let end = rest
+                .iter()
+                .position(|byte| *byte == b' ')
+                .unwrap_or(rest.len());
+            if field == 6 {
+                inode = std::str::from_utf8(&rest[..end])
+                    .ok()
+                    .and_then(|text| text.parse::<u64>().ok());
+            }
+            rest = &rest[end..];
+        }
+        if let (Some(inode), Some(path)) = (inode, rest.strip_prefix(b" "))
+            && path.first() == Some(&b'/')
+        {
+            paths.insert(inode, PathBuf::from(std::ffi::OsStr::from_bytes(path)));
+        }
+    }
+    paths
 }
 
 fn pseudo_target(path: &Path) -> bool {
@@ -1082,6 +1160,68 @@ mod tests {
         symlink("unexpected-relative-file", process.join("fd/4")).unwrap();
         let result = fixture.scan(&NativeProc, Limits::default());
         assert!(!result.complete);
+    }
+
+    /// A process serving a socket inside a tree is using the tree, though its
+    /// descriptor links only to `socket:[inode]` (tmux, ssh-agent, the iOS
+    /// Simulator's launchd). Abstract and unbound sockets name no file.
+    #[test]
+    fn a_bound_unix_socket_is_a_reference_to_its_file() {
+        let fixture = Fixture::new();
+        let served = fixture.root.join("tmux-1000").join("default");
+        fs::create_dir_all(served.parent().unwrap()).unwrap();
+        let process = fixture.pid(77);
+        for (fd, inode) in [(5, 4242), (6, 4343), (7, 4444)] {
+            symlink(
+                format!("socket:[{inode}]"),
+                process.join("fd").join(fd.to_string()),
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(fixture.proc_root.join("net")).unwrap();
+        fs::write(
+            fixture.proc_root.join("net").join("unix"),
+            format!(
+                "Num       RefCount Protocol Flags    Type St Inode Path\n\
+                 0000000000000000: 00000002 00000000 00010000 0001 01  4242 {}\n\
+                 0000000000000000: 00000002 00000000 00010000 0001 01  4343 @abstract\n\
+                 0000000000000000: 00000003 00000000 00000000 0001 03  4444\n",
+                served.display()
+            ),
+        )
+        .unwrap();
+
+        let result = fixture.scan(&NativeProc, Limits::default());
+        assert!(result.complete);
+        assert_eq!(
+            result
+                .files
+                .iter()
+                .map(|file| (file.pid, file.path.clone()))
+                .collect::<Vec<_>>(),
+            vec![(77, served.clone())]
+        );
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        assert!(targets.contains(&served), "{targets:?}");
+    }
+
+    #[test]
+    fn unix_socket_table_rows_keep_only_absolute_bound_paths() {
+        let table = parse_unix_socket_paths(
+            b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+              0000000000000000: 00000002 00000000 00010000 0001 01 123456 /run/user/1000/bus\n\
+              0000000000000000: 00000002 00000000 00010000 0001 01    17 /tmp/with space.sock\n\
+              0000000000000000: 00000002 00000000 00010000 0001 01    18 @/tmp/.X11-unix/X0\n\
+              0000000000000000: 00000003 00000000 00000000 0001 03    19\n\
+              garbage\n",
+        );
+        assert_eq!(table.len(), 2);
+        assert_eq!(table[&123_456], PathBuf::from("/run/user/1000/bus"));
+        assert_eq!(table[&17], PathBuf::from("/tmp/with space.sock"));
+        assert_eq!(socket_inode(Path::new("socket:[17]")), Some(17));
+        assert_eq!(socket_inode(Path::new("pipe:[17]")), None);
     }
 
     #[test]

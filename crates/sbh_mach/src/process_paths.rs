@@ -134,6 +134,77 @@ fn validate_argument_length(length: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// `PROC_PIDFDSOCKETINFO` (xnu `sys/proc_info.h`). libc declares
+/// `proc_pidfdinfo` but not `struct socket_fdinfo`, so the record is read
+/// into bytes and only the fields below are decoded.
+const PROC_PIDFDSOCKETINFO: i32 = 3;
+/// `struct socket_fdinfo` is a 24-byte `proc_fileinfo` followed by
+/// `struct socket_info`, whose `soi_family` is 160 bytes in and whose
+/// protocol union starts 240 bytes in. For `AF_UNIX` that union is
+/// `un_sockinfo`: two 8-byte handles, then the bound `sockaddr_un`
+/// (`sun_len`, `sun_family`, then up to 104 path bytes).
+const SOCKET_FAMILY_OFFSET: usize = 24 + 160;
+const UNIX_BOUND_ADDRESS_OFFSET: usize = 24 + 240 + 16;
+const UNIX_PATH_MAX: usize = 104;
+/// Larger than any `socket_fdinfo` (792 bytes on macOS 14-27); the kernel
+/// writes only the record and reports its size.
+const SOCKET_FDINFO_CAPACITY: usize = 2048;
+
+/// The filesystem path a process's `AF_UNIX` socket descriptor is bound to.
+///
+/// A listening server shows here what its descriptor is otherwise silent
+/// about: the socket file it serves. `None` for other families, unbound
+/// sockets (clients) and sockets bound to a relative or empty path.
+#[allow(unsafe_code)]
+pub fn proc_pid_unix_socket_path(pid: i32, fd: i32) -> io::Result<Option<PathBuf>> {
+    validate_pid(pid)?;
+    let mut record = vec![0u8; SOCKET_FDINFO_CAPACITY];
+    let capacity = i32::try_from(record.len())
+        .map_err(|_| io::Error::other("socket record buffer is too large"))?;
+    // SAFETY: record is initialized, writable storage of `capacity` bytes;
+    // proc_pidfdinfo writes at most that many and retains no pointer.
+    let received = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            fd,
+            PROC_PIDFDSOCKETINFO,
+            record.as_mut_ptr().cast(),
+            capacity,
+        )
+    };
+    if received <= 0 {
+        let error = io::Error::last_os_error();
+        return Err(if error.raw_os_error() == Some(0) {
+            io::Error::new(io::ErrorKind::NotFound, "socket descriptor unavailable")
+        } else {
+            error
+        });
+    }
+    decode_unix_socket_path(&record, usize::try_from(received).unwrap_or(0))
+}
+
+fn decode_unix_socket_path(record: &[u8], received: usize) -> io::Result<Option<PathBuf>> {
+    let path_start = UNIX_BOUND_ADDRESS_OFFSET + 2;
+    if received < path_start + UNIX_PATH_MAX || record.len() < received {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incomplete socket descriptor record",
+        ));
+    }
+    let family = i32::from_ne_bytes(
+        record[SOCKET_FAMILY_OFFSET..SOCKET_FAMILY_OFFSET + 4]
+            .try_into()
+            .map_err(|_| io::Error::other("socket family field"))?,
+    );
+    if family != libc::AF_UNIX {
+        return Ok(None);
+    }
+    let raw = &record[path_start..path_start + UNIX_PATH_MAX];
+    let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+    let path = PathBuf::from(OsString::from_vec(raw[..end].to_vec()));
+    Ok(path.is_absolute().then_some(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +238,51 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
+    }
+
+    /// Proves the record offsets on the running kernel: a listener reports
+    /// the exact path it was bound to, a socketpair end reports nothing.
+    #[test]
+    fn a_bound_unix_socket_reports_its_path() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let dir = std::env::temp_dir().join(format!("sbh-mach-sock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probe.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let pid = i32::try_from(std::process::id()).unwrap();
+
+        let bound = proc_pid_unix_socket_path(pid, listener.as_raw_fd()).unwrap();
+        let (left, _right) = UnixStream::pair().unwrap();
+        let unbound = proc_pid_unix_socket_path(pid, left.as_raw_fd()).unwrap();
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+
+        assert_eq!(bound, Some(path));
+        assert_eq!(unbound, None);
+    }
+
+    #[test]
+    fn socket_records_are_decoded_only_when_complete_and_absolute() {
+        let path_start = UNIX_BOUND_ADDRESS_OFFSET + 2;
+        let full = path_start + UNIX_PATH_MAX;
+        let mut record = vec![0u8; full];
+        record[SOCKET_FAMILY_OFFSET..SOCKET_FAMILY_OFFSET + 4]
+            .copy_from_slice(&libc::AF_UNIX.to_ne_bytes());
+        record[path_start..path_start + 9].copy_from_slice(b"/tmp/x.so");
+        assert_eq!(
+            decode_unix_socket_path(&record, full).unwrap(),
+            Some(PathBuf::from("/tmp/x.so"))
+        );
+        assert!(decode_unix_socket_path(&record, full - 1).is_err());
+        record[path_start..path_start + 9].copy_from_slice(b"relative\0");
+        assert_eq!(decode_unix_socket_path(&record, full).unwrap(), None);
+        record[SOCKET_FAMILY_OFFSET..SOCKET_FAMILY_OFFSET + 4]
+            .copy_from_slice(&libc::AF_INET.to_ne_bytes());
+        assert_eq!(decode_unix_socket_path(&record, full).unwrap(), None);
     }
 
     #[test]
