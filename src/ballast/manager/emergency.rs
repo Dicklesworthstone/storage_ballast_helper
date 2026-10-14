@@ -368,6 +368,7 @@ mod unix {
             });
             let immediate = rx.recv_timeout(Duration::from_secs(2));
             // Always release the fixture lock before joining, even on failure.
+            flock(&lock, FlockOperation::Unlock).unwrap();
             drop(lock);
             let (mut manager, result) = match immediate {
                 Ok(result) => result,
@@ -394,6 +395,7 @@ mod unix {
                 assert!(tx.send((manager, result)).is_ok());
             });
             let immediate = rx.recv_timeout(Duration::from_secs(2));
+            flock(&lock, FlockOperation::Unlock).unwrap();
             drop(lock);
             let (mut manager, result) = match immediate {
                 Ok(result) => result,
@@ -750,6 +752,7 @@ mod unix {
             flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
             assert!(manager.release(1).unwrap_err().to_string().contains("busy"));
             assert!(manager.file_path(3).exists());
+            flock(&lock, FlockOperation::Unlock).unwrap();
             drop(lock);
             assert_eq!(manager.release(1).unwrap().files_released, 1);
         }

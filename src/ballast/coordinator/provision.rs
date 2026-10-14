@@ -314,6 +314,7 @@ mod tests {
         assert_eq!(report.files_created, 0);
         assert!(!report.errors.is_empty());
         assert!(!pool.ballast_dir.exists());
+        flock(&lock, FlockOperation::Unlock).unwrap();
         drop(lock);
         assert_eq!(provision(&mut pool, None).unwrap().files_created, 2);
     }
@@ -462,6 +463,7 @@ mod tests {
         assert!(!report.errors.is_empty());
         assert!(retired.exists());
         assert!(!pool.ballast_dir.exists());
+        flock(&lock, FlockOperation::Unlock).unwrap();
         drop(lock);
         assert!(maintenance_tick(&mut pool, &mut controller, PressureLevel::Green, None).is_none());
         assert!(!pool.ballast_dir.exists());
