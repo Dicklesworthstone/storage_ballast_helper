@@ -109,6 +109,29 @@ fn check_above_threshold_is_exit_zero() {
     assert!(stdout(&output).is_empty(), "{}", stdout(&output));
 }
 
+/// `check` without `--target-free` uses the daemon's Yellow line, absolute
+/// floors included (bd-ud9s): a large disk well above its floor is not under
+/// pressure just because its free share is below the percentage.
+#[test]
+fn check_honours_the_absolute_free_floors() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(dir.path());
+    let base = fs::read_to_string(&config).unwrap();
+    let percentages = "[pressure]\ngreen_min_free_pct = 99.9\nyellow_min_free_pct = 99.8\n\
+                       orange_min_free_pct = 99.7\nred_min_free_pct = 99.6\n";
+    let target = dir.path().display().to_string();
+
+    fs::write(&config, format!("{base}{percentages}")).unwrap();
+    let without_floors = sbh(&config, &["check", &target]);
+    assert_eq!(without_floors.status.code(), Some(1), "{without_floors:?}");
+
+    let floors = "green_min_free_bytes = 4\nyellow_min_free_bytes = 3\n\
+                  orange_min_free_bytes = 2\nred_min_free_bytes = 1\n";
+    fs::write(&config, format!("{base}{percentages}{floors}")).unwrap();
+    let with_floors = sbh(&config, &["check", &target]);
+    assert_eq!(with_floors.status.code(), Some(0), "{with_floors:?}");
+}
+
 /// A path that cannot be stat'ed is an I/O failure: exit 2.
 #[test]
 fn check_on_a_missing_path_is_exit_two() {

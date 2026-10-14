@@ -14066,9 +14066,13 @@ fn run_check(cli: &Cli, args: &CheckArgs) -> Result<(), CliError> {
 
     let free_pct = capacity_free_pct(&capacity);
     let config = Config::load(cli.config.as_deref()).unwrap_or_default();
-    let threshold_pct = args
-        .target_free
-        .unwrap_or(config.pressure.yellow_min_free_pct);
+    // The daemon's Yellow line on this volume: absolute floors (bd-ud9s)
+    // lower it on a large disk, so `check` agrees with the daemon's level.
+    let threshold_pct = args.target_free.unwrap_or_else(|| {
+        config
+            .pressure
+            .free_pct_thresholds_for(capacity.total_bytes)[1]
+    });
 
     // Check 1: absolute free space requirement.
     if let Some(need_bytes) = args.need
