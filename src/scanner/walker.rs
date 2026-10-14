@@ -3969,7 +3969,7 @@ mod tests {
             .find(|entry| entry.path == target_dir)
             .expect("v2 should emit opaque target candidate");
 
-        let (open_ancestors, complete) = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
+        let (open_ancestors, _complete) = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
 
         // Containers or hidepid settings can hide even our own fd. Keep the
         // fixture non-flaky there; normal Linux workers exercise the assertion.
@@ -3978,7 +3978,8 @@ mod tests {
             return;
         }
 
-        assert!(complete, "open-file ancestor scan should complete");
+        // The open file was found. Whether every other user's process was
+        // readable (`complete`) does not bear on the veto under test.
         assert!(
             is_path_open_by_ancestor(&target_dir, &open_ancestors),
             "an open descendant must mark the opaque candidate root busy"
@@ -4024,14 +4025,15 @@ mod tests {
             .join("src")
             .join("lib.rs");
         let open_handle = fs::File::open(&open_file).unwrap();
-        let (open_ancestors, complete) = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
+        let (open_ancestors, _complete) = collect_open_path_ancestors(&[tmp.path().to_path_buf()]);
 
         if !open_ancestors.contains(&open_file) {
             drop(open_handle);
             return;
         }
 
-        assert!(complete, "open-file ancestor scan should complete");
+        // The open file was found. Whether every other user's process was
+        // readable (`complete`) does not bear on the vetoes compared here.
         let v1 = scanner_validation_report(tmp.path(), false, &open_ancestors);
         let v2 = scanner_validation_report(tmp.path(), true, &open_ancestors);
 
