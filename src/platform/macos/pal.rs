@@ -195,6 +195,10 @@ impl Platform for MacOsPal {
         Ok(processes)
     }
 
+    fn build_directories_in_use(&self) -> Vec<(i32, PathBuf)> {
+        super::build_directories::collect()
+    }
+
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {
         let usage = proc_pid_rusage_v4_safe(pid)
             .map_err(|error| macos_method_error("process_io", &error))?;
@@ -988,7 +992,7 @@ fn process_info_from_task_all(
         name,
         command_line,
         executable,
-        cwd: None,
+        cwd: sbh_mach::proc_pid_cwd(pid).ok(),
         start_time_unix_ms: start_time_unix_ms(raw.pbsd.pbi_start_tvsec, raw.pbsd.pbi_start_tvusec),
         virtual_memory_bytes: Some(raw.ptinfo.pti_virtual_size),
         resident_memory_bytes: Some(raw.ptinfo.pti_resident_size),
