@@ -1,6 +1,10 @@
 //! Exercise the real read-only CLI, not a separate model of its selection logic.
 
-#![cfg(all(feature = "cli", target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#![cfg(all(
+    feature = "cli",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 use std::fs;
 use std::path::Path;
@@ -14,8 +18,13 @@ fn cold(path: &Path) {
 fn command(config: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sbh"));
     command.arg("--config").arg(config).args([
-        "--json", "compress", "--discover", "--min-size-bytes", "1",
-        "--min-age-secs", "3600",
+        "--json",
+        "compress",
+        "--discover",
+        "--min-size-bytes",
+        "1",
+        "--min-age-secs",
+        "3600",
     ]);
     command
 }
@@ -28,7 +37,14 @@ fn discover_preserves_inputs_and_creates_no_journal() {
     let path = root.join("cold.bin");
     cold(&path);
     let config = temp.path().join("config.toml");
-    fs::write(&config, format!("[paths]\nstate_file = {:?}\n", temp.path().join("state.json"))).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "[paths]\nstate_file = {:?}\n",
+            temp.path().join("state.json")
+        ),
+    )
+    .unwrap();
     let output = command(&config).arg("--").arg(&root).output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -51,7 +67,11 @@ fn a_partial_discovery_has_exit_four_and_no_invented_complete_prefix() {
     cold(&root.join("b.bin"));
     let config = temp.path().join("config.toml");
     fs::write(&config, "").unwrap();
-    let output = command(&config).args(["--max-entries", "1", "--"]).arg(&root).output().unwrap();
+    let output = command(&config)
+        .args(["--max-entries", "1", "--"])
+        .arg(&root)
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(4), "{output:?}");
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["exit_code"], 4);
@@ -59,6 +79,12 @@ fn a_partial_discovery_has_exit_four_and_no_invented_complete_prefix() {
     assert_eq!(report["discovery"]["entries_examined"], 1);
     assert!(report["candidates"].as_array().unwrap().is_empty());
     assert!(report["discovery"]["resume_after_hex"].is_null());
-    assert_eq!(fs::read(root.join("a.bin")).unwrap(), b"preserve this payload");
-    assert_eq!(fs::read(root.join("b.bin")).unwrap(), b"preserve this payload");
+    assert_eq!(
+        fs::read(root.join("a.bin")).unwrap(),
+        b"preserve this payload"
+    );
+    assert_eq!(
+        fs::read(root.join("b.bin")).unwrap(),
+        b"preserve this payload"
+    );
 }
