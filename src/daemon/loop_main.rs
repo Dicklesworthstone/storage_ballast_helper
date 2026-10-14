@@ -146,6 +146,9 @@ const DEVICE_AFFINITY_WARN_INTERVAL: Duration = Duration::from_mins(15);
 const ATTRIBUTION_REPORT_INTERVAL: Duration = Duration::from_hours(1);
 /// How long a mount must stay at Red or worse before it is attributed.
 const ATTRIBUTION_SUSTAINED_PRESSURE: Duration = Duration::from_mins(10);
+/// bd-ffjj: how often the RAM fallback's headroom is re-checked while the
+/// logging mount stays pressured (the check reads the mount table).
+const LOGGING_RAM_RECHECK: Duration = Duration::from_secs(30);
 /// Swap usage threshold that indicates probable paging thrash.
 const SWAP_THRASH_USED_PCT_THRESHOLD: f64 = 70.0;
 /// Minimum free RAM for high swap use to indicate thrash (anomalous paging
@@ -1987,6 +1990,9 @@ pub struct MonitoringDaemon {
     /// The level last reported for the logging mount, so the log line and
     /// the mirror switch happen per level change, never per tick.
     logging_level_logged: Option<PressureLevel>,
+    /// When the RAM fallback's headroom was last checked while the logging
+    /// mount was pressured (bd-ffjj).
+    logging_ram_checked_at: Option<Instant>,
     /// Per-location alert throttle for the special-location horizon rule.
     special_alerts: AlertThrottle,
     /// When the last Green maintenance pass was dispatched.
@@ -3286,6 +3292,7 @@ impl MonitoringDaemon {
             mount_rates: HashMap::new(),
             logging_placement,
             logging_level_logged: None,
+            logging_ram_checked_at: None,
             special_alerts: AlertThrottle::default(),
             last_maintenance_scan: None,
             last_quarantine_sweep: None,
@@ -3389,35 +3396,44 @@ impl MonitoringDaemon {
     /// bd-rc-master-ajg1.7.4: when the mount carrying the daemon's own files
     /// is a reclaim target, its level drives the JSONL mirror. Orange or
     /// worse turns the RAM mirror on, unless that RAM is itself short
-    /// (bd-ffjj); Yellow or better turns it off. One log line per level
-    /// change, never per tick.
+    /// (bd-ffjj); Yellow or better turns it off. While pressured, the RAM
+    /// headroom is re-checked every [`LOGGING_RAM_RECHECK`], so a mirror stops
+    /// when swap fills and a refused one starts once RAM recovers. One log
+    /// line per level or mirror change, never per tick.
     fn note_logging_mount_level(&mut self, mount: &Path, level: PressureLevel) {
         if !self.logging_placement.on_monitored_fs
             || mount.to_string_lossy() != self.logging_placement.device
         {
             return;
         }
-        if self.logging_level_logged == Some(level) {
-            return;
-        }
-        self.logging_level_logged = Some(level);
         let pressured = matches!(
             level,
             PressureLevel::Orange | PressureLevel::Red | PressureLevel::Critical
         );
-        // bd-ffjj: the mirror must not add to RAM that is itself short.
+        let level_changed = self.logging_level_logged != Some(level);
+        let now = Instant::now();
+        if !level_changed && !logging_ram_recheck_due(pressured, self.logging_ram_checked_at, now) {
+            return;
+        }
+        self.logging_level_logged = Some(level);
         let refusal = if pressured {
+            self.logging_ram_checked_at = Some(now);
             crate::monitor::ram_scratch::ram_log_mirror_refusal(
                 self.platform.as_ref(),
                 &crate::logger::jsonl::ram_fallback_path(),
             )
         } else {
+            self.logging_ram_checked_at = None;
             None
         };
         let mirror = pressured && refusal.is_none();
+        let mirror_changed = mirror != self.logging_placement.mirroring;
+        if !level_changed && !mirror_changed {
+            return;
+        }
         let level_name = format!("{level:?}").to_lowercase();
         self.logging_placement.level = Some(level_name.clone());
-        if mirror != self.logging_placement.mirroring {
+        if mirror_changed {
             self.logging_placement.mirroring = mirror;
             self.logger_handle.mirror_jsonl(mirror);
         }
@@ -10115,6 +10131,14 @@ fn executor_thread_main(
 
 // ──────────────────── tests ────────────────────
 
+/// bd-ffjj: whether the logging mount's RAM headroom is due for a re-check at
+/// an unchanged level. Only while pressured, and at most every
+/// [`LOGGING_RAM_RECHECK`].
+fn logging_ram_recheck_due(pressured: bool, last_check: Option<Instant>, now: Instant) -> bool {
+    pressured
+        && last_check.is_none_or(|at| now.saturating_duration_since(at) >= LOGGING_RAM_RECHECK)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15816,5 +15840,31 @@ mod tests {
             super::is_swap_thrash_risk_inner(&genuine_thrash, true),
             "Low RAM with high zram swap is genuine thrash risk"
         );
+    }
+
+    #[test]
+    fn logging_ram_headroom_is_rechecked_only_while_pressured_and_at_most_every_30s() {
+        let now = Instant::now();
+        let earlier = |secs| now.checked_sub(Duration::from_secs(secs)).unwrap();
+        // First pressured tick checks; an unpressured level never does.
+        assert!(super::logging_ram_recheck_due(true, None, now));
+        assert!(!super::logging_ram_recheck_due(false, None, now));
+        assert!(!super::logging_ram_recheck_due(
+            false,
+            Some(earlier(600)),
+            now
+        ));
+        // While pressured: not before the interval, then again after it.
+        assert!(!super::logging_ram_recheck_due(
+            true,
+            Some(earlier(29)),
+            now
+        ));
+        assert!(super::logging_ram_recheck_due(true, Some(earlier(30)), now));
+        assert!(super::logging_ram_recheck_due(
+            true,
+            Some(earlier(300)),
+            now
+        ));
     }
 }
