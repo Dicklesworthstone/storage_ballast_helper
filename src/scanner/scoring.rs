@@ -123,7 +123,7 @@ pub fn classify_certainty(
     let in_temp_root = location_factor >= 0.9;
     let pattern = classification.pattern_name.as_ref();
 
-    let definite = signals.has_cachedir_tag
+    let definite = signals.regenerable_cache_tag()
         || rust_markers >= 2
         || (classification.category == ArtifactCategory::GoCache
             && classification.structural_confidence >= 0.9)
@@ -1197,7 +1197,7 @@ fn factor_structure(signals: StructuralSignals) -> f64 {
     }
     // A validated CACHEDIR.TAG root marker is a definitive regenerable-cache
     // signal, independent of the directory's name or nested cargo markers.
-    if signals.has_cachedir_tag {
+    if signals.regenerable_cache_tag() {
         return 0.95;
     }
     if signals.has_fingerprint || signals.has_incremental {
@@ -2180,6 +2180,7 @@ mod tests {
                     has_cargo_toml: false,
                     mostly_object_files: true,
                     has_cachedir_tag: false,
+                    has_pyvenv_cfg: false,
                 },
                 active_references: ActiveReferenceSummary::default(),
                 is_open: false,
@@ -2733,6 +2734,7 @@ mod tests {
                 has_cargo_toml: false,
                 mostly_object_files: true,
                 has_cachedir_tag: false,
+                has_pyvenv_cfg: false,
             },
             active_references: ActiveReferenceSummary::default(),
             is_open: false,
@@ -2776,6 +2778,7 @@ mod tests {
                 has_cargo_toml: false,
                 mostly_object_files: false,
                 has_cachedir_tag: false,
+                has_pyvenv_cfg: false,
             },
             active_references: ActiveReferenceSummary::default(),
             is_open: false,
@@ -2922,6 +2925,7 @@ mod tests {
                 has_cargo_toml: false,
                 mostly_object_files: false,
                 has_cachedir_tag: false,
+                has_pyvenv_cfg: false,
             },
             active_references: ActiveReferenceSummary::default(),
             is_open: false,
@@ -3101,6 +3105,7 @@ mod tests {
                     has_cargo_toml: false,
                     mostly_object_files: false,
                     has_cachedir_tag: false,
+                    has_pyvenv_cfg: false,
                 },
                 active_references: ActiveReferenceSummary::default(),
                 is_open: false,

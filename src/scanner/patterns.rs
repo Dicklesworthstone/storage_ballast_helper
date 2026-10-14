@@ -89,9 +89,23 @@ pub struct StructuralSignals {
     /// caches (e.g. `srw`, `p4-verify`, the shared `cargo-target`) that never
     /// matched the old `rch_target_*` name predicate.
     pub has_cachedir_tag: bool,
+    /// A `pyvenv.cfg` at the root: the directory is a Python virtual
+    /// environment. uv writes a `CACHEDIR.TAG` into every venv it creates (so
+    /// that backup tools skip it), which does not make a venv a regenerable
+    /// cache (see [`Self::regenerable_cache_tag`]).
+    pub has_pyvenv_cfg: bool,
 }
 
 impl StructuralSignals {
+    /// A `CACHEDIR.TAG` that marks a regenerable cache: not a venv's. On trj
+    /// (2026-10-14) sbh quarantined three uv venvs a running release gate was
+    /// using, at Green, as `cachedir-tagged-cache`; the gate's next step
+    /// failed with `ModuleNotFoundError`.
+    #[must_use]
+    pub fn regenerable_cache_tag(&self) -> bool {
+        self.has_cachedir_tag && !self.has_pyvenv_cfg
+    }
+
     /// Returns true if the signals strongly indicate a build artifact directory
     /// (e.g., Rust target with incremental/deps/fingerprint markers, or mostly
     /// object files).
@@ -99,7 +113,7 @@ impl StructuralSignals {
     pub fn has_strong_signal(&self) -> bool {
         // A validated CACHEDIR.TAG is a definitive, name-independent marker of a
         // regenerable cache directory — on its own it is a strong signal.
-        if self.has_cachedir_tag {
+        if self.regenerable_cache_tag() {
             return true;
         }
         // Two or more Rust-specific markers = strong signal.
@@ -1043,7 +1057,7 @@ impl ArtifactPatternRegistry {
                 structural_confidence: 0.0,
                 combined_confidence: rescue_confidence,
             };
-        } else if best.category == ArtifactCategory::Unknown && signals.has_cachedir_tag {
+        } else if best.category == ArtifactCategory::Unknown && signals.regenerable_cache_tag() {
             // Name-agnostic rescue: the directory carries a validated
             // CACHEDIR.TAG at its root (per the Cache Directory Tagging
             // Standard) but its *name* matched no artifact pattern — exactly
@@ -1214,7 +1228,7 @@ fn structural_score(category: ArtifactCategory, signals: StructuralSignals) -> f
     // A validated CACHEDIR.TAG at the root is a definitive, name-independent
     // marker that the directory is a regenerable cache — score it strongly
     // regardless of category so arbitrarily-named build caches are reclaimable.
-    if signals.has_cachedir_tag {
+    if signals.regenerable_cache_tag() {
         return 0.95;
     }
     match category {
@@ -1904,6 +1918,27 @@ mod tests {
             ..StructuralSignals::default()
         };
         assert!(with_manifest.has_strong_signal());
+    }
+
+    /// uv writes a CACHEDIR.TAG into every venv. On trj (2026-10-14) three
+    /// venvs of a running release gate were quarantined at Green as
+    /// `cachedir-tagged-cache`, and the gate's next step failed.
+    #[test]
+    fn a_venvs_cachedir_tag_does_not_make_it_a_cache() {
+        let registry = ArtifactPatternRegistry::default();
+        let venv = StructuralSignals {
+            has_cachedir_tag: true,
+            has_pyvenv_cfg: true,
+            ..StructuralSignals::default()
+        };
+        assert!(!venv.regenerable_cache_tag());
+        assert!(!venv.has_strong_signal());
+        let classification = registry.classify(
+            Path::new("/data/tmp/relwave-pane4-fsci-rprime/venv-noscipy-3.13"),
+            venv,
+        );
+        assert_eq!(classification.category, ArtifactCategory::Unknown);
+        assert_ne!(classification.pattern_name, "cachedir-tagged-cache");
     }
 
     #[test]

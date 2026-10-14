@@ -297,6 +297,7 @@ fn note_opaque_signal(
                     signals.has_cachedir_tag = true;
                 }
             }
+            "pyvenv.cfg" => signals.has_pyvenv_cfg = true,
             "Cargo.toml" => signals.has_cargo_toml = true,
             _ => {}
         }
@@ -899,6 +900,7 @@ fn process_directory(
                         signals.has_cachedir_tag = true;
                     }
                 }
+                "pyvenv.cfg" => signals.has_pyvenv_cfg = true,
                 "cargo.toml" | "Cargo.toml" => signals.has_cargo_toml = true,
                 "package.json"
                 | "package-lock.json"
@@ -1170,6 +1172,7 @@ fn signals_from_children(child_names: &[String]) -> StructuralSignals {
             ".fingerprint" => signals.has_fingerprint = true,
             ".git" => signals.has_git = true,
             "cargo.toml" => signals.has_cargo_toml = true,
+            "pyvenv.cfg" => signals.has_pyvenv_cfg = true,
             // A name list cannot establish cache-tag contents or file type.
             // Live collection and replay both validate that evidence on disk.
             _ => {}
@@ -3075,6 +3078,44 @@ mod tests {
     }
 
     const VALID_CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n# For information about cache directory tags see https://bford.info/cachedir/\n";
+
+    /// A uv venv (`pyvenv.cfg` beside uv's `CACHEDIR.TAG`) is seen as a venv
+    /// by the walk, the opaque probe and the single-path replay alike.
+    #[test]
+    fn a_uv_venv_records_its_pyvenv_cfg_beside_the_tag() {
+        let tmp = TempDir::new().unwrap();
+        let venv = tmp.path().join("venv-tools");
+        fs::create_dir_all(venv.join("lib").join("python3.13").join("site-packages")).unwrap();
+        fs::create_dir_all(venv.join("bin")).unwrap();
+        fs::write(venv.join("CACHEDIR.TAG"), VALID_CACHEDIR_TAG).unwrap();
+        fs::write(
+            venv.join("pyvenv.cfg"),
+            "home = /usr/bin\nimplementation = CPython\nuv = 0.9.0\nversion_info = 3.13.0\n",
+        )
+        .unwrap();
+
+        let walker =
+            DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only());
+        let entries = walker.walk().unwrap();
+        let entry = entries.iter().find(|e| e.path == venv).unwrap();
+        assert!(entry.structural_signals.has_pyvenv_cfg);
+        assert!(!entry.structural_signals.regenerable_cache_tag());
+
+        let replayed = structural_signals_for_path(&venv);
+        assert!(replayed.has_cachedir_tag && replayed.has_pyvenv_cfg);
+        assert!(!replayed.regenerable_cache_tag());
+
+        let root_dev = device_id(&fs::metadata(&venv).unwrap());
+        let probe = opaque_tree_probe(
+            &venv,
+            false,
+            root_dev,
+            OPAQUE_SIZE_PROBE_BUDGET,
+            &AtomicBool::new(false),
+        );
+        assert!(probe.signals.has_pyvenv_cfg, "{:?}", probe.signals);
+        assert!(!probe.signals.regenerable_cache_tag());
+    }
 
     #[test]
     fn collects_cachedir_tag_signal_on_arbitrarily_named_dir() {

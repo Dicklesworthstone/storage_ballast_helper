@@ -1363,6 +1363,7 @@ mod tests {
                 has_cargo_toml: false,
                 mostly_object_files: true,
                 has_cachedir_tag: false,
+                has_pyvenv_cfg: false,
             },
             active_references: ActiveReferenceSummary::default(),
             is_open: false,
