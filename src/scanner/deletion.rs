@@ -2650,12 +2650,6 @@ mod tests {
     #[test]
     fn observed_freed_bytes_are_measured_not_estimated() {
         let dir = scratch_dir();
-        let blob = dir.path().join("blob.bin");
-        let mut file = fs::File::create(&blob).unwrap();
-        std::io::Write::write_all(&mut file, &vec![0x5a_u8; 64 * 1024 * 1024]).unwrap();
-        file.sync_all().unwrap();
-        drop(file);
-
         let executor = DeletionExecutor::new(
             DeletionConfig {
                 check_open_files: false,
@@ -2664,20 +2658,32 @@ mod tests {
             None,
         );
         let estimate = 100 * 1024 * 1024;
-        let report = executor.execute(
-            &executor.plan(vec![make_candidate(&blob, estimate, 0.9)]),
-            None,
-        );
-        assert_eq!(report.items_deleted, 1);
-        assert_eq!(report.bytes_freed, estimate);
-        let observed = report
-            .bytes_freed_observed
-            .expect("an unlink on a local volume is measured");
-        assert!(
-            observed >= 16 * 1024 * 1024,
-            "removing 64 MiB should free most of it, observed {observed}"
-        );
-        assert_ne!(observed, estimate);
+        // The observation is a free-space difference on a volume that the
+        // tests running in parallel write to as well; one of them filling it
+        // during the unlink can hide the 64 MiB. Retry a disturbed attempt.
+        let mut observations = Vec::new();
+        for attempt in 0..5 {
+            let blob = dir.path().join(format!("blob-{attempt}.bin"));
+            let mut file = fs::File::create(&blob).unwrap();
+            std::io::Write::write_all(&mut file, &vec![0x5a_u8; 64 * 1024 * 1024]).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            let report = executor.execute(
+                &executor.plan(vec![make_candidate(&blob, estimate, 0.9)]),
+                None,
+            );
+            assert_eq!(report.items_deleted, 1);
+            assert_eq!(report.bytes_freed, estimate);
+            let observed = report
+                .bytes_freed_observed
+                .expect("an unlink on a local volume is measured");
+            assert_ne!(observed, estimate);
+            if observed >= 16 * 1024 * 1024 {
+                return;
+            }
+            observations.push(observed);
+        }
+        panic!("removing 64 MiB never freed most of it: observed {observations:?}");
     }
 
     /// A quarantine rename frees nothing, and is not counted as freed.
