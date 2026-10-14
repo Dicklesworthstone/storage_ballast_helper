@@ -1738,6 +1738,24 @@ fn walk_single_entry(
         ));
     };
     let selected_scanner_engine = SelectedScannerEngine::for_mode(config.scanner.engine);
+    // The walker scores entries below its roots, so it is rooted at the
+    // parent; every sibling is excluded so that only the target is walked.
+    // Explaining one directory in mac-studio's `$TMPDIR` walked all of it and
+    // did not finish in 170 s (bd-g3g3).
+    let mut excluded_paths = config
+        .scanner
+        .excluded_paths
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    if let Ok(siblings) = std::fs::read_dir(parent) {
+        excluded_paths.extend(
+            siblings
+                .flatten()
+                .map(|sibling| sibling.path())
+                .filter(|sibling| sibling != path),
+        );
+    }
     let walker = DirectoryWalker::new(
         WalkerConfig {
             root_paths: vec![parent.to_path_buf()],
@@ -1745,12 +1763,7 @@ fn walk_single_entry(
             follow_symlinks: config.scanner.follow_symlinks,
             cross_devices: config.scanner.cross_devices,
             parallelism: 1,
-            excluded_paths: config
-                .scanner
-                .excluded_paths
-                .iter()
-                .cloned()
-                .collect::<HashSet<_>>(),
+            excluded_paths,
             opaque_pruning: selected_scanner_engine.opaque_pruning(),
         },
         protection,
