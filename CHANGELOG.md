@@ -14,11 +14,38 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ### Known limitations
 
-- macOS: the evidence that a live build is using a tree (its working
-  directory, and the caches its environment names) is Linux-only. On a Mac a
-  build is recognised only by the files and executables it holds open, so a
-  cache it is not reading at that moment can still be reclaimed under Orange
-  or higher pressure (bd-j7ho).
+- macOS withholds the environment of Apple platform binaries (Xcode's
+  `clang` and `swift`, `/usr/bin/python3`) from every other process, root
+  included. For a build run by one of those, sbh sees its working directory
+  and open files but not the caches its environment names. Builds run by
+  rustup's cargo and rustc or by Homebrew's tools are seen in full (bd-j7ho).
+- A daemon that cannot inspect every process (a user-scope install, or a
+  daemon without `cap_sys_ptrace`) holds every batch while such a process is
+  running instead of guessing. On such hosts it reclaims little (#27).
+
+### Changed
+
+- **Caches are checked for in-use evidence at any size.** Scoring used to
+  probe live processes only for candidates of at least
+  `active_reference_min_size_bytes` (100 MiB). A small cache under a running
+  build was nominated with no evidence at all; in a real-build test a fresh
+  62 MB default `~/.cargo` was approved and only the deletion preflight
+  stopped it. Cache candidates (`cachedir-tagged-cache`, cargo stores, catalog
+  caches, Go caches) are now always probed. When the probe cannot complete,
+  the candidate is vetoed with the reason, never approved. `sbh explain
+  --why-not` now always probes, as its documentation said (`e9b5c55`).
+- **Empty-pass backoff survives a threshold that flaps.** A rise in pressure
+  since the last pass clears the backoff. A host whose free space hovers at
+  the Red line crossed it every minute or two and never reached the
+  terminal-idle pacing: one host reset its backoff 365 times in 6 hours and
+  ran 816 passes, 723 of them finding nothing. A return to a level that came
+  back empty within the last five minutes now keeps the backoff; a rise above
+  it still resets it (`cdbdb75`).
+- Default npm, pip and uv caches count as in use while a package manager
+  runs: `~/.npm` for npm and npx, `~/.cache/pip` (macOS:
+  `~/Library/Caches/pip`) for pip, and uv's cache under `XDG_CACHE_HOME` or
+  `~/.cache/uv`, unless an explicit override names another place. A plain
+  node or python process implies none of them (`d5392cf`).
 
 ### Changed
 
@@ -51,6 +78,20 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
     live process.
   `sbh explain` names the process and the reason. Affected: v0.5.0 through
   v0.7.2 (`53942a3`, `5a6f04a`, `11a609c`).
+- macOS: a live build now holds its caches as it does on Linux. sbh reads a
+  process's working directory (`PROC_PIDVNODEPATHINFO`) and the environment
+  and arguments of recognised build tools (`KERN_PROCARGS2`), including
+  `python -m pip` and Node-hosted npm, through bounded read-only calls in
+  `sbh_mach` (`538f362`, `22491fa`, `4efa6a6`).
+- A cache or output directory a live build names protects everything below
+  it, also when the candidate is reached by another spelling (a symlinked or
+  bind-mounted parent), in both unlink and quarantine mode (`3b821ff`,
+  `c17cb96`).
+- Linux: a refused read of a process's working directory, or of a build
+  tool's environment, makes the deletion preflight's process sweep
+  incomplete, and the batch is held (`open_scan_incomplete`). Before, the
+  refusal was ignored and that process counted as using nothing. The journal
+  names the pid and the file (`e9b5c55`).
 - On Linux, live builds of other toolchains hold their caches the same way
   (bd-j7ho): Go's build and module caches (`GOCACHE`, `GOMODCACHE`,
   `GOTMPDIR`, or their defaults under `XDG_CACHE_HOME`, the first `GOPATH`
