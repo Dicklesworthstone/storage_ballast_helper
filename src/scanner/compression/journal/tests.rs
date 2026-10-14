@@ -272,6 +272,10 @@ fn journal_read_budget_is_checked_before_reading_the_payload() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses file names that are not UTF-8 (EILSEQ)"
+)]
 fn native_path_bytes_survive_intent_storage_and_recovery() {
     use std::os::unix::ffi::OsStringExt;
     let (temp, mut session, file, mut item) = fixture();
