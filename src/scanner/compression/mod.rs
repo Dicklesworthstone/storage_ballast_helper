@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::config::Config;
 use crate::platform::pal::Platform;
 
+pub mod discovery;
 pub mod journal;
 
 #[cfg(all(
@@ -240,8 +241,8 @@ pub fn run(
     }
     #[cfg(not(all(
         target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    )))]
+        any(target_arch = "x86_64", target_arch = "aarch64"))
+    ))]
     {
         let _ = (config, platform);
         Ok(CompressionReport {
