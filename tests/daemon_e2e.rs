@@ -808,6 +808,9 @@ fn test_mode_daemon_refuses_to_start_under_a_service_manager() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn injected_orange_mount_reclaims_only_the_stale_target() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
     // The daemon polls its configured roots plus `/`, so the rootless
@@ -1446,6 +1449,9 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
 /// Scenario `orange-reclaim` on the default v2 engine.
 #[test]
 fn orange_reclaim_deletes_the_stale_target_and_keeps_the_guarded_siblings() {
+    if !common::sees_every_process() {
+        return;
+    }
     let deleted = run_orange_reclaim("v2");
     assert!(
         deleted.iter().any(|n| n == "stale-proj/target"),
@@ -1457,6 +1463,9 @@ fn orange_reclaim_deletes_the_stale_target_and_keeps_the_guarded_siblings() {
 /// reclaims on the same fixtures (both daemons run concurrently).
 #[test]
 fn engine_v1_reclaims_the_same_set_as_v2_at_orange() {
+    if !common::sees_every_process() {
+        return;
+    }
     let v2 = std::thread::spawn(|| run_orange_reclaim("v2"));
     let v1 = run_orange_reclaim("v1");
     let v2 = v2.join().expect("v2 run");
@@ -2040,6 +2049,9 @@ fn green_event_scopes_the_pass_to_the_changed_project() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn green_quarantine_holds_the_stale_target_and_orange_drains_it_first() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
     let fixture_mount = dir.path().to_path_buf();
@@ -2231,6 +2243,9 @@ fn green_quarantine_holds_the_stale_target_and_orange_drains_it_first() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
     let fixture_mount = dir.path().to_path_buf();
@@ -2393,6 +2408,9 @@ fn recreating_a_deleted_target_under_a_live_process_is_labelled_regret() {
 /// the next maintenance pass.
 #[test]
 fn sighup_reload_scans_the_new_root_and_relogs_the_matrix() {
+    if !common::sees_every_process() {
+        return;
+    }
     let dir = scratch();
     let root_a = dir.path().join("root");
     fs::create_dir_all(&root_a).unwrap();
@@ -3231,6 +3249,9 @@ fn orange_pressure_with_only_unclear_candidates_backs_off_instead_of_replaying()
 /// paces an unconfirmed one like an empty pass.
 #[test]
 fn dry_run_orange_pressure_backs_off_after_the_first_dispatch() {
+    if !common::sees_every_process() {
+        return;
+    }
     let scratch_base = non_temp_scratch_base();
     fs::create_dir_all(&scratch_base).unwrap();
     let dir = tempfile::tempdir_in(&scratch_base).unwrap();
