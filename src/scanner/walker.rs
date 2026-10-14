@@ -1907,18 +1907,16 @@ pub fn collect_active_reference_index(
         Err(_) => index.complete = false,
     }
 
-    for root in &roots {
-        match platform.mmap_regions_under(root) {
-            Ok(regions) => {
-                for region in regions {
-                    let name = process_names.get(&region.pid).cloned();
-                    index.add_reference(&roots, &region.path, |summary| {
-                        summary.add_mmap_region(region.pid, name.clone());
-                    });
-                }
+    match platform.mmap_regions_under_roots(&roots) {
+        Ok(regions) => {
+            for region in regions {
+                let name = process_names.get(&region.pid).cloned();
+                index.add_reference(&roots, &region.path, |summary| {
+                    summary.add_mmap_region(region.pid, name.clone());
+                });
             }
-            Err(_) => index.complete = false,
         }
+        Err(_) => index.complete = false,
     }
 
     index

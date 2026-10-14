@@ -338,6 +338,17 @@ pub trait Platform: Send + Sync {
         pal_not_implemented(self.name(), "mmap_regions_under")
     }
 
+    /// Return mapped-file evidence under any candidate root. Platforms with a
+    /// host-wide process sweep should override this to scan once per pass.
+    /// Partial or inaccessible coverage is an error, not negative evidence.
+    fn mmap_regions_under_roots(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+        let mut merged = Vec::new();
+        for root in roots {
+            merged.extend(self.mmap_regions_under(root)?);
+        }
+        Ok(merged)
+    }
+
     /// Open files under any of `roots`. The default asks root by root; a
     /// platform whose sweep reads every process anyway answers all roots from
     /// one sweep. A catalog pass hands over ~170 roots, and asking per root

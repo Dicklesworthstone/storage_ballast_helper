@@ -207,13 +207,27 @@ impl Cache {
 }
 
 pub(super) fn read_under(root: &Path) -> Result<Vec<MappedRegion>> {
+    read_under_roots(std::slice::from_ref(&root.to_path_buf()))
+}
+
+/// Reuse one coverage-checked snapshot for an entire scanner pass. A catalog
+/// batch can have hundreds of overlapping roots; filtering the same snapshot
+/// once prevents repeated per-root result allocation and path resolution.
+pub(super) fn read_under_roots(roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
     static CACHE: OnceLock<Cache> = OnceLock::new();
-    CACHE
-        .get_or_init(Cache::default)
-        .obtain(Instant::now, || {
-            collect(&Native, Path::new(PROC_ROOT), Limits::default())
-        })?
-        .under(root)
+    let snapshot = CACHE.get_or_init(Cache::default).obtain(Instant::now, || {
+        collect(&Native, Path::new(PROC_ROOT), Limits::default())
+    })?;
+    if let Some(reason) = &snapshot.incomplete {
+        return Err(incomplete_error(reason));
+    }
+    let roots = roots.iter().map(|root| resolve_absolute_path(root)).collect::<Vec<_>>();
+    Ok(snapshot.regions.iter().filter(|region| {
+        roots.iter().any(|root| region.path.starts_with(root))
+    }).cloned().collect())
 }
 
 struct Sweep<'a, A> {

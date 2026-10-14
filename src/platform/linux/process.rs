@@ -96,6 +96,11 @@ pub(super) fn read_mmap_regions_under(root: &Path) -> Result<Vec<MappedRegion>> 
     mmap_scan::read_under(root)
 }
 
+/// Inspect the mapped regions once for the complete candidate-root set.
+pub(super) fn read_mmap_regions_under_roots(roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+    mmap_scan::read_under_roots(roots)
+}
+
 pub(super) fn read_process_io(pid: i32) -> Result<ProcessIo> {
     let path = pid_proc_path(pid).join("io");
     let raw = fs::read_to_string(&path).map_err(|source| SbhError::Io {
