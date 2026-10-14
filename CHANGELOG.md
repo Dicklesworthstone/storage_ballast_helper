@@ -56,6 +56,17 @@ Git repositories.
 - `sbh install --ballast-count` and `--ballast-size` reach the config it
   writes, so the daemon keeps the ballast the install was told to provision
   instead of the default 10 x 1 GiB per pool (bd-ncxh; `c77b89f`).
+- **Writeback tuning is never applied from inside a container** (bd-pivw;
+  `59bda6e`). `vm.dirty_*` is shared with the host, so `sbh install` or
+  `sbh tune --apply` in a privileged container set the host's limits, sized
+  for the container's view. Under Docker, Podman, systemd-nspawn or LXC sbh
+  now writes no sysctl snippet, applies nothing, and says to tune on the
+  host.
+- **The log is not mirrored into RAM that is already short** (bd-ffjj;
+  `0ab5535`). When the log's own disk is pressured the daemon copies its
+  log lines to `/dev/shm`; it did so even with `/dev/shm` nearly full and
+  swap exhausted. It now skips the copy unless `/dev/shm` has a fifth of its
+  space free and swap is not nearly full, and logs why.
 
 ### Added
 
