@@ -27,7 +27,11 @@ pub struct AttributionLimits {
 
 impl Default for AttributionLimits {
     fn default() -> Self {
-        Self { max_entries: 20_000, max_depth: 8, top: 10 }
+        Self {
+            max_entries: 20_000,
+            max_depth: 8,
+            top: 10,
+        }
     }
 }
 
@@ -38,8 +42,10 @@ impl AttributionLimits {
             || self.max_depth > 32
             || !(1..=50).contains(&self.top)
         {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "scratch attribution requires 1..100000 entries, depth 0..32, and top 1..50"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scratch attribution requires 1..100000 entries, depth 0..32, and top 1..50",
+            ));
         }
         Ok(())
     }
@@ -96,7 +102,10 @@ pub fn inspect(
 ) -> io::Result<Vec<MountAttribution>> {
     limits.validate()?;
     if mounts.len() > 1024 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many scratch mounts"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many scratch mounts",
+        ));
     }
     let mut remaining = limits.max_entries;
     let mut reports = Vec::with_capacity(mounts.len());
@@ -104,9 +113,13 @@ pub fn inspect(
         let left = mounts.len() - index;
         let share = remaining.div_ceil(left);
         let time = deadline.saturating_duration_since(Instant::now());
-        let slice = time.checked_div(u32::try_from(left).unwrap_or(u32::MAX))
+        let slice = time
+            .checked_div(u32::try_from(left).unwrap_or(u32::MAX))
             .unwrap_or(Duration::ZERO);
-        let mount_deadline = Instant::now().checked_add(slice).unwrap_or(deadline).min(deadline);
+        let mount_deadline = Instant::now()
+            .checked_add(slice)
+            .unwrap_or(deadline)
+            .min(deadline);
         #[cfg(target_os = "linux")]
         let report = linux::inspect(mount, limits, share, mount_deadline);
         #[cfg(not(target_os = "linux"))]
@@ -122,8 +135,12 @@ pub fn inspect(
 
 fn unavailable(mount: &ScratchMount, reason: &str) -> MountAttribution {
     MountAttribution {
-        mount_path: mount.path.clone(), complete: false, entries_examined: 0,
-        mount_boundaries_skipped: 0, symlinks_skipped: 0,
-        entries: Vec::new(), issues: vec![reason.to_owned()],
+        mount_path: mount.path.clone(),
+        complete: false,
+        entries_examined: 0,
+        mount_boundaries_skipped: 0,
+        symlinks_skipped: 0,
+        entries: Vec::new(),
+        issues: vec![reason.to_owned()],
     }
 }

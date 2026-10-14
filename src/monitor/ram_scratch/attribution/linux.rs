@@ -37,7 +37,10 @@ impl Probe {
 
     fn budget(&self) -> io::Result<()> {
         if Instant::now() >= self.deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "scratch attribution deadline exhausted"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "scratch attribution deadline exhausted",
+            ));
         }
         Ok(())
     }
@@ -54,8 +57,10 @@ impl Probe {
             relative,
             flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS
-                | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_XDEV,
+            ResolveFlags::BENEATH
+                | ResolveFlags::NO_SYMLINKS
+                | ResolveFlags::NO_MAGICLINKS
+                | ResolveFlags::NO_XDEV,
         )?))
     }
 
@@ -114,13 +119,16 @@ impl Probe {
                 }
                 Err(error) => {
                     complete = false;
-                    self.issue(format!("{relative:?}: {error}"));
+                    self.issue(format!("{}: {error}", relative.display()));
                     continue;
                 }
             };
             if depth == 0 && (metadata.dev(), metadata.ino()) != initial {
                 complete = false;
-                self.issue(format!("{relative:?}: entry replaced before attribution"));
+                self.issue(format!(
+                    "{}: entry replaced before attribution",
+                    relative.display()
+                ));
                 break;
             }
             if metadata.file_type().is_symlink() {
@@ -135,8 +143,11 @@ impl Probe {
                 complete = false;
                 continue;
             }
-            let Some(total) = metadata.blocks().checked_mul(512)
-                .and_then(|bytes| allocated.checked_add(bytes)) else {
+            let Some(total) = metadata
+                .blocks()
+                .checked_mul(512)
+                .and_then(|bytes| allocated.checked_add(bytes))
+            else {
                 complete = false;
                 self.issue("allocated-byte accounting overflow");
                 break;
@@ -154,33 +165,53 @@ impl Probe {
                 Ok(file) => file,
                 Err(error) => {
                     complete = false;
-                    self.issue(format!("{relative:?}: {error}"));
+                    self.issue(format!("{}: {error}", relative.display()));
                     continue;
                 }
             };
             let verified = directory.metadata();
-            if !verified.as_ref().is_ok_and(|other| same_stamp(&metadata, other)) {
+            if !verified
+                .as_ref()
+                .is_ok_and(|other| same_stamp(&metadata, other))
+            {
                 complete = false;
-                self.issue(format!("{relative:?}: directory changed before enumeration"));
+                self.issue(format!(
+                    "{}: directory changed before enumeration",
+                    relative.display()
+                ));
                 continue;
             }
             match self.names(&directory) {
                 Ok((names, all_names)) => {
                     complete &= all_names;
-                    pending.extend(names.into_iter().rev().map(|name| (relative.join(name), depth + 1)));
+                    pending.extend(
+                        names
+                            .into_iter()
+                            .rev()
+                            .map(|name| (relative.join(name), depth + 1)),
+                    );
                 }
                 Err(error) => {
                     complete = false;
-                    self.issue(format!("{relative:?}: {error}"));
+                    self.issue(format!("{}: {error}", relative.display()));
                 }
             }
-            if !directory.metadata().as_ref().is_ok_and(|other| same_stamp(&metadata, other)) {
+            if !directory
+                .metadata()
+                .as_ref()
+                .is_ok_and(|other| same_stamp(&metadata, other))
+            {
                 complete = false;
-                self.issue(format!("{relative:?}: directory changed during enumeration"));
+                self.issue(format!(
+                    "{}: directory changed during enumeration",
+                    relative.display()
+                ));
             }
         }
         let idle = if complete {
-            SystemTime::now().duration_since(UNIX_EPOCH).ok()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
                 .and_then(|now| i128::try_from(now.as_nanos()).ok())
                 .and_then(|now| now.checked_sub(newest))
                 .filter(|age| *age >= 0)
@@ -199,10 +230,13 @@ fn newest_time(metadata: &Metadata) -> i128 {
 }
 
 fn same_stamp(left: &Metadata, right: &Metadata) -> bool {
-    left.dev() == right.dev() && left.ino() == right.ino()
-        && left.len() == right.len() && left.mtime() == right.mtime()
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
         && left.mtime_nsec() == right.mtime_nsec()
-        && left.ctime() == right.ctime() && left.ctime_nsec() == right.ctime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
 }
 
 #[allow(clippy::too_many_lines)] // ordered read-only scope and per-entry evidence
@@ -219,11 +253,17 @@ pub(super) fn inspect(
     // A lossy mount spelling must never accidentally inspect a different path.
     // Native mount names which cannot be represented here are reported unknown.
     if !path.is_absolute() || mount.path.contains('\u{fffd}') {
-        return unavailable(mount, "mount path is not an unambiguous absolute native spelling");
+        return unavailable(
+            mount,
+            "mount path is not an unambiguous absolute native spelling",
+        );
     }
     let root = match openat2(
-        CWD, path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(), ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     ) {
         Ok(fd) => File::from(fd),
         Err(error) => return unavailable(mount, &format!("cannot pin mount: {error}")),
@@ -233,9 +273,16 @@ pub(super) fn inspect(
         _ => return unavailable(mount, "mount identity changed since capacity collection"),
     };
     let mut probe = Probe {
-        root, device: mount.filesystem_id, maximum, examined: 0, deadline,
-        max_depth: limits.max_depth, seen: BTreeSet::new(), mount_boundaries: 0,
-        symlinks: 0, issues: Vec::new(),
+        root,
+        device: mount.filesystem_id,
+        maximum,
+        examined: 0,
+        deadline,
+        max_depth: limits.max_depth,
+        seen: BTreeSet::new(),
+        mount_boundaries: 0,
+        symlinks: 0,
+        issues: Vec::new(),
     };
     let directory = match probe.root.try_clone() {
         Ok(file) => file,
@@ -253,14 +300,17 @@ pub(super) fn inspect(
             break;
         }
         let relative = PathBuf::from(name);
-        let metadata = match probe.open(&relative, false).and_then(|file| file.metadata()) {
+        let metadata = match probe
+            .open(&relative, false)
+            .and_then(|file| file.metadata())
+        {
             Ok(metadata) => metadata,
             Err(error) => {
                 complete = false;
                 if error.raw_os_error() == Some(libc::EXDEV) {
                     probe.mount_boundaries += 1;
                 } else {
-                    probe.issue(format!("{relative:?}: {error}"));
+                    probe.issue(format!("{}: {error}", relative.display()));
                 }
                 continue;
             }
@@ -272,22 +322,36 @@ pub(super) fn inspect(
         entries.push(ScratchEntry {
             path: full.to_string_lossy().into_owned(),
             native_path_hex: crate::core::hex_lower(full.as_os_str().as_encoded_bytes()),
-            owner_uid, observed_allocated_bytes: bytes,
-            complete: entry_complete, idle_hours,
+            owner_uid,
+            observed_allocated_bytes: bytes,
+            complete: entry_complete,
+            idle_hours,
         });
         // Output stays bounded even if a mount has many immediate children.
-        entries.sort_by(|a, b| b.observed_allocated_bytes.cmp(&a.observed_allocated_bytes)
-            .then_with(|| a.native_path_hex.cmp(&b.native_path_hex)));
+        entries.sort_by(|a, b| {
+            b.observed_allocated_bytes
+                .cmp(&a.observed_allocated_bytes)
+                .then_with(|| a.native_path_hex.cmp(&b.native_path_hex))
+        });
         entries.truncate(limits.top);
     }
-    if !probe.root.metadata().as_ref().is_ok_and(|other| same_stamp(&root_stamp, other)) {
+    if !probe
+        .root
+        .metadata()
+        .as_ref()
+        .is_ok_and(|other| same_stamp(&root_stamp, other))
+    {
         complete = false;
         probe.issue("mount root changed during attribution");
     }
     MountAttribution {
-        mount_path: mount.path.clone(), complete, entries_examined: probe.examined,
-        mount_boundaries_skipped: probe.mount_boundaries, symlinks_skipped: probe.symlinks,
-        entries, issues: probe.issues,
+        mount_path: mount.path.clone(),
+        complete,
+        entries_examined: probe.examined,
+        mount_boundaries_skipped: probe.mount_boundaries,
+        symlinks_skipped: probe.symlinks,
+        entries,
+        issues: probe.issues,
     }
 }
 
