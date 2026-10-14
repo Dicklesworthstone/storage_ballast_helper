@@ -1,0 +1,4 @@
+# Local-only fuzzing state (55k+ corpus files, crash artifacts); builds never need it and syncing it
+# to rch workers timed out (2026-10-14).
+fuzz/work/
+fuzz/artifacts/
