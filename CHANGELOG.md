@@ -65,8 +65,15 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   cache was deleted under running builds again and again (eleven times on
   one host in a day), and the builds failed with their dependency sources
   gone. Three causes are fixed:
-  - a directory recognised only by its `CACHEDIR.TAG` was given the minimum
-    age after two minutes of observation; it now has to be its real age;
+  - under pressure, a cache seen for two minutes was given the minimum age
+    at once. No cache of any kind, and no cargo home by name, is shortened
+    that way now: it has to be its real age. In a real-build test on macOS a
+    default `~/.cargo/registry/src` extracted 174 s earlier was deleted at
+    "age 300 s" under the running build;
+  - the cargo process went unrecognised on hosts with rch, which renames the
+    real cargo `cargo-rch-real`, and build scripts did not count as build
+    tools. Both run with cargo's environment, so a build is held while only
+    they are running (a long build script, a link);
   - a process whose working directory is inside a tree now counts as using
     it;
   - on Linux, the cargo home and target directory of a running cargo or
