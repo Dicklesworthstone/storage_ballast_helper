@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::core::config::Config;
 use crate::platform::pal::Platform;
 
+pub mod journal;
+
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod linux;
 
@@ -80,13 +82,16 @@ pub struct CompressionMode {
 
 /// A per-file result. `mutation_attempted` stays true after an ioctl failure:
 /// the kernel may have completed some work before returning an error.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionFileReport {
     /// Requested path, resolved to its canonical location after admission.
     /// Lossy UTF-8 is used for display only; execution retains the original
     /// OS pathname. An unusual filename must not prevent a post-mutation report.
     #[serde(serialize_with = "serialize_display_path")]
     pub path: PathBuf,
+    /// Stable identifier for the durable pre-mutation intent, if one was prepared.
+    #[serde(default)]
+    pub operation_id: Option<String>,
     /// eligible, skipped, compressed, partial, or failed.
     pub outcome: String,
     /// Human-readable exclusion, failure, or completion explanation.
@@ -120,7 +125,8 @@ fn serialize_display_path<S: serde::Serializer>(path: &Path, serializer: S) -> R
 impl CompressionFileReport {
     fn new(path: &Path) -> Self {
         Self {
-            path: path.to_path_buf(), outcome: "skipped".into(), detail: String::new(),
+            path: path.to_path_buf(), operation_id: None,
+            outcome: "skipped".into(), detail: String::new(),
             logical_bytes: 0, physical_data_bytes_before: None,
             physical_data_bytes_after: None, processed_bytes: 0,
             mutation_attempted: false, sha256_before: None, sha256_after: None,
@@ -130,7 +136,7 @@ impl CompressionFileReport {
 }
 
 /// Referenced savings are not proof that a mount can reuse those bytes yet.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionReclaimReport {
     /// Reduction in the file's referenced physical data allocation.
     pub referenced_bytes_saved: u64,
@@ -158,6 +164,9 @@ pub struct CompressionReport {
     pub supported: bool,
     /// Selected work limits, recorded for reproducibility.
     pub policy: CompressionPolicy,
+    /// Private intent/outcome journal for this apply pass; absent for previews
+    /// and passes without an eligible file. This path is display-only.
+    pub journal_path: Option<String>,
     /// Results for files actually considered; unvisited inputs are counted.
     pub files: Vec<CompressionFileReport>,
     /// Explicit input paths not visited because a budget or safety stop fired.
@@ -173,6 +182,9 @@ pub struct CompressionReport {
 /// Run on explicitly selected regular files. No recursive scan, deletion,
 /// truncation, service changes, or persistent policy changes are performed.
 /// Each input needs a fresh admission; a preview is never execution authority.
+/// Apply requires an fsynced intent journal beside the configured state file;
+/// failure to record intent refuses mutation, and failed outcome recording
+/// stops further work. The state file's parent must already exist.
 pub fn run(
     paths: &[PathBuf],
     policy: &CompressionPolicy,
@@ -197,7 +209,7 @@ pub fn run(
         let _ = (config, platform);
         Ok(CompressionReport {
             schema: "sbh.compression.v1", dry_run: !mode.apply, supported: false,
-            policy: policy.clone(), files: Vec::new(), unvisited_files: paths.len(),
+            policy: policy.clone(), journal_path: None, files: Vec::new(), unvisited_files: paths.len(),
             stop_reason: Some("compression is supported only on Linux x86-64/AArch64 Btrfs".into()),
             elapsed_ms: 0, exit_code: 0,
         })

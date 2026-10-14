@@ -4,15 +4,15 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use nix::sys::statvfs::{FsFlags, fstatvfs};
 use rustix::fs::{Mode, OFlags, ResolveFlags, CWD, openat2};
 use sbh_btrfs::{FileStamp, IdleIoPriority, MAX_CHUNK_BYTES, ZstdConsent};
-use sha2::{Digest, Sha256};
 
+use super::journal::{AuditSession, digest};
 use super::{CompressionFileReport, CompressionMode, CompressionPolicy,
     CompressionReclaimReport, CompressionReport, already_compressed, cold_enough};
 use crate::core::config::Config;
@@ -30,11 +30,14 @@ pub(super) fn run(
     let deadline = start + Duration::from_secs(policy.timeout_secs);
     let mut report = CompressionReport {
         schema: "sbh.compression.v1", dry_run: !mode.apply, supported: true,
-        policy: policy.clone(), files: Vec::new(), unvisited_files: paths.len(),
+        policy: policy.clone(), journal_path: None, files: Vec::new(), unvisited_files: paths.len(),
         stop_reason: None, elapsed_ms: 0, exit_code: 0,
     };
     let mut admitted_bytes = 0_u64;
     let mut identities = BTreeSet::new();
+    let mut audit = AuditSession::new(
+        config.paths.state_file.with_file_name("compression-journal"), paths.len(), policy,
+    );
     // Apply passes run all verification and rewrite I/O at idle priority. A
     // failure to lower priority is an error, not permission to run at normal IO.
     let priority = if mode.apply { Some(IdleIoPriority::enter()?) } else { None };
@@ -45,15 +48,29 @@ pub(super) fn run(
         }
         let mut item = CompressionFileReport::new(path);
         let result = process_file(path, &mut item, policy, mode, config, platform,
-            deadline, &mut admitted_bytes, &mut identities);
+            deadline, &mut admitted_bytes, &mut identities, &mut audit);
         if let Err(error) = result {
             item.outcome = if item.mutation_attempted { "partial" } else { "failed" }.into();
             item.detail = error.to_string();
         }
-        let unsafe_to_continue = item.mutation_attempted && item.outcome != "compressed";
+        // Complete the durable record even when an error escaped postflight.
+        // A failed intent write poisons the journal and must not be followed by
+        // a footer that makes an uncertain prefix look like a completed run.
+        if !audit.failed() {
+            if let Err(error) = audit.complete(&item) {
+                item.outcome = if item.mutation_attempted { "partial" } else { "failed" }.into();
+                item.detail.push_str(&format!("; durable outcome recording failed: {error}"));
+            }
+        }
+        let unsafe_to_continue = audit.failed()
+            || (item.mutation_attempted && item.outcome != "compressed");
         report.files.push(item);
         if unsafe_to_continue {
-            report.stop_reason = Some("stopped after incomplete or unverified mutation; inspect the per-file report".into());
+            report.stop_reason = Some(if audit.failed() {
+                "stopped because durable compression auditing failed; inspect the journal and per-file report"
+            } else {
+                "stopped after incomplete or unverified mutation; inspect the per-file report"
+            }.into());
             break;
         }
     }
@@ -61,20 +78,32 @@ pub(super) fn run(
     if report.unvisited_files != 0 && report.stop_reason.is_none() {
         report.stop_reason = Some("file-count budget exhausted".into());
     }
+    let mut priority_failed = false;
     if let Some(priority) = priority {
         if let Err(error) = priority.restore() {
             report.stop_reason = Some(format!("could not restore I/O priority: {error}"));
-            report.exit_code = 2;
+            priority_failed = true;
         }
     }
-    let failed = report.files.iter().any(|item| matches!(item.outcome.as_str(), "failed" | "partial"));
-    if report.unvisited_files != 0 || report.files.iter().any(|item| item.outcome == "partial") {
-        report.exit_code = 4;
-    } else if failed {
-        report.exit_code = 2;
+    let attempted = report.files.iter().any(|item| item.mutation_attempted);
+    let failed = priority_failed || audit.failed()
+        || report.files.iter().any(|item| matches!(item.outcome.as_str(), "failed" | "partial"));
+    report.exit_code = pass_exit_code(attempted, failed, report.unvisited_files);
+    report.journal_path = audit.path().map(|path| path.to_string_lossy().into_owned());
+    if !audit.failed() {
+        if let Err(error) = audit.finish(report.exit_code, report.unvisited_files) {
+            report.exit_code = if attempted { 4 } else { 2 };
+            report.stop_reason = Some(format!("could not durably finish the compression journal: {error}"));
+        }
     }
     report.elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(report)
+}
+
+fn pass_exit_code(mutation_attempted: bool, failed: bool, unvisited: usize) -> i32 {
+    if unvisited != 0 || (mutation_attempted && failed) { 4 }
+    else if failed { 2 }
+    else { 0 }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -88,6 +117,7 @@ fn process_file(
     deadline: Instant,
     admitted_bytes: &mut u64,
     identities: &mut BTreeSet<(u64, u64)>,
+    audit: &mut AuditSession,
 ) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
@@ -167,6 +197,10 @@ fn process_file(
     if FileStamp::read(&file)? != before.stamp {
         return Err(io::Error::other("file changed during preflight hashing"));
     }
+    // This fsync is an admission gate, not best-effort telemetry. The first
+    // ioctl is unreachable until the intent and journal filename are durable.
+    // The live safety checks below still run after journal I/O consumes time.
+    audit.prepare(report, &file)?;
     let consent = ZstdConsent::acknowledge_filesystem_compatibility_change();
     let mut expected = before.stamp;
     let mut operation_error = None;
@@ -327,25 +361,6 @@ fn verify_path(path: &Path, file: &File, expected: FileStamp) -> io::Result<()> 
     Ok(())
 }
 
-fn digest(file: &File, size: u64, deadline: Instant) -> io::Result<String> {
-    let mut hash = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    let mut offset = 0_u64;
-    while offset < size {
-        budget(deadline)?;
-        let length = usize::try_from((size - offset).min(buffer.len() as u64))
-            .map_err(|_| io::Error::other("hash read length overflow"))?;
-        let read = match file.read_at(&mut buffer[..length], offset) {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            result => result?,
-        };
-        if read == 0 { return Err(io::Error::other("file shortened during hashing")); }
-        hash.update(&buffer[..read]);
-        offset += read as u64;
-    }
-    Ok(format!("{:x}", hash.finalize()))
-}
-
 fn budget(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline {
         Err(io::Error::new(io::ErrorKind::TimedOut, "compression work budget exhausted"))
@@ -360,3 +375,17 @@ fn other(error: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod audit_exit_tests {
+    use super::pass_exit_code;
+
+    #[test]
+    fn a_later_failure_cannot_hide_an_earlier_successful_mutation() {
+        assert_eq!(pass_exit_code(true, true, 0), 4);
+        assert_eq!(pass_exit_code(false, true, 0), 2);
+        assert_eq!(pass_exit_code(true, false, 0), 0);
+        assert_eq!(pass_exit_code(false, false, 0), 0);
+        assert_eq!(pass_exit_code(false, false, 1), 4);
+    }
+}
