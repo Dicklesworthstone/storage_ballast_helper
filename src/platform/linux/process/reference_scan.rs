@@ -20,14 +20,15 @@ use crate::core::errors::{Result, SbhError};
 use crate::platform::types::{ExecutablesResult, OpenFile, OpenFilesResult, ProcessInfo};
 
 mod build_environment;
+mod unix_sockets;
 
 const MAX_DESCRIPTORS: usize = 262_144;
 const MAX_DESCRIPTORS_PER_PID: usize = 16_384;
 const MAX_PROC_ENTRIES: usize = OPEN_FILES_MAX_PIDS + 4096;
 const MAX_EXECUTABLE_COMM_BYTES: usize = 256;
 const MAX_EXECUTABLE_STAT_BYTES: usize = 8192;
-/// `/proc/net/unix` larger than this (about 300,000 sockets) is not read;
-/// the sweep then sees no bound socket paths, as before they were read.
+/// Socket metadata is bounded independently of descriptor enumeration.
+/// Failed or oversized reads revoke coverage; they never mean an empty table.
 const MAX_UNIX_SOCKET_TABLE_BYTES: usize = 32 * 1024 * 1024;
 // Linux include/linux/sched.h: task has no user executable (PF_KTHREAD).
 const PF_KTHREAD: u64 = 0x0020_0000;
@@ -98,7 +99,7 @@ struct Sweep<'a, P> {
     descriptors_seen: usize,
     /// Bound socket paths by inode, read once, when the first socket
     /// descriptor is seen.
-    unix_sockets: Option<std::collections::HashMap<u64, PathBuf>>,
+    unix_sockets: Option<unix_sockets::Table>,
 }
 
 impl<'a, P: ProcAccess> Sweep<'a, P> {
@@ -113,20 +114,30 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
         }
     }
 
-    /// The filesystem path the socket with this inode is bound to.
+    /// Preserve positive bindings and propagate missing socket coverage to both
+    /// the PAL scorer and the executor's final path-only sweep.
     fn unix_socket_path(&mut self, proc_root: &Path, inode: u64) -> Option<PathBuf> {
+        if self.expired() {
+            return None;
+        }
         let proc = self.proc;
-        self.unix_sockets
-            .get_or_insert_with(|| {
-                proc.read_bounded(
-                    &proc_root.join("net").join("unix"),
-                    MAX_UNIX_SOCKET_TABLE_BYTES,
-                )
-                .map(|raw| parse_unix_socket_paths(&raw))
-                .unwrap_or_default()
-            })
-            .get(&inode)
-            .cloned()
+        let started = self.started;
+        let time = self.limits.time;
+        let table = self.unix_sockets.get_or_insert_with(|| {
+            proc.read_bounded(
+                &proc_root.join("net").join("unix"),
+                MAX_UNIX_SOCKET_TABLE_BYTES,
+            )
+            .map(|raw| unix_sockets::Table::parse(&raw, MAX_DESCRIPTORS, || {
+                proc.now().checked_duration_since(started)
+                    .is_none_or(|elapsed| elapsed >= time)
+            }))
+            .unwrap_or_default()
+        });
+        self.complete &= table.complete_for(inode);
+        let path = table.path(inode).map(Path::to_path_buf);
+        self.expired();
+        path
     }
 
     fn expired(&mut self) -> bool {
@@ -255,7 +266,10 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
                     socket_inode(&target).and_then(|inode| self.unix_socket_path(proc_root, inode))
                 {
                     visit(&process, fd, &fd_path, bound);
-                } else if !pseudo_target(&target) {
+                } else if !pseudo_target(&target)
+                    || (target.as_os_str().as_encoded_bytes().starts_with(b"socket:[")
+                        && socket_inode(&target).is_none())
+                {
                     // Kernel pseudo-links must not become paths relative to
                     // sbh's cwd. Unknown relative targets are not absence
                     // evidence.
@@ -384,7 +398,7 @@ fn stat_has_no_user_executable(raw: &[u8], pid: i32) -> bool {
     };
     if observed_pid.trim().parse::<i32>().ok() != Some(pid) {
         return false;
-    }
+    };
     let Ok(fields) = super::proc_stat_fields_after_comm(raw) else {
         return false;
     };
@@ -405,48 +419,16 @@ fn disappeared(error: &io::Error) -> bool {
 }
 
 fn socket_inode(target: &Path) -> Option<u64> {
-    target
-        .to_str()?
-        .strip_prefix("socket:[")?
-        .strip_suffix(']')?
-        .parse()
-        .ok()
+    let raw = target.as_os_str().as_encoded_bytes()
+        .strip_prefix(b"socket:[")?.strip_suffix(b"]")?;
+    unix_sockets::decimal(raw).filter(|inode| *inode != 0)
 }
 
-/// `/proc/net/unix` rows are `Num RefCount Protocol Flags Type St Inode Path`
-/// with a padded inode column. Only sockets bound to an absolute filesystem
-/// path are kept: abstract (`@name`) and unbound sockets have no file.
+// Keep the original positive-path parser fixture; coverage assertions live in
+// the shared typed parser and the PAL/executor socket regression tests below.
+#[cfg(test)]
 fn parse_unix_socket_paths(raw: &[u8]) -> std::collections::HashMap<u64, PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let mut paths = std::collections::HashMap::new();
-    for line in raw.split(|byte| *byte == b'\n').skip(1) {
-        let mut rest = line;
-        let mut inode = None;
-        for field in 0..7 {
-            let start = rest
-                .iter()
-                .position(|byte| *byte != b' ')
-                .unwrap_or(rest.len());
-            rest = &rest[start..];
-            let end = rest
-                .iter()
-                .position(|byte| *byte == b' ')
-                .unwrap_or(rest.len());
-            if field == 6 {
-                inode = std::str::from_utf8(&rest[..end])
-                    .ok()
-                    .and_then(|text| text.parse::<u64>().ok());
-            }
-            rest = &rest[end..];
-        }
-        if let (Some(inode), Some(path)) = (inode, rest.strip_prefix(b" "))
-            && path.first() == Some(&b'/')
-        {
-            paths.insert(inode, PathBuf::from(std::ffi::OsStr::from_bytes(path)));
-        }
-    }
-    paths
+    unix_sockets::Table::parse(raw, MAX_DESCRIPTORS, || false).paths
 }
 
 fn pseudo_target(path: &Path) -> bool {
@@ -1136,6 +1118,7 @@ mod tests {
     #[test]
     fn pseudo_links_do_not_turn_into_cwd_relative_references() {
         let fixture = Fixture::new();
+        socket_table_fixture(&fixture, b"");
         let process = fixture.pid(1);
         for (fd, target) in [
             "socket:[123]",
@@ -1822,6 +1805,7 @@ mod tests {
     #[test]
     fn path_only_sweep_excludes_pseudo_links_but_reports_unknown_relative_targets() {
         let fixture = Fixture::new();
+        socket_table_fixture(&fixture, b"");
         let retained = fixture.fd(1, 0);
         symlink("socket:[123]", fixture.proc_root.join("1/fd/1")).unwrap();
         symlink("anon_inode:[eventpoll]", fixture.proc_root.join("1/fd/2")).unwrap();
@@ -2146,5 +2130,171 @@ mod tests {
         assert!(result.complete);
         assert_eq!(result.processes[0].executable.as_ref(), Some(&target));
         assert_eq!(result.processes[0].name, "program-1");
+    }
+
+    fn socket_table_fixture(fixture: &Fixture, rows: &[u8]) -> PathBuf {
+        let path = fixture.proc_root.join("net/unix");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut raw = unix_sockets::HEADER.to_vec();
+        raw.extend_from_slice(rows);
+        fs::write(&path, raw).unwrap();
+        path
+    }
+
+    fn socket_fd_fixture(fixture: &Fixture, pid: i32, fd: i32, inode: u64) {
+        let process = fixture.pid(pid);
+        symlink(
+            format!("socket:[{inode}]"),
+            process.join("fd").join(fd.to_string()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn socket_table_read_failures_hold_both_scoring_and_executor_sweeps() {
+        let fixture = Fixture::new();
+        let retained = fixture.fd(77, 0);
+        socket_fd_fixture(&fixture, 77, 1, 4242);
+        let table = socket_table_fixture(&fixture, b"");
+        for error in [libc::ENOENT, libc::EACCES, libc::EPERM, libc::EIO, libc::EFBIG] {
+            let mut access = Faults::default();
+            access.reads.insert(table.clone(), error);
+            let result = fixture.scan(&access, Limits::default());
+            assert!(!result.complete, "socket table error {error}");
+            assert_eq!(result.files.len(), 1);
+            assert_eq!(result.files[0].path, retained);
+            let (targets, complete) =
+                open_targets_with(&access, &fixture.proc_root, Limits::default()).unwrap();
+            assert!(!complete, "executor must retain the same uncertainty");
+            assert!(targets.contains(&retained));
+        }
+        assert_eq!(fs::read(retained).unwrap(), b"retained artifact");
+    }
+
+    #[test]
+    fn malformed_socket_rows_keep_valid_bound_paths_but_never_certify_absence() {
+        let fixture = Fixture::new();
+        let retained = fixture.fd(77, 0);
+        let served = fixture.root.join("server.sock");
+        socket_fd_fixture(&fixture, 77, 1, 4242);
+        let rows = format!(
+            "garbage\n0: 2 0 10000 1 1 4242 {}\nbroken final row\n", served.display()
+        );
+        socket_table_fixture(&fixture, rows.as_bytes());
+        let result = fixture.scan(&NativeProc, Limits::default());
+        assert!(!result.complete);
+        assert!(result.files.iter().any(|file| file.path == retained));
+        assert!(result.files.iter().any(|file| file.path == served));
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(!complete);
+        assert!(targets.contains(&retained));
+        assert!(targets.contains(&served));
+    }
+
+    #[test]
+    fn a_relative_socket_binding_is_unknown_not_reconstructed_from_current_cwd() {
+        let fixture = Fixture::new();
+        socket_fd_fixture(&fixture, 77, 1, 4242);
+        let current = fixture.root.join("not-the-bind-directory");
+        fs::create_dir(&current).unwrap();
+        symlink(&current, fixture.proc_root.join("77/cwd")).unwrap();
+        socket_table_fixture(&fixture, b"0: 2 0 10000 1 1 4242 relative.sock\n");
+        let result = fixture.scan(&NativeProc, Limits::default());
+        assert!(!result.complete);
+        assert!(result.files.is_empty());
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(!complete);
+        assert!(!targets.contains(&current.join("relative.sock")));
+        assert!(targets.contains(&current), "the independent cwd reference still counts");
+    }
+
+    #[test]
+    fn a_socket_table_is_read_once_even_when_failed_or_many_descriptors_use_it() {
+        let fixture = Fixture::new();
+        for fd in 0..16 {
+            socket_fd_fixture(&fixture, 77, fd, 4242);
+        }
+        let path = socket_table_fixture(&fixture, b"0: 2 0 10000 1 1 4242 @abstract\n");
+        for denied in [false, true] {
+            let mut access = Faults::default();
+            if denied {
+                access.reads.insert(path.clone(), libc::EACCES);
+            }
+            let result = fixture.scan(&access, Limits::default());
+            assert_eq!(result.complete, !denied);
+            assert!(result.files.is_empty());
+            assert_eq!(
+                access.read_paths.borrow().iter().filter(|read| **read == path).count(),
+                1,
+                "failure does not start a per-descriptor retry loop"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_socket_pseudo_links_are_not_known_fileless_descriptors() {
+        for target in ["socket:[+42]", "socket:[]", "socket:[bad]", "socket:[0]", "socket:[42]extra"] {
+            let fixture = Fixture::new();
+            let retained = fixture.fd(77, 0);
+            symlink(target, fixture.proc_root.join("77/fd/1")).unwrap();
+            let result = fixture.scan(&NativeProc, Limits::default());
+            assert!(!result.complete, "{target}");
+            assert_eq!(result.files[0].path, retained);
+        }
+    }
+
+    #[test]
+    fn scans_without_socket_descriptors_do_not_read_socket_tables() {
+        let fixture = Fixture::new();
+        fixture.fd(77, 0);
+        let access = Faults::default();
+        assert!(fixture.scan(&access, Limits::default()).complete);
+        assert!(access.read_paths.borrow().is_empty());
+    }
+
+    #[test]
+    fn expired_socket_resolution_does_not_start_another_proc_read() {
+        let fixture = Fixture::new();
+        socket_fd_fixture(&fixture, 77, 1, 4242);
+        socket_table_fixture(&fixture, b"0: 2 0 10000 1 1 4242 @abstract\n");
+        let access = Faults {
+            advance_per_link: Duration::from_secs(2),
+            ..Faults::default()
+        };
+        let result = fixture.scan(&access, Limits { time: Duration::from_secs(1), ..Limits::default() });
+        assert!(!result.complete);
+        assert!(access.read_paths.borrow().is_empty());
+    }
+
+    #[test]
+    fn socket_table_size_and_nonregular_file_failures_are_not_empty_evidence() {
+        let fixture = Fixture::new();
+        socket_fd_fixture(&fixture, 77, 1, 4242);
+        let table = socket_table_fixture(&fixture, b"");
+        fs::File::create(&table).unwrap()
+            .set_len(u64::try_from(MAX_UNIX_SOCKET_TABLE_BYTES).unwrap() + 1).unwrap();
+        assert!(!fixture.scan(&NativeProc, Limits::default()).complete);
+        let saved = table.with_extension("oversized");
+        fs::rename(&table, &saved).unwrap();
+        nix::unistd::mkfifo(
+            &table, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR
+        ).unwrap();
+        assert!(!fixture.scan(&NativeProc, Limits::default()).complete);
+    }
+
+    #[test]
+    fn a_native_listener_is_resolved_from_the_actual_kernel_table() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::UnixListener;
+        let fixture = Fixture::new();
+        let path = fixture.root.join("bound.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let target = fs::read_link(format!("/proc/self/fd/{}", listener.as_raw_fd())).unwrap();
+        let inode = socket_inode(&target).unwrap();
+        let mut sweep = Sweep::new(&NativeProc, Limits::default());
+        assert_eq!(sweep.unix_socket_path(Path::new(PROC_ROOT), inode), Some(path));
+        assert!(sweep.complete);
     }
 }
