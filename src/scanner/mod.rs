@@ -1,6 +1,7 @@
 //! Artifact scanner: directory walker, pattern matching, multi-factor scoring, deletion.
 
 pub mod active_lease;
+pub mod compression;
 pub mod decision_record;
 pub mod deletion;
 pub mod engine;

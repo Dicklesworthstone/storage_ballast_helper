@@ -1547,6 +1547,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbh_btrfs"
+version = "0.1.0"
+
+[[package]]
 name = "sbh_mach"
 version = "0.1.0"
 dependencies = [
@@ -1738,6 +1742,7 @@ dependencies = [
  "regex",
  "rusqlite",
  "rustix",
+ "sbh_btrfs",
  "sbh_mach",
  "serde",
  "serde_json",

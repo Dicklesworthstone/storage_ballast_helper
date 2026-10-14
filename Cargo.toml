@@ -88,6 +88,7 @@ rustix = { version = "=1.1.4", features = ["fs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 inotify = { version = "0.11.1", default-features = false }
+sbh_btrfs = { path = "crates/sbh_btrfs" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue"] }
@@ -137,3 +138,5 @@ assert_is_empty = "allow"
 # the root package alone are unaffected.
 [workspace]
 members = [".", "crates/sbh_mach"]
+# The dependency-free Linux syscall boundary retains its own native test lane.
+exclude = ["crates/sbh_btrfs"]
