@@ -531,10 +531,31 @@ impl BallastPoolCoordinator {
 
     /// Provision all pools (idempotent: skips existing valid files).
     pub fn provision_all(&mut self, platform: &dyn Platform) -> Result<MultiProvisionReport> {
+        self.provision_all_until(platform, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// [`Self::provision_all`] that stops when `stop` is set: the pool being
+    /// grown stops before its next file, and the remaining pools are skipped.
+    /// Provisioning can write gigabytes at disk speed, and a daemon asked to
+    /// stop in the middle of it must not hold the service manager's stop until
+    /// every pool is full.
+    pub fn provision_all_until(
+        &mut self,
+        platform: &dyn Platform,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<MultiProvisionReport> {
+        let stopped = || stop.load(std::sync::atomic::Ordering::Relaxed);
         let mut per_volume = Vec::new();
         let mut skipped_volumes = Vec::new();
 
         for (mount_path, pool) in &mut self.pools {
+            if stopped() {
+                skipped_volumes.push((
+                    mount_path.clone(),
+                    "provisioning stopped: shutdown requested".to_string(),
+                ));
+                continue;
+            }
             // A volume whose stats cannot be read cannot be planned against.
             if let Err(e) = platform.fs_stats(mount_path) {
                 skipped_volumes.push((mount_path.clone(), format!("failed to get fs stats: {e}")));
@@ -546,7 +567,12 @@ impl BallastPoolCoordinator {
             // a partial reserve instead of none.
             let mount_path_clone = mount_path.clone();
             let platform_ref = platform;
+            // A stop request admits no further file: the manager treats
+            // zero headroom as "refuse the next file" and returns.
             let free_check = move || -> f64 {
+                if stopped() {
+                    return 0.0;
+                }
                 platform_ref
                     .fs_stats(&mount_path_clone)
                     .map_or(0.0, |s| s.free_pct())
@@ -1278,6 +1304,49 @@ mod tests {
             .unwrap();
         assert_eq!(discovered_data.orphans, vec![orphan.clone()]);
         assert!(orphan.exists(), "opening managers never prunes");
+    }
+
+    /// A daemon asked to stop while provisioning stops before the next file
+    /// and skips the remaining pools (a `systemctl stop` during a fresh
+    /// install's first start otherwise waited for every pool to fill).
+    #[test]
+    fn provisioning_stops_when_shutdown_is_requested() {
+        let dir_data = tempfile::tempdir().unwrap();
+        let dir_scratch = tempfile::tempdir().unwrap();
+        let platform = mock_platform_two_volumes(dir_data.path(), dir_scratch.path());
+        let watched = vec![
+            dir_data.path().to_path_buf(),
+            dir_scratch.path().to_path_buf(),
+        ];
+        let config = tiny_ballast_config();
+        let manager_platform: Arc<dyn Platform> = Arc::new(platform.clone());
+        let mut coordinator = BallastPoolCoordinator::discover_with_manager_platform(
+            &config,
+            &watched,
+            &platform,
+            &manager_platform,
+        )
+        .unwrap();
+
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let report = coordinator.provision_all_until(&platform, &stop).unwrap();
+
+        assert_eq!(report.total_files_created(), 0);
+        assert_eq!(
+            report.skipped_volumes.len(),
+            2,
+            "{:?}",
+            report.skipped_volumes
+        );
+        assert!(
+            report
+                .skipped_volumes
+                .iter()
+                .all(|(_, reason)| reason.contains("shutdown requested"))
+        );
+        // Not stopping provisions as before.
+        let report = coordinator.provision_all(&platform).unwrap();
+        assert_eq!(report.total_files_created(), 6);
     }
 
     #[test]

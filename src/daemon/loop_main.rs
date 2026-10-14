@@ -604,18 +604,22 @@ impl StartupExtension {
 }
 
 /// Run `work` while repeatedly asking the service manager for more startup
-/// time; the requests stop when `work` returns or after `extension.max`.
+/// time; the requests stop when `work` returns, after `extension.max`, or
+/// once `stop` is set. systemd applies `EXTEND_TIMEOUT_USEC` to whichever
+/// timeout is running, so extending after a stop request would also hold off
+/// the stop timeout: a `systemctl stop` during provisioning waited minutes.
 fn with_startup_extension<T>(
     service_manager: Box<dyn crate::platform::pal::ServiceManager>,
     status: &str,
     extension: StartupExtension,
+    stop: &AtomicBool,
     work: impl FnOnce() -> T,
 ) -> T {
     let (done_tx, done_rx) = bounded::<()>(0);
     thread::scope(|scope| {
         scope.spawn(move || {
             let started = Instant::now();
-            while started.elapsed() < extension.max {
+            while started.elapsed() < extension.max && !stop.load(Ordering::Relaxed) {
                 let _ = service_manager.notify_extend_startup(extension.extend_by, status);
                 if !matches!(
                     done_rx.recv_timeout(extension.every),
@@ -4188,6 +4192,7 @@ impl MonitoringDaemon {
             self.platform.service_manager(),
             "provisioning ballast",
             StartupExtension::DEFAULT,
+            &self.signal_handler.shutdown_token(),
             || self.provision_ballast(),
         )?;
 
@@ -6237,9 +6242,11 @@ impl MonitoringDaemon {
             );
             return Ok(());
         }
+        // A stop requested mid-provisioning ends it at the next file.
+        let shutdown = self.signal_handler.shutdown_token();
         let report = self
             .ballast_coordinator
-            .provision_all(self.platform.as_ref())?;
+            .provision_all_until(self.platform.as_ref(), &shutdown)?;
 
         let total_files = report.total_files_created();
         let total_bytes = report.total_bytes();
@@ -12511,10 +12518,12 @@ mod tests {
             max: Duration::from_mins(1),
         };
         let recorder = Recorder::default();
+        let never = AtomicBool::new(false);
         let value = with_startup_extension(
             Box::new(recorder.clone()),
             "provisioning ballast",
             extension,
+            &never,
             || {
                 std::thread::sleep(Duration::from_millis(110));
                 7
@@ -12546,12 +12555,35 @@ mod tests {
                 max: Duration::from_millis(50),
                 ..extension
             },
+            &never,
             || std::thread::sleep(Duration::from_millis(200)),
         );
         let calls = hung.0.lock().len();
         assert!(
             (1..=4).contains(&calls),
             "extensions for a hung step: {calls}"
+        );
+
+        // A stop request ends the extensions while the step still runs, so
+        // the service manager's stop timeout applies again.
+        let stopping = Recorder::default();
+        let stop = AtomicBool::new(false);
+        with_startup_extension(
+            Box::new(stopping.clone()),
+            "provisioning ballast",
+            extension,
+            &stop,
+            || {
+                std::thread::sleep(Duration::from_millis(50));
+                stop.store(true, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(40));
+                let at_stop = stopping.0.lock().len();
+                std::thread::sleep(Duration::from_millis(150));
+                assert!(
+                    stopping.0.lock().len() <= at_stop + 1,
+                    "extensions continued after the stop request"
+                );
+            },
         );
     }
 
