@@ -410,6 +410,7 @@ fn open_targets_with(
     let mut targets = std::collections::HashSet::new();
     let current = i32::try_from(std::process::id()).ok();
     let mut denied = None;
+    let mut refused = 0usize;
     for pid in pids {
         if sweep.expired() {
             break;
@@ -435,6 +436,7 @@ fn open_targets_with(
             match fs::read_link(proc_root.join(pid.to_string()).join("cwd")) {
                 Ok(cwd) => add_target_spellings(&mut targets, cwd),
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    refused += 1;
                     denied.get_or_insert(UnreadableProcess {
                         pid,
                         file: "cwd",
@@ -454,12 +456,23 @@ fn open_targets_with(
     }
     // A process sbh may not inspect could be using any candidate: its
     // references are unknown, not absent, so the sweep certifies nothing.
-    if let Some(unreadable) = denied.or(build_denied) {
+    // Name a refused build tool first: an unprivileged daemon is refused
+    // pid 1 before it reaches the build anyone is looking for.
+    let refused = refused + usize::from(build_denied.is_some());
+    if let Some(unreadable) = build_denied.or(denied) {
         sweep.complete = false;
+        let others = refused.saturating_sub(1);
         eprintln!(
-            "[SBH-SAFETY] open-file sweep incomplete: cannot read /proc/{}/{} ({}); \
+            "[SBH-SAFETY] open-file sweep incomplete: cannot read /proc/{}/{} ({}){}; \
              candidates in this batch are held",
-            unreadable.pid, unreadable.file, unreadable.error
+            unreadable.pid,
+            unreadable.file,
+            unreadable.error,
+            if others == 0 {
+                String::new()
+            } else {
+                format!(", nor {others} more")
+            }
         );
     }
     let mut targets: Vec<_> = targets.into_iter().collect();
