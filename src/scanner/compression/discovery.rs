@@ -142,8 +142,9 @@ impl Selection {
         self.validate_scope(path)
     }
 
-    /// Recheck root confinement between chunks without comparing the original
-    /// ctime: our own completed defrag can legitimately change the file's ctime.
+    /// Recheck root confinement and Git exclusion between chunks without comparing
+    /// the original ctime: completed defrag can legitimately change file ctime.
+    /// This does not replace the executor's other live protection checks.
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -168,6 +169,7 @@ impl Selection {
         if current.dev() != pinned.dev() || current.ino() != pinned.ino() {
             return Err(io::Error::other("compression discovery root was replaced"));
         }
+        super::linux::repository::check_file(path)?;
         Ok(())
     }
 }
@@ -290,6 +292,7 @@ mod native {
 
     #[allow(clippy::wildcard_imports)] // the parent module's discovery types
     use super::*;
+    use crate::scanner::compression::linux::repository;
     use crate::scanner::{active_lease, protection};
 
     #[derive(Debug)]
@@ -427,6 +430,22 @@ mod native {
                 self.skip("symlink_or_special_file");
                 return Ok(());
             }
+            // Use the same fresh Git ancestry veto as explicit-file execution.
+            // Prune repositories before enumeration, even with a shallow budget
+            // or an explicit root that starts inside the worktree/admin tree.
+            let directory = if metadata.is_dir() {
+                path.as_path()
+            } else {
+                path.parent()
+                    .ok_or_else(|| invalid("candidate has no parent"))?
+            };
+            if path.file_name().is_some_and(|name| name == ".git")
+                || repository::directory_exclusion(directory)?.is_some()
+            {
+                self.skip("git_repository");
+                return Ok(());
+            }
+            self.budget()?;
             if self.protected(&path, metadata.is_dir())? {
                 self.skip("protected_or_leased");
                 return Ok(());

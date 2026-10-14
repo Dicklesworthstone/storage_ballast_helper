@@ -12,7 +12,7 @@ to rewrite every reported file. It never calls the compression mutation backend,
 creates a journal, deletes files, changes service policy, or enables automatic
 compression. `--discover` conflicts with `--apply`, `--allow-zstd-feature`,
 `--quiescent`, and `--recover-journal`. Ordinary explicit-file preview and apply
-remain unchanged. Native discovery currently requires Linux x86-64/AArch64 with
+remain separate. Native discovery currently requires Linux x86-64/AArch64 with
 `openat2`; unsupported targets report an unsupported no-op.
 
 ## Selection and limits
@@ -23,6 +23,30 @@ order, refuses descendant mount crossings and symlinks, and prunes protected or
 leased trees. It reuses the existing configured protection patterns, marker
 checks and sacred-path catalog. Hard-linked files, young/future-dated files,
 small files and already-compressed suffixes are excluded.
+
+### Git content is excluded, including untracked build outputs
+
+Discovery and explicit-file execution now share a fresh, metadata-only Git
+ancestry check. It excludes whole worktrees (tracked and untracked files), `.git`
+internals, linked worktree/submodule gitfiles, and bare or relocated Git
+administrative directories identified by `HEAD` plus `objects`, `refs`,
+`packed-refs`, or `commondir`. A malformed, empty, or dangling `.git` marker is
+also a conservative veto. The check does not invoke Git, parse configuration,
+follow a gitfile target, or read object contents. Arbitrary external object
+stores with none of these markers are not discovered by this layout heuristic.
+
+Repository directories are pruned before enumeration and counted under
+`discovery.skipped.git_repository`; a count is a pruned visit, not the number of
+files inside it. An explicit root already inside a repository is excluded too.
+Marker/ancestry inspection errors produce an incomplete scan, not negative Git
+evidence. Ancestry work is bounded at 256 directories per check.
+
+The executor repeats this veto before opening an input for rewrite and between
+chunks. A retained library selection also rechecks it through `validate_file`
+and `validate_scope`, so adding a Git marker after discovery cannot make the old
+selection bypass the veto. These checks are observations, not a repository
+creation lock. Quiescence and every existing executor protection remain required;
+there is no compression force override, including for ignored worktree files.
 
 `--min-size-bytes`, `--min-age-secs`, `--max-files`, and `--max-bytes` use the
 existing compression defaults and safety floors. Logical bytes limit selected
@@ -71,5 +95,6 @@ invent a continuation past unexamined work.
 The library selection also retains discovered file stamps and pinned roots,
 with `validate_file` and `validate_scope` checks for future executor integration.
 The current CLI deliberately exposes discovery read-only. Recursive apply,
-automatic Yellow/Orange scheduling, persistent compression configuration and
-shared activity-ledger/`sbh explain` integration remain unfinished.
+automatic Yellow/Orange scheduling, and persistent compression configuration
+remain unfinished. Explicit-file journal explanations are documented separately
+in `compression-explain.md`; shared activity output is separate from discovery.

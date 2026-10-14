@@ -255,4 +255,145 @@ mod native_tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn repository_subtrees_are_pruned_before_depth_and_entry_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for name in ["a-worktree", "b-linked", "c-bare", "d-admin"] {
+            fs::create_dir_all(root.join(name).join("deep/nested")).unwrap();
+            cold(&root.join(name).join("deep/nested/cold.bin"));
+        }
+        fs::create_dir(root.join("a-worktree/.git")).unwrap();
+        fs::write(root.join("b-linked/.git"), b"gitdir: /not-followed\n").unwrap();
+        fs::write(root.join("c-bare/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::create_dir(root.join("c-bare/objects")).unwrap();
+        fs::write(root.join("d-admin/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(root.join("d-admin/commondir"), b"/not-followed\n").unwrap();
+        cold(&root.join("z.bin"));
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits {
+                max_depth: 0,
+                max_entries: 5,
+                max_directories: 1,
+                ..Default::default()
+            },
+            &policy(),
+        );
+        assert!(selection.report().complete, "{:?}", selection.report());
+        assert_eq!(selection.paths(), [root.join("z.bin")]);
+        assert_eq!(selection.report().skipped.get("git_repository"), Some(&4));
+        assert_eq!(selection.report().directories_opened, 1);
+        assert_eq!(selection.report().entries_examined, 5);
+        for name in ["a-worktree", "b-linked", "c-bare", "d-admin"] {
+            assert_eq!(
+                fs::read(root.join(name).join("deep/nested/cold.bin")).unwrap(),
+                b"cold contents"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_roots_inside_repository_scopes_are_not_enumerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("repo/.git/objects/pack")).unwrap();
+        fs::create_dir_all(root.join("repo/src/deep")).unwrap();
+        fs::create_dir_all(root.join("bare/objects/pack")).unwrap();
+        fs::write(root.join("bare/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        for name in ["repo/src/deep", "repo/.git/objects/pack", "bare/objects/pack"] {
+            let inside = root.join(name);
+            cold(&inside.join("cold.bin"));
+            let selection = scan(
+                &[inside],
+                &DiscoveryLimits {
+                    max_depth: 0,
+                    max_entries: 1,
+                    max_directories: 1,
+                    ..Default::default()
+                },
+                &policy(),
+            );
+            assert!(selection.report().complete, "{:?}", selection.report());
+            assert!(selection.paths().is_empty());
+            assert_eq!(selection.report().skipped.get("git_repository"), Some(&1));
+            assert_eq!(selection.report().entries_examined, 0);
+            assert_eq!(selection.report().directories_opened, 0);
+        }
+    }
+
+    #[test]
+    fn retained_selection_rechecks_git_ancestry_even_outside_its_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let root = parent.join("scope");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("cold.bin");
+        cold(&path);
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy(),
+        );
+        let file = fs::File::open(&path).unwrap();
+        let stamp = sbh_btrfs::FileStamp::read(&file).unwrap();
+        assert!(selection.validate_file(&path, stamp).is_ok());
+        fs::write(parent.join(".git"), b"gitdir: /not-followed\n").unwrap();
+        // Neither file identity nor contents changed. New Git ancestry alone
+        // must invalidate the earlier selection for both revalidation methods.
+        assert_eq!(sbh_btrfs::FileStamp::read(&file).unwrap(), stamp);
+        assert_eq!(
+            selection.validate_scope(&path).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            selection.validate_file(&path, stamp).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let fresh = scan(&[root], &DiscoveryLimits::default(), &policy());
+        assert!(fresh.paths().is_empty());
+        assert_eq!(fresh.report().directories_opened, 0);
+        assert_eq!(fs::read(&path).unwrap(), b"cold contents");
+    }
+
+    #[test]
+    fn repository_pruning_preserves_sorted_continuation_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("b-repo/.git")).unwrap();
+        cold(&root.join("b-repo/cold.bin"));
+        for name in ["a.bin", "c.bin", "d.bin"] {
+            cold(&root.join(name));
+        }
+        let policy = CompressionPolicy { max_files: 1, ..policy() };
+        let first = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy,
+        );
+        assert_eq!(first.paths(), [root.join("a.bin")]);
+        let second = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits {
+                after: Some(continuation_path(first.report().resume_after_hex.as_deref().unwrap()).unwrap()),
+                ..Default::default()
+            },
+            &policy,
+        );
+        assert_eq!(second.paths(), [root.join("c.bin")]);
+        assert_eq!(second.report().skipped.get("git_repository"), Some(&1));
+        let third = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits {
+                after: Some(continuation_path(second.report().resume_after_hex.as_deref().unwrap()).unwrap()),
+                ..Default::default()
+            },
+            &policy,
+        );
+        assert_eq!(third.paths(), [root.join("d.bin")]);
+        assert!(third.report().complete);
+        assert!(third.report().resume_after_hex.is_none());
+        assert_eq!(fs::read(root.join("b-repo/cold.bin")).unwrap(), b"cold contents");
+    }
 }
