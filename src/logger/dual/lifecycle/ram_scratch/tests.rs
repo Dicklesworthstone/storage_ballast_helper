@@ -53,7 +53,7 @@ fn observation(pressured: bool, complete: bool) -> Observation {
             scope: "fixture host counters, not deletion authority",
             assessment: Some(assessment),
             issues: Vec::new(),
-            exit_code: if !complete { 4 } else { i32::from(pressured) },
+            exit_code: if complete { i32::from(pressured) } else { 4 },
         },
         attribution: Vec::new(),
         attribution_mounts_omitted: 0,
@@ -96,14 +96,22 @@ fn full_swap_fixture_produces_one_warning_naming_all_four_mounts() {
     for path in ["/tmp", "/dev/shm", "/run", "/run/user/1000"] {
         assert!(summary.contains(path), "{path}: {summary}");
     }
-    assert!(notices.finish(Ok(observation(true, true)), Instant::now()).is_none());
+    assert!(
+        notices
+            .finish(Ok(observation(true, true)), Instant::now())
+            .is_none()
+    );
 }
 
 #[test]
 fn empty_mounts_do_not_warn_or_start_recovery_messages() {
     let mut notices = Notices::default();
     for _ in 0..3 {
-        assert!(notices.finish(Ok(observation(false, true)), Instant::now()).is_none());
+        assert!(
+            notices
+                .finish(Ok(observation(false, true)), Instant::now())
+                .is_none()
+        );
     }
 }
 
@@ -112,8 +120,16 @@ fn recurring_risk_is_coalesced_and_missing_evidence_cannot_clear_it() {
     let now = Instant::now();
     let mut notices = Notices::default();
     assert!(notices.finish(Ok(observation(true, true)), now).is_some());
-    assert!(notices.finish(Ok(observation(true, true)), now + SAMPLE_INTERVAL).is_none());
-    assert!(notices.finish(Ok(observation(false, false)), now + SAMPLE_INTERVAL * 2).is_none());
+    assert!(
+        notices
+            .finish(Ok(observation(true, true)), now + SAMPLE_INTERVAL)
+            .is_none()
+    );
+    assert!(
+        notices
+            .finish(Ok(observation(false, false)), now + SAMPLE_INTERVAL * 2)
+            .is_none()
+    );
     let (_, payload) = warning(
         notices
             .finish(Ok(observation(false, false)), now + NOTICE_INTERVAL)
@@ -133,8 +149,16 @@ fn recurring_risk_is_coalesced_and_missing_evidence_cannot_clear_it() {
         serde_json::from_str::<serde_json::Value>(&message).unwrap()["state"],
         "recovered"
     );
-    assert!(notices.finish(Ok(observation(false, true)), now + NOTICE_INTERVAL * 2).is_none());
-    assert!(notices.finish(Ok(observation(true, true)), now + NOTICE_INTERVAL * 2).is_some());
+    assert!(
+        notices
+            .finish(Ok(observation(false, true)), now + NOTICE_INTERVAL * 2)
+            .is_none()
+    );
+    assert!(
+        notices
+            .finish(Ok(observation(true, true)), now + NOTICE_INTERVAL * 2)
+            .is_some()
+    );
 }
 
 #[test]
@@ -144,11 +168,23 @@ fn new_risks_are_reported_without_rearming_for_threshold_flapping() {
     let mut initial = observation(true, true);
     initial.host.assessment.as_mut().unwrap().reasons = vec!["tmpfs_exceeds_half_ram"];
     assert!(notices.finish(Ok(initial), now).is_some());
-    assert!(notices.finish(Ok(observation(true, true)), now + SAMPLE_INTERVAL).is_some());
+    assert!(
+        notices
+            .finish(Ok(observation(true, true)), now + SAMPLE_INTERVAL)
+            .is_some()
+    );
     let mut reduced = observation(true, true);
     reduced.host.assessment.as_mut().unwrap().reasons = vec!["tmpfs_exceeds_half_ram"];
-    assert!(notices.finish(Ok(reduced), now + SAMPLE_INTERVAL * 2).is_none());
-    assert!(notices.finish(Ok(observation(true, true)), now + SAMPLE_INTERVAL * 3).is_none());
+    assert!(
+        notices
+            .finish(Ok(reduced), now + SAMPLE_INTERVAL * 2)
+            .is_none()
+    );
+    assert!(
+        notices
+            .finish(Ok(observation(true, true)), now + SAMPLE_INTERVAL * 3)
+            .is_none()
+    );
 }
 
 #[test]
@@ -184,9 +220,18 @@ fn wait_for_worker(observer: &Observer) {
 fn probes_start_only_for_daemon_lifecycle_and_wait_for_the_startup_grace() {
     let now = Instant::now();
     let mut observer = Observer::default();
-    assert!(observer.poll_with(now, || panic!("inactive observer ran")).is_none());
+    assert!(
+        observer
+            .poll_with(now, || panic!("inactive observer ran"))
+            .is_none()
+    );
     assert!(observer.job.is_none());
-    observer.on_event(&ActivityEvent::Info { message: "CLI output".into() }, now);
+    observer.on_event(
+        &ActivityEvent::Info {
+            message: "CLI output".into(),
+        },
+        now,
+    );
     assert!(!observer.enabled);
     observer.on_event(
         &ActivityEvent::DaemonStarted {
@@ -196,11 +241,14 @@ fn probes_start_only_for_daemon_lifecycle_and_wait_for_the_startup_grace() {
         now,
     );
     assert_eq!(observer.enabled, cfg!(target_os = "linux"));
-    assert!(observer
-        .poll_with(now + STARTUP_DELAY - Duration::from_nanos(1), || {
-            panic!("startup grace ignored")
-        })
-        .is_none());
+    assert!(
+        observer
+            .poll_with(
+                now + STARTUP_DELAY.saturating_sub(Duration::from_nanos(1)),
+                || { panic!("startup grace ignored") }
+            )
+            .is_none()
+    );
     assert!(observer.job.is_none());
 }
 
@@ -210,23 +258,30 @@ fn completed_probe_waits_a_full_interval_before_starting_another() {
     let count = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&count);
     let mut observer = armed(now);
-    assert!(observer
-        .poll_with(now, move || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Ok(observation(false, true))
-        })
-        .is_none());
+    assert!(
+        observer
+            .poll_with(now, move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(observation(false, true))
+            })
+            .is_none()
+    );
     wait_for_worker(&observer);
-    assert!(observer
-        .poll_with(now, || panic!("completion started another probe"))
-        .is_none());
+    assert!(
+        observer
+            .poll_with(now, || panic!("completion started another probe"))
+            .is_none()
+    );
     assert!(observer.job.is_none());
     assert_eq!(count.load(Ordering::SeqCst), 1);
-    assert!(observer
-        .poll_with(now + SAMPLE_INTERVAL - Duration::from_nanos(1), || {
-            panic!("cadence ignored")
-        })
-        .is_none());
+    assert!(
+        observer
+            .poll_with(
+                now + SAMPLE_INTERVAL.saturating_sub(Duration::from_nanos(1)),
+                || { panic!("cadence ignored") }
+            )
+            .is_none()
+    );
     assert!(observer.job.is_none());
 }
 
@@ -258,17 +313,24 @@ fn stalled_probe_is_single_flight_and_does_not_block_observer_shutdown() {
             .unwrap(),
     );
     assert_eq!(code, "SBH-RAM-SCRATCH-INCOMPLETE");
-    assert!(observer
-        .poll_with(now + SAMPLE_INTERVAL, || panic!("replacement for blocked probe"))
-        .is_none());
-    assert_eq!(observer.job.as_ref().unwrap().worker.thread().id(), original_thread);
+    assert!(
+        observer
+            .poll_with(now + SAMPLE_INTERVAL, || panic!(
+                "replacement for blocked probe"
+            ))
+            .is_none()
+    );
+    assert_eq!(
+        observer.job.as_ref().unwrap().worker.thread().id(),
+        original_thread
+    );
     let (done_tx, done_rx) = bounded(1);
-    let stopper = thread::spawn(move || {
+    let shutdown_thread = thread::spawn(move || {
         observer.on_event(&ActivityEvent::Shutdown, now);
         assert!(done_tx.send(observer).is_ok());
     });
     let mut stopped = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    stopper.join().unwrap();
+    shutdown_thread.join().unwrap();
     assert!(!stopped.enabled);
     assert!(stopped.job.is_none());
     stopped.on_event(
@@ -278,7 +340,10 @@ fn stalled_probe_is_single_flight_and_does_not_block_observer_shutdown() {
         },
         now,
     );
-    assert!(!stopped.enabled, "a stopped observer must not replace its detached worker");
+    assert!(
+        !stopped.enabled,
+        "a stopped observer must not replace its detached worker"
+    );
 }
 
 #[test]
@@ -298,7 +363,10 @@ fn logger_consumer_arms_the_observer_and_shutdown_keeps_its_queue_boundary() {
         control.receive(&rx, Duration::ZERO).unwrap().event,
         ActivityEvent::DaemonStarted { .. }
     ));
-    assert_eq!(control.ram_scratch.lock().enabled, cfg!(target_os = "linux"));
+    assert_eq!(
+        control.ram_scratch.lock().enabled,
+        cfg!(target_os = "linux")
+    );
     control.request_shutdown();
     assert!(matches!(
         control.receive(&rx, Duration::ZERO).unwrap().event,

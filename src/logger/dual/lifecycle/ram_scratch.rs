@@ -19,7 +19,7 @@ use crate::monitor::ram_scratch::{self, ScratchLimits, ScratchReport};
 
 const STARTUP_DELAY: Duration = Duration::from_secs(30);
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(300);
-const NOTICE_INTERVAL: Duration = Duration::from_secs(900);
+const NOTICE_INTERVAL: Duration = Duration::from_mins(15);
 const STALL_AFTER: Duration = Duration::from_secs(20);
 const MAX_DETAILS_BYTES: usize = 128 * 1024;
 const MAX_ATTRIBUTION_MOUNTS: usize = 16;
@@ -285,8 +285,7 @@ impl Observer {
             .spawn(move || {
                 // A closed observer or a stuck logger cannot block this producer.
                 let _ = tx.try_send(collect());
-            })
-        {
+            }) {
             Ok(worker) => {
                 self.job = Some(Job {
                     started: now,

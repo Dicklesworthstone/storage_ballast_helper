@@ -208,7 +208,8 @@ impl Control {
         // An observation admitted before shutdown precedes the final flush just
         // like an external producer's event. No new probe starts after closure.
         if let Some(_admission) = self.admit() {
-            if let Some(event) = self.ram_scratch.lock().poll(Instant::now()) {
+            let polled = self.ram_scratch.lock().poll(Instant::now());
+            if let Some(event) = polled {
                 return Ok(Message {
                     event,
                     mirror: self.mirror(),
@@ -233,7 +234,9 @@ impl Control {
                     | ActivityEvent::Shutdown
             )
         {
-            self.ram_scratch.lock().on_event(&message.event, Instant::now());
+            self.ram_scratch
+                .lock()
+                .on_event(&message.event, Instant::now());
         }
         if let Ok(message) = &result
             && events.is_empty()
