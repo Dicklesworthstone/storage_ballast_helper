@@ -3459,13 +3459,27 @@ fn maybe_apply_writeback_on_install(cli: &Cli, config: &Config) {
         return;
     };
     let is_root = running_as_root();
-    // Benchmark only when we can actually apply (root); otherwise heuristic.
-    let Some(tuning) = build_writeback_tuning(config, platform.as_ref(), is_root) else {
+    let container = writeback_container_block();
+    // Benchmark only when we can actually apply (root, not in a container); otherwise heuristic.
+    let Some(tuning) =
+        build_writeback_tuning(config, platform.as_ref(), is_root && container.is_none())
+    else {
         return; // disabled, not applicable on this platform, or already healthy
     };
     let human = output_mode(cli) == OutputMode::Human;
 
-    if is_root {
+    if let Some(reason) = container {
+        if human {
+            println!("Skipped kernel writeback tuning: {reason}");
+        } else {
+            let _ = write_json_line(&json!({
+                "command": "install",
+                "step": "writeback_tuning",
+                "applied": false,
+                "skipped": reason,
+            }));
+        }
+    } else if is_root {
         match apply_writeback_tuning(config, platform.as_ref(), &tuning.plan) {
             Ok(report) => {
                 if human {
@@ -5923,6 +5937,17 @@ fn build_writeback_tuning(
     })
 }
 
+/// Why kernel-writeback tuning must not be applied here: `vm.dirty_*` is host-wide, so
+/// applying it from a container would retune the host (bd-pivw).
+fn writeback_container_block() -> Option<String> {
+    storage_ballast_helper::tuning::writeback::container_marker(Path::new("/")).map(|marker| {
+        format!(
+            "running in a container ({marker}); vm.dirty_* is host-wide, so apply it on the \
+             host with `sudo sbh tune --apply --yes`"
+        )
+    })
+}
+
 /// Outcome of applying kernel-writeback tuning, for reporting.
 struct WritebackApplyReport {
     sysctl_path: std::path::PathBuf,
@@ -6177,8 +6202,10 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
     // Append kernel-writeback recommendation(s). Run the bandwidth micro-benchmark
     // only when we are actually about to apply (root + --yes, not opted out); every
     // read-only path — `sbh tune`, the `--apply` confirmation preview, and a
-    // non-root `--apply` — uses the zero-write device-class heuristic instead.
-    let measure_bandwidth = args.apply && args.yes && !args.no_benchmark && running_as_root();
+    // non-root or in-container `--apply` — uses the zero-write device-class heuristic instead.
+    let container = writeback_container_block();
+    let measure_bandwidth =
+        args.apply && args.yes && !args.no_benchmark && running_as_root() && container.is_none();
     let writeback = build_writeback_tuning(&config, platform.as_ref(), measure_bandwidth);
     if let Some(ref tuning) = writeback {
         recs.extend(tuning.recommendations.clone());
@@ -6337,7 +6364,9 @@ fn run_tune(cli: &Cli, args: &TuneArgs) -> Result<(), CliError> {
     let mut writeback_report: Option<WritebackApplyReport> = None;
     let mut writeback_skipped: Option<String> = None;
     if let Some(ref tuning) = writeback {
-        if running_as_root() {
+        if let Some(reason) = container {
+            writeback_skipped = Some(reason);
+        } else if running_as_root() {
             writeback_report = Some(apply_writeback_tuning(
                 &config,
                 platform.as_ref(),
