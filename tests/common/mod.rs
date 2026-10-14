@@ -17,6 +17,38 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// ──────────────────── process visibility ────────────────────
+
+/// Whether this user can see every process. A non-root user on a shared host
+/// cannot read other users' `/proc/<pid>/cwd`, so sbh's open-file sweep is
+/// incomplete and every deletion is held, as it must be. Tests that need a
+/// deletion to happen have nothing to prove there; they skip and say so.
+pub fn sees_every_process() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+            {
+                continue;
+            }
+            if let Err(error) = fs::read_link(entry.path().join("cwd"))
+                && error.kind() == std::io::ErrorKind::PermissionDenied
+            {
+                eprintln!("skipped: this user cannot see every process");
+                return false;
+            }
+        }
+    }
+    true
+}
+
 // ──────────────────── CLI test runner ────────────────────
 
 pub struct CmdResult {
