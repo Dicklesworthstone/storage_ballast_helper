@@ -2,7 +2,7 @@
 //! Kept as an integration target so it can run without native mount fixtures.
 
 #[path = "../src/scanner/walker/result_batch.rs"]
-mod result_batch;
+pub mod result_batch;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +22,10 @@ fn queue_budget_counts_entries_not_packets() {
     assert!(receiver.capacity().unwrap() * BATCH_SIZE <= 10_000);
     for capacity in [1, 2, BATCH_SIZE - 1, BATCH_SIZE, BATCH_SIZE + 1] {
         let (_, receiver) = result_batch::bounded::<usize>(capacity);
-        assert_eq!(receiver.capacity(), Some(capacity / capacity.min(BATCH_SIZE)));
+        assert_eq!(
+            receiver.capacity(),
+            Some(capacity / capacity.min(BATCH_SIZE))
+        );
     }
 }
 
@@ -37,7 +40,10 @@ fn full_batches_and_final_partial_batch_preserve_order_exactly() {
     assert!(sender.flush(&cancel, RETRY));
     drop(sender);
     let packets: Vec<_> = receiver.into_iter().collect();
-    assert_eq!(packets.iter().map(Vec::len).collect::<Vec<_>>(), [BATCH_SIZE, 3]);
+    assert_eq!(
+        packets.iter().map(Vec::len).collect::<Vec<_>>(),
+        [BATCH_SIZE, 3]
+    );
     assert_eq!(
         packets.into_iter().flatten().collect::<Vec<_>>(),
         (0..(BATCH_SIZE + 3)).collect::<Vec<_>>()
@@ -85,13 +91,18 @@ fn slow_consumer_does_not_drop_owned_nonclone_entries_on_retry() {
             let mut success = true;
             for value in 0..101 {
                 success &= sender.push(Owned(value), &cancel, RETRY);
-                if !success { break; }
+                if !success {
+                    break;
+                }
             }
             success &= sender.flush(&cancel, RETRY);
             done_tx.send(success).unwrap();
         })
     };
-    assert_eq!(done_rx.recv_timeout(RETRY * 4), Err(channel::RecvTimeoutError::Timeout));
+    assert_eq!(
+        done_rx.recv_timeout(RETRY * 4),
+        Err(channel::RecvTimeoutError::Timeout)
+    );
     let mut seen = Vec::new();
     loop {
         match receiver.recv_timeout(DEADLINE) {
@@ -116,14 +127,22 @@ fn cancellation_releases_a_producer_with_a_full_queue_and_no_consumer() {
     let (done_tx, done_rx) = channel::bounded(1);
     let worker = {
         let cancel = Arc::clone(&cancel);
-        thread::spawn(move || { done_tx.send(sender.push(2, &cancel, RETRY)).unwrap(); })
+        thread::spawn(move || {
+            done_tx.send(sender.push(2, &cancel, RETRY)).unwrap();
+        })
     };
-    assert_eq!(done_rx.recv_timeout(RETRY * 4), Err(channel::RecvTimeoutError::Timeout));
+    assert_eq!(
+        done_rx.recv_timeout(RETRY * 4),
+        Err(channel::RecvTimeoutError::Timeout)
+    );
     cancel.store(true, Ordering::Relaxed);
     assert!(!done_rx.recv_timeout(DEADLINE).unwrap());
     worker.join().unwrap();
     assert_eq!(receiver.recv_timeout(DEADLINE).unwrap(), [1]);
-    assert_eq!(receiver.recv_timeout(DEADLINE), Err(channel::RecvTimeoutError::Disconnected));
+    assert_eq!(
+        receiver.recv_timeout(DEADLINE),
+        Err(channel::RecvTimeoutError::Disconnected)
+    );
 }
 
 #[test]

@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{self as channel, Receiver, Sender, SendTimeoutError};
+use crossbeam_channel::{self as channel, Receiver, SendTimeoutError, Sender};
 
 /// Maximum results transferred by one producer/collector channel operation.
 pub(super) const BATCH_SIZE: usize = 64;
@@ -105,8 +105,7 @@ impl<T> BatchSender<T> {
         if self.pending.is_empty() {
             return true;
         }
-        let mut packet =
-            std::mem::replace(&mut self.pending, Vec::with_capacity(self.batch_size));
+        let mut packet = std::mem::replace(&mut self.pending, Vec::with_capacity(self.batch_size));
         self.oldest = None;
         loop {
             if cancel.load(Ordering::Relaxed) {
