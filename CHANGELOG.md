@@ -68,10 +68,14 @@ Git repositories.
   full and swap exhausted. It now copies only while `/dev/shm` has a fifth
   of its space free and swap is not nearly full, re-checks every 30 seconds,
   and logs why when it stops or skips the copy.
-- `sbh compress --recover-journal` run just after a pass ended no longer
-  reports the pass as still running because another process was being
-  started at that moment; it waits up to two seconds for the lock
-  (`ddc6a16`).
+- **Locks are released when sbh lets go of them, even while it is starting
+  another process** (`b9e925f`, `ddc6a16`). A lock stayed held for as long
+  as a child process being started still had a copy of its descriptor.
+  So the daemon's next ballast replenish could find the pool "busy" right
+  after a release. And `sbh compress --recover-journal`, run just after a
+  pass, could report that pass as still running. Both locks are now
+  released explicitly, and recovery also waits up to two seconds for a lock
+  before calling a pass live.
 - `install.sh` reads the latest release tag from GitHub API responses
   served as one-line JSON, where it took part of the release notes as the
   version (`8023aa9`).
