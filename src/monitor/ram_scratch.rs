@@ -74,16 +74,24 @@ impl ScratchAssessment {
     /// One human-readable warning with observed quantities and mount names.
     #[must_use]
     pub fn summary(&self) -> String {
-        let mounts = self.mounts.iter().map(|mount| {
-            format!("{:?}={} bytes", mount.path, mount.used_bytes)
-        }).collect::<Vec<_>>().join(", ");
+        let mounts = self
+            .mounts
+            .iter()
+            .map(|mount| format!("{:?}={} bytes", mount.path, mount.used_bytes))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "RAM scratch: {} occupied tmpfs bytes across {} filesystems; RAM={} available={}; swap free={}/{}; process VmSwap={} (complete={}); reasons=[{}]; mounts=[{}]. Report only: no cleanup authority.",
-            self.tmpfs_used_bytes, self.unique_filesystems,
-            self.memory.total_bytes, self.memory.available_bytes,
-            self.memory.swap_free_bytes, self.memory.swap_total_bytes,
-            self.process_swap.bytes, self.process_swap.complete,
-            self.reasons.join(", "), mounts,
+            self.tmpfs_used_bytes,
+            self.unique_filesystems,
+            self.memory.total_bytes,
+            self.memory.available_bytes,
+            self.memory.swap_free_bytes,
+            self.memory.swap_total_bytes,
+            self.process_swap.bytes,
+            self.process_swap.complete,
+            self.reasons.join(", "),
+            mounts,
         )
     }
 }
@@ -98,24 +106,30 @@ pub fn assess(
     mut mounts: Vec<ScratchMount>,
     process_swap: ProcessSwap,
 ) -> io::Result<ScratchAssessment> {
-    if memory.total_bytes == 0 || memory.available_bytes > memory.total_bytes
+    if memory.total_bytes == 0
+        || memory.available_bytes > memory.total_bytes
         || memory.swap_free_bytes > memory.swap_total_bytes
     {
         return Err(invalid("inconsistent RAM or swap counters"));
     }
-    let nominal_ram_plus_swap_bytes = memory.total_bytes.checked_add(memory.swap_total_bytes)
+    let nominal_ram_plus_swap_bytes = memory
+        .total_bytes
+        .checked_add(memory.swap_total_bytes)
         .ok_or_else(|| invalid("RAM + swap capacity overflow"))?;
     let mut filesystems = BTreeMap::<u64, u64>::new();
     for mount in &mounts {
         if mount.used_bytes > mount.total_bytes || mount.available_bytes > mount.total_bytes {
             return Err(invalid("inconsistent tmpfs capacity counters"));
         }
-        filesystems.entry(mount.filesystem_id)
+        filesystems
+            .entry(mount.filesystem_id)
             .and_modify(|used| *used = (*used).max(mount.used_bytes))
             .or_insert(mount.used_bytes);
     }
     let tmpfs_used_bytes = filesystems.values().try_fold(0_u64, |total, used| {
-        total.checked_add(*used).ok_or_else(|| invalid("tmpfs usage sum overflow"))
+        total
+            .checked_add(*used)
+            .ok_or_else(|| invalid("tmpfs usage sum overflow"))
     })?;
     let mut reasons = Vec::new();
     if u128::from(tmpfs_used_bytes) * 2 > u128::from(memory.total_bytes) {
@@ -131,7 +145,11 @@ pub fn assess(
     if mounts.iter().any(runtime_mount_pressured) {
         reasons.push("runtime_tmpfs_pressure");
     }
-    mounts.sort_by(|a, b| b.used_bytes.cmp(&a.used_bytes).then_with(|| a.path.cmp(&b.path)));
+    mounts.sort_by(|a, b| {
+        b.used_bytes
+            .cmp(&a.used_bytes)
+            .then_with(|| a.path.cmp(&b.path))
+    });
     Ok(ScratchAssessment {
         memory,
         process_swap,
@@ -156,9 +174,12 @@ pub fn swap_nearly_full(memory: &MemoryInfo) -> bool {
 /// to callers so observing pressure never implies adding logs to that pressure.
 #[must_use]
 pub fn ram_log_destination_healthy(memory: &MemoryInfo, total: u64, available: u64) -> bool {
-    memory.total_bytes != 0 && memory.available_bytes <= memory.total_bytes
+    memory.total_bytes != 0
+        && memory.available_bytes <= memory.total_bytes
         && memory.swap_free_bytes <= memory.swap_total_bytes
-        && !swap_nearly_full(memory) && total > 0 && available <= total
+        && !swap_nearly_full(memory)
+        && total > 0
+        && available <= total
         && u128::from(available) * 5 >= u128::from(total)
 }
 
@@ -166,10 +187,14 @@ fn runtime_mount_pressured(mount: &ScratchMount) -> bool {
     let path = std::path::Path::new(&mount.path);
     let runtime = path == std::path::Path::new("/run")
         || (path.parent() == Some(std::path::Path::new("/run/user"))
-            && path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
-                !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit())
-            }));
-    runtime && mount.used_bytes > 0
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit())
+                }));
+    runtime
+        && mount.used_bytes > 0
         && (mount.used_bytes >= 4 * 1024 * 1024 * 1024
             || (mount.total_bytes > 0
                 && u128::from(mount.available_bytes) * 10 < u128::from(mount.total_bytes)))
@@ -188,7 +213,11 @@ pub struct ScratchLimits {
 
 impl Default for ScratchLimits {
     fn default() -> Self {
-        Self { timeout_secs: 10, max_processes: 16_384, max_mounts: 256 }
+        Self {
+            timeout_secs: 10,
+            max_processes: 16_384,
+            max_mounts: 256,
+        }
     }
 }
 
@@ -199,8 +228,10 @@ impl ScratchLimits {
             || !(1..=131_072).contains(&self.max_processes)
             || !(1..=1024).contains(&self.max_mounts)
         {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "RAM scratch limits require 1..60 seconds, 1..131072 processes and 1..1024 mounts"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RAM scratch limits require 1..60 seconds, 1..131072 processes and 1..1024 mounts",
+            ));
         }
         Ok(())
     }
@@ -237,14 +268,21 @@ pub fn inspect(
 ) -> io::Result<ScratchReport> {
     limits.validate()?;
     #[cfg(target_os = "linux")]
-    { linux::inspect(platform, limits) }
+    {
+        linux::inspect(platform, limits)
+    }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = platform;
         Ok(ScratchReport {
-            schema: "sbh.ram_scratch.v1", read_only: true, supported: false,
-            complete: false, scope: "Linux tmpfs collector unavailable on this platform",
-            assessment: None, issues: Vec::new(), exit_code: 0,
+            schema: "sbh.ram_scratch.v1",
+            read_only: true,
+            supported: false,
+            complete: false,
+            scope: "Linux tmpfs collector unavailable on this platform",
+            assessment: None,
+            issues: Vec::new(),
+            exit_code: 0,
         })
     }
 }
