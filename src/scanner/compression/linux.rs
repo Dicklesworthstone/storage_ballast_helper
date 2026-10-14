@@ -22,6 +22,8 @@ use crate::core::config::Config;
 use crate::platform::pal::Platform;
 use crate::scanner::{active_lease, protection};
 
+pub(super) mod repository;
+
 #[allow(clippy::too_many_lines)] // one bounded pass, in order
 pub(super) fn run(
     paths: &[std::path::PathBuf],
@@ -379,6 +381,7 @@ fn process_file(
 }
 
 fn check_protection(path: &Path, config: &Config, platform: &dyn Platform) -> io::Result<()> {
+    repository::check_file(path)?;
     check_control_paths(path, config)?;
     // Construct a fresh registry: a negative ancestor-marker cache from
     // preflight must never hide a marker created before the next chunk.

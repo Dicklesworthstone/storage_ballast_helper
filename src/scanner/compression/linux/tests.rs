@@ -100,3 +100,86 @@ fn only_the_exact_inspection_descriptor_is_exempt_from_open_file_vetoes() {
     assert!(foreign_reference(-1, Some(42), 42));
     assert!(foreign_reference(pid.saturating_add(1), Some(42), 42));
 }
+
+#[test]
+fn git_packfile_preview_and_apply_stop_before_hashing_or_journaling() {
+    use crate::platform::pal::{FsStats, MountPoint, PlatformPaths};
+    use std::collections::HashMap;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("repo/.git/objects/pack/old.pack");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"repository payload must stay untouched").unwrap();
+    filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+    let stats = FsStats {
+        total_bytes: 16 * 1024 * 1024 * 1024,
+        free_bytes: 8 * 1024 * 1024 * 1024,
+        available_bytes: 8 * 1024 * 1024 * 1024,
+        fs_type: "btrfs".into(),
+        mount_point: root.clone(),
+        is_readonly: false,
+    };
+    // Advertise Btrfs to reach real application admission on any test FS.
+    // The expected Git refusal precedes all Btrfs ioctls, not a mock mutation.
+    let platform = MockPlatform::new(
+        vec![MountPoint {
+            path: root.clone(),
+            device: "fixture".into(),
+            fs_type: "btrfs".into(),
+            is_ram_backed: false,
+        }],
+        HashMap::from([(root.clone(), stats)]),
+        MockPlatform::healthy().memory_info().unwrap(),
+        PlatformPaths::default(),
+    );
+    let policy = CompressionPolicy {
+        min_size_bytes: 1,
+        min_age_secs: 3600,
+        max_bytes: 1024,
+        ..Default::default()
+    };
+    for apply in [false, true] {
+        let mut item = CompressionFileReport::new(&path);
+        let mut audit = AuditSession::new(root.join("journal"), 1, &policy);
+        let mut bytes = 0;
+        let mut identities = BTreeSet::new();
+        let error = process_file(
+            &path,
+            &mut item,
+            &policy,
+            CompressionMode { apply, allow_zstd_feature: true, quiescent: true },
+            &Config::default(),
+            &platform,
+            Instant::now() + Duration::from_secs(30),
+            &mut bytes,
+            &mut identities,
+            &mut audit,
+        ).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("Git repository"));
+        assert!(!item.mutation_attempted);
+        assert!(item.sha256_before.is_none());
+        assert!(item.operation_id.is_none());
+        assert!(audit.path().is_none());
+        assert_eq!(bytes, 0);
+        assert!(identities.is_empty());
+        assert!(!root.join("journal").exists());
+        assert_eq!(fs::read(&path).unwrap(), b"repository payload must stay untouched");
+    }
+}
+
+#[test]
+fn per_chunk_protection_detects_a_new_gitfile_without_reusing_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("cold.bin");
+    fs::write(&path, b"not rewritten").unwrap();
+    let config = Config::default();
+    let platform = MockPlatform::healthy();
+    assert!(check_protection(&path, &config, &platform).is_ok());
+    fs::write(root.join(".git"), b"gitdir: /not-followed\n").unwrap();
+    let error = check_protection(&path, &config, &platform).unwrap_err();
+    assert!(error.to_string().contains("Git repository"));
+    assert_eq!(fs::read(&path).unwrap(), b"not rewritten");
+}
