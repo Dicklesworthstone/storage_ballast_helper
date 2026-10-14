@@ -33,9 +33,13 @@ impl<'a> Lookup<'a> {
         let (run, sequence) = operation.rsplit_once(':').ok_or_else(invalid_id)?;
         // A run ID becomes ONE basename under the configured journal directory.
         // Never accept slashes, traversal, encoded paths, specifiers or NULs.
-        if run.is_empty() || run.len() > 128
-            || !run.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            || sequence.is_empty() || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+        if run.is_empty()
+            || run.len() > 128
+            || !run
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || sequence.is_empty()
+            || !sequence.bytes().all(|byte| byte.is_ascii_digit())
         {
             return Err(invalid_id());
         }
@@ -48,8 +52,10 @@ impl<'a> Lookup<'a> {
 }
 
 fn invalid_id() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput,
-        "compression IDs use compress:RUN:SEQUENCE, where RUN is the journal basename and SEQUENCE is a positive decimal intent sequence")
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "compression IDs use compress:RUN:SEQUENCE, where RUN is the journal basename and SEQUENCE is a positive decimal intent sequence",
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -94,11 +100,14 @@ pub(super) fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
         }
         Err((code, error)) => {
             if matches.get_flag("json") {
-                serde_json::to_writer(&mut out, &serde_json::json!({
-                    "schema": "sbh.compression.explanation.v1", "read_only": true,
-                    "source": "compression_journal", "id": id,
-                    "error": error, "exit_code": code,
-                }))?;
+                serde_json::to_writer(
+                    &mut out,
+                    &serde_json::json!({
+                        "schema": "sbh.compression.explanation.v1", "read_only": true,
+                        "source": "compression_journal", "id": id,
+                        "error": error, "exit_code": code,
+                    }),
+                )?;
                 writeln!(out)?;
             } else {
                 eprintln!("sbh: compression explanation failed: {error}");
@@ -110,7 +119,11 @@ pub(super) fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
     Ok(Some(code))
 }
 
-fn execute(matches: &ArgMatches, command: &ArgMatches, id: &str) -> Result<Explanation, (i32, String)> {
+fn execute(
+    matches: &ArgMatches,
+    command: &ArgMatches,
+    id: &str,
+) -> Result<Explanation, (i32, String)> {
     let lookup = Lookup::parse(id).map_err(|error| (1, error.to_string()))?;
     for key in ["why_not", "replay"] {
         if command.ids().any(|id| id.as_str() == key)
@@ -122,7 +135,10 @@ fn execute(matches: &ArgMatches, command: &ArgMatches, id: &str) -> Result<Expla
     let explicit = matches.get_one::<std::path::PathBuf>("config");
     let config = Config::load(explicit.map(std::path::PathBuf::as_path))
         .map_err(|error| (1, error.to_string()))?;
-    let directory = config.paths.state_file.with_file_name("compression-journal");
+    let directory = config
+        .paths
+        .state_file
+        .with_file_name("compression-journal");
     if !directory.is_absolute() {
         return Err((1, "compression journal directory must be absolute".into()));
     }
@@ -136,13 +152,24 @@ fn explain_journal(path: &Path, lookup: &Lookup<'_>) -> io::Result<Explanation> 
     // checks and its torn-tail and false-success-footer rules.
     let report = journal::recover(path, REHASH_BYTES, INSPECTION_SECONDS)?;
     if report.run_id != lookup.run {
-        return Err(io::Error::new(io::ErrorKind::InvalidData,
-            "journal run identity does not match the requested compression ID"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal run identity does not match the requested compression ID",
+        ));
     }
-    let operation = report.operations.into_iter()
+    let operation = report
+        .operations
+        .into_iter()
         .find(|operation| operation.operation_id == lookup.operation)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
-            format!("compression operation {} is absent from this journal", lookup.operation)))?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "compression operation {} is absent from this journal",
+                    lookup.operation
+                ),
+            )
+        })?;
     let summary = operation.recorded_result.as_ref().map_or_else(
         || "Only a durable pre-mutation intent exists. Whether compression ran or reclaimed space remains unknown; no replay was attempted.".into(),
         |result| format!("Durable historical {} outcome. Allocation measurements describe the recorded operation, not current filesystem free space.", result.outcome),
@@ -166,33 +193,63 @@ fn explain_journal(path: &Path, lookup: &Lookup<'_>) -> io::Result<Explanation> 
 }
 
 fn write_human(out: &mut impl Write, report: &Explanation) -> io::Result<()> {
-    writeln!(out, "Compression operation {}\n{}", report.id, report.summary)?;
-    writeln!(out, "Source: {:?}\nFile: {:?}", report.journal_path, report.operation.path)?;
-    writeln!(out, "Run finished: {}; torn final record: {}.", report.run_finished, report.truncated_tail)?;
+    writeln!(
+        out,
+        "Compression operation {}\n{}",
+        report.id, report.summary
+    )?;
+    writeln!(
+        out,
+        "Source: {:?}\nFile: {:?}",
+        report.journal_path, report.operation.path
+    )?;
+    writeln!(
+        out,
+        "Run finished: {}; torn final record: {}.",
+        report.run_finished, report.truncated_tail
+    )?;
     if let Some(result) = &report.operation.recorded_result {
-        writeln!(out, "Recorded outcome: {}; mutation attempted: {}; contents verified then: {}.",
-            result.outcome, result.mutation_attempted, result.content_verified)?;
-        writeln!(out, "Physical data allocation before/after: {:?} / {:?} bytes.",
-            result.physical_data_bytes_before, result.physical_data_bytes_after)?;
+        writeln!(
+            out,
+            "Recorded outcome: {}; mutation attempted: {}; contents verified then: {}.",
+            result.outcome, result.mutation_attempted, result.content_verified
+        )?;
+        writeln!(
+            out,
+            "Physical data allocation before/after: {:?} / {:?} bytes.",
+            result.physical_data_bytes_before, result.physical_data_bytes_after
+        )?;
         if let Some(reclaim) = &result.reclaim {
-            writeln!(out, "Referenced savings: {}; added: {}; pending old data: {}; confirmed net data-only reclaim: {} bytes.",
-                reclaim.referenced_bytes_saved, reclaim.referenced_bytes_added,
-                reclaim.old_data_bytes_pending, reclaim.confirmed_data_bytes_reclaimed)?;
+            writeln!(
+                out,
+                "Referenced savings: {}; added: {}; pending old data: {}; confirmed net data-only reclaim: {} bytes.",
+                reclaim.referenced_bytes_saved,
+                reclaim.referenced_bytes_added,
+                reclaim.old_data_bytes_pending,
+                reclaim.confirmed_data_bytes_reclaimed
+            )?;
         } else {
             writeln!(out, "Physical reclaim evidence: unknown.")?;
         }
     }
-    writeln!(out, "Current-input verification: {}. {}", report.operation.verification, report.operation.detail)?;
-    writeln!(out, "For full unfinished-input verification, use sbh compress --recover-journal with this journal path. This explanation never rewrites inputs or journal records.")?;
+    writeln!(
+        out,
+        "Current-input verification: {}. {}",
+        report.operation.verification, report.operation.detail
+    )?;
+    writeln!(
+        out,
+        "For full unfinished-input verification, use sbh compress --recover-journal with this journal path. This explanation never rewrites inputs or journal records."
+    )?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
     use std::fs::{self, OpenOptions};
     use std::os::unix::fs::OpenOptionsExt as _;
-    use serde_json::{Value, json};
 
     const RUN: &str = "abc-42-0";
     const ID: &str = "compress:abc-42-0:1";
@@ -202,37 +259,58 @@ mod tests {
         let path = dir.path().join(format!("{RUN}.jsonl"));
         let source = dir.path().join("source-not-opened.bin");
         let hash = "0".repeat(64);
-        let wrap = |sequence: u64, entry: Value| json!({
-            "schema": "sbh.compression.journal.v1", "run_id": RUN,
-            "sequence": sequence, "at": "2026-10-14T00:00:00Z", "entry": entry,
-        });
+        let wrap = |sequence: u64, entry: Value| {
+            json!({
+                "schema": "sbh.compression.journal.v1", "run_id": RUN,
+                "sequence": sequence, "at": "2026-10-14T00:00:00Z", "entry": entry,
+            })
+        };
         let mut rows = vec![
-            wrap(0, json!({"kind": "run_started", "pid": 42, "input_files": 1,
-                "policy": CompressionPolicy::default()})),
-            wrap(1, json!({"kind": "prepared", "intent": {
-                "operation_id": "abc-42-0:1",
-                "path_hex": storage_ballast_helper::core::hex_lower(source.as_os_str().as_encoded_bytes()),
-                "identity": {"device": 1, "inode": 2, "size": 67108864,
-                    "mtime": 1, "mtime_nsec": 0, "ctime": 2, "ctime_nsec": 0, "links": 1},
-                "sha256_before": hash, "physical_data_bytes_before": 65536,
-            }})),
+            wrap(
+                0,
+                json!({"kind": "run_started", "pid": 42, "input_files": 1,
+                "policy": CompressionPolicy::default()}),
+            ),
+            wrap(
+                1,
+                json!({"kind": "prepared", "intent": {
+                    "operation_id": "abc-42-0:1",
+                    "path_hex": storage_ballast_helper::core::hex_lower(source.as_os_str().as_encoded_bytes()),
+                    "identity": {"device": 1, "inode": 2, "size": 67_108_864,
+                        "mtime": 1, "mtime_nsec": 0, "ctime": 2, "ctime_nsec": 0, "links": 1},
+                    "sha256_before": hash, "physical_data_bytes_before": 65536,
+                }}),
+            ),
         ];
         if finished {
-            rows.push(wrap(2, json!({"kind": "file_finished", "report": {
-                "path": source, "operation_id": "abc-42-0:1", "outcome": "compressed",
-                "detail": "fixture historical outcome", "logical_bytes": 67108864,
-                "physical_data_bytes_before": 65536, "physical_data_bytes_after": 8192,
-                "processed_bytes": 67108864, "mutation_attempted": true,
-                "sha256_before": hash, "sha256_after": hash, "content_verified": true,
-                "reclaim": {"referenced_bytes_saved": 57344, "referenced_bytes_added": 0,
-                    "old_data_bytes_pending": 0, "old_data_bytes_released": 65536,
-                    "new_data_bytes_allocated": 8192, "confirmed_data_bytes_reclaimed": 57344},
-                "accounting_error": null,
-            }})));
-            rows.push(wrap(3, json!({"kind": "run_finished", "exit_code": 0, "unvisited_files": 0})));
+            rows.push(wrap(
+                2,
+                json!({"kind": "file_finished", "report": {
+                    "path": source, "operation_id": "abc-42-0:1", "outcome": "compressed",
+                    "detail": "fixture historical outcome", "logical_bytes": 67_108_864,
+                    "physical_data_bytes_before": 65536, "physical_data_bytes_after": 8192,
+                    "processed_bytes": 67_108_864, "mutation_attempted": true,
+                    "sha256_before": hash, "sha256_after": hash, "content_verified": true,
+                    "reclaim": {"referenced_bytes_saved": 57344, "referenced_bytes_added": 0,
+                        "old_data_bytes_pending": 0, "old_data_bytes_released": 65536,
+                        "new_data_bytes_allocated": 8192, "confirmed_data_bytes_reclaimed": 57344},
+                    "accounting_error": null,
+                }}),
+            ));
+            rows.push(wrap(
+                3,
+                json!({"kind": "run_finished", "exit_code": 0, "unvisited_files": 0}),
+            ));
         }
-        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).unwrap();
-        for row in rows { writeln!(file, "{row}").unwrap(); }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        for row in rows {
+            writeln!(file, "{row}").unwrap();
+        }
         file.sync_all().unwrap();
         (dir, path)
     }
@@ -241,9 +319,15 @@ mod tests {
     fn namespaced_ids_cannot_escape_the_journal_directory() {
         assert_eq!(Lookup::parse(ID).unwrap().run, RUN);
         for id in [
-            "compress:", "compress:../other:1", "compress:/tmp/file:1",
-            "compress:%2fetc:1", "compress:abc:0", "compress:abc:01",
-            "compress:abc:-1", "compress:abc:1:2", "compress:abc:18446744073709551616",
+            "compress:",
+            "compress:../other:1",
+            "compress:/tmp/file:1",
+            "compress:%2fetc:1",
+            "compress:abc:0",
+            "compress:abc:01",
+            "compress:abc:-1",
+            "compress:abc:1:2",
+            "compress:abc:18446744073709551616",
         ] {
             assert!(Lookup::parse(id).is_err(), "{id}");
         }
@@ -259,7 +343,10 @@ mod tests {
         assert_eq!(report.operation.verification, "recorded_only");
         assert!(!report.operation.content_verified_now);
         let result = report.operation.recorded_result.as_ref().unwrap();
-        assert_eq!(result.reclaim.as_ref().unwrap().referenced_bytes_saved, 57344);
+        assert_eq!(
+            result.reclaim.as_ref().unwrap().referenced_bytes_saved,
+            57344
+        );
         assert!(!dir.path().join("source-not-opened.bin").exists());
         assert_eq!(fs::read(path).unwrap(), before);
     }
@@ -279,10 +366,18 @@ mod tests {
     #[test]
     fn missing_operations_and_foreign_run_ids_are_not_silently_substituted() {
         let (_dir, path) = fixture(true);
-        assert_eq!(explain_journal(&path, &Lookup::parse("compress:abc-42-0:9").unwrap())
-            .unwrap_err().kind(), io::ErrorKind::NotFound);
-        assert_eq!(explain_journal(&path, &Lookup::parse("compress:different:1").unwrap())
-            .unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            explain_journal(&path, &Lookup::parse("compress:abc-42-0:9").unwrap())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            explain_journal(&path, &Lookup::parse("compress:different:1").unwrap())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -295,14 +390,20 @@ mod tests {
 
     #[test]
     fn ordinary_deletion_ids_fall_through_without_loading_config() {
-        let matches = crate::cli_command().try_get_matches_from([
-            "sbh", "--config", "/nonexistent-compression-explanation-config",
-            "explain", "--id", "ordinary-deletion-id",
-        ]).unwrap();
+        let matches = crate::cli_command()
+            .try_get_matches_from([
+                "sbh",
+                "--config",
+                "/nonexistent-compression-explanation-config",
+                "explain",
+                "--id",
+                "ordinary-deletion-id",
+            ])
+            .unwrap();
         assert_eq!(run(&matches).unwrap(), None);
-        let matches = crate::cli_command().try_get_matches_from([
-            "sbh", "--json", "explain", "--id", ID,
-        ]).unwrap();
+        let matches = crate::cli_command()
+            .try_get_matches_from(["sbh", "--json", "explain", "--id", ID])
+            .unwrap();
         let (_, command) = matches.subcommand().unwrap();
         assert_eq!(command.get_one::<String>("id").unwrap(), ID);
     }
