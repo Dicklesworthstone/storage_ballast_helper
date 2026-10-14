@@ -4,6 +4,20 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
+## v0.7.6
+
+Compare: [`v0.7.5...v0.7.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.5...v0.7.6)
+
+### Fixed
+
+- **`sbh check` honours the absolute free-space floors** (`bca8ba4`). It
+  compared free space with the Yellow percentage alone and ignored the
+  `*_min_free_bytes` floors that the daemon's levels use, so a large disk
+  with hundreds of gigabytes free could still fail the check: `sbh check
+  --need 20G` exited 1 on a 3.6 TiB volume with 453 GB free. `check` now
+  uses the daemon's Yellow line for that volume; `--target-free` still
+  overrides it.
+
 ## v0.7.5 **[release]**
 
 Compare: [`v0.7.4...v0.7.5`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.4...v0.7.5)
