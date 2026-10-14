@@ -2465,6 +2465,9 @@ enabled = false
 #[test]
 #[allow(clippy::too_many_lines)]
 fn clean_quarantines_at_green_and_undo_restores_the_target() {
+    if !common::sees_every_process() {
+        return;
+    }
     // Outside the hardcoded source-tree roots (a remote worker's temp dir
     // can sit under the project) and canonical, as `clean` reports paths.
     let base = system_temp_base();
