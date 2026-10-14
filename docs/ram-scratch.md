@@ -78,10 +78,46 @@ JSON uses `sbh.ram_scratch.v1`. Exit 0 is healthy or explicitly unsupported,
 failure, and 4 is incomplete host or attribution evidence. A warning remains
 visible with exit 4; partial coverage must not be interpreted as healthy.
 
+## Periodic daemon warnings
+
+On Linux, receiving the daemon-start event arms a report-only observer with a
+30-second startup grace. A new sample is due five minutes after the previous
+probe is consumed. CLI preview, discovery, recovery and ordinary one-shot logs
+do not emit that lifecycle event and do not arm the observer.
+
+Collection runs in at most one independent read-only worker. It retains no
+logger producer handle, never scans on the monitor/executor or logger thread,
+and publishes through the existing dual logger into JSONL and SQLite when
+available. It does not open a second activity writer. Admission closes with the
+normal logger shutdown boundary; a blocked probe is detached rather than waited
+on or replaced. Its in-flight kernel operation may finish later. Stalls become
+incomplete observations, not fresh healthy reports or a respawn loop.
+
+Periodic work uses smaller limits than the operator command: two cooperative
+seconds for up to 4096 process statuses and 128 mount paths, and five seconds
+shared with optional attribution. On warnings, attribution visits at most 16
+unique occupied filesystems, 8192 entries total, depth 4, and retains three
+observed entries per mount. Omitted or incomplete work is explicit. These limits
+are not a hard real-time guarantee and do not establish a filesystem snapshot.
+
+`SBH-RAM-SCRATCH` is one combined warning, not one event per mount or entry.
+Unchanged warnings repeat at most every 15 minutes; newly observed risk reasons
+can be reported at the next sample. Reasons remain remembered across threshold
+flapping until a complete healthy sample. `SBH-RAM-SCRATCH-INCOMPLETE` identifies
+missing evidence or a stalled/failed probe. Missing evidence cannot clear an
+existing warning. A complete healthy sample emits one recovery event, then
+healthy observations are silent.
+
+The versioned `sbh.ram_scratch.observation.v1` JSON object in activity `details`
+contains the assessment, collection timestamp, sampled entry ownership/age,
+coverage flags and scope limitations. Payloads exceeding 128 KiB use an explicitly
+truncated summary with `complete=false`. Generic deletion size/decision fields
+remain unset; no reclaimed bytes or cleanup authority are invented. Backend
+logging retains its existing delivery and degradation semantics.
+
 ## Remaining integration
 
-This command and the shared assessment do not yet schedule periodic daemon
-warnings or change JSONL mirror routing. The shared
-`ram_log_destination_healthy` predicate is available for that integration, but
-merely adding the predicate does not stop a daemon from using its existing RAM
-fallback. No new deletion paths or automatic cleanup actions are introduced.
+JSONL mirror routing is unchanged. The shared `ram_log_destination_healthy`
+predicate exists, but periodic reporting does not stop the daemon from using its
+existing RAM fallback. Headroom enforcement for mirror/fallback writes remains
+unfinished. No new deletion paths or automatic cleanup actions are introduced.

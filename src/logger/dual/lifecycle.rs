@@ -29,6 +29,8 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 
 use super::ActivityEvent;
 
+mod ram_scratch;
+
 const CLOSED: usize = 1usize << (usize::BITS - 1);
 const ACTIVE: u8 = 0;
 const EXITED: u8 = 1;
@@ -76,6 +78,9 @@ pub(super) struct Control {
     // timestamp avoids a mutex/OnceLock initializer on the control caller.
     stop_started: AtomicU64,
     result: AtomicU8,
+    // Consumer-only scheduling state. Producers and shutdown never lock this.
+    // The observer owns no logger sender and does no collection on this thread.
+    ram_scratch: parking_lot::Mutex<ram_scratch::Observer>,
 }
 
 impl Control {
@@ -92,6 +97,7 @@ impl Control {
             born: Instant::now(),
             stop_started: AtomicU64::new(0),
             result: AtomicU8::new(ACTIVE),
+            ram_scratch: parking_lot::Mutex::new(ram_scratch::Observer::default()),
         }
     }
 
@@ -190,10 +196,26 @@ impl Control {
         // The release of its admission follows the queue attempt. Acquire
         // that completion before observing an empty queue as end-of-stream.
         if self.admission.load(Ordering::Acquire) == CLOSED && events.is_empty() {
+            self.ram_scratch.lock().stop();
             return Ok(Message {
                 event: ActivityEvent::Shutdown,
                 mirror: self.mirror(),
             });
+        }
+        // Report-only daemon observations share the existing writer and both
+        // backends. Polling only checks a bounded result channel / thread state;
+        // /proc and directory work happen in at most one independent worker.
+        // An observation admitted before shutdown precedes the final flush just
+        // like an external producer's event. No new probe starts after closure.
+        if let Some(_admission) = self.admit() {
+            if let Some(event) = self.ram_scratch.lock().poll(Instant::now()) {
+                return Ok(Message {
+                    event,
+                    mirror: self.mirror(),
+                });
+            }
+        } else {
+            self.ram_scratch.lock().stop();
         }
         let result = crossbeam_channel::select! {
             recv(events) -> message => message.map_err(|_| RecvTimeoutError::Disconnected),
@@ -203,6 +225,16 @@ impl Control {
             },
             default(timeout) => Err(RecvTimeoutError::Timeout),
         };
+        if let Ok(message) = &result
+            && matches!(
+                message.event,
+                ActivityEvent::DaemonStarted { .. }
+                    | ActivityEvent::DaemonStopped { .. }
+                    | ActivityEvent::Shutdown
+            )
+        {
+            self.ram_scratch.lock().on_event(&message.event, Instant::now());
+        }
         if let Ok(message) = &result
             && events.is_empty()
             && message.mirror != self.mirror()
@@ -217,6 +249,7 @@ impl Control {
             // The logger's ordinary all-producers-dropped exit also flushes.
             // Start supervision before returning to that finalization path.
             self.request_shutdown();
+            self.ram_scratch.lock().stop();
         }
         result
     }
