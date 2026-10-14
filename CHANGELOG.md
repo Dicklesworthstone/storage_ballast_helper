@@ -4,7 +4,27 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
-## Unreleased
+## v0.7.3 **[release]**
+
+Compare: [`v0.7.2...v0.7.3`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.2...v0.7.3)
+
+A safety release. sbh v0.5.0 through v0.7.2 could delete the `registry/`
+and `git/` caches of a cargo home that a running build was using: rch
+renames cargo `cargo-rch-real`, and neither that name nor build scripts
+counted as a build tool, so a live build's default `~/.cargo` was
+unprotected (bd-d1kt). v0.7.3 holds such caches on Linux and macOS, and an
+idle daemon no longer spends a large share of a core rescanning a busy temp
+root (bd-os02).
+
+### Upgrade note: `sbh update` from v0.7.2
+
+- The update from v0.7.2 is performed by v0.7.2's updater. Where sbh runs
+  from outside `/usr/local/bin` and `/usr/bin` (for example `~/.local/bin`),
+  that updater installs v0.7.3 and then exits 2 with "could not locate sbh
+  binary", leaving the service on the old binary (#35). Restart the service
+  once (`systemctl restart sbh`, or `systemctl --user restart sbh` for a
+  user install). `install.sh` is not affected, and updates from v0.7.3 on
+  restart the service themselves.
 
 ### Upgrade note: rollback snapshots
 
@@ -22,6 +42,13 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 - A daemon that cannot inspect every process (a user-scope install, or a
   daemon without `cap_sys_ptrace`) holds every batch while such a process is
   running instead of guessing. On such hosts it reclaims little (#27).
+  The `[SBH-SAFETY] open-file sweep incomplete` line such a daemon logs
+  names the first process it was refused, usually pid 1, rather than the
+  build that matters (bd-3maz, fixed after this release).
+- On a fresh host, `sbh install --systemd --scope system` can list
+  `ReadWritePaths=` entries that do not exist yet, and the unit then fails
+  with `226/NAMESPACE`. v0.7.2 does the same; create the listed directories
+  and restart the unit (bd-2dzx).
 
 ### Changed
 
@@ -46,8 +73,6 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
   `~/Library/Caches/pip`) for pip, and uv's cache under `XDG_CACHE_HOME` or
   `~/.cache/uv`, unless an explicit override names another place. A plain
   node or python process implies none of them (`d5392cf`).
-
-### Changed
 
 - #33 source-root detection is report-only in this release; enforcement is
   pending a narrower definition. `sbh doctor` lists each scanner root with
