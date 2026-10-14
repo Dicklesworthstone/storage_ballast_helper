@@ -328,8 +328,18 @@ mod tests {
     #[test]
     fn command_line_only_output_directories_reach_the_native_provider() {
         let mut fixture = Fixture::default();
-        fixture.invocation(41, "rustc", &[b"rustc", b"lib.rs", b"--out-dir", b"/active/objects"], b"");
-        fixture.invocation(42, "Python", &[b"python3", b"-m", b"pip", b"--cache-dir", b"../pip-cache"], b"");
+        fixture.invocation(
+            41,
+            "rustc",
+            &[b"rustc", b"lib.rs", b"--out-dir", b"/active/objects"],
+            b"",
+        );
+        fixture.invocation(
+            42,
+            "Python",
+            &[b"python3", b"-m", b"pip", b"--cache-dir", b"../pip-cache"],
+            b"",
+        );
         assert_eq!(
             collect_with(&fixture, 99, Limits::default()),
             vec![
