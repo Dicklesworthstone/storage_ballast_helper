@@ -153,10 +153,10 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
         Ok(pids)
     }
 
-    fn fds(&mut self, proc_root: &Path, pid: i32, root: &Path, out: &mut Vec<OpenFile>) {
+    fn fds(&mut self, proc_root: &Path, pid: i32, roots: &[PathBuf], out: &mut Vec<OpenFile>) {
         self.fd_targets(proc_root, pid, |process, fd, fd_path, target| {
             let path = resolve_absolute_path(&target);
-            if path.starts_with(root) {
+            if roots.iter().any(|root| path.starts_with(root)) {
                 out.push(OpenFile {
                     pid,
                     path,
@@ -237,7 +237,13 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
         }
     }
 
-    fn executable(&mut self, proc_root: &Path, pid: i32, root: &Path, out: &mut Vec<ProcessInfo>) {
+    fn executable(
+        &mut self,
+        proc_root: &Path,
+        pid: i32,
+        roots: &[PathBuf],
+        out: &mut Vec<ProcessInfo>,
+    ) {
         let process = proc_root.join(pid.to_string());
         let target = match self.proc.link(&process.join("exe")) {
             Ok(target) => target,
@@ -253,7 +259,7 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
             return;
         }
         let executable = resolve_absolute_path(&target);
-        if !executable.starts_with(root) {
+        if !roots.iter().any(|root| executable.starts_with(root)) {
             return;
         }
 
@@ -573,13 +579,31 @@ pub(super) fn open_files(root: &Path) -> Result<OpenFilesResult> {
     open_files_with(&NativeProc, Path::new(PROC_ROOT), root, Limits::default())
 }
 
+/// One sweep for every root (bd-om52): the sweep reads each process's
+/// descriptors whatever the root, so asking per root repeated all of it.
+pub(super) fn open_files_roots(roots: &[PathBuf]) -> Result<OpenFilesResult> {
+    open_files_with_roots(&NativeProc, Path::new(PROC_ROOT), roots, Limits::default())
+}
+
 fn open_files_with(
     proc: &impl ProcAccess,
     proc_root: &Path,
     root: &Path,
     limits: Limits,
 ) -> Result<OpenFilesResult> {
-    let root = resolve_absolute_path(root);
+    open_files_with_roots(proc, proc_root, &[root.to_path_buf()], limits)
+}
+
+fn open_files_with_roots(
+    proc: &impl ProcAccess,
+    proc_root: &Path,
+    roots: &[PathBuf],
+    limits: Limits,
+) -> Result<OpenFilesResult> {
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .map(|root| resolve_absolute_path(root))
+        .collect();
     let mut sweep = Sweep::new(proc, limits);
     let pids = sweep
         .pids(proc_root)
@@ -589,7 +613,7 @@ fn open_files_with(
         if sweep.expired() {
             break;
         }
-        sweep.fds(proc_root, pid, &root, &mut files);
+        sweep.fds(proc_root, pid, &roots, &mut files);
     }
     // Include time spent in a failed/empty directory read in the one budget.
     sweep.expired();
@@ -609,13 +633,30 @@ pub(super) fn executables(root: &Path) -> Result<ExecutablesResult> {
     executables_with(&NativeProc, Path::new(PROC_ROOT), root, Limits::default())
 }
 
+/// One sweep for every root; see [`open_files_roots`].
+pub(super) fn executables_roots(roots: &[PathBuf]) -> Result<ExecutablesResult> {
+    executables_with_roots(&NativeProc, Path::new(PROC_ROOT), roots, Limits::default())
+}
+
 fn executables_with(
     proc: &impl ProcAccess,
     proc_root: &Path,
     root: &Path,
     limits: Limits,
 ) -> Result<ExecutablesResult> {
-    let root = resolve_absolute_path(root);
+    executables_with_roots(proc, proc_root, &[root.to_path_buf()], limits)
+}
+
+fn executables_with_roots(
+    proc: &impl ProcAccess,
+    proc_root: &Path,
+    roots: &[PathBuf],
+    limits: Limits,
+) -> Result<ExecutablesResult> {
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .map(|root| resolve_absolute_path(root))
+        .collect();
     let mut sweep = Sweep::new(proc, limits);
     let pids = sweep
         .pids(proc_root)
@@ -625,7 +666,7 @@ fn executables_with(
         if sweep.expired() {
             break;
         }
-        sweep.executable(proc_root, pid, &root, &mut processes);
+        sweep.executable(proc_root, pid, &roots, &mut processes);
     }
     sweep.expired();
     processes.sort_by(|left, right| {
@@ -811,7 +852,12 @@ mod tests {
         let pid = i32::try_from(std::process::id()).unwrap();
         let mut sweep = Sweep::new(&NativeProc, Limits::default());
         let mut files = Vec::new();
-        sweep.fds(Path::new(PROC_ROOT), pid, &fixture.root, &mut files);
+        sweep.fds(
+            Path::new(PROC_ROOT),
+            pid,
+            std::slice::from_ref(&fixture.root),
+            &mut files,
+        );
         sweep.expired();
         assert!(sweep.complete);
         assert!(
@@ -1298,6 +1344,39 @@ mod tests {
             .reads
             .insert(process.join("environ"), libc::EACCES);
         assert!(sweep(&unrelated));
+    }
+
+    #[test]
+    fn one_sweep_answers_every_root() {
+        let fixture = Fixture::new();
+        let kept = fixture.fd(1, 0);
+        let other_root = fixture.root.join("other-root");
+        fs::create_dir(&other_root).unwrap();
+        let elsewhere = other_root.join("held");
+        fs::write(&elsewhere, b"held").unwrap();
+        let process = fixture.pid(2);
+        symlink(&elsewhere, process.join("fd").join("3")).unwrap();
+        fs::write(
+            process.join("fdinfo").join("3"),
+            b"pos:\t0\nflags:\t0100002\n",
+        )
+        .unwrap();
+        let roots = vec![kept.parent().unwrap().to_path_buf(), other_root];
+
+        let access = Faults::default();
+        let result =
+            open_files_with_roots(&access, &fixture.proc_root, &roots, Limits::default()).unwrap();
+        assert!(result.complete);
+        let paths: Vec<_> = result.files.iter().map(|file| file.path.clone()).collect();
+        assert!(paths.contains(&resolve_absolute_path(&kept)));
+        assert!(paths.contains(&resolve_absolute_path(&elsewhere)));
+        // Each descriptor link is read once, not once per root.
+        let single = access.link_calls.get();
+        let per_root = Faults::default();
+        for root in &roots {
+            open_files_with(&per_root, &fixture.proc_root, root, Limits::default()).unwrap();
+        }
+        assert_eq!(per_root.link_calls.get(), single * roots.len());
     }
 
     #[test]
@@ -1835,7 +1914,12 @@ mod tests {
         let pid = i32::try_from(std::process::id()).unwrap();
         let mut sweep = Sweep::new(&NativeProc, Limits::default());
         let mut processes = Vec::new();
-        sweep.executable(Path::new(PROC_ROOT), pid, &executable, &mut processes);
+        sweep.executable(
+            Path::new(PROC_ROOT),
+            pid,
+            std::slice::from_ref(&executable),
+            &mut processes,
+        );
         sweep.expired();
         assert!(sweep.complete);
         assert_eq!(processes.len(), 1);

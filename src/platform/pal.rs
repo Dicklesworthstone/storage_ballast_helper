@@ -338,6 +338,47 @@ pub trait Platform: Send + Sync {
         pal_not_implemented(self.name(), "mmap_regions_under")
     }
 
+    /// Open files under any of `roots`. The default asks root by root; a
+    /// platform whose sweep reads every process anyway answers all roots from
+    /// one sweep. A catalog pass hands over ~170 roots, and asking per root
+    /// cost a full process sweep each (trj: 160-514 CPU-s a pass, bd-om52).
+    /// A root that cannot be read leaves the result incomplete, never empty.
+    fn open_files_under_roots(&self, roots: &[PathBuf]) -> Result<OpenFilesResult> {
+        let mut merged = OpenFilesResult {
+            files: Vec::new(),
+            complete: true,
+        };
+        for root in roots {
+            match self.open_files_under(root) {
+                Ok(result) => {
+                    merged.complete &= result.complete;
+                    merged.files.extend(result.files);
+                }
+                Err(_) => merged.complete = false,
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Running executables under any of `roots`; see
+    /// [`Platform::open_files_under_roots`].
+    fn executables_under_roots(&self, roots: &[PathBuf]) -> Result<ExecutablesResult> {
+        let mut merged = ExecutablesResult {
+            processes: Vec::new(),
+            complete: true,
+        };
+        for root in roots {
+            match self.executables_under(root) {
+                Ok(result) => {
+                    merged.complete &= result.complete;
+                    merged.processes.extend(result.processes);
+                }
+                Err(_) => merged.complete = false,
+            }
+        }
+        Ok(merged)
+    }
+
     /// Directories a running build names as its own without necessarily
     /// holding anything open in them: the cargo home's cache subtrees and the
     /// target directory in a live cargo/rustc's environment (bd-d1kt). Each

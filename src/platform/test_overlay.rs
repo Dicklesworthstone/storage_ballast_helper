@@ -360,6 +360,14 @@ impl Platform for TestOverlayPlatform {
         self.inner.mmap_regions_under(path)
     }
 
+    fn open_files_under_roots(&self, roots: &[std::path::PathBuf]) -> Result<OpenFilesResult> {
+        self.inner.open_files_under_roots(roots)
+    }
+
+    fn executables_under_roots(&self, roots: &[std::path::PathBuf]) -> Result<ExecutablesResult> {
+        self.inner.executables_under_roots(roots)
+    }
+
     fn self_stats(&self) -> Result<SelfStats> {
         self.inner.self_stats()
     }

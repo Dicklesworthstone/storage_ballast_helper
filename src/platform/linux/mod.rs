@@ -170,6 +170,14 @@ impl Platform for LinuxPal {
         process::read_executables_under(path)
     }
 
+    fn open_files_under_roots(&self, roots: &[std::path::PathBuf]) -> Result<OpenFilesResult> {
+        process::read_open_files_under_roots(roots)
+    }
+
+    fn executables_under_roots(&self, roots: &[std::path::PathBuf]) -> Result<ExecutablesResult> {
+        process::read_executables_under_roots(roots)
+    }
+
     fn build_directories_in_use(&self) -> Vec<(i32, std::path::PathBuf)> {
         process::read_build_directories_in_use()
     }

@@ -1652,19 +1652,17 @@ pub fn collect_open_path_ancestors_with_platform(
         },
         |root| vec![root],
     );
-    for root in &probe_roots {
-        let Ok(result) = platform.open_files_under(root) else {
-            return (ancestors, false);
-        };
-        if !result.complete {
-            incomplete = true;
+    let Ok(result) = platform.open_files_under_roots(&probe_roots) else {
+        return (ancestors, false);
+    };
+    if !result.complete {
+        incomplete = true;
+    }
+    for open_file in result.files {
+        if own_directory_handle(&open_file) {
+            continue;
         }
-        for open_file in result.files {
-            if own_directory_handle(&open_file) {
-                continue;
-            }
-            add_open_path_ancestor_chain(&mut ancestors, &open_file.path, &normalized_roots);
-        }
+        add_open_path_ancestor_chain(&mut ancestors, &open_file.path, &normalized_roots);
     }
 
     (ancestors, !incomplete)
@@ -1872,42 +1870,44 @@ pub fn collect_active_reference_index(
         index.build_scopes.insert(pid, &directory, name);
     }
 
-    for root in &roots {
-        match platform.open_files_under(root) {
-            Ok(result) => {
-                if !result.complete {
-                    index.complete = false;
+    // One query for all roots: a catalog pass hands over ~170 of them, and
+    // asking per root swept every process once per root (bd-om52).
+    match platform.open_files_under_roots(&roots) {
+        Ok(result) => {
+            if !result.complete {
+                index.complete = false;
+            }
+            for open_file in result.files {
+                if own_directory_handle(&open_file) {
+                    continue;
                 }
-                for open_file in result.files {
-                    if own_directory_handle(&open_file) {
-                        continue;
-                    }
-                    let name = process_names.get(&open_file.pid).cloned();
-                    index.add_reference(&roots, &open_file.path, |summary| {
-                        summary.add_open_file_descriptor(open_file.pid, name.clone());
+                let name = process_names.get(&open_file.pid).cloned();
+                index.add_reference(&roots, &open_file.path, |summary| {
+                    summary.add_open_file_descriptor(open_file.pid, name.clone());
+                });
+            }
+        }
+        Err(_) => index.complete = false,
+    }
+
+    match platform.executables_under_roots(&roots) {
+        Ok(result) => {
+            if !result.complete {
+                index.complete = false;
+            }
+            for process in result.processes {
+                if let Some(executable) = process.executable.as_deref() {
+                    let name = Some(process.name.clone());
+                    index.add_reference(&roots, executable, |summary| {
+                        summary.add_running_executable(process.pid, name.clone());
                     });
                 }
             }
-            Err(_) => index.complete = false,
         }
+        Err(_) => index.complete = false,
+    }
 
-        match platform.executables_under(root) {
-            Ok(result) => {
-                if !result.complete {
-                    index.complete = false;
-                }
-                for process in result.processes {
-                    if let Some(executable) = process.executable.as_deref() {
-                        let name = Some(process.name.clone());
-                        index.add_reference(&roots, executable, |summary| {
-                            summary.add_running_executable(process.pid, name.clone());
-                        });
-                    }
-                }
-            }
-            Err(_) => index.complete = false,
-        }
-
+    for root in &roots {
         match platform.mmap_regions_under(root) {
             Ok(regions) => {
                 for region in regions {
