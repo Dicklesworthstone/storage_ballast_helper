@@ -8,5 +8,6 @@ pub mod fs_stats;
 pub mod guardrails;
 pub mod pid;
 pub mod predictive;
+pub mod ram_scratch;
 pub mod special_locations;
 pub mod voi_scheduler;
