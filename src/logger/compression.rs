@@ -43,7 +43,9 @@ impl CompressionActivity {
             .filter(|id| !id.is_empty() && id.len() <= 256)
             .ok_or_else(|| invalid("compression activity requires a prepared operation ID"))?;
         if !matches!(report.outcome.as_str(), "compressed" | "partial" | "failed") {
-            return Err(invalid("preview and discovery are not compression outcomes"));
+            return Err(invalid(
+                "preview and discovery are not compression outcomes",
+            ));
         }
         let hash_matches = report.sha256_before.as_ref().is_some_and(|before| {
             before.len() == 64
@@ -51,7 +53,9 @@ impl CompressionActivity {
                 && report.sha256_after.as_ref() == Some(before)
         });
         if report.content_verified && (!report.mutation_attempted || !hash_matches) {
-            return Err(invalid("content verification lacks matching pre/post hashes"));
+            return Err(invalid(
+                "content verification lacks matching pre/post hashes",
+            ));
         }
         if report.outcome == "compressed"
             && (!report.content_verified
@@ -59,12 +63,18 @@ impl CompressionActivity {
                 || report.physical_data_bytes_after.is_none()
                 || report.accounting_error.is_some())
         {
-            return Err(invalid("successful compression activity has incomplete evidence"));
+            return Err(invalid(
+                "successful compression activity has incomplete evidence",
+            ));
         }
         let complete = report.outcome == "compressed" && journal_outcome_recorded;
         let mut entry = LogEntry::new(
             EventType::Info,
-            if complete { Severity::Info } else { Severity::Warning },
+            if complete {
+                Severity::Info
+            } else {
+                Severity::Warning
+            },
         );
         entry.path = Some(report.path.to_string_lossy().into_owned());
         entry.ok = Some(complete);
@@ -82,15 +92,20 @@ impl CompressionActivity {
         });
         let details = serde_json::to_string(&details).map_err(io::Error::other)?;
         if details.len() > MAX_DETAILS_BYTES {
-            return Err(invalid("compression activity exceeds its 128 KiB payload budget"));
+            return Err(invalid(
+                "compression activity exceeds its 128 KiB payload budget",
+            ));
         }
         entry.details = Some(details);
         if !complete {
-            entry.error_code = Some(if journal_outcome_recorded {
-                "SBH-COMPRESSION-INCOMPLETE"
-            } else {
-                "SBH-COMPRESSION-AUDIT"
-            }.to_string());
+            entry.error_code = Some(
+                if journal_outcome_recorded {
+                    "SBH-COMPRESSION-INCOMPLETE"
+                } else {
+                    "SBH-COMPRESSION-AUDIT"
+                }
+                .to_string(),
+            );
             entry.error_message = Some(report.detail.clone());
         }
         Ok(Self { entry })
@@ -112,7 +127,12 @@ impl CompressionActivity {
         crate::logger::sqlite::ActivityRow {
             timestamp: self.entry.ts.clone(),
             event_type: "info".to_string(),
-            severity: if self.entry.severity == Severity::Info { "info" } else { "warning" }.to_string(),
+            severity: if self.entry.severity == Severity::Info {
+                "info"
+            } else {
+                "warning"
+            }
+            .to_string(),
             path: self.entry.path.clone(),
             size_bytes: None,
             score: None,
@@ -120,7 +140,7 @@ impl CompressionActivity {
             pressure_level: None,
             free_pct: None,
             duration_ms: None,
-            success: if self.entry.ok == Some(true) { 1 } else { 0 },
+            success: i32::from(self.entry.ok == Some(true)),
             error_code: self.entry.error_code.clone(),
             error_message: self.entry.error_message.clone(),
             details: self.entry.details.clone(),

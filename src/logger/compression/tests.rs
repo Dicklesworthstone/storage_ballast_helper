@@ -28,8 +28,12 @@ fn result() -> CompressionFileReport {
 }
 
 fn projection(report: &CompressionFileReport, durable: bool) -> CompressionActivity {
-    CompressionActivity::new(report, Path::new("/state/compression-journal/abc-42-0.jsonl"), durable)
-        .unwrap()
+    CompressionActivity::new(
+        report,
+        Path::new("/state/compression-journal/abc-42-0.jsonl"),
+        durable,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -48,8 +52,14 @@ fn referenced_savings_are_not_promoted_to_freed_bytes_or_deletion_decisions() {
     assert_eq!(details["operation_id"], "compress:abc-42-0:1");
     assert_eq!(details["observed_at"], entry.ts);
     assert_eq!(details["journal_outcome_recorded"], true);
-    assert_eq!(details["result"]["reclaim"]["referenced_bytes_saved"], 126_976);
-    assert_eq!(details["result"]["reclaim"]["confirmed_data_bytes_reclaimed"], 0);
+    assert_eq!(
+        details["result"]["reclaim"]["referenced_bytes_saved"],
+        126_976
+    );
+    assert_eq!(
+        details["result"]["reclaim"]["confirmed_data_bytes_reclaimed"],
+        0
+    );
     entry.run_id = Some("activity-run".to_string());
     entry.schema_version = Some(crate::logger::schema::SCHEMA_VERSION);
     crate::logger::schema::validate_value(&serde_json::to_value(entry).unwrap()).unwrap();
@@ -67,7 +77,8 @@ fn partial_work_and_failed_journal_writes_remain_distinguishable() {
         let entry = projection(&report, durable).to_log_entry();
         assert_eq!(entry.severity, Severity::Warning);
         assert_eq!(entry.ok, Some(false));
-        let details: serde_json::Value = serde_json::from_str(entry.details.as_ref().unwrap()).unwrap();
+        let details: serde_json::Value =
+            serde_json::from_str(entry.details.as_ref().unwrap()).unwrap();
         assert_eq!(details["journal_outcome_recorded"], durable);
         assert!(details["result"]["reclaim"].is_null());
         assert!(details["result"]["physical_data_bytes_after"].is_null());
@@ -75,7 +86,10 @@ fn partial_work_and_failed_journal_writes_remain_distinguishable() {
     }
     let complete_without_audit = projection(&result(), false).to_log_entry();
     assert_eq!(complete_without_audit.ok, Some(false));
-    assert_eq!(complete_without_audit.error_code.as_deref(), Some("SBH-COMPRESSION-AUDIT"));
+    assert_eq!(
+        complete_without_audit.error_code.as_deref(),
+        Some("SBH-COMPRESSION-AUDIT")
+    );
 }
 
 #[test]
@@ -85,7 +99,10 @@ fn unsigned_measurements_are_preserved_without_signed_saturation() {
     let activity = projection(&report, true);
     let entry = activity.to_log_entry();
     let details: serde_json::Value = serde_json::from_str(entry.details.as_ref().unwrap()).unwrap();
-    assert_eq!(details["result"]["physical_data_bytes_before"].as_u64(), Some(u64::MAX));
+    assert_eq!(
+        details["result"]["physical_data_bytes_before"].as_u64(),
+        Some(u64::MAX)
+    );
     #[cfg(feature = "sqlite")]
     assert!(activity.to_activity_row().size_bytes.is_none());
 }
@@ -120,7 +137,10 @@ fn native_path_bytes_survive_display_replacement_characters() {
     let entry = projection(&report, true).to_log_entry();
     let details: serde_json::Value = serde_json::from_str(entry.details.as_ref().unwrap()).unwrap();
     assert_eq!(details["native_path_hex"], crate::core::hex_lower(bytes));
-    assert_eq!(details["result"]["path"], report.path.to_string_lossy().as_ref());
+    assert_eq!(
+        details["result"]["path"],
+        report.path.to_string_lossy().as_ref()
+    );
 }
 
 #[cfg(feature = "sqlite")]
@@ -135,12 +155,17 @@ fn both_backends_receive_identical_payloads_without_deletion_accounting() {
     assert!(row.size_bytes.is_none());
     assert_eq!(row.event_type, "info");
     let temp = tempfile::tempdir().unwrap();
-    let db = crate::logger::sqlite::SqliteLogger::open(&temp.path().join("activity.sqlite3")).unwrap();
+    let db =
+        crate::logger::sqlite::SqliteLogger::open(&temp.path().join("activity.sqlite3")).unwrap();
     db.log_activity(&row).unwrap();
     let stored = db.recent_activity(10).unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].details, entry.details);
-    assert_eq!(db.count_events_since("artifact_delete", "2000-01-01T00:00:00Z").unwrap(), 0);
+    assert_eq!(
+        db.count_events_since("artifact_delete", "2000-01-01T00:00:00Z")
+            .unwrap(),
+        0
+    );
     assert!(db.recent_decisions(10).unwrap().is_empty());
     assert!(db.ballast_inventory().unwrap().is_empty());
 }

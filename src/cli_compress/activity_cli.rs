@@ -70,14 +70,20 @@ impl ActivityDelivery {
 
     pub(super) fn write_human(&self, out: &mut impl Write) -> io::Result<()> {
         if self.prepared_outcomes_observed == 0 {
-            return writeln!(out, "Shared activity logger not started: no prepared outcomes.");
+            return writeln!(
+                out,
+                "Shared activity logger not started: no prepared outcomes."
+            );
         }
         writeln!(
             out,
             "Shared activity logger: {}; submitted {}; rejected {}; queue drops {}.",
             self.writer_status, self.submit_attempts, self.rejected_outcomes, self.queue_drops
         )?;
-        writeln!(out, "Activity backend durability is unverified; the compression journal remains recovery authority.")
+        writeln!(
+            out,
+            "Activity backend durability is unverified; the compression journal remains recovery authority."
+        )
     }
 
     pub(super) fn warn_if_incomplete(&self) {
@@ -88,7 +94,9 @@ impl ActivityDelivery {
                 self.rejected_outcomes,
                 self.queue_drops,
                 self.suppressed_diagnostics,
-                self.first_error.as_deref().unwrap_or("not all submissions are accounted for")
+                self.first_error
+                    .as_deref()
+                    .unwrap_or("not all submissions are accounted for")
             );
         }
     }
@@ -114,7 +122,10 @@ pub(super) fn execute(
     // The existing supervisor bounds shutdown even when a backend is blocked.
     // Final activity flushing is not part of the compression rewrite budget.
     let activity_delivery = activity.finish();
-    result.map(|compression| CommandReport { compression, activity_delivery })
+    result.map(|compression| CommandReport {
+        compression,
+        activity_delivery,
+    })
 }
 
 struct Session {
@@ -166,7 +177,10 @@ impl Session {
                 self.reject("activity logger initialization previously failed");
                 return;
             };
-            config.run_id = observation.file.operation_id.as_deref()
+            config.run_id = observation
+                .file
+                .operation_id
+                .as_deref()
                 .and_then(|id| id.rsplit_once(':'))
                 .map(|(run, _)| format!("compress:{run}"));
             match spawn_logger(config) {
@@ -201,13 +215,16 @@ impl Session {
             handle.shutdown();
             if join.join().is_err() {
                 self.delivery.writer_status = "writer_panicked";
-                self.delivery.record_error("activity logger supervisor or writer panicked");
+                self.delivery
+                    .record_error("activity logger supervisor or writer panicked");
             } else {
                 self.delivery.writer_status = match handle.shutdown_status() {
                     LoggerShutdownStatus::WriterExited => "writer_exited",
                     LoggerShutdownStatus::TimedOut => "timed_out",
                     LoggerShutdownStatus::WriterPanicked => "writer_panicked",
-                    LoggerShutdownStatus::Running | LoggerShutdownStatus::StopRequested => "unfinished",
+                    LoggerShutdownStatus::Running | LoggerShutdownStatus::StopRequested => {
+                        "unfinished"
+                    }
                 };
             }
             self.delivery.queue_drops = handle.dropped_events();
@@ -281,12 +298,15 @@ mod tests {
         file.operation_id = None;
         file.outcome = "eligible".into();
         session.observe(CompressionObservation {
-            file: &file, journal_path: None, journal_outcome_recorded: false,
+            file: &file,
+            journal_path: None,
+            journal_outcome_recorded: false,
         });
         assert_eq!(session.delivery.prepared_outcomes_observed, 0);
         file.operation_id = Some("fixture-42-0:1".into());
         session.observe(CompressionObservation {
-            file: &file, journal_path: Some(&state_root.join("run.jsonl")),
+            file: &file,
+            journal_path: Some(&state_root.join("run.jsonl")),
             journal_outcome_recorded: false,
         });
         let delivery = session.finish();
@@ -308,11 +328,15 @@ mod tests {
             let mut file = report();
             file.operation_id = Some(format!("fixture-42-0:{}", index * 2 + 1));
             session.observe(CompressionObservation {
-                file: &file, journal_path: Some(&journal),
+                file: &file,
+                journal_path: Some(&journal),
                 journal_outcome_recorded: index != 7,
             });
         }
-        assert!(session.worker.is_some(), "publication must not wait until finish");
+        assert!(
+            session.worker.is_some(),
+            "publication must not wait until finish"
+        );
         let delivery = session.finish();
         assert_eq!(delivery.writer_status, "writer_exited");
         assert_eq!(delivery.submit_attempts, 8);
@@ -321,20 +345,33 @@ mod tests {
         assert!(!delivery.has_known_loss());
         assert_eq!(delivery.backend_durability, "not_verified");
         let text = std::fs::read_to_string(&config.paths.jsonl_log).unwrap();
-        let lines: Vec<serde_json::Value> = text.lines()
-            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(lines.len(), 8);
         assert_eq!(lines[7]["error_code"], "SBH-COMPRESSION-AUDIT");
-        assert!(lines.iter().all(|line| line["run_id"] == "compress:fixture-42-0"));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line["run_id"] == "compress:fixture-42-0")
+        );
         let db = storage_ballast_helper::logger::sqlite::SqliteLogger::open_read_only(
             &config.paths.sqlite_db,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(db.recent_activity(10).unwrap().len(), 8);
         assert!(db.recent_decisions(10).unwrap().is_empty());
-        assert!(!journal.exists(), "synthetic event publication never fabricates a journal");
+        assert!(
+            !journal.exists(),
+            "synthetic event publication never fabricates a journal"
+        );
     }
 
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn real_preview_keeps_its_response_fields_and_opens_no_activity_destinations() {
         let temp = tempfile::tempdir().unwrap();
@@ -343,16 +380,23 @@ mod tests {
         let state_root = temp.path().join("not-created");
         let config = config(&state_root);
         let report = execute(
-            &[file.clone()], &CompressionPolicy::default(), CompressionMode::default(),
-            &config, &storage_ballast_helper::platform::current(),
-        ).unwrap();
+            std::slice::from_ref(&file),
+            &CompressionPolicy::default(),
+            CompressionMode::default(),
+            &config,
+            &storage_ballast_helper::platform::current(),
+        )
+        .unwrap();
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["schema"], "sbh.compression.v1");
         assert_eq!(json["dry_run"], true);
         assert_eq!(json["files"][0]["outcome"], "skipped");
         assert_eq!(json["exit_code"], 0);
         assert_eq!(json["activity_delivery"]["writer_status"], "not_started");
-        assert_eq!(json["activity_delivery"]["backend_durability"], "not_verified");
+        assert_eq!(
+            json["activity_delivery"]["backend_durability"],
+            "not_verified"
+        );
         assert_eq!(std::fs::read(file).unwrap(), b"unchanged input");
         assert!(!state_root.exists());
     }

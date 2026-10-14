@@ -433,7 +433,10 @@ fn check_control_paths(path: &Path, config: &Config) -> io::Result<()> {
     check_control_overlap(path, &crate::logger::jsonl::ram_fallback_path(), false)?;
     check_control_overlap(
         path,
-        &config.paths.state_file.with_file_name("compression-journal"),
+        &config
+            .paths
+            .state_file
+            .with_file_name("compression-journal"),
         true,
     )
 }
@@ -441,17 +444,22 @@ fn check_control_paths(path: &Path, config: &Config) -> io::Result<()> {
 fn check_control_overlap(path: &Path, protected: &Path, subtree: bool) -> io::Result<()> {
     let overlaps = |target: &Path| path == target || (subtree && path.starts_with(target));
     if overlaps(protected) {
-        return Err(io::Error::other("sbh control or activity path is not a compression input"));
+        return Err(io::Error::other(
+            "sbh control or activity path is not a compression input",
+        ));
     }
     match protected.canonicalize() {
-        Ok(target) if overlaps(&target) => {
-            Err(io::Error::other("sbh control-path alias is not a compression input"))
-        }
+        Ok(target) if overlaps(&target) => Err(io::Error::other(
+            "sbh control-path alias is not a compression input",
+        )),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io::Error::new(
             error.kind(),
-            format!("cannot resolve protected sbh control path {}: {error}", protected.display()),
+            format!(
+                "cannot resolve protected sbh control path {}: {error}",
+                protected.display()
+            ),
         )),
     }
 }
@@ -587,9 +595,15 @@ mod control_path_tests {
         let temp = tempfile::tempdir().unwrap();
         let config = config(temp.path());
         for name in [
-            "config.toml", "state.json", "activity.sqlite3", "activity.jsonl",
-            "activity.sqlite3-wal", "activity.sqlite3-shm", "activity.sqlite3-journal",
-            "update.json", "notifications.jsonl",
+            "config.toml",
+            "state.json",
+            "activity.sqlite3",
+            "activity.jsonl",
+            "activity.sqlite3-wal",
+            "activity.sqlite3-shm",
+            "activity.sqlite3-journal",
+            "update.json",
+            "notifications.jsonl",
         ] {
             let path = temp.path().join(name);
             fs::write(&path, b"untouched").unwrap();
