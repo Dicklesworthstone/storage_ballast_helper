@@ -67,6 +67,53 @@ cooperative budget and accounting its own 30-second budget. Exhaustion is
 reported as incomplete, never as successful verification. Partial/unverified
 mutations or measured allocation growth stop the pass before the next file.
 
+## Durable audit and interrupted-run inspection
+
+Before the first rewrite of each eligible file, apply synchronizes an intent
+record containing its native pathname bytes, device/inode, length, timestamps,
+preflight SHA-256 and measured physical allocation. Each file's final outcome is
+synchronized immediately after postflight, not postponed until the final stdout
+report. A journal error before mutation refuses the operation; an outcome-write
+error after mutation stops the pass and leaves the intent for inspection.
+
+Journals are created lazily under `compression-journal/` beside the configured
+state file, for example `/var/lib/sbh/compression-journal/RUN.jsonl`. The state
+file's parent directory must already exist. The journal directory is private
+(mode 0700) and files are created exclusively (mode 0600); existing permissions
+are never widened. The new file, its directory, and the parent directory are
+synchronized before an intent can authorize a rewrite. Files are capped at
+32 MiB and individual records at 128 KiB. This feature does not automatically
+rotate, delete or prune audit history. Preview and no-eligible-input passes
+create no journal files or directories.
+
+The apply report includes `journal_path`, and each prepared file report includes
+an `operation_id`. To inspect a recorded or interrupted pass, as the same effective
+user that created the journal:
+
+```sh
+sudo sbh --json compress \
+  --recover-journal /var/lib/sbh/compression-journal/RUN.jsonl \
+  --max-bytes 8589934592 --timeout-secs 300
+```
+
+Recovery is **read-only** and does not load the current daemon config. It refuses
+an actively locked journal, symlinked or multi-link journal files, foreign/non-private
+ownership, oversized input, inconsistent sequences, mismatched run IDs, malformed
+complete records, and false success footers. An unterminated last record is
+reported as torn/uncertain; earlier complete records remain inspectable.
+
+For an unfinished intent, recovery rechecks the original file identity, length,
+mtime and SHA-256 within the selected byte/time budget. Native pathname bytes are
+retained independently of lossy display strings. Replaced, renamed, missing,
+changed or unverified files remain uncertain. Recovery never replays compression,
+restores old bytes, or edits the journal. Completed outcomes are shown as
+**historical records**, not newly verified current state.
+
+An intent proves only that mutation was prepared, not that a kernel call happened.
+Even successful post-interruption content verification does **not** establish
+compression completion or physical reclaim. Interrupted/torn runs always return
+exit 4; a fully recorded run retains its recorded exit code.
+
 ## Read the evidence, not just the exit code
 
 The `sbh.compression.v1` JSON report records per-file eligibility/failure reasons,
@@ -88,27 +135,32 @@ accounting query yields unknown evidence, not a fabricated zero or an estimate.
 Recheck actual filesystem headroom before any subsequent reclamation action.
 
 Exit 0 means the pass completed, previewed, or was a no-op; inspect individual
-outcomes because a skipped file is not compressed. Exit 1 indicates the command
-could not start. Exit 2 indicates a failed file admission/operation or priority
-restoration. Exit 4 indicates incomplete visitation or a partial mutation;
-inspect `mutation_attempted`, `content_verified`, and the accounting fields.
+outcomes because a skipped file is not compressed. Exit 1 indicates invalid
+configuration or input. Exit 2 indicates a runtime/inspection failure before
+mutation. Exit 4 indicates incomplete visitation, a partial mutation, or a later
+failure after an earlier mutation; inspect `mutation_attempted`, `content_verified`,
+the journal, and the accounting fields. Recovery emits `sbh.compression.recovery.v1`
+and preserves uncertainty rather than converting verified contents into success.
 
 ## Validation and scope
 
 The dedicated Btrfs workflow contains dependency-free backend tests, application
-policy/CLI tests, Linux UAPI assertions, and opt-in native tests on a disposable
-Btrfs loop mount. The native tests check byte preservation, size/mtime stability,
-physical allocation reduction, and reflink refusal. To run the backend lane:
+policy/journal/CLI tests, Linux UAPI assertions, and opt-in native tests on a
+disposable Btrfs loop mount. The native tests check byte preservation, size/mtime
+stability, physical allocation reduction, and reflink refusal. Journal tests
+exercise interrupted and torn records, locking, identity/hash changes, ownership,
+write/read budgets, failure poisoning, and native filename preservation. To run:
 
 ```sh
 cargo test --locked --manifest-path crates/sbh_btrfs/Cargo.toml
+cargo test --locked --no-default-features --features cli,daemon,sqlite --lib scanner::compression
+cargo test --locked --no-default-features --features cli,daemon,sqlite --bin sbh cli_compress
 # Root and an explicitly prepared disposable Btrfs filesystem are required:
 SBH_BTRFS_TEST_ROOT=/path/to/disposable/btrfs \
   cargo test --locked --manifest-path crates/sbh_btrfs/Cargo.toml -- --ignored
 ```
 
 Automatic Yellow/Orange pressure scheduling, persistent `[scanner.compress]`
-configuration, and activity-ledger/`sbh explain` integration are not implemented
-by this operator command. The command returns its report to standard output;
-retain it outside the selected inputs. It does not provide a durable recovery
-journal if the process is killed before reporting.
+configuration, and integration into the shared activity-ledger/`sbh explain`
+interface remain separate unfinished work. The durable compression journal is
+not a fabricated deletion decision and does not enable automatic daemon writes.

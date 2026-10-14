@@ -1,0 +1,40 @@
+name: Systemd namespace startup
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/daemon/service/**'
+      - 'src/daemon/service.rs'
+      - 'src/core/config.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/systemd-namespace.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fresh-host-namespace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/sbh-namespace-target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Compile and test service contracts
+        run: |
+          cargo test --locked --no-default-features --features cli,daemon,sqlite --lib daemon::service::systemd
+      - name: Prove missing grant failure and prepared strict-namespace write
+        run: |
+          set -euo pipefail
+          systemctl --version
+          mapfile -t tests < <(find "$CARGO_TARGET_DIR/debug/deps" -maxdepth 1 -type f -name 'storage_ballast_helper-*' -executable)
+          test "${#tests[@]}" -eq 1
+          name='daemon::service::systemd::namespace::tests::native_missing_grant_fails_then_prepared_namespace_can_write'
+          "${tests[0]}" --list | grep -F "${name}: test"
+          sudo "${tests[0]}" --exact "$name" --ignored --nocapture
