@@ -2272,6 +2272,32 @@ fn adjusted_candidate_age(
     path: &Path,
     classification: &ArtifactClassification,
 ) -> Duration {
+    adjusted_candidate_age_after_arrival(
+        observed_age,
+        min_file_age_minutes,
+        pressure_level,
+        path,
+        classification,
+        || candidate_arrival_age(path),
+    )
+}
+
+/// The fast-track shortens the wait for an old tree whose contents were
+/// recently touched, not for a tree that has just arrived. JE's policy
+/// (bd-macg, 2026-10-14): a candidate whose root arrived less than the
+/// minimum age ago keeps its real age. On fmd a JE-approved copy of idle
+/// tmpfs scratch into /data/tmp was deleted five minutes after the copy,
+/// recorded at the 600 s minimum, and hz2 lost a 1.9 GB copied
+/// `node_modules` the same way. `arrival` is asked only when the fast-track
+/// would apply; an unknown arrival keeps the real age.
+fn adjusted_candidate_age_after_arrival(
+    observed_age: Duration,
+    min_file_age_minutes: u64,
+    pressure_level: PressureLevel,
+    path: &Path,
+    classification: &ArtifactClassification,
+    arrival: impl FnOnce() -> Option<Duration>,
+) -> Duration {
     if !should_fast_track_temp_age(pressure_level, path, classification) {
         return observed_age;
     }
@@ -2280,7 +2306,37 @@ fn adjusted_candidate_age(
     }
 
     let min_age = Duration::from_secs(min_file_age_minutes.saturating_mul(60));
+    if arrival().is_none_or(|arrived| arrived < min_age) {
+        return observed_age;
+    }
     observed_age.max(min_age)
+}
+
+/// How long ago a candidate's root came to be where it is: the newer of its
+/// birth time and its status-change time. A copy is born when it is copied;
+/// a tree moved into place keeps its birth time and mtime but gets a new
+/// ctime; an extracted archive is born when it is extracted. Writes deep
+/// inside a build tree change neither. A time in the future counts as now.
+fn candidate_arrival_age(path: &Path) -> Option<Duration> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt as _;
+        u64::try_from(metadata.ctime())
+            .ok()
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+    };
+    #[cfg(not(unix))]
+    let changed = None;
+    let arrived = [metadata.created().ok(), changed]
+        .into_iter()
+        .flatten()
+        .max()?;
+    Some(
+        SystemTime::now()
+            .duration_since(arrived)
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
@@ -15072,14 +15128,57 @@ mod tests {
             structural_confidence: 0.70,
             combined_confidence: 0.84,
         };
-        let adjusted = adjusted_candidate_age(
+        let adjusted = adjusted_candidate_age_after_arrival(
             Duration::from_mins(5),
             30,
             PressureLevel::Red,
             Path::new("/tmp/green-ft"),
             &classification,
+            || Some(Duration::from_hours(48)),
         );
         assert_eq!(adjusted, Duration::from_mins(30));
+    }
+
+    /// bd-macg (JE's policy, 2026-10-14): a tree that arrived less than the
+    /// minimum age ago keeps its real age under pressure. fmd deleted a fresh
+    /// copy of relocated scratch five minutes after it was made, recorded at
+    /// the 600 s minimum. An old tree with fresh contents is still
+    /// fast-tracked, and an unknown arrival keeps the real age.
+    #[test]
+    fn a_tree_that_just_arrived_is_not_age_fast_tracked() {
+        let scratch = ArtifactClassification {
+            pattern_name: "mktemp-scratch".into(),
+            category: ArtifactCategory::TempDir,
+            name_confidence: 0.90,
+            structural_confidence: 0.70,
+            combined_confidence: 0.84,
+        };
+        let path = Path::new("/data/tmp/tmpfs-relocated-20261014/tmp/x/tmp.B9bB76Il49");
+        let adjusted = |arrival: Option<Duration>| {
+            adjusted_candidate_age_after_arrival(
+                Duration::from_mins(5),
+                10,
+                PressureLevel::Orange,
+                path,
+                &scratch,
+                || arrival,
+            )
+        };
+        assert_eq!(
+            adjusted(Some(Duration::from_mins(5))),
+            Duration::from_mins(5)
+        );
+        assert_eq!(adjusted(None), Duration::from_mins(5));
+        assert_eq!(
+            adjusted(Some(Duration::from_hours(48))),
+            Duration::from_mins(10)
+        );
+
+        // A directory created just now has just arrived.
+        let fresh = tempfile::tempdir().unwrap();
+        let arrived = candidate_arrival_age(fresh.path()).unwrap();
+        assert!(arrived < Duration::from_mins(1), "{arrived:?}");
+        assert!(candidate_arrival_age(&fresh.path().join("missing")).is_none());
     }
 
     /// bd-d1kt: on hz2 at Red, the registry/ and git/ of a cargo home that a
@@ -15134,12 +15233,13 @@ mod tests {
         }
         // Build output in temp storage still is.
         assert_eq!(
-            adjusted_candidate_age(
+            adjusted_candidate_age_after_arrival(
                 observed,
                 5,
                 PressureLevel::Red,
                 Path::new("/data/tmp/job/target"),
                 &class("opaque-cargo-target", ArtifactCategory::RustTarget),
+                || Some(Duration::from_hours(48)),
             ),
             Duration::from_mins(5)
         );
@@ -15188,12 +15288,13 @@ mod tests {
             combined_confidence: 0.93,
         };
         assert_eq!(
-            adjusted_candidate_age(
+            adjusted_candidate_age_after_arrival(
                 Duration::from_mins(5),
                 30,
                 PressureLevel::Red,
                 Path::new("/data/tmp/ftcairo-1013/target"),
-                &target
+                &target,
+                || Some(Duration::from_hours(48)),
             ),
             Duration::from_mins(30)
         );
@@ -15243,12 +15344,13 @@ mod tests {
             structural_confidence: 0.70,
             combined_confidence: 0.88,
         };
-        let adjusted = adjusted_candidate_age(
+        let adjusted = adjusted_candidate_age_after_arrival(
             Duration::from_mins(5),
             30,
             PressureLevel::Red,
             Path::new("/data/projects/franken_engine/crates/franken-engine/.rch-target"),
             &classification,
+            || Some(Duration::from_hours(48)),
         );
         assert_eq!(adjusted, Duration::from_mins(30));
     }
@@ -15310,12 +15412,13 @@ mod tests {
             structural_confidence: 0.30,
             combined_confidence: 0.60,
         };
-        let adjusted = adjusted_candidate_age(
+        let adjusted = adjusted_candidate_age_after_arrival(
             Duration::from_mins(5),
             30,
             PressureLevel::Red,
             Path::new("/tmp/random-agent-build-cache"),
             &classification,
+            || Some(Duration::from_hours(48)),
         );
         assert_eq!(adjusted, Duration::from_mins(30));
     }
