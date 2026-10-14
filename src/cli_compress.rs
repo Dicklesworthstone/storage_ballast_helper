@@ -11,6 +11,7 @@ use storage_ballast_helper::scanner::compression::{
 };
 
 mod discovery_cli;
+mod explain_cli;
 
 #[derive(Debug, Args)]
 #[allow(clippy::struct_excessive_bools)] // independent CLI switches
@@ -57,10 +58,16 @@ struct Options {
 pub fn command() -> Command {
     discovery_cli::augment(Options::augment_args(Command::new("compress")
         .about("Preview or apply lossless compression to selected cold, unshared Btrfs files")
-        .after_help("Preview is the default. Linux x86-64/AArch64 and openat2 support are required for apply; extent-tree inspection normally requires root.\n\nApply preserves contents and verifies SHA-256, size and mtime. Protected, leased, open, executing, mapped, shared, already-compressed and low-headroom files are refused. There is no force override.\n\nFIEMAP inspection is not a snapshot lock. --quiescent acknowledges that concurrent writers, snapshots and reflinks have been stopped. A deadline stops between bounded calls; postflight verification may take additional time.\n\nBefore any rewrite, apply records a durable intent under compression-journal beside state.json. The state directory must already exist. Audit failures stop mutation.\n\nExamples:\n  sudo sbh compress --json -- /data/old-debug-binary /data/old-session.jsonl\n  sudo sbh compress --apply --allow-zstd-feature --quiescent --json -- /data/old-debug-binary\n  sudo sbh compress --recover-journal /var/lib/sbh/compression-journal/RUN.jsonl --json\n  sbh compress --discover --json -- /data/cold-archive\n\n--discover recursively selects metadata candidates without applying compression. It rejects all apply consent flags; live-use and physical-extent checks are still required by ordinary file preview/apply.\n\nRecovery is read-only, requires no daemon config, and never replays compression. Verified content after interruption is not evidence of physical reclaim. This command does not enable automatic daemon compression or change deletion policy.")))
+        .after_help("Preview is the default. Linux x86-64/AArch64 and openat2 support are required for apply; extent-tree inspection normally requires root.\n\nApply preserves contents and verifies SHA-256, size and mtime. Protected, leased, open, executing, mapped, shared, already-compressed and low-headroom files are refused. There is no force override.\n\nFIEMAP inspection is not a snapshot lock. --quiescent acknowledges that concurrent writers, snapshots and reflinks have been stopped. A deadline stops between bounded calls; postflight verification may take additional time.\n\nBefore any rewrite, apply records a durable intent under compression-journal beside state.json. The state directory must already exist. Audit failures stop mutation.\n\nExamples:\n  sudo sbh compress --json -- /data/old-debug-binary /data/old-session.jsonl\n  sudo sbh compress --apply --allow-zstd-feature --quiescent --json -- /data/old-debug-binary\n  sudo sbh compress --recover-journal /var/lib/sbh/compression-journal/RUN.jsonl --json\n  sbh compress --discover --json -- /data/cold-archive\n  sudo sbh explain --id compress:RUN:SEQUENCE --json\n\n--discover recursively selects metadata candidates without applying compression. It rejects all apply consent flags; live-use and physical-extent checks are still required by ordinary file preview/apply.\n\nRecovery is read-only, requires no daemon config, and never replays compression. Verified content after interruption is not evidence of physical reclaim. This command does not enable automatic daemon compression or change deletion policy.")))
 }
 
 pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
+    // main calls this dispatcher before the derive-based legacy command enum.
+    // Only explicit compression IDs are intercepted; all other explanations
+    // continue through the existing deletion ledger and its selectors.
+    if let Some(code) = explain_cli::run(matches)? {
+        return Ok(Some(code));
+    }
     let Some(("compress", subcommand)) = matches.subcommand() else {
         return Ok(None);
     };
@@ -199,6 +206,7 @@ fn write_human(out: &mut impl Write, report: &CompressionReport) -> io::Result<(
         )?;
         if let Some(id) = &file.operation_id {
             writeln!(out, "  Journal operation: {id}")?;
+            writeln!(out, "  Explain: sbh explain --id compress:{id}")?;
         }
         if let Some(before) = file.physical_data_bytes_before {
             writeln!(out, "  Physical data bytes before: {before}")?;
