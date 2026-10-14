@@ -204,6 +204,19 @@ pub struct CompressionReport {
     pub exit_code: i32,
 }
 
+/// One completed file visit, emitted before considering the next input.
+/// References are valid only during the callback; retain owned copies as needed.
+#[derive(Debug, Clone, Copy)]
+pub struct CompressionObservation<'a> {
+    /// The outcome, including skips and failures before mutation.
+    pub file: &'a CompressionFileReport,
+    /// Pinned journal's display location, if a journal was created.
+    pub journal_path: Option<&'a Path>,
+    /// True only after this file's outcome append and fsync succeeded.
+    /// A prepared intent alone, a skip, or failed auditing never sets this flag.
+    pub journal_outcome_recorded: bool,
+}
+
 /// Run on explicitly selected regular files.
 ///
 /// No recursive scan, deletion, truncation, service changes, or persistent
@@ -218,6 +231,24 @@ pub fn run(
     mode: CompressionMode,
     config: &Config,
     platform: &dyn Platform,
+) -> io::Result<CompressionReport> {
+    run_observed(paths, policy, mode, config, platform, &mut |_| {})
+}
+
+/// Execute the same pass with per-file observations for activity logging.
+///
+/// Observers run after postflight and the outcome-journal write attempt, never
+/// in place of a safety check or durable intent. They receive immutable evidence
+/// and cannot authorize further mutations. Keep callbacks nonblocking; their
+/// time counts against the cooperative pass deadline. Invalid requests and
+/// unsupported platforms do not invoke the observer.
+pub fn run_observed(
+    paths: &[PathBuf],
+    policy: &CompressionPolicy,
+    mode: CompressionMode,
+    config: &Config,
+    platform: &dyn Platform,
+    observer: &mut dyn FnMut(CompressionObservation<'_>),
 ) -> io::Result<CompressionReport> {
     policy.validate()?;
     if paths.is_empty() || paths.len() > 4096 {
@@ -237,14 +268,14 @@ pub fn run(
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
-        linux::run(paths, policy, mode, config, platform)
+        linux::run(paths, policy, mode, config, platform, observer)
     }
     #[cfg(not(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     )))]
     {
-        let _ = (config, platform);
+        let _ = (config, platform, observer);
         Ok(CompressionReport {
             schema: "sbh.compression.v1",
             dry_run: !mode.apply,

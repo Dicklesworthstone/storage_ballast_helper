@@ -161,6 +161,9 @@ pub enum ActivityEvent {
     /// A cleanup decision (keep, delete, review, veto) for the evidence
     /// ledger: SQLite `decision_log` plus a JSONL `decision` line.
     DecisionRecorded(Box<DecisionRecord>),
+    /// A compression outcome is an audit event, not a throttled diagnostic.
+    /// Its structured info envelope never contributes deletion/ballast bytes.
+    CompressionRecorded(Box<crate::logger::compression::CompressionActivity>),
     /// What became of a deletion (regret label): SQLite `decision_outcome`
     /// plus a JSONL `decision_outcome` line.
     DecisionOutcome(Box<crate::scanner::regret::DecisionOutcome>),
@@ -639,6 +642,7 @@ fn scan_completion_details(
 #[allow(clippy::too_many_lines)]
 fn event_to_log_entry(event: &ActivityEvent) -> LogEntry {
     match event {
+        ActivityEvent::CompressionRecorded(record) => record.to_log_entry(),
         ActivityEvent::DaemonStarted {
             version,
             config_hash,
@@ -844,6 +848,7 @@ fn event_to_activity_row(event: &ActivityEvent) -> Option<ActivityRow> {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     match event {
+        ActivityEvent::CompressionRecorded(record) => Some(record.to_activity_row()),
         ActivityEvent::DaemonStarted {
             version,
             config_hash,

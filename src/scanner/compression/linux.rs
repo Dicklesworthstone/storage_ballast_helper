@@ -15,8 +15,8 @@ use sbh_btrfs::{FileStamp, IdleIoPriority, MAX_CHUNK_BYTES, ZstdConsent};
 
 use super::journal::{AuditSession, digest};
 use super::{
-    CompressionFileReport, CompressionMode, CompressionPolicy, CompressionReclaimReport,
-    CompressionReport, already_compressed, cold_enough,
+    CompressionFileReport, CompressionMode, CompressionObservation, CompressionPolicy,
+    CompressionReclaimReport, CompressionReport, already_compressed, cold_enough,
 };
 use crate::core::config::Config;
 use crate::platform::pal::Platform;
@@ -29,6 +29,7 @@ pub(super) fn run(
     mode: CompressionMode,
     config: &Config,
     platform: &dyn Platform,
+    observer: &mut dyn FnMut(CompressionObservation<'_>),
 ) -> io::Result<CompressionReport> {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(policy.timeout_secs);
@@ -104,6 +105,13 @@ pub(super) fn run(
         }
         let unsafe_to_continue =
             audit.failed() || (item.mutation_attempted && item.outcome != "compressed");
+        // Observability follows the durable outcome attempt, including failures.
+        // The callback receives no mutable state or authority to bypass a stop.
+        observer(CompressionObservation {
+            file: &item,
+            journal_path: audit.path(),
+            journal_outcome_recorded: item.operation_id.is_some() && !audit.failed(),
+        });
         report.files.push(item);
         if unsafe_to_continue {
             report.stop_reason = Some(if audit.failed() {
@@ -371,6 +379,7 @@ fn process_file(
 }
 
 fn check_protection(path: &Path, config: &Config, platform: &dyn Platform) -> io::Result<()> {
+    check_control_paths(path, config)?;
     // Construct a fresh registry: a negative ancestor-marker cache from
     // preflight must never hide a marker created before the next chunk.
     let mut registry = protection::ProtectionRegistry::new(Some(&config.scanner.protected_paths))
@@ -400,6 +409,51 @@ fn check_protection(path: &Path, config: &Config, platform: &dyn Platform) -> io
         return Err(io::Error::other("sacred-path catalog overlap"));
     }
     Ok(())
+}
+
+// A lazy activity logger can open its destinations only AFTER the first file's
+// outcome. Do not rely on the open-fd veto to protect that first input from
+// being sbh's own state, configuration, database, log, or recovery evidence.
+fn check_control_paths(path: &Path, config: &Config) -> io::Result<()> {
+    for protected in [
+        &config.paths.config_file,
+        &config.paths.state_file,
+        &config.paths.sqlite_db,
+        &config.paths.jsonl_log,
+        &config.update.metadata_cache_file,
+        &config.notifications.file.path,
+    ] {
+        check_control_overlap(path, protected, false)?;
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = config.paths.sqlite_db.as_os_str().to_os_string();
+        name.push(suffix);
+        check_control_overlap(path, Path::new(&name), false)?;
+    }
+    check_control_overlap(path, &crate::logger::jsonl::ram_fallback_path(), false)?;
+    check_control_overlap(
+        path,
+        &config.paths.state_file.with_file_name("compression-journal"),
+        true,
+    )
+}
+
+fn check_control_overlap(path: &Path, protected: &Path, subtree: bool) -> io::Result<()> {
+    let overlaps = |target: &Path| path == target || (subtree && path.starts_with(target));
+    if overlaps(protected) {
+        return Err(io::Error::other("sbh control or activity path is not a compression input"));
+    }
+    match protected.canonicalize() {
+        Ok(target) if overlaps(&target) => {
+            Err(io::Error::other("sbh control-path alias is not a compression input"))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("cannot resolve protected sbh control path {}: {error}", protected.display()),
+        )),
+    }
 }
 
 fn check_active(path: &Path, own_fd: i32, platform: &dyn Platform) -> io::Result<()> {
@@ -510,5 +564,59 @@ mod audit_exit_tests {
         assert_eq!(pass_exit_code(true, false, 0), 0);
         assert_eq!(pass_exit_code(false, false, 0), 0);
         assert_eq!(pass_exit_code(false, false, 1), 4);
+    }
+}
+
+#[cfg(test)]
+mod control_path_tests {
+    use super::{Config, Path, check_control_paths, fs};
+
+    fn config(root: &Path) -> Config {
+        let mut config = Config::default();
+        config.paths.config_file = root.join("config.toml");
+        config.paths.state_file = root.join("state.json");
+        config.paths.sqlite_db = root.join("activity.sqlite3");
+        config.paths.jsonl_log = root.join("activity.jsonl");
+        config.update.metadata_cache_file = root.join("update.json");
+        config.notifications.file.path = root.join("notifications.jsonl");
+        config
+    }
+
+    #[test]
+    fn control_files_and_database_sidecars_are_protected_before_logging_starts() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        for name in [
+            "config.toml", "state.json", "activity.sqlite3", "activity.jsonl",
+            "activity.sqlite3-wal", "activity.sqlite3-shm", "activity.sqlite3-journal",
+            "update.json", "notifications.jsonl",
+        ] {
+            let path = temp.path().join(name);
+            fs::write(&path, b"untouched").unwrap();
+            assert!(check_control_paths(&path, &config).is_err(), "{name}");
+            assert_eq!(fs::read(&path).unwrap(), b"untouched");
+        }
+        let cold = temp.path().join("ordinary-cold.jsonl");
+        fs::write(&cold, b"eligible for other checks").unwrap();
+        assert!(check_control_paths(&cold, &config).is_ok());
+    }
+
+    #[test]
+    fn journal_subtrees_and_configured_aliases_cannot_be_compressed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config(temp.path());
+        let journal = temp.path().join("compression-journal");
+        fs::create_dir(&journal).unwrap();
+        let old_run = journal.join("old-run.jsonl");
+        fs::write(&old_run, b"durable history").unwrap();
+        assert!(check_control_paths(&old_run, &config).is_err());
+        let unrelated = temp.path().join("compression-journal-other.jsonl");
+        fs::write(&unrelated, b"not inside the journal").unwrap();
+        assert!(check_control_paths(&unrelated, &config).is_ok());
+        let alias = temp.path().join("log-alias");
+        std::os::unix::fs::symlink(&unrelated, &alias).unwrap();
+        config.paths.jsonl_log = alias;
+        assert!(check_control_paths(&unrelated, &config).is_err());
+        assert_eq!(fs::read(&old_run).unwrap(), b"durable history");
     }
 }
