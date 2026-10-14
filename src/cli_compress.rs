@@ -7,9 +7,10 @@ use clap::{ArgMatches, Args, Command, FromArgMatches};
 use storage_ballast_helper::core::config::Config;
 use storage_ballast_helper::scanner::compression::journal::{self, RecoveryReport};
 use storage_ballast_helper::scanner::compression::{
-    self, CompressionMode, CompressionPolicy, CompressionReport,
+    CompressionMode, CompressionPolicy, CompressionReport,
 };
 
+mod activity_cli;
 mod discovery_cli;
 mod explain_cli;
 
@@ -58,7 +59,7 @@ struct Options {
 pub fn command() -> Command {
     discovery_cli::augment(Options::augment_args(Command::new("compress")
         .about("Preview or apply lossless compression to selected cold, unshared Btrfs files")
-        .after_help("Preview is the default. Linux x86-64/AArch64 and openat2 support are required for apply; extent-tree inspection normally requires root.\n\nApply preserves contents and verifies SHA-256, size and mtime. Protected, leased, open, executing, mapped, shared, already-compressed and low-headroom files are refused. There is no force override.\n\nFIEMAP inspection is not a snapshot lock. --quiescent acknowledges that concurrent writers, snapshots and reflinks have been stopped. A deadline stops between bounded calls; postflight verification may take additional time.\n\nBefore any rewrite, apply records a durable intent under compression-journal beside state.json. The state directory must already exist. Audit failures stop mutation.\n\nExamples:\n  sudo sbh compress --json -- /data/old-debug-binary /data/old-session.jsonl\n  sudo sbh compress --apply --allow-zstd-feature --quiescent --json -- /data/old-debug-binary\n  sudo sbh compress --recover-journal /var/lib/sbh/compression-journal/RUN.jsonl --json\n  sbh compress --discover --json -- /data/cold-archive\n  sudo sbh explain --id compress:RUN:SEQUENCE --json\n\n--discover recursively selects metadata candidates without applying compression. It rejects all apply consent flags; live-use and physical-extent checks are still required by ordinary file preview/apply.\n\nRecovery is read-only, requires no daemon config, and never replays compression. Verified content after interruption is not evidence of physical reclaim. This command does not enable automatic daemon compression or change deletion policy.")))
+        .after_help("Preview is the default. Linux x86-64/AArch64 and openat2 support are required for apply; extent-tree inspection normally requires root.\n\nApply preserves contents and verifies SHA-256, size and mtime. Protected, leased, open, executing, mapped, shared, already-compressed and low-headroom files are refused. There is no force override.\n\nFIEMAP inspection is not a snapshot lock. --quiescent acknowledges that concurrent writers, snapshots and reflinks have been stopped. A deadline stops between bounded calls; postflight verification may take additional time.\n\nBefore any rewrite, apply records a durable intent under compression-journal beside state.json. The state directory must already exist. Audit failures stop mutation. Prepared-file outcomes are also submitted to the shared activity log; activity_delivery reports transport separately, never proof of backend durability.\n\nExamples:\n  sudo sbh compress --json -- /data/old-debug-binary /data/old-session.jsonl\n  sudo sbh compress --apply --allow-zstd-feature --quiescent --json -- /data/old-debug-binary\n  sudo sbh compress --recover-journal /var/lib/sbh/compression-journal/RUN.jsonl --json\n  sbh compress --discover --json -- /data/cold-archive\n  sudo sbh explain --id compress:RUN:SEQUENCE --json\n\n--discover recursively selects metadata candidates without applying compression. It rejects all apply consent flags; live-use and physical-extent checks are still required by ordinary file preview/apply.\n\nRecovery is read-only, requires no daemon config, and never replays compression. Verified content after interruption is not evidence of physical reclaim. This command does not enable automatic daemon compression or change deletion policy.")))
 }
 
 pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
@@ -98,7 +99,7 @@ pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
     let result = Config::load(explicit_config.map(PathBuf::as_path))
         .map_err(|error| (1, error.to_string()))
         .and_then(|config| {
-            compression::run(
+            activity_cli::execute(
                 &options.paths,
                 &policy,
                 mode,
@@ -110,14 +111,16 @@ pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
     let mut out = io::stdout().lock();
     match result {
         Ok(report) => {
+            report.activity_delivery.warn_if_incomplete();
             if matches.get_flag("json") {
                 serde_json::to_writer_pretty(&mut out, &report)?;
                 writeln!(out)?;
             } else if !matches.get_flag("quiet") {
-                write_human(&mut out, &report)?;
+                write_human(&mut out, &report.compression)?;
+                report.activity_delivery.write_human(&mut out)?;
             }
             out.flush()?;
-            Ok(Some(report.exit_code))
+            Ok(Some(report.compression.exit_code))
         }
         Err((exit_code, error)) => {
             if matches.get_flag("json") {
