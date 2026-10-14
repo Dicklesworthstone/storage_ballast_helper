@@ -2208,21 +2208,26 @@ mod tests {
         assert!(targets.contains(&served));
     }
 
+    /// A relative binding is never rebuilt from the process's current cwd (it
+    /// may have moved since bind), and it does not hold the batch either:
+    /// Postfix binds every service relatively, and holding on it stopped all
+    /// reclaim on css, csd and yto. A server still in its directory holds it
+    /// through its cwd.
     #[test]
-    fn a_relative_socket_binding_is_unknown_not_reconstructed_from_current_cwd() {
+    fn a_relative_socket_binding_is_neither_rebuilt_nor_a_reason_to_hold() {
         let fixture = Fixture::new();
         socket_fd_fixture(&fixture, 77, 1, 4242);
         let current = fixture.root.join("not-the-bind-directory");
         fs::create_dir(&current).unwrap();
         symlink(&current, fixture.proc_root.join("77/cwd")).unwrap();
-        socket_table_fixture(&fixture, b"0: 2 0 10000 1 1 4242 relative.sock\n");
+        socket_table_fixture(&fixture, b"0: 2 0 10000 1 1 4242 public/pickup\n");
         let result = fixture.scan(&NativeProc, Limits::default());
-        assert!(!result.complete);
+        assert!(result.complete);
         assert!(result.files.is_empty());
         let (targets, complete) =
             open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
-        assert!(!complete);
-        assert!(!targets.contains(&current.join("relative.sock")));
+        assert!(complete);
+        assert!(!targets.contains(&current.join("public/pickup")));
         assert!(
             targets.contains(&current),
             "the independent cwd reference still counts"

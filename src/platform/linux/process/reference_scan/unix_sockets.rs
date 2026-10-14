@@ -2,8 +2,9 @@
 //!
 //! A readable header-only table is empty evidence; a missing, malformed or
 //! truncated table is not. Positive absolute paths survive malformed rows.
-//! Relative bindings cannot be reconstructed from a process's *current* cwd:
-//! a server may chdir after bind, so their owning descriptors revoke coverage.
+//! Relative bindings cannot be reconstructed from a process's *current* cwd
+//! (a server may chdir after bind), so they name no path; they do not revoke
+//! coverage either: Postfix binds every service socket relatively.
 //! This module never opens a socket, follows a binding, or reads file payloads.
 
 use std::collections::{HashMap, HashSet};
@@ -15,7 +16,6 @@ pub(super) const HEADER: &[u8] = b"Num RefCount Protocol Flags Type St Inode Pat
 #[derive(Debug, Default)]
 pub(super) struct Table {
     pub(super) paths: HashMap<u64, PathBuf>,
-    unresolved: HashSet<u64>,
     complete: bool,
 }
 
@@ -61,20 +61,21 @@ impl Table {
             if !seen.insert(inode) {
                 table.complete = false;
             }
-            match binding {
-                Some(bytes) if bytes.first() == Some(&b'/') => {
-                    table
-                        .paths
-                        .entry(inode)
-                        .or_insert_with(|| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
-                }
-                // Linux prints abstract names with '@'; they have no pathname
-                // in this representation. Unbound sockets have no path column.
-                None => {}
-                Some(bytes) if bytes.first() == Some(&b'@') => {}
-                Some(_) => {
-                    table.unresolved.insert(inode);
-                }
+            // Only an absolute binding names a file. Linux prints abstract
+            // names with '@', and unbound sockets have no path column. A
+            // relative binding is relative to the binder's cwd at bind time,
+            // which is not recorded anywhere; a server still working in that
+            // directory holds it through its cwd (bd-d1kt). Revoking coverage
+            // for it held every batch on any host running Postfix, whose
+            // master binds `public/pickup`, `private/*` and the rest relative
+            // to its queue directory (css, csd and yto, 2026-10-14).
+            if let Some(bytes) = binding
+                && bytes.first() == Some(&b'/')
+            {
+                table
+                    .paths
+                    .entry(inode)
+                    .or_insert_with(|| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
             }
         }
         if expired() {
@@ -83,8 +84,8 @@ impl Table {
         table
     }
 
-    pub(super) fn complete_for(&self, inode: u64) -> bool {
-        self.complete && !self.unresolved.contains(&inode)
+    pub(super) fn complete_for(&self, _inode: u64) -> bool {
+        self.complete
     }
 
     pub(super) fn path(&self, inode: u64) -> Option<&Path> {
@@ -194,15 +195,16 @@ mod tests {
     }
 
     #[test]
-    fn relative_binding_is_unknown_only_for_the_referencing_inode() {
+    fn relative_bindings_name_no_path_and_keep_coverage() {
+        // Postfix's master binds its services relative to the queue directory.
         let table = parse(&[
-            line(1, Some(b"relative.sock")),
-            line(2, Some(b"../old/socket")),
+            line(1, Some(b"public/pickup")),
+            line(2, Some(b"private/local")),
             line(3, Some(b"  leading-space.sock")),
             line(4, Some(b"/tmp/absolute")),
         ]);
         for inode in 1..=3 {
-            assert!(!table.complete_for(inode));
+            assert!(table.complete_for(inode));
             assert!(table.path(inode).is_none());
         }
         assert!(table.complete_for(4));
