@@ -4,6 +4,84 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
+## v0.7.5
+
+Compare: [`v0.7.4...v0.7.5`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.4...v0.7.5)
+
+A safety release. sbh v0.7.4 and earlier could delete a Python virtual
+environment that a long-running job was still using, because uv marks every
+venv with a cache tag, and could delete a freshly copied or moved temp tree
+two minutes after it arrived when the disk was under pressure. This release
+also adds `sbh relocate`, and `sbh compress` no longer rewrites files inside
+Git repositories.
+
+### Fixed
+
+- **A Python venv is not a cache because uv tagged it** (bd-tx4l). uv writes
+  a `CACHEDIR.TAG` into every venv it creates so that backup tools skip it.
+  sbh read the tag as "regenerable cache", so an idle venv whose name matched
+  no pattern was reclaimable at any pressure, including Green. On one host
+  sbh quarantined three venvs of a running job between uses, and the job's
+  next step failed with `ModuleNotFoundError`. A tag beside a `pyvenv.cfg`
+  is no longer cache evidence (`24be113`).
+- **A tree that has just arrived keeps its real age under pressure**
+  (bd-macg; JE's policy decision). At Orange or above, a classified artifact
+  in a temp root seen for two minutes was treated as old enough to delete.
+  That shortened the wait for trees that had just been copied, moved or
+  extracted, not only for old trees with fresh contents: a fresh copy of
+  relocated scratch was deleted five minutes after it was made. A
+  candidate whose root was born or moved into place less than the minimum
+  age ago now keeps its real age; an old build tree with fresh writes inside
+  is still fast-tracked (`1426666`). This does not make a temp root a safe
+  place to keep a copy: once older than the minimum age, it is reclaimable.
+  Protect such a copy with `sbh protect`, or keep it outside the scan roots.
+- `sbh compress` skips files inside Git work trees and repository internals
+  (bd-1p9j; `9d9a1bf`, `b9cafb1`).
+- `sbh explain --why-not <dir>` walks only the directory it explains. It
+  walked every sibling as well, so in a crowded `$TMPDIR` on macOS it did not
+  finish in three minutes (bd-g3g3; `898d309`).
+- **The socket evidence fails closed** (`9916f43`, `a828c3c`). A
+  `/proc/net/unix` table that cannot be read, is too large, or is malformed
+  or truncated no longer counts as "no socket here": the sweep is incomplete
+  and the batch is held, as for any other unreadable process evidence. A
+  socket bound to a relative path names no file and holds nothing; Postfix
+  binds its sockets that way, and holding on them would have stopped all
+  reclaim on any host running it.
+- **A stop requested while the first start is still writing ballast is not
+  held off** (`7d96b0b`). The start-timeout extension added in v0.7.4 also
+  extended systemd's stop timeout, and provisioning ignored the request
+  until every pool was full; `systemctl stop` waited minutes. Provisioning
+  now stops before its next file, and the extension ends with the stop
+  request.
+- `sbh install --ballast-count` and `--ballast-size` reach the config it
+  writes, so the daemon keeps the ballast the install was told to provision
+  instead of the default 10 x 1 GiB per pool (bd-ncxh; `c77b89f`).
+
+### Added
+
+- **`sbh relocate`** (`0991337`, `91f0464`): moves a protected scratch tree that
+  has been dormant for weeks to another disk or host and leaves a stub in its
+  place. **It does nothing after install:** it moves nothing unless
+  `/etc/sbh/relocation.toml` sets `enabled = true` and a `target`, and turning
+  it on is a per-host decision. Without that, `sbh relocate` only reports.
+  - Linux only for moves; macOS can report.
+  - Only `/tmp`, `/var/tmp`, `/dev/shm` and `/data/tmp` are considered, never
+    home or project trees. Cargo, rch, cass and agent-mail paths are never
+    moved, and a marker can opt a tree out (`relocatable = false`).
+  - A tree qualifies only if nothing in it has changed or been read for 14
+    days (on a `noatime` mount, 14 days of observation first), no process
+    holds it, it is at least 256 MiB, and it crosses no mount.
+  - A move copies, verifies the copy by checksum, re-checks the tree, writes
+    the stub, and only then removes the original, without crossing into any
+    other mount. `sbh relocate --restore <stub>` brings a tree back; a stub
+    something else has written into is kept aside and reported.
+
+### Documentation
+
+- The README explains how to verify a release: the minisign public key
+  (key id `1BBD79B28BF718D0`) and the commands that check the signed
+  manifest and an archive against it (`ca1b62a`).
+
 ## v0.7.4 **[release]**
 
 Compare: [`v0.7.3...v0.7.4`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.3...v0.7.4)
