@@ -405,7 +405,11 @@ mod tests {
         use std::process::Command;
         assert!(nix::unistd::geteuid().is_root(), "run this proof as root");
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("fresh state %h");
+        // No '%': systemd-run hands properties to the manager without
+        // specifier expansion, so the unit-file escape `%%h` would name a
+        // different path and the prepared run would still fail with 226.
+        // Specifier escaping is covered by the unit-file fixtures above.
+        let directory = temp.path().join("fresh state");
         let request = render(std::slice::from_ref(&directory));
         let run = |label: &str| {
             Command::new("systemd-run")
