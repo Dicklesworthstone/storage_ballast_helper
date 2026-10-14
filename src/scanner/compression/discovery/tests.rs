@@ -302,7 +302,11 @@ mod native_tests {
         fs::create_dir_all(root.join("repo/src/deep")).unwrap();
         fs::create_dir_all(root.join("bare/objects/pack")).unwrap();
         fs::write(root.join("bare/HEAD"), b"ref: refs/heads/main\n").unwrap();
-        for name in ["repo/src/deep", "repo/.git/objects/pack", "bare/objects/pack"] {
+        for name in [
+            "repo/src/deep",
+            "repo/.git/objects/pack",
+            "bare/objects/pack",
+        ] {
             let inside = root.join(name);
             cold(&inside.join("cold.bin"));
             let selection = scan(
@@ -366,7 +370,10 @@ mod native_tests {
         for name in ["a.bin", "c.bin", "d.bin"] {
             cold(&root.join(name));
         }
-        let policy = CompressionPolicy { max_files: 1, ..policy() };
+        let policy = CompressionPolicy {
+            max_files: 1,
+            ..policy()
+        };
         let first = scan(
             std::slice::from_ref(&root),
             &DiscoveryLimits::default(),
@@ -376,7 +383,9 @@ mod native_tests {
         let second = scan(
             std::slice::from_ref(&root),
             &DiscoveryLimits {
-                after: Some(continuation_path(first.report().resume_after_hex.as_deref().unwrap()).unwrap()),
+                after: Some(
+                    continuation_path(first.report().resume_after_hex.as_deref().unwrap()).unwrap(),
+                ),
                 ..Default::default()
             },
             &policy,
@@ -386,7 +395,10 @@ mod native_tests {
         let third = scan(
             std::slice::from_ref(&root),
             &DiscoveryLimits {
-                after: Some(continuation_path(second.report().resume_after_hex.as_deref().unwrap()).unwrap()),
+                after: Some(
+                    continuation_path(second.report().resume_after_hex.as_deref().unwrap())
+                        .unwrap(),
+                ),
                 ..Default::default()
             },
             &policy,
@@ -394,6 +406,9 @@ mod native_tests {
         assert_eq!(third.paths(), [root.join("d.bin")]);
         assert!(third.report().complete);
         assert!(third.report().resume_after_hex.is_none());
-        assert_eq!(fs::read(root.join("b-repo/cold.bin")).unwrap(), b"cold contents");
+        assert_eq!(
+            fs::read(root.join("b-repo/cold.bin")).unwrap(),
+            b"cold contents"
+        );
     }
 }

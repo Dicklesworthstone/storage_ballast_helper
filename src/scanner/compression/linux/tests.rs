@@ -148,14 +148,19 @@ fn git_packfile_preview_and_apply_stop_before_hashing_or_journaling() {
             &path,
             &mut item,
             &policy,
-            CompressionMode { apply, allow_zstd_feature: true, quiescent: true },
+            CompressionMode {
+                apply,
+                allow_zstd_feature: true,
+                quiescent: true,
+            },
             &Config::default(),
             &platform,
             Instant::now() + Duration::from_secs(30),
             &mut bytes,
             &mut identities,
             &mut audit,
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("Git repository"));
         assert!(!item.mutation_attempted);
@@ -165,7 +170,10 @@ fn git_packfile_preview_and_apply_stop_before_hashing_or_journaling() {
         assert_eq!(bytes, 0);
         assert!(identities.is_empty());
         assert!(!root.join("journal").exists());
-        assert_eq!(fs::read(&path).unwrap(), b"repository payload must stay untouched");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"repository payload must stay untouched"
+        );
     }
 }
 

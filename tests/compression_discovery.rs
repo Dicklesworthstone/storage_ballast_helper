@@ -102,7 +102,10 @@ fn discovery_reports_git_pruning_but_keeps_unrelated_scratch() {
     let config = temp.path().join("config.toml");
     fs::write(
         &config,
-        format!("[paths]\nstate_file = {:?}\n", temp.path().join("state.json")),
+        format!(
+            "[paths]\nstate_file = {:?}\n",
+            temp.path().join("state.json")
+        ),
     )
     .unwrap();
     let output = command(&config)
@@ -121,7 +124,10 @@ fn discovery_reports_git_pruning_but_keeps_unrelated_scratch() {
     assert_eq!(report["discovery"]["selected_files"], 1);
     let candidates = report["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0]["path"], scratch.canonicalize().unwrap().to_string_lossy().as_ref());
+    assert_eq!(
+        candidates[0]["path"],
+        scratch.canonicalize().unwrap().to_string_lossy().as_ref()
+    );
     for path in [&pack, &scratch, &root.join("repo/source.rs")] {
         assert_eq!(fs::read(path).unwrap(), b"preserve this payload");
     }
@@ -144,7 +150,10 @@ fn repository_pruning_uses_native_paths_after_ancestor_alias_resolution() {
     let config = temp.path().join("config.toml");
     fs::write(
         &config,
-        format!("[paths]\nstate_file = {:?}\n", temp.path().join("state.json")),
+        format!(
+            "[paths]\nstate_file = {:?}\n",
+            temp.path().join("state.json")
+        ),
     )
     .unwrap();
     // The explicit root is a real directory reached through an ancestor alias.

@@ -22,11 +22,13 @@ const EXCLUSION: &str = "git_repository";
 /// Refuse explicit files inside repository content before opening for rewrite.
 pub(in crate::scanner::compression) fn check_file(path: &Path) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "compression input has no parent")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "compression input has no parent",
+        )
     })?;
     // A worktree's .git FILE is repository data too, not just its descendants.
-    if path.file_name().is_some_and(|name| name == ".git")
-        || directory_exclusion(parent)?.is_some()
+    if path.file_name().is_some_and(|name| name == ".git") || directory_exclusion(parent)?.is_some()
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -186,7 +188,11 @@ mod tests {
         }
         let ordinary = root.join("ordinary");
         fs::create_dir(&ordinary).unwrap();
-        fs::write(ordinary.join("HEAD"), b"not enough to identify a repository").unwrap();
+        fs::write(
+            ordinary.join("HEAD"),
+            b"not enough to identify a repository",
+        )
+        .unwrap();
         fs::write(ordinary.join(".gitignore"), b"target\n").unwrap();
         assert_eq!(directory_exclusion(&ordinary).unwrap(), None);
     }
