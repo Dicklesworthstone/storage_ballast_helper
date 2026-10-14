@@ -311,6 +311,25 @@ mod tests {
     }
 
     #[test]
+    fn command_line_only_output_directories_reach_the_native_provider() {
+        let mut fixture = Fixture::default();
+        fixture.invocation(41, "rustc", &[b"rustc", b"lib.rs", b"--out-dir", b"/active/objects"], b"");
+        fixture.invocation(42, "Python", &[b"python3", b"-m", b"pip", b"--cache-dir", b"../pip-cache"], b"");
+        assert_eq!(
+            collect_with(&fixture, 99, Limits::default()),
+            vec![
+                (41, PathBuf::from("/active/objects")),
+                (42, PathBuf::from("/workspace/../pip-cache")),
+            ]
+        );
+        fixture.processes.get_mut(&42).unwrap().cwd = None;
+        assert_eq!(
+            collect_with(&fixture, 99, Limits::default()),
+            vec![(41, PathBuf::from("/active/objects"))]
+        );
+    }
+
+    #[test]
     fn native_transport_shape_feeds_shared_cache_rules_without_descriptors() {
         let mut fixture = Fixture::default();
         fixture.add(42, "rustc", b"CARGO_HOME=/cache/cargo\0CARGO_TARGET_DIR=/target\0");
