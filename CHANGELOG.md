@@ -4,6 +4,94 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
+## v0.7.4
+
+Compare: [`v0.7.3...v0.7.4`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.3...v0.7.4)
+
+A safety release. sbh v0.7.3 and earlier could delete the directory of a
+server that was still serving a Unix-domain socket from it, because socket
+descriptors were invisible to the in-use check. This release also lets a
+fresh system install start on its first attempt, stops a refused candidate
+from being planned again on every pass, and adds a read-only check of tmpfs
+scratch against RAM and swap and an opt-in Btrfs compression command.
+
+### Fixed
+
+- **A process serving a Unix socket now holds the socket's directory**
+  (bd-zx8b). The in-use check read only descriptors that carry a file path.
+  On macOS a socket descriptor is not a file, and on Linux it shows only as
+  `socket:[inode]`, so a directory holding nothing but a served socket looked
+  unused at any age: tmux's `/tmp/tmux-<uid>`, an ssh-agent directory, a
+  launchd listener. On two Macs sbh deleted the `/private/tmp/com.apple.launchd.*`
+  directories of a running iOS Simulator (`launchd_sim`, `testmanagerd`),
+  after which XCTest and the Web Inspector could no longer reach it. sbh now
+  resolves socket descriptors to the path they are bound to:
+  `PROC_PIDFDSOCKETINFO` on macOS, `/proc/net/unix` on Linux. This covers
+  scoring and the deletion preflight's last check (`8eff34e`).
+- **A fresh system install starts on the first try.**
+  - `sbh install --systemd --scope system` creates every directory it lists
+    in `ReadWritePaths=` before it enables the unit. A missing one made
+    systemd fail the unit with `226/NAMESPACE` (bd-2dzx; `10dd6ce`,
+    `c60b38a`).
+  - The daemon writes its ballast before it reports ready. On a fresh host
+    that can be gigabytes per pool, written as random data on Btrfs, ZFS and
+    bcachefs, and it outlasted the unit's 30-second start timeout: 20 GiB took
+    45 s. systemd killed the first start. Repeated timeouts can reach
+    systemd's start limit and leave the service failed. The daemon now asks
+    systemd for more time (`EXTEND_TIMEOUT_USEC`) every 10 s while it
+    provisions, for up to 15 minutes (bd-yqg0; `1416b93`).
+- **A candidate that is always refused is not planned on every pass**
+  (bd-pb40). A uv cache, which the deletion preflight refuses because it
+  holds Git checkouts, was planned 72 times in a few hours on one host and
+  over a hundred on another, and every pass counted as dispatched but freed
+  nothing. The per-path backoff meant to stop this never held. The scanner
+  index was keyed on each pass's roots and was rebuilt on about half the
+  passes, and the pre-scan and the walk each reset the other's backoff.
+  The index is now kept across passes over different roots, and the backoff
+  stays with the directory until the directory itself changes (`d71e452`).
+- The `[SBH-SAFETY] open-file sweep incomplete` line names a refused build
+  tool first, with the number of other refused processes. Before, it named
+  the first refusal, usually pid 1 (bd-3maz; `af41970`).
+
+### Added
+
+- **`sbh check --ram-scratch`** (Linux, read-only; bd-ffjj). It compares what
+  the tmpfs mounts (`/tmp`, `/dev/shm`, `/run`, `/run/user/<uid>`) hold
+  with host RAM and swap. It warns when they hold more than half of RAM, or
+  when swap is nearly full and they hold more than all processes have
+  swapped out. On a warning it names the largest top-level entries with
+  owner and idle hours. On one host idle agent scratch had filled all 64 GiB
+  of swap while sbh reported only "/dev/shm 20% free". The daemon samples the
+  same check every five minutes and logs a risk at most every 15 minutes. It
+  adds no deletion roots (`22ec3b4`, `ddbfa04`, `ad0d3f9`).
+- **`sbh compress`** (Linux x86-64 and AArch64 on Btrfs; bd-rxq5): lossless
+  zstd compression of cold, unshared files named explicitly. Preview is the
+  default. Applying needs `--apply` with both `--allow-zstd-feature` and
+  `--quiescent`. Each change is recorded in a journal before and after it
+  happens.
+  - `--discover` lists cold candidates under directory roots without changing
+    anything.
+  - `--recover-journal` inspects an interrupted run.
+  - `sbh explain --id compress:RUN:SEQ` explains one operation.
+  - Outcomes go to the activity log.
+
+  Nothing is compressed automatically. See `docs/btrfs-compression.md`
+  (`f021401`, `ed3be77`, `4a80038`, `9a25898`, `e6cbc44`, `47d4be5`,
+  `f569683`, `9bf82e2`, `f1c1adb`, `42d74fa`, `e4c3478`).
+
+### Changed
+
+- Linux: one `/proc/<pid>/maps` pass now serves all scan roots, instead of
+  one per root (`5bb8269`).
+
+### Known limitations
+
+- Socket evidence covers sockets in sbh's own network namespace and sockets
+  bound to absolute paths. A server inside a container with its own network
+  namespace, or one that bound a relative path, is not seen.
+- `sbh compress --discover` does not check live processes or physical extents.
+  Preview and apply of the selected files do.
+
 ## v0.7.3 **[release]**
 
 Compare: [`v0.7.2...v0.7.3`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.2...v0.7.3)
