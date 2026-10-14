@@ -70,10 +70,12 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
     that way now: it has to be its real age. In a real-build test on macOS a
     default `~/.cargo/registry/src` extracted 174 s earlier was deleted at
     "age 300 s" under the running build;
-  - the cargo process went unrecognised on hosts with rch, which renames the
-    real cargo `cargo-rch-real`, and build scripts did not count as build
-    tools. Both run with cargo's environment, so a build is held while only
-    they are running (a long build script, a link);
+  - sbh 0.7.2 and earlier did not recognise cargo when rch has renamed it
+    `cargo-rch-real` (the usual name on hosts with rch), nor build scripts,
+    as build tools. A live build's default-home cache was therefore
+    unprotected whenever only those were running, even though the evidence
+    was there to read. Both are recognised now, and both run with cargo's
+    environment;
   - a process whose working directory is inside a tree now counts as using
     it;
   - on Linux, the cargo home and target directory of a running cargo or
@@ -85,7 +87,7 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
     live process.
   `sbh explain` names the process and the reason. Affected: v0.5.0 through
   v0.7.2 (`53942a3`, `5a6f04a`, `11a609c`).
-- macOS: a live build now holds its caches as it does on Linux. sbh reads a
+- macOS: live builds are now held. A build holds its caches as it does on Linux: sbh reads a
   process's working directory (`PROC_PIDVNODEPATHINFO`) and the environment
   and arguments of recognised build tools (`KERN_PROCARGS2`), including
   `python -m pip` and Node-hosted npm, through bounded read-only calls in
