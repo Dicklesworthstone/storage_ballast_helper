@@ -40,6 +40,8 @@ pub(super) fn parse(mut value: &str) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+// Fallible only where paths must be UTF-8.
+#[cfg_attr(unix, allow(clippy::unnecessary_wraps))]
 fn path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf> {
     #[cfg(unix)]
     {
@@ -65,7 +67,9 @@ fn grant_path(word: &Path) -> Result<(PathBuf, bool)> {
     }
     let path = path_from_bytes(bytes.to_vec())?;
     if !path.is_absolute() {
-        return Err(invalid("ReadWritePaths requires an absolute path after '-'/'+' modifiers"));
+        return Err(invalid(
+            "ReadWritePaths requires an absolute path after '-'/'+' modifiers",
+        ));
     }
     Ok((path, optional))
 }
@@ -89,7 +93,9 @@ fn safe_grant(path: &Path) -> Result<()> {
         || path == Path::new("/")
         || path.starts_with("/proc")
         || path.starts_with("/sys")
-        || path.components().any(|part| matches!(part, Component::ParentDir))
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
         || path.as_os_str().as_encoded_bytes().contains(&0)
     {
         return Err(invalid(&format!(
@@ -108,17 +114,19 @@ fn validate_directory(path: &Path) -> Result<()> {
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
             Ok(_) => {
-                let resolved = fs::canonicalize(ancestor)
-                    .map_err(|source| SbhError::io(ancestor, source))?;
-                let suffix = path.strip_prefix(ancestor)
+                let resolved =
+                    fs::canonicalize(ancestor).map_err(|source| SbhError::io(ancestor, source))?;
+                let suffix = path
+                    .strip_prefix(ancestor)
                     .map_err(|_| invalid("ReadWritePaths ancestor resolution failed"))?;
                 safe_grant(&resolved.join(suffix))?;
-                let metadata = fs::metadata(ancestor)
-                    .map_err(|source| SbhError::io(ancestor, source))?;
+                let metadata =
+                    fs::metadata(ancestor).map_err(|source| SbhError::io(ancestor, source))?;
                 if !metadata.is_dir() {
                     return Err(invalid(&format!(
                         "ReadWritePaths directory {} is blocked by non-directory {}; existing data was not replaced",
-                        path.display(), ancestor.display()
+                        path.display(),
+                        ancestor.display()
                     )));
                 }
                 return Ok(());
@@ -127,7 +135,9 @@ fn validate_directory(path: &Path) -> Result<()> {
             Err(source) => return Err(SbhError::io(ancestor, source)),
         }
     }
-    Err(invalid("ReadWritePaths has no accessible existing ancestor"))
+    Err(invalid(
+        "ReadWritePaths has no accessible existing ancestor",
+    ))
 }
 
 // Keep assignment ordering, including resets across file boundaries. Parsing
@@ -148,12 +158,15 @@ fn assignments(text: &str) -> Vec<(String, String)> {
         }
         pending.push_str(trimmed);
         let line = std::mem::take(&mut pending);
-        if let Some(name) = line.strip_prefix('[').and_then(|value| value.strip_suffix(']')) {
+        if let Some(name) = line
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        {
             section = name.trim().to_string();
-        } else if section == "Service" {
-            if let Some((key, value)) = line.split_once('=') {
-                result.push((key.trim().to_string(), value.trim().to_string()));
-            }
+        } else if section == "Service"
+            && let Some((key, value)) = line.split_once('=')
+        {
+            result.push((key.trim().to_string(), value.trim().to_string()));
         }
     }
     // An unfinished continuation is not a successfully inspected namespace.
@@ -183,13 +196,20 @@ pub(super) fn validate_unit(installed: &str, dropins: &[(PathBuf, String)]) -> R
             }
         }
     }
-    let Some(values) = effective.get("ReadWritePaths").filter(|values| !values.is_empty()) else {
+    let Some(values) = effective
+        .get("ReadWritePaths")
+        .filter(|values| !values.is_empty())
+    else {
         return Ok(());
     };
     if ["RootDirectory", "RootImage"].iter().any(|key| {
-        effective.get(*key).is_some_and(|values| values.iter().any(|value| !value.is_empty()))
+        effective
+            .get(*key)
+            .is_some_and(|values| values.iter().any(|value| !value.is_empty()))
     }) {
-        return Err(invalid("cannot validate ReadWritePaths inside a custom RootDirectory/RootImage from the host namespace"));
+        return Err(invalid(
+            "cannot validate ReadWritePaths inside a custom RootDirectory/RootImage from the host namespace",
+        ));
     }
     let mut failures = Vec::new();
     for value in values {
@@ -213,21 +233,27 @@ pub(super) fn validate_unit(installed: &str, dropins: &[(PathBuf, String)]) -> R
 }
 
 fn invalid(details: &str) -> SbhError {
-    SbhError::Runtime { details: details.to_string() }
+    SbhError::Runtime {
+        details: details.to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{SystemdConfig, SystemdServiceManager};
+    use super::*;
 
     #[test]
     fn fresh_namespace_becomes_startable_without_broadening_the_grants() {
         let temp = tempfile::tempdir().unwrap();
-        let paths = vec![temp.path().join("state/ballast"), temp.path().join("logs"),
-            temp.path().join("scratch/builds with spaces")];
+        let paths = vec![
+            temp.path().join("state/ballast"),
+            temp.path().join("logs"),
+            temp.path().join("scratch/builds with spaces"),
+        ];
         let manager = SystemdServiceManager::new(SystemdConfig {
-            user_scope: false, binary_path: "/usr/local/bin/sbh".into(),
+            user_scope: false,
+            binary_path: "/usr/local/bin/sbh".into(),
             read_write_paths: paths.clone(),
         });
         let before = manager.generate_unit_file();
@@ -271,9 +297,15 @@ mod tests {
         let missing = temp.path().join("not-created");
         let file = temp.path().join("occupied");
         fs::write(&file, b"retained").unwrap();
-        for invalid in [PathBuf::from("relative"), PathBuf::from("/"),
-            PathBuf::from("/proc/new"), PathBuf::from("/sys/new"),
-            temp.path().join("../escape"), file.clone(), file.join("child")] {
+        for invalid in [
+            PathBuf::from("relative"),
+            PathBuf::from("/"),
+            PathBuf::from("/proc/new"),
+            PathBuf::from("/sys/new"),
+            temp.path().join("../escape"),
+            file.clone(),
+            file.join("child"),
+        ] {
             assert!(prepare(&[missing.clone(), invalid]).is_err());
             assert!(!missing.exists());
             assert_eq!(fs::read(&file).unwrap(), b"retained");
@@ -296,9 +328,16 @@ mod tests {
 
     #[test]
     fn grants_round_trip_quotes_backslashes_control_bytes_and_specifiers() {
-        let paths = ["/tmp/plain", "/tmp/with space", "/tmp/quote\"and'quote",
-            "/tmp/back\\slash", "/tmp/%h/${HOME}", "/tmp/line\nReadWritePaths=/\ntail",
-            "/tmp/tab\there"].map(PathBuf::from);
+        let paths = [
+            "/tmp/plain",
+            "/tmp/with space",
+            "/tmp/quote\"and'quote",
+            "/tmp/back\\slash",
+            "/tmp/%h/${HOME}",
+            "/tmp/line\nReadWritePaths=/\ntail",
+            "/tmp/tab\there",
+        ]
+        .map(PathBuf::from);
         let encoded = render(&paths);
         assert!(!encoded.contains('\n'));
         assert!(encoded.contains("%%h"));
@@ -314,32 +353,47 @@ mod tests {
     fn native_filename_bytes_survive_sandbox_serialization() {
         use std::os::unix::ffi::OsStringExt;
         let path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/\xff%h space".to_vec()));
-        assert_eq!(parse(&render(std::slice::from_ref(&path))).unwrap(), vec![path]);
+        assert_eq!(
+            parse(&render(std::slice::from_ref(&path))).unwrap(),
+            vec![path]
+        );
     }
 
     #[test]
     fn live_checks_honor_optional_entries_and_dropin_resets() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing");
-        let unit = format!("[Service]\nReadWritePaths={}\n", render(std::slice::from_ref(&missing)));
+        let unit = format!(
+            "[Service]\nReadWritePaths={}\n",
+            render(std::slice::from_ref(&missing))
+        );
         assert!(validate_unit(&unit, &[]).is_err());
-        let dropins = vec![(temp.path().join("reset.conf"), format!(
-            "[Service]\nReadWritePaths=\nReadWritePaths={}\n",
-            render(&[temp.path().to_path_buf()])
-        ))];
+        let dropins = vec![(
+            temp.path().join("reset.conf"),
+            format!(
+                "[Service]\nReadWritePaths=\nReadWritePaths={}\n",
+                render(&[temp.path().to_path_buf()])
+            ),
+        )];
         assert!(validate_unit(&unit, &dropins).is_ok());
         let optional = format!("[Service]\nReadWritePaths=-{}\n", missing.display());
         assert!(validate_unit(&optional, &[]).is_ok());
         // Parsing for drift preserves modifier distinctions.
-        assert_ne!(parse(&format!("-{}", missing.display())).unwrap(), vec![missing]);
+        assert_ne!(
+            parse(&format!("-{}", missing.display())).unwrap(),
+            vec![missing]
+        );
     }
 
     #[test]
     fn diagnostics_read_continued_assignments_without_creating_paths() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing");
-        let unit = format!("[Service]\nReadWritePaths={} \\\n  {}\n",
-            render(&[temp.path().to_path_buf()]), render(std::slice::from_ref(&missing)));
+        let unit = format!(
+            "[Service]\nReadWritePaths={} \\\n  {}\n",
+            render(&[temp.path().to_path_buf()]),
+            render(std::slice::from_ref(&missing))
+        );
         assert!(validate_unit(&unit, &[]).is_err());
         assert!(!missing.exists());
     }
@@ -356,14 +410,24 @@ mod tests {
         let run = |label: &str| {
             Command::new("systemd-run")
                 .args(["--wait", "--pipe", "--collect", "--quiet"])
-                .arg(format!("--unit=sbh-namespace-{}-{label}", std::process::id()))
+                .arg(format!(
+                    "--unit=sbh-namespace-{}-{label}",
+                    std::process::id()
+                ))
                 .arg("--property=Type=oneshot")
                 .arg("--property=RuntimeMaxSec=30")
                 .arg("--property=ProtectSystem=strict")
                 .arg(format!("--property=ReadWritePaths={request}"))
-                .args(["--", "/bin/sh", "-c", "printf '%s' verified > \"$1/probe\"", "sbh-proof"])
+                .args([
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "printf '%s' verified > \"$1/probe\"",
+                    "sbh-proof",
+                ])
                 .arg(&directory)
-                .output().unwrap()
+                .output()
+                .unwrap()
         };
         let before = run("missing");
         assert_eq!(before.status.code(), Some(226), "{before:?}");

@@ -15,10 +15,19 @@ fn regular_item(bytenr: u64, disk_bytes: u64, logical_bytes: u64, compression: u
 fn eligible_map() -> ExtentMap {
     ExtentMap {
         stamp: FileStamp {
-            device: 1, inode: 256, size: 131_072, mtime: 1, mtime_nsec: 2,
-            ctime: 3, ctime_nsec: 4, links: 1,
+            device: 1,
+            inode: 256,
+            size: 131_072,
+            mtime: 1,
+            mtime_nsec: 2,
+            ctime: 3,
+            ctime_nsec: 4,
+            links: 1,
         },
-        extents: vec![DataExtent { bytenr: 1_048_576, disk_num_bytes: 131_072 }],
+        extents: vec![DataExtent {
+            bytenr: 1_048_576,
+            disk_num_bytes: 131_072,
+        }],
         physical_data_bytes: 131_072,
         inline_bytes: 0,
         fiemap_flags: ioctl::FIEMAP_EXTENT_LAST,
@@ -31,14 +40,25 @@ fn eligible_map() -> ExtentMap {
 #[test]
 fn compressed_disk_length_is_not_the_logical_or_ram_length() {
     let parsed = parse_file_extent(&regular_item(1_048_576, 4096, 131_072, 3)).unwrap();
-    assert_eq!(parsed.extent, Some(DataExtent { bytenr: 1_048_576, disk_num_bytes: 4096 }));
+    assert_eq!(
+        parsed.extent,
+        Some(DataExtent {
+            bytenr: 1_048_576,
+            disk_num_bytes: 4096
+        })
+    );
     assert!(parsed.encoded);
     assert_eq!(parsed.inline_bytes, 0);
 }
 
 #[test]
 fn holes_and_inline_items_are_distinct_from_data_allocations() {
-    assert_eq!(parse_file_extent(&regular_item(0, 0, 131_072, 0)).unwrap().extent, None);
+    assert_eq!(
+        parse_file_extent(&regular_item(0, 0, 131_072, 0))
+            .unwrap()
+            .extent,
+        None
+    );
     let mut inline = vec![0; 21 + 37];
     inline[16] = 3;
     let parsed = parse_file_extent(&inline).unwrap();
@@ -51,7 +71,10 @@ fn holes_and_inline_items_are_distinct_from_data_allocations() {
 fn truncated_unknown_and_overflowing_extent_items_are_rejected() {
     let item = regular_item(1_048_576, 4096, 131_072, 0);
     for length in 0..item.len() {
-        assert!(parse_file_extent(&item[..length]).is_err(), "length={length}");
+        assert!(
+            parse_file_extent(&item[..length]).is_err(),
+            "length={length}"
+        );
     }
     let mut unknown = item.clone();
     unknown[20] = 9;
@@ -96,8 +119,11 @@ fn compression_requests_are_finite_aligned_and_inside_the_file() {
     assert!(validate_range(0, MAX_CHUNK_BYTES, MAX_CHUNK_BYTES).is_ok());
     assert!(validate_range(4096, 123, 4219).is_ok());
     for (start, length, size) in [
-        (0, 0, 1), (0, MAX_CHUNK_BYTES + 1, u64::MAX), (1, 4096, 8192),
-        (4096, 4096, 5000), (u64::MAX - 4095, 4096, u64::MAX),
+        (0, 0, 1),
+        (0, MAX_CHUNK_BYTES + 1, u64::MAX),
+        (1, 4096, 8192),
+        (4096, 4096, 5000),
+        (u64::MAX - 4095, 4096, u64::MAX),
     ] {
         assert!(validate_range(start, length, size).is_err());
     }

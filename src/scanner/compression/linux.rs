@@ -1,6 +1,7 @@
 //! Native execution with fresh application-level admission at every chunk.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -9,16 +10,19 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use nix::sys::statvfs::{FsFlags, fstatvfs};
-use rustix::fs::{Mode, OFlags, ResolveFlags, CWD, openat2};
+use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 use sbh_btrfs::{FileStamp, IdleIoPriority, MAX_CHUNK_BYTES, ZstdConsent};
 
 use super::journal::{AuditSession, digest};
-use super::{CompressionFileReport, CompressionMode, CompressionPolicy,
-    CompressionReclaimReport, CompressionReport, already_compressed, cold_enough};
+use super::{
+    CompressionFileReport, CompressionMode, CompressionPolicy, CompressionReclaimReport,
+    CompressionReport, already_compressed, cold_enough,
+};
 use crate::core::config::Config;
 use crate::platform::pal::Platform;
 use crate::scanner::{active_lease, protection};
 
+#[allow(clippy::too_many_lines)] // one bounded pass, in order
 pub(super) fn run(
     paths: &[std::path::PathBuf],
     policy: &CompressionPolicy,
@@ -29,41 +33,77 @@ pub(super) fn run(
     let start = Instant::now();
     let deadline = start + Duration::from_secs(policy.timeout_secs);
     let mut report = CompressionReport {
-        schema: "sbh.compression.v1", dry_run: !mode.apply, supported: true,
-        policy: policy.clone(), journal_path: None, files: Vec::new(), unvisited_files: paths.len(),
-        stop_reason: None, elapsed_ms: 0, exit_code: 0,
+        schema: "sbh.compression.v1",
+        dry_run: !mode.apply,
+        supported: true,
+        policy: policy.clone(),
+        journal_path: None,
+        files: Vec::new(),
+        unvisited_files: paths.len(),
+        stop_reason: None,
+        elapsed_ms: 0,
+        exit_code: 0,
     };
     let mut admitted_bytes = 0_u64;
     let mut identities = BTreeSet::new();
     let mut audit = AuditSession::new(
-        config.paths.state_file.with_file_name("compression-journal"), paths.len(), policy,
+        config
+            .paths
+            .state_file
+            .with_file_name("compression-journal"),
+        paths.len(),
+        policy,
     );
     // Apply passes run all verification and rewrite I/O at idle priority. A
     // failure to lower priority is an error, not permission to run at normal IO.
-    let priority = if mode.apply { Some(IdleIoPriority::enter()?) } else { None };
+    let priority = if mode.apply {
+        Some(IdleIoPriority::enter()?)
+    } else {
+        None
+    };
     for path in paths.iter().take(policy.max_files) {
         if Instant::now() >= deadline {
             report.stop_reason = Some("pass deadline exhausted".into());
             break;
         }
         let mut item = CompressionFileReport::new(path);
-        let result = process_file(path, &mut item, policy, mode, config, platform,
-            deadline, &mut admitted_bytes, &mut identities, &mut audit);
+        let result = process_file(
+            path,
+            &mut item,
+            policy,
+            mode,
+            config,
+            platform,
+            deadline,
+            &mut admitted_bytes,
+            &mut identities,
+            &mut audit,
+        );
         if let Err(error) = result {
-            item.outcome = if item.mutation_attempted { "partial" } else { "failed" }.into();
+            item.outcome = if item.mutation_attempted {
+                "partial"
+            } else {
+                "failed"
+            }
+            .into();
             item.detail = error.to_string();
         }
         // Complete the durable record even when an error escaped postflight.
         // A failed intent write poisons the journal and must not be followed by
         // a footer that makes an uncertain prefix look like a completed run.
-        if !audit.failed() {
-            if let Err(error) = audit.complete(&item) {
-                item.outcome = if item.mutation_attempted { "partial" } else { "failed" }.into();
-                item.detail.push_str(&format!("; durable outcome recording failed: {error}"));
+        if !audit.failed()
+            && let Err(error) = audit.complete(&item)
+        {
+            item.outcome = if item.mutation_attempted {
+                "partial"
+            } else {
+                "failed"
             }
+            .into();
+            let _ = write!(item.detail, "; durable outcome recording failed: {error}");
         }
-        let unsafe_to_continue = audit.failed()
-            || (item.mutation_attempted && item.outcome != "compressed");
+        let unsafe_to_continue =
+            audit.failed() || (item.mutation_attempted && item.outcome != "compressed");
         report.files.push(item);
         if unsafe_to_continue {
             report.stop_reason = Some(if audit.failed() {
@@ -78,35 +118,46 @@ pub(super) fn run(
     if report.unvisited_files != 0 && report.stop_reason.is_none() {
         report.stop_reason = Some("file-count budget exhausted".into());
     }
-    let mut priority_failed = false;
-    if let Some(priority) = priority {
-        if let Err(error) = priority.restore() {
-            report.stop_reason = Some(format!("could not restore I/O priority: {error}"));
-            priority_failed = true;
-        }
-    }
+    let priority_failed = if let Some(priority) = priority
+        && let Err(error) = priority.restore()
+    {
+        report.stop_reason = Some(format!("could not restore I/O priority: {error}"));
+        true
+    } else {
+        false
+    };
     let attempted = report.files.iter().any(|item| item.mutation_attempted);
-    let failed = priority_failed || audit.failed()
-        || report.files.iter().any(|item| matches!(item.outcome.as_str(), "failed" | "partial"));
+    let failed = priority_failed
+        || audit.failed()
+        || report
+            .files
+            .iter()
+            .any(|item| matches!(item.outcome.as_str(), "failed" | "partial"));
     report.exit_code = pass_exit_code(attempted, failed, report.unvisited_files);
     report.journal_path = audit.path().map(|path| path.to_string_lossy().into_owned());
-    if !audit.failed() {
-        if let Err(error) = audit.finish(report.exit_code, report.unvisited_files) {
-            report.exit_code = if attempted { 4 } else { 2 };
-            report.stop_reason = Some(format!("could not durably finish the compression journal: {error}"));
-        }
+    if !audit.failed()
+        && let Err(error) = audit.finish(report.exit_code, report.unvisited_files)
+    {
+        report.exit_code = if attempted { 4 } else { 2 };
+        report.stop_reason = Some(format!(
+            "could not durably finish the compression journal: {error}"
+        ));
     }
     report.elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(report)
 }
 
 fn pass_exit_code(mutation_attempted: bool, failed: bool, unvisited: usize) -> i32 {
-    if unvisited != 0 || (mutation_attempted && failed) { 4 }
-    else if failed { 2 }
-    else { 0 }
+    if unvisited != 0 || (mutation_attempted && failed) {
+        4
+    } else if failed {
+        2
+    } else {
+        0
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn process_file(
     path: &Path,
     report: &mut CompressionFileReport,
@@ -138,14 +189,18 @@ fn process_file(
         return Ok(());
     }
     if metadata.len() > policy.max_bytes.saturating_sub(*admitted_bytes) {
-        report.detail = "file exceeds remaining logical-byte budget; no partial-file budget admission".into();
+        report.detail =
+            "file exceeds remaining logical-byte budget; no partial-file budget admission".into();
         return Ok(());
     }
     let canonical = path.canonicalize()?;
     report.path.clone_from(&canonical);
     let stats = platform.fs_stats(&canonical).map_err(other)?;
     if stats.fs_type != "btrfs" {
-        report.detail = format!("unsupported filesystem {}; no compression attempted", stats.fs_type);
+        report.detail = format!(
+            "unsupported filesystem {}; no compression attempted",
+            stats.fs_type
+        );
         return Ok(());
     }
     if stats.is_readonly {
@@ -155,17 +210,34 @@ fn process_file(
     check_protection(&canonical, config, platform)?;
     // Resolve every component without symlinks in one kernel operation. There
     // is no fallback to a pathname-following open on unsupported kernels.
-    let flags = OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOATIME
-        | if mode.apply { OFlags::RDWR } else { OFlags::RDONLY };
-    let file = File::from(openat2(CWD, &canonical, flags, Mode::empty(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS)?);
+    let flags = OFlags::CLOEXEC
+        | OFlags::NOFOLLOW
+        | OFlags::NONBLOCK
+        | OFlags::NOATIME
+        | if mode.apply {
+            OFlags::RDWR
+        } else {
+            OFlags::RDONLY
+        };
+    let file = File::from(openat2(
+        CWD,
+        &canonical,
+        flags,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )?);
     let stamp = FileStamp::read(&file)?;
-    if stamp.device != metadata.dev() || stamp.inode != metadata.ino()
-        || stamp.size != metadata.len() || stamp.mtime != metadata.mtime()
-        || stamp.mtime_nsec != metadata.mtime_nsec() || stamp.ctime != metadata.ctime()
+    if stamp.device != metadata.dev()
+        || stamp.inode != metadata.ino()
+        || stamp.size != metadata.len()
+        || stamp.mtime != metadata.mtime()
+        || stamp.mtime_nsec != metadata.mtime_nsec()
+        || stamp.ctime != metadata.ctime()
         || stamp.ctime_nsec != metadata.ctime_nsec()
     {
-        return Err(io::Error::other("file changed while opening its pinned descriptor"));
+        return Err(io::Error::other(
+            "file changed while opening its pinned descriptor",
+        ));
     }
     if !identities.insert((stamp.device, stamp.inode)) {
         report.detail = "duplicate inode in this pass".into();
@@ -185,7 +257,8 @@ fn process_file(
     }
     check_headroom(&file, policy.min_free_bytes)?;
     verify_path(&canonical, &file, before.stamp)?;
-    *admitted_bytes = admitted_bytes.checked_add(before.stamp.size)
+    *admitted_bytes = admitted_bytes
+        .checked_add(before.stamp.size)
         .ok_or_else(|| io::Error::other("compression work budget overflow"))?;
     if !mode.apply {
         report.outcome = "eligible".into();
@@ -228,21 +301,32 @@ fn process_file(
         }
     }
     if !report.mutation_attempted {
-        return Err(io::Error::other(operation_error.unwrap_or_else(|| "compression stopped before mutation".into())));
+        return Err(io::Error::other(
+            operation_error.unwrap_or_else(|| "compression stopped before mutation".into()),
+        ));
     }
     // Postflight has a separate, bounded budget. A rewrite timeout must not
     // suppress content verification or erase the fact that mutation happened.
     let verification_deadline = Instant::now() + Duration::from_secs(120);
     match digest(&file, before.stamp.size, verification_deadline) {
         Ok(hash_after) => {
-            let stable = before.stamp.same_contents_and_identity(FileStamp::read(&file)?);
+            let stable = before
+                .stamp
+                .same_contents_and_identity(FileStamp::read(&file)?);
             report.content_verified = stable && hash_before == hash_after;
             report.sha256_after = Some(hash_after);
             if !report.content_verified {
-                operation_error = Some("content or file identity changed; stop and investigate concurrent writers".into());
+                operation_error = Some(
+                    "content or file identity changed; stop and investigate concurrent writers"
+                        .into(),
+                );
             }
         }
-        Err(error) => operation_error = Some(format!("postflight content verification incomplete: {error}")),
+        Err(error) => {
+            operation_error = Some(format!(
+                "postflight content verification incomplete: {error}"
+            ));
+        }
     }
     let accounting_deadline = Instant::now() + Duration::from_secs(30);
     match sbh_btrfs::inspect(&file, accounting_deadline) {
@@ -250,18 +334,21 @@ fn process_file(
             report.physical_data_bytes_after = Some(after.physical_data_bytes);
             if report.content_verified {
                 match sbh_btrfs::reclaim_evidence(&file, &before, &after, accounting_deadline) {
-                    Ok(evidence) => report.reclaim = Some(CompressionReclaimReport {
-                        referenced_bytes_saved: evidence.referenced_bytes_saved,
-                        referenced_bytes_added: evidence.referenced_bytes_added,
-                        old_data_bytes_pending: evidence.old_data_bytes_pending,
-                        old_data_bytes_released: evidence.old_data_bytes_released,
-                        new_data_bytes_allocated: evidence.new_data_bytes_allocated,
-                        confirmed_data_bytes_reclaimed: evidence.confirmed_data_bytes_reclaimed,
-                    }),
+                    Ok(evidence) => {
+                        report.reclaim = Some(CompressionReclaimReport {
+                            referenced_bytes_saved: evidence.referenced_bytes_saved,
+                            referenced_bytes_added: evidence.referenced_bytes_added,
+                            old_data_bytes_pending: evidence.old_data_bytes_pending,
+                            old_data_bytes_released: evidence.old_data_bytes_released,
+                            new_data_bytes_allocated: evidence.new_data_bytes_allocated,
+                            confirmed_data_bytes_reclaimed: evidence.confirmed_data_bytes_reclaimed,
+                        });
+                    }
                     Err(error) => report.accounting_error = Some(error.to_string()),
                 }
             } else {
-                report.accounting_error = Some("reclaim is not attributed to an unverified file".into());
+                report.accounting_error =
+                    Some("reclaim is not attributed to an unverified file".into());
             }
         }
         Err(error) => report.accounting_error = Some(error.to_string()),
@@ -271,7 +358,8 @@ fn process_file(
         report.detail = error;
     } else if let Some(error) = &report.accounting_error {
         report.outcome = "partial".into();
-        report.detail = format!("content verified, but physical reclaim accounting is incomplete: {error}");
+        report.detail =
+            format!("content verified, but physical reclaim accounting is incomplete: {error}");
     } else if report.physical_data_bytes_after > report.physical_data_bytes_before {
         report.outcome = "partial".into();
         report.detail = "content verified, but physical data allocation grew; stopping the pass rather than increasing pressure further".into();
@@ -287,16 +375,27 @@ fn check_protection(path: &Path, config: &Config, platform: &dyn Platform) -> io
     // preflight must never hide a marker created before the next chunk.
     let mut registry = protection::ProtectionRegistry::new(Some(&config.scanner.protected_paths))
         .map_err(other)?;
-    let parent = path.parent().ok_or_else(|| io::Error::other("file has no parent"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("file has no parent"))?;
     registry.discover_ancestor_markers(parent).map_err(other)?;
     if registry.is_protected(path) {
-        return Err(io::Error::other("protected by marker or configured path rule"));
+        return Err(io::Error::other(
+            "protected by marker or configured path rule",
+        ));
     }
     if active_lease::path_is_actively_leased(path) {
         return Err(io::Error::other("active or uncertain target lease"));
     }
-    let overlaps = protection::find_sacred_overlaps_with_config(path, &platform.sacred_paths(),
-        protection::StowawayScanConfig { max_depth: 0, ..Default::default() }).map_err(other)?;
+    let overlaps = protection::find_sacred_overlaps_with_config(
+        path,
+        &platform.sacred_paths(),
+        protection::StowawayScanConfig {
+            max_depth: 0,
+            ..Default::default()
+        },
+    )
+    .map_err(other)?;
     if !overlaps.is_empty() {
         return Err(io::Error::other("sacred-path catalog overlap"));
     }
@@ -310,17 +409,27 @@ fn check_active(path: &Path, own_fd: i32, platform: &dyn Platform) -> io::Result
     }
     // Exempt ONLY this pinned descriptor, not every file owned by this PID.
     // stdout redirected into an input file must still veto compression.
-    if open.files.iter().any(|item| foreign_reference(item.pid, item.fd, own_fd)) {
+    if open
+        .files
+        .iter()
+        .any(|item| foreign_reference(item.pid, item.fd, own_fd))
+    {
         return Err(io::Error::other("file has active open references"));
     }
     let executables = platform.executables_under(path).map_err(other)?;
     if !executables.complete || !executables.processes.is_empty() {
-        return Err(io::Error::other("executable inspection incomplete or file is executing"));
+        return Err(io::Error::other(
+            "executable inspection incomplete or file is executing",
+        ));
     }
     if !platform.mmap_regions_under(path).map_err(other)?.is_empty() {
         return Err(io::Error::other("file has active memory mappings"));
     }
-    if platform.build_directories_in_use().iter().any(|(_, root)| path.starts_with(root)) {
+    if platform
+        .build_directories_in_use()
+        .iter()
+        .any(|(_, root)| path.starts_with(root))
+    {
         return Err(io::Error::other("file is inside an active build directory"));
     }
     Ok(())
@@ -337,33 +446,47 @@ fn check_headroom(file: &File, reserve: u64) -> io::Result<()> {
     if stats.flags().contains(FsFlags::ST_RDONLY) {
         return Err(io::Error::other("filesystem became read-only"));
     }
-    let available = stats.blocks_available().checked_mul(stats.fragment_size())
+    let available = stats
+        .blocks_available()
+        .checked_mul(stats.fragment_size())
         .ok_or_else(|| io::Error::other("filesystem available-byte overflow"))?;
-    let needed = reserve.checked_add(2 * MAX_CHUNK_BYTES)
+    let needed = reserve
+        .checked_add(2 * MAX_CHUNK_BYTES)
         .ok_or_else(|| io::Error::other("rewrite reserve overflow"))?;
     if available < needed {
-        return Err(io::Error::other("insufficient free-space reserve for bounded copy-on-write compression"));
+        return Err(io::Error::other(
+            "insufficient free-space reserve for bounded copy-on-write compression",
+        ));
     }
     Ok(())
 }
 
 fn verify_path(path: &Path, file: &File, expected: FileStamp) -> io::Result<()> {
     if FileStamp::read(file)? != expected {
-        return Err(io::Error::other("pinned file changed since its last verified state"));
+        return Err(io::Error::other(
+            "pinned file changed since its last verified state",
+        ));
     }
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.dev() != expected.device || metadata.ino() != expected.inode
+    if !metadata.is_file()
+        || metadata.dev() != expected.device
+        || metadata.ino() != expected.inode
         || path.canonicalize()? != path
         || fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))? != path
     {
-        return Err(io::Error::other("path or ancestor was replaced, renamed, or unlinked"));
+        return Err(io::Error::other(
+            "path or ancestor was replaced, renamed, or unlinked",
+        ));
     }
     Ok(())
 }
 
 fn budget(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline {
-        Err(io::Error::new(io::ErrorKind::TimedOut, "compression work budget exhausted"))
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "compression work budget exhausted",
+        ))
     } else {
         Ok(())
     }

@@ -5,8 +5,22 @@ use crate::platform::pal::MockPlatform;
 fn incomplete_process_evidence_never_admits_compression() {
     let path = Path::new("/tmp/cold-input");
     assert!(check_active(path, -1, &MockPlatform::healthy()).is_ok());
-    assert!(check_active(path, -1, &MockPlatform::healthy().with_open_files_complete(false)).is_err());
-    assert!(check_active(path, -1, &MockPlatform::healthy().with_executables_complete(false)).is_err());
+    assert!(
+        check_active(
+            path,
+            -1,
+            &MockPlatform::healthy().with_open_files_complete(false)
+        )
+        .is_err()
+    );
+    assert!(
+        check_active(
+            path,
+            -1,
+            &MockPlatform::healthy().with_executables_complete(false)
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -28,7 +42,10 @@ fn configured_parent_protection_is_a_hard_veto_for_explicit_files() {
     let file = temp.path().join("cold.bin");
     fs::write(&file, b"protected").unwrap();
     let mut config = Config::default();
-    config.scanner.protected_paths.push(temp.path().to_string_lossy().into_owned());
+    config
+        .scanner
+        .protected_paths
+        .push(temp.path().to_string_lossy().into_owned());
     assert!(check_protection(&file, &config, &MockPlatform::healthy()).is_err());
 }
 
@@ -54,10 +71,15 @@ fn preflight_hash_is_exact_and_short_reads_or_deadlines_are_not_success() {
     fs::write(&path, b"abc").unwrap();
     let file = File::open(path).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
-    assert_eq!(digest(&file, 3, deadline).unwrap(),
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert_eq!(
+        digest(&file, 3, deadline).unwrap(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
     assert!(digest(&file, 4, deadline).is_err());
-    assert_eq!(digest(&file, 3, Instant::now()).unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert_eq!(
+        digest(&file, 3, Instant::now()).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
 }
 
 #[test]

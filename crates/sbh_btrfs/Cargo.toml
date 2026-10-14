@@ -5,9 +5,8 @@ edition = "2024"
 license = "MIT"
 description = "Small, descriptor-only Btrfs compression and physical-extent inspection boundary for sbh"
 
-# Keep the Linux syscall boundary independently testable, like sbh_mach's
-# platform-specific tests. The main application remains unsafe-free.
-[workspace]
+# A workspace member, like sbh_mach: test it alone with `cargo test -p sbh_btrfs`.
+# The main application remains unsafe-free.
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

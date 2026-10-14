@@ -15,7 +15,11 @@ fn fixture() -> (tempfile::TempDir, AuditSession, File, CompressionFileReport) {
     report.logical_bytes = 3;
     report.physical_data_bytes_before = Some(4096);
     report.sha256_before = Some(ABC.into());
-    let policy = CompressionPolicy { min_size_bytes: 1, max_bytes: 64, ..Default::default() };
+    let policy = CompressionPolicy {
+        min_size_bytes: 1,
+        max_bytes: 64,
+        ..Default::default()
+    };
     let session = AuditSession::new(root.join("compression-journal"), 2, &policy);
     (temp, session, file, report)
 }
@@ -47,8 +51,14 @@ fn intent_is_readable_before_mutation_and_live_writer_cannot_be_recovered() {
     assert_eq!(parsed.operations.len(), 1);
     assert!(parsed.operations[0].1.is_none());
     assert_eq!(parsed.operations[0].0.sha256_before, ABC);
-    assert_eq!(parsed.operations[0].0.operation_id, report.operation_id.as_deref().unwrap());
-    assert!(recover(path, 64, 30).is_err(), "an active run must not appear interrupted");
+    assert_eq!(
+        parsed.operations[0].0.operation_id,
+        report.operation_id.as_deref().unwrap()
+    );
+    assert!(
+        recover(path, 64, 30).is_err(),
+        "an active run must not appear interrupted"
+    );
     assert_eq!(fs::read(&report.path).unwrap(), b"abc");
 }
 
@@ -68,8 +78,15 @@ fn interrupted_intent_verifies_content_without_rewriting_or_claiming_reclaim() {
     assert_eq!(fs::read(&journal).unwrap(), before_journal);
     assert_eq!(fs::read(&source).unwrap(), b"abc");
     let after = fs::metadata(&source).unwrap();
-    assert_eq!((after.ino(), after.len(), after.mtime(), after.mtime_nsec()),
-        (before_source.ino(), before_source.len(), before_source.mtime(), before_source.mtime_nsec()));
+    assert_eq!(
+        (after.ino(), after.len(), after.mtime(), after.mtime_nsec()),
+        (
+            before_source.ino(),
+            before_source.len(),
+            before_source.mtime(),
+            before_source.mtime_nsec()
+        )
+    );
 }
 
 #[test]
@@ -89,7 +106,13 @@ fn completed_failure_is_durable_and_preserves_its_nonzero_exit_code() {
     let operation = &report.operations[0];
     assert_eq!(operation.verification, "recorded_only");
     assert!(!operation.content_verified_now);
-    assert!(!operation.recorded_result.as_ref().unwrap().mutation_attempted);
+    assert!(
+        !operation
+            .recorded_result
+            .as_ref()
+            .unwrap()
+            .mutation_attempted
+    );
 }
 
 #[test]
@@ -106,14 +129,20 @@ fn a_torn_last_record_is_uncertain_but_a_malformed_complete_record_is_an_error()
     assert!(parse_records(&torn).is_err());
     let mut blank = prefix;
     blank.push(b'\n');
-    assert!(parse_records(&blank).is_err(), "complete blank lines must not disappear");
+    assert!(
+        parse_records(&blank).is_err(),
+        "complete blank lines must not disappear"
+    );
 }
 
 #[test]
 fn recovery_rejects_forged_sequences_run_ids_and_premature_success_footers() {
     let (_temp, journal, _) = intent_only();
     let text = fs::read_to_string(journal).unwrap();
-    let records: Vec<serde_json::Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
     for (field, replacement) in [
         ("sequence", serde_json::json!(99)),
         ("run_id", serde_json::json!("another-run")),
@@ -121,7 +150,11 @@ fn recovery_rejects_forged_sequences_run_ids_and_premature_success_footers() {
     ] {
         let mut changed = records.clone();
         changed[1][field] = replacement;
-        let bytes = changed.iter().map(|record| format!("{record}\n")).collect::<String>();
+        let bytes = changed.iter().fold(String::new(), |mut out, record| {
+            out.push_str(&record.to_string());
+            out.push('\n');
+            out
+        });
         assert!(parse_records(bytes.as_bytes()).is_err(), "{field}");
     }
     let mut bytes = text.into_bytes();
@@ -132,7 +165,10 @@ fn recovery_rejects_forged_sequences_run_ids_and_premature_success_footers() {
         }
     });
     bytes.extend_from_slice(format!("{footer}\n").as_bytes());
-    assert!(parse_records(&bytes).is_err(), "an intent without an outcome is not success");
+    assert!(
+        parse_records(&bytes).is_err(),
+        "an intent without an outcome is not success"
+    );
 }
 
 #[test]
@@ -146,7 +182,11 @@ fn oversized_outcome_poisoning_leaves_the_original_intent_recoverable() {
     assert!(session.complete(&item).is_err());
     assert!(session.failed());
     assert!(session.finish(2, 0).is_err());
-    assert_eq!(fs::read(&path).unwrap(), before, "check the record budget before writing");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "check the record budget before writing"
+    );
     drop(session);
     assert!(!recover(&path, 64, 30).unwrap().run_finished);
 }
@@ -199,7 +239,11 @@ fn changed_bytes_are_detected_even_if_size_and_mtime_were_restored() {
     assert_eq!(report.operations[0].verification, "content_mismatch");
     assert!(!report.operations[0].content_verified_now);
     assert_eq!(report.exit_code, 4);
-    assert_eq!(fs::read(source).unwrap(), b"xyz", "recovery must not repair or replace data");
+    assert_eq!(
+        fs::read(source).unwrap(),
+        b"xyz",
+        "recovery must not repair or replace data"
+    );
 }
 
 #[test]
@@ -217,7 +261,12 @@ fn recovery_budget_exhaustion_is_not_success_or_replay() {
 #[test]
 fn journal_read_budget_is_checked_before_reading_the_payload() {
     let (_temp, journal, _) = intent_only();
-    OpenOptions::new().write(true).open(&journal).unwrap().set_len(MAX_JOURNAL_BYTES + 1).unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(&journal)
+        .unwrap()
+        .set_len(MAX_JOURNAL_BYTES + 1)
+        .unwrap();
     let error = recover(&journal, 64, 30).unwrap_err();
     assert!(error.to_string().contains("32 MiB"));
 }
@@ -226,14 +275,21 @@ fn journal_read_budget_is_checked_before_reading_the_payload() {
 fn native_path_bytes_survive_intent_storage_and_recovery() {
     use std::os::unix::ffi::OsStringExt;
     let (temp, mut session, file, mut item) = fixture();
-    let native = temp.path().canonicalize().unwrap().join(std::ffi::OsString::from_vec(b"cold-\xff.bin".to_vec()));
+    let native = temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(std::ffi::OsString::from_vec(b"cold-\xff.bin".to_vec()));
     fs::rename(&item.path, &native).unwrap();
     item.path = native.clone();
     session.prepare(&mut item, &file).unwrap();
     let journal = session.path().unwrap().to_path_buf();
     drop(session);
     let parsed = parse_records(&fs::read(&journal).unwrap()).unwrap();
-    assert_eq!(decode_path(&parsed.operations[0].0.path_hex).unwrap(), native);
+    assert_eq!(
+        decode_path(&parsed.operations[0].0.path_hex).unwrap(),
+        native
+    );
     let recovered = recover(&journal, 64, 30).unwrap();
     assert!(recovered.operations[0].content_verified_now);
     assert!(serde_json::to_value(recovered).is_ok());
@@ -241,7 +297,14 @@ fn native_path_bytes_survive_intent_storage_and_recovery() {
 
 #[test]
 fn native_path_decoding_refuses_nul_relative_traversal_and_invalid_hex() {
-    for value in ["", "00", "ffg0", "2f746d702f00", "72656c6174697665", "2f746d702f2e2e2f66696c65"] {
+    for value in [
+        "",
+        "00",
+        "ffg0",
+        "2f746d702f00",
+        "72656c6174697665",
+        "2f746d702f2e2e2f66696c65",
+    ] {
         assert!(decode_path(value).is_err(), "{value}");
     }
 }
@@ -250,7 +313,8 @@ fn native_path_decoding_refuses_nul_relative_traversal_and_invalid_hex() {
 fn appending_a_torn_outcome_does_not_erase_the_prepared_intent() {
     let (_temp, journal, _) = intent_only();
     let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
-    file.write_all(b"{\"entry\":{\"kind\":\"file_finished\"").unwrap();
+    file.write_all(b"{\"entry\":{\"kind\":\"file_finished\"")
+        .unwrap();
     file.sync_all().unwrap();
     drop(file);
     let report = recover(&journal, 64, 30).unwrap();

@@ -38,7 +38,11 @@ fn call<T>(file: &File, operation: c_ulong, buffer: &mut T) -> io::Result<()> {
     // correctly sized/aligned for the request at each private call site, and
     // these synchronous ioctls do not retain its pointer after returning.
     let result = unsafe { ioctl(file.as_raw_fd(), operation, std::ptr::from_mut(buffer)) };
-    if result < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) fn features(file: &File) -> io::Result<u64> {
@@ -83,7 +87,9 @@ pub(super) fn fiemap_flags(
     length: u64,
     deadline: Instant,
 ) -> io::Result<u32> {
-    let end = start.checked_add(length).ok_or_else(|| invalid("FIEMAP range overflow"))?;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| invalid("FIEMAP range overflow"))?;
     let mut cursor = start;
     let mut total = 0_usize;
     let mut flags = 0_u32;
@@ -105,16 +111,24 @@ pub(super) fn fiemap_flags(
         if count > FIEMAP_BATCH {
             return Err(invalid("kernel FIEMAP count exceeds buffer"));
         }
-        if count == 0 { break; }
-        total = total.checked_add(count).ok_or_else(|| invalid("FIEMAP count overflow"))?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count)
+            .ok_or_else(|| invalid("FIEMAP count overflow"))?;
         if total > MAX_EXTENTS {
             return Err(invalid("FIEMAP extent budget exceeded"));
         }
         let mut next = cursor;
         for (index, extent) in buffer.extents[..count].iter().enumerate() {
-            let extent_end = extent.logical.checked_add(extent.length)
+            let extent_end = extent
+                .logical
+                .checked_add(extent.length)
                 .ok_or_else(|| invalid("FIEMAP extent offset overflow"))?;
-            if extent.length == 0 || extent.logical >= end || extent_end <= next
+            if extent.length == 0
+                || extent.logical >= end
+                || extent_end <= next
                 || (index != 0 && extent.logical < next)
             {
                 return Err(invalid("unordered or non-progressing FIEMAP"));
@@ -126,7 +140,9 @@ pub(super) fn fiemap_flags(
             flags |= extent.flags;
         }
         cursor = next;
-        if flags & FIEMAP_EXTENT_LAST != 0 { break; }
+        if flags & FIEMAP_EXTENT_LAST != 0 {
+            break;
+        }
     }
     Ok(flags)
 }
@@ -183,16 +199,22 @@ pub(super) fn visit_items(
         };
         call(file, TREE_SEARCH, &mut buffer)?;
         let count = buffer.key.nr_items as usize;
-        if count == 0 { return Ok(()); }
+        if count == 0 {
+            return Ok(());
+        }
         if count > 128 {
             return Err(invalid("kernel TREE_SEARCH count exceeds request"));
         }
-        total = total.checked_add(count).ok_or_else(|| invalid("tree item count overflow"))?;
+        total = total
+            .checked_add(count)
+            .ok_or_else(|| invalid("tree item count overflow"))?;
         if total > MAX_EXTENTS {
             return Err(invalid("tree item budget exceeded"));
         }
         let last = parse_search_page(&buffer.bytes, count, object, kind, cursor, &mut visit)?;
-        let Some(next) = last.checked_add(1) else { return Ok(()); };
+        let Some(next) = last.checked_add(1) else {
+            return Ok(());
+        };
         cursor = next;
     }
 }
@@ -208,23 +230,53 @@ fn parse_search_page(
     let mut position = 0_usize;
     let mut last = None;
     for _ in 0..count {
-        let header_end = position.checked_add(32).ok_or_else(|| invalid("tree header overflow"))?;
-        let header = bytes.get(position..header_end).ok_or_else(|| invalid("truncated search header"))?;
+        let header_end = position
+            .checked_add(32)
+            .ok_or_else(|| invalid("tree header overflow"))?;
+        let header = bytes
+            .get(position..header_end)
+            .ok_or_else(|| invalid("truncated search header"))?;
         // The ioctl header is NATIVE endian. Its packed on-disk payload is not.
-        let returned_object = u64::from_ne_bytes(header[8..16].try_into().map_err(|_| invalid("search object"))?);
-        let offset = u64::from_ne_bytes(header[16..24].try_into().map_err(|_| invalid("search offset"))?);
-        let returned_kind = u32::from_ne_bytes(header[24..28].try_into().map_err(|_| invalid("search type"))?);
-        let length = u32::from_ne_bytes(header[28..32].try_into().map_err(|_| invalid("search length"))?) as usize;
-        if returned_object != object || returned_kind != kind || offset < minimum_offset
+        let returned_object = u64::from_ne_bytes(
+            header[8..16]
+                .try_into()
+                .map_err(|_| invalid("search object"))?,
+        );
+        let offset = u64::from_ne_bytes(
+            header[16..24]
+                .try_into()
+                .map_err(|_| invalid("search offset"))?,
+        );
+        let returned_kind = u32::from_ne_bytes(
+            header[24..28]
+                .try_into()
+                .map_err(|_| invalid("search type"))?,
+        );
+        let length = u32::from_ne_bytes(
+            header[28..32]
+                .try_into()
+                .map_err(|_| invalid("search length"))?,
+        ) as usize;
+        if returned_object != object
+            || returned_kind != kind
+            || offset < minimum_offset
             || last.is_some_and(|previous| offset <= previous)
         {
-            return Err(invalid("TREE_SEARCH returned an out-of-range or unordered key"));
+            return Err(invalid(
+                "TREE_SEARCH returned an out-of-range or unordered key",
+            ));
         }
         // A zero-length item can be V1's signal that an item did not fit.
         // Neither file extent items nor allocation items are legitimately empty.
-        if length == 0 { return Err(invalid("empty or oversized tree item")); }
-        let payload_end = header_end.checked_add(length).ok_or_else(|| invalid("tree payload overflow"))?;
-        let payload = bytes.get(header_end..payload_end).ok_or_else(|| invalid("truncated tree item"))?;
+        if length == 0 {
+            return Err(invalid("empty or oversized tree item"));
+        }
+        let payload_end = header_end
+            .checked_add(length)
+            .ok_or_else(|| invalid("tree payload overflow"))?;
+        let payload = bytes
+            .get(header_end..payload_end)
+            .ok_or_else(|| invalid("truncated tree item"))?;
         visit(offset, payload)?;
         last = Some(offset);
         position = payload_end;
@@ -247,7 +299,7 @@ pub(super) fn defrag_zstd(file: &File, start: u64, length: u64) -> io::Result<()
     let mut range = DefragRange {
         start,
         length,
-        flags: 1 | 2, // COMPRESS | START_IO
+        flags: 1 | 2,     // COMPRESS | START_IO
         compress_type: 3, // BTRFS_COMPRESS_ZSTD, not zlib's zero/default
         ..DefragRange::default()
     };
@@ -277,7 +329,11 @@ pub(super) fn get_ioprio() -> io::Result<i32> {
 pub(super) fn set_ioprio(priority: i32) -> io::Result<()> {
     // SAFETY: integer-only syscall, operating on the calling thread (who=0).
     let result = unsafe { syscall(IOPRIO_SET, 1 as c_long, 0 as c_long, c_long::from(priority)) };
-    if result < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 // Compile-time ABI checks for both supported LP64/asm-generic ioctl targets.
@@ -323,7 +379,8 @@ mod tests {
             visited.push(offset);
             assert_eq!(data, &[1, 2, 3]);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(visited, [0, 4096, 8192]);
         assert_eq!(last, 8192);
     }
@@ -332,7 +389,9 @@ mod tests {
     fn truncated_search_headers_and_payloads_fail_closed() {
         let bytes = page(42, 108, &[0]);
         for length in 0..bytes.len() {
-            assert!(parse_search_page(&bytes[..length], 1, 42, 108, 0, &mut |_, _| Ok(())).is_err());
+            assert!(
+                parse_search_page(&bytes[..length], 1, 42, 108, 0, &mut |_, _| Ok(())).is_err()
+            );
         }
     }
 
@@ -345,7 +404,9 @@ mod tests {
             (page(42, 108, &[4096, 0]), 2, 0),
             (page(42, 108, &[0]), 1, 1),
         ] {
-            assert!(parse_search_page(&bytes, count, 42, 108, minimum, &mut |_, _| Ok(())).is_err());
+            assert!(
+                parse_search_page(&bytes, count, 42, 108, minimum, &mut |_, _| Ok(())).is_err()
+            );
         }
         let mut bytes = page(42, 108, &[0]);
         bytes[28..32].fill(0);

@@ -137,6 +137,8 @@ assert_is_empty = "allow"
 # compiles to nothing (`#![cfg(target_os = "macos")]`), so Linux jobs that build
 # the root package alone are unaffected.
 [workspace]
-members = [".", "crates/sbh_mach"]
-# The dependency-free Linux syscall boundary retains its own native test lane.
-exclude = ["crates/sbh_btrfs"]
+# `crates/sbh_btrfs` likewise compiles to nothing off Linux x86-64/AArch64 and
+# keeps its own lane through `cargo test -p sbh_btrfs`. It must be a member:
+# excluded while the root depends on it by path, cargo refuses the workspace
+# ("multiple workspace roots").
+members = [".", "crates/sbh_mach", "crates/sbh_btrfs"]

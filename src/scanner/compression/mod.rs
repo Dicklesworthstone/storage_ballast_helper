@@ -16,7 +16,10 @@ use crate::platform::pal::Platform;
 
 pub mod journal;
 
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod linux;
 
 /// Limits for a serial compression pass. Logical input bytes bound rewrite and
@@ -61,8 +64,10 @@ impl CompressionPolicy {
             || !(1..=3600).contains(&self.timeout_secs)
             || self.min_free_bytes < 256 * 1024 * 1024
         {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "compression requires nonzero size/byte limits, age >= 3600s, 1..4096 files, 1..3600s, and free reserve >= 256 MiB"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "compression requires nonzero size/byte limits, age >= 3600s, 1..4096 files, 1..3600s, and free reserve >= 256 MiB",
+            ));
         }
         Ok(())
     }
@@ -118,19 +123,38 @@ pub struct CompressionFileReport {
     pub accounting_error: Option<String>,
 }
 
-fn serialize_display_path<S: serde::Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+fn serialize_display_path<S: serde::Serializer>(
+    path: &Path,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&path.to_string_lossy())
 }
 
 impl CompressionFileReport {
+    // Only the Linux backend builds reports.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     fn new(path: &Path) -> Self {
         Self {
-            path: path.to_path_buf(), operation_id: None,
-            outcome: "skipped".into(), detail: String::new(),
-            logical_bytes: 0, physical_data_bytes_before: None,
-            physical_data_bytes_after: None, processed_bytes: 0,
-            mutation_attempted: false, sha256_before: None, sha256_after: None,
-            content_verified: false, reclaim: None, accounting_error: None,
+            path: path.to_path_buf(),
+            operation_id: None,
+            outcome: "skipped".into(),
+            detail: String::new(),
+            logical_bytes: 0,
+            physical_data_bytes_before: None,
+            physical_data_bytes_after: None,
+            processed_bytes: 0,
+            mutation_attempted: false,
+            sha256_before: None,
+            sha256_after: None,
+            content_verified: false,
+            reclaim: None,
+            accounting_error: None,
         }
     }
 }
@@ -179,8 +203,10 @@ pub struct CompressionReport {
     pub exit_code: i32,
 }
 
-/// Run on explicitly selected regular files. No recursive scan, deletion,
-/// truncation, service changes, or persistent policy changes are performed.
+/// Run on explicitly selected regular files.
+///
+/// No recursive scan, deletion, truncation, service changes, or persistent
+/// policy changes are performed.
 /// Each input needs a fresh admission; a preview is never execution authority.
 /// Apply requires an fsynced intent journal beside the configured state file;
 /// failure to record intent refuses mutation, and failed outcome recording
@@ -194,38 +220,74 @@ pub fn run(
 ) -> io::Result<CompressionReport> {
     policy.validate()?;
     if paths.is_empty() || paths.len() > 4096 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "supply 1..4096 explicit file paths"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "supply 1..4096 explicit file paths",
+        ));
     }
     if mode.apply && (!mode.allow_zstd_feature || !mode.quiescent) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "apply requires --allow-zstd-feature and --quiescent; stop concurrent writers, snapshots and reflinks first"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "apply requires --allow-zstd-feature and --quiescent; stop concurrent writers, snapshots and reflinks first",
+        ));
     }
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     {
         linux::run(paths, policy, mode, config, platform)
     }
-    #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     {
         let _ = (config, platform);
         Ok(CompressionReport {
-            schema: "sbh.compression.v1", dry_run: !mode.apply, supported: false,
-            policy: policy.clone(), journal_path: None, files: Vec::new(), unvisited_files: paths.len(),
+            schema: "sbh.compression.v1",
+            dry_run: !mode.apply,
+            supported: false,
+            policy: policy.clone(),
+            journal_path: None,
+            files: Vec::new(),
+            unvisited_files: paths.len(),
             stop_reason: Some("compression is supported only on Linux x86-64/AArch64 Btrfs".into()),
-            elapsed_ms: 0, exit_code: 0,
+            elapsed_ms: 0,
+            exit_code: 0,
         })
     }
 }
 
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    allow(dead_code)
+)]
 fn already_compressed(path: &Path) -> bool {
-    let Some(suffix) = path.extension().and_then(|value| value.to_str()) else { return false; };
-    ["gz", "zst", "xz", "bz2", "zip", "7z", "rar", "br", "lz4", "lzma",
-        "png", "jpg", "jpeg", "webp", "avif", "heic", "mp3", "mp4", "mkv",
-        "ogg", "flac", "woff", "woff2", "pdf"]
-        .iter().any(|excluded| suffix.eq_ignore_ascii_case(excluded))
+    let Some(suffix) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    [
+        "gz", "zst", "xz", "bz2", "zip", "7z", "rar", "br", "lz4", "lzma", "png", "jpg", "jpeg",
+        "webp", "avif", "heic", "mp3", "mp4", "mkv", "ogg", "flac", "woff", "woff2", "pdf",
+    ]
+    .iter()
+    .any(|excluded| suffix.eq_ignore_ascii_case(excluded))
 }
 
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    allow(dead_code)
+)]
 fn cold_enough(modified: std::time::SystemTime, now: std::time::SystemTime, minimum: u64) -> bool {
-    now.duration_since(modified).is_ok_and(|age| age >= Duration::from_secs(minimum))
+    now.duration_since(modified)
+        .is_ok_and(|age| age >= Duration::from_secs(minimum))
 }
 
 #[cfg(test)]

@@ -184,7 +184,10 @@ pub fn inspect(file: &File, deadline: Instant) -> io::Result<ExtentMap> {
     check_deadline(deadline)?;
     let stamp = FileStamp::read(file)?;
     if !is_btrfs(file)? {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "not a Btrfs file"));
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "not a Btrfs file",
+        ));
     }
     let inode_flags = ioctl::inode_flags(file)?;
     let fiemap_flags = ioctl::fiemap_flags(file, 0, stamp.size, deadline)?;
@@ -199,12 +202,11 @@ pub fn inspect(file: &File, deadline: Instant) -> io::Result<ExtentMap> {
         inline_bytes = inline_bytes
             .checked_add(parsed.inline_bytes)
             .ok_or_else(|| invalid("inline byte count overflow"))?;
-        if let Some(extent) = parsed.extent {
-            if let Some(previous) = allocations.insert(extent.bytenr, extent.disk_num_bytes) {
-                if previous != extent.disk_num_bytes {
-                    return Err(invalid("inconsistent physical extent lengths"));
-                }
-            }
+        if let Some(extent) = parsed.extent
+            && let Some(previous) = allocations.insert(extent.bytenr, extent.disk_num_bytes)
+            && previous != extent.disk_num_bytes
+        {
+            return Err(invalid("inconsistent physical extent lengths"));
         }
         Ok(())
     })?;
@@ -217,7 +219,10 @@ pub fn inspect(file: &File, deadline: Instant) -> io::Result<ExtentMap> {
     let physical_data_bytes = checked_sum(allocations.values().copied())?;
     let extents = allocations
         .into_iter()
-        .map(|(bytenr, disk_num_bytes)| DataExtent { bytenr, disk_num_bytes })
+        .map(|(bytenr, disk_num_bytes)| DataExtent {
+            bytenr,
+            disk_num_bytes,
+        })
         .collect();
     Ok(ExtentMap {
         stamp,
@@ -256,14 +261,19 @@ pub fn compress_range(
         return Err(invalid("refusing a hard-linked or unlinked file"));
     }
     if !is_btrfs(file)? {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "not a Btrfs file"));
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "not a Btrfs file",
+        ));
     }
     if ioctl::inode_flags(file)? & ioctl::EXCLUDED_INODE_FLAGS != 0 {
         return Err(invalid("inode flags forbid compression"));
     }
     let flags = ioctl::fiemap_flags(file, start, length, deadline)?;
     if flags & !ioctl::FIEMAP_EXTENT_LAST != 0 {
-        return Err(invalid("range is shared, encoded, delayed, or otherwise unsupported"));
+        return Err(invalid(
+            "range is shared, encoded, delayed, or otherwise unsupported",
+        ));
     }
     if FileStamp::read(file)? != stamp {
         return Err(io::Error::other("file changed before compression"));
@@ -272,7 +282,9 @@ pub fn compress_range(
     ioctl::defrag_zstd(file, start, length)?;
     file.sync_all()?;
     if !stamp.same_contents_and_identity(FileStamp::read(file)?) {
-        return Err(io::Error::other("file identity, size, or mtime changed during compression"));
+        return Err(io::Error::other(
+            "file identity, size, or mtime changed during compression",
+        ));
     }
     Ok(())
 }
@@ -305,19 +317,29 @@ pub fn reclaim_evidence(
     deadline: Instant,
 ) -> io::Result<ReclaimEvidence> {
     if !before.stamp.same_contents_and_identity(after.stamp)
-        || !after.stamp.same_contents_and_identity(FileStamp::read(file)?)
+        || !after
+            .stamp
+            .same_contents_and_identity(FileStamp::read(file)?)
     {
-        return Err(io::Error::other("file changed; reclaim attribution is invalid"));
+        return Err(io::Error::other(
+            "file changed; reclaim attribution is invalid",
+        ));
     }
     let mut evidence = ReclaimEvidence {
-        referenced_bytes_saved: before.physical_data_bytes.saturating_sub(after.physical_data_bytes),
-        referenced_bytes_added: after.physical_data_bytes.saturating_sub(before.physical_data_bytes),
+        referenced_bytes_saved: before
+            .physical_data_bytes
+            .saturating_sub(after.physical_data_bytes),
+        referenced_bytes_added: after
+            .physical_data_bytes
+            .saturating_sub(before.physical_data_bytes),
         ..ReclaimEvidence::default()
     };
     for extent in &after.extents {
         if before.extents.binary_search(extent).is_err() {
-            evidence.new_data_bytes_allocated = evidence.new_data_bytes_allocated
-                .checked_add(extent.disk_num_bytes).ok_or_else(|| invalid("allocation sum overflow"))?;
+            evidence.new_data_bytes_allocated = evidence
+                .new_data_bytes_allocated
+                .checked_add(extent.disk_num_bytes)
+                .ok_or_else(|| invalid("allocation sum overflow"))?;
         }
     }
     for extent in &before.extents {
@@ -336,10 +358,12 @@ pub fn reclaim_evidence(
         } else {
             &mut evidence.old_data_bytes_released
         };
-        *sum = sum.checked_add(extent.disk_num_bytes)
+        *sum = sum
+            .checked_add(extent.disk_num_bytes)
             .ok_or_else(|| invalid("retired allocation sum overflow"))?;
     }
-    evidence.confirmed_data_bytes_reclaimed = evidence.old_data_bytes_released
+    evidence.confirmed_data_bytes_reclaimed = evidence
+        .old_data_bytes_released
         .saturating_sub(evidence.new_data_bytes_allocated);
     Ok(evidence)
 }
@@ -359,7 +383,11 @@ impl IdleIoPriority {
     pub fn enter() -> io::Result<Self> {
         let previous = ioctl::get_ioprio()?;
         ioctl::set_ioprio(3 << 13)?; // IOPRIO_CLASS_IDLE
-        Ok(Self { previous, restored: false, same_thread: PhantomData })
+        Ok(Self {
+            previous,
+            restored: false,
+            same_thread: PhantomData,
+        })
     }
 
     /// Restore the previous priority and surface restoration errors explicitly.
@@ -379,17 +407,24 @@ impl Drop for IdleIoPriority {
 }
 
 fn validate_range(start: u64, length: u64, size: u64) -> io::Result<()> {
-    if length == 0 || length > MAX_CHUNK_BYTES || start % 4096 != 0
+    if length == 0
+        || length > MAX_CHUNK_BYTES
+        || !start.is_multiple_of(4096)
         || start.checked_add(length).is_none_or(|end| end > size)
     {
-        return Err(invalid("invalid, unaligned, or oversized compression range"));
+        return Err(invalid(
+            "invalid, unaligned, or oversized compression range",
+        ));
     }
     Ok(())
 }
 
 fn check_deadline(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline {
-        Err(io::Error::new(io::ErrorKind::TimedOut, "compression inspection budget exhausted"))
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "compression inspection budget exhausted",
+        ))
     } else {
         Ok(())
     }
@@ -401,7 +436,8 @@ fn invalid(message: &'static str) -> io::Error {
 
 fn checked_sum(mut values: impl Iterator<Item = u64>) -> io::Result<u64> {
     values.try_fold(0_u64, |sum, value| {
-        sum.checked_add(value).ok_or_else(|| invalid("physical byte count overflow"))
+        sum.checked_add(value)
+            .ok_or_else(|| invalid("physical byte count overflow"))
     })
 }
 
@@ -420,13 +456,25 @@ fn parse_file_extent(item: &[u8]) -> io::Result<ParsedExtent> {
     }
     let encoded = item[16..20].iter().any(|byte| *byte != 0);
     match item[20] {
-        0 => Ok(ParsedExtent { inline_bytes: (item.len() - 21) as u64, encoded, ..ParsedExtent::default() }),
+        0 => Ok(ParsedExtent {
+            inline_bytes: (item.len() - 21) as u64,
+            encoded,
+            ..ParsedExtent::default()
+        }),
         kind @ (1 | 2) => {
             if item.len() != 53 {
                 return Err(invalid("unsupported regular file extent item length"));
             }
-            let bytenr = u64::from_le_bytes(item[21..29].try_into().map_err(|_| invalid("extent address"))?);
-            let disk_num_bytes = u64::from_le_bytes(item[29..37].try_into().map_err(|_| invalid("extent length"))?);
+            let bytenr = u64::from_le_bytes(
+                item[21..29]
+                    .try_into()
+                    .map_err(|_| invalid("extent address"))?,
+            );
+            let disk_num_bytes = u64::from_le_bytes(
+                item[29..37]
+                    .try_into()
+                    .map_err(|_| invalid("extent length"))?,
+            );
             if (bytenr == 0) != (disk_num_bytes == 0) {
                 return Err(invalid("inconsistent hole or data allocation"));
             }
@@ -434,7 +482,10 @@ fn parse_file_extent(item: &[u8]) -> io::Result<ParsedExtent> {
                 return Err(invalid("extent address overflow"));
             }
             Ok(ParsedExtent {
-                extent: (bytenr != 0).then_some(DataExtent { bytenr, disk_num_bytes }),
+                extent: (bytenr != 0).then_some(DataExtent {
+                    bytenr,
+                    disk_num_bytes,
+                }),
                 encoded,
                 preallocated: kind == 2,
                 ..ParsedExtent::default()
