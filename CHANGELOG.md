@@ -68,6 +68,13 @@ Git repositories.
   full and swap exhausted. It now copies only while `/dev/shm` has a fifth
   of its space free and swap is not nearly full, re-checks every 30 seconds,
   and logs why when it stops or skips the copy.
+- `sbh compress --recover-journal` run just after a pass ended no longer
+  reports the pass as still running because another process was being
+  started at that moment; it waits up to two seconds for the lock
+  (`ddc6a16`).
+- `install.sh` reads the latest release tag from GitHub API responses
+  served as one-line JSON, where it took part of the release notes as the
+  version (`8023aa9`).
 
 ### Added
 
