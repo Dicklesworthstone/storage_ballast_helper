@@ -250,6 +250,20 @@ impl CandidateIndexRecord {
         self.parent_identity == parent_identity && self.parent_mtime_nanos == parent_mtime_nanos
     }
 
+    /// The same filesystem object in the same observed state: what a failure
+    /// backoff belongs to. The priority pre-scan and the walk describe one
+    /// directory with different size estimates, prune decisions and
+    /// structural evidence; comparing those (`evidence_matches`) reset the
+    /// backoff whenever both saw a directory in one pass, so a refused
+    /// candidate was dispatched again on the next.
+    #[must_use]
+    pub fn same_object(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.identity == other.identity
+            && self.candidate_mtime_nanos == other.candidate_mtime_nanos
+            && self.candidate_ctime_nanos == other.candidate_ctime_nanos
+    }
+
     #[must_use]
     pub fn evidence_matches(&self, other: &Self) -> bool {
         self.path == other.path
@@ -391,7 +405,7 @@ impl ScannerCandidateIndex {
                 // reusing its old path later must not retire this new binding.
                 self.paths.remove(&existing.path);
             }
-            if existing.evidence_matches(&record) {
+            if existing.same_object(&record) {
                 record.fail_count = existing.fail_count;
                 record.cooldown_until_nanos = existing.cooldown_until_nanos;
                 // A failed attempt is retryable, not permission to overwrite
@@ -410,7 +424,7 @@ impl ScannerCandidateIndex {
     #[must_use]
     pub fn candidate_in_cooldown(&self, record: &CandidateIndexRecord, now: SystemTime) -> bool {
         self.records.get(&record.identity).is_some_and(|existing| {
-            existing.evidence_matches(record) && self.in_cooldown(record.identity, now)
+            existing.same_object(record) && self.in_cooldown(record.identity, now)
         })
     }
 
@@ -428,6 +442,60 @@ impl ScannerCandidateIndex {
             system_time_nanos(now),
             limit,
         )
+    }
+
+    /// [`Self::ranked_records`] restricted to records under one of `roots`.
+    /// One index serves every pass over the configured roots; a pass replays
+    /// only what lies under the roots it was asked to relieve.
+    #[must_use]
+    pub fn ranked_records_within(
+        &self,
+        roots: &[PathBuf],
+        now: SystemTime,
+        limit: usize,
+    ) -> Vec<CandidateIndexRecord> {
+        replay::ranked_records(
+            self.records
+                .values()
+                .filter(|record| roots.iter().any(|root| record.path.starts_with(root))),
+            self.event_generation,
+            system_time_nanos(now),
+            limit,
+        )
+    }
+
+    /// Forget a record whose path is gone or now names another object. A
+    /// replacement is indexed with its own evidence when a walk finds it.
+    pub fn forget(&mut self, identity: IndexedIdentity) {
+        if let Some(record) = self.records.remove(&identity)
+            && self.paths.get(&record.path) == Some(&identity)
+        {
+            self.paths.remove(&record.path);
+        }
+    }
+
+    /// Drop records that can neither be replayed nor hold a candidate back:
+    /// written before the current event generation, not cooling down, and
+    /// either never failed or no longer present. A walk that sees the path
+    /// again re-indexes it. Without this a long-lived index keeps every path
+    /// it ever scored, deleted ones included, until the checkpoint limit
+    /// refuses to save. Returns the number of records dropped.
+    pub fn evict_stale(&mut self, now: SystemTime) -> usize {
+        let now_nanos = system_time_nanos(now);
+        let generation = self.event_generation;
+        let before = self.records.len();
+        self.records.retain(|_, record| {
+            record.event_generation == generation
+                || record
+                    .cooldown_until_nanos
+                    .is_some_and(|until| now_nanos < until)
+                // Kept so a path that keeps failing keeps its growing backoff.
+                || (record.fail_count > 0 && fs::symlink_metadata(&record.path).is_ok())
+        });
+        let records = &self.records;
+        self.paths
+            .retain(|_, identity| records.contains_key(identity));
+        before - self.records.len()
     }
 
     /// Persisted scores turned straight into dispatchable candidates. Kept
@@ -771,6 +839,88 @@ mod tests {
         assert!(index.in_cooldown(id, now + Duration::from_secs(5)));
         assert!(!index.in_cooldown(id, now + Duration::from_secs(11)));
         assert_eq!(index.get(id).unwrap().fail_count, 1);
+    }
+
+    #[test]
+    fn replay_is_scoped_to_the_pass_roots() {
+        let mut index = ScannerCandidateIndex::new(context("same"));
+        let mut inside = record(identity(1), identity(99));
+        inside.path = PathBuf::from("/data/tmp/build-1/target");
+        let mut outside = record(identity(2), identity(99));
+        outside.path = PathBuf::from("/home/u/.cache/uv");
+        let mut sibling = record(identity(3), identity(99));
+        sibling.path = PathBuf::from("/data/tmpx/target");
+        index.upsert(inside);
+        index.upsert(outside);
+        index.upsert(sibling);
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+
+        let ranked = index.ranked_records_within(&[PathBuf::from("/data/tmp")], now, 8);
+
+        assert_eq!(
+            ranked.iter().map(|r| r.identity).collect::<Vec<_>>(),
+            vec![identity(1)]
+        );
+        assert_eq!(index.ranked_records(now, 8).len(), 3);
+    }
+
+    #[test]
+    fn forget_removes_only_the_named_identity() {
+        let mut index = ScannerCandidateIndex::new(context("same"));
+        let old = record(identity(1), identity(99));
+        let path = old.path.clone();
+        index.upsert(old);
+        let mut replacement = record(identity(2), identity(99));
+        replacement.path = path.clone();
+        index.upsert(replacement);
+
+        // The superseded identity is already gone; forgetting it again must
+        // not unbind the path from its replacement.
+        index.forget(identity(1));
+        assert_eq!(index.paths.get(&path), Some(&identity(2)));
+
+        index.forget(identity(2));
+        assert!(index.is_empty());
+        assert!(index.paths.is_empty());
+    }
+
+    #[test]
+    fn eviction_keeps_current_cooling_and_failing_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut index = ScannerCandidateIndex::new(context("same"));
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let base = Duration::from_secs(10);
+        let max = Duration::from_mins(1);
+        let at = |n: u64, path: PathBuf| {
+            let mut r = record(identity(n), identity(99));
+            r.path = path;
+            r
+        };
+        // Written in generation 0, then the generation advances.
+        index.upsert(at(1, tmp.path().join("stale")));
+        index.upsert(at(2, tmp.path().join("cooling")));
+        index.record_failure(identity(2), now, base, max);
+        let failing = tmp.path().join("failing");
+        std::fs::create_dir(&failing).unwrap();
+        index.upsert(at(3, failing));
+        index.record_failure(identity(3), now, base, max);
+        index.upsert(at(4, tmp.path().join("failed-and-gone")));
+        index.record_failure(identity(4), now, base, max);
+        index.mark_event_overflow();
+        index.upsert(at(5, tmp.path().join("current")));
+
+        let later = now + Duration::from_secs(5);
+        assert_eq!(index.evict_stale(later), 1, "only the idle stale record");
+        assert!(index.get(identity(1)).is_none());
+        assert!(index.get(identity(2)).is_some());
+
+        // After the cooldowns: a failing path that still exists keeps its
+        // backoff history; one that is gone is dropped.
+        let after = now + Duration::from_secs(30);
+        assert_eq!(index.evict_stale(after), 2);
+        assert!(index.get(identity(3)).is_some());
+        assert!(index.get(identity(5)).is_some());
+        assert_eq!(index.paths.len(), index.len());
     }
 
     #[test]

@@ -6805,6 +6805,7 @@ fn persist_scanner_index_records(
     for record in records.drain(..) {
         index.upsert(record);
     }
+    index.evict_stale(SystemTime::now());
     if let Err(err) = index.save_checkpoint(scanner_index_path) {
         logger.send(ActivityEvent::Error {
             code: err.code().to_string(),
@@ -7472,8 +7473,16 @@ fn scanner_thread_main(
         let mut scanner_event_dirty_roots = BTreeSet::new();
         let mut scanner_event_stats = EventSourceStats::default();
         let scanner_index_event_generation = if scanner_index_enabled {
-            let context =
-                ScannerIndexContext::from_roots_and_config(&request.paths, &current_scanner_config);
+            // Keyed on the configured roots, not this pass's: maintenance,
+            // per-mount and special-location passes each walk a different
+            // subset, and a per-pass key rebuilt the index on about half the
+            // passes on hz1 (2026-10-14), discarding every failure backoff, so
+            // a candidate the preflight always refuses was re-planned every
+            // pass. Replay is scoped to the pass's roots instead.
+            let context = ScannerIndexContext::from_roots_and_config(
+                &current_scanner_config.root_paths,
+                &current_scanner_config,
+            );
             let needs_load = scanner_index
                 .as_ref()
                 .is_none_or(|index| index.context() != &context);
@@ -7796,7 +7805,8 @@ fn scanner_thread_main(
             // classification and age) before it may be dispatched. Anything
             // the fresh evidence rejects is backed off in the index.
             let replay_now = SystemTime::now();
-            let records = index.ranked_records(replay_now, request.max_delete_batch);
+            let records =
+                index.ranked_records_within(&request.paths, replay_now, request.max_delete_batch);
             let index_generation = index.event_generation();
             let mut indexed_candidates: Vec<CandidacyScore> = Vec::with_capacity(records.len());
             let mut revetoed = 0usize;
@@ -7873,7 +7883,11 @@ fn scanner_thread_main(
                                 record.event_generation,
                                 drop.label()
                             );
-                            if drop != ReplayDrop::GenerationAdvanced {
+                            if matches!(drop, ReplayDrop::Missing | ReplayDrop::IdentityChanged) {
+                                // Deleted (often by this daemon) or replaced:
+                                // there is nothing left to back off.
+                                index.forget(record.identity);
+                            } else if drop != ReplayDrop::GenerationAdvanced {
                                 index.record_failure(
                                     record.identity,
                                     replay_now,
@@ -12352,6 +12366,136 @@ mod tests {
                 "linux contract: a just-created tree is young (age {age:?})"
             );
         }
+    }
+
+    /// A failure backoff outlives a pass over other roots. hz1, 2026-10-14:
+    /// maintenance, per-mount and special-location passes each walk a
+    /// different subset of the configured roots, the index was keyed on the
+    /// subset and rebuilt on about half the passes, and `~/.cache/uv` (always
+    /// refused by the deletion preflight: it holds git checkouts) was planned
+    /// 40 times in two hours.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn failure_backoff_survives_a_pass_over_other_roots() {
+        use crate::scanner::walker::identity_for_path;
+
+        fn run_pass(
+            temp: &Path,
+            roots: &[PathBuf],
+            pass_root: &Path,
+            feedback: Option<ScannerIndexFeedback>,
+            label: &str,
+        ) -> bool {
+            let mut config = Config::default();
+            config.scanner.root_paths = roots.to_vec();
+            config.scanner.min_file_age_minutes = 0;
+            config.scanner.active_reference_min_size_bytes = u64::MAX;
+
+            let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+                sqlite_path: None,
+                jsonl_config: crate::logger::jsonl::JsonlConfig {
+                    path: temp.join(format!("activity-{label}.jsonl")),
+                    fallback_path: None,
+                    max_size_bytes: 1_048_576,
+                    max_rotated_files: 0,
+                    fsync_interval_secs: 0,
+                },
+                channel_capacity: 64,
+                run_id: None,
+            })
+            .unwrap();
+            let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+            let (del_tx, del_rx) = bounded::<DeletionBatch>(4);
+            let (report_tx, _report_rx) = bounded::<WorkerReport>(4);
+            let (index_feedback_tx, index_feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+            if let Some(feedback) = feedback {
+                index_feedback_tx.send(feedback).unwrap();
+            }
+            let executor_config = Arc::new(SharedExecutorConfig::new(
+                false, 10, 0.0, 60, 3600, false, 0,
+            ));
+            executor_config.set_min_certainty(ArtifactCertainty::Likely);
+            scan_tx
+                .send(ScanRequest {
+                    paths: vec![pass_root.to_path_buf()],
+                    urgency: 0.9,
+                    pressure_level: PressureLevel::Orange,
+                    free_pct: Some(9.0),
+                    max_delete_batch: 10,
+                    force_full_scan: false,
+                    config_update: None,
+                    catalog_roots: Vec::new(),
+                    maintenance: false,
+                    target_bytes: None,
+                })
+                .unwrap();
+            drop(scan_tx);
+
+            scanner_thread_main(
+                &scan_rx,
+                &del_tx,
+                &logger,
+                &Arc::new(RwLock::new(config.scoring)),
+                &Arc::new(RwLock::new(config.scanner)),
+                &(Arc::new(MockPlatform::healthy()) as Arc<dyn Platform>),
+                &ThreadHeartbeat::new("test-scanner"),
+                &report_tx,
+                &Arc::new(AtomicBool::new(false)),
+                &temp.join("scanner-index.json"),
+                &temp.join("prescan-cursor.json"),
+                &index_feedback_rx,
+                &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+                &executor_config,
+                &Arc::new(SharedRegret::new(&Config::default())),
+            );
+            logger.shutdown();
+            logger_join.join().unwrap();
+            del_rx.try_recv().is_ok()
+        }
+
+        let temp = non_temp_scratch_dir();
+        let root_a = temp.path().join("root-a");
+        let root_b = temp.path().join("root-b");
+        std::fs::create_dir_all(&root_b).unwrap();
+        // A definite cargo target: dispatched at Orange on its first walk.
+        let project = root_a.join("crate");
+        let debug = project.join("target").join("debug");
+        for sub in ["deps", "incremental", ".fingerprint"] {
+            std::fs::create_dir_all(debug.join(sub)).unwrap();
+        }
+        std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"crate\"\n").unwrap();
+        std::fs::write(
+            project.join("target").join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n",
+        )
+        .unwrap();
+        std::fs::write(debug.join("deps").join("libcrate.rlib"), vec![0xA5u8; 8192]).unwrap();
+        std::fs::write(debug.join("incremental").join("unit-0"), b"x").unwrap();
+        std::fs::write(debug.join(".fingerprint").join("lib-crate"), b"x").unwrap();
+        let roots = vec![root_a.clone(), root_b.clone()];
+
+        assert!(
+            run_pass(temp.path(), &roots, &root_a, None, "first"),
+            "precondition: the target is dispatched on its first walk"
+        );
+        // The executor refused it (e.g. a preflight veto); the feedback lands
+        // while the daemon is relieving a different root.
+        let identity = identity_for_path(&project.join("target"), false).unwrap();
+        let feedback = ScannerIndexFeedback {
+            identity: identity.into(),
+            path: project.join("target"),
+        };
+        assert!(!run_pass(
+            temp.path(),
+            &roots,
+            &root_b,
+            Some(feedback),
+            "other-root"
+        ));
+        assert!(
+            !run_pass(temp.path(), &roots, &root_a, None, "again"),
+            "a refused candidate is not re-dispatched while its backoff runs"
+        );
     }
 
     /// bd-8aeq: a `Delete` verdict below the behavior cell's certainty gate is

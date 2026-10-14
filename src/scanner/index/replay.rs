@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_structural_evidence_reopens_a_previously_failed_candidate() {
+    fn a_changed_root_reopens_a_previously_failed_candidate() {
         let mut index = index();
         let mut current = record(1);
         index.upsert(current.clone());
@@ -319,7 +319,21 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(60),
         );
+        // The priority pre-scan sees only the root's own entries, the walk
+        // also the markers below them: two descriptions of one unchanged
+        // directory, so the backoff stands. Resetting it here re-dispatched
+        // a refused candidate on every pass.
+        let mut pre_scan_view = current.clone();
+        pre_scan_view.structural_signals.has_deps = !current.structural_signals.has_deps;
+        pre_scan_view.prune_decision = IndexedPruneDecision::None;
+        pre_scan_view.size_estimate_bytes += 1;
+        assert!(index.candidate_in_cooldown(&pre_scan_view, UNIX_EPOCH));
+        index.upsert(pre_scan_view);
+        assert_eq!(index.get(current.identity).unwrap().fail_count, 1);
+        // A marker created in the root changes the root: new evidence, so the
+        // candidate is retried now.
         current.structural_signals.has_cachedir_tag = true;
+        current.candidate_mtime_nanos += 1;
         assert!(!index.candidate_in_cooldown(&current, UNIX_EPOCH));
         index.upsert(current.clone());
         assert_eq!(index.get(current.identity).unwrap().fail_count, 0);
