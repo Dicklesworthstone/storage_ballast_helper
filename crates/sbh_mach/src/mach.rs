@@ -939,7 +939,7 @@ mod tests {
     /// newer XNU. Because the libc constant is `size_of::<struct>() /
     /// size_of::<integer_t>()`, the requested count went 38 -> 90. The count is
     /// an ABI *revision selector*, not a buffer size, so the kernel rejected the
-    /// unrecognised revision with KERN_INVALID_ARGUMENT — silently killing every
+    /// unrecognised revision with `KERN_INVALID_ARGUMENT` — silently killing every
     /// macOS memory read. Asserting the exact rev0 value means a future libc
     /// widening (or a typo in the mirror struct) fails loudly here instead of
     /// disabling memory monitoring in production.
