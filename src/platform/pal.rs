@@ -258,6 +258,14 @@ pub trait ServiceManager: Send + Sync {
         Ok(())
     }
 
+    /// Ask for more startup time while work that precedes `notify_ready` is
+    /// still running (`EXTEND_TIMEOUT_USEC=` for systemd: the start timeout
+    /// becomes at least `extend_by` from now). Default no-op.
+    fn notify_extend_startup(&self, extend_by: std::time::Duration, status: &str) -> Result<()> {
+        let _ = (extend_by, status);
+        Ok(())
+    }
+
     fn restart(&self) -> Result<()> {
         pal_not_implemented("service", "restart")
     }

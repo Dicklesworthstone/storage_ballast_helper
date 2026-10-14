@@ -583,6 +583,54 @@ pub struct ScanRequest {
     pub target_bytes: Option<u64>,
 }
 
+/// How a long startup step keeps a `Type=notify` unit from timing out.
+#[derive(Debug, Clone, Copy)]
+struct StartupExtension {
+    /// Each request makes the start timeout at least this far from now.
+    extend_by: Duration,
+    /// How often the request is repeated while the step runs.
+    every: Duration,
+    /// Stop asking after this long, so a step that hangs still lets the
+    /// service manager's timeout fail the start.
+    max: Duration,
+}
+
+impl StartupExtension {
+    const DEFAULT: Self = Self {
+        extend_by: Duration::from_secs(30),
+        every: Duration::from_secs(10),
+        max: Duration::from_mins(15),
+    };
+}
+
+/// Run `work` while repeatedly asking the service manager for more startup
+/// time; the requests stop when `work` returns or after `extension.max`.
+fn with_startup_extension<T>(
+    service_manager: Box<dyn crate::platform::pal::ServiceManager>,
+    status: &str,
+    extension: StartupExtension,
+    work: impl FnOnce() -> T,
+) -> T {
+    let (done_tx, done_rx) = bounded::<()>(0);
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < extension.max {
+                let _ = service_manager.notify_extend_startup(extension.extend_by, status);
+                if !matches!(
+                    done_rx.recv_timeout(extension.every),
+                    Err(RecvTimeoutError::Timeout)
+                ) {
+                    break;
+                }
+            }
+        });
+        let result = work();
+        drop(done_tx);
+        result
+    })
+}
+
 /// B6: consecutive no-progress passes after which even Red/Critical pressure
 /// stops bypassing the empty-pass cooldown ("terminal idle"). Re-walking a
 /// tree whose every candidate is protected cannot free bytes no matter how
@@ -4076,8 +4124,16 @@ impl MonitoringDaemon {
                 volumes_monitored: self.ballast_coordinator.pool_count(),
             });
 
-        // Provision ballast files (idempotent).
-        self.provision_ballast()?;
+        // Provision ballast files (idempotent). This precedes READY=1, and on
+        // a fresh install it writes every pool (random data on CoW
+        // filesystems) at disk speed: 20 GiB took 45 s in a systemd container
+        // and the unit was killed at TimeoutStartSec=30, then restarted.
+        with_startup_extension(
+            self.platform.service_manager(),
+            "provisioning ballast",
+            StartupExtension::DEFAULT,
+            || self.provision_ballast(),
+        )?;
 
         // Initial pressure check.
         let initial_response = self.check_pressure()?;
@@ -12366,6 +12422,81 @@ mod tests {
                 "linux contract: a just-created tree is young (age {age:?})"
             );
         }
+    }
+
+    /// A slow startup step keeps asking for more time and stops once it
+    /// returns; a hung step stops being extended at `max`, so the service
+    /// manager's own timeout still fails the start.
+    #[test]
+    fn startup_extension_repeats_while_the_step_runs_and_stops_after() {
+        use crate::platform::pal::ServiceManager;
+
+        #[derive(Clone, Default)]
+        struct Recorder(Arc<Mutex<Vec<(Duration, String)>>>);
+        impl ServiceManager for Recorder {
+            fn install(&self) -> Result<()> {
+                Ok(())
+            }
+            fn uninstall(&self) -> Result<()> {
+                Ok(())
+            }
+            fn status(&self) -> Result<String> {
+                Ok("active".to_string())
+            }
+            fn notify_extend_startup(&self, extend_by: Duration, status: &str) -> Result<()> {
+                self.0.lock().push((extend_by, status.to_string()));
+                Ok(())
+            }
+        }
+
+        let extension = StartupExtension {
+            extend_by: Duration::from_secs(30),
+            every: Duration::from_millis(20),
+            max: Duration::from_mins(1),
+        };
+        let recorder = Recorder::default();
+        let value = with_startup_extension(
+            Box::new(recorder.clone()),
+            "provisioning ballast",
+            extension,
+            || {
+                std::thread::sleep(Duration::from_millis(110));
+                7
+            },
+        );
+        assert_eq!(value, 7);
+        let calls = recorder.0.lock().len();
+        assert!(calls >= 2, "extensions while the step ran: {calls}");
+        assert!(
+            recorder
+                .0
+                .lock()
+                .iter()
+                .all(|(by, status)| *by == Duration::from_secs(30)
+                    && status == "provisioning ballast")
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            recorder.0.lock().len(),
+            calls,
+            "none after the step returned"
+        );
+
+        let hung = Recorder::default();
+        with_startup_extension(
+            Box::new(hung.clone()),
+            "hung",
+            StartupExtension {
+                max: Duration::from_millis(50),
+                ..extension
+            },
+            || std::thread::sleep(Duration::from_millis(200)),
+        );
+        let calls = hung.0.lock().len();
+        assert!(
+            (1..=4).contains(&calls),
+            "extensions for a hung step: {calls}"
+        );
     }
 
     /// A failure backoff outlives a pass over other roots. hz1, 2026-10-14:

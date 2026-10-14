@@ -518,6 +518,18 @@ impl ServiceManager for SystemdServiceManager {
         })
     }
 
+    fn notify_extend_startup(&self, extend_by: std::time::Duration, status: &str) -> Result<()> {
+        let Some(socket_path) = systemd_notify_socket() else {
+            return Ok(());
+        };
+        sd_notify_send(&sd_extend_timeout_message(extend_by, status), &socket_path).map_err(
+            |source| SbhError::Io {
+                path: PathBuf::from(socket_path),
+                source,
+            },
+        )
+    }
+
     fn restart(&self) -> Result<()> {
         load_state::restart(self.config.user_scope, || {
             self.run_systemctl(&["restart", SYSTEMD_UNIT_NAME])
@@ -552,6 +564,16 @@ pub const SD_STOPPING_MESSAGE: &str = "STOPPING=1\n";
 #[must_use]
 pub fn sd_ready_message(pid: u32) -> String {
     format!("READY=1\nMAINPID={pid}\n")
+}
+
+/// `sd_notify(3)` message extending the current start timeout to at least
+/// `extend_by` from now (systemd 236+; older managers ignore it).
+#[must_use]
+pub fn sd_extend_timeout_message(extend_by: std::time::Duration, status: &str) -> String {
+    format!(
+        "EXTEND_TIMEOUT_USEC={}\nSTATUS={status}\n",
+        extend_by.as_micros()
+    )
 }
 
 /// `sd_notify(3)` watchdog heartbeat message.
@@ -1761,6 +1783,10 @@ mod watchdog_tests {
 
     #[test]
     fn sd_notify_messages_follow_the_protocol() {
+        assert_eq!(
+            sd_extend_timeout_message(std::time::Duration::from_secs(30), "provisioning ballast"),
+            "EXTEND_TIMEOUT_USEC=30000000\nSTATUS=provisioning ballast\n"
+        );
         assert_eq!(sd_ready_message(4242), "READY=1\nMAINPID=4242\n");
         assert_eq!(SD_STOPPING_MESSAGE, "STOPPING=1\n");
         assert_eq!(
