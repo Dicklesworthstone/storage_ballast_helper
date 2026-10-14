@@ -77,6 +77,24 @@ impl ActiveReferenceScanConfig {
     pub fn should_probe(self, candidate_size_bytes: u64) -> bool {
         self.min_candidate_size_bytes == 0 || candidate_size_bytes >= self.min_candidate_size_bytes
     }
+
+    /// Whether a candidate gets the in-use probe. Caches are probed at any
+    /// size: a build reads its cargo home and package caches without holding
+    /// them open, and in a real-build proof a fresh 15 MB default `~/.cargo`
+    /// under a running build was approved for deletion because only
+    /// candidates over the size floor were probed (2026-10-14).
+    #[must_use]
+    pub fn should_probe_candidate(
+        self,
+        candidate_size_bytes: u64,
+        category: crate::scanner::patterns::ArtifactCategory,
+    ) -> bool {
+        use crate::scanner::patterns::ArtifactCategory;
+        matches!(
+            category,
+            ArtifactCategory::CacheDir | ArtifactCategory::GoCache
+        ) || self.should_probe(candidate_size_bytes)
+    }
 }
 
 impl Default for ActiveReferenceScanConfig {
@@ -2780,11 +2798,17 @@ mod tests {
 
     #[test]
     fn active_reference_scan_config_gates_small_candidates() {
+        use crate::scanner::patterns::ArtifactCategory;
         let config = ActiveReferenceScanConfig::new(Duration::from_secs(30), 100 * 1024 * 1024);
 
         assert!(!config.should_probe(100 * 1024 * 1024 - 1));
         assert!(config.should_probe(100 * 1024 * 1024));
         assert!(ActiveReferenceScanConfig::new(Duration::ZERO, 0).should_probe(1));
+        // Caches are probed whatever their size; build output keeps the floor.
+        assert!(config.should_probe_candidate(15 * 1024 * 1024, ArtifactCategory::CacheDir));
+        assert!(config.should_probe_candidate(1, ArtifactCategory::GoCache));
+        assert!(!config.should_probe_candidate(15 * 1024 * 1024, ArtifactCategory::RustTarget));
+        assert!(config.should_probe_candidate(100 * 1024 * 1024, ArtifactCategory::RustTarget));
     }
 
     #[test]

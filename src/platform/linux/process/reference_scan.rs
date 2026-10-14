@@ -403,6 +403,7 @@ fn open_targets_with(
         .map_err(|error| SbhError::io(proc_root, error))?;
     let mut targets = std::collections::HashSet::new();
     let current = i32::try_from(std::process::id()).ok();
+    let mut denied = None;
     for pid in pids {
         if sweep.expired() {
             break;
@@ -423,13 +424,37 @@ fn open_targets_with(
         // A process working inside a tree is using it, whatever it holds
         // open at this instant (bd-d1kt): rustc compiles a registry crate
         // from that crate's source directory.
-        if !own && let Ok(cwd) = fs::read_link(proc_root.join(pid.to_string()).join("cwd")) {
-            add_target_spellings(&mut targets, cwd);
+        if !own {
+            // Not through `proc.link`: the sweep's descriptor bounds count links.
+            match fs::read_link(proc_root.join(pid.to_string()).join("cwd")) {
+                Ok(cwd) => add_target_spellings(&mut targets, cwd),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    denied.get_or_insert(UnreadableProcess {
+                        pid,
+                        file: "cwd",
+                        error,
+                    });
+                }
+                // Exited, or a zombie without a working directory: it works
+                // nowhere, and counting it would stall every batch.
+                Err(_) => {}
+            }
         }
     }
     // So are the external cache and output directories a live build names.
-    for (_, directory) in build_directories_with(proc, proc_root, limits) {
+    let (directories, build_denied) = build_directory_sweep(proc, proc_root, limits);
+    for (_, directory) in directories {
         add_target_spellings(&mut targets, directory);
+    }
+    // A process sbh may not inspect could be using any candidate: its
+    // references are unknown, not absent, so the sweep certifies nothing.
+    if let Some(unreadable) = denied.or(build_denied) {
+        sweep.complete = false;
+        eprintln!(
+            "[SBH-SAFETY] open-file sweep incomplete: cannot read /proc/{}/{} ({}); \
+             candidates in this batch are held",
+            unreadable.pid, unreadable.file, unreadable.error
+        );
     }
     let mut targets: Vec<_> = targets.into_iter().collect();
     targets.sort_unstable();
@@ -437,6 +462,14 @@ fn open_targets_with(
     // cooperative budget. An expired observation cannot certify absence.
     sweep.expired();
     Ok((targets, sweep.complete))
+}
+
+/// The first process whose working directory or build environment the sweep
+/// was refused (EACCES/EPERM).
+struct UnreadableProcess {
+    pid: i32,
+    file: &'static str,
+    error: io::Error,
 }
 
 /// An environment larger than this is skipped, not truncated.
@@ -456,10 +489,21 @@ fn build_directories_with(
     proc_root: &Path,
     limits: Limits,
 ) -> Vec<(i32, PathBuf)> {
+    build_directory_sweep(proc, proc_root, limits).0
+}
+
+/// [`build_directories_with`], plus the first build tool whose environment
+/// sbh was refused: its cache and output directories are unknown.
+fn build_directory_sweep(
+    proc: &impl ProcAccess,
+    proc_root: &Path,
+    limits: Limits,
+) -> (Vec<(i32, PathBuf)>, Option<UnreadableProcess>) {
     let mut sweep = Sweep::new(proc, limits);
     let Ok(pids) = sweep.pids(proc_root) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
+    let mut denied = None;
     let own = i32::try_from(std::process::id()).ok();
     let mut seen = std::collections::HashSet::new();
     let mut directories = Vec::new();
@@ -480,8 +524,18 @@ fn build_directories_with(
         if sweep.expired() {
             break;
         }
-        let Ok(environ) = proc.read_bounded(&process.join("environ"), BUILD_ENVIRON_LIMIT) else {
-            continue;
+        let environ = match proc.read_bounded(&process.join("environ"), BUILD_ENVIRON_LIMIT) {
+            Ok(environ) => environ,
+            Err(error) => {
+                if error.kind() == io::ErrorKind::PermissionDenied {
+                    denied.get_or_insert(UnreadableProcess {
+                        pid,
+                        file: "environ",
+                        error,
+                    });
+                }
+                continue;
+            }
         };
         // Do not start another syscall after the budget expires, but retain
         // absolute references from the environment we already observed.
@@ -496,7 +550,7 @@ fn build_directories_with(
             }
         }
     }
-    directories
+    (directories, denied)
 }
 
 fn add_target_spellings(targets: &mut std::collections::HashSet<PathBuf>, target: PathBuf) {
@@ -1204,6 +1258,46 @@ mod tests {
         }
         assert!(ancestors.contains(&cargo_home));
         assert_eq!(fs::read_dir(process.join("fd")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_refused_build_environment_holds_the_batch() {
+        let fixture = Fixture::new();
+        let pid = i32::try_from(std::process::id())
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+        let process = fixture.pid(pid);
+        let work = fixture.root.join("work");
+        fs::create_dir(&work).unwrap();
+        fs::write(process.join("comm"), b"rustc\n").unwrap();
+        fs::write(process.join("environ"), b"HOME=/home/builder\0").unwrap();
+        symlink(&work, process.join("cwd")).unwrap();
+        let sweep = |faults: &Faults| {
+            open_targets_with(faults, &fixture.proc_root, Limits::default())
+                .unwrap()
+                .1
+        };
+        assert!(sweep(&Faults::default()), "everything readable");
+
+        // A daemon that may not inspect the builder (another uid, no
+        // CAP_SYS_PTRACE) cannot know what it uses: the batch is held.
+        let mut refused = Faults::default();
+        refused.reads.insert(process.join("environ"), libc::EACCES);
+        assert!(!sweep(&refused), "a refused build environment");
+        // An exited process uses nothing; counting it would stall every batch.
+        let mut gone = Faults::default();
+        gone.reads.insert(process.join("environ"), libc::ESRCH);
+        assert!(sweep(&gone), "gone is not refused");
+
+        // A refused environment of a process that is not a build tool is
+        // never read at all.
+        fs::write(process.join("comm"), b"bash\n").unwrap();
+        let mut unrelated = Faults::default();
+        unrelated
+            .reads
+            .insert(process.join("environ"), libc::EACCES);
+        assert!(sweep(&unrelated));
     }
 
     #[test]

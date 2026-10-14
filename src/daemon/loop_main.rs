@@ -8252,7 +8252,8 @@ fn scanner_thread_main(
                         });
                         if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
                             && !score.vetoed
-                            && active_reference_scan.should_probe(size)
+                            && active_reference_scan
+                                .should_probe_candidate(size, score.classification.category)
                         {
                             if has_active_reference_scan_budget(
                                 scan_deadline,
@@ -8925,7 +8926,8 @@ fn scanner_thread_main(
             };
             if score.decision.action == crate::scanner::scoring::DecisionAction::Delete
                 && !score.vetoed
-                && active_reference_scan.should_probe(probe_size)
+                && active_reference_scan
+                    .should_probe_candidate(probe_size, input.classification.category)
             {
                 if has_active_reference_scan_budget(scan_deadline, active_reference_probe_budget) {
                     let open_files = open_files_joined.get_or_insert_with(|| {
@@ -10513,6 +10515,126 @@ mod tests {
             "measured, not the directory's own entries: {} bytes",
             candidate.size_bytes
         );
+    }
+
+    /// A cache is probed for in-use evidence whatever its size. A small cache
+    /// under a live build was approved because only candidates over
+    /// `active_reference_min_size_bytes` (100 MiB) were probed; the same
+    /// cache with nobody in it is still dispatched.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_small_cache_in_use_is_held_and_an_idle_one_is_dispatched() {
+        let run = |busy: bool| -> Vec<PathBuf> {
+            let temp = temp_root_scratch_dir();
+            let root = temp.path().join("scan-root");
+            let cache = root.join("srw");
+            let deep = cache.join("a").join("b");
+            std::fs::create_dir_all(&deep).unwrap();
+            write_cargo_cachedir_tag(&cache);
+            std::fs::write(deep.join("blob.bin"), vec![7_u8; 512 * 1024]).unwrap();
+            let old = SystemTime::now() - Duration::from_hours(6);
+            for path in [
+                deep.join("blob.bin"),
+                cache.join("CACHEDIR.TAG"),
+                deep.clone(),
+                cache.join("a"),
+                cache.clone(),
+            ] {
+                std::fs::File::open(&path)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+            let mut config = Config::default();
+            config.scanner.root_paths = vec![root.clone()];
+            config.scanner.min_file_age_minutes = 0;
+            // The default size floor: the cache is far below it.
+            assert!(config.scanner.active_reference_min_size_bytes > 512 * 1024);
+            config.validate().expect("the tuned config stays valid");
+            let (scanner_index_path, prescan_cursor_path) = scanner_state_paths(temp.path());
+            let mut mock = MockPlatform::healthy();
+            if busy {
+                // rustc compiling from inside the cache, nothing held open.
+                mock = mock.with_process(crate::platform::types::ProcessInfo {
+                    pid: 4242,
+                    parent_pid: None,
+                    name: "rustc".to_string(),
+                    command_line: Vec::new(),
+                    executable: None,
+                    cwd: Some(deep),
+                    start_time_unix_ms: None,
+                    virtual_memory_bytes: None,
+                    resident_memory_bytes: None,
+                    cpu_user_micros: None,
+                    cpu_system_micros: None,
+                });
+            }
+            let platform: Arc<dyn Platform> = Arc::new(mock);
+            let (logger, logger_join) = spawn_logger(DualLoggerConfig {
+                sqlite_path: None,
+                jsonl_config: crate::logger::jsonl::JsonlConfig {
+                    path: temp.path().join("activity.jsonl"),
+                    fallback_path: None,
+                    max_size_bytes: 1_048_576,
+                    max_rotated_files: 0,
+                    fsync_interval_secs: 0,
+                },
+                channel_capacity: 1024,
+                run_id: None,
+            })
+            .unwrap();
+            let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+            let (del_tx, del_rx) = bounded::<DeletionBatch>(64);
+            let (report_tx, _report_rx) = bounded::<WorkerReport>(64);
+            let (_feedback_tx, feedback_rx) = bounded::<ScannerIndexFeedback>(1);
+            scan_tx
+                .send(ScanRequest {
+                    paths: vec![root],
+                    urgency: 0.9,
+                    pressure_level: PressureLevel::Orange,
+                    free_pct: Some(9.0),
+                    max_delete_batch: 10,
+                    force_full_scan: false,
+                    config_update: None,
+                    catalog_roots: Vec::new(),
+                    maintenance: false,
+                    target_bytes: None,
+                })
+                .unwrap();
+            drop(scan_tx);
+            scanner_thread_main(
+                &scan_rx,
+                &del_tx,
+                &logger,
+                &Arc::new(RwLock::new(config.scoring.clone())),
+                &Arc::new(RwLock::new(config.scanner)),
+                &platform,
+                &heartbeat_for_test(),
+                &report_tx,
+                &Arc::new(AtomicBool::new(false)),
+                &scanner_index_path,
+                &prescan_cursor_path,
+                &feedback_rx,
+                &Arc::new(Mutex::new(CpuBudget::new(0, Instant::now(), 0.0))),
+                &Arc::new(SharedExecutorConfig::new(
+                    false, 10, 0.0, 60, 3600, false, 0,
+                )),
+                &Arc::new(SharedRegret::new(&Config::default())),
+            );
+            logger.shutdown();
+            logger_join.join().unwrap();
+            let mut dispatched = Vec::new();
+            while let Ok(batch) = del_rx.try_recv() {
+                dispatched.extend(batch.candidates.into_iter().map(|c| c.path));
+            }
+            dispatched.retain(|path| path == &cache);
+            dispatched
+        };
+        assert!(
+            run(true).is_empty(),
+            "a cache a live build works in is held"
+        );
+        assert_eq!(run(false).len(), 1, "an idle cache is still dispatched");
     }
 
     fn scanner_state_paths(dir: &Path) -> (PathBuf, PathBuf) {

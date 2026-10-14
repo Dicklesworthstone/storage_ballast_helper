@@ -1858,7 +1858,10 @@ fn why_not_report(
         path.parent()
             .map_or_else(|| path.to_path_buf(), Path::to_path_buf),
     ];
-    let active_reference_scan = active_reference_scan_config(config);
+    let active_reference_scan = ActiveReferenceScanConfig {
+        min_candidate_size_bytes: 0,
+        ..active_reference_scan_config(config)
+    };
     let mut open_paths = None;
     let mut active_reference_index = None;
     candidate.is_open = open_status_for_candidate(
@@ -1867,6 +1870,7 @@ fn why_not_report(
         active_reference_scan,
         &entry.path,
         entry.metadata.content_size_bytes,
+        candidate.classification.category,
     );
     let (active_references, active_reference_checked) = active_references_for_candidate(
         &mut active_reference_index,
@@ -1875,6 +1879,7 @@ fn why_not_report(
         &entry.path,
         Some(entry.metadata.identity()),
         entry.metadata.content_size_bytes,
+        candidate.classification.category,
     );
     candidate.active_references = active_references;
 
@@ -12070,6 +12075,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                     active_reference_scan,
                     &entry.path,
                     entry.metadata.content_size_bytes,
+                    candidate.classification.category,
                 );
                 let (active_references, checked) = active_references_for_candidate(
                     &mut active_reference_index,
@@ -12078,6 +12084,7 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<(), CliError> {
                     &entry.path,
                     Some(entry.metadata.identity()),
                     entry.metadata.content_size_bytes,
+                    candidate.classification.category,
                 );
                 candidate.active_references = active_references;
                 checked
@@ -13077,6 +13084,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                     active_reference_scan,
                     &entry.path,
                     entry.metadata.content_size_bytes,
+                    candidate.classification.category,
                 );
                 let (active_references, _) = active_references_for_candidate(
                     &mut active_reference_index,
@@ -13085,6 +13093,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
                     &entry.path,
                     Some(entry.metadata.identity()),
                     entry.metadata.content_size_bytes,
+                    candidate.classification.category,
                 );
                 candidate.active_references = active_references;
             }
@@ -13584,8 +13593,9 @@ fn active_references_for_candidate(
     path: &Path,
     identity: Option<FsIdentity>,
     size_bytes: u64,
+    category: ArtifactCategory,
 ) -> (ActiveReferenceSummary, bool) {
-    if !scan_config.should_probe(size_bytes) {
+    if !scan_config.should_probe_candidate(size_bytes, category) {
         return (ActiveReferenceSummary::default(), false);
     }
 
@@ -13605,8 +13615,9 @@ fn open_status_for_candidate(
     scan_config: ActiveReferenceScanConfig,
     path: &Path,
     size_bytes: u64,
+    category: ArtifactCategory,
 ) -> bool {
-    if !scan_config.should_probe(size_bytes) {
+    if !scan_config.should_probe_candidate(size_bytes, category) {
         return false;
     }
 
@@ -14901,6 +14912,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                     active_reference_scan,
                     &entry.path,
                     entry.metadata.content_size_bytes,
+                    candidate.classification.category,
                 );
                 let (active_references, _) = active_references_for_candidate(
                     &mut active_reference_index,
@@ -14909,6 +14921,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
                     &entry.path,
                     Some(entry.metadata.identity()),
                     entry.metadata.content_size_bytes,
+                    candidate.classification.category,
                 );
                 candidate.active_references = active_references;
             }
