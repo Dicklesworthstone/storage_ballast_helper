@@ -6,15 +6,29 @@ use clap::{CommandFactory, FromArgMatches};
 
 mod cli_app;
 mod cli_compress;
+mod cli_ram_scratch;
 mod cli_source_roots;
 
 fn cli_command() -> clap::Command {
-    cli_app::Cli::command().subcommand(cli_compress::command())
+    cli_app::Cli::command()
+        .subcommand(cli_compress::command())
+        .mut_subcommand("check", cli_ram_scratch::augment)
 }
 
 fn main() {
     storage_ballast_helper::daemon::service::capture_sbh_binary_path();
     let matches = cli_command().get_matches();
+    // Host RAM-scratch inspection is a read-only check, independent of daemon
+    // configuration. Ordinary disk checks continue through the existing enum.
+    match cli_ram_scratch::run(&matches) {
+        Ok(Some(0)) => return,
+        Ok(Some(code)) => std::process::exit(code),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("sbh: could not write RAM scratch report: {error}");
+            std::process::exit(2);
+        }
+    }
     // The opt-in compression command owns its report and exit status. Handle
     // it before converting legacy subcommands into the derive-based enum.
     match cli_compress::run(&matches) {

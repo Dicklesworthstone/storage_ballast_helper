@@ -11,6 +11,8 @@ use serde::Serialize;
 
 use crate::platform::pal::MemoryInfo;
 
+pub mod attribution;
+
 #[cfg(target_os = "linux")]
 mod linux;
 
