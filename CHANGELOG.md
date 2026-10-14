@@ -63,10 +63,11 @@ Git repositories.
   now writes no sysctl snippet, applies nothing, and says to tune on the
   host.
 - **The log is not mirrored into RAM that is already short** (bd-ffjj;
-  `0ab5535`). When the log's own disk is pressured the daemon copies its
-  log lines to `/dev/shm`; it did so even with `/dev/shm` nearly full and
-  swap exhausted. It now skips the copy unless `/dev/shm` has a fifth of its
-  space free and swap is not nearly full, and logs why.
+  `0ab5535`, `b36e956`). When the log's own disk is pressured the daemon
+  copies its log lines to `/dev/shm`; it did so even with `/dev/shm` nearly
+  full and swap exhausted. It now copies only while `/dev/shm` has a fifth
+  of its space free and swap is not nearly full, re-checks every 30 seconds,
+  and logs why when it stops or skips the copy.
 
 ### Added
 
