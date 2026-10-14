@@ -39,7 +39,20 @@ pub enum CacheLayout {
 pub fn tool(comm: &[u8]) -> Option<Tool> {
     let name = std::str::from_utf8(comm).ok()?.trim_end();
     match name {
-        "cargo" | "rustc" | "rustdoc" | "clippy-driver" | "cargo-clippy" => Some(Tool::Rust),
+        // rch installs its wrapper as `cargo` and renames the real one
+        // `cargo-rch-real`: on rch hosts that is the cargo process, so it was
+        // never recognised and a live build held its cargo home only while a
+        // rustc ran (a release proof deleted it during a build script).
+        "cargo" | "cargo-rch-real" | "cargo-nextest" | "rustc" | "rustdoc" | "clippy-driver"
+        | "cargo-clippy" => Some(Tool::Rust),
+        // A build script runs with cargo's environment and its package as cwd;
+        // procfs truncates its name (`build_script_ma` for build_script_main).
+        _ if ["build-script-", "build_script_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)) =>
+        {
+            Some(Tool::Rust)
+        }
         "go" | "compile" | "link" | "cgo" => Some(Tool::Go),
         "node" | "nodejs" | "pnpm" | "yarn" | "bun" => Some(Tool::Node),
         "npm" | "npx" => Some(Tool::Npm),
@@ -297,8 +310,23 @@ mod tests {
 
     #[test]
     fn recognized_names_cover_build_tools_without_substring_matches() {
-        for name in ["cargo", "rustc", "rustdoc", "clippy-driver", "cargo-clippy"] {
-            assert_eq!(tool(format!("{name}\n").as_bytes()), Some(Tool::Rust));
+        for name in [
+            "cargo",
+            "cargo-rch-real",
+            "cargo-nextest",
+            "rustc",
+            "rustdoc",
+            "clippy-driver",
+            "cargo-clippy",
+            "build-script-build",
+            "build_script_ma",
+            "build-script-bu",
+        ] {
+            assert_eq!(
+                tool(format!("{name}\n").as_bytes()),
+                Some(Tool::Rust),
+                "{name}"
+            );
         }
         for (name, family) in [
             ("go", Tool::Go),
@@ -318,6 +346,7 @@ mod tests {
             "bash",
             "sbh",
             "cargo-data",
+            "build-scripts",
             "python-notes",
             "python3..1",
             "npmx",

@@ -2811,6 +2811,37 @@ mod tests {
         assert!(config.should_probe_candidate(100 * 1024 * 1024, ArtifactCategory::RustTarget));
     }
 
+    /// The release proof's shape on a real Mac: a live process whose working
+    /// directory is inside a cache holds that cache in the active-reference
+    /// index the scanner and `sbh explain` read.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_live_process_working_in_a_cache_holds_it_on_macos() {
+        let dir = TempDir::new().unwrap();
+        let registry = dir.path().join("home/.cargo/registry");
+        let package = registry.join("src/index.crates.io-x/quote-1.0.47");
+        fs::create_dir_all(&package).unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .current_dir(&package)
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let platform = crate::platform::macos::MacOsPal::new();
+        let index = collect_active_reference_index(&platform, std::slice::from_ref(&registry));
+        let summary =
+            index.summary_for_identity(identity_for_path(&registry.join("src"), false).unwrap());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            summary
+                .processes
+                .iter()
+                .any(|process| process.pid == pid && process.working_directory),
+            "{summary:?}"
+        );
+    }
+
     #[test]
     fn cached_active_reference_collection_reuses_snapshot_within_ttl() {
         let tmp = TempDir::new().unwrap();

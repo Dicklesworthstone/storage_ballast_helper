@@ -2118,6 +2118,14 @@ fn is_named_in_tree_rch_target(classification: &ArtifactClassification) -> bool 
     )
 }
 
+/// Patterns that name a whole cargo home; they classify as temp directories.
+fn is_cargo_home_pattern(classification: &ArtifactClassification) -> bool {
+    matches!(
+        classification.pattern_name.as_ref(),
+        "cargo-home-prefix" | "tmp-cargo-home" | "rch-cargo-home" | "dot-cargo-prefix"
+    )
+}
+
 fn should_fast_track_temp_age(
     pressure_level: PressureLevel,
     path: &Path,
@@ -2129,11 +2137,18 @@ fn should_fast_track_temp_age(
     if classification.category == ArtifactCategory::Unknown {
         return false;
     }
-    // A CACHEDIR.TAG proves "regenerable", not "abandoned", and this
-    // name-agnostic classification relies on the minimum age (patterns.rs).
-    // Fast-tracking it gave a live cargo home's registry/ and git/, minutes
-    // old and being compiled from, the configured minimum age (bd-d1kt).
-    if classification.pattern_name == "cachedir-tagged-cache" {
+    // A cache proves "regenerable", not "abandoned". Fast-tracking one gave
+    // a live cargo home's stores, minutes old and being compiled from, the
+    // configured minimum age: first the CACHEDIR.TAG'd registry/ and git/
+    // (bd-d1kt), then, in a real-build proof on macOS, a default ~/.cargo's
+    // registry/src classified as an opaque cargo cache, 174 s old, deleted at
+    // "age 300 s" under the running build. No cache of any kind, and no cargo
+    // home by name, is fast-tracked.
+    if matches!(
+        classification.category,
+        ArtifactCategory::CacheDir | ArtifactCategory::GoCache
+    ) || is_cargo_home_pattern(classification)
+    {
         return false;
     }
     // Restrict fast-track to tmp-like roots, with one carved-out exception:
@@ -14796,6 +14811,65 @@ mod tests {
     /// running `cargo test` was compiling from were 5 and 8 minutes old,
     /// recorded as 1800 s and deleted. A CACHEDIR.TAG says a directory is
     /// regenerable, not that it is abandoned: it must be its real age.
+    #[test]
+    fn no_cache_or_cargo_home_is_age_fast_tracked() {
+        let class = |pattern_name: &'static str, category| ArtifactClassification {
+            pattern_name: pattern_name.into(),
+            category,
+            name_confidence: 0.9,
+            structural_confidence: 1.0,
+            combined_confidence: 0.9,
+        };
+        let observed = Duration::from_secs(174);
+        let cases = [
+            // The macOS proof: a default ~/.cargo under a temp home.
+            (
+                "/private/tmp/proof/home/.cargo/registry/src",
+                class("opaque-cargo-cache", ArtifactCategory::CacheDir),
+            ),
+            (
+                "/data/tmp/rch-cargo-cache-hz4/registry",
+                class("cachedir-tagged-cache", ArtifactCategory::CacheDir),
+            ),
+            (
+                "/data/tmp/job/go-build",
+                class("opaque-go-build-cache", ArtifactCategory::GoCache),
+            ),
+            (
+                "/data/tmp/cargo-home-x",
+                class("cargo-home-prefix", ArtifactCategory::TempDir),
+            ),
+            (
+                "/tmp/rch-cargo-home-1",
+                class("rch-cargo-home", ArtifactCategory::TempDir),
+            ),
+        ];
+        for (path, classification) in &cases {
+            for level in [
+                PressureLevel::Orange,
+                PressureLevel::Red,
+                PressureLevel::Critical,
+            ] {
+                assert_eq!(
+                    adjusted_candidate_age(observed, 5, level, Path::new(path), classification),
+                    observed,
+                    "{path} at {level:?}"
+                );
+            }
+        }
+        // Build output in temp storage still is.
+        assert_eq!(
+            adjusted_candidate_age(
+                observed,
+                5,
+                PressureLevel::Red,
+                Path::new("/data/tmp/job/target"),
+                &class("opaque-cargo-target", ArtifactCategory::RustTarget),
+            ),
+            Duration::from_mins(5)
+        );
+    }
+
     #[test]
     fn a_cachedir_tagged_cache_is_never_age_fast_tracked() {
         let tagged = ArtifactClassification {
