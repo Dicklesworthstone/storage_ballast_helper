@@ -305,7 +305,18 @@ fn restore(stub: &std::path::Path, json: bool) -> i32 {
     {
         let result = storage_ballast_helper::relocate::execute::restore(stub);
         let (code, message) = match &result {
-            Ok(path) => (0, format!("restored {}", path.display())),
+            Ok(restored) => match &restored.kept_stub {
+                None => (0, format!("restored {}", restored.path.display())),
+                Some((kept, names)) => (
+                    0,
+                    format!(
+                        "restored {}; the old stub held other files ({}) and was kept at {}",
+                        restored.path.display(),
+                        names.join(", "),
+                        kept.display()
+                    ),
+                ),
+            },
             Err(error) => (4, format!("restore failed: {error}")),
         };
         if json {

@@ -315,7 +315,6 @@ fn holder(platform: &dyn Platform, path: &Path) -> Option<String> {
 }
 
 /// Relocate one selected candidate. `stamp` names this run.
-#[allow(clippy::too_many_lines)]
 pub fn relocate(
     config: &RelocationConfig,
     platform: &dyn Platform,
@@ -323,6 +322,59 @@ pub fn relocate(
     candidate: &Candidate,
     stamp: &str,
     now: i64,
+) -> Outcome {
+    relocate_with_hooks(
+        config,
+        platform,
+        ledger,
+        candidate,
+        stamp,
+        now,
+        &Hooks::default(),
+    )
+}
+
+/// The postcheck: the renamed tree must be exactly what was copied. A mount
+/// that appeared inside it was skipped by the copy (`--one-file-system`) and
+/// must not reach the removal either.
+fn postcheck_matches(snapshot: &survey::UnitStats, after: &survey::TreeSurvey) -> bool {
+    let unit = &after.units[0];
+    !after.truncated
+        && !unit.crosses_mount
+        && !unit.unreadable
+        && unit.newest_change_below <= snapshot.newest_change_below
+        && unit.files == snapshot.files
+        && unit.entries == snapshot.entries
+}
+
+/// Remove the stub this run created, file by file. Anything else found in it
+/// (a job that wrote there meanwhile) keeps the directory.
+fn remove_own_stub(path: &Path) {
+    for name in [README_FILENAME, RECORD_FILENAME, MARKER_FILENAME] {
+        let _ = fs::remove_file(path.join(name));
+    }
+    let _ = fs::remove_dir(path);
+}
+
+/// Fault-injection points for tests: what another process might do between
+/// two steps. `after_rename` gets the original path, `before_remove` the
+/// renamed tree.
+#[derive(Default)]
+struct Hooks<'a> {
+    after_rename: Option<&'a dyn Fn(&Path)>,
+    before_remove: Option<&'a dyn Fn(&Path)>,
+}
+
+/// [`relocate`] with fault-injection hooks.
+#[allow(clippy::too_many_lines)]
+fn relocate_with_hooks(
+    config: &RelocationConfig,
+    platform: &dyn Platform,
+    ledger: &mut Ledger,
+    candidate: &Candidate,
+    stamp: &str,
+    now: i64,
+    hooks: &Hooks<'_>,
 ) -> Outcome {
     let path = candidate.stats.path.clone();
     let fail = |stage: &str, error: String| Outcome::Failed {
@@ -443,22 +495,29 @@ pub fn relocate(
         };
         fail(stage, format!("{error}{restored}"))
     };
+    if let Some(hook) = hooks.after_rename {
+        hook(&path);
+    }
     match survey::survey_tree(&aside, 0, config.max_entries) {
-        Ok(after)
-            if !after.truncated
-                && after.units[0].newest_change_below <= snapshot.newest_change_below
-                && after.units[0].files == snapshot.files
-                && after.units[0].entries == snapshot.entries => {}
+        Ok(after) if postcheck_matches(&snapshot, &after) => {}
         Ok(_) => return undo("postcheck", "tree changed during the copy".into()),
         Err(error) => return undo("postcheck", error.to_string()),
     }
+    let aside_identity = match fs::symlink_metadata(&aside) {
+        Ok(metadata) => metadata,
+        Err(error) => return undo("postcheck", error.to_string()),
+    };
     if let Some(reason) = holder(platform, &aside) {
         return undo("postcheck", format!("in use: {reason}"));
     }
 
-    // The stub: same owner and mode as the original directory.
+    // The stub: same owner and mode as the original directory. A path that
+    // reappeared meanwhile belongs to whoever made it: create_dir fails and
+    // nothing of theirs is touched.
+    let mut created = false;
     let stub = (|| -> io::Result<()> {
         fs::create_dir(&path)?;
+        created = true;
         write_file(&path.join(README_FILENAME), readme(&record).as_bytes())?;
         write_file(&path.join(RECORD_FILENAME), &record_json)?;
         if candidate.stats.depth == 0 {
@@ -471,7 +530,9 @@ pub fn relocate(
         fs::set_permissions(&path, fs::Permissions::from_mode(record.mode))
     })();
     if let Err(error) = stub {
-        let _ = fs::remove_dir_all(&path);
+        if created {
+            remove_own_stub(&path);
+        }
         return undo("stub", error.to_string());
     }
 
@@ -487,7 +548,12 @@ pub fn relocate(
     let saved = ledger.save(&config.state_dir);
     // The copy is verified and the stub is in place; only now may the
     // original bytes go.
-    if let Err(error) = fs::remove_dir_all(&aside) {
+    if let Some(hook) = hooks.before_remove {
+        hook(&aside);
+    }
+    // Descriptor-relative, no symlinks followed, and refusing any other
+    // mount (openat2 NO_XDEV): the deletion executor's own removal.
+    if let Err(error) = crate::scanner::quarantine::remove_direct(&aside, &aside_identity, false) {
         return fail(
             "remove",
             format!(
@@ -510,7 +576,7 @@ pub fn relocate(
 }
 
 /// Bring a relocated tree back from its copy and replace the stub.
-pub fn restore(stub: &Path) -> Result<PathBuf, String> {
+pub fn restore(stub: &Path) -> Result<Restored, String> {
     let record: RelocationRecord = serde_json::from_slice(
         &fs::read(stub.join(RECORD_FILENAME))
             .map_err(|error| format!("{}: {error}", stub.join(RECORD_FILENAME).display()))?,
@@ -541,13 +607,37 @@ pub fn restore(stub: &Path) -> Result<PathBuf, String> {
         let _ = fs::rename(&old_stub, stub);
         return Err(format!("swapping the tree in: {error}"));
     }
-    fs::remove_dir_all(&old_stub).map_err(|error| {
-        format!(
-            "restored, but the old stub remains at {}: {error}",
-            old_stub.display()
-        )
-    })?;
-    Ok(record.path)
+    // The stub is an ordinary directory; a job may have written into it
+    // since the move. Only a stub holding nothing but sbh's files goes.
+    let foreign: Vec<String> = fs::read_dir(&old_stub)
+        .map_err(|error| format!("restored, but reading the old stub failed: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            ![README_FILENAME, RECORD_FILENAME, MARKER_FILENAME].contains(&name.as_str())
+        })
+        .collect();
+    if !foreign.is_empty() {
+        return Ok(Restored {
+            path: record.path,
+            kept_stub: Some((old_stub, foreign)),
+        });
+    }
+    remove_own_stub(&old_stub);
+    Ok(Restored {
+        path: record.path,
+        kept_stub: old_stub.exists().then(|| (old_stub, Vec::new())),
+    })
+}
+
+/// A completed restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restored {
+    /// The restored path.
+    pub path: PathBuf,
+    /// The old stub, kept because it held more than sbh's files, with the
+    /// names it held.
+    pub kept_stub: Option<(PathBuf, Vec<String>)>,
 }
 
 #[cfg(test)]
@@ -643,7 +733,11 @@ mod tests {
         assert_eq!(ledger.relocations.len(), 1);
         assert!(ledger.in_progress.is_empty());
 
-        assert_eq!(restore(&unit).unwrap(), unit);
+        let restored = restore(&unit).unwrap();
+        assert_eq!(
+            (restored.path.as_path(), restored.kept_stub),
+            (unit.as_path(), None)
+        );
         assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
         assert!(!unit.join(README_FILENAME).exists());
         assert!(!sibling(&unit, "sbh-stub").unwrap().exists());
@@ -679,6 +773,217 @@ mod tests {
         );
         assert!(unit.join("a/b/data").is_file());
         assert!(!tmp.path().join("bulk").exists());
+    }
+
+    #[test]
+    fn a_path_recreated_mid_move_is_left_alone() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        let config = local_config(tmp.path());
+        // A job recreates the path between the rename and the stub.
+        let job = |path: &Path| {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("job-output"), b"new work").unwrap();
+        };
+        let outcome = relocate_with_hooks(
+            &config,
+            &crate::platform::current(),
+            &mut Ledger::default(),
+            &candidate_for(&unit),
+            "S",
+            1_000,
+            &Hooks {
+                after_rename: Some(&job),
+                ..Hooks::default()
+            },
+        );
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, .. } if stage == "stub"),
+            "{outcome:?}"
+        );
+        // The job's directory is untouched, and the original tree is intact
+        // where it was renamed to.
+        assert_eq!(fs::read(unit.join("job-output")).unwrap(), b"new work");
+        let aside = sibling(&unit, "sbh-relocating").unwrap();
+        assert_eq!(
+            fs::read(aside.join("a/b/data")).unwrap(),
+            vec![7u8; 300_000]
+        );
+    }
+
+    #[test]
+    fn restore_keeps_a_stub_that_holds_new_files() {
+        if !rsync_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        let config = local_config(tmp.path());
+        let outcome = relocate(
+            &config,
+            &crate::platform::current(),
+            &mut Ledger::default(),
+            &candidate_for(&unit),
+            "S",
+            1_000,
+        );
+        assert!(matches!(outcome, Outcome::Relocated { .. }), "{outcome:?}");
+        fs::write(unit.join("written-after-the-move"), b"keep me").unwrap();
+        let restored = restore(&unit).unwrap();
+        let (kept, names) = restored.kept_stub.expect("stub kept");
+        assert_eq!(names, vec!["written-after-the-move".to_string()]);
+        assert_eq!(
+            fs::read(kept.join("written-after-the-move")).unwrap(),
+            b"keep me"
+        );
+        assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+    }
+
+    /// Mount a 1 MiB tmpfs at `at` holding one file, or `None` without the
+    /// privilege to mount (the test then has nothing to prove here).
+    fn mount_victim(at: &Path) -> Option<PathBuf> {
+        use nix::mount::{MsFlags, mount};
+        mount(
+            Some("tmpfs"),
+            at,
+            Some("tmpfs"),
+            MsFlags::empty(),
+            Some("size=1m"),
+        )
+        .ok()?;
+        let victim = at.join("victim");
+        fs::write(&victim, b"not part of the tree").unwrap();
+        Some(victim)
+    }
+
+    fn unmount(at: &Path) {
+        let _ = nix::mount::umount2(at, nix::mount::MntFlags::MNT_DETACH);
+    }
+
+    fn mount_allowed(tmp: &Path) -> bool {
+        let probe = tmp.join("mount-probe");
+        fs::create_dir(&probe).unwrap();
+        let allowed = mount_victim(&probe).is_some();
+        unmount(&probe);
+        allowed
+    }
+
+    #[test]
+    fn a_mount_appearing_after_the_precheck_stops_the_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !rsync_available() || !mount_allowed(tmp.path()) {
+            eprintln!("skipped: needs rsync and CAP_SYS_ADMIN");
+            return;
+        }
+        // The filesystem exists before the tree is planned, so its times are
+        // no newer than the snapshot: only the device boundary gives it away.
+        let staging = tmp.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        mount_victim(&staging).unwrap();
+        let unit = marked_tree(tmp.path());
+        fs::create_dir(unit.join("a/mnt")).unwrap();
+        let config = local_config(tmp.path());
+        let bound = std::cell::Cell::new(false);
+        let bind_inside = |path: &Path| {
+            use nix::mount::{MsFlags, mount};
+            let aside = sibling(path, "sbh-relocating").unwrap();
+            let target = aside.join("a/mnt");
+            bound.set(
+                mount(
+                    Some(&staging),
+                    &target,
+                    None::<&str>,
+                    MsFlags::MS_BIND,
+                    None::<&str>,
+                )
+                .is_ok(),
+            );
+        };
+        let outcome = relocate_with_hooks(
+            &config,
+            &crate::platform::current(),
+            &mut Ledger::default(),
+            &candidate_for(&unit),
+            "S",
+            1_000,
+            &Hooks {
+                after_rename: Some(&bind_inside),
+                ..Hooks::default()
+            },
+        );
+        // The postcheck sees the boundary and puts the tree back.
+        let kept = fs::read(unit.join("a/mnt/victim")).or_else(|_| {
+            fs::read(
+                sibling(&unit, "sbh-relocating")
+                    .unwrap()
+                    .join("a/mnt/victim"),
+            )
+        });
+        unmount(&unit.join("a/mnt"));
+        unmount(&sibling(&unit, "sbh-relocating").unwrap().join("a/mnt"));
+        let staged = fs::read(staging.join("victim"));
+        unmount(&staging);
+        assert!(bound.get(), "bind mount failed");
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, .. } if stage == "postcheck"),
+            "{outcome:?}"
+        );
+        assert_eq!(kept.unwrap(), b"not part of the tree");
+        assert_eq!(staged.unwrap(), b"not part of the tree");
+        assert_eq!(fs::read(unit.join("a/b/data")).unwrap(), vec![7u8; 300_000]);
+    }
+
+    #[test]
+    fn removal_stops_at_a_mount_that_appears_after_the_postcheck() {
+        let tmp = tempfile::tempdir().unwrap();
+        if !rsync_available() || !mount_allowed(tmp.path()) {
+            eprintln!("skipped: needs rsync and CAP_SYS_ADMIN");
+            return;
+        }
+        let unit = marked_tree(tmp.path());
+        fs::create_dir(unit.join("a/mnt")).unwrap();
+        let config = local_config(tmp.path());
+        let aside = sibling(&unit, "sbh-relocating").unwrap();
+        let mount_inside = |aside: &Path| {
+            assert!(mount_victim(&aside.join("a/mnt")).is_some());
+        };
+        let outcome = relocate_with_hooks(
+            &config,
+            &crate::platform::current(),
+            &mut Ledger::default(),
+            &candidate_for(&unit),
+            "S",
+            1_000,
+            &Hooks {
+                before_remove: Some(&mount_inside),
+                ..Hooks::default()
+            },
+        );
+        let kept = fs::read(aside.join("a/mnt/victim"));
+        unmount(&aside.join("a/mnt"));
+        // The removal refuses the other device; the mounted file survives.
+        assert!(
+            matches!(&outcome, Outcome::Failed { stage, .. } if stage == "remove"),
+            "{outcome:?}"
+        );
+        assert_eq!(kept.unwrap(), b"not part of the tree");
+    }
+
+    #[test]
+    fn a_mount_inside_fails_the_postcheck() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = marked_tree(tmp.path());
+        let snapshot = survey::survey_tree(&unit, 0, 10_000).unwrap().units[0].clone();
+        let mut after = survey::survey_tree(&unit, 0, 10_000).unwrap();
+        assert!(postcheck_matches(&snapshot, &after));
+        after.units[0].crosses_mount = true;
+        assert!(!postcheck_matches(&snapshot, &after));
+        after.units[0].crosses_mount = false;
+        after.units[0].unreadable = true;
+        assert!(!postcheck_matches(&snapshot, &after));
     }
 
     #[test]
