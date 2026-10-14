@@ -9,9 +9,9 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
+use super::CompressionPolicy;
 use crate::core::config::Config;
 use crate::platform::pal::Platform;
-use super::CompressionPolicy;
 
 /// Traversal limits, independent of the compression rewrite budget.
 #[derive(Debug, Clone)]
@@ -49,7 +49,9 @@ impl DiscoveryLimits {
             || !(1..=8192).contains(&self.max_directories)
             || !(1..=60).contains(&self.timeout_secs)
         {
-            return Err(invalid("discovery requires depth <= 64, 1..1000000 entries, 1..8192 directories and 1..60 seconds"));
+            return Err(invalid(
+                "discovery requires depth <= 64, 1..1000000 entries, 1..8192 directories and 1..60 seconds",
+            ));
         }
         if let Some(path) = &self.after {
             validate_absolute(path)?;
@@ -89,7 +91,10 @@ pub struct DiscoveryReport {
 #[derive(Debug)]
 pub struct Selection {
     report: DiscoveryReport,
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     native: native::Evidence,
 }
 
@@ -103,11 +108,17 @@ impl Selection {
     /// Native paths in deterministic order. These are not an authorization token.
     #[must_use]
     pub fn paths(&self) -> Vec<PathBuf> {
-        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         {
             self.native.files.keys().cloned().collect()
         }
-        #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
         {
             Vec::new()
         }
@@ -115,9 +126,15 @@ impl Selection {
 
     /// Recheck both the discovered file and its original root. An old selection
     /// cannot silently admit a replacement or a renamed root.
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     pub fn validate_file(&self, path: &Path, stamp: sbh_btrfs::FileStamp) -> io::Result<()> {
-        let candidate = self.native.files.get(path)
+        let candidate = self
+            .native
+            .files
+            .get(path)
             .ok_or_else(|| invalid("file was not observed in this selection"))?;
         if candidate.stamp != stamp {
             return Err(io::Error::other("file changed after compression discovery"));
@@ -127,15 +144,23 @@ impl Selection {
 
     /// Recheck root confinement between chunks without comparing the original
     /// ctime: our own completed defrag can legitimately change the file's ctime.
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     pub fn validate_scope(&self, path: &Path) -> io::Result<()> {
         use std::os::unix::fs::MetadataExt as _;
 
-        let candidate = self.native.files.get(path)
+        let candidate = self
+            .native
+            .files
+            .get(path)
             .ok_or_else(|| invalid("file was not observed in this selection"))?;
         let root = &self.native.roots[candidate.root];
         if !path.starts_with(&root.path) || path.canonicalize()? != path {
-            return Err(io::Error::other("discovered path escaped its original root"));
+            return Err(io::Error::other(
+                "discovered path escaped its original root",
+            ));
         }
         let current = native::open_root(&root.path)?;
         let current = current.metadata()?;
@@ -154,7 +179,7 @@ pub fn continuation_path(hex: &str) -> io::Result<PathBuf> {
         return Err(invalid("invalid discovery continuation length"));
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.as_bytes().chunks_exact(2) {
+    for pair in hex.as_bytes().as_chunks::<2>().0 {
         let digit = |byte: u8| -> io::Result<u8> {
             match byte {
                 b'0'..=b'9' => Ok(byte - b'0'),
@@ -181,9 +206,13 @@ pub fn continuation_path(hex: &str) -> io::Result<PathBuf> {
 
 fn validate_absolute(path: &Path) -> io::Result<()> {
     if !path.is_absolute()
-        || path.components().any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
     {
-        return Err(invalid("discovery continuation must be an absolute path without traversal"));
+        return Err(invalid(
+            "discovery continuation must be an absolute path without traversal",
+        ));
     }
     Ok(())
 }
@@ -211,7 +240,10 @@ pub fn discover(
         return Err(invalid("supply 1..32 explicit compression discovery roots"));
     }
     let report = DiscoveryReport {
-        supported: cfg!(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        supported: cfg!(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
         roots: Vec::new(),
         entries_examined: 0,
         directories_opened: 0,
@@ -222,20 +254,30 @@ pub fn discover(
         stop_reason: None,
         resume_after_hex: None,
     };
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     {
         native::discover(roots, policy, limits, config, platform, report)
     }
-    #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     {
         let _ = (config, platform);
         let mut report = report;
-        report.stop_reason = Some("native compression discovery is unavailable on this target".into());
+        report.stop_reason =
+            Some("native compression discovery is unavailable on this target".into());
         Ok(Selection { report })
     }
 }
 
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod native {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::{self, File};
@@ -246,6 +288,7 @@ mod native {
     use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
     use sbh_btrfs::FileStamp;
 
+    #[allow(clippy::wildcard_imports)] // the parent module's discovery types
     use super::*;
     use crate::scanner::{active_lease, protection};
 
@@ -269,8 +312,11 @@ mod native {
 
     pub(super) fn open_root(path: &Path) -> io::Result<File> {
         Ok(File::from(openat2(
-            CWD, path, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(), ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+            CWD,
+            path,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
         )?))
     }
 
@@ -294,49 +340,83 @@ mod native {
 
     impl Walker<'_> {
         fn skip(&mut self, reason: &str) {
-            *self.selection.report.skipped.entry(reason.into()).or_default() += 1;
+            *self
+                .selection
+                .report
+                .skipped
+                .entry(reason.into())
+                .or_default() += 1;
         }
 
         fn budget(&self) -> io::Result<()> {
             if Instant::now() >= self.deadline {
-                Err(io::Error::new(io::ErrorKind::TimedOut, "discovery deadline exhausted"))
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "discovery deadline exhausted",
+                ))
             } else {
                 Ok(())
             }
         }
 
         fn protected(&mut self, path: &Path, directory: bool) -> io::Result<bool> {
-            let parent = if directory { path } else {
-                path.parent().ok_or_else(|| invalid("candidate has no parent"))?
+            let parent = if directory {
+                path
+            } else {
+                path.parent()
+                    .ok_or_else(|| invalid("candidate has no parent"))?
             };
-            self.registry.discover_ancestor_markers(parent).map_err(other)?;
+            self.registry
+                .discover_ancestor_markers(parent)
+                .map_err(other)?;
             if self.registry.is_protected(path) || active_lease::path_is_actively_leased(path) {
                 return Ok(true);
             }
             Ok(!protection::find_sacred_overlaps_with_config(
-                path, &self.sacred,
-                protection::StowawayScanConfig { max_depth: 0, ..Default::default() },
-            ).map_err(other)?.is_empty())
+                path,
+                &self.sacred,
+                protection::StowawayScanConfig {
+                    max_depth: 0,
+                    ..Default::default()
+                },
+            )
+            .map_err(other)?
+            .is_empty())
         }
 
-        fn visit(&mut self, task: Task) -> io::Result<()> {
+        #[allow(clippy::too_many_lines)] // one directory step, in order
+        fn visit(&mut self, task: &Task) -> io::Result<()> {
             self.budget()?;
             let root = &self.selection.native.roots[task.root];
             let path = root.path.join(&task.relative);
             // Skip whole earlier subtrees, but descend into ancestors of the
             // cursor. No filesystem query or mutation is authorized by it.
-            if self.limits.after.as_ref().is_some_and(|after| path <= *after && !after.starts_with(&path)) {
+            if self
+                .limits
+                .after
+                .as_ref()
+                .is_some_and(|after| path <= *after && !after.starts_with(&path))
+            {
                 self.skip("before_cursor");
                 return Ok(());
             }
-            let relative = if task.relative.as_os_str().is_empty() { Path::new(".") } else { &task.relative };
+            let relative = if task.relative.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                &task.relative
+            };
             let file = match openat2(
-                &root.file, relative, OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS
-                    | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_XDEV,
+                &root.file,
+                relative,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::BENEATH
+                    | ResolveFlags::NO_SYMLINKS
+                    | ResolveFlags::NO_MAGICLINKS
+                    | ResolveFlags::NO_XDEV,
             ) {
                 Ok(fd) => File::from(fd),
-                Err(error) if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::XDEV) => {
+                Err(rustix::io::Errno::LOOP | rustix::io::Errno::XDEV) => {
                     self.skip("symlink_or_mount_boundary");
                     return Ok(());
                 }
@@ -353,7 +433,10 @@ mod native {
             }
             if metadata.is_dir() {
                 if task.depth > self.limits.max_depth {
-                    return Err(io::Error::other(format!("discovery depth limit at {}", path.display())));
+                    return Err(io::Error::other(format!(
+                        "discovery depth limit at {}",
+                        path.display()
+                    )));
                 }
                 if self.selection.report.directories_opened >= self.limits.max_directories {
                     return Err(io::Error::other("discovery directory budget exhausted"));
@@ -383,7 +466,12 @@ mod native {
                 }
                 return Ok(());
             }
-            if self.limits.after.as_ref().is_some_and(|after| path <= *after) {
+            if self
+                .limits
+                .after
+                .as_ref()
+                .is_some_and(|after| path <= *after)
+            {
                 self.skip("before_cursor");
                 return Ok(());
             }
@@ -392,33 +480,54 @@ mod native {
                 self.skip("hard_linked_or_unlinked");
             } else if stamp.size < self.policy.min_size_bytes {
                 self.skip("below_minimum_size");
-            } else if !super::super::cold_enough(metadata.modified()?, self.now, self.policy.min_age_secs) {
+            } else if !super::super::cold_enough(
+                metadata.modified()?,
+                self.now,
+                self.policy.min_age_secs,
+            ) {
                 self.skip("young_or_future_timestamp");
             } else if super::super::already_compressed(&path) {
                 self.skip("compressed_suffix");
-            } else if stamp.size > self.policy.max_bytes.saturating_sub(self.selection.report.selected_bytes) {
+            } else if stamp.size
+                > self
+                    .policy
+                    .max_bytes
+                    .saturating_sub(self.selection.report.selected_bytes)
+            {
                 self.skip("logical_byte_budget");
             } else if !self.identities.insert((stamp.device, stamp.inode)) {
                 self.skip("duplicate_inode");
             } else {
                 self.selection.report.selected_files += 1;
                 self.selection.report.selected_bytes += stamp.size;
-                self.selection.native.files.insert(path, Candidate { stamp, root: task.root });
+                self.selection.native.files.insert(
+                    path,
+                    Candidate {
+                        stamp,
+                        root: task.root,
+                    },
+                );
             }
             Ok(())
         }
     }
 
     pub(super) fn discover(
-        roots: &[PathBuf], policy: &CompressionPolicy, limits: &DiscoveryLimits,
-        config: &Config, platform: &dyn Platform, mut report: DiscoveryReport,
+        roots: &[PathBuf],
+        policy: &CompressionPolicy,
+        limits: &DiscoveryLimits,
+        config: &Config,
+        platform: &dyn Platform,
+        mut report: DiscoveryReport,
     ) -> io::Result<Selection> {
         let deadline = Instant::now() + Duration::from_secs(limits.timeout_secs);
         let mut canonical = BTreeSet::new();
         for path in roots {
             let metadata = fs::symlink_metadata(path)?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(invalid("discovery roots must be real directories, not symlinks or files"));
+                return Err(invalid(
+                    "discovery roots must be real directories, not symlinks or files",
+                ));
             }
             let resolved = path.canonicalize()?;
             let pinned = open_root(&resolved)?.metadata()?;
@@ -429,34 +538,64 @@ mod native {
         }
         let mut evidence = Evidence::default();
         for path in canonical {
-            if evidence.roots.iter().any(|root| path.starts_with(&root.path)) {
+            if evidence
+                .roots
+                .iter()
+                .any(|root| path.starts_with(&root.path))
+            {
                 continue;
             }
             let file = open_root(&path)?;
             report.roots.push(path.to_string_lossy().into_owned());
             evidence.roots.push(Root { path, file });
         }
-        if limits.after.as_ref().is_some_and(|after| !evidence.roots.iter().any(|root| after.starts_with(&root.path))) {
-            return Err(invalid("continuation is outside the explicitly selected roots"));
+        if limits.after.as_ref().is_some_and(|after| {
+            !evidence
+                .roots
+                .iter()
+                .any(|root| after.starts_with(&root.path))
+        }) {
+            return Err(invalid(
+                "continuation is outside the explicitly selected roots",
+            ));
         }
-        let pending = (0..evidence.roots.len()).rev()
-            .map(|root| Task { root, relative: PathBuf::new(), depth: 0 }).collect();
+        let pending = (0..evidence.roots.len())
+            .rev()
+            .map(|root| Task {
+                root,
+                relative: PathBuf::new(),
+                depth: 0,
+            })
+            .collect();
         let mut walker = Walker {
-            policy, limits, deadline, now: SystemTime::now(),
-            registry: protection::ProtectionRegistry::new(Some(&config.scanner.protected_paths)).map_err(other)?,
+            policy,
+            limits,
+            deadline,
+            now: SystemTime::now(),
+            registry: protection::ProtectionRegistry::new(Some(&config.scanner.protected_paths))
+                .map_err(other)?,
             sacred: platform.sacred_paths(),
-            selection: Selection { report, native: evidence },
-            pending, identities: BTreeSet::new(),
+            selection: Selection {
+                report,
+                native: evidence,
+            },
+            pending,
+            identities: BTreeSet::new(),
         };
         while let Some(task) = walker.pending.pop() {
             if walker.selection.report.selected_files >= policy.max_files {
                 walker.selection.report.complete = false;
-                walker.selection.report.stop_reason = Some("discovery file-count budget exhausted".into());
-                walker.selection.report.resume_after_hex = walker.selection.native.files.last_key_value()
+                walker.selection.report.stop_reason =
+                    Some("discovery file-count budget exhausted".into());
+                walker.selection.report.resume_after_hex = walker
+                    .selection
+                    .native
+                    .files
+                    .last_key_value()
                     .map(|(path, _)| crate::core::hex_lower(path.as_os_str().as_encoded_bytes()));
                 break;
             }
-            if let Err(error) = walker.visit(task) {
+            if let Err(error) = walker.visit(&task) {
                 walker.selection.report.complete = false;
                 walker.selection.report.stop_reason = Some(error.to_string());
                 break;

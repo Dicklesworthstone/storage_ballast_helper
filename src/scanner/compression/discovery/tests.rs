@@ -4,11 +4,26 @@ use super::*;
 fn limits_reject_unbounded_work_and_traversal_cursors() {
     assert!(DiscoveryLimits::default().validate().is_ok());
     for limits in [
-        DiscoveryLimits { max_depth: 65, ..Default::default() },
-        DiscoveryLimits { max_entries: 0, ..Default::default() },
-        DiscoveryLimits { max_directories: 8193, ..Default::default() },
-        DiscoveryLimits { timeout_secs: 61, ..Default::default() },
-        DiscoveryLimits { after: Some("/data/../elsewhere".into()), ..Default::default() },
+        DiscoveryLimits {
+            max_depth: 65,
+            ..Default::default()
+        },
+        DiscoveryLimits {
+            max_entries: 0,
+            ..Default::default()
+        },
+        DiscoveryLimits {
+            max_directories: 8193,
+            ..Default::default()
+        },
+        DiscoveryLimits {
+            timeout_secs: 61,
+            ..Default::default()
+        },
+        DiscoveryLimits {
+            after: Some("/data/../elsewhere".into()),
+            ..Default::default()
+        },
     ] {
         assert!(limits.validate().is_err(), "{limits:?}");
     }
@@ -25,12 +40,15 @@ fn continuations_preserve_non_utf8_filename_bytes() {
     assert_eq!(path.as_os_str().as_bytes(), b"/tmp/cold-\xff");
 }
 
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod native_tests {
     use super::*;
+    use crate::platform::pal::MockPlatform;
     use std::fs;
     use std::os::unix::fs::symlink;
-    use crate::platform::pal::MockPlatform;
 
     fn cold(path: &Path) {
         fs::write(path, b"cold contents").unwrap();
@@ -39,11 +57,22 @@ mod native_tests {
     }
 
     fn policy() -> CompressionPolicy {
-        CompressionPolicy { min_size_bytes: 1, min_age_secs: 3600, ..Default::default() }
+        CompressionPolicy {
+            min_size_bytes: 1,
+            min_age_secs: 3600,
+            ..Default::default()
+        }
     }
 
     fn scan(roots: &[PathBuf], limits: &DiscoveryLimits, policy: &CompressionPolicy) -> Selection {
-        discover(roots, policy, limits, &Config::default(), &MockPlatform::healthy()).unwrap()
+        discover(
+            roots,
+            policy,
+            limits,
+            &Config::default(),
+            &MockPlatform::healthy(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -60,25 +89,48 @@ mod native_tests {
         cold(&root.join("a.bin"));
         cold(&root.join("archive.ZST"));
         fs::write(root.join("hot.bin"), b"recent").unwrap();
-        let selection = scan(&[root.clone()], &DiscoveryLimits::default(), &policy());
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy(),
+        );
         assert!(selection.report().complete, "{:?}", selection.report());
         assert_eq!(selection.paths(), [root.join("a.bin"), root.join("z.bin")]);
         assert_eq!(selection.report().selected_bytes, 26);
         assert_eq!(selection.report().directories_opened, 1);
-        assert_eq!(fs::read(outside.path().join("outside.bin")).unwrap(), b"cold contents");
+        assert_eq!(
+            fs::read(outside.path().join("outside.bin")).unwrap(),
+            b"cold contents"
+        );
     }
 
     #[test]
     fn a_full_file_budget_has_a_native_continuation_without_duplicates() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        for name in ["c.bin", "a.bin", "b.bin"] { cold(&root.join(name)); }
-        let policy = CompressionPolicy { max_files: 2, ..policy() };
-        let first = scan(&[root.clone()], &DiscoveryLimits::default(), &policy);
+        for name in ["c.bin", "a.bin", "b.bin"] {
+            cold(&root.join(name));
+        }
+        let policy = CompressionPolicy {
+            max_files: 2,
+            ..policy()
+        };
+        let first = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy,
+        );
         assert!(!first.report().complete);
         assert_eq!(first.paths(), [root.join("a.bin"), root.join("b.bin")]);
         let after = continuation_path(first.report().resume_after_hex.as_deref().unwrap()).unwrap();
-        let second = scan(&[root.clone()], &DiscoveryLimits { after: Some(after), ..Default::default() }, &policy);
+        let second = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits {
+                after: Some(after),
+                ..Default::default()
+            },
+            &policy,
+        );
         assert!(second.report().complete);
         assert_eq!(second.paths(), [root.join("c.bin")]);
     }
@@ -88,7 +140,14 @@ mod native_tests {
         let dir = tempfile::tempdir().unwrap();
         cold(&dir.path().join("a.bin"));
         cold(&dir.path().join("b.bin"));
-        let selection = scan(&[dir.path().into()], &DiscoveryLimits { max_entries: 1, ..Default::default() }, &policy());
+        let selection = scan(
+            &[dir.path().into()],
+            &DiscoveryLimits {
+                max_entries: 1,
+                ..Default::default()
+            },
+            &policy(),
+        );
         assert!(!selection.report().complete);
         assert!(selection.paths().is_empty());
         assert!(selection.report().resume_after_hex.is_none());
@@ -102,7 +161,11 @@ mod native_tests {
         fs::create_dir(&root).unwrap();
         let path = root.join("cold.bin");
         cold(&path);
-        let selection = scan(&[root.clone()], &DiscoveryLimits::default(), &policy());
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy(),
+        );
         let file = fs::File::open(&path).unwrap();
         let stamp = sbh_btrfs::FileStamp::read(&file).unwrap();
         assert!(selection.validate_file(&path, stamp).is_ok());
@@ -110,7 +173,11 @@ mod native_tests {
         fs::create_dir(&root).unwrap();
         cold(&path);
         let replacement = fs::File::open(&path).unwrap();
-        assert!(selection.validate_file(&path, sbh_btrfs::FileStamp::read(&replacement).unwrap()).is_err());
+        assert!(
+            selection
+                .validate_file(&path, sbh_btrfs::FileStamp::read(&replacement).unwrap())
+                .is_err()
+        );
         assert!(selection.validate_scope(&path).is_err());
     }
 
@@ -122,12 +189,26 @@ mod native_tests {
         cold(&root.join("sub/a.bin"));
         cold(&root.join("linked.bin"));
         fs::hard_link(root.join("linked.bin"), root.join("linked-again.bin")).unwrap();
-        let selection = scan(&[root.join("sub"), root.clone()], &DiscoveryLimits::default(), &policy());
+        let selection = scan(
+            &[root.join("sub"), root.clone()],
+            &DiscoveryLimits::default(),
+            &policy(),
+        );
         assert_eq!(selection.report().roots.len(), 1);
         assert_eq!(selection.paths(), [root.join("sub/a.bin")]);
         let mut config = Config::default();
-        config.scanner.protected_paths.push(root.to_string_lossy().into_owned());
-        let protected = discover(&[root], &policy(), &DiscoveryLimits::default(), &config, &MockPlatform::healthy()).unwrap();
+        config
+            .scanner
+            .protected_paths
+            .push(root.to_string_lossy().into_owned());
+        let protected = discover(
+            &[root],
+            &policy(),
+            &DiscoveryLimits::default(),
+            &config,
+            &MockPlatform::healthy(),
+        )
+        .unwrap();
         assert!(protected.paths().is_empty());
         assert!(protected.report().complete);
         assert_eq!(protected.report().directories_opened, 0);
@@ -140,12 +221,38 @@ mod native_tests {
         fs::create_dir(root.join("sub")).unwrap();
         cold(&root.join("a.bin"));
         cold(&root.join("sub/b.bin"));
-        let selection = scan(&[root.clone()], &DiscoveryLimits { max_depth: 0, ..Default::default() }, &policy());
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits {
+                max_depth: 0,
+                ..Default::default()
+            },
+            &policy(),
+        );
         assert!(!selection.report().complete);
         assert_eq!(selection.paths(), [root.join("a.bin")]);
-        let selection = scan(&[root.clone()], &DiscoveryLimits::default(), &CompressionPolicy { max_bytes: 13, ..policy() });
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &CompressionPolicy {
+                max_bytes: 13,
+                ..policy()
+            },
+        );
         assert_eq!(selection.report().selected_bytes, 13);
         assert_eq!(selection.report().selected_files, 1);
-        assert!(discover(&[root], &policy(), &DiscoveryLimits { after: Some("/unrelated/file".into()), ..Default::default() }, &Config::default(), &MockPlatform::healthy()).is_err());
+        assert!(
+            discover(
+                &[root],
+                &policy(),
+                &DiscoveryLimits {
+                    after: Some("/unrelated/file".into()),
+                    ..Default::default()
+                },
+                &Config::default(),
+                &MockPlatform::healthy()
+            )
+            .is_err()
+        );
     }
 }
