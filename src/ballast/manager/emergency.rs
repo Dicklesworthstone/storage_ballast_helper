@@ -122,7 +122,20 @@ mod unix {
     /// No mkdir, create, truncate, write or blocking flock on this path.
     struct PoolLock {
         directory: File,
-        _lock: File,
+        lock: File,
+        owner_pid: u32,
+    }
+
+    impl Drop for PoolLock {
+        fn drop(&mut self) {
+            // Closing our descriptor alone leaves the flock live while a child
+            // that another thread is spawning holds a copy of it, and the next
+            // replenish then finds the pool busy. Only the acquiring process
+            // unlocks; a forked guard must not unlock its parent.
+            if self.owner_pid == std::process::id() {
+                let _ = flock(&self.lock, FlockOperation::Unlock);
+            }
+        }
     }
 
     impl PoolLock {
@@ -166,7 +179,8 @@ mod unix {
             }
             Ok(Some(Self {
                 directory,
-                _lock: lock,
+                lock,
+                owner_pid: std::process::id(),
             }))
         }
 
@@ -588,6 +602,18 @@ mod unix {
             let name = path.file_name().unwrap();
             assert!(guard.remove(name, &meta).is_err());
             assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        }
+
+        #[test]
+        fn a_copied_lock_descriptor_does_not_keep_the_pool_busy_after_release() {
+            let (_root, manager) = fixture();
+            let guard = PoolLock::open(&manager.ballast_dir).unwrap().unwrap();
+            // A child that another thread is still spawning holds a copy.
+            let child_copy = guard.lock.try_clone().unwrap();
+            drop(guard);
+            let next = File::open(manager.ballast_dir.join(".lock")).unwrap();
+            flock(&next, FlockOperation::NonBlockingLockExclusive).unwrap();
+            drop(child_copy);
         }
 
         #[test]

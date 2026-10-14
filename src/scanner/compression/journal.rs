@@ -604,6 +604,14 @@ mod writer {
             self.failed
         }
 
+        /// A copy of the journal's descriptor, as a child being spawned holds.
+        #[cfg(test)]
+        pub(in crate::scanner::compression) fn journal_descriptor_copy(&self) -> Option<File> {
+            self.writer
+                .as_ref()
+                .map(|writer| writer.file.try_clone().unwrap())
+        }
+
         pub(in crate::scanner::compression) fn prepare(
             &mut self,
             report: &mut CompressionFileReport,
@@ -723,6 +731,19 @@ mod writer {
         sequence: u64,
         bytes: u64,
         poisoned: bool,
+        owner_pid: u32,
+    }
+
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            // Closing the descriptor alone leaves the lock held while a child
+            // that another thread is spawning has a copy of it, and recovery
+            // right after the pass would call the pass live. Only the
+            // acquiring process unlocks; a forked copy must not unlock its parent.
+            if self.owner_pid == std::process::id() {
+                let _ = self.file.unlock();
+            }
+        }
     }
 
     impl Writer {
@@ -795,6 +816,7 @@ mod writer {
                 sequence: 0,
                 bytes: 0,
                 poisoned: false,
+                owner_pid: std::process::id(),
             };
             writer.append(Entry::RunStarted {
                 pid: std::process::id(),

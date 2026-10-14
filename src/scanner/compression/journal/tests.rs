@@ -353,3 +353,16 @@ fn recovery_waits_out_a_briefly_held_writer_lock_but_refuses_a_running_pass() {
     assert!(error.to_string().contains("still running"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(2));
 }
+
+#[test]
+fn a_copied_writer_descriptor_does_not_make_a_finished_pass_look_live() {
+    let (_temp, mut session, file, mut item) = fixture();
+    session.prepare(&mut item, &file).unwrap();
+    let path = session.path().unwrap().to_path_buf();
+    let child_copy = session.journal_descriptor_copy().unwrap();
+    drop(session);
+    let started = Instant::now();
+    assert!(!recover(&path, 64, 30).unwrap().run_finished);
+    assert!(started.elapsed() < LIVE_LOCK_PATIENCE);
+    drop(child_copy);
+}
