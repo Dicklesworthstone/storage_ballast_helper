@@ -34,6 +34,8 @@ pub mod fuzzing;
 pub mod logger;
 pub mod monitor;
 pub mod platform;
+#[cfg(unix)]
+pub mod relocate;
 pub mod scanner;
 #[cfg(feature = "tui")]
 pub mod tui;

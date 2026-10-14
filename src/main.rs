@@ -7,11 +7,13 @@ use clap::{CommandFactory, FromArgMatches};
 mod cli_app;
 mod cli_compress;
 mod cli_ram_scratch;
+mod cli_relocate;
 mod cli_source_roots;
 
 fn cli_command() -> clap::Command {
     cli_app::Cli::command()
         .subcommand(cli_compress::command())
+        .subcommand(cli_relocate::command())
         .mut_subcommand("check", cli_ram_scratch::augment)
 }
 
@@ -26,6 +28,17 @@ fn main() {
         Ok(None) => {}
         Err(error) => {
             eprintln!("sbh: could not write RAM scratch report: {error}");
+            std::process::exit(2);
+        }
+    }
+    // Relocation of dormant protected scratch reads its own settings file and
+    // owns its report and exit status.
+    match cli_relocate::run(&matches) {
+        Ok(Some(0)) => return,
+        Ok(Some(code)) => std::process::exit(code),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("sbh: could not write relocation report: {error}");
             std::process::exit(2);
         }
     }
