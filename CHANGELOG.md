@@ -52,6 +52,9 @@ scratch against RAM and swap and an opt-in Btrfs compression command.
 - The `[SBH-SAFETY] open-file sweep incomplete` line names a refused build
   tool first, with the number of other refused processes. Before, it named
   the first refusal, usually pid 1 (bd-3maz; `af41970`).
+- `sbh explain --why-not <dir>` walks only the directory it explains. It
+  walked every sibling as well, so in a crowded `$TMPDIR` on macOS it did not
+  finish in three minutes (bd-g3g3; `898d309`).
 
 ### Added
 
