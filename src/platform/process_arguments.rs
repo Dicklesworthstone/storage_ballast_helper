@@ -23,12 +23,12 @@ pub struct DarwinArguments<'a> {
 /// An empty environment is valid. A double NUL ends the environment; any
 /// auxiliary strings following it are not configuration evidence.
 pub fn darwin_arguments(raw: &[u8]) -> Option<DarwinArguments<'_>> {
-    let argc = i32::from_ne_bytes(raw.get(..ARGC_BYTES)?.try_into().ok()?);
-    let argc = usize::try_from(argc).ok().filter(|argc| *argc > 0)?;
+    let count = i32::from_ne_bytes(raw.get(..ARGC_BYTES)?.try_into().ok()?);
+    let count = usize::try_from(count).ok().filter(|count| *count > 0)?;
     let strings = raw.get(ARGC_BYTES..)?;
     // Every argument requires at least a NUL byte. A corrupt count cannot
     // induce work or allocation beyond the size of the bounded input.
-    if argc > strings.len() {
+    if count > strings.len() {
         return None;
     }
     let exec_end = next_nul(strings, 0)?;
@@ -36,14 +36,9 @@ pub fn darwin_arguments(raw: &[u8]) -> Option<DarwinArguments<'_>> {
         return None;
     }
     let mut cursor = exec_end.checked_add(1)?;
-    cursor = cursor.checked_add(
-        strings
-            .get(cursor..)?
-            .iter()
-            .position(|byte| *byte != 0)?,
-    )?;
+    cursor = cursor.checked_add(strings.get(cursor..)?.iter().position(|byte| *byte != 0)?)?;
     let argv_start = cursor;
-    for _ in 0..argc {
+    for _ in 0..count {
         cursor = next_nul(strings, cursor)?.checked_add(1)?;
     }
     let argv = strings.get(argv_start..cursor)?;
@@ -88,7 +83,11 @@ mod tests {
     fn argv_is_borrowed_separately_from_environment_and_padding() {
         let env = b"HOME=/builder\0\0npm-cli.js\0";
         for padding in 0..=16 {
-            let raw = frame(&[b"python3", b"", b"-m", b"pip", b"path-\xff"], env, padding);
+            let raw = frame(
+                &[b"python3", b"", b"-m", b"pip", b"path-\xff"],
+                env,
+                padding,
+            );
             let parsed = darwin_arguments(&raw).unwrap();
             assert_eq!(parsed.argv, b"python3\0\0-m\0pip\0path-\xff\0");
             assert_eq!(parsed.environment, b"HOME=/builder\0");
@@ -148,7 +147,10 @@ mod tests {
             assert_eq!(darwin_environment(&raw), Some(b"".as_slice()));
         }
         let raw = frame(&[b"cargo"], b"HOME=/builder\0\0CARGO_HOME=/auxiliary\0", 0);
-        assert_eq!(darwin_environment(&raw), Some(b"HOME=/builder\0".as_slice()));
+        assert_eq!(
+            darwin_environment(&raw),
+            Some(b"HOME=/builder\0".as_slice())
+        );
     }
 
     #[test]

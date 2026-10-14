@@ -30,6 +30,8 @@ pub enum Tool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheLayout {
+    // Built only by the Linux sweep, and by tests on every platform.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Linux,
     MacOs,
 }
@@ -84,13 +86,11 @@ fn versioned(name: &str, prefix: &str) -> bool {
     })
 }
 
+/// Linux's procfs sweep has no argv-aware layer; macOS goes through
+/// `build_invocation` with [`CacheLayout::MacOs`].
+#[cfg(target_os = "linux")]
 pub fn references(tool: Tool, environ: &[u8], cwd: Option<&Path>) -> Vec<PathBuf> {
-    let layout = if cfg!(target_os = "macos") {
-        CacheLayout::MacOs
-    } else {
-        CacheLayout::Linux
-    };
-    references_with_layout(layout, tool, environ, cwd)
+    references_with_layout(CacheLayout::Linux, tool, environ, cwd)
 }
 
 pub fn references_with_layout(
@@ -614,17 +614,13 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn native_entry_point_selects_the_compiled_platform_layout() {
+    fn native_entry_point_uses_the_linux_layout() {
         let env = b"HOME=/builder\0";
-        let layout = if cfg!(target_os = "macos") {
-            CacheLayout::MacOs
-        } else {
-            CacheLayout::Linux
-        };
         assert_eq!(
             super::references(Tool::Go, env, None),
-            references_with_layout(layout, Tool::Go, env, None)
+            references_with_layout(CacheLayout::Linux, Tool::Go, env, None)
         );
     }
 }

@@ -38,6 +38,8 @@ pub fn references(
     build_environment::references_with_layout(layout, tool, environment, cwd)
 }
 
+// By reference: `slice::split` hands its predicate a `&u8`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn nul(byte: &u8) -> bool {
     *byte == 0
 }
@@ -47,9 +49,9 @@ fn arguments(argv: &[u8]) -> Option<(&[u8], Arguments<'_>)> {
     // Without the terminator an incomplete final argument could look like a
     // package name and incorrectly authorize an implicit default cache.
     let bytes = argv.strip_suffix(b"\0")?;
-    let mut args = bytes.split(nul as fn(&u8) -> bool);
-    let program = args.next().filter(|program| !program.is_empty())?;
-    Some((program, args))
+    let mut rest = bytes.split(nul as fn(&u8) -> bool);
+    let program = rest.next().filter(|program| !program.is_empty())?;
+    Some((program, rest))
 }
 
 fn basename(path: &[u8]) -> &[u8] {
@@ -57,12 +59,12 @@ fn basename(path: &[u8]) -> &[u8] {
 }
 
 fn invocation_tool(observed: Tool, argv: &[u8]) -> Tool {
-    let Some((program, args)) = arguments(argv) else {
+    let Some((program, rest)) = arguments(argv) else {
         return observed;
     };
     let manager = match observed {
-        Tool::Python => python_manager(args),
-        Tool::Node if matches!(basename(program), b"node" | b"nodejs") => node_manager(args),
+        Tool::Python => python_manager(rest),
+        Tool::Node if matches!(basename(program), b"node" | b"nodejs") => node_manager(rest),
         _ => None,
     };
     manager.unwrap_or(observed)
@@ -91,10 +93,7 @@ fn python_manager(mut args: Arguments<'_>) -> Option<Tool> {
 
 fn python_switches(arg: &[u8]) -> bool {
     arg.strip_prefix(b"-").is_some_and(|switches| {
-        !switches.is_empty()
-            && switches
-                .iter()
-                .all(|byte| b"bBdEiIOPqsSuv".contains(byte))
+        !switches.is_empty() && switches.iter().all(|byte| b"bBdEiIOPqsSuv".contains(byte))
     })
 }
 
@@ -108,7 +107,9 @@ fn python_module(module: &[u8]) -> Option<Tool> {
 
 fn python_script(script: &[u8]) -> Option<Tool> {
     let name = basename(script);
-    if build_environment::tool(name) == Some(Tool::Pip) {
+    // An entry script is run by path (/venv/bin/pip3.13). A bare "pip" is a
+    // file in the cwd, or the value an option like -W left behind.
+    if script.contains(&b'/') && build_environment::tool(name) == Some(Tool::Pip) {
         return Some(Tool::Pip);
     }
     // python /venv/.../pip/__main__.py, not an unrelated __main__.py.
@@ -141,8 +142,11 @@ fn node_manager(mut args: Arguments<'_>) -> Option<Tool> {
 }
 
 fn node_script(script: &[u8]) -> Option<Tool> {
-    matches!(basename(script), b"npm-cli.js" | b"npx-cli.js" | b"npm" | b"npx")
-        .then_some(Tool::Npm)
+    matches!(
+        basename(script),
+        b"npm-cli.js" | b"npx-cli.js" | b"npm" | b"npx"
+    )
+    .then_some(Tool::Npm)
 }
 
 #[cfg(test)]
@@ -180,11 +184,21 @@ mod tests {
 
     #[test]
     fn node_hosted_npm_and_npx_protect_the_conventional_cache() {
-        for script in [b"/opt/npm/bin/npm-cli.js".as_slice(), b"/bin/npx", b"npm-cli.js"] {
+        for script in [
+            b"/opt/npm/bin/npm-cli.js".as_slice(),
+            b"/bin/npx",
+            b"npm-cli.js",
+        ] {
             let args = argv(&[b"/bin/node", b"--no-warnings", script, b"install"]);
             assert_eq!(invocation_tool(Tool::Node, &args), Tool::Npm);
             assert_eq!(
-                references(CacheLayout::MacOs, Tool::Node, &args, b"HOME=/builder\0", None),
+                references(
+                    CacheLayout::MacOs,
+                    Tool::Node,
+                    &args,
+                    b"HOME=/builder\0",
+                    None
+                ),
                 vec![PathBuf::from("/builder/.npm")]
             );
         }
@@ -192,8 +206,14 @@ mod tests {
 
     #[test]
     fn native_script_path_bytes_do_not_require_utf8() {
-        for script in [b"/venv-\xff/bin/pip3.13".as_slice(), b"/venv-\xff/pip/__main__.py"] {
-            assert_eq!(invocation_tool(Tool::Python, &argv(&[b"python3", script])), Tool::Pip);
+        for script in [
+            b"/venv-\xff/bin/pip3.13".as_slice(),
+            b"/venv-\xff/pip/__main__.py",
+        ] {
+            assert_eq!(
+                invocation_tool(Tool::Python, &argv(&[b"python3", script])),
+                Tool::Pip
+            );
         }
         assert_eq!(
             invocation_tool(Tool::Node, &argv(&[b"node", b"/prefix-\xff/npm-cli.js"])),
@@ -217,7 +237,12 @@ mod tests {
         for args in [
             vec![b"node".as_slice(), b"-e", b"npm-cli.js", b"npm-cli.js"],
             vec![b"node".as_slice(), b"server.js", b"npm-cli.js"],
-            vec![b"node".as_slice(), b"--require", b"npm-cli.js", b"server.js"],
+            vec![
+                b"node".as_slice(),
+                b"--require",
+                b"npm-cli.js",
+                b"server.js",
+            ],
             vec![b"node".as_slice(), b"npm-cli.js.backup"],
             vec![b"bun".as_slice(), b"npm-cli.js"],
         ] {
@@ -254,8 +279,13 @@ mod tests {
             ),
             vec![PathBuf::from("/project/relative")]
         );
-        for (tool, args) in [(Tool::Python, b"python3\0".as_slice()), (Tool::Node, b"node\0")] {
-            assert!(references(CacheLayout::MacOs, tool, args, b"HOME=/builder\0", None).is_empty());
+        for (tool, args) in [
+            (Tool::Python, b"python3\0".as_slice()),
+            (Tool::Node, b"node\0"),
+        ] {
+            assert!(
+                references(CacheLayout::MacOs, tool, args, b"HOME=/builder\0", None).is_empty()
+            );
         }
         assert_eq!(
             references(CacheLayout::MacOs, Tool::Npm, b"", b"HOME=/builder\0", None),
@@ -268,7 +298,12 @@ mod tests {
         for name in [b"Python".as_slice(), b"Python3.13", b"python3.13"] {
             assert_eq!(observed_tool(name), Some(Tool::Python));
         }
-        for name in [b"Python-notes".as_slice(), b"PYTHON", b"Python3..1", b"Python\xff"] {
+        for name in [
+            b"Python-notes".as_slice(),
+            b"PYTHON",
+            b"Python3..1",
+            b"Python\xff",
+        ] {
             assert_eq!(observed_tool(name), None);
         }
     }

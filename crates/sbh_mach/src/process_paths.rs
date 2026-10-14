@@ -12,7 +12,7 @@ use std::mem::{MaybeUninit, size_of};
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
-/// Maximum bytes copied from one process's KERN_PROCARGS2 buffer.
+/// Maximum bytes copied from one process's `KERN_PROCARGS2` buffer.
 /// Oversized records fail rather than returning a truncated environment.
 pub const PROCESS_ARGUMENTS_MAX_BYTES: usize = 512 * 1024;
 
@@ -26,7 +26,7 @@ fn validate_pid(pid: i32) -> io::Result<()> {
     Ok(())
 }
 
-/// Read the kernel-held current directory through PROC_PIDVNODEPATHINFO.
+/// Read the kernel-held current directory through `PROC_PIDVNODEPATHINFO`.
 /// Native path bytes are preserved; an empty or unterminated path is unknown.
 #[allow(unsafe_code)]
 pub fn proc_pid_cwd(pid: i32) -> io::Result<PathBuf> {
@@ -69,14 +69,19 @@ pub fn proc_pid_cwd(pid: i32) -> io::Result<PathBuf> {
             "process cwd is not a directory",
         ));
     }
-    decode_cwd(&info.pvi_cdir.vip_path)
+    // libc declares the MAXPATHLEN array as 32 rows of 32 for old compilers.
+    decode_cwd(info.pvi_cdir.vip_path.as_flattened())
 }
 
 fn decode_cwd(raw: &[libc::c_char]) -> io::Result<PathBuf> {
-    let end = raw.iter().position(|byte| *byte == 0).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "unterminated process cwd")
-    })?;
-    let bytes: Vec<u8> = raw[..end].iter().map(|byte| byte.to_ne_bytes()[0]).collect();
+    let end = raw
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unterminated process cwd"))?;
+    let bytes: Vec<u8> = raw[..end]
+        .iter()
+        .map(|byte| byte.to_ne_bytes()[0])
+        .collect();
     let path = PathBuf::from(OsString::from_vec(bytes));
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -87,8 +92,9 @@ fn decode_cwd(raw: &[libc::c_char]) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Read one complete, bounded KERN_PROCARGS2 record (argc, executable, argv,
-/// environment). Callers should retain only the specific fields they need and
+/// Read one complete, bounded `KERN_PROCARGS2` record.
+///
+/// The record holds argc, the executable, argv and the environment. Callers should retain only the specific fields they need and
 /// must not log the buffer: unrelated environment variables can be sensitive.
 /// No dynamic kernel size hint can make this allocate above the fixed cap.
 #[allow(unsafe_code)]
@@ -143,23 +149,38 @@ mod tests {
     }
 
     fn c_bytes(bytes: &[u8]) -> Vec<libc::c_char> {
-        bytes.iter().map(|byte| libc::c_char::from_ne_bytes([*byte])).collect()
+        bytes
+            .iter()
+            .map(|byte| libc::c_char::from_ne_bytes([*byte]))
+            .collect()
     }
 
     #[test]
     fn nonpositive_pids_are_rejected_before_native_queries() {
         for pid in [i32::MIN, -1, 0] {
-            assert_eq!(proc_pid_cwd(pid).unwrap_err().kind(), io::ErrorKind::InvalidInput);
-            assert_eq!(proc_pid_arguments(pid).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                proc_pid_cwd(pid).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                proc_pid_arguments(pid).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
         }
     }
 
     #[test]
     fn cwd_requires_a_terminated_absolute_path() {
         for raw in [b"".as_slice(), b"\0", b"relative\0", b"/unterminated"] {
-            assert_eq!(decode_cwd(&c_bytes(raw)).unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                decode_cwd(&c_bytes(raw)).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
         }
-        assert_eq!(decode_cwd(&c_bytes(b"/\0ignored")).unwrap(), PathBuf::from("/"));
+        assert_eq!(
+            decode_cwd(&c_bytes(b"/\0ignored")).unwrap(),
+            PathBuf::from("/")
+        );
     }
 
     #[test]
@@ -191,10 +212,24 @@ mod tests {
 
     #[test]
     fn a_child_exposes_its_cwd_and_environment_without_opening_that_cwd() {
-        let child = Command::new("/bin/sleep")
-            .arg("30")
+        const HOLD: &str = "SBH_PROCESS_PATH_TEST";
+        if std::env::var_os(HOLD).is_some() {
+            // The child: stay alive until the parent has looked.
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+        // Not /bin/sleep: macOS withholds the environment of Apple platform
+        // binaries from KERN_PROCARGS2, even for root. Build tools (rustup's
+        // cargo and rustc, Homebrew's node and python) are third-party
+        // binaries like this test executable, whose environment is readable.
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process_paths::tests::a_child_exposes_its_cwd_and_environment_without_opening_that_cwd",
+                "--nocapture",
+            ])
             .current_dir("/")
-            .env("SBH_PROCESS_PATH_TEST", "owned-fixture")
+            .env(HOLD, "owned-fixture")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

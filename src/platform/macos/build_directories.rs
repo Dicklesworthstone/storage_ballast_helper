@@ -291,9 +291,24 @@ mod tests {
     #[test]
     fn interpreter_hosted_package_managers_reach_native_cache_protection() {
         let mut fixture = Fixture::default();
-        fixture.invocation(41, "Python", &[b"python3", b"-m", b"pip"], b"HOME=/builder\0");
-        fixture.invocation(42, "node", &[b"node", b"/opt/npm/bin/npm-cli.js"], b"HOME=/builder\0");
-        fixture.invocation(43, "python3", &[b"python3", b"worker.py", b"-m", b"pip"], b"HOME=/builder\0");
+        fixture.invocation(
+            41,
+            "Python",
+            &[b"python3", b"-m", b"pip"],
+            b"HOME=/builder\0",
+        );
+        fixture.invocation(
+            42,
+            "node",
+            &[b"node", b"/opt/npm/bin/npm-cli.js"],
+            b"HOME=/builder\0",
+        );
+        fixture.invocation(
+            43,
+            "python3",
+            &[b"python3", b"worker.py", b"-m", b"pip"],
+            b"HOME=/builder\0",
+        );
         assert_eq!(
             collect_with(&fixture, 99, Limits::default()),
             vec![
@@ -313,7 +328,11 @@ mod tests {
     #[test]
     fn native_transport_shape_feeds_shared_cache_rules_without_descriptors() {
         let mut fixture = Fixture::default();
-        fixture.add(42, "rustc", b"CARGO_HOME=/cache/cargo\0CARGO_TARGET_DIR=/target\0");
+        fixture.add(
+            42,
+            "rustc",
+            b"CARGO_HOME=/cache/cargo\0CARGO_TARGET_DIR=/target\0",
+        );
         fixture.add(43, "go", b"HOME=/builder\0");
         fixture.add(44, "npm", b"HOME=/builder\0");
         fixture.add(45, "uv", b"HOME=/builder\0");
@@ -337,9 +356,13 @@ mod tests {
             collect_with(&fixture, 42, Limits::default()),
             vec![(43, PathBuf::from("/active"))]
         );
-        assert!(!fixture.reads.borrow().iter().any(|(pid, kind)| {
-            *pid == 42 || (*pid == 41 && *kind != "identity")
-        }));
+        assert!(
+            !fixture
+                .reads
+                .borrow()
+                .iter()
+                .any(|(pid, kind)| { *pid == 42 || (*pid == 41 && *kind != "identity") })
+        );
     }
 
     #[test]
@@ -361,7 +384,11 @@ mod tests {
     #[test]
     fn relative_cache_values_require_the_observed_cwd_not_daemon_state() {
         let mut fixture = Fixture::default();
-        fixture.add(42, "rustc", b"CARGO_TARGET_DIR=../target\0SCCACHE_DIR=/absolute\0");
+        fixture.add(
+            42,
+            "rustc",
+            b"CARGO_TARGET_DIR=../target\0SCCACHE_DIR=/absolute\0",
+        );
         let found = collect_with(&fixture, 99, Limits::default());
         assert!(found.contains(&(42, PathBuf::from("/workspace/../target"))));
         assert!(found.contains(&(42, PathBuf::from("/absolute"))));
@@ -396,11 +423,38 @@ mod tests {
             vec![(42, "identity"), (42, "arguments")]
         );
         fixture.elapsed_per_read = Duration::ZERO;
-        let found = collect_with(&fixture, 99, Limits { paths: 2, ..Limits::default() });
+        let found = collect_with(
+            &fixture,
+            99,
+            Limits {
+                paths: 2,
+                ..Limits::default()
+            },
+        );
         assert_eq!(found.len(), 2);
         assert!(found.iter().all(|(pid, _)| *pid == 42));
-        assert!(collect_with(&fixture, 99, Limits { pids: 0, ..Limits::default() }).is_empty());
-        assert!(collect_with(&fixture, 99, Limits { paths: 0, ..Limits::default() }).is_empty());
+        assert!(
+            collect_with(
+                &fixture,
+                99,
+                Limits {
+                    pids: 0,
+                    ..Limits::default()
+                }
+            )
+            .is_empty()
+        );
+        assert!(
+            collect_with(
+                &fixture,
+                99,
+                Limits {
+                    paths: 0,
+                    ..Limits::default()
+                }
+            )
+            .is_empty()
+        );
     }
 
     struct ChildGuard(Child);
@@ -438,9 +492,11 @@ mod tests {
         );
         let pid = i32::try_from(child.0.id()).unwrap();
         let platform = super::super::pal::MacOsPal::new();
-        assert!(platform
-            .build_directories_in_use()
-            .contains(&(pid, home.join("registry/src"))));
+        assert!(
+            platform
+                .build_directories_in_use()
+                .contains(&(pid, home.join("registry/src")))
+        );
         let process = platform
             .process_list()
             .unwrap()
