@@ -647,6 +647,17 @@ mod tests {
     use super::*;
     use crate::relocate::plan::Verdict;
 
+    /// The precheck refuses while it cannot see every process, as it must. A
+    /// user who cannot read other users' processes has nothing to prove here.
+    fn sees_every_process(path: &Path) -> bool {
+        let platform = crate::platform::current();
+        let visible = crate::relocate::plan::sweep(&platform, &[path.to_path_buf()]).is_complete();
+        if !visible {
+            eprintln!("skipped: this user cannot see every process");
+        }
+        visible
+    }
+
     fn rsync_available() -> bool {
         Command::new("rsync")
             .arg("--version")
@@ -695,6 +706,9 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let unit = marked_tree(tmp.path());
+        if !sees_every_process(&unit) {
+            return;
+        }
         let config = local_config(tmp.path());
         let mut ledger = Ledger::default();
         let platform = crate::platform::current();
@@ -782,6 +796,9 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let unit = marked_tree(tmp.path());
+        if !sees_every_process(&unit) {
+            return;
+        }
         let config = local_config(tmp.path());
         // A job recreates the path between the rename and the stub.
         let job = |path: &Path| {
@@ -821,6 +838,9 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let unit = marked_tree(tmp.path());
+        if !sees_every_process(&unit) {
+            return;
+        }
         let config = local_config(tmp.path());
         let outcome = relocate(
             &config,
