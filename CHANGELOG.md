@@ -4,7 +4,7 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
-## v0.7.4
+## v0.7.4 **[release]**
 
 Compare: [`v0.7.3...v0.7.4`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.3...v0.7.4)
 
