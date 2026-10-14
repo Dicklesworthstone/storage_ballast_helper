@@ -3388,8 +3388,9 @@ impl MonitoringDaemon {
 
     /// bd-rc-master-ajg1.7.4: when the mount carrying the daemon's own files
     /// is a reclaim target, its level drives the JSONL mirror. Orange or
-    /// worse turns the RAM mirror on; Yellow or better turns it off. One log
-    /// line per level change, never per tick.
+    /// worse turns the RAM mirror on, unless that RAM is itself short
+    /// (bd-ffjj); Yellow or better turns it off. One log line per level
+    /// change, never per tick.
     fn note_logging_mount_level(&mut self, mount: &Path, level: PressureLevel) {
         if !self.logging_placement.on_monitored_fs
             || mount.to_string_lossy() != self.logging_placement.device
@@ -3404,15 +3405,27 @@ impl MonitoringDaemon {
             level,
             PressureLevel::Orange | PressureLevel::Red | PressureLevel::Critical
         );
+        // bd-ffjj: the mirror must not add to RAM that is itself short.
+        let refusal = if pressured {
+            crate::monitor::ram_scratch::ram_log_mirror_refusal(
+                self.platform.as_ref(),
+                &crate::logger::jsonl::ram_fallback_path(),
+            )
+        } else {
+            None
+        };
+        let mirror = pressured && refusal.is_none();
         let level_name = format!("{level:?}").to_lowercase();
         self.logging_placement.level = Some(level_name.clone());
-        if pressured != self.logging_placement.mirroring {
-            self.logging_placement.mirroring = pressured;
-            self.logger_handle.mirror_jsonl(pressured);
+        if mirror != self.logging_placement.mirroring {
+            self.logging_placement.mirroring = mirror;
+            self.logger_handle.mirror_jsonl(mirror);
         }
         eprintln!(
-            "[SBH-DAEMON] logging.on_monitored_fs=true device={} level={level_name} mirror_to_ram={}",
-            self.logging_placement.device, self.logging_placement.mirroring
+            "[SBH-DAEMON] logging.on_monitored_fs=true device={} level={level_name} mirror_to_ram={}{}",
+            self.logging_placement.device,
+            self.logging_placement.mirroring,
+            refusal.map_or_else(String::new, |reason| format!(" (not mirroring: {reason})"))
         );
         self.self_monitor
             .set_logging_snapshot(self.logging_placement.clone());

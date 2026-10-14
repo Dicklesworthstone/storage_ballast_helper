@@ -6,10 +6,11 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::path::Path;
 
 use serde::Serialize;
 
-use crate::platform::pal::MemoryInfo;
+use crate::platform::pal::{MemoryInfo, Platform};
 
 pub mod attribution;
 
@@ -181,6 +182,46 @@ pub fn ram_log_destination_healthy(memory: &MemoryInfo, total: u64, available: u
         && total > 0
         && available <= total
         && u128::from(available) * 5 >= u128::from(total)
+}
+
+/// Why the daemon must not start mirroring its log to `path`, if it must not.
+///
+/// The mirror exists for a pressured log volume, and on Linux it lands on
+/// `/dev/shm`. Adding it to a RAM mount that is itself short, or while swap is
+/// nearly full, moves the pressure into RAM (fmd, bd-ffjj). A mirror that is
+/// not RAM-backed is outside this check. On a RAM mount, unreadable memory or
+/// mount figures refuse.
+#[must_use]
+pub fn ram_log_mirror_refusal(platform: &dyn Platform, path: &Path) -> Option<String> {
+    let dir = path.parent().unwrap_or(path);
+    if !platform.is_ram_backed(dir).unwrap_or(false) {
+        return None;
+    }
+    let memory = match platform.memory_info() {
+        Ok(memory) => memory,
+        Err(error) => return Some(format!("host memory is unreadable: {error}")),
+    };
+    let stats = match platform.fs_stats(dir) {
+        Ok(stats) => stats,
+        Err(error) => return Some(format!("{} is unreadable: {error}", dir.display())),
+    };
+    if ram_log_destination_healthy(&memory, stats.total_bytes, stats.available_bytes) {
+        return None;
+    }
+    Some(if swap_nearly_full(&memory) {
+        format!(
+            "swap is nearly full ({} of {} MiB free)",
+            memory.swap_free_bytes >> 20,
+            memory.swap_total_bytes >> 20
+        )
+    } else {
+        format!(
+            "{} has {} of {} MiB free",
+            dir.display(),
+            stats.available_bytes >> 20,
+            stats.total_bytes >> 20
+        )
+    })
 }
 
 fn runtime_mount_pressured(mount: &ScratchMount) -> bool {

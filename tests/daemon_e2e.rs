@@ -1355,17 +1355,22 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
     // bd-rc-master-ajg1.7.4: the daemon's own files sit on the fixture mount,
     // which is a scan root's mount at injected Orange: state.json says so,
     // the JSONL is mirrored to the RAM fallback while it stays pressured,
-    // and the mirror carries this run's lines.
+    // and the mirror carries this run's lines. A test host whose own RAM is
+    // short (swap nearly full, or /dev/shm under a fifth free) keeps the
+    // mirror off and says why instead (bd-ffjj).
     run.wait_until(
         "the logging placement in state.json",
         Duration::from_secs(40),
         |run| {
-            run.state()
-                .and_then(|state| state.get("logging").cloned())
-                .is_some_and(|logging| logging["mirroring"] == Value::Bool(true))
+            run.stderr_count("(not mirroring:") > 0
+                || run
+                    .state()
+                    .and_then(|state| state.get("logging").cloned())
+                    .is_some_and(|logging| logging["mirroring"] == Value::Bool(true))
         },
     )
     .unwrap_or_else(|e| panic!("[{engine}] {e}"));
+    let ram_short = run.stderr_count("(not mirroring:") > 0;
     let state = run.state().unwrap();
     let logging = &state["logging"];
     assert_eq!(
@@ -1389,21 +1394,30 @@ fn run_orange_reclaim(engine: &'static str) -> Vec<String> {
         "{}",
         run.stderr()
     );
-    assert!(
-        run.stderr_count("mirror_to_ram=true") >= 1,
-        "{}",
-        run.stderr()
-    );
-    let run_id = state["run_id"].as_str().unwrap().to_string();
-    let mirror = storage_ballast_helper::logger::jsonl::ram_fallback_path();
-    let mirrored = fs::read_to_string(&mirror).unwrap_or_default();
-    assert!(
-        mirrored
-            .lines()
-            .any(|line| line.contains(&run_id) && line.contains("artifact_delete")),
-        "[{engine}] no mirrored artifact_delete line for run {run_id} in {}",
-        mirror.display()
-    );
+    if ram_short {
+        assert_eq!(
+            logging["mirroring"],
+            Value::Bool(false),
+            "[{engine}] {logging}"
+        );
+        eprintln!("[{engine}] this host's RAM is short, so the log mirror stayed off");
+    } else {
+        assert!(
+            run.stderr_count("mirror_to_ram=true") >= 1,
+            "{}",
+            run.stderr()
+        );
+        let run_id = state["run_id"].as_str().unwrap().to_string();
+        let mirror = storage_ballast_helper::logger::jsonl::ram_fallback_path();
+        let mirrored = fs::read_to_string(&mirror).unwrap_or_default();
+        assert!(
+            mirrored
+                .lines()
+                .any(|line| line.contains(&run_id) && line.contains("artifact_delete")),
+            "[{engine}] no mirrored artifact_delete line for run {run_id} in {}",
+            mirror.display()
+        );
+    }
 
     let status = run.stop();
     assert!(status.success(), "[{engine}] {status}");

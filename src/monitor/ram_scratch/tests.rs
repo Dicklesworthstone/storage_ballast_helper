@@ -178,3 +178,56 @@ fn ram_log_destination_predicate_refuses_low_swap_or_full_mount() {
     assert!(!ram_log_destination_healthy(&memory(64, 32, 0), 100, 90));
     assert!(!ram_log_destination_healthy(&memory(64, 32, 32), 0, 0));
 }
+
+#[test]
+fn ram_log_mirror_refuses_a_short_ram_mount_or_full_swap_but_never_judges_disk() {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use crate::platform::pal::{FsStats, MockPlatform, MountPoint, PlatformPaths};
+
+    let platform = |ram_backed: bool, available: u64, memory: MemoryInfo| {
+        let mount = MountPoint {
+            path: PathBuf::from("/dev/shm"),
+            device: "tmpfs".to_string(),
+            fs_type: "tmpfs".to_string(),
+            is_ram_backed: ram_backed,
+        };
+        let stats = FsStats {
+            total_bytes: 100 * GIB,
+            free_bytes: available * GIB,
+            available_bytes: available * GIB,
+            fs_type: "tmpfs".to_string(),
+            mount_point: mount.path.clone(),
+            is_readonly: false,
+        };
+        MockPlatform::new(
+            vec![mount.clone()],
+            HashMap::from([(mount.path, stats)]),
+            memory,
+            PlatformPaths::default(),
+        )
+    };
+    let mirror = Path::new("/dev/shm/sbh-0.jsonl");
+
+    assert_eq!(
+        ram_log_mirror_refusal(&platform(true, 50, memory(62, 64, 32)), mirror),
+        None
+    );
+    // fmd on 10-14: /dev/shm below a fifth free, and swap 64 of 64 GiB used.
+    let shm_short = ram_log_mirror_refusal(&platform(true, 19, memory(62, 64, 32)), mirror);
+    assert_eq!(
+        shm_short.as_deref(),
+        Some("/dev/shm has 19456 of 102400 MiB free")
+    );
+    let swap_full = ram_log_mirror_refusal(&platform(true, 50, memory(62, 64, 0)), mirror);
+    assert_eq!(
+        swap_full.as_deref(),
+        Some("swap is nearly full (0 of 65536 MiB free)")
+    );
+    // A mirror on disk (macOS $TMPDIR) is not RAM: same figures, no refusal.
+    assert_eq!(
+        ram_log_mirror_refusal(&platform(false, 1, memory(62, 64, 0)), mirror),
+        None
+    );
+}
