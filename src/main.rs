@@ -5,11 +5,27 @@
 use clap::{CommandFactory, FromArgMatches};
 
 mod cli_app;
+mod cli_compress;
 mod cli_source_roots;
+
+fn cli_command() -> clap::Command {
+    cli_app::Cli::command().subcommand(cli_compress::command())
+}
 
 fn main() {
     storage_ballast_helper::daemon::service::capture_sbh_binary_path();
-    let matches = cli_app::Cli::command().get_matches();
+    let matches = cli_command().get_matches();
+    // The opt-in compression command owns its report and exit status. Handle
+    // it before converting legacy subcommands into the derive-based enum.
+    match cli_compress::run(&matches) {
+        Ok(Some(0)) => return,
+        Ok(Some(code)) => std::process::exit(code),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("sbh: could not write compression report: {error}");
+            std::process::exit(2);
+        }
+    }
     // Capture the same target the updater selects, before it can replace us.
     // In particular, `update --system` may install somewhere other than the
     // running executable's directory. Do not restart that other installation.
