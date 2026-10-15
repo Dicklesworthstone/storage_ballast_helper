@@ -564,7 +564,7 @@ mod tests {
             open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
         assert!(complete);
         // The now-explicit fixture cwd is also a legitimate point reference.
-        let mut expected = vec![PathBuf::from("/shared"), fixture.root.clone()];
+        let mut expected = vec![PathBuf::from("/shared"), fixture.root];
         expected.sort();
         assert_eq!(targets, expected);
     }
