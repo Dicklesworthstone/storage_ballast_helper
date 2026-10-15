@@ -26,7 +26,9 @@ Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballas
   the target directory. It now also tracks `CARGO_BUILD_TARGET_DIR`,
   `CARGO_BUILD_BUILD_DIR` and an inherited `OUT_DIR` separately from the
   final artifacts. If a known build tool's process details can't be read
-  in full, the deletion waits.
+  in full, the deletion waits; a build process caught while exiting gets
+  a few milliseconds to finish first (`8a89b93`), or busy build hosts
+  held most batches.
 - **On Linux, a running cargo's configured and default target directories
   count as in use** (`e688393`, `5441d1a`, `8177792`). A `build.target-dir`
   or `build-dir` set in a Cargo config file (the hierarchy above the build,
