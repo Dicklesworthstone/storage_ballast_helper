@@ -89,6 +89,10 @@ pub(super) fn read_build_directories_in_use() -> Vec<(i32, PathBuf)> {
     reference_scan::build_directories()
 }
 
+pub(crate) fn read_build_directory_snapshot() -> (Vec<(i32, PathBuf)>, bool) {
+    reference_scan::build_directory_snapshot()
+}
+
 /// Return mappings only when the visible process scope was fully inspected.
 /// The Vec-returning PAL interface cannot carry partial coverage, so access
 /// failures, malformed data and budget exhaustion must remain explicit errors.

@@ -1797,14 +1797,29 @@ pub(crate) fn open_path_ancestors_for_roots(
     for target in targets {
         add_open_path_ancestor_chain(&mut ancestors, target, &normalized_roots);
     }
-    // Cache/output declarations are subtree references, unlike descriptors.
-    // Refresh them once per batch even when the expensive fd sweep is reused.
+    ancestors
+}
+
+/// Refresh build declarations independently of a reusable descriptor snapshot.
+/// Incomplete fresh discovery must never inherit a cached complete verdict.
+#[cfg(target_os = "linux")]
+pub(crate) fn checked_open_path_ancestors_for_roots(
+    targets: &[PathBuf],
+    descriptor_complete: bool,
+    root_paths: &[PathBuf],
+) -> (HashSet<PathBuf>, bool) {
+    let mut ancestors = open_path_ancestors_for_roots(targets, root_paths);
+    if root_paths.is_empty() {
+        return (ancestors, descriptor_complete);
+    }
+    let (directories, build_complete) =
+        crate::platform::linux::process::read_build_directory_snapshot();
     build_scopes::add_candidate_scopes(
-        crate::platform::current().build_directories_in_use(),
-        &normalized_roots,
+        directories,
+        &normalized_open_roots(root_paths),
         &mut ancestors,
     );
-    ancestors
+    (ancestors, descriptor_complete && build_complete)
 }
 
 /// Collect open path ancestors using a specific platform implementation.
