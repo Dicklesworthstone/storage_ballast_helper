@@ -53,6 +53,14 @@ Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballas
   mid-check could even make root open a device. On Linux, configuration
   paths are now opened without following any symlink, and files on procfs,
   sysfs, debugfs, tracefs and similar filesystems are refused unread.
+- **A wedged process can no longer freeze the daemon's monitor**
+  (`c1d8f23`). Reading another process's command line waits for that
+  process's memory-map lock. Under memory pressure a build stuck in `mmap`
+  held it for 19 minutes, and the daemon's monitor thread, which read every
+  process's command line for its I/O history and regret checks, waited
+  with it: no logging, no pressure response, no ballast release on a
+  Critical host. Those checks never used the command line and no longer
+  read it.
 - **Naming what fills an unreclaimable mount stays bounded and can't stall
   the monitor** (`5b4bc8e`, `4e8036b`). When a mount under pressure has
   nothing sbh can delete, the daemon reports its largest directories. That
