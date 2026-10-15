@@ -27,6 +27,30 @@ Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballas
   `CARGO_BUILD_BUILD_DIR` and an inherited `OUT_DIR` separately from the
   final artifacts. If a known build tool's process details can't be read
   in full, the deletion waits.
+- **On Linux, a running cargo's configured and default target directories
+  count as in use** (`e688393`, `5441d1a`, `8177792`). A `build.target-dir`
+  or `build-dir` set in a Cargo config file (the hierarchy above the build,
+  the cargo home's config, `--config` files and inline values, and their
+  includes) was not seen at all. Nor was a build's default `target/`
+  before its first artifact existed. sbh now reads those config files, bounded and without running
+  Cargo, and derives the default target from the package or workspace
+  manifest (`--manifest-path`, virtual and nested workspaces). A config
+  file that disappears or changes while sbh reads it counts as unreadable,
+  not absent, so the deletion waits.
+- **Build inspection that can't finish holds the batch** (`e089850`,
+  `900c47a`). The executor re-checks live builds' declared directories for
+  each batch but ignored whether that check finished. Within 20 seconds of
+  a complete open-file sweep, a build whose workspace manifest couldn't be
+  read could lose its target's protection. An incomplete check now holds
+  the batch, as an incomplete open-file sweep already did, in scoring, the
+  executor and compression.
+- **The root daemon no longer reads kernel pseudo-files a user names as
+  Cargo configuration** (`c9c971e`). Any local user could start a process
+  named `cargo` with `--config /proc/kmsg`, and every sweep then read it
+  as root, draining the kernel log; a directory swapped for a symlink
+  mid-check could even make root open a device. On Linux, configuration
+  paths are now opened without following any symlink, and files on procfs,
+  sysfs, debugfs, tracefs and similar filesystems are refused unread.
 - **Naming what fills an unreclaimable mount stays bounded and can't stall
   the monitor** (`5b4bc8e`, `4e8036b`). When a mount under pressure has
   nothing sbh can delete, the daemon reports its largest directories. That
