@@ -526,36 +526,26 @@ impl JsonlWriter {
         self.maybe_try_recover();
         self.enforce_destination_health();
 
-        // The primary may retain a large event; the RAM fallback may not.
-        if self.state == WriterState::Fallback && line.len() as u64 > FALLBACK_MAX_BYTES {
-            let _ = write!(io::stderr(), "[SBH-JSONL] {line}");
-            return;
+        if self.state == WriterState::Normal
+            && self.bytes_written.saturating_add(line.len() as u64) > self.config.max_size_bytes
+            && self.bytes_written > 0
+        {
+            self.rotate();
+            // Rotation may have failed over to an existing, nearly full RAM
+            // file. Apply the same admission and cap checks as any fallback.
+            self.enforce_destination_health();
         }
-
-        // Check if rotation is needed before writing. The RAM-backed
-        // fallback is never rotated: it is truncated at its cap instead.
-        match self.state {
-            WriterState::Normal
-                if self.bytes_written.saturating_add(line.len() as u64)
-                    > self.config.max_size_bytes
-                    && self.bytes_written > 0 =>
-            {
-                self.rotate();
+        if self.state == WriterState::Fallback {
+            // The primary may retain a large event; the RAM fallback may not.
+            if line.len() as u64 > FALLBACK_MAX_BYTES {
+                let _ = write!(io::stderr(), "[SBH-JSONL] {line}");
+                return;
             }
-            WriterState::Fallback
-                if self.bytes_written.saturating_add(line.len() as u64) > FALLBACK_MAX_BYTES =>
-            {
+            if self.bytes_written.saturating_add(line.len() as u64) > FALLBACK_MAX_BYTES {
                 self.truncate_fallback();
             }
-            _ => {}
         }
 
-        // Rotation can itself degrade to the fallback. Re-enter the admission
-        // and size checks before writing to that newly selected destination.
-        if self.state == WriterState::Fallback && line.len() as u64 > FALLBACK_MAX_BYTES {
-            let _ = write!(io::stderr(), "[SBH-JSONL] {line}");
-            return;
-        }
         match self.state {
             WriterState::Normal | WriterState::Fallback => {
                 if let Some(w) = self.writer.as_mut() {
@@ -675,6 +665,7 @@ impl JsonlWriter {
     }
 
     fn degrade(&mut self) {
+        let failed_state = self.state;
         // A mirror and fallback share a path. Close the mirror before opening
         // the fallback, and never flush it after its headroom was refused.
         self.set_mirror(false);
@@ -683,7 +674,10 @@ impl JsonlWriter {
         }
         self.bytes_written = 0;
         self.lines_since_fsync = 0;
-        match self.state {
+        // set_mirror can independently move an unsafe fallback to stderr.
+        // Base this transition on the failed sink, not that intermediate state,
+        // so a fallback failure never skips the stderr retry and discards data.
+        match failed_state {
             WriterState::Normal => {
                 self.try_open_fallback();
             }
@@ -851,7 +845,16 @@ impl Drop for JsonlWriter {
 // ──────────────────────── helpers ────────────────────────
 
 fn check_ram_log_destination(path: &Path) -> Option<String> {
-    crate::monitor::ram_scratch::ram_log_mirror_refusal(&crate::platform::current(), path)
+    // Reuse the PAL's bounded mount-table cache on the logger thread. Memory
+    // and filesystem capacity are still read for each admission; creating a
+    // fresh PAL per line would throw away the cache and reparse every mount.
+    std::thread_local! {
+        static PLATFORM: Box<dyn crate::platform::pal::Platform> =
+            Box::new(crate::platform::current());
+    }
+    PLATFORM.with(|platform| {
+        crate::monitor::ram_scratch::ram_log_mirror_refusal(platform.as_ref(), path)
+    })
 }
 
 /// Open or create a file for appending. Returns `(File, current_size)`.
@@ -911,10 +914,13 @@ fn format_utc_now() -> String {
 mod tests {
     use super::*;
 
+    // Callback fixtures retain the production admission-check signature.
+    #[allow(clippy::unnecessary_wraps)]
     fn allow_destination(_: &Path) -> Option<String> {
         None
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn refuse_destination(_: &Path) -> Option<String> {
         Some("fixture: RAM headroom unavailable".to_owned())
     }
@@ -1338,6 +1344,7 @@ mod tests {
         // "Fix" the primary path and trigger recovery.
         writer.config.path = primary_path.clone();
         writer.last_recover_attempt = UNIX_EPOCH;
+
         writer.write_entry(&LogEntry::new(EventType::DaemonStart, Severity::Info));
         writer.flush();
 
@@ -1634,7 +1641,10 @@ mod tests {
                 writer.set_mirror(false);
             }
             drop(writer);
-            assert_eq!(fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(), 0);
+            assert_eq!(
+                fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(),
+                0
+            );
             assert_eq!(
                 fs::read_to_string(dir.path().join("primary.jsonl")).unwrap(),
                 "{\"primary_only\":true}\n"
@@ -1649,11 +1659,17 @@ mod tests {
         writer.write_line("{\"buffered\":true}\n");
         let bytes = writer.bytes_written();
         assert!(bytes > 0);
-        assert_eq!(fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(), 0);
+        assert_eq!(
+            fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(),
+            0
+        );
         writer.try_recover();
         assert_eq!(writer.bytes_written(), bytes);
         writer.flush();
-        assert_eq!(fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(), bytes);
+        assert_eq!(
+            fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(),
+            bytes
+        );
     }
 
     #[test]
@@ -1664,8 +1680,14 @@ mod tests {
         let line = "x".repeat(usize::try_from(FALLBACK_MAX_BYTES).unwrap() + 1);
         writer.write_line(&line);
         writer.flush();
-        assert_eq!(fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(), 0);
-        assert_eq!(fs::metadata(dir.path().join("primary.jsonl")).unwrap().len(), line.len() as u64);
+        assert_eq!(
+            fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(),
+            0
+        );
+        assert_eq!(
+            fs::metadata(dir.path().join("primary.jsonl")).unwrap().len(),
+            line.len() as u64
+        );
         writer.write_line("\n{\"small\":true}\n");
         writer.flush();
         assert_eq!(
@@ -1691,6 +1713,65 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("primary.jsonl")).unwrap(),
             "{\"primary\":true}\n"
+        );
+    }
+
+    #[test]
+    fn rotation_failure_applies_the_cap_to_the_new_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = dir.path().join("fallback.jsonl");
+        File::create(&fallback)
+            .unwrap()
+            .set_len(FALLBACK_MAX_BYTES)
+            .unwrap();
+        let mut writer = open_writer(guarded_config(dir.path(), true));
+        writer.config.path = uncreatable_path(dir.path(), "rotating.jsonl");
+        writer.config.max_size_bytes = 1;
+        writer.bytes_written = 1;
+        let line = "{\"after_rotation\":true}\n";
+        writer.write_line(line);
+        writer.flush();
+        assert_eq!(writer.state(), "fallback");
+        assert_eq!(fs::read_to_string(&fallback).unwrap(), line);
+        assert_eq!(writer.bytes_written(), line.len() as u64);
+        assert!(!rotated_name(&fallback, 1).exists());
+    }
+
+    #[test]
+    fn primary_failure_hands_over_mirror_without_duplicate_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary.jsonl");
+        let fallback = dir.path().join("fallback.jsonl");
+        let mut writer = open_writer(guarded_config(dir.path(), true));
+        writer.set_mirror(true);
+        let before = "{\"before\":true}\n";
+        writer.write_line(before);
+        // Replacing this handle flushes the healthy primary's earlier line.
+        // The next large write fails on a real read-only descriptor.
+        writer.writer = Some(BufWriter::new(File::open(&primary).unwrap()));
+        writer.last_recover_attempt = SystemTime::now();
+        let failed_line = format!("{{\"payload\":\"{}\"}}\n", "x".repeat(65_536));
+        writer.write_line(&failed_line);
+        writer.flush();
+        assert_eq!(writer.state(), "fallback");
+        assert!(!writer.mirroring());
+        assert_eq!(fs::read_to_string(primary).unwrap(), before);
+        assert_eq!(fs::read_to_string(&fallback).unwrap(), format!("{before}{failed_line}"));
+        assert_eq!(writer.bytes_written(), fs::metadata(fallback).unwrap().len());
+    }
+
+    #[test]
+    fn fallback_failure_during_pressure_transition_does_not_skip_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = open_writer(guarded_config(dir.path(), false));
+        writer.write_line("{\"pending\":true}\n");
+        writer.destination_check = refuse_destination;
+        writer.degrade();
+        assert_eq!(writer.state(), "stderr");
+        drop(writer);
+        assert_eq!(
+            fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(),
+            0
         );
     }
 }
