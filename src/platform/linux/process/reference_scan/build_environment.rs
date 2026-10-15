@@ -4,14 +4,14 @@
 //! erase positives from the other. Both the PAL scorer and native executor use
 //! this sweep. Its completeness is observation coverage, not an exhaustive
 //! resolver of configuration files, process mutations, or mount namespaces.
-//! Raw argument/environment bytes are never included in diagnostics.
+//! Raw argument/environment/configuration bytes are never logged.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use super::{BUILD_ENVIRON_LIMIT, Limits, ProcAccess, Sweep, UnreadableProcess, disappeared};
 use crate::platform::build_environment::{self, CacheLayout, Tool};
-use crate::platform::build_invocation;
+use crate::platform::{build_invocation, cargo_config};
 
 const BUILD_ARGV_LIMIT: usize = 512 * 1024;
 const MAX_BUILD_REFERENCES: usize = 16_384;
@@ -68,6 +68,9 @@ pub(super) fn sweep(proc: &impl ProcAccess, proc_root: &Path, limits: Limits) ->
         return result;
     };
     let own = i32::try_from(std::process::id()).ok();
+    // A shared workspace/home is read once during this sweep, not once per
+    // compiler or process. Discard the cache when the observation finishes.
+    let mut configurations = cargo_config::Resolver::default();
     'processes: for pid in pids {
         if sweep.expired() {
             break;
@@ -110,7 +113,36 @@ pub(super) fn sweep(proc: &impl ProcAccess, proc_root: &Path, limits: Limits) ->
                 BUILD_ARGV_LIMIT,
                 &mut result,
             );
-            build_invocation::references(CacheLayout::Linux, tool, &argv, &environ, cwd.as_deref())
+            let mut paths = build_invocation::references(
+                CacheLayout::Linux,
+                tool,
+                &argv,
+                &environ,
+                cwd.as_deref(),
+            );
+            if tool == Tool::Rust && cargo_config::is_cargo(&argv) {
+                let evidence =
+                    configurations.observe(&argv, &environ, cwd.as_deref(), |path, limit| {
+                        if sweep.expired() {
+                            Err(io::ErrorKind::TimedOut.into())
+                        } else {
+                            cargo_config::read_file(path, limit)
+                        }
+                    });
+                if !evidence.complete {
+                    result.missing(
+                        pid,
+                        "cargo config",
+                        io::Error::other("Cargo configuration observation incomplete"),
+                    );
+                }
+                for directory in evidence.directories {
+                    if !paths.contains(&directory) {
+                        paths.push(directory);
+                    }
+                }
+            }
+            paths
         };
         for path in paths {
             // Keep attribution to every live process sharing a cache. The
@@ -209,6 +241,14 @@ mod tests {
             fs::write(process.join("comm"), format!("{comm}\n")).unwrap();
             fs::write(process.join("environ"), environment).unwrap();
             fs::write(process.join("cmdline"), argv).unwrap();
+            // A readable Cargo fixture also declares where its config
+            // hierarchy starts. rustc's missing-cwd fixture remains unchanged.
+            if matches!(
+                comm,
+                "cargo" | "cargo-clippy" | "cargo-rch-real" | "cargo-nextest"
+            ) {
+                symlink(&self.root, process.join("cwd")).unwrap();
+            }
             process
         }
 
@@ -523,7 +563,10 @@ mod tests {
         let (targets, complete) =
             open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
         assert!(complete);
-        assert_eq!(targets, vec![PathBuf::from("/shared")]);
+        // The now-explicit fixture cwd is also a legitimate point reference.
+        let mut expected = vec![PathBuf::from("/shared"), fixture.root.clone()];
+        expected.sort();
+        assert_eq!(targets, expected);
     }
 
     #[test]
@@ -541,5 +584,75 @@ mod tests {
         assert!(!result.complete);
         assert_eq!(result.path_bytes, MAX_REFERENCE_BYTES);
         assert_eq!(result.directories.len(), 1);
+    }
+
+    #[test]
+    fn config_only_outputs_reach_the_native_executor_without_open_descriptors() {
+        let fixture = Fixture::new();
+        let config_dir = fixture.root.join(".cargo");
+        fs::create_dir(&config_dir).unwrap();
+        let target = fixture.root.join("separate-output");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"live build").unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            "[build]\ntarget-dir='separate-output'",
+        )
+        .unwrap();
+        let process = fixture.install(fixture.pid, "cargo", b"", b"cargo\0build\0");
+        let found = fixture.collect(&NativeProc);
+        assert!(found.complete);
+        assert_eq!(found.directories, vec![(fixture.pid, target.clone())]);
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        assert!(targets.contains(&target));
+        assert_eq!(fs::read_dir(process.join("fd")).unwrap().count(), 0);
+        assert_eq!(fs::read(target.join("keep")).unwrap(), b"live build");
+    }
+
+    #[test]
+    fn incomplete_config_holds_native_preflight_without_erasing_known_outputs() {
+        let fixture = Fixture::new();
+        let config_dir = fixture.root.join(".cargo");
+        fs::create_dir(&config_dir).unwrap();
+        fs::write(config_dir.join("config.toml"), "[build]\ntarget-dir = [").unwrap();
+        fixture.install(
+            fixture.pid,
+            "cargo",
+            b"CARGO_TARGET_DIR=/known\0",
+            b"cargo\0build\0",
+        );
+        let found = fixture.collect(&NativeProc);
+        assert!(!found.complete);
+        assert_eq!(
+            found.directories,
+            vec![(fixture.pid, PathBuf::from("/known"))]
+        );
+        assert_eq!(found.denied.unwrap().file, "cargo config");
+        let (targets, complete) =
+            open_targets_with(&NativeProc, &fixture.proc_root, Limits::default()).unwrap();
+        assert!(!complete);
+        assert!(targets.contains(&PathBuf::from("/known")));
+    }
+
+    #[test]
+    fn inline_config_and_environment_destinations_are_independent_and_deduplicated() {
+        let fixture = Fixture::new();
+        fixture.install(
+            fixture.pid,
+            "cargo-rch-real",
+            b"CARGO_TARGET_DIR=/known\0",
+            b"cargo-rch-real\0build\0--config=build.target-dir='/known'\0--config=build.build-dir='/intermediate'\0",
+        );
+        let found = fixture.collect(&NativeProc);
+        assert!(found.complete);
+        assert_eq!(
+            found.directories,
+            vec![
+                (fixture.pid, PathBuf::from("/known")),
+                (fixture.pid, PathBuf::from("/intermediate"))
+            ]
+        );
     }
 }
