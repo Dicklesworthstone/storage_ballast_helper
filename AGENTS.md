@@ -665,8 +665,9 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | scanner | `active_reference_cache_ttl_secs` | `30` | Active-reference (open file) cache lifetime | `src/core/config.rs` |
 | scanner | `active_reference_min_size_bytes` | `100 MiB` | Smallest entry checked for active references | `src/core/config.rs` |
 | walker | `RESULT_CHANNEL_CAP` | `10000` | Worker → collector channel bound | `src/scanner/walker.rs` |
+| walker | `WALK_BATCH_ENTRIES` | `64` | Entries a worker sends the collector at once | `src/scanner/walker.rs` |
 | walker | `WORK_RECV_TIMEOUT` | `50 ms` | Idle wait before a worker re-checks shutdown | `src/scanner/walker.rs` |
-| walker | `SEND_TIMEOUT` | `100 ms` | Wait on a full channel before dropping the entry | `src/scanner/walker.rs` |
+| walker | `SEND_TIMEOUT` | `100 ms` | Wait on a full channel between cancellation checks | `src/scanner/walker.rs` |
 | walker | `MAX_ENTRIES_PER_DIR` | `65536` | Entries read per directory before it is cut off | `src/scanner/walker.rs` |
 | walker | `OPEN_FILES_SCAN_BUDGET` | `30 s` | Time budget of one /proc open-file sweep | `src/scanner/walker.rs` |
 | walker | `OPEN_FILES_MAX_PIDS` | `50000` | Processes inspected per open-file sweep | `src/scanner/walker.rs` |

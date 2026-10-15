@@ -47,7 +47,7 @@ fn first_entry(roots: Vec<PathBuf>, excluded_paths: HashSet<PathBuf>) -> WalkEnt
         },
         ProtectionRegistry::new(None).unwrap(),
     );
-    let receiver = walker.stream().unwrap();
+    let mut receiver = walker.stream().unwrap();
     let first = receiver.recv_timeout(Duration::from_secs(5));
     // Cancel before asserting, including a failed receive. Wait for worker
     // senders to close before the TempDir fixture is allowed to clean up.

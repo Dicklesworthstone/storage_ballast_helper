@@ -1170,6 +1170,13 @@ pub fn constants() -> Vec<ConstantDoc> {
         ),
         constant(
             "walker",
+            "WALK_BATCH_ENTRIES",
+            walker::WALK_BATCH_ENTRIES,
+            "Entries a worker sends the collector at once",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
             "WORK_RECV_TIMEOUT",
             fmt_duration(walker::WORK_RECV_TIMEOUT),
             "Idle wait before a worker re-checks shutdown",
@@ -1179,7 +1186,7 @@ pub fn constants() -> Vec<ConstantDoc> {
             "walker",
             "SEND_TIMEOUT",
             fmt_duration(walker::SEND_TIMEOUT),
-            "Wait on a full channel before dropping the entry",
+            "Wait on a full channel between cancellation checks",
             "src/scanner/walker.rs",
         ),
         constant(

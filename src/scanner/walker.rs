@@ -33,15 +33,23 @@ use build_scopes::BuildDirectoryScopes;
 pub const DEFAULT_ACTIVE_REFERENCE_CACHE_TTL_SECS: u64 = 30;
 pub const DEFAULT_ACTIVE_REFERENCE_MIN_SIZE_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Bound of the worker → collector result channel; a full channel makes a
-/// worker wait `SEND_TIMEOUT` and then drop the entry rather than deadlock.
+/// Most entries buffered in the worker → collector result channel.
+///
+/// The channel holds `RESULT_CHANNEL_CAP / WALK_BATCH_ENTRIES` batches. A
+/// worker facing a full channel waits, re-checking cancellation every
+/// `SEND_TIMEOUT`.
 pub const RESULT_CHANNEL_CAP: usize = 10_000;
+
+/// Most entries a worker sends the collector in one message. One message
+/// per entry made the collector's receive spin and yield once per
+/// directory, most of a busy Mac daemon's scan CPU (bd-vf9z).
+pub const WALK_BATCH_ENTRIES: usize = 64;
 
 /// How long a worker waits for work before re-checking the shutdown flag.
 pub const WORK_RECV_TIMEOUT: Duration = Duration::from_millis(50);
 
-/// How long a worker waits on a full work or result channel before giving
-/// up on that send (the walk then counts the entry as skipped).
+/// How long a worker waits on a full work or result channel before checking
+/// whether the walk was cancelled; it keeps sending until it is.
 pub const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 pub const MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING: &str =
     "fd check incomplete: other-user processes not visible";
@@ -201,6 +209,106 @@ struct WorkItem {
     depth: usize,
     root_device_id: u64,
     opaque_tree: Option<OpaqueTreeClassification>,
+}
+
+/// Entries of a running walk, one at a time. The workers send them in
+/// batches of up to [`WALK_BATCH_ENTRIES`]; the stream ends when every
+/// worker has finished or been cancelled.
+#[derive(Debug)]
+pub struct WalkStream {
+    rx: channel::Receiver<Vec<WalkEntry>>,
+    pending: std::vec::IntoIter<WalkEntry>,
+}
+
+impl WalkStream {
+    fn new(rx: channel::Receiver<Vec<WalkEntry>>) -> Self {
+        Self {
+            rx,
+            pending: Vec::new().into_iter(),
+        }
+    }
+
+    /// A stream of entries already in hand, such as a catalog scan's units.
+    #[must_use]
+    pub fn from_entries(entries: Vec<WalkEntry>) -> Self {
+        let (tx, rx) = channel::bounded(1);
+        // Room for exactly this batch, and the receiver is alive.
+        let _ = tx.send(entries);
+        Self::new(rx)
+    }
+
+    /// The next entry, waiting up to `timeout` for the workers to send more.
+    pub fn recv_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> std::result::Result<WalkEntry, channel::RecvTimeoutError> {
+        loop {
+            if let Some(entry) = self.pending.next() {
+                return Ok(entry);
+            }
+            self.pending = self.rx.recv_timeout(timeout)?.into_iter();
+        }
+    }
+}
+
+impl Iterator for WalkStream {
+    type Item = WalkEntry;
+
+    fn next(&mut self) -> Option<WalkEntry> {
+        loop {
+            if let Some(entry) = self.pending.next() {
+                return Some(entry);
+            }
+            self.pending = self.rx.recv().ok()?.into_iter();
+        }
+    }
+}
+
+/// A worker's results not yet sent to the collector.
+struct ResultBatch<'a> {
+    tx: &'a channel::Sender<Vec<WalkEntry>>,
+    pending: Vec<WalkEntry>,
+    capacity: usize,
+}
+
+impl<'a> ResultBatch<'a> {
+    fn new(tx: &'a channel::Sender<Vec<WalkEntry>>, capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            tx,
+            pending: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Queue `entry`, sending the batch once it is full. False when the walk
+    /// was cancelled or the collector is gone.
+    fn push(&mut self, entry: WalkEntry, cancel: &AtomicBool) -> bool {
+        self.pending.push(entry);
+        self.pending.len() < self.capacity || self.flush(cancel)
+    }
+
+    /// Send the queued entries, waiting while the channel is full. False,
+    /// with the entries dropped, when the walk was cancelled or the
+    /// collector is gone.
+    fn flush(&mut self, cancel: &AtomicBool) -> bool {
+        if self.pending.is_empty() {
+            return true;
+        }
+        let mut batch = std::mem::replace(&mut self.pending, Vec::with_capacity(self.capacity));
+        loop {
+            match self.tx.send_timeout(batch, SEND_TIMEOUT) {
+                Ok(()) => return true,
+                Err(channel::SendTimeoutError::Timeout(unsent)) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        return false;
+                    }
+                    batch = unsent;
+                }
+                Err(channel::SendTimeoutError::Disconnected(_)) => return false,
+            }
+        }
+    }
 }
 
 pub const OPAQUE_CANDIDATE_SIZE_FLOOR: u64 = 100 * 1_048_576;
@@ -600,13 +708,13 @@ impl DirectoryWalker {
     /// score them. Open-file set should be collected separately and matched
     /// against results afterward.
     pub fn walk(&self) -> Result<Vec<WalkEntry>> {
-        Ok(self.stream()?.into_iter().collect())
+        Ok(self.stream()?.collect())
     }
 
     /// Stream entries as they are discovered.
     ///
-    /// Returns a receiver that yields entries. The walk runs in background threads.
-    pub fn stream(&self) -> Result<channel::Receiver<WalkEntry>> {
+    /// The walk runs in background threads.
+    pub fn stream(&self) -> Result<WalkStream> {
         let parallelism = self.config.parallelism.max(1);
 
         // Channels: work items (unbounded) and results (bounded for memory safety).
@@ -617,10 +725,11 @@ impl DirectoryWalker {
         //
         // Per-directory iteration cap (MAX_ENTRIES_PER_DIR) prevents any single huge
         // directory (e.g. /data/tmp with 60K+ children) from monopolizing traversal.
-        // Result channel bounded to 10,000 entries to prevent unbounded memory growth
-        // on large trees (previously unbounded, causing 14GB+ RSS on trj).
+        // Result channel bounded to 10,000 entries, in batches, to prevent unbounded
+        // memory growth on large trees (previously unbounded, causing 14GB+ RSS on trj).
         let (work_tx, work_rx) = channel::unbounded::<WorkItem>();
-        let (result_tx, result_rx) = channel::bounded::<WalkEntry>(RESULT_CHANNEL_CAP);
+        let (result_tx, result_rx) =
+            channel::bounded::<Vec<WalkEntry>>(RESULT_CHANNEL_CAP / WALK_BATCH_ENTRIES);
 
         // Track in-flight work items so workers know when to stop.
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -682,7 +791,7 @@ impl DirectoryWalker {
             });
         }
 
-        Ok(result_rx)
+        Ok(WalkStream::new(result_rx))
     }
 
     /// Access the protection registry (e.g. to list discovered markers).
@@ -697,13 +806,14 @@ impl DirectoryWalker {
 fn walker_thread(
     work_rx: &channel::Receiver<WorkItem>,
     work_tx: &channel::Sender<WorkItem>,
-    result_tx: &channel::Sender<WalkEntry>,
+    result_tx: &channel::Sender<Vec<WalkEntry>>,
     in_flight: &AtomicUsize,
     config: &WalkerConfig,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
     heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
     cancel: &AtomicBool,
 ) {
+    let mut results = ResultBatch::new(result_tx, WALK_BATCH_ENTRIES);
     loop {
         // Check cancellation flag before doing any work.
         if cancel.load(Ordering::Relaxed) {
@@ -715,6 +825,12 @@ fn walker_thread(
             hb();
         }
 
+        // Send what this worker holds before waiting for work, so the
+        // collector never waits on entries an idle worker is sitting on.
+        if work_rx.is_empty() && !results.flush(cancel) {
+            return;
+        }
+
         match work_rx.recv_timeout(WORK_RECV_TIMEOUT) {
             Ok(item) => {
                 process_directory(
@@ -723,7 +839,7 @@ fn walker_thread(
                     item.root_device_id,
                     item.opaque_tree,
                     work_tx,
-                    result_tx,
+                    &mut results,
                     in_flight,
                     config,
                     protection,
@@ -739,29 +855,20 @@ fn walker_thread(
             }
             Err(channel::RecvTimeoutError::Timeout) => {
                 // Check cancel on timeout too, so threads don't linger waiting for work.
-                if cancel.load(Ordering::Relaxed) || in_flight.load(Ordering::Acquire) == 0 {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                // Another worker may have taken the item this one saw queued,
+                // so entries can still be held here when the walk finishes.
+                if in_flight.load(Ordering::Acquire) == 0 {
+                    results.flush(cancel);
                     return;
                 }
             }
-            Err(channel::RecvTimeoutError::Disconnected) => return,
-        }
-    }
-}
-
-fn send_walk_entry(
-    result_tx: &channel::Sender<WalkEntry>,
-    walk_entry: &WalkEntry,
-    cancel: &AtomicBool,
-) -> bool {
-    loop {
-        match result_tx.send_timeout(walk_entry.clone(), SEND_TIMEOUT) {
-            Ok(()) => return true,
-            Err(channel::SendTimeoutError::Timeout(_)) => {
-                if cancel.load(Ordering::Relaxed) {
-                    return false;
-                }
+            Err(channel::RecvTimeoutError::Disconnected) => {
+                results.flush(cancel);
+                return;
             }
-            Err(channel::SendTimeoutError::Disconnected(_)) => return false,
         }
     }
 }
@@ -780,7 +887,7 @@ fn process_directory(
     root_dev: u64,
     opaque_tree: Option<OpaqueTreeClassification>,
     work_tx: &channel::Sender<WorkItem>,
-    result_tx: &channel::Sender<WalkEntry>,
+    results: &mut ResultBatch<'_>,
     in_flight: &AtomicUsize,
     config: &WalkerConfig,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
@@ -1038,7 +1145,7 @@ fn process_directory(
                         is_open: false,
                         opaque_tree: Some(opaque),
                     };
-                    if !send_walk_entry(result_tx, &walk_entry, cancel) {
+                    if !results.push(walk_entry, cancel) {
                         return;
                     }
                     continue;
@@ -1100,7 +1207,7 @@ fn process_directory(
             opaque_tree,
         };
 
-        let _ = send_walk_entry(result_tx, &walk_entry, cancel);
+        results.push(walk_entry, cancel);
     }
 }
 
@@ -4250,12 +4357,12 @@ mod tests {
         fs::write(dir.join("file.bin"), b"payload").unwrap();
 
         let (work_tx, work_rx) = channel::bounded::<WorkItem>(1);
-        let (result_tx, result_rx) = channel::bounded::<WalkEntry>(1);
+        let (result_tx, result_rx) = channel::bounded::<Vec<WalkEntry>>(1);
         drop(work_rx);
 
         // Fill the result channel so the directory emitter must wait.
         result_tx
-            .send(WalkEntry {
+            .send(vec![WalkEntry {
                 path: tmp.path().join("placeholder"),
                 metadata: EntryMetadata {
                     size_bytes: 0,
@@ -4273,7 +4380,7 @@ mod tests {
                 structural_signals: StructuralSignals::default(),
                 is_open: false,
                 opaque_tree: None,
-            })
+            }])
             .unwrap();
 
         let in_flight = AtomicUsize::new(0);
@@ -4293,13 +4400,15 @@ mod tests {
         let dir_clone = dir;
         let start = Instant::now();
         let join = thread::spawn(move || {
+            // A one-entry batch sends on every push, so the emitter blocks.
+            let mut results = ResultBatch::new(&result_tx, 1);
             process_directory(
                 &dir_clone,
                 1,
                 0,
                 None,
                 &work_tx,
-                &result_tx,
+                &mut results,
                 &in_flight,
                 &config,
                 &protection,
@@ -4317,6 +4426,114 @@ mod tests {
             "process_directory should stop promptly when cancellation is requested",
         );
         assert_eq!(result_rx.len(), 1, "no extra entries should be emitted");
+    }
+
+    fn bare_entry(path: &str) -> WalkEntry {
+        WalkEntry {
+            path: PathBuf::from(path),
+            metadata: EntryMetadata {
+                size_bytes: 0,
+                content_size_bytes: 0,
+                modified: SystemTime::UNIX_EPOCH,
+                created: None,
+                tree_last_modified: None,
+                is_dir: true,
+                inode: 0,
+                device_id: 0,
+                kind: FsEntryKind::Directory,
+                permissions: 0,
+            },
+            depth: 1,
+            structural_signals: StructuralSignals::default(),
+            is_open: false,
+            opaque_tree: None,
+        }
+    }
+
+    /// bd-vf9z: a worker sends full batches as it goes and the rest when it
+    /// flushes; an empty flush sends nothing.
+    #[test]
+    fn result_batches_send_full_batches_then_the_remainder_on_flush() {
+        use crossbeam_channel as channel;
+
+        let (tx, rx) = channel::unbounded::<Vec<WalkEntry>>();
+        let cancel = AtomicBool::new(false);
+        let mut results = ResultBatch::new(&tx, 4);
+        for i in 0..10 {
+            assert!(results.push(bare_entry(&format!("/d{i}")), &cancel));
+        }
+        let sizes = |rx: &channel::Receiver<Vec<WalkEntry>>| {
+            rx.try_iter().map(|batch| batch.len()).collect::<Vec<_>>()
+        };
+        assert_eq!(sizes(&rx), [4, 4]);
+        assert!(results.flush(&cancel));
+        assert_eq!(sizes(&rx), [2]);
+        assert!(results.flush(&cancel));
+        assert_eq!(sizes(&rx), [0; 0]);
+    }
+
+    /// bd-vf9z: the stream hands out batched entries one at a time, in order,
+    /// and ends when the senders are gone; a catalog stream works the same.
+    #[test]
+    fn a_walk_stream_yields_batched_entries_one_at_a_time_then_ends() {
+        use crossbeam_channel as channel;
+
+        let (tx, rx) = channel::unbounded::<Vec<WalkEntry>>();
+        tx.send(vec![bare_entry("/a"), bare_entry("/b")]).unwrap();
+        tx.send(vec![bare_entry("/c")]).unwrap();
+        drop(tx);
+        let mut stream = WalkStream::new(rx);
+        let wait = Duration::from_secs(1);
+        assert_eq!(stream.recv_timeout(wait).unwrap().path, Path::new("/a"));
+        assert_eq!(stream.next().unwrap().path, Path::new("/b"));
+        assert_eq!(stream.recv_timeout(wait).unwrap().path, Path::new("/c"));
+        assert!(matches!(
+            stream.recv_timeout(wait),
+            Err(channel::RecvTimeoutError::Disconnected)
+        ));
+
+        let catalog: Vec<_> = WalkStream::from_entries(vec![bare_entry("/x"), bare_entry("/y")])
+            .map(|entry| entry.path)
+            .collect();
+        assert_eq!(catalog, [PathBuf::from("/x"), PathBuf::from("/y")]);
+    }
+
+    /// bd-vf9z: batching loses nothing and duplicates nothing, including the
+    /// partial batches workers still hold when the walk runs out of work.
+    #[test]
+    fn a_batched_walk_delivers_every_directory_exactly_once() {
+        let tmp = TempDir::new().unwrap();
+        // 13 + 13 * 23 = 312 directories: not a multiple of the batch size.
+        let mut expected = HashSet::new();
+        for parent in 0..13 {
+            let parent_dir = tmp.path().join(format!("p{parent}"));
+            for child in 0..23 {
+                let dir = parent_dir.join(format!("c{child}"));
+                fs::create_dir_all(&dir).unwrap();
+                expected.insert(dir);
+            }
+            expected.insert(parent_dir);
+        }
+        for parallelism in [1, 4, 16] {
+            for _ in 0..5 {
+                let mut config = test_config(tmp.path());
+                config.parallelism = parallelism;
+                let walker = DirectoryWalker::new(config, ProtectionRegistry::marker_only());
+                let paths: Vec<PathBuf> = walker
+                    .walk()
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.path)
+                    .collect();
+                let unique: HashSet<PathBuf> = paths.iter().cloned().collect();
+                assert_eq!(
+                    paths.len(),
+                    unique.len(),
+                    "an entry arrived twice with parallelism {parallelism}"
+                );
+                assert_eq!(unique, expected, "parallelism {parallelism}");
+            }
+        }
     }
 
     #[test]

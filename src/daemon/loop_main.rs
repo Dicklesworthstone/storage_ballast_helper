@@ -103,8 +103,8 @@ use crate::scanner::scoring::{
     ActiveReferenceSummary, ArtifactCertainty, CandidacyScore, ScoringEngine,
 };
 use crate::scanner::walker::{
-    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkEntry, WalkerConfig,
-    collect_active_reference_index_cached, collect_open_path_ancestors_cached,
+    ActiveReferenceIndex, ActiveReferenceScanConfig, DirectoryWalker, WalkEntry, WalkStream,
+    WalkerConfig, collect_active_reference_index_cached, collect_open_path_ancestors_cached,
 };
 
 // ──────────────────── channel capacities ────────────────────
@@ -8912,7 +8912,7 @@ fn scanner_thread_main(
         // Catalog-only requests do not walk: each derived root is one opaque
         // candidate unit, sized and dated by a bounded probe, and flows
         // through the same classification, scoring, vetoes and dispatch below.
-        let (rx, cancel_token) = if request.catalog_roots.is_empty() {
+        let (mut rx, cancel_token) = if request.catalog_roots.is_empty() {
             let walker = DirectoryWalker::new(walker_config, protection).with_heartbeat({
                 let hb = Arc::clone(heartbeat);
                 move || hb.beat()
@@ -8947,12 +8947,10 @@ fn scanner_thread_main(
             );
             eprintln!("[SBH-SCANNER] {message}");
             logger.send(ActivityEvent::Info { message });
-            let (tx, rx) = crossbeam_channel::unbounded::<WalkEntry>();
-            for entry in entries {
-                let _ = tx.send(entry);
-            }
-            drop(tx);
-            (rx, Arc::new(AtomicBool::new(false)))
+            (
+                WalkStream::from_entries(entries),
+                Arc::new(AtomicBool::new(false)),
+            )
         };
 
         let mut paths_scanned = 0;
