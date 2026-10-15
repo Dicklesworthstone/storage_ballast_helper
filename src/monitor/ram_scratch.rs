@@ -447,7 +447,7 @@ mod log_headroom_tests {
     }
 
     #[test]
-    fn_verified_disk_destination_does_not_need_host_memory_headroom() {
+    fn verified_disk_destination_does_not_need_host_memory_headroom() {
         let path = Path::new("/scratch/activity.jsonl");
         assert!(ram_log_mirror_refusal(&platform(false, 0, false, false), path).is_none());
     }
