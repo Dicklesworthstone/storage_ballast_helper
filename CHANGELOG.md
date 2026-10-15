@@ -22,6 +22,11 @@ Compare: [`v0.7.5...v0.7.6`](https://github.com/Dicklesworthstone/storage_ballas
   Critical pressure with no risk budget, it could choose a 0-byte candidate,
   which frees nothing and still risks a live directory. That empty target
   above was such a choice.
+- **A `kill -USR1` scan is no longer dropped while the scanner is busy**
+  (`911c776`). With the scan queue full, the forced scan was discarded
+  after 100 ms while the log said "forced scan triggered". It is now
+  retried every monitor tick until queued, and the log says when it was
+  deferred and when it was queued.
 - **`sbh check` honours the absolute free-space floors** (`bca8ba4`). It
   compared free space with the Yellow percentage alone and ignored the
   `*_min_free_bytes` floors that the daemon's levels use, so a large disk
@@ -46,6 +51,14 @@ Compare: [`v0.7.5...v0.7.6`](https://github.com/Dicklesworthstone/storage_ballas
 
 ### Changed
 
+- **Generated systemd units cap memory at 768M, above the daemon's own
+  limit** (`cb6e62c`). `MemoryMax=256M` sat below the daemon's 500 MiB RSS
+  hard limit, so on a tree that needed more than 256 MiB the kernel
+  killed the daemon, possibly mid-deletion, before it could exit cleanly
+  and be restarted. A host scanning 500k entries per pass needs about
+  290 MiB. Existing installs keep their unit until `sudo sbh service
+  --systemd reinstall-unit` rewrites it (or a drop-in sets the two
+  `[Service]` lines `MemoryMax=768M` and `Environment=MALLOC_ARENA_MAX=2`).
 - **Generated systemd units cap glibc malloc arenas at two** (`8da899d`).
   glibc keeps a malloc arena per scanner thread along with its freed pages,
   so on a large tree the daemon's RSS settled at about twice its live set:
