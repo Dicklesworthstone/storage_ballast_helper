@@ -451,8 +451,33 @@ fn parse(raw: &[u8]) -> Option<Parsed> {
 /// dotfile symlinks, reject special files, then verify the opened observation.
 /// No write handles, subprocesses or configuration error text are exposed.
 pub(crate) fn read_file(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
-    // A dangling config symlink is unavailable, not an absent config layer.
+    read_file_with(path, limit, || {})
+}
+
+fn read_file_with(
+    path: &Path,
+    limit: usize,
+    before_verify: impl FnOnce(),
+) -> io::Result<Vec<u8>> {
+    // Only absence on the first observation can mean an optional layer is
+    // missing. Once it existed, ENOENT from opening, reading or revalidation
+    // means a changed observation, not Cached::Missing. Otherwise a live
+    // Cargo config renamed mid-read silently removes its output protection.
     fs::symlink_metadata(path)?;
+    read_observed_file(path, limit, before_verify).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            io::Error::other("Cargo configuration disappeared during observation")
+        } else {
+            error
+        }
+    })
+}
+
+fn read_observed_file(
+    path: &Path,
+    limit: usize,
+    before_verify: impl FnOnce(),
+) -> io::Result<Vec<u8>> {
     let resolved = fs::canonicalize(path)
         .map_err(|_| io::Error::other("Cargo configuration path cannot be resolved"))?;
     let before = fs::symlink_metadata(&resolved)?;
@@ -475,10 +500,15 @@ pub(crate) fn read_file(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     (&file)
         .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
         .read_to_end(&mut raw)?;
-    if raw.len() > limit
-        || !same_file(&opened, &file.metadata()?)
-        || !same_file(&opened, &fs::metadata(path)?)
-    {
+    if raw.len() > limit || !same_file(&opened, &file.metadata()?) {
+        return Err(io::Error::other(
+            "Cargo configuration changed during observation",
+        ));
+    }
+    // Production passes a no-op. The seam is between descriptor and pathname
+    // verification: a rename here cannot already have been caught by fstat.
+    before_verify();
+    if !same_file(&opened, &fs::metadata(path)?) {
         return Err(io::Error::other(
             "Cargo configuration changed during observation",
         ));
@@ -811,5 +841,82 @@ mod tests {
             read_file(&broken, FILE_BYTES).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn only_initial_absence_is_an_optional_missing_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let absent = temp.path().join("absent.toml");
+        assert_eq!(read_file(&absent, FILE_BYTES).unwrap_err().kind(), io::ErrorKind::NotFound);
+        let mut resolver = Resolver::default();
+        assert!(matches!(resolver.cached(&absent, &mut read_file), Cached::Missing));
+    }
+
+    #[test]
+    fn disappearing_optional_layer_is_unavailable_and_preserves_other_positives() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let saved = temp.path().join("saved.toml");
+        fs::write(&path, b"[build]\ntarget-dir='/active'").unwrap();
+        let mut observation = Observation {
+            paths: BTreeSet::from([PathBuf::from("/independent")]),
+            complete: true,
+            visits: 0,
+            target_override: false,
+        };
+        let mut resolver = Resolver::default();
+        resolver.file(&path, true, 0, &mut observation, &mut |path, limit| {
+            read_file_with(path, limit, || fs::rename(path, &saved).unwrap())
+        });
+        assert!(!observation.complete, "an optional layer existed but was lost mid-read");
+        assert_eq!(observation.paths, BTreeSet::from([PathBuf::from("/independent")]));
+        assert!(matches!(resolver.cached(&path, &mut |_, _| panic!("cached failure must not retry")), Cached::Unavailable));
+        assert_eq!(fs::read(saved).unwrap(), b"[build]\ntarget-dir='/active'");
+    }
+
+    #[test]
+    fn replacement_inode_cannot_validate_bytes_from_the_old_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let saved = temp.path().join("saved.toml");
+        let bytes = b"[build]\ntarget-dir='/active'";
+        fs::write(&path, bytes).unwrap();
+        let result = read_file_with(&path, FILE_BYTES, || {
+            fs::rename(&path, &saved).unwrap();
+            fs::write(&path, bytes).unwrap();
+        });
+        assert!(result.is_err(), "same bytes and length do not preserve inode identity");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read(saved).unwrap(), bytes);
+    }
+
+    #[test]
+    fn same_inode_change_after_read_is_not_a_valid_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(&path, b"[build]\ntarget-dir='/a'").unwrap();
+        let result = read_file_with(&path, FILE_BYTES, || {
+            fs::write(&path, b"[build]\ntarget-dir='/different-output'").unwrap();
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn retargeted_alias_invalidates_the_observation_without_reading_the_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original.toml");
+        let replacement = temp.path().join("replacement.toml");
+        let alias = temp.path().join("config.toml");
+        let saved_alias = temp.path().join("saved-alias.toml");
+        fs::write(&original, b"[build]\ntarget-dir='/original'").unwrap();
+        fs::write(&replacement, b"[build]\ntarget-dir='/replacement'").unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let result = read_file_with(&alias, FILE_BYTES, || {
+            fs::rename(&alias, &saved_alias).unwrap();
+            std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&original).unwrap(), b"[build]\ntarget-dir='/original'");
+        assert_eq!(fs::read(&replacement).unwrap(), b"[build]\ntarget-dir='/replacement'");
     }
 }
