@@ -112,12 +112,47 @@ The versioned `sbh.ram_scratch.observation.v1` JSON object in activity `details`
 contains the assessment, collection timestamp, sampled entry ownership/age,
 coverage flags and scope limitations. Payloads exceeding 128 KiB use an explicitly
 truncated summary with `complete=false`. Generic deletion size/decision fields
-remain unset; no reclaimed bytes or cleanup authority are invented. Backend
-logging retains its existing delivery and degradation semantics.
+remain unset; no reclaimed bytes or cleanup authority are invented. Logging is
+best-effort; RAM-route refusal and its buffered-record tradeoff are described
+below.
 
-## Remaining integration
+## RAM-backed log destination protection
 
-JSONL mirror routing is unchanged. The shared `ram_log_destination_healthy`
-predicate exists, but periodic reporting does not stop the daemon from using its
-existing RAM fallback. Headroom enforcement for mirror/fallback writes remains
-unfinished. No new deletion paths or automatic cleanup actions are introduced.
+The JSONL writer checks fallback and mirror destinations independently of the
+five-minute report-only observer. A RAM-backed destination requires at least
+10% of host RAM available, at least 20% of its filesystem available, and at least
+10% of configured swap free. Having no configured swap is not itself a refusal.
+An empty tmpfs does not override low host RAM. Missing filesystem identity,
+unreadable or inconsistent RAM/mount counters, and a read-only RAM filesystem
+refuse admission rather than being interpreted as healthy. A verified disk-backed
+fallback is not subject to the RAM-headroom policy.
+
+Checks cover opening, recovery, ongoing writes, explicit flush/fsync, idle ticks,
+mirror shutdown, and writer destruction. Memory and filesystem capacity are read
+at admission; the platform's existing bounded mount-table cache is reused. These
+checks do not enumerate processes or perform directory attribution on the logger
+thread.
+
+When a mirror becomes unsafe, mirroring stops and the primary continues. When an
+active fallback becomes unsafe, subsequent records use stderr. Pending buffers
+for the refused route are discarded **without flushing into the RAM filesystem**,
+including during shutdown. This intentionally prioritizes headroom over retaining
+those pending fallback records; it is not a lossless delivery guarantee. A
+`[SBH-JSONL] fallback/mirror refused` diagnostic is emitted at most once every
+30 seconds. Recovery can still reopen the primary regardless of fallback refusal.
+The existing write-triggered recovery retry can reopen a healthy fallback, and a
+mirror can be enabled again when requested after headroom recovers.
+
+The fallback and mirror retain their 16 MiB, non-rotating cap. A single oversized
+record cannot bypass that cap on an empty file: it remains eligible for the
+primary but is skipped by the mirror, or uses stderr when already on fallback.
+Failed truncation stops the affected route instead of allowing unbounded appends.
+Rotation failure applies the cap to the newly selected fallback too. Handover
+closes the mirror before opening the same file as the fallback, avoiding two
+buffered writers and duplicate handover records.
+
+These are best-effort host observations, not memory reservations, atomic
+filesystem snapshots, cgroup headroom guarantees, or protection against concurrent
+path/mount replacement. The guard covers JSONL fallback and mirror routes, not an
+operator-selected primary on RAM, SQLite, or storage chosen by a stderr consumer.
+No new deletion paths or automatic cleanup actions are introduced.
