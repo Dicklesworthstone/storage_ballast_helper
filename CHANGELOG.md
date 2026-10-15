@@ -8,6 +8,17 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.7.5...v0.7.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.5...v0.7.6)
 
+A safety release. sbh v0.7.5 could delete the target directory of a build
+offloaded with `rch exec`, because it didn't count `rch` as a build process,
+and under Critical pressure it could choose to delete an empty directory,
+which frees nothing. A user-scoped macOS sbh could delete a small candidate
+that another user's process held open. Generated systemd units now give the
+daemon room above its own memory limit and cap glibc's malloc arenas. Also:
+`sbh check` honours the absolute free-space floors, the root `install.sh`
+honours `--dest`, a `kill -USR1` scan is no longer dropped, the activity
+log's RAM fallback keeps clear of a full RAM filesystem, and sbh's HTTP
+User-Agent names sbh.
+
 ### Fixed
 
 - **An offloaded `rch` build's target directory counts as in use**
@@ -48,6 +59,19 @@ Compare: [`v0.7.5...v0.7.6`](https://github.com/Dicklesworthstone/storage_ballas
   Every path now refuses such candidates, and `clean`/`emergency` print a
   hint to run `sudo sbh <command>` or the system-scope daemon. Root sbh and
   every Linux sbh are unchanged.
+- **The activity log's fallback and mirror stay off a RAM filesystem that
+  is short of room** (`c0fa218`, `01b8cc1`, `1165983`). A fallback or
+  mirror log on tmpfs is used only while the host has at least 10% of its
+  RAM available, its filesystem 20% free and, if it has swap, 10% of the
+  swap free; counters that can't be read or don't add up count as a
+  refusal. The check runs on open, recovery, writes, flushes, idle ticks
+  and shutdown. A refused mirror stops while the primary log carries on; a
+  refused fallback sends later records to stderr and drops its pending
+  buffer instead of flushing it into RAM. sbh prints `[SBH-JSONL]
+  fallback/mirror refused` at most every 30 seconds. The 16 MiB cap on the
+  fallback and mirror now holds for a single oversized record and after a
+  failed rotation, and a handover no longer opens the same file with two
+  writers. Details in `docs/ram-scratch.md`.
 
 ### Changed
 
