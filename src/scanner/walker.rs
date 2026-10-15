@@ -671,6 +671,8 @@ pub struct DirectoryWalker {
     /// instead of blocking on full channels. This prevents thread leaks when the
     /// scanner times out a scan pass.
     cancel: Arc<AtomicBool>,
+    /// Entries of one directory processed per pass.
+    dir_window: u32,
 }
 
 impl DirectoryWalker {
@@ -680,7 +682,14 @@ impl DirectoryWalker {
             protection: Arc::new(parking_lot::RwLock::new(protection)),
             heartbeat: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            dir_window: MAX_ENTRIES_PER_DIR,
         }
+    }
+
+    #[cfg(test)]
+    fn with_dir_window(mut self, entries: u32) -> Self {
+        self.dir_window = entries.max(1);
+        self
     }
 
     /// Return a handle to the cancellation flag.
@@ -766,6 +775,11 @@ impl DirectoryWalker {
             });
         }
 
+        let windows = Arc::new(DirWindows {
+            size: self.dir_window,
+            starts: oversized_window_starts().lock().clone(),
+        });
+
         // Clone sender for workers; drop original so channel closes when workers finish.
         for _ in 0..parallelism {
             let work_rx = work_rx.clone();
@@ -776,6 +790,7 @@ impl DirectoryWalker {
             let protection = Arc::clone(&self.protection);
             let heartbeat = self.heartbeat.clone();
             let cancel = Arc::clone(&self.cancel);
+            let windows = Arc::clone(&windows);
 
             thread::spawn(move || {
                 walker_thread(
@@ -784,6 +799,7 @@ impl DirectoryWalker {
                     &result_tx,
                     &in_flight,
                     &config,
+                    &windows,
                     &protection,
                     heartbeat.as_ref(),
                     &cancel,
@@ -809,6 +825,7 @@ fn walker_thread(
     result_tx: &channel::Sender<Vec<WalkEntry>>,
     in_flight: &AtomicUsize,
     config: &WalkerConfig,
+    windows: &DirWindows,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
     heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
     cancel: &AtomicBool,
@@ -842,6 +859,7 @@ fn walker_thread(
                     &mut results,
                     in_flight,
                     config,
+                    windows,
                     protection,
                     heartbeat,
                     cancel,
@@ -890,6 +908,7 @@ fn process_directory(
     results: &mut ResultBatch<'_>,
     in_flight: &AtomicUsize,
     config: &WalkerConfig,
+    windows: &DirWindows,
     protection: &parking_lot::RwLock<ProtectionRegistry>,
     heartbeat: Option<&Arc<dyn Fn() + Send + Sync>>,
     cancel: &AtomicBool,
@@ -948,6 +967,10 @@ fn process_directory(
     // thread before we discover a .sbh-protect marker later in the listing.
     let mut pending_children: Vec<PathBuf> = Vec::new();
 
+    // The entries this pass processes; every name is still checked.
+    let window_start = windows.starts.get(dir_path).copied().unwrap_or(0);
+    let window = window_start..window_start.saturating_add(windows.size);
+
     for entry_result in entries {
         // Large flat directories can take a long time to iterate. Honor
         // cancellation during the hot loop so the daemon can stop promptly
@@ -968,71 +991,74 @@ fn process_directory(
             continue;
         };
 
-        let child_path = entry.path();
+        // Per-directory budget: names are cheap to read, so every one is
+        // checked (up to MAX_NAMES_READ_PER_DIR), and a `.sbh-protect` marker
+        // anywhere in the listing protects the directory. Stats and queueing
+        // are bounded to this pass's window; later passes move it on.
+        let index = total_count;
+        if index >= MAX_NAMES_READ_PER_DIR {
+            break;
+        }
+        total_count += 1;
 
         // ─── Incremental Signal Collection ───
         // We can check signals purely from the name without stat-ing the file.
-        if let Some(name_os) = child_path.file_name() {
-            let name = name_os.to_string_lossy();
-            total_count += 1;
-
-            // Per-directory iteration budget: avoid spending seconds iterating
-            // directories with tens of thousands of entries. Structural markers
-            // appear early; MAX_ENTRIES_PER_DIR (65 536) is generous.
-            if total_count >= MAX_ENTRIES_PER_DIR {
-                break;
+        let name_os = entry.file_name();
+        let name = name_os.to_string_lossy();
+        match name.as_ref() {
+            // Detect .sbh-protect marker during iteration. If found,
+            // register the marker and bail — no children get queued.
+            ".sbh-protect" => {
+                protection.write().register_marker(dir_path);
+                return; // Skip rest of directory — protected subtree.
             }
-
-            match name.as_ref() {
-                // Detect .sbh-protect marker during iteration. If found,
-                // register the marker and bail — no children get queued.
-                ".sbh-protect" => {
-                    protection.write().register_marker(dir_path);
-                    return; // Skip rest of directory — protected subtree.
+            "incremental" => signals.has_incremental = true,
+            "deps" => signals.has_deps = true,
+            "build" => signals.has_build = true,
+            ".fingerprint" => signals.has_fingerprint = true,
+            ".git" => signals.has_git = true,
+            // Root-level cache-directory tag (Cache Directory Tagging
+            // Standard, case-sensitive uppercase per the spec). This is the
+            // one signal that identifies an arbitrarily-named build cache —
+            // whose deps/incremental/.fingerprint markers live one level
+            // deeper under debug/ and release/ — without a name match.
+            // Validate the signature line so an unrelated file that merely
+            // shares the name cannot mark a directory reclaimable.
+            "CACHEDIR.TAG" => {
+                if is_valid_cachedir_tag(&entry.path()) {
+                    signals.has_cachedir_tag = true;
                 }
-                "incremental" => signals.has_incremental = true,
-                "deps" => signals.has_deps = true,
-                "build" => signals.has_build = true,
-                ".fingerprint" => signals.has_fingerprint = true,
-                ".git" => signals.has_git = true,
-                // Root-level cache-directory tag (Cache Directory Tagging
-                // Standard, case-sensitive uppercase per the spec). This is the
-                // one signal that identifies an arbitrarily-named build cache —
-                // whose deps/incremental/.fingerprint markers live one level
-                // deeper under debug/ and release/ — without a name match.
-                // Validate the signature line so an unrelated file that merely
-                // shares the name cannot mark a directory reclaimable.
-                "CACHEDIR.TAG" => {
-                    if is_valid_cachedir_tag(&child_path) {
-                        signals.has_cachedir_tag = true;
-                    }
-                }
-                "pyvenv.cfg" => signals.has_pyvenv_cfg = true,
-                "cargo.toml" | "Cargo.toml" => signals.has_cargo_toml = true,
-                "package.json"
-                | "package-lock.json"
-                | "npm-shrinkwrap.json"
-                | "pnpm-lock.yaml"
-                | "yarn.lock"
-                | "bun.lock"
-                | "bun.lockb" => {
-                    parent_has_node_manifest = true;
-                }
-                _ => {}
             }
+            "pyvenv.cfg" => signals.has_pyvenv_cfg = true,
+            "cargo.toml" | "Cargo.toml" => signals.has_cargo_toml = true,
+            "package.json"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb" => {
+                parent_has_node_manifest = true;
+            }
+            _ => {}
+        }
 
-            // Check extension for object file heuristics.
-            if let Some(ext) = Path::new(name_os).extension() {
-                let ext_str = ext.to_string_lossy();
-                if ext_str.eq_ignore_ascii_case("o")
-                    || ext_str.eq_ignore_ascii_case("rlib")
-                    || ext_str.eq_ignore_ascii_case("rmeta")
-                    || ext_str.eq_ignore_ascii_case("d")
-                {
-                    object_count += 1;
-                }
+        // Check extension for object file heuristics.
+        if let Some(ext) = Path::new(&name_os).extension() {
+            let ext_str = ext.to_string_lossy();
+            if ext_str.eq_ignore_ascii_case("o")
+                || ext_str.eq_ignore_ascii_case("rlib")
+                || ext_str.eq_ignore_ascii_case("rmeta")
+                || ext_str.eq_ignore_ascii_case("d")
+            {
+                object_count += 1;
             }
         }
+
+        if !window.contains(&index) {
+            continue;
+        }
+        let child_path = entry.path();
 
         // ─── Type Check & Symlink Handling ───
         // Use file_type() which is often free (cached in directory entry).
@@ -1075,9 +1101,19 @@ fn process_directory(
         }
     }
 
+    // A listing longer than one window: the next pass takes the next window.
+    let next_start = next_window_start(window_start, total_count, windows.size);
+    if next_start.is_some() || window_start > 0 {
+        let mut starts = oversized_window_starts().lock();
+        match next_start {
+            Some(start) => starts.insert(dir_path.to_path_buf(), start),
+            None => starts.remove(dir_path),
+        };
+    }
+
     // ─── Deferred Recursion Dispatch ───
-    // Now that we've confirmed no .sbh-protect marker exists (we would have
-    // returned above), queue collected child dirs for worker threads.
+    // No .sbh-protect marker was in the listing (we would have returned
+    // above), so queue collected child dirs for worker threads.
     //
     // Use send_timeout + cancel check instead of blocking send to prevent
     // thread leaks: when the scanner times out and sets the cancel flag,
@@ -1533,12 +1569,48 @@ fn collect_open_files_linux() -> HashSet<(u64, u64)> {
     open
 }
 
-/// Maximum child entries iterated per directory for signal collection.
+/// Maximum child entries of one directory a pass processes (stats, queues).
 ///
 /// Large enough to cover big project directories in full (node_modules,
-/// flat object directories): iteration is reasonably cheap, and missing
-/// entries cause permanent blind spots.
+/// flat object directories). A directory listing more is processed one
+/// window of this many entries per pass, the window moving on each pass, so
+/// a huge temp root has no permanent blind spot.
 pub const MAX_ENTRIES_PER_DIR: u32 = 65_536;
+
+/// Maximum names read from one directory per pass. Past the processing
+/// window only names are checked, for a `.sbh-protect` marker and structural
+/// signals; this bounds even that.
+pub const MAX_NAMES_READ_PER_DIR: u32 = 16 * MAX_ENTRIES_PER_DIR;
+
+/// The next pass's window start, per directory that listed more entries than
+/// its window. Process-wide, so the daemon's successive passes take turns
+/// through a large directory; a one-shot CLI walk starts at the top.
+static OVERSIZED_WINDOW_STARTS: OnceLock<parking_lot::Mutex<HashMap<PathBuf, u32>>> =
+    OnceLock::new();
+
+fn oversized_window_starts() -> &'static parking_lot::Mutex<HashMap<PathBuf, u32>> {
+    OVERSIZED_WINDOW_STARTS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// Which entries of each directory listing a walk processes.
+struct DirWindows {
+    /// Entries processed per directory per pass.
+    size: u32,
+    /// Window starts as of the walk's start, read without locking.
+    starts: HashMap<PathBuf, u32>,
+}
+
+/// Where the next pass's window starts, after a pass that processed
+/// `start..start + size` of a listing of `read` names; `None` when the whole
+/// listing fits one window. Windows run to the end of the listing, then
+/// start over from the top.
+fn next_window_start(start: u32, read: u32, size: u32) -> Option<u32> {
+    if read <= size {
+        return None;
+    }
+    let next = start.saturating_add(size);
+    Some(if next >= read { 0 } else { next })
+}
 
 /// Maximum wall time to spend scanning /proc for open file ancestors.
 ///
@@ -4402,6 +4474,10 @@ mod tests {
         let join = thread::spawn(move || {
             // A one-entry batch sends on every push, so the emitter blocks.
             let mut results = ResultBatch::new(&result_tx, 1);
+            let windows = DirWindows {
+                size: MAX_ENTRIES_PER_DIR,
+                starts: HashMap::new(),
+            };
             process_directory(
                 &dir_clone,
                 1,
@@ -4411,6 +4487,7 @@ mod tests {
                 &mut results,
                 &in_flight,
                 &config,
+                &windows,
                 &protection,
                 None,
                 &worker_cancel,
@@ -4534,6 +4611,87 @@ mod tests {
                 assert_eq!(unique, expected, "parallelism {parallelism}");
             }
         }
+    }
+
+    #[test]
+    fn window_starts_run_to_the_end_of_the_listing_then_start_over() {
+        assert_eq!(next_window_start(0, 4, 4), None, "fits one window");
+        assert_eq!(next_window_start(0, 10, 4), Some(4));
+        assert_eq!(next_window_start(4, 10, 4), Some(8));
+        assert_eq!(next_window_start(8, 10, 4), Some(0));
+        // A listing that shrank below its window start starts over.
+        assert_eq!(next_window_start(8, 6, 4), Some(0));
+        // ts2's /data/tmp: 68,519 entries take two passes.
+        assert_eq!(
+            next_window_start(0, 68_519, MAX_ENTRIES_PER_DIR),
+            Some(MAX_ENTRIES_PER_DIR)
+        );
+        assert_eq!(
+            next_window_start(MAX_ENTRIES_PER_DIR, 68_519, MAX_ENTRIES_PER_DIR),
+            Some(0)
+        );
+    }
+
+    /// A directory listing more entries than one window is processed a
+    /// window per pass, so every child is visited within a few passes. The
+    /// cap used to stop at the same entries every pass: on btrfs, which lists
+    /// in creation order, the newest ~3,000 of ts2's 68,519 /data/tmp entries
+    /// (40 GiB) were never visited.
+    #[test]
+    fn an_oversized_directory_is_covered_by_successive_passes() {
+        let tmp = TempDir::new().unwrap();
+        let big = tmp.path().join("big");
+        let mut expected = HashSet::new();
+        for index in 0..10 {
+            let child = big.join(format!("c{index:02}"));
+            fs::create_dir_all(&child).unwrap();
+            expected.insert(child);
+        }
+
+        let mut seen = HashSet::new();
+        let mut per_pass = Vec::new();
+        for _ in 0..4 {
+            let walker =
+                DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                    .with_dir_window(4);
+            let children: Vec<PathBuf> = walker
+                .walk()
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.path)
+                .filter(|path| path.parent() == Some(big.as_path()))
+                .collect();
+            per_pass.push(children.len());
+            seen.extend(children);
+        }
+        // Windows of 4 over 10 entries: 4, 4, the last 2, then from the top.
+        assert_eq!(per_pass, [4, 4, 2, 4]);
+        assert_eq!(seen, expected);
+    }
+
+    /// Every name is read, so a `.sbh-protect` marker outside the processing
+    /// window still keeps the walker out of the directory.
+    #[test]
+    fn a_protect_marker_outside_the_window_still_protects_the_directory() {
+        let tmp = TempDir::new().unwrap();
+        let guarded = tmp.path().join("guarded");
+        for index in 0..10 {
+            fs::create_dir_all(guarded.join(format!("c{index:02}"))).unwrap();
+        }
+        fs::write(guarded.join(".sbh-protect"), b"").unwrap();
+
+        let walker =
+            DirectoryWalker::new(test_config(tmp.path()), ProtectionRegistry::marker_only())
+                .with_dir_window(1);
+        let inside: Vec<PathBuf> = walker
+            .walk()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .filter(|path| path.starts_with(&guarded))
+            .collect();
+        assert_eq!(inside, Vec::<PathBuf>::new());
+        assert!(walker.protection().read().is_protected(&guarded));
     }
 
     #[test]

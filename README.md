@@ -1753,7 +1753,7 @@ An atomic `in_flight` counter tracks work items that have been dequeued but not 
 
 #### Per-Directory Iteration Cap
 
-Directories with tens of thousands of entries (e.g., `/data/tmp` with 60K+ children, `node_modules` flats) can monopolize a worker thread for seconds. Each directory is capped at <!-- claim:constants.walker.MAX_ENTRIES_PER_DIR -->65536<!-- /claim --> child entries. Structural signals (`.git`, `Cargo.lock`, `deps/`, `build/`) are detected early during iteration, so the cap rarely affects scoring accuracy. This prevents any single pathological directory from starving other workers.
+Directories with tens of thousands of entries (e.g., `/data/tmp` with 60K+ children, `node_modules` flats) can monopolize a worker thread for seconds. A pass stats and queues at most <!-- claim:constants.walker.MAX_ENTRIES_PER_DIR -->65536<!-- /claim --> entries of one directory. A directory with more is taken a window at a time: the next pass continues where this one stopped, and after the last entry the window starts over, so no entry is skipped on every pass. Every name in the listing, up to <!-- claim:constants.walker.MAX_NAMES_READ_PER_DIR -->1048576<!-- /claim -->, is still read: a `.sbh-protect` marker anywhere in it protects the directory, and structural signals (`.git`, `Cargo.lock`, `deps/`, `build/`) count wherever they appear. This keeps any single pathological directory from starving other workers.
 
 #### Open-File Detection
 

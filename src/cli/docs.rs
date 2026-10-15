@@ -1193,7 +1193,14 @@ pub fn constants() -> Vec<ConstantDoc> {
             "walker",
             "MAX_ENTRIES_PER_DIR",
             walker::MAX_ENTRIES_PER_DIR,
-            "Entries read per directory before it is cut off",
+            "Entries of one directory processed per pass; the window moves on each pass",
+            "src/scanner/walker.rs",
+        ),
+        constant(
+            "walker",
+            "MAX_NAMES_READ_PER_DIR",
+            walker::MAX_NAMES_READ_PER_DIR,
+            "Names read per directory per pass (marker and signal checks)",
             "src/scanner/walker.rs",
         ),
         constant(
