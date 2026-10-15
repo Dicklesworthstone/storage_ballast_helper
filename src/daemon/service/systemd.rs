@@ -349,6 +349,10 @@ impl SystemdServiceManager {
         // host: throttled in up to 100% of periods, scans timing out at Critical.
         writeln!(unit, "CPUQuota=100%").ok();
         writeln!(unit, "CPUWeight=1").ok();
+        // glibc gives each walker thread its own malloc arena and keeps the
+        // freed pages: on a 500k-entry tree RSS settled at 480 MiB against
+        // ~290 MiB with two arenas, at the same scan CPU (ts2 2026-10-15).
+        writeln!(unit, "Environment=MALLOC_ARENA_MAX=2").ok();
         writeln!(unit).ok();
 
         if !self.config.user_scope {
@@ -1492,6 +1496,20 @@ mod unit_drift_tests {
         );
         assert!(drift.is_clean(), "{drift:?}");
         assert!(drift.exec_start_matches);
+    }
+
+    #[test]
+    fn generated_units_cap_glibc_malloc_arenas_in_both_scopes() {
+        for user_scope in [false, true] {
+            let mut manager = manager();
+            manager.config.user_scope = user_scope;
+            let directives = parse_unit_directives(&manager.generate_unit_file());
+            assert_eq!(
+                directives.get("Service/Environment"),
+                Some(&vec!["MALLOC_ARENA_MAX=2".to_string()]),
+                "user_scope={user_scope}"
+            );
+        }
     }
 
     #[test]

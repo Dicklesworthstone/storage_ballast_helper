@@ -1955,6 +1955,7 @@ This keeps `sbh` at background priority. System-scope systemd units also add a c
 - `MemoryMax=256M` — hard memory ceiling enforced by the cgroup controller
 - `CPUQuota=100%` — caps CPU at one core as a runaway backstop
 - `CPUWeight=1` — the lowest CPU share, so builds win whenever cores are busy
+- `Environment=MALLOC_ARENA_MAX=2` — two glibc malloc arenas rather than one per scanner thread, so on a large tree RSS stays near the live set instead of settling at about twice it
 
 **Lifecycle:**
 - `Type=notify` (system scope) with `WatchdogSec=60` for automatic restart on stall
