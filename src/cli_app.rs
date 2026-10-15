@@ -19331,10 +19331,12 @@ mod tests {
         let config_path = tmp.path().join("config.toml");
         let protected = tmp.path().join("critical-build");
         std::fs::create_dir_all(&protected).unwrap();
+        // macOS adds the real user temp dir as a root by default; a marker
+        // there (sbh's own quarantine) counted as a second protection.
         std::fs::write(
             &config_path,
             format!(
-                "[scanner]\nroot_paths = [\"{}\"]\nprotected_paths = [\"{}\"]\n",
+                "[scanner]\ninclude_user_temp_dir = false\nroot_paths = [\"{}\"]\nprotected_paths = [\"{}\"]\n",
                 tmp.path().to_string_lossy(),
                 protected.to_string_lossy()
             ),
@@ -19359,7 +19361,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "[scanner]\nroot_paths = [\"{}\"]\nprotected_paths = [\"{}\"]\n",
+                "[scanner]\ninclude_user_temp_dir = false\nroot_paths = [\"{}\"]\nprotected_paths = [\"{}\"]\n",
                 tmp.path().to_string_lossy(),
                 protected.to_string_lossy()
             ),
