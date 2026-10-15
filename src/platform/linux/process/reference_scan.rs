@@ -369,7 +369,34 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
             .read_bounded(&process.join("stat"), MAX_EXECUTABLE_STAT_BYTES)
             .is_ok_and(|raw| stat_has_no_user_executable(&raw, pid))
     }
+
+    /// [`Self::no_user_executable`], giving an exiting process a moment to
+    /// finish. Its argv reads empty once its memory is released, shortly
+    /// before it becomes a zombie or is reaped. On a busy build host (trj,
+    /// 2,373 processes) short-lived compilers exited mid-sweep in two of
+    /// three sweeps, and each one made the whole sweep incomplete and held
+    /// the batch. A process still running after the settle, such as one
+    /// whose main thread exited while its siblings run, stays unproven.
+    fn exited_without_user_executable(&mut self, process: &Path, pid: i32) -> bool {
+        for settle in EXIT_SETTLE {
+            if self.no_user_executable(process, pid) {
+                return true;
+            }
+            if self.expired() {
+                return false;
+            }
+            std::thread::sleep(settle);
+        }
+        self.no_user_executable(process, pid)
+    }
 }
+
+/// Waits between re-checks of a process whose argv read empty.
+const EXIT_SETTLE: [Duration; 3] = [
+    Duration::from_millis(2),
+    Duration::from_millis(10),
+    Duration::from_millis(50),
+];
 
 fn read_proc_bytes(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     use std::io::Read as _;

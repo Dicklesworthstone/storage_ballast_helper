@@ -177,8 +177,9 @@ fn metadata(
             if invalid {
                 // Zombies can still have a build-tool comm but no argv. An
                 // empty argv alone is not proof of that terminal state.
-                let terminal =
-                    file == "cmdline" && raw.is_empty() && sweep.no_user_executable(process, pid);
+                let terminal = file == "cmdline"
+                    && raw.is_empty()
+                    && sweep.exited_without_user_executable(process, pid);
                 if !terminal {
                     result.missing(
                         pid,
@@ -540,6 +541,30 @@ mod tests {
         fs::write(process.join("cmdline"), b"cargo\0").unwrap();
         let gone = Fault::new("environ", libc::ESRCH);
         assert!(fixture.collect(&gone).complete);
+    }
+
+    /// A build process caught mid-exit, its argv already empty but not yet a
+    /// zombie, finishes exiting during the settle and does not make the sweep
+    /// incomplete. On trj two of three sweeps were held for this.
+    #[test]
+    fn a_build_process_finishing_its_exit_during_the_sweep_does_not_hold_the_batch() {
+        let fixture = Fixture::new();
+        let process = fixture.install(fixture.pid, "cargo", b"", b"");
+        let stat = |state: &str| {
+            let mut fields = ["0"; 20];
+            fields[0] = state;
+            fields[17] = "1";
+            format!("{} (cargo) {}\n", fixture.pid, fields.join(" "))
+        };
+        fs::write(process.join("stat"), stat("R")).unwrap();
+        let exiting = process.join("stat");
+        let zombie = stat("Z");
+        let exit = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            fs::write(exiting, zombie).unwrap();
+        });
+        assert!(fixture.collect(&NativeProc).complete);
+        exit.join().unwrap();
     }
 
     #[test]
