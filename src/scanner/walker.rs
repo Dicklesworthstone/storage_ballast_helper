@@ -1763,10 +1763,7 @@ fn add_open_path_ancestor_chain(
 #[cfg(target_os = "linux")]
 fn collect_open_path_ancestors_linux(root_paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
     let (targets, complete) = collect_open_file_targets_linux();
-    (
-        open_path_ancestors_for_roots(&targets, root_paths),
-        complete,
-    )
+    checked_open_path_ancestors_for_roots(&targets, complete, root_paths)
 }
 
 /// Every absolute path some process holds open, from one walk of
@@ -1808,12 +1805,26 @@ pub(crate) fn checked_open_path_ancestors_for_roots(
     descriptor_complete: bool,
     root_paths: &[PathBuf],
 ) -> (HashSet<PathBuf>, bool) {
+    checked_open_path_ancestors_with_builds(
+        targets,
+        descriptor_complete,
+        root_paths,
+        crate::platform::linux::process::read_build_directory_snapshot,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn checked_open_path_ancestors_with_builds(
+    targets: &[PathBuf],
+    descriptor_complete: bool,
+    root_paths: &[PathBuf],
+    build_snapshot: impl FnOnce() -> (Vec<(i32, PathBuf)>, bool),
+) -> (HashSet<PathBuf>, bool) {
     let mut ancestors = open_path_ancestors_for_roots(targets, root_paths);
     if root_paths.is_empty() {
         return (ancestors, descriptor_complete);
     }
-    let (directories, build_complete) =
-        crate::platform::linux::process::read_build_directory_snapshot();
+    let (directories, build_complete) = build_snapshot();
     build_scopes::add_candidate_scopes(
         directories,
         &normalized_open_roots(root_paths),
@@ -4961,6 +4972,178 @@ mod tests {
         assert!(complete);
         assert!(is_path_open_by_ancestor(&child, &ancestors));
         assert!(!is_path_open_by_ancestor(&idle, &ancestors));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn per_item_artifact(path: &Path) -> crate::scanner::scoring::CandidacyScore {
+        use crate::scanner::patterns::ArtifactClassification;
+
+        let input = CandidateInput {
+            path: path.to_path_buf(),
+            size_bytes: 18,
+            age: Duration::from_hours(48),
+            classification: ArtifactClassification::unknown(),
+            signals: StructuralSignals::default(),
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+        let mut score =
+            ScoringEngine::from_config(&ScoringConfig::default(), 0).score_candidate(&input, 0.9);
+        score.identity = Some(identity_for_path(path, false).unwrap());
+        score.total_score = 0.99;
+        score.vetoed = false;
+        score.veto_reason = None;
+        score.decision.action = DecisionAction::Delete;
+        score
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn per_item_native_collector_keeps_declared_build_without_target_descriptors() {
+        use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, SkipReason};
+        use std::os::unix::fs::symlink;
+        use std::process::{Command, Stdio};
+
+        struct Holder(std::process::Child);
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        // Re-execute this exact test through our cargo alias as an idle
+        // process fixture, without adding a production environment variable.
+        // The parent observes real /proc metadata; the child does no cleanup.
+        if std::env::args_os().next().is_some_and(|arg| {
+            Path::new(&arg)
+                .file_name()
+                .is_some_and(|name| name == "cargo")
+        }) {
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let cache = root.join("cache");
+        let target = cache.join("objects/target");
+        let idle = root.join("idle/target");
+        for path in [&target, &idle] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("artifact.o"), b"active build bytes").unwrap();
+        }
+        // A real, idle Linux process supplies comm/argv/environment to the
+        // production /proc observer. This is not a Cargo build or a PAL mock.
+        let executable = root.join("cargo");
+        symlink(std::env::current_exe().unwrap(), &executable).unwrap();
+        let holder = Holder(
+            Command::new(&executable)
+                .arg("--exact")
+                .arg("scanner::walker::tests::per_item_native_collector_keeps_declared_build_without_target_descriptors")
+                .arg("--test-threads=1")
+                .env_clear()
+                .env("CARGO_TARGET_DIR", &cache)
+                .current_dir(&root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let process = PathBuf::from(format!("/proc/{}", holder.0.id()));
+        assert_eq!(
+            fs::read_to_string(process.join("comm")).unwrap().trim(),
+            "cargo"
+        );
+        assert!(
+            !fs::read_link(process.join("cwd"))
+                .unwrap()
+                .starts_with(&target)
+        );
+        for fd in fs::read_dir(process.join("fd")).unwrap() {
+            assert!(
+                !fs::read_link(fd.unwrap().path())
+                    .unwrap()
+                    .starts_with(&target)
+            );
+        }
+
+        let (paths, _) = collect_open_path_ancestors(&[target.clone(), idle.clone()]);
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        assert_eq!(
+            executor.explain_preflight(&per_item_artifact(&target), Some(&paths)),
+            Err(SkipReason::FileOpen)
+        );
+        assert_eq!(
+            executor.explain_preflight(&per_item_artifact(&idle), Some(&paths)),
+            Ok(())
+        );
+        assert_eq!(
+            fs::read(target.join("artifact.o")).unwrap(),
+            b"active build bytes"
+        );
+        // Other host processes can make the global scan incomplete. The test
+        // proves retained positive scope evidence, not exhaustive host coverage.
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn per_item_build_snapshot_never_upgrades_incomplete_coverage() {
+        use crate::scanner::deletion::{
+            CheckedDeletion, DeletionConfig, DeletionExecutor, SkipReason,
+        };
+
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let target = root.join("cache/objects/target");
+        let idle = root.join("idle/target");
+        for path in [&target, &idle] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("artifact.o"), b"active build bytes").unwrap();
+        }
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        for descriptor_complete in [false, true] {
+            for build_complete in [false, true] {
+                let (paths, complete) = checked_open_path_ancestors_with_builds(
+                    &[],
+                    descriptor_complete,
+                    &[target.clone(), idle.clone()],
+                    || (vec![(42, root.join("cache"))], build_complete),
+                );
+                assert_eq!(complete, descriptor_complete && build_complete);
+                assert_eq!(
+                    executor.explain_preflight(&per_item_artifact(&target), Some(&paths)),
+                    Err(SkipReason::FileOpen)
+                );
+                assert_eq!(
+                    executor.explain_preflight(&per_item_artifact(&idle), Some(&paths)),
+                    Ok(())
+                );
+                if !complete {
+                    assert!(matches!(
+                        executor
+                            .delete_candidate_checked(&per_item_artifact(&idle), None)
+                            .unwrap(),
+                        CheckedDeletion::Skipped(SkipReason::OpenScanIncomplete)
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            fs::read(idle.join("artifact.o")).unwrap(),
+            b"active build bytes"
+        );
+        let (paths, complete) =
+            checked_open_path_ancestors_with_builds(&[], true, std::slice::from_ref(&idle), || {
+                (vec![], true)
+            });
+        assert!(complete);
+        assert_eq!(
+            executor.explain_preflight(&per_item_artifact(&idle), Some(&paths)),
+            Ok(())
+        );
     }
 
     #[cfg(unix)]
