@@ -1,9 +1,10 @@
 //! Bounded, read-only attribution of a mount the daemon cannot reclaim.
 //!
-//! Diagnostics run on the monitor thread. One shared entry/time budget must
-//! cover discovery and every consumer, not restart for each directory. Sizes
-//! describe observed allocated blocks, never deletion authority or a promise
-//! of reclaimable space. Kernel I/O may outlast the cooperative deadline.
+//! One shared entry/time budget covers discovery and every consumer. The
+//! monitor waits only for a bounded receive, never joins a timed-out probe,
+//! and admits no replacement while that probe is still in filesystem I/O.
+//! Sizes describe observed allocated blocks, never deletion authority or a
+//! promise of reclaimable space. These are not atomic filesystem snapshots.
 
 use std::collections::HashSet;
 use std::ffi::CStr;
@@ -13,6 +14,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat, open, openat, statat};
@@ -21,8 +24,10 @@ use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat, open, openat, stata
 const CONTAINERS: &[&str] = &["home", "data", "var", "srv", "opt", "Users", "root"];
 /// Directory-read attempts shared by discovery and all recursive probes.
 pub const PROBE_BUDGET_ENTRIES: usize = 400_000;
-/// Cooperative wall-time allowance for the entire monitor-thread diagnostic.
-pub const PROBE_TIME_BUDGET: Duration = Duration::from_secs(2);
+/// Cooperative allowance, leaving time to publish a partial observation.
+pub const PROBE_TIME_BUDGET: Duration = Duration::from_millis(1500);
+/// Monitor receive timeout; no join follows a timeout. Not a real-time guarantee.
+pub const PROBE_WAIT_BUDGET: Duration = Duration::from_secs(2);
 /// Entries named in one daemon report.
 pub const REPORT_TOP: usize = 8;
 const MAX_DISCOVERY_READS: usize = 4096;
@@ -32,6 +37,50 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
+
+// Shared across mounts: a stuck mount must not accumulate a new blocked
+// worker on every attribution attempt. No logger or daemon handle is retained.
+static PROBE_ACTIVE: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+struct ProbePermit(Arc<AtomicBool>);
+
+impl Drop for ProbePermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn bounded_probe(
+    active: Arc<AtomicBool>,
+    deadline: Instant,
+    probe: impl FnOnce() -> Vec<Consumer> + Send + 'static,
+) -> Option<Vec<Consumer>> {
+    if Instant::now() >= deadline
+        || active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return None;
+    }
+    // The worker owns admission, not the waiting monitor. Timeout must not
+    // clear it. Dropping the closure on spawn failure or unwinding a worker
+    // releases it; a kernel-blocked worker continues to hold it.
+    let permit = ProbePermit(active);
+    let (tx, rx) = mpsc::sync_channel(1);
+    let worker = std::thread::Builder::new()
+        .name("sbh-attribution".to_owned())
+        .spawn(move || {
+            let result = probe();
+            drop(permit);
+            // Each invocation has its own receiver. A late result is dropped,
+            // never presented as a fresh observation of another mount.
+            let _ = tx.send(result);
+        })
+        .ok()?;
+    drop(worker);
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+}
 
 /// One consumer's observed allocation on the selected filesystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,17 +122,41 @@ struct Candidate {
 
 /// Largest observed directories on `mount`, with conventional containers
 /// expanded by one level. No descendant symlink is followed. File descriptors,
-/// depth, retained consumers, directory reads and wall time are all bounded.
+/// depth, retained consumers, directory reads and monitor waiting are bounded.
 /// A truncated inventory marks every returned size incomplete: the ranking is
 /// among observed consumers, not a claim that unobserved consumers are smaller.
+/// Busy, stalled or failed probes return an explicitly incomplete observation.
 #[must_use]
 pub fn top_consumers(mount: &Path, budget: usize, top: usize) -> Vec<Consumer> {
-    let mut work = WorkBudget {
-        remaining: budget.min(PROBE_BUDGET_ENTRIES),
-        examined: 0,
-        deadline: Instant::now() + PROBE_TIME_BUDGET,
-    };
-    collect_consumers(mount, top, &mut work)
+    let active = Arc::clone(PROBE_ACTIVE.get_or_init(|| Arc::new(AtomicBool::new(false))));
+    top_consumers_with_gate(mount, budget, top, active)
+}
+
+fn top_consumers_with_gate(
+    mount: &Path,
+    budget: usize,
+    top: usize,
+    active: Arc<AtomicBool>,
+) -> Vec<Consumer> {
+    if top == 0 {
+        return Vec::new();
+    }
+    if budget == 0 {
+        return unknown(mount);
+    }
+    let started = Instant::now();
+    let anchor = mount.to_path_buf();
+    bounded_probe(active, started + PROBE_WAIT_BUDGET, move || {
+        let mut work = WorkBudget {
+            remaining: budget.min(PROBE_BUDGET_ENTRIES),
+            examined: 0,
+            deadline: started + PROBE_TIME_BUDGET,
+        };
+        // All filesystem calls, including anchor resolution, stay off the
+        // monitor. A cooperative deadline alone cannot bound blocked I/O.
+        collect_consumers(&anchor, top, &mut work)
+    })
+    .unwrap_or_else(|| unknown(mount))
 }
 
 fn unknown(mount: &Path) -> Vec<Consumer> {
@@ -213,9 +286,11 @@ fn discover(
             complete = false;
             continue;
         };
-        if stat_device(&stat) != Some(device)
-            || !FileType::from_raw_mode(stat.st_mode).is_dir()
-        {
+        let Some(entry_device) = stat_device(&stat) else {
+            complete = false;
+            continue;
+        };
+        if entry_device != device || !FileType::from_raw_mode(stat.st_mode).is_dir() {
             continue;
         }
         if candidates.len() >= MAX_CONSUMERS {
@@ -301,7 +376,11 @@ fn measure_directory(
             complete = false;
             continue;
         };
-        if stat_device(&stat) != Some(device) {
+        let Some(entry_device) = stat_device(&stat) else {
+            complete = false;
+            continue;
+        };
+        if entry_device != device {
             continue;
         }
         let observed = if FileType::from_raw_mode(stat.st_mode).is_dir() {
@@ -416,6 +495,20 @@ pub fn describe(consumers: &[Consumer]) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    // Filesystem fixtures use independent admission. Contention and stalled
+    // workers are tested explicitly below, without global test-order coupling.
+    fn top_consumers(mount: &Path, budget: usize, top: usize) -> Vec<Consumer> {
+        top_consumers_with_gate(mount, budget, top, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn wait_for_idle(active: &AtomicBool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while active.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!active.load(Ordering::Acquire), "probe did not release admission");
+    }
 
     #[test]
     fn largest_directories_first_with_containers_expanded() {
@@ -539,5 +632,137 @@ mod tests {
         assert!(!text.contains('\n'));
         assert!(!text.contains('\x1b'));
         assert!(text.contains("partial observation"));
+    }
+
+    #[test]
+    fn completed_probe_returns_its_report_and_releases_admission() {
+        let active = Arc::new(AtomicBool::new(false));
+        let expected = unknown(Path::new("/observed"));
+        let result = expected.clone();
+        assert_eq!(
+            bounded_probe(
+                Arc::clone(&active),
+                Instant::now() + Duration::from_secs(5),
+                move || result,
+            ),
+            Some(expected)
+        );
+        assert!(!active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn timed_out_probe_blocks_replacement_and_discards_its_late_result() {
+        let active = Arc::new(AtomicBool::new(false));
+        let (release, blocked) = mpsc::sync_channel::<()>(1);
+        let result = bounded_probe(
+            Arc::clone(&active),
+            Instant::now() + Duration::from_millis(20),
+            move || {
+                // Simulate a kernel call that ignores cooperative cancellation.
+                blocked.recv().unwrap();
+                unknown(Path::new("/old-mount"))
+            },
+        );
+        assert!(result.is_none());
+        assert!(active.load(Ordering::Acquire));
+        let attempted = Arc::new(AtomicBool::new(false));
+        let other_attempt = Arc::clone(&attempted);
+        assert!(
+            bounded_probe(
+                Arc::clone(&active),
+                Instant::now() + Duration::from_secs(5),
+                move || {
+                    other_attempt.store(true, Ordering::Release);
+                    Vec::new()
+                },
+            )
+            .is_none()
+        );
+        assert!(!attempted.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        wait_for_idle(&active);
+        let fresh = unknown(Path::new("/new-mount"));
+        let expected = fresh.clone();
+        assert_eq!(
+            bounded_probe(
+                active,
+                Instant::now() + Duration::from_secs(5),
+                move || fresh,
+            ),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn busy_admission_reports_the_requested_mount_as_unknown() {
+        let active = Arc::new(AtomicBool::new(true));
+        let path = Path::new("/unobserved-mount");
+        assert_eq!(
+            top_consumers_with_gate(path, 100, 8, active),
+            unknown(path)
+        );
+        assert!(super::top_consumers(path, 100, 0).is_empty());
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn unwinding_worker_does_not_permanently_disable_attribution() {
+        let active = Arc::new(AtomicBool::new(false));
+        assert!(
+            bounded_probe(
+                Arc::clone(&active),
+                Instant::now() + Duration::from_secs(5),
+                || panic!("injected attribution failure"),
+            )
+            .is_none()
+        );
+        wait_for_idle(&active);
+    }
+
+    #[test]
+    fn retained_consumer_cap_marks_the_inventory_incomplete() {
+        let mount = tempfile::tempdir().unwrap();
+        for index in 0..MAX_CONSUMERS + 1 {
+            fs::create_dir(mount.path().join(format!("tree-{index}"))).unwrap();
+        }
+        let consumers = top_consumers(mount.path(), 10_000, usize::MAX);
+        assert_eq!(consumers.len(), MAX_CONSUMERS);
+        assert!(consumers.iter().all(|consumer| !consumer.complete));
+    }
+
+    #[test]
+    fn hard_links_are_not_counted_again_within_or_between_consumers() {
+        let mount = tempfile::tempdir().unwrap();
+        let a = mount.path().join("a");
+        let b = mount.path().join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        let data = a.join("data");
+        fs::write(&data, vec![3u8; 64 * 1024]).unwrap();
+        fs::hard_link(&data, a.join("copy")).unwrap();
+        fs::hard_link(&data, b.join("copy")).unwrap();
+        let expected = [&a, &b, &data]
+            .into_iter()
+            .map(|path| fs::metadata(path).unwrap().blocks() * 512)
+            .sum::<u64>();
+        let consumers = top_consumers(mount.path(), 100, 8);
+        assert_eq!(consumers.len(), 2);
+        assert_eq!(consumers.iter().map(|consumer| consumer.bytes).sum::<u64>(), expected);
+        assert!(consumers.iter().any(|consumer| !consumer.complete));
+    }
+
+    #[test]
+    fn sparse_file_accounting_uses_blocks_instead_of_logical_length() {
+        let mount = tempfile::tempdir().unwrap();
+        let tree = mount.path().join("tree");
+        fs::create_dir(&tree).unwrap();
+        let sparse = tree.join("sparse");
+        File::create(&sparse).unwrap().set_len(64 * 1024 * 1024).unwrap();
+        let expected = fs::metadata(&tree).unwrap().blocks() * 512
+            + fs::metadata(&sparse).unwrap().blocks() * 512;
+        let consumers = top_consumers(mount.path(), 100, 8);
+        assert_eq!(consumers.len(), 1);
+        assert_eq!(consumers[0].bytes, expected);
+        assert!(consumers[0].complete);
     }
 }
