@@ -431,14 +431,18 @@ fn parent_in_use(platform: &dyn Platform, parent: &Path) -> bool {
     {
         return true;
     }
-    platform.process_list().is_ok_and(|processes| {
-        processes.iter().any(|process| {
-            process
-                .cwd
-                .as_deref()
-                .is_some_and(|cwd| cwd.starts_with(parent))
+    // Runs on the monitor thread and needs only cwd: no argv reads, which
+    // can block behind another process's memory-map lock.
+    platform
+        .process_list_without_command_lines()
+        .is_ok_and(|processes| {
+            processes.iter().any(|process| {
+                process
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|cwd| cwd.starts_with(parent))
+            })
         })
-    })
 }
 
 // ──────────────────── thread panic tracking ────────────────────

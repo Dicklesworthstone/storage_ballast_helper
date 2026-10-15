@@ -40,6 +40,16 @@ struct IoCounters {
 }
 
 pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
+    read_processes(true)
+}
+
+/// The process list without reading any process's `cmdline`, which takes
+/// that process's memory-map lock and can block behind it indefinitely.
+pub(super) fn read_process_list_without_command_lines() -> Result<Vec<ProcessInfo>> {
+    read_processes(false)
+}
+
+fn read_processes(with_command_lines: bool) -> Result<Vec<ProcessInfo>> {
     let current_pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
     let boot_time_unix_ms = read_proc_file(PROC_STAT)
         .ok()
@@ -50,7 +60,7 @@ pub(super) fn read_process_list() -> Result<Vec<ProcessInfo>> {
         if pid <= 0 || pid == current_pid {
             continue;
         }
-        if let Some(process) = process_info_for_pid(pid, boot_time_unix_ms) {
+        if let Some(process) = process_info_for_pid(pid, boot_time_unix_ms, with_command_lines) {
             processes.push(process);
         }
     }
@@ -172,7 +182,11 @@ fn pid_proc_path(pid: i32) -> PathBuf {
     PathBuf::from(PROC_ROOT).join(pid.to_string())
 }
 
-fn process_info_for_pid(pid: i32, boot_time_unix_ms: Option<i64>) -> Option<ProcessInfo> {
+fn process_info_for_pid(
+    pid: i32,
+    boot_time_unix_ms: Option<i64>,
+    with_command_line: bool,
+) -> Option<ProcessInfo> {
     let proc_path = pid_proc_path(pid);
     let name = fs::read_to_string(proc_path.join("comm"))
         .ok()?
@@ -195,7 +209,11 @@ fn process_info_for_pid(pid: i32, boot_time_unix_ms: Option<i64>) -> Option<Proc
             .as_deref()
             .and_then(|raw| parse_status_i32_field(raw, "PPid")),
         name,
-        command_line: read_command_line(&proc_path),
+        command_line: if with_command_line {
+            read_command_line(&proc_path)
+        } else {
+            Vec::new()
+        },
         executable: fs::read_link(proc_path.join("exe")).ok(),
         cwd: fs::read_link(proc_path.join("cwd")).ok(),
         start_time_unix_ms: stat
@@ -494,7 +512,8 @@ mod tests {
         mapped_region_from_maps_line, parse_fdinfo_flags, parse_proc_boot_time_unix_ms,
         parse_proc_io, parse_proc_self_stat, parse_proc_self_status, parse_proc_start_time_unix_ms,
         read_executables_under, read_mmap_regions_under, read_open_files_under, read_process_io,
-        read_process_list, read_self_stats, ticks_to_micros,
+        read_process_list, read_process_list_without_command_lines, read_self_stats,
+        ticks_to_micros,
     };
     use crate::core::paths::resolve_absolute_path;
     use crate::platform::types::{OpenFileKind, OpenFileMode};
@@ -592,6 +611,22 @@ mod tests {
                 .iter()
                 .any(|process| process.start_time_unix_ms.is_some())
         );
+    }
+
+    /// The monitor thread's list reads no argv, which can block behind another
+    /// process's memory-map lock; everything else is still there.
+    #[test]
+    fn linux_process_list_without_command_lines_keeps_everything_but_argv() {
+        let processes = read_process_list_without_command_lines()
+            .expect("process list should be readable from /proc");
+        assert!(!processes.is_empty());
+        assert!(
+            processes
+                .iter()
+                .all(|process| process.command_line.is_empty())
+        );
+        assert!(processes.iter().all(|process| !process.name.is_empty()));
+        assert!(processes.iter().any(|process| process.cwd.is_some()));
     }
 
     #[test]

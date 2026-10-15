@@ -330,6 +330,16 @@ pub trait Platform: Send + Sync {
         pal_not_implemented(self.name(), "process_list")
     }
 
+    /// [`Self::process_list`] with `command_line` left empty. Reading another
+    /// process's command line can block until that process releases its
+    /// memory-map lock, for many minutes under memory pressure: on ts2
+    /// (2026-10-15) the daemon's monitor thread sat 15+ minutes reading a
+    /// rustc's argv while one of its threads waited in mmap. The daemon's
+    /// monitor-thread callers need pids, cwd and counters only.
+    fn process_list_without_command_lines(&self) -> Result<Vec<ProcessInfo>> {
+        self.process_list()
+    }
+
     fn process_io(&self, _pid: i32) -> Result<ProcessIo> {
         pal_not_implemented(self.name(), "process_io")
     }
