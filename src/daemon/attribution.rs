@@ -101,10 +101,7 @@ struct WorkBudget {
 
 impl WorkBudget {
     fn take(&mut self, allowance: &mut usize, deadline: Instant) -> bool {
-        if self.remaining == 0
-            || *allowance == 0
-            || Instant::now() >= deadline.min(self.deadline)
-        {
+        if self.remaining == 0 || *allowance == 0 || Instant::now() >= deadline.min(self.deadline) {
             return false;
         }
         self.remaining -= 1;
@@ -120,9 +117,11 @@ struct Candidate {
     stamp: Metadata,
 }
 
-/// Largest observed directories on `mount`, with conventional containers
-/// expanded by one level. No descendant symlink is followed. File descriptors,
-/// depth, retained consumers, directory reads and monitor waiting are bounded.
+/// Largest observed directories on `mount`.
+///
+/// Conventional containers are expanded by one level. No descendant symlink
+/// is followed. File descriptors, depth, retained consumers, directory reads
+/// and monitor waiting are bounded.
 /// A truncated inventory marks every returned size incomplete: the ranking is
 /// among observed consumers, not a claim that unobserved consumers are smaller.
 /// Busy, stalled or failed probes return an explicitly incomplete observation.
@@ -384,25 +383,14 @@ fn measure_directory(
             continue;
         }
         let observed = if FileType::from_raw_mode(stat.st_mode).is_dir() {
-            match open_directory(directory, name, &stat) {
-                Ok(child) => {
-                    let (child_bytes, child_complete) = measure_directory(
-                        &child,
-                        device,
-                        depth + 1,
-                        work,
-                        allowance,
-                        deadline,
-                        seen,
-                    );
-                    complete &= child_complete;
-                    child_bytes
-                }
-                Err(_) => {
-                    complete = false;
-                    continue;
-                }
-            }
+            let Ok(child) = open_directory(directory, name, &stat) else {
+                complete = false;
+                continue;
+            };
+            let (child_bytes, child_complete) =
+                measure_directory(&child, device, depth + 1, work, allowance, deadline, seen);
+            complete &= child_complete;
+            child_bytes
         } else {
             let Some(inode) = stat_inode(&stat) else {
                 complete = false;
@@ -436,8 +424,7 @@ fn measure_directory(
 fn open_directory(parent: &File, name: &CStr, expected: &Stat) -> io::Result<File> {
     let file = File::from(openat(parent, name, DIRECTORY_FLAGS, Mode::empty())?);
     let metadata = file.metadata()?;
-    if stat_device(expected) != Some(metadata.dev())
-        || stat_inode(expected) != Some(metadata.ino())
+    if stat_device(expected) != Some(metadata.dev()) || stat_inode(expected) != Some(metadata.ino())
     {
         return Err(io::Error::other("directory changed before attribution"));
     }
@@ -483,6 +470,7 @@ pub fn describe(consumers: &[Consumer]) -> String {
         let bound = if consumer.complete { "" } else { ">=" };
         // Debug escaping keeps hostile file names from injecting log lines or
         // terminal control sequences. These paths are display-only.
+        #[allow(clippy::unnecessary_debug_formatting)]
         let _ = write!(out, "{:?} {bound}{gib:.1} GiB", consumer.path);
     }
     if consumers.iter().any(|consumer| !consumer.complete) {
@@ -507,7 +495,10 @@ mod tests {
         while active.load(Ordering::Acquire) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!active.load(Ordering::Acquire), "probe did not release admission");
+        assert!(
+            !active.load(Ordering::Acquire),
+            "probe did not release admission"
+        );
     }
 
     #[test]
@@ -684,11 +675,9 @@ mod tests {
         let fresh = unknown(Path::new("/new-mount"));
         let expected = fresh.clone();
         assert_eq!(
-            bounded_probe(
-                active,
-                Instant::now() + Duration::from_secs(5),
-                move || fresh,
-            ),
+            bounded_probe(active, Instant::now() + Duration::from_secs(5), move || {
+                fresh
+            },),
             Some(expected)
         );
     }
@@ -697,10 +686,7 @@ mod tests {
     fn busy_admission_reports_the_requested_mount_as_unknown() {
         let active = Arc::new(AtomicBool::new(true));
         let path = Path::new("/unobserved-mount");
-        assert_eq!(
-            top_consumers_with_gate(path, 100, 8, active),
-            unknown(path)
-        );
+        assert_eq!(top_consumers_with_gate(path, 100, 8, active), unknown(path));
         assert!(super::top_consumers(path, 100, 0).is_empty());
     }
 
@@ -722,7 +708,7 @@ mod tests {
     #[test]
     fn retained_consumer_cap_marks_the_inventory_incomplete() {
         let mount = tempfile::tempdir().unwrap();
-        for index in 0..MAX_CONSUMERS + 1 {
+        for index in 0..=MAX_CONSUMERS {
             fs::create_dir(mount.path().join(format!("tree-{index}"))).unwrap();
         }
         let consumers = top_consumers(mount.path(), 10_000, usize::MAX);
@@ -747,7 +733,10 @@ mod tests {
             .sum::<u64>();
         let consumers = top_consumers(mount.path(), 100, 8);
         assert_eq!(consumers.len(), 2);
-        assert_eq!(consumers.iter().map(|consumer| consumer.bytes).sum::<u64>(), expected);
+        assert_eq!(
+            consumers.iter().map(|consumer| consumer.bytes).sum::<u64>(),
+            expected
+        );
         assert!(consumers.iter().any(|consumer| !consumer.complete));
     }
 
@@ -757,7 +746,10 @@ mod tests {
         let tree = mount.path().join("tree");
         fs::create_dir(&tree).unwrap();
         let sparse = tree.join("sparse");
-        File::create(&sparse).unwrap().set_len(64 * 1024 * 1024).unwrap();
+        File::create(&sparse)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
         let expected = fs::metadata(&tree).unwrap().blocks() * 512
             + fs::metadata(&sparse).unwrap().blocks() * 512;
         let consumers = top_consumers(mount.path(), 100, 8);
