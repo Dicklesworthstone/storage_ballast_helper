@@ -102,6 +102,15 @@ Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballas
   a time, and whatever they hold before they wait for more work. Scanning
   a 200,000-directory tree took 82–95% fewer voluntary context switches
   and 16–21% less user CPU, in the same wall time.
+- **Memory pressure no longer flaps between levels** (`14530fe`). On
+  Linux, memory pressure is the kernel's 10-second stall average against
+  fixed thresholds (Warn 5%, Critical 20%). With the average hovering near
+  5%, the daemon switched between Normal and Warn every few seconds (up to
+  31 behavior changes an hour on one host), changing how aggressively it
+  scans each time. A level is now left only once the average falls a
+  fifth below its threshold. And a host that goes quiet after pressure is
+  now seen to recover: the daemon checked again only when a new stall
+  occurred, so it could stay at Warn or Critical indefinitely.
 - **The RSS warning no longer repeats every minute** (`13e8d5c`). While RSS
   stayed over the warning level (256 MiB), the daemon logged the same
   warning on every state write, about 1,440 lines a day on a host whose
