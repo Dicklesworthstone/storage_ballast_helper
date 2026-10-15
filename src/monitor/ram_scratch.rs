@@ -222,33 +222,35 @@ pub fn ram_log_mirror_refusal(platform: &dyn Platform, path: &Path) -> Option<St
     if ram_log_destination_healthy(&memory, stats.total_bytes, stats.available_bytes) {
         return None;
     }
-    Some(if memory.total_bytes == 0
-        || memory.available_bytes > memory.total_bytes
-        || memory.swap_free_bytes > memory.swap_total_bytes
-    {
-        "inconsistent host RAM or swap counters".to_owned()
-    } else if swap_nearly_full(&memory) {
-        format!(
-            "swap is nearly full ({} of {} MiB free)",
-            memory.swap_free_bytes >> 20,
-            memory.swap_total_bytes >> 20
-        )
-    } else if u128::from(memory.available_bytes) * 10 < u128::from(memory.total_bytes) {
-        format!(
-            "host RAM is short ({} of {} MiB available)",
-            memory.available_bytes >> 20,
-            memory.total_bytes >> 20
-        )
-    } else if stats.total_bytes == 0 || stats.available_bytes > stats.total_bytes {
-        format!("{} has inconsistent capacity counters", dir.display())
-    } else {
-        format!(
-            "{} has {} of {} MiB free",
-            dir.display(),
-            stats.available_bytes >> 20,
-            stats.total_bytes >> 20
-        )
-    })
+    Some(
+        if memory.total_bytes == 0
+            || memory.available_bytes > memory.total_bytes
+            || memory.swap_free_bytes > memory.swap_total_bytes
+        {
+            "inconsistent host RAM or swap counters".to_owned()
+        } else if swap_nearly_full(&memory) {
+            format!(
+                "swap is nearly full ({} of {} MiB free)",
+                memory.swap_free_bytes >> 20,
+                memory.swap_total_bytes >> 20
+            )
+        } else if u128::from(memory.available_bytes) * 10 < u128::from(memory.total_bytes) {
+            format!(
+                "host RAM is short ({} of {} MiB available)",
+                memory.available_bytes >> 20,
+                memory.total_bytes >> 20
+            )
+        } else if stats.total_bytes == 0 || stats.available_bytes > stats.total_bytes {
+            format!("{} has inconsistent capacity counters", dir.display())
+        } else {
+            format!(
+                "{} has {} of {} MiB free",
+                dir.display(),
+                stats.available_bytes >> 20,
+                stats.total_bytes >> 20
+            )
+        },
+    )
 }
 
 fn runtime_mount_pressured(mount: &ScratchMount) -> bool {
@@ -432,7 +434,12 @@ mod log_headroom_tests {
                 },
             );
         }
-        MockPlatform::new(vec![mount], stats, memory(available), PlatformPaths::default())
+        MockPlatform::new(
+            vec![mount],
+            stats,
+            memory(available),
+            PlatformPaths::default(),
+        )
     }
 
     #[test]
