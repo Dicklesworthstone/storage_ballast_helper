@@ -1555,7 +1555,10 @@ mod tests {
         writer.write_line("{\"recovered\":true}\n");
         writer.flush();
         assert_eq!(writer.state(), "fallback");
-        assert_eq!(fs::read_to_string(fallback).unwrap(), "{\"recovered\":true}\n");
+        assert_eq!(
+            fs::read_to_string(fallback).unwrap(),
+            "{\"recovered\":true}\n"
+        );
     }
 
     #[test]
@@ -1642,7 +1645,9 @@ mod tests {
             }
             drop(writer);
             assert_eq!(
-                fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(),
+                fs::metadata(dir.path().join("fallback.jsonl"))
+                    .unwrap()
+                    .len(),
                 0
             );
             assert_eq!(
@@ -1660,14 +1665,18 @@ mod tests {
         let bytes = writer.bytes_written();
         assert!(bytes > 0);
         assert_eq!(
-            fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(),
+            fs::metadata(dir.path().join("fallback.jsonl"))
+                .unwrap()
+                .len(),
             0
         );
         writer.try_recover();
         assert_eq!(writer.bytes_written(), bytes);
         writer.flush();
         assert_eq!(
-            fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(),
+            fs::metadata(dir.path().join("fallback.jsonl"))
+                .unwrap()
+                .len(),
             bytes
         );
     }
@@ -1681,11 +1690,15 @@ mod tests {
         writer.write_line(&line);
         writer.flush();
         assert_eq!(
-            fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(),
+            fs::metadata(dir.path().join("fallback.jsonl"))
+                .unwrap()
+                .len(),
             0
         );
         assert_eq!(
-            fs::metadata(dir.path().join("primary.jsonl")).unwrap().len(),
+            fs::metadata(dir.path().join("primary.jsonl"))
+                .unwrap()
+                .len(),
             line.len() as u64
         );
         writer.write_line("\n{\"small\":true}\n");
@@ -1756,8 +1769,14 @@ mod tests {
         assert_eq!(writer.state(), "fallback");
         assert!(!writer.mirroring());
         assert_eq!(fs::read_to_string(primary).unwrap(), before);
-        assert_eq!(fs::read_to_string(&fallback).unwrap(), format!("{before}{failed_line}"));
-        assert_eq!(writer.bytes_written(), fs::metadata(fallback).unwrap().len());
+        assert_eq!(
+            fs::read_to_string(&fallback).unwrap(),
+            format!("{before}{failed_line}")
+        );
+        assert_eq!(
+            writer.bytes_written(),
+            fs::metadata(fallback).unwrap().len()
+        );
     }
 
     #[test]
@@ -1770,7 +1789,9 @@ mod tests {
         assert_eq!(writer.state(), "stderr");
         drop(writer);
         assert_eq!(
-            fs::metadata(dir.path().join("fallback.jsonl")).unwrap().len(),
+            fs::metadata(dir.path().join("fallback.jsonl"))
+                .unwrap()
+                .len(),
             0
         );
     }
