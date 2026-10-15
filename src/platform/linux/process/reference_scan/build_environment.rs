@@ -144,6 +144,16 @@ pub(super) fn sweep(proc: &impl ProcAccess, proc_root: &Path, limits: Limits) ->
             }
             paths
         };
+        if tool == Tool::Rust && build_environment::unresolved_cargo_build_directory(&environ) {
+            result.missing(
+                pid,
+                "environ",
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CARGO_BUILD_BUILD_DIR template is unresolved",
+                ),
+            );
+        }
         for path in paths {
             // Keep attribution to every live process sharing a cache. The
             // resolver deduplicates within one invocation; the executor later
@@ -170,7 +180,13 @@ fn metadata(
         result.complete = false;
         return Vec::new();
     }
-    match sweep.proc.read_bounded(&process.join(file), limit) {
+    // Both files wait for the process's memory-map lock; a process wedged
+    // in mmap must not hold this sweep past its deadline.
+    let wait = sweep.remaining();
+    match sweep
+        .proc
+        .read_process_memory(&process.join(file), limit, wait)
+    {
         Ok(raw) => {
             let invalid = (!raw.is_empty() && !raw.ends_with(b"\0"))
                 || (file == "cmdline" && (raw.is_empty() || raw.first() == Some(&0)));
@@ -360,6 +376,26 @@ mod tests {
             open_targets_with(&access, &fixture.proc_root, Limits::default()).unwrap();
         assert!(!complete);
         assert!(targets.contains(&target));
+    }
+
+    #[test]
+    fn an_unresolved_build_dir_template_keeps_other_evidence_but_holds_the_batch() {
+        let fixture = Fixture::new();
+        let target = fixture.root.join("final");
+        fixture.install(
+            fixture.pid,
+            "rustc",
+            format!(
+                "CARGO_BUILD_BUILD_DIR={{cargo-cache-home}}/build\0CARGO_TARGET_DIR={}\0",
+                target.display()
+            )
+            .as_bytes(),
+            b"rustc\0lib.rs\0",
+        );
+        let found = fixture.collect(&NativeProc);
+        assert!(!found.complete);
+        assert_eq!(found.directories, vec![(fixture.pid, target)]);
+        assert_eq!(found.denied.unwrap().file, "environ");
     }
 
     #[test]

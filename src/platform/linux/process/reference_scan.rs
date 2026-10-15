@@ -4,7 +4,9 @@
 //! that this sweep inspected its visible scope, not that procfs is an atomic
 //! snapshot or that hidepid/container namespaces expose every host process.
 //! Deadlines are cooperative: a single blocked kernel operation cannot be
-//! interrupted here. Caps bound discovery, descriptor work, and result memory.
+//! interrupted here, except `cmdline` and `environ` reads, which wait on the
+//! target's memory-map lock and are abandoned at the deadline
+//! (`memory_reads`). Caps bound discovery, descriptor work, and result memory.
 
 use std::ffi::OsString;
 use std::fs;
@@ -20,6 +22,7 @@ use crate::core::errors::{Result, SbhError};
 use crate::platform::types::{ExecutablesResult, OpenFile, OpenFilesResult, ProcessInfo};
 
 mod build_environment;
+mod memory_reads;
 mod unix_sockets;
 
 use build_environment::sweep as build_directory_sweep;
@@ -48,6 +51,19 @@ trait ProcAccess {
     fn read_bounded(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
         read_proc_bytes(path, limit)
     }
+
+    /// [`Self::read_bounded`] for `cmdline` or `environ`, whose read waits for
+    /// the process's memory-map lock and so lasts as long as the process is
+    /// stuck in a fault or mmap. Production stops waiting after `wait`.
+    fn read_process_memory(
+        &self,
+        path: &Path,
+        limit: usize,
+        wait: Duration,
+    ) -> io::Result<Vec<u8>> {
+        let _ = wait;
+        self.read_bounded(path, limit)
+    }
 }
 
 struct NativeProc;
@@ -69,6 +85,17 @@ impl ProcAccess for NativeProc {
 
     fn now(&self) -> Instant {
         Instant::now()
+    }
+
+    fn read_process_memory(
+        &self,
+        path: &Path,
+        limit: usize,
+        wait: Duration,
+    ) -> io::Result<Vec<u8>> {
+        let process = path.parent().unwrap_or(path);
+        let path = path.to_path_buf();
+        memory_reads::read(process, wait, move || read_proc_bytes(&path, limit))
     }
 }
 
@@ -143,6 +170,16 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
         let path = table.path(inode).map(Path::to_path_buf);
         self.expired();
         path
+    }
+
+    /// Time left before the deadline.
+    fn remaining(&self) -> Duration {
+        let elapsed = self
+            .proc
+            .now()
+            .checked_duration_since(self.started)
+            .unwrap_or(self.limits.time);
+        self.limits.time.saturating_sub(elapsed)
     }
 
     fn expired(&mut self) -> bool {
