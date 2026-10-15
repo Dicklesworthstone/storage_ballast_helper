@@ -10,6 +10,18 @@ Compare: [`v0.7.5...v0.7.6`](https://github.com/Dicklesworthstone/storage_ballas
 
 ### Fixed
 
+- **An offloaded `rch` build's target directory counts as in use**
+  (`eb43d58`). `rch exec -- cargo build` compiles on a worker, so the only
+  local process is `rch`, which sbh did not treat as a build process, and
+  nothing holds the `CARGO_TARGET_DIR` open until the artifacts sync back.
+  On a dispatcher, v0.7.5 deleted a live build's fresh, empty target
+  directory eight minutes into the build, and the sync-back recreated it.
+  `rch` now counts as a Rust build process, so the `CARGO_TARGET_DIR` and
+  cargo home named in its environment are in use while it runs.
+- **The planner never deletes an empty candidate** (`eb43d58`). At
+  Critical pressure with no risk budget, it could choose a 0-byte candidate,
+  which frees nothing and still risks a live directory. That empty target
+  above was such a choice.
 - **`sbh check` honours the absolute free-space floors** (`bca8ba4`). It
   compared free space with the Yellow percentage alone and ignored the
   `*_min_free_bytes` floors that the daemon's levels use, so a large disk
@@ -31,6 +43,13 @@ Compare: [`v0.7.5...v0.7.6`](https://github.com/Dicklesworthstone/storage_ballas
   Every path now refuses such candidates, and `clean`/`emergency` print a
   hint to run `sudo sbh <command>` or the system-scope daemon. Root sbh and
   every Linux sbh are unchanged.
+
+### Changed
+
+- **sbh identifies itself honestly in HTTP requests** (`2eb0210`). The
+  updater, release-asset downloads and webhook notifications sent a
+  User-Agent borrowed from other companies' clients. They now send
+  `sbh (+https://github.com/Dicklesworthstone/storage_ballast_helper)`.
 
 ## v0.7.5 **[release]**
 
