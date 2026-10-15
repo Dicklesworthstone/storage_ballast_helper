@@ -8,6 +8,17 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.6...v0.7.7)
 
+### Fixed
+
+- **A directory with more than 65,536 entries is covered over successive
+  passes** (`d1f154d`). The walker stopped at that many entries and
+  started at the top again every pass, so the rest was never visited. On
+  btrfs, which lists entries in creation order, that is the newest ones:
+  a 68,519-entry `/data/tmp` hid its newest 2,984 entries (40 GiB) from
+  every pass. Each pass now processes the next 65,536 entries, and every
+  name is still read, so a `.sbh-protect` marker anywhere in a large
+  directory protects it.
+
 ### Changed
 
 - **Scan workers hand their results over in batches** (bd-vf9z;
