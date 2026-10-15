@@ -15,6 +15,14 @@ Compare: [`v0.7.7...v0.7.8`](https://github.com/Dicklesworthstone/storage_ballas
   first artifact exists, but only for known build subcommands; Cargo's
   built-in alias `d` was missing (`b`, `c`, `t` and `r` were covered).
 
+### Changed
+
+- **Maintenance passes stop repeating the same "keep" lines** (`94a2e3d`).
+  A maintenance pass logs why each classified entry was kept, and the same
+  entries recur on every pass: on one host that was 100,000 identical lines
+  a day, 95% of sbh's journal, on a disk at 95%. Each path is now logged
+  when first seen, when its verdict changes, and otherwise hourly.
+
 ## v0.7.7 **[release]**
 
 Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.6...v0.7.7)
