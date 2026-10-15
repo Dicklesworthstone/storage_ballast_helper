@@ -183,6 +183,32 @@ fn linux_pressure_level(psi_avg10_centipercent: Option<u64>) -> MemoryPressureLe
     }
 }
 
+/// `level` with an exit band: a level is left only once PSI avg10 falls a
+/// fifth below its threshold. avg10 hovering near 5% flipped the daemon
+/// between Normal and Warn every 2-15 s on ts2 (2026-10-15, up to 31 behavior
+/// changes an hour).
+fn banded_level(
+    previous: MemoryPressureLevel,
+    psi_avg10_centipercent: Option<u64>,
+    level: MemoryPressureLevel,
+) -> MemoryPressureLevel {
+    let Some(avg10) = psi_avg10_centipercent else {
+        return level;
+    };
+    let holds = |threshold: u64| avg10 >= threshold - threshold / 5;
+    match (previous, level) {
+        (
+            MemoryPressureLevel::Critical,
+            MemoryPressureLevel::Warn | MemoryPressureLevel::Normal,
+        ) if holds(PSI_CRITICAL_AVG10_CENTIPERCENT) => MemoryPressureLevel::Critical,
+        (
+            MemoryPressureLevel::Critical | MemoryPressureLevel::Warn,
+            MemoryPressureLevel::Normal,
+        ) if holds(PSI_WARN_AVG10_CENTIPERCENT) => MemoryPressureLevel::Warn,
+        _ => level,
+    }
+}
+
 fn system_page_size_bytes() -> u64 {
     nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
         .ok()
@@ -261,21 +287,25 @@ where
                     Err(Errno::EINTR) => continue,
                     Err(_) => break,
                 };
-                if count == 0 {
+                if count > 0 {
+                    let flags = events[0].events();
+                    if flags.intersects(EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP) {
+                        break;
+                    }
+                    if !flags.contains(EpollFlags::EPOLLPRI) {
+                        continue;
+                    }
+                } else if last_level == MemoryPressureLevel::Normal {
                     continue;
                 }
+                // The trigger fires only on stalls, so a host that goes
+                // quiet after pressure never fires it again: above Normal,
+                // the timeout samples too, or recovery would go unseen.
 
-                let flags = events[0].events();
-                if flags.intersects(EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP) {
-                    break;
-                }
-                if !flags.contains(EpollFlags::EPOLLPRI) {
-                    continue;
-                }
-
-                let Ok(pressure) = sampler() else {
+                let Ok(mut pressure) = sampler() else {
                     continue;
                 };
+                pressure.level = banded_level(last_level, pressure.linux_psi_avg10, pressure.level);
                 if pressure.level != last_level {
                     last_level = pressure.level;
                     callback(pressure);
@@ -315,9 +345,10 @@ where
                 if weak_liveness.upgrade().is_none() {
                     break;
                 }
-                let Ok(pressure) = sampler() else {
+                let Ok(mut pressure) = sampler() else {
                     continue;
                 };
+                pressure.level = banded_level(last_level, pressure.linux_psi_avg10, pressure.level);
                 if pressure.level != last_level {
                     last_level = pressure.level;
                     callback(pressure);
@@ -341,9 +372,31 @@ mod tests {
     use crate::platform::types::{MemoryPressure, MemoryPressureLevel};
 
     use super::{
-        memory_pressure_from_info, memory_psi_trigger_spec, parse_meminfo, parse_memory_psi_avg10,
-        spawn_memory_pressure_subscription,
+        banded_level, memory_pressure_from_info, memory_psi_trigger_spec, parse_meminfo,
+        parse_memory_psi_avg10, spawn_memory_pressure_subscription,
     };
+
+    #[test]
+    fn levels_are_left_only_a_fifth_below_their_threshold() {
+        use MemoryPressureLevel::{Critical, Normal, Unknown, Warn};
+        let banded = |previous, avg10: u64, level| banded_level(previous, Some(avg10), level);
+        // Entering is unchanged.
+        assert_eq!(banded(Normal, 500, Warn), Warn);
+        assert_eq!(banded(Warn, 2_000, Critical), Critical);
+        // Warn holds down to 4%, then recovers.
+        assert_eq!(banded(Warn, 450, Normal), Warn);
+        assert_eq!(banded(Warn, 400, Normal), Warn);
+        assert_eq!(banded(Warn, 399, Normal), Normal);
+        // Critical holds down to 16%, then falls to the level PSI shows,
+        // still banded against Warn.
+        assert_eq!(banded(Critical, 1_700, Warn), Critical);
+        assert_eq!(banded(Critical, 1_599, Warn), Warn);
+        assert_eq!(banded(Critical, 450, Normal), Warn);
+        assert_eq!(banded(Critical, 100, Normal), Normal);
+        // No PSI, or no prior level, means no band.
+        assert_eq!(banded_level(Warn, None, Normal), Normal);
+        assert_eq!(banded(Unknown, 450, Normal), Normal);
+    }
 
     #[test]
     fn parses_meminfo_with_kib_units() {
