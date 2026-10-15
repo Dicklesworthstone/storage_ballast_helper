@@ -8,10 +8,10 @@
 //! remembered across sweeps. Observations are not atomic filesystem snapshots.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, Metadata, OpenOptions};
+use std::fs::{self, Metadata};
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 mod default_outputs;
@@ -479,10 +479,7 @@ fn read_observed_file(
             "Cargo configuration is not a bounded regular file",
         ));
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(&resolved)?;
+    let file = open_config(&resolved)?;
     let opened = file.metadata()?;
     if !same_file(&before, &opened) {
         return Err(io::Error::other(
@@ -507,6 +504,67 @@ fn read_observed_file(
         ));
     }
     Ok(raw)
+}
+
+/// Open a configuration file for reading. Any local user can name the path
+/// (`cargo --config <path>`, `--manifest-path`, an include) and the daemon
+/// reads it as root. On Linux no symlink is followed anywhere in the already
+/// canonical path, so a directory swapped for a link into /dev between the
+/// checks above and this open cannot make root open a device, and a file on
+/// a kernel pseudo-filesystem is refused before a byte is read: reading
+/// /proc/kmsg as root drains the kernel log.
+#[cfg(target_os = "linux")]
+fn open_config(resolved: &Path) -> io::Result<fs::File> {
+    use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, fstatfs, openat2};
+
+    let file = fs::File::from(openat2(
+        CWD,
+        resolved,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )?);
+    if is_pseudo_filesystem(fstatfs(&file)?.f_type) {
+        return Err(io::Error::other(
+            "Cargo configuration is on a kernel pseudo-filesystem",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_config(resolved: &Path) -> io::Result<fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(resolved)
+}
+
+/// procfs, sysfs, debugfs, tracefs, securityfs, configfs, efivarfs, pstore,
+/// bpffs and cgroup v1/v2 (`statfs(2)` magic numbers): never where a Cargo
+/// configuration lives, and reading some of their files has side effects.
+#[cfg(target_os = "linux")]
+fn is_pseudo_filesystem<T>(f_type: T) -> bool
+where
+    u32: TryFrom<T>,
+{
+    const PSEUDO: [u32; 11] = [
+        0x0000_9fa0, // proc
+        0x6265_6572, // sysfs
+        0x6462_6720, // debugfs
+        0x7472_6163, // tracefs
+        0x7363_6673, // securityfs
+        0x6265_6570, // configfs
+        0xde5e_81e4, // efivarfs
+        0x6165_676c, // pstore
+        0xcafe_4a11, // bpf
+        0x0027_e0eb, // cgroup
+        0x6367_7270, // cgroup2
+    ];
+    u32::try_from(f_type).is_ok_and(|magic| PSEUDO.contains(&magic))
 }
 
 fn same_file(a: &Metadata, b: &Metadata) -> bool {
@@ -935,5 +993,19 @@ mod tests {
             fs::read(&replacement).unwrap(),
             b"[build]\ntarget-dir='/replacement'"
         );
+    }
+
+    /// A local user names the path and the daemon reads it as root: a regular
+    /// file on procfs (as /proc/kmsg is, whose read drains the kernel log)
+    /// is refused before any byte is read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configuration_on_a_kernel_pseudo_filesystem_is_never_read() {
+        let error = read_file(Path::new("/proc/self/status"), FILE_BYTES).unwrap_err();
+        assert!(error.to_string().contains("pseudo-filesystem"), "{error}");
+        assert!(is_pseudo_filesystem(0x9fa0_i64));
+        assert!(is_pseudo_filesystem(0xde5e_81e4_u32));
+        assert!(!is_pseudo_filesystem(0xef53_i64), "ext4");
+        assert!(!is_pseudo_filesystem(-1_i64));
     }
 }
