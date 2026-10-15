@@ -4,9 +4,22 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
-## v0.7.7
+## v0.7.7 **[release]**
 
 Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.6...v0.7.7)
+
+An availability and safety release. On a host under memory pressure, a
+build stuck in `mmap` froze the daemon's monitor for 19 minutes: no pressure
+response and no ballast release on a Critical host. Neither the monitor nor
+scans and deletions now wait on another process's memory. On Linux, a live
+build's command-line output directories, its Cargo config's target and
+build directories, and its default `target/` now count as in use, and a
+build that can't be fully inspected holds the batch. Also: directories with
+more than 65,536 entries are covered over successive passes, a local user
+can no longer make the root daemon read kernel pseudo-files as Cargo
+configuration, memory pressure no longer flaps between levels, scan workers
+hand over results in batches (16–21% less user CPU), and protection
+refusals are reported as refusals.
 
 ### Fixed
 
