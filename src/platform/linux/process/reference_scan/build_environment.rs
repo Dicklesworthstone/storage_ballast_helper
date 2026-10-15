@@ -49,17 +49,14 @@ impl BuildReferences {
 
     fn missing(&mut self, pid: i32, file: &'static str, error: io::Error) {
         self.complete = false;
-        self.denied.get_or_insert(UnreadableProcess { pid, file, error });
+        self.denied
+            .get_or_insert(UnreadableProcess { pid, file, error });
     }
 }
 
 /// Read only metadata of recognized tools, keeping independent positive
 /// observations and one bounded diagnostic. The caller owns the scan budget.
-pub(super) fn sweep(
-    proc: &impl ProcAccess,
-    proc_root: &Path,
-    limits: Limits,
-) -> BuildReferences {
+pub(super) fn sweep(proc: &impl ProcAccess, proc_root: &Path, limits: Limits) -> BuildReferences {
     let mut sweep = Sweep::new(proc, limits);
     let mut result = BuildReferences::new();
     if sweep.expired() {
@@ -113,13 +110,7 @@ pub(super) fn sweep(
                 BUILD_ARGV_LIMIT,
                 &mut result,
             );
-            build_invocation::references(
-                CacheLayout::Linux,
-                tool,
-                &argv,
-                &environ,
-                cwd.as_deref(),
-            )
+            build_invocation::references(CacheLayout::Linux, tool, &argv, &environ, cwd.as_deref())
         };
         for path in paths {
             // Keep attribution to every live process sharing a cache. The
@@ -154,9 +145,8 @@ fn metadata(
             if invalid {
                 // Zombies can still have a build-tool comm but no argv. An
                 // empty argv alone is not proof of that terminal state.
-                let terminal = file == "cmdline"
-                    && raw.is_empty()
-                    && sweep.no_user_executable(process, pid);
+                let terminal =
+                    file == "cmdline" && raw.is_empty() && sweep.no_user_executable(process, pid);
                 if !terminal {
                     result.missing(
                         pid,
@@ -169,9 +159,7 @@ fn metadata(
         }
         Err(error) => {
             let gone = error.raw_os_error() == Some(libc::ESRCH)
-                || (disappeared(&error)
-                    && !sweep.expired()
-                    && sweep.proc.process_gone(process));
+                || (disappeared(&error) && !sweep.expired() && sweep.proc.process_gone(process));
             if !gone {
                 result.missing(pid, file, error);
             }
@@ -336,12 +324,26 @@ mod tests {
     #[test]
     fn unavailable_argv_keeps_environment_evidence_and_never_certifies_absence() {
         let fixture = Fixture::new();
-        fixture.install(fixture.pid, "cargo", b"CARGO_TARGET_DIR=/known\0", b"cargo\0");
-        for code in [libc::EACCES, libc::EPERM, libc::ENOENT, libc::EIO, libc::EMFILE] {
+        fixture.install(
+            fixture.pid,
+            "cargo",
+            b"CARGO_TARGET_DIR=/known\0",
+            b"cargo\0",
+        );
+        for code in [
+            libc::EACCES,
+            libc::EPERM,
+            libc::ENOENT,
+            libc::EIO,
+            libc::EMFILE,
+        ] {
             let access = Fault::new("cmdline", code);
             let found = fixture.collect(&access);
             assert!(!found.complete, "{code}");
-            assert_eq!(found.directories, vec![(fixture.pid, PathBuf::from("/known"))]);
+            assert_eq!(
+                found.directories,
+                vec![(fixture.pid, PathBuf::from("/known"))]
+            );
             assert_eq!(found.denied.unwrap().file, "cmdline");
             let (targets, complete) =
                 open_targets_with(&access, &fixture.proc_root, Limits::default()).unwrap();
@@ -363,7 +365,10 @@ mod tests {
             fs::write(process.join("cmdline"), raw).unwrap();
             let found = fixture.collect(&NativeProc);
             assert!(!found.complete);
-            assert_eq!(found.directories, vec![(fixture.pid, PathBuf::from("/known"))]);
+            assert_eq!(
+                found.directories,
+                vec![(fixture.pid, PathBuf::from("/known"))]
+            );
         }
         let cmdline = process.join("cmdline");
         fs::rename(&cmdline, process.join("saved-argv")).unwrap();
@@ -374,7 +379,10 @@ mod tests {
         .unwrap();
         let found = fixture.collect(&NativeProc);
         assert!(!found.complete);
-        assert_eq!(found.directories, vec![(fixture.pid, PathBuf::from("/known"))]);
+        assert_eq!(
+            found.directories,
+            vec![(fixture.pid, PathBuf::from("/known"))]
+        );
     }
 
     #[test]
@@ -411,7 +419,10 @@ mod tests {
         let expected = fixture.root.join(std::ffi::OsString::from_vec(
             b"../target-\xff = data".to_vec(),
         ));
-        assert_eq!(fixture.collect(&NativeProc).directories, vec![(fixture.pid, expected)]);
+        assert_eq!(
+            fixture.collect(&NativeProc).directories,
+            vec![(fixture.pid, expected)]
+        );
     }
 
     #[test]
@@ -441,7 +452,12 @@ mod tests {
     #[test]
     fn deadline_exhaustion_retains_positives_without_starting_an_argv_read() {
         let fixture = Fixture::new();
-        fixture.install(fixture.pid, "cargo", b"CARGO_TARGET_DIR=/known\0", b"cargo\0");
+        fixture.install(
+            fixture.pid,
+            "cargo",
+            b"CARGO_TARGET_DIR=/known\0",
+            b"cargo\0",
+        );
         let mut access = Fault::new("unused", libc::EIO);
         access.step = Duration::from_secs(1);
         let found = sweep(
@@ -453,9 +469,18 @@ mod tests {
             },
         );
         assert!(!found.complete);
-        assert_eq!(found.directories, vec![(fixture.pid, PathBuf::from("/known"))]);
+        assert_eq!(
+            found.directories,
+            vec![(fixture.pid, PathBuf::from("/known"))]
+        );
         assert_eq!(access.reads.borrow().len(), 2);
-        assert!(!access.reads.borrow().iter().any(|path| path.ends_with("cmdline")));
+        assert!(
+            !access
+                .reads
+                .borrow()
+                .iter()
+                .any(|path| path.ends_with("cmdline"))
+        );
     }
 
     #[test]

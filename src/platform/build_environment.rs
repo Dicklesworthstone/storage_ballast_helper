@@ -690,7 +690,9 @@ mod tests {
         assert_eq!(
             references(Tool::Rust, env, Some(Path::new("/project"))),
             vec![
-                PathBuf::from(OsString::from_vec(b"/project/../build-\xff = data".to_vec())),
+                PathBuf::from(OsString::from_vec(
+                    b"/project/../build-\xff = data".to_vec()
+                )),
                 PathBuf::from("/project/generated"),
             ]
         );
@@ -708,7 +710,11 @@ mod tests {
                 "CARGO_BUILD_BUILD_DIR={template}\0CARGO_TARGET_DIR=/final\0OUT_DIR=/resolved-output\0"
             );
             assert_eq!(
-                references(Tool::Rust, env.as_bytes(), Some(Path::new("/not-the-workspace"))),
+                references(
+                    Tool::Rust,
+                    env.as_bytes(),
+                    Some(Path::new("/not-the-workspace"))
+                ),
                 paths(&["/final", "/resolved-output"])
             );
         }
@@ -717,7 +723,10 @@ mod tests {
     #[test]
     fn split_outputs_keep_first_key_semantics_and_ignore_incomplete_tail_values() {
         let env = b"CARGO_BUILD_BUILD_DIR=/first\0CARGO_BUILD_BUILD_DIR=/second\0OUT_DIR=/generated\0CARGO_BUILD_TARGET_DIR=/unfinished";
-        assert_eq!(references(Tool::Rust, env, None), paths(&["/first", "/generated"]));
+        assert_eq!(
+            references(Tool::Rust, env, None),
+            paths(&["/first", "/generated"])
+        );
         for env in [
             b"CARGO_BUILD_TARGET_DIR=\0CARGO_BUILD_BUILD_DIR=\0OUT_DIR=\0".as_slice(),
             b"CARGO_BUILD_BUILD_DIR=/unfinished",

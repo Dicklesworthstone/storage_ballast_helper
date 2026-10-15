@@ -783,15 +783,20 @@ mod tests {
 
     #[test]
     fn renamed_cargo_binary_keeps_its_explicit_target_directory() {
-        for program in [b"cargo-rch-real".as_slice(), b"/toolchain/bin/cargo-rch-real"] {
+        for program in [
+            b"cargo-rch-real".as_slice(),
+            b"/toolchain/bin/cargo-rch-real",
+        ] {
             assert_eq!(
-                cli_paths(Tool::Rust, &[program, b"build", b"--target-dir=/pool"], None),
+                cli_paths(
+                    Tool::Rust,
+                    &[program, b"build", b"--target-dir=/pool"],
+                    None
+                ),
                 vec![PathBuf::from("/pool")]
             );
         }
-        assert!(
-            cli_paths(Tool::Rust, &[b"cargo-data", b"--target-dir=/decoy"], None).is_empty()
-        );
+        assert!(cli_paths(Tool::Rust, &[b"cargo-data", b"--target-dir=/decoy"], None).is_empty());
     }
 
     #[test]
@@ -829,7 +834,12 @@ mod tests {
     #[test]
     fn incremental_evidence_is_family_scoped_and_stops_at_forwarded_arguments() {
         for args in [
-            vec![b"cargo".as_slice(), b"rustc", b"--", b"-Cincremental=/decoy"],
+            vec![
+                b"cargo".as_slice(),
+                b"rustc",
+                b"--",
+                b"-Cincremental=/decoy",
+            ],
             vec![b"rustc".as_slice(), b"--", b"-Cincremental=/decoy"],
             vec![b"rustc".as_slice(), b"-C", b"link-arg=incremental=/decoy"],
             vec![b"rustc".as_slice(), b"--cfg", b"-Cincremental=/decoy"],
@@ -860,7 +870,11 @@ mod tests {
 
     #[test]
     fn split_environment_and_compiler_outputs_are_preserved_together() {
-        let args = argv(&[b"rustc", b"--out-dir=/objects", b"-Cincremental=/incremental"]);
+        let args = argv(&[
+            b"rustc",
+            b"--out-dir=/objects",
+            b"-Cincremental=/incremental",
+        ]);
         let env = b"CARGO_TARGET_DIR=/final\0CARGO_BUILD_BUILD_DIR=/build\0OUT_DIR=/generated\0";
         for layout in [CacheLayout::Linux, CacheLayout::MacOs] {
             assert_eq!(
