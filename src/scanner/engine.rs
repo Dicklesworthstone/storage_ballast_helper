@@ -1,9 +1,8 @@
 //! Scanner engine rollout selection.
 //!
-//! The v2 engine is selectable through configuration and currently dispatches
-//! to the opaque-pruning walker. The default remains v1 until validation and
-//! promotion artifacts prove that v2 is safe enough to make the production
-//! default.
+//! The v2 engine, the default (`ScannerEngineMode::V2` in the scanner config),
+//! dispatches to the opaque-pruning walker. Configuring `engine = "v1"` opts
+//! back into the legacy full-descent walker.
 
 use std::fmt;
 
