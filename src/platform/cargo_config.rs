@@ -1,4 +1,4 @@
-//! Read-only, bounded evidence for Cargo outputs named in configuration files.
+//! Read-only, bounded evidence for configured and default Cargo outputs.
 //!
 //! This is a deny-only observer, not Cargo's configuration evaluator. Retain
 //! destinations from all observed layers rather than guessing which override
@@ -13,6 +13,8 @@ use std::io::{self, Read};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+mod default_outputs;
 
 const FILE_BYTES: usize = 64 * 1024;
 const TOTAL_BYTES: usize = 1024 * 1024;
@@ -42,6 +44,8 @@ struct Parsed {
     destinations: Vec<String>,
     includes: Vec<Include>,
     incomplete: bool,
+    target_override: bool,
+    manifest: default_outputs::Manifest,
 }
 
 #[derive(Clone)]
@@ -64,6 +68,7 @@ struct Observation {
     paths: BTreeSet<PathBuf>,
     complete: bool,
     visits: usize,
+    target_override: bool,
 }
 
 impl Observation {
@@ -121,6 +126,9 @@ impl Resolver {
             paths: BTreeSet::new(),
             complete: true,
             visits: 0,
+            target_override: [b"CARGO_TARGET_DIR".as_slice(), b"CARGO_BUILD_TARGET_DIR"]
+                .iter()
+                .any(|key| env_value(environment, key).is_some_and(|value| !value.is_empty())),
         };
         if !is_cargo(argv) {
             return Evidence {
@@ -156,6 +164,16 @@ impl Resolver {
             self.directory(&home.join(".cargo"), &mut observation, &mut read);
         }
         self.command_line(argv, cwd, &mut observation, &mut read);
+        // Resolve the manifest's default output scope before the first
+        // compiler child or artifact exists. An observed target override
+        // suppresses that default; an independent build-dir override does not.
+        if !observation.target_override {
+            if !environment.is_empty() && !environment.ends_with(b"\0") {
+                observation.complete = false;
+            } else if let Some(request) = default_outputs::request(argv) {
+                self.default_target(request, cwd, &mut observation, &mut read);
+            }
+        }
         Evidence {
             directories: observation.paths.into_iter().collect(),
             complete: observation.complete,
@@ -241,6 +259,7 @@ impl Resolver {
                 // config file, including files supplied with --config.
                 let base = path.parent().and_then(Path::parent);
                 observation.complete &= !parsed.incomplete;
+                observation.target_override |= parsed.target_override;
                 for value in parsed.destinations {
                     observation.add(base, &value);
                 }
@@ -300,6 +319,7 @@ impl Resolver {
                 match parse(value) {
                     Some(parsed) => {
                         observation.complete &= !parsed.incomplete && parsed.includes.is_empty();
+                        observation.target_override |= parsed.target_override;
                         for value in parsed.destinations {
                             observation.add(cwd, &value);
                         }
@@ -333,6 +353,10 @@ fn cargo_value_option(arg: &[u8]) -> bool {
             | b"--message-format"
             | b"--color"
             | b"--lockfile-path"
+            | b"--bin"
+            | b"--example"
+            | b"--test"
+            | b"--bench"
             | b"-C"
             | b"-Z"
     )
@@ -368,6 +392,7 @@ fn parse(raw: &[u8]) -> Option<Parsed> {
     let mut parsed = Parsed::default();
     if let Some(build) = document.get("build") {
         if build.is_table() {
+            parsed.target_override = build.get("target-dir").is_some();
             for key in ["target-dir", "build-dir"] {
                 if let Some(value) = build.get(key) {
                     if let Some(value) = value.as_str().filter(|value| {
@@ -418,6 +443,7 @@ fn parse(raw: &[u8]) -> Option<Parsed> {
             parsed.incomplete = true;
         }
     }
+    parsed.manifest = default_outputs::parse_manifest(&document);
     Some(parsed)
 }
 
