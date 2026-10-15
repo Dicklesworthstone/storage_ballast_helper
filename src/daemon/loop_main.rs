@@ -9952,11 +9952,12 @@ fn executor_thread_main(
             protection::sacred_paths_from_protected_patterns(&scanner_config.protected_paths);
         let skip_protected = |path: &Path| {
             if shutdown.load(Ordering::Relaxed) {
-                return true;
+                return Some(SkipReason::ShuttingDown);
             }
             // Runs once per candidate: a long batch keeps beating.
             heartbeat.beat();
             let mut protection = protection.lock();
+            // A proved or unprovable (fail-closed) protection refusal.
             should_skip_protected_daemon_candidate(
                 &mut protection,
                 path,
@@ -9964,6 +9965,7 @@ fn executor_thread_main(
                 logger,
                 "executor preflight",
             )
+            .then_some(SkipReason::SacredStowaway)
         };
 
         // Regret labels (Q4): the entry identity (parent device and inode,
@@ -11334,7 +11336,7 @@ mod tests {
             let mut protection = protection.lock();
             daemon_protection_reason(&mut protection, path, &sacred_paths)
                 .unwrap()
-                .is_some()
+                .map(|_| SkipReason::SacredStowaway)
         };
 
         let executor = DeletionExecutor::new(
@@ -11352,6 +11354,7 @@ mod tests {
 
         assert_eq!(report.items_deleted, 0);
         assert_eq!(report.items_skipped, 1);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
         assert!(
             protected.exists(),
             "protected candidate must remain present after executor preflight"
