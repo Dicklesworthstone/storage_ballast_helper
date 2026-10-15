@@ -182,6 +182,10 @@ impl Platform for LinuxPal {
         process::read_build_directories_in_use()
     }
 
+    fn build_directories_in_use_checked(&self) -> (Vec<(i32, std::path::PathBuf)>, bool) {
+        process::read_build_directory_snapshot()
+    }
+
     fn mmap_regions_under(&self, path: &Path) -> Result<Vec<crate::platform::types::MappedRegion>> {
         process::read_mmap_regions_under(path)
     }
