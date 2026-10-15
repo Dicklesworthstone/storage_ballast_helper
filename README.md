@@ -231,9 +231,11 @@ gh release download --repo Dicklesworthstone/storage_ballast_helper --pattern "s
 ### Verify a Release
 
 Each release ships a manifest, `storage_ballast_helper-vX.Y.Z-manifest.json`,
-that lists every artifact's SHA-256, and a minisign signature for it
-(`.minisig`). Check the signature, then check the file you downloaded
-against the manifest:
+that lists every archive's SHA-256, and a minisign signature for it
+(`.minisig`). The raw `sbh_<os>_<arch>` binaries are not all listed under
+their published names, so verify the archive for your platform; the `sbh`
+inside it is the same file as the raw binary. Check the signature, then
+check the archive against the manifest:
 
 ```bash
 V=0.7.4
