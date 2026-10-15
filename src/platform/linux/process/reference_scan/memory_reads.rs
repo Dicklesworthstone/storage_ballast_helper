@@ -48,6 +48,7 @@ pub(super) fn read(
             let mut abandoned = ABANDONED.lock();
             abandoned.retain(|path| *path != key);
             let _ = reply.send(value);
+            drop(abandoned);
         })?;
     match result.recv_timeout(wait) {
         Ok(value) => value,
@@ -57,6 +58,7 @@ pub(super) fn read(
                 return value;
             }
             abandoned.push(process.to_path_buf());
+            drop(abandoned);
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "process memory read blocked past the sweep deadline",
