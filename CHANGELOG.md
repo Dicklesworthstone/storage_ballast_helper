@@ -61,6 +61,28 @@ Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballas
   with it: no logging, no pressure response, no ballast release on a
   Critical host. Those checks never used the command line and no longer
   read it.
+- **A wedged process can no longer stall scans or deletions either**
+  (`3b45c3d`, `bbf3867`). Two more readers waited on that lock. The
+  scanner's index of what live processes use read every process's command
+  line, for names and working directories it gets elsewhere; it no longer
+  does. The build inspection before each deletion batch must read build
+  tools' environments and arguments, so on Linux each read now runs on a
+  helper thread and is abandoned at the inspection's 30-second deadline.
+  A process whose read is stuck counts as not inspected, so the batch
+  waits as for any incomplete check. It costs one blocked thread until it
+  recovers, not one per sweep.
+- **An unexpandable `CARGO_BUILD_BUILD_DIR` holds the batch** (`3b45c3d`).
+  A build-dir template (`{workspace-root}`, `{cargo-cache-home}`, ...) in
+  a build's environment was skipped silently, though the same template in
+  a Cargo config file already held the batch. Both now do; the build's
+  other declared directories stay protected either way.
+- **Protection refusals are reported as refusals** (bd-drua; `30f55e1`).
+  A candidate the daemon's executor refused because it is protected (an
+  `.sbh-protect` marker, a sacred path, or a protection check that failed
+  and is treated as protected) was counted under `target_free_reached`,
+  documented as "not a refusal — a success". It is now `sacred_stowaway`.
+  A batch cut short by shutdown reports the new `shutting_down` reason and
+  no longer puts the rest of the batch on per-path backoff.
 - **Naming what fills an unreclaimable mount stays bounded and can't stall
   the monitor** (`5b4bc8e`, `4e8036b`). When a mount under pressure has
   nothing sbh can delete, the daemon reports its largest directories. That
