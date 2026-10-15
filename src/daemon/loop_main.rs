@@ -7427,6 +7427,40 @@ impl ScanCursor {
     }
 }
 
+/// How often an unchanged "maintenance keep" verdict for one path is repeated.
+const MAINTENANCE_KEEP_REPEAT: Duration = Duration::from_hours(1);
+/// Paths whose last keep line is remembered; past this, older ones are dropped.
+const MAINTENANCE_KEEP_TRACKED: usize = 65_536;
+
+/// Rate limit for the maintenance pass's "why was this kept" lines. The same
+/// entries recur on every pass: on ts1 (2026-10-15) that was 100,000 identical
+/// lines a day, 95% of sbh's journal, on a host at 95% disk. A path is logged
+/// when first seen, when its verdict changes, and otherwise hourly.
+#[derive(Default)]
+struct MaintenanceKeepLog {
+    logged: HashMap<PathBuf, (String, Instant)>,
+}
+
+impl MaintenanceKeepLog {
+    fn should_log(&mut self, path: &Path, verdict: String, now: Instant) -> bool {
+        if let Some((last, at)) = self.logged.get(path)
+            && *last == verdict
+            && now.saturating_duration_since(*at) < MAINTENANCE_KEEP_REPEAT
+        {
+            return false;
+        }
+        if self.logged.len() >= MAINTENANCE_KEEP_TRACKED {
+            self.logged
+                .retain(|_, (_, at)| now.saturating_duration_since(*at) < MAINTENANCE_KEEP_REPEAT);
+            if self.logged.len() >= MAINTENANCE_KEEP_TRACKED {
+                self.logged.clear();
+            }
+        }
+        self.logged.insert(path.to_path_buf(), (verdict, now));
+        true
+    }
+}
+
 /// Scanner thread: receives scan requests, walks directories, scores candidates,
 /// and sends deletion batches to the executor.
 ///
@@ -7487,6 +7521,7 @@ fn scanner_thread_main(
     // avoid re-discovering and re-rejecting the same paths every 10 minutes
     // (previously caused thousands of ContainsGit log entries per hour).
     let mut known_git_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut maintenance_keeps = MaintenanceKeepLog::default();
     let mut last_scanner_engine_mode: Option<ScannerEngineMode> = None;
 
     // B6: inter-pass cooldown. When a pass dispatches nothing reclaimable,
@@ -9130,10 +9165,22 @@ fn scanner_thread_main(
             mark_visibility_gap(&mut input, visibility_gap);
 
             let mut score = engine.score_candidate(&input, request.urgency);
-            // A maintenance pass is rare and its point is to reclaim what is
-            // definitely stale, so say why a classified entry was not.
+            // A maintenance pass's point is to reclaim what is definitely
+            // stale, so say why a classified entry was not: once per verdict,
+            // then hourly, since the same entries recur on every pass.
             if request.maintenance
                 && score.decision.action != crate::scanner::scoring::DecisionAction::Delete
+                && maintenance_keeps.should_log(
+                    &entry.path,
+                    format!(
+                        "{:?} {} {} {}",
+                        score.decision.action,
+                        score.decision.certainty.label(),
+                        score.vetoed,
+                        score.veto_reason.as_deref().unwrap_or("-"),
+                    ),
+                    Instant::now(),
+                )
             {
                 eprintln!(
                     "[SBH-SCANNER] maintenance keep: {} action={:?} total={:.2} posterior={:.2} \
@@ -11317,6 +11364,30 @@ mod tests {
             parent_reason.contains("contains sacred path"),
             "executor defense must skip a parent whose deletion would remove a protected child"
         );
+    }
+
+    #[test]
+    fn maintenance_keep_lines_repeat_only_on_change_or_hourly() {
+        let mut log = MaintenanceKeepLog::default();
+        let start = Instant::now();
+        let path = Path::new("/tmp/project/target");
+        let keep = || "Keep likely false -".to_string();
+        assert!(log.should_log(path, keep(), start));
+        // Every later pass within the hour stays quiet...
+        assert!(!log.should_log(path, keep(), start + Duration::from_mins(5)));
+        assert!(!log.should_log(path, keep(), start + Duration::from_mins(59)));
+        // ...unless the verdict changes, which restarts the hour.
+        let review = "Review possible false -".to_string();
+        assert!(log.should_log(path, review.clone(), start + Duration::from_mins(59)));
+        assert!(!log.should_log(path, review, start + Duration::from_mins(60)));
+        // Other paths are independent, and an unchanged verdict repeats hourly.
+        assert!(log.should_log(
+            Path::new("/tmp/other"),
+            keep(),
+            start + Duration::from_mins(60)
+        ));
+        assert!(log.should_log(path, keep(), start + Duration::from_mins(60)));
+        assert!(log.should_log(path, keep(), start + Duration::from_mins(121)));
     }
 
     #[test]
