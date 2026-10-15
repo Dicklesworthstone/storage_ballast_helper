@@ -22,6 +22,15 @@ Compare: [`v0.7.5...v0.7.6`](https://github.com/Dicklesworthstone/storage_ballas
   installed to `$SBH_INSTALL_DIR` or `/usr/local/bin` and, run as root,
   silently replaced the system daemon's binary. It now takes `--dest`,
   `--version` and `--help`; anything else exits 2 before downloading.
+- **A user-scoped macOS sbh no longer deletes what it cannot check**
+  (bd-1ouz; `645e0d2`). Run without root, macOS hides other users' open
+  files. The v1 scanner refused every candidate for that reason, but the v2
+  scanner, its index replay, and the CLI's `clean`, `emergency` and `scan`
+  checked open files only for large candidates outside cache categories, so
+  a small candidate could be deleted while another user's process held it.
+  Every path now refuses such candidates, and `clean`/`emergency` print a
+  hint to run `sudo sbh <command>` or the system-scope daemon. Root sbh and
+  every Linux sbh are unchanged.
 
 ## v0.7.5 **[release]**
 
