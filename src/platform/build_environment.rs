@@ -43,8 +43,12 @@ pub fn tool(comm: &[u8]) -> Option<Tool> {
         // `cargo-rch-real`: on rch hosts that is the cargo process, so it was
         // never recognised and a live build held its cargo home only while a
         // rustc ran (a release proof deleted it during a build script).
+        // `rch exec -- cargo build` runs the build on a worker: locally only
+        // `rch` lives, holding nothing open in its CARGO_TARGET_DIR until it
+        // syncs the artifacts back (ts2 2026-10-15: an empty mktemp target
+        // was deleted mid-build and recreated by the sync-back).
         "cargo" | "cargo-rch-real" | "cargo-nextest" | "rustc" | "rustdoc" | "clippy-driver"
-        | "cargo-clippy" => Some(Tool::Rust),
+        | "cargo-clippy" | "rch" => Some(Tool::Rust),
         // A build script runs with cargo's environment and its package as cwd;
         // procfs truncates its name (`build_script_ma` for build_script_main).
         _ if ["build-script-", "build_script_"]
@@ -318,6 +322,7 @@ mod tests {
             "rustdoc",
             "clippy-driver",
             "cargo-clippy",
+            "rch",
             "build-script-build",
             "build_script_ma",
             "build-script-bu",
@@ -345,6 +350,7 @@ mod tests {
         for name in [
             "bash",
             "sbh",
+            "rchd",
             "cargo-data",
             "build-scripts",
             "python-notes",

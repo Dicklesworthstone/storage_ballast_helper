@@ -643,7 +643,11 @@ pub fn plan_batch(
         let next_risk = risk_used + planned.expected_loss;
         let over_budget =
             !next_risk.is_finite() || risk_budget.is_some_and(|budget| next_risk > budget + 1e-9);
-        if target_met
+        // An empty candidate frees nothing and still carries its loss: at
+        // Critical (no risk budget) the greedy pass took a fresh, empty
+        // mktemp target of a live remote build (ts2 2026-10-15).
+        if planned.bytes == 0
+            || target_met
             || chosen_idx.len() >= request.max_items
             || over_budget
             || selected.overlaps(score)
@@ -1486,6 +1490,50 @@ mod tests {
         let mut req = request(PressureLevel::Orange, Some(GIB), None);
         req.max_items = 0;
         assert!(plan_batch(candidates, &req).0.is_empty());
+    }
+
+    /// ts2 2026-10-15: at Critical with no risk budget and an unreachable
+    /// target, a 0-byte target dir was chosen (value 0, expected loss 3.4).
+    #[test]
+    fn an_empty_candidate_is_never_chosen_even_at_critical() {
+        for (target, budget) in [
+            (Some(600 * GIB), None),
+            (None, None),
+            (Some(GIB), Some(100.0)),
+        ] {
+            let (chosen, plan) = plan_batch(
+                vec![
+                    candidate("/tmp/empty-target", 0, 0.93, 1.6, DecisionAction::Delete),
+                    candidate(
+                        "/tmp/old-target",
+                        20 * MIB,
+                        0.93,
+                        1.5,
+                        DecisionAction::Delete,
+                    ),
+                ],
+                &request(PressureLevel::Critical, target, budget),
+            );
+            let paths: Vec<_> = chosen.iter().map(|c| c.path.as_path()).collect();
+            assert_eq!(
+                paths,
+                vec![Path::new("/tmp/old-target")],
+                "{target:?} {budget:?}"
+            );
+            assert_eq!(plan.planned_bytes, 20 * MIB);
+        }
+        let (chosen, plan) = plan_batch(
+            vec![candidate(
+                "/tmp/empty",
+                0,
+                0.99,
+                1.0,
+                DecisionAction::Delete,
+            )],
+            &request(PressureLevel::Critical, Some(GIB), None),
+        );
+        assert!(chosen.is_empty());
+        assert!(plan.risk_used.abs() < f64::EPSILON);
     }
 
     #[test]

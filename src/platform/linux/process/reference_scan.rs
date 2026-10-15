@@ -1395,6 +1395,31 @@ mod tests {
         assert!(targets.contains(&target));
     }
 
+    /// ts2 2026-10-15: `rch exec -- cargo build` compiles on a worker, so the
+    /// only local process is `rch`, and its fresh mktemp target stays empty
+    /// until the artifacts sync back. Its environment names the target.
+    #[test]
+    fn an_offloaded_rch_build_names_its_target_directory() {
+        let fixture = Fixture::new();
+        let own = i32::try_from(std::process::id()).unwrap();
+        let target = fixture
+            .root
+            .join("mea-bfv-recurrence/rch-target-20261015T091718Z-p8M5L7");
+        let process = fixture.pid(own.checked_add(1).unwrap());
+        fs::write(process.join("comm"), "rch\n").unwrap();
+        fs::write(
+            process.join("environ"),
+            format!(
+                "HOME=/home/builder\0CARGO_TARGET_DIR={}\0RCH_REQUIRE_REMOTE=1\0",
+                target.display()
+            ),
+        )
+        .unwrap();
+
+        let found = build_directories_with(&NativeProc, &fixture.proc_root, Limits::default());
+        assert!(found.iter().any(|(_, path)| *path == target), "{found:?}");
+    }
+
     #[test]
     fn a_default_home_build_holds_its_cargo_caches_and_an_idle_home_does_not() {
         let fixture = Fixture::new();
