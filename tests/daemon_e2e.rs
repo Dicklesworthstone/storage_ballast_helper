@@ -1459,6 +1459,66 @@ fn orange_reclaim_deletes_the_stale_target_and_keeps_the_guarded_siblings() {
     );
 }
 
+/// bd-1ouz: a user-scoped macOS daemon cannot see other users' processes, so
+/// the v2 engine reclaims nothing, as v1 does: the stale target that
+/// `orange_reclaim_deletes_the_stale_target_and_keeps_the_guarded_siblings`
+/// deletes as root survives a forced pass at Orange here. Only a non-root
+/// macOS run has the gap; elsewhere this skips and says so.
+#[test]
+fn a_user_scope_daemon_without_full_visibility_reclaims_nothing_in_v2() {
+    if !common::other_users_hidden() {
+        eprintln!("skipped: needs a non-root macOS run, where the visibility gap is real");
+        return;
+    }
+    let dir = scratch();
+    let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 64 * 1024);
+    let created = Instant::now();
+    let table = injected_table(&[
+        (dir.path(), 1_000_000_000_000, 110_000_000_000, false),
+        quiet_root_mount(),
+    ]);
+    let scenario = ScenarioConfig {
+        root_paths: vec![fixtures.root.clone()],
+        min_file_age_minutes: 1,
+        engine: "v2",
+        ..ScenarioConfig::default()
+    };
+    let mut run = DaemonRun::spawn(dir.path(), &scenario, Some(&table));
+    let gate = created + Duration::from_secs(66);
+    run.wait_until("the age gate", Duration::from_secs(80), |_| {
+        fixtures.touch_fresh();
+        Instant::now() >= gate
+    })
+    .unwrap();
+    let passes = run.stderr_count("[SBH-SCANNER] scan complete");
+    run.signal("-USR1");
+    run.wait_until(
+        "a pass after the age gate",
+        Duration::from_secs(60),
+        |run| {
+            fixtures.touch_fresh();
+            run.stderr_count("[SBH-SCANNER] scan complete") > passes
+        },
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_secs(10));
+    assert!(run.deleted_paths().is_empty(), "{:?}", run.deleted_paths());
+    assert!(
+        fixtures.stale_target.exists(),
+        "the stale target was reclaimed"
+    );
+    // The pass ran at Orange and found nothing it may reclaim: the veto, not
+    // the age gate or the pressure level, kept the target (with the gap
+    // ignored, this same scenario deletes it).
+    assert!(
+        run.stderr_count("no reclaimable progress this pass") > 0,
+        "{}",
+        run.stderr()
+    );
+    let status = run.stop();
+    assert!(status.success(), "{status}");
+}
+
 /// Scenario `engines`: the v1 rollback engine reclaims exactly what v2
 /// reclaims on the same fixtures (both daemons run concurrently).
 #[test]
@@ -1808,6 +1868,12 @@ fn an_idle_yellow_mount_rebuilds_an_empty_reserve() {
 /// reclaim. Such passes are now paced by `min_rescan_interval_secs`.
 #[test]
 fn prescan_timeouts_on_a_busy_root_are_paced_by_the_rescan_interval() {
+    if common::other_users_hidden() {
+        // Vetoed candidates never pay for a size probe, so the pre-scan has
+        // nothing slow to time out on.
+        eprintln!("skipped: this user cannot see every process");
+        return;
+    }
     let dir = scratch();
     let root = dir.path().join("busy-root");
     fs::create_dir(&root).unwrap();

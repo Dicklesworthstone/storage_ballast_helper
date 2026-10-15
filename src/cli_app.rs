@@ -10946,9 +10946,9 @@ fn linux_platform_json(_capacity: &Capacity) -> Value {
 const LINUX_UNPRIVILEGED_SCANNER_NOTICE: &str = "scanner reclaim is disabled: sbh is not running as root, so it cannot inspect other users' processes for open or mapped files and refuses every deletion candidate. Ballast release still works. Run the daemon as a system service (`sudo sbh install --systemd --scope system`) to reclaim build artifacts";
 
 /// macOS hides other users' processes from a non-root sbh, so its open-file
-/// check is never complete; candidates it must walk, or that reach
-/// `active_reference_min_size_bytes`, are then refused.
-const MACOS_UNPRIVILEGED_SCANNER_NOTICE: &str = "own-user processes only: sbh is not running as root, so macOS hides other users' processes from its open-file check, which is never complete, and the scanner refuses every candidate it must walk or that is 100 MB or larger (scanner.active_reference_min_size_bytes): almost nothing is reclaimed. Ballast release still works. Run the daemon as a root LaunchDaemon (`sudo sbh install --launchd --scope system`) to reclaim build artifacts";
+/// check is never complete and every deletion candidate is refused
+/// (bd-1ouz).
+const MACOS_UNPRIVILEGED_SCANNER_NOTICE: &str = "own-user processes only: sbh is not running as root, so macOS hides other users' processes from its open-file check, which is never complete, and the scanner refuses every deletion candidate: nothing is reclaimed. Ballast release still works. Run the daemon as a root LaunchDaemon (`sudo sbh install --launchd --scope system`) to reclaim build artifacts";
 
 fn process_attribution_visibility(
     platform_name: &str,
@@ -13092,6 +13092,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
     let registry = ArtifactPatternRegistry::default();
     let mut scoring_config = config.scoring.clone();
     scoring_config.min_score = args.min_score;
+    warn_visibility_gap("clean");
     let engine = ScoringEngine::from_config(&scoring_config, config.scanner.min_file_age_minutes);
     let sacred_paths = active_sacred_paths(&config)?;
     let now = SystemTime::now();
@@ -13628,6 +13629,31 @@ fn collect_active_reference_index_best_effort(
         })
 }
 
+/// bd-1ouz: why this CLI cannot see every process's references, if it cannot
+/// (a non-root macOS user is not shown other users' file handles). Every
+/// candidate is then refused, as the daemon refuses it.
+fn cli_visibility_gap() -> Option<&'static str> {
+    static GAP: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        detect_platform().ok().and_then(|platform| {
+            storage_ballast_helper::scanner::walker::active_reference_visibility_warning(
+                platform.as_ref(),
+            )
+        })
+    })
+}
+
+/// The one line `clean` and `emergency` print when the visibility gap
+/// refuses every candidate.
+fn warn_visibility_gap(command: &str) {
+    if let Some(gap) = cli_visibility_gap() {
+        eprintln!(
+            "sbh: {gap}, so every deletion candidate is refused; run `sudo sbh {command}` or the \
+             system-scope daemon to reclaim"
+        );
+    }
+}
+
 fn active_references_for_candidate(
     active_reference_index: &mut Option<ActiveReferenceIndex>,
     root_paths: &[PathBuf],
@@ -13638,7 +13664,12 @@ fn active_references_for_candidate(
     category: ArtifactCategory,
 ) -> (ActiveReferenceSummary, bool) {
     if !scan_config.should_probe_candidate(size_bytes, category) {
-        return (ActiveReferenceSummary::default(), false);
+        // Unprobed is not unreferenced when other users' processes are hidden.
+        let mut summary = ActiveReferenceSummary::default();
+        if let Some(gap) = cli_visibility_gap() {
+            summary.mark_incomplete(gap);
+        }
+        return (summary, false);
     }
 
     let index = active_reference_index.get_or_insert_with(|| {
@@ -14927,6 +14958,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
     // Classify and score using default weights; the age floor is the flag's,
     // since no config is read.
     let registry = ArtifactPatternRegistry::default();
+    warn_visibility_gap("emergency");
     let engine = ScoringEngine::from_config(&config.scoring, args.min_age);
     let sacred_paths = active_sacred_paths(&config)?;
     let now = SystemTime::now();
@@ -20575,14 +20607,14 @@ mod tests {
     }
 
     #[test]
-    fn macos_without_root_says_the_scanner_reclaims_almost_nothing() {
+    fn macos_without_root_says_the_scanner_reclaims_nothing() {
         let visibility = process_attribution_visibility_for("macos", false)
             .expect("an unprivileged macOS sbh must say what it cannot do");
         for expected in [
             "not running as root",
             "other users' processes",
-            "refuses every candidate it must walk",
-            "almost nothing is reclaimed",
+            "refuses every deletion candidate",
+            "nothing is reclaimed",
             "Ballast release still works",
             "sudo sbh install --launchd --scope system",
         ] {

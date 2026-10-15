@@ -19,11 +19,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ──────────────────── process visibility ────────────────────
 
+/// bd-1ouz: a non-root macOS user is not shown other users' file handles, so
+/// sbh (daemon and CLI alike) refuses every deletion candidate there.
+pub fn other_users_hidden() -> bool {
+    cfg!(target_os = "macos") && !nix::unistd::geteuid().is_root()
+}
+
 /// Whether this user can see every process. A non-root user on a shared host
-/// cannot read other users' `/proc/<pid>/cwd`, so sbh's open-file sweep is
-/// incomplete and every deletion is held, as it must be. Tests that need a
+/// cannot read other users' `/proc/<pid>/cwd` (Linux), and a non-root macOS
+/// user is not shown other users' file handles, so sbh holds or vetoes every
+/// deletion, as it must. Tests that need a
 /// deletion to happen have nothing to prove there; they skip and say so.
 pub fn sees_every_process() -> bool {
+    if other_users_hidden() {
+        eprintln!("skipped: this user cannot see every process");
+        return false;
+    }
     #[cfg(target_os = "linux")]
     {
         let Ok(entries) = fs::read_dir("/proc") else {

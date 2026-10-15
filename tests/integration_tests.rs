@@ -2684,6 +2684,11 @@ enabled = false
 #[test]
 #[allow(clippy::too_many_lines)]
 fn explain_reads_back_decisions_recorded_by_clean_dry_run() {
+    if common::other_users_hidden() {
+        // Every candidate is vetoed there, so clean records no decision.
+        eprintln!("skipped: this user cannot see every process");
+        return;
+    }
     let dir = tempfile::tempdir().expect("temp dir");
     let scan_root = dir.path().join("scan-root");
     let state_dir = dir.path().join("state");

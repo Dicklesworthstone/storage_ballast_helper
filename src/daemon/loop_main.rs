@@ -7037,6 +7037,16 @@ impl ReplayDrop {
     }
 }
 
+/// bd-1ouz: a daemon that cannot see every process (a user-scoped macOS
+/// daemon) cannot know what other users' processes hold, so every candidate's
+/// references are unknown, not absent, and scoring vetoes it: in v2, whose
+/// opaque candidates may skip the reference probe, as in v1.
+fn mark_visibility_gap(input: &mut crate::scanner::scoring::CandidateInput, gap: Option<&str>) {
+    if let Some(reason) = gap {
+        input.active_references.mark_incomplete(reason);
+    }
+}
+
 /// Re-examine one persisted index record with fresh evidence and return the
 /// candidate to dispatch, or why it must not be.
 ///
@@ -7056,6 +7066,7 @@ fn replay_indexed_record(
     protection: &mut ProtectionRegistry,
     sacred_paths: &[crate::platform::types::SacredPath],
     open_files: &HashSet<PathBuf>,
+    visibility_gap: Option<&str>,
     logger: &ActivityLoggerHandle,
 ) -> std::result::Result<CandidacyScore, ReplayDrop> {
     use crate::scanner::active_lease::{ActiveLeaseState, inspect_path};
@@ -7161,7 +7172,7 @@ fn replay_indexed_record(
     } else {
         record.size_estimate_bytes
     };
-    let input = CandidateInput {
+    let mut input = CandidateInput {
         path: path.clone(),
         size_bytes: size_estimate.max(allocated),
         age: adjusted_candidate_age(
@@ -7177,6 +7188,7 @@ fn replay_indexed_record(
         is_open: is_path_open_by_ancestor(path, open_files),
         excluded: false,
     };
+    mark_visibility_gap(&mut input, visibility_gap);
     let mut score = engine.score_candidate(&input, request.urgency);
     if !score.vetoed && score.decision.action == DecisionAction::Delete {
         let overlaps = protection::find_sacred_overlaps(path, sacred_paths)
@@ -7400,6 +7412,8 @@ fn scanner_thread_main(
 
     // Initialize pattern registry (default built-ins).
     let pattern_registry = ArtifactPatternRegistry::default();
+    let visibility_gap =
+        crate::scanner::walker::active_reference_visibility_warning(platform.as_ref());
 
     // Incremental scan cursor — persists across scan iterations to skip
     // barren directory subtrees that yielded no candidates on a prior pass.
@@ -7996,6 +8010,7 @@ fn scanner_thread_main(
                         &mut replay_protection,
                         &replay_sacred,
                         &replay_open_files,
+                        visibility_gap,
                         logger,
                     ) {
                         Ok(score) => {
@@ -8411,6 +8426,7 @@ fn scanner_thread_main(
                             is_open: false,
                             excluded: false,
                         };
+                        mark_visibility_gap(&mut input, visibility_gap);
                         let mut score = prescan_engine.score_candidate(&input, request.urgency);
                         // Nomination keeps the floor in the size factor; only a
                         // directory that would be deleted pays for a real size
@@ -9071,6 +9087,7 @@ fn scanner_thread_main(
                 is_open: false,
                 excluded: false, // Walker already filters excluded paths.
             };
+            mark_visibility_gap(&mut input, visibility_gap);
 
             let mut score = engine.score_candidate(&input, request.urgency);
             // A maintenance pass is rare and its point is to reclaim what is
@@ -10917,6 +10934,7 @@ mod tests {
                 protection,
                 &sacred,
                 &open_files,
+                None,
                 &logger,
             )
         };
@@ -10938,6 +10956,24 @@ mod tests {
             replay(&record(2), 3, &mut protection).unwrap_err(),
             ReplayDrop::GenerationAdvanced
         );
+
+        // bd-1ouz: a daemon that cannot see every process vetoes the same
+        // intact artifact; its references are unknown, not absent.
+        let gap = crate::scanner::walker::MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING;
+        let blind = replay_indexed_record(
+            &record(3),
+            3,
+            &registry,
+            &engine,
+            &config.scanner,
+            &request,
+            &mut protection,
+            &sacred,
+            &open_files,
+            Some(gap),
+            &logger,
+        );
+        assert_eq!(blind.unwrap_err(), ReplayDrop::Vetoed(gap.to_string()));
 
         // Planted after the checkpoint: a .git, then a Cargo.toml.
         std::fs::create_dir_all(target.join(".git")).unwrap();
@@ -15186,6 +15222,44 @@ mod tests {
             &mut again, &request, &del_tx, &mut pass
         ));
         assert!(del_rx.try_recv().is_err());
+    }
+
+    /// bd-1ouz: an opaque v2 candidate small enough to skip the reference
+    /// probe is still vetoed when the daemon cannot see every process (a
+    /// user-scoped macOS daemon), as v1 vetoes it; without the gap it is
+    /// scored on its merits.
+    #[test]
+    fn visibility_gap_vetoes_a_candidate_that_skips_the_reference_probe() {
+        use crate::scanner::scoring::{CandidateInput, DecisionAction, ScoringEngine};
+        let engine = ScoringEngine::from_config(&Config::default().scoring, 0);
+        let candidate = || CandidateInput {
+            path: PathBuf::from("/tmp/proj/target"),
+            size_bytes: 64 * 1024,
+            age: Duration::from_hours(5),
+            classification: ArtifactClassification {
+                pattern_name: "opaque-cargo-target".into(),
+                category: ArtifactCategory::RustTarget,
+                name_confidence: 0.93,
+                structural_confidence: 1.0,
+                combined_confidence: 0.93,
+            },
+            signals: StructuralSignals::default(),
+            active_references: ActiveReferenceSummary::default(),
+            is_open: false,
+            excluded: false,
+        };
+
+        let mut seen = candidate();
+        mark_visibility_gap(&mut seen, None);
+        assert!(!engine.score_candidate(&seen, 0.9).vetoed);
+
+        let gap = crate::scanner::walker::MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING;
+        let mut blind = candidate();
+        mark_visibility_gap(&mut blind, Some(gap));
+        let score = engine.score_candidate(&blind, 0.9);
+        assert!(score.vetoed);
+        assert_eq!(score.decision.action, DecisionAction::Keep);
+        assert_eq!(score.veto_reason.as_deref(), Some(gap));
     }
 
     #[test]

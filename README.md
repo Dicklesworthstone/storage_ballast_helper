@@ -165,10 +165,10 @@ sbh status
 LaunchAgent, uses native Application Support paths, and provisions the default
 ballast preset. A user-scoped sbh cannot see other users' processes (macOS
 hides them), so its open-file check is never complete and the scanner refuses
-every candidate it must walk or that is 100 MB or larger: it reclaims almost
-nothing, and only ballast release works fully. `sbh status` and
-`sbh doctor --system` report this. To reclaim build artifacts, register the
-daemon in system scope:
+every deletion candidate: user-scope daemons are conservative by design (they
+veto whatever they cannot prove unused), and only ballast release works.
+`sbh status` and `sbh doctor --system` report this. The root (system-scope)
+daemon is the supported mode for reclaiming build artifacts; register it with:
 
 ```bash
 sudo sbh install --launchd --scope system --auto

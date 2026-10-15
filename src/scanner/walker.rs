@@ -1938,7 +1938,10 @@ fn own_directory_handle(open_file: &crate::platform::types::OpenFile) -> bool {
         && i32::try_from(std::process::id()).is_ok_and(|own| own == open_file.pid)
 }
 
-fn active_reference_visibility_warning(platform: &dyn Platform) -> Option<&'static str> {
+/// Why this process cannot see every process's references, if it cannot:
+/// a user-scoped macOS daemon is not shown other users' file handles.
+#[must_use]
+pub fn active_reference_visibility_warning(platform: &dyn Platform) -> Option<&'static str> {
     if platform.name() == "macos" && !process_can_inspect_all_users() {
         Some(MACOS_USER_SCOPE_ACTIVE_REFERENCE_WARNING)
     } else {
