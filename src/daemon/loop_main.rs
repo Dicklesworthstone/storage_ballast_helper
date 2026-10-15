@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
+use crossbeam_channel::{
+    Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError, bounded,
+};
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
@@ -2042,6 +2044,9 @@ pub struct MonitoringDaemon {
     swap_thrash_active: bool,
     last_scan_channel_warn: Option<Instant>,
     scan_channel_warn_suppressed: u64,
+    /// When a SIGUSR1 scan the full scan queue could not take yet arrived;
+    /// it is retried every tick until queued.
+    forced_scan_pending_since: Option<Instant>,
     /// Rate-limit for the B5 "pressured device has no root_path" warning so the
     /// back-off path does not spam logs on every tick.
     last_device_affinity_warn: Option<Instant>,
@@ -3325,6 +3330,7 @@ impl MonitoringDaemon {
             last_swap_thrash_warning: None,
             swap_thrash_active: false,
             last_scan_channel_warn: None,
+            forced_scan_pending_since: None,
             scan_channel_warn_suppressed: 0,
             last_device_affinity_warn: None,
             attribution_reported: HashMap::new(),
@@ -4511,9 +4517,30 @@ impl MonitoringDaemon {
             }
 
             // 9. Forced scan signal (SIGUSR1). Also wakes idle mounts next tick.
+            // A full scan queue defers it to the next tick instead of
+            // dropping it.
             if self.signal_handler.should_scan() {
-                self.trigger_forced_scan(&scan_tx, &response);
+                if self.forced_scan_pending_since.is_none()
+                    && !Self::trigger_forced_scan(
+                        &self.config.scanner.root_paths,
+                        &scan_tx,
+                        &response,
+                    )
+                {
+                    self.forced_scan_pending_since = Some(Instant::now());
+                    eprintln!(
+                        "[SBH-DAEMON] forced scan deferred (SIGUSR1): scan queue full, retrying every tick"
+                    );
+                }
                 self.wake_next_tick.forced_scan = true;
+            } else if let Some(since) = self.forced_scan_pending_since
+                && Self::trigger_forced_scan(&self.config.scanner.root_paths, &scan_tx, &response)
+            {
+                self.forced_scan_pending_since = None;
+                eprintln!(
+                    "[SBH-DAEMON] deferred forced scan queued after {:.1}s",
+                    since.elapsed().as_secs_f64()
+                );
             }
 
             // 10. Thread health check.
@@ -5919,14 +5946,15 @@ impl MonitoringDaemon {
         }
     }
 
+    /// Queue the SIGUSR1 scan. `false` means the scan queue is full and the
+    /// caller retries next tick; a disconnected queue is logged and given up.
     fn trigger_forced_scan(
-        &self,
+        root_paths: &[PathBuf],
         scan_tx: &Sender<ScanRequest>,
         response: &crate::monitor::pid::PressureResponse,
-    ) {
-        eprintln!("[SBH-DAEMON] forced scan triggered (SIGUSR1)");
+    ) -> bool {
         let request = ScanRequest {
-            paths: self.config.scanner.root_paths.clone(),
+            paths: root_paths.to_vec(),
             urgency: response.urgency.max(0.5), // at least moderate urgency for forced scans
             pressure_level: response.level,
             free_pct: Some(response.free_pct),
@@ -5937,8 +5965,18 @@ impl MonitoringDaemon {
             maintenance: false,
             target_bytes: None,
         };
-        // For forced scans, block briefly to ensure delivery.
-        let _ = scan_tx.send_timeout(request, Duration::from_millis(100));
+        // Block briefly: the scanner may be about to take the next request.
+        match scan_tx.send_timeout(request, Duration::from_millis(100)) {
+            Ok(()) => {
+                eprintln!("[SBH-DAEMON] forced scan triggered (SIGUSR1)");
+                true
+            }
+            Err(SendTimeoutError::Timeout(_)) => false,
+            Err(SendTimeoutError::Disconnected(_)) => {
+                eprintln!("[SBH-DAEMON] forced scan dropped (SIGUSR1): scan channel disconnected");
+                true
+            }
+        }
     }
 
     fn check_predictive_warning(&mut self, response: &crate::monitor::pid::PressureResponse) {
@@ -13871,6 +13909,50 @@ mod tests {
         assert!(args.foreground);
         assert!(args.pidfile.is_none());
         assert_eq!(args.watchdog_sec, 0);
+    }
+
+    /// SIGUSR1 used to `send_timeout` and ignore the result: with the scan
+    /// queue full the forced scan was dropped while the log said triggered.
+    #[test]
+    fn a_forced_scan_reports_a_full_queue_and_queues_once_there_is_room() {
+        let response = PressureResponse {
+            level: PressureLevel::Green,
+            urgency: 0.0,
+            scan_interval: Duration::from_secs(3),
+            release_ballast_files: 0,
+            max_delete_batch: 7,
+            fallback_active: false,
+            causing_mount: PathBuf::from("/"),
+            free_pct: 60.0,
+            predicted_seconds: None,
+        };
+        let roots = [PathBuf::from("/data/tmp")];
+        let (scan_tx, scan_rx) = bounded::<ScanRequest>(1);
+        assert!(MonitoringDaemon::trigger_forced_scan(
+            &roots, &scan_tx, &response
+        ));
+        assert!(!MonitoringDaemon::trigger_forced_scan(
+            &roots, &scan_tx, &response
+        ));
+        let queued = scan_rx.try_recv().unwrap();
+        assert!(queued.force_full_scan);
+        assert_eq!(queued.paths, roots);
+        assert!(
+            scan_rx.try_recv().is_err(),
+            "the full-queue attempt queued nothing"
+        );
+        assert!(MonitoringDaemon::trigger_forced_scan(
+            &roots, &scan_tx, &response
+        ));
+        assert_eq!(
+            scan_reason_for_request(&scan_rx.try_recv().unwrap()),
+            "forced"
+        );
+        drop(scan_rx);
+        // Disconnected: given up (true) rather than retried forever.
+        assert!(MonitoringDaemon::trigger_forced_scan(
+            &roots, &scan_tx, &response
+        ));
     }
 
     #[test]
