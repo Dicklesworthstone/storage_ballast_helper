@@ -486,6 +486,9 @@ pub enum SkipReason {
     /// not be fully inspected, or was removed/retargeted after this candidate
     /// was queued. Root diagnostics identify the offending path/repository.
     SourceRootDenied,
+    /// The daemon began shutting down mid-batch; the rest of the batch is
+    /// left for the next run, with no per-path backoff.
+    ShuttingDown,
 }
 
 impl SkipReason {
@@ -495,7 +498,7 @@ impl SkipReason {
     /// mapping a `skipped_by_reason` JSON key back to its prose. Previously this
     /// list was duplicated at each call site, so adding a variant silently left
     /// it unexplained. `all_covers_every_variant` guards completeness.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::TargetFreeReached,
         Self::PathGone,
         Self::FileOpen,
@@ -516,6 +519,7 @@ impl SkipReason {
         Self::OpenScanIncomplete,
         Self::CategorySuspended,
         Self::SourceRootDenied,
+        Self::ShuttingDown,
     ];
 
     /// Resolve a `skipped_by_reason` key back to its variant.
@@ -550,6 +554,7 @@ impl SkipReason {
             Self::OpenScanIncomplete => "open_scan_incomplete",
             Self::CategorySuspended => "category_suspended",
             Self::SourceRootDenied => "source_root_denied",
+            Self::ShuttingDown => "shutting_down",
         }
     }
 
@@ -596,6 +601,7 @@ impl SkipReason {
                 "scanner root is blocked by source-tree policy; inspect doctor/status, narrow \
                  root_paths or explicitly authorize scanner.allow_source_tree_roots"
             }
+            Self::ShuttingDown => "the daemon was shutting down — left for the next run",
         }
     }
 }
@@ -641,6 +647,7 @@ fn should_backoff_skip(reason: SkipReason) -> bool {
             | SkipReason::FilesystemReadOnly
             | SkipReason::CategorySuspended
             | SkipReason::SourceRootDenied
+            | SkipReason::ShuttingDown
     )
 }
 
@@ -662,6 +669,10 @@ pub enum CheckedDeletion {
 
 type AuthorizationCheck<'a> = &'a dyn Fn(&CandidacyScore) -> std::result::Result<(), SkipReason>;
 type UnlinkObserver<'a> = &'a dyn Fn(&CandidacyScore, Instant);
+/// A caller's per-candidate check run before preflight: the reason to leave
+/// this path alone now (target free space reached, a protection refusal, a
+/// shutdown), or `None` to continue.
+pub type SkipCheck<'a> = &'a dyn Fn(&Path) -> Option<SkipReason>;
 
 /// The deletion executor: takes scored candidates and deletes them safely.
 pub struct DeletionExecutor {
@@ -771,11 +782,12 @@ impl DeletionExecutor {
     /// Execute a deletion plan, deleting up to `max_batch_size` candidates.
     ///
     /// Returns a report summarizing what was deleted, skipped, or failed.
-    /// If `should_skip` returns `true` for a candidate path, it is skipped.
+    /// A candidate for which `should_skip` returns a reason is skipped with
+    /// that reason.
     pub fn execute(
         &self,
         plan: &DeletionPlan,
-        should_skip: Option<&dyn Fn(&Path) -> bool>,
+        should_skip: Option<SkipCheck<'_>>,
     ) -> DeletionReport {
         self.execute_with_guard(plan, should_skip, None)
     }
@@ -791,7 +803,7 @@ impl DeletionExecutor {
     pub fn execute_with_guard(
         &self,
         plan: &DeletionPlan,
-        should_skip: Option<&dyn Fn(&Path) -> bool>,
+        should_skip: Option<SkipCheck<'_>>,
         authorize: Option<AuthorizationCheck<'_>>,
     ) -> DeletionReport {
         self.execute_with_hooks(plan, should_skip, authorize, None)
@@ -809,7 +821,7 @@ impl DeletionExecutor {
     pub fn execute_with_hooks(
         &self,
         plan: &DeletionPlan,
-        should_skip: Option<&dyn Fn(&Path) -> bool>,
+        should_skip: Option<SkipCheck<'_>>,
         authorize: Option<AuthorizationCheck<'_>>,
         on_unlinked: Option<UnlinkObserver<'_>>,
     ) -> DeletionReport {
@@ -912,12 +924,13 @@ impl DeletionExecutor {
                 break;
             }
 
-            // Dynamic skip check (e.g. target free space met).
-            if let Some(skip) = should_skip
-                && skip(&candidate.path)
-            {
-                report.record_skip(SkipReason::TargetFreeReached);
-                report.backoff_candidates.push(candidate.clone());
+            // Dynamic skip check: target free space met, a live protection
+            // refusal, or a shutdown. Each is recorded under its own reason.
+            if let Some(reason) = should_skip.and_then(|skip| skip(&candidate.path)) {
+                report.record_skip(reason);
+                if should_backoff_skip(reason) {
+                    report.backoff_candidates.push(candidate.clone());
+                }
                 continue;
             }
 
@@ -2460,6 +2473,7 @@ mod tests {
                 SkipReason::OpenScanIncomplete => 17,
                 SkipReason::CategorySuspended => 18,
                 SkipReason::SourceRootDenied => 19,
+                SkipReason::ShuttingDown => 20,
             }
         }
         let mut seen = [false; SkipReason::ALL.len()];
@@ -3454,12 +3468,46 @@ mod tests {
             &plan,
             Some(&|_path| {
                 let count = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                count >= 1 // Resolved after first
+                // Resolved after first
+                (count >= 1).then_some(SkipReason::TargetFreeReached)
             }),
         );
 
         // Should delete 1, then stop.
         assert_eq!(report.items_deleted, 1);
+        assert_eq!(
+            report.skipped_by_reason.get("target_free_reached"),
+            Some(&4)
+        );
+        assert_eq!(report.backoff_candidates.len(), 4);
+    }
+
+    /// A hook's refusal is recorded under the hook's own reason, and a
+    /// shutdown leaves the rest of the batch without per-path backoff
+    /// (bd-drua: protection refusals were reported as target free reached).
+    #[test]
+    fn hook_skips_keep_their_reason_and_shutdown_has_no_backoff() {
+        let dir = scratch_dir();
+        let candidates = (0..3)
+            .map(|i| {
+                let p = dir.path().join(format!("hook_{i}.txt"));
+                fs::write(&p, "x").unwrap();
+                make_candidate(&p, 10, 0.8)
+            })
+            .collect::<Vec<_>>();
+        let executor = DeletionExecutor::new(offline_config(), None);
+        let plan = executor.plan(candidates);
+
+        let protected = executor.execute(&plan, Some(&|_| Some(SkipReason::SacredStowaway)));
+        assert_eq!(protected.items_deleted, 0);
+        assert_eq!(protected.skipped_by_reason.get("sacred_stowaway"), Some(&3));
+        assert_eq!(protected.skipped_by_reason.get("target_free_reached"), None);
+        assert_eq!(protected.backoff_candidates.len(), 3);
+
+        let stopping = executor.execute(&plan, Some(&|_| Some(SkipReason::ShuttingDown)));
+        assert_eq!(stopping.items_deleted, 0);
+        assert_eq!(stopping.skipped_by_reason.get("shutting_down"), Some(&3));
+        assert!(stopping.backoff_candidates.is_empty());
     }
 
     #[test]

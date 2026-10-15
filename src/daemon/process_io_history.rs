@@ -150,7 +150,9 @@ impl ProcessIoHistory {
         self.last_sample_at = Some(now);
         let collected_at_unix_ms = unix_time_ms();
         self.prune_history(collected_at_unix_ms);
-        let processes = match platform.process_list() {
+        // Runs on the monitor thread: no argv reads, which can block behind
+        // another process's memory-map lock.
+        let processes = match platform.process_list_without_command_lines() {
             Ok(processes) => processes,
             Err(error) => {
                 return (

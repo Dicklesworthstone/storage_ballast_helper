@@ -57,7 +57,7 @@ use storage_ballast_helper::scanner::active_lease::{
     self, ACTIVE_LEASE_TARGET_ENV, ACTIVE_LEASE_TOKEN_ENV, ActiveLease, LeasePolicy,
 };
 use storage_ballast_helper::scanner::deletion::{
-    DeletionConfig, DeletionExecutor, DeletionMode, DeletionPlan,
+    DeletionConfig, DeletionExecutor, DeletionMode, DeletionPlan, SkipCheck, SkipReason,
 };
 use storage_ballast_helper::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use storage_ballast_helper::scanner::patterns::{
@@ -13309,12 +13309,7 @@ fn run_clean(cli: &Cli, args: &CleanArgs) -> Result<(), CliError> {
             std::time::Duration::from_millis(500),
         ));
         let pressure_check = build_pressure_check(args.target_free, collector);
-        let report = executor.execute(
-            &plan,
-            pressure_check
-                .as_ref()
-                .map(|f| f as &dyn Fn(&std::path::Path) -> bool),
-        );
+        let report = executor.execute(&plan, pressure_check.as_ref().map(|f| f as SkipCheck));
 
         match output_mode(cli) {
             OutputMode::Human => {
@@ -13602,12 +13597,13 @@ fn candidate_decision_id(candidate: &CandidacyScore) -> String {
 fn build_pressure_check(
     target_free: Option<f64>,
     collector: std::sync::Arc<FsStatsCollector>,
-) -> Option<Box<dyn Fn(&Path) -> bool>> {
+) -> Option<Box<dyn Fn(&Path) -> Option<SkipReason>>> {
     let target = target_free?;
     Some(Box::new(move |path: &Path| {
         collector
             .collect(path)
             .is_ok_and(|stats| stats.free_pct() >= target)
+            .then_some(SkipReason::TargetFreeReached)
     }))
 }
 
@@ -15115,12 +15111,7 @@ fn run_emergency(cli: &Cli, args: &EmergencyArgs) -> Result<(), CliError> {
             std::time::Duration::from_millis(500),
         ));
         let pressure_check = build_pressure_check(Some(args.target_free), collector);
-        let report = executor.execute(
-            &plan,
-            pressure_check
-                .as_ref()
-                .map(|f| f as &dyn Fn(&std::path::Path) -> bool),
-        );
+        let report = executor.execute(&plan, pressure_check.as_ref().map(|f| f as SkipCheck));
 
         match output_mode(cli) {
             OutputMode::Human => {

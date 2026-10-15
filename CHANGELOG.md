@@ -4,9 +4,33 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
-## v0.7.7
+## v0.7.8
+
+Compare: [`v0.7.7...v0.7.8`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.7...v0.7.8)
+
+### Fixed
+
+- **`cargo d` holds its default target like `cargo doc`** (`d5dafbf`). On
+  Linux a running cargo's default `target/` counts as in use before its
+  first artifact exists, but only for known build subcommands; Cargo's
+  built-in alias `d` was missing (`b`, `c`, `t` and `r` were covered).
+
+## v0.7.7 **[release]**
 
 Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.6...v0.7.7)
+
+An availability and safety release. On a host under memory pressure, a
+build stuck in `mmap` froze the daemon's monitor for 19 minutes: no pressure
+response and no ballast release on a Critical host. Neither the monitor nor
+scans and deletions now wait on another process's memory. On Linux, a live
+build's command-line output directories, its Cargo config's target and
+build directories, and its default `target/` now count as in use, and a
+build that can't be fully inspected holds the batch. Also: directories with
+more than 65,536 entries are covered over successive passes, a local user
+can no longer make the root daemon read kernel pseudo-files as Cargo
+configuration, memory pressure no longer flaps between levels, scan workers
+hand over results in batches (16–21% less user CPU), and protection
+refusals are reported as refusals.
 
 ### Fixed
 
@@ -26,7 +50,9 @@ Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballas
   the target directory. It now also tracks `CARGO_BUILD_TARGET_DIR`,
   `CARGO_BUILD_BUILD_DIR` and an inherited `OUT_DIR` separately from the
   final artifacts. If a known build tool's process details can't be read
-  in full, the deletion waits.
+  in full, the deletion waits; a build process caught while exiting gets
+  a few milliseconds to finish first (`8a89b93`), or busy build hosts
+  held most batches.
 - **On Linux, a running cargo's configured and default target directories
   count as in use** (`e688393`, `5441d1a`, `8177792`). A `build.target-dir`
   or `build-dir` set in a Cargo config file (the hierarchy above the build,
@@ -51,6 +77,36 @@ Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballas
   mid-check could even make root open a device. On Linux, configuration
   paths are now opened without following any symlink, and files on procfs,
   sysfs, debugfs, tracefs and similar filesystems are refused unread.
+- **A wedged process can no longer freeze the daemon's monitor**
+  (`c1d8f23`). Reading another process's command line waits for that
+  process's memory-map lock. Under memory pressure a build stuck in `mmap`
+  held it for 19 minutes, and the daemon's monitor thread, which read every
+  process's command line for its I/O history and regret checks, waited
+  with it: no logging, no pressure response, no ballast release on a
+  Critical host. Those checks never used the command line and no longer
+  read it.
+- **A wedged process can no longer stall scans or deletions either**
+  (`3b45c3d`, `bbf3867`). Two more readers waited on that lock. The
+  scanner's index of what live processes use read every process's command
+  line, for names and working directories it gets elsewhere; it no longer
+  does. The build inspection before each deletion batch must read build
+  tools' environments and arguments, so on Linux each read now runs on a
+  helper thread and is abandoned at the inspection's 30-second deadline.
+  A process whose read is stuck counts as not inspected, so the batch
+  waits as for any incomplete check. It costs one blocked thread until it
+  recovers, not one per sweep.
+- **An unexpandable `CARGO_BUILD_BUILD_DIR` holds the batch** (`3b45c3d`).
+  A build-dir template (`{workspace-root}`, `{cargo-cache-home}`, ...) in
+  a build's environment was skipped silently, though the same template in
+  a Cargo config file already held the batch. Both now do; the build's
+  other declared directories stay protected either way.
+- **Protection refusals are reported as refusals** (bd-drua; `30f55e1`).
+  A candidate the daemon's executor refused because it is protected (an
+  `.sbh-protect` marker, a sacred path, or a protection check that failed
+  and is treated as protected) was counted under `target_free_reached`,
+  documented as "not a refusal — a success". It is now `sacred_stowaway`.
+  A batch cut short by shutdown reports the new `shutting_down` reason and
+  no longer puts the rest of the batch on per-path backoff.
 - **Naming what fills an unreclaimable mount stays bounded and can't stall
   the monitor** (`5b4bc8e`, `4e8036b`). When a mount under pressure has
   nothing sbh can delete, the daemon reports its largest directories. That
@@ -70,6 +126,15 @@ Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballas
   a time, and whatever they hold before they wait for more work. Scanning
   a 200,000-directory tree took 82–95% fewer voluntary context switches
   and 16–21% less user CPU, in the same wall time.
+- **Memory pressure no longer flaps between levels** (`14530fe`). On
+  Linux, memory pressure is the kernel's 10-second stall average against
+  fixed thresholds (Warn 5%, Critical 20%). With the average hovering near
+  5%, the daemon switched between Normal and Warn every few seconds (up to
+  31 behavior changes an hour on one host), changing how aggressively it
+  scans each time. A level is now left only once the average falls a
+  fifth below its threshold. And a host that goes quiet after pressure is
+  now seen to recover: the daemon checked again only when a new stall
+  occurred, so it could stay at Warn or Critical indefinitely.
 - **The RSS warning no longer repeats every minute** (`13e8d5c`). While RSS
   stayed over the warning level (256 MiB), the daemon logged the same
   warning on every state write, about 1,440 lines a day on a host whose

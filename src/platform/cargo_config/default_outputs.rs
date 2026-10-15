@@ -189,6 +189,7 @@ pub(super) fn request(argv: &[u8]) -> Option<ManifestRequest<'_>> {
             | b"r"
             | b"bench"
             | b"doc"
+            | b"d"
             | b"rustc"
             | b"rustdoc"
             | b"clippy"
@@ -262,6 +263,32 @@ mod tests {
                 .iter()
                 .any(|path| path.starts_with("/work/project/target"))
         );
+    }
+
+    /// Cargo's built-in aliases build into the same default target.
+    #[test]
+    fn built_in_aliases_hold_the_default_target() {
+        let mut files = Files::default();
+        files.put(
+            "/work/project/Cargo.toml",
+            "[package]\nname='app'\nversion='0.1.0'",
+        );
+        for argv in [
+            b"cargo\0b\0".as_slice(),
+            b"cargo\0c\0",
+            b"cargo\0t\0",
+            b"cargo\0r\0",
+            b"cargo\0d\0",
+        ] {
+            let found = files.observe(&mut Resolver::default(), argv, b"HOME=/builder\0");
+            assert!(found.complete);
+            assert_eq!(
+                found.directories,
+                vec![PathBuf::from("/work/project/target")],
+                "{}",
+                String::from_utf8_lossy(argv)
+            );
+        }
     }
 
     #[test]

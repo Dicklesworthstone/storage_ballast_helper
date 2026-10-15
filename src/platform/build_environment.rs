@@ -208,6 +208,14 @@ pub fn references_with_layout(
     paths
 }
 
+/// `CARGO_BUILD_BUILD_DIR` names a template only Cargo can expand. Observers
+/// count it as missing evidence, as they do the same template in a config file.
+#[cfg(target_os = "linux")]
+pub fn unresolved_cargo_build_directory(environ: &[u8]) -> bool {
+    nonempty(environ, b"CARGO_BUILD_BUILD_DIR")
+        .is_some_and(|value| value.contains(&b'{') || value.contains(&b'}'))
+}
+
 fn cargo_build_directory(environ: &[u8], cwd: Option<&Path>) -> Option<PathBuf> {
     let value = nonempty(environ, b"CARGO_BUILD_BUILD_DIR")?;
     // Cargo expands {workspace-root}, {workspace-path-hash}, and

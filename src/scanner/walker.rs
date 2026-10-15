@@ -2043,7 +2043,9 @@ pub fn collect_active_reference_index(
         index.complete = false;
     }
     let mut process_names = HashMap::new();
-    match platform.process_list() {
+    // Names and working directories only: an argv read can block behind a
+    // process wedged in mmap, and that would hold the scan with it.
+    match platform.process_list_without_command_lines() {
         Ok(processes) => {
             let own = i32::try_from(std::process::id()).ok();
             for process in processes {
