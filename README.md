@@ -1875,7 +1875,7 @@ Thread statuses are reported in the state file and displayed on the dashboard Di
 
 #### RSS Memory Tracking
 
-The daemon samples its own RSS through the PAL `self_stats()` method on each state file write. Linux uses `/proc/self` data; macOS uses Mach task and libproc resource usage. If RSS exceeds the configured warning level (<!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> by default), a warning is logged to stderr. The RSS value is included in the state file for external monitoring tools.
+The daemon samples its own RSS through the PAL `self_stats()` method on each state file write. Linux uses `/proc/self` data; macOS uses Mach task and libproc resource usage. If RSS exceeds the configured warning level (<!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> by default), a warning is logged to stderr when it crosses, then again hourly or after another 64 MiB of growth while it stays above. The RSS value is included in the state file for external monitoring tools.
 
 The daemon warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> of RSS and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim --> so the service manager restarts it clean; the generated systemd unit caps the cgroup at `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->768M<!-- /claim -->`, above that hard limit, so the daemon's own clean exit comes before the kernel's OOM kill (which could land mid-deletion). Both keep `sbh` from competing with build workloads for memory; on machines with constrained RAM, lower them in the unit file (`sbh service --systemd reinstall-unit` rewrites it) or in `[telemetry]`.
 

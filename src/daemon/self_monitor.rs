@@ -67,6 +67,23 @@ pub fn generate_run_id() -> String {
 pub const DEFAULT_DAEMON_RSS_WARNING_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES: u64 = 500 * 1024 * 1024;
 
+/// Growth past the last reported RSS that logs the warning again.
+const RSS_WARNING_REGROWTH_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How often an RSS that stays over the warning level is reported again.
+const RSS_WARNING_REPEAT: Duration = Duration::from_hours(1);
+
+/// Whether an RSS over the warning level should be logged now. It is logged
+/// when it first crosses, then hourly or after further growth, not on every
+/// state write: a host whose tree needs ~300 MiB logged it once a minute,
+/// all day.
+fn rss_warning_due(warned: Option<(Instant, u64)>, rss: u64, now: Instant) -> bool {
+    warned.is_none_or(|(at, reported)| {
+        rss >= reported.saturating_add(RSS_WARNING_REGROWTH_BYTES)
+            || now.saturating_duration_since(at) >= RSS_WARNING_REPEAT
+    })
+}
+
 // ──────────────────── daemon lock (liveness) ────────────────────
 
 /// Lock file kept next to `state.json`.
@@ -983,6 +1000,9 @@ pub struct SelfMonitor {
     last_write: Option<Instant>,
     rss_warning_bytes: u64,
     rss_hard_limit_bytes: u64,
+    /// When the RSS warning was last logged, and the RSS it reported; `None`
+    /// while RSS is under the warning level.
+    rss_warned: Option<(Instant, u64)>,
 
     // Mutable counters updated by the main loop.
     pub scan_count: u64,
@@ -1158,6 +1178,7 @@ impl SelfMonitor {
             last_write: None,
             rss_warning_bytes,
             rss_hard_limit_bytes,
+            rss_warned: None,
             mount_snapshot: Vec::new(),
             controller_snapshot: Vec::new(),
             rate_snapshot: std::collections::BTreeMap::new(),
@@ -1214,13 +1235,7 @@ impl SelfMonitor {
             return tick;
         }
 
-        if rss > self.rss_warning_bytes {
-            eprintln!(
-                "[SBH-SELFMON] WARNING: RSS {} MB exceeds limit {} MB",
-                rss / (1024 * 1024),
-                self.rss_warning_bytes / (1024 * 1024),
-            );
-        }
+        self.warn_on_rss(rss, now);
         if tick.rss_hard_limit_exceeded {
             eprintln!(
                 "[SBH-SELFMON] FATAL: RSS {} MB exceeds hard limit {} MB; daemon will exit nonzero for service restart",
@@ -1389,6 +1404,21 @@ impl SelfMonitor {
     /// Record an error.
     pub fn record_error(&mut self) {
         self.errors_total += 1;
+    }
+
+    /// Log an RSS over the warning level when [`rss_warning_due`] says so.
+    fn warn_on_rss(&mut self, rss: u64, now: Instant) {
+        if rss <= self.rss_warning_bytes {
+            self.rss_warned = None;
+        } else if rss_warning_due(self.rss_warned, rss, now) {
+            eprintln!(
+                "[SBH-SELFMON] WARNING: RSS {} MB exceeds limit {} MB (repeated hourly, or after {} MB more)",
+                rss / (1024 * 1024),
+                self.rss_warning_bytes / (1024 * 1024),
+                RSS_WARNING_REGROWTH_BYTES / (1024 * 1024),
+            );
+            self.rss_warned = Some((now, rss));
+        }
     }
 
     fn current_rss_bytes(&self) -> u64 {
@@ -2303,6 +2333,49 @@ mod tests {
         let state = SelfMonitor::read_state(&path).expect("hard-limit tick should force write");
         assert_eq!(state.pressure.overall, "red");
         assert_eq!(state.memory_rss_bytes, 4096);
+    }
+
+    #[test]
+    fn an_rss_over_the_warning_level_is_reported_on_crossing_then_hourly_or_on_growth() {
+        const MIB: u64 = 1024 * 1024;
+        let start = Instant::now();
+        assert!(rss_warning_due(None, 300 * MIB, start), "first crossing");
+        let warned = Some((start, 300 * MIB));
+        let minute = start + Duration::from_secs(60);
+        assert!(
+            !rss_warning_due(warned, 300 * MIB, minute),
+            "same RSS a minute later"
+        );
+        assert!(
+            !rss_warning_due(warned, 363 * MIB, minute),
+            "under 64 MiB of growth"
+        );
+        assert!(
+            rss_warning_due(warned, 364 * MIB, minute),
+            "64 MiB of growth"
+        );
+        assert!(
+            rss_warning_due(warned, 300 * MIB, start + RSS_WARNING_REPEAT),
+            "an hour later"
+        );
+    }
+
+    #[test]
+    fn dropping_under_the_warning_level_rearms_the_rss_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut monitor = SelfMonitor::with_rss_limits(
+            dir.path().join("state.json"),
+            Arc::new(MockPlatform::healthy().with_self_stats(test_self_stats(2048))),
+            1024,
+            1 << 30,
+        );
+        monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10, 0, "enforce");
+        assert_eq!(monitor.rss_warned.map(|(_, rss)| rss), Some(2048));
+
+        monitor.platform = Arc::new(MockPlatform::healthy().with_self_stats(test_self_stats(512)));
+        monitor.last_write = None;
+        monitor.maybe_write_state(PressureLevel::Green, 25.0, "/data", 10, 10, 0, "enforce");
+        assert_eq!(monitor.rss_warned, None);
     }
 
     // ──────── failure-injection tests ────────
