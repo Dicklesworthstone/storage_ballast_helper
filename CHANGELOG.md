@@ -18,6 +18,23 @@ Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballas
   every pass. Each pass now processes the next 65,536 entries, and every
   name is still read, so a `.sbh-protect` marker anywhere in a large
   directory protects it.
+- **On Linux, build output directories named on a live build's command
+  line count as in use** (`0c64ff6`, `a7838ef`). sbh read a build
+  process's environment but not its arguments, so it could delete a
+  running build's `cargo --target-dir` directory (also via `cargo-clippy`
+  and rch's `cargo-rch-real`), or rustc's `-C incremental=` cache outside
+  the target directory. It now also tracks `CARGO_BUILD_TARGET_DIR`,
+  `CARGO_BUILD_BUILD_DIR` and an inherited `OUT_DIR` separately from the
+  final artifacts. If a known build tool's process details can't be read
+  in full, the deletion waits.
+- **Naming what fills an unreclaimable mount stays bounded and can't stall
+  the monitor** (`5b4bc8e`, `4e8036b`). When a mount under pressure has
+  nothing sbh can delete, the daemon reports its largest directories. That
+  probe restarted its budget for each directory and ran on the monitor
+  thread. One entry and time budget now covers the whole mount, the
+  monitor waits a bounded time and never on a stalled probe, symlinks are
+  not followed, and a cut-short inventory reports its sizes as lower
+  bounds.
 
 ### Changed
 
