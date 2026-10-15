@@ -2,6 +2,8 @@
 
 pub(crate) mod build_environment;
 pub(crate) mod build_invocation;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod cargo_config;
 pub mod cleanup_catalog;
 pub mod linux;
 pub mod macos;
