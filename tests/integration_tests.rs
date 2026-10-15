@@ -2366,6 +2366,9 @@ file_size_bytes = 4096
 
 [notifications]
 enabled = false
+
+[scoring.batch_risk_budget_by_level]
+critical = 1.0
 "#,
             toml_path(&state_dir.join("state.json")),
             toml_path(&state_dir.join("activity.sqlite3")),
