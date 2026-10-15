@@ -594,6 +594,7 @@ pub(super) fn build_directory_snapshot() -> (Vec<(i32, PathBuf)>, bool) {
 /// its external cache between reads. The same bounded discovery feeds scoring
 /// and the native executor. Unreadable metadata remains best-effort evidence,
 /// not a claim of complete coverage; raw environments are never logged.
+#[cfg(test)]
 fn build_directories_with(
     proc: &impl ProcAccess,
     proc_root: &Path,
