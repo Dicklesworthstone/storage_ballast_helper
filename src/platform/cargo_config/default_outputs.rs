@@ -8,7 +8,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{Cached, MAX_ANCESTORS, MAX_PATH_BYTES, Observation, Resolver, byte_path, cargo_value_option};
+use super::{
+    Cached, MAX_ANCESTORS, MAX_PATH_BYTES, Observation, Resolver, byte_path, cargo_value_option,
+};
 
 #[derive(Clone, Default)]
 pub(super) struct Manifest {
@@ -53,13 +55,11 @@ impl Resolver {
                 observation.complete = false;
                 return;
             };
-            match self.cached(&path, read) {
-                Cached::Present(parsed) => Some((path, parsed.manifest)),
-                _ => {
-                    observation.complete = false;
-                    return;
-                }
-            }
+            let Cached::Present(parsed) = self.cached(&path, read) else {
+                observation.complete = false;
+                return;
+            };
+            Some((path, parsed.manifest))
         } else {
             self.find_manifest(cwd, false, observation, read)
         };
@@ -136,6 +136,7 @@ impl Resolver {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum ManifestRequest<'a> {
     Search,
     Explicit(&'a [u8]),
@@ -144,15 +145,15 @@ pub(super) enum ManifestRequest<'a> {
 /// Only known local build commands without a target-dir override need defaults.
 /// Forwarded arguments and operands of other options are not Cargo commands.
 pub(super) fn request(argv: &[u8]) -> Option<ManifestRequest<'_>> {
-    let mut args = argv.strip_suffix(b"\0")?.split(|byte| *byte == 0);
-    let program = args.next()?.rsplit(|byte| *byte == b'/').next()?;
+    let mut operands = argv.strip_suffix(b"\0")?.split(|byte| *byte == 0);
+    let program = operands.next()?.rsplit(|byte| *byte == b'/').next()?;
     let mut command = match program {
         b"cargo-clippy" => Some(b"clippy".as_slice()),
         b"cargo-nextest" => Some(b"nextest".as_slice()),
         _ => None,
     };
     let mut manifest = ManifestRequest::Search;
-    while let Some(arg) = args.next() {
+    while let Some(arg) = operands.next() {
         if arg == b"--" {
             break;
         }
@@ -160,7 +161,7 @@ pub(super) fn request(argv: &[u8]) -> Option<ManifestRequest<'_>> {
             return None;
         }
         if arg == b"--manifest-path" {
-            let value = args.next()?;
+            let value = operands.next()?;
             if value.is_empty() || value.starts_with(b"-") {
                 return None;
             }
@@ -171,24 +172,38 @@ pub(super) fn request(argv: &[u8]) -> Option<ManifestRequest<'_>> {
             }
             manifest = ManifestRequest::Explicit(value);
         } else if arg == b"--config" || cargo_value_option(arg) {
-            args.next()?;
+            operands.next()?;
         } else if command.is_none() && !arg.starts_with(b"-") && !arg.starts_with(b"+") {
             command = Some(arg);
         }
     }
     matches!(
         command?,
-        b"build" | b"b" | b"check" | b"c" | b"test" | b"t" | b"run" | b"r"
-            | b"bench" | b"doc" | b"rustc" | b"rustdoc" | b"clippy" | b"fix"
-            | b"nextest" | b"package" | b"publish"
+        b"build"
+            | b"b"
+            | b"check"
+            | b"c"
+            | b"test"
+            | b"t"
+            | b"run"
+            | b"r"
+            | b"bench"
+            | b"doc"
+            | b"rustc"
+            | b"rustdoc"
+            | b"clippy"
+            | b"fix"
+            | b"nextest"
+            | b"package"
+            | b"publish"
     )
     .then_some(manifest)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{Evidence, TOTAL_BYTES};
+    use super::*;
     use std::collections::BTreeMap;
     use std::os::unix::ffi::OsStringExt as _;
 
@@ -219,47 +234,83 @@ mod tests {
         }
 
         fn observe(&mut self, resolver: &mut Resolver, argv: &[u8], env: &[u8]) -> Evidence {
-            resolver.observe(argv, env, Some(Path::new("/work/project")), |path, limit| {
-                self.read(path, limit)
-            })
+            resolver.observe(
+                argv,
+                env,
+                Some(Path::new("/work/project")),
+                |path, limit| self.read(path, limit),
+            )
         }
     }
 
     #[test]
     fn a_standalone_build_holds_default_outputs_before_any_artifact_exists() {
         let mut files = Files::default();
-        files.put("/work/project/Cargo.toml", "[package]\nname='app'\nversion='0.1.0'");
+        files.put(
+            "/work/project/Cargo.toml",
+            "[package]\nname='app'\nversion='0.1.0'",
+        );
         let found = files.observe(&mut Resolver::default(), ARGV, b"HOME=/builder\0");
         assert!(found.complete);
-        assert_eq!(found.directories, vec![PathBuf::from("/work/project/target")]);
-        assert!(!files.reads.iter().any(|path| path.starts_with("/work/project/target")));
+        assert_eq!(
+            found.directories,
+            vec![PathBuf::from("/work/project/target")]
+        );
+        assert!(
+            !files
+                .reads
+                .iter()
+                .any(|path| path.starts_with("/work/project/target"))
+        );
     }
 
     #[test]
     fn workspace_members_hold_shared_outputs_and_the_excluded_package_possibility() {
         let mut files = Files::default();
-        files.put("/work/project/Cargo.toml", "[package]\nname='member'\nversion='0.1.0'");
+        files.put(
+            "/work/project/Cargo.toml",
+            "[package]\nname='member'\nversion='0.1.0'",
+        );
         files.put("/work/Cargo.toml", "[workspace]\nmembers=['project']");
         let found = files.observe(&mut Resolver::default(), ARGV, b"");
         assert!(found.complete);
-        assert_eq!(found.directories, vec![
-            PathBuf::from("/work/project/target"), PathBuf::from("/work/target")
-        ]);
+        assert_eq!(
+            found.directories,
+            vec![
+                PathBuf::from("/work/project/target"),
+                PathBuf::from("/work/target")
+            ]
+        );
         files.put("/work/project/Cargo.toml", "[workspace]\nmembers=[]");
         let found = files.observe(&mut Resolver::default(), ARGV, b"");
         assert!(found.complete);
-        assert_eq!(found.directories, vec![PathBuf::from("/work/project/target")]);
+        assert_eq!(
+            found.directories,
+            vec![PathBuf::from("/work/project/target")]
+        );
     }
 
     #[test]
     fn explicit_external_workspace_is_verified_without_following_pointer_cycles() {
         let mut files = Files::default();
-        files.put("/work/project/Cargo.toml", "[package]\nworkspace='/shared/workspace'");
-        files.put("/shared/workspace/Cargo.toml", "[workspace]\nmembers=['/work/project']");
+        files.put(
+            "/work/project/Cargo.toml",
+            "[package]\nworkspace='/shared/workspace'",
+        );
+        files.put(
+            "/shared/workspace/Cargo.toml",
+            "[workspace]\nmembers=['/work/project']",
+        );
         let found = files.observe(&mut Resolver::default(), ARGV, b"");
         assert!(found.complete);
-        assert_eq!(found.directories, vec![PathBuf::from("/shared/workspace/target")]);
-        files.put("/shared/workspace/Cargo.toml", "[package]\nworkspace='/work/project'");
+        assert_eq!(
+            found.directories,
+            vec![PathBuf::from("/shared/workspace/target")]
+        );
+        files.put(
+            "/shared/workspace/Cargo.toml",
+            "[package]\nworkspace='/work/project'",
+        );
         let before = files.reads.len();
         let found = files.observe(&mut Resolver::default(), ARGV, b"");
         assert!(!found.complete);
@@ -274,11 +325,16 @@ mod tests {
         files.put("/other/Cargo.toml", "[workspace]");
         let found = files.observe(
             &mut Resolver::default(),
-            b"cargo\0check\0--manifest-path=/other/Cargo.toml\0", b""
+            b"cargo\0check\0--manifest-path=/other/Cargo.toml\0",
+            b"",
         );
         assert!(found.complete);
         assert_eq!(found.directories, vec![PathBuf::from("/other/target")]);
-        assert!(!files.reads.contains(&PathBuf::from("/work/project/Cargo.toml")));
+        assert!(
+            !files
+                .reads
+                .contains(&PathBuf::from("/work/project/Cargo.toml"))
+        );
     }
 
     #[test]
@@ -290,26 +346,47 @@ mod tests {
             (ARGV, b"CARGO_BUILD_TARGET_DIR=/elsewhere\0"),
             (b"cargo\0build\0--target-dir=/elsewhere\0", b""),
             (b"cargo\0build\0--target-dir\0/elsewhere\0", b""),
-            (b"cargo\0build\0--config=build.target-dir='/elsewhere'\0", b""),
+            (
+                b"cargo\0build\0--config=build.target-dir='/elsewhere'\0",
+                b"",
+            ),
         ] {
             files.reads.clear();
             let found = files.observe(&mut Resolver::default(), argv, env);
             assert!(found.complete);
-            assert!(!found.directories.contains(&PathBuf::from("/work/project/target")));
-            assert!(!files.reads.contains(&PathBuf::from("/work/project/Cargo.toml")));
+            assert!(
+                !found
+                    .directories
+                    .contains(&PathBuf::from("/work/project/target"))
+            );
+            assert!(
+                !files
+                    .reads
+                    .contains(&PathBuf::from("/work/project/Cargo.toml"))
+            );
         }
-        files.put("/work/project/.cargo/config.toml", "[build]\nbuild-dir='/intermediate'");
+        files.put(
+            "/work/project/.cargo/config.toml",
+            "[build]\nbuild-dir='/intermediate'",
+        );
         let found = files.observe(&mut Resolver::default(), ARGV, b"");
         assert!(found.complete);
-        assert_eq!(found.directories, vec![
-            PathBuf::from("/intermediate"), PathBuf::from("/work/project/target")
-        ]);
+        assert_eq!(
+            found.directories,
+            vec![
+                PathBuf::from("/intermediate"),
+                PathBuf::from("/work/project/target")
+            ]
+        );
     }
 
     #[test]
     fn manifest_failure_keeps_known_intermediates_without_certifying_absence() {
         let mut files = Files::default();
-        files.put("/work/project/.cargo/config.toml", "[build]\nbuild-dir='/known'");
+        files.put(
+            "/work/project/.cargo/config.toml",
+            "[build]\nbuild-dir='/known'",
+        );
         for text in ["invalid TOML", "[package]\nworkspace=7", "[unrelated]"] {
             files.put("/work/project/Cargo.toml", text);
             let found = files.observe(&mut Resolver::default(), ARGV, b"");
@@ -329,7 +406,10 @@ mod tests {
         files.denied = Some("/work/Cargo.toml".into());
         let found = files.observe(&mut Resolver::default(), ARGV, b"");
         assert!(!found.complete);
-        assert_eq!(found.directories, vec![PathBuf::from("/work/project/target")]);
+        assert_eq!(
+            found.directories,
+            vec![PathBuf::from("/work/project/target")]
+        );
     }
 
     #[test]
@@ -345,26 +425,45 @@ mod tests {
             files.reads.clear();
             let found = files.observe(&mut Resolver::default(), argv, b"");
             assert!(found.directories.is_empty());
-            assert!(!files.reads.iter().any(|path| path.file_name().is_some_and(|n| n == "Cargo.toml")));
+            assert!(
+                !files
+                    .reads
+                    .iter()
+                    .any(|path| path.file_name().is_some_and(|n| n == "Cargo.toml"))
+            );
         }
-        let found = files.observe(&mut Resolver::default(),
-            b"cargo\0run\0--\0--manifest-path=/not-ours/Cargo.toml\0", b"");
+        let found = files.observe(
+            &mut Resolver::default(),
+            b"cargo\0run\0--\0--manifest-path=/not-ours/Cargo.toml\0",
+            b"",
+        );
         assert!(found.complete);
-        assert_eq!(found.directories, vec![PathBuf::from("/work/project/target")]);
+        assert_eq!(
+            found.directories,
+            vec![PathBuf::from("/work/project/target")]
+        );
         assert!(!files.reads.contains(&PathBuf::from("/not-ours/Cargo.toml")));
     }
 
     #[test]
     fn native_manifest_path_bytes_are_preserved_in_the_default_target() {
         let mut files = Files::default();
-        let manifest = PathBuf::from(std::ffi::OsString::from_vec(b"/project-\xff/Cargo.toml".to_vec()));
+        let manifest = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/project-\xff/Cargo.toml".to_vec(),
+        ));
         files.data.insert(manifest, b"[workspace]".to_vec());
-        let found = files.observe(&mut Resolver::default(),
-            b"cargo\0build\0--manifest-path\0/project-\xff/Cargo.toml\0", b"");
+        let found = files.observe(
+            &mut Resolver::default(),
+            b"cargo\0build\0--manifest-path\0/project-\xff/Cargo.toml\0",
+            b"",
+        );
         assert!(found.complete);
-        assert_eq!(found.directories, vec![PathBuf::from(std::ffi::OsString::from_vec(
-            b"/project-\xff/target".to_vec()
-        ))]);
+        assert_eq!(
+            found.directories,
+            vec![PathBuf::from(std::ffi::OsString::from_vec(
+                b"/project-\xff/target".to_vec()
+            ))]
+        );
     }
 
     #[test]
@@ -377,7 +476,10 @@ mod tests {
         let second = files.observe(&mut resolver, ARGV, b"");
         assert_eq!(first.directories, second.directories);
         assert_eq!(before, files.reads.len());
-        let mut full = Resolver { bytes: TOTAL_BYTES, ..Resolver::default() };
+        let mut full = Resolver {
+            bytes: TOTAL_BYTES,
+            ..Resolver::default()
+        };
         files.reads.clear();
         let found = files.observe(&mut full, ARGV, b"");
         assert!(!found.complete);
@@ -388,11 +490,18 @@ mod tests {
     #[test]
     fn missing_explicit_manifest_and_unterminated_environment_remain_unknown() {
         let mut files = Files::default();
-        let found = files.observe(&mut Resolver::default(),
-            b"cargo\0build\0--manifest-path=/absent/Cargo.toml\0", b"");
+        let found = files.observe(
+            &mut Resolver::default(),
+            b"cargo\0build\0--manifest-path=/absent/Cargo.toml\0",
+            b"",
+        );
         assert!(!found.complete);
         files.put("/work/project/Cargo.toml", "[workspace]");
-        let found = files.observe(&mut Resolver::default(), ARGV, b"OTHER=complete\0CARGO_TARGET_DIR=/tail");
+        let found = files.observe(
+            &mut Resolver::default(),
+            ARGV,
+            b"OTHER=complete\0CARGO_TARGET_DIR=/tail",
+        );
         assert!(!found.complete);
         assert!(found.directories.is_empty());
     }
