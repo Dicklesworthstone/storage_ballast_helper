@@ -4,6 +4,17 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
+## v0.7.8
+
+Compare: [`v0.7.7...v0.7.8`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.7...v0.7.8)
+
+### Fixed
+
+- **`cargo d` holds its default target like `cargo doc`** (`d5dafbf`). On
+  Linux a running cargo's default `target/` counts as in use before its
+  first artifact exists, but only for known build subcommands; Cargo's
+  built-in alias `d` was missing (`b`, `c`, `t` and `r` were covered).
+
 ## v0.7.7 **[release]**
 
 Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.6...v0.7.7)
