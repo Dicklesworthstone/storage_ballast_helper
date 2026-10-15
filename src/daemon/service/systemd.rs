@@ -343,7 +343,12 @@ impl SystemdServiceManager {
         writeln!(unit).ok();
 
         writeln!(unit, "# Resource limits").ok();
-        writeln!(unit, "MemoryMax=256M").ok();
+        writeln!(
+            unit,
+            "MemoryMax={}",
+            crate::daemon::service::SYSTEMD_MEMORY_MAX
+        )
+        .ok();
         // One core as the runaway backstop; the weight (plus Nice/IO idle)
         // keeps it out of the way of builds. 10% of one core starved every
         // host: throttled in up to 100% of periods, scans timing out at Critical.
@@ -1496,6 +1501,23 @@ mod unit_drift_tests {
         );
         assert!(drift.is_clean(), "{drift:?}");
         assert!(drift.exec_start_matches);
+    }
+
+    /// The kernel's cap must sit above the daemon's own hard limit, or the
+    /// OOM killer (SIGKILL, maybe mid-deletion) always beats the graceful
+    /// exit-and-restart.
+    #[test]
+    fn generated_memory_max_is_above_the_daemons_own_rss_hard_limit() {
+        let directives = parse_unit_directives(&manager().generate_unit_file());
+        let value = &directives["Service/MemoryMax"][0];
+        let mib: u64 = value
+            .strip_suffix('M')
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("MemoryMax={value} is not in M"));
+        let hard_limit = crate::core::config::Config::default()
+            .telemetry
+            .daemon_rss_hard_limit_bytes;
+        assert!(mib * 1024 * 1024 > hard_limit, "MemoryMax={value}");
     }
 
     #[test]

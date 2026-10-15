@@ -1875,9 +1875,9 @@ Thread statuses are reported in the state file and displayed on the dashboard Di
 
 #### RSS Memory Tracking
 
-The daemon samples its own RSS through the PAL `self_stats()` method on each state file write. Linux uses `/proc/self` data; macOS uses Mach task and libproc resource usage. If RSS exceeds the configured warning level (<!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> by default, matching the systemd `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->` directive on Linux), a warning is logged to stderr. The RSS value is included in the state file for external monitoring tools.
+The daemon samples its own RSS through the PAL `self_stats()` method on each state file write. Linux uses `/proc/self` data; macOS uses Mach task and libproc resource usage. If RSS exceeds the configured warning level (<!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> by default), a warning is logged to stderr. The RSS value is included in the state file for external monitoring tools.
 
-The daemon warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> of RSS and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim --> so the service manager restarts it clean; the generated systemd unit caps the cgroup at `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->`, which is the limit that binds in practice. Both keep `sbh` from competing with build workloads for memory; on machines with constrained RAM, lower them in the unit file (`sbh service --systemd reinstall-unit` rewrites it) or in `[telemetry]`.
+The daemon warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> of RSS and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim --> so the service manager restarts it clean; the generated systemd unit caps the cgroup at `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->768M<!-- /claim -->`, above that hard limit, so the daemon's own clean exit comes before the kernel's OOM kill (which could land mid-deletion). Both keep `sbh` from competing with build workloads for memory; on machines with constrained RAM, lower them in the unit file (`sbh service --systemd reinstall-unit` rewrites it) or in `[telemetry]`.
 
 #### State File Protocol
 
@@ -1952,7 +1952,7 @@ This keeps `sbh` at background priority. System-scope systemd units also add a c
 - `LimitNOFILE=4096` — caps file descriptor count
 
 **Resource limits:**
-- `MemoryMax=256M` — hard memory ceiling enforced by the cgroup controller
+- `MemoryMax=768M` — cgroup ceiling, set above the daemon's own 500 MiB exit so a clean restart comes first
 - `CPUQuota=100%` — caps CPU at one core as a runaway backstop
 - `CPUWeight=1` — the lowest CPU share, so builds win whenever cores are busy
 - `Environment=MALLOC_ARENA_MAX=2` — two glibc malloc arenas rather than one per scanner thread, so on a large tree RSS stays near the live set instead of settling at about twice it
@@ -2313,8 +2313,8 @@ For test harness conventions and structured logging registration, see `docs/test
 - If using systemd with `Type=notify`, the watchdog will auto-restart after 60 seconds of no heartbeat.
 
 ### "Memory usage keeps growing"
-- The daemon warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> of RSS and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim -->; the systemd unit caps it at `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->`. Check `sbh status --json | jq '.memory_rss_bytes'`.
-- Systemd's `MemoryMax=256M` provides a hard ceiling.
+- The daemon warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> of RSS and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim -->; the systemd unit caps it at `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->768M<!-- /claim -->`. Check `sbh status --json | jq '.memory_rss_bytes'`.
+- Systemd's `MemoryMax=768M` is a backstop above the daemon's own exit.
 - Large candidate scan indexes on machines with many directories can increase baseline memory. Consider reducing `scanner.root_paths` scope.
 
 ## Limitations
@@ -2351,7 +2351,7 @@ Send `SIGUSR1` to the daemon: `kill -USR1 $(pidof sbh)`. This bypasses the VOI s
 Yes. The v2 candidate index (`src/scanner/index.rs`, persisted to `scanner-index-v2.json`) records event generations, candidate records, and SHA-256 checksums across restarts under `scanner.engine = "v2"` (default since v0.4.32). If the checkpoint is corrupt or missing, v2 rebuilds through bounded reconciliation. (The legacy `src/scanner/merkle.rs` implementation remains in the repository as reference code but is not active in the live daemon.)
 
 ### How much memory does `sbh` use?
-Under normal operation, 20-60 MB of RSS. The systemd unit's `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->256M<!-- /claim -->` is the binding cap; the daemon's own self-monitor warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim --> (which only binds without a cgroup cap, as on launchd). Machines with hundreds of thousands of directories in watched paths will use more due to the candidate scan index.
+Under normal operation, 20-60 MB of RSS. The daemon's own self-monitor warns at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_WARNING_BYTES -->256 MiB<!-- /claim --> and exits at <!-- claim:constants.daemon.DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES -->500 MiB<!-- /claim -->; the systemd unit's `MemoryMax=<!-- claim:constants.service.SYSTEMD_MEMORY_MAX -->768M<!-- /claim -->` is a backstop above that. Machines with hundreds of thousands of directories in watched paths use more: a host scanning 500k entries per pass holds about 290 MiB with two malloc arenas.
 
 ### Is this Linux-only?
 No. It is cross-platform, with service integration for `systemd` (Linux) and `launchd` (macOS). Open-file vetoes are platform-specific internally: Linux uses `/proc/*/fd`, while macOS uses PAL/libproc evidence for visible processes. Other safety layers, including age, sacred-path, protected-path, active executable/mmap, and `.git` guards, remain active on both platforms.

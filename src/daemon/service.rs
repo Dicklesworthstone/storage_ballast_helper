@@ -13,10 +13,13 @@ use std::path::{Path, PathBuf};
 
 use crate::core::errors::Result;
 
-/// `MemoryMax=` written into the generated systemd unit: the cgroup cap,
-/// above the daemon's own RSS warning and below nothing else (the daemon
-/// exits at its hard limit first only when that is lower).
-pub const SYSTEMD_MEMORY_MAX: &str = "256M";
+/// `MemoryMax=` written into the generated systemd unit.
+///
+/// It sits above the daemon's own RSS hard limit (500 MiB by default), so
+/// the daemon exits on its own and is restarted before the kernel OOM-kills
+/// it, maybe mid-deletion. A 500k-entry tree needs about 290 MiB even with
+/// two malloc arenas (ts2 2026-10-15), so the old 256M cap bound first.
+pub const SYSTEMD_MEMORY_MAX: &str = "768M";
 use crate::platform::pal::{NoopServiceManager, Platform, ServiceManager};
 use crate::platform::types::ServiceKind;
 
@@ -1180,7 +1183,10 @@ mod tests {
         let mgr = SystemdServiceManager::new(test_config(false));
         let unit = mgr.generate_unit_file();
 
-        assert!(unit.contains("MemoryMax=256M"));
+        assert!(unit.contains(&format!(
+            "MemoryMax={}",
+            crate::daemon::service::SYSTEMD_MEMORY_MAX
+        )));
         assert!(unit.contains("CPUQuota=100%"));
         assert!(unit.contains("CPUWeight=1"));
     }

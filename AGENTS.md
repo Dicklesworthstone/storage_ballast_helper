@@ -716,7 +716,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | control | `MAX_REQUESTS_PER_SECOND` | `10` | Control-socket request rate limit | `src/daemon/control.rs` |
 | control | `MAX_LINE_BYTES` | `64 KiB` | Longest request line accepted | `src/daemon/control.rs` |
 | control | `IO_TIMEOUT` | `5 s` | Read/write timeout per control connection | `src/daemon/control.rs` |
-| service | `SYSTEMD_MEMORY_MAX` | `256M` | MemoryMax= in the generated systemd unit | `src/daemon/service.rs` |
+| service | `SYSTEMD_MEMORY_MAX` | `768M` | MemoryMax= in the generated systemd unit | `src/daemon/service.rs` |
 | scanner | `event_watch_budget` | `8192` | inotify watches planned across the roots (Linux) | `src/core/config.rs` |
 | control | `MAX_SOCKET_PATH_BYTES` | `100` | Longest socket path a Unix address can carry | `src/daemon/control.rs` |
 | voi | `ewma_alpha` | `0.3` | Smoothing of the scheduler's expected-reclaim estimates | `src/core/config.rs` |
