@@ -406,6 +406,13 @@ pub trait Platform: Send + Sync {
         Vec::new()
     }
 
+    /// Build-directory evidence together with coverage of the attempted
+    /// observation. The default preserves legacy platform implementations;
+    /// platforms with a coverage-aware collector should override this.
+    fn build_directories_in_use_checked(&self) -> (Vec<(i32, PathBuf)>, bool) {
+        (self.build_directories_in_use(), true)
+    }
+
     fn self_stats(&self) -> Result<SelfStats> {
         pal_not_implemented(self.name(), "self_stats")
     }

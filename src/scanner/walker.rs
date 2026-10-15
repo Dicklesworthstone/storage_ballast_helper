@@ -1797,14 +1797,29 @@ pub(crate) fn open_path_ancestors_for_roots(
     for target in targets {
         add_open_path_ancestor_chain(&mut ancestors, target, &normalized_roots);
     }
-    // Cache/output declarations are subtree references, unlike descriptors.
-    // Refresh them once per batch even when the expensive fd sweep is reused.
+    ancestors
+}
+
+/// Refresh build declarations independently of a reusable descriptor snapshot.
+/// Incomplete fresh discovery must never inherit a cached complete verdict.
+#[cfg(target_os = "linux")]
+pub(crate) fn checked_open_path_ancestors_for_roots(
+    targets: &[PathBuf],
+    descriptor_complete: bool,
+    root_paths: &[PathBuf],
+) -> (HashSet<PathBuf>, bool) {
+    let mut ancestors = open_path_ancestors_for_roots(targets, root_paths);
+    if root_paths.is_empty() {
+        return (ancestors, descriptor_complete);
+    }
+    let (directories, build_complete) =
+        crate::platform::linux::process::read_build_directory_snapshot();
     build_scopes::add_candidate_scopes(
-        crate::platform::current().build_directories_in_use(),
-        &normalized_roots,
+        directories,
+        &normalized_open_roots(root_paths),
         &mut ancestors,
     );
-    ancestors
+    (ancestors, descriptor_complete && build_complete)
 }
 
 /// Collect open path ancestors using a specific platform implementation.
@@ -1818,13 +1833,11 @@ pub fn collect_open_path_ancestors_with_platform(
     }
 
     let mut ancestors = HashSet::with_capacity(4096);
-    // Preserve positive build-scope evidence even if a later fd query fails.
-    build_scopes::add_candidate_scopes(
-        platform.build_directories_in_use(),
-        &normalized_roots,
-        &mut ancestors,
-    );
-    let mut incomplete = false;
+    // Preserve positive build-scope evidence even when its own observation or
+    // a later fd query is incomplete. Either missing source revokes coverage.
+    let (build_directories, build_complete) = platform.build_directories_in_use_checked();
+    build_scopes::add_candidate_scopes(build_directories, &normalized_roots, &mut ancestors);
+    let mut incomplete = !build_complete;
     let probe_roots = common_open_file_probe_root(&normalized_roots).map_or_else(
         || {
             normalized_roots
@@ -2041,8 +2054,13 @@ pub fn collect_active_reference_index(
     }
 
     // The cargo home and target directory a live build names are in use for
-    // as long as it runs, whatever it holds open (bd-d1kt).
-    for (pid, directory) in platform.build_directories_in_use() {
+    // as long as it runs, whatever it holds open (bd-d1kt). Coverage matters:
+    // missing build metadata is unknown use, not proof that a path is idle.
+    let (build_directories, build_complete) = platform.build_directories_in_use_checked();
+    if !build_complete {
+        index.complete = false;
+    }
+    for (pid, directory) in build_directories {
         let name = process_names.get(&pid).cloned();
         index.add_reference(&roots, &directory, |summary| {
             summary.add_build_directory(pid, name.clone());

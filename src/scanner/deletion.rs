@@ -865,10 +865,7 @@ impl DeletionExecutor {
                     #[cfg(target_os = "linux")]
                     {
                         let (targets, complete) = open_targets_for_batch(&roots);
-                        (
-                            walker::open_path_ancestors_for_roots(&targets, &roots),
-                            complete,
-                        )
+                        walker::checked_open_path_ancestors_for_roots(&targets, complete, &roots)
                     }
                     #[cfg(not(target_os = "linux"))]
                     {

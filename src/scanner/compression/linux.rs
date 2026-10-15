@@ -490,8 +490,13 @@ fn check_active(path: &Path, own_fd: i32, platform: &dyn Platform) -> io::Result
     if !platform.mmap_regions_under(path).map_err(other)?.is_empty() {
         return Err(io::Error::other("file has active memory mappings"));
     }
-    if platform
-        .build_directories_in_use()
+    let (build_directories, build_complete) = platform.build_directories_in_use_checked();
+    if !build_complete {
+        return Err(io::Error::other(
+            "active build-directory inspection was incomplete",
+        ));
+    }
+    if build_directories
         .iter()
         .any(|(_, root)| path.starts_with(root))
     {

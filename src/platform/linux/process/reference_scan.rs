@@ -580,7 +580,13 @@ struct UnreadableProcess {
 const BUILD_ENVIRON_LIMIT: usize = 512 * 1024;
 
 pub(super) fn build_directories() -> Vec<(i32, PathBuf)> {
-    build_directories_with(&NativeProc, Path::new(PROC_ROOT), Limits::default())
+    build_directory_snapshot().0
+}
+
+/// Return positive build references and observation completeness together.
+pub(super) fn build_directory_snapshot() -> (Vec<(i32, PathBuf)>, bool) {
+    let result = build_directory_sweep(&NativeProc, Path::new(PROC_ROOT), Limits::default());
+    (result.directories, result.complete)
 }
 
 /// Positive directory references from live Rust, Go, Node, Python and native
