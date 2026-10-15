@@ -26,9 +26,9 @@ const MAX_CLI_CONFIGS: usize = 32;
 
 /// Positive directories and whether the attempted configuration observation
 /// finished. This does not certify complete process or configuration coverage.
-pub(crate) struct Evidence {
-    pub(crate) directories: Vec<PathBuf>,
-    pub(crate) complete: bool,
+pub struct Evidence {
+    pub directories: Vec<PathBuf>,
+    pub complete: bool,
 }
 
 #[derive(Clone)]
@@ -54,7 +54,7 @@ enum Cached {
 /// Per-sweep cache with aggregate input, pathname and probe bounds. Only the
 /// selected directory fields are retained, never unrelated configuration data.
 #[derive(Default)]
-pub(crate) struct Resolver {
+pub struct Resolver {
     files: BTreeMap<PathBuf, Cached>,
     bytes: usize,
     path_bytes: usize,
@@ -94,7 +94,7 @@ impl Observation {
 
 /// Only complete argv for a known Cargo executable authorizes config reads.
 /// rustc/build-script/rch processes retain their independent env/argv evidence.
-pub(crate) fn is_cargo(argv: &[u8]) -> bool {
+pub fn is_cargo(argv: &[u8]) -> bool {
     let Some(raw) = argv.strip_suffix(b"\0") else {
         return false;
     };
@@ -110,7 +110,7 @@ impl Resolver {
     /// inline build directory values. `read` must enforce the caller's shared
     /// deadline before I/O; this layer enforces byte, path, depth and work caps.
     /// A missing HOME is not replaced with the observer's account information.
-    pub(crate) fn observe(
+    pub fn observe(
         &mut self,
         argv: &[u8],
         environment: &[u8],
@@ -185,14 +185,10 @@ impl Resolver {
                 self.bytes += raw.len();
                 parse(&raw).map_or(Cached::Unavailable, Cached::Present)
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Cached::Missing,
             // A reader may have consumed the full allowance before refusing.
             // Charge failed attempts too; errors cannot evade the byte budget.
-            Ok(_) => {
-                self.bytes += limit;
-                Cached::Unavailable
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Cached::Missing,
-            Err(_) => {
+            Ok(_) | Err(_) => {
                 self.bytes += limit;
                 Cached::Unavailable
             }
@@ -269,14 +265,14 @@ impl Resolver {
         observation: &mut Observation,
         read: &mut impl FnMut(&Path, usize) -> io::Result<Vec<u8>>,
     ) {
-        let mut args = argv[..argv.len() - 1].split(|byte| *byte == 0).skip(1);
+        let mut operands = argv[..argv.len() - 1].split(|byte| *byte == 0).skip(1);
         let mut count = 0;
-        while let Some(arg) = args.next() {
+        while let Some(arg) = operands.next() {
             if arg == b"--" {
                 break;
             }
             let value = if arg == b"--config" {
-                let Some(value) = args.next() else {
+                let Some(value) = operands.next() else {
                     observation.complete = false;
                     break;
                 };
@@ -286,7 +282,7 @@ impl Resolver {
             } else {
                 // Operands must not impersonate a new Cargo option. The
                 // observed cwd already reflects Cargo's -C, if applied.
-                if cargo_value_option(arg) && args.next().is_none() {
+                if cargo_value_option(arg) && operands.next().is_none() {
                     observation.complete = false;
                 }
                 continue;
@@ -388,16 +384,17 @@ fn parse(raw: &[u8]) -> Option<Parsed> {
     if let Some(includes) = document.get("include") {
         if let Some(includes) = includes.as_array() {
             for include in includes.iter().take(MAX_CLI_CONFIGS) {
-                let (path, optional) = if let Some(path) = include.as_str() {
-                    (Some(path), Some(false))
-                } else {
-                    (
-                        include.get("path").and_then(toml::Value::as_str),
-                        include
-                            .get("optional")
-                            .map_or(Some(false), toml::Value::as_bool),
-                    )
-                };
+                let (path, optional) = include.as_str().map_or_else(
+                    || {
+                        (
+                            include.get("path").and_then(toml::Value::as_str),
+                            include
+                                .get("optional")
+                                .map_or(Some(false), toml::Value::as_bool),
+                        )
+                    },
+                    |path| (Some(path), Some(false)),
+                );
                 if let (Some(path), Some(optional)) = (path, optional)
                     && !path.is_empty()
                     && path.len() <= MAX_PATH_BYTES
@@ -424,7 +421,7 @@ fn parse(raw: &[u8]) -> Option<Parsed> {
 /// Bounded regular-file reader used for configuration only. Resolve legitimate
 /// dotfile symlinks, reject special files, then verify the opened observation.
 /// No write handles, subprocesses or configuration error text are exposed.
-pub(crate) fn read_file(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+pub fn read_file(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     // A dangling config symlink is unavailable, not an absent config layer.
     fs::symlink_metadata(path)?;
     let resolved = fs::canonicalize(path)
@@ -729,7 +726,7 @@ mod tests {
         assert!(!files.observe(&mut resolver, ARGV, b"").complete);
         assert!(files.reads.is_empty());
         let mut args = b"cargo\0".to_vec();
-        for _ in 0..MAX_CLI_CONFIGS + 1 {
+        for _ in 0..=MAX_CLI_CONFIGS {
             args.extend_from_slice(b"--config=build.target-dir='/one'\0");
         }
         let found = files.observe(&mut Resolver::default(), &args, b"");
