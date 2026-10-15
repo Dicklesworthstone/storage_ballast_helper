@@ -46,6 +46,11 @@ Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballas
   a time, and whatever they hold before they wait for more work. Scanning
   a 200,000-directory tree took 82–95% fewer voluntary context switches
   and 16–21% less user CPU, in the same wall time.
+- **The RSS warning no longer repeats every minute** (`13e8d5c`). While RSS
+  stayed over the warning level (256 MiB), the daemon logged the same
+  warning on every state write, about 1,440 lines a day on a host whose
+  tree needs ~300 MiB. It is now logged when RSS crosses the level, then
+  hourly or after another 64 MiB of growth.
 
 ## v0.7.6 **[release]**
 
