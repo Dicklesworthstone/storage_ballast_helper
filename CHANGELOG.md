@@ -46,6 +46,13 @@ Compare: [`v0.7.5...v0.7.6`](https://github.com/Dicklesworthstone/storage_ballas
 
 ### Changed
 
+- **Generated systemd units cap glibc malloc arenas at two** (`8da899d`).
+  glibc keeps a malloc arena per scanner thread along with its freed pages,
+  so on a large tree the daemon's RSS settled at about twice its live set:
+  on a host scanning 500k entries per pass it reached 480–499 MiB and once
+  exited on the 500 MiB hard limit. With `MALLOC_ARENA_MAX=2` it held at
+  about 290 MiB for an hour at the same scan CPU. Units written by other
+  installers can add the line in a drop-in.
 - **sbh identifies itself honestly in HTTP requests** (`2eb0210`). The
   updater, release-asset downloads and webhook notifications sent a
   User-Agent borrowed from other companies' clients. They now send
