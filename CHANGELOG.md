@@ -4,6 +4,21 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
+## v0.7.7
+
+Compare: [`v0.7.6...v0.7.7`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.6...v0.7.7)
+
+### Changed
+
+- **Scan workers hand their results over in batches** (bd-vf9z;
+  `7eac2c7`). Each walker thread sent one message per directory, so the
+  collector waited on the channel, spinning and then yielding, once per
+  directory; on a loaded Mac the daemon's scanner thread spent about a
+  third of its time in those yields. Workers now send up to 64 entries at
+  a time, and whatever they hold before they wait for more work. Scanning
+  a 200,000-directory tree took 82–95% fewer voluntary context switches
+  and 16–21% less user CPU, in the same wall time.
+
 ## v0.7.6 **[release]**
 
 Compare: [`v0.7.5...v0.7.6`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.5...v0.7.6)
