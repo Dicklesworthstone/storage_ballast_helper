@@ -22,6 +22,8 @@ use crate::platform::types::{ExecutablesResult, OpenFile, OpenFilesResult, Proce
 mod build_environment;
 mod unix_sockets;
 
+use build_environment::sweep as build_directory_sweep;
+
 const MAX_DESCRIPTORS: usize = 262_144;
 const MAX_DESCRIPTORS_PER_PID: usize = 16_384;
 const MAX_PROC_ENTRIES: usize = OPEN_FILES_MAX_PIDS + 4096;
@@ -518,11 +520,25 @@ fn open_targets_with(
             }
         }
     }
-    // So are the external cache and output directories a live build names.
-    let (directories, build_denied) = build_directory_sweep(proc, proc_root, limits);
-    for (_, directory) in directories {
+    // The build metadata phase uses the remaining deadline, not another full
+    // proc-scan allowance. Its missing coverage must reach final preflight.
+    let elapsed = proc
+        .now()
+        .checked_duration_since(sweep.started)
+        .unwrap_or(limits.time);
+    let build = build_directory_sweep(
+        proc,
+        proc_root,
+        Limits {
+            time: limits.time.saturating_sub(elapsed),
+            ..limits
+        },
+    );
+    sweep.complete &= build.complete;
+    for (_, directory) in build.directories {
         add_target_spellings(&mut targets, directory);
     }
+    let build_denied = build.denied;
     // A process sbh may not inspect could be using any candidate: its
     // references are unknown, not absent, so the sweep certifies nothing.
     // Name a refused build tool first: an unprivileged daemon is refused
@@ -552,8 +568,8 @@ fn open_targets_with(
     Ok((targets, sweep.complete))
 }
 
-/// The first process whose working directory or build environment the sweep
-/// was refused (EACCES/EPERM).
+/// The first process whose working directory, environment or invocation
+/// metadata could not be inspected completely.
 struct UnreadableProcess {
     pid: i32,
     file: &'static str,
@@ -577,68 +593,7 @@ fn build_directories_with(
     proc_root: &Path,
     limits: Limits,
 ) -> Vec<(i32, PathBuf)> {
-    build_directory_sweep(proc, proc_root, limits).0
-}
-
-/// [`build_directories_with`], plus the first build tool whose environment
-/// sbh was refused: its cache and output directories are unknown.
-fn build_directory_sweep(
-    proc: &impl ProcAccess,
-    proc_root: &Path,
-    limits: Limits,
-) -> (Vec<(i32, PathBuf)>, Option<UnreadableProcess>) {
-    let mut sweep = Sweep::new(proc, limits);
-    let Ok(pids) = sweep.pids(proc_root) else {
-        return (Vec::new(), None);
-    };
-    let mut denied = None;
-    let own = i32::try_from(std::process::id()).ok();
-    let mut seen = std::collections::HashSet::new();
-    let mut directories = Vec::new();
-    for pid in pids {
-        if sweep.expired() {
-            break;
-        }
-        if Some(pid) == own {
-            continue;
-        }
-        let process = proc_root.join(pid.to_string());
-        let Ok(comm) = proc.read_bounded(&process.join("comm"), 64) else {
-            continue;
-        };
-        let Some(tool) = build_environment::tool(&comm) else {
-            continue;
-        };
-        if sweep.expired() {
-            break;
-        }
-        let environ = match proc.read_bounded(&process.join("environ"), BUILD_ENVIRON_LIMIT) {
-            Ok(environ) => environ,
-            Err(error) => {
-                if error.kind() == io::ErrorKind::PermissionDenied {
-                    denied.get_or_insert(UnreadableProcess {
-                        pid,
-                        file: "environ",
-                        error,
-                    });
-                }
-                continue;
-            }
-        };
-        // Do not start another syscall after the budget expires, but retain
-        // absolute references from the environment we already observed.
-        let cwd = if sweep.expired() {
-            None
-        } else {
-            proc.link(&process.join("cwd")).ok()
-        };
-        for path in build_environment::references(tool, &environ, cwd.as_deref()) {
-            if seen.insert(path.clone()) {
-                directories.push((pid, path));
-            }
-        }
-    }
-    (directories, denied)
+    build_directory_sweep(proc, proc_root, limits).directories
 }
 
 fn add_target_spellings(targets: &mut std::collections::HashSet<PathBuf>, target: PathBuf) {
@@ -794,6 +749,12 @@ mod tests {
             let process = self.proc_root.join(pid.to_string());
             fs::create_dir_all(process.join("fd")).unwrap();
             fs::create_dir_all(process.join("fdinfo")).unwrap();
+            // Existing transport fixtures describe a readable invocation
+            // with no CLI override; argv failures have dedicated fixtures.
+            let cmdline = process.join("cmdline");
+            if !cmdline.exists() {
+                fs::write(cmdline, b"fixture\0").unwrap();
+            }
             process
         }
 

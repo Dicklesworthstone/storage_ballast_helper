@@ -103,8 +103,8 @@ fn versioned(name: &str, prefix: &str) -> bool {
     })
 }
 
-/// Linux's procfs sweep has no argv-aware layer; macOS goes through
-/// `build_invocation` with [`CacheLayout::MacOs`].
+/// Environment-only Linux entry point. Families with supported command-line
+/// destinations additionally go through the shared `build_invocation` resolver.
 #[cfg(target_os = "linux")]
 pub fn references(tool: Tool, environ: &[u8], cwd: Option<&Path>) -> Vec<PathBuf> {
     references_with_layout(CacheLayout::Linux, tool, environ, cwd)
@@ -136,6 +136,13 @@ pub fn references_with_layout(
                 }
             }
             add(&mut paths, environ, b"CARGO_TARGET_DIR", cwd);
+            // Final outputs and intermediate artifacts can live on separate
+            // volumes. Protect each explicitly named location, without
+            // assuming Cargo's private build-directory layout or precedence.
+            add(&mut paths, environ, b"CARGO_BUILD_TARGET_DIR", cwd);
+            if let Some(path) = cargo_build_directory(environ, cwd) {
+                push_unique(&mut paths, path);
+            }
         }
         Tool::Go => {
             for path in [go_build_cache(layout, environ), go_module_cache(environ)]
@@ -194,8 +201,23 @@ pub fn references_with_layout(
     if matches!(tool, Tool::Rust | Tool::Compiler) {
         add(&mut paths, environ, b"SCCACHE_DIR", cwd);
         add(&mut paths, environ, b"CCACHE_DIR", cwd);
+        // Cargo supplies the actual build-script output directory. Native
+        // compiler children inherit it; it need not be under target-dir.
+        add(&mut paths, environ, b"OUT_DIR", cwd);
     }
     paths
+}
+
+fn cargo_build_directory(environ: &[u8], cwd: Option<&Path>) -> Option<PathBuf> {
+    let value = nonempty(environ, b"CARGO_BUILD_BUILD_DIR")?;
+    // Cargo expands {workspace-root}, {workspace-path-hash}, and
+    // {cargo-cache-home}. A process cwd does not establish its workspace;
+    // never manufacture a literal brace-named path from an unresolved template.
+    // The child's resolved OUT_DIR/--out-dir remain independent positives.
+    if value.contains(&b'{') || value.contains(&b'}') {
+        return None;
+    }
+    directory(Some(value), cwd)
 }
 
 fn home_subdir(environ: &[u8], subdir: &str) -> Option<PathBuf> {
@@ -647,6 +669,83 @@ mod tests {
             references_with_layout(CacheLayout::MacOs, Tool::Rust, env, None),
             cargo_paths("/builder/.cargo")
         );
+    }
+
+    #[test]
+    fn split_cargo_outputs_are_independent_positive_references_on_both_platforms() {
+        let env = b"CARGO_TARGET_DIR=/final\0CARGO_BUILD_TARGET_DIR=/configured-final\0CARGO_BUILD_BUILD_DIR=/intermediate\0OUT_DIR=/generated\0";
+        for layout in [CacheLayout::Linux, CacheLayout::MacOs] {
+            assert_eq!(
+                references_with_layout(layout, Tool::Rust, env, None),
+                paths(&["/final", "/configured-final", "/intermediate", "/generated"])
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_intermediate_paths_preserve_native_bytes_and_require_observed_relative_base() {
+        let env = b"CARGO_BUILD_BUILD_DIR=../build-\xff = data\0OUT_DIR=generated\0";
+        assert!(references(Tool::Rust, env, None).is_empty());
+        assert!(references(Tool::Rust, env, Some(Path::new("relative"))).is_empty());
+        assert_eq!(
+            references(Tool::Rust, env, Some(Path::new("/project"))),
+            vec![
+                PathBuf::from(OsString::from_vec(b"/project/../build-\xff = data".to_vec())),
+                PathBuf::from("/project/generated"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unresolved_cargo_templates_do_not_manufacture_literal_paths() {
+        for template in [
+            "{workspace-root}/build",
+            "/shared/{workspace-path-hash}",
+            "{cargo-cache-home}/build",
+            "/shared/{unknown}",
+        ] {
+            let env = format!(
+                "CARGO_BUILD_BUILD_DIR={template}\0CARGO_TARGET_DIR=/final\0OUT_DIR=/resolved-output\0"
+            );
+            assert_eq!(
+                references(Tool::Rust, env.as_bytes(), Some(Path::new("/not-the-workspace"))),
+                paths(&["/final", "/resolved-output"])
+            );
+        }
+    }
+
+    #[test]
+    fn split_outputs_keep_first_key_semantics_and_ignore_incomplete_tail_values() {
+        let env = b"CARGO_BUILD_BUILD_DIR=/first\0CARGO_BUILD_BUILD_DIR=/second\0OUT_DIR=/generated\0CARGO_BUILD_TARGET_DIR=/unfinished";
+        assert_eq!(references(Tool::Rust, env, None), paths(&["/first", "/generated"]));
+        for env in [
+            b"CARGO_BUILD_TARGET_DIR=\0CARGO_BUILD_BUILD_DIR=\0OUT_DIR=\0".as_slice(),
+            b"CARGO_BUILD_BUILD_DIR=/unfinished",
+            b"CARGO_BUILD_BUILD_DIR=\0CARGO_BUILD_BUILD_DIR=/shadowed\0",
+        ] {
+            assert!(references(Tool::Rust, env, Some(Path::new("/project"))).is_empty());
+        }
+    }
+
+    #[test]
+    fn shared_cargo_destinations_are_deduplicated_not_counted_as_separate_allocations() {
+        let env = b"CARGO_TARGET_DIR=/shared\0CARGO_BUILD_TARGET_DIR=/shared\0CARGO_BUILD_BUILD_DIR=/shared\0OUT_DIR=/shared\0SCCACHE_DIR=/shared\0";
+        assert_eq!(references(Tool::Rust, env, None), paths(&["/shared"]));
+    }
+
+    #[test]
+    fn native_compiler_children_hold_build_script_outputs_without_claiming_cargo_defaults() {
+        let env = b"HOME=/builder\0CARGO_BUILD_BUILD_DIR=/cargo-build\0OUT_DIR=/generated\0";
+        for name in ["cc", "gcc", "clang", "sccache"] {
+            assert_eq!(
+                references(tool(name.as_bytes()).unwrap(), env, None),
+                paths(&["/generated"])
+            );
+        }
+        for family in [Tool::Python, Tool::Node, Tool::Go] {
+            let env = b"CARGO_BUILD_BUILD_DIR=/cargo-build\0OUT_DIR=/generated\0";
+            assert!(references(family, env, None).is_empty());
+        }
     }
 
     #[cfg(target_os = "linux")]

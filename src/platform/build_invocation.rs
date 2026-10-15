@@ -41,12 +41,19 @@ pub fn references(
     };
     let mut paths =
         build_environment::references_with_layout(layout, invocation.tool, environment, cwd);
-    // These are additive positive observations, not a complete configuration
-    // resolver. A command-line override must not erase environment evidence.
-    if let Some(path) = command_directory(invocation, cwd)
-        && !paths.contains(&path)
+    // Outputs and incremental state need not share a directory. Each option
+    // contributes at most one path; a CLI override never erases environment
+    // evidence. This remains positive evidence, not a configuration resolver.
+    for path in [
+        command_directory(&invocation, cwd),
+        incremental_directory(&invocation, cwd),
+    ]
+    .into_iter()
+    .flatten()
     {
-        paths.push(path);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
     }
     paths
 }
@@ -107,7 +114,6 @@ fn python_manager(mut args: Arguments<'_>) -> Option<(Tool, Arguments<'_>)> {
             _ if arg.starts_with(b"-m") => return Some((python_module(&arg[2..])?, args)),
             _ if python_switches(arg) => {}
             // -c, stdin, unknown options and scripts end interpretation here.
-            // A later "-m pip" is data for that entry point, not a new command.
             _ if arg.starts_with(b"-") => return None,
             _ => return Some((python_script(arg)?, args)),
         }
@@ -178,26 +184,32 @@ fn node_script(script: &[u8]) -> Option<Tool> {
 /// duplicate options before running; this parser only adds positive evidence.
 /// A repeated option cannot grow the result or hide its final value behind a
 /// result cap. All other cache evidence remains in the environment resolver.
-fn command_directory(invocation: Invocation<'_>, cwd: Option<&Path>) -> Option<PathBuf> {
+fn command_directory(invocation: &Invocation<'_>, cwd: Option<&Path>) -> Option<PathBuf> {
     let program = basename(invocation.program);
     let flag = match invocation.tool {
-        Tool::Rust if matches!(program, b"cargo" | b"cargo-clippy") => b"--target-dir".as_slice(),
+        Tool::Rust if matches!(program, b"cargo" | b"cargo-clippy" | b"cargo-rch-real") => {
+            b"--target-dir".as_slice()
+        }
         Tool::Rust if matches!(program, b"rustc" | b"rustdoc" | b"clippy-driver") => b"--out-dir",
         Tool::Pip | Tool::Uv => b"--cache-dir",
         Tool::Npm => b"--cache",
         _ => return None,
     };
-    let mut args = invocation.args;
+    let mut args = invocation.args.clone();
     let mut destination = None;
     let uv = invocation.tool == Tool::Uv;
     let rustdoc = invocation.tool == Tool::Rust && program == b"rustdoc";
+    let compiler = invocation.tool == Tool::Rust
+        && matches!(program, b"rustc" | b"rustdoc" | b"clippy-driver");
     let mut forwarding = uv && program == b"uvx";
     while let Some(arg) = args.next() {
         if arg == b"--" {
             break;
         }
         if arg == flag || (rustdoc && arg == b"-o") {
-            let value = args.next()?;
+            let Some(value) = args.next() else {
+                break;
+            };
             // A missing operand must not turn another option into a path.
             // Values starting with '-' are still supported in the = form.
             if value.starts_with(b"-") {
@@ -217,6 +229,9 @@ fn command_directory(invocation: Invocation<'_>, cwd: Option<&Path>) -> Option<P
             destination = Some(value);
             continue;
         }
+        if compiler && rustc_value_option(arg) {
+            args.next()?;
+        }
         if uv {
             // uv run/tool run and uvx forward the first positional command
             // and everything after it, even without an explicit '--'. Never
@@ -235,7 +250,84 @@ fn command_directory(invocation: Invocation<'_>, cwd: Option<&Path>) -> Option<P
             }
         }
     }
-    let value = destination.filter(|value| !value.is_empty())?;
+    resolve_directory(destination, cwd)
+}
+
+/// rustc's incremental cache can be outside both Cargo's target-dir and the
+/// compiler's --out-dir. Do not confuse an arbitrary codegen value, forwarded
+/// program argument, or source-file string with the incremental option.
+fn incremental_directory(invocation: &Invocation<'_>, cwd: Option<&Path>) -> Option<PathBuf> {
+    if invocation.tool != Tool::Rust
+        || !matches!(basename(invocation.program), b"rustc" | b"clippy-driver")
+    {
+        return None;
+    }
+    let mut args = invocation.args.clone();
+    let mut destination = None;
+    while let Some(arg) = args.next() {
+        if arg == b"--" {
+            break;
+        }
+        let option = if matches!(arg, b"-C" | b"--codegen") {
+            let Some(value) = args.next() else {
+                break;
+            };
+            value
+        } else if let Some(value) = arg
+            .strip_prefix(b"-C")
+            .or_else(|| arg.strip_prefix(b"--codegen="))
+        {
+            value
+        } else {
+            if rustc_value_option(arg) {
+                args.next()?;
+            }
+            continue;
+        };
+        if let Some(value) = option.strip_prefix(b"incremental=") {
+            destination = Some(value);
+        }
+    }
+    resolve_directory(destination, cwd)
+}
+
+/// Operands are data, even when their bytes resemble another compiler flag.
+fn rustc_value_option(arg: &[u8]) -> bool {
+    matches!(
+        arg,
+        b"--cfg"
+            | b"--check-cfg"
+            | b"--crate-name"
+            | b"--crate-type"
+            | b"--edition"
+            | b"--emit"
+            | b"--explain"
+            | b"--out-dir"
+            | b"--print"
+            | b"--target"
+            | b"--extern"
+            | b"--sysroot"
+            | b"--error-format"
+            | b"--json"
+            | b"--diagnostic-width"
+            | b"--cap-lints"
+            | b"--remap-path-prefix"
+            | b"--remap-path-scope"
+            | b"--codegen"
+            | b"-C"
+            | b"-L"
+            | b"-l"
+            | b"-o"
+            | b"-A"
+            | b"-W"
+            | b"-D"
+            | b"-F"
+            | b"-Z"
+    )
+}
+
+fn resolve_directory(value: Option<&[u8]>, cwd: Option<&Path>) -> Option<PathBuf> {
+    let value = value.filter(|value| !value.is_empty())?;
     let path = PathBuf::from(OsString::from_vec(value.to_vec()));
     if path.is_absolute() {
         Some(path)
@@ -686,6 +778,111 @@ mod tests {
             b"Python\xff",
         ] {
             assert_eq!(observed_tool(name), None);
+        }
+    }
+
+    #[test]
+    fn renamed_cargo_binary_keeps_its_explicit_target_directory() {
+        for program in [b"cargo-rch-real".as_slice(), b"/toolchain/bin/cargo-rch-real"] {
+            assert_eq!(
+                cli_paths(Tool::Rust, &[program, b"build", b"--target-dir=/pool"], None),
+                vec![PathBuf::from("/pool")]
+            );
+        }
+        assert!(
+            cli_paths(Tool::Rust, &[b"cargo-data", b"--target-dir=/decoy"], None).is_empty()
+        );
+    }
+
+    #[test]
+    fn incremental_codegen_forms_protect_a_second_directory() {
+        for option in [
+            vec![b"-C".as_slice(), b"incremental=/incremental"],
+            vec![b"-Cincremental=/incremental".as_slice()],
+            vec![b"--codegen".as_slice(), b"incremental=/incremental"],
+            vec![b"--codegen=incremental=/incremental".as_slice()],
+        ] {
+            for program in [b"rustc".as_slice(), b"/bin/clippy-driver"] {
+                let mut args = vec![program, b"lib.rs", b"--out-dir=/objects"];
+                args.extend(option.iter().copied());
+                assert_eq!(
+                    cli_paths(Tool::Rust, &args, None),
+                    vec![PathBuf::from("/objects"), PathBuf::from("/incremental")]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_paths_keep_bytes_spaces_and_equals_and_need_the_process_cwd() {
+        let args = [b"rustc".as_slice(), b"-Cincremental=../cache-\xff = data"];
+        assert!(cli_paths(Tool::Rust, &args, None).is_empty());
+        assert!(cli_paths(Tool::Rust, &args, Some(Path::new("relative"))).is_empty());
+        assert_eq!(
+            cli_paths(Tool::Rust, &args, Some(Path::new("/project"))),
+            vec![PathBuf::from(OsString::from_vec(
+                b"/project/../cache-\xff = data".to_vec()
+            ))]
+        );
+    }
+
+    #[test]
+    fn incremental_evidence_is_family_scoped_and_stops_at_forwarded_arguments() {
+        for args in [
+            vec![b"cargo".as_slice(), b"rustc", b"--", b"-Cincremental=/decoy"],
+            vec![b"rustc".as_slice(), b"--", b"-Cincremental=/decoy"],
+            vec![b"rustc".as_slice(), b"-C", b"link-arg=incremental=/decoy"],
+            vec![b"rustc".as_slice(), b"--cfg", b"-Cincremental=/decoy"],
+            vec![b"rustc".as_slice(), b"--extern", b"--out-dir=/decoy"],
+            vec![b"rustc".as_slice(), b"-Cincremental-mode=/decoy"],
+            vec![b"rustc".as_slice(), b"--codegen"],
+            vec![b"rustc".as_slice(), b"-Cincremental="],
+        ] {
+            assert!(cli_paths(Tool::Rust, &args, Some(Path::new("/project"))).is_empty());
+        }
+        for tool in [Tool::Python, Tool::Node, Tool::Go, Tool::Compiler] {
+            assert!(cli_paths(tool, &[b"rustc", b"-Cincremental=/decoy"], None).is_empty());
+        }
+    }
+
+    #[test]
+    fn repeated_incremental_options_keep_only_the_last_observed_destination() {
+        let mut args = b"rustc\0--out-dir=/objects\0".to_vec();
+        for _ in 0..10_000 {
+            args.extend_from_slice(b"-Cincremental=/earlier\0");
+        }
+        args.extend_from_slice(b"-C\0incremental=/last\0");
+        assert_eq!(
+            references(CacheLayout::Linux, Tool::Rust, &args, b"", None),
+            vec![PathBuf::from("/objects"), PathBuf::from("/last")]
+        );
+    }
+
+    #[test]
+    fn split_environment_and_compiler_outputs_are_preserved_together() {
+        let args = argv(&[b"rustc", b"--out-dir=/objects", b"-Cincremental=/incremental"]);
+        let env = b"CARGO_TARGET_DIR=/final\0CARGO_BUILD_BUILD_DIR=/build\0OUT_DIR=/generated\0";
+        for layout in [CacheLayout::Linux, CacheLayout::MacOs] {
+            assert_eq!(
+                references(layout, Tool::Rust, &args, env, None),
+                vec![
+                    PathBuf::from("/final"),
+                    PathBuf::from("/build"),
+                    PathBuf::from("/generated"),
+                    PathBuf::from("/objects"),
+                    PathBuf::from("/incremental"),
+                ]
+            );
+            assert_eq!(
+                references(
+                    layout,
+                    Tool::Rust,
+                    &argv(&[b"rustc", b"--out-dir=/shared", b"-Cincremental=/shared"]),
+                    b"OUT_DIR=/shared\0",
+                    None,
+                ),
+                vec![PathBuf::from("/shared")]
+            );
         }
     }
 }
