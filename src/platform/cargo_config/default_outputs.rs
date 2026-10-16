@@ -209,6 +209,7 @@ mod tests {
     use std::os::unix::ffi::OsStringExt as _;
 
     const ARGV: &[u8] = b"cargo\0build\0";
+    const PASSWD: &[u8] = b"builder:x:1000:1000::/builder:/bin/sh\n";
 
     #[derive(Default)]
     struct Files {
@@ -235,10 +236,14 @@ mod tests {
         }
 
         fn observe(&mut self, resolver: &mut Resolver, argv: &[u8], env: &[u8]) -> Evidence {
+            self.data
+                .entry("/etc/passwd".into())
+                .or_insert_with(|| PASSWD.to_vec());
             resolver.observe(
                 argv,
                 env,
                 Some(Path::new("/work/project")),
+                Some(1000),
                 |path, limit| self.read(path, limit),
             )
         }

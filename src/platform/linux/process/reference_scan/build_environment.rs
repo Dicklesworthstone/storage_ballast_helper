@@ -14,6 +14,9 @@ use crate::platform::build_environment::{self, CacheLayout, Tool};
 use crate::platform::{build_invocation, cargo_config};
 
 const BUILD_ARGV_LIMIT: usize = 512 * 1024;
+/// `/proc/PID/status` is about 1.5 KiB; unlike `cmdline` and `environ`, its
+/// read does not wait for the process's memory-map lock.
+const STATUS_LIMIT: usize = 16 * 1024;
 const MAX_BUILD_REFERENCES: usize = 16_384;
 const MAX_REFERENCE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -121,14 +124,14 @@ pub(super) fn sweep(proc: &impl ProcAccess, proc_root: &Path, limits: Limits) ->
                 cwd.as_deref(),
             );
             if tool == Tool::Rust && cargo_config::is_cargo(&argv) {
-                let evidence =
-                    configurations.observe(&argv, &environ, cwd.as_deref(), |path, limit| {
-                        if sweep.expired() {
-                            Err(io::ErrorKind::TimedOut.into())
-                        } else {
-                            cargo_config::read_file(path, limit)
-                        }
-                    });
+                let evidence = cargo_configuration(
+                    &mut configurations,
+                    &mut sweep,
+                    &process,
+                    &argv,
+                    &environ,
+                    cwd.as_deref(),
+                );
                 if !evidence.complete {
                     result.missing(
                         pid,
@@ -217,6 +220,43 @@ fn metadata(
     }
 }
 
+/// What a Cargo process's configuration files name as its outputs. Without
+/// HOME, Cargo reads the config of its account's passwd home (bd-ny5j #2).
+fn cargo_configuration(
+    configurations: &mut cargo_config::Resolver,
+    sweep: &mut Sweep<'_, impl ProcAccess>,
+    process: &Path,
+    argv: &[u8],
+    environ: &[u8],
+    cwd: Option<&Path>,
+) -> cargo_config::Evidence {
+    let uid = real_uid(
+        &sweep
+            .proc
+            .read_bounded(&process.join("status"), STATUS_LIMIT),
+    );
+    configurations.observe(argv, environ, cwd, uid, |path, limit| {
+        if sweep.expired() {
+            Err(io::ErrorKind::TimedOut.into())
+        } else {
+            cargo_config::read_file(path, limit)
+        }
+    })
+}
+
+/// The real uid in a `/proc/PID/status` read: the account whose passwd home
+/// Cargo falls back to without HOME.
+fn real_uid(status: &io::Result<Vec<u8>>) -> Option<u32> {
+    let status = status.as_deref().ok()?;
+    let line = status
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"Uid:"))?;
+    let real = line
+        .split(u8::is_ascii_whitespace)
+        .find(|field| !field.is_empty())?;
+    std::str::from_utf8(real).ok()?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +267,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::super::{Entries, NativeProc, open_targets_with, read_proc_bytes};
+
+    const NOBODY_STATUS: &str = "Name:\tcargo\nUid:\t65534\t65534\t65534\t65534\n";
 
     struct Fixture {
         _temp: tempfile::TempDir,
@@ -260,11 +302,14 @@ mod tests {
             fs::write(process.join("cmdline"), argv).unwrap();
             // A readable Cargo fixture also declares where its config
             // hierarchy starts. rustc's missing-cwd fixture remains unchanged.
+            // Its account is `nobody`, whose passwd home (`/nonexistent`)
+            // holds no Cargo config: the home a HOME-less Cargo falls back to.
             if matches!(
                 comm,
                 "cargo" | "cargo-clippy" | "cargo-rch-real" | "cargo-nextest"
             ) {
                 symlink(&self.root, process.join("cwd")).unwrap();
+                fs::write(process.join("status"), NOBODY_STATUS).unwrap();
             }
             process
         }
@@ -670,6 +715,38 @@ mod tests {
         assert!(targets.contains(&target));
         assert_eq!(fs::read_dir(process.join("fd")).unwrap().count(), 0);
         assert_eq!(fs::read(target.join("keep")).unwrap(), b"live build");
+    }
+
+    /// A Cargo without HOME (a systemd unit, `env -i`) reads the config of its
+    /// account's passwd home. With no account to resolve, the config it may
+    /// read is unknown and the sweep is incomplete (bd-ny5j #2).
+    #[test]
+    fn a_cargo_without_home_uses_its_accounts_home_or_is_incomplete() {
+        assert_eq!(
+            real_uid(&Ok(NOBODY_STATUS.as_bytes().to_vec())),
+            Some(65534)
+        );
+        assert_eq!(real_uid(&Ok(b"Uid:\t1000\t0\t0\t0\n".to_vec())), Some(1000));
+        assert_eq!(real_uid(&Ok(b"Name:\tcargo\n".to_vec())), None);
+        assert_eq!(real_uid(&Err(io::ErrorKind::NotFound.into())), None);
+
+        let fixture = Fixture::new();
+        let process = fixture.install(
+            fixture.pid,
+            "cargo",
+            b"CARGO_TARGET_DIR=/known\0",
+            b"cargo\0build\0",
+        );
+        assert!(fixture.collect(&NativeProc).complete);
+        fs::remove_file(process.join("status")).unwrap();
+        let found = fixture.collect(&NativeProc);
+        assert!(!found.complete);
+        assert_eq!(found.denied.unwrap().file, "cargo config");
+        // Known outputs survive the missing account.
+        assert_eq!(
+            found.directories,
+            vec![(fixture.pid, PathBuf::from("/known"))]
+        );
     }
 
     #[test]

@@ -62,6 +62,8 @@ pub struct Resolver {
     files: BTreeMap<PathBuf, Cached>,
     bytes: usize,
     path_bytes: usize,
+    /// `/etc/passwd`, read at most once per sweep; empty when unreadable.
+    passwd: Option<Vec<u8>>,
 }
 
 struct Observation {
@@ -114,12 +116,15 @@ impl Resolver {
     /// Observe conventional hierarchy/home files, explicit --config files and
     /// inline build directory values. `read` must enforce the caller's shared
     /// deadline before I/O; this layer enforces byte, path, depth and work caps.
-    /// A missing HOME is not replaced with the observer's account information.
+    /// A missing HOME is not replaced with the observer's account information:
+    /// like Cargo, it falls back to the passwd home of the process's real
+    /// `uid`, and without one the observation is incomplete.
     pub fn observe(
         &mut self,
         argv: &[u8],
         environment: &[u8],
         cwd: Option<&Path>,
+        uid: Option<u32>,
         mut read: impl FnMut(&Path, usize) -> io::Result<Vec<u8>>,
     ) -> Evidence {
         let mut observation = Observation {
@@ -157,11 +162,20 @@ impl Resolver {
             } else {
                 observation.complete = false;
             }
-        } else if environment.ends_with(b"\0")
-            && let Some(home) =
-                env_value(environment, b"HOME").and_then(|home| byte_path(home, None))
-        {
-            self.directory(&home.join(".cargo"), &mut observation, &mut read);
+        } else if environment.is_empty() || environment.ends_with(b"\0") {
+            // Cargo's home without CARGO_HOME: HOME as given (relative to the
+            // working directory), or the account's passwd home when HOME is
+            // unset or empty, as for a systemd unit or `env -i` (bd-ny5j #2).
+            let home = env_value(environment, b"HOME")
+                .filter(|home| !home.is_empty())
+                .map_or_else(
+                    || uid.and_then(|uid| self.account_home(uid, &mut read)),
+                    |home| byte_path(home, cwd),
+                );
+            match home {
+                Some(home) => self.directory(&home.join(".cargo"), &mut observation, &mut read),
+                None => observation.complete = false,
+            }
         }
         self.command_line(argv, cwd, &mut observation, &mut read);
         // Resolve the manifest's default output scope before the first
@@ -178,6 +192,38 @@ impl Resolver {
             directories: observation.paths.into_iter().collect(),
             complete: observation.complete,
         }
+    }
+
+    /// The home directory `/etc/passwd` gives `uid`. Accounts known only to
+    /// NSS (LDAP, systemd dynamic users) are not found: unknown, not absent.
+    /// The read counts against the sweep's byte budget like any config file.
+    fn account_home(
+        &mut self,
+        uid: u32,
+        read: &mut impl FnMut(&Path, usize) -> io::Result<Vec<u8>>,
+    ) -> Option<PathBuf> {
+        if self.passwd.is_none() {
+            let limit = FILE_BYTES.min(TOTAL_BYTES.saturating_sub(self.bytes));
+            let raw = if limit == 0 {
+                Vec::new()
+            } else {
+                read(Path::new("/etc/passwd"), limit).unwrap_or_default()
+            };
+            self.bytes += raw.len();
+            self.passwd = Some(raw);
+        }
+        let uid = uid.to_string();
+        self.passwd
+            .as_deref()?
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| {
+                let mut fields = line.split(|byte| *byte == b':');
+                let uid_field = fields.nth(2)?;
+                let home = fields.nth(2)?;
+                (uid_field == uid.as_bytes())
+                    .then(|| byte_path(home, None))
+                    .flatten()
+            })
     }
 
     fn cached(
@@ -583,6 +629,8 @@ mod tests {
     use super::*;
 
     const ARGV: &[u8] = b"cargo\0build\0";
+    const PASSWD: &[u8] =
+        b"root:x:0:0:root:/root:/bin/bash\nbuilder:x:1000:1000::/builder:/bin/sh\n";
 
     #[derive(Default)]
     struct Files {
@@ -609,12 +657,64 @@ mod tests {
         }
 
         fn observe(&mut self, resolver: &mut Resolver, argv: &[u8], env: &[u8]) -> Evidence {
+            self.data
+                .entry("/etc/passwd".into())
+                .or_insert_with(|| PASSWD.to_vec());
             resolver.observe(
                 argv,
                 env,
                 Some(Path::new("/work/project")),
+                Some(1000),
                 |path, limit| self.read(path, limit),
             )
+        }
+    }
+
+    /// Without CARGO_HOME, Cargo's home is HOME (relative to the working
+    /// directory), or the account's passwd home when HOME is unset or empty
+    /// (bd-ny5j #2). No resolvable home is unknown, not absent.
+    #[test]
+    fn a_cargo_without_home_reads_its_accounts_home_config() {
+        let mut files = Files::default();
+        files.put(
+            "/builder/.cargo/config.toml",
+            "[build]\ntarget-dir = '/account'",
+        );
+        files.put(
+            "/work/project/rel/.cargo/config.toml",
+            "[build]\ntarget-dir = '/relative'",
+        );
+        let mut resolver = Resolver::default();
+        for env in [&b""[..], b"CARGO_TARGET_DIR=/known\0", b"HOME=\0"] {
+            let found = files.observe(&mut resolver, ARGV, env);
+            assert!(found.complete, "{env:?}");
+            assert!(
+                found.directories.contains(&PathBuf::from("/account")),
+                "{env:?}: {:?}",
+                found.directories
+            );
+        }
+        // One passwd read serves the whole sweep.
+        let passwd_reads = files
+            .reads
+            .iter()
+            .filter(|path| *path == Path::new("/etc/passwd"))
+            .count();
+        assert_eq!(passwd_reads, 1);
+        let found = files.observe(&mut Resolver::default(), ARGV, b"HOME=rel\0");
+        assert!(found.complete);
+        assert!(found.directories.contains(&PathBuf::from("/relative")));
+
+        // An account /etc/passwd does not know, or no account at all.
+        for uid in [Some(4242), None] {
+            let found = Resolver::default().observe(
+                ARGV,
+                b"",
+                Some(Path::new("/work/project")),
+                uid,
+                |path, limit| files.read(path, limit),
+            );
+            assert!(!found.complete, "{uid:?}");
         }
     }
 
@@ -772,6 +872,7 @@ mod tests {
             b"cargo\0--config=build.target-dir='/inline'\0",
             b"",
             Some(Path::new("/work")),
+            Some(1000),
             |_, _| Err(io::ErrorKind::TimedOut.into()),
         );
         assert!(!found.complete);
@@ -809,6 +910,7 @@ mod tests {
         let found = Resolver::default().observe(
             b"cargo\0--config=build.build-dir='/inline'\0",
             b"CARGO_HOME=/selected\0HOME=/wrong\0",
+            None,
             None,
             |path, limit| files.read(path, limit),
         );
