@@ -8,6 +8,16 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 Compare: [`v0.7.8...v0.7.9`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.8...v0.7.9)
 
+### Added
+
+- **`sbh compress --discover --apply` compresses a directory's cold files
+  in one pass** (`74e1f93`). Discovery could only list candidates, so
+  compressing a tree meant pasting its output into an explicit-file apply.
+  With `--apply` and both consents, the same pass now runs every apply check
+  on exactly the selected files, and refuses a file that changed since
+  discovery or whose root was replaced. Automatic compression under pressure
+  is still not enabled.
+
 ### Fixed
 
 - **Ballast is released for `/` under a sandboxed systemd unit**
