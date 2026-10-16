@@ -34,7 +34,8 @@ Compare: [`v0.7.8...v0.7.9`](https://github.com/Dicklesworthstone/storage_ballas
   them all, logging only that inspection was "incomplete". On one host a
   long-running `bfs` search with 65,536 directories open stopped all
   deletions for hours. The per-process limit is now 131,072, and when a
-  limit is hit the log names the process.
+  limit is hit the log names the process, and so do the scanner's
+  "incomplete" line and `sbh explain` (`726c9a2`).
 - **Ballast is released for `/` under a sandboxed systemd unit**
   (`151b50f`). With `ProtectSystem=strict` (what `sbh install` generates for
   a system service), `/` is a read-only mount inside the service and the
