@@ -169,6 +169,37 @@ pub fn swap_nearly_full(memory: &MemoryInfo) -> bool {
         && u128::from(memory.swap_free_bytes) * 10 < u128::from(memory.swap_total_bytes)
 }
 
+/// How much headroom a RAM log destination needs.
+///
+/// Starting to use one takes a margin over what keeping it takes, so headroom
+/// hovering at a threshold does not flip the mirror on and off: css
+/// (2026-10-15/16) started it 19 times and refused it 14 times a day as swap
+/// hovered at 10% free, and each refusal discards the mirror's buffered lines
+/// (bd-sz85).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RamLogHeadroom {
+    /// Keep a destination already in use: 10% RAM, 10% swap, 20% free.
+    Keep,
+    /// Start using one: 15% RAM, 15% swap, 25% free.
+    Start,
+}
+
+impl RamLogHeadroom {
+    /// Minimum percentages of host RAM available, swap free and the
+    /// destination free.
+    const fn floors(self) -> (u128, u128, u128) {
+        match self {
+            Self::Keep => (10, 10, 20),
+            Self::Start => (15, 15, 25),
+        }
+    }
+}
+
+/// `part` is at least `pct` percent of `whole`.
+fn at_least_pct(part: u64, whole: u64, pct: u128) -> bool {
+    u128::from(part) * 100 >= u128::from(whole) * pct
+}
+
 /// Whether a RAM-backed log destination has enough observed headroom.
 ///
 /// Require at least 10% host RAM available and 20% of the destination free,
@@ -177,14 +208,27 @@ pub fn swap_nearly_full(memory: &MemoryInfo) -> bool {
 /// reservation or a cgroup-specific allocation guarantee.
 #[must_use]
 pub fn ram_log_destination_healthy(memory: &MemoryInfo, total: u64, available: u64) -> bool {
+    ram_log_destination_has(memory, total, available, RamLogHeadroom::Keep)
+}
+
+/// [`ram_log_destination_healthy`] against the floors of `headroom`.
+#[must_use]
+pub fn ram_log_destination_has(
+    memory: &MemoryInfo,
+    total: u64,
+    available: u64,
+    headroom: RamLogHeadroom,
+) -> bool {
+    let (ram, swap, free) = headroom.floors();
     memory.total_bytes != 0
         && memory.available_bytes <= memory.total_bytes
-        && u128::from(memory.available_bytes) * 10 >= u128::from(memory.total_bytes)
+        && at_least_pct(memory.available_bytes, memory.total_bytes, ram)
         && memory.swap_free_bytes <= memory.swap_total_bytes
-        && !swap_nearly_full(memory)
+        && (memory.swap_total_bytes == 0
+            || at_least_pct(memory.swap_free_bytes, memory.swap_total_bytes, swap))
         && total > 0
         && available <= total
-        && u128::from(available) * 5 >= u128::from(total)
+        && at_least_pct(available, total, free)
 }
 
 /// Why the daemon must not use a RAM-backed log destination at `path`.
@@ -197,6 +241,18 @@ pub fn ram_log_destination_healthy(memory: &MemoryInfo, total: u64, available: u
 /// and mount observations on a RAM destination also refuse.
 #[must_use]
 pub fn ram_log_mirror_refusal(platform: &dyn Platform, path: &Path) -> Option<String> {
+    ram_log_mirror_refusal_for(platform, path, RamLogHeadroom::Keep)
+}
+
+/// [`ram_log_mirror_refusal`] against the floors of `headroom`: the daemon
+/// starts a mirror only with [`RamLogHeadroom::Start`]'s margin and keeps it
+/// while [`RamLogHeadroom::Keep`]'s floors hold.
+#[must_use]
+pub fn ram_log_mirror_refusal_for(
+    platform: &dyn Platform,
+    path: &Path,
+    headroom: RamLogHeadroom,
+) -> Option<String> {
     let dir = path.parent().unwrap_or(path);
     match platform.is_ram_backed(dir) {
         Ok(false) => return None,
@@ -219,38 +275,43 @@ pub fn ram_log_mirror_refusal(platform: &dyn Platform, path: &Path) -> Option<St
     if stats.is_readonly {
         return Some(format!("{} is read-only", dir.display()));
     }
-    if ram_log_destination_healthy(&memory, stats.total_bytes, stats.available_bytes) {
+    if ram_log_destination_has(&memory, stats.total_bytes, stats.available_bytes, headroom) {
         return None;
     }
-    Some(
-        if memory.total_bytes == 0
-            || memory.available_bytes > memory.total_bytes
-            || memory.swap_free_bytes > memory.swap_total_bytes
-        {
-            "inconsistent host RAM or swap counters".to_owned()
-        } else if swap_nearly_full(&memory) {
-            format!(
-                "swap is nearly full ({} of {} MiB free)",
-                memory.swap_free_bytes >> 20,
-                memory.swap_total_bytes >> 20
-            )
-        } else if u128::from(memory.available_bytes) * 10 < u128::from(memory.total_bytes) {
-            format!(
-                "host RAM is short ({} of {} MiB available)",
-                memory.available_bytes >> 20,
-                memory.total_bytes >> 20
-            )
-        } else if stats.total_bytes == 0 || stats.available_bytes > stats.total_bytes {
-            format!("{} has inconsistent capacity counters", dir.display())
-        } else {
-            format!(
-                "{} has {} of {} MiB free",
-                dir.display(),
-                stats.available_bytes >> 20,
-                stats.total_bytes >> 20
-            )
-        },
-    )
+    let (ram, swap, _) = headroom.floors();
+    let reason = if memory.total_bytes == 0
+        || memory.available_bytes > memory.total_bytes
+        || memory.swap_free_bytes > memory.swap_total_bytes
+    {
+        "inconsistent host RAM or swap counters".to_owned()
+    } else if memory.swap_total_bytes > 0
+        && !at_least_pct(memory.swap_free_bytes, memory.swap_total_bytes, swap)
+    {
+        format!(
+            "swap is nearly full ({} of {} MiB free)",
+            memory.swap_free_bytes >> 20,
+            memory.swap_total_bytes >> 20
+        )
+    } else if !at_least_pct(memory.available_bytes, memory.total_bytes, ram) {
+        format!(
+            "host RAM is short ({} of {} MiB available)",
+            memory.available_bytes >> 20,
+            memory.total_bytes >> 20
+        )
+    } else if stats.total_bytes == 0 || stats.available_bytes > stats.total_bytes {
+        format!("{} has inconsistent capacity counters", dir.display())
+    } else {
+        format!(
+            "{} has {} of {} MiB free",
+            dir.display(),
+            stats.available_bytes >> 20,
+            stats.total_bytes >> 20
+        )
+    };
+    Some(match headroom {
+        RamLogHeadroom::Keep => reason,
+        RamLogHeadroom::Start => format!("{reason}, short of the margin to start mirroring"),
+    })
 }
 
 fn runtime_mount_pressured(mount: &ScratchMount) -> bool {
@@ -399,6 +460,33 @@ mod log_headroom_tests {
         assert!(ram_log_destination_healthy(&sample, 100, 100));
         sample.swap_free_bytes = 1;
         assert!(!ram_log_destination_healthy(&sample, 100, 100));
+    }
+
+    /// Starting a RAM destination takes a margin over keeping one, so headroom
+    /// hovering at a floor does not flip the mirror (bd-sz85).
+    #[test]
+    fn starting_needs_a_margin_that_keeping_does_not() {
+        use super::{RamLogHeadroom, ram_log_destination_has};
+        let has = |memory: &MemoryInfo, free: u64, headroom| {
+            ram_log_destination_has(memory, 100, free, headroom)
+        };
+        // RAM at 12% available.
+        let ram = memory(12);
+        assert!(has(&ram, 100, RamLogHeadroom::Keep));
+        assert!(!has(&ram, 100, RamLogHeadroom::Start));
+        // Swap at 12% free.
+        let swap = MemoryInfo {
+            swap_total_bytes: 100,
+            swap_free_bytes: 12,
+            ..memory(50)
+        };
+        assert!(has(&swap, 100, RamLogHeadroom::Keep));
+        assert!(!has(&swap, 100, RamLogHeadroom::Start));
+        // The destination at 22% free.
+        assert!(has(&memory(50), 22, RamLogHeadroom::Keep));
+        assert!(!has(&memory(50), 22, RamLogHeadroom::Start));
+        // Clear of every margin, both agree.
+        assert!(has(&memory(50), 50, RamLogHeadroom::Start));
     }
 
     #[test]

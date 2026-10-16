@@ -3457,9 +3457,17 @@ impl MonitoringDaemon {
         self.logging_level_logged = Some(level);
         let refusal = if pressured {
             self.logging_ram_checked_at = Some(now);
-            crate::monitor::ram_scratch::ram_log_mirror_refusal(
+            // A margin to start, the plain floors to keep: no flapping at a
+            // threshold (bd-sz85).
+            let headroom = if self.logging_placement.mirroring {
+                crate::monitor::ram_scratch::RamLogHeadroom::Keep
+            } else {
+                crate::monitor::ram_scratch::RamLogHeadroom::Start
+            };
+            crate::monitor::ram_scratch::ram_log_mirror_refusal_for(
                 self.platform.as_ref(),
                 &crate::logger::jsonl::ram_fallback_path(),
+                headroom,
             )
         } else {
             self.logging_ram_checked_at = None;

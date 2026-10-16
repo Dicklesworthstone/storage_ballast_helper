@@ -266,7 +266,20 @@ pub struct JsonlWriter {
     /// not depend on the build host's current RAM or swap pressure.
     destination_check: fn(&Path) -> Option<String>,
     last_destination_warning: Option<Instant>,
+    /// When the RAM route last passed `destination_check`, and how long that
+    /// verdict stands before a line checks again (bd-sz85).
+    destination_ok_at: Option<Instant>,
+    destination_recheck: Duration,
 }
+
+/// How long a healthy RAM-route verdict stands. The check reads
+/// `/proc/meminfo` and `statvfs`, and it ran for every line while mirroring
+/// (bd-sz85); a refusal still acts on the line that observes it. Tests swap
+/// the check between lines, so they re-check every line.
+#[cfg(not(test))]
+const DESTINATION_RECHECK: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const DESTINATION_RECHECK: Duration = Duration::ZERO;
 
 impl JsonlWriter {
     /// Open the JSONL log file. Falls through the degradation chain on failure.
@@ -292,6 +305,8 @@ impl JsonlWriter {
             run_id: None,
             destination_check,
             last_destination_warning: None,
+            destination_ok_at: None,
+            destination_recheck: DESTINATION_RECHECK,
         };
         w.try_open_primary();
         w
@@ -506,9 +521,17 @@ impl JsonlWriter {
         if self.state != WriterState::Fallback && self.mirror.is_none() {
             return;
         }
+        if self
+            .destination_ok_at
+            .is_some_and(|at| at.elapsed() < self.destination_recheck)
+        {
+            return;
+        }
         let Some(reason) = self.fallback_refusal() else {
+            self.destination_ok_at = Some(Instant::now());
             return;
         };
+        self.destination_ok_at = None;
         self.discard_mirror();
         if self.state == WriterState::Fallback {
             if let Some(writer) = self.writer.take() {
@@ -1559,6 +1582,37 @@ mod tests {
             fs::read_to_string(fallback).unwrap(),
             "{\"recovered\":true}\n"
         );
+    }
+
+    static COUNTED_CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn counted_allow(_: &Path) -> Option<String> {
+        COUNTED_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        None
+    }
+
+    /// A healthy RAM-route verdict stands for `destination_recheck`, so a
+    /// line on the RAM route does not re-read meminfo and statvfs; once the
+    /// verdict lapses a refusal still acts on the next line (bd-sz85).
+    #[test]
+    fn a_healthy_ram_route_is_not_rechecked_on_every_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = JsonlWriter::open_with_destination_check(
+            guarded_config(dir.path(), false),
+            counted_allow,
+        );
+        writer.destination_recheck = Duration::from_secs(3600);
+        assert_eq!(writer.state(), "fallback");
+        let before = COUNTED_CHECKS.load(std::sync::atomic::Ordering::Relaxed);
+        for index in 0..50 {
+            writer.write_line(&format!("{{\"line\":{index}}}\n"));
+        }
+        let checks = COUNTED_CHECKS.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(checks, 1, "one check for 50 lines");
+        writer.destination_check = refuse_destination;
+        writer.destination_ok_at = None;
+        writer.write_line("{\"refused\":true}\n");
+        assert_eq!(writer.state(), "stderr");
     }
 
     #[test]
