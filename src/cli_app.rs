@@ -7091,6 +7091,14 @@ fn run_ballast(cli: &Cli, args: &BallastArgs) -> Result<(), CliError> {
                                 for orphan in &volume.orphans {
                                     println!("      orphan: {}", orphan.display());
                                 }
+                                for dir in &volume.unreachable_reserve {
+                                    println!(
+                                        "      not releasable by the service (read-only in its \
+                                         sandbox; grant it in ReadWritePaths= or release those \
+                                         files by hand): {}",
+                                        dir.display()
+                                    );
+                                }
                             }
                         }
                     }

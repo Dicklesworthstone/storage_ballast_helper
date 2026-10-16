@@ -56,7 +56,7 @@ fn path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf> {
     }
 }
 
-fn grant_path(word: &Path) -> Result<(PathBuf, bool)> {
+pub(super) fn grant_path(word: &Path) -> Result<(PathBuf, bool)> {
     let mut bytes = word.as_os_str().as_encoded_bytes();
     let optional = bytes.starts_with(b"-");
     if optional {

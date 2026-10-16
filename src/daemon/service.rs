@@ -29,8 +29,8 @@ pub use launchctl::{LaunchctlDomain, LaunchctlServiceTarget};
 pub use launchd::{LaunchdConfig, LaunchdServiceManager, LaunchdStatusReport};
 pub(crate) use systemd::test_unit_dir_override;
 pub use systemd::{
-    ConditionGate, DirectiveChange, DriftSeverity, ForeignDropIn, ReinstallReport, SystemdConfig,
-    SystemdServiceManager, UnitDrift, parse_unit_directives,
+    ConditionGate, DirectiveChange, DriftSeverity, ForeignDropIn, ReinstallReport, ServiceSandbox,
+    SystemdConfig, SystemdServiceManager, UnitDrift, parse_unit_directives,
 };
 
 /// Unit name for the systemd service.
