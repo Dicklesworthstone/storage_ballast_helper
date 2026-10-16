@@ -175,13 +175,27 @@ step_package() {
 }
 
 step_minisign() {
-    local base
+    local base names stage here there
     base="$(basename "${MANIFEST}")"
-    scp -q "${MANIFEST}" "${MINISIGN_HOST}:/tmp/${base}"
+    # dsr >= 0.2.3 signs a manifest only beside exactly the release set it
+    # lists (css refused v0.7.8's manifest copied alone to /tmp), so stage
+    # both in a fresh directory on the key host and sign there.
+    names="$(jq -r '.artifacts[].name' "${MANIFEST}")" || die "cannot list the artifacts in ${MANIFEST}"
+    [ -n "${names}" ] || die "${MANIFEST} lists no artifacts"
+    stage="$(ssh "${MINISIGN_HOST}" 'mktemp -d /tmp/sbh-minisign.XXXXXX')" ||
+        die "cannot create a staging directory on ${MINISIGN_HOST}"
+    # shellcheck disable=SC2086 # one word per artifact name
+    (cd "${DIR}" && scp -q ${names} "${base}" "${MINISIGN_HOST}:${stage}/") ||
+        die "staging the release set on ${MINISIGN_HOST}:${stage} failed"
+    # shellcheck disable=SC2086
+    here="$(cd "${DIR}" && shasum -a 256 ${names} "${base}" | LC_ALL=C sort -k2)"
     # shellcheck disable=SC2029 # the path is meant to expand locally
-    ssh "${MINISIGN_HOST}" "dsr signing sign /tmp/${base} && dsr signing verify /tmp/${base}" >/dev/null
-    scp -q "${MINISIGN_HOST}:/tmp/${base}.minisig" "${DIR}/"
-    say "manifest minisigned on ${MINISIGN_HOST}"
+    there="$(ssh "${MINISIGN_HOST}" "cd ${stage} && sha256sum * | LC_ALL=C sort -k2")"
+    [ "${here}" = "${there}" ] || die "staged bytes on ${MINISIGN_HOST}:${stage} differ from ${DIR}"
+    # shellcheck disable=SC2029
+    ssh "${MINISIGN_HOST}" "dsr signing sign ${stage}/${base} && dsr signing verify ${stage}/${base}" >/dev/null
+    scp -q "${MINISIGN_HOST}:${stage}/${base}.minisig" "${DIR}/"
+    say "manifest minisigned on ${MINISIGN_HOST} (release set staged in ${stage})"
 }
 
 step_publish() {
