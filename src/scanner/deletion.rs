@@ -2054,9 +2054,12 @@ pub(crate) fn source_marker_within(path: &Path, max_entries: usize) -> bool {
     ];
 
     // Source-file extensions — any one direct-child source file vetos.
+    // `mjs`/`cjs`/`mts`/`cts` too: a tracked scripts/build holding only
+    // `.mjs` passed this veto and was deleted (ts2, 2026-10-16, bd-8nol).
     const SOURCE_EXTS: &[&str] = &[
-        "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "kt", "rb", "ex", "exs", "ml", "hs",
-        "cpp", "cc", "c", "h", "hpp", "swift", "scala", "clj", "cljs", "lua", "jl", "lean",
+        "rs", "py", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "go", "java", "kt", "rb",
+        "ex", "exs", "ml", "hs", "cpp", "cc", "c", "h", "hpp", "swift", "scala", "clj", "cljs",
+        "lua", "jl", "lean",
     ];
 
     let Ok(entries) = fs::read_dir(path) else {
@@ -3840,6 +3843,17 @@ mod tests {
         let dir = scratch_dir();
         fs::write(dir.path().join("main.py"), "x = 1").unwrap();
         assert!(looks_like_source_code(dir.path()));
+    }
+
+    /// midas_edge's tracked scripts/build holds only `.mjs` files; it passed
+    /// this veto and was deleted from repo copies on ts2 (bd-8nol).
+    #[test]
+    fn looks_like_source_code_detects_esm_and_commonjs_modules() {
+        for name in ["cjs-shim.mjs", "loader.cjs", "types.mts", "config.cts"] {
+            let dir = scratch_dir();
+            fs::write(dir.path().join(name), "export {};\n").unwrap();
+            assert!(looks_like_source_code(dir.path()), "{name}");
+        }
     }
 
     #[test]

@@ -358,20 +358,28 @@ pub fn classify_opaque_tree(
     None
 }
 
-/// `build` and `dist` also name source directories. Beside a project manifest
-/// they are that project's output; deeper inside a project tree, temp placement
-/// alone does not make them output. On ts2 (2026-10-16) tracked
-/// `scripts/build/*.mjs`, `tests/golden/build` and `src/cmd/build` were deleted
-/// at Critical from repo copies under /data/tmp on the name alone.
+/// `build` and `dist` also name source directories and the shipped code of
+/// installed packages. They are output only beside the manifest of a tool that
+/// writes them. On ts2 (2026-10-16) temp placement alone deleted tracked
+/// `scripts/build/*.mjs` and golden-test fixtures from repo copies under
+/// /data/tmp, and a `package.json` beside them deleted the `dist/` code of
+/// packages in a bun install cache (bd-8nol).
 fn classify_build_output_name(
     path: &Path,
     name: &str,
     context: OpaqueTreeContext,
 ) -> OpaqueTreeClassification {
-    if name != ".next" && !context.parent_has_node_manifest && nested_in_project_source(path) {
-        return OpaqueTreeClassification::signal_only(
-            "build/dist name inside a project tree under temp storage, not beside its manifest",
-        );
+    if name != ".next" {
+        if installed_package_content(path) {
+            return OpaqueTreeClassification::signal_only(
+                "build/dist inside an installed or cached package is its shipped code",
+            );
+        }
+        if !context.parent_has_node_manifest && !beside_producing_manifest(path, name) {
+            return OpaqueTreeClassification::signal_only(
+                "build/dist name without a manifest beside it whose tool writes it",
+            );
+        }
     }
     OpaqueTreeClassification::candidate(
         "build output with project/temp context",
@@ -1177,35 +1185,53 @@ fn inside_project_tree(path: &Path) -> bool {
         .take(8)
         .take_while(|dir| !is_temp_root_dir(dir))
         .any(|dir| {
-            MARKERS
-                .iter()
-                .any(|marker| dir.join(marker).symlink_metadata().is_ok())
+            // A marker that cannot be checked counts as present: being wrong
+            // here keeps scratch, being wrong the other way deletes a project.
+            MARKERS.iter().any(|marker| {
+                !matches!(
+                    dir.join(marker).symlink_metadata(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                )
+            })
         })
 }
 
-/// Whether `path` sits inside a project tree but not directly beside one of
-/// its manifests: `<copy>/scripts/build` rather than `<copy>/build`.
-fn nested_in_project_source(path: &Path) -> bool {
-    const ROOT_MARKERS: &[&str] = &[
-        ".git",
+/// Whether the manifest of a tool that writes `name` sits beside it. Python
+/// and JS packaging write `dist/`; CMake, Make, Meson, Gradle, Python and JS
+/// builds write `build/`. Cargo, Go and a bare repo write neither, and a Rust
+/// repo can track its own `dist/` beside `Cargo.toml` (franken_manim).
+fn beside_producing_manifest(path: &Path, name: &str) -> bool {
+    const DIST: &[&str] = &["package.json", "pyproject.toml", "setup.cfg", "setup.py"];
+    const BUILD: &[&str] = &[
         "CMakeLists.txt",
-        "Cargo.toml",
         "Makefile",
         "build.gradle",
         "build.gradle.kts",
-        "go.mod",
         "meson.build",
         "package.json",
         "pyproject.toml",
         "setup.py",
     ];
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    !ROOT_MARKERS
-        .iter()
-        .any(|marker| parent.join(marker).symlink_metadata().is_ok())
-        && inside_project_tree(path)
+    let markers = if name == "dist" { DIST } else { BUILD };
+    path.parent().is_some_and(|parent| {
+        markers
+            .iter()
+            .any(|marker| parent.join(marker).metadata().is_ok())
+    })
+}
+
+/// Inside `node_modules` or a package manager's cache, a `dist/` or `build/`
+/// beside `package.json` is the published package's code, not output of a
+/// build on this host. Bun's install cache names entries
+/// `<name>@<version>@@@<n>`; Deno's npm cache sits under `registry.npmjs.org`.
+fn installed_package_content(path: &Path) -> bool {
+    path.parent().is_some_and(|parent| {
+        parent.components().any(|component| {
+            component.as_os_str().to_str().is_some_and(|part| {
+                part == "node_modules" || part == "registry.npmjs.org" || part.contains("@@@")
+            })
+        })
+    })
 }
 
 fn matches_builtin(kind: MatchKind, normalized: &str) -> bool {
@@ -2114,35 +2140,98 @@ mod tests {
     #[test]
     fn temp_build_and_dist_names_inside_a_project_copy_stay_source() {
         use std::fs;
-        // Under a temp root, like the /data/tmp verify checkouts that lost
-        // their tracked scripts/build on ts2.
+        // Under a temp root, like the /data/tmp verify checkouts, partial
+        // exports and bun install cache that lost source or package code on
+        // ts2 (bd-8nol).
         let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
-        let copy = dir.path().join("verify-af880e0");
-        for sub in ["scripts/build", "src/dist", "build", "app/.next"] {
-            fs::create_dir_all(copy.join(sub)).unwrap();
-        }
-        fs::write(copy.join("package.json"), b"{}").unwrap();
-        fs::write(copy.join("scripts/build/cjs-shim.mjs"), b"export {};\n").unwrap();
-        let loose = dir.path().join("loose").join("build");
-        fs::create_dir_all(&loose).unwrap();
-        let disposition = |path: &Path| {
-            classify_opaque_tree(path, OpaqueTreeContext::default())
-                .map(|opaque| opaque.disposition)
+        let tree = |root: &str, dirs: &[&str], files: &[&str]| {
+            let base = dir.path().join(root);
+            for sub in dirs {
+                fs::create_dir_all(base.join(sub)).unwrap();
+            }
+            for file in files {
+                fs::write(base.join(file), b"{}\n").unwrap();
+            }
+            base
+        };
+        let node = tree(
+            "verify-af880e0",
+            &[
+                "scripts/build",
+                "src/dist",
+                "build",
+                "app/.next",
+                "frontend/dist",
+            ],
+            &[
+                "package.json",
+                "scripts/build/cjs-shim.mjs",
+                "frontend/package.json",
+            ],
+        );
+        // A partial export: source directories, no manifest anywhere.
+        let partial = tree(
+            "tealforest-kmk",
+            &["scripts/build", "tests/golden/build"],
+            &[],
+        );
+        // A Cargo-only copy: Cargo writes neither build/ nor dist/.
+        let cargo = tree(
+            "hfdt-clean-export",
+            &["build", "dist", "crates/hfdt-cli/src/cmd/build"],
+            &["Cargo.toml", "crates/hfdt-cli/Cargo.toml"],
+        );
+        let cmake = tree("cmake-copy", &["build"], &["CMakeLists.txt"]);
+        let python = tree("py-copy", &["dist", "build"], &["pyproject.toml"]);
+        // Published packages: a bun install-cache entry and an installed
+        // dependency, each with package.json beside its dist/.
+        let bun = tree(
+            "bun-install-cache/sharp@0.35.4@@@1",
+            &["dist"],
+            &["package.json"],
+        );
+        let installed = tree("app/node_modules/unenv", &["dist"], &["package.json"]);
+        let disposition = |path: &Path, beside_node_manifest: bool| {
+            classify_opaque_tree(
+                path,
+                OpaqueTreeContext {
+                    parent_has_node_manifest: beside_node_manifest,
+                    ..OpaqueTreeContext::default()
+                },
+            )
+            .map(|opaque| opaque.disposition)
         };
 
-        for nested in [copy.join("scripts/build"), copy.join("src/dist")] {
+        for (source, beside_node_manifest) in [
+            (node.join("scripts/build"), false),
+            (node.join("src/dist"), false),
+            (partial.join("scripts/build"), false),
+            (partial.join("tests/golden/build"), false),
+            (cargo.join("build"), false),
+            (cargo.join("dist"), false),
+            (cargo.join("crates/hfdt-cli/src/cmd/build"), false),
+            (bun.join("dist"), true),
+            (installed.join("dist"), true),
+        ] {
             assert_eq!(
-                disposition(&nested),
+                disposition(&source, beside_node_manifest),
                 Some(OpaqueTreeDisposition::SignalOnly),
                 "{}",
-                nested.display()
+                source.display()
             );
         }
-        // Beside the manifest, with no project around it, and `.next`
-        // anywhere, temp placement still promotes as before.
-        for output in [copy.join("build"), loose, copy.join("app/.next")] {
+        // Beside the manifest of a tool that writes it, and `.next`
+        // anywhere, it is still output.
+        for (output, beside_node_manifest) in [
+            (node.join("build"), true),
+            (node.join("frontend/dist"), true),
+            (node.join("app/.next"), false),
+            (cmake.join("build"), false),
+            (python.join("dist"), false),
+            (python.join("build"), false),
+        ] {
             assert_eq!(
-                disposition(&output),
+                disposition(&output, beside_node_manifest),
                 Some(OpaqueTreeDisposition::CandidateOpaque),
                 "{}",
                 output.display()
