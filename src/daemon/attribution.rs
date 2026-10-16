@@ -6,7 +6,8 @@
 //! Sizes describe observed allocated blocks, never deletion authority or a
 //! promise of reclaimable space. These are not atomic filesystem snapshots.
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::fmt::Write as _;
 use std::fs::{File, Metadata};
@@ -23,11 +24,20 @@ use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat, open, openat, stata
 /// Top-level directories whose children are reported instead of themselves.
 const CONTAINERS: &[&str] = &["home", "data", "var", "srv", "opt", "Users", "root"];
 /// Directory-read attempts shared by discovery and all recursive probes.
-pub const PROBE_BUDGET_ENTRIES: usize = 400_000;
+///
+/// The budget is split evenly over the top-level consumers. At 400k entries
+/// and 1.5 s, a multi-terabyte mount gave each one ~50 ms: the trees holding
+/// hundreds of GiB measured ~0 and the advice named whatever fit, such as a
+/// 5 GiB placeholder on ts2 or "/Applications >=0.1 GiB" on mac-studio with
+/// 590 GiB of agent scratch in /private (bd-q4nx). A report runs on its own
+/// thread at most hourly per mount under sustained Red, and only hard-linked
+/// files are remembered, so the larger budget costs seconds, not memory.
+pub const PROBE_BUDGET_ENTRIES: usize = 2_000_000;
 /// Cooperative allowance, leaving time to publish a partial observation.
-pub const PROBE_TIME_BUDGET: Duration = Duration::from_millis(1500);
-/// Monitor receive timeout; no join follows a timeout. Not a real-time guarantee.
-pub const PROBE_WAIT_BUDGET: Duration = Duration::from_secs(2);
+pub const PROBE_TIME_BUDGET: Duration = Duration::from_secs(10);
+/// Receive timeout of the reporting thread; no join follows a timeout. Not a
+/// real-time guarantee. The monitor never waits on it.
+pub const PROBE_WAIT_BUDGET: Duration = Duration::from_secs(12);
 /// Entries named in one daemon report.
 pub const REPORT_TOP: usize = 8;
 const MAX_DISCOVERY_READS: usize = 4096;
@@ -91,6 +101,18 @@ pub struct Consumer {
     pub bytes: u64,
     /// Whether discovery and this consumer's traversal completed unchanged.
     pub complete: bool,
+    /// For an unfinished consumer, a sampled estimate of its whole size
+    /// ([`estimate_tree`]): it ranks the consumer and is shown as one, never
+    /// as a measurement (bd-q4nx).
+    pub estimated: Option<u64>,
+}
+
+impl Consumer {
+    /// The size it ranks by: the estimate when it exceeds the measurement.
+    fn rank_bytes(&self) -> u64 {
+        self.estimated
+            .map_or(self.bytes, |estimate| estimate.max(self.bytes))
+    }
 }
 
 struct WorkBudget {
@@ -163,6 +185,7 @@ fn unknown(mount: &Path) -> Vec<Consumer> {
         path: mount.to_path_buf(),
         bytes: 0,
         complete: false,
+        estimated: None,
     }]
 }
 
@@ -206,8 +229,15 @@ fn collect_consumers(mount: &Path, top: usize, work: &mut WorkBudget) -> Vec<Con
         };
     }
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
+    // Half the entries and time samples the consumers the walk cannot finish,
+    // so their size is estimated rather than read off whatever part of them
+    // fit (bd-q4nx).
+    let estimate_entries = work.remaining / 2;
+    work.remaining -= estimate_entries;
+    let started = Instant::now();
+    let walk_until = started + work.deadline.saturating_duration_since(started) / 2;
     let count = candidates.len();
-    let mut consumers = Vec::with_capacity(count);
+    let mut measured = Vec::with_capacity(count);
     let mut seen = HashSet::new();
     for (index, candidate) in candidates.into_iter().enumerate() {
         // Reserve a share for every observed consumer instead of allowing the
@@ -216,7 +246,7 @@ fn collect_consumers(mount: &Path, top: usize, work: &mut WorkBudget) -> Vec<Con
         let mut allowance = work.remaining / left;
         let now = Instant::now();
         let divisor = u32::try_from(left).unwrap_or(u32::MAX);
-        let deadline = now + work.deadline.saturating_duration_since(now) / divisor;
+        let deadline = now + walk_until.saturating_duration_since(now) / divisor;
         let (bytes, complete) = measure_directory(
             &candidate.directory,
             device,
@@ -230,12 +260,19 @@ fn collect_consumers(mount: &Path, top: usize, work: &mut WorkBudget) -> Vec<Con
             .directory
             .metadata()
             .is_ok_and(|after| same_stamp(&candidate.stamp, &after));
-        consumers.push(Consumer {
+        let consumer = Consumer {
             path: candidate.path,
             bytes,
             complete: complete && unchanged && discovery_complete,
-        });
+            estimated: None,
+        };
+        measured.push((consumer, candidate.directory));
     }
+    work.remaining += estimate_entries;
+    estimate_unfinished(&mut measured, device, work, &mut |len| {
+        usize::try_from(rand::random::<u64>() % (len as u64)).unwrap_or(0)
+    });
+    let mut consumers: Vec<Consumer> = measured.into_iter().map(|(consumer, _)| consumer).collect();
     if !root
         .metadata()
         .is_ok_and(|after| same_stamp(&stamp, &after))
@@ -244,9 +281,241 @@ fn collect_consumers(mount: &Path, top: usize, work: &mut WorkBudget) -> Vec<Con
             consumer.complete = false;
         }
     }
-    consumers.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+    consumers.sort_by(|a, b| {
+        b.rank_bytes()
+            .cmp(&a.rank_bytes())
+            .then_with(|| a.path.cmp(&b.path))
+    });
     consumers.truncate(top.min(MAX_CONSUMERS));
     consumers
+}
+
+/// Sample every consumer the walk left unfinished, sharing what is left of
+/// the budget evenly among them.
+fn estimate_unfinished(
+    measured: &mut [(Consumer, File)],
+    device: u64,
+    work: &mut WorkBudget,
+    choose: &mut impl FnMut(usize) -> usize,
+) {
+    let unfinished = measured
+        .iter()
+        .filter(|(consumer, _)| !consumer.complete)
+        .count();
+    for (index, (consumer, directory)) in measured
+        .iter_mut()
+        .filter(|(consumer, _)| !consumer.complete)
+        .enumerate()
+    {
+        let left = unfinished - index;
+        let mut allowance = work.remaining / left;
+        let now = Instant::now();
+        let divisor = u32::try_from(left).unwrap_or(u32::MAX);
+        let deadline = now + work.deadline.saturating_duration_since(now) / divisor;
+        consumer.estimated =
+            estimate_tree(directory, device, work, &mut allowance, deadline, choose);
+    }
+}
+
+/// Random paths sampled per estimate, spread over the consumer's children.
+const ESTIMATE_PROBES: u32 = 512;
+/// Files whose size is read per directory; the others are scaled from them.
+const FILE_SAMPLE: usize = 32;
+/// Directory entries listed per unit of work: a listing costs far less than
+/// a `stat`, and only directories and sampled files are `stat`ed.
+const LISTED_PER_UNIT: usize = 64;
+
+/// One directory's own allocated bytes (itself and its files) and its
+/// subdirectories on the same device.
+struct Level {
+    own: u64,
+    children: Vec<(std::ffi::CString, Stat)>,
+}
+
+/// Knuth's estimate of a tree's allocated bytes. A probe walks one random
+/// path down the tree and weights each directory's own bytes by the product
+/// of the fan-outs above it; the mean is unbiased for any tree shape, so a
+/// tree too large to walk is ranked by its size rather than by the part of it
+/// a budget reached. Every child of the root gets its own probes, so a large
+/// child is never missed by chance; children the budget does not reach count
+/// as average. Levels are read once and reused. `None` when no child was.
+fn estimate_tree(
+    root: &File,
+    device: u64,
+    work: &mut WorkBudget,
+    allowance: &mut usize,
+    deadline: Instant,
+    choose: &mut impl FnMut(usize) -> usize,
+) -> Option<u64> {
+    let top = read_level(root, device, work, allowance, deadline, choose)?;
+    if top.children.is_empty() {
+        return Some(top.own);
+    }
+    let per_child =
+        (ESTIMATE_PROBES / u32::try_from(top.children.len()).unwrap_or(u32::MAX)).max(1);
+    let mut levels: HashMap<u64, Level> = HashMap::new();
+    let (mut sum, mut reached) = (0.0_f64, 0_u32);
+    for (name, stat) in &top.children {
+        let Ok(child) = open_directory(root, name, stat) else {
+            continue;
+        };
+        let mut sampler = Sampler {
+            levels: &mut levels,
+            device,
+            work: &mut *work,
+            allowance: &mut *allowance,
+            deadline,
+            choose: &mut *choose,
+        };
+        let Some(mean) = sampler.probe_mean(&child, per_child) else {
+            break;
+        };
+        sum += mean;
+        reached += 1;
+    }
+    if reached == 0 {
+        return None;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let children = (sum * top.children.len() as f64 / f64::from(reached)) as u64;
+    Some(top.own.saturating_add(children))
+}
+
+/// The state [`estimate_tree`]'s probes share.
+struct Sampler<'a, C: FnMut(usize) -> usize> {
+    levels: &'a mut HashMap<u64, Level>,
+    device: u64,
+    work: &'a mut WorkBudget,
+    allowance: &'a mut usize,
+    deadline: Instant,
+    choose: &'a mut C,
+}
+
+impl<C: FnMut(usize) -> usize> Sampler<'_, C> {
+    /// The mean of up to `probes` random paths below `start`; a probe the
+    /// budget cuts short is dropped. `None` when none finished.
+    fn probe_mean(&mut self, start: &File, probes: u32) -> Option<f64> {
+        let (mut total, mut done) = (0.0_f64, 0_u32);
+        'probes: while done < probes {
+            let mut directory = start.try_clone().ok()?;
+            let (mut weight, mut sample) = (1.0_f64, 0.0_f64);
+            for _ in 0..MAX_DEPTH {
+                let Ok(inode) = directory.metadata().map(|meta| meta.ino()) else {
+                    break 'probes;
+                };
+                let level = match self.levels.entry(inode) {
+                    Entry::Occupied(known) => known.into_mut(),
+                    Entry::Vacant(unread) => {
+                        let Some(level) = read_level(
+                            &directory,
+                            self.device,
+                            self.work,
+                            self.allowance,
+                            self.deadline,
+                            self.choose,
+                        ) else {
+                            break 'probes;
+                        };
+                        unread.insert(level)
+                    }
+                };
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    sample = weight.mul_add(level.own as f64, sample);
+                    weight *= level.children.len() as f64;
+                }
+                if level.children.is_empty() {
+                    break;
+                }
+                let (name, expected) = &level.children[(self.choose)(level.children.len())];
+                let Ok(child) = open_directory(&directory, name, expected) else {
+                    break 'probes;
+                };
+                directory = child;
+            }
+            total += sample;
+            done += 1;
+        }
+        (done > 0).then(|| total / f64::from(done))
+    }
+}
+
+/// List one directory for [`estimate_tree`]. Entry types come from the
+/// listing; directories are `stat`ed, and a reservoir of [`FILE_SAMPLE`]
+/// files sizes the rest. `None` when the budget runs out or it cannot be read.
+fn read_level(
+    directory: &File,
+    device: u64,
+    work: &mut WorkBudget,
+    allowance: &mut usize,
+    deadline: Instant,
+    choose: &mut impl FnMut(usize) -> usize,
+) -> Option<Level> {
+    let mut own = directory.metadata().ok()?.blocks().checked_mul(512)?;
+    let mut entries = Dir::read_from(directory).ok()?;
+    let mut children = Vec::new();
+    let (mut files, mut sample) = (0_usize, Vec::with_capacity(FILE_SAMPLE));
+    let mut listed = 0_usize;
+    while let Some(entry) = entries.read() {
+        if listed.is_multiple_of(LISTED_PER_UNIT) && !work.take(allowance, deadline) {
+            return None;
+        }
+        listed += 1;
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let kind = entry.file_type();
+        if kind == FileType::RegularFile {
+            // Reservoir sampling keeps a uniform sample of any number of files.
+            if sample.len() < FILE_SAMPLE {
+                sample.push(name.to_owned());
+            } else if let Some(slot) = sample.get_mut(choose(files + 1)) {
+                name.clone_into(slot);
+            }
+            files += 1;
+            continue;
+        }
+        if kind != FileType::Directory && kind != FileType::Unknown {
+            continue;
+        }
+        if !work.take(allowance, deadline) {
+            return None;
+        }
+        let Ok(stat) = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
+            continue;
+        };
+        if stat_device(&stat) != Some(device) {
+            continue;
+        }
+        if FileType::from_raw_mode(stat.st_mode).is_dir() {
+            children.push((name.to_owned(), stat));
+        } else {
+            own = own.saturating_add(stat_blocks(&stat).unwrap_or(0));
+        }
+    }
+    let (mut sampled_bytes, mut sampled) = (0_u64, 0_u64);
+    for name in &sample {
+        if !work.take(allowance, deadline) {
+            return None;
+        }
+        if let Ok(stat) = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            sampled_bytes = sampled_bytes.saturating_add(stat_blocks(&stat).unwrap_or(0));
+            sampled += 1;
+        }
+    }
+    if sampled > 0 {
+        let scaled = u128::from(sampled_bytes) * files as u128 / u128::from(sampled);
+        own = own.saturating_add(u64::try_from(scaled).unwrap_or(u64::MAX));
+    }
+    Some(Level { own, children })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -396,7 +665,7 @@ fn measure_directory(
                 complete = false;
                 continue;
             };
-            if !seen.insert((device, inode)) {
+            if stat_hard_linked(&stat) && !seen.insert((device, inode)) {
                 complete = false;
                 continue;
             }
@@ -447,6 +716,13 @@ fn stat_blocks(stat: &Stat) -> Option<u64> {
     u64::try_from(stat.st_blocks).ok()?.checked_mul(512)
 }
 
+/// A file with one link cannot be met twice, so only hard-linked files need
+/// remembering: the set stays small however many entries are walked.
+#[allow(clippy::useless_conversion)]
+fn stat_hard_linked(stat: &Stat) -> bool {
+    u64::from(stat.st_nlink) > 1
+}
+
 fn same_stamp(left: &Metadata, right: &Metadata) -> bool {
     left.dev() == right.dev()
         && left.ino() == right.ino()
@@ -465,16 +741,26 @@ pub fn describe(consumers: &[Consumer]) -> String {
         if index > 0 {
             out.push_str(", ");
         }
+        // An estimate above the measured part is shown as an estimate; a
+        // measurement cut short is a lower bound.
+        let (bytes, mark, suffix) = match consumer.estimated {
+            Some(estimate) if !consumer.complete && estimate > consumer.bytes => {
+                (estimate, "~", " est.")
+            }
+            _ if consumer.complete => (consumer.bytes, "", ""),
+            _ => (consumer.bytes, ">=", ""),
+        };
         #[allow(clippy::cast_precision_loss)]
-        let gib = consumer.bytes as f64 / 1_073_741_824.0;
-        let bound = if consumer.complete { "" } else { ">=" };
+        let gib = bytes as f64 / 1_073_741_824.0;
         // Debug escaping keeps hostile file names from injecting log lines or
         // terminal control sequences. These paths are display-only.
         #[allow(clippy::unnecessary_debug_formatting)]
-        let _ = write!(out, "{:?} {bound}{gib:.1} GiB", consumer.path);
+        let _ = write!(out, "{:?} {mark}{gib:.1} GiB{suffix}", consumer.path);
     }
     if consumers.iter().any(|consumer| !consumer.complete) {
-        out.push_str(" (partial observation; unobserved entries may be larger)");
+        out.push_str(
+            " (partial observation: >= is the part measured, ~ a sampled estimate of the whole)",
+        );
     }
     out
 }
@@ -619,6 +905,7 @@ mod tests {
             path: PathBuf::from("/tmp/a\n\x1b[2J"),
             bytes: 1024,
             complete: false,
+            estimated: None,
         }]);
         assert!(!text.contains('\n'));
         assert!(!text.contains('\x1b'));
@@ -738,6 +1025,134 @@ mod tests {
             expected
         );
         assert!(consumers.iter().any(|consumer| !consumer.complete));
+    }
+
+    fn allocated_tree(path: &Path) -> u64 {
+        let meta = fs::symlink_metadata(path).unwrap();
+        let mut total = meta.blocks() * 512;
+        if meta.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                total += allocated_tree(&entry.unwrap().path());
+            }
+        }
+        total
+    }
+
+    fn estimate(path: &Path, choose: &mut impl FnMut(usize) -> usize) -> Option<u64> {
+        let root = File::open(path).unwrap();
+        let device = root.metadata().unwrap().dev();
+        let mut work = WorkBudget {
+            remaining: 100_000,
+            examined: 0,
+            deadline: Instant::now() + Duration::from_secs(30),
+        };
+        let mut allowance = 100_000;
+        estimate_tree(
+            &root,
+            device,
+            &mut work,
+            &mut allowance,
+            Instant::now() + Duration::from_secs(30),
+            choose,
+        )
+    }
+
+    /// The sampled estimate is exact on a symmetric tree whichever path a
+    /// probe takes, and its mean is exact when probes cover every branch
+    /// equally: unbiased, unlike the share of a tree a budget reaches.
+    #[test]
+    fn sampled_estimate_is_unbiased() {
+        let tree = tempfile::tempdir().unwrap();
+        for branch in ["a", "b", "c"] {
+            let deep = tree.path().join(branch).join("deep");
+            fs::create_dir_all(&deep).unwrap();
+            fs::write(deep.join("data"), vec![1u8; 64 * 1024]).unwrap();
+        }
+        let exact = allocated_tree(tree.path());
+        assert_eq!(estimate(tree.path(), &mut |_| 0), Some(exact));
+        assert_eq!(estimate(tree.path(), &mut |len| len - 1), Some(exact));
+
+        // Every child of the root is visited; below that, paths are sampled.
+        let skewed = tempfile::tempdir().unwrap();
+        let below = skewed.path().join("below");
+        fs::create_dir_all(below.join("big")).unwrap();
+        fs::write(below.join("big/data"), vec![2u8; 256 * 1024]).unwrap();
+        fs::create_dir(below.join("empty")).unwrap();
+        let exact = allocated_tree(skewed.path());
+        let mut turn = 0_usize;
+        let alternate = &mut |len: usize| {
+            turn += 1;
+            turn % len
+        };
+        assert_eq!(estimate(skewed.path(), alternate), Some(exact));
+        // Each path alone is wrong in its own direction.
+        let first = estimate(skewed.path(), &mut |_| 0).unwrap();
+        let last = estimate(skewed.path(), &mut |len| len - 1).unwrap();
+        assert!(first.min(last) < exact && exact < first.max(last));
+    }
+
+    /// A consumer the walk cannot finish is ranked by its estimated size,
+    /// shown as an estimate, above a smaller one measured in full (bd-q4nx).
+    #[test]
+    fn an_unfinished_consumer_is_ranked_by_its_estimate() {
+        let mount = tempfile::tempdir().unwrap();
+        for branch in ["one", "two", "three"] {
+            let dir = mount.path().join("big").join(branch);
+            fs::create_dir_all(&dir).unwrap();
+            for index in 0..40 {
+                fs::write(dir.join(format!("f{index}")), vec![3u8; 4096]).unwrap();
+            }
+        }
+        fs::create_dir(mount.path().join("small")).unwrap();
+        fs::write(mount.path().join("small/data"), vec![4u8; 64 * 1024]).unwrap();
+        let mut work = WorkBudget {
+            remaining: 100,
+            examined: 0,
+            deadline: Instant::now() + Duration::from_secs(30),
+        };
+        let consumers = collect_consumers(mount.path(), 8, &mut work);
+        assert_eq!(consumers.len(), 2, "{consumers:?}");
+        let (big, small) = (&consumers[0], &consumers[1]);
+        assert!(big.path.ends_with("big"), "{consumers:?}");
+        assert!(!big.complete && small.complete, "{consumers:?}");
+        let exact = allocated_tree(&mount.path().join("big"));
+        assert_eq!(big.estimated, Some(exact), "{consumers:?}");
+        assert!(big.bytes < exact);
+        let text = describe(&consumers);
+        assert!(text.contains(" ~") && text.contains("GiB est."), "{text}");
+    }
+
+    /// Only directories and hard-linked files are remembered, so a large
+    /// budget does not grow the set with every file walked (bd-q4nx).
+    #[test]
+    fn only_hard_linked_files_are_remembered() {
+        let tree = tempfile::tempdir().unwrap();
+        for index in 0..20 {
+            fs::write(tree.path().join(format!("single-{index}")), b"x").unwrap();
+        }
+        fs::write(tree.path().join("linked"), b"y").unwrap();
+        fs::hard_link(tree.path().join("linked"), tree.path().join("link")).unwrap();
+        let directory = File::open(tree.path()).unwrap();
+        let device = directory.metadata().unwrap().dev();
+        let mut work = WorkBudget {
+            remaining: 1_000,
+            examined: 0,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let mut allowance = 1_000;
+        let mut seen = HashSet::new();
+        let (bytes, _) = measure_directory(
+            &directory,
+            device,
+            0,
+            &mut work,
+            &mut allowance,
+            Instant::now() + Duration::from_secs(10),
+            &mut seen,
+        );
+        assert!(bytes > 0);
+        // The directory itself and the one hard-linked inode.
+        assert_eq!(seen.len(), 2, "{seen:?}");
     }
 
     #[test]
