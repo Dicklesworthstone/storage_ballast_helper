@@ -51,6 +51,15 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   status JSON and state file, and the new `sbh_bytes_freed_basis` metric,
   say how the figure was obtained, and the measured figure is kept
   alongside. sbh's cleanup decisions don't use these figures.
+- **"Largest directories" names the real space users on large disks**
+  (`59944ea`). When reclaim can't keep up, sbh lists the biggest
+  directories on the disk. On multi-terabyte disks it had time to look at
+  only a sliver of each, so it named whatever was quick to measure: a
+  5 GiB placeholder on one host, "/Applications" on a Mac whose space was
+  in temporary agent work. Directories too large to measure fully are now
+  estimated by sampling and shown as "~X GiB est.". On a Mac with 1.7 TiB
+  used, the home directory ranked first in every trial; before, it wasn't
+  listed at all. Estimates of very large trees tend to run low.
 
 ## v0.7.9 **[release]**
 
