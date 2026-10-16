@@ -4,6 +4,26 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
+## v0.7.10
+
+Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.10)
+
+### Added
+
+- **macOS: browsers' leftover app copies are reclaimed** (`0bd2dbb`).
+  Chrome, Canary, Edge, Brave and Opera copy their app bundle into
+  `/var/folders/<xx>/<hash>/X` at every launch and remove the copy only
+  when they exit normally. Killed headless browsers left 1,027 of them on
+  one Mac. With the v2 engine, a configured user temp dir root
+  (`/var/folders/<xx>/<hash>/T`) now brings the `X` directory beside it,
+  where only these copies are candidates. A copy is kept while a running
+  instance of its browser may own it: one that started up to 10 minutes
+  before the copy was made, or any instance for the browser's newest
+  copy. Open files can't tell which copy is live: some browsers hold
+  nothing open in theirs, and copies made from one binary all link that
+  binary. Freed space is smaller than the sizes listed, because the copies
+  share blocks with the installed app and with each other.
+
 ## v0.7.9 **[release]**
 
 Compare: [`v0.7.8...v0.7.9`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.8...v0.7.9)
