@@ -3118,10 +3118,14 @@ fn check_predict_reads_the_daemon_forecast_and_refuses_stale_state() {
     let dir = scratch();
     let fixtures = Fixtures::build(dir.path(), Duration::from_hours(5), 4096);
     let fixture_mount = dir.path().to_path_buf();
-    // 1 TB volume: 50% free, falling 2.5% every 4 s (6.25 GB/s) from t=4 s
-    // down to 5% (below red) at t=72 s, then holding there.
-    let series: Vec<(u64, u64)> = (1..=18)
-        .map(|i| (i * 4, 500_000_000_000u64.saturating_sub(i * 25_000_000_000)))
+    // 1 TB volume: 50% free, falling 0.8% every 4 s (2 GB/s) from t=4 s
+    // down to 5.2% (below the 6% red) at t=224 s, then holding there. The
+    // fall must outlast the 150 s wait below: once the mount is past red there
+    // is no horizon left to publish, and under a loaded e2e run the old
+    // series (red at ~70 s) passed red before the daemon's forecast had warmed
+    // up (bd-zvmn).
+    let series: Vec<(u64, u64)> = (1..=56)
+        .map(|i| (i * 4, 500_000_000_000u64.saturating_sub(i * 8_000_000_000)))
         .collect();
     let (root, root_total, root_free, root_ro) = quiet_root_mount();
     let table = table_of(&[
