@@ -24,6 +24,23 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   binary. Freed space is smaller than the sizes listed, because the copies
   share blocks with the installed app and with each other.
 
+### Fixed
+
+- **Linux: a Cargo build without HOME keeps its home config's protection**
+  (`f0e17ac`). A build run from a systemd unit or under `env -i` has no
+  HOME, so Cargo reads the config in its account's home instead. sbh read
+  no home config at all and still treated the build as fully inspected,
+  so a `build.target-dir` set there wasn't protected. sbh now reads the
+  same home config, finding the account from the process's user ID. When
+  it can't find the account, it treats the build as not fully inspected
+  and deletions wait.
+- **Installed Python packages in uv's cache are no longer nominated one
+  directory at a time** (`4bdd857`). With `~/.cache` as a scan root, sbh
+  nominated `__pycache__` directories inside packages uv had unpacked,
+  300–600 times an hour on one host. Running interpreters had them open,
+  so every attempt was refused. sbh now leaves the inside of each uv
+  cache entry alone; the uv cache as a whole can still be reclaimed.
+
 ## v0.7.9 **[release]**
 
 Compare: [`v0.7.8...v0.7.9`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.8...v0.7.9)
