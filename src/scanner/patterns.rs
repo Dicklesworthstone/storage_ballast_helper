@@ -224,6 +224,10 @@ pub fn classify_opaque_tree(
         ));
     }
 
+    if let Some(opaque) = classify_code_sign_clone_area(path) {
+        return Some(opaque);
+    }
+
     // Anything strictly inside cargo's own stores (`registry/src`,
     // `registry/cache`, `registry/index`, `git/checkouts`, `git/db`) is
     // cargo-managed content — unpacked crate SOURCE, `.crate` archives, index
@@ -356,6 +360,29 @@ pub fn classify_opaque_tree(
     }
 
     None
+}
+
+/// Chromium browsers on macOS (Chrome, Canary, Edge, Brave, Opera) keep an
+/// APFS clone of their app bundle, made at every launch and removed only when
+/// the browser exits normally. Killed headless browsers left 1,027 of them on
+/// mac-studio (2026-10-16, bd-39da). Only the clones are candidates, and
+/// nothing else in the clone area is walked; the active-reference index marks
+/// the clones a running browser may own (`walker::code_sign_clones`).
+fn classify_code_sign_clone_area(path: &Path) -> Option<OpaqueTreeClassification> {
+    Some(match darwin_code_sign_clone_level(path)? {
+        CodeSignCloneLevel::CloneDir => OpaqueTreeClassification::candidate(
+            "browser code-sign clone: a per-launch app copy its browser did not remove",
+            "opaque-browser-code-sign-clone",
+            ArtifactCategory::TempDir,
+            0.93,
+        ),
+        CodeSignCloneLevel::Container => OpaqueTreeClassification::signal_only(
+            "browser code-sign clone container: only the clones inside are candidates",
+        ),
+        CodeSignCloneLevel::Other => OpaqueTreeClassification::protected(
+            "macOS code-sign clone area: only browser clones are candidates",
+        ),
+    })
 }
 
 /// `build` and `dist` also name source directories and the shipped code of
@@ -761,33 +788,84 @@ fn is_tmp_like_path(path: &Path) -> bool {
 /// is the per-user cache dir and `0` belongs to the system.
 #[must_use]
 pub fn is_darwin_user_temp_path(path: &Path) -> bool {
+    matches!(
+        darwin_per_user_folder_names(path).as_deref(),
+        Some(["T", _, ..])
+    )
+}
+
+/// The names below a macOS per-user folder, `/var/folders/<xx>/<hash>/` (or
+/// its `/private/var/...` spelling): `["T", "entry"]` for an entry in the
+/// temp dir. Only plain names count: a `.` or `..` could step out of the
+/// folder while still matching the pattern textually.
+fn darwin_per_user_folder_names(path: &Path) -> Option<Vec<&str>> {
     use std::path::Component;
     let mut components = path.components();
     if components.next() != Some(Component::RootDir) {
-        return false;
+        return None;
     }
-    // Only plain names after the root: a `.` or `..` could step out of the
-    // temp dir while still matching the pattern textually.
-    let names: Option<Vec<&str>> = components
+    let names: Vec<&str> = components
         .map(|part| match part {
             Component::Normal(name) => name.to_str(),
             _ => None,
         })
-        .collect();
-    let Some(names) = names else {
-        return false;
-    };
-    let mut parts = names.into_iter();
-    let mut first = parts.next();
-    if first == Some("private") {
-        first = parts.next();
+        .collect::<Option<_>>()?;
+    let names = names.strip_prefix(&["private"]).unwrap_or(&names);
+    match names {
+        ["var", "folders", _, _, below @ ..] => Some(below.to_vec()),
+        _ => None,
     }
-    first == Some("var")
-        && parts.next() == Some("folders")
-        && parts.next().is_some()
-        && parts.next().is_some()
-        && parts.next() == Some("T")
-        && parts.next().is_some()
+}
+
+/// Where a path sits in a macOS per-user code-sign clone area,
+/// `/var/folders/<xx>/<hash>/X`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeSignCloneLevel {
+    /// `X/<bundle-id>.code_sign_clone`: one browser's clones.
+    Container,
+    /// `X/<bundle-id>.code_sign_clone/code_sign_clone.XXXXXX`: one clone.
+    CloneDir,
+    /// Anything else directly in `X` or in a container.
+    Other,
+}
+
+fn darwin_code_sign_clone_level(path: &Path) -> Option<CodeSignCloneLevel> {
+    let is_container = |name: &str| {
+        name.strip_suffix(".code_sign_clone")
+            .is_some_and(|bundle_id| !bundle_id.is_empty())
+    };
+    match darwin_per_user_folder_names(path)?.as_slice() {
+        ["X", name] if is_container(name) => Some(CodeSignCloneLevel::Container),
+        ["X", container, name] if is_container(container) && is_code_sign_clone_name(name) => {
+            Some(CodeSignCloneLevel::CloneDir)
+        }
+        ["X", _] => Some(CodeSignCloneLevel::Other),
+        ["X", container, _] if is_container(container) => Some(CodeSignCloneLevel::Other),
+        _ => None,
+    }
+}
+
+/// One browser's app clone,
+/// `/var/folders/<xx>/<hash>/X/<bundle-id>.code_sign_clone/code_sign_clone.XXXXXX`.
+#[must_use]
+pub fn is_browser_code_sign_clone(path: &Path) -> bool {
+    darwin_code_sign_clone_level(path) == Some(CodeSignCloneLevel::CloneDir)
+}
+
+/// `code_sign_clone.XXXXXX`, the `mkdtemp` name Chromium gives each clone.
+fn is_code_sign_clone_name(name: &str) -> bool {
+    name.strip_prefix("code_sign_clone.").is_some_and(|suffix| {
+        suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+/// The code-sign clone area beside a macOS per-user temp dir root: `X` for
+/// `/var/folders/<xx>/<hash>/T`. Scanning a user's temp dir includes the
+/// clones their browsers leave there; see [`classify_opaque_tree`].
+#[must_use]
+pub fn darwin_code_sign_clone_area_for_temp_root(root: &Path) -> Option<std::path::PathBuf> {
+    matches!(darwin_per_user_folder_names(root).as_deref(), Some(["T"]))
+        .then(|| root.with_file_name("X"))
 }
 
 /// `.cargo/registry` or `.cargo/git`.
@@ -1926,6 +2004,83 @@ mod tests {
         assert!(crate::scanner::scoring::is_volatile_temp_path(Path::new(
             "/var/folders/vt/n2xyn_s51b97_j3yh2qbqcnc0000gn/T/proj/target"
         )));
+    }
+
+    #[test]
+    fn browser_code_sign_clones_are_the_only_candidates_in_the_clone_area() {
+        let classify =
+            |path: &str| classify_opaque_tree(Path::new(path), OpaqueTreeContext::default());
+        let x = "/private/var/folders/vt/n2xy/X";
+        for clone in [
+            format!("{x}/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk"),
+            "/var/folders/vt/n2xy/X/com.brave.Browser.code_sign_clone/code_sign_clone.a1B2c3"
+                .to_string(),
+        ] {
+            let opaque = classify(&clone).unwrap();
+            assert_eq!(
+                opaque.disposition,
+                OpaqueTreeDisposition::CandidateOpaque,
+                "{clone}"
+            );
+            assert_eq!(opaque.classification.category, ArtifactCategory::TempDir);
+            assert_eq!(
+                opaque.classification.pattern_name,
+                "opaque-browser-code-sign-clone"
+            );
+        }
+        // A browser's container is walked for its clones, never scored.
+        let container = classify(&format!("{x}/com.google.Chrome.code_sign_clone")).unwrap();
+        assert_eq!(container.disposition, OpaqueTreeDisposition::SignalOnly);
+        // Nothing else in the area is walked or scored.
+        for other in [
+            format!("{x}/com.example.Other"),
+            format!("{x}/.code_sign_clone"),
+            format!("{x}/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMR"),
+            format!("{x}/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk7"),
+            format!("{x}/com.google.Chrome.code_sign_clone/code_sign_clone.R3-MRk"),
+            format!("{x}/com.google.Chrome.code_sign_clone/Google Chrome.app"),
+        ] {
+            let opaque = classify(&other).unwrap();
+            assert_eq!(
+                opaque.disposition,
+                OpaqueTreeDisposition::ProtectedOpaque,
+                "{other}"
+            );
+        }
+        // The same names anywhere else get no special treatment.
+        for elsewhere in [
+            "/private/var/folders/vt/n2xy/T/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk",
+            "/tmp/X/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk",
+            "/private/var/folders/vt/X/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk",
+            "/private/var/folders/vt/n2xy/X/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk/Google Chrome.app.bundle",
+            "/private/var/folders/vt/n2xy/X/../X/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk",
+        ] {
+            assert!(classify(elsewhere).is_none(), "{elsewhere}");
+        }
+    }
+
+    #[test]
+    fn the_clone_area_sits_beside_a_user_temp_dir_root_only() {
+        use super::darwin_code_sign_clone_area_for_temp_root as area;
+        use std::path::PathBuf;
+        for (root, want) in [
+            (
+                "/private/var/folders/vt/n2xy/T",
+                "/private/var/folders/vt/n2xy/X",
+            ),
+            ("/var/folders/vt/n2xy/T/", "/var/folders/vt/n2xy/X"),
+        ] {
+            assert_eq!(area(Path::new(root)), Some(PathBuf::from(want)), "{root}");
+        }
+        for root in [
+            "/private/var/folders/vt/n2xy/T/.tmpAbc",
+            "/private/var/folders/vt/n2xy/C",
+            "/private/var/folders/vt/n2xy",
+            "/private/var/folders",
+            "/private/tmp",
+        ] {
+            assert_eq!(area(Path::new(root)), None, "{root}");
+        }
     }
 
     fn classify_macos(

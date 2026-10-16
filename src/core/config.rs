@@ -592,7 +592,9 @@ pub struct ScannerConfig {
     /// `/var/folders/<x>/<y>/T`), where cargo test tempdirs and most tools
     /// write. The default roots (`/tmp`, `/var/tmp`) resolve to
     /// `/private/...` there and never reach it. Added at load unless a root
-    /// already covers it. No effect on other platforms.
+    /// already covers it. No effect on other platforms. A temp dir root,
+    /// added here or configured, also brings its sibling `X` with the v2
+    /// engine, where crashed browsers leave their app clones.
     pub include_user_temp_dir: bool,
     /// How often (seconds) a catalog scan may repeat on the same mount at the
     /// same pressure level; a rising level re-arms it immediately.
@@ -2081,6 +2083,23 @@ impl Config {
         {
             add_root_unless_covered(&mut cfg.scanner.root_paths, dir);
         }
+        // A user's temp dir root brings the browser code-sign clones beside
+        // it (bd-39da). Only v2 knows which entries there are clones: the v1
+        // walker would descend into a running browser's app copy.
+        if cfg.scanner.engine == ScannerEngineMode::V2 {
+            let clone_areas: Vec<PathBuf> = cfg
+                .scanner
+                .root_paths
+                .iter()
+                .filter_map(|root| {
+                    crate::scanner::patterns::darwin_code_sign_clone_area_for_temp_root(root)
+                })
+                .filter(|area| area.is_dir())
+                .collect();
+            for area in clone_areas {
+                add_root_unless_covered(&mut cfg.scanner.root_paths, area);
+            }
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -3391,6 +3410,15 @@ mod tests {
             "{:?}",
             cfg.scanner.root_paths
         );
+        // The browser code-sign clone area beside it comes along (bd-39da),
+        // when this account has one.
+        let clone_area = temp.with_file_name("X");
+        assert_eq!(
+            cfg.scanner.root_paths.contains(&clone_area),
+            clone_area.is_dir(),
+            "{:?}",
+            cfg.scanner.root_paths
+        );
         std::fs::write(
             &path,
             "[scanner]\nroot_paths = [\"/private/tmp\"]\ninclude_user_temp_dir = false\n",
@@ -3402,6 +3430,16 @@ mod tests {
             "{:?}",
             cfg.scanner.root_paths
         );
+        assert!(!cfg.scanner.root_paths.contains(&clone_area));
+        // Only v2 knows which entries there are clones.
+        std::fs::write(
+            &path,
+            "[scanner]\nroot_paths = [\"/private/tmp\"]\nengine = \"v1\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert!(cfg.scanner.root_paths.contains(&temp));
+        assert!(!cfg.scanner.root_paths.contains(&clone_area));
     }
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};

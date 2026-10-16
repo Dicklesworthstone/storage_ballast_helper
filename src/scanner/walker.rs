@@ -29,6 +29,8 @@ use crate::scanner::scoring::ActiveReferenceSummary;
 
 mod build_scopes;
 use build_scopes::BuildDirectoryScopes;
+mod code_sign_clones;
+use code_sign_clones::AppInstance;
 
 pub const DEFAULT_ACTIVE_REFERENCE_CACHE_TTL_SECS: u64 = 30;
 pub const DEFAULT_ACTIVE_REFERENCE_MIN_SIZE_BYTES: u64 = 100 * 1024 * 1024;
@@ -2043,6 +2045,7 @@ pub fn collect_active_reference_index(
         index.complete = false;
     }
     let mut process_names = HashMap::new();
+    let mut app_instances = Vec::new();
     // Names and working directories only: an argv read can block behind a
     // process wedged in mmap, and that would hold the scan with it.
     match platform.process_list_without_command_lines() {
@@ -2060,11 +2063,14 @@ pub fn collect_active_reference_index(
                         summary.add_working_directory(process.pid, name.clone());
                     });
                 }
+                app_instances.extend(AppInstance::of_process(&process));
                 process_names.insert(process.pid, process.name);
             }
         }
         Err(_) => index.complete = false,
     }
+
+    code_sign_clones::add_owners(&mut index, &roots, &app_instances);
 
     // The cargo home and target directory a live build names are in use for
     // as long as it runs, whatever it holds open (bd-d1kt). Coverage matters:

@@ -129,6 +129,8 @@ pub fn classify_certainty(
             && classification.structural_confidence >= 0.9)
         || (classification.category == ArtifactCategory::NodeModules && in_temp_root)
         || pattern == "xcode-derived-data"
+        // A copy of an installed app, made again at every launch.
+        || pattern == "opaque-browser-code-sign-clone"
         || pattern.starts_with("electron-");
     if definite {
         return ArtifactCertainty::Definite;
@@ -170,6 +172,8 @@ pub struct ActiveReferenceSummary {
     pub incomplete_reason: Option<String>,
 }
 
+// Each flag is an independent kind of evidence the veto names.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveReferenceProcess {
     pub pid: i32,
@@ -181,6 +185,9 @@ pub struct ActiveReferenceProcess {
     pub working_directory: bool,
     /// The process names the tree as its cargo home or target directory.
     pub build_directory: bool,
+    /// The process is a running instance of the app this browser code-sign
+    /// clone copies, started just before the clone was made (bd-39da).
+    pub app_instance: bool,
 }
 
 impl ActiveReferenceSummary {
@@ -214,6 +221,12 @@ impl ActiveReferenceSummary {
     /// (bd-d1kt). It is in use for as long as that build runs.
     pub fn add_build_directory(&mut self, pid: i32, name: Option<String>) {
         self.process_mut(pid, name).build_directory = true;
+    }
+
+    /// A browser need not hold its code-sign clone open while it runs, yet
+    /// needs it to launch helpers after an in-place update (bd-39da).
+    pub fn add_app_instance(&mut self, pid: i32, name: Option<String>) {
+        self.process_mut(pid, name).app_instance = true;
     }
 
     pub fn mark_incomplete(&mut self, reason: impl Into<String>) {
@@ -266,6 +279,7 @@ impl ActiveReferenceSummary {
                 mmap_regions: 0,
                 working_directory: false,
                 build_directory: false,
+                app_instance: false,
             });
             self.processes.sort_by_key(|p| p.pid);
             self.processes
@@ -292,6 +306,7 @@ impl ActiveReferenceProcess {
             && self.mmap_regions == 0
             && !self.working_directory
             && !self.build_directory
+            && !self.app_instance
     }
 
     fn safe_reclaim_reason(&self) -> String {
@@ -319,6 +334,9 @@ impl ActiveReferenceProcess {
         }
         if self.build_directory {
             evidence.push("its cargo home or target directory here".to_string());
+        }
+        if self.app_instance {
+            evidence.push("the running app this clone was made for".to_string());
         }
         format!("{label} has {}", evidence.join(", "))
     }
@@ -1073,6 +1091,8 @@ fn factor_location(path: &Path) -> f64 {
         || text.starts_with("/data/tmp")
         || text.starts_with("/dev/shm")
         || crate::scanner::patterns::is_darwin_user_temp_path(path)
+        // A browser makes each code-sign clone as a temporary directory.
+        || crate::scanner::patterns::is_browser_code_sign_clone(path)
     {
         0.95
     } else if text.contains("/data/projects/") && text.contains("/.tmp_") {
@@ -2354,6 +2374,29 @@ mod tests {
         let score = engine.score_candidate(&fresh, 0.93);
         assert!(score.vetoed, "{:?}", score.veto_reason);
         assert!(!score.decision.posterior_floor_applied);
+    }
+
+    /// A browser's per-launch app clone sits in the temp location band and is
+    /// definitely regenerable; whether it is in use is the vetoes' call
+    /// (bd-39da).
+    #[test]
+    fn browser_code_sign_clones_are_definite_temp_output() {
+        let clone = Path::new(
+            "/private/var/folders/vt/n2xy/X/com.google.Chrome.code_sign_clone/code_sign_clone.R3PMRk",
+        );
+        let location = super::factor_location(clone);
+        assert!((location - 0.95).abs() < f64::EPSILON, "{location}");
+        let classification = ArtifactClassification {
+            pattern_name: Cow::Borrowed("opaque-browser-code-sign-clone"),
+            category: ArtifactCategory::TempDir,
+            name_confidence: 0.93,
+            structural_confidence: 1.0,
+            combined_confidence: 0.93,
+        };
+        assert_eq!(
+            classify_certainty(&classification, StructuralSignals::default(), location),
+            ArtifactCertainty::Definite
+        );
     }
 
     #[test]
