@@ -24,8 +24,8 @@ Compare: [`v0.7.8...v0.7.9`](https://github.com/Dicklesworthstone/storage_ballas
   temp root are no longer deleted** (`41bce34`). Any `build` or `dist`
   directory under `/tmp` or `/data/tmp` counted as build output on its
   location alone. On one host that deleted 1,743 of them, including 717
-  tracked `scripts/build` source directories, golden-test fixtures and a Rust
-  `src/cmd/build` module, from agents' verify checkouts and exports, for about
+  tracked scripts/build source directories, golden-test fixtures and a Rust
+  src/cmd/build module, from agents' verify checkouts and exports, for about
   12 KiB each. Inside a project tree such a directory now needs a project
   manifest beside it to count as output.
 - **Ballast is released for `/` under a sandboxed systemd unit**
@@ -43,6 +43,14 @@ Compare: [`v0.7.8...v0.7.9`](https://github.com/Dicklesworthstone/storage_ballas
   one host that was the entire root reserve, 10 GiB. The daemon now names
   such directories at startup, with the remedy, and `sbh --json ballast
   status` lists them under `unreachable_reserve`.
+- **A root `sbh ballast status` no longer counts that reserve as
+  releasable** (`54bfabb`). Outside the service's sandbox `/` is writable,
+  so the CLI still adopted the read-only reserve and reported it as
+  releasable (10.7 GB on that host, which the daemon could never release).
+  The CLI now reads the installed unit and its drop-ins, and a reserve
+  directory that no `ReadWritePaths=` entry grants under
+  `ProtectSystem=strict` is listed as unreachable instead. Human output
+  names it per volume, with the remedy.
 
 ## v0.7.8 **[release]**
 

@@ -1774,9 +1774,40 @@ fn installed_service_config() -> Option<PathBuf> {
     candidate.filter(|path| fs::File::open(path).is_ok())
 }
 
+/// The filesystem sandbox of the installed systemd service, if one is installed.
+///
+/// It is read from the unit and its drop-ins, searched in
+/// [`installed_service_config`]'s order: root sees the system unit first,
+/// another user its own user unit first. A root CLI run outside that sandbox
+/// can write paths the service cannot, so whether the service can release a
+/// reserve is judged against this.
+#[must_use]
+pub fn installed_service_sandbox() -> Option<crate::daemon::service::ServiceSandbox> {
+    if cfg!(test) || env::var_os("SBH_TEST_MODE").is_some() {
+        return None;
+    }
+    let system = Some(PathBuf::from("/etc/systemd/system"));
+    let user = env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/systemd/user"));
+    let dirs = if effective_uid_is_root() {
+        [system, user]
+    } else {
+        [user, system]
+    };
+    dirs.into_iter()
+        .flatten()
+        .find_map(|dir| systemd_unit_texts(&dir))
+        .map(|texts| crate::daemon::service::ServiceSandbox::from_unit_texts(&texts))
+}
+
 /// `--config` of the effective `ExecStart=` in `<dir>/sbh.service` and its
 /// `sbh.service.d/*.conf` drop-ins (the last assignment wins, as in systemd).
 pub(crate) fn config_from_systemd_unit_dir(dir: &Path) -> Option<PathBuf> {
+    config_from_systemd_texts(&systemd_unit_texts(dir)?)
+}
+
+/// `<dir>/sbh.service` followed by its `sbh.service.d/*.conf` drop-ins in
+/// name order, which is the order systemd applies them.
+fn systemd_unit_texts(dir: &Path) -> Option<Vec<String>> {
     let unit = fs::read_to_string(dir.join("sbh.service")).ok()?;
     let mut texts = vec![unit];
     if let Ok(entries) = fs::read_dir(dir.join("sbh.service.d")) {
@@ -1787,7 +1818,7 @@ pub(crate) fn config_from_systemd_unit_dir(dir: &Path) -> Option<PathBuf> {
         dropins.sort();
         texts.extend(dropins.iter().filter_map(|p| fs::read_to_string(p).ok()));
     }
-    config_from_systemd_texts(&texts)
+    Some(texts)
 }
 
 fn config_from_systemd_texts(texts: &[String]) -> Option<PathBuf> {

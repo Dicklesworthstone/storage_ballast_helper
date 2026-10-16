@@ -17,6 +17,7 @@ use crate::ballast::manager::{
 };
 use crate::core::config::BallastConfig;
 use crate::core::errors::Result;
+use crate::daemon::service::ServiceSandbox;
 use crate::platform::pal::{MountPoint, Platform};
 
 mod provision;
@@ -416,7 +417,7 @@ impl BallastPoolCoordinator {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let legacy_dirs =
             stranded::legacy_dirs(watched_paths, configured_ballast_dir, home.as_deref());
-        let service_dir = crate::core::config::installed_service_ballast_dir();
+        let service = InstalledService::installed();
 
         // Deduplicate watched paths by mount point.
         let mut seen_mounts = HashMap::<PathBuf, MountPoint>::new();
@@ -512,7 +513,7 @@ impl BallastPoolCoordinator {
                 mount_path,
                 &aliases,
                 &resolved_dir,
-                service_dir.as_deref(),
+                &service,
                 &legacy_dirs,
                 platform,
                 &mounts,
@@ -874,22 +875,42 @@ fn record_folded_mounts(
     }
 }
 
-/// Conventional reserve locations on this pool's filesystem: those this
-/// process can write (stranded reserve, adopted and released), and those that
+/// What this process knows about the installed sbh service (see
+/// `installed_service_ballast_dir` for which service that is).
+#[derive(Debug, Clone, Default)]
+struct InstalledService {
+    /// Its configured pool: live, so never stranded, even when this process
+    /// runs with another config.
+    ballast_dir: Option<PathBuf>,
+    /// Its systemd sandbox. A root CLI run outside the sandbox can write a
+    /// reserve the service cannot, and must not count it as releasable.
+    sandbox: Option<ServiceSandbox>,
+}
+
+impl InstalledService {
+    fn installed() -> Self {
+        Self {
+            ballast_dir: crate::core::config::installed_service_ballast_dir(),
+            sandbox: crate::core::config::installed_service_sandbox(),
+        }
+    }
+}
+
+/// Conventional reserve locations on this pool's filesystem: those the
+/// service can write (stranded reserve, adopted and released), and those that
 /// hold sbh ballast but are read-only to it, so it can neither count nor
 /// release them. Under `ProtectSystem=strict` everything outside
 /// `ReadWritePaths=` is read-only (trj, 2026-10-16: 10 GiB at `/.sbh/ballast`
-/// while the configured pool was empty and `/` stayed at Critical).
+/// while the configured pool was empty and `/` stayed at Critical). Inside
+/// the sandbox the mount reports that itself; outside it (a root
+/// `sbh ballast status`) the installed unit's sandbox decides.
 /// Discovery subsequently deduplicates directory inode aliases and excludes
 /// any alias of the managed directory itself.
-/// `service_dir` is the installed service's configured pool (see
-/// `installed_service_ballast_dir` for which service that is): it is live,
-/// so it is never stranded, even when this process runs with another config.
 fn stranded_pool_dirs(
     mount_path: &Path,
     aliases: &HashMap<PathBuf, PathBuf>,
     resolved_dir: &Path,
-    service_dir: Option<&Path>,
+    service: &InstalledService,
     legacy_dirs: &[PathBuf],
     platform: &dyn Platform,
     mounts: &[MountPoint],
@@ -900,6 +921,12 @@ fn stranded_pool_dirs(
                 (std::fs::canonicalize(a), std::fs::canonicalize(b)),
                 (Ok(a), Ok(b)) if a == b
             )
+    };
+    let service_denied = |dir: &Path| {
+        service.sandbox.as_ref().is_some_and(|sandbox| {
+            sandbox.denies_write(dir)
+                && std::fs::canonicalize(dir).map_or(true, |real| sandbox.denies_write(&real))
+        })
     };
     let (mut stranded, mut unreachable) = (Vec::new(), Vec::new());
     for dir in std::iter::once(mount_path)
@@ -912,11 +939,16 @@ fn stranded_pool_dirs(
         .map(|root| root.join(BALLAST_SUBDIR))
         .chain(legacy_dirs.iter().cloned())
         .filter(|dir| dir != resolved_dir)
-        .filter(|dir| !service_dir.is_some_and(|live| same_dir(dir, live)))
+        .filter(|dir| {
+            !service
+                .ballast_dir
+                .as_deref()
+                .is_some_and(|live| same_dir(dir, live))
+        })
     {
         match pool_filesystem_access(&dir, mount_path, aliases, platform, mounts) {
-            Some(true) => stranded.push(dir),
-            Some(false) if holds_ballast_files(&dir) => unreachable.push(dir),
+            Some(true) if !service_denied(&dir) => stranded.push(dir),
+            Some(_) if holds_ballast_files(&dir) => unreachable.push(dir),
             _ => {}
         }
     }
@@ -1902,7 +1934,10 @@ mod tests {
                 mount.path(),
                 &HashMap::new(),
                 &resolved,
-                service,
+                &InstalledService {
+                    ballast_dir: service.map(Path::to_path_buf),
+                    sandbox: None,
+                },
                 &legacy,
                 &platform,
                 &mounts,
@@ -1918,6 +1953,64 @@ mod tests {
             assert!(!dirs.contains(&live), "{service:?}: {dirs:?}");
             assert!(dirs.contains(&former), "{service:?}: {dirs:?}");
         }
+    }
+
+    /// A root `sbh ballast status` runs outside the service's sandbox and can
+    /// write a reserve the service cannot (trj, 2026-10-16: `/.sbh/ballast`
+    /// shown as 10.7 GB releasable while the daemon had nothing to release on
+    /// `/`). Under the installed unit's `ProtectSystem=strict`, a reserve no
+    /// `ReadWritePaths=` entry grants is named as unreachable, never adopted.
+    #[cfg(unix)]
+    #[test]
+    fn reserve_outside_the_services_sandbox_is_not_adopted() {
+        let mount = tempfile::tempdir().unwrap();
+        let granted_root = mount.path().join("var/lib/sbh");
+        let denied = mount.path().join(".sbh/ballast");
+        let granted = granted_root.join("old/ballast");
+        let denied_empty = mount.path().join("home/old/.local/share/sbh/ballast");
+        for dir in [&denied, &granted, &denied_empty] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        for dir in [&denied, &granted] {
+            fs::write(dir.join("SBH_BALLAST_FILE_00001.dat"), b"former").unwrap();
+        }
+        let platform = MockPlatform::new(
+            vec![mock_mount(mount.path(), "/dev/sda1")],
+            HashMap::from([(mount.path().to_path_buf(), mock_stats(mount.path(), false))]),
+            mock_memory(),
+            PlatformPaths::default(),
+        );
+        let mounts = platform.mount_points().unwrap();
+        let legacy = vec![granted.clone(), denied_empty.clone()];
+        let unit = format!(
+            "[Service]\nProtectSystem=strict\nReadWritePaths=-{}\n",
+            granted_root.display()
+        );
+        let sandbox = ServiceSandbox::from_unit_texts(&[unit]);
+        let partition = |sandbox: Option<ServiceSandbox>| {
+            stranded_pool_dirs(
+                mount.path(),
+                &HashMap::new(),
+                &mount.path().join("configured/ballast"),
+                &InstalledService {
+                    ballast_dir: None,
+                    sandbox,
+                },
+                &legacy,
+                &platform,
+                &mounts,
+            )
+        };
+
+        let (stranded, unreachable) = partition(Some(sandbox));
+        assert_eq!(stranded, vec![granted.clone()]);
+        assert_eq!(unreachable, vec![denied.clone()]);
+
+        // Without an installed sandbox, everything this process can write is
+        // adopted, as before.
+        let (stranded, unreachable) = partition(None);
+        assert!(stranded.contains(&denied) && stranded.contains(&granted));
+        assert!(stranded.contains(&denied_empty) && unreachable.is_empty());
     }
 
     /// A sandboxed systemd unit sees each `ReadWritePaths=` entry as a bind
