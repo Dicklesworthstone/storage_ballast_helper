@@ -4,34 +4,31 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
-## v0.7.10
-
-Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.10)
-
-### Fixed
-
-- **Packages' shipped code and partial repo copies are kept too**
-  (`183fd53`). A `dist/` beside `package.json` counted as output anywhere,
-  so sbh deleted the code of three packages in a bun install cache, and a
-  partial export with no manifest at all still lost its build directories.
-  A `build/` or `dist/` now counts as output only beside the manifest of a
-  tool that writes it (JS and Python packaging for `dist/`; CMake, Make,
-  Meson, Gradle, Python and JS builds for `build/`), and never inside
-  `node_modules` or a package cache. The executor's last-line source check
-  now also recognises `.mjs`, `.cjs`, `.mts` and `.cts` files.
-- **The scanner's "incomplete" line and `sbh explain` name the process an
-  open-file limit cut short** (`726c9a2`). In v0.7.9 only the sweep's own
-  log line named it.
-
 ## v0.7.9 **[release]**
 
 Compare: [`v0.7.8...v0.7.9`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.8...v0.7.9)
 
-A safety and availability release. sbh deleted source directories named
-`build` or `dist` inside repo copies under temp roots, on the name alone;
-it now needs a project manifest beside them. One process with tens of
-thousands of open files (a `bfs` search) stopped every deletion on its
-host; the limit is higher and the log names the process. Under the
+The first published release since v0.7.6: v0.7.7 and v0.7.8 were tagged
+but not published, and this release carries everything listed under both.
+From those: on a host under memory pressure, a build stuck in `mmap` froze
+the daemon's monitor for 19 minutes, and neither the monitor nor scans and
+deletions now wait on another process's memory. On Linux, a live build's
+command-line output directories, its Cargo config's target and build
+directories, and its default `target/` count as in use (also for `sbh
+clean` and `sbh emergency`), and a build that can't be fully inspected
+holds the batch. Directories with more than 65,536 entries are covered over
+successive passes, the root daemon no longer reads kernel pseudo-files
+named as Cargo configuration, memory pressure no longer flaps between
+levels, scans use 16–21% less CPU, protection refusals are reported as
+refusals, and maintenance passes no longer flood the journal.
+
+New in this release, a safety and availability fix set: sbh deleted source
+directories named `build` or `dist` inside repo copies under temp roots,
+and the shipped code of packages in install caches, on the name alone; such
+a directory now counts as output only beside the manifest of a tool that
+writes it. One process with tens of thousands of open files (a `bfs`
+search) stopped every deletion on its host; the limit is higher and the
+log names the process. Under the
 hardened systemd unit `sbh install` generates, ballast was never released
 for `/`; it now is, and ballast the service can't release is named
 instead of counted. Also: `sbh compress --discover --apply` compresses a
@@ -58,13 +55,23 @@ directory's cold files in one pass.
   (a Rust src/cmd/build module was spared only by the executor's source
   check). Inside a project tree such a directory now needs a project
   manifest beside it to count as output.
+- **Packages' shipped code and partial repo copies are kept too**
+  (`183fd53`). A `dist/` beside `package.json` counted as output anywhere,
+  so sbh deleted the code of three packages in a bun install cache, and a
+  partial export with no manifest at all still lost its build directories.
+  A `build/` or `dist/` now counts as output only beside the manifest of a
+  tool that writes it (JS and Python packaging for `dist/`; CMake, Make,
+  Meson, Gradle, Python and JS builds for `build/`), and never inside
+  `node_modules` or a package cache. The executor's last-line source check
+  now also recognises `.mjs`, `.cjs`, `.mts` and `.cts` files.
 - **One process with many open files no longer stops every deletion**
-  (`48c1414`). sbh reads each process's open files before deleting, up to
-  16,384 per process; past that it couldn't vouch for any candidate and held
-  them all, logging only that inspection was "incomplete". On one host a
-  long-running `bfs` search with 65,536 directories open stopped all
-  deletions for hours. The per-process limit is now 131,072, and when a
-  limit is hit the log names the process.
+  (`48c1414`, `726c9a2`). sbh reads each process's open files before
+  deleting, up to 16,384 per process; past that it couldn't vouch for any
+  candidate and held them all, logging only that inspection was
+  "incomplete". On one host a long-running `bfs` search with 65,536
+  directories open stopped all deletions for hours. The per-process limit
+  is now 131,072, and when a limit is hit the log, the scanner's
+  "incomplete" line and `sbh explain` name the process.
 - **Ballast is released for `/` under a sandboxed systemd unit**
   (`151b50f`). With `ProtectSystem=strict` (what `sbh install` generates for
   a system service), `/` is a read-only mount inside the service and the
@@ -89,14 +96,17 @@ directory's cold files in one pass.
   `ProtectSystem=strict` is listed as unreachable instead. Human output
   names it per volume, with the remedy.
 
-## v0.7.8 **[release]**
+## v0.7.8
 
 Compare: [`v0.7.7...v0.7.8`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.7...v0.7.8)
 
-The first published release since v0.7.6: v0.7.7 was tagged but held back,
-because its build-inspection rework left Linux `sbh clean` and `sbh
-emergency` without a live build's declared directories. This release fixes
-that and carries everything listed under v0.7.7. On a host under memory
+Tagged (`5bc148d`) but not published: v0.7.9 followed the same day with
+fixes found during its canary. Its changes ship in v0.7.9.
+
+v0.7.7 was tagged but held back, because its build-inspection rework left
+Linux `sbh clean` and `sbh emergency` without a live build's declared
+directories. This version fixed that and carried everything listed under
+v0.7.7. On a host under memory
 pressure, a build stuck in `mmap` froze the daemon's monitor for 19
 minutes: no pressure response and no ballast release on a Critical host.
 Neither the monitor nor scans and deletions now wait on another process's
