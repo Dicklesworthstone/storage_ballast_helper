@@ -8,6 +8,10 @@ policy, or enable automatic compression. Preview is the default:
 sudo sbh --json compress -- /data/old-debug-binary /data/old-session.jsonl
 ```
 
+To select cold files beneath directories instead of naming them, use
+`--discover`, and add `--apply` to compress that selection in the same pass
+(`compression-discovery.md`).
+
 The native backend supports Linux x86-64 and AArch64 on Btrfs. Other filesystems
 are skipped and other operating systems report an unsupported no-op. Linux
 `openat2` support and sufficient privileges for Btrfs tree inspection are
@@ -160,7 +164,6 @@ SBH_BTRFS_TEST_ROOT=/path/to/disposable/btrfs \
   cargo test --locked --manifest-path crates/sbh_btrfs/Cargo.toml -- --ignored
 ```
 
-Automatic Yellow/Orange pressure scheduling, persistent `[scanner.compress]`
-configuration, and integration into the shared activity-ledger/`sbh explain`
-interface remain separate unfinished work. The durable compression journal is
+Automatic Yellow/Orange pressure scheduling and persistent `[scanner.compress]`
+configuration remain separate unfinished work. The durable compression journal is
 not a fabricated deletion decision and does not enable automatic daemon writes.

@@ -361,6 +361,128 @@ mod native_tests {
         assert_eq!(fs::read(&path).unwrap(), b"cold contents");
     }
 
+    fn btrfs_platform() -> MockPlatform {
+        use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths};
+        let mount = PathBuf::from("/");
+        let stats = FsStats {
+            total_bytes: 1_000_000_000_000,
+            free_bytes: 500_000_000_000,
+            available_bytes: 500_000_000_000,
+            fs_type: "btrfs".into(),
+            mount_point: mount.clone(),
+            is_readonly: false,
+        };
+        MockPlatform::new(
+            vec![MountPoint {
+                path: mount.clone(),
+                device: "mockdev".into(),
+                fs_type: "btrfs".into(),
+                is_ram_backed: false,
+            }],
+            std::collections::HashMap::from([(mount, stats)]),
+            MemoryInfo {
+                total_bytes: 64 << 30,
+                available_bytes: 32 << 30,
+                swap_total_bytes: 0,
+                swap_free_bytes: 0,
+            },
+            PlatformPaths::default(),
+        )
+    }
+
+    fn run_selected(
+        selection: &Selection,
+        platform: &MockPlatform,
+    ) -> crate::scanner::compression::CompressionReport {
+        crate::scanner::compression::run_discovered(
+            selection,
+            &policy(),
+            crate::scanner::compression::CompressionMode::default(),
+            &Config::default(),
+            platform,
+            &mut |_| {},
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn discovered_execution_refuses_a_replaced_root_before_opening_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let root = parent.join("root");
+        fs::create_dir(&root).unwrap();
+        cold(&root.join("a.bin"));
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy(),
+        );
+        assert_eq!(selection.paths(), [root.join("a.bin")]);
+        // Unchanged: the selection admits the file, and the mock filesystem
+        // type is what stops this preview.
+        let admitted = run_selected(&selection, &MockPlatform::healthy());
+        assert_eq!(admitted.files.len(), 1);
+        assert!(
+            admitted.files[0].detail.contains("unsupported filesystem"),
+            "{:?}",
+            admitted.files[0]
+        );
+        // A lookalike root holding the same name is not the discovered root.
+        fs::rename(&root, parent.join("moved")).unwrap();
+        fs::create_dir(&root).unwrap();
+        cold(&root.join("a.bin"));
+        let refused = run_selected(&selection, &MockPlatform::healthy());
+        assert_eq!(refused.files.len(), 1);
+        let file = &refused.files[0];
+        assert_eq!(file.outcome, "failed", "{file:?}");
+        assert!(file.detail.contains("root was replaced"), "{file:?}");
+        assert!(!file.mutation_attempted);
+        assert_eq!(refused.unvisited_files, 0);
+        assert_eq!(fs::read(root.join("a.bin")).unwrap(), b"cold contents");
+    }
+
+    #[test]
+    fn discovered_execution_refuses_a_file_changed_after_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        cold(&root.join("changed.bin"));
+        cold(&root.join("same.bin"));
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits::default(),
+            &policy(),
+        );
+        assert_eq!(
+            selection.paths(),
+            [root.join("changed.bin"), root.join("same.bin")]
+        );
+        // Still cold (mtime restored), so only the discovery stamp can refuse
+        // it. The length differs because ctime alone can share a coarse tick.
+        fs::write(root.join("changed.bin"), b"cold contents, edited").unwrap();
+        filetime::set_file_mtime(
+            root.join("changed.bin"),
+            filetime::FileTime::from_unix_time(1, 0),
+        )
+        .unwrap();
+        let report = run_selected(&selection, &btrfs_platform());
+        assert_eq!(report.files.len(), 2);
+        let changed = &report.files[0];
+        assert_eq!(changed.outcome, "failed", "{changed:?}");
+        assert!(
+            changed
+                .detail
+                .contains("changed after compression discovery"),
+            "{changed:?}"
+        );
+        assert!(!changed.mutation_attempted);
+        // The unchanged sibling passes the selection checks and continues to
+        // the real extent inspection, whatever this host's filesystem is.
+        let same = &report.files[1];
+        assert!(!same.detail.contains("discovery"), "{same:?}");
+        assert!(!same.mutation_attempted);
+        assert_eq!(fs::read(root.join("same.bin")).unwrap(), b"cold contents");
+    }
+
     #[test]
     fn repository_pruning_preserves_sorted_continuation_without_duplicates() {
         let dir = tempfile::tempdir().unwrap();

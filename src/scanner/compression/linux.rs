@@ -13,6 +13,7 @@ use nix::sys::statvfs::{FsFlags, fstatvfs};
 use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 use sbh_btrfs::{FileStamp, IdleIoPriority, MAX_CHUNK_BYTES, ZstdConsent};
 
+use super::discovery::Selection;
 use super::journal::{AuditSession, digest};
 use super::{
     CompressionFileReport, CompressionMode, CompressionObservation, CompressionPolicy,
@@ -27,6 +28,7 @@ pub(super) mod repository;
 #[allow(clippy::too_many_lines)] // one bounded pass, in order
 pub(super) fn run(
     paths: &[std::path::PathBuf],
+    selection: Option<&Selection>,
     policy: &CompressionPolicy,
     mode: CompressionMode,
     config: &Config,
@@ -72,6 +74,7 @@ pub(super) fn run(
         let mut item = CompressionFileReport::new(path);
         let result = process_file(
             path,
+            selection,
             &mut item,
             policy,
             mode,
@@ -170,6 +173,7 @@ fn pass_exit_code(mutation_attempted: bool, failed: bool, unvisited: usize) -> i
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn process_file(
     path: &Path,
+    selection: Option<&Selection>,
     report: &mut CompressionFileReport,
     policy: &CompressionPolicy,
     mode: CompressionMode,
@@ -205,6 +209,11 @@ fn process_file(
     }
     let canonical = path.canonicalize()?;
     report.path.clone_from(&canonical);
+    // A discovered input is refused before any descriptor is opened for
+    // writing once its root was replaced or it gained Git ancestry.
+    if let Some(selection) = selection {
+        selection.validate_scope(&canonical)?;
+    }
     let stats = platform.fs_stats(&canonical).map_err(other)?;
     if stats.fs_type != "btrfs" {
         report.detail = format!(
@@ -248,6 +257,9 @@ fn process_file(
         return Err(io::Error::other(
             "file changed while opening its pinned descriptor",
         ));
+    }
+    if let Some(selection) = selection {
+        selection.validate_file(&canonical, stamp)?;
     }
     if !identities.insert((stamp.device, stamp.inode)) {
         report.detail = "duplicate inode in this pass".into();
@@ -293,6 +305,9 @@ fn process_file(
         let result = (|| -> io::Result<()> {
             budget(deadline)?;
             check_protection(&canonical, config, platform)?;
+            if let Some(selection) = selection {
+                selection.validate_scope(&canonical)?;
+            }
             check_active(&canonical, file.as_raw_fd(), platform)?;
             check_headroom(&file, policy.min_free_bytes)?;
             verify_path(&canonical, &file, expected)?;

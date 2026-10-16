@@ -115,10 +115,18 @@ pub(super) fn execute(
     config: &Config,
     platform: &dyn Platform,
 ) -> io::Result<CommandReport> {
+    execute_with(config, |observer| {
+        compression::run_observed(paths, policy, mode, config, platform, observer)
+    })
+}
+
+/// Publish the per-file outcomes of `pass`, an explicit or discovered run.
+pub(super) fn execute_with(
+    config: &Config,
+    pass: impl FnOnce(&mut dyn FnMut(CompressionObservation<'_>)) -> io::Result<CompressionReport>,
+) -> io::Result<CommandReport> {
     let mut activity = Session::new(config);
-    let result = compression::run_observed(paths, policy, mode, config, platform, &mut |visit| {
-        activity.observe(visit);
-    });
+    let result = pass(&mut |visit| activity.observe(visit));
     // The existing supervisor bounds shutdown even when a backend is blocked.
     // Final activity flushing is not part of the compression rewrite budget.
     let activity_delivery = activity.finish();

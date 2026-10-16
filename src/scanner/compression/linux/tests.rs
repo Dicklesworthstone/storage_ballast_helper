@@ -146,6 +146,7 @@ fn git_packfile_preview_and_apply_stop_before_hashing_or_journaling() {
         let mut identities = BTreeSet::new();
         let error = process_file(
             &path,
+            None,
             &mut item,
             &policy,
             CompressionMode {

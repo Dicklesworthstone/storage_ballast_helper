@@ -250,6 +250,44 @@ pub fn run_observed(
     platform: &dyn Platform,
     observer: &mut dyn FnMut(CompressionObservation<'_>),
 ) -> io::Result<CompressionReport> {
+    run_checked(paths, None, policy, mode, config, platform, observer)
+}
+
+/// Execute the same pass on the files a [`discovery::discover`] walk selected.
+///
+/// Every executor check still runs. In addition, each file must be unchanged
+/// since discovery and still lie beneath its pinned, unreplaced root without
+/// new Git ancestry; this is rechecked before the rewrite and between chunks.
+/// The selection narrows what may be rewritten and never authorizes more.
+pub fn run_discovered(
+    selection: &discovery::Selection,
+    policy: &CompressionPolicy,
+    mode: CompressionMode,
+    config: &Config,
+    platform: &dyn Platform,
+    observer: &mut dyn FnMut(CompressionObservation<'_>),
+) -> io::Result<CompressionReport> {
+    let paths = selection.paths();
+    run_checked(
+        &paths,
+        Some(selection),
+        policy,
+        mode,
+        config,
+        platform,
+        observer,
+    )
+}
+
+fn run_checked(
+    paths: &[PathBuf],
+    selection: Option<&discovery::Selection>,
+    policy: &CompressionPolicy,
+    mode: CompressionMode,
+    config: &Config,
+    platform: &dyn Platform,
+    observer: &mut dyn FnMut(CompressionObservation<'_>),
+) -> io::Result<CompressionReport> {
     policy.validate()?;
     if paths.is_empty() || paths.len() > 4096 {
         return Err(io::Error::new(
@@ -268,14 +306,14 @@ pub fn run_observed(
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     {
-        linux::run(paths, policy, mode, config, platform, observer)
+        linux::run(paths, selection, policy, mode, config, platform, observer)
     }
     #[cfg(not(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     )))]
     {
-        let _ = (config, platform, observer);
+        let _ = (selection, config, platform, observer);
         Ok(CompressionReport {
             schema: "sbh.compression.v1",
             dry_run: !mode.apply,
