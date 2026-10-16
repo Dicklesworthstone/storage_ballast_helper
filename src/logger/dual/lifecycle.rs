@@ -295,6 +295,15 @@ pub(super) fn spawn_worker(
     spawn_supervised(control, SHUTDOWN_WAIT, worker)
 }
 
+/// [`spawn_worker`] with a caller-chosen shutdown allowance.
+pub(super) fn spawn_worker_with_wait(
+    control: &Arc<Control>,
+    shutdown_wait: Duration,
+    worker: impl FnOnce() + Send + 'static,
+) -> io::Result<JoinHandle<()>> {
+    spawn_supervised(control, shutdown_wait, worker)
+}
+
 fn spawn_supervised(
     control: &Arc<Control>,
     shutdown_wait: Duration,

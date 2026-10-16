@@ -311,6 +311,26 @@ fn dirs_default_sqlite() -> String {
 pub fn spawn_logger(
     config: DualLoggerConfig,
 ) -> Result<(ActivityLoggerHandle, thread::JoinHandle<()>)> {
+    spawn_logger_inner(config, None)
+}
+
+/// [`spawn_logger`] with a caller-chosen shutdown allowance.
+///
+/// The allowance is how long the writer may drain at shutdown before it is
+/// detached and reported `TimedOut` (the daemon's is 5 s). Tests in other
+/// crates that read the files after shutdown need a longer one on a loaded
+/// build host.
+pub fn spawn_logger_with_shutdown_wait(
+    config: DualLoggerConfig,
+    shutdown_wait: Duration,
+) -> Result<(ActivityLoggerHandle, thread::JoinHandle<()>)> {
+    spawn_logger_inner(config, Some(shutdown_wait))
+}
+
+fn spawn_logger_inner(
+    config: DualLoggerConfig,
+    shutdown_wait: Option<Duration>,
+) -> Result<(ActivityLoggerHandle, thread::JoinHandle<()>)> {
     let (tx, rx) = bounded::<lifecycle::Message>(config.channel_capacity);
     let dropped = Arc::new(AtomicU64::new(0));
     let dropped_clone = Arc::clone(&dropped);
@@ -332,7 +352,7 @@ pub fn spawn_logger(
         last_beat_ms: last_beat,
     };
 
-    let join = lifecycle::spawn_worker(&control, move || {
+    let worker = move || {
         logger_thread_main(
             rx,
             config.sqlite_path,
@@ -343,7 +363,11 @@ pub fn spawn_logger(
             diagnostics_clone,
             worker_control,
         );
-    })
+    };
+    let join = match shutdown_wait {
+        Some(wait) => lifecycle::spawn_worker_with_wait(&control, wait, worker),
+        None => lifecycle::spawn_worker(&control, worker),
+    }
     .map_err(|e| crate::core::errors::SbhError::Runtime {
         details: format!("failed to spawn logger thread: {e}"),
     })?;
