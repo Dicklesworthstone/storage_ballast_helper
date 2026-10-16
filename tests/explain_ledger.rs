@@ -880,8 +880,16 @@ fn why_not_names_the_first_rail_for_each_fixture_class() {
         .iter()
         .map(|c| c["factor"].as_str().unwrap())
         .collect();
+    // Under a Linux temp root a `build/` with no manifest beside it whose
+    // tool writes it is never scored at all (SignalOnly, 183fd53): nothing
+    // can flip it, so there is nothing to counter.
+    let signal_only = report["scanner_note"]
+        .as_str()
+        .is_some_and(|note| note.contains("SignalOnly"));
     assert!(
-        factors == ["age", "size", "pressure"] || factors == ["veto"],
+        factors == ["age", "size", "pressure"]
+            || factors == ["veto"]
+            || (signal_only && factors.is_empty()),
         "{report}"
     );
     for item in counterfactuals {

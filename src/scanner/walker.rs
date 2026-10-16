@@ -5069,12 +5069,13 @@ mod tests {
                 .unwrap()
                 .starts_with(&target)
         );
+        // The child is still starting and closes descriptors as we list
+        // them: a link that vanished is not one into the target.
         for fd in fs::read_dir(process.join("fd")).unwrap() {
-            assert!(
-                !fs::read_link(fd.unwrap().path())
-                    .unwrap()
-                    .starts_with(&target)
-            );
+            let Ok(link) = fs::read_link(fd.unwrap().path()) else {
+                continue;
+            };
+            assert!(!link.starts_with(&target));
         }
 
         let (paths, _) = collect_open_path_ancestors(&[target.clone(), idle.clone()]);
