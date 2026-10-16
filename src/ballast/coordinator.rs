@@ -429,6 +429,7 @@ impl BallastPoolCoordinator {
             configured_owner_mount.as_deref(),
         );
         record_folded_mounts(&aliases, &mounts, &mut skipped_pools);
+        let aliases = alias_other_entries_of_pooled_devices(aliases, &seen_mounts, &mounts);
 
         for (mount_path, mount) in &seen_mounts {
             let mount_str = mount_path.to_string_lossy();
@@ -948,6 +949,36 @@ fn owning_mount<'a>(
     reported
         .and_then(|mount_point| mounts.iter().find(|mount| mount.path == mount_point))
         .or_else(|| find_mount(path, mounts))
+}
+
+/// Map every other mount-table entry of a pooled block device to that
+/// device's pool, so pressure reported on any entry of the filesystem reaches
+/// its ballast. Folding sees only entries that own a watched path; under
+/// `ProtectSystem=strict` the read-only bind of `/` may own none, while the
+/// pool sits on a `ReadWritePaths=` bind of the same device. trj's `/` stayed
+/// at Critical and every release found no pool ("released 0 ballast
+/// file(s)", eight times, 2026-10-13..16). Unlike folded entries these are
+/// not listed as skipped volumes: they were never candidates.
+fn alias_other_entries_of_pooled_devices(
+    mut aliases: HashMap<PathBuf, PathBuf>,
+    seen_mounts: &HashMap<PathBuf, MountPoint>,
+    mounts: &[MountPoint],
+) -> HashMap<PathBuf, PathBuf> {
+    // Folding leaves at most one seen entry per `/dev/` device.
+    let keepers: HashMap<&str, &PathBuf> = seen_mounts
+        .iter()
+        .filter(|(_, mount)| mount.device.starts_with("/dev/"))
+        .map(|(path, mount)| (mount.device.as_str(), path))
+        .collect();
+    for mount in mounts {
+        if seen_mounts.contains_key(&mount.path) || aliases.contains_key(&mount.path) {
+            continue;
+        }
+        if let Some(keeper) = keepers.get(mount.device.as_str()) {
+            aliases.insert(mount.path.clone(), (*keeper).clone());
+        }
+    }
+    aliases
 }
 
 /// Fold mount entries that are the same filesystem into one pool, returning
@@ -1891,6 +1922,61 @@ mod tests {
             })
             .count();
         assert_eq!(folded, 2, "{inventory:?}");
+    }
+
+    /// The read-only bind of `/` under `ProtectSystem=strict` may own no
+    /// watched path while the pool sits on a writable bind of the same
+    /// device. Pressure reported on `/` must still reach that pool (trj: eight
+    /// Critical episodes on `/`, "released 0 ballast file(s)" each time).
+    #[test]
+    fn pressure_on_an_unwatched_entry_of_the_pool_device_reaches_the_pool() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("var/lib/sbh");
+        let scratch = root.path().join("var/tmp");
+        let other = root.path().join("data");
+        for dir in [&state, &scratch, &other] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let platform = MockPlatform::new(
+            vec![
+                mock_mount(root.path(), "/dev/sda1"),
+                mock_mount(&state, "/dev/sda1"),
+                mock_mount(&scratch, "/dev/sda1"),
+                mock_mount(&other, "/dev/sdb1"),
+            ],
+            HashMap::from([
+                (root.path().to_path_buf(), mock_stats(root.path(), true)),
+                (state.clone(), mock_stats(&state, false)),
+                (scratch.clone(), mock_stats(&scratch, false)),
+                (other.clone(), mock_stats(&other, false)),
+            ]),
+            mock_memory(),
+            PlatformPaths::default(),
+        );
+        // Nothing watched is owned by the root entry itself.
+        let watched = vec![scratch, state.join("ballast"), other.clone()];
+        let mut coordinator = BallastPoolCoordinator::discover_with_configured_dir(
+            &tiny_ballast_config(),
+            &watched,
+            &platform,
+            Some(&state.join("ballast")),
+        )
+        .unwrap();
+
+        assert_eq!(coordinator.pool_count(), 2);
+        assert_eq!(
+            coordinator.pool_for_mount(root.path()).unwrap().mount_point,
+            state
+        );
+        coordinator.set_provision_floor(0.0);
+        coordinator.provision_all(&platform).unwrap();
+        let released = coordinator.release_for_mount(root.path(), 1).unwrap();
+        assert_eq!(released.map(|r| r.files_released), Some(1));
+        // A different device is not drawn into this pool.
+        assert_eq!(
+            coordinator.pool_for_mount(&other).unwrap().mount_point,
+            other
+        );
     }
 
     /// Distinct devices keep distinct pools even when one is mounted inside
