@@ -4,6 +4,25 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
+## v0.7.10
+
+Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.9...v0.7.10)
+
+### Fixed
+
+- **Packages' shipped code and partial repo copies are kept too**
+  (`183fd53`). A `dist/` beside `package.json` counted as output anywhere,
+  so sbh deleted the code of three packages in a bun install cache, and a
+  partial export with no manifest at all still lost its build directories.
+  A `build/` or `dist/` now counts as output only beside the manifest of a
+  tool that writes it (JS and Python packaging for `dist/`; CMake, Make,
+  Meson, Gradle, Python and JS builds for `build/`), and never inside
+  `node_modules` or a package cache. The executor's last-line source check
+  now also recognises `.mjs`, `.cjs`, `.mts` and `.cts` files.
+- **The scanner's "incomplete" line and `sbh explain` name the process an
+  open-file limit cut short** (`726c9a2`). In v0.7.9 only the sweep's own
+  log line named it.
+
 ## v0.7.9 **[release]**
 
 Compare: [`v0.7.8...v0.7.9`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.8...v0.7.9)
@@ -33,10 +52,11 @@ directory's cold files in one pass.
 - **Source directories named `build` or `dist` inside repo copies under a
   temp root are no longer deleted** (`41bce34`). Any `build` or `dist`
   directory under `/tmp` or `/data/tmp` counted as build output on its
-  location alone. On one host that deleted 1,743 of them, including 717
-  tracked scripts/build source directories, golden-test fixtures and a Rust
-  src/cmd/build module, from agents' verify checkouts and exports, for about
-  12 KiB each. Inside a project tree such a directory now needs a project
+  location alone. On one host sbh chose 1,743 of them and deleted 863 from
+  agents' verify checkouts and exports, for about 12 KiB each: 711 tracked
+  scripts/build source directories and 152 golden-test fixture directories
+  (a Rust src/cmd/build module was spared only by the executor's source
+  check). Inside a project tree such a directory now needs a project
   manifest beside it to count as output.
 - **One process with many open files no longer stops every deletion**
   (`48c1414`). sbh reads each process's open files before deleting, up to
@@ -44,8 +64,7 @@ directory's cold files in one pass.
   them all, logging only that inspection was "incomplete". On one host a
   long-running `bfs` search with 65,536 directories open stopped all
   deletions for hours. The per-process limit is now 131,072, and when a
-  limit is hit the log names the process, and so do the scanner's
-  "incomplete" line and `sbh explain` (`726c9a2`).
+  limit is hit the log names the process.
 - **Ballast is released for `/` under a sandboxed systemd unit**
   (`151b50f`). With `ProtectSystem=strict` (what `sbh install` generates for
   a system service), `/` is a read-only mount inside the service and the
