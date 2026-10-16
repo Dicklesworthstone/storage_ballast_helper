@@ -40,6 +40,17 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   300–600 times an hour on one host. Running interpreters had them open,
   so every attempt was refused. sbh now leaves the inside of each uv
   cache entry alone; the uv cache as a whole can still be reclaimed.
+- **Space freed on ext4 and btrfs is reported, and marked as an estimate**
+  (`7eee639`). These filesystems release a deleted file's blocks only when
+  they next commit, so the gain measured right after each deletion was
+  close to zero. One host reported "0.0 GB freed" while freeing 4–6 GiB
+  an hour. There, summaries, status, the dashboard and notifications now
+  use the deleted trees' allocated size and say so: "~4.2 GB freed,
+  estimated". On btrfs a snapshot or reflink can keep shared blocks, so
+  the figure reads "up to 4.2 GB". The new `freed_basis` field in the
+  status JSON and state file, and the new `sbh_bytes_freed_basis` metric,
+  say how the figure was obtained, and the measured figure is kept
+  alongside. sbh's cleanup decisions don't use these figures.
 
 ## v0.7.9 **[release]**
 
