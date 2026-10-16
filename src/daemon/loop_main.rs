@@ -3173,6 +3173,15 @@ impl MonitoringDaemon {
                 inv.ballast_dir.display(),
                 if inv.skipped { " (skipped)" } else { "" }
             );
+            for dir in &inv.unreachable_reserve {
+                eprintln!(
+                    "[SBH-DAEMON] ballast reserve at {} is read-only to this service and \
+                     cannot be released for {} (systemd ProtectSystem=strict without it in \
+                     ReadWritePaths=): grant it there, or release those files by hand",
+                    dir.display(),
+                    inv.mount_point.display()
+                );
+            }
         }
 
         // 7. Release controller.

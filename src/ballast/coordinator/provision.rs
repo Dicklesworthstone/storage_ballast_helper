@@ -174,6 +174,7 @@ mod tests {
             strategy: ProvisionStrategy::Fallocate,
             manager,
             stranded,
+            unreachable_reserve: Vec::new(),
         };
         (temp, pool)
     }

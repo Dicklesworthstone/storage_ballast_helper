@@ -73,6 +73,8 @@ pub struct BallastPool {
     /// Verified, identity-bound reserve outside the managed directory. Release
     /// retired files first; never provision into a former installation's pool.
     stranded: StrandedReserve,
+    /// Ballast directories on this filesystem that are read-only to us.
+    unreachable_reserve: Vec<PathBuf>,
 }
 
 impl BallastPool {
@@ -124,6 +126,11 @@ pub struct PoolInventory {
     /// Ballast files in the pool dir outside the configured index range;
     /// reported here, removed only by provision/replenish under the lock.
     pub orphans: Vec<PathBuf>,
+    /// Directories on this pool's filesystem that hold sbh ballast this
+    /// process cannot remove, because they are read-only to it (outside a
+    /// `ProtectSystem=strict` unit's `ReadWritePaths=`). Never counted as
+    /// releasable.
+    pub unreachable_reserve: Vec<PathBuf>,
     pub skipped: bool,
     pub skip_reason: Option<String>,
 }
@@ -139,6 +146,8 @@ struct PlannedPool {
     /// Default and conventional legacy pool directories on this filesystem,
     /// excluding the active managed directory.
     stranded_dirs: Vec<PathBuf>,
+    /// The same locations holding sbh ballast but read-only to this process.
+    unreachable_reserve: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -299,6 +308,7 @@ impl BallastPoolCoordinator {
                     strategy: plan.strategy,
                     manager,
                     stranded,
+                    unreachable_reserve: plan.unreachable_reserve,
                 },
             );
         }
@@ -358,6 +368,7 @@ impl BallastPoolCoordinator {
                         observed.health,
                         releasable_bytes,
                     ),
+                    unreachable_reserve: plan.unreachable_reserve,
                     skipped: false,
                     skip_reason: None,
                 }
@@ -377,6 +388,7 @@ impl BallastPoolCoordinator {
                     configured_bytes: 0,
                     health: BallastHealth::Unconfigured,
                     orphans: Vec::new(),
+                    unreachable_reserve: Vec::new(),
                     skipped: true,
                     skip_reason: Some(info.reason),
                 }),
@@ -496,7 +508,7 @@ impl BallastPoolCoordinator {
 
             // Configured ballast_dir on this mount is honored verbatim;
             // otherwise fall back to the per-volume subdirectory.
-            let stranded_dirs = stranded_pool_dirs(
+            let (stranded_dirs, unreachable_reserve) = stranded_pool_dirs(
                 mount_path,
                 &aliases,
                 &resolved_dir,
@@ -512,6 +524,7 @@ impl BallastPoolCoordinator {
                 strategy,
                 config: per_volume_config(config, &mount_str),
                 stranded_dirs,
+                unreachable_reserve,
             });
         }
 
@@ -696,6 +709,7 @@ impl BallastPoolCoordinator {
                     pool.releasable_bytes(),
                 ),
                 orphans: pool.manager.orphans(),
+                unreachable_reserve: pool.unreachable_reserve.clone(),
                 skipped: false,
                 skip_reason: None,
             })
@@ -715,6 +729,7 @@ impl BallastPoolCoordinator {
                     configured_bytes: 0,
                     health: BallastHealth::Unconfigured,
                     orphans: Vec::new(),
+                    unreachable_reserve: Vec::new(),
                     skipped: true,
                     skip_reason: Some(skipped.reason.clone()),
                 }),
@@ -859,9 +874,14 @@ fn record_folded_mounts(
     }
 }
 
-/// Conventional reserve locations that are actually on this pool's writable
-/// filesystem. Discovery subsequently deduplicates directory inode aliases and
-/// excludes any alias of the managed directory itself.
+/// Conventional reserve locations on this pool's filesystem: those this
+/// process can write (stranded reserve, adopted and released), and those that
+/// hold sbh ballast but are read-only to it, so it can neither count nor
+/// release them. Under `ProtectSystem=strict` everything outside
+/// `ReadWritePaths=` is read-only (trj, 2026-10-16: 10 GiB at `/.sbh/ballast`
+/// while the configured pool was empty and `/` stayed at Critical).
+/// Discovery subsequently deduplicates directory inode aliases and excludes
+/// any alias of the managed directory itself.
 /// `service_dir` is the installed service's configured pool (see
 /// `installed_service_ballast_dir` for which service that is): it is live,
 /// so it is never stranded, even when this process runs with another config.
@@ -873,7 +893,7 @@ fn stranded_pool_dirs(
     legacy_dirs: &[PathBuf],
     platform: &dyn Platform,
     mounts: &[MountPoint],
-) -> Vec<PathBuf> {
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let same_dir = |a: &Path, b: &Path| {
         a == b
             || matches!(
@@ -881,7 +901,8 @@ fn stranded_pool_dirs(
                 (Ok(a), Ok(b)) if a == b
             )
     };
-    let mut dirs: Vec<PathBuf> = std::iter::once(mount_path)
+    let (mut stranded, mut unreachable) = (Vec::new(), Vec::new());
+    for dir in std::iter::once(mount_path)
         .chain(
             aliases
                 .iter()
@@ -892,13 +913,35 @@ fn stranded_pool_dirs(
         .chain(legacy_dirs.iter().cloned())
         .filter(|dir| dir != resolved_dir)
         .filter(|dir| !service_dir.is_some_and(|live| same_dir(dir, live)))
-        .filter(|dir| same_pool_filesystem(dir, mount_path, aliases, platform, mounts))
-        .collect();
-    dirs.sort();
-    dirs.dedup();
-    dirs
+    {
+        match pool_filesystem_access(&dir, mount_path, aliases, platform, mounts) {
+            Some(true) => stranded.push(dir),
+            Some(false) if holds_ballast_files(&dir) => unreachable.push(dir),
+            _ => {}
+        }
+    }
+    for dirs in [&mut stranded, &mut unreachable] {
+        dirs.sort();
+        dirs.dedup();
+    }
+    (stranded, unreachable)
 }
 
+/// Whether `dir` directly contains a canonically named sbh ballast file.
+fn holds_ballast_files(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.take(4096).flatten().any(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with("SBH_BALLAST_FILE_")
+                    && Path::new(name)
+                        .extension()
+                        .is_some_and(|extension| extension == "dat")
+            })
+        })
+    })
+}
+
+#[cfg(test)]
 fn same_pool_filesystem(
     dir: &Path,
     mount_path: &Path,
@@ -906,26 +949,36 @@ fn same_pool_filesystem(
     platform: &dyn Platform,
     mounts: &[MountPoint],
 ) -> bool {
-    let Ok(stats) = platform.fs_stats(dir) else {
-        return false;
-    };
-    if stats.is_readonly {
-        return false;
-    }
+    pool_filesystem_access(dir, mount_path, aliases, platform, mounts) == Some(true)
+}
+
+/// `Some(writable)` when `dir` is on the pool's filesystem, else `None`.
+fn pool_filesystem_access(
+    dir: &Path,
+    mount_path: &Path,
+    aliases: &HashMap<PathBuf, PathBuf>,
+    platform: &dyn Platform,
+    mounts: &[MountPoint],
+) -> Option<bool> {
+    let stats = platform.fs_stats(dir).ok()?;
+    let writable = !stats.is_readonly;
     if stats.mount_point == mount_path
         || aliases
             .get(&stats.mount_point)
             .is_some_and(|keeper| keeper == mount_path)
     {
-        return true;
+        return Some(writable);
     }
     // An old user-scope pool can be behind a bind mount that is not itself
     // watched. As in folding, only actual block-device sources may alias.
     let owner = mounts.iter().find(|mount| mount.path == mount_path);
     let legacy = mounts.iter().find(|mount| mount.path == stats.mount_point);
-    owner.zip(legacy).is_some_and(|(owner, legacy)| {
-        owner.device.starts_with("/dev/") && owner.device == legacy.device
-    })
+    owner
+        .zip(legacy)
+        .is_some_and(|(owner, legacy)| {
+            owner.device.starts_with("/dev/") && owner.device == legacy.device
+        })
+        .then_some(writable)
 }
 
 /// The mount entry that holds `path`, as the kernel reports it.
@@ -1854,6 +1907,7 @@ mod tests {
                 &platform,
                 &mounts,
             )
+            .0
         };
 
         let without_service = stranded(None);
@@ -1937,6 +1991,10 @@ mod tests {
         for dir in [&state, &scratch, &other] {
             fs::create_dir_all(dir).unwrap();
         }
+        // A former pool on the read-only root entry: sbh cannot release it.
+        let former = root.path().join(".sbh/ballast");
+        fs::create_dir_all(&former).unwrap();
+        fs::write(former.join("SBH_BALLAST_FILE_00001.dat"), b"former").unwrap();
         let platform = MockPlatform::new(
             vec![
                 mock_mount(root.path(), "/dev/sda1"),
@@ -1968,6 +2026,14 @@ mod tests {
             coordinator.pool_for_mount(root.path()).unwrap().mount_point,
             state
         );
+        // The read-only former pool is named, and not counted as releasable.
+        let pooled = coordinator
+            .inventory()
+            .into_iter()
+            .find(|volume| volume.mount_point == state)
+            .unwrap();
+        assert_eq!(pooled.unreachable_reserve, vec![former]);
+        assert_eq!(pooled.releasable_bytes, 0);
         coordinator.set_provision_floor(0.0);
         coordinator.provision_all(&platform).unwrap();
         let released = coordinator.release_for_mount(root.path(), 1).unwrap();

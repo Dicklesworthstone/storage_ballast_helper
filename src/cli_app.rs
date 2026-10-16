@@ -6971,6 +6971,11 @@ fn ballast_volume_json(
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect::<Vec<_>>(),
+        "unreachable_reserve": volume
+            .unreachable_reserve
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
         "skipped": volume.skipped,
         "skip_reason": volume.skip_reason,
     })
