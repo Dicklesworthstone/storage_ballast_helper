@@ -18,6 +18,13 @@ Compare: [`v0.7.8...v0.7.9`](https://github.com/Dicklesworthstone/storage_ballas
   pressure: one host logged "released 0 ballast file(s)" at Critical eight
   times in three days. Every mount entry of a pooled disk now reaches its
   pool.
+- **The daemon says when it can't release a ballast reserve** (`f1284a9`).
+  sbh ballast left in a former pool directory that is read-only to the
+  service (outside `ReadWritePaths=`) was skipped silently, and a root `sbh
+  ballast status`, run outside the sandbox, counted it as releasable. On
+  one host that was the entire root reserve, 10 GiB. The daemon now names
+  such directories at startup, with the remedy, and `sbh --json ballast
+  status` lists them under `unreachable_reserve`.
 
 ## v0.7.8 **[release]**
 
