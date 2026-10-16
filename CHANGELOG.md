@@ -4,9 +4,19 @@ All notable changes to `storage_ballast_helper` (`sbh`) are documented here.
 
 Versions with published GitHub Release assets are marked **[release]**. Versions without that marker were tagged or referenced in commit messages but not published as GitHub Releases. `scripts/changelog_check.sh --all` audits the markers against GitHub, and `scripts/dsr_release.sh publish` refuses to publish a tag that has no section here. Commit links point to the canonical repository at `https://github.com/Dicklesworthstone/storage_ballast_helper`.
 
-## v0.7.9
+## v0.7.9 **[release]**
 
 Compare: [`v0.7.8...v0.7.9`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.7.8...v0.7.9)
+
+A safety and availability release. sbh deleted source directories named
+`build` or `dist` inside repo copies under temp roots, on the name alone;
+it now needs a project manifest beside them. One process with tens of
+thousands of open files (a `bfs` search) stopped every deletion on its
+host; the limit is higher and the log names the process. Under the
+hardened systemd unit `sbh install` generates, ballast was never released
+for `/`; it now is, and ballast the service can't release is named
+instead of counted. Also: `sbh compress --discover --apply` compresses a
+directory's cold files in one pass.
 
 ### Added
 
