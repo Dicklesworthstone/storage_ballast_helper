@@ -20,6 +20,14 @@ Compare: [`v0.7.8...v0.7.9`](https://github.com/Dicklesworthstone/storage_ballas
 
 ### Fixed
 
+- **Source directories named `build` or `dist` inside repo copies under a
+  temp root are no longer deleted** (`41bce34`). Any `build` or `dist`
+  directory under `/tmp` or `/data/tmp` counted as build output on its
+  location alone. On one host that deleted 1,743 of them, including 717
+  tracked `scripts/build` source directories, golden-test fixtures and a Rust
+  `src/cmd/build` module, from agents' verify checkouts and exports, for about
+  12 KiB each. Inside a project tree such a directory now needs a project
+  manifest beside it to count as output.
 - **Ballast is released for `/` under a sandboxed systemd unit**
   (`151b50f`). With `ProtectSystem=strict` (what `sbh install` generates for
   a system service), `/` is a read-only mount inside the service and the
