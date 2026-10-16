@@ -1640,11 +1640,20 @@ mod tests {
             "step_package must build the canonical asset set with the release packager"
         );
 
+        // dsr >= 0.2.3 signs a manifest only beside the release set it lists.
         let minisign = shell_function(script, "step_minisign");
-        assert!(
-            minisign.contains("dsr signing sign /tmp/${base} && dsr signing verify /tmp/${base}")
-                && minisign.contains("${base}.minisig"),
-            "step_minisign must sign and verify the manifest and fetch its .minisig"
+        assert_in_order(
+            minisign,
+            "step_minisign must stage the manifest with the artifacts it lists, check the \
+             staged bytes, sign and verify there, and fetch its .minisig",
+            &[
+                "jq -r '.artifacts[].name' \"${MANIFEST}\"",
+                "mktemp -d /tmp/sbh-minisign.XXXXXX",
+                "scp -q ${names} \"${base}\" \"${MINISIGN_HOST}:${stage}/\"",
+                "[ \"${here}\" = \"${there}\" ]",
+                "dsr signing sign ${stage}/${base} && dsr signing verify ${stage}/${base}",
+                "\"${MINISIGN_HOST}:${stage}/${base}.minisig\"",
+            ],
         );
 
         let publish = shell_function(script, "step_publish");
