@@ -25,6 +25,7 @@ use crate::daemon::mount_controller::MountStateRecord;
 use crate::monitor::pid::PressureLevel;
 use crate::platform::pal::Platform;
 use crate::platform::types::SelfStats;
+use crate::scanner::deletion::FreedBasis;
 
 // ──────────────────── constants ────────────────────
 
@@ -847,6 +848,11 @@ pub struct Counters {
     pub scans: u64,
     pub deletions: u64,
     pub bytes_freed: u64,
+    /// How `bytes_freed` is known: `observed`, or an allocated-size estimate
+    /// where the filesystem frees blocks at commit (bd-oj33).
+    pub freed_basis: FreedBasis,
+    /// The free space measured around the removals, when every one was.
+    pub bytes_freed_observed: Option<u64>,
     pub errors: u64,
     /// Log events silently dropped due to channel back-pressure.
     pub dropped_log_events: u64,
@@ -1011,6 +1017,10 @@ pub struct SelfMonitor {
     pub last_scan_deleted: usize,
     pub deletions_total: u64,
     pub bytes_freed_total: u64,
+    /// How `bytes_freed_total` is known: the weakest basis of its batches.
+    pub freed_basis: FreedBasis,
+    /// The free space measured around every removal, while each was.
+    pub bytes_freed_observed_total: Option<u64>,
     pub errors_total: u64,
     /// Cumulative scan duration for averaging.
     scan_duration_total: Duration,
@@ -1199,6 +1209,8 @@ impl SelfMonitor {
             last_scan_deleted: 0,
             deletions_total: 0,
             bytes_freed_total: 0,
+            freed_basis: FreedBasis::Observed,
+            bytes_freed_observed_total: Some(0),
             errors_total: 0,
             scan_duration_total: Duration::ZERO,
         }
@@ -1277,6 +1289,8 @@ impl SelfMonitor {
                 scans: self.scan_count,
                 deletions: self.deletions_total,
                 bytes_freed: self.bytes_freed_total,
+                freed_basis: self.freed_basis,
+                bytes_freed_observed: self.bytes_freed_observed_total,
                 errors: self.errors_total,
                 dropped_log_events,
             },
@@ -1331,11 +1345,11 @@ impl SelfMonitor {
         mount_path: &str,
     ) -> String {
         let rss_mb = self.current_rss_bytes() / (1024 * 1024);
-        let gb_freed = self.bytes_freed_total as f64 / 1_073_741_824.0;
         format!(
             "{pressure_level:?} {free_pct:.1}% free on {mount_path} | \
-             {deletions} deletions ({gb_freed:.1} GB freed) | RSS {rss_mb} MB",
+             {deletions} deletions ({freed}) | RSS {rss_mb} MB",
             deletions = self.deletions_total,
+            freed = self.freed_basis.freed_phrase(self.bytes_freed_total),
         )
     }
 
@@ -1399,6 +1413,16 @@ impl SelfMonitor {
         {
             self.last_scan_deleted = count as usize;
         }
+    }
+
+    /// How a batch's freed bytes are known, and what was measured beside
+    /// them; the totals keep the weakest basis (bd-oj33).
+    pub fn record_freed_basis(&mut self, basis: FreedBasis, observed: Option<u64>) {
+        self.freed_basis = self.freed_basis.combine(basis);
+        self.bytes_freed_observed_total = self
+            .bytes_freed_observed_total
+            .zip(observed)
+            .map(|(sum, bytes)| sum.saturating_add(bytes));
     }
 
     /// Record an error.
@@ -1929,6 +1953,8 @@ mod tests {
                 bytes_freed: 467_800_000_000,
                 errors: 2,
                 dropped_log_events: 0,
+                freed_basis: FreedBasis::Observed,
+                bytes_freed_observed: None,
             },
             memory_rss_bytes: 44_040_192,
             policy_mode: "enforce".into(),
@@ -1990,6 +2016,8 @@ mod tests {
                 bytes_freed: 0,
                 errors: 0,
                 dropped_log_events: 0,
+                freed_basis: FreedBasis::Observed,
+                bytes_freed_observed: None,
             },
             memory_rss_bytes: 0,
             policy_mode: String::new(),
@@ -2053,6 +2081,8 @@ mod tests {
                 bytes_freed: 0,
                 errors: 0,
                 dropped_log_events: 0,
+                freed_basis: FreedBasis::Observed,
+                bytes_freed_observed: None,
             },
             memory_rss_bytes: 0,
             policy_mode: String::new(),

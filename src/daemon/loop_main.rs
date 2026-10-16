@@ -78,7 +78,9 @@ use crate::platform::pal::{MemoryInfo, Platform, detect_platform};
 use crate::platform::types::{
     FullDiskAccessState, FullDiskAccessStatus, MemoryPressure, MemoryPressureLevel,
 };
-use crate::scanner::deletion::{DeletionConfig, DeletionExecutor, DeletionMode, SkipReason};
+use crate::scanner::deletion::{
+    DeletionConfig, DeletionExecutor, DeletionMode, FreedBasis, SkipReason,
+};
 use crate::scanner::engine::{ScannerEngine, SelectedScannerEngine};
 use crate::scanner::events::{
     EventInvalidation, EventSourceConfig, EventSourceStats, ScannerEventSource,
@@ -1012,7 +1014,12 @@ enum WorkerReport {
     /// Executor completed a deletion batch.
     DeletionCompleted {
         deleted: u64,
+        /// What to report as freed; `freed_basis` says how it is known.
+        /// Reporting only: no control decision reads it (bd-oj33).
         bytes_freed: u64,
+        freed_basis: FreedBasis,
+        /// The free space measured around the removals, when every one was.
+        bytes_freed_observed: Option<u64>,
         failed: u64,
         /// Candidates whose filesystem answered EROFS or ENOSPC: their
         /// mounts need recovery, not another attempt.
@@ -2065,6 +2072,9 @@ pub struct MonitoringDaemon {
     summary_deleted: u64,
     summary_failed: u64,
     summary_bytes_freed: u64,
+    /// How `summary_bytes_freed` is known, and what was measured beside it.
+    summary_freed_basis: FreedBasis,
+    summary_bytes_freed_observed: Option<u64>,
     last_full_disk_access_check: Option<Instant>,
     last_full_disk_access_state: Option<FullDiskAccessState>,
     full_disk_access_granted_logged: bool,
@@ -2869,9 +2879,13 @@ struct StatusDumpCounters {
     window_deleted: u64,
     window_failed: u64,
     window_bytes_freed: u64,
+    window_freed_basis: FreedBasis,
+    window_bytes_freed_observed: Option<u64>,
     scans_total: u64,
     deletions_total: u64,
     bytes_freed_total: u64,
+    freed_basis_total: FreedBasis,
+    bytes_freed_observed_total: Option<u64>,
     errors_total: u64,
     dropped_log_events: u64,
 }
@@ -3012,11 +3026,15 @@ fn build_status_dump_payload(input: &StatusDumpPayloadInput<'_>) -> Value {
                 "deleted": counters.window_deleted,
                 "failed": counters.window_failed,
                 "bytes_freed": counters.window_bytes_freed,
+                "freed_basis": counters.window_freed_basis.label(),
+                "bytes_freed_observed": counters.window_bytes_freed_observed,
             },
             "total": {
                 "scans": counters.scans_total,
                 "deletions": counters.deletions_total,
                 "bytes_freed": counters.bytes_freed_total,
+                "freed_basis": counters.freed_basis_total.label(),
+                "bytes_freed_observed": counters.bytes_freed_observed_total,
                 "errors": counters.errors_total,
                 "dropped_log_events": counters.dropped_log_events,
             },
@@ -3355,6 +3373,8 @@ impl MonitoringDaemon {
             summary_deleted: 0,
             summary_failed: 0,
             summary_bytes_freed: 0,
+            summary_freed_basis: FreedBasis::Observed,
+            summary_bytes_freed_observed: Some(0),
             last_full_disk_access_check: None,
             last_full_disk_access_state: None,
             full_disk_access_granted_logged: false,
@@ -3971,9 +3991,13 @@ impl MonitoringDaemon {
                 window_deleted: self.summary_deleted,
                 window_failed: self.summary_failed,
                 window_bytes_freed: self.summary_bytes_freed,
+                window_freed_basis: self.summary_freed_basis,
+                window_bytes_freed_observed: self.summary_bytes_freed_observed,
                 scans_total: self.self_monitor.scan_count,
                 deletions_total: self.self_monitor.deletions_total,
                 bytes_freed_total: self.self_monitor.bytes_freed_total,
+                freed_basis_total: self.self_monitor.freed_basis,
+                bytes_freed_observed_total: self.self_monitor.bytes_freed_observed_total,
                 errors_total: self.self_monitor.errors_total,
                 dropped_log_events: self.logger_handle.dropped_events(),
             },
@@ -4471,6 +4495,8 @@ impl MonitoringDaemon {
                     WorkerReport::DeletionCompleted {
                         deleted,
                         bytes_freed,
+                        freed_basis,
+                        bytes_freed_observed,
                         failed,
                         recovery_paths,
                         failure_alarm,
@@ -4478,7 +4504,14 @@ impl MonitoringDaemon {
                         self.summary_deleted += deleted;
                         self.summary_failed += failed;
                         self.summary_bytes_freed += bytes_freed;
+                        self.summary_freed_basis = self.summary_freed_basis.combine(freed_basis);
+                        self.summary_bytes_freed_observed = self
+                            .summary_bytes_freed_observed
+                            .zip(bytes_freed_observed)
+                            .map(|(sum, bytes)| sum.saturating_add(bytes));
                         self.self_monitor.record_deletions(deleted, bytes_freed);
+                        self.self_monitor
+                            .record_freed_basis(freed_basis, bytes_freed_observed);
                         // One reaction cycle: poll, scan, then the reclaim
                         // that followed it; it sizes the burst windows.
                         if let Some((scan_completed_at, scan_duration)) =
@@ -4518,6 +4551,7 @@ impl MonitoringDaemon {
                                 &NotificationEvent::CleanupCompleted {
                                     items_deleted,
                                     bytes_freed,
+                                    freed_basis,
                                     mount: "various".to_string(),
                                 },
                             );
@@ -4664,13 +4698,17 @@ impl MonitoringDaemon {
                 let mode_str = self.policy_engine.lock().mode();
                 eprintln!(
                     "[SBH-SUMMARY] scans={} timeouts={} candidates={} deleted={} \
-                     failed={} freed={}B pressure={:?} guard={} mode={} rss={}MB uptime={}s",
+                     failed={} freed={}B freed_basis={} observed_freed={} pressure={:?} \
+                     guard={} mode={} rss={}MB uptime={}s",
                     self.summary_scans,
                     self.summary_scan_timeouts,
                     self.summary_candidates,
                     self.summary_deleted,
                     self.summary_failed,
                     self.summary_bytes_freed,
+                    self.summary_freed_basis.label(),
+                    self.summary_bytes_freed_observed
+                        .map_or_else(|| "unknown".to_string(), |bytes| format!("{bytes}B")),
                     response.level,
                     guard_str,
                     mode_str,
@@ -4683,6 +4721,8 @@ impl MonitoringDaemon {
                 self.summary_deleted = 0;
                 self.summary_failed = 0;
                 self.summary_bytes_freed = 0;
+                self.summary_freed_basis = FreedBasis::Observed;
+                self.summary_bytes_freed_observed = Some(0);
                 self.last_summary_report = Instant::now();
             }
 
@@ -10132,7 +10172,7 @@ fn executor_thread_main(
             }
         } else if report.items_deleted > 0 || report.items_failed > 0 {
             eprintln!(
-                "[SBH-EXECUTOR] deleted={} failed={} skipped={} freed={}B observed_freed={} sacred_scans={} sacred_ms={} ({:?})",
+                "[SBH-EXECUTOR] deleted={} failed={} skipped={} freed={}B observed_freed={} sacred_scans={} sacred_ms={} ({:?}) freed_at_commit={}B{}",
                 report.items_deleted,
                 report.items_failed,
                 report.items_skipped,
@@ -10143,6 +10183,12 @@ fn executor_thread_main(
                 report.sacred_scans,
                 report.sacred_scan_ms,
                 report.duration,
+                report.bytes_freed_at_commit,
+                if report.freed_at_commit_on_btrfs {
+                    " (btrfs: upper bound)"
+                } else {
+                    ""
+                },
             );
         }
 
@@ -10207,12 +10253,16 @@ fn executor_thread_main(
         };
 
         // Report deletion stats back to main loop for SelfMonitor counters.
+        // What the filesystem gained where every removal was measured and it
+        // frees blocks at once; the scanner's estimate (a lower bound for
+        // truncated probes, or a 100 MiB floor) where it frees them at commit
+        // or a removal could not be measured, marked as such (bd-oj33).
+        let (bytes_freed, freed_basis) = report.reported_freed();
         let _ = report_tx.try_send(WorkerReport::DeletionCompleted {
             deleted: report.items_deleted as u64,
-            // What the filesystem gained when every removal was measured;
-            // the scanner's estimate (a lower bound for truncated probes, or
-            // a 100 MiB floor) only when some removal could not be.
-            bytes_freed: report.bytes_freed_observed.unwrap_or(report.bytes_freed),
+            bytes_freed,
+            freed_basis,
+            bytes_freed_observed: report.bytes_freed_observed,
             failed: report.items_failed as u64,
             recovery_paths: report.recovery_paths().cloned().collect(),
             failure_alarm,

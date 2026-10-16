@@ -257,6 +257,8 @@ fn multi_mount_state() -> DaemonState {
             bytes_freed: 2_147_483_648,
             errors: 3,
             dropped_log_events: 1,
+            freed_basis: crate::scanner::deletion::FreedBasis::Observed,
+            bytes_freed_observed: None,
         },
         policy_mode: "enforce".into(),
         mount_controllers: Vec::new(),

@@ -5789,6 +5789,7 @@ fn notification_manager_handles_events_without_panic() {
     manager.notify(&NotificationEvent::CleanupCompleted {
         items_deleted: 5,
         bytes_freed: 1_000_000,
+        freed_basis: storage_ballast_helper::scanner::deletion::FreedBasis::Observed,
         mount: "/data".to_string(),
     });
     manager.notify(&NotificationEvent::BallastReleased {

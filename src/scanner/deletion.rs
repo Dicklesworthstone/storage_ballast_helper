@@ -288,6 +288,15 @@ pub struct DeletionReport {
     /// holding the blocks correctly shows 0. `None` when any removal could
     /// not be measured, so a partial sum never poses as the whole.
     pub bytes_freed_observed: Option<u64>,
+    /// The part of `bytes_freed` on filesystems that return an unlinked
+    /// file's blocks only at their next commit (ext4 ~5 s, btrfs ~30 s), so
+    /// the delta measured right after the unlink reads ~0 (bd-oj33).
+    pub bytes_freed_at_commit: u64,
+    /// The measured delta for those same removals (logging only).
+    pub bytes_freed_at_commit_observed: u64,
+    /// Some of those removals were on btrfs, where extents a snapshot or
+    /// reflink shares free nothing: their estimate is only an upper bound.
+    pub freed_at_commit_on_btrfs: bool,
     /// Bytes that would have been reclaimed in dry-run mode.
     pub bytes_would_free: u64,
     pub duration: Duration,
@@ -338,6 +347,119 @@ impl DeletionReport {
             .iter()
             .chain(self.no_space_paths.iter())
     }
+
+    /// The freed bytes to report, and how they are known: the measured gain
+    /// where the filesystem frees blocks at once, the scanner's estimate
+    /// where it frees them at commit or a removal went unmeasured (bd-oj33).
+    /// Reporting only; no control decision reads it.
+    #[must_use]
+    pub fn reported_freed(&self) -> (u64, FreedBasis) {
+        let estimated_now = self.bytes_freed.saturating_sub(self.bytes_freed_at_commit);
+        let observed_now = self
+            .bytes_freed_observed
+            .map(|observed| observed.saturating_sub(self.bytes_freed_at_commit_observed));
+        let bytes = observed_now
+            .unwrap_or(estimated_now)
+            .saturating_add(self.bytes_freed_at_commit);
+        let basis = if self.freed_at_commit_on_btrfs {
+            FreedBasis::EstimatedUpperBound
+        } else if self.bytes_freed_at_commit > 0 || observed_now.is_none() {
+            FreedBasis::Estimated
+        } else {
+            FreedBasis::Observed
+        };
+        (bytes, basis)
+    }
+}
+
+/// How a reported freed-bytes figure is known (bd-oj33).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum FreedBasis {
+    /// The free space measured around each removal.
+    #[default]
+    #[serde(rename = "observed")]
+    Observed,
+    /// The removed trees' allocated size: the filesystem returns blocks only
+    /// at its next commit (ext4), or a removal was not measured.
+    #[serde(rename = "estimated_allocated")]
+    Estimated,
+    /// The allocated size on btrfs, an upper bound: extents a snapshot or
+    /// reflink shares free nothing.
+    #[serde(rename = "estimated_upper_bound")]
+    EstimatedUpperBound,
+}
+
+impl FreedBasis {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Estimated => "estimated_allocated",
+            Self::EstimatedUpperBound => "estimated_upper_bound",
+        }
+    }
+
+    /// The basis of a total over several figures: the weakest of them.
+    #[must_use]
+    pub fn combine(self, other: Self) -> Self {
+        self.max(other)
+    }
+
+    /// `2.0 GB freed`, `~2.0 GB freed, estimated` or `up to 2.0 GB freed,
+    /// estimated`, so an estimate never reads as a measurement.
+    #[must_use]
+    pub fn freed_phrase(self, bytes: u64) -> String {
+        #[allow(clippy::cast_precision_loss)]
+        let gb = bytes as f64 / 1_073_741_824.0;
+        match self {
+            Self::Observed => format!("{gb:.1} GB freed"),
+            Self::Estimated => format!("~{gb:.1} GB freed, estimated"),
+            Self::EstimatedUpperBound => format!("up to {gb:.1} GB freed, estimated"),
+        }
+    }
+}
+
+/// Filesystems that return an unlinked file's blocks only at their next
+/// journal or transaction commit, so free space read right after an unlink
+/// has not grown yet (bd-oj33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum CommitFreeing {
+    Ext4,
+    Btrfs,
+}
+
+/// How the filesystem holding `path` frees blocks, from its parent's
+/// `statfs` magic. `None` when it frees them at once or cannot be read.
+#[cfg(target_os = "linux")]
+fn commit_freeing_beside(path: &Path) -> Option<CommitFreeing> {
+    const EXT4_SUPER_MAGIC: u32 = 0xEF53;
+    const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
+    let f_type = rustix::fs::statfs(path.parent()?).ok()?.f_type;
+    // The field is signed and word-sized on most targets; the magic is 32 bits.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let magic = f_type as u32;
+    match magic {
+        EXT4_SUPER_MAGIC => Some(CommitFreeing::Ext4),
+        BTRFS_SUPER_MAGIC => Some(CommitFreeing::Btrfs),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn commit_freeing_beside(_path: &Path) -> Option<CommitFreeing> {
+    None
 }
 
 /// Per-batch bookkeeping for the pre-flight sacred containment check.
@@ -833,6 +955,9 @@ impl DeletionExecutor {
             items_would_delete: 0,
             bytes_freed: 0,
             bytes_freed_observed: Some(0),
+            bytes_freed_at_commit: 0,
+            bytes_freed_at_commit_observed: 0,
+            freed_at_commit_on_btrfs: false,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -1051,6 +1176,15 @@ impl DeletionExecutor {
                             .bytes_freed_observed
                             .zip(gained)
                             .map(|(sum, bytes)| sum.saturating_add(bytes));
+                        if let Some(freeing) = commit_freeing_beside(&candidate.path) {
+                            report.bytes_freed_at_commit = report
+                                .bytes_freed_at_commit
+                                .saturating_add(candidate.size_bytes);
+                            report.bytes_freed_at_commit_observed = report
+                                .bytes_freed_at_commit_observed
+                                .saturating_add(gained.unwrap_or(0));
+                            report.freed_at_commit_on_btrfs |= freeing == CommitFreeing::Btrfs;
+                        }
                     }
                     consecutive_failures = 0;
 
@@ -2511,6 +2645,9 @@ mod tests {
             items_would_delete: 0,
             bytes_freed: 0,
             bytes_freed_observed: None,
+            bytes_freed_at_commit: 0,
+            bytes_freed_at_commit_observed: 0,
+            freed_at_commit_on_btrfs: false,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -2587,6 +2724,9 @@ mod tests {
             items_would_delete: 0,
             bytes_freed: 0,
             bytes_freed_observed: None,
+            bytes_freed_at_commit: 0,
+            bytes_freed_at_commit_observed: 0,
+            freed_at_commit_on_btrfs: false,
             bytes_would_free: 0,
             duration: Duration::ZERO,
             errors: Vec::new(),
@@ -2620,6 +2760,60 @@ mod tests {
         dry.dry_run = true;
         dry.items_skipped = 5;
         assert!(!dry.stalled());
+    }
+
+    /// Where a filesystem frees blocks at commit the measured gain reads ~0,
+    /// so the report carries the estimate and says so; btrfs's estimate is
+    /// an upper bound (bd-oj33).
+    #[test]
+    fn reported_freed_says_how_each_part_is_known() {
+        let mut report = executor_report_template();
+        report.bytes_freed = 300;
+        report.bytes_freed_observed = Some(180);
+        assert_eq!(report.reported_freed(), (180, FreedBasis::Observed));
+        // An unmeasured removal falls back to the estimate.
+        report.bytes_freed_observed = None;
+        assert_eq!(report.reported_freed(), (300, FreedBasis::Estimated));
+        // 200 of the 300 estimated bytes went on ext4, measured as 0: the
+        // rest stays measured (180 - 0), the ext4 part is the estimate.
+        report.bytes_freed_observed = Some(180);
+        report.bytes_freed_at_commit = 200;
+        report.bytes_freed_at_commit_observed = 0;
+        assert_eq!(report.reported_freed(), (380, FreedBasis::Estimated));
+        report.freed_at_commit_on_btrfs = true;
+        assert_eq!(
+            report.reported_freed(),
+            (380, FreedBasis::EstimatedUpperBound)
+        );
+        // Totals take the weakest basis; phrases never pass an estimate off
+        // as a measurement.
+        assert_eq!(
+            FreedBasis::Observed.combine(FreedBasis::Estimated),
+            FreedBasis::Estimated
+        );
+        assert_eq!(
+            FreedBasis::EstimatedUpperBound.combine(FreedBasis::Observed),
+            FreedBasis::EstimatedUpperBound
+        );
+        let gib = 2 * 1_073_741_824;
+        assert_eq!(FreedBasis::Observed.freed_phrase(gib), "2.0 GB freed");
+        assert_eq!(
+            FreedBasis::Estimated.freed_phrase(gib),
+            "~2.0 GB freed, estimated"
+        );
+        assert_eq!(
+            FreedBasis::EstimatedUpperBound.freed_phrase(gib),
+            "up to 2.0 GB freed, estimated"
+        );
+        assert_eq!(
+            serde_json::to_string(&FreedBasis::Estimated).unwrap(),
+            "\"estimated_allocated\""
+        );
+    }
+
+    fn executor_report_template() -> DeletionReport {
+        let executor = DeletionExecutor::new(DeletionConfig::default(), None);
+        executor.execute(&executor.plan(Vec::new()), None)
     }
 
     #[test]
@@ -2704,6 +2898,15 @@ mod tests {
                 .bytes_freed_observed
                 .expect("an unlink on a local volume is measured");
             assert_ne!(observed, estimate);
+            // A filesystem that frees at commit reports the estimate, marked
+            // as one; elsewhere the measurement stands (bd-oj33).
+            let (reported, basis) = report.reported_freed();
+            if commit_freeing_beside(&blob).is_some() {
+                assert_eq!(reported, estimate);
+                assert_ne!(basis, FreedBasis::Observed);
+            } else {
+                assert_eq!((reported, basis), (observed, FreedBasis::Observed));
+            }
             if observed >= 16 * 1024 * 1024 {
                 return;
             }

@@ -21,9 +21,9 @@ use super::model::{
 use super::preferences::{DensityMode, HintVerbosity, StartScreen};
 use super::theme::{AccessibilityProfile, PaletteEntry, SpacingScale, Theme, ThemePalette};
 use super::widgets::{
-    colored_sparkline, extract_time, gauge, human_bytes, human_duration, human_rate, key_hint,
-    mini_bar_chart, progress_indicator, section_header, segmented_gauge, separator_line, sparkline,
-    status_badge, styled_badge, styled_status_strip, trend_label,
+    colored_sparkline, extract_time, gauge, human_bytes, human_duration, human_freed, human_rate,
+    key_hint, mini_bar_chart, progress_indicator, section_header, segmented_gauge, separator_line,
+    sparkline, status_badge, styled_badge, styled_status_strip, trend_label,
 };
 use crate::daemon::mount_controller::unprotected_pressure;
 use crate::daemon::self_monitor::DaemonState;
@@ -957,7 +957,7 @@ fn styled_action_lane<'a>(model: &'a DashboardModel, theme: &'a Theme) -> Vec<Li
                         "scans={} deleted={} freed={}",
                         state.counters.scans,
                         state.counters.deletions,
-                        human_bytes(state.counters.bytes_freed)
+                        human_freed(state.counters.bytes_freed, state.counters.freed_basis)
                     ),
                     Style::default().fg(theme.palette.text_secondary()),
                 ),
@@ -1059,7 +1059,7 @@ fn styled_extended_counters<'a>(model: &'a DashboardModel, theme: &'a Theme) -> 
         lines.push(Line::from_spans([Span::styled(
             format!(
                 "  freed={} rss={} up={}",
-                human_bytes(state.counters.bytes_freed),
+                human_freed(state.counters.bytes_freed, state.counters.freed_basis),
                 human_bytes(state.memory_rss_bytes),
                 human_duration(state.uptime_seconds),
             ),
@@ -4268,7 +4268,7 @@ fn render_action_lane(model: &DashboardModel) -> String {
             "actions scans={} deleted={} freed={}",
             state.counters.scans,
             state.counters.deletions,
-            human_bytes(state.counters.bytes_freed),
+            human_freed(state.counters.bytes_freed, state.counters.freed_basis),
         )
     } else {
         String::from("actions awaiting daemon connection")
@@ -4514,7 +4514,7 @@ fn render_extended_counters(model: &DashboardModel) -> String {
         let _ = write!(
             out,
             "\n  freed={} rss={} uptime={}",
-            human_bytes(state.counters.bytes_freed),
+            human_freed(state.counters.bytes_freed, state.counters.freed_basis),
             human_bytes(state.memory_rss_bytes),
             human_duration(state.uptime_seconds),
         );
@@ -5852,6 +5852,8 @@ mod tests {
                 bytes_freed: 1_024_000,
                 errors: 1,
                 dropped_log_events: 0,
+                freed_basis: crate::scanner::deletion::FreedBasis::Observed,
+                bytes_freed_observed: None,
             },
             policy_mode: "enforce".into(),
             mount_controllers: Vec::new(),
@@ -6028,6 +6030,8 @@ mod tests {
                 bytes_freed: 2_147_483_648,
                 errors: 3,
                 dropped_log_events: 1,
+                freed_basis: crate::scanner::deletion::FreedBasis::Observed,
+                bytes_freed_observed: None,
             },
             policy_mode: "enforce".into(),
             mount_controllers: Vec::new(),

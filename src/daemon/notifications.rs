@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::pid::PressureLevel;
+use crate::scanner::deletion::FreedBasis;
 
 const DEFAULT_NOTIFY_INTERVAL_SECS: u64 = 60;
 const DEFAULT_URGENT_NOTIFY_INTERVAL_SECS: u64 = 300;
@@ -82,6 +83,9 @@ pub enum NotificationEvent {
     CleanupCompleted {
         items_deleted: usize,
         bytes_freed: u64,
+        /// How `bytes_freed` is known; an estimate is labelled as one.
+        #[serde(default)]
+        freed_basis: FreedBasis,
         mount: String,
     },
     BallastReleased {
@@ -269,11 +273,12 @@ impl NotificationEvent {
             Self::CleanupCompleted {
                 items_deleted,
                 bytes_freed,
+                freed_basis,
                 mount,
-            } => {
-                let gb = *bytes_freed as f64 / 1_073_741_824.0;
-                format!("Cleaned {items_deleted} items on {mount} ({gb:.1} GB freed)")
-            }
+            } => format!(
+                "Cleaned {items_deleted} items on {mount} ({})",
+                freed_basis.freed_phrase(*bytes_freed)
+            ),
             Self::BallastReleased {
                 mount,
                 files_released,
@@ -1040,6 +1045,7 @@ mod tests {
         let event = NotificationEvent::CleanupCompleted {
             items_deleted: 15,
             bytes_freed: 20 * 1_073_741_824,
+            freed_basis: FreedBasis::Observed,
             mount: "/data".to_string(),
         };
         assert_eq!(event.level(), NotificationLevel::Warning);
@@ -1050,6 +1056,7 @@ mod tests {
         let event = NotificationEvent::CleanupCompleted {
             items_deleted: 2,
             bytes_freed: 100_000,
+            freed_basis: FreedBasis::Observed,
             mount: "/data".to_string(),
         };
         assert_eq!(event.level(), NotificationLevel::Info);
@@ -1098,11 +1105,24 @@ mod tests {
         let event = NotificationEvent::CleanupCompleted {
             items_deleted: 5,
             bytes_freed: 5_368_709_120, // 5 GB
+            freed_basis: FreedBasis::Observed,
             mount: "/data".to_string(),
         };
         let summary = event.summary();
         assert!(summary.contains("5 items"));
-        assert!(summary.contains("5.0 GB"));
+        assert!(summary.contains("(5.0 GB freed)"));
+        // On ext4 the figure is the allocated-size estimate, and says so.
+        let estimated = NotificationEvent::CleanupCompleted {
+            items_deleted: 5,
+            bytes_freed: 5_368_709_120,
+            freed_basis: FreedBasis::Estimated,
+            mount: "/data".to_string(),
+        };
+        assert!(
+            estimated.summary().contains("(~5.0 GB freed, estimated)"),
+            "{}",
+            estimated.summary()
+        );
     }
 
     #[test]
