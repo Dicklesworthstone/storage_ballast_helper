@@ -374,14 +374,14 @@ pub trait Platform: Send + Sync {
     /// cost a full process sweep each (trj: 160-514 CPU-s a pass, bd-om52).
     /// A root that cannot be read leaves the result incomplete, never empty.
     fn open_files_under_roots(&self, roots: &[PathBuf]) -> Result<OpenFilesResult> {
-        let mut merged = OpenFilesResult {
-            files: Vec::new(),
-            complete: true,
-        };
+        let mut merged = OpenFilesResult::complete(Vec::new());
         for root in roots {
             match self.open_files_under(root) {
                 Ok(result) => {
                     merged.complete &= result.complete;
+                    if merged.incomplete_reason.is_none() {
+                        merged.incomplete_reason = result.incomplete_reason;
+                    }
                     merged.files.extend(result.files);
                 }
                 Err(_) => merged.complete = false,
@@ -834,6 +834,7 @@ impl Platform for MockPlatform {
                 .cloned()
                 .collect(),
             complete: self.open_files_complete,
+            incomplete_reason: None,
         })
     }
 

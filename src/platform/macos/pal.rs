@@ -381,6 +381,7 @@ fn cached_open_files_under(root: &Path) -> Result<OpenFilesResult> {
             return Ok(OpenFilesResult {
                 files: entry.open_files.clone(),
                 complete: entry.complete,
+                incomplete_reason: None,
             });
         }
     }
@@ -435,6 +436,7 @@ fn collect_open_files_under(root: &Path) -> Result<OpenFilesResult> {
     Ok(OpenFilesResult {
         files: open_files,
         complete: !incomplete,
+        incomplete_reason: None,
     })
 }
 
