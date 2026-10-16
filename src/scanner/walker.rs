@@ -2089,6 +2089,11 @@ pub fn collect_active_reference_index(
         Ok(result) => {
             if !result.complete {
                 index.complete = false;
+                if index.incomplete_reason.is_none() {
+                    index.incomplete_reason = result
+                        .incomplete_reason
+                        .map(|reason| format!("open-file sweep incomplete: {reason}"));
+                }
             }
             for open_file in result.files {
                 if own_directory_handle(&open_file) {

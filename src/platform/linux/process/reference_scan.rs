@@ -152,8 +152,10 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
         }
     }
 
-    /// The `[SBH-SAFETY]` explanation for a descriptor cap, if one was hit.
-    fn descriptor_limit_note(&self, proc_root: &Path) -> Option<String> {
+    /// Which process a descriptor cap cut short, if one did. It also travels
+    /// as `OpenFilesResult::incomplete_reason`, so the scanner's incomplete
+    /// line and explain name the cause, not only this sweep's log line.
+    fn descriptor_limit_reason(&self, proc_root: &Path) -> Option<String> {
         let (pid, limit) = self.descriptor_limit?;
         let comm = self
             .proc
@@ -161,9 +163,15 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
             .map(|raw| String::from_utf8_lossy(&raw).trim().to_string())
             .unwrap_or_default();
         Some(format!(
-            "[SBH-SAFETY] open-file sweep incomplete: pid {pid} ({comm}) has more than {limit} \
-             open descriptors, past the sweep's limit; candidates are held"
+            "pid {pid} ({comm}) has more than {limit} open descriptors, past the sweep's limit"
         ))
+    }
+
+    /// The `[SBH-SAFETY]` explanation for a descriptor cap, if one was hit.
+    fn descriptor_limit_note(&self, proc_root: &Path) -> Option<String> {
+        self.descriptor_limit_reason(proc_root).map(|reason| {
+            format!("[SBH-SAFETY] open-file sweep incomplete: {reason}; candidates are held")
+        })
     }
 
     /// Preserve positive bindings and propagate missing socket coverage to both
@@ -755,8 +763,9 @@ fn open_files_with_roots(
         }
         sweep.fds(proc_root, pid, &roots, &mut files);
     }
-    if let Some(note) = sweep.descriptor_limit_note(proc_root) {
-        eprintln!("{note}");
+    let incomplete_reason = sweep.descriptor_limit_reason(proc_root);
+    if let Some(reason) = &incomplete_reason {
+        eprintln!("[SBH-SAFETY] open-file sweep incomplete: {reason}; candidates are held");
     }
     // Include time spent in a failed/empty directory read in the one budget.
     sweep.expired();
@@ -769,6 +778,7 @@ fn open_files_with_roots(
     Ok(OpenFilesResult {
         files,
         complete: sweep.complete,
+        incomplete_reason,
     })
 }
 
@@ -1145,6 +1155,43 @@ mod tests {
         whole.fds(&fixture.proc_root, 7, &roots, &mut Vec::new());
         assert!(whole.complete);
         assert_eq!(whole.descriptor_limit_note(&fixture.proc_root), None);
+
+        // The PAL result carries the same cause, for the scanner and explain.
+        let result = fixture.scan(
+            &NativeProc,
+            Limits {
+                per_pid: 1,
+                ..Limits::default()
+            },
+        );
+        assert!(!result.complete);
+        assert_eq!(
+            result.incomplete_reason.as_deref(),
+            Some("pid 7 (bfs) has more than 1 open descriptors, past the sweep's limit")
+        );
+        assert_eq!(
+            fixture
+                .scan(&NativeProc, Limits::default())
+                .incomplete_reason,
+            None
+        );
+    }
+
+    /// The ts2 incident's count fits the default limits: 65,538 descriptors in
+    /// one process no longer make the sweep incomplete (bd-qs1r).
+    #[test]
+    fn one_process_with_65538_descriptors_fits_the_default_limits() {
+        let fixture = Fixture::new();
+        let process = fixture.pid(1);
+        let walked = fixture.root.join("walked-dir");
+        fs::create_dir(&walked).unwrap();
+        for fd in 0..65_538 {
+            symlink(&walked, process.join("fd").join(fd.to_string())).unwrap();
+        }
+        let (targets, complete) =
+            open_targets_with(&Faults::default(), &fixture.proc_root, Limits::default()).unwrap();
+        assert!(complete);
+        assert!(targets.contains(&walked));
     }
 
     #[test]
