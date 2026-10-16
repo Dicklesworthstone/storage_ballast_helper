@@ -243,6 +243,11 @@ pub fn classify_opaque_tree(
             "cargo registry/git store content is crate source, never a build target",
         ));
     }
+    if is_uv_cache_internal_path(path) {
+        return Some(OpaqueTreeClassification::protected(
+            "uv cache entry content is installed packages, managed by uv",
+        ));
+    }
 
     // Go toolchain caches (GOCACHE build cache / GOMODCACHE module cache).
     // Detected structurally because on the fleet they sit under arbitrarily
@@ -743,6 +748,33 @@ pub fn is_cargo_registry_internal_path(path: &Path) -> bool {
     })
 }
 
+/// True when `path` lies strictly inside an entry of uv's unpacked-package or
+/// tool-environment buckets, `uv/archive-vN/<entry>/` or
+/// `uv/environments-vN/<entry>/`.
+///
+/// Those are installed packages that running interpreters import from. On
+/// css (2026-10-16) sbh nominated 397 `__pycache__` directories inside them
+/// on the name alone and the executor refused each one as open, 300-600
+/// times an hour (bd-p9fw). The uv cache as a whole stays a reclaim unit.
+#[must_use]
+pub fn is_uv_cache_internal_path(path: &Path) -> bool {
+    let is_bucket = |name: &str| {
+        ["archive-v", "environments-v"].iter().any(|prefix| {
+            name.strip_prefix(prefix).is_some_and(|version| {
+                !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+    };
+    // The entry must be a STRICT ancestor: the entry itself is uv's unit.
+    path.ancestors().skip(1).any(|entry| {
+        let mut above = entry.ancestors().skip(1).map(Path::file_name);
+        matches!(
+            (above.next().flatten().and_then(|n| n.to_str()), above.next().flatten()),
+            (Some(bucket), Some(uv)) if is_bucket(bucket) && uv == "uv"
+        )
+    })
+}
+
 /// Name-only rules for agent scratch (`cass_*`, `frankenterm-*`, `pi_agent_*`,
 /// `claude-*`, ...) describe directories an agent creates directly in a temp
 /// root. Deeper, the same names are someone's data: the fleet deleted
@@ -1080,8 +1112,9 @@ impl ArtifactPatternRegistry {
             return ArtifactClassification::unknown();
         };
         // Crate source unpacked under a cargo store is never an artifact,
-        // whatever its basename looks like (`target-triple-1.0.0`).
-        if is_cargo_registry_internal_path(path) {
+        // whatever its basename looks like (`target-triple-1.0.0`), and
+        // neither is a package uv unpacked or installed in its cache.
+        if is_cargo_registry_internal_path(path) || is_uv_cache_internal_path(path) {
             return ArtifactClassification::unknown();
         }
         let normalized = name_os.to_string_lossy().to_lowercase();
@@ -2420,6 +2453,55 @@ mod tests {
         ] {
             assert!(!is_cargo_registry_internal_path(Path::new(p)), "{p}");
         }
+    }
+
+    #[test]
+    fn uv_cache_entry_content_is_never_walked_or_named_a_candidate() {
+        use super::is_uv_cache_internal_path as internal;
+        let registry = ArtifactPatternRegistry::default();
+        for inside in [
+            "/home/ubuntu/.cache/uv/archive-v0/SSbRqQhYGRnnG2bz/lib/python3.12/site-packages/torch/nn/utils/__pycache__",
+            "/home/ubuntu/.cache/uv/archive-v0/qGMYdM4VKIJ2H-It/lib",
+            "/root/.cache/uv/environments-v2/ruff-1a2b/lib/python3.12/site-packages/__pycache__",
+        ] {
+            let path = Path::new(inside);
+            assert!(internal(path), "{inside}");
+            assert_eq!(
+                registry
+                    .classify(path, StructuralSignals::default())
+                    .category,
+                ArtifactCategory::Unknown,
+                "{inside}"
+            );
+            assert_eq!(
+                classify_opaque_tree(path, OpaqueTreeContext::default())
+                    .unwrap()
+                    .disposition,
+                OpaqueTreeDisposition::ProtectedOpaque,
+                "{inside}"
+            );
+        }
+        // uv's own units, its other buckets and other caches are unchanged.
+        for outside in [
+            "/home/ubuntu/.cache/uv",
+            "/home/ubuntu/.cache/uv/archive-v0",
+            "/home/ubuntu/.cache/uv/archive-v0/SSbRqQhYGRnnG2bz",
+            "/home/ubuntu/.cache/uv/wheels-v5/pypi/__pycache__",
+            "/home/ubuntu/.cache/uv/archive-vx/entry/__pycache__",
+            "/home/ubuntu/.cache/pip/archive-v0/entry/__pycache__",
+            "/home/ubuntu/project/__pycache__",
+        ] {
+            assert!(!internal(Path::new(outside)), "{outside}");
+        }
+        assert_eq!(
+            registry
+                .classify(
+                    Path::new("/home/ubuntu/project/__pycache__"),
+                    StructuralSignals::default()
+                )
+                .category,
+            ArtifactCategory::PythonCache
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::platform::cleanup_catalog::{CleanupConfidence, CleanupRule, ReclaimCo
 use crate::platform::{linux, macos};
 use crate::scanner::patterns::{
     ArtifactCategory, ArtifactClassification, StructuralSignals, is_cargo_registry_internal_path,
-    is_obvious_build_artifact_basename,
+    is_obvious_build_artifact_basename, is_uv_cache_internal_path,
 };
 use crate::scanner::protection::SacredOverlap;
 use crate::scanner::walker::FsIdentity;
@@ -663,6 +663,11 @@ impl ScoringEngine {
         if is_cargo_registry_internal_path(&input.path) {
             return Some(Cow::Borrowed(
                 "inside a cargo registry/git store: crate source, not build output",
+            ));
+        }
+        if is_uv_cache_internal_path(&input.path) {
+            return Some(Cow::Borrowed(
+                "inside a uv cache entry: installed packages, managed by uv",
             ));
         }
         if let Some(reason) = rch_target_veto_reason(&input.path, urgency) {
