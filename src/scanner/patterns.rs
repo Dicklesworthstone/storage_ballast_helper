@@ -352,15 +352,33 @@ pub fn classify_opaque_tree(
     if matches!(name.as_str(), ".next" | "dist" | "build")
         && (context.parent_has_node_manifest || tmp_like)
     {
-        return Some(OpaqueTreeClassification::candidate(
-            "build output with project/temp context",
-            "opaque-build-output",
-            ArtifactCategory::BuildOutput,
-            0.88,
-        ));
+        return Some(classify_build_output_name(path, &name, context));
     }
 
     None
+}
+
+/// `build` and `dist` also name source directories. Beside a project manifest
+/// they are that project's output; deeper inside a project tree, temp placement
+/// alone does not make them output. On ts2 (2026-10-16) tracked
+/// `scripts/build/*.mjs`, `tests/golden/build` and `src/cmd/build` were deleted
+/// at Critical from repo copies under /data/tmp on the name alone.
+fn classify_build_output_name(
+    path: &Path,
+    name: &str,
+    context: OpaqueTreeContext,
+) -> OpaqueTreeClassification {
+    if name != ".next" && !context.parent_has_node_manifest && nested_in_project_source(path) {
+        return OpaqueTreeClassification::signal_only(
+            "build/dist name inside a project tree under temp storage, not beside its manifest",
+        );
+    }
+    OpaqueTreeClassification::candidate(
+        "build output with project/temp context",
+        "opaque-build-output",
+        ArtifactCategory::BuildOutput,
+        0.88,
+    )
 }
 
 fn is_context_gated_dependency_tree_name(name: &str) -> bool {
@@ -1163,6 +1181,31 @@ fn inside_project_tree(path: &Path) -> bool {
                 .iter()
                 .any(|marker| dir.join(marker).symlink_metadata().is_ok())
         })
+}
+
+/// Whether `path` sits inside a project tree but not directly beside one of
+/// its manifests: `<copy>/scripts/build` rather than `<copy>/build`.
+fn nested_in_project_source(path: &Path) -> bool {
+    const ROOT_MARKERS: &[&str] = &[
+        ".git",
+        "CMakeLists.txt",
+        "Cargo.toml",
+        "Makefile",
+        "build.gradle",
+        "build.gradle.kts",
+        "go.mod",
+        "meson.build",
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+    ];
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    !ROOT_MARKERS
+        .iter()
+        .any(|marker| parent.join(marker).symlink_metadata().is_ok())
+        && inside_project_tree(path)
 }
 
 fn matches_builtin(kind: MatchKind, normalized: &str) -> bool {
@@ -2064,6 +2107,45 @@ mod tests {
                 opaque.map(|opaque| opaque.disposition),
                 Some(OpaqueTreeDisposition::CandidateOpaque),
                 "{path} must not become an opaque source-tree candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn temp_build_and_dist_names_inside_a_project_copy_stay_source() {
+        use std::fs;
+        // Under a temp root, like the /data/tmp verify checkouts that lost
+        // their tracked scripts/build on ts2.
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let copy = dir.path().join("verify-af880e0");
+        for sub in ["scripts/build", "src/dist", "build", "app/.next"] {
+            fs::create_dir_all(copy.join(sub)).unwrap();
+        }
+        fs::write(copy.join("package.json"), b"{}").unwrap();
+        fs::write(copy.join("scripts/build/cjs-shim.mjs"), b"export {};\n").unwrap();
+        let loose = dir.path().join("loose").join("build");
+        fs::create_dir_all(&loose).unwrap();
+        let disposition = |path: &Path| {
+            classify_opaque_tree(path, OpaqueTreeContext::default())
+                .map(|opaque| opaque.disposition)
+        };
+
+        for nested in [copy.join("scripts/build"), copy.join("src/dist")] {
+            assert_eq!(
+                disposition(&nested),
+                Some(OpaqueTreeDisposition::SignalOnly),
+                "{}",
+                nested.display()
+            );
+        }
+        // Beside the manifest, with no project around it, and `.next`
+        // anywhere, temp placement still promotes as before.
+        for output in [copy.join("build"), loose, copy.join("app/.next")] {
+            assert_eq!(
+                disposition(&output),
+                Some(OpaqueTreeDisposition::CandidateOpaque),
+                "{}",
+                output.display()
             );
         }
     }
