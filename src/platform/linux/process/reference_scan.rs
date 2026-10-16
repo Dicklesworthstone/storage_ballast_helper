@@ -28,7 +28,12 @@ mod unix_sockets;
 use build_environment::sweep as build_directory_sweep;
 
 const MAX_DESCRIPTORS: usize = 262_144;
-const MAX_DESCRIPTORS_PER_PID: usize = 16_384;
+/// Half the sweep's descriptor budget. One process past this cap makes every
+/// sweep incomplete and holds every deletion on the host: on ts2
+/// (2026-10-16) a `bfs` search kept 65,536 directory descriptors open (its
+/// limit was 1,048,576) under the old 16,384 cap, and the host deleted
+/// nothing for hours. Reading 65,536 links takes well under a second.
+const MAX_DESCRIPTORS_PER_PID: usize = 131_072;
 const MAX_PROC_ENTRIES: usize = OPEN_FILES_MAX_PIDS + 4096;
 const MAX_EXECUTABLE_COMM_BYTES: usize = 256;
 const MAX_EXECUTABLE_STAT_BYTES: usize = 8192;
@@ -126,6 +131,9 @@ struct Sweep<'a, P> {
     started: Instant,
     complete: bool,
     descriptors_seen: usize,
+    /// The first process whose descriptors a cap cut short, and that cap:
+    /// otherwise the sweep is incomplete with nothing saying why.
+    descriptor_limit: Option<(i32, usize)>,
     /// Bound socket paths by inode, read once, when the first socket
     /// descriptor is seen.
     unix_sockets: Option<unix_sockets::Table>,
@@ -139,8 +147,23 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
             started: proc.now(),
             complete: true,
             descriptors_seen: 0,
+            descriptor_limit: None,
             unix_sockets: None,
         }
+    }
+
+    /// The `[SBH-SAFETY]` explanation for a descriptor cap, if one was hit.
+    fn descriptor_limit_note(&self, proc_root: &Path) -> Option<String> {
+        let (pid, limit) = self.descriptor_limit?;
+        let comm = self
+            .proc
+            .read_bounded(&proc_root.join(pid.to_string()).join("comm"), 64)
+            .map(|raw| String::from_utf8_lossy(&raw).trim().to_string())
+            .unwrap_or_default();
+        Some(format!(
+            "[SBH-SAFETY] open-file sweep incomplete: pid {pid} ({comm}) has more than {limit} \
+             open descriptors, past the sweep's limit; candidates are held"
+        ))
     }
 
     /// Preserve positive bindings and propagate missing socket coverage to both
@@ -268,10 +291,16 @@ impl<'a, P: ProcAccess> Sweep<'a, P> {
             }
         };
         for (seen, entry) in entries.enumerate() {
-            if self.expired()
-                || seen >= self.limits.per_pid
-                || self.descriptors_seen >= self.limits.descriptors
-            {
+            let cap = if seen >= self.limits.per_pid {
+                Some(self.limits.per_pid)
+            } else {
+                (self.descriptors_seen >= self.limits.descriptors)
+                    .then_some(self.limits.descriptors)
+            };
+            if let Some(cap) = cap {
+                self.descriptor_limit.get_or_insert((pid, cap));
+            }
+            if self.expired() || cap.is_some() {
                 self.complete = false;
                 break;
             }
@@ -624,6 +653,9 @@ fn open_targets_with(
             }
         );
     }
+    if let Some(note) = sweep.descriptor_limit_note(proc_root) {
+        eprintln!("{note}");
+    }
     let mut targets: Vec<_> = targets.into_iter().collect();
     targets.sort_unstable();
     // Failed/empty directory reads and final ordering belong to the same
@@ -722,6 +754,9 @@ fn open_files_with_roots(
             break;
         }
         sweep.fds(proc_root, pid, &roots, &mut files);
+    }
+    if let Some(note) = sweep.descriptor_limit_note(proc_root) {
+        eprintln!("{note}");
     }
     // Include time spent in a failed/empty directory read in the one budget.
     sweep.expired();
@@ -1077,6 +1112,39 @@ mod tests {
         );
         assert!(result.complete);
         assert_eq!(result.files.len(), 3);
+    }
+
+    /// A cap that cuts a process short names that process and the cap, and a
+    /// sweep within its caps names nothing (ts2: a `bfs` with 65,536
+    /// descriptors held every batch while the logs said only "incomplete").
+    #[test]
+    fn a_descriptor_cap_names_the_process_it_cut_short() {
+        let fixture = Fixture::new();
+        fixture.fd(7, 0);
+        fixture.fd(7, 1);
+        fs::write(fixture.pid(7).join("comm"), "bfs\n").unwrap();
+        let roots = [fixture.root.clone()];
+        let mut capped = Sweep::new(
+            &NativeProc,
+            Limits {
+                per_pid: 1,
+                ..Limits::default()
+            },
+        );
+        let mut files = Vec::new();
+        capped.fds(&fixture.proc_root, 7, &roots, &mut files);
+        assert!(!capped.complete);
+        assert_eq!(capped.descriptor_limit, Some((7, 1)));
+        let note = capped.descriptor_limit_note(&fixture.proc_root).unwrap();
+        assert!(
+            note.contains("pid 7 (bfs) has more than 1 open descriptors"),
+            "{note}"
+        );
+
+        let mut whole = Sweep::new(&NativeProc, Limits::default());
+        whole.fds(&fixture.proc_root, 7, &roots, &mut Vec::new());
+        assert!(whole.complete);
+        assert_eq!(whole.descriptor_limit_note(&fixture.proc_root), None);
     }
 
     #[test]
