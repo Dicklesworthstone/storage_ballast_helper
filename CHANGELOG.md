@@ -60,6 +60,15 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   estimated by sampling and shown as "~X GiB est.". On a Mac with 1.7 TiB
   used, the home directory ranked first in every trial; before, it wasn't
   listed at all. Estimates of very large trees tend to run low.
+- **The log's RAM copy no longer switches on and off near a limit**
+  (`12c910f`). When the disk holding sbh's log fills, sbh also writes the
+  log to RAM, but stops when RAM or swap runs short. Starting and
+  stopping used the same limit, so on one host the copy started 19 times
+  and stopped 14 times a day, and each stop lost the lines it was holding.
+  Starting now needs more headroom than keeping it running (15% instead
+  of 10% of RAM and swap, 25% instead of 20% of the destination), and
+  sbh checks that headroom about once a second instead of on every log
+  line.
 
 ## v0.7.9 **[release]**
 
