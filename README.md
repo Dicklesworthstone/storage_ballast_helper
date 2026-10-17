@@ -1259,6 +1259,8 @@ When guardrails report a non-Pass status, a penalty (default 50.0) is added to t
 
 What actually runs at a given pressure is the behavior matrix: memory pressure (rows) crossed with disk pressure (columns) selects a scanner posture, a cleanup posture, a ballast action and a notification severity. `[behavior] preset` (or `SBH_BEHAVIOR_PRESET`) picks `v0.6` (the default: reclaim before the cliff), `v0.5` (the matrix shipped through v0.5.x, for rollback) or `custom` (`v0.6` plus `[behavior.cells.<memory>_<disk>]` overrides, which go through the never-reduce rule in `src/daemon/policy.rs`). The tables are generated from the code by `sbh docs --render README.md`.
 
+The scan posture sets the CPU pace: `aggressive` paces the scanner at twice `telemetry.cpu_budget_pct` (at most one core), `light` and `definite_only` at half, `normal` at the configured value, and `skip` starts no new scans. Critical disk pressure is unpaced regardless. `definite_only` does not yet restrict which paths are walked.
+
 <!-- sbh-docs:begin behavior-matrix -->
 **Preset `v0.6` (default)** (cell = scan / cleanup / ballast / notify):
 
@@ -1301,7 +1303,7 @@ Before any deletion is executed, an eight-point pre-flight check must pass:
 1. **Path still exists**: Uses `symlink_metadata()` (doesn't follow symlinks) to verify the target hasn't been removed by another process since scoring.
 2. **Not a symlink**: Symlinks are rejected because `remove_dir_all` follows symlinks into the target, which could destroy data outside watched directories.
 3. **Parent is writable**: Checks effective write permission via `access(W_OK)` to catch read-only mounts and permission changes since scan time.
-4. **No `.git/` directory**: A final safety net that prevents deletion of any directory containing a Git repository, even if all other signals suggest it's an artifact.
+4. **No Git metadata or tracked source**: Candidates containing a Git repository or tracked files are retained, including deep subtrees of linked worktrees. Ordinary untracked build artifacts remain eligible. If a repository marker exists but Git cannot verify its index, the candidate is retained. Lean source files also veto deletion when no repository metadata is available.
 5. **Not a Cargo source root**: A direct `Cargo.toml` without Cargo build-output markers vetoes deletion, even when a directory name matches `target`, `target_*`, `*_target`, or `*-target`. Broad target-like names outside temporary storage also require Cargo build-output markers before they can become deletion candidates; `/private/tmp` target caches still require open-file checks.
 6. **No stowaway sacred state**: Depth-limited scans reject cleanup candidates that contain protected marker directories or database state such as `.git/`, `.beads/`, `*.db`, `*.sqlite`, or `*.sqlite3`.
 7. **Not open by any process**: The deletion executor checks platform open-file evidence before reclaiming a target tree. Linux scans `/proc/*/fd` symlinks; macOS uses the PAL/libproc open-file collector. If that pre-flight evidence is incomplete, the batch fails conservative instead of deleting an in-use directory.
@@ -1403,6 +1405,17 @@ The PID controller's pressure response directly determines how many ballast file
 - **Emergency** (> 0.9): Release all remaining files. Maximum immediate relief.
 
 Release is instant (just `unlink()`), providing space recovery in milliseconds rather than the seconds-to-minutes required for scanning and deletion.
+
+Graduated release targets count observed depletion of the physical reserve,
+rather than configured slots that might never have been provisioned. The daemon
+carries that observation in each pool's existing `state.json` record, bound to
+the directory's device, inode and creation time when the filesystem supplies it.
+A restart over the same pool keeps prior release credit; recreated reserve
+retires the credit, and a replaced pool begins a new window. Config reload keeps
+the observed window while updating the replenish cooldown. Missing, unreadable
+or non-matching history leaves the actual partial reserve usable. Critical
+pressure still releases the available reserve. State persistence retains the
+existing write cadence; emergency release adds no history-file writes or waits.
 
 On macOS/APFS, local Time Machine snapshots can retain the released ballast blocks. In that case the release operation succeeds, but apparent free space in `df`, Finder, and some system APIs may not increase until one of these happens:
 

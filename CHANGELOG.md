@@ -6,6 +6,126 @@ Versions with published GitHub Release assets are marked **[release]**. Versions
 
 ## Unreleased
 
+## v0.6.24 **[release]**
+
+Compare: [`v0.6.23...v0.6.24`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.23...v0.6.24)
+
+### Fixed — no more dispatching candidates the executor always refuses
+
+- The scorer approved directories that the executor's source-tree floor and
+  source-file check refuse every time: one host logged 902 refused plans in
+  an hour, another backed off 58 times at Critical pressure because those
+  passes "reclaimed nothing", and the scan index re-dispatched them on every
+  pass. Both checks now also run at the end of the scorer's veto chain (the
+  source-file check bounded to 4096 entries there); the executor keeps its
+  own unbounded checks, so nothing becomes deletable that was not before
+  (`75ad60a`).
+
+## v0.6.23 **[release]**
+
+Compare: [`v0.6.22...v0.6.23`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.22...v0.6.23)
+
+### Reverted — the rch job TMPDIR rule (v0.6.21, v0.6.22)
+
+- Neither release reclaimed a single `.rch-tmp`. With the scorer and the
+  sacred layer past, the executor still refused every one: its source-tree
+  floor, nested-`.git`, Cargo-manifest and source-file checks all match the
+  test fixtures that live in a job TMPDIR, and those fail-closed layers
+  exist because sbh once destroyed real working trees. Meanwhile each pass
+  spent large idle probes and containment walks on candidates that could
+  never be deleted. The code is back to v0.6.20's (`d1db715`). rch, which
+  owns that directory and already prunes children idle >24 h, is the right
+  place to sweep projects that stop receiving jobs.
+
+## v0.6.22 **[release]**
+
+Compare: [`v0.6.21...v0.6.22`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.21...v0.6.22)
+
+### Fixed — idle rch job TMPDIRs are no longer protected by test fixtures
+
+- v0.6.21's `.rch-tmp` rule reclaimed nothing: tests leave `git init`
+  repos and SQLite files in their TMPDIR, which matched the built-in
+  sacred markers, and the largest dirs exceeded the containment walk's
+  directory bound. For a `.rch-tmp` (which rch itself prunes after 24 h,
+  and which sbh only nominates once its whole tree is that idle) the
+  built-in test-fixture markers (`.git/`, `.beads/`, `beads.db*`, `*.db*`,
+  `*.sqlite*`) are no longer consulted. `.sbh-protect` markers, user
+  `protected_paths` / `sacred.toml` and the built-in secret stores
+  (`.ssh/`, `.gnupg/`, `.config/age/`) still protect it, and a walk that
+  cannot finish still fails closed (`95724d8`).
+- **Did not reclaim anything either:** the executor's source-tree and
+  nested-`.git` checks refused every `.rch-tmp`; reverted in v0.6.23.
+
+## v0.6.21 **[release]**
+
+Compare: [`v0.6.20...v0.6.21`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.20...v0.6.21)
+
+### Added — idle rch job TMPDIRs are reclaimed
+
+- rch points every job's TMPDIR at `<project>/.rch-tmp` and prunes it only
+  when the next job for that project arrives, so projects that stop getting
+  jobs keep every leaked test tempdir: one host held ~13 GB in idle
+  `.rch-tmp` dirs, one with 315k entries idle for five days. sbh kept each
+  tiny child and re-scored all of them on every pre-scan cycle (a full CPU
+  slice per project). The whole `.rch-tmp` is now the reclaim unit (rch
+  recreates it per job), vetoed until nothing in it has been written for
+  rch's own 24 h prune floor (`d8d5e42`).
+- **Not effective yet:** after rollout no host reclaimed a `.rch-tmp`. The
+  sacred-path layer still protects every one observed, because leaked test
+  fixtures inside match the built-in `*.db`, `*.sqlite` and `.git/` markers,
+  and the largest exceed the containment scan's 50k-directory bound (which
+  fails closed). Whether idle rch job TMPDIRs may override those built-in
+  markers is an open policy decision.
+
+## v0.6.20 **[release]**
+
+Compare: [`v0.6.19...v0.6.20`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.19...v0.6.20)
+
+### Changed — the behavior matrix's scan posture sets the scanner's CPU pace
+
+- The matrix's scan posture was only a label (just `skip` was honoured), so
+  at Yellow through Red with healthy memory the "aggressive" scanner ran
+  exactly like a Green one; at Orange one host's priority pre-scan stopped
+  on the CPU budget ~150 times an hour. `aggressive` now paces at twice
+  `telemetry.cpu_budget_pct` (at most one core), `light` and
+  `definite_only` (memory pressure) at half. Critical disk pressure stays
+  unpaced; `definite_only` does not yet restrict which paths are walked
+  (`6ebd3a3`).
+
+## v0.6.19 **[release]**
+
+Compare: [`v0.6.18...v0.6.19`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.18...v0.6.19)
+
+### Added — abandoned `mktemp` scratch in temp trees is reclaimable
+
+- Directories made by `mktemp -d -t <prefix>.XXXXXXXX` matched no name
+  pattern, so sbh never nominated them: one host at Critical pressure
+  reported "nothing to reclaim" while 14 idle `fsfs-quickstart.*` test
+  dirs held 53 GB. A directory under a temp tree named
+  `<prefix>.<6-16 random alphanumerics mixing upper and lower case>` is
+  now temp scratch, unless a directory between it and the temp root is a
+  project (`.git`, `Cargo.toml`, `package.json`, `pyproject.toml`,
+  `go.mod`). Digit-free suffixes with a run of four or more lowercase
+  letters are words (`com.apple.WindowManager` in a macOS `$TMPDIR`) and
+  do not count. The whole-tree idle age and open-file checks still apply
+  (`4cb4c54`, `8136b30`).
+
+## v0.6.18 **[release]**
+
+Compare: [`v0.6.17...v0.6.18`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.17...v0.6.18)
+
+### Fixed — reported and planned sizes are measured, not a 100 MiB placeholder
+
+- The priority pre-scan recorded candidates in its index at the 100 MiB
+  nomination placeholder, so every later replay dispatched and reported
+  that size: in 12 hours one host logged 361 deletions and 17.9 GB "freed",
+  all of it the placeholder (171 deletions at exactly 100 MiB) for a few
+  megabytes of tiny `node_modules`, and the reclaim byte target counted it
+  as progress. (The release commit's "73 GB in 12 hours" came from a query
+  whose time filter matched a much longer window.)
+  The index now records the measured size, and records written by earlier
+  versions are re-measured when replayed (`e4c33d4`).
+
 ## v0.6.17 **[release]**
 
 Compare: [`v0.6.16...v0.6.17`](https://github.com/Dicklesworthstone/storage_ballast_helper/compare/v0.6.16...v0.6.17)
