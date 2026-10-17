@@ -7,7 +7,7 @@ use clap::{ArgMatches, Args, Command, FromArgMatches};
 use storage_ballast_helper::core::config::Config;
 use storage_ballast_helper::scanner::compression::journal::{self, RecoveryReport};
 use storage_ballast_helper::scanner::compression::{
-    CompressionMode, CompressionPolicy, CompressionReport,
+    CompressionMode, CompressionPolicy, CompressionReport, ConcurrencyAcknowledgement,
 };
 
 mod activity_cli;
@@ -93,7 +93,11 @@ pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
     let mode = CompressionMode {
         apply: options.apply && !options.dry_run,
         allow_zstd_feature: options.allow_zstd_feature,
-        quiescent: options.quiescent,
+        acknowledgement: if options.quiescent {
+            ConcurrencyAcknowledgement::Quiescent
+        } else {
+            ConcurrencyAcknowledgement::None
+        },
     };
     let explicit_config = matches.get_one::<PathBuf>("config");
     let result = Config::load(explicit_config.map(PathBuf::as_path))

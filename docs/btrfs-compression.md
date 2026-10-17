@@ -1,8 +1,9 @@
 # Lossless Btrfs compression
 
 `sbh compress` is an opt-in operator command for explicitly selected cold,
-unshared regular files. It does not delete files, truncate logs, change daemon
-policy, or enable automatic compression. Preview is the default:
+unshared regular files. It does not delete files, truncate logs or change daemon
+policy. The daemon compresses on its own only when `[compress]` is enabled (see
+[Daemon tier](#daemon-tier)). Preview is the default:
 
 ```sh
 sudo sbh --json compress -- /data/old-debug-binary /data/old-session.jsonl
@@ -164,6 +165,45 @@ SBH_BTRFS_TEST_ROOT=/path/to/disposable/btrfs \
   cargo test --locked --manifest-path crates/sbh_btrfs/Cargo.toml -- --ignored
 ```
 
-Automatic Yellow/Orange pressure scheduling and persistent `[scanner.compress]`
-configuration remain separate unfinished work. The durable compression journal is
-not a fabricated deletion decision and does not enable automatic daemon writes.
+The durable compression journal is not a fabricated deletion decision.
+
+## Daemon tier
+
+With `[compress] enabled = true`, the daemon runs the same discover-then-apply
+pass on its own. A pass starts when a configured root sits on Btrfs whose mount
+is at or above `start_level` (default `yellow`), no pass is running, and
+`interval_minutes` (default 30) have passed since the last one started. Each
+pass is bounded by `[compress.policy]`: by default files idle for 24 hours and at
+least 16 MiB, at most 128 files and 8 GiB, and 300 seconds. Discovery resumes
+where the previous pass stopped. Every file outcome reaches the activity log, as
+for the CLI, and an `[SBH-COMPRESS]` line summarizes the pass and the referenced
+bytes saved. The tier never deletes anything, and never touches a root on another
+filesystem.
+
+```toml
+[compress]
+enabled = true
+roots = ["/data/tmp"]
+allow_zstd_feature = true   # required: the first zstd write sets COMPRESS_ZSTD
+start_level = "yellow"
+interval_minutes = 30
+
+[compress.policy]
+min_age_secs = 86400
+```
+
+Enabling the tier stands in for the CLI's `--quiescent`, which no daemon can
+promise on a shared host. Content stays protected by the checks every apply runs
+anyway:
+
+- the minimum idle age;
+- the open, mmap and lease vetoes;
+- the file stamp and root scope, rechecked between chunks;
+- a SHA-256 re-read from disk after the rewrite.
+
+What you accept by enabling it is about space, not data: a snapshot or reflink
+made during a pass keeps the old extents alive, so those bytes are freed only
+when it goes away.
+
+The scheduling is in `src/daemon/compress_tier.rs`. `sbh daemon reload` applies
+config changes.

@@ -8,7 +8,9 @@ use storage_ballast_helper::core::config::Config;
 use storage_ballast_helper::scanner::compression::discovery::{
     self, DiscoveryLimits, DiscoveryReport,
 };
-use storage_ballast_helper::scanner::compression::{self, CompressionMode, CompressionPolicy};
+use storage_ballast_helper::scanner::compression::{
+    self, CompressionMode, CompressionPolicy, ConcurrencyAcknowledgement,
+};
 
 #[derive(Debug, Args)]
 struct DiscoveryOptions {
@@ -153,7 +155,11 @@ fn execute(
         let mode = CompressionMode {
             apply: true,
             allow_zstd_feature: options.allow_zstd_feature,
-            quiescent: options.quiescent,
+            acknowledgement: if options.quiescent {
+                ConcurrencyAcknowledgement::Quiescent
+            } else {
+                ConcurrencyAcknowledgement::None
+            },
         };
         Some(
             super::activity_cli::execute_with(&config, |observer| {

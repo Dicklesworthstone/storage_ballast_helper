@@ -31,6 +31,7 @@ use crate::ballast::coordinator::BallastPoolCoordinator;
 use crate::ballast::release::BallastReleaseController;
 use crate::core::config::{Config, ScannerConfig, ScannerEngineMode};
 use crate::core::errors::{Result, SbhError};
+use crate::daemon::compress_tier::CompressTier;
 use crate::daemon::control::{
     BallastAction as ControlBallastAction, ControlBackend, ControlCommand, ControlResponse,
     ControlServer, Peer, PolicyAction, persist_policy_mode,
@@ -2065,6 +2066,8 @@ pub struct MonitoringDaemon {
     attribution_reported: HashMap<PathBuf, Instant>,
     /// Since when each mount has been continuously at Red or worse.
     attribution_pressured_since: HashMap<PathBuf, Instant>,
+    /// Opt-in lossless compression passes on btrfs (`[compress]`, bd-rxq5).
+    compress_tier: CompressTier,
     last_summary_report: Instant,
     summary_scans: u64,
     summary_scan_timeouts: u64,
@@ -3366,6 +3369,7 @@ impl MonitoringDaemon {
             last_device_affinity_warn: None,
             attribution_reported: HashMap::new(),
             attribution_pressured_since: HashMap::new(),
+            compress_tier: CompressTier::default(),
             last_summary_report: Instant::now(),
             summary_scans: 0,
             summary_scan_timeouts: 0,
@@ -5456,6 +5460,20 @@ impl MonitoringDaemon {
         }
         self.emit_reclaim_unavailable(&unprotected_mounts, now);
         self.report_unreclaimable_growth(now);
+        if self.config.compress.enabled {
+            let mount_levels: HashMap<PathBuf, PressureLevel> = self
+                .mount_controllers
+                .iter()
+                .map(|(mount, controller)| (mount.clone(), controller.level()))
+                .collect();
+            self.compress_tier.tick(
+                now,
+                &self.config,
+                &self.platform,
+                &mount_levels,
+                &self.logger_handle,
+            );
+        }
 
         global_tick(cadence, base_poll)
     }

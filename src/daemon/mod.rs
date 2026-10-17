@@ -2,6 +2,8 @@
 //! self-monitoring, and multi-channel notifications.
 
 pub mod attribution;
+#[cfg(feature = "daemon")]
+pub mod compress_tier;
 pub mod control;
 pub mod cpu_budget;
 #[cfg(feature = "daemon")]

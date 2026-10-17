@@ -118,6 +118,6 @@ invent a continuation past unexamined work.
 
 The library selection retains discovered file stamps and pinned roots; the
 executor's `validate_file` and `validate_scope` calls are the discovered-apply
-checks above. Automatic Yellow/Orange scheduling and persistent compression
-configuration remain unfinished. Explicit-file journal explanations are
-documented separately in `compression-explain.md`.
+checks above. The daemon runs the same discover-then-apply pass when
+`[compress]` is enabled (`btrfs-compression.md`, Daemon tier). Explicit-file
+journal explanations are documented separately in `compression-explain.md`.

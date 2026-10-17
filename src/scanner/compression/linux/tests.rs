@@ -152,7 +152,7 @@ fn git_packfile_preview_and_apply_stop_before_hashing_or_journaling() {
             CompressionMode {
                 apply,
                 allow_zstd_feature: true,
-                quiescent: true,
+                acknowledgement: crate::scanner::compression::ConcurrencyAcknowledgement::Quiescent,
             },
             &Config::default(),
             &platform,

@@ -83,6 +83,8 @@ pub struct Config {
     pub special_locations: SpecialLocationsConfig,
     pub system_tuning: SystemTuningConfig,
     pub platform: PlatformConfig,
+    /// Opt-in lossless compression of cold btrfs files (`[compress]`).
+    pub compress: CompressConfig,
     /// Keys the loaded file contained that no section declares. Not part
     /// of the file format (never serialized; excluded from `stable_hash`).
     #[serde(skip)]
@@ -911,6 +913,103 @@ impl Default for PlatformMacOsConfig {
         Self {
             query_foundation_purgeable: true,
         }
+    }
+}
+
+/// Daemon tier that rewrites cold files on btrfs compressed (`[compress]`).
+///
+/// Off by default. Lossless: each rewritten file's stamp is rechecked between
+/// chunks and its SHA-256 re-read from disk. Files that are open, mapped,
+/// leased, younger than `policy.min_age_secs` or share extents are skipped,
+/// and a root on another filesystem is never touched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompressConfig {
+    /// Run compression passes from the daemon. Enabling it stands in for the
+    /// CLI's `--quiescent`: a snapshot or reflink made during a pass keeps
+    /// the old extents alive, so those bytes are not freed until it goes.
+    pub enabled: bool,
+    /// Directories whose cold files may be compressed (absolute, at most 32).
+    pub roots: Vec<PathBuf>,
+    /// Lowest pressure level of a root's mount at which a pass may start:
+    /// green, yellow, orange, red or critical.
+    pub start_level: String,
+    /// Minimum minutes between the starts of two passes.
+    pub interval_minutes: u64,
+    /// Consent to btrfs's COMPRESS_ZSTD incompat flag, which the first zstd
+    /// write sets for good (mounting then needs Linux 4.14 or later).
+    pub allow_zstd_feature: bool,
+    /// Admission and work limits of one pass.
+    pub policy: crate::scanner::compression::CompressionPolicy,
+}
+
+impl Default for CompressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            roots: Vec::new(),
+            start_level: "yellow".to_string(),
+            interval_minutes: 30,
+            allow_zstd_feature: false,
+            policy: crate::scanner::compression::CompressionPolicy::default(),
+        }
+    }
+}
+
+impl CompressConfig {
+    /// `start_level` as a pressure level, if it names one.
+    #[must_use]
+    pub fn start_pressure_level(&self) -> Option<crate::monitor::pid::PressureLevel> {
+        use crate::monitor::pid::PressureLevel;
+        match self.start_level.as_str() {
+            "green" => Some(PressureLevel::Green),
+            "yellow" => Some(PressureLevel::Yellow),
+            "orange" => Some(PressureLevel::Orange),
+            "red" => Some(PressureLevel::Red),
+            "critical" => Some(PressureLevel::Critical),
+            _ => None,
+        }
+    }
+
+    /// Reject an enabled tier that could never run, or could run unbounded.
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let invalid = |details: String| SbhError::InvalidConfig { details };
+        if self.roots.is_empty() || self.roots.len() > 32 {
+            return Err(invalid(format!(
+                "compress.roots must list 1..32 directories when compress.enabled, got {}",
+                self.roots.len()
+            )));
+        }
+        if let Some(root) = self.roots.iter().find(|root| !root.is_absolute()) {
+            return Err(invalid(format!(
+                "compress.roots must be absolute: {}",
+                root.display()
+            )));
+        }
+        if self.start_pressure_level().is_none() {
+            return Err(invalid(format!(
+                "compress.start_level must be green, yellow, orange, red or critical, got {:?}",
+                self.start_level
+            )));
+        }
+        if self.interval_minutes == 0 {
+            return Err(invalid(
+                "compress.interval_minutes must be at least 1".to_string(),
+            ));
+        }
+        if !self.allow_zstd_feature {
+            return Err(invalid(
+                "compress.enabled needs compress.allow_zstd_feature = true: the first zstd \
+                 write sets btrfs's COMPRESS_ZSTD incompat flag for good"
+                    .to_string(),
+            ));
+        }
+        self.policy
+            .validate()
+            .map_err(|error| invalid(format!("compress.policy: {error}")))
     }
 }
 
@@ -2542,6 +2641,7 @@ impl Config {
                 details: format!("behavior: {details}"),
             }
         })?;
+        self.compress.validate()?;
 
         // I31: Thresholds must be in 0.0..=100.0.
         for (name, val) in [
@@ -4112,6 +4212,58 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn compress_tier_is_off_by_default_and_rejects_configs_that_could_not_run() {
+        use super::CompressConfig;
+        use crate::monitor::pid::PressureLevel;
+        use crate::scanner::compression::CompressionPolicy;
+        type Edit = fn(&mut CompressConfig);
+
+        let default = Config::default();
+        assert!(!default.compress.enabled);
+        default.validate().unwrap();
+
+        let enabled = |edit: Edit| {
+            let mut config = Config::default();
+            config.compress.enabled = true;
+            config.compress.roots = vec![PathBuf::from("/data/tmp")];
+            config.compress.allow_zstd_feature = true;
+            edit(&mut config.compress);
+            config.validate()
+        };
+        enabled(|_| {}).unwrap();
+        let rejected: [(&str, Edit); 6] = [
+            ("no roots", |c| c.roots.clear()),
+            ("relative root", |c| {
+                c.roots = vec![PathBuf::from("data/tmp")];
+            }),
+            ("unknown level", |c| c.start_level = "amber".to_string()),
+            ("zero interval", |c| c.interval_minutes = 0),
+            ("no zstd consent", |c| c.allow_zstd_feature = false),
+            ("policy under an hour", |c| c.policy.min_age_secs = 60),
+        ];
+        for (what, edit) in rejected {
+            assert!(enabled(edit).is_err(), "{what}");
+        }
+
+        let parsed: Config = toml::from_str(
+            "[compress]\nenabled = true\nroots = [\"/data/tmp\"]\nallow_zstd_feature = true\n\
+             start_level = \"orange\"\n[compress.policy]\nmin_age_secs = 172800\n",
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(
+            parsed.compress.start_pressure_level(),
+            Some(PressureLevel::Orange)
+        );
+        assert_eq!(parsed.compress.policy.min_age_secs, 172_800);
+        assert_eq!(
+            parsed.compress.policy.max_files,
+            CompressionPolicy::default().max_files,
+            "unset policy keys keep their defaults"
+        );
     }
 
     #[test]
