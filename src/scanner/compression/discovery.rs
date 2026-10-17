@@ -82,8 +82,12 @@ pub struct DiscoveryReport {
     pub complete: bool,
     /// Why discovery stopped before all requested work was examined.
     pub stop_reason: Option<String>,
-    /// Native bytes of the last selected path as lowercase hex, when a file
-    /// limit stopped a complete sorted prefix. Pass to `--after-hex` to resume.
+    /// Native bytes, as lowercase hex, of the path a stopped walk resumes
+    /// after: the last selected file when the file limit stopped it, else the
+    /// last path visited to completion when a directory, entry or time budget
+    /// or a failed entry stopped it. Everything sorted before it is done.
+    /// Absent when the walk completed or stopped before visiting anything.
+    /// Pass to `--after-hex` to resume.
     pub resume_after_hex: Option<String>,
 }
 
@@ -339,6 +343,10 @@ mod native {
         selection: Selection,
         pending: Vec<Task>,
         identities: BTreeSet<(u64, u64)>,
+        /// The last path visited to completion. The walk is depth-first in
+        /// sorted order, so everything sorted before it is done, and a
+        /// stopped run resumes after it.
+        last_visited: Option<PathBuf>,
     }
 
     impl Walker<'_> {
@@ -451,11 +459,12 @@ mod native {
                 return Ok(());
             }
             if metadata.is_dir() {
+                // Skipped, not a stop: a stop here would recur at the same
+                // directory on every resumed run and wedge the walk.
                 if task.depth > self.limits.max_depth {
-                    return Err(io::Error::other(format!(
-                        "discovery depth limit at {}",
-                        path.display()
-                    )));
+                    self.selection.report.complete = false;
+                    self.skip("depth_limit");
+                    return Ok(());
                 }
                 if self.selection.report.directories_opened >= self.limits.max_directories {
                     return Err(io::Error::other("discovery directory budget exhausted"));
@@ -600,6 +609,7 @@ mod native {
             },
             pending,
             identities: BTreeSet::new(),
+            last_visited: None,
         };
         while let Some(task) = walker.pending.pop() {
             if walker.selection.report.selected_files >= policy.max_files {
@@ -614,10 +624,24 @@ mod native {
                     .map(|(path, _)| crate::core::hex_lower(path.as_os_str().as_encoded_bytes()));
                 break;
             }
-            if let Err(error) = walker.visit(&task) {
-                walker.selection.report.complete = false;
-                walker.selection.report.stop_reason = Some(error.to_string());
-                break;
+            let path = walker.selection.native.roots[task.root]
+                .path
+                .join(&task.relative);
+            match walker.visit(&task) {
+                Ok(()) => walker.last_visited = Some(path),
+                Err(error) => {
+                    walker.selection.report.complete = false;
+                    walker.selection.report.stop_reason = Some(error.to_string());
+                    // Any stop (a budget, or an entry that vanished or could
+                    // not be read) resumes after the last path visited to
+                    // completion: a truncated directory read is never
+                    // claimed, and the failed entry is simply retried.
+                    walker.selection.report.resume_after_hex = walker
+                        .last_visited
+                        .as_ref()
+                        .map(|path| crate::core::hex_lower(path.as_os_str().as_encoded_bytes()));
+                    break;
+                }
             }
         }
         Ok(walker.selection)

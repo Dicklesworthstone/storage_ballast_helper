@@ -154,6 +154,77 @@ mod native_tests {
         assert_eq!(selection.report().entries_examined, 1);
     }
 
+    /// A directory budget stops with a cursor at the last path visited to
+    /// completion, so resumed runs (the daemon tier) cover the whole tree,
+    /// each file once. Before, only the file limit left a cursor, and a
+    /// budget-stopped walk restarted from the top on every run.
+    #[test]
+    fn a_budget_stop_resumes_until_the_tree_is_covered_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for sub in ["d1", "d2", "d3", "d4"] {
+            fs::create_dir(root.join(sub)).unwrap();
+            cold(&root.join(sub).join("f.bin"));
+        }
+        let mut after = None;
+        let mut seen = Vec::new();
+        let mut runs = 0;
+        loop {
+            runs += 1;
+            assert!(runs <= 8, "no progress after {runs} runs: {seen:?}");
+            let selection = scan(
+                std::slice::from_ref(&root),
+                &DiscoveryLimits {
+                    max_directories: 3,
+                    after: after.clone(),
+                    ..Default::default()
+                },
+                &policy(),
+            );
+            seen.extend(selection.paths());
+            let Some(hex) = selection.report().resume_after_hex.as_deref() else {
+                assert!(selection.report().complete);
+                break;
+            };
+            assert_eq!(
+                selection.report().stop_reason.as_deref(),
+                Some("discovery directory budget exhausted")
+            );
+            after = Some(continuation_path(hex).unwrap());
+        }
+        assert!(runs > 1, "the budget must actually stop the first run");
+        seen.sort();
+        assert_eq!(
+            seen,
+            ["d1", "d2", "d3", "d4"].map(|sub| root.join(sub).join("f.bin"))
+        );
+    }
+
+    /// A subtree past the depth limit is skipped and the walk goes on: a stop
+    /// there would recur at the same directory on every resumed run.
+    #[test]
+    fn a_too_deep_subtree_is_skipped_without_stopping_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("a/deep")).unwrap();
+        cold(&root.join("a/deep/f.bin"));
+        fs::create_dir(root.join("b")).unwrap();
+        cold(&root.join("b/f.bin"));
+        let selection = scan(
+            std::slice::from_ref(&root),
+            &DiscoveryLimits {
+                max_depth: 1,
+                ..Default::default()
+            },
+            &policy(),
+        );
+        assert_eq!(selection.paths(), [root.join("b/f.bin")]);
+        assert!(!selection.report().complete);
+        assert_eq!(selection.report().skipped.get("depth_limit"), Some(&1));
+        assert!(selection.report().stop_reason.is_none());
+        assert!(selection.report().resume_after_hex.is_none());
+    }
+
     #[test]
     fn selected_files_and_roots_are_revalidated_after_replacement() {
         let dir = tempfile::tempdir().unwrap();

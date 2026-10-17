@@ -100,10 +100,15 @@ directory contributes no selected children: the selector must read and sort the
 whole directory before treating it as an ordered prefix. Even a completed walk
 is not a filesystem snapshot; files may change afterwards.
 
-## Continue a file-count-limited selection
+## Continue a stopped selection
 
-When `--max-files` stops an otherwise complete sorted prefix, JSON includes
-`discovery.resume_after_hex`. Continue after that exact native pathname:
+When a walk stops before covering its roots, JSON includes
+`discovery.resume_after_hex`: the last selected file if `--max-files` stopped
+it, or else the last path visited to completion when an entry, directory or
+time budget or a failed entry stopped it. Everything sorted before that path
+was examined. A directory past `--max-depth` is skipped, not a stop: the walk
+continues and reports itself incomplete. Continue after that exact native
+pathname:
 
 ```sh
 sbh --json compress --discover --max-files 128 \
@@ -113,8 +118,9 @@ sbh --json compress --discover --max-files 128 \
 Use the same roots and selection filters. A continuation outside those roots is
 rejected. A continuation is only a skip hint; it never authorizes mutation or
 suppresses fresh protection checks. Rewind by omitting it to reconsider earlier
-files after the filesystem or policy changes. Entry/depth/time failures do not
-invent a continuation past unexamined work.
+files after the filesystem or policy changes. A continuation never reaches past
+unexamined work: a directory whose read was cut short is read again in full by
+the next run. The daemon tier resumes from these continuations on its own.
 
 The library selection retains discovered file stamps and pinned roots; the
 executor's `validate_file` and `validate_scope` calls are the discovered-apply

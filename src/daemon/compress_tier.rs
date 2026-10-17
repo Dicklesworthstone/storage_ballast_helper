@@ -164,13 +164,26 @@ fn run_pass(
 ) -> String {
     let policy = &config.compress.policy;
     let after = resume_after.lock().ok().and_then(|resume| resume.clone());
+    // The largest budgets discovery accepts. A resumed walk re-reads the
+    // cursor's ancestors first (a temp root can hold tens of thousands of
+    // entries), so small budgets would leave little for new ground.
     let limits = discovery::DiscoveryLimits {
+        max_entries: 1_000_000,
+        max_directories: 8192,
+        timeout_secs: 60,
         after,
         ..discovery::DiscoveryLimits::default()
     };
     let selection = match discovery::discover(roots, policy, &limits, config, platform) {
         Ok(selection) => selection,
-        Err(error) => return format!("discovery under {} root(s) failed: {error}", roots.len()),
+        Err(error) => {
+            // A cursor from other roots (the due set changed) is refused; drop
+            // it so the next pass starts from the top instead of failing too.
+            if let Ok(mut resume) = resume_after.lock() {
+                *resume = None;
+            }
+            return format!("discovery under {} root(s) failed: {error}", roots.len());
+        }
     };
     let report = selection.report();
     let next = report
