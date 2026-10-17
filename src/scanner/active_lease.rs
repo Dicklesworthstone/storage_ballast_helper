@@ -565,21 +565,38 @@ fn inspect_exact_target(target: &Path) -> Option<ActiveLeaseInspection> {
 
 #[cfg(unix)]
 fn current_state(metadata: &ActiveLeaseMetadata) -> Result<ActiveLeaseState> {
+    state_with_allocation_walk(metadata, allocated_bytes)
+}
+
+#[cfg(unix)]
+fn target_identity_matches(metadata: &ActiveLeaseMetadata) -> Result<bool> {
     let target_metadata = fs::symlink_metadata(&metadata.target)
         .map_err(|error| SbhError::io(&metadata.target, error))?;
-    if !target_metadata.is_dir()
-        || target_metadata.file_type().is_symlink()
-        || target_metadata.dev() != metadata.target_device_id
-        || target_metadata.ino() != metadata.target_inode
-    {
+    Ok(target_metadata.is_dir()
+        && !target_metadata.file_type().is_symlink()
+        && target_metadata.dev() == metadata.target_device_id
+        && target_metadata.ino() == metadata.target_inode)
+}
+
+#[cfg(unix)]
+fn state_with_allocation_walk(
+    metadata: &ActiveLeaseMetadata,
+    measure: impl FnOnce(&Path) -> Result<u64>,
+) -> Result<ActiveLeaseState> {
+    if !target_identity_matches(metadata)? {
         return Ok(ActiveLeaseState::Invalid);
     }
     let now = unix_seconds()?;
     if now >= metadata.expires_at_unix_seconds || now >= metadata.hard_expires_at_unix_seconds {
         return Ok(ActiveLeaseState::Expired);
     }
-    if allocated_bytes(&metadata.target)? > metadata.max_bytes {
+    if measure(&metadata.target)? > metadata.max_bytes {
         return Ok(ActiveLeaseState::OverQuota);
+    }
+    // A descendant can vanish because the whole target was replaced. Do not
+    // let the race-tolerant size walk turn that identity change into Active.
+    if !target_identity_matches(metadata)? {
+        return Ok(ActiveLeaseState::Invalid);
     }
     if available_bytes(&metadata.scanner_root)? < metadata.emergency_reserve_bytes {
         return Ok(ActiveLeaseState::EmergencyReserveCrossed);
@@ -832,6 +849,21 @@ fn available_bytes(path: &Path) -> Result<u64> {
 
 #[cfg(unix)]
 fn allocated_bytes(root: &Path) -> Result<u64> {
+    walk_allocated_bytes(root, |_, _| {})
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AllocationWalkStage {
+    BeforeMetadata,
+    BeforeReadDir,
+}
+
+#[cfg(unix)]
+fn walk_allocated_bytes(
+    root: &Path,
+    mut observe: impl FnMut(&Path, AllocationWalkStage),
+) -> Result<u64> {
     let mut stack = vec![root.to_path_buf()];
     let mut total = 0_u64;
     let mut entries = 0_usize;
@@ -843,14 +875,33 @@ fn allocated_bytes(root: &Path) -> Result<u64> {
                 format!("active lease target exceeds {MAX_WALK_ENTRIES} filesystem entries"),
             ));
         }
-        let metadata = fs::symlink_metadata(&path).map_err(|error| SbhError::io(&path, error))?;
+        observe(&path, AllocationWalkStage::BeforeMetadata);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if path != root && error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => return Err(SbhError::io(&path, error)),
+        };
         if metadata.file_type().is_symlink() {
             continue;
         }
         total = total.saturating_add(metadata.blocks().saturating_mul(512));
         if metadata.is_dir() {
-            for entry in fs::read_dir(&path).map_err(|error| SbhError::io(&path, error))? {
-                stack.push(entry.map_err(|error| SbhError::io(&path, error))?.path());
+            observe(&path, AllocationWalkStage::BeforeReadDir);
+            let children = match fs::read_dir(&path) {
+                Ok(children) => children,
+                Err(error) if path != root && error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => return Err(SbhError::io(&path, error)),
+            };
+            for entry in children {
+                match entry {
+                    Ok(entry) => stack.push(entry.path()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(SbhError::io(&path, error)),
+                }
             }
         }
     }
@@ -945,6 +996,143 @@ mod tests {
             watch_interval: Duration::from_millis(10),
             termination_grace: Duration::from_millis(20),
         }
+    }
+
+    #[test]
+    fn vanished_child_files_do_not_invalidate_allocation_walks() {
+        assert_vanished_child_is_tolerated(AllocationWalkStage::BeforeMetadata, false);
+    }
+
+    #[test]
+    fn vanished_child_directories_do_not_invalidate_allocation_walks() {
+        assert_vanished_child_is_tolerated(AllocationWalkStage::BeforeMetadata, true);
+        assert_vanished_child_is_tolerated(AllocationWalkStage::BeforeReadDir, true);
+    }
+
+    fn assert_vanished_child_is_tolerated(boundary: AllocationWalkStage, directory: bool) {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let target = root.join("leased");
+        let lease = ActiveLease::acquire_with_policy(
+            std::slice::from_ref(&root),
+            &target,
+            Duration::from_secs(30),
+            1024 * 1024,
+            test_policy(),
+        )
+        .unwrap();
+        let child = target.join("changing-artifact");
+        let payload = vec![7_u8; 128 * 1024];
+        if directory {
+            fs::create_dir(&child).unwrap();
+            fs::write(child.join("payload.o"), &payload).unwrap();
+        } else {
+            fs::write(&child, &payload).unwrap();
+        }
+        let stable = target.join("stable.o");
+        fs::write(&stable, vec![3_u8; 64 * 1024]).unwrap();
+        let before = allocated_bytes(&target).unwrap();
+        let retained = root.join("retained-artifact");
+        assert!(!retained.exists());
+        let mut moved = false;
+        let mut measured = 0;
+        let state = state_with_allocation_walk(lease.metadata(), |target| {
+            measured = walk_allocated_bytes(target, |path, observed_stage| {
+                if path == child && observed_stage == boundary {
+                    assert!(!moved);
+                    // Preserve every byte while making the queued descendant
+                    // disappear at the exact filesystem operation under test.
+                    fs::rename(&child, &retained).unwrap();
+                    moved = true;
+                }
+            })?;
+            Ok(measured)
+        })
+        .expect("a vanished descendant must not invalidate a live target");
+        assert_eq!(state, ActiveLeaseState::Active);
+        assert!(moved, "the interleaving must actually execute");
+        assert!(measured < before);
+        assert!(measured >= fs::metadata(&stable).unwrap().blocks() * 512);
+        let retained_payload = if directory {
+            retained.join("payload.o")
+        } else {
+            retained
+        };
+        assert_eq!(fs::read(retained_payload).unwrap(), payload);
+        assert_eq!(
+            current_state(lease.metadata()).unwrap(),
+            ActiveLeaseState::Active
+        );
+    }
+
+    #[test]
+    fn missing_allocation_root_remains_an_error() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("missing-target");
+        assert!(allocated_bytes(&root).is_err());
+    }
+
+    #[test]
+    fn allocation_walk_does_not_swallow_other_io_errors() {
+        let fixture = tempfile::tempdir().unwrap();
+        let child = fixture.path().join("changing-directory");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("payload.o"), b"preserved payload").unwrap();
+        let retained = fixture.path().join("retained-directory");
+        assert!(!retained.exists());
+        let mut changed = false;
+        let result = walk_allocated_bytes(fixture.path(), |path, stage| {
+            if path == child && stage == AllocationWalkStage::BeforeReadDir {
+                fs::rename(&child, &retained).unwrap();
+                fs::write(&child, b"now a file").unwrap();
+                changed = true;
+            }
+        });
+        assert!(changed);
+        let SbhError::Io { source, .. } = result.unwrap_err() else {
+            panic!("the real directory-open failure must remain an I/O error");
+        };
+        assert_ne!(source.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::read(retained.join("payload.o")).unwrap(),
+            b"preserved payload"
+        );
+    }
+
+    #[test]
+    fn target_replacement_during_allocation_walk_remains_invalid() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let target = root.join("leased");
+        let lease = ActiveLease::acquire_with_policy(
+            std::slice::from_ref(&root),
+            &target,
+            Duration::from_secs(30),
+            1024 * 1024,
+            test_policy(),
+        )
+        .unwrap();
+        let child = target.join("artifact.o");
+        fs::write(&child, b"preserved source witness").unwrap();
+        let retained = root.join("retained-target");
+        assert!(!retained.exists());
+        let mut replaced = false;
+        let state = state_with_allocation_walk(lease.metadata(), |target| {
+            walk_allocated_bytes(target, |path, stage| {
+                if path == child && stage == AllocationWalkStage::BeforeMetadata {
+                    fs::rename(target, &retained).unwrap();
+                    fs::create_dir(target).unwrap();
+                    replaced = true;
+                }
+            })
+        })
+        .unwrap();
+        assert!(replaced);
+        assert_eq!(state, ActiveLeaseState::Invalid);
+        assert_eq!(
+            fs::read(retained.join("artifact.o")).unwrap(),
+            b"preserved source witness"
+        );
     }
 
     #[test]

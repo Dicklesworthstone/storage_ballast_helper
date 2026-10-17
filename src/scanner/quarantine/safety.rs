@@ -16,6 +16,9 @@ use super::{
 };
 use crate::core::errors::{Result, SbhError};
 
+#[path = "purge.rs"]
+mod confined_purge;
+
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 
 fn invalid(message: &str) -> io::Error {
@@ -61,7 +64,33 @@ fn remove_file_if_present(path: &Path) -> io::Result<()> {
 // Lock the directory itself: this needs no lock-file allocation at ENOSPC,
 // works across daemon/CLI processes, and disappears on process death. Never
 // unlink a lock inode or wait indefinitely behind a slow pressure drain.
-fn lock_store(root: &Path) -> io::Result<File> {
+struct StoreLock {
+    file: File,
+    owner_pid: u32,
+}
+
+impl std::ops::Deref for StoreLock {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.owner_pid == std::process::id() {
+            // Closing alone leaves the flock held by any inherited copy of
+            // the open file description. End THIS process's lock scope even
+            // if a child is still between fork and exec. An inherited guard
+            // in a different PID must not unlock its parent's active scope.
+            let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+        }
+    }
+}
+
+fn lock_store(root: &Path) -> io::Result<StoreLock> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -70,7 +99,10 @@ fn lock_store(root: &Path) -> io::Result<File> {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(root)?;
         rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
-        Ok(file)
+        Ok(StoreLock {
+            file,
+            owner_pid: std::process::id(),
+        })
     }
     #[cfg(not(unix))]
     {
@@ -386,26 +418,20 @@ pub(super) fn purge(store: &QuarantineStore, id: &str) -> Result<u64> {
         store.clear_stuck(id);
         return Ok(0);
     };
-    let metadata =
-        payload_metadata(store, &record).map_err(|e| SbhError::io(&record.quarantine_path, e))?;
-    let bytes = if let Some(metadata) = metadata {
-        // Only the recorded payload is authorized, not arbitrary siblings
-        // subsequently placed in the decision directory.
-        let result = if metadata.is_dir() {
-            fs::remove_dir_all(&record.quarantine_path)
-        } else {
-            fs::remove_file(&record.quarantine_path)
-        };
-        result.map_err(|e| SbhError::io(&record.quarantine_path, e))?;
+    // Resolve the payload from the locked store descriptor, not a pathname
+    // checked earlier. Nested mounts are not part of a quarantined artifact.
+    // On refusal keep its manifest so later drains/undo can recover what
+    // remains; never fall back to unrestricted recursive removal.
+    let removed = confined_purge::remove_payload(&lock, &record)
+        .map_err(|e| SbhError::io(&record.quarantine_path, e))?;
+    let bytes = if removed {
         record.size_bytes
     } else {
         // Interrupted cleanup or a prior undo did not free these bytes now.
         0
     };
-    // Persist the payload removal before dropping its recovery record. A
-    // crash must not resurrect a payload after its manifest has disappeared.
-    sync_existing_directory(&store.entry_dir(id))
-        .map_err(|e| SbhError::io(store.entry_dir(id), e))?;
+    // The confined remover synced the opened payload parent before this
+    // point, including an already-absent payload from an interrupted purge.
     remove_records(store, id).map_err(|e| SbhError::io(store.record_path(id), e))?;
     let _ = fs::remove_dir(store.entry_dir(id));
     lock.sync_all().map_err(|e| SbhError::io(store.root(), e))?;
@@ -694,6 +720,62 @@ mod tests {
         drop(lock);
         store.restore("locked", false).unwrap();
         assert!(record.original_path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_the_guard_releases_its_lock_while_an_inherited_child_fd_stays_open() {
+        struct Holder(std::process::Child);
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (store, record) = held(dir.path(), "inherited");
+        let lock = lock_store(store.root()).unwrap();
+        // stdin deliberately retains this same open file description across
+        // exec. The real holder process outlives the parent's lock scope.
+        let mut child = Holder(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "printf ready; exec /bin/sleep 60"])
+                .stdin(std::process::Stdio::from(lock.try_clone().unwrap()))
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut stdout = child.0.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut ready = [0u8; 5];
+            let result = stdout.read_exact(&mut ready).map(|()| ready);
+            let _ = ready_tx.send(result);
+        });
+        assert_eq!(
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            *b"ready"
+        );
+        reader.join().unwrap();
+        assert_eq!(
+            lock_store(store.root()).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock,
+            "the active guard still excludes a competing operation"
+        );
+        assert!(record.quarantine_path.exists());
+        drop(lock);
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "holder is still alive"
+        );
+        store.restore("inherited", false).unwrap();
+        assert_eq!(fs::read(&record.original_path).unwrap(), b"original bytes");
+        assert!(!record.quarantine_path.exists());
+        assert!(store.record("inherited").unwrap().is_none());
+        assert!(child.0.try_wait().unwrap().is_none());
     }
 
     #[test]

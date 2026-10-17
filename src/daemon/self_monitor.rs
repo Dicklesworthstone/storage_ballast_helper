@@ -501,7 +501,8 @@ pub struct DaemonState {
     pub threads: ThreadsState,
     /// CPU time (user + system) the daemon has consumed, seconds.
     pub cpu_secs_total: f64,
-    /// The CPU budget (Q7): configured percent, last-minute use, deficit.
+    /// The CPU budget (Q7): the percent being paced at (the configured one
+    /// scaled by the behavior mode), last-minute use, deficit.
     #[serde(default)]
     pub cpu_budget: CpuBudgetState,
     /// Why the whole daemon is idle, when every mount is observe-only or
@@ -553,6 +554,9 @@ pub struct BallastPoolState {
     /// Observed release effectiveness EWMA (eta_m): delta_free / bytes_released (bd-rc-master-ajg1.9.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_efficiency: Option<f64>,
+    /// Physical inventory observation used to retain release credit on restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_history: Option<crate::ballast::release::BallastReleaseHistory>,
 }
 
 /// One path in the last VOI scan plan, as the dashboard's overlay lists it.
@@ -1720,6 +1724,7 @@ mod tests {
                 skipped: false,
                 skip_reason: None,
                 release_efficiency: None,
+                release_history: None,
             }],
             ..Default::default()
         };

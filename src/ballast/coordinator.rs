@@ -393,6 +393,11 @@ impl BallastPoolCoordinator {
         platform: &dyn Platform,
         configured_ballast_dir: Option<&Path>,
     ) -> Result<PoolPlan> {
+        // Resolve an operator-selected directory alias at the configuration
+        // boundary, before choosing its volume. The manager still opens the
+        // resulting real pool with O_NOFOLLOW and verifies every slot's identity.
+        let bound_configured_dir = configured_ballast_dir.map(resolve_configured_pool_alias);
+        let configured_ballast_dir = bound_configured_dir.as_deref();
         let mounts = platform.mount_points()?;
         let mut planned = Vec::new();
         let mut skipped_pools = HashMap::new();
@@ -754,6 +759,14 @@ impl BallastPoolCoordinator {
 }
 
 // ──────────────────── helpers ────────────────────
+
+fn resolve_configured_pool_alias(path: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
 
 /// Build the per-volume `BallastConfig` for one mount, applying any
 /// per-volume file-count / file-size overrides for that mount.

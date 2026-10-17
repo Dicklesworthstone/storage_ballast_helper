@@ -33,7 +33,7 @@ use crate::daemon::control::{
     BallastAction as ControlBallastAction, ControlBackend, ControlCommand, ControlResponse,
     ControlServer, Peer, PolicyAction, persist_policy_mode,
 };
-use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD, PassCpuGuard};
+use crate::daemon::cpu_budget::{CpuBudget, MAX_TICK_YIELD, PassCpuGuard, paced_pct};
 use crate::daemon::mount_controller::{
     IdleReason, MountController, MountControllerConfig, MountState, MountStateRecord, MountSurface,
     MountTickInput, ReserveBurst, ReserveState, WakeSignals, global_tick,
@@ -2870,8 +2870,25 @@ impl MonitoringDaemon {
         }
 
         // 7. Release controller.
-        let release_controller =
+        let mut release_controller =
             BallastReleaseController::new(config.ballast.replenish_cooldown_minutes);
+        if let Ok(previous) = SelfMonitor::read_state(&config.paths.state_file) {
+            for saved in previous.ballast_pools {
+                let mount = PathBuf::from(&saved.mount);
+                let Some(pool) = ballast_coordinator.pool_for_mount(&mount) else {
+                    continue;
+                };
+                if saved.skipped {
+                    continue;
+                }
+                if let Some(history) = saved.release_history
+                    && release_controller.restore_pool_history(&mount, &pool.ballast_dir, history)
+                    && let Some(efficiency) = saved.release_efficiency
+                {
+                    release_controller.set_release_efficiency(&mount, efficiency);
+                }
+            }
+        }
 
         // 8. Scoring engine.
         let scoring_engine =
@@ -2943,7 +2960,10 @@ impl MonitoringDaemon {
         // (config load, ballast discovery) is not charged to the first tick.
         let cpu_budget = Arc::new(Mutex::new(
             CpuBudget::new(
-                config.telemetry.cpu_budget_pct,
+                paced_pct(
+                    config.telemetry.cpu_budget_pct,
+                    behavior_state.mode.scan_aggressiveness,
+                ),
                 Instant::now(),
                 self_monitor.current_cpu_secs(),
             )
@@ -3218,6 +3238,10 @@ impl MonitoringDaemon {
             BehaviorUpdate::Applied(transition) => {
                 self.shared_executor_config
                     .set_min_certainty(min_certainty_for(transition.to_mode.cleanup_action));
+                self.cpu_budget.lock().set_pct(paced_pct(
+                    self.config.telemetry.cpu_budget_pct,
+                    transition.to_mode.scan_aggressiveness,
+                ));
                 let message = format!(
                     "behavior mode changed source={source} latency_ms={} memory={:?}->{:?} \
                      disk={:?}->{:?} mode=({}) -> ({})",
@@ -3477,6 +3501,9 @@ impl MonitoringDaemon {
         }
         let mut pools = Vec::new();
         for mount in mounts {
+            if let Some(pool) = self.ballast_coordinator.pool_for_mount(&mount) {
+                self.release_controller.bind_pool(&mount, &pool.ballast_dir);
+            }
             // Operator-driven changes are logged like the daemon's own so the
             // Timeline and `sbh stats` see them; the release controller is
             // told too, so an operator's release is not refilled at once.
@@ -3647,30 +3674,40 @@ impl MonitoringDaemon {
             .ballast_coordinator
             .inventory()
             .into_iter()
-            .map(|pool| super::self_monitor::BallastPoolState {
-                mount: pool.mount_point.display().to_string(),
-                ballast_dir: pool.ballast_dir.display().to_string(),
-                fs_type: pool.fs_type,
-                strategy: match pool.strategy {
-                    super::super::ballast::coordinator::ProvisionStrategy::Fallocate => {
-                        "fallocate".to_string()
-                    }
-                    super::super::ballast::coordinator::ProvisionStrategy::RandomData => {
-                        "random_data".to_string()
-                    }
-                    super::super::ballast::coordinator::ProvisionStrategy::Skip => {
-                        "skip".to_string()
-                    }
-                },
-                available: pool.files_available,
-                total: pool.files_total,
-                releasable_bytes: pool.releasable_bytes,
-                skipped: pool.skipped,
-                skip_reason: pool.skip_reason,
-                release_efficiency: Some(
-                    self.release_controller
-                        .release_efficiency(&pool.mount_point),
-                ),
+            .map(|pool| {
+                // Bind/reset the physical observation before serializing its
+                // efficiency, so a replacement cannot inherit the old eta.
+                let release_history = self.release_controller.pool_history(
+                    &pool.mount_point,
+                    &pool.ballast_dir,
+                    pool.files_available,
+                );
+                super::self_monitor::BallastPoolState {
+                    mount: pool.mount_point.display().to_string(),
+                    ballast_dir: pool.ballast_dir.display().to_string(),
+                    fs_type: pool.fs_type,
+                    strategy: match pool.strategy {
+                        super::super::ballast::coordinator::ProvisionStrategy::Fallocate => {
+                            "fallocate".to_string()
+                        }
+                        super::super::ballast::coordinator::ProvisionStrategy::RandomData => {
+                            "random_data".to_string()
+                        }
+                        super::super::ballast::coordinator::ProvisionStrategy::Skip => {
+                            "skip".to_string()
+                        }
+                    },
+                    available: pool.files_available,
+                    total: pool.files_total,
+                    releasable_bytes: pool.releasable_bytes,
+                    skipped: pool.skipped,
+                    skip_reason: pool.skip_reason,
+                    release_efficiency: Some(
+                        self.release_controller
+                            .release_efficiency(&pool.mount_point),
+                    ),
+                    release_history,
+                }
             })
             .collect();
         pools.sort_by(|a, b| a.mount.cmp(&b.mount));
@@ -5117,6 +5154,9 @@ impl MonitoringDaemon {
         mount: &Path,
         response: &crate::monitor::pid::PressureResponse,
     ) {
+        if let Some(pool) = self.ballast_coordinator.pool_for_mount(mount) {
+            self.release_controller.bind_pool(mount, &pool.ballast_dir);
+        }
         let fs_type = self
             .fs_collector
             .collect(mount)
@@ -5225,6 +5265,8 @@ impl MonitoringDaemon {
         else {
             return false;
         };
+        self.release_controller
+            .bind_pool(mount, &pool_info.ballast_dir);
         if !self.release_controller.is_ready_for_replenish(
             mount,
             level,
@@ -5276,6 +5318,7 @@ impl MonitoringDaemon {
         };
         let available = pool.available_count();
         let expected = pool.expected_count();
+        self.release_controller.bind_pool(mount, &pool.ballast_dir);
         let count = self
             .release_controller
             .files_to_release(mount, response, available, expected);
@@ -5911,10 +5954,8 @@ impl MonitoringDaemon {
                         &new_config.scoring,
                         new_config.scanner.min_file_age_minutes,
                     );
-                    self.release_controller = BallastReleaseController::new(
-                        new_config.ballast.replenish_cooldown_minutes,
-                    );
-                    self.release_controller.reset();
+                    self.release_controller
+                        .set_replenish_cooldown(new_config.ballast.replenish_cooldown_minutes);
                     let discovery_paths =
                         ballast_discovery_paths(&new_config, &self.special_locations);
                     match BallastPoolCoordinator::discover_inner(
@@ -6022,7 +6063,10 @@ impl MonitoringDaemon {
                         .update_config(&new_config.notifications);
                     {
                         let mut budget = self.cpu_budget.lock();
-                        budget.set_pct(new_config.telemetry.cpu_budget_pct);
+                        budget.set_pct(paced_pct(
+                            new_config.telemetry.cpu_budget_pct,
+                            self.behavior_state.mode.scan_aggressiveness,
+                        ));
                         budget.set_burst_secs(new_config.telemetry.cpu_budget_burst_secs);
                     }
 
@@ -6717,9 +6761,19 @@ fn replay_indexed_record(
     };
     #[cfg(not(unix))]
     let allocated = meta.len();
+    // Records written before 0.6.18 could carry the pre-scan's nomination
+    // floor instead of a measured size; exactly the floor means "never
+    // measured", so measure it now rather than dispatch and report 100 MiB.
+    let size_estimate = if meta.is_dir()
+        && record.size_estimate_bytes == crate::scanner::walker::OPAQUE_CANDIDATE_SIZE_FLOOR
+    {
+        prescan_dir_size(path, scanner_config.cross_devices, &AtomicBool::new(false))
+    } else {
+        record.size_estimate_bytes
+    };
     let input = CandidateInput {
         path: path.clone(),
-        size_bytes: record.size_estimate_bytes.max(allocated),
+        size_bytes: size_estimate.max(allocated),
         age: adjusted_candidate_age(
             age,
             scanner_config.min_file_age_minutes,
@@ -8005,6 +8059,15 @@ fn scanner_thread_main(
                                 current_scanner_config.follow_symlinks,
                             )
                             .ok();
+                            // Before the index record is made: the record's
+                            // size is what every later replay dispatches and
+                            // reports. Recording the 100 MiB nomination floor
+                            // made fmd log 73 GB "freed" for a few MB of tiny
+                            // node_modules (2026-09-29), and the byte target
+                            // counted that fiction as progress.
+                            if let Some(measured) = measured_size {
+                                score.size_bytes = measured;
+                            }
                             let mut scanner_index_backoff_active = false;
                             if scanner_index_enabled {
                                 match CandidateIndexRecord::from_candidate_score(
@@ -10468,6 +10531,14 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn prescan_over_a_large_tree_yields_candidates_and_moves_the_cursor() {
+        struct PassObservation {
+            dispatched: Vec<PathBuf>,
+            candidates: usize,
+            indexed: std::collections::BTreeSet<PathBuf>,
+            walker_entries: usize,
+            walker_targets: usize,
+            replayed: usize,
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("scan-root");
         // 600 repositories, each with a nested `target/debug` the pre-scan
@@ -10494,8 +10565,7 @@ mod tests {
         let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        // (dispatched candidate paths, candidates the pass found, timed out)
-        let run_pass = |pass: usize| -> (Vec<PathBuf>, usize, bool) {
+        let run_pass = |pass: usize| -> PassObservation {
             let (logger, logger_join) = spawn_logger(DualLoggerConfig {
                 sqlite_path: None,
                 jsonl_config: crate::logger::jsonl::JsonlConfig {
@@ -10566,16 +10636,52 @@ mod tests {
             }
             logger.shutdown();
             logger_join.join().unwrap();
-            (dispatched, candidates_found, timed_out)
+            let checkpoint: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&scanner_index_path).unwrap()).unwrap();
+            let completion_log =
+                std::fs::read_to_string(temp.path().join(format!("activity-{pass}.jsonl")))
+                    .unwrap();
+            let completions: Vec<serde_json::Value> = completion_log
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .filter(|event: &serde_json::Value| event["event"] == "scan_complete")
+                .collect();
+            assert_eq!(completions.len(), 1, "one request completes exactly once");
+            let details = completions[0]["details"].as_str().unwrap();
+            let field = |name: &str| {
+                details
+                    .split_whitespace()
+                    .find_map(|part| part.split_once('=').filter(|(key, _)| *key == name))
+                    .unwrap()
+                    .1
+            };
+            assert_eq!(
+                field("candidates").parse::<usize>().unwrap(),
+                candidates_found
+            );
+            assert_eq!(field("timed_out").parse::<bool>().unwrap(), timed_out);
+            let records: Vec<CandidateIndexRecord> =
+                serde_json::from_value(checkpoint["records"].clone()).unwrap();
+            let indexed: std::collections::BTreeSet<_> =
+                records.iter().map(|record| record.path.clone()).collect();
+            assert_eq!(indexed.len(), records.len(), "no duplicate indexed paths");
+            PassObservation {
+                dispatched,
+                candidates: candidates_found,
+                indexed,
+                walker_entries: field("paths_scanned").parse().unwrap(),
+                walker_targets: field("opaque_pruned_dirs").parse().unwrap(),
+                replayed: field("replayed_records").parse().unwrap(),
+            }
         };
 
-        let (first_dispatched, first_candidates, _) = run_pass(1);
+        let first = run_pass(1);
         assert!(
-            !first_dispatched.is_empty(),
+            !first.dispatched.is_empty(),
             "a pre-scan must dispatch what it found, never an empty set"
         );
         assert!(
-            first_candidates > 0,
+            first.candidates > 0,
             "a pre-scan must report the candidates it reached, timed out or not"
         );
         let after_first = PrescanCursor::load(&prescan_cursor_path);
@@ -10585,9 +10691,9 @@ mod tests {
             "the pre-scan must record where it stopped"
         );
 
-        let (second_dispatched, second_candidates, _) = run_pass(2);
+        let second = run_pass(2);
         let after_second = PrescanCursor::load(&prescan_cursor_path);
-        assert!(second_candidates > 0, "the second pass must also find work");
+        assert!(second.candidates > 0, "the second pass must also find work");
         match after_first.position() {
             (_, Some(resume_point)) => {
                 // Pass 1 was truncated: pass 2's pre-scan picks up strictly
@@ -10611,28 +10717,70 @@ mod tests {
                 }
                 if resume_point.as_path() < root.join("repo-0599").as_path() {
                     assert!(
-                        second_dispatched
+                        second
+                            .dispatched
                             .iter()
                             .any(|path| path.as_path() > resume_point.as_path()),
                         "pass 2 must dispatch targets beyond pass 1's resume point ({}): \
-                         {second_dispatched:?}",
-                        resume_point.display()
+                         {:?}",
+                        resume_point.display(),
+                        second.dispatched
                     );
                 }
             }
             (root_after, None) => {
                 // Pass 1 covered the whole root: it must have found every
                 // target, and the cursor wrapped back to the root's start.
-                // On macOS the FSEvents startup replan marks the root dirty,
-                // so the walk reconciles after the pre-scan and counts each
-                // target again (README "What feeds the index").
-                let expected = if cfg!(target_os = "macos") { 1200 } else { 600 };
+                let expected_paths: std::collections::BTreeSet<_> = (0..600)
+                    .map(|index| root.join(format!("repo-{index:04}/target")))
+                    .collect();
                 assert_eq!(
-                    first_candidates, expected,
-                    "a completed pre-scan finds every target"
+                    first.indexed, expected_paths,
+                    "every distinct target is indexed"
+                );
+                assert_eq!(
+                    first.replayed, 0,
+                    "a fresh index cannot replay prior records"
+                );
+                // Reconciliation is a runtime decision on either OS. With
+                // this fixture a walk visits one repo and one opaque target
+                // per repository, and counts the same targets a second time.
+                if first.walker_entries == 0 {
+                    assert_eq!(first.walker_targets, 0);
+                } else {
+                    assert_eq!(
+                        first.walker_entries, 1200,
+                        "the walk covers the entire fixture"
+                    );
+                    assert_eq!(
+                        first.walker_targets, 600,
+                        "the walk sees every opaque target"
+                    );
+                }
+                assert_eq!(
+                    first.candidates,
+                    600 + first.walker_targets,
+                    "candidate observations equal the pre-scan plus the actual walk"
                 );
                 assert_eq!(root_after, Some(root.as_path()));
             }
+        }
+    }
+
+    /// `size_estimate_bytes` of the scanner-index record for `path`,
+    /// wherever it sits in the persisted JSON.
+    fn recorded_size(value: &serde_json::Value, path: &str) -> Option<u64> {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("path").and_then(serde_json::Value::as_str) == Some(path) {
+                    return map
+                        .get("size_estimate_bytes")
+                        .and_then(serde_json::Value::as_u64);
+                }
+                map.values().find_map(|v| recorded_size(v, path))
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(|v| recorded_size(v, path)),
+            _ => None,
         }
     }
 
@@ -10754,6 +10902,16 @@ mod tests {
             target.size_bytes < crate::scanner::walker::OPAQUE_CANDIDATE_SIZE_FLOOR,
             "a near-empty target must be planned at its real size: {}",
             target.size_bytes
+        );
+        // So is the index record every later replay dispatches from: it was
+        // written with the floor, and fmd reported 73 GB freed for a few MB.
+        let index: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&scanner_index_path).unwrap()).unwrap();
+        let recorded = recorded_size(&index, &target_dir.to_string_lossy())
+            .expect("the target is recorded in the scanner index");
+        assert!(
+            recorded < crate::scanner::walker::OPAQUE_CANDIDATE_SIZE_FLOOR,
+            "the index must record the measured size, not the nomination floor: {recorded}"
         );
 
         logger.shutdown();

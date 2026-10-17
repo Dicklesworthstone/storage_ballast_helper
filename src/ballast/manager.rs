@@ -2,9 +2,8 @@
 //!
 //! Ballast files are named `SBH_BALLAST_FILE_NNNNN.dat` and contain a 4096-byte
 //! JSON header followed by reserved data blocks. On platforms with native
-//! preallocation, provisioning uses the PAL for instant allocation; on CoW
-//! filesystems (btrfs, zfs), random data is written in 4 MB chunks to defeat
-//! deduplication.
+//! preallocation, provisioning uses the PAL through an exclusively owned file
+//! descriptor; on CoW filesystems, random data is written in 4 MB chunks.
 //!
 //! Access to the ballast directory is serialized via `flock()` on a lockfile so
 //! concurrent daemon + CLI operations don't race.
@@ -28,7 +27,10 @@ use crate::core::errors::{Result, SbhError};
 use crate::platform::pal::Platform;
 
 mod admission;
+mod creation;
 mod emergency;
+mod observation;
+mod repair;
 
 // ──────────────────── constants ────────────────────
 
@@ -163,8 +165,10 @@ impl BallastHealth {
     /// Evaluate pool health from the configured pool size and the bytes that
     /// releasing every inventoried file would actually free.
     ///
-    /// Integrity-corrupt files still count toward `releasable_bytes`:
-    /// deleting a file frees its on-disk bytes regardless of header state.
+    /// Integrity-corrupt configured slots still count toward `releasable_bytes`:
+    /// deleting them frees their on-disk bytes regardless of header state.
+    /// Surplus files outside the configured slots require a valid header before
+    /// inventory may treat them as ballast at all.
     #[must_use]
     pub fn evaluate(configured_pool_bytes: u64, releasable_bytes: u64) -> Self {
         if configured_pool_bytes == 0 {
@@ -199,10 +203,9 @@ impl std::fmt::Display for BallastHealth {
 
 /// Read-only snapshot of a ballast pool's actual availability (#16).
 ///
-/// Unlike [`BallastManager::new`], observing never creates the pool
-/// directory and never prunes orphans, so it is safe to call from read-only
-/// surfaces (`sbh status`, `sbh check`, `sbh doctor`) even on a full or
-/// read-only filesystem.
+/// Like [`BallastManager::new`], observing never creates the pool directory and
+/// never prunes orphans, so it is safe to call from read-only surfaces (`sbh
+/// status`, `sbh check`, `sbh doctor`) even on a full or read-only filesystem.
 #[derive(Debug, Clone)]
 pub struct BallastAvailability {
     /// Configured number of ballast files.
@@ -211,19 +214,23 @@ pub struct BallastAvailability {
     pub configured_file_size_bytes: u64,
     /// Configured total pool size (`count × size`, saturating).
     pub configured_pool_bytes: u64,
-    /// Ballast files currently present on disk.
+    /// Independently releasable regular ballast files currently present.
+    /// On Unix this includes verified surplus beyond the configured slots.
     pub available_count: usize,
-    /// Configured files confirmed absent (released or lost).
+    /// Configured slots confirmed absent or unusable by managed release.
     ///
-    /// Only counts files whose `stat` returned `NotFound`. Files that could not
-    /// be inspected at all are counted in `unreadable_count` instead, so a
-    /// permission failure is never reported as a missing reserve.
+    /// Includes links, non-regular files and foreign-device slots. Files that
+    /// could not be inspected are counted in `unreadable_count` instead, so a
+    /// permission failure is never reported as a missing reserve. Surplus does
+    /// not erase a missing configured slot from this count.
     pub missing_count: usize,
-    /// Configured files whose presence could not be determined, because `stat`
-    /// failed for a reason other than "not found" (permission denied, I/O
-    /// error). Non-zero means this snapshot is not authoritative.
+    /// Configured or surplus files whose state could not be determined because
+    /// inspection failed (permission denied, I/O error, concurrent replacement).
+    /// At least one is recorded when directory enumeration fails and the exact
+    /// number is unknown. Non-zero means this snapshot is not authoritative.
     pub unreadable_count: usize,
-    /// Bytes that releasing every present file would free.
+    /// Conservative allocation estimate, capped by logical length. Snapshots
+    /// may retain blocks after unlink; this is not a guaranteed free-space delta.
     pub releasable_bytes: u64,
     /// Overall pool health derived from the fields above.
     pub health: BallastHealth,
@@ -233,54 +240,12 @@ impl BallastAvailability {
     /// Observe the pool at `ballast_dir` without mutating anything.
     #[must_use]
     pub fn observe(ballast_dir: &Path, config: &BallastConfig) -> Self {
-        let configured_pool_bytes =
-            (config.file_count as u64).saturating_mul(config.file_size_bytes);
-        let mut available_count = 0usize;
-        let mut missing_count = 0usize;
-        let mut unreadable_count = 0usize;
-        let mut releasable_bytes = 0u64;
-        for i in 1..=config.file_count {
-            let path = ballast_dir.join(ballast_file_name(i as u32));
-            match fs::metadata(&path) {
-                Ok(meta) if meta.is_file() => {
-                    available_count += 1;
-                    releasable_bytes = releasable_bytes.saturating_add(meta.len());
-                }
-                // Path exists but is not a regular file: the reserve slot is
-                // genuinely unusable, which is a real absence.
-                Ok(_) => missing_count += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing_count += 1,
-                // Permission denied, I/O error, and friends: we simply do not
-                // know. Never fold this into `missing`.
-                Err(_) => unreadable_count += 1,
-            }
-        }
-        let health = if configured_pool_bytes == 0 {
-            // No reserve is configured, so readability of the directory is
-            // irrelevant — reporting `Indeterminate` here would send an operator
-            // off to sudo-inspect a pool that is absent by design.
-            // `Unconfigured` outranks `Indeterminate`.
-            BallastHealth::Unconfigured
-        } else if unreadable_count > 0 {
-            BallastHealth::Indeterminate
-        } else {
-            BallastHealth::evaluate(configured_pool_bytes, releasable_bytes)
-        };
-        Self {
-            configured_count: config.file_count,
-            configured_file_size_bytes: config.file_size_bytes,
-            configured_pool_bytes,
-            available_count,
-            missing_count,
-            unreadable_count,
-            releasable_bytes,
-            health,
-        }
+        observation::observe(ballast_dir, config)
     }
 
-    /// Whether this snapshot is authoritative (every configured slot was
-    /// successfully inspected). Callers should avoid asserting that the reserve
-    /// is gone when this is `false`.
+    /// Whether configured slots and surplus discovery were successfully
+    /// inspected. Callers should avoid asserting that the reserve is gone when
+    /// this is `false`; unknown surplus is not proof of an empty pool.
     #[must_use]
     pub const fn is_authoritative(&self) -> bool {
         self.unreadable_count == 0
@@ -394,6 +359,10 @@ pub struct BallastManager {
     /// Percent of the volume that must remain free after each ballast file
     /// is created. See [`DEFAULT_PROVISION_FLOOR_PCT`].
     provision_floor_pct: f64,
+    /// Last controller observation for this manager's physical directory.
+    /// A fresh controller can retain actual release credit without treating
+    /// never-provisioned configured slots as releases.
+    release_history: Option<super::release::BallastReleaseHistory>,
 }
 
 /// Outcome of the per-file headroom check.
@@ -430,15 +399,16 @@ impl BallastManager {
             platform,
             skip_fallocate: false,
             provision_floor_pct: DEFAULT_PROVISION_FLOOR_PCT,
+            release_history: None,
         };
         mgr.scan_existing();
         Ok(mgr)
     }
 
-    /// Ballast files in the pool directory whose index is outside
-    /// `1..=file_count` (left behind by a smaller `file_count`, or foreign).
-    /// Reported by `status`; removed only by `provision`/`replenish` under
-    /// the lock.
+    /// Files in the pool directory whose index is outside `1..=file_count`
+    /// (left behind by a smaller `file_count`, or foreign). Reported by status
+    /// and pruned by provisioning under the lock. On Unix, verified surplus
+    /// ballast is also inventoried and may be used for emergency release.
     #[must_use]
     pub fn orphans(&self) -> Vec<PathBuf> {
         orphan_ballast_files(&self.ballast_dir, self.config.file_count)
@@ -454,19 +424,34 @@ impl BallastManager {
         &self.config
     }
 
-    /// Current inventory of ballast files.
+    /// Current inventory of releasable files, including verified Unix surplus.
     pub fn inventory(&self) -> &[BallastFile] {
         &self.inventory
     }
 
     /// How many bytes can be released (sum of all inventoried files).
     pub fn releasable_bytes(&self) -> u64 {
-        self.inventory.iter().map(|f| f.size).sum()
+        self.inventory
+            .iter()
+            .map(|file| file.size)
+            .fold(0_u64, u64::saturating_add)
     }
 
-    /// Number of ballast files currently available.
+    /// Number of ballast files currently available, not configured capacity.
     pub fn available_count(&self) -> usize {
         self.inventory.len()
+    }
+
+    pub(crate) fn release_history(&self) -> Option<super::release::BallastReleaseHistory> {
+        self.release_history
+            .filter(|history| history.matches_pool(&self.ballast_dir))
+    }
+
+    pub(crate) fn remember_release_history(
+        &mut self,
+        history: Option<super::release::BallastReleaseHistory>,
+    ) {
+        self.release_history = history.filter(|history| history.matches_pool(&self.ballast_dir));
     }
 
     /// Configured total pool size (`file_count × file_size_bytes`, saturating).
@@ -479,14 +464,14 @@ impl BallastManager {
         BallastHealth::evaluate(self.configured_pool_bytes(), self.releasable_bytes())
     }
 
-    /// Update configuration at runtime.
+    /// Update configuration at runtime without creating or deleting files.
     ///
-    /// Files above a lowered `file_count` become orphans; they are reported
-    /// by `orphans()` and removed by the next provision/replenish under the
-    /// lock, never here (this runs unlocked on config reload).
+    /// On Unix, verified files above a lowered `file_count` remain physical
+    /// reserve in the inventory even though they are also reported as orphans.
+    /// Lowering or disabling future provisioning must not hide emergency space.
     pub fn update_config(&mut self, config: BallastConfig) {
         self.config = config;
-        // Re-scan inventory to reflect new file count limits.
+        // Revalidate configured slots and any independently verified surplus.
         self.scan_existing();
     }
 
@@ -599,10 +584,9 @@ impl BallastManager {
             let index = i as u32;
             let path = self.file_path(index);
 
-            // A damaged reserve is still emergency space. Do not remove it
-            // until the replacement has passed the live headroom check.
-            let replace_existing = path.exists();
-            if replace_existing && self.verify_single_file(&path, index).is_ok() {
+            // A damaged reserve is still emergency space. Repair it in place
+            // only after the full replacement allocation passes headroom.
+            if path.exists() && self.verify_single_file(&path, index).is_ok() {
                 report.files_skipped += 1;
                 continue;
             }
@@ -625,19 +609,6 @@ impl BallastManager {
                         .errors
                         .push(format!("file {index}: headroom probe failed: {error}"));
                     break;
-                }
-            }
-
-            if replace_existing {
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => {
-                        report.errors.push(format!(
-                            "file {index}: cannot replace existing reserve: {error}"
-                        ));
-                        break;
-                    }
                 }
             }
 
@@ -667,7 +638,8 @@ impl BallastManager {
     ///
     /// On Unix, use the existing pool lock without allocating or waiting for a
     /// provisioner. Inventory is refreshed under that lock and only successful
-    /// removals consume the quota. A busy pool can be retried on a later tick.
+    /// removals consume the quota, including verified surplus after a target
+    /// change. A busy pool can be retried on a later tick.
     pub fn release(&mut self, count: usize) -> Result<ReleaseReport> {
         emergency::release(self, count)
     }
@@ -771,9 +743,8 @@ impl BallastManager {
             let index = i as u32;
             let path = self.file_path(index);
 
-            // Keep the existing reserve when no replacement can safely fit.
-            let replace_existing = path.exists();
-            if replace_existing && self.verify_single_file(&path, index).is_ok() {
+            // Keep the existing reserve linked throughout an admitted repair.
+            if path.exists() && self.verify_single_file(&path, index).is_ok() {
                 report.files_skipped += 1;
                 continue;
             }
@@ -796,19 +767,6 @@ impl BallastManager {
                         .errors
                         .push(format!("file {index}: headroom probe failed: {error}"));
                     break;
-                }
-            }
-
-            if replace_existing {
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => {
-                        report.errors.push(format!(
-                            "file {index}: cannot replace existing reserve: {error}"
-                        ));
-                        break;
-                    }
                 }
             }
 
@@ -849,32 +807,7 @@ impl BallastManager {
     }
 
     fn scan_existing(&mut self) {
-        self.inventory.clear();
-        for i in 1..=self.config.file_count {
-            let index = i as u32;
-            let path = self.file_path(index);
-            if path.exists() {
-                let integrity_ok = self.verify_single_file(&path, index).is_ok();
-                let size = fs::metadata(&path).map_or(0, |m| m.len());
-                let created_at = fs::metadata(&path)
-                    .ok()
-                    .and_then(|m| m.created().ok())
-                    .map(|t| {
-                        let dt: chrono::DateTime<chrono::Utc> = t.into();
-                        dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                    })
-                    .unwrap_or_default();
-
-                self.inventory.push(BallastFile {
-                    path: path.clone(),
-                    index,
-                    size,
-                    created_at,
-                    integrity_ok,
-                });
-            }
-            // If the file doesn't exist, it's been released (not added to inventory).
-        }
+        self.inventory = observation::inventory(self);
     }
 
     fn verify_single_file(
@@ -882,118 +815,26 @@ impl BallastManager {
         path: &Path,
         expected_index: u32,
     ) -> std::result::Result<(), String> {
-        // Check file size.
-        let meta = fs::metadata(path).map_err(|e| format!("metadata: {e}"))?;
-        if meta.len() != self.config.file_size_bytes {
-            return Err(format!(
-                "size mismatch: expected {} got {}",
-                self.config.file_size_bytes,
-                meta.len()
-            ));
-        }
-
-        // Read and validate header.
-        let mut file = File::open(path).map_err(|e| format!("open: {e}"))?;
-        let mut header_buf = vec![0u8; HEADER_SIZE];
-        file.read_exact(&mut header_buf)
-            .map_err(|e| format!("read header: {e}"))?;
-
-        // Find the end of JSON (null-padded).
-        let json_end = header_buf
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(HEADER_SIZE);
-        let header_str = std::str::from_utf8(&header_buf[..json_end])
-            .map_err(|e| format!("header not UTF-8: {e}"))?;
-        let header: BallastHeader =
-            serde_json::from_str(header_str).map_err(|e| format!("header parse: {e}"))?;
-
-        if !header.validate() {
-            return Err(format!("bad magic: {}", header.magic));
-        }
-        if header.file_index != expected_index {
-            return Err(format!(
-                "index mismatch: expected {expected_index} got {}",
-                header.file_index
-            ));
-        }
-        if header.file_size != self.config.file_size_bytes {
-            return Err(format!(
-                "header size mismatch: {} vs {}",
-                header.file_size, self.config.file_size_bytes
-            ));
-        }
-
-        let blocks = self
-            .platform
-            .file_block_count(path)
-            .map_err(|e| format!("block count: {e}"))?;
-        let allocated_bytes = blocks
-            .checked_mul(512)
-            .ok_or_else(|| "allocated block count overflow".to_string())?;
-        if allocated_bytes < self.config.file_size_bytes {
-            return Err(format!(
-                "allocated bytes mismatch: expected at least {} got {allocated_bytes}",
-                self.config.file_size_bytes
-            ));
-        }
-
-        Ok(())
+        observation::verify(self, path, expected_index)
     }
 
     fn create_ballast_file(&self, index: u32) -> Result<()> {
-        let path = self.file_path(index);
         let size = self.config.file_size_bytes;
-
         if size < HEADER_SIZE as u64 {
             return Err(SbhError::InvalidConfig {
                 details: format!("file_size_bytes ({size}) must be >= HEADER_SIZE ({HEADER_SIZE})"),
             });
         }
 
-        let result = self.write_ballast_file_inner(index, &path, size);
-        if result.is_err() {
-            // Clean up partial file on write error.
-            let _ = fs::remove_file(&path);
+        // Existing allocations never enter the new-file cleanup path. Even
+        // a failed/partial repair leaves the configured reserve available for
+        // emergency release; symlinks and shared inodes are refused untouched.
+        if repair::existing(self, index)? {
+            return Ok(());
         }
-        result
-    }
-
-    fn write_ballast_file_inner(&self, index: u32, path: &Path, size: u64) -> Result<()> {
-        let header_buf = ballast_header_buffer(index, size)?;
-
-        if !self.skip_fallocate {
-            match self.platform.preallocate_file(path, size) {
-                Ok(()) => {
-                    Self::write_header_to_preallocated_file(path, size, &header_buf)?;
-                    return Ok(());
-                }
-                Err(error) if is_storage_exhausted_error(&error) => return Err(error),
-                Err(_) => {}
-            }
-        }
-
-        let data_size = size - HEADER_SIZE as u64;
-        let mut file = create_truncated_ballast_file(path)?;
-        file.write_all(&header_buf)
-            .map_err(|e| SbhError::io(path, e))?;
-        self.write_random_data(&mut file, data_size, path)?;
-        file.sync_all().map_err(|e| SbhError::io(path, e))?;
-        Ok(())
-    }
-
-    fn write_header_to_preallocated_file(path: &Path, size: u64, header_buf: &[u8]) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(false)
-            .truncate(false)
-            .open(path)
-            .map_err(|e| SbhError::io(path, e))?;
-        file.set_len(size).map_err(|e| SbhError::io(path, e))?;
-        file.write_all(header_buf)
-            .map_err(|e| SbhError::io(path, e))?;
-        file.sync_all().map_err(|e| SbhError::io(path, e))?;
-        Ok(())
+        // The absent check above is advisory: creation itself must be
+        // exclusive, and only its owned inode may be removed on failure.
+        creation::create(self, index)
     }
 
     #[allow(clippy::unused_self)]
@@ -1043,17 +884,6 @@ fn ballast_header_buffer(index: u32, size: u64) -> Result<Vec<u8>> {
     Ok(header_buf)
 }
 
-fn create_truncated_ballast_file(path: &Path) -> Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    opts.open(path).map_err(|e| SbhError::io(path, e))
-}
-
 fn record_create_error(
     report: &mut ProvisionReport,
     index: u32,
@@ -1082,7 +912,9 @@ fn is_storage_exhausted_error(error: &SbhError) -> bool {
                     method_name,
                     ..
                 },
-        } if method_name == "preallocate_file" => message_mentions_storage_full(details),
+        } if method_name == "preallocate_file" || method_name == "preallocate_open_file" => {
+            message_mentions_storage_full(details)
+        }
         SbhError::Runtime { details } => message_mentions_storage_full(details),
         _ => false,
     }
@@ -1097,7 +929,7 @@ fn io_error_is_storage_full(error: &std::io::Error) -> bool {
 
 #[cfg(unix)]
 fn raw_os_error_is_storage_full(code: i32) -> bool {
-    code == libc::ENOSPC
+    code == libc::ENOSPC || code == libc::EDQUOT
 }
 
 #[cfg(windows)]
@@ -1117,6 +949,8 @@ fn message_mentions_storage_full(message: &str) -> bool {
         || message.contains("storage full")
         || message.contains("disk full")
         || message.contains("not enough space")
+        || message.contains("disk quota exceeded")
+        || message.contains("edquot")
 }
 
 fn time_machine_snapshot_release_warning(
@@ -1817,12 +1651,21 @@ mod tests {
             );
         }
 
-        // Reduce to 3 files
+        // Reduce the target, not the physical reserve that emergency release
+        // can use. The portable non-Unix backend still inventories slots only.
         config.file_count = 3;
         mgr.update_config(config);
-
-        // Inventory should show 3
-        assert_eq!(mgr.available_count(), 3);
+        let expected_available = if cfg!(unix) { 5 } else { 3 };
+        assert_eq!(mgr.available_count(), expected_available);
+        assert_eq!(mgr.config().file_count, 3);
+        assert_eq!(
+            mgr.releasable_bytes(),
+            expected_available as u64 * small_config().file_size_bytes
+        );
+        let observed = BallastAvailability::observe(dir.path(), mgr.config());
+        assert_eq!(observed.available_count, expected_available);
+        assert_eq!(observed.configured_count, 3);
+        assert_eq!(observed.releasable_bytes, mgr.releasable_bytes());
 
         // Files 4 and 5 are orphans now: reported, not removed (config
         // reload runs unlocked; only provision/replenish prune).
@@ -1845,6 +1688,7 @@ mod tests {
             "Orphaned file 5 should be removed by provision"
         );
         assert_eq!(mgr.orphans(), Vec::<PathBuf>::new());
+        assert_eq!(mgr.available_count(), 3);
     }
 
     // ──── #16: health / availability ────

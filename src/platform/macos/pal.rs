@@ -81,6 +81,12 @@ impl Platform for MacOsPal {
             .map_err(|error| macos_method_error("mount_points", &error))
     }
 
+    fn mount_lookup_path(&self, path: &Path) -> Result<PathBuf> {
+        let resolved = crate::core::paths::resolve_absolute_path(path);
+        sys::resolve_firmlinked_path(&resolved)
+            .map_err(|error| macos_method_error("mount_lookup_path", &error))
+    }
+
     fn is_ram_backed(&self, path: &Path) -> Result<bool> {
         sys::statfs(path)
             .map(|stats| stats.is_ram_backed())

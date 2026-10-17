@@ -8,8 +8,7 @@
 #![allow(missing_docs)]
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::{BufReader, BufWriter, Write as IoWrite};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +26,7 @@ use crate::scanner::scoring::{
 };
 use crate::scanner::walker::{FsEntryKind, FsIdentity};
 
+mod checkpoint;
 mod replay;
 
 /// Bumped to 2 when records gained `structural_signals`; a version-1
@@ -327,20 +327,15 @@ fn safety_state_from_score(score: &CandidacyScore) -> CandidateSafetyState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ScannerIndexCheckpoint {
-    version: u32,
-    context: ScannerIndexContext,
-    event_generation: u64,
-    records: Vec<CandidateIndexRecord>,
-    integrity_hash: [u8; 32],
-}
-
 #[derive(Debug, Clone)]
 pub struct ScannerCandidateIndex {
     context: ScannerIndexContext,
     event_generation: u64,
     records: BTreeMap<IndexedIdentity, CandidateIndexRecord>,
+    /// One current identity per observed path. A rebuilt artifact must retire
+    /// its old inode's replay hint rather than leave both in the ranked queue.
+    /// Derived from records on load, never independently persisted.
+    paths: BTreeMap<PathBuf, IndexedIdentity>,
 }
 
 impl ScannerCandidateIndex {
@@ -350,6 +345,7 @@ impl ScannerCandidateIndex {
             context,
             event_generation: 0,
             records: BTreeMap::new(),
+            paths: BTreeMap::new(),
         }
     }
 
@@ -380,19 +376,33 @@ impl ScannerCandidateIndex {
 
     pub fn upsert(&mut self, mut record: CandidateIndexRecord) {
         record.event_generation = self.event_generation;
-        if let Some(existing) = self.records.get(&record.identity)
-            && existing.evidence_matches(&record)
+        // A fresh observation of this path supersedes every earlier identity
+        // at that path, even when the new candidate is vetoed or has no score.
+        // Otherwise an obsolete high score can monopolize a bounded replay.
+        if let Some(previous) = self.paths.get(&record.path).copied()
+            && previous != record.identity
         {
-            record.fail_count = existing.fail_count;
-            record.cooldown_until_nanos = existing.cooldown_until_nanos;
-            // A failed attempt is retryable, not permission to overwrite a
-            // newly observed active-reference or safety veto with Failed.
-            if existing.safety_state == CandidateSafetyState::Failed
-                && record.safety_state == CandidateSafetyState::Safe
-            {
-                record.safety_state = CandidateSafetyState::Failed;
+            self.records.remove(&previous);
+        }
+        if let Some(existing) = self.records.get(&record.identity) {
+            if existing.path != record.path {
+                // Rename or a newly observed alias of the same identity:
+                // reusing its old path later must not retire this new binding.
+                self.paths.remove(&existing.path);
+            }
+            if existing.evidence_matches(&record) {
+                record.fail_count = existing.fail_count;
+                record.cooldown_until_nanos = existing.cooldown_until_nanos;
+                // A failed attempt is retryable, not permission to overwrite
+                // a newly observed active-reference or safety veto with Failed.
+                if existing.safety_state == CandidateSafetyState::Failed
+                    && record.safety_state == CandidateSafetyState::Safe
+                {
+                    record.safety_state = CandidateSafetyState::Failed;
+                }
             }
         }
+        self.paths.insert(record.path.clone(), record.identity);
         self.records.insert(record.identity, record);
     }
 
@@ -440,6 +450,7 @@ impl ScannerCandidateIndex {
             // Saturation would make a subsequent overflow leave every record
             // apparently fresh. Reset only after revoking all old records.
             self.records.clear();
+            self.paths.clear();
             self.event_generation = 0;
         }
     }
@@ -473,146 +484,21 @@ impl ScannerCandidateIndex {
             .is_some_and(|until| system_time_nanos(now) < until)
     }
 
+    /// Publish a complete, synced checkpoint without cloning the record map.
+    /// Failure before publication leaves the previous checkpoint intact.
     pub fn save_checkpoint(&self, path: &Path) -> Result<()> {
-        let records = self.records.values().cloned().collect::<Vec<_>>();
-        let integrity_hash =
-            checkpoint_integrity_hash(&self.context, self.event_generation, &records)?;
-        let checkpoint = ScannerIndexCheckpoint {
-            version: CHECKPOINT_VERSION,
-            context: self.context.clone(),
-            event_generation: self.event_generation,
-            records,
-            integrity_hash,
-        };
-
-        let temp_path = path.with_extension("tmp");
-        if let Some(parent) = temp_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| SbhError::io(parent, e))?;
-        }
-
-        let file = {
-            let mut opts = OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                opts.mode(0o600);
-            }
-            opts.open(&temp_path)
-                .map_err(|e| SbhError::io(&temp_path, e))?
-        };
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &checkpoint).map_err(|e| SbhError::Serialization {
-            context: "scanner_candidate_index_write",
-            details: e.to_string(),
-        })?;
-        writer.flush().map_err(|e| SbhError::io(&temp_path, e))?;
-        fs::rename(&temp_path, path).map_err(|e| SbhError::io(path, e))?;
-        Ok(())
+        checkpoint::save(self, path)
     }
 
+    /// Load a bounded regular-file snapshot; unusable caches yield an empty
+    /// index so the scanner can rediscover candidates instead of failing boot.
     #[must_use]
     pub fn load_checkpoint(
         path: &Path,
         expected_context: ScannerIndexContext,
     ) -> (Self, ScannerIndexLoadStatus) {
-        let missing = || {
-            (
-                Self::new(expected_context.clone()),
-                ScannerIndexLoadStatus::Missing,
-            )
-        };
-        let file = match fs::File::open(path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return missing(),
-            Err(err) => {
-                return (
-                    Self::new(expected_context),
-                    ScannerIndexLoadStatus::Corrupt(err.to_string()),
-                );
-            }
-        };
-        let reader = BufReader::new(file);
-        let checkpoint: ScannerIndexCheckpoint = match serde_json::from_reader(reader) {
-            Ok(checkpoint) => checkpoint,
-            Err(err) => {
-                return (
-                    Self::new(expected_context),
-                    ScannerIndexLoadStatus::Corrupt(err.to_string()),
-                );
-            }
-        };
-
-        if checkpoint.version != CHECKPOINT_VERSION {
-            return (
-                Self::new(expected_context),
-                ScannerIndexLoadStatus::Stale(format!(
-                    "unsupported scanner index version {} (expected {CHECKPOINT_VERSION})",
-                    checkpoint.version
-                )),
-            );
-        }
-        if checkpoint.context != expected_context {
-            return (
-                Self::new(expected_context),
-                ScannerIndexLoadStatus::Stale(
-                    "root or scanner config fingerprint changed".to_string(),
-                ),
-            );
-        }
-        match checkpoint_integrity_hash(
-            &checkpoint.context,
-            checkpoint.event_generation,
-            &checkpoint.records,
-        ) {
-            Ok(computed) if computed == checkpoint.integrity_hash => {}
-            Ok(_) => {
-                return (
-                    Self::new(expected_context),
-                    ScannerIndexLoadStatus::Corrupt("integrity hash mismatch".to_string()),
-                );
-            }
-            Err(err) => {
-                return (
-                    Self::new(expected_context),
-                    ScannerIndexLoadStatus::Corrupt(err.to_string()),
-                );
-            }
-        }
-
-        let mut records = BTreeMap::new();
-        for record in checkpoint.records {
-            records.insert(record.identity, record);
-        }
-        (
-            Self {
-                context: checkpoint.context,
-                event_generation: checkpoint.event_generation,
-                records,
-            },
-            ScannerIndexLoadStatus::Loaded,
-        )
+        checkpoint::load(path, expected_context)
     }
-}
-
-fn checkpoint_integrity_hash(
-    context: &ScannerIndexContext,
-    event_generation: u64,
-    records: &[CandidateIndexRecord],
-) -> Result<[u8; 32]> {
-    let mut hasher = Sha256::new();
-    let context_bytes = serde_json::to_vec(context).map_err(|e| SbhError::Serialization {
-        context: "scanner_candidate_index_integrity",
-        details: e.to_string(),
-    })?;
-    let records_bytes = serde_json::to_vec(records).map_err(|e| SbhError::Serialization {
-        context: "scanner_candidate_index_integrity",
-        details: e.to_string(),
-    })?;
-    hasher.update(context_bytes);
-    hasher.update(event_generation.to_le_bytes());
-    hasher.update(records_bytes);
-    Ok(hasher.finalize().into())
 }
 
 fn root_fingerprint(root_paths: &[PathBuf]) -> String {
@@ -1025,5 +911,204 @@ mod tests {
         let v2 = ScannerIndexContext::from_roots_and_config(&roots, &v2_config);
 
         assert_ne!(v1.config_fingerprint, v2.config_fingerprint);
+    }
+
+    fn assert_path_index_consistent(index: &ScannerCandidateIndex) {
+        assert_eq!(index.paths.len(), index.records.len());
+        for (identity, record) in &index.records {
+            assert_eq!(index.paths.get(&record.path), Some(identity));
+        }
+    }
+
+    #[test]
+    fn rebuilding_one_path_does_not_accumulate_replayable_old_inodes() {
+        let mut index = ScannerCandidateIndex::new(context("rebuild"));
+        for inode in 1..=1000 {
+            let mut current = record(identity(inode), identity(99));
+            current.path = PathBuf::from("/cache/rebuilt/target");
+            current.score = Some(if inode == 1 { 0.99 } else { 0.6 });
+            index.upsert(current.clone());
+            assert_eq!(index.len(), 1);
+            assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![current]);
+            assert_path_index_consistent(&index);
+        }
+    }
+
+    #[test]
+    fn a_vetoed_replacement_retires_the_old_high_score_without_starving_other_work() {
+        for state in [
+            CandidateSafetyState::Vetoed,
+            CandidateSafetyState::ActiveReference,
+        ] {
+            let mut index = ScannerCandidateIndex::new(context("veto"));
+            let mut old = record(identity(1), identity(99));
+            old.score = Some(0.99);
+            let useful = record(identity(2), identity(99));
+            index.upsert(old.clone());
+            index.upsert(useful.clone());
+            let mut replacement = old.clone();
+            replacement.identity = identity(3);
+            replacement.safety_state = state;
+            index.upsert(replacement);
+            assert!(index.get(old.identity).is_none());
+            assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![useful]);
+            assert_path_index_consistent(&index);
+        }
+    }
+
+    #[test]
+    fn late_failure_for_a_retired_inode_does_not_cool_down_its_replacement() {
+        let mut index = ScannerCandidateIndex::new(context("late-failure"));
+        let old = record(identity(1), identity(99));
+        index.upsert(old.clone());
+        index.record_failure(
+            old.identity,
+            UNIX_EPOCH,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let mut replacement = old.clone();
+        replacement.identity = identity(2);
+        index.upsert(replacement.clone());
+        index.record_failure(
+            old.identity,
+            UNIX_EPOCH,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![replacement]);
+        assert!(index.get(old.identity).is_none());
+        assert_path_index_consistent(&index);
+    }
+
+    #[test]
+    fn reusing_an_old_path_after_a_rename_preserves_the_renamed_candidate() {
+        let mut index = ScannerCandidateIndex::new(context("rename"));
+        let original = record(identity(1), identity(99));
+        let mut renamed = original.clone();
+        renamed.path = PathBuf::from("/cache/new-name");
+        index.upsert(original.clone());
+        index.upsert(renamed.clone());
+        let mut replacement = original;
+        replacement.identity = identity(2);
+        index.upsert(replacement.clone());
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.get(renamed.identity), Some(&renamed));
+        assert_eq!(index.get(replacement.identity), Some(&replacement));
+        assert_path_index_consistent(&index);
+    }
+
+    #[test]
+    fn rename_over_an_indexed_path_retires_only_the_displaced_identity() {
+        let mut index = ScannerCandidateIndex::new(context("replace-rename"));
+        let first = record(identity(1), identity(99));
+        let second = record(identity(2), identity(99));
+        index.upsert(first.clone());
+        index.upsert(second.clone());
+        let mut renamed = first.clone();
+        renamed.path = second.path;
+        index.upsert(renamed.clone());
+        assert!(index.get(second.identity).is_none());
+        assert_eq!(index.get(first.identity), Some(&renamed));
+        let mut third = first;
+        third.identity = identity(3);
+        index.upsert(third);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.get(renamed.identity), Some(&renamed));
+        assert_path_index_consistent(&index);
+    }
+
+    #[test]
+    fn replacement_lookup_is_rebuilt_after_checkpoint_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("checkpoint.json");
+        let mut index = ScannerCandidateIndex::new(context("restart"));
+        let old = record(identity(1), identity(99));
+        index.upsert(old.clone());
+        index.save_checkpoint(&path).unwrap();
+        let (mut restarted, status) = ScannerCandidateIndex::load_checkpoint(&path, index.context);
+        assert_eq!(status, ScannerIndexLoadStatus::Loaded);
+        assert_path_index_consistent(&restarted);
+        let mut current = old.clone();
+        current.identity = identity(2);
+        restarted.upsert(current.clone());
+        assert!(restarted.get(old.identity).is_none());
+        assert_eq!(restarted.ranked_records(UNIX_EPOCH, 1), vec![current]);
+        assert_path_index_consistent(&restarted);
+    }
+
+    #[test]
+    fn overflow_clears_path_bindings_before_generation_reuse() {
+        let mut index = ScannerCandidateIndex::new(context("overflow"));
+        index.event_generation = u64::MAX;
+        index.upsert(record(identity(1), identity(99)));
+        index.mark_event_overflow();
+        assert!(index.paths.is_empty());
+        let mut current = record(identity(2), identity(99));
+        current.path = record(identity(1), identity(99)).path;
+        index.upsert(current.clone());
+        assert_eq!(index.ranked_records(UNIX_EPOCH, 1), vec![current]);
+        assert_path_index_consistent(&index);
+    }
+
+    #[test]
+    fn identical_inode_numbers_on_different_devices_remain_independent() {
+        let mut index = ScannerCandidateIndex::new(context("devices"));
+        let first = record(identity(1), identity(99));
+        let mut second = first.clone();
+        second.identity.device_id += 1;
+        second.path = PathBuf::from("/other-device/target");
+        index.upsert(first.clone());
+        index.upsert(second.clone());
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.get(first.identity), Some(&first));
+        assert_eq!(index.get(second.identity), Some(&second));
+        assert_path_index_consistent(&index);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_real_directory_replacement_revokes_the_old_replay_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("target");
+        fs::create_dir(&path).unwrap();
+        let old_identity = identity_from_metadata(&fs::symlink_metadata(&path).unwrap());
+        let old_score = score(path.clone(), old_identity.into());
+        let old = CandidateIndexRecord::from_candidate_score(
+            &old_score,
+            None,
+            StructuralSignals::default(),
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        let mut index = ScannerCandidateIndex::new(context("filesystem"));
+        index.upsert(old);
+        // Preserve the original inode so this is deterministic even on a
+        // filesystem that immediately recycles deleted directory identities.
+        let retired = temp.path().join("retired-original");
+        fs::rename(&path, &retired).unwrap();
+        fs::create_dir(&path).unwrap();
+        let new_identity = identity_from_metadata(&fs::symlink_metadata(&path).unwrap());
+        assert_ne!(new_identity, old_identity);
+        let mut fresh_score = score(path, new_identity.into());
+        fresh_score.vetoed = true;
+        fresh_score.veto_reason = Some("currently open".into());
+        let fresh = CandidateIndexRecord::from_candidate_score(
+            &fresh_score,
+            None,
+            StructuralSignals::default(),
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        index.upsert(fresh);
+        assert!(index.get(old_identity).is_none());
+        assert!(index.ranked_records(SystemTime::now(), 10).is_empty());
+        assert!(
+            retired.is_dir(),
+            "retiring an index hint never deletes its artifact"
+        );
+        assert_path_index_consistent(&index);
     }
 }
