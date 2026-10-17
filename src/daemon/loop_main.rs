@@ -6976,11 +6976,18 @@ fn dispatch_top_candidates(
     // Neither a path under a dispatched tree nor one containing it: deleting
     // an ancestor would take a subtree rebuilt since its own deletion. The
     // ancestor waits for the next pass.
+    // A candidate that frees nothing is never chosen by the planner (once an
+    // empty mktemp target of a live build was: ts2 2026-10-15), so it is not
+    // dispatched either. Each still cost a policy evaluation, a plan and a
+    // decision_log row on every pass: on ts2 at Critical (2026-10-17) that was
+    // 3,479 empty bun-workspace node_modules and target dirs in 20 minutes,
+    // ~250,000 rows (~0.6 GB) a day kept for 30 days.
     scored.retain(|candidate| {
-        !dispatched
-            .paths
-            .iter()
-            .any(|sent| candidate.path.starts_with(sent) || sent.starts_with(&candidate.path))
+        candidate.size_bytes > 0
+            && !dispatched
+                .paths
+                .iter()
+                .any(|sent| candidate.path.starts_with(sent) || sent.starts_with(&candidate.path))
     });
     if scored.is_empty() {
         return true;
@@ -13890,6 +13897,54 @@ mod tests {
             scored.len()
         );
         assert!(del_rx.try_recv().is_err());
+    }
+
+    /// Empty candidates are never sent to the executor: the planner never
+    /// chooses them, and each one cost a policy evaluation and a decision_log
+    /// row per pass (ts2 2026-10-17: ~250,000 rows a day at Critical).
+    #[test]
+    fn dispatch_top_candidates_drops_candidates_that_free_nothing() {
+        let (del_tx, del_rx) = bounded::<DeletionBatch>(2);
+        let request = ScanRequest {
+            paths: vec![PathBuf::from("/tmp")],
+            urgency: 1.0,
+            pressure_level: PressureLevel::Critical,
+            free_pct: None,
+            max_delete_batch: 10,
+            force_full_scan: false,
+            config_update: None,
+            catalog_roots: Vec::new(),
+            maintenance: false,
+            target_bytes: None,
+        };
+        let empty = |path: &str| CandidacyScore {
+            size_bytes: 0,
+            ..test_candidate(path, 0.9)
+        };
+
+        let mut scored = vec![empty("/tmp/empty-a"), empty("/tmp/empty-b")];
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &del_tx,
+            &mut PassDispatch::default()
+        ));
+        assert!(scored.is_empty());
+        assert!(
+            del_rx.try_recv().is_err(),
+            "a batch of only empty candidates is not sent"
+        );
+
+        let mut scored = vec![empty("/tmp/empty-c"), test_candidate("/tmp/full", 0.5)];
+        assert!(dispatch_top_candidates(
+            &mut scored,
+            &request,
+            &del_tx,
+            &mut PassDispatch::default()
+        ));
+        let batch = del_rx.try_recv().expect("the non-empty candidate is sent");
+        let paths: Vec<_> = batch.candidates.iter().map(|c| c.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("/tmp/full")]);
     }
 
     #[derive(Debug, serde::Serialize)]
