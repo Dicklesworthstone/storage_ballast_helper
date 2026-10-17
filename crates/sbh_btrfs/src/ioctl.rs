@@ -2,7 +2,7 @@
 //! Keep layouts in sync with linux/{btrfs,fiemap,fs}.h. No borrowed pointer is
 //! retained by these ioctls, and no kernel-returned count is trusted unchecked.
 
-use std::ffi::{c_int, c_long, c_ulong};
+use std::ffi::{c_int, c_long, c_uint, c_ulong};
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -29,6 +29,24 @@ const DEFRAG_RANGE: c_ulong = request(1, 0x94, 16, 48);
 unsafe extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     fn syscall(number: c_long, ...) -> c_long;
+    fn sync_file_range(fd: c_int, offset: i64, nbytes: i64, flags: c_uint) -> c_int;
+}
+
+/// SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER.
+const SYNC_FILE_RANGE_WAIT: c_uint = 7;
+
+/// Write back `[start, start + length)` and wait until it is on disk, so the
+/// next defrag call starts from committed extents.
+pub(super) fn sync_range_wait(file: &File, start: u64, length: u64) -> io::Result<()> {
+    let start = i64::try_from(start).map_err(|_| invalid("offset exceeds i64"))?;
+    let length = i64::try_from(length).map_err(|_| invalid("length exceeds i64"))?;
+    // SAFETY: integer arguments only; the descriptor is borrowed for the call.
+    let result = unsafe { sync_file_range(file.as_raw_fd(), start, length, SYNC_FILE_RANGE_WAIT) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 // Private: every call below passes exactly the initialized UAPI structure for
@@ -81,12 +99,55 @@ struct FiemapBuffer {
     extents: [FiemapExtent; FIEMAP_BATCH],
 }
 
+/// One extent FIEMAP mapped: logical and physical start, length, flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MappedExtent {
+    pub logical: u64,
+    pub physical: u64,
+    pub length: u64,
+    pub flags: u32,
+}
+
+/// Union of the flags of every extent in `[start, start + length)`.
 pub(super) fn fiemap_flags(
     file: &File,
     start: u64,
     length: u64,
     deadline: Instant,
 ) -> io::Result<u32> {
+    let mut flags = 0_u32;
+    fiemap_walk(file, start, length, deadline, &mut |extent| {
+        flags |= extent.flags;
+    })?;
+    Ok(flags)
+}
+
+/// Every extent mapped in `[start, start + length)`, in logical order.
+pub(super) fn fiemap_extents(
+    file: &File,
+    start: u64,
+    length: u64,
+    deadline: Instant,
+) -> io::Result<Vec<MappedExtent>> {
+    let mut extents = Vec::new();
+    fiemap_walk(file, start, length, deadline, &mut |extent| {
+        extents.push(MappedExtent {
+            logical: extent.logical,
+            physical: extent.physical,
+            length: extent.length,
+            flags: extent.flags,
+        });
+    })?;
+    Ok(extents)
+}
+
+fn fiemap_walk(
+    file: &File,
+    start: u64,
+    length: u64,
+    deadline: Instant,
+    visit: &mut dyn FnMut(&FiemapExtent),
+) -> io::Result<()> {
     let end = start
         .checked_add(length)
         .ok_or_else(|| invalid("FIEMAP range overflow"))?;
@@ -138,13 +199,14 @@ pub(super) fn fiemap_flags(
             }
             next = extent_end;
             flags |= extent.flags;
+            visit(extent);
         }
         cursor = next;
         if flags & FIEMAP_EXTENT_LAST != 0 {
             break;
         }
     }
-    Ok(flags)
+    Ok(())
 }
 
 #[repr(C)]
@@ -299,7 +361,9 @@ pub(super) fn defrag_zstd(file: &File, start: u64, length: u64) -> io::Result<()
     let mut range = DefragRange {
         start,
         length,
-        flags: 1 | 2,     // COMPRESS | START_IO
+        // COMPRESS only: the caller writes each cluster back and waits for it
+        // (sync_range_wait), which START_IO alone does not.
+        flags: 1,
         compress_type: 3, // BTRFS_COMPRESS_ZSTD, not zlib's zero/default
         ..DefragRange::default()
     };

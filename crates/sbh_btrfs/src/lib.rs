@@ -36,9 +36,19 @@ use std::os::unix::fs::MetadataExt;
 use std::rc::Rc;
 use std::time::Instant;
 
-/// Upper bound on a single defrag request. A kernel ioctl can still block;
-/// deadlines are cooperative checks BETWEEN ioctls, not a hard time guarantee.
+/// Upper bound on one `compress_range` request. A kernel ioctl can still
+/// block; deadlines are cooperative checks BETWEEN requests, not a hard time
+/// guarantee.
 pub const MAX_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+/// Bytes covered by one defrag ioctl. On Linux 6.17 one call over a large raw
+/// extent compressed only its first 256 KiB cluster while that rewrite was
+/// still in flight, leaving the rest raw: a part-compressed file uses MORE
+/// space, because btrfs keeps the whole original extent while any range still
+/// references it (ts2, 2026-10-14, and the daemon tier's on-host run,
+/// 2026-10-17, where every fresh 20 MiB file came out partial). One call per
+/// cluster, each written back and waited for before the next, compressed
+/// tens of thousands of files fully on the same host.
+pub const DEFRAG_CLUSTER_BYTES: u64 = 256 * 1024;
 /// Bound the memory and work used to inspect a highly fragmented file.
 pub const MAX_EXTENTS: usize = 262_144;
 
@@ -245,8 +255,10 @@ pub fn inspect(file: &File, deadline: Instant) -> io::Result<ExtentMap> {
 ///
 /// Only the requested range is inspected here: previously compressed chunks
 /// must not make the remainder of a large file unreachable. Zero-length and
-/// unbounded requests are rejected. START_IO plus fsync prevents unbounded
-/// dirty-page accumulation across chunks.
+/// unbounded requests are rejected. Each 256 KiB cluster is written back and
+/// waited for before the next, and passes repeat over whatever the range
+/// still stores raw in its original extents until none is left or a pass
+/// makes no progress; a remainder is an error, never a silent success.
 pub fn compress_range(
     file: &File,
     start: u64,
@@ -279,14 +291,83 @@ pub fn compress_range(
         return Err(io::Error::other("file changed before compression"));
     }
     check_deadline(deadline)?;
-    ioctl::defrag_zstd(file, start, length)?;
-    file.sync_all()?;
+    // A started range is finished, on its own bounded allowance rather than
+    // the pass deadline: stopping part-way leaves the part-compressed file
+    // these passes exist to prevent.
+    let allowance = Instant::now() + RANGE_FINISH_ALLOWANCE;
+    let original = ioctl::fiemap_extents(file, start, length, allowance)?;
+    let mut previous = u64::MAX;
+    for _ in 0..MAX_DEFRAG_PASSES {
+        let todo = still_original(file, start, length, &original, allowance)?;
+        let remaining: u64 = todo.iter().map(|&(_, len)| len).sum();
+        if remaining == 0 || remaining >= previous {
+            break;
+        }
+        previous = remaining;
+        for (range_start, range_length) in todo {
+            let range_end = range_start + range_length;
+            let mut offset = range_start;
+            while offset < range_end {
+                let cluster = (range_end - offset).min(DEFRAG_CLUSTER_BYTES);
+                ioctl::defrag_zstd(file, offset, cluster)?;
+                ioctl::sync_range_wait(file, offset, cluster)?;
+                offset += cluster;
+            }
+        }
+        file.sync_all()?;
+    }
     if !stamp.same_contents_and_identity(FileStamp::read(file)?) {
         return Err(io::Error::other(
             "file identity, size, or mtime changed during compression",
         ));
     }
+    let left: u64 = still_original(file, start, length, &original, allowance)?
+        .iter()
+        .map(|&(_, len)| len)
+        .sum();
+    if left != 0 {
+        return Err(io::Error::other(format!(
+            "{left} bytes of the range are still stored raw in their original extent, which \
+             btrfs keeps whole while any of it is referenced"
+        )));
+    }
     Ok(())
+}
+
+/// Passes over the raw remainder of one range before giving up.
+const MAX_DEFRAG_PASSES: usize = 16;
+/// Time a started range gets to finish, independent of the pass deadline.
+const RANGE_FINISH_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Logical ranges of `[start, start + length)` still stored raw in one of the
+/// `original` extents at the same logical-to-physical offset: rewritten
+/// ranges, compressed or not, live in new extents and are not listed.
+fn still_original(
+    file: &File,
+    start: u64,
+    length: u64,
+    original: &[ioctl::MappedExtent],
+    deadline: Instant,
+) -> io::Result<Vec<(u64, u64)>> {
+    let end = start + length;
+    let mut ranges = Vec::new();
+    for extent in ioctl::fiemap_extents(file, start, length, deadline)? {
+        if extent.flags & ioctl::FIEMAP_EXTENT_ENCODED != 0 {
+            continue;
+        }
+        let in_original = original.iter().any(|old| {
+            extent.physical >= old.physical
+                && extent.physical - old.physical < old.length
+                && extent.logical >= old.logical
+                && extent.physical - old.physical == extent.logical - old.logical
+        });
+        let range_start = extent.logical.max(start);
+        let range_end = extent.logical.saturating_add(extent.length).min(end);
+        if in_original && range_start < range_end {
+            ranges.push((range_start, range_end - range_start));
+        }
+    }
+    Ok(ranges)
 }
 
 /// Evidence for one compression operation, excluding metadata overhead and
