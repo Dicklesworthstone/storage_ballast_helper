@@ -60,6 +60,13 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   later pass. Every stop now continues after the last path it fully
   examined, and a directory past the depth limit is skipped instead of
   ending the walk.
+- **Empty candidates no longer fill the decision log** (`7d41487`). The
+  planner never deletes a candidate that frees nothing, but the scanner
+  still sent every one to it, and each became a decision record on every
+  pass. On one host at Critical that was 3,479 empty directories every 20
+  minutes, about 250,000 records a day kept for 30 days: the activity
+  database grew from 1.1 to 1.5 GB in a day while nothing was deleted.
+  They are no longer sent.
 - **Linux: a Cargo build without HOME keeps its home config's protection**
   (`f0e17ac`). A build run from a systemd unit or under `env -i` has no
   HOME, so Cargo reads the config in its account's home instead. sbh read
