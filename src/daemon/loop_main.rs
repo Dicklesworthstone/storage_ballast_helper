@@ -11477,7 +11477,10 @@ mod tests {
 
     #[test]
     fn executor_preflight_skips_config_protected_daemon_candidate() {
-        let temp = tempfile::tempdir().unwrap();
+        // Under /tmp, never the default temp dir: on rch workers that sits
+        // inside the synced /data/projects tree, where the earlier
+        // hardcoded-source-tree veto skips the candidate first (bd-c47s).
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
         let protected = temp
             .path()
             .join("asupersync_ansi_c")
@@ -11510,7 +11513,12 @@ mod tests {
 
         assert_eq!(report.items_deleted, 0);
         assert_eq!(report.items_skipped, 1);
-        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert_eq!(
+            report.skipped_by_reason.get("sacred_stowaway"),
+            Some(&1),
+            "skipped for another reason first: {:?}",
+            report.skipped_by_reason
+        );
         assert!(
             protected.exists(),
             "protected candidate must remain present after executor preflight"
