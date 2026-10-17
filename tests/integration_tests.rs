@@ -64,7 +64,13 @@ static MACOS_APFS_CAPACITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 
 #[test]
 fn help_command_prints_usage() {
-    let result = common::run_cli_case("help_command_prints_usage", &["--help"]);
+    // This case checks the literal plain-text help contract. A worker's
+    // inherited color policy must not insert ANSI spans inside the banner.
+    let result = common::run_cli_case_with_env(
+        "help_command_prints_usage",
+        &["--help"],
+        &[("NO_COLOR", "1")],
+    );
     assert!(
         result.status.success(),
         "expected success; log: {}",
@@ -73,6 +79,11 @@ fn help_command_prints_usage() {
     assert!(
         result.stdout.contains("Usage: sbh [OPTIONS] <COMMAND>"),
         "missing help banner; log: {}",
+        result.log_path.display()
+    );
+    assert!(
+        !result.stdout.contains('\u{1b}'),
+        "NO_COLOR help must omit ANSI escapes; log: {}",
         result.log_path.display()
     );
 }
@@ -6259,7 +6270,9 @@ fn e2e_scenario_4_index_corruption_full_scan() {
     // Simulate a full scan by scoring candidates directly (no incremental index).
     let candidates: Vec<CandidateInput> = vec![
         e2e_candidate("/data/projects/p1/target", 3, 48, 0.9),
-        e2e_candidate("/data/projects/p2/.target_agent", 2, 72, 0.85),
+        // A name the executor's source-tree floor accepts under
+        // /data/projects (it refuses `.target_agent`, so the scorer vetoes it).
+        e2e_candidate("/data/projects/p2/target-agent", 2, 72, 0.85),
         e2e_candidate("/data/projects/p3/build", 1, 24, 0.3),
     ];
 
