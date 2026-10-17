@@ -52,6 +52,14 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   none is left. A remainder is reported, never counted as compressed. On
   one host's test files, a pass that left both files partial now
   compresses them fully, 20 to 1.2 MiB each.
+- **Compression discovery resumes where any budget stopped it**
+  (`4a9ed94`). Only the file limit left a continuation, so a walk stopped
+  by its directory, entry or time budget started over from the top next
+  time: on a temp root with tens of thousands of entries, the daemon tier
+  would have compressed the first part and then found nothing new on every
+  later pass. Every stop now continues after the last path it fully
+  examined, and a directory past the depth limit is skipped instead of
+  ending the walk.
 - **Linux: a Cargo build without HOME keeps its home config's protection**
   (`f0e17ac`). A build run from a systemd unit or under `env -i` has no
   HOME, so Cargo reads the config in its account's home instead. sbh read
