@@ -14,15 +14,15 @@
 //! talk. The socket's mode is the real access control, the token guards
 //! against a stale or foreign client talking to a daemon that restarted.
 //!
-//! The listener thread accepts, a short-lived thread per connection reads
-//! one line (bounded), checks the token, applies a token-bucket rate limit
-//! and a concurrency bound, and hands the parsed [`ControlCommand`] to the
+//! The listener admits connections before spawning workers. Each admitted
+//! worker holds a slot through its bounded request read and response write,
+//! checks the token, and hands the parsed [`ControlCommand`] to the
 //! daemon's [`ControlBackend`]. Everything the daemon has to execute on its
 //! own thread (a fresh state write, ballast release) goes through the
 //! backend's channel to the main loop; `ping`, `explain` and the signal-flag
 //! commands are answered by the connection thread itself.
 
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::io::Write as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,6 +37,12 @@ use serde_json::{Value, json};
 use crate::core::errors::{Result, SbhError};
 use crate::daemon::self_monitor::{DaemonLockProbe, probe_daemon_lock};
 
+mod endpoint;
+mod transport;
+
+#[cfg(test)]
+mod connection_tests;
+
 /// File name of the socket, a sibling of `state.json`.
 pub const CONTROL_SOCKET_FILE_NAME: &str = "control.sock";
 /// Connections handled at the same time; the rest get `busy`.
@@ -45,7 +51,11 @@ pub const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 pub const MAX_REQUESTS_PER_SECOND: f64 = 10.0;
 /// Longest request line accepted; longer ones are rejected unread.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
-/// Read and write deadline for one connection, both directions.
+/// Longest response frame, including its newline. Status and decision records
+/// need more room than commands, but a peer cannot grow a client without bound.
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// Budget for each read/write phase, not a fresh timeout per partial syscall.
+/// Backend execution has its own timeout policy; it is not cancelled by I/O.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the listener thread checks the shutdown flag while idle.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
@@ -109,6 +119,7 @@ pub fn read_endpoint(state_file: &Path) -> Option<ControlEndpoint> {
 
 /// One request line.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlRequest {
     /// Command name: `ping`, `status`, `scan-now`, `reload`, `policy`,
     /// `explain`, `ballast` or `shutdown`.
@@ -125,7 +136,7 @@ pub struct ControlRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlError {
     /// `unauthorized`, `bad_request`, `unknown_command`, `rate_limited`,
-    /// `busy`, `not_found`, `unavailable`, `timeout` or `failed`.
+    /// `busy`, `not_found`, `unavailable`, `timeout`, `response_too_large` or `failed`.
     pub code: String,
     /// What went wrong, for a person.
     pub message: String,
@@ -248,6 +259,33 @@ impl ControlCommand {
             code: "bad_request".to_string(),
             message,
         };
+        // A misspelled scope must not become the default (all mounts/roots),
+        // and scalar args must not make a mutating command silently ignore
+        // its intended options. Null remains the wire spelling of no args.
+        let fields: Option<&[&str]> = match request.cmd.as_str() {
+            "ping" | "status" | "reload" | "shutdown" => Some(&[]),
+            "scan-now" | "scan_now" => Some(&["paths", "force"]),
+            "policy" => Some(&["action"]),
+            "explain" => Some(&["id"]),
+            "ballast" => Some(&["mount", "release", "replenish"]),
+            _ => None,
+        };
+        if let Some(fields) = fields {
+            match args {
+                Value::Null => {}
+                Value::Object(args) => {
+                    if let Some(key) = args.keys().find(|key| !fields.contains(&key.as_str())) {
+                        return Err(bad(format!("{}: unknown argument {key:?}", request.cmd)));
+                    }
+                }
+                _ => {
+                    return Err(bad(format!(
+                        "{}: args must be an object or null",
+                        request.cmd
+                    )));
+                }
+            }
+        }
         match request.cmd.as_str() {
             "ping" => Ok(Self::Ping),
             "status" => Ok(Self::Status),
@@ -257,9 +295,12 @@ impl ControlCommand {
                     Some(Value::Array(items)) => items
                         .iter()
                         .map(|item| {
-                            item.as_str().map(PathBuf::from).ok_or_else(|| {
-                                bad("scan-now: every path must be a string".to_string())
-                            })
+                            item.as_str()
+                                .filter(|path| !path.trim().is_empty() && !path.contains('\0'))
+                                .map(PathBuf::from)
+                                .ok_or_else(|| {
+                                    bad("scan-now: every path must be a nonempty string without NUL".to_string())
+                                })
                         })
                         .collect::<std::result::Result<Vec<_>, _>>()?,
                     Some(other) => {
@@ -268,7 +309,12 @@ impl ControlCommand {
                         )));
                     }
                 };
-                let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+                let force = match args.get("force") {
+                    None => false,
+                    Some(value) => value
+                        .as_bool()
+                        .ok_or_else(|| bad("scan-now: force must be a boolean".to_string()))?,
+                };
                 Ok(Self::ScanNow { paths, force })
             }
             "reload" => Ok(Self::Reload),
@@ -294,23 +340,7 @@ impl ControlCommand {
                     .ok_or_else(|| bad("explain: args.id is required".to_string()))?;
                 Ok(Self::Explain { id: id.to_string() })
             }
-            "ballast" => {
-                let mount = args.get("mount").and_then(Value::as_str).map(PathBuf::from);
-                if let Some(count) = args.get("release") {
-                    let count = count.as_u64().filter(|count| *count > 0).ok_or_else(|| {
-                        bad("ballast: release must be a positive integer".to_string())
-                    })?;
-                    let count = usize::try_from(count)
-                        .map_err(|_| bad("ballast: release count is too large".to_string()))?;
-                    return Ok(Self::Ballast(BallastAction::Release { count, mount }));
-                }
-                if args.get("replenish").and_then(Value::as_bool) == Some(true) {
-                    return Ok(Self::Ballast(BallastAction::Replenish { mount }));
-                }
-                Err(bad(
-                    "ballast: give release = <count> or replenish = true".to_string()
-                ))
-            }
+            "ballast" => Self::parse_ballast(args),
             "shutdown" => Ok(Self::Shutdown),
             other => Err(ControlError {
                 code: "unknown_command".to_string(),
@@ -319,6 +349,46 @@ impl ControlCommand {
                 ),
             }),
         }
+    }
+
+    fn parse_ballast(args: &Value) -> std::result::Result<Self, ControlError> {
+        let bad = |message: &str| ControlError {
+            code: "bad_request".to_string(),
+            message: message.to_string(),
+        };
+        let mount = match args.get("mount") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(path)) if Path::new(path).is_absolute() && !path.contains('\0') => {
+                Some(PathBuf::from(path))
+            }
+            Some(_) => {
+                return Err(bad(
+                    "ballast: mount must be an absolute path string or null",
+                ));
+            }
+        };
+        let replenish = match args.get("replenish") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| bad("ballast: replenish must be a boolean"))?,
+        };
+        if args.get("release").is_some() && replenish {
+            return Err(bad("ballast: release and replenish are mutually exclusive"));
+        }
+        if let Some(count) = args.get("release") {
+            let count = count
+                .as_u64()
+                .filter(|count| *count > 0)
+                .ok_or_else(|| bad("ballast: release must be a positive integer"))?;
+            let count =
+                usize::try_from(count).map_err(|_| bad("ballast: release count is too large"))?;
+            return Ok(Self::Ballast(BallastAction::Release { count, mount }));
+        }
+        if replenish {
+            return Ok(Self::Ballast(BallastAction::Replenish { mount }));
+        }
+        Err(bad("ballast: give release = <count> or replenish = true"))
     }
 
     /// The wire name of the command.
@@ -460,50 +530,25 @@ struct Shared {
     active: Arc<AtomicUsize>,
 }
 
-/// The running listener. Dropping it (or calling [`Self::stop`]) unlinks
-/// the socket.
+/// The running listener. Dropping it (or calling [`Self::stop`]) removes
+/// only the socket it bound, then releases its persistent sidecar lease.
 pub struct ControlServer {
     path: PathBuf,
     shutdown: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
+    endpoint: Option<endpoint::EndpointGuard>,
 }
 
 impl ControlServer {
-    /// Bind `path` (a stale socket file is unlinked first), restrict it to
-    /// the owner, and start serving. `token` is the per-boot secret every
-    /// request must carry.
+    /// Lease `path`, reclaim only a confirmed stale owned socket, restrict
+    /// the new endpoint to its owner, and start serving. Regular files,
+    /// symlinks, live listeners and uncertain liveness are never overwritten.
+    /// `token` is the per-boot secret every request must carry.
     pub fn start(path: &Path, token: &str, backend: Arc<dyn ControlBackend>) -> Result<Self> {
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|source| SbhError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| SbhError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let listener = UnixListener::bind(path).map_err(|source| SbhError::Io {
+        let (listener, endpoint) = endpoint::bind(path).map_err(|source| SbhError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |source| SbhError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                },
-            )?;
-        }
-        listener
-            .set_nonblocking(true)
-            .map_err(|source| SbhError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
@@ -523,6 +568,7 @@ impl ControlServer {
             path: path.to_path_buf(),
             shutdown,
             join: Some(join),
+            endpoint: Some(endpoint),
         })
     }
 
@@ -532,13 +578,13 @@ impl ControlServer {
         &self.path
     }
 
-    /// Stop accepting, join the listener, unlink the socket.
+    /// Stop accepting, join the listener, then clean up the owned endpoint.
     pub fn stop(mut self) {
         self.shutdown.store(true, Ordering::Release);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
-        let _ = std::fs::remove_file(&self.path);
+        drop(self.endpoint.take());
     }
 }
 
@@ -548,7 +594,7 @@ impl Drop for ControlServer {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
-        let _ = std::fs::remove_file(&self.path);
+        drop(self.endpoint.take());
     }
 }
 
@@ -556,10 +602,18 @@ fn accept_loop(listener: &UnixListener, shutdown: &AtomicBool, shared: &Arc<Shar
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
+                let accepted_at = Instant::now();
+                let slot = match admit_connection(shared, accepted_at) {
+                    Ok(slot) => slot,
+                    Err(response) => {
+                        reject_connection(&stream, &response);
+                        continue;
+                    }
+                };
                 let shared = Arc::clone(shared);
                 let spawned = thread::Builder::new()
                     .name("sbh-control-conn".to_string())
-                    .spawn(move || serve_connection(&stream, &shared));
+                    .spawn(move || serve_connection(&stream, &shared, slot, accepted_at));
                 if let Err(error) = spawned {
                     eprintln!("[SBH-CONTROL] could not spawn a connection thread: {error}");
                 }
@@ -575,52 +629,82 @@ fn accept_loop(listener: &UnixListener, shutdown: &AtomicBool, shared: &Arc<Shar
     }
 }
 
-fn serve_connection(stream: &UnixStream, shared: &Shared) {
-    let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    let response = respond(stream, shared);
-    let mut writer = stream;
-    if let Ok(mut line) = serde_json::to_string(&response) {
-        line.push('\n');
-        let _ = writer.write_all(line.as_bytes());
-        let _ = writer.flush();
+fn admit_connection(
+    shared: &Shared,
+    now: Instant,
+) -> std::result::Result<ConnectionSlot, ControlResponse> {
+    let Some(slot) = ConnectionSlot::acquire(&shared.active, MAX_CONCURRENT_CONNECTIONS) else {
+        return Err(ControlResponse::failure(
+            "busy",
+            format!("{MAX_CONCURRENT_CONNECTIONS} control connections are already open"),
+        ));
+    };
+    if !shared.limiter.lock().allow(now) {
+        return Err(ControlResponse::failure(
+            "rate_limited",
+            format!("more than {MAX_REQUESTS_PER_SECOND} requests per second"),
+        ));
+    }
+    Ok(slot)
+}
+
+// Refusals must not spawn a thread or wait behind a peer that is not reading.
+// A fresh local socket normally accepts this tiny response in one write. If
+// it cannot, close it rather than blocking the listener or adding more workers.
+fn reject_connection(stream: &UnixStream, response: &ControlResponse) {
+    if stream.set_nonblocking(true).is_ok()
+        && let Ok(line) = transport::encode_frame(response, MAX_LINE_BYTES)
+    {
+        let mut writer = stream;
+        let _ = writer.write(&line);
     }
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
-fn respond(stream: &UnixStream, shared: &Shared) -> ControlResponse {
-    let Some(_slot) = ConnectionSlot::acquire(&shared.active, MAX_CONCURRENT_CONNECTIONS) else {
-        return ControlResponse::failure(
-            "busy",
-            format!("{MAX_CONCURRENT_CONNECTIONS} control connections are already open"),
-        );
-    };
-    if !shared.limiter.lock().allow(Instant::now()) {
-        return ControlResponse::failure(
-            "rate_limited",
-            format!("more than {MAX_REQUESTS_PER_SECOND} requests per second"),
-        );
+fn serve_connection(
+    stream: &UnixStream,
+    shared: &Shared,
+    _slot: ConnectionSlot,
+    accepted_at: Instant,
+) {
+    if stream.set_nonblocking(false).is_err() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return;
     }
-    let mut line = String::new();
-    let mut reader = BufReader::new(stream).take(MAX_LINE_BYTES as u64 + 1);
-    match reader.read_line(&mut line) {
-        Ok(0) => return ControlResponse::failure("bad_request", "empty request"),
-        Ok(_) => {}
-        Err(error) => {
-            return ControlResponse::failure(
-                "bad_request",
-                format!("could not read request: {error}"),
-            );
+    let response = respond(stream, shared, accepted_at);
+    let frame = transport::encode_frame(&response, MAX_RESPONSE_BYTES).or_else(|error| {
+        transport::encode_frame(
+            &ControlResponse::failure(
+                "response_too_large",
+                format!("cannot encode response: {error}; command may have completed, inspect status before retrying"),
+            ),
+            MAX_RESPONSE_BYTES,
+        )
+    });
+    if let Ok(line) = frame {
+        let _ = transport::write_frame(stream, &line, Instant::now(), IO_TIMEOUT);
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    // `_slot` is deliberately held until after response delivery, including
+    // failed writes. A slow reader still owns one of the bounded worker slots.
+}
+
+fn respond(stream: &UnixStream, shared: &Shared, accepted_at: Instant) -> ControlResponse {
+    let line = match transport::read_frame(stream, MAX_LINE_BYTES, accepted_at, IO_TIMEOUT) {
+        Ok(line) if line.is_empty() => {
+            return ControlResponse::failure("bad_request", "empty request");
         }
-    }
-    if line.len() > MAX_LINE_BYTES {
-        return ControlResponse::failure(
-            "bad_request",
-            format!("request longer than {MAX_LINE_BYTES} bytes"),
-        );
-    }
-    let request: ControlRequest = match serde_json::from_str(line.trim_end()) {
+        Ok(line) => line,
+        Err(error) => {
+            let code = if error.kind() == std::io::ErrorKind::TimedOut {
+                "timeout"
+            } else {
+                "bad_request"
+            };
+            return ControlResponse::failure(code, format!("could not read request: {error}"));
+        }
+    };
+    let request: ControlRequest = match serde_json::from_slice(&line) {
         Ok(request) => request,
         Err(error) => {
             return ControlResponse::failure("bad_request", format!("not a request: {error}"));
@@ -654,6 +738,15 @@ pub fn request(
     cmd: &str,
     args: &Value,
 ) -> Result<ControlResponse> {
+    // Reject an oversized request before opening a connection or dispatching it.
+    let line = transport::encode_frame(
+        &json!({ "cmd": cmd, "args": args, "token": token }),
+        MAX_LINE_BYTES,
+    )
+    .map_err(|source| SbhError::Io {
+        path: socket_path.to_path_buf(),
+        source,
+    })?;
     let stream = UnixStream::connect(socket_path).map_err(|source| SbhError::Io {
         path: socket_path.to_path_buf(),
         source,
@@ -662,16 +755,14 @@ pub fn request(
         path: socket_path.to_path_buf(),
         source,
     };
-    stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(io)?;
-    stream.set_write_timeout(Some(IO_TIMEOUT)).map_err(io)?;
-    let mut line = json!({ "cmd": cmd, "args": args, "token": token }).to_string();
-    line.push('\n');
-    let mut writer = &stream;
-    writer.write_all(line.as_bytes()).map_err(io)?;
-    writer.flush().map_err(io)?;
-    let mut reply = String::new();
-    BufReader::new(&stream).read_line(&mut reply).map_err(io)?;
-    if reply.trim().is_empty() {
+    let write_error = transport::write_frame(&stream, &line, Instant::now(), IO_TIMEOUT).err();
+    let reply = transport::read_frame(&stream, MAX_RESPONSE_BYTES, Instant::now(), IO_TIMEOUT)
+        .map_err(|error| {
+            io(write_error.as_ref().map_or(error, |write_error| {
+                std::io::Error::new(write_error.kind(), write_error.to_string())
+            }))
+        })?;
+    if reply.iter().all(u8::is_ascii_whitespace) {
         return Err(SbhError::Runtime {
             details: format!(
                 "{}: the daemon closed the connection without answering",
@@ -679,10 +770,24 @@ pub fn request(
             ),
         });
     }
-    serde_json::from_str(reply.trim_end()).map_err(|error| SbhError::Serialization {
-        context: "control response",
-        details: error.to_string(),
-    })
+    let response: ControlResponse =
+        serde_json::from_slice(&reply).map_err(|error| SbhError::Serialization {
+            context: "control response",
+            details: error.to_string(),
+        })?;
+    // Admission can refuse and close before the client's first write. Surface
+    // that explicit pre-dispatch refusal, not an incidental BrokenPipe. Never
+    // accept a success response after an incomplete request write.
+    if let Some(error) = write_error
+        && (response.ok
+            || !response
+                .error
+                .as_ref()
+                .is_some_and(|error| matches!(error.code.as_str(), "busy" | "rate_limited")))
+    {
+        return Err(io(error));
+    }
+    Ok(response)
 }
 
 /// Persist `[policy] initial_mode = <mode>` so a promotion survives restarts.
@@ -880,7 +985,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state.json");
         let socket = control_socket_path(&state);
-        std::fs::write(&socket, b"stale").unwrap();
+        // A closed listener leaves a real stale socket, not a regular file
+        // which startup has no authority to delete.
+        drop(UnixListener::bind(&socket).unwrap());
 
         let server = ControlServer::start(&socket, "secret", Arc::new(EchoBackend)).unwrap();
         {

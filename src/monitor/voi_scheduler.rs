@@ -46,6 +46,8 @@ use std::time::{Duration, Instant};
 
 pub use crate::core::config::VoiConfig;
 
+mod pressure_order;
+
 // ──────────────────── configuration ────────────────────
 
 /// Age at which a completed scan no longer excludes a root from the
@@ -293,6 +295,10 @@ pub struct VoiScheduler {
     /// A one-slot budget alternates contending exploration and ordinary
     /// work. This records an opportunity, never a completed scan.
     last_plan_explored: bool,
+    /// Pressure scans use a caller-selected scope and may exhaust their time
+    /// budget in its first root. Their opportunities are separate from Green
+    /// maintenance plans and never update completed-scan statistics.
+    pressure_order: pressure_order::PressureOrder,
 }
 
 impl VoiScheduler {
@@ -306,6 +312,7 @@ impl VoiScheduler {
             rr_cursor: 0,
             exploration_after: None,
             last_plan_explored: false,
+            pressure_order: pressure_order::PressureOrder::default(),
         }
     }
 
@@ -314,9 +321,11 @@ impl VoiScheduler {
         self.path_stats.entry(path).or_insert_with(PathStats::new);
     }
 
-    /// Update configuration at runtime.
+    /// Update configuration at runtime. Discard old pressure opportunities,
+    /// but retain completed-scan and calibration evidence.
     pub fn update_config(&mut self, config: VoiConfig) {
         self.config = config;
+        self.pressure_order.reset();
     }
 
     /// Record the results of a completed scan for a path.
@@ -356,37 +365,61 @@ impl VoiScheduler {
         }
     }
 
-    /// Order `paths` by the hazard index (dirty roots first), for callers
-    /// that already know which roots to scan but not in which order. Paths
-    /// the scheduler has never seen keep their input order at the end.
+    /// Order precisely the caller's unique roots for a pressure scan.
+    ///
+    /// The daemon uses this instead of `schedule` under pressure, so fallback
+    /// and overdue-root protection must apply here too. Fallback rotates the
+    /// leading opportunity; otherwise overdue roots share the lead with the
+    /// ordinary dirty/index winner. Returning a suffix does not prove it was
+    /// scanned before the caller's entry/time budget expired.
+    ///
+    /// No root is added or registered, and the maintenance root-count budget
+    /// does not truncate pressure's scope. Only completion feedback changes
+    /// last-scanned times, dirty flags, yield forecasts or calibration.
     #[must_use]
-    pub fn rank_paths(&self, paths: &[PathBuf], now: Instant) -> Vec<PathBuf> {
-        let prior = self.unscanned_reclaim_prior();
-        let mut ranked: Vec<(bool, f64, usize, &PathBuf)> = paths
-            .iter()
-            .enumerate()
-            .map(|(position, path)| {
-                let stats = self.path_stats.get(path);
-                let dirty = stats.is_some_and(|s| s.dirty_pending);
-                let index = stats.map_or(f64::NEG_INFINITY, |s| {
-                    s.hazard_index(
-                        Self::expected_reclaim(s, prior),
-                        self.config.io_cost_weight,
-                        now,
-                    )
-                });
-                (dirty, index, position, path)
+    pub fn rank_paths(&mut self, paths: &[PathBuf], now: Instant) -> Vec<PathBuf> {
+        let fallback = self.is_fallback_active();
+        let mut paths = if fallback {
+            // An unreliable or disabled forecast must not influence this path,
+            // including by making us evaluate or sort invalid utility values.
+            paths.to_vec()
+        } else {
+            let prior = self.unscanned_reclaim_prior();
+            let mut ranked: Vec<(bool, f64, usize, &PathBuf)> = paths
+                .iter()
+                .enumerate()
+                .map(|(position, path)| {
+                    let stats = self.path_stats.get(path);
+                    let dirty = stats.is_some_and(|s| s.dirty_pending);
+                    let index = stats.map_or(f64::NEG_INFINITY, |s| {
+                        s.hazard_index(
+                            Self::expected_reclaim(s, prior),
+                            self.config.io_cost_weight,
+                            now,
+                        )
+                    });
+                    (dirty, index, position, path)
+                })
+                .collect();
+            ranked.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| a.2.cmp(&b.2))
+            });
+            ranked
+                .into_iter()
+                .map(|(_, _, _, path)| path.clone())
+                .collect()
+        };
+        let stats = &self.path_stats;
+        self.pressure_order.reorder(&mut paths, fallback, |path| {
+            stats.get(path).is_none_or(|stats| {
+                stats
+                    .last_scanned
+                    .is_none_or(|last| now.saturating_duration_since(last) >= MAX_REVISIT_INTERVAL)
             })
-            .collect();
-        ranked.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-                .then_with(|| a.2.cmp(&b.2))
         });
-        ranked
-            .into_iter()
-            .map(|(_, _, _, path)| path.clone())
-            .collect()
+        paths
     }
 
     /// Reclaim to assume for a root that was never scanned: the mean
