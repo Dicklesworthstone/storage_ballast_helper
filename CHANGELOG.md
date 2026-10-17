@@ -41,6 +41,17 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
 
 ### Fixed
 
+- **Btrfs compression no longer leaves large files part-compressed**
+  (`3110b29`). On Linux 6.17 one defrag call over a large uncompressed
+  extent compresses only its first 256 KiB, so `sbh compress --apply`
+  left most fresh files partial. A part-compressed file uses more space
+  than before, because btrfs keeps the whole original extent while any
+  of it is still in use, and later passes refused to touch it again. Each
+  256 KiB is now compressed and written to disk before the next, and
+  anything still uncompressed in the original extents is retried until
+  none is left. A remainder is reported, never counted as compressed. On
+  one host's test files, a pass that left both files partial now
+  compresses them fully, 20 to 1.2 MiB each.
 - **Linux: a Cargo build without HOME keeps its home config's protection**
   (`f0e17ac`). A build run from a systemd unit or under `env -i` has no
   HOME, so Cargo reads the config in its account's home instead. sbh read
