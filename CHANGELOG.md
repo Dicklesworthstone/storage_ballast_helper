@@ -10,6 +10,21 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
 
 ### Added
 
+- **Btrfs: the daemon can compress cold files instead of deleting
+  anything** (`6bc9fde`). Opt-in with `[compress] enabled = true`, a list
+  of `roots` and `allow_zstd_feature = true`. When a root's Btrfs mount
+  reaches `start_level` (default yellow), the daemon runs the same
+  discover-then-apply pass as `sbh compress --discover --apply`, at most
+  one at a time and at most every `interval_minutes` (default 30), bounded
+  by `[compress.policy]` (files idle 24 hours and at least 16 MiB, 128
+  files and 8 GiB per pass by default). Each file is rewritten losslessly:
+  open, mapped, leased, young and shared files are skipped, and the result
+  is checked against a SHA-256 read back from disk. Outcomes go to the
+  activity log; an `[SBH-COMPRESS]` line summarizes each pass. Enabling it
+  stands in for the CLI's `--quiescent`: a snapshot or reflink made during
+  a pass keeps the old extents, so those bytes are freed only when it
+  goes. On one host the same method, run by hand, freed several hundred
+  GB in two days while deletion freed megabytes an hour.
 - **macOS: browsers' leftover app copies are reclaimed** (`0bd2dbb`).
   Chrome, Canary, Edge, Brave and Opera copy their app bundle into
   `/var/folders/<xx>/<hash>/X` at every launch and remove the copy only
