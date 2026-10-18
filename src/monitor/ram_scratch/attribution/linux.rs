@@ -30,8 +30,11 @@ struct Probe {
 
 impl Probe {
     fn issue(&mut self, message: impl Into<String>) {
-        if self.issues.len() < MAX_ISSUES {
-            self.issues.push(message.into());
+        let message = message.into();
+        // An exhausted budget is hit by every later directory; say it once
+        // so the bounded list keeps room for distinct evidence.
+        if self.issues.len() < MAX_ISSUES && !self.issues.contains(&message) {
+            self.issues.push(message);
         }
     }
 

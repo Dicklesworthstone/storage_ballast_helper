@@ -25,7 +25,7 @@ pub fn augment(command: Command) -> Command {
             .help("Largest observed top-level entries per occupied mount on warning, default 10 (1..50)"))
         .arg(Arg::new("ram_scratch_max_entries").long("ram-scratch-max-entries")
             .requires("ram_scratch").value_parser(value_parser!(usize))
-            .help("Total metadata-attribution entry budget, default 20000 (1..100000)"))
+            .help("Total metadata-attribution entry budget, default 2000000 (1..5000000)"))
         .arg(Arg::new("ram_scratch_depth").long("ram-scratch-depth")
             .requires("ram_scratch").value_parser(value_parser!(usize))
             .help("Attribution directory depth below each top-level child, default 8 (0..32)"))
@@ -54,19 +54,20 @@ pub fn run(matches: &ArgMatches) -> io::Result<Option<i32>> {
             .unwrap_or(10),
         ..Default::default()
     };
+    let defaults = AttributionLimits::default();
     let attribution = AttributionLimits {
         top: command
             .get_one::<usize>("ram_scratch_top")
             .copied()
-            .unwrap_or(10),
+            .unwrap_or(defaults.top),
         max_entries: command
             .get_one::<usize>("ram_scratch_max_entries")
             .copied()
-            .unwrap_or(20_000),
+            .unwrap_or(defaults.max_entries),
         max_depth: command
             .get_one::<usize>("ram_scratch_depth")
             .copied()
-            .unwrap_or(8),
+            .unwrap_or(defaults.max_depth),
     };
     // Do not load config or initialize log/state backends for a host diagnostic.
     let result = execute(

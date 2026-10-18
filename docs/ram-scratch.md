@@ -56,20 +56,22 @@ unknown age. A mount with incomplete coverage reports `complete=false`; the
 ranking is only among observed entries. Even a complete age measurement is not
 proof of inactivity or permission to remove an entry.
 
-Defaults are 10 seconds shared by host collection and attribution, 20,000 total
-attribution directory entries, depth 8 below each top-level child, and 10 results
-per mount. Remaining time and entry budgets are shared across mount probes so a
-large `/tmp` does not monopolize them. Override with:
+Defaults are 10 seconds shared by host collection and attribution, 2,000,000
+total attribution directory entries, depth 8 below each top-level child, and 10
+results per mount. Remaining time and entry budgets are shared across mount
+probes so a large `/tmp` does not monopolize them. Mounts are probed smallest
+first, so what a small runtime mount leaves unused passes to the fuller ones
+instead of each mount being held to an even share. Override with:
 
 ```sh
 sudo sbh --json check --ram-scratch \
   --ram-scratch-timeout-secs 30 \
-  --ram-scratch-max-entries 50000 \
+  --ram-scratch-max-entries 4000000 \
   --ram-scratch-depth 12 --ram-scratch-top 20
 ```
 
-Hard limits are 60 seconds, 100,000 attribution entries, depth 32, and 50 results
-per mount. Process collection separately attempts at most 16,384 processes and
+Hard limits are 60 seconds, 5,000,000 attribution entries, depth 32, and 50
+results per mount. Process collection separately attempts at most 16,384 processes and
 256 mount paths by default. Deadlines are cooperative; kernel I/O can overrun
 an in-flight call. Healthy host assessments avoid directory attribution work.
 
@@ -96,7 +98,7 @@ incomplete observations, not fresh healthy reports or a respawn loop.
 Periodic work uses smaller limits than the operator command: two cooperative
 seconds for up to 4096 process statuses and 128 mount paths, and five seconds
 shared with optional attribution. On warnings, attribution visits at most 16
-unique occupied filesystems, 8192 entries total, depth 4, and retains three
+unique occupied filesystems, 1,000,000 entries total, depth 4, and retains three
 observed entries per mount. Omitted or incomplete work is explicit. These limits
 are not a hard real-time guarantee and do not establish a filesystem snapshot.
 

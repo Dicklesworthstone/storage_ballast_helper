@@ -59,6 +59,17 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
 
 ### Fixed
 
+- **The RAM-scratch report names the largest tmpfs trees again.** `sbh
+  check --ram-scratch` and the daemon's `SBH-RAM-SCRATCH` warning split
+  a 20,000-entry budget (8192 in the daemon) evenly across the occupied
+  mounts, largest first. On one host with swap 100% full, `/tmp` held
+  45 GiB in 128k entries; the report saw a few percent of it, listed
+  trees of about 1 GiB, and missed the three of 16.8, 12.3 and 3.9 GiB
+  that filled most of it. Mounts are now probed smallest first, so what a runtime
+  mount leaves unused passes to the fullest one, and the budgets are
+  2,000,000 entries (hard limit 5,000,000) and 1,000,000 in the daemon;
+  the existing deadlines still bound the work. A budget hit by many
+  directories is reported once.
 - **A deferred behavior-mode change now takes effect when its window
   ends.** A memory transition that came within
   `pressure.behavior_hysteresis_secs` of the previous one in the same

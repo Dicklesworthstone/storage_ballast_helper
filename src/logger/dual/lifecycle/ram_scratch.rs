@@ -113,7 +113,9 @@ fn collect() -> io::Result<Observation> {
         match attribution::inspect(
             &mounts,
             AttributionLimits {
-                max_entries: 8192,
+                // The five-second deadline bounds the work; 8192 entries
+                // named only small early trees on a 640k-entry host.
+                max_entries: 1_000_000,
                 max_depth: 4,
                 top: 3,
             },
