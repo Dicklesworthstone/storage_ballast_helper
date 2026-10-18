@@ -32,6 +32,7 @@ use crate::platform::types::{
 };
 use parking_lot::RwLock;
 
+mod executables;
 mod references;
 
 const FDA_CACHE_TTL_SECS: u64 = 60;
@@ -230,36 +231,14 @@ impl Platform for MacOsPal {
     }
 
     fn executables_under(&self, path: &Path) -> Result<ExecutablesResult> {
-        let root = process_observed_path(path);
-        let root_variants = macos_process_path_variants(&root);
-        let mut processes: Vec<ProcessInfo> = Vec::new();
-        let deadline = Instant::now() + OPEN_FILES_SCAN_BUDGET;
-        let mut incomplete = false;
+        self.executables_under_roots(&[path.to_path_buf()])
+    }
 
-        for (pids_scanned, pid) in process_pids_current_first()
-            .map_err(|error| macos_method_error("executables_under", &error))?
-            .into_iter()
-            .enumerate()
-        {
-            if pids_scanned >= OPEN_FILES_MAX_PIDS || Instant::now() >= deadline {
-                incomplete = true;
-                break;
-            }
-            if let Some(process) = process_info_for_pid_without_command_line(pid)
-                && executable_is_under(&process, &root_variants)
-            {
-                processes.push(process);
-            }
-        }
-        processes.sort_by(|left, right| {
-            left.pid
-                .cmp(&right.pid)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        Ok(ExecutablesResult {
-            processes,
-            complete: !incomplete,
-        })
+    /// Query executable paths once for the whole scope and preserve failures
+    /// as incomplete coverage instead of dropping unavailable process records.
+    fn executables_under_roots(&self, roots: &[PathBuf]) -> Result<ExecutablesResult> {
+        executables::collect(roots)
+            .map_err(|error| macos_method_error("executables_under_roots", &error))
     }
 
     fn mmap_regions_under(&self, path: &Path) -> Result<Vec<MappedRegion>> {
@@ -1062,14 +1041,6 @@ fn process_pids_current_first() -> io::Result<Vec<i32>> {
     pids.sort_by_key(|pid| (*pid != current_pid, *pid));
     pids.dedup();
     Ok(pids)
-}
-
-fn executable_is_under(process: &ProcessInfo, root_variants: &[PathBuf]) -> bool {
-    process
-        .executable
-        .as_deref()
-        .and_then(|path| observed_process_path_under_root(path, root_variants))
-        .is_some()
 }
 
 fn open_files_for_pid_under(pid: i32, root: &Path) -> Vec<OpenFile> {
