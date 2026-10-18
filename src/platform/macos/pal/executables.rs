@@ -8,6 +8,9 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::{macos_process_path_variants, observed_process_path_under_root};
@@ -18,6 +21,7 @@ use crate::platform::types::{
 
 const MAX_PATH_BYTES: usize = 8192;
 const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+static PROBE_BUSY: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 struct Limits {
@@ -58,14 +62,87 @@ impl ProcessAccess for NativeProcesses {
     }
 }
 
+/// One admission permit remains with the native worker, not its waiter. A
+/// timed-out lookup can never cause later callers to accumulate stuck threads.
+struct Admission(Arc<AtomicBool>);
+
+impl Admission {
+    fn acquire(busy: Arc<AtomicBool>) -> io::Result<Self> {
+        busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "macOS executable inspection is already in progress",
+            ))?;
+        Ok(Self(busy))
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+struct Probe {
+    receiver: mpsc::Receiver<io::Result<ExecutablesResult>>,
+    worker: JoinHandle<()>,
+}
+
+impl Probe {
+    fn start(
+        admission: Admission,
+        inspect: impl FnOnce() -> io::Result<ExecutablesResult> + Send + 'static,
+    ) -> io::Result<Self> {
+        // Each request owns its result channel. There is no shared mailbox or
+        // cached result which a late lookup could deliver to another scope.
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("sbh-macos-executables".to_owned())
+            .spawn(move || {
+                let result = inspect();
+                drop(admission);
+                let _ = sender.send(result);
+            })?;
+        Ok(Self { receiver, worker })
+    }
+
+    fn wait(&self, timeout: Duration) -> io::Result<ExecutablesResult> {
+        self.receiver.recv_timeout(timeout).map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => io::Error::new(
+                io::ErrorKind::TimedOut,
+                "macOS executable inspection exceeded its caller wait budget",
+            ),
+            mpsc::RecvTimeoutError::Disconnected => {
+                io::Error::other("macOS executable worker stopped without a result")
+            }
+        })?
+    }
+}
+
 pub(super) fn collect(roots: &[PathBuf]) -> io::Result<ExecutablesResult> {
-    let mut variants: Vec<_> = roots
-        .iter()
-        .flat_map(|root| macos_process_path_variants(root))
-        .collect();
-    variants.sort();
-    variants.dedup();
-    collect_with(&NativeProcesses, &variants, Limits::default())
+    if roots.is_empty() {
+        return Ok(ExecutablesResult { processes: Vec::new(), complete: true });
+    }
+    let busy = PROBE_BUSY.get_or_init(|| Arc::new(AtomicBool::new(false)));
+    // Acquire before copying root data or starting any native work.
+    let admission = Admission::acquire(Arc::clone(busy))?;
+    let roots = roots.to_vec();
+    let probe = Probe::start(admission, move || {
+        // Even relative-root resolution belongs in the worker. A blocked
+        // getcwd must not defeat the caller's receive timeout.
+        let mut variants: Vec<_> = roots
+            .iter()
+            .flat_map(|root| macos_process_path_variants(root))
+            .collect();
+        variants.sort();
+        variants.dedup();
+        collect_with(&NativeProcesses, &variants, Limits::default())
+    })?;
+    let result = probe.wait(OPEN_FILES_SCAN_BUDGET.saturating_add(Duration::from_millis(250)));
+    // Never join a timed-out native call. Its permit remains held until it
+    // finishes; subsequent callers receive incomplete evidence via an error.
+    drop(probe.worker);
+    result
 }
 
 /// Inspect each visible PID once, regardless of the number of candidate roots.
@@ -449,5 +526,74 @@ mod tests {
         assert_eq!(result.processes[0].executable.as_ref(), Some(&expected));
         assert!(result.processes[0].command_line.is_empty());
         assert!(result.processes[0].start_time_unix_ms.is_none());
+    }
+
+    #[test]
+    fn worker_failure_preserves_the_error_and_releases_admission() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let admission = Admission::acquire(Arc::clone(&busy)).unwrap();
+        let probe = Probe::start(admission, || Err(io::ErrorKind::PermissionDenied.into())).unwrap();
+        assert_eq!(probe.wait(Duration::from_secs(5)).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        probe.worker.join().unwrap();
+        assert!(!busy.load(Ordering::Acquire));
+        assert!(Admission::acquire(busy).is_ok());
+    }
+
+    #[test]
+    fn timed_out_worker_keeps_admission_and_its_late_result_cannot_cross_scopes() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let (started, start) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let probe = Probe::start(Admission::acquire(Arc::clone(&busy)).unwrap(), move || {
+            started.send(()).unwrap();
+            released.recv().unwrap();
+            Ok(ExecutablesResult {
+                processes: vec![executable_reference(41, "/first/program".into())],
+                complete: true,
+            })
+        }).unwrap();
+        start.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(probe.wait(Duration::ZERO).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(Admission::acquire(Arc::clone(&busy)).err().unwrap().kind(), io::ErrorKind::WouldBlock);
+        release.send(()).unwrap();
+        probe.worker.join().unwrap();
+        assert!(!busy.load(Ordering::Acquire));
+        let fresh = Probe::start(Admission::acquire(busy).unwrap(), || {
+            Ok(ExecutablesResult {
+                processes: vec![executable_reference(42, "/second/program".into())],
+                complete: true,
+            })
+        }).unwrap();
+        let current = fresh.wait(Duration::from_secs(5)).unwrap();
+        fresh.worker.join().unwrap();
+        assert_eq!(current.processes[0].executable.as_deref(), Some(Path::new("/second/program")));
+        let late = probe.receiver.try_recv().unwrap().unwrap();
+        assert_eq!(late.processes[0].executable.as_deref(), Some(Path::new("/first/program")));
+    }
+
+    #[test]
+    fn abandoning_the_receiver_does_not_release_a_running_native_probe() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let (release, released) = mpsc::sync_channel(1);
+        let probe = Probe::start(Admission::acquire(Arc::clone(&busy)).unwrap(), move || {
+            released.recv().unwrap();
+            Ok(ExecutablesResult { processes: Vec::new(), complete: true })
+        }).unwrap();
+        drop(probe.receiver);
+        assert_eq!(Admission::acquire(Arc::clone(&busy)).err().unwrap().kind(), io::ErrorKind::WouldBlock);
+        release.send(()).unwrap();
+        probe.worker.join().unwrap();
+        assert!(!busy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn worker_unwind_releases_admission_without_returning_complete_evidence() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let probe = Probe::start(Admission::acquire(Arc::clone(&busy)).unwrap(), || {
+            panic!("injected executable observer failure");
+        }).unwrap();
+        assert!(probe.worker.join().is_err());
+        assert!(probe.receiver.recv_timeout(Duration::from_secs(5)).is_err());
+        assert!(!busy.load(Ordering::Acquire));
     }
 }
