@@ -1149,6 +1149,13 @@ pub fn constants() -> Vec<ConstantDoc> {
         ),
         constant(
             "scanner",
+            "target_only_idle_hours",
+            scanner.target_only_idle_hours,
+            "Idle hours before a pure cargo target in a target-only root may go",
+            CONFIG,
+        ),
+        constant(
+            "scanner",
             "active_reference_cache_ttl_secs",
             scanner.active_reference_cache_ttl_secs,
             "Active-reference (open file) cache lifetime",
@@ -1711,6 +1718,13 @@ fn daemon_constants() -> Vec<ConstantDoc> {
             crate::daemon::policy::CANARY_REPROVE_SECS / 60,
             "Clean minutes an automatic Canary needs to return to the intended mode",
             "src/daemon/policy.rs",
+        ),
+        constant(
+            "daemon",
+            "TARGET_TIER_PASS_MINUTES",
+            crate::daemon::target_tier::PASS_INTERVAL.as_secs() / 60,
+            "Shortest gap between two target-only passes",
+            "src/daemon/target_tier.rs",
         ),
     ]
 }

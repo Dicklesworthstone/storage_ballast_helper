@@ -457,8 +457,9 @@ impl ExpansionBudget {
 
 /// Expand an absolute pattern without returning a silently incomplete plan.
 /// An over-budget or unreadable pattern enters the caller's failure cooldown;
-/// other configured patterns remain eligible for reclamation.
-fn expand_pattern(pattern: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+/// other configured patterns remain eligible for reclamation. The daemon's
+/// target-only roots (`scanner.target_only_roots`) use the same language.
+pub(crate) fn expand_pattern(pattern: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     let mut budget = ExpansionBudget {
         remaining_steps: MAX_PATTERN_STEPS,
         deadline: Instant::now() + PATTERN_TIME_BUDGET,

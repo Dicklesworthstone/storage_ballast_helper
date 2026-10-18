@@ -467,7 +467,7 @@ One mapping for every command (`CliError::exit_code`, C-EXIT); generated from `c
 | `[pressure]` | `green_min_free_pct`, `yellow_min_free_pct`, `orange_min_free_pct`, `red_min_free_pct`, `poll_interval_ms` |
 | `[pressure.prediction]` | `enabled`, `action_horizon_minutes`, `warning_horizon_minutes`, `min_confidence`, `min_samples`, `coverage_target` (conformal time-to-red bound) |
 | `[pressure.controller]` | per-mount PID: `kp`, `ki`, `kd`, `kf` (forecast feedforward), `integral_cap`, `hysteresis_pct`, `reference_total_bytes`, `kp_scale_min`, `kp_scale_max` |
-| `[scanner]` | `engine` (`"v2"` default, `"v1"` rollback), `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run`, `cross_devices`, `quarantine_enabled`, `quarantine_ttl_hours`, `quarantine_max_bytes_pct` |
+| `[scanner]` | `engine` (`"v2"` default, `"v1"` rollback), `root_paths`, `excluded_paths`, `protected_paths`, `min_file_age_minutes`, `max_depth`, `parallelism`, `dry_run`, `cross_devices`, `quarantine_enabled`, `quarantine_ttl_hours`, `quarantine_max_bytes_pct`, `target_only_roots` + `target_only_idle_hours` (pure idle cargo targets inside otherwise protected roots, `src/daemon/target_tier.rs`) |
 | `[scoring]` | `min_score`, `location_weight`, `name_weight`, `age_weight`, `size_weight`, `structure_weight` |
 | `[scoring]` (decision-theoretic) | `false_positive_loss`, `false_negative_loss`, `calibration_floor`, `posterior_floor_definite` |
 | `[scoring]` (batch planner) | `batch_risk_budget_by_level` (`green`, `yellow`, `orange`, `red`, `critical`): expected loss per batch as multiples of `false_positive_loss`; `[SBH-PLANNER]` line per batch, `plan` block in `clean`/`scan --json` |
@@ -662,6 +662,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | scanner | `prescan_time_budget_secs` | `60` | Longest priority pre-scan phase before the walker takes over | `src/core/config.rs` |
 | scanner | `quarantine_ttl_hours` | `24` | Quarantined entries expire after this | `src/core/config.rs` |
 | scanner | `quarantine_max_bytes_pct` | `5` | Quarantine size cap as % of the volume | `src/core/config.rs` |
+| scanner | `target_only_idle_hours` | `24` | Idle hours before a pure cargo target in a target-only root may go | `src/core/config.rs` |
 | scanner | `active_reference_cache_ttl_secs` | `30` | Active-reference (open file) cache lifetime | `src/core/config.rs` |
 | scanner | `active_reference_min_size_bytes` | `100 MiB` | Smallest entry checked for active references | `src/core/config.rs` |
 | walker | `RESULT_CHANNEL_CAP` | `10000` | Worker → collector channel bound | `src/scanner/walker.rs` |
@@ -741,6 +742,7 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | daemon | `CATALOG_PROBE_MAX_ENTRIES` | `50000` | Entries a catalog freshness probe may visit | `src/daemon/loop_main.rs` |
 | daemon | `CATALOG_PROBE_MAX_DEPTH` | `5` | Depth of a catalog freshness probe | `src/daemon/loop_main.rs` |
 | daemon | `CANARY_REPROVE_MINUTES` | `30` | Clean minutes an automatic Canary needs to return to the intended mode | `src/daemon/policy.rs` |
+| daemon | `TARGET_TIER_PASS_MINUTES` | `10` | Shortest gap between two target-only passes | `src/daemon/target_tier.rs` |
 <!-- sbh-docs:end -->
 
 ---

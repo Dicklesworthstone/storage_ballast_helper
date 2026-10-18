@@ -25,6 +25,24 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   a pass keeps the old extents, so those bytes are freed only when it
   goes. On one host the same method, run by hand, freed several hundred
   GB in two days while deletion freed megabytes an hour.
+- **Idle cargo targets inside protected agent scratch are reclaimed**
+  (bd-232u). Operators protect a coding agent's session scratch as a
+  whole, since it holds temp clones and evidence, but agents also build
+  there with `CARGO_TARGET_DIR`. On one 3.6 TB Mac about 151 GB of such
+  targets sat untouched for over a day while the volume reached 99% and
+  sbh released nothing. Under each `scanner.target_only_roots` root
+  (macOS default `/private/tmp/claude-*`; none elsewhere), while its mount
+  is at Yellow or above, the daemon now looks every 10 minutes for
+  directories with `CACHEDIR.TAG` or `.rustc_info.json` whose top level
+  holds only cargo's own entries, with no `.sbh-protect` or `.git` in,
+  inside or above them below the root, nothing changed within
+  `scanner.target_only_idle_hours` (24), and no process with a file open
+  or its working directory in them. Those go to the executor as a
+  target-only batch: the policy mode, the decision ledger, the planner and
+  every executor check still apply, but `protected_paths` does not.
+  Everything else under the root stays untouchable. A user-scoped macOS
+  daemon cannot see other users' processes and so keeps every candidate;
+  the tier needs the system-scope service there.
 - **macOS: browsers' leftover app copies are reclaimed** (`0bd2dbb`).
   Chrome, Canary, Edge, Brave and Opera copy their app bundle into
   `/var/folders/<xx>/<hash>/X` at every launch and remove the copy only

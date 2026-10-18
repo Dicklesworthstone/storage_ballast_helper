@@ -515,6 +515,17 @@ pub struct ScannerConfig {
     pub allow_source_tree_roots: bool,
     pub excluded_paths: Vec<PathBuf>,
     pub protected_paths: Vec<String>,
+    /// Roots, usually excluded or protected as a whole, inside which sbh may
+    /// still remove pure, idle cargo target directories (bd-232u). An agent's
+    /// session scratch holds temp clones and evidence, but agents also build
+    /// there with `CARGO_TARGET_DIR`. Each entry is an absolute path that may
+    /// contain `*` inside a segment, as in `log_truncation.paths`. Everything
+    /// else under the root stays untouchable; the checks are in
+    /// `src/daemon/target_tier.rs`. Empty turns the tier off. macOS default:
+    /// the agent scratch root `/private/tmp/claude-*`.
+    pub target_only_roots: Vec<PathBuf>,
+    /// Hours nothing inside a target-only candidate may have changed.
+    pub target_only_idle_hours: u64,
     pub min_file_age_minutes: u64,
     pub max_depth: usize,
     pub parallelism: usize,
@@ -956,6 +967,36 @@ impl Default for CompressConfig {
     }
 }
 
+impl ScannerConfig {
+    /// Reject target-only roots the tier could not bound: relative paths, and
+    /// more roots or a shorter idle window than an operator plausibly means.
+    fn validate_target_only(&self) -> Result<()> {
+        let invalid = |details: String| SbhError::InvalidConfig { details };
+        if self.target_only_roots.len() > 32 {
+            return Err(invalid(format!(
+                "scanner.target_only_roots lists at most 32 roots, got {}",
+                self.target_only_roots.len()
+            )));
+        }
+        if let Some(root) = self
+            .target_only_roots
+            .iter()
+            .find(|root| !root.is_absolute())
+        {
+            return Err(invalid(format!(
+                "scanner.target_only_roots must be absolute: {}",
+                root.display()
+            )));
+        }
+        if self.target_only_idle_hours == 0 {
+            return Err(invalid(
+                "scanner.target_only_idle_hours must be at least 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl CompressConfig {
     /// `start_level` as a pressure level, if it names one.
     #[must_use]
@@ -1330,6 +1371,15 @@ impl Default for ScannerConfig {
                 PathBuf::from("/var/log"),
             ],
             protected_paths: Vec::new(),
+            // Coding agents keep their session scratch here on macOS
+            // (`claude-<uid>`); on other hosts it is wherever the agent's
+            // temp dir points, so there is no default.
+            target_only_roots: if cfg!(target_os = "macos") {
+                vec![PathBuf::from("/private/tmp/claude-*")]
+            } else {
+                Vec::new()
+            },
+            target_only_idle_hours: 24,
             min_file_age_minutes: 5,
             max_depth: 10,
             parallelism: std::thread::available_parallelism()
@@ -3045,6 +3095,7 @@ impl Config {
         for pattern in &self.scanner.protected_paths {
             crate::scanner::protection::validate_glob_pattern(pattern)?;
         }
+        self.scanner.validate_target_only()?;
 
         // System tuning (kernel writeback).
         let tuning = &self.system_tuning;
@@ -4212,6 +4263,41 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn target_only_roots_default_to_the_macos_agent_scratch_and_must_be_bounded() {
+        let default = Config::default();
+        let expected: Vec<PathBuf> = if cfg!(target_os = "macos") {
+            vec![PathBuf::from("/private/tmp/claude-*")]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(default.scanner.target_only_roots, expected);
+        assert_eq!(default.scanner.target_only_idle_hours, 24);
+        default.validate().unwrap();
+
+        let with = |roots: Vec<PathBuf>, idle_hours: u64| {
+            let mut config = Config::default();
+            config.scanner.target_only_roots = roots;
+            config.scanner.target_only_idle_hours = idle_hours;
+            config.validate()
+        };
+        with(vec![PathBuf::from("/data/tmp/claude-*")], 1).unwrap();
+        assert!(with(vec![PathBuf::from("tmp/claude-*")], 24).is_err());
+        assert!(with(vec![PathBuf::from("/data/tmp")], 0).is_err());
+        assert!(with(vec![PathBuf::from("/data/tmp"); 33], 24).is_err());
+
+        let parsed: Config = toml::from_str(
+            "[scanner]\ntarget_only_roots = [\"/data/tmp/claude-*\"]\ntarget_only_idle_hours = 48\n",
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(
+            parsed.scanner.target_only_roots,
+            vec![PathBuf::from("/data/tmp/claude-*")]
+        );
+        assert_eq!(parsed.scanner.target_only_idle_hours, 48);
     }
 
     #[test]

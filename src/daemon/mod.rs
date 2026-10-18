@@ -18,3 +18,5 @@ pub mod self_monitor;
 pub mod service;
 #[cfg(feature = "daemon")]
 pub mod signals;
+#[cfg(feature = "daemon")]
+pub mod target_tier;

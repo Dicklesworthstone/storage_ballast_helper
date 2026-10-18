@@ -53,6 +53,7 @@ use crate::daemon::self_monitor::{
     assess_logging_placement, nearest_existing_ancestor,
 };
 use crate::daemon::signals::{SignalHandler, WatchdogHeartbeat, resolve_watchdog_sec};
+use crate::daemon::target_tier::TargetTier;
 use crate::logger::dual::{
     ActivityEvent, ActivityLoggerHandle, DualLoggerConfig, ScanCompletionTelemetry, spawn_logger,
 };
@@ -982,6 +983,12 @@ pub struct DeletionBatch {
     pub urgency: f64,
     /// W1 planner: the byte target of the pass that produced the batch.
     pub target_bytes: Option<u64>,
+    /// Pure, idle cargo target dirs the target-only tier vetted inside a
+    /// `scanner.target_only_roots` root (bd-232u). The executor does not apply
+    /// the operator's `protected_paths` to them, since such a root is usually
+    /// protected as a whole; every other check, `.sbh-protect` markers
+    /// included, still runs. Only that tier sets it.
+    pub target_only: bool,
 }
 
 /// Results reported from worker threads back to the main monitoring loop.
@@ -2088,6 +2095,8 @@ pub struct MonitoringDaemon {
     attribution_pressured_since: HashMap<PathBuf, Instant>,
     /// Opt-in lossless compression passes on btrfs (`[compress]`, bd-rxq5).
     compress_tier: CompressTier,
+    /// Pure idle cargo targets inside `scanner.target_only_roots` (bd-232u).
+    target_tier: TargetTier,
     last_summary_report: Instant,
     summary_scans: u64,
     summary_scan_timeouts: u64,
@@ -3390,6 +3399,7 @@ impl MonitoringDaemon {
             attribution_reported: HashMap::new(),
             attribution_pressured_since: HashMap::new(),
             compress_tier: CompressTier::default(),
+            target_tier: TargetTier::default(),
             last_summary_report: Instant::now(),
             summary_scans: 0,
             summary_scan_timeouts: 0,
@@ -4474,7 +4484,7 @@ impl MonitoringDaemon {
 
             // 5. Handle pressure response per mount; the tick follows the
             //    tightest mount sbh is actually working on.
-            let requested_tick = self.handle_pressure(&response, &scan_tx, &scan_rx);
+            let requested_tick = self.handle_pressure(&response, &scan_tx, &scan_rx, &del_tx);
             self.watchdog.maybe_notify("pressure handled");
 
             // 5b. Policy mode changes since the last tick (the engine runs
@@ -5124,6 +5134,7 @@ impl MonitoringDaemon {
         response: &crate::monitor::pid::PressureResponse,
         scan_tx: &Sender<ScanRequest>,
         scan_rx: &Receiver<ScanRequest>,
+        del_tx: &Sender<DeletionBatch>,
     ) -> Duration {
         // Reset min_score to config default at the start of each tick;
         // PreemptiveCleanup may lower it below.
@@ -5503,6 +5514,23 @@ impl MonitoringDaemon {
                 &self.config,
                 &self.platform,
                 &mount_levels,
+                &self.logger_handle,
+            );
+        }
+        if !self.config.scanner.target_only_roots.is_empty() {
+            let mounts: HashMap<PathBuf, (PressureLevel, f64)> = self
+                .mount_controllers
+                .iter()
+                .map(|(mount, controller)| {
+                    (mount.clone(), (controller.level(), controller.urgency()))
+                })
+                .collect();
+            self.target_tier.tick(
+                now,
+                &self.config,
+                &self.platform,
+                &mounts,
+                del_tx,
                 &self.logger_handle,
             );
         }
@@ -7046,6 +7074,7 @@ fn dispatch_top_candidates(
         pressure_level: request.pressure_level,
         urgency: request.urgency,
         target_bytes: request.target_bytes,
+        target_only: false,
     };
     let batch_len = batch.candidates.len();
     let batch_paths: Vec<PathBuf> = batch.candidates.iter().map(|c| c.path.clone()).collect();
@@ -9796,6 +9825,20 @@ impl RepeatDeletionTracker {
 
 // ──────────────────── executor thread ────────────────────
 
+/// The operator's `protected_paths` as the executor applies them to a batch:
+/// none for a target-only batch, whose root they usually cover as a whole
+/// (bd-232u). `.sbh-protect` markers are checked separately and always apply.
+fn batch_protected_paths(
+    batch: &DeletionBatch,
+    scanner: &crate::core::config::ScannerConfig,
+) -> Vec<String> {
+    if batch.target_only {
+        Vec::new()
+    } else {
+        scanner.protected_paths.clone()
+    }
+}
+
 /// Executor thread: receives deletion batches and safely removes artifacts.
 ///
 /// Gates all deletions through the `PolicyEngine` before execution. In Observe
@@ -10022,10 +10065,11 @@ fn executor_thread_main(
         }
         // The executor's pre-flight sacred rail sees the same catalog the
         // scoring stage does: platform builtins plus operator patterns.
+        let operator_protected_paths = batch_protected_paths(&batch, &shared_scanner_config.read());
         let executor_sacred_paths = {
             let mut catalog = platform_sacred_paths.to_vec();
             catalog.extend(protection::sacred_paths_from_protected_patterns(
-                &shared_scanner_config.read().protected_paths,
+                &operator_protected_paths,
             ));
             catalog
         };
@@ -10094,7 +10138,9 @@ fn executor_thread_main(
         }
 
         let scanner_config = shared_scanner_config.read().clone();
-        let protection = match ProtectionRegistry::new(Some(&scanner_config.protected_paths)) {
+        // Markers always protect; the operator's patterns, as above, not for
+        // a target-only batch.
+        let protection = match ProtectionRegistry::new(Some(&operator_protected_paths)) {
             Ok(registry) => Mutex::new(registry),
             Err(err) => {
                 eprintln!(
@@ -10110,7 +10156,7 @@ fn executor_thread_main(
             }
         };
         let sacred_paths =
-            protection::sacred_paths_from_protected_patterns(&scanner_config.protected_paths);
+            protection::sacred_paths_from_protected_patterns(&operator_protected_paths);
         let skip_protected = |path: &Path| {
             if shutdown.load(Ordering::Relaxed) {
                 return Some(SkipReason::ShuttingDown);
@@ -11562,6 +11608,101 @@ mod tests {
             protected.exists(),
             "protected candidate must remain present after executor preflight"
         );
+    }
+
+    /// bd-232u: the operator's `protected_paths` stop an ordinary batch but
+    /// not a target-only one, and a `.sbh-protect` marker stops both. The
+    /// executor is composed as `executor_thread_main` composes it, from
+    /// `batch_protected_paths`, but with the mock platform's open-file
+    /// evidence: in a non-root test the real /proc sweep is incomplete and
+    /// holds every candidate, whatever its protection.
+    #[cfg(unix)]
+    #[test]
+    fn executor_skips_protected_paths_only_for_target_only_batches() {
+        use crate::scanner::walker::{FsEntryKind, FsIdentity};
+        use std::os::unix::fs::MetadataExt;
+
+        // Under /tmp, as above (bd-c47s).
+        let scratch = tempfile::tempdir_in("/tmp").unwrap();
+        let root = scratch.path().join("claude-501");
+        let ordinary = root.join("a/target-ordinary");
+        let target_only = root.join("b/target-only");
+        let marked = root.join("c/target-marked");
+        for dir in [&ordinary, &target_only, &marked] {
+            std::fs::create_dir_all(dir.join("debug")).unwrap();
+            std::fs::write(dir.join("debug/libdemo.rlib"), [7u8; 64]).unwrap();
+        }
+        protection::create_marker(&marked, None).unwrap();
+        let scanner = crate::core::config::ScannerConfig {
+            protected_paths: vec![root.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let platform: Arc<dyn Platform> = Arc::new(MockPlatform::healthy());
+
+        let candidate = |path: &PathBuf| {
+            let meta = std::fs::symlink_metadata(path).unwrap();
+            let mut candidate = test_candidate(&path.to_string_lossy(), 3.0);
+            candidate.size_bytes = 64;
+            candidate.identity = Some(FsIdentity {
+                device_id: meta.dev(),
+                inode: meta.ino(),
+                kind: FsEntryKind::Directory,
+            });
+            candidate
+        };
+        let run = |paths: &[&PathBuf], target_only: bool| {
+            let batch = DeletionBatch {
+                candidates: paths.iter().map(|path| candidate(path)).collect(),
+                pressure_level: PressureLevel::Critical,
+                urgency: 0.9,
+                target_bytes: None,
+                target_only,
+            };
+            let patterns = batch_protected_paths(&batch, &scanner);
+            let skip_sacred = protection::sacred_paths_from_protected_patterns(&patterns);
+            let mut catalog = platform.sacred_paths();
+            catalog.extend(skip_sacred.iter().cloned());
+            let registry = Mutex::new(ProtectionRegistry::new(Some(&patterns)).unwrap());
+            let skip_protected = |path: &Path| {
+                let mut registry = registry.lock();
+                daemon_protection_reason(&mut registry, path, &skip_sacred)
+                    .unwrap()
+                    .map(|_| SkipReason::SacredStowaway)
+            };
+            let executor = DeletionExecutor::new(
+                DeletionConfig {
+                    dry_run: false,
+                    min_score: 0.0,
+                    check_open_files: true,
+                    require_identity: true,
+                    sacred_paths: catalog,
+                    mode: DeletionMode::Unlink,
+                    ..Default::default()
+                },
+                None,
+            )
+            .with_platform(Arc::clone(&platform));
+            let plan = executor.plan(batch.candidates);
+            executor.execute(&plan, Some(&skip_protected))
+        };
+
+        let report = run(&[&ordinary], false);
+        assert_eq!(
+            report.skipped_by_reason.get("sacred_stowaway"),
+            Some(&1),
+            "{:?}",
+            report.skipped_by_reason
+        );
+        assert!(ordinary.exists(), "protected_paths stop an ordinary batch");
+
+        let report = run(&[&target_only, &marked], true);
+        assert_eq!(report.items_deleted, 1, "{:?}", report.skipped_by_reason);
+        assert_eq!(report.skipped_by_reason.get("sacred_stowaway"), Some(&1));
+        assert!(
+            !target_only.exists(),
+            "a target-only batch is not stopped by protected_paths"
+        );
+        assert!(marked.exists(), "a marker stops a target-only batch");
     }
 
     #[cfg(unix)]
@@ -14434,6 +14575,7 @@ mod tests {
             pressure_level: PressureLevel::Orange,
             urgency: 0.5,
             target_bytes: None,
+            target_only: false,
         };
         del_tx.send(batch).unwrap();
         let received_batch = del_rx.recv().unwrap();
@@ -15593,6 +15735,7 @@ mod tests {
                 pressure_level: PressureLevel::Critical,
                 urgency: 0.5,
                 target_bytes: None,
+                target_only: false,
             })
             .expect("prefill channel");
 
