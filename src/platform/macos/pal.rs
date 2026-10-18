@@ -32,6 +32,8 @@ use crate::platform::types::{
 };
 use parking_lot::RwLock;
 
+mod references;
+
 const FDA_CACHE_TTL_SECS: u64 = 60;
 const FDA_CACHE_TTL: Duration = Duration::from_secs(FDA_CACHE_TTL_SECS);
 const OPEN_FILES_CACHE_TTL_SECS: u64 = 30;
@@ -218,6 +220,13 @@ impl Platform for MacOsPal {
     fn open_files_under(&self, path: &Path) -> Result<OpenFilesResult> {
         let root = process_observed_path(path);
         cached_open_files_under(&root)
+    }
+
+    /// Mutation preflight and active-reference scoring need one fresh sweep
+    /// for the full candidate set, never cached per-root absence verdicts.
+    fn open_files_under_roots(&self, roots: &[PathBuf]) -> Result<OpenFilesResult> {
+        references::collect(roots)
+            .map_err(|error| macos_method_error("open_files_under_roots", &error))
     }
 
     fn executables_under(&self, path: &Path) -> Result<ExecutablesResult> {
