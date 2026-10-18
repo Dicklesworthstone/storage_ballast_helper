@@ -19,7 +19,17 @@ use crate::core::errors::Result;
 /// the daemon exits on its own and is restarted before the kernel OOM-kills
 /// it, maybe mid-deletion. A 500k-entry tree needs about 290 MiB even with
 /// two malloc arenas (ts2 2026-10-15), so the old 256M cap bound first.
-pub const SYSTEMD_MEMORY_MAX: &str = "768M";
+///
+/// The cgroup is also charged for the kernel's dentry and inode cache the
+/// walker fills, which RSS never shows. At 768M that share was ~400 MiB,
+/// less than one pass needs on a large host, so the cgroup sat at the cap:
+/// ts2 (2026-10-18) spent 73-79% of its time stalled on memory and the
+/// monitor tick stretched to minutes at Critical. Raised at runtime to 4G,
+/// the next pass ran with no memory stall at about 1.1 GiB; back at 768M
+/// the stall returned within a minute. The RSS limit
+/// still bounds the daemon's own allocations; the rest of this cap only
+/// bounds reclaimable cache.
+pub const SYSTEMD_MEMORY_MAX: &str = "4096M";
 use crate::platform::pal::{NoopServiceManager, Platform, ServiceManager};
 use crate::platform::types::ServiceKind;
 

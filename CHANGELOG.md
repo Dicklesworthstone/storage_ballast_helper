@@ -59,6 +59,20 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
 
 ### Fixed
 
+- **Generated systemd units cap memory at 4096M, not 768M.** The cgroup
+  is charged for the dentry and inode cache the walker fills, not only the
+  daemon's RSS. On one large host at Critical the cgroup sat at the 768M
+  cap with about 400 MiB of that cache. The daemon spent 73-79% of its
+  time stalled on memory, and its monitor tick stretched to minutes, so
+  its CPU self-report read 220-1093% of a core against a real 100%.
+  Raised to 4G at runtime, the next pass ran with no memory stall at
+  about 1.1 GiB, and ticks were regular again; when a `daemon-reload`
+  restored the 768M drop-in 14 minutes later, the stall was back within a
+  minute and the ticks stretched again. The daemon's own RSS limit
+  (500 MiB) still bounds its allocations; the rest of the cap only bounds
+  reclaimable cache. Existing installs keep their unit until `sudo sbh
+  service --systemd reinstall-unit` rewrites it; a drop-in that sets
+  `MemoryMax=768M` overrides the new unit and must be changed too.
 - **The RAM-scratch report names the largest tmpfs trees again.** `sbh
   check --ram-scratch` and the daemon's `SBH-RAM-SCRATCH` warning split
   a 20,000-entry budget (8192 in the daemon) evenly across the occupied
