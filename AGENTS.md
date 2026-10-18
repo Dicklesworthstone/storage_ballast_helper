@@ -705,10 +705,10 @@ Every tunable default and hard-coded limit the daemon runs with, read from the c
 | quarantine | `DEFAULT_MAX_BYTES_PCT` | `5` | Quarantine size cap used without config | `src/scanner/quarantine.rs` |
 | daemon | `DAEMON_STATE_WRITE_INTERVAL_SECS` | `30` | state.json write cadence | `src/daemon/self_monitor.rs` |
 | daemon | `DAEMON_STATE_STALE_THRESHOLD_SECS` | `90` | state.json older than this is stale | `src/daemon/self_monitor.rs` |
-| daemon | `DEFAULT_DAEMON_RSS_WARNING_BYTES` | `256 MiB` | RSS that logs a warning | `src/daemon/self_monitor.rs` |
-| daemon | `DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES` | `500 MiB` | RSS at which the daemon restarts itself | `src/daemon/self_monitor.rs` |
-| daemon | `daemon_rss_warning_bytes` | `256 MiB` | Config-side RSS warning | `src/core/config.rs` |
-| daemon | `daemon_rss_hard_limit_bytes` | `500 MiB` | Config-side RSS hard limit | `src/core/config.rs` |
+| daemon | `DEFAULT_DAEMON_RSS_WARNING_BYTES` | `512 MiB` | RSS that logs a warning | `src/daemon/self_monitor.rs` |
+| daemon | `DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES` | `1 GiB` | RSS at which the daemon restarts itself | `src/daemon/self_monitor.rs` |
+| daemon | `daemon_rss_warning_bytes` | `512 MiB` | Config-side RSS warning | `src/core/config.rs` |
+| daemon | `daemon_rss_hard_limit_bytes` | `1 GiB` | Config-side RSS hard limit | `src/core/config.rs` |
 | logger | `CHANNEL_CAPACITY` | `1024` | Logger channel bound (try_send, drops when full) | `src/logger/dual.rs` |
 | logger | `SQLITE_FAILURE_TRIP` | `3` | Consecutive SQLite write failures that switch to JSONL only | `src/logger/dual.rs` |
 | logger | `DAEMON_MAX_SIZE_BYTES` | `50 MiB` | JSONL size that triggers rotation in the daemon | `src/logger/jsonl.rs` |

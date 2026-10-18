@@ -15,10 +15,11 @@ use crate::core::errors::Result;
 
 /// `MemoryMax=` written into the generated systemd unit.
 ///
-/// It sits above the daemon's own RSS hard limit (500 MiB by default), so
+/// It sits above the daemon's own RSS hard limit (1 GiB by default), so
 /// the daemon exits on its own and is restarted before the kernel OOM-kills
-/// it, maybe mid-deletion. A 500k-entry tree needs about 290 MiB even with
-/// two malloc arenas (ts2 2026-10-15), so the old 256M cap bound first.
+/// it, maybe mid-deletion. A 500k-entry tree needs 290-550 MiB of RSS even
+/// with two malloc arenas (ts2 2026-10-15 and 2026-10-18), so the old 256M
+/// cap bound first.
 ///
 /// The cgroup is also charged for the kernel's dentry and inode cache the
 /// walker fills, which RSS never shows. At 768M that share was ~400 MiB,

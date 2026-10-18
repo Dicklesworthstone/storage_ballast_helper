@@ -1485,8 +1485,9 @@ impl Default for TelemetryConfig {
             ewma_rate_history_size: 200,
             guardrail_window_size: 500,
             guardrail_min_observations: 60,
-            daemon_rss_warning_bytes: 256 * 1024 * 1024,
-            daemon_rss_hard_limit_bytes: 500 * 1024 * 1024,
+            daemon_rss_warning_bytes: crate::daemon::self_monitor::DEFAULT_DAEMON_RSS_WARNING_BYTES,
+            daemon_rss_hard_limit_bytes:
+                crate::daemon::self_monitor::DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES,
             cpu_budget_pct: 25,
             cpu_budget_burst_secs: crate::daemon::cpu_budget::BURST_SECS,
             metrics_enabled: true,
@@ -4380,10 +4381,13 @@ mod tests {
     }
 
     #[test]
-    fn daemon_rss_hard_limit_defaults_to_500_mib() {
+    fn daemon_rss_limits_default_to_512_mib_and_1_gib() {
         let cfg = Config::default();
-        assert_eq!(cfg.telemetry.daemon_rss_warning_bytes, 256 * 1024 * 1024);
-        assert_eq!(cfg.telemetry.daemon_rss_hard_limit_bytes, 500 * 1024 * 1024);
+        assert_eq!(cfg.telemetry.daemon_rss_warning_bytes, 512 * 1024 * 1024);
+        assert_eq!(
+            cfg.telemetry.daemon_rss_hard_limit_bytes,
+            1024 * 1024 * 1024
+        );
     }
 
     #[test]

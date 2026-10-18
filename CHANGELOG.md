@@ -69,10 +69,24 @@ Compare: [`v0.7.9...v0.7.10`](https://github.com/Dicklesworthstone/storage_balla
   about 1.1 GiB, and ticks were regular again; when a `daemon-reload`
   restored the 768M drop-in 14 minutes later, the stall was back within a
   minute and the ticks stretched again. The daemon's own RSS limit
-  (500 MiB) still bounds its allocations; the rest of the cap only bounds
+  still bounds its allocations; the rest of the cap only bounds
   reclaimable cache. Existing installs keep their unit until `sudo sbh
   service --systemd reinstall-unit` rewrites it; a drop-in that sets
   `MemoryMax=768M` overrides the new unit and must be changed too.
+- **The daemon no longer restarts itself on a large host's normal working
+  set.** Its RSS limits default to 512 MiB (warning) and 1 GiB (exit),
+  from 256 MiB and 500 MiB. Under the 768M cap the kernel had pushed part
+  of the daemon's memory into swap, which kept RSS under 500 MiB. Under
+  4096M the same host, whose passes stop at the 500k-entry budget, settled
+  at 460-490 MiB and passed 545 MiB at the end of a pass. It exited on the
+  hard limit under Critical pressure after 52 hours, and the new process
+  climbed back to 490 MiB within two hours. Installs that set the limits in
+  `[telemetry]` keep their values.
+- **The end of a timed-out pass no longer copies every barren directory.**
+  The incremental scan cursor cloned each visited directory that had no
+  candidates, about 450k paths per pass on that host, and then kept
+  50,000. It now clones at most 50,000. Which directories it keeps is
+  unchanged: fresh ones first, then the newest cached ones.
 - **The RAM-scratch report names the largest tmpfs trees again.** `sbh
   check --ram-scratch` and the daemon's `SBH-RAM-SCRATCH` warning split
   a 20,000-entry budget (8192 in the daemon) evenly across the occupied

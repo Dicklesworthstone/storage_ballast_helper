@@ -7543,13 +7543,6 @@ impl ScanCursor {
 
         let now = Instant::now();
 
-        // Add newly discovered barren dirs.
-        for dir in visited_dirs {
-            if !dirs_with_candidates.contains(dir) {
-                self.barren_dirs.entry(dir.clone()).or_insert(now);
-            }
-        }
-
         // Remove dirs that turned out to have candidates (they may have been
         // cached as barren from a prior pass but gained artifacts since).
         for dir in dirs_with_candidates {
@@ -7560,12 +7553,30 @@ impl ScanCursor {
         self.barren_dirs
             .retain(|_, ts| now.duration_since(*ts) < self.ttl);
 
-        // Cap size: if over limit, drop oldest entries.
-        if self.barren_dirs.len() > self.max_entries {
-            let mut entries: Vec<_> = self.barren_dirs.drain().collect();
-            entries.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
-            entries.truncate(self.max_entries);
-            self.barren_dirs = entries.into_iter().collect();
+        // Newly discovered barren dirs. They are newer than every cached one,
+        // so the cap keeps them first; take no more than fit. Copying every
+        // barren dir and truncating afterwards cloned ~450k paths per pass on
+        // a host whose passes stop at the entry budget, the daemon's largest
+        // allocation burst (ts2, 2026-10-18). A dir already cached keeps its
+        // older timestamp.
+        let fresh: Vec<&PathBuf> = visited_dirs
+            .iter()
+            .filter(|dir| {
+                !dirs_with_candidates.contains(*dir) && !self.barren_dirs.contains_key(*dir)
+            })
+            .take(self.max_entries)
+            .collect();
+
+        // Cap size: the newest older entries fill whatever room is left.
+        let room = self.max_entries - fresh.len();
+        if self.barren_dirs.len() > room {
+            let mut older: Vec<_> = self.barren_dirs.drain().collect();
+            older.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+            older.truncate(room);
+            self.barren_dirs = older.into_iter().collect();
+        }
+        for dir in fresh {
+            self.barren_dirs.insert(dir.clone(), now);
         }
     }
 }
@@ -11558,6 +11569,83 @@ mod tests {
         ));
         assert!(log.should_log(path, keep(), start + Duration::from_mins(60)));
         assert!(log.should_log(path, keep(), start + Duration::from_mins(121)));
+    }
+
+    fn scan_cursor(max_entries: usize, cached: &[(&str, u64)]) -> ScanCursor {
+        let now = Instant::now();
+        ScanCursor {
+            barren_dirs: cached
+                .iter()
+                .map(|&(path, age_mins)| {
+                    let at = now.checked_sub(Duration::from_mins(age_mins)).unwrap();
+                    (PathBuf::from(path), at)
+                })
+                .collect(),
+            ttl: Duration::from_mins(30),
+            max_entries,
+        }
+    }
+
+    fn path_set(paths: &[&str]) -> HashSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn scan_cursor_keeps_only_fresh_barren_dirs_when_they_fill_the_cap() {
+        let mut cursor = scan_cursor(3, &[("/old/a", 1), ("/old/b", 2)]);
+        let visited: HashSet<PathBuf> = (1..=10)
+            .map(|n| PathBuf::from(format!("/new/{n}")))
+            .collect();
+
+        cursor.update(&visited, &path_set(&["/new/1"]), true);
+
+        assert_eq!(cursor.barren_dirs.len(), 3);
+        for dir in cursor.barren_dirs.keys() {
+            assert!(
+                dir.starts_with("/new"),
+                "older entry kept: {}",
+                dir.display()
+            );
+            assert_ne!(
+                dir,
+                Path::new("/new/1"),
+                "a dir with candidates is never barren"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_cursor_fills_spare_room_with_the_newest_cached_dirs() {
+        let mut cursor = scan_cursor(
+            4,
+            &[
+                ("/old/1", 1),
+                ("/old/2", 2),
+                ("/old/3", 3),
+                ("/old/4", 4),
+                ("/old/expired", 40),
+            ],
+        );
+        // /old/2 was walked again and is still barren; /old/3 gained candidates.
+        let visited = path_set(&["/new/a", "/new/b", "/old/2", "/cand"]);
+
+        cursor.update(&visited, &path_set(&["/cand", "/old/3"]), true);
+
+        let mut kept: Vec<&str> = cursor
+            .barren_dirs
+            .keys()
+            .map(|dir| dir.to_str().unwrap())
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["/new/a", "/new/b", "/old/1", "/old/2"]);
+        assert!(
+            cursor.barren_dirs[Path::new("/old/2")] < cursor.barren_dirs[Path::new("/new/a")],
+            "a dir already cached keeps its older timestamp"
+        );
+
+        // A pass that completes forgets everything.
+        cursor.update(&visited, &HashSet::new(), false);
+        assert!(cursor.barren_dirs.is_empty());
     }
 
     #[test]

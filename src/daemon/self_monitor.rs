@@ -65,8 +65,19 @@ pub fn generate_run_id() -> String {
         chrono::Utc::now().timestamp_millis()
     )
 }
-pub const DEFAULT_DAEMON_RSS_WARNING_BYTES: u64 = 256 * 1024 * 1024;
-pub const DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES: u64 = 500 * 1024 * 1024;
+/// RSS that logs a warning.
+///
+/// Above the steady state of a host whose passes stop at the entry budget,
+/// so it reports growth rather than repeating.
+pub const DEFAULT_DAEMON_RSS_WARNING_BYTES: u64 = 512 * 1024 * 1024;
+/// RSS at which the daemon exits for a clean restart.
+///
+/// A leak guard, so it sits well above a large host's working set. ts2
+/// (2026-10-18), 500k entries per pass, two malloc arenas: 460-490 MiB steady
+/// and over 545 MiB at a pass's end. At the former 500 MiB it restarted itself
+/// under Critical pressure once `MemoryMax=4096M` stopped pushing its pages
+/// into swap.
+pub const DEFAULT_DAEMON_RSS_HARD_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Growth past the last reported RSS that logs the warning again.
 const RSS_WARNING_REGROWTH_BYTES: u64 = 64 * 1024 * 1024;
