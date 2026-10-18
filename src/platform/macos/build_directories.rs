@@ -1,21 +1,22 @@
-//! Positive live-build cache evidence from native macOS process records.
+//! Live-build cache evidence from native macOS process records.
 //!
 //! Do not invoke ps or a build tool, inspect unrelated environments, or use
-//! sbh's HOME. Bound process work and each argument record; retain completed
-//! positive observations when another process is inaccessible. This Vec-returning
-//! PAL method is deliberately not a certificate of complete process visibility.
+//! sbh's HOME. Bound process work, each argument record and retained paths.
+//! Checked observations preserve positive references alongside incomplete
+//! coverage; the positive-only API is not a certificate of process visibility.
 
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::platform::build_environment::CacheLayout;
-use crate::platform::build_invocation;
-use crate::platform::process_arguments::darwin_arguments;
 use crate::platform::types::{OPEN_FILES_MAX_PIDS, OPEN_FILES_SCAN_BUDGET};
 
+mod checked;
+
 const MAX_DECLARED_PATHS: usize = 65_536;
+const MAX_DECLARED_PATH_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcessIdentity {
@@ -83,6 +84,7 @@ struct Limits {
     time: Duration,
     pids: usize,
     paths: usize,
+    bytes: usize,
 }
 
 impl Default for Limits {
@@ -91,85 +93,24 @@ impl Default for Limits {
             time: OPEN_FILES_SCAN_BUDGET,
             pids: OPEN_FILES_MAX_PIDS,
             paths: MAX_DECLARED_PATHS,
+            bytes: MAX_DECLARED_PATH_BYTES,
         }
     }
 }
 
 pub(super) fn collect() -> Vec<(i32, PathBuf)> {
-    collect_with(&NativeProcesses, std::process::id(), Limits::default())
+    collect_checked().0
 }
 
+/// Keep coverage attached to the same native observation as its references.
+/// Missing evidence may veto mutation; it never discards another live build.
+pub(super) fn collect_checked() -> (Vec<(i32, PathBuf)>, bool) {
+    checked::collect_with(&NativeProcesses, std::process::id(), Limits::default())
+}
+
+#[cfg(test)]
 fn collect_with(access: &impl ProcessAccess, own: u32, limits: Limits) -> Vec<(i32, PathBuf)> {
-    let started = access.now();
-    let in_budget = || {
-        access
-            .now()
-            .checked_duration_since(started)
-            .is_some_and(|elapsed| elapsed < limits.time)
-    };
-    let mut directories = BTreeSet::new();
-    if limits.pids == 0 || limits.paths == 0 || !in_budget() {
-        return Vec::new();
-    }
-    let Ok(pids) = access.pids() else {
-        return Vec::new();
-    };
-    for (seen, pid) in pids.into_iter().enumerate() {
-        if seen >= limits.pids || directories.len() >= limits.paths || !in_budget() {
-            break;
-        }
-        if pid <= 0 || u32::try_from(pid).ok() == Some(own) {
-            continue;
-        }
-        let Ok(before) = access.identity(pid) else {
-            continue;
-        };
-        if before.pid != pid {
-            continue;
-        }
-        let Some(tool) = build_invocation::observed_tool(&before.name) else {
-            continue;
-        };
-        if !in_budget() {
-            break;
-        }
-        let Ok(raw) = access.arguments(pid) else {
-            continue;
-        };
-        if raw.len() > sbh_mach::PROCESS_ARGUMENTS_MAX_BYTES {
-            continue;
-        }
-        let Some(arguments) = darwin_arguments(&raw) else {
-            continue;
-        };
-        if !in_budget() {
-            break;
-        }
-        // An inaccessible cwd does not erase absolute cache declarations.
-        // Relative values can only be interpreted in this process's cwd.
-        let cwd = access.cwd(pid).ok();
-        if !in_budget() {
-            break;
-        }
-        // Process exit/reuse or a changed name must not combine observations
-        // from different builders. This is still not an atomic exec snapshot.
-        if access.identity(pid).ok().as_ref() != Some(&before) {
-            continue;
-        }
-        for directory in build_invocation::references(
-            CacheLayout::MacOs,
-            tool,
-            arguments.argv,
-            arguments.environment,
-            cwd.as_deref(),
-        ) {
-            if directories.len() >= limits.paths {
-                break;
-            }
-            directories.insert((pid, directory));
-        }
-    }
-    directories.into_iter().collect()
+    checked::collect_with(access, own, limits).0
 }
 
 #[cfg(test)]
