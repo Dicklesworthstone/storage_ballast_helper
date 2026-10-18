@@ -340,6 +340,10 @@ impl Platform for TestOverlayPlatform {
         self.inner.process_list()
     }
 
+    fn process_list_without_command_lines(&self) -> Result<Vec<ProcessInfo>> {
+        self.inner.process_list_without_command_lines()
+    }
+
     fn process_io(&self, pid: i32) -> Result<ProcessIo> {
         self.inner.process_io(pid)
     }
@@ -352,12 +356,20 @@ impl Platform for TestOverlayPlatform {
         self.inner.build_directories_in_use()
     }
 
+    fn build_directories_in_use_checked(&self) -> (Vec<(i32, PathBuf)>, bool) {
+        self.inner.build_directories_in_use_checked()
+    }
+
     fn executables_under(&self, path: &Path) -> Result<ExecutablesResult> {
         self.inner.executables_under(path)
     }
 
     fn mmap_regions_under(&self, path: &Path) -> Result<Vec<MappedRegion>> {
         self.inner.mmap_regions_under(path)
+    }
+
+    fn mmap_regions_under_roots(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+        self.inner.mmap_regions_under_roots(roots)
     }
 
     fn open_files_under_roots(&self, roots: &[std::path::PathBuf]) -> Result<OpenFilesResult> {
@@ -530,5 +542,132 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("ENOSPC"));
         assert_eq!(std::fs::read(path).unwrap(), b"preserve");
+    }
+
+    mod reference_delegation {
+        use super::*;
+        use crate::core::errors::Result;
+        use crate::platform::pal::{FsStats, MemoryInfo, MountPoint, PlatformPaths, ServiceManager};
+        use crate::platform::types::{
+            ExecutablesResult, MappedRegion, OpenFile, OpenFileKind, OpenFileMode,
+            OpenFilesResult, PalError, ProcessInfo,
+        };
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct StrictReferences {
+            calls: Mutex<Vec<&'static str>>,
+        }
+
+        impl StrictReferences {
+            fn record(&self, name: &'static str) {
+                self.calls.lock().unwrap().push(name);
+            }
+
+            fn batch(&self, name: &'static str, roots: &[PathBuf]) {
+                assert_eq!(roots, &[PathBuf::from("/one"), PathBuf::from("/two")]);
+                self.record(name);
+            }
+        }
+
+        impl Platform for StrictReferences {
+            fn fs_stats(&self, path: &Path) -> Result<FsStats> {
+                MockPlatform::healthy().fs_stats(path)
+            }
+            fn mount_points(&self) -> Result<Vec<MountPoint>> { Ok(Vec::new()) }
+            fn is_ram_backed(&self, _: &Path) -> Result<bool> { Ok(false) }
+            fn default_paths(&self) -> PlatformPaths { PlatformPaths::default() }
+            fn memory_info(&self) -> Result<MemoryInfo> { MockPlatform::healthy().memory_info() }
+            fn service_manager(&self) -> Box<dyn ServiceManager> {
+                panic!("process evidence must not control services")
+            }
+            fn process_list(&self) -> Result<Vec<ProcessInfo>> {
+                panic!("no-argv queries must not fall back to command-line reads")
+            }
+            fn process_list_without_command_lines(&self) -> Result<Vec<ProcessInfo>> {
+                self.record("processes");
+                Ok(Vec::new())
+            }
+            fn build_directories_in_use(&self) -> Vec<(i32, PathBuf)> {
+                panic!("checked evidence must not pass through a positive-only API")
+            }
+            fn build_directories_in_use_checked(&self) -> (Vec<(i32, PathBuf)>, bool) {
+                self.record("builds");
+                (vec![(42, PathBuf::from("/active"))], false)
+            }
+            fn open_files_under(&self, _: &Path) -> Result<OpenFilesResult> {
+                panic!("batch descriptor scope must not be split into per-root queries")
+            }
+            fn open_files_under_roots(&self, roots: &[PathBuf]) -> Result<OpenFilesResult> {
+                self.batch("files", roots);
+                Ok(OpenFilesResult {
+                    files: vec![OpenFile {
+                        pid: 42,
+                        path: PathBuf::from("/one/active"),
+                        fd: Some(7),
+                        kind: OpenFileKind::Regular,
+                        mode: OpenFileMode::Read,
+                    }],
+                    complete: false,
+                    incomplete_reason: Some("unreadable peer process".to_owned()),
+                })
+            }
+            fn executables_under(&self, _: &Path) -> Result<ExecutablesResult> {
+                panic!("batch executable scope must not be split")
+            }
+            fn executables_under_roots(&self, roots: &[PathBuf]) -> Result<ExecutablesResult> {
+                self.batch("executables", roots);
+                Ok(ExecutablesResult { processes: Vec::new(), complete: false })
+            }
+            fn mmap_regions_under(&self, _: &Path) -> Result<Vec<MappedRegion>> {
+                panic!("batch mapping scope must not be split")
+            }
+            fn mmap_regions_under_roots(&self, roots: &[PathBuf]) -> Result<Vec<MappedRegion>> {
+                self.batch("mappings", roots);
+                Err(PalError::method_failed("fixture", "mmap_regions_under_roots", "mapped metadata refused").into())
+            }
+        }
+
+        #[test]
+        fn checked_build_observation_keeps_partial_positives_and_coverage() {
+            let inner = Arc::new(StrictReferences::default());
+            let overlay = TestOverlayPlatform::new(inner.clone(), InjectedFsTable::default());
+            let (directories, complete) = overlay.build_directories_in_use_checked();
+            assert!(!complete);
+            assert_eq!(directories, vec![(42, PathBuf::from("/active"))]);
+            assert_eq!(*inner.calls.lock().unwrap(), vec!["builds"]);
+        }
+
+        #[test]
+        fn batch_results_keep_partial_references_errors_and_one_shared_query() {
+            let inner = Arc::new(StrictReferences::default());
+            let overlay = TestOverlayPlatform::new(inner.clone(), InjectedFsTable::default());
+            let roots = vec![PathBuf::from("/one"), PathBuf::from("/two")];
+            let files = overlay.open_files_under_roots(&roots).unwrap();
+            assert!(!files.complete);
+            assert_eq!(files.incomplete_reason.as_deref(), Some("unreadable peer process"));
+            assert_eq!(files.files.len(), 1);
+            assert_eq!(files.files[0].path, PathBuf::from("/one/active"));
+            assert_eq!(files.files[0].pid, 42);
+            assert_eq!(files.files[0].fd, Some(7));
+            let executables = overlay.executables_under_roots(&roots).unwrap();
+            assert!(!executables.complete);
+            assert!(executables.processes.is_empty());
+            let error = overlay.mmap_regions_under_roots(&roots).unwrap_err();
+            assert!(error.to_string().contains("mapped metadata refused"));
+            assert_eq!(*inner.calls.lock().unwrap(), vec!["files", "executables", "mappings"]);
+        }
+
+        #[test]
+        fn nested_overlays_do_not_reintroduce_argv_reads_or_complete_verdicts() {
+            let inner = Arc::new(StrictReferences::default());
+            let first = Arc::new(TestOverlayPlatform::new(inner.clone(), InjectedFsTable::default()));
+            let outer = TestOverlayPlatform::new(first, InjectedFsTable::default());
+            assert!(outer.process_list_without_command_lines().unwrap().is_empty());
+            let (directories, complete) = outer.build_directories_in_use_checked();
+            assert!(!complete);
+            assert_eq!(directories, vec![(42, PathBuf::from("/active"))]);
+            assert_eq!(*inner.calls.lock().unwrap(), vec!["processes", "builds"]);
+        }
     }
 }
